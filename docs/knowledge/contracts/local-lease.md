@@ -263,159 +263,353 @@ or unknown, and any output truncation, returns exit 2.
 
 ## Capacity and eviction
 
-### Deferred whole-slot deletion (proposed, oxide#180)
+### Whole-tree holding deletion (oxide#190)
 
-This is a design for independent review and freeze, not shipped behaviour or
-authority to implement it. It replaces the current in-lock deletion and
-reconciliation path only after the fence and the complete protocol below are
-implemented. The problem is whole-tree work under the pool lock: one slow
-unlink can hold up every admission. The goal is that no admission waits for a
-whole-slot deletion, including a replay. Short pool-lock transactions and their
-filesystem operations can still take time; this is not a latency guarantee.
+Eviction no longer walks a slot tree under the pool lock. The measured problem
+(2026-10-29, live Builds pool) was #155's per-entry capture, verify and unlink
+with a journal kept inside the ledger: the ledger was rewritten and fully
+synced for **every** entry while the pool lock was held, so a 15.5 GB slot held
+the lock for about 23 minutes at about 60 entries per second and every
+admission and release on the host waited. The slot tree is Oxide's own private,
+owner-only directory, so per-entry journaling was unnecessary.
 
-**Fence first.** Before publishing any deferred record, journal or out-of-lock
-effect, install a permanent forward format fence in every control and ledger
-entry point that can mutate, reconcile, allocate, release or delete in this
-pool, including library paths. The fence must be understood by the first new
-binary and rejected before effects by every older supported binary; merely
-adding an optional field that old parsers ignore is insufficient. Under the
-pool lock, check and durably publish the control fence before the ledger fence,
-as in oxide#177's fence-first rule. Verify that the actual old parsers refuse
-both intermediate and final states. A crash between fences resumes the upgrade
-without deletion; a missing, contradictory or unreadable fence refuses
-mutation. Holding the pool lock during upgrade also waits out an old in-lock
-deleter; an old process returning later must check the fence on its next entry,
-before effects. If any supported entry point can bypass that check, the fence
-is not adequate and deferred deletion must not be enabled. Keep legacy
-in-lock records readable for safe migration; do not reinterpret an uncertain
-old journal as a new one.
+**Under the pool lock (milliseconds).** The victim is chosen exactly as before
+(an idle, positively writer-closed, verified slot; unknown or partial slots stay
+ineligible). The slot root is verified as the real owner-only directory the
+ledger records, on the slots root's own device; the descriptor of that root is
+opened without following a link and the identity it reports is bound durably and
+**carried to the rename boundary**, so a root a racer replaced after the check
+refuses (`UnsafePath`) instead of being held and later deleted. `renameat` then
+moves the tree **whole** into a private holding area on the same device:
+`<payload>/.oxide-holding/<store>-<slot>-<incarnation>-<nonce>`. The area is
+created owner-only (`0700`) and verified (real directory, caller's own, payload
+device). One durable revised ledger write then records one holding row — name,
+slot, incarnation, the directory identity the rename moved, the recorded bytes
+and when it was recorded — and drops the slot row.
 
-**Custody and publication.** Under the pool lock select only a positively
-writer-closed idle generation, validate its scope and backing, and establish a
-fresh deletion nonce bound to store, slot, incarnation, root and backing
-identity. Publish an `Evicting` record with that identity, conservative charge
-and a reference to a private, owner-only per-deletion control directory. Its
-stable lock file is created and identity-verified before publication; it is
-never unlinked or replaced while the record can be observed. Sync creation
-and record before releasing the pool lock. A crash before publication has no
-payload effect; an orphan control directory is not deletion authority. A crash
-after publication leaves an isolated, charged record even if no worker starts.
-Never select that generation for lease, adoption or another eviction.
+Two synced ledger writes in total, both O(1): one **rename intent** before the
+rename (the derived name and the verified identity) and the row swap after it.
+Nothing is written per entry — the tree is a private directory that becomes
+unreachable from every slot path the moment it is renamed, which is what made
+per-entry journaling unnecessary. The brief asked for one sync; the Oxide
+Supervisor accepted two on 2026-10-30 (decision `1e522ecc`) and clarified on the
+same day (decision `e0f63aa4`) that the authority is **O(1) durable transactions
+per eviction, not per-entry durability**, and that it does not waive the
+under-one-second lock interval. The intent is what makes a crash between the
+rename and the row recoverable **by identity** rather than by a name. Any figure
+quoted for the lock-held interval therefore covers the intent write, the rename
+and the row write together.
 
-The deleter holds an exclusive OS lock on that verified lock file for the
-entire deletion, including journal replay and final record removal. Claim it
-nonblocking while holding the pool lock, then release the pool lock before any
-tree walk, capture, unlink or replay. A busy lock is positive evidence of a
-live custodian, not permission to wait: other admissions skip that record.
-A successfully acquired lock is positive exclusive custody, including after a
-crash; a missing, replaced, inaccessible or unverifiable lock is unknown and
-keeps the record. No PID age, timeout or presumed death grants custody. Do not
-inherit the lock into children or allow a detached worker to outlive it. A
-claimant rechecks the exact nonce, generation, control-file identity and
-backing under the pool lock after acquiring custody. Lock ordering is pool lock
-then nonblocking custody claim; a custodian may later take the pool lock while
-holding custody, but no pool-lock holder waits for custody. A loser skips the
-object. No second claimant may replay a live worker's journal.
+The nonce is the generation's own recorded `last_lease_id`, not a fresh random
+token. Every part of the entry name is durable ledger state, and the intent is
+what makes each window recoverable **by identity rather than by name**: a crash
+before the intent leaves an untouched idle slot that is still a candidate; a
+crash between the intent and the rename leaves a stale intent that the next open
+clears (nothing moved, nothing adopted); a crash between the rename and the row
+swap leaves the idle row, its intent and the tree under the derived name, which
+the next open adopts only because the entry's identity is the one the intent
+bound; a crash after the row leaves a charged, isolated row a later command
+finishes. Nothing in any window is concluded from an absent name or from a name
+alone.
 
-**Journal and crash replay.** Move this generation's #155 journal to a
-bounded, atomically replaced and synced per-deletion file in that verified
-control directory, bound to the same nonce and identities. Its single writer
-holds custody. It never replaces a stale copy of the shared ledger; concurrent
-admissions and other deletions may update that ledger independently. The
-initial journal and directory are durable before the ledger references them;
-the ledger reference is durable before payload mutation. A missing, malformed,
-oversized or mismatched journal after publication is unknown, never an empty
-journal or authority to recreate one. Journal updates retain #155's exact
-capture, foreign-object, mode-restoration and per-entry removal semantics and
-durability ordering, including #175's narrow regular-file absence rule. The
-[complete-listing rule](workflow.md#finder-metadata-in-pools) still precedes
-acting on a listing: an error or unproved end of enumeration means no action on
-that partial list. The #175 completeness preflight and conservative charge
-also remain in force. Capture, verification and unlink stay descriptor-relative
-and identity-bound; no partial listing, unknown name or foreign capture becomes
-authority to delete.
+**Recovery order and the legacy migration window.** `Pool::open` reconciles the
+holding area **before** it replays a recorded deletion, and the legacy replay
+verifies its pending root in **O(1)**: the root is opened without following a
+link and its identity, owner, mode and device are checked (against the journal
+when one exists) — the recursive inventory preflight #155 needed is gone, so one
+large legacy pending tree can no longer hold the pool lock across every admission
+on the host. Per-object refusals belong to the outside-lock deletion, which keeps
+anything it cannot delete and reports it. Adoption therefore
+covers every generation whose tree is already in the holding area, including a
+legacy `Evicting` row interrupted between its migration rename and the write
+that would have recorded the holding row: that row is adopted (its per-entry
+journal, if any was already resolved, is dropped with it) and the pool is not
+left blocked behind a root its own rename moved. A tree still at its recorded
+root adopts nothing, so an unreplayed legacy journal keeps its own record until
+the replay decides it.
 
-After a crash, the next claimant verifies custody, the journal and backing,
-then applies the existing replay rules: a planned root at its original or
-private name is reconciled by recorded identity; recorded nested captures are
-restored deepest-first with recorded modes before a fresh deletion attempt.
-An unrecorded private capture, conflicting name, missing root without its
-durable `removed` phase, or any unresolved foreign capture stays pending.
-Crashes before or after each rename, phase write, unlink or mode repair retain
-the corresponding #155 outcome; a live unlink is not inferred complete from
-absence. Only a durable root `removed` phase proves completion. With custody
-still held, retake the pool lock, reload the current ledger and remove only the
-matching `Evicting` nonce and generation, preserving all concurrent updates;
-sync that revision before releasing custody. A crash after `removed` but before
-record removal repeats this final transaction without touching payload. A
-crash after record removal cannot resurrect it; cleanup of its private control
-directory is separately bounded and must not race a claimant or remove an
-unverified object. A failed cleanup cannot restore a charge or grant deletion
-authority. No whole-tree operation runs in the final pool-lock transaction.
+**Adoption is always identity-bound; a name alone adopts nothing.** Every
+generation that can be a rename source — an **ordinary idle eviction** and a
+recorded legacy deletion, both through the same `retire_idle_slot`/migration
+call — carries a durable `hold_intent` naming the derived entry and the root
+identity the writer verified, written before the rename. On the ordinary path
+that is the one intent write the eviction makes before its rename; the row swap
+that drops the slot row and records the holding row follows the rename. Recovery adopts an interrupted
+rename only when the entry's own `(device, inode)` **is** that bound identity.
+A stranger at the derived name, an entry whose identity differs, and an entry an
+observation error could not classify are all never adopted: their record, its
+charge and any journal stay, the pool keeps its refusal, and only a replay (for a
+legacy row) or the operator decides. An `Evicting` row with no intent adopts
+nothing at all, and a held row is never a rename source.
 
-**Admission and failure.** An in-flight or failed deletion remains charged
-until its record is durably dropped: use #175's maximum of recorded closed size
-and largest recorded slot for an unresolved eviction, without an unsafe
-pathname observation or double-counting hard links as newly free space. Count
-the record against finite slot and ledger limits until removal. Admission may
-use another eligible idle slot or allocate when the remaining byte and count
-limits permit; it must not wait for custody or synchronously reconcile the
-pending object. If capacity genuinely cannot accommodate a request while the
-charge remains, return a bounded capacity/busy result naming that constraint,
-not a global reconciliation failure or a claim that deletion freed space.
-An undeletable, unreadable or identity-uncertain object stays isolated and
-charged, and its error is reported per slot; it does not block unrelated
-admission with sufficient capacity. Global backing, ledger or fence integrity
-failures still refuse globally: per-object isolation cannot turn unknown shared
-authority into permission. Status remains observational and identifies pending
-deletions without taking custody or walking their trees by default.
+**A private capture name is never ordinary content.** The recursive #155
+inventory preflight that once refused such a tree ran under the pool lock and is
+gone; the same rule now lives in the outside-lock deletion. A name matching the
+private capture prefix (`.oxide-capture-…`) inside a held tree is #155 journal
+state that no record names any more, so it is **kept as uncertain**: the entry
+stays in place, the tree stays held and charged, and the pass reports it. It is
+never unlinked as ordinary content, and no locked walk is needed to notice it.
 
-**Removable backing.** Before each effect and replay, retain #098's verified
-volume and writer-closure rules. An absent, removed, replaced or unverifiable
-volume stops effects and keeps the record and charge; absence is not root
-removal. Reattachment must positively match the recorded volume and root
-identities before replay. A lost held slot follows #098's quarantine and
-positive closure rules before it can become a deletion candidate; neither a
-free custody lock nor a restart alone proves an arbitrary writer closed.
-Selection may fall back under the existing removable policy, without treating
-the missing volume's bytes as reclaimed or touching a replacement mount.
+**A rename that moved the wrong object is contained as well.** The source root's
+descriptor identity is compared with the caller's verified identity before the
+rename and with the moved entry afterwards. If a swap happened inside that
+window, the foreign tree is moved to `.unverified-<derived name>`:
+`holding_name_is_bounded` refuses a leading `.`, so no generation can derive that
+name and no recorded row names it. Whether or not that containment rename
+succeeds, the identity binding above already makes the entry unadoptable; the
+containment additionally keeps a foreign tree out of the reachable name space and
+the command refuses. The payload walk keeps charging those bytes, and the
+generation's own row stays recorded (its root is wherever the racer put it), so
+the slot is never silently freed and no foreign bytes are ever deleted.
 
-**Headroom.** An optional later policy may initiate deletion of eligible idle
-slots ahead of a byte or count ceiling, using exactly the same fence, custody,
-charge and journal protocol. It grants no new victim authority, does not count
-anticipated reclamation as free, and uses bounded work and concurrency; no
-resident daemon or background process is required by this design. Admission
-correctness and progress with sufficient capacity cannot depend on it.
+**Only a positively classified miss is absence.** A recorded holding row is
+dropped when its entry is gone with `NotFound`. Any other `lstat` failure
+(`EACCES`, `EIO`, an over-bound name) is **unknown**, never absence: the row and
+its charge are kept, the pool refuses rather than concluding, and a pass that
+cannot open a recorded entry keeps it, reports it and deletes nothing else. A
+holding entry is therefore never reported as deleted, and never stops being
+accounted, because an error could not be classified. The one positive absence
+that finishes rows without deleting anything is the **holding area itself**: the
+area probe reads the payload first, a locked open holds the pool lock (so no
+other command can be creating it), and no tree can live in an area that does not
+exist — so each recorded row there is finished and stops being charged instead of
+keeping its charge forever because its directory vanished outside Oxide's
+control. An absent removable volume never reaches that conclusion, because the
+open that gets there has already resolved the payload.
 
-**Implementation and proof slices.** Each product slice is Elevated because
-it deletes or replays deletion, with HIGH complexity for native-proof authoring.
-Each future approved brief must name its exact selectors, fixed wall-clock and
-scratch budget and satisfy the [premise checklist](workflow.md#proof-authoring-premise-checklist).
-The intended slices are:
+**Asynchronous delete, outside the lock.** The command that evicted the slot
+deletes that tree on a worker thread it owns while its own writer runs, and
+joins it before exit with a bounded wait whose progress is printed (60 s, then
+the entry is left recorded for a later command). The traversal holds
+descriptors only: `unlinkat`/`AT_REMOVEDIR` against a held parent, `O_NOFOLLOW`
+directories, never a path lookup, never a followed link (a symlink is unlinked
+as a leaf), never another device. An owned directory the owner left read-only
+or without its read bit is entered through a search-only descriptor and its own
+mode gains the owner bits, exactly as the retired path did; the claimed tree's
+**own root** is repaired the same way before its children are touched, so a slot
+tree the owner left owner-no-write is still deleted whole instead of staying
+charged forever. Each listing batch opens the directory afresh (never a `dup`,
+which would share the offset and make the next batch read an empty directory),
+so a refused entry can never be mistaken for an empty one. An already-missing
+entry counts as done, so a pass is idempotent. When the entry directory is gone,
+one brief locked write drops its row. A regression proves the device boundary
+both ways on one tree by injecting the device the traversal compares against: the
+foreign-device child directory is refused by name and kept while an ordinary file
+beside it is removed, and the same tree with its real device empties completely.
 
-1. Fence, custody and durable journal migration, with crash and concurrent
-   ledger tests; no out-of-lock payload effect until all entry points are fenced.
-2. Deferred deletion and per-object admission isolation, including count and
-   byte pressure, concurrent workers, complete-listing failure and every #155
-   crash boundary; then removable loss and reattachment with #098 closure.
-3. Optional headroom scheduling, only after the first two slices qualify, with
-   bounded concurrency and unchanged accounting and victim eligibility.
+**Progress does not depend on admission.** The refusal is re-evaluated for every
+positive removal, including one the *pre-admission* pass made after the refusal was
+decided (that pass runs beside the admission, so a removal — not a pass — is the
+trigger). A command therefore never retries against an unchanged figure and never
+gives up while a removal has already changed it. Takeover order is
+least-recently-attempted first, recorded as one O(1) write when a pass concludes
+with a row still in place, so an undeletable row cannot starve a later deletable
+one even while every admission is capacity-blocked and no grant or release
+advances the rotation.
 
-For each slice the covering selectors are `effigy rust:compile`,
-`effigy rust:format`, `effigy test rust`, `effigy docs:check` when docs change,
-and a newly briefed focused native selector plus its pure regression selector.
-The native plan is a short fixed fixture script under `effigy` heavy admission
-and the qualified `scripts/bounded-test.py` supervisor, with private pools,
-300 s and 512 MiB monitored scratch including cleanup; an owned 128 MiB APFS
-image is used only for removable cases. It pauses a real deletion at controlled
-boundaries while another admission completes with sufficient capacity, proves
-live custody is skipped, kills the owning fixture process and proves exclusive
-replay, tests failures and the old binary's fence refusals, and records resource
-figures and closure. Run its uncounted keep-going diagnostic first, then the
-author's counted native and an independent reviewer's separate native session;
-each requires its own activation and exact-head evidence. The diagnostic is
-not a pass. These proposed selectors and limits require source-fit review and
-an approved implementation brief; no native run is authorized by this design.
+**Custody and publication.** The evicting admission reports exactly the holding
+entries it created, and a command that evicts a slot by ID names that entry
+through the same derivation, so a command always publishes **its own** eviction
+instead of selecting a row by rotation; the rotation remains only the takeover
+path for entries a command did not create. A claim takes an exclusive
+**non-blocking** `flock` on the holding entry's own directory descriptor, under a
+brief pool lock, and holds it for the whole deletion. A second command that finds it held claims nothing and deletes
+nothing: a live custodian is never waited for, and nothing infers custody from a
+PID, an age or a timeout. Each pass claims at most one entry: the name its own
+command published first, otherwise the **least-recently-attempted** recorded row
+(with the oldest row breaking a tie), so a permanently refused entry never keeps
+another entry from being deleted by a later command. That order is independent of
+grants and releases: a pass that concludes with a row still in place records the
+attempt in one O(1) write, so the rotation advances even while every admission is
+capacity-blocked. A deleted entry's descriptor is closed with its last name gone,
+so a later pass can never re-acquire it.
+
+**One bounded victim per decision.** Because a held tree keeps its bytes charged,
+the figure cannot fall inside one locked attempt. Byte pressure therefore selects
+**one** victim, releases the lock, and the command publishes that tree and
+re-evaluates from the new figure — up to a small fixed number of rounds, each
+removing exactly one tree. Nothing evicts a warm idle slot ahead of the decision
+that needs it, and a pool that cannot converge refuses with a bounded capacity
+result. The count ceilings (slot and project) still evict only as many whole idle
+slots as they need.
+
+**Accounting.** A holding row is charged its recorded bytes (the generation's
+closed observation, else the largest recorded slot, at least one byte) in the
+admission capacity decision **until it is positively removed** — an eviction
+moves bytes, it never frees them early, and no admission decides as if a held
+tree were already gone. A holding row is neither a slot nor a member: it counts
+toward neither the slot ceiling nor a project's slot cap, and the payload scope
+walk isolates the recorded entries so nothing is counted twice. An **unrecorded**
+entry in the holding area is never adopted and never deleted; it stays counted by
+the payload walk (so its bytes are charged rather than free) and is reported. A
+command whose admission is refused because of such bytes finishes a pending
+deletion outside the pool lock and **re-evaluates**: a positive removal — not a
+pass — is the trigger, so the admission is retried for a removal the
+pre-admission pass made after the refusal as well, and each later round publishes
+one more tree and re-evaluates again, up to a small fixed bound of four rounds. A
+round that removes nothing keeps the last refusal. It never assumes the bytes are
+free. An undeletable tree therefore keeps
+its charge and its admission refuses with a bounded capacity result rather than
+exceeding the budget. `oxide status` lists each held entry with its recorded
+bytes, its age and one presence check — no walk, no custody, no deletion.
+
+**Per-object failure.** An entry the traversal cannot delete (permission,
+`EBUSY`, another owner, another device, a depth beyond the bound, an unknown
+entry type) stays in the holding area, still recorded and still charged, and is
+reported by name in the pass's bounded diagnostics. It never blocks admission
+that has capacity and never blocks another holding entry: the attempt marker moves
+it behind the others in the takeover order above.
+
+**Mixed versions.** The fence comes first (#177's rule): control state version
+9 always carries the forward-only `oxide.holding/1` fence, and the admission
+gate makes it durable before any locked pool open or ledger write that can
+record a holding row or a rename intent. An older binary hands off to a receipt-matching successor
+(at its own `control_state_version` capability) or refuses; it never meets a
+holding row with a schema it cannot represent. The library ledger's `holding`
+row is omitted while empty, so a pool that never evicted keeps the exact bytes
+an older binary wrote.
+
+**Legacy migration.** A `#155` per-entry journal can still exist in a ledger
+written by an older binary; its row carries the same durable `hold_intent` the
+idle path uses, written before its rename, and adoption is bound by it. The first locked open resolves it exactly as #155's
+replay rules allow (`reconcile_root_capture`, deepest-first rollback of recorded
+captures, recorded mode restoration, `RootCaptureState::Absent`/`Uncertain` and
+any recorded foreign capture staying pending) and then, instead of starting
+another per-entry journal, moves the resolved root whole into the holding area
+and drops the slot row in one write. An uncertain record is never reinterpreted:
+it keeps its record and starts no holding row. `Pool::open` never starts a new
+`#155` journal.
+
+**Retired machinery.** Whole-tree capture, private-name journaling, per-entry
+removal and its mode-widening guard are retired from the eviction path and
+deleted with their eviction-path regressions; the shared descriptor-relative
+owned-delete primitives (`owned_delete`) that `clean`, `prune` and the #155
+replay still use, and their own unit tests, are unchanged. The test-only seams
+that existed only for the retired per-entry path went with it — the per-entry
+unlink, permission-repair, child-reopen and root-capture crash hooks and their
+regressions — so no dead hook remains in `src/test_fs.rs`. `oxide clean` and the
+other owned-delete callers keep their own rules: the holding approach is not
+applied to them by this change, because a workspace target tree can contain
+bytes whose ownership and writer closure are not a private slot's.
+
+**Selectors and their oracles.** `effigy rust:holding-delete` is the focused
+native proof (one fixed script under the qualified shared supervisor,
+`--root-parent /private/tmp` for its genuine internal fixture pool, 300 s,
+512 MiB), `effigy rust:holding-delete:diagnostic` its uncounted keep-going twin,
+and `effigy proof:holding-delete:test` its self-check (one private temporary
+directory, removed before it returns; no child, pool or staging), which includes the
+progress-estimator counterfactual: a one-tick and a two-bucket window are rejected,
+a sustained multi-bucket window yields its average rate, and the old one-tick
+estimator is shown to fail where the corrected one is discriminating. Every native
+run needs its own owner activation, and the counted run and the independent
+reviewer native of the Elevated gate are separate.
+
+**Premise checklist, recorded before any activation.** The script carries the
+nine items of the [proof-authoring premise
+checklist](workflow.md#proof-authoring-premise-checklist) in `PREMISE_CHECKLIST`,
+and `--plan` prints them: private `HOME` and rustup (the invoking `RUSTUP_HOME`,
+or the invoking `HOME/.rustup` when unset, is read before any private `HOME`
+exists and passed to staging and every fixture with `RUSTUP_TOOLCHAIN` pinned and
+`RUSTUP_AUTO_INSTALL=0`; staging is the only `--locked` call, against this
+repository's committed lock, while the fixture crate is dependency-free and no
+fixture invocation passes `--locked`); the account-home control (`OXIDE_TEST_HOME_FROM_ENV=1`
+beside the private `HOME`); environment isolation (the staging sweep drops every
+`CARGO_TARGET_`/`CARGO_BUILD_`/`CARGO_ENCODED_`/`SCCACHE_`/`OXIDE_`/`XDG_` key and
+every compiler override, and the fixture environment is built from a fixed
+allow-list); automatic adoption, Cargo's external-subcommand argv and owned
+images (all three inapplicable, because no case uses permanent outputs, invokes
+an external subcommand or touches an image); compiler flags (`RUSTFLAGS` frozen
+with the encoded forms dropped); temporary storage (the documented
+`--root-parent /private/tmp` internal-placement exception for the genuine
+internal fixture pool, with per-tree `TMPDIR`/`TMP`/`TEMP`); and macOS `mktemp`
+(no shell `mktemp` anywhere; the self-check's two temporary directories come from
+`tempfile.mkdtemp`, which honours the supervisor's `TMPDIR`, and are removed).
+The pure self-check binds the map to the source it names — all nine items in
+order, every inapplicable item carrying its reason, every applicable disposition
+naming a helper the script really defines — and it binds item 1's lock claim to
+the two places it can drift: `create_project` must write a manifest with no
+`[dependencies]` table and no lock of its own, and the only `--locked` Cargo
+invocation in the script's effectful region must be staging's. A counterfactual
+manifest that declares a dependency, and a second `--locked` call, each fail that
+check, so a disposition cannot drift into a claim no case body supports.
+Recording them activates nothing: the uncounted
+diagnostic, the counted author native and the reviewer native remain separately
+owner-gated, and none has run at this head.
+
+Its concurrency fixture is asymmetrical: a 70,000-entry victim tree (above the
+brief's 20,000-entry floor, sized so its deletion outlasts the bound's two-second
+slack even at a conservative 15,000-unlinks/s floor) beside an 8,000-entry
+competitor tree, under a 290 MiB cap the victim alone stays below and only the pair
+exceeds — so both seeds record without pressure and exactly one eviction is forced.
+Its concurrency case measures progress under the deleter's own non-blocking
+custody with one cheap `listdir` count of the held tree's planted bucket
+directories — never a full-entry walk per sample — and estimates the rate
+only once at least three buckets are gone, as the average over the whole
+first-to-last window, so a single 20 ms tick cannot satisfy it (the counter is
+quantized: a bucket disappears only when its last entry is unlinked). The
+competitor then starts while most buckets remain, and its warm-reuse admission
+must complete with the evicting command alive, its holding row still recorded and
+the held tree still non-empty (all read at the completion instant), inside the
+in-lock control bound, with the estimated remaining deletion time required to
+exceed that bound. Its diagnostic mode leaves every fixture command — and
+therefore its descendants — in the qualified shared supervisor's own session and
+process group: the script creates no session and never signals a group, because
+session closure and the census that decides it belong to that supervisor. Each
+child it starts is waited for, or killed by its own PID and reaped, and only a
+positive reap counts as closure; an unreaped child stays tracked and ends the run
+rather than continuing with unknown custody, and no closure of a descendant is
+ever claimed. A recoverable oracle failure therefore continues the diagnostic
+only when the failed case never started a fixture command at all: once such a case
+has run a child, reaping the leader proves nothing about its descendants, whose
+closure belongs to the supervisor's census, so the run aborts and every case not
+reached stays `unexecuted`.
+
+The proof's lock figure is the **whole eviction-deciding pool-lock interval**:
+from the evicting command's pool-lock acquisition to that eviction's row write,
+so it covers the fence, the ledger read, reconciliation, admission bookkeeping,
+the byte-pressure decision and the recorded-total walks that feed it
+(oxide#177/#186), the victim selection, and then the intent write, the
+identity-verified rename and the row write. It is measured by a debug-only
+observation armed only inside the supervisor's scratch layout, so an inner
+fragment — and the rename transaction alone — cannot pass as the whole interval.
+This is the interval decision `e0f63aa4` refuses to waive ("the under-one-second
+lock interval is not waived"): the figure the counted native must show under a
+second includes the accounting walks the eviction decision makes, not only the
+rename. A command that evicts more than once under one lock records a figure
+that also covers the evictions before it. Its killed-deleter case runs the
+later command as a **warm reuse of the fixture's own idle slot**, not a new
+project: the fixture is over its cap on purpose (the victim's recorded charge
+plus the reusable slot exceeds the cap), so a new admission would legitimately
+retire an idle whole slot — the very tree that case's oracle requires to survive
+— and the case would prove the fixture's arithmetic rather than the takeover. A
+reuse takes no capacity decision, so the command's only effect on a slot is
+finishing the abandoned holding entry; the case asserts that the killed command
+was reaped, that the row and its partly deleted tree survived, that the later
+command reported and finished it, that no holding row remained, that the takeover
+added no slot, that its own slot came back idle, and that slot's tree still
+exists — and in the same run it confirms a reuse completes while a charged
+holding row sits above the pool's byte figure, which is what case 3's concurrent
+admission measures. Its concurrency oracle is positive
+and falsifiable: the competitor's admission is observed by the pool's own new
+ledger row appearing while the deleting process is alive and the held tree is
+provably still being deleted (a measured, decreasing, non-zero entry count under
+the deleter's custody), and that admission must stay inside three times the same
+admission measured on a separate pressure-free pool plus two seconds — an
+in-lock deletion would delay it by the whole deletion and fail that control, and
+the control's own numbers are recorded. Its diagnostic mode keeps explicit
+accounting: a recoverable oracle failure marks that case `failed` and the
+independent cases still run, an unclassified outcome (unexpected exception,
+unreaped child, exhausted deadline) marks the case `aborted` and the rest
+`unexecuted`, and a case that never ran is never a pass. Staging drops Cargo's
+encoded forms (including `CARGO_ENCODED_RUSTFLAGS`) and fixes every flag it
+sets.
+
+The proof's throughput figures are observations of a 20,000-entry fixture, not a
+real pool's rate; the retired path's incident figure is recorded as a labelled
+historical reference, never as a live comparison. This is still not a latency
+guarantee: a short rename and one synced ledger write can take time on a slow
+volume.
+
 
 Current pools are budget-only (`directory-budget-v1`, `apfs-volume-v1`):
 the budget is a soft admission figure with no OS ceiling, and current
@@ -786,31 +980,41 @@ a larger ledger, so every accepted ledger is at most 8 MiB.
 The measured state the current writer can reach from an empty ledger is
 serialized at every bounded maximum: the all-idle 256-slot ledger (numeric
 fields at their full 20-digit width including `cap_bytes`, every string at its
-cap including the widest accepted `lease_id`) measures 4,213,726 bytes, and
-with **one** maximal `DeletionJournal` (96 capture records and 32 mismatched
-captures, chains of 64 capture private names, name fields at `PATH_MAX` 1024
-bytes in `NAME_MAX` 255-byte components, `expected_mode` at the unrestricted
-u32 maximum, maximal sixfold escapes) it measures 5,625,456 bytes on an
-`Evicting` record that retains its closed observation. The writer
-refuses an over-bound journal object per object and puts it back without
-deleting it; the reader refuses a ledger that carries one. Ordinary evictions go
-through `retire_idle_slot`, which refuses while reconciliation is blocked or any
-journal is outstanding (so the guard covers `evict_idle_slot` too), and every
-open reconciles all `Evicting` records before admitting anything.
+cap including the widest accepted `lease_id`) measures 4,213,726 bytes. That is
+the figure this writer's ordinary eviction path reaches: since oxide#190 it
+writes one holding row and two O(1) synced writes per eviction and starts no
+journal at all. A `DeletionJournal` is now only **legacy input**: a ledger an
+older writer left can still carry one — with **one** maximal journal (96 capture
+records and 32 mismatched captures, chains of 64 capture private names, name
+fields at `PATH_MAX` 1024 bytes in `NAME_MAX` 255-byte components,
+`expected_mode` at the unrestricted u32 maximum, maximal sixfold escapes) it
+measures 5,625,456 bytes on an `Evicting` record that retains its closed
+observation, and the reader and the replay both accept it. The writer refuses
+an over-bound journal object per object and puts it back without deleting it;
+the reader refuses a ledger that carries one. Ordinary evictions go through
+`retire_idle_slot`, which refuses while reconciliation is blocked or a legacy
+journal is still outstanding (so the guard covers `evict_idle_slot` too), and
+every open reconciles the holding area and then all `Evicting` records before
+admitting anything.
 
-**Recovery is a second journal path, not a preserve-only path.** Every
-`Pool::open` runs `reconcile_evicting`. For an `Evicting` record with no
-journal, `reconcile_slot_capture` returns `Resume` and `remove_owned_slot`
-creates and persists a fresh `SlotCaptureJournal` through `begin`, without the
-`retire_idle_slot` guard; a recoverable inherited journal is rolled back,
-cleared and restarted the same way. The journal is started only after
-`pending_root_ready` completes its bounded preflight, so a blocked or
-partially inventoried tree keeps its record and starts no journal; a failed
-deletion that did start one keeps it and is retried on the next open. The front
-door's admission gate and the library's own locked open make the version-8
-control fence durable before any reconciliation (see the fence paragraph), so
-recovery, journal starts and ledger writes are all preceded by the hand-off
-fence.
+**Recovery moves trees; it never starts a journal.** Every `Pool::open`
+reconciles the holding area first (`reconcile_holding`: adoption only against a
+recorded intent-verified identity, rows dropped only when positively absent) and
+then the `Evicting` records. For a legacy `Evicting` record,
+`reconcile_slot_capture` resolves the #155 journal by #155's own rules —
+`Concluded` drops the record, `Resume` continues only after the recorded root is
+restored at its recorded name, `Blocked` keeps the record and starts nothing. A
+`Resume` then verifies the restored root in O(1) with `pending_root_verified`
+and moves it whole into the holding area, exactly as an ordinary eviction does.
+No path in this binary creates or persists a `SlotCaptureJournal`: the
+per-entry capture, journal start and in-lock per-entry removal, and the
+recovery functions that started a journal (`remove_owned_slot`, `begin`,
+`pending_root_ready`), no longer exist, and a blocked or unclassifiable pending
+root keeps its record instead of starting one. The front door's admission gate
+and the library's own locked open make the version-9 control fence (which
+carries `oxide.holding/1`) durable before any reconciliation (see the fence
+paragraph), so recovery, holding moves and ledger writes are all preceded by
+the hand-off fence.
 
 **Worst-valid byte bound (oxide#177; Supervisor ruling 49081d79).**
 `MAX_LEDGER_BYTES` *is* the worst-valid byte bound: the read and write paths
@@ -859,17 +1063,19 @@ stays at or below 128 slots never carries `4`, so its ledger stays readable by
 an older binary. The ledger alone cannot order that switch against the
 [#122 hand-off](workflow.md#installed-binary-hand-off-oxide122), which reads
 control state rather than the ledger, so the mutating-command admission gate
-makes a forward-only **version-8** control fence durable as the command's
+makes a forward-only **version-9** control fence durable as the command's
 first write (the oxide#177 `oxide.slots/256` fence, beside the oxide#175
-eviction-accounting and oxide#146 recorded-accounting fences; Oxide Supervisor
+eviction-accounting, oxide#146 recorded-accounting and oxide#190
+`oxide.holding/1` fences; Oxide Supervisor
 ruling 4c9984a1, fence first). The gate runs under the admission lock and
-before any locked `Pool::open` (which reconciles recorded deletions, can start
-a recovery journal and writes the ledger), so every such effect — ordinary
-eviction, recovery, journal start and ledger write — is preceded by the
+before any locked `Pool::open` (which reconciles the holding area and recorded
+deletions and writes the ledger), so every such effect — ordinary eviction,
+recovery, a holding move and ledger write — is preceded by the
 durable fence. A locked `Pool::open` also raises the same fence itself, under
 the pool lock, before its first reconciliation: pre-Store entries
 (`Store::open_at`, `Store::open_removable` and `recover-interrupted`'s ledger
-read) and a direct library open therefore cannot start a journal before it.
+read) and a direct library open therefore cannot write to a holding-era pool
+before it.
 That library path writes only the version and the three fence fields, taking
 the admission lock non-blocking and refusing rather than reconciling under
 contention; an absent control state (a library fixture) and passive
@@ -961,9 +1167,10 @@ its own, so the runner owns closure on any fault. With every slot's record
 current it also checks oxide#177's accounting-cost gate: a new-slot admission
 at 256 walks no inventory, the evicted slot is never walked, a release walks
 only its own slot, and default `status` at 256 walks nothing. The maximal
-writer-reachable ledger serialization — the measured one-journal `Evicting`
-state, 5,625,456 bytes with 2,763,152 bytes headroom under the 8 MiB
-worst-valid byte bound — escaped round-trip and oversized-field refusals are
+accepted ledger serialization — the legacy one-journal `Evicting` state,
+5,625,456 bytes with 2,763,152 bytes headroom under the 8 MiB
+worst-valid byte bound, which since oxide#190 is only input an older writer
+left (this writer starts no journal) — escaped round-trip and oversized-field refusals are
 unit tests in `effigy test rust`, as is a
 fixed 1000 ms ceiling on a whole 128-slot and 256-slot recorded-ledger round
 trip with a journal (bounded read via the passive snapshot, ranked ordering,
@@ -1361,7 +1568,8 @@ The raised-ceiling fence (oxide#177) repeats that ordering for `capacity_policy:
 4`: the admission gate writes control version 8 (with the `oxide.slots/256`
 fence) as the command's first write, before the locked open and before that
 same admission can record the 129th slot, and a later ordinary save keeps
-version 8 because the fences are part of the document. A
+version 8 because the fences are part of the document (oxide#190 later raises
+the same document to version 9, which also carries `oxide.holding/1`). A
 crash between the two writes leaves control 5 with a v1 ledger, which is a
 normal state for the new binary and a hand-off for the older one; the reverse
 order would strand it. The old binary's own refusal remains the honest
@@ -1435,9 +1643,9 @@ decision mocks where a real path exists:
    `MAX_LEDGER_BYTES`; an oversized field refuses with the file untouched.
 8. **Compatibility.** `capacity_policy: 1`, legacy (no fence), `2`, `3` and
    `4` ledgers; held IDs preserved; the admission gate writes control version
-   8 (recorded, eviction-accounting and raised-ceiling fences) as every
+   9 (recorded, eviction-accounting, raised-ceiling and holding fences) as every
    mutating command's first write, and a locked `Pool::open` raises it before
-   its recovery, journal start or ledger write, so a pool this binary mutates
+   its reconciliation, holding move or ledger write, so a pool this binary mutates
    never feeds a predecessor a ledger it cannot represent or a control version
    it cannot read; an
    owned-outputs-only state derives version 4 (proved on `save` directly, not
@@ -1742,9 +1950,11 @@ may return exit 5 without touching any new holder. Do not treat an unknown
 or mistyped ID as evidence that the intended writer ended. A held compatible
 project/profile returns busy rather than allowing a concurrent writer.
 
-A recorded deletion also journals every capture it makes (oxide#155). The slot's
-ledger record carries the root plan — the planned private name, the root's
-`(device, inode)`, the verified parent's `(device, inode)` and the root's full
+A recorded deletion also journals every capture it makes (oxide#155). This is the
+retired shape: since oxide#190 no deletion starts a journal — a legacy record
+like this one is still read and resolved by the replay below, and a resumed
+deletion moves its verified root whole into the holding area. The slot's
+ledger record carries the root plan — the planned private name, the root's`(device, inode)`, the verified parent's `(device, inode)` and the root's full
 `st_mode`, written before the exclusive rename, then the captured phase after it
 and a `removed` phase only once the root's own removal completed — beside a
 record for every nested capture: its private and observed names, its verified

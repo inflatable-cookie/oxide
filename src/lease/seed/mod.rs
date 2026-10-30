@@ -1667,6 +1667,8 @@ struct ControlState {
     #[serde(default)]
     slot_ceiling: Option<String>,
     #[serde(default)]
+    holding: Option<String>,
+    #[serde(default)]
     one_use_workspaces: Option<String>,
     #[serde(default)]
     records: Vec<ControlRecord>,
@@ -1733,6 +1735,18 @@ fn donor_control(pool_root: &Path, record_id: u64) -> DonorControl {
         || (state.version == 8
             && state.eviction_accounting.as_deref() == Some("oxide.eviction-accounting/1")
             && state.slot_ceiling.as_deref() == Some("oxide.slots/256")
+            && state.one_use_workspaces.is_none()
+            && state
+                .records
+                .iter()
+                .all(|record| !record.class.0 && !record.class_reason.0))
+        // Version 9 adds the whole-tree holding fence (oxide#190) and changes
+        // nothing this donor check reads: a record's phase, holder and lease are
+        // still the donor's own durable facts.
+        || (state.version == 9
+            && state.eviction_accounting.as_deref() == Some("oxide.eviction-accounting/1")
+            && state.slot_ceiling.as_deref() == Some("oxide.slots/256")
+            && state.holding.as_deref() == Some("oxide.holding/1")
             && state.one_use_workspaces.is_none()
             && state
                 .records

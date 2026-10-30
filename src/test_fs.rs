@@ -235,55 +235,6 @@ pub(crate) fn race_firing(label: &std::ffi::OsStr) -> Option<&'static str> {
     })
 }
 
-struct ArmedUnlink {
-    /// Unlinks still to skip before the action fires.
-    remaining: u32,
-    action: Box<dyn FnOnce()>,
-}
-
-thread_local! {
-    static BEFORE_UNLINK: RefCell<Option<ArmedUnlink>> = const { RefCell::new(None) };
-}
-
-/// Run `action` once, inside the deletion seam, immediately before its first
-/// per-entry unlink. This is how a unit test rebinds the directory name at
-/// exactly the boundary the seam revalidates, instead of racing on timing.
-#[must_use = "dropping the guard ends the armed action"]
-pub(crate) struct BeforeUnlinkGuard {
-    _thread_bound: PhantomData<Rc<()>>,
-}
-
-pub(crate) fn before_unlink(action: impl FnOnce() + 'static) -> BeforeUnlinkGuard {
-    before_unlink_at(1, action)
-}
-
-/// The same, armed for the `index`-th per-entry unlink of the drain (1-based),
-/// so a test can swap the *last* verified entry for something else and observe
-/// the accepted boundary.
-pub(crate) fn before_unlink_at(index: u32, action: impl FnOnce() + 'static) -> BeforeUnlinkGuard {
-    BEFORE_UNLINK.with(|cell| {
-        assert!(
-            cell.borrow().is_none(),
-            "overlapping before-unlink injections"
-        );
-        *cell.borrow_mut() = Some(ArmedUnlink {
-            remaining: index.max(1),
-            action: Box::new(action),
-        });
-    });
-    BeforeUnlinkGuard {
-        _thread_bound: PhantomData,
-    }
-}
-
-impl Drop for BeforeUnlinkGuard {
-    fn drop(&mut self) {
-        BEFORE_UNLINK.with(|cell| {
-            let _ = cell.borrow_mut().take();
-        });
-    }
-}
-
 /// Fire the armed action, if any. Called by the seam before each per-entry
 /// unlink; a no-op everywhere else.
 /// Fire the armed capture action for this 1-based entry ordinal, if any.
@@ -342,166 +293,6 @@ impl Drop for BeforeCaptureGuard {
     }
 }
 
-pub(crate) fn run_before_unlink() {
-    let action = BEFORE_UNLINK.with(|cell| {
-        let mut cell = cell.borrow_mut();
-        let armed = cell.as_mut()?;
-        armed.remaining = armed.remaining.saturating_sub(1);
-        if armed.remaining == 0 {
-            cell.take().map(|armed| armed.action)
-        } else {
-            None
-        }
-    });
-    if let Some(action) = action {
-        action();
-    }
-}
-
-thread_local! {
-    static BEFORE_REPAIR: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
-}
-
-/// Arm one action that runs inside the lease deletion, immediately before an
-/// unreadable owned directory's permission repair. This is how a unit test
-/// rebinds that name at exactly the repair boundary the no-follow rule has to
-/// survive.
-#[must_use = "dropping the guard ends the armed action"]
-pub(crate) struct BeforeRepairGuard {
-    _thread_bound: PhantomData<Rc<()>>,
-}
-
-pub(crate) fn before_repair(action: impl FnOnce() + 'static) -> BeforeRepairGuard {
-    BEFORE_REPAIR.with(|cell| {
-        assert!(
-            cell.borrow().is_none(),
-            "overlapping before-repair injections"
-        );
-        *cell.borrow_mut() = Some(Box::new(action));
-    });
-    BeforeRepairGuard {
-        _thread_bound: PhantomData,
-    }
-}
-
-impl Drop for BeforeRepairGuard {
-    fn drop(&mut self) {
-        BEFORE_REPAIR.with(|cell| {
-            let _ = cell.borrow_mut().take();
-        });
-    }
-}
-
-/// Fire the armed repair action, if any.
-pub(crate) fn run_before_repair() {
-    let action = BEFORE_REPAIR.with(|cell| cell.borrow_mut().take());
-    if let Some(action) = action {
-        action();
-    }
-}
-
-/// The exact point at which a test models an abrupt process end inside the
-/// journaled root capture of a whole-slot deletion. A real crash runs no
-/// put-back, no journal write and no ledger write, so the armed action panics
-/// and the test unwinds without any of that.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RootCaptureCrash {
-    /// The planned record is durable and the exclusive rename has not run.
-    Planned,
-    /// The rename is durable and the captured phase is not recorded.
-    Renamed,
-    /// The captured root's mode was widened and the tree was not walked.
-    ModeWidened,
-    /// The captured root lost its first child deletion.
-    MidDelete,
-}
-
-thread_local! {
-    static ROOT_CRASH: RefCell<Option<RootCaptureCrash>> = const { RefCell::new(None) };
-}
-
-/// Arm one root-capture crash. The armed stage fires once; the guard clears it
-/// for a test that does not reach the stage.
-#[must_use = "dropping the guard ends the armed crash"]
-pub(crate) struct RootCaptureCrashGuard {
-    _thread_bound: PhantomData<Rc<()>>,
-}
-
-pub(crate) fn root_capture_crash(stage: RootCaptureCrash) -> RootCaptureCrashGuard {
-    ROOT_CRASH.with(|cell| {
-        assert!(cell.borrow().is_none(), "overlapping root-capture crashes");
-        *cell.borrow_mut() = Some(stage);
-    });
-    RootCaptureCrashGuard {
-        _thread_bound: PhantomData,
-    }
-}
-
-impl Drop for RootCaptureCrashGuard {
-    fn drop(&mut self) {
-        ROOT_CRASH.with(|cell| {
-            let _ = cell.borrow_mut().take();
-        });
-    }
-}
-
-/// Fire the armed root-capture crash for this stage, if any.
-pub(crate) fn run_root_capture(stage: RootCaptureCrash) {
-    let armed = ROOT_CRASH.with(|cell| {
-        let mut cell = cell.borrow_mut();
-        if cell.as_ref() != Some(&stage) {
-            return None;
-        }
-        cell.take()
-    });
-    if armed.is_some() {
-        panic!("test: modelled crash at root capture stage {stage:?}");
-    }
-}
-
-thread_local! {
-    static BEFORE_CHILD_REOPEN: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
-}
-
-/// Arm one action that runs inside the lease deletion, immediately after an
-/// unreadable owned directory's access was repaired and strictly before the
-/// deleted private name is reopened and its identity verified. This is how a
-/// unit test replaces that name at the exact boundary where a restoration must
-/// only ever act on the verified descriptor.
-#[must_use = "dropping the guard ends the armed action"]
-pub(crate) struct BeforeChildReopenGuard {
-    _thread_bound: PhantomData<Rc<()>>,
-}
-
-pub(crate) fn before_child_reopen(action: impl FnOnce() + 'static) -> BeforeChildReopenGuard {
-    BEFORE_CHILD_REOPEN.with(|cell| {
-        assert!(
-            cell.borrow().is_none(),
-            "overlapping before-child-reopen injections"
-        );
-        *cell.borrow_mut() = Some(Box::new(action));
-    });
-    BeforeChildReopenGuard {
-        _thread_bound: PhantomData,
-    }
-}
-
-impl Drop for BeforeChildReopenGuard {
-    fn drop(&mut self) {
-        BEFORE_CHILD_REOPEN.with(|cell| {
-            let _ = cell.borrow_mut().take();
-        });
-    }
-}
-
-/// Fire the armed before-child-reopen action, if any.
-pub(crate) fn run_before_child_reopen() {
-    let action = BEFORE_CHILD_REOPEN.with(|cell| cell.borrow_mut().take());
-    if let Some(action) = action {
-        action();
-    }
-}
-
 thread_local! {
     static BEFORE_WALK_CAPTURE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
 }
@@ -539,6 +330,91 @@ impl Drop for BeforeWalkCaptureGuard {
 /// Fire the armed before-walk-capture action, if any.
 pub(crate) fn run_before_walk_capture() {
     let action = BEFORE_WALK_CAPTURE.with(|cell| cell.borrow_mut().take());
+    if let Some(action) = action {
+        action();
+    }
+}
+
+thread_local! {
+    static BEFORE_HOLDING_RENAME: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
+/// Arm one action that runs inside a holding rename, immediately after the
+/// source root's descriptor identity was verified and strictly before the
+/// `renameat`. This is how a unit test swaps the observed source name so the
+/// rename moves an object that is not the verified one — the containment path
+/// (oxide#190).
+#[must_use = "dropping the guard ends the armed action"]
+pub(crate) struct BeforeHoldingRenameGuard {
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+pub(crate) fn before_holding_rename(action: impl FnOnce() + 'static) -> BeforeHoldingRenameGuard {
+    BEFORE_HOLDING_RENAME.with(|cell| {
+        assert!(
+            cell.borrow().is_none(),
+            "overlapping before-holding-rename injections"
+        );
+        *cell.borrow_mut() = Some(Box::new(action));
+    });
+    BeforeHoldingRenameGuard {
+        _thread_bound: PhantomData,
+    }
+}
+
+impl Drop for BeforeHoldingRenameGuard {
+    fn drop(&mut self) {
+        BEFORE_HOLDING_RENAME.with(|cell| {
+            let _ = cell.borrow_mut().take();
+        });
+    }
+}
+
+/// Fire the armed before-holding-rename action, if any.
+pub(crate) fn run_before_holding_rename() {
+    let action = BEFORE_HOLDING_RENAME.with(|cell| cell.borrow_mut().take());
+    if let Some(action) = action {
+        action();
+    }
+}
+
+thread_local! {
+    static AFTER_HOLDING_RENAME: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
+/// Arm one action that runs inside a holding rename, immediately after the
+/// rename and its moved-identity verification and strictly before the caller's
+/// durable row write. This is how a unit test models the crash window between
+/// an eviction's rename and its row (oxide#190).
+#[must_use = "dropping the guard ends the armed action"]
+pub(crate) struct AfterHoldingRenameGuard {
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+pub(crate) fn after_holding_rename(action: impl FnOnce() + 'static) -> AfterHoldingRenameGuard {
+    AFTER_HOLDING_RENAME.with(|cell| {
+        assert!(
+            cell.borrow().is_none(),
+            "overlapping after-holding-rename injections"
+        );
+        *cell.borrow_mut() = Some(Box::new(action));
+    });
+    AfterHoldingRenameGuard {
+        _thread_bound: PhantomData,
+    }
+}
+
+impl Drop for AfterHoldingRenameGuard {
+    fn drop(&mut self) {
+        AFTER_HOLDING_RENAME.with(|cell| {
+            let _ = cell.borrow_mut().take();
+        });
+    }
+}
+
+/// Fire the armed after-holding-rename action, if any.
+pub(crate) fn run_after_holding_rename() {
+    let action = AFTER_HOLDING_RENAME.with(|cell| cell.borrow_mut().take());
     if let Some(action) = action {
         action();
     }

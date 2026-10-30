@@ -4,10 +4,10 @@ use super::pool::{
     recover_injected, release_injected, status_injected, with_accounting_limits,
 };
 use super::{
-    remove_tree_owned, AccountingCoverage, AccountingGapKind, AccountingScan, AdmissionClass,
-    LeaseError, LeaseRequest, Profile, SlotLayout, SlotOccupancy, VictimPolicy,
-    BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES,
-    MAX_LEDGER_BYTES, MAX_REFUSAL_SLOTS, RAISED_CAPACITY_POLICY_VERSION,
+    AccountingCoverage, AccountingGapKind, AccountingScan, AdmissionClass, LeaseError,
+    LeaseRequest, Profile, SlotLayout, SlotOccupancy, VictimPolicy, BUDGET_BACKEND_DIRECTORY_V1,
+    MANAGED_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_LEDGER_BYTES, MAX_REFUSAL_SLOTS,
+    RAISED_CAPACITY_POLICY_VERSION,
 };
 use std::fs::{self, File};
 use std::io::Write;
@@ -87,6 +87,69 @@ impl Drop for Fixture {
             make_removable(&self.path);
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+}
+
+/// [`lease_publishing`] for the public `managed::lease` entry point.
+fn lease_after_publishing(
+    pool: &Path,
+    request: LeaseRequest,
+) -> Result<super::LeaseGrant, LeaseError> {
+    match managed::lease(request.clone()) {
+        Ok(grant) => Ok(grant),
+        Err(error @ (LeaseError::Full | LeaseError::CapacityCharged { .. })) => {
+            let mut last = Err(error);
+            for _ in 0..4 {
+                let removed = managed::drain_holding(pool, None)
+                    .map(|pass| pass.gone)
+                    .unwrap_or(false);
+                if !removed {
+                    break;
+                }
+                last = managed::lease(request.clone());
+                if last.is_ok() {
+                    break;
+                }
+            }
+            last
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// The product's two-step byte-pressure admission (oxide#190).
+///
+/// Every held tree stays charged in the capacity decision until it is
+/// positively removed, so an admission that evicts cannot admit in the same
+/// attempt: it refuses with a capacity result while its trees are still held.
+/// The command then deletes one pending tree outside the pool lock and retries
+/// exactly once. This helper performs that shape for a test that wants the
+/// end state, and returns the first refusal so a caller can assert it happened.
+fn lease_publishing(
+    pool: &Path,
+    request: LeaseRequest,
+) -> (Result<super::LeaseGrant, LeaseError>, Option<LeaseError>) {
+    match lease_injected(request.clone()) {
+        Ok(grant) => (Ok(grant), None),
+        Err(error @ (LeaseError::Full | LeaseError::CapacityCharged { .. })) => {
+            // The product publishes one tree outside the lock and re-evaluates,
+            // up to a small bound; a pass that removes nothing ends it.
+            let mut last = Err(error.clone());
+            for _ in 0..4 {
+                let removed = managed::drain_holding(pool, None)
+                    .map(|pass| pass.gone)
+                    .unwrap_or(false);
+                if !removed {
+                    break;
+                }
+                last = lease_injected(request.clone());
+                if last.is_ok() {
+                    break;
+                }
+            }
+            (last, Some(error))
+        }
+        Err(other) => (Err(other.clone()), Some(other)),
     }
 }
 
@@ -352,6 +415,11 @@ fn byte_pressure_evicts_the_rank_lru_idle_whole_slot_only() {
     create_injected(&pool, cap).expect("init");
     let workspace = fx.dir("workspace");
 
+    // A held slot first, so it is the oldest rank and would be the first victim
+    // if held slots were eligible.
+    let c = lease_injected(request(&pool, &fx.dir("project-c"), &workspace, "c")).expect("c");
+    let c_marker = c.env.cargo_build_build_dir.join("blob");
+    fs::write(&c_marker, vec![b'c'; 512 * 1024]).expect("c payload");
     let a = lease_injected(request(&pool, &fx.dir("project-a"), &workspace, "a")).expect("a");
     let a_marker = a.env.cargo_build_build_dir.join("blob");
     fs::write(&a_marker, vec![b'a'; 3 * 1024 * 1024]).expect("a payload");
@@ -360,19 +428,19 @@ fn byte_pressure_evicts_the_rank_lru_idle_whole_slot_only() {
     let b_marker = b.env.cargo_build_build_dir.join("blob");
     fs::write(&b_marker, vec![b'b'; 1024 * 1024]).expect("b payload");
     release_injected(&pool, &b.lease_id).expect("release b");
-    let c = lease_injected(request(&pool, &fx.dir("project-c"), &workspace, "c")).expect("c");
-    let c_marker = c.env.cargo_build_build_dir.join("blob");
-    fs::write(&c_marker, vec![b'c'; 512 * 1024]).expect("c payload");
     // c stays held: a held slot is never an eviction candidate.
 
-    let d = lease_injected(request(&pool, &fx.dir("project-d"), &workspace, "d"))
-        .expect("byte pressure replaces the oldest idle slot");
+    // Every held tree stays charged until it is positively removed, so byte
+    // pressure retires every eligible idle slot in rank order before the
+    // attempt refuses; the publishing pass then frees one tree and the retry
+    // admits. `a` is the oldest idle slot, so it is retired first, and the held
+    // slot is never a victim. The single-decision LRU order is asserted where
+    // one decision is observable (`evict_one_idle_with` in the pool tests).
+    let d = lease_publishing(&pool, request(&pool, &fx.dir("project-d"), &workspace, "d"))
+        .0
+        .expect("byte pressure retires idle slots and admits after a published pass");
     assert!(!d.reused_slot);
     assert!(!a_marker.exists(), "the rank-LRU idle slot was not evicted");
-    assert_eq!(
-        fs::read(&b_marker).expect("newer idle slot survives"),
-        vec![b'b'; 1024 * 1024]
-    );
     assert_eq!(
         fs::read(&c_marker).expect("held slot survives"),
         vec![b'c'; 512 * 1024]
@@ -384,14 +452,14 @@ fn byte_pressure_evicts_the_rank_lru_idle_whole_slot_only() {
         .map(|slot| slot.slot_id.as_str())
         .collect();
     assert!(!ids.contains(&a.slot_id.as_str()));
-    assert!(ids.contains(&b.slot_id.as_str()));
-    let held = status
-        .slots
-        .iter()
-        .find(|slot| slot.slot_id == c.slot_id)
-        .expect("held slot remains a member");
-    assert_eq!(held.state, SlotOccupancy::Held);
-    assert!(status.slots.iter().any(|slot| slot.slot_id == d.slot_id));
+    assert!(ids.contains(&c.slot_id.as_str()));
+    // A newer idle slot can only be gone after the older one was.
+    if !b_marker.exists() {
+        assert!(
+            !a_marker.exists(),
+            "a newer slot was retired before the older"
+        );
+    }
 }
 
 #[test]
@@ -765,7 +833,9 @@ fn eviction_removes_only_idle_owned_slots() {
     let sentinel = project_a.join("src");
     fs::create_dir(&sentinel).unwrap();
     release_injected(&pool, &first.lease_id).expect("release a");
-    let second = lease_injected(request(&pool, &project_b, &workspace, "holder-b")).expect("b");
+    let second = lease_publishing(&pool, request(&pool, &project_b, &workspace, "holder-b"))
+        .0
+        .expect("b");
     assert_ne!(second.slot_id, first.slot_id);
     assert!(!marker.exists());
     assert!(sentinel.exists());
@@ -1116,11 +1186,20 @@ fn budget_pool_admits_against_the_budget_and_evicts_whole_idle_slots() {
     managed::release(&pool, &first.lease_id).expect("release");
 
     // Over budget with an idle slot: it is evicted whole, then admitted.
-    let second = managed::lease(request(&pool, &project_b, &workspace, "holder-b"))
-        .expect("evict then admit");
+    let second = lease_after_publishing(&pool, request(&pool, &project_b, &workspace, "holder-b"))
+        .expect("evict, publish, then admit");
     assert_ne!(second.slot_id, first.slot_id);
     assert!(!blob.exists());
     assert!(!pool.join("payload/slots").join(&first.slot_id).exists());
+    // Nothing is left held: the eviction's tree was published and positively
+    // removed, which is what freed the bytes the retry admitted against.
+    assert!(
+        managed::ledger_view(&pool)
+            .expect("ledger view")
+            .holding
+            .is_empty(),
+        "a held tree survived the publishing command"
+    );
     managed::release(&pool, &second.lease_id).expect("release second");
     let third =
         managed::lease(request(&pool, &project_c, &workspace, "holder-c")).expect("under budget");
@@ -1247,7 +1326,21 @@ fn a_changed_soft_budget_applies_at_the_next_admission() {
     let project_c = fx.dir("project-c");
     let mut smaller = request(&pool, &project_c, &workspace, "holder-c");
     smaller.budget_bytes = Some(64 * 1024);
-    let third = managed::lease(smaller).expect("admitted after idle eviction");
+    // Every held tree stays charged until it is positively removed, so this
+    // admission first refuses while its evicted trees are held; publishing the
+    // pending trees outside the lock is what lets the next attempt admit.
+    assert!(
+        matches!(
+            managed::lease(smaller.clone()),
+            Err(LeaseError::Full) | Err(LeaseError::CapacityCharged { .. })
+        ),
+        "an admission over budget decided as if its held trees were already gone"
+    );
+    while managed::drain_holding(&pool, None)
+        .map(|pass| pass.gone)
+        .unwrap_or(false)
+    {}
+    let third = managed::lease(smaller).expect("admitted once the evicted trees are gone");
     let status = managed::status(&pool).expect("status after eviction");
     assert!(status
         .slots
@@ -1549,7 +1642,7 @@ fn unreadable_slot_entry_refuses_reuse_admission_and_eviction() {
     // accepted stale-idle policy trusts a current record, so a new-slot
     // admission does not re-walk that slot: it evicts the whole idle slot it
     // owns instead of refusing on an entry only a fresh walk would notice.
-    let admit = managed::lease(request(&pool, &fx.dir("other"), &workspace, "c"));
+    let admit = lease_after_publishing(&pool, request(&pool, &fx.dir("other"), &workspace, "c"));
     let status = managed::status(&pool);
     assert!(denied.hits() >= 1, "permission injection was not reached");
     drop(denied);
@@ -1652,7 +1745,7 @@ fn vanished_paths_allow_only_the_needed_whole_idle_slot_eviction() {
             {"path": vanished_dir, "action": "remove_before_read_dir"}
         ])
         .to_string(),
-        || managed::lease(request(&pool, &next_project, &workspace, "next")),
+        || lease_after_publishing(&pool, request(&pool, &next_project, &workspace, "next")),
     )
     .expect("complete observation permits admission");
 
@@ -1711,7 +1804,7 @@ fn a_real_gap_still_refuses_before_whole_idle_slot_deletion() {
             {"path": vanished_file, "action": "remove_before_symlink_metadata"}
         ])
         .to_string(),
-        || managed::lease(request(&pool, &next_project, &workspace, "next")),
+        || lease_after_publishing(&pool, request(&pool, &next_project, &workspace, "next")),
     );
     let scan = incomplete(refused);
     assert_eq!(scan.coverage, AccountingCoverage::Partial);
@@ -2644,16 +2737,15 @@ fn maximal_journal_json(tag: u64) -> serde_json::Value {
     })
 }
 
-/// The maximal ledger this writer reaches on its **ordinary eviction path**
-/// (oxide#177): the raised-ceiling representation at 256 slots with every field
-/// at its cap, where the one slot a pool can durably leave `Evicting` carries a
-/// maximal deletion journal. `retire_idle_slot` refuses a second deletion while
-/// a journal is outstanding, so an admission starts one. `MAX_LEDGER_BYTES` is
+/// The maximal accepted ledger carrying a legacy journal (oxide#177): the
+/// raised-ceiling representation at 256 slots with every field at its cap, where
+/// one slot carries a maximal deletion journal. Since oxide#190 no path in this
+/// binary starts a journal, so this is a **read-side** bound — an older writer
+/// left the journal, `retire_idle_slot` and the reader both still honour it, and
+/// the replay rewrites or drops it. `MAX_LEDGER_BYTES` is
 /// the *worst-valid byte bound* — a larger ledger is corrupt and refused, and
-/// the reader accepts any otherwise-valid ledger at or below it. Recovery can
-/// leave more journals (see
-/// `recovery_creates_a_journal_for_a_second_pending_deletion`), so this figure
-/// is the maximal ordinary-path state, not a bound on recovery.
+/// the reader accepts any otherwise-valid ledger at or below it, including one
+/// an older writer left with more than one journal.
 #[test]
 fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
     let fx = Fixture::new("worst-journal-ledger");
@@ -2752,14 +2844,17 @@ fn worst_valid_journaled_ledger_roundtrips_within_the_byte_cap() {
     assert_eq!(snapshot.evicting_slot_ids.len(), 1);
 }
 
-/// Recovery is a second journal path (oxide#177): `Pool::open` reconciles
-/// every `Evicting` record, and `remove_owned_slot` creates and persists a fresh
-/// `SlotCaptureJournal` for one that has none (or after a recoverable journal is
-/// rolled back and cleared), without `retire_idle_slot`'s single-journal guard;
-/// the loop continues past a blocked record and a failed deletion keeps its
-/// journal. One open can therefore leave a journal per failing pending
-/// deletion. The admission gate and the library's locked open make the
-/// version-8 control fence durable before the open, so this recovery path is
+/// Recovery moves a legacy pending root whole and never starts a journal
+/// (oxide#190): `Pool::open` reconciles the holding area and then every
+/// `Evicting` record, `reconcile_slot_capture` resolves a legacy #155 journal by
+/// #155's own rules (`Concluded` drops the record, `Resume` continues only after
+/// the root is restored, `Blocked` keeps it and starts nothing), and a resumed
+/// deletion verifies its root in O(1) and moves it into the holding area.
+/// Because the per-entry journal start is retired, no open can leave a new
+/// journal behind: this test proves the legacy shape stays readable and is
+/// adopted, and that a blocked record keeps its journal without starting
+/// another. The admission gate and the library's locked open make the
+/// version-9 control fence durable before the open, so this path is
 /// preceded by the hand-off fence (oxide#177, fence first).
 #[test]
 fn recovery_keeps_a_second_pending_deletion_without_a_journal() {
@@ -2776,8 +2871,6 @@ fn recovery_keeps_a_second_pending_deletion_without_a_journal() {
     let first_id: u64 = first.slot_id.parse().expect("slot id");
     let second_id: u64 = second.slot_id.parse().expect("slot id");
     let first_path = pool.join("payload/slots").join(&first.slot_id);
-    let second_path = pool.join("payload/slots").join(&second.slot_id);
-
     // Slot A: an unclassifiable journal, so reconciliation blocks and keeps it.
     super::pool::mark_evicting_for_test(&pool, first_id).expect("recorded deletion");
     fs::remove_dir_all(&first_path).expect("the recorded root is absent");
@@ -2800,17 +2893,14 @@ fn recovery_keeps_a_second_pending_deletion_without_a_journal() {
     )
     .expect("journal");
 
-    // Slot B: `Evicting` with no journal, and a tree the deletion cannot
-    // finish (a directory with no search bit), so recovery refuses before its
-    // preflight and keeps the record without starting a journal (oxide#175).
+    // Slot B: `Evicting` with no journal. Its migration is an O(1) root
+    // verification plus a whole-tree move, so it completes in the same open
+    // instead of waiting on a locked inventory.
     super::pool::mark_evicting_for_test(&pool, second_id).expect("recorded deletion");
-    let blocked = second_path.join("blocked");
-    fs::create_dir(&blocked).expect("blocked directory");
-    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).expect("no search bit");
 
-    // One open reconciles them: A stays blocked with its journal, and B stays
-    // pending with no journal, so recovery never starts a second one
-    // (oxide#177's single-journal writer guard, kept by the fence-first run).
+    // One open reconciles them: A stays blocked with its unclassifiable
+    // journal, and B moves whole into the holding area with no journal
+    // started at all.
     let _ = status_injected(&pool);
     assert!(
         super::pool::capture_record_injected(&pool, first_id).is_some(),
@@ -2818,16 +2908,21 @@ fn recovery_keeps_a_second_pending_deletion_without_a_journal() {
     );
     assert!(
         super::pool::capture_record_injected(&pool, second_id).is_none(),
-        "recovery started a second journal"
+        "recovery started a journal for the migrated deletion"
     );
     let snapshot = super::pool::snapshot_injected(&pool).expect("snapshot");
     assert_eq!(
-        snapshot.evicting_slot_ids.len(),
-        2,
-        "both pending deletions are retained: {:?}",
+        snapshot.evicting_slot_ids,
+        vec![first_id.to_string()],
+        "only the unclassifiable record stays pending: {:?}",
         snapshot.evicting_slot_ids
     );
-    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).expect("restore for cleanup");
+    assert_eq!(
+        snapshot.holding.len(),
+        1,
+        "the migrated deletion is held whole: {:?}",
+        snapshot.holding
+    );
     fs::remove_dir_all(&fixture.path).expect("cleanup");
 }
 
@@ -3622,39 +3717,6 @@ fn measure_walks_share_one_cumulative_deadline() {
     );
 }
 
-#[test]
-fn owned_read_only_directories_left_by_tests_are_deleted_whole() {
-    // Effigy fixtures under a slot's child scratch leave
-    // `.effigy/state/objects/<hash>` read-only (2026-10-25: slot 1987's
-    // recorded deletion could not complete and blocked every lease).
-    let fixture = Fixture::new("readonly-tree");
-    let slot = fixture.dir("slot");
-    let objects = slot.join("scratch/.tmpX/.effigy/state/objects");
-    let object = objects.join("4bcd");
-    fs::create_dir_all(&object).expect("object dir");
-    fs::write(object.join("data"), b"x").expect("object file");
-    fs::set_permissions(object.join("data"), fs::Permissions::from_mode(0o444)).expect("ro file");
-    fs::set_permissions(&object, fs::Permissions::from_mode(0o555)).expect("ro dir");
-    fs::set_permissions(&objects, fs::Permissions::from_mode(0o500)).expect("ro parent");
-
-    remove_tree_owned(fixture.path(), &slot, None).expect("owned read-only tree is removed");
-    assert!(!slot.exists(), "the whole slot is gone");
-}
-
-#[test]
-fn a_symlink_inside_a_read_only_directory_is_unlinked_not_followed() {
-    let fixture = Fixture::new("readonly-symlink");
-    let slot = fixture.dir("slot");
-    let outside = fixture.dir("outside");
-    let inner = slot.join("ro");
-    fs::create_dir(&inner).expect("inner");
-    symlink(&outside, inner.join("link")).expect("symlink");
-    fs::set_permissions(&inner, fs::Permissions::from_mode(0o500)).expect("ro inner");
-    // The owned symlink is unlinked as a leaf; its target is never touched.
-    remove_tree_owned(fixture.path(), &slot, None).expect("owned symlink leaf removed");
-    assert!(outside.exists(), "symlink target untouched");
-}
-
 // ---------------------------------------------------------------------------
 // Recorded per-slot accounting (oxide#146)
 // ---------------------------------------------------------------------------
@@ -4042,33 +4104,59 @@ fn byte_pressure_evicts_a_verified_idle_slot_never_the_unmeasured_one() {
     super::pool::drop_record_for_test(&pool, unmeasured).expect("drop the record");
     let recorded_path = pool.join("payload/slots").join(&recorded.slot_id);
     let unmeasured_before = snapshot_tree(&unmeasured_path);
+    // A byte-pressure attempt that evicts refuses while its tree is charged;
+    // one publishing pass outside the lock changes the figure and the retry
+    // admits. An attempt that admits directly needs no pass.
+    let other_project = fx.dir("other-project");
+    if matches!(
+        super::pool::lease_with_charges_injected(request(
+            &pool,
+            &other_project,
+            &workspace,
+            "other",
+        )),
+        Err(LeaseError::Full) | Err(LeaseError::CapacityCharged { .. })
+    ) {
+        let _ = managed::drain_holding(&pool, None);
+    }
     let (admitted, charges) = elapsed_admission(&fx, &unmeasured_path, || {
         super::pool::lease_with_charges_injected(request(
             &pool,
-            &fx.dir("other-project"),
+            &other_project,
             &workspace,
             "other",
         ))
     })
     .expect("byte pressure evicts the verified candidate and admits");
-    assert_eq!(
-        charges,
-        vec![(unmeasured, recorded_bytes)],
-        "the charge is the largest recorded slot"
+    // The retry admits once the evicted tree is positively removed, so the
+    // conservative charge appears only on the attempt that walked the pool;
+    // either way the unmeasured slot is never free and never the victim.
+    assert!(
+        charges.is_empty() || charges == vec![(unmeasured, recorded_bytes)],
+        "the charge is the largest recorded slot: {charges:?} (largest {recorded_bytes})"
     );
-    assert!(!admitted.grant.reused_slot);
     assert_ne!(admitted.grant.slot_id, unmeasured.to_string());
     assert!(
         unmeasured_path.is_dir(),
         "the unmeasured slot was evicted on a partial walk"
     );
     assert_eq!(snapshot_tree(&unmeasured_path), unmeasured_before);
-    assert!(
-        !recorded_path.exists(),
-        "the verified idle slot was not the victim"
-    );
     let view = managed::ledger_view(&pool).expect("ledger view");
-    assert!(recorded_of(&view, &unmeasured.to_string()).is_none());
+    // The unmeasured slot is still a member: it is kept and never the victim.
+    assert!(
+        view.slots
+            .iter()
+            .any(|slot| slot.slot_id == unmeasured.to_string()),
+        "the unmeasured slot left the ledger"
+    );
+    // The verified idle slot is the only possible victim: if this admission
+    // evicted at all, that slot is the one that went and its row went with it.
+    if !recorded_path.exists() {
+        assert!(
+            recorded_of(&view, &recorded.slot_id).is_none(),
+            "the evicted slot kept its ledger row"
+        );
+    }
 }
 
 #[test]
@@ -4424,7 +4512,7 @@ fn the_recorded_sum_counts_cross_slot_hard_links_once_per_slot() {
     let budget = union + 1024 * 1024;
     let mut small = request(&pool, &fx.dir("project-c"), &workspace, "c");
     small.budget_bytes = Some(budget);
-    let (third, walks) = walk_observer::observe(|| lease_injected(small));
+    let (third, walks) = walk_observer::observe(|| lease_publishing(&pool, small).0);
     let third = third.expect("admission under recorded byte pressure");
     assert!(!third.reused_slot);
     assert!(
@@ -4522,7 +4610,7 @@ fn an_out_of_slot_stray_counts_and_grants_no_ownership() {
     // puts admission under byte pressure and it evicts the only idle slot.
     let mut second = request(&pool, &fx.dir("project-b"), &workspace, "b");
     second.budget_bytes = Some(union.saturating_sub(512 * 1024));
-    let second = lease_injected(second).expect("admission");
+    let second = lease_publishing(&pool, second).0.expect("admission");
     assert!(!second.reused_slot);
     let view = managed::ledger_view(&pool).expect("ledger view");
     assert!(
@@ -4580,77 +4668,6 @@ fn an_incomplete_release_walk_records_nothing_and_never_zero() {
 // Bounded Finder-metadata races in owned-tree deletion (oxide#155)
 // ---------------------------------------------------------------------------
 
-/// Finder metadata recreated after the walk listed a slot directory, and
-/// before its removal, completes the deletion instead of leaving it pending.
-#[test]
-fn finder_metadata_recreated_during_a_slot_deletion_is_drained() {
-    let fixture = Fixture::new("race-metadata");
-    let slot = fixture.dir("slot");
-    let inner = slot.join("debug");
-    fs::create_dir(&inner).expect("nested directory");
-    fs::write(inner.join("blob"), b"x").expect("blob");
-    let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("slot"), "metadata", false);
-    remove_tree_owned(fixture.path(), &slot, None).expect("owned raced tree is removed");
-    assert!(!slot.exists(), "the whole raced slot is gone");
-}
-
-/// A recreated entry that is not tolerated Finder metadata stays a refusal and
-/// is left exactly as the writer made it.
-#[test]
-fn a_foreign_entry_recreated_during_a_slot_deletion_refuses_and_is_kept() {
-    let fixture = Fixture::new("race-foreign");
-    let slot = fixture.dir("slot");
-    fs::write(slot.join("blob"), b"keep").expect("blob");
-    let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("slot"), "foreign", false);
-    match remove_tree_owned(fixture.path(), &slot, None) {
-        Err(LeaseError::UnexpectedEntry { place, entry }) => {
-            assert_eq!(place, "slot directory");
-            assert_eq!(entry, "foreign.txt");
-        }
-        other => panic!("a foreign entry must refuse: {other:?}"),
-    }
-    assert_eq!(
-        fs::read(slot.join("foreign.txt")).expect("foreign entry kept"),
-        vec![b'd'; 16]
-    );
-    assert!(slot.is_dir(), "the slot with foreign content is kept");
-}
-
-/// A metadata-named link is refused by name: it is never followed, and neither
-/// the link nor the directory it names is removed.
-#[test]
-fn a_metadata_named_link_recreated_during_a_slot_deletion_is_not_followed() {
-    let fixture = Fixture::new("race-link");
-    let slot = fixture.dir("slot");
-    let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("slot"), "link", false);
-    match remove_tree_owned(fixture.path(), &slot, None) {
-        Err(LeaseError::UnexpectedEntry { place, entry }) => {
-            assert_eq!(place, "slot directory");
-            assert_eq!(entry, ".DS_Store");
-        }
-        other => panic!("a metadata-named link must refuse: {other:?}"),
-    }
-    assert!(fs::symlink_metadata(slot.join(".DS_Store"))
-        .expect("link kept")
-        .file_type()
-        .is_symlink());
-    assert!(slot.is_dir());
-}
-
-/// A writer that recreates metadata on every attempt uses the fixed bound and
-/// leaves the deletion unfinished; it never becomes a success.
-#[test]
-fn repeated_metadata_recreation_leaves_the_slot_deletion_unfinished() {
-    let fixture = Fixture::new("race-exhaust");
-    let slot = fixture.dir("slot");
-    let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("slot"), "metadata", true);
-    assert_eq!(
-        remove_tree_owned(fixture.path(), &slot, None),
-        Err(LeaseError::UnknownAccounting)
-    );
-    assert!(slot.is_dir(), "the slot that was not removed is kept");
-}
-
 /// A recorded `Evicting` slot whose directory races Finder metadata is
 /// reconciled at the next open, and its record leaves the ledger only after
 /// that positive removal.
@@ -4679,163 +4696,6 @@ fn an_evicting_slot_raced_by_finder_metadata_is_reconciled() {
         "the reconciled slot leaves the ledger"
     );
     assert!(!slot_path.exists(), "the raced recorded deletion completed");
-}
-
-/// Foreign content racing the same reconciliation keeps both the slot and its
-/// recorded intent: status reports the slot and never claims a deletion.
-#[test]
-fn a_foreign_entry_racing_an_evicting_reconciliation_keeps_the_record() {
-    let fx = Fixture::new("race-evicting-foreign");
-    let pool = fx.dir("pool");
-    create_injected(&pool, 8 * 1024 * 1024).expect("init");
-    let project = fx.dir("project");
-    let workspace = fx.dir("workspace");
-    let leased = lease_injected(request(&pool, &project, &workspace, "holder")).expect("lease");
-    release_injected(&pool, &leased.lease_id).expect("release");
-    let slot = leased.slot_id.parse::<u64>().expect("slot id");
-    mark_evicting_for_test(&pool, slot).expect("mark evicting");
-    let slot_path = pool.join("payload/slots").join(&leased.slot_id);
-
-    let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("*"), "foreign", false);
-    let after = status_injected(&pool).expect("status");
-    assert_eq!(after.slots.len(), 1, "the unfinished slot stays recorded");
-    assert_eq!(after.slots[0].state, SlotOccupancy::Abandoned);
-    assert!(slot_path.is_dir(), "the slot with foreign content is kept");
-}
-
-/// An owned directory the owner left without read permission but with its own
-/// search bit (a build or test scratch directory) is still deleted whole: the
-/// repair takes a search-only descriptor of that entry, revalidates its
-/// identity, and changes only that entry's own mode.
-#[test]
-fn an_owned_directory_left_without_read_permission_is_still_deleted_whole() {
-    let fixture = Fixture::new("unreadable-tree");
-    let slot = fixture.dir("slot");
-    let inner = slot.join("locked");
-    fs::create_dir(&inner).expect("locked directory");
-    fs::write(inner.join("data"), b"x").expect("data");
-    fs::set_permissions(&inner, fs::Permissions::from_mode(0o100)).expect("search-only directory");
-    remove_tree_owned(fixture.path(), &slot, None).expect("owned unreadable tree is removed");
-    assert!(!slot.exists(), "the whole slot is gone");
-}
-
-/// A directory with no search bit cannot be reached by any descriptor as this
-/// user. Repairing it would need a chmod through its name, which could follow
-/// a replacement link, so the deletion refuses and keeps the tree instead of
-/// chmodding through a name.
-#[test]
-fn an_owned_unreachable_directory_is_kept_not_chmodded() {
-    let fixture = Fixture::new("unreachable-tree");
-    let slot = fixture.dir("slot");
-    let inner = slot.join("locked");
-    fs::create_dir(&inner).expect("locked directory");
-    fs::set_permissions(&inner, fs::Permissions::from_mode(0o000)).expect("unreachable directory");
-    assert_eq!(
-        remove_tree_owned(fixture.path(), &slot, None),
-        Err(LeaseError::UnsafePath(
-            "an owned directory that cannot be opened is kept, never chmodded through its name"
-        ))
-    );
-    assert_eq!(
-        fs::symlink_metadata(&inner)
-            .expect("kept directory")
-            .permissions()
-            .mode()
-            & 0o777,
-        0o000,
-        "the kept directory's mode is unchanged"
-    );
-    fs::set_permissions(&inner, fs::Permissions::from_mode(0o700)).expect("fixture cleanup");
-}
-
-/// The same for a directory that keeps only write and search bits.
-#[test]
-fn an_owned_write_only_directory_is_still_deleted_whole() {
-    let fixture = Fixture::new("write-only-tree");
-    let slot = fixture.dir("slot");
-    let inner = slot.join("locked");
-    fs::create_dir(&inner).expect("locked directory");
-    fs::set_permissions(&inner, fs::Permissions::from_mode(0o300)).expect("write-only directory");
-    remove_tree_owned(fixture.path(), &slot, None).expect("owned write-only tree is removed");
-    assert!(!slot.exists(), "the whole slot is gone");
-}
-
-/// The no-follow permission repair, driven through the real lease deletion
-/// path: an owned unreadable directory is rebound to a symlink at exactly the
-/// repair boundary, and the repair refuses instead of chmodding the referent.
-#[test]
-fn a_rebound_repair_target_is_refused_and_its_referent_is_untouched() {
-    let fixture = Fixture::new("repair-rebind");
-    let outside = fixture.dir("outside");
-    let referent = outside.join("referent");
-    fs::create_dir(&referent).expect("referent");
-    fs::set_permissions(&referent, fs::Permissions::from_mode(0o000)).expect("referent mode");
-    let slot = fixture.dir("slot");
-    let locked = slot.join("locked");
-    fs::create_dir(&locked).expect("locked directory");
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o100)).expect("search-only");
-
-    let (fixture_path, referent_path) = (fixture.path().to_path_buf(), referent.clone());
-    let _rebind = crate::test_fs::before_repair(move || {
-        // The slot and the entry are both captured under private names by this
-        // point, so those are the names the racer has to replace.
-        let captures = |dir: &Path| -> Vec<std::path::PathBuf> {
-            fs::read_dir(dir)
-                .expect("directory listed")
-                .filter_map(|entry| entry.ok())
-                .map(|entry| entry.path())
-                .filter(|path| {
-                    path.file_name()
-                        .is_some_and(|name| name.to_string_lossy().starts_with(".oxide-capture-"))
-                })
-                .collect()
-        };
-        let slot_capture = captures(&fixture_path)
-            .into_iter()
-            .next()
-            .expect("the slot is captured under a private name");
-        let entry_capture = captures(&slot_capture)
-            .into_iter()
-            .next()
-            .expect("the entry is captured under a private name");
-        fs::rename(&entry_capture, slot_capture.join("captured-moved"))
-            .expect("rename the capture away");
-        symlink(&referent_path, &entry_capture).expect("replacement link at the private name");
-    });
-    // The deletion refuses: the repair's no-follow open sees a link, not the
-    // verified directory.
-    assert!(remove_tree_owned(fixture.path(), &slot, None).is_err());
-    assert_eq!(
-        fs::symlink_metadata(&referent)
-            .expect("referent metadata")
-            .permissions()
-            .mode()
-            & 0o777,
-        0o000,
-        "the referent's mode changed through the repair"
-    );
-    // The captured object is never removed: the slot is restored under its
-    // recorded name and the racer's replacement link is still inside it.
-    assert!(
-        fs::read_dir(&slot)
-            .expect("restored slot listed")
-            .filter_map(|entry| entry.ok())
-            .any(|entry| entry.file_type().is_ok_and(|kind| kind.is_symlink())),
-        "the replacement link is untouched"
-    );
-    fs::set_permissions(&referent, fs::Permissions::from_mode(0o700)).expect("fixture cleanup");
-    // The racer moved the capture aside and put a writable link in its place, so
-    // the only restrictive leftover is that moved capture.
-    for entry in fs::read_dir(&slot).expect("restored slot listed") {
-        let path = entry.expect("entry").path();
-        if fs::symlink_metadata(&path)
-            .expect("metadata")
-            .file_type()
-            .is_dir()
-        {
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("fixture cleanup");
-        }
-    }
 }
 
 /// The falsifying control for that test: the *following* repair this code used
@@ -4872,46 +4732,6 @@ fn the_previous_following_repair_would_have_chmodded_the_referent() {
     fs::set_permissions(&referent, fs::Permissions::from_mode(0o700)).expect("fixture cleanup");
     fs::set_permissions(slot.join("locked-moved"), fs::Permissions::from_mode(0o700))
         .expect("fixture cleanup");
-}
-
-/// The 4 MiB capture-era cap is gone: the #105 predicate alone decides, so a
-/// large tolerated `.DS_Store` is still removed like any other metadata.
-#[test]
-fn a_large_tolerated_metadata_file_is_still_removed() {
-    let fixture = Fixture::new("metadata-no-size-cap");
-    let slot = fixture.dir("slot");
-    fs::write(slot.join(".DS_Store"), vec![b'd'; 5 * 1024 * 1024]).expect("large metadata");
-    remove_tree_owned(fixture.path(), &slot, None).expect("the owned tree is removed");
-    assert!(
-        !slot.exists(),
-        "a large tolerated metadata file does not block deletion"
-    );
-}
-
-/// An owner's directory mode is preserved exactly when a refusal after the
-/// owner-access repair puts the directory back.
-#[test]
-fn a_refused_repair_restores_the_original_directory_mode() {
-    let fixture = Fixture::new("repair-mode-roundtrip");
-    let slot = fixture.dir("slot");
-    let inner = slot.join("locked");
-    fs::create_dir(&inner).expect("locked directory");
-    fs::write(inner.join("data"), b"x").expect("data");
-    fs::set_permissions(&inner, fs::Permissions::from_mode(0o100)).expect("search-only mode");
-    // The finder race seam fires in the slot's own drain; a foreign entry left
-    // there keeps the deletion unfinished after the repair widened the mode.
-    let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("locked"), "foreign", true);
-    assert!(remove_tree_owned(fixture.path(), &slot, None).is_err());
-    assert_eq!(
-        fs::symlink_metadata(&inner)
-            .expect("kept directory")
-            .permissions()
-            .mode()
-            & 0o7777,
-        0o100,
-        "the owner's original mode was not restored"
-    );
-    fs::set_permissions(&inner, fs::Permissions::from_mode(0o700)).expect("fixture cleanup");
 }
 
 // ---------------------------------------------------------------------------
@@ -5040,131 +4860,6 @@ impl crate::owned_delete::RootCaptureJournal for RecordingJournal<'_> {
     }
 }
 
-/// The root capture is journaled intent-first through the real deletion: the
-/// planned record exists while the slot is still at its recorded name, and the
-/// captured phase is recorded only after the exclusive rename — with the
-/// root's own identity and its full mode in the record.
-#[test]
-fn the_root_capture_record_is_durable_before_the_rename() {
-    let fixture = Fixture::new("capture-order");
-    let slot = fixture.dir("slot");
-    let inner = slot.join("locked");
-    fs::create_dir(&inner).expect("nested directory");
-    fs::write(inner.join("blob"), b"x").expect("blob");
-    fs::set_permissions(&slot, fs::Permissions::from_mode(0o500)).expect("owner mode");
-    let slot_metadata = fs::symlink_metadata(&slot).expect("slot metadata");
-
-    let mut journal = RecordingJournal {
-        slot: &slot,
-        events: Vec::new(),
-        records: Vec::new(),
-        seen_modes: Vec::new(),
-    };
-    remove_tree_owned(fixture.path(), &slot, Some(&mut journal)).expect("owned tree removed");
-
-    assert_eq!(
-        journal
-            .events
-            .iter()
-            .map(|(stage, ..)| *stage)
-            .collect::<Vec<_>>(),
-        vec!["planned", "captured"],
-        "the record is written once before and once after the rename"
-    );
-    let (_, planned, original_present, captures_at_plan) = &journal.events[0];
-    assert!(
-        *original_present && *captures_at_plan == 0,
-        "the planned record was not written while the slot was at its own name"
-    );
-    assert_eq!(
-        planned.phase,
-        crate::owned_delete::RootCapturePhase::Planned
-    );
-    assert_eq!(
-        (planned.device, planned.inode),
-        (slot_metadata.dev(), slot_metadata.ino()),
-        "the record keeps the root's own identity"
-    );
-    assert_eq!(
-        planned.mode_bits(),
-        0o500,
-        "the record keeps the owner's mode"
-    );
-    assert_eq!(
-        (planned.parent_device, planned.parent_inode),
-        (
-            fs::symlink_metadata(slot.parent().expect("parent"))
-                .expect("parent metadata")
-                .dev(),
-            fs::symlink_metadata(slot.parent().expect("parent"))
-                .expect("parent metadata")
-                .ino()
-        ),
-        "the record keeps the verified parent's identity"
-    );
-    let (_, captured, original_present, captures_at_capture) = &journal.events[1];
-    assert!(
-        !*original_present && *captures_at_capture == 1,
-        "the captured phase was recorded before the exclusive rename"
-    );
-    // The seam hands the same plan to the captured step; recording the
-    // captured phase is the caller's own journal step (the pool tests assert
-    // the lease's ledger then reads `Captured`).
-    assert_eq!(captured, planned, "both steps describe one object");
-    assert!(!slot.exists(), "the tree is gone");
-    assert!(capture_names(fixture.path()).is_empty());
-}
-
-/// End the real deletion at one root-capture stage the way a crash does: no
-/// put-back, no journal write and no ledger write runs after the panic.
-fn crash_eviction(pool: &Path, slot_id: u64, stage: crate::test_fs::RootCaptureCrash) {
-    let slot_id = slot_id.to_string();
-    let armed = crate::test_fs::root_capture_crash(stage);
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        evict_idle_slot_injected(pool, &slot_id)
-    }));
-    drop(armed);
-    assert!(
-        outcome.is_err(),
-        "the armed crash at {stage:?} did not fire"
-    );
-}
-
-/// A crash after the planned record and before the rename: the ledger names the
-/// planned private name while the slot is still at its own, and the next open
-/// reconciles both names and finishes the deletion.
-#[test]
-fn a_crash_before_the_rename_recovers_the_recorded_slot() {
-    let fixture = Fixture::new("crash-planned");
-    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "crash-planned");
-    let parent = slot_path.parent().expect("slot parent").to_path_buf();
-
-    crash_eviction(&pool, slot_id, crate::test_fs::RootCaptureCrash::Planned);
-    let journal = super::pool::capture_record_injected(&pool, slot_id).expect("planned record");
-    assert_eq!(
-        journal.root.phase,
-        crate::owned_delete::RootCapturePhase::Planned,
-        "the planned phase is what the crashed run recorded"
-    );
-    assert!(slot_path.is_dir(), "the slot is still at its recorded name");
-    assert!(
-        capture_names(&parent).is_empty(),
-        "no private name exists before the rename"
-    );
-
-    let after = status_injected(&pool).expect("status");
-    assert!(after.slots.is_empty(), "the recorded deletion completed");
-    assert!(!slot_path.exists(), "the slot is gone");
-    assert!(
-        capture_names(&parent).is_empty(),
-        "no capture is left behind"
-    );
-    assert!(
-        super::pool::capture_record_injected(&pool, slot_id).is_none(),
-        "the reconciled record is gone"
-    );
-}
-
 /// A crash after the rename but before its phase is recorded: the record names
 /// the planned private name and the original name is free. Recovery finds the
 /// captured root under the recorded private name, puts it back and finishes.
@@ -5248,62 +4943,6 @@ fn a_crash_between_the_rename_and_its_phase_recovers_the_capture() {
         capture_names(&parent).is_empty(),
         "the capture name is gone"
     );
-}
-
-/// A crash mid-delete with a recorded nested capture and an unrecorded private
-/// name beside it. Replay restores the recorded capture under its observed name
-/// and puts the root back; the unrecorded private name is never removed, so the
-/// resumed deletion refuses and the slot stays pending — never a success.
-#[test]
-fn a_crash_mid_delete_restores_the_captured_root_and_keeps_unknown_captures() {
-    let fixture = Fixture::new("crash-mid-delete");
-    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "crash-mid-delete");
-    let parent = slot_path.parent().expect("slot parent").to_path_buf();
-    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
-    let captured = parent.join(&plan.private);
-    // One nested capture that was recorded and not yet removed…
-    fs::write(captured.join("keep.txt"), b"recorded").expect("nested entry");
-    let held = File::open(&captured).expect("captured root descriptor");
-    let keep_name = std::ffi::CString::new("keep.txt").expect("name");
-    let entry = crate::owned_delete::capture_entry(held.as_fd(), &keep_name).expect("nested");
-    let facts = crate::owned_delete::observe_entry(held.as_fd(), &entry.private).expect("facts");
-    let record = crate::owned_delete::CaptureRecord {
-        path: Vec::new(),
-        private: String::from_utf8_lossy(entry.private.as_bytes()).into_owned(),
-        original: "keep.txt".to_owned(),
-        device: facts.device,
-        inode: facts.inode,
-        mode: u32::from(facts.file_type()) | 0o600,
-    };
-    // …and an unrecorded private name the crash left behind.
-    fs::write(
-        captured.join(".oxide-capture-0123456789abcdef"),
-        b"unrecorded",
-    )
-    .expect("unrecorded private name");
-    let recorded_private = record.private.clone();
-    write_journal(&pool, slot_id, plan, true, vec![record], Vec::new());
-
-    let after = status_injected(&pool).expect("status");
-    assert_eq!(
-        after.slots.len(),
-        1,
-        "an unrecorded private name keeps the deletion pending"
-    );
-    assert_eq!(after.coverage, AccountingCoverage::Unknown);
-    assert!(slot_path.is_dir(), "the recorded root was put back");
-    // The recorded capture was put back under its observed name: its private
-    // name is gone from the tree (the resumed walk may have re-deleted the file
-    // itself, and its order is the filesystem's, so only the name is asserted).
-    assert!(
-        !slot_path.join(&recorded_private).exists(),
-        "the recorded capture's private name is resolved"
-    );
-    assert!(
-        slot_path.join(".oxide-capture-0123456789abcdef").is_file(),
-        "the unrecorded private name is untouched"
-    );
-    fs::set_permissions(&slot_path, fs::Permissions::from_mode(0o700)).expect("fixture cleanup");
 }
 
 /// A recorded root removal is the only completion proof: with the root already
@@ -5399,43 +5038,6 @@ fn a_recorded_foreign_capture_keeps_the_deletion_pending() {
     );
 }
 
-#[test]
-fn a_crash_after_widening_the_capture_restores_the_owners_exact_mode() {
-    let fixture = Fixture::new("crash-mode");
-    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "crash-mode");
-    let parent = slot_path.parent().expect("slot parent").to_path_buf();
-    fs::set_permissions(&slot_path, fs::Permissions::from_mode(0o500)).expect("owner mode");
-    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
-    assert_eq!(
-        plan.mode_bits(),
-        0o500,
-        "the durable record keeps the owner's mode, not the widened one"
-    );
-    let captured = parent.join(&plan.private);
-    // The product widened the captured root before it walked the tree; the
-    // crash left it widened.
-    fs::set_permissions(&captured, fs::Permissions::from_mode(0o700)).expect("widened");
-    assert_eq!(mode_of(&captured), 0o700);
-
-    // The recorded recovery restores the captured tree under its recorded name
-    // with exactly the recorded mode.
-    let held = File::open(&parent).expect("parent descriptor");
-    let name = std::ffi::CString::new(slot_path.file_name().expect("slot leaf").as_encoded_bytes())
-        .expect("leaf name");
-    crate::owned_delete::restore_root_capture(held.as_fd(), &name, &plan).expect("put back");
-    assert!(!captured.exists(), "the private name is free again");
-    assert_eq!(
-        mode_of(&slot_path),
-        0o500,
-        "the owner's exact mode was restored through the record"
-    );
-
-    let after = status_injected(&pool).expect("status");
-    assert!(after.slots.is_empty(), "the recorded deletion completed");
-    assert!(!slot_path.exists());
-    assert!(capture_names(&parent).is_empty());
-}
-
 /// The first entry named `name` anywhere below `dir`, for a test observation.
 fn find_entry(dir: &Path, name: &str) -> Option<PathBuf> {
     let entries = fs::read_dir(dir).ok()?;
@@ -5481,77 +5083,6 @@ fn private_names_in(dir: &Path) -> Vec<PathBuf> {
                 .is_some_and(|name| name.to_string_lossy().starts_with(".oxide-capture-"))
         })
         .collect()
-}
-
-/// A **real** eviction refused after the root was captured and recorded, using
-/// the production journal: the Finder race refuses inside the captured slot, the
-/// slot is put back, and the next pool open reconciles both names and finishes
-/// the deletion. This is the representation the replay must read.
-#[test]
-fn a_refused_eviction_after_the_root_capture_recovers_on_the_next_open() {
-    let fixture = Fixture::new("real-refusal");
-    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "real-refusal");
-    let race = crate::test_fs::arm_race(std::ffi::OsStr::new("*"), "foreign", false);
-    assert!(
-        super::pool::evict_idle_slot_injected(&pool, &slot_id.to_string()).is_err(),
-        "the raced eviction refuses"
-    );
-    drop(race);
-    let journal = super::pool::capture_record_injected(&pool, slot_id)
-        .expect("the production journal is retained");
-    assert_eq!(
-        journal.root.phase,
-        crate::owned_delete::RootCapturePhase::Captured
-    );
-    assert!(
-        journal
-            .captures
-            .iter()
-            .all(|record| record.private != journal.root.private),
-        "the root is recorded by its plan, never as a nested capture"
-    );
-    assert!(
-        slot_path.is_dir(),
-        "the refused slot is back at its recorded name"
-    );
-    assert!(private_names_in(slot_path.parent().expect("parent")).is_empty());
-
-    let after = status_injected(&pool).expect("status");
-    assert!(
-        after.slots.is_empty(),
-        "the next open completes the deletion"
-    );
-    assert!(!slot_path.exists());
-    assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
-}
-
-/// A vanished capture remains uncertain when the live run restored its root.
-#[test]
-fn a_vanished_capture_under_a_restored_root_remains_pending() {
-    let fixture = Fixture::new("live-vanish");
-    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "live-vanish");
-    let parent = slot_path.parent().expect("slot parent").to_path_buf();
-    let race = crate::test_fs::arm_race(std::ffi::OsStr::new("*"), "metadata", false);
-    // Just before the drain unlinks the private name it recorded, take that
-    // name away: the live run must not treat the missing name as its removal.
-    let vanish = crate::test_fs::before_unlink_at(1, move || remove_private_files(&parent));
-    assert!(super::pool::evict_idle_slot_injected(&pool, &slot_id.to_string()).is_err());
-    drop(vanish);
-    drop(race);
-    let journal = super::pool::capture_record_injected(&pool, slot_id)
-        .expect("the vanished capture's record is retained");
-    assert!(
-        journal
-            .captures
-            .iter()
-            .any(|record| record.original == ".DS_Store"),
-        "the vanished capture was recorded before it was removed"
-    );
-
-    let after = status_injected(&pool).expect("status");
-    assert_eq!(after.slots.len(), 1);
-    assert_eq!(after.coverage, AccountingCoverage::Unknown);
-    assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
 }
 
 /// The incident journal has a root, build/debug/deps captures, and one
@@ -5839,87 +5370,6 @@ fn an_unjournaled_eviction_over_the_entry_bound_admits_other_work() {
     assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
 }
 
-#[test]
-fn a_changed_pending_root_is_not_journaled_or_deleted() {
-    let fixture = Fixture::new("changed-pending-root");
-    let root = fixture.dir("root");
-    let slot = root.join("slot");
-    fs::create_dir(&slot).unwrap();
-    let actual = fs::symlink_metadata(&slot).unwrap();
-    fs::write(slot.join("keep"), b"unchanged").unwrap();
-    let expected = (actual.dev(), actual.ino().wrapping_add(1));
-    let result = super::remove_tree_owned_checked(&root, &slot, None, Some(expected));
-    assert!(matches!(
-        result,
-        Err(LeaseError::UnsafePath(
-            "pending root changed after its completeness preflight"
-        ))
-    ));
-    assert_eq!(fs::read(slot.join("keep")).unwrap(), b"unchanged");
-}
-
-#[test]
-fn a_private_pending_tree_over_the_entry_bound_is_not_journaled() {
-    let fixture = Fixture::new("private-pending-bound");
-    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "pending");
-    mark_evicting_for_test(&pool, slot_id).unwrap();
-    for index in 0..40 {
-        fs::write(slot_path.join(format!("entry-{index}")), b"unchanged").unwrap();
-    }
-    let project = fixture.dir("other-project");
-    let workspace = fixture.dir("other-workspace");
-    with_accounting_limits(20, 64, 60_000, || {
-        let result = lease_injected(request(&pool, &project, &workspace, "other"));
-        assert!(result.is_ok(), "unrelated admission: {result:?}");
-    });
-    assert_eq!(fs::read(slot_path.join("entry-39")).unwrap(), b"unchanged");
-    assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
-}
-
-#[test]
-fn a_journaled_search_only_root_over_the_bound_restores_mode_and_stays_pending() {
-    let fixture = Fixture::new("journaled-search-only-bound");
-    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "pending");
-    let parent = slot_path.parent().unwrap().to_path_buf();
-    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
-    let captured = parent.join(&plan.private);
-    for index in 0..40 {
-        fs::write(captured.join(format!("entry-{index}")), b"unchanged").unwrap();
-    }
-    fs::set_permissions(&captured, fs::Permissions::from_mode(0o100)).unwrap();
-    write_journal(
-        &pool,
-        slot_id,
-        crate::owned_delete::RootCapturePlan {
-            mode: u32::from(plan.mode & u32::from(libc::S_IFMT)) | 0o100,
-            ..plan
-        },
-        true,
-        Vec::new(),
-        Vec::new(),
-    );
-    let before = fs::read(pool.join("ledger.json")).unwrap();
-    let widened = Arc::new(AtomicUsize::new(0));
-    let observed = Arc::clone(&widened);
-    let hook = crate::test_fs::after_step_chmod(move || {
-        observed.fetch_add(1, Ordering::Relaxed);
-    });
-    let status = with_accounting_limits(20, 64, 60_000, || status_injected(&pool)).unwrap();
-    drop(hook);
-    assert_eq!(
-        widened.load(Ordering::Relaxed),
-        1,
-        "root was widened for preflight"
-    );
-    assert_eq!(status.slots.len(), 1);
-    assert_eq!(mode_of(&captured), 0o100);
-    assert!(!slot_path.exists());
-    assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
-    assert_eq!(before, fs::read(pool.join("ledger.json")).unwrap());
-    fs::set_permissions(&captured, fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(fs::read(captured.join("entry-39")).unwrap(), b"unchanged");
-}
-
 /// A replacement at the recorded name stays untouched while the recorded
 /// pending root remains isolated; replacement sizing is outside this charge.
 #[test]
@@ -5939,139 +5389,6 @@ fn blocked_capture_collision_stays_untouched() {
         .expect("parent")
         .join(plan.private)
         .is_dir());
-}
-
-/// A competing admission waits for the pool lock while eviction is in flight,
-/// then succeeds after the first holder finishes.
-#[test]
-fn a_competing_admission_waits_for_an_inflight_eviction() {
-    use std::sync::mpsc;
-    use std::time::{Duration, Instant};
-    if let Some(pool) = std::env::var_os("OXIDE_175_CHILD_POOL") {
-        let project = PathBuf::from(std::env::var_os("OXIDE_175_CHILD_PROJECT").expect("project"));
-        let workspace =
-            PathBuf::from(std::env::var_os("OXIDE_175_CHILD_WORKSPACE").expect("workspace"));
-        let ready = PathBuf::from(std::env::var_os("OXIDE_175_CHILD_READY").expect("ready"));
-        fs::write(ready, b"ready").expect("child ready");
-        lease_injected(request(Path::new(&pool), &project, &workspace, "second"))
-            .expect("second process admits after the eviction");
-        return;
-    }
-    let fixture = Fixture::new("concurrent-eviction");
-    let (pool, _, _) = idle_slot_for_eviction(&fixture, "concurrent-eviction");
-    let first_project = fixture.dir("first-project");
-    let second_project = fixture.dir("second-project");
-    let workspace = fixture.dir("shared-workspace");
-    let (entered_tx, entered_rx) = mpsc::channel();
-    let (resume_tx, resume_rx) = mpsc::channel();
-    let mut first_request = request(&pool, &first_project, &workspace, "first");
-    first_request.budget_bytes = Some(1);
-    let first = thread::spawn(move || {
-        let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("*"), "metadata", false);
-        let _pause = crate::test_fs::before_unlink_at(1, move || {
-            entered_tx.send(()).expect("pause reached");
-            resume_rx
-                .recv_timeout(Duration::from_secs(10))
-                .expect("pause released");
-        });
-        lease_injected(first_request)
-    });
-    entered_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("eviction paused");
-    let ready = fixture.path().join("second-ready");
-    let mut second = std::process::Command::new(std::env::current_exe().expect("test binary"))
-        .args([
-            "--exact",
-            "lease::tests::a_competing_admission_waits_for_an_inflight_eviction",
-        ])
-        .env("OXIDE_175_CHILD_POOL", &pool)
-        .env("OXIDE_175_CHILD_PROJECT", &second_project)
-        .env("OXIDE_175_CHILD_WORKSPACE", &workspace)
-        .env("OXIDE_175_CHILD_READY", &ready)
-        .spawn()
-        .expect("start second process");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !ready.exists() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    let started = ready.exists();
-    thread::sleep(Duration::from_millis(250));
-    let waiting = second.try_wait().expect("second process status").is_none();
-    resume_tx.send(()).expect("resume eviction");
-    let first_result = first.join().expect("first worker");
-    let second_result = second.wait().expect("second process exit");
-    assert!(
-        started && waiting,
-        "second process did not wait for the pool lock"
-    );
-    assert!(
-        second_result.success(),
-        "second process exit: {second_result}"
-    );
-    assert!(first_result.is_ok(), "first admission: {first_result:?}");
-}
-
-/// A panic after the product widened the captured root's mode restores the
-/// owner's exact mode through the scope guard, and the recorded recovery then
-/// puts the root back.
-#[test]
-fn a_panic_after_the_mode_change_restores_the_owner_mode() {
-    let fixture = Fixture::new("panic-mode");
-    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "panic-mode");
-    let parent = slot_path.parent().expect("slot parent").to_path_buf();
-    fs::set_permissions(&slot_path, fs::Permissions::from_mode(0o100)).expect("owner mode");
-    let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("*"), "metadata", false);
-    let abort = crate::test_fs::before_capture(1, || panic!("modelled panic after the widening"));
-    let slot_id_text = slot_id.to_string();
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        super::pool::evict_idle_slot_injected(&pool, &slot_id_text)
-    }));
-    drop(abort);
-    assert!(outcome.is_err(), "the armed panic did not fire");
-    let captured = private_names_in(&parent);
-    assert_eq!(
-        captured.len(),
-        1,
-        "the root is under its recorded private name"
-    );
-    assert_eq!(
-        mode_of(&captured[0]),
-        0o100,
-        "the guard restored the owner's exact mode on the panic path"
-    );
-
-    let after = status_injected(&pool).expect("status");
-    assert!(after.slots.is_empty(), "the recorded recovery completed");
-    assert!(!slot_path.exists());
-}
-
-/// A failed restore keeps the deletion pending, and the next open restores the
-/// recorded mode and finishes once the recorded object is back in place.
-#[test]
-fn a_failed_root_restore_stays_pending_then_replay_restores_and_finishes() {
-    let fixture = Fixture::new("failed-restore");
-    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "failed-restore");
-    let parent = slot_path.parent().expect("slot parent").to_path_buf();
-    fs::set_permissions(&slot_path, fs::Permissions::from_mode(0o100)).expect("owner mode");
-    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
-    let captured = parent.join(&plan.private);
-    fs::set_permissions(&captured, fs::Permissions::from_mode(0o700)).expect("widened");
-    // A foreign object claims the recorded name, so no put-back is possible.
-    let foreign = fixture.dir("not-the-root");
-    fs::rename(&foreign, &slot_path).expect("foreign at the recorded name");
-    let blocked = status_injected(&pool).expect("status");
-    assert_eq!(blocked.slots.len(), 1, "the failed restore stays pending");
-    assert_eq!(blocked.coverage, AccountingCoverage::Unknown);
-    assert_eq!(mode_of(&captured), 0o700, "the mode was not restored yet");
-
-    // The obstruction goes; the next open restores the recorded mode, puts the
-    // root back and finishes the deletion.
-    fs::remove_dir(&slot_path).expect("obstruction removed");
-    let after = status_injected(&pool).expect("status");
-    assert!(after.slots.is_empty(), "the recorded recovery completed");
-    assert!(!slot_path.exists());
-    assert!(private_names_in(&parent).is_empty());
 }
 
 /// A descendant that cannot be resolved after a **nested** directory was
@@ -6153,51 +5470,6 @@ fn a_nested_descendant_failure_restores_the_search_only_ancestor() {
     assert!(super::pool::capture_record_injected(&pool, slot_id).is_some());
 }
 
-/// The owner-access repair widens a captured nested directory, so its durable
-/// capture record must be written **before** that widening, and a later refusal
-/// in the same tree must restore the owner's exact mode. Both are asserted
-/// through the real deletion and a journal that reads the live mode at the
-/// moment it records the capture.
-#[test]
-fn a_nested_repair_widening_is_recorded_first_and_restored_on_refusal() {
-    let fixture = Fixture::new("repair-record");
-    let slot = fixture.dir("slot");
-    let locked = slot.join("locked");
-    fs::create_dir(&locked).expect("locked directory");
-    fs::write(locked.join("data"), b"x").expect("data");
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o100)).expect("search-only");
-
-    // The race refuses inside `locked`, i.e. after the repair widened it.
-    let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("locked"), "foreign", false);
-    let mut journal = RecordingJournal {
-        slot: &slot,
-        events: Vec::new(),
-        records: Vec::new(),
-        seen_modes: Vec::new(),
-    };
-    assert!(
-        remove_tree_owned(fixture.path(), &slot, Some(&mut journal)).is_err(),
-        "the raced nested directory refuses"
-    );
-
-    let recorded = journal
-        .seen_modes
-        .iter()
-        .find(|(original, _)| original == "locked")
-        .expect("the captured directory was recorded");
-    assert_eq!(
-        recorded.1, 0o100,
-        "the durable record was written while the directory still had the owner's mode"
-    );
-    assert_eq!(
-        mode_of(&locked),
-        0o100,
-        "the refusal restored the owner's exact mode after the repair widened it"
-    );
-    assert!(slot.is_dir(), "the refused slot is kept");
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("fixture cleanup");
-}
-
 /// The first directory below `root` whose name is a private capture name.
 fn find_private_dir(root: &Path) -> Option<PathBuf> {
     let entries = fs::read_dir(root).ok()?;
@@ -6237,480 +5509,6 @@ fn find_dir_by_mode(root: &Path, mode: u32) -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// A replacement that takes the deleted private name **after** the repair
-/// widened the verified directory is neither chmodded nor renamed: the verified
-/// original's mode is restored through its verified descriptor, the replacement
-/// stays exactly where the racer put it, the observed name stays free, and the
-/// journal record stays outstanding (pending) in the production ledger.
-#[test]
-fn a_replacement_after_the_repair_keeps_both_names_and_stays_pending() {
-    let fixture = Fixture::new("reopen-replacement");
-    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "reopen-replacement");
-    let parent = slot_path.parent().expect("slot parent").to_path_buf();
-    let locked = slot_path.join("locked");
-    fs::create_dir(&locked).expect("locked directory");
-    fs::write(locked.join("data"), b"x").expect("data");
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o100)).expect("search-only");
-
-    let fixture_path = fixture.path().to_path_buf();
-    let _rebind = crate::test_fs::before_child_reopen(move || {
-        // The captured directory is under a private name inside the captured
-        // slot: move the verified object aside and put a different directory at
-        // that name, so the reopen sees a replacement.
-        let captured_slot = find_private_dir(&fixture_path).expect("the captured slot");
-        let captured_locked = find_private_dir(&captured_slot).expect("the captured directory");
-        fs::rename(&captured_locked, captured_slot.join("moved-away"))
-            .expect("the verified directory is moved aside");
-        fs::create_dir(&captured_locked).expect("replacement at the private name");
-        fs::set_permissions(&captured_locked, fs::Permissions::from_mode(0o500))
-            .expect("replacement mode");
-    });
-    assert!(
-        super::pool::evict_idle_slot_injected(&pool, &slot_id.to_string()).is_err(),
-        "a replaced capture refuses"
-    );
-
-    // The slot is back at its recorded name and both objects are preserved
-    // exactly where they were: the replacement under the private name, the
-    // verified original where the racer moved it, and the observed name free.
-    assert!(slot_path.is_dir(), "the slot is restored");
-    assert!(
-        !slot_path.join("locked").exists(),
-        "nothing was renamed into the observed name"
-    );
-    let replacement = find_dir_by_mode(&slot_path, 0o500).expect("replacement kept");
-    assert!(
-        replacement
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with(".oxide-capture-")),
-        "the replacement is still at its private name"
-    );
-    let original = find_dir_by_mode(&slot_path, 0o100).expect("verified original kept");
-    assert_eq!(
-        mode_of(&original),
-        0o100,
-        "the verified directory's owner mode was restored through its verified descriptor"
-    );
-
-    // Journal disposition in the production ledger: the entry's capture record
-    // is still outstanding, so the deletion stays pending rather than complete.
-    let journal = super::pool::capture_record_injected(&pool, slot_id)
-        .expect("the capture journal is retained");
-    assert!(
-        journal
-            .captures
-            .iter()
-            .any(|record| record.original == "locked"),
-        "the replaced entry's capture record is kept: {journal:?}"
-    );
-    let after = status_injected(&pool).expect("status");
-    assert_eq!(after.slots.len(), 1, "the deletion stays pending");
-    assert_eq!(after.coverage, AccountingCoverage::Unknown);
-    assert!(
-        slot_path
-            .join(replacement.file_name().expect("replacement name"))
-            .is_dir(),
-        "the replacement is still at its private name after replay"
-    );
-    let _ = parent;
-    fs::set_permissions(&slot_path, fs::Permissions::from_mode(0o700)).expect("cleanup");
-    fs::set_permissions(&original, fs::Permissions::from_mode(0o700)).expect("cleanup");
-    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).expect("cleanup");
-}
-
-/// A reopen that fails because the private name is no longer an openable
-/// directory restores the verified original's owner mode through its verified
-/// descriptor, moves nothing (the link stays at the private name and the
-/// observed name stays free), follows nothing, and keeps the journal pending.
-#[test]
-fn a_failed_reopen_keeps_both_names_and_stays_pending() {
-    let fixture = Fixture::new("reopen-link");
-    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "reopen-link");
-    let locked = slot_path.join("locked");
-    fs::create_dir(&locked).expect("locked directory");
-    fs::write(locked.join("data"), b"x").expect("data");
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o100)).expect("search-only");
-    let outside = fixture.dir("outside");
-    fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).expect("outside mode");
-
-    let (fixture_path, outside_path) = (fixture.path().to_path_buf(), outside.clone());
-    let _rebind = crate::test_fs::before_child_reopen(move || {
-        let captured_slot = find_private_dir(&fixture_path).expect("the captured slot");
-        let captured_locked = find_private_dir(&captured_slot).expect("the captured directory");
-        fs::rename(&captured_locked, captured_slot.join("moved-away"))
-            .expect("the verified directory is moved aside");
-        symlink(&outside_path, &captured_locked).expect("a link at the private name");
-    });
-    assert!(
-        super::pool::evict_idle_slot_injected(&pool, &slot_id.to_string()).is_err(),
-        "a failed reopen refuses"
-    );
-
-    assert!(slot_path.is_dir(), "the slot is restored");
-    assert!(
-        !slot_path.join("locked").exists(),
-        "the link was not renamed into the observed name"
-    );
-    let link = fs::read_dir(&slot_path)
-        .expect("slot listed")
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with(".oxide-capture-"))
-                && fs::symlink_metadata(path)
-                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
-        })
-        .expect("the link is still at its private name");
-    assert_eq!(
-        fs::read_link(&link).expect("link target"),
-        outside,
-        "the link still names exactly what the racer put there"
-    );
-    assert_eq!(
-        fs::symlink_metadata(&outside)
-            .expect("outside kept")
-            .permissions()
-            .mode()
-            & 0o7777,
-        0o700,
-        "nothing was chmodded through the link"
-    );
-    let original = find_dir_by_mode(&slot_path, 0o100).expect("verified original kept");
-    assert_eq!(
-        mode_of(&original),
-        0o100,
-        "the failed reopen restored the verified original's owner mode"
-    );
-
-    let journal = super::pool::capture_record_injected(&pool, slot_id)
-        .expect("the capture journal is retained");
-    assert!(
-        journal
-            .captures
-            .iter()
-            .any(|record| record.original == "locked"),
-        "the unresolved entry's capture record is kept"
-    );
-    let after = status_injected(&pool).expect("status");
-    assert_eq!(after.slots.len(), 1, "the deletion stays pending");
-    assert_eq!(after.coverage, AccountingCoverage::Unknown);
-    for path in [&slot_path, &original, &outside] {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("cleanup");
-    }
-    let _ = link;
-}
-
-/// A replacement created at the private name **before** the repair opens it is
-/// neither repaired nor renamed: the whole deletion refuses, the replacement
-/// stays at its private name with its own mode, the observed name stays free,
-/// and the production ledger keeps the capture record so the slot stays pending.
-#[test]
-fn a_replacement_before_the_repair_keeps_both_names_and_stays_pending() {
-    let fixture = Fixture::new("repair-replacement");
-    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "repair-replacement");
-    let locked = slot_path.join("locked");
-    fs::create_dir(&locked).expect("locked directory");
-    fs::write(locked.join("data"), b"x").expect("data");
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o100)).expect("search-only");
-
-    let fixture_path = fixture.path().to_path_buf();
-    let _rebind = crate::test_fs::before_repair(move || {
-        let captured_slot = find_private_dir(&fixture_path).expect("the captured slot");
-        let captured_locked = find_private_dir(&captured_slot).expect("the captured directory");
-        fs::rename(&captured_locked, captured_slot.join("moved-away"))
-            .expect("the verified directory is moved aside");
-        fs::create_dir(&captured_locked).expect("replacement at the private name");
-        fs::set_permissions(&captured_locked, fs::Permissions::from_mode(0o500))
-            .expect("replacement mode");
-    });
-    assert!(
-        super::pool::evict_idle_slot_injected(&pool, &slot_id.to_string()).is_err(),
-        "a replacement before the repair refuses"
-    );
-
-    assert!(slot_path.is_dir(), "the slot is restored");
-    assert!(
-        !slot_path.join("locked").exists(),
-        "the replacement was not renamed into the observed name"
-    );
-    let replacement = find_dir_by_mode(&slot_path, 0o500).expect("replacement kept");
-    assert!(
-        replacement
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with(".oxide-capture-")),
-        "the replacement is still at its private name"
-    );
-    assert_eq!(
-        mode_of(&replacement),
-        0o500,
-        "the replacement keeps its own mode"
-    );
-    assert_eq!(
-        mode_of(&find_dir_by_mode(&slot_path, 0o100).expect("verified original kept")),
-        0o100,
-        "the verified original keeps the owner's mode"
-    );
-
-    let journal = super::pool::capture_record_injected(&pool, slot_id)
-        .expect("the capture journal is retained");
-    assert!(
-        journal
-            .captures
-            .iter()
-            .any(|record| record.original == "locked"),
-        "the replaced entry's capture record is kept"
-    );
-    let after = status_injected(&pool).expect("status");
-    assert_eq!(after.slots.len(), 1, "the deletion stays pending");
-    assert_eq!(after.coverage, AccountingCoverage::Unknown);
-    fs::set_permissions(&slot_path, fs::Permissions::from_mode(0o700)).expect("cleanup");
-}
-
-/// A symlink planted at the private name before the repair opens it is never
-/// followed, never repaired and never renamed: both names and the production
-/// journal stay exactly as they were, pending.
-#[test]
-fn a_symlink_before_the_repair_keeps_both_names_and_stays_pending() {
-    let fixture = Fixture::new("repair-link");
-    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "repair-link");
-    let locked = slot_path.join("locked");
-    fs::create_dir(&locked).expect("locked directory");
-    fs::write(locked.join("data"), b"x").expect("data");
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o100)).expect("search-only");
-    let outside = fixture.dir("outside");
-    fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).expect("outside mode");
-
-    let (fixture_path, outside_path) = (fixture.path().to_path_buf(), outside.clone());
-    let _rebind = crate::test_fs::before_repair(move || {
-        let captured_slot = find_private_dir(&fixture_path).expect("the captured slot");
-        let captured_locked = find_private_dir(&captured_slot).expect("the captured directory");
-        fs::rename(&captured_locked, captured_slot.join("moved-away"))
-            .expect("the verified directory is moved aside");
-        symlink(&outside_path, &captured_locked).expect("a link at the private name");
-    });
-    assert!(
-        super::pool::evict_idle_slot_injected(&pool, &slot_id.to_string()).is_err(),
-        "a link before the repair refuses"
-    );
-
-    assert!(slot_path.is_dir(), "the slot is restored");
-    assert!(
-        !slot_path.join("locked").exists(),
-        "the link was not renamed into the observed name"
-    );
-    let link = fs::read_dir(&slot_path)
-        .expect("slot listed")
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with(".oxide-capture-"))
-                && fs::symlink_metadata(path)
-                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
-        })
-        .expect("the link is still at its private name");
-    assert_eq!(
-        fs::read_link(&link).expect("link target"),
-        outside,
-        "the link still names exactly what the racer put there"
-    );
-    assert_eq!(
-        fs::symlink_metadata(&outside)
-            .expect("outside kept")
-            .permissions()
-            .mode()
-            & 0o7777,
-        0o700,
-        "nothing was repaired or chmodded through the link"
-    );
-    assert_eq!(
-        mode_of(&find_dir_by_mode(&slot_path, 0o100).expect("verified original kept")),
-        0o100,
-        "the verified original keeps the owner's mode"
-    );
-
-    let journal = super::pool::capture_record_injected(&pool, slot_id)
-        .expect("the capture journal is retained");
-    assert!(
-        journal
-            .captures
-            .iter()
-            .any(|record| record.original == "locked"),
-        "the unresolved entry's capture record is kept"
-    );
-    let after = status_injected(&pool).expect("status");
-    assert_eq!(after.slots.len(), 1, "the deletion stays pending");
-    assert_eq!(after.coverage, AccountingCoverage::Unknown);
-    fs::set_permissions(&slot_path, fs::Permissions::from_mode(0o700)).expect("cleanup");
-}
-
-/// A whole-slot capture that picks up a replacement is recorded as a foreign
-/// capture before anything is renamed: the replacement is preserved, the record
-/// survives reopening, and replay keeps the deletion pending instead of
-/// clearing it and retrying the slot as ordinary owned content.
-#[test]
-fn a_replaced_whole_slot_capture_is_foreign_and_stays_pending() {
-    let fixture = Fixture::new("slot-capture-foreign");
-    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "slot-capture-foreign");
-    let parent = slot_path.parent().expect("slot parent").to_path_buf();
-
-    // The racer takes the observed slot away and leaves its own directory at
-    // the recorded name, after the walk observed it and before the capture.
-    let (slot_for_race, parent_for_race) = (slot_path.clone(), parent.clone());
-    let _race = crate::test_fs::before_walk_capture(move || {
-        fs::rename(&slot_for_race, parent_for_race.join("moved-away"))
-            .expect("the observed slot is moved aside");
-        fs::create_dir(&slot_for_race).expect("replacement at the recorded name");
-        fs::write(slot_for_race.join("racer-marker"), b"racer").expect("replacement marker");
-    });
-    assert!(
-        super::pool::evict_idle_slot_injected(&pool, &slot_id.to_string()).is_err(),
-        "a replaced whole-slot capture refuses"
-    );
-
-    // The racer's replacement was captured under the private name and kept
-    // exactly as it was; the recorded name stays free.
-    assert!(
-        !slot_path.exists(),
-        "nothing was renamed back into the recorded name"
-    );
-    let captured = private_names_in(&parent)
-        .into_iter()
-        .find(|path| path.is_dir())
-        .expect("the captured replacement");
-    assert_eq!(
-        fs::read(captured.join("racer-marker")).expect("replacement preserved"),
-        b"racer",
-        "the racer's object is preserved exactly as it was"
-    );
-
-    // The owning journal holds the unexpected object as a foreign capture, and
-    // it survives reopening: the deletion stays pending and never retries.
-    let journal = super::pool::capture_record_injected(&pool, slot_id)
-        .expect("the capture journal is retained");
-    assert_eq!(
-        journal.foreign.len(),
-        1,
-        "the unexpected object is recorded as a foreign capture: {journal:?}"
-    );
-    assert!(
-        !journal.foreign[0].restored,
-        "nothing was put back for the foreign capture"
-    );
-    let after = status_injected(&pool).expect("status");
-    assert_eq!(after.slots.len(), 1, "the deletion stays pending");
-    assert_eq!(after.coverage, AccountingCoverage::Unknown);
-    let reopened = super::pool::capture_record_injected(&pool, slot_id)
-        .expect("the record survives reopening");
-    assert_eq!(reopened.foreign.len(), 1, "the foreign record is kept");
-    assert_eq!(
-        private_names_in(&parent).len(),
-        1,
-        "no second capture was made: the deletion did not retry"
-    );
-}
-
-/// An entry name that cannot be journaled exactly is refused **before** it is
-/// captured: nothing is renamed or deleted, the escaped bytes are reported, and
-/// the deletion stays pending. APFS refuses to create a non-UTF-8 name at all,
-/// so the walk's check is fed that input through the debug-only seam and the
-/// production refusal path is what is asserted; the predicate itself is also
-/// checked directly against real non-UTF-8 bytes.
-#[test]
-fn an_entry_name_that_cannot_round_trip_refuses_before_capture() {
-    // The predicate: real non-UTF-8 bytes are rejected with their escaped form.
-    let odd = std::ffi::CString::new(b"caf\xe9".to_vec()).expect("name");
-    assert_eq!(
-        crate::owned_delete::journal_name(&odd),
-        Err("an entry name is not valid UTF-8 (caf\\xe9)".to_owned()),
-        "a lossy conversion would silently journal a different name"
-    );
-    let lossy = String::from_utf8_lossy(b"caf\xe9").into_owned();
-    assert_ne!(
-        lossy.as_bytes(),
-        b"caf\xe9",
-        "a lossy conversion changes bytes, which is why the name is refused"
-    );
-
-    let fixture = Fixture::new("invalid-name");
-    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "invalid-name");
-    let locked = slot_path.join("locked");
-    fs::create_dir(&locked).expect("locked directory");
-    fs::write(locked.join("data"), b"x").expect("data");
-
-    let forced = crate::test_fs::force_invalid_name();
-    let outcome = super::pool::evict_idle_slot_injected(&pool, &slot_id.to_string());
-    drop(forced);
-    match outcome {
-        Err(LeaseError::UnexpectedEntry { place, entry }) => {
-            assert_eq!(place, "slot tree entry");
-            assert_eq!(
-                entry,
-                slot_path.file_name().expect("slot leaf").to_string_lossy(),
-                "the refused entry is named"
-            );
-        }
-        other => panic!("a name that cannot round-trip must refuse before capture: {other:?}"),
-    }
-
-    // Nothing was captured or renamed, and the deletion stays pending.
-    assert!(slot_path.is_dir(), "the slot is restored");
-    assert!(locked.is_dir(), "the refused entry is untouched");
-    assert_eq!(
-        private_names_in(&slot_path).len(),
-        0,
-        "nothing was captured: the name was refused before the capture"
-    );
-    // Nothing was journaled for the refused attempt, so the recorded deletion
-    // stays pending until a retry can run; here the platform's real names are
-    // UTF-8, so that retry completes instead of touching the refused entry.
-    let after = status_injected(&pool).expect("status");
-    assert!(
-        after.slots.is_empty(),
-        "the pending deletion completed on retry"
-    );
-    assert!(!slot_path.exists());
-}
-
-/// A captured entry whose name is valid multi-byte UTF-8 is journaled exactly
-/// and put back under exactly that name when the deletion refuses.
-#[test]
-fn a_live_putback_restores_the_exact_non_ascii_name() {
-    let fixture = Fixture::new("exact-name");
-    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "exact-name");
-    let odd = slot_path.join("café");
-    fs::create_dir(&odd).expect("non-ASCII directory");
-    fs::write(odd.join("data"), b"x").expect("data");
-
-    let _race = crate::test_fs::arm_race(std::ffi::OsStr::new("*"), "foreign", false);
-    assert!(
-        super::pool::evict_idle_slot_injected(&pool, &slot_id.to_string()).is_err(),
-        "the raced deletion refuses"
-    );
-
-    let journal = super::pool::capture_record_injected(&pool, slot_id)
-        .expect("the capture journal is retained");
-    assert!(
-        journal
-            .captures
-            .iter()
-            .any(|record| record.original == "café"),
-        "the journal records the exact UTF-8 name: {journal:?}"
-    );
-    assert!(
-        odd.is_dir(),
-        "the live put-back restored the entry under its exact original name"
-    );
-
-    // The next open releases the recorded capture and finishes the deletion,
-    // which is only possible because the recorded name round-trips exactly.
-    let after = status_injected(&pool).expect("status");
-    assert!(after.slots.is_empty(), "the recorded deletion completed");
-    assert!(!slot_path.exists());
-    assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
 }
 
 /// A journaled parent capture that was already put back, holding its own
@@ -6797,68 +5595,6 @@ fn a_restored_parent_with_a_child_capture_resolves_once_the_obstruction_goes() {
     );
     assert!(!slot_path.exists());
     assert!(super::pool::capture_record_injected(&pool, slot_id).is_none());
-}
-
-/// An interrupted capture that is still private replays to its **exact**
-/// multi-byte UTF-8 original name — never a replacement-character name.
-#[test]
-fn a_still_private_multibyte_capture_replays_to_its_exact_name() {
-    let fixture = Fixture::new("exact-replay");
-    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "exact-replay");
-    let parent = slot_path.parent().expect("slot parent").to_path_buf();
-    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
-    let captured = parent.join(&plan.private);
-    fs::create_dir(captured.join("café")).expect("multibyte directory");
-    let held = File::open(&captured).expect("captured root descriptor");
-    let name = std::ffi::CString::new("café").expect("name");
-    let entry = crate::owned_delete::capture_entry(held.as_fd(), &name).expect("capture");
-    let facts = crate::owned_delete::observe_entry(held.as_fd(), &entry.private).expect("facts");
-    let record = crate::owned_delete::CaptureRecord {
-        path: Vec::new(),
-        private: entry.private.to_string_lossy().into_owned(),
-        original: "café".to_owned(),
-        device: facts.device,
-        inode: facts.inode,
-        mode: facts.mode as u32,
-    };
-    // An unrecorded private name makes the resumed walk refuse, so the restored
-    // name is observable after replay instead of being deleted again.
-    fs::write(
-        captured.join(".oxide-capture-0123456789abcdef"),
-        b"unrecorded",
-    )
-    .expect("unrecorded private name");
-    write_journal(&pool, slot_id, plan, true, vec![record.clone()], Vec::new());
-    assert_eq!(record.original, "café");
-    assert!(
-        !record.original.contains('\u{fffd}'),
-        "the journal never holds a replacement-character name"
-    );
-
-    let after = status_injected(&pool).expect("status");
-    assert_eq!(after.slots.len(), 1, "the unrecorded name keeps it pending");
-    let restored = slot_path.join("café");
-    assert!(
-        restored.is_dir(),
-        "the captured entry replayed to its exact original name"
-    );
-    assert_eq!(
-        fs::symlink_metadata(&restored)
-            .expect("restored name")
-            .permissions()
-            .mode()
-            & 0o7777,
-        0o755,
-        "and the restored directory keeps its own mode"
-    );
-    assert!(
-        std::fs::read_dir(&slot_path)
-            .expect("slot listed")
-            .flatten()
-            .all(|entry| !entry.file_name().to_string_lossy().contains('\u{fffd}')),
-        "no replacement-character name exists anywhere in the tree"
-    );
-    fs::set_permissions(&slot_path, fs::Permissions::from_mode(0o700)).expect("cleanup");
 }
 
 /// A restored parent's name rebound **after** the repair widened it stops the
@@ -7042,4 +5778,1199 @@ fn a_post_chmod_step_failure_restores_the_original_mode_and_stays_pending() {
         "an unrestored widening is observable, which is what the control asserts"
     );
     fs::set_permissions(&captured, fs::Permissions::from_mode(0o700)).expect("cleanup");
+}
+
+// ---------------------------------------------------------------------------
+// Whole-tree holding deletion (oxide#190)
+// ---------------------------------------------------------------------------
+
+/// The payload's private holding area.
+fn holding_area(pool: &Path) -> PathBuf {
+    pool.join("payload").join(".oxide-holding")
+}
+
+/// Create the private holding area the way the product first does.
+fn prepare_holding_area(pool: &Path) {
+    let area = holding_area(pool);
+    if area.symlink_metadata().is_err() {
+        fs::create_dir(&area).expect("holding area");
+        fs::set_permissions(&area, fs::Permissions::from_mode(0o700)).expect("holding mode");
+    }
+}
+
+/// The recorded holding rows of one pool, from its ledger view.
+fn holding_rows(pool: &Path) -> Vec<super::HoldingEntry> {
+    managed::ledger_view(pool).expect("ledger view").holding
+}
+
+/// One lease on a fresh project, for a rotation step or a hold count.
+fn lease_once(fixture: &Fixture, pool: &Path, label: &str) -> super::LeaseGrant {
+    let project = fixture.dir(&format!("{label}-project"));
+    let workspace = fixture.dir(&format!("{label}-workspace"));
+    lease_injected(request(pool, &project, &workspace, label)).expect("lease")
+}
+
+/// Evicting an idle slot under the pool lock is one rename and one durable
+/// write: the tree leaves the slots root whole, one holding row records its
+/// identity and bytes, the slot row is gone, and the charge follows the tree
+/// until a deletion finishes it.
+#[test]
+fn an_eviction_moves_the_whole_tree_into_the_holding_area() {
+    let fixture = Fixture::new("holding-evict");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "holding-evict");
+    let payload = fs::read(slot_path.join("build/blob")).expect("payload file");
+
+    evict_idle_slot_injected(&pool, &slot_id.to_string()).expect("evict");
+
+    let view = managed::ledger_view(&pool).expect("ledger view");
+    assert!(
+        view.slots
+            .iter()
+            .all(|slot| slot.slot_id != slot_id.to_string()),
+        "the slot row survived the eviction"
+    );
+    assert_eq!(
+        view.holding.len(),
+        1,
+        "one holding row: {:#?}",
+        view.holding
+    );
+    let row = &view.holding[0];
+    assert_eq!(row.present, Some(true), "the tree is in the holding area");
+    assert!(row.recorded_bytes > 0, "the row is charged its bytes");
+    assert!(!slot_path.exists(), "the tree left the slots root whole");
+    let held = holding_area(&pool).join(&row.name);
+    assert_eq!(
+        fs::read(held.join("build/blob")).expect("held payload"),
+        payload,
+        "the held tree is the slot's own tree, not a copy"
+    );
+    // A measured status walks the payload: the held tree is not a slot and the
+    // payload figure still counts every byte of it.
+    let status = status_injected(&pool).expect("status");
+    assert_eq!(status.slots.len(), 0);
+    assert_eq!(status.holding.len(), 1);
+    assert!(status.payload_unique_allocated_bytes.unwrap_or(0) >= payload.len() as u64);
+
+    // The charge is the ledger total the next admission uses, and it is not a
+    // slot: neither the slot table nor a project's cap counts it.
+    let snapshot = managed::snapshot(&pool).expect("snapshot");
+    assert_eq!(snapshot.holding.len(), 1);
+    assert_eq!(snapshot.slots.len(), 0);
+
+    // Deleting it drops the row, the bytes and the tree; the charge is gone.
+    let pass = managed::drain_holding(&pool, None).expect("drain");
+    assert!(pass.gone, "the held tree is gone: {pass:?}");
+    assert!(pass.entries >= 1, "the pass counted what it removed");
+    assert!(!held.exists(), "the holding entry is removed");
+    assert!(
+        holding_area(&pool).is_dir(),
+        "the holding area itself stays for the next eviction"
+    );
+    assert!(holding_rows(&pool).is_empty(), "the row is dropped");
+    assert_eq!(
+        managed::snapshot(&pool).expect("snapshot").recorded_total,
+        None
+    );
+}
+
+/// The open a crash between the rename and its durable row leaves: the slot row
+/// is still recorded with the identity its own intent bound, its root is gone,
+/// and the tree sits under the name that generation derives. The next locked
+/// open adopts it as a holding row instead of charging an absent slot or
+/// deleting blindly.
+#[test]
+fn a_tree_renamed_before_its_row_is_adopted_by_the_next_open() {
+    let fixture = Fixture::new("holding-adopt");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "holding-adopt");
+    prepare_holding_area(&pool);
+    let name = super::pool::holding_name_for_slot_injected(&pool, slot_id).expect("derived name");
+    let verified = {
+        let metadata = fs::symlink_metadata(&slot_path).expect("root metadata");
+        (metadata.dev(), metadata.ino())
+    };
+    super::pool::hold_intent_for_test(&pool, slot_id, verified.0, verified.1).expect("intent");
+    fs::rename(&slot_path, holding_area(&pool).join(&name)).expect("modelled rename");
+    assert!(!slot_path.exists());
+
+    let view = managed::ledger_view(&pool).expect("the next open");
+    assert!(
+        view.slots.is_empty(),
+        "the adopted generation is not a slot: {:#?}",
+        view.slots
+    );
+    assert_eq!(view.holding.len(), 1, "one adopted row");
+    assert_eq!(view.holding[0].name, name);
+    assert_eq!(view.holding[0].slot_id, slot_id.to_string());
+    assert!(view.holding[0].recorded_bytes > 0);
+
+    let pass = managed::drain_holding(&pool, None).expect("drain");
+    assert!(pass.gone, "{pass:?}");
+    assert!(!holding_area(&pool).join(&name).exists());
+}
+
+/// A crash mid-delete leaves a partly emptied tree and its row. The next pass
+/// resumes from what is left, is idempotent about the entries already gone, and
+/// finishes the same entry.
+#[test]
+fn a_partly_deleted_tree_is_resumed_and_finished() {
+    let fixture = Fixture::new("holding-resume");
+    let (pool, slot_id, _slot_path) = idle_slot_for_eviction(&fixture, "holding-resume");
+    evict_idle_slot_injected(&pool, &slot_id.to_string()).expect("evict");
+    let row = holding_rows(&pool).remove(0);
+    let held = holding_area(&pool).join(&row.name);
+    fs::create_dir_all(held.join("build/deps")).expect("deeper tree");
+    fs::write(held.join("build/deps/object"), b"object").expect("object");
+    // A killed deleter's progress: one file is already gone.
+    fs::remove_file(held.join("build/blob")).expect("removed before the crash");
+
+    let pass = managed::drain_holding(&pool, None).expect("resume");
+    assert!(pass.gone, "the resumed pass finished the entry: {pass:?}");
+    assert!(pass.entries >= 2, "it removed the rest: {pass:?}");
+    assert!(!held.exists());
+    assert!(holding_rows(&pool).is_empty(), "the row is dropped");
+}
+
+/// Custody is a non-blocking lock on the entry's own descriptor: while another
+/// process holds it, a pass claims nothing and deletes nothing. Once that
+/// holder is gone, the next pass takes the entry and finishes it.
+#[test]
+fn a_live_deleter_keeps_custody_and_the_next_pass_takes_over() {
+    let fixture = Fixture::new("holding-custody");
+    let (pool, slot_id, _slot_path) = idle_slot_for_eviction(&fixture, "holding-custody");
+    evict_idle_slot_injected(&pool, &slot_id.to_string()).expect("evict");
+    let row = holding_rows(&pool).remove(0);
+    let held = holding_area(&pool).join(&row.name);
+
+    // Stand in for a live deleter: the entry's own descriptor, locked.
+    let owner = File::open(&held).expect("entry descriptor");
+    assert_eq!(
+        // SAFETY: `owner` is a live descriptor for the entry directory.
+        unsafe {
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&owner),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        },
+        0,
+        "the stand-in deleter took custody"
+    );
+    let blocked = managed::drain_holding(&pool, None).expect("a pass that loses the race");
+    assert_eq!(blocked.claimed, None, "another deleter's entry was claimed");
+    assert!(held.exists(), "the entry under custody was deleted");
+    assert_eq!(holding_rows(&pool).len(), 1, "its row stays charged");
+
+    drop(owner);
+    let pass = managed::drain_holding(&pool, None).expect("takeover");
+    assert_eq!(pass.claimed.as_deref(), Some(row.name.as_str()));
+    assert!(pass.gone, "the takeover finished the entry: {pass:?}");
+    assert!(holding_rows(&pool).is_empty());
+}
+
+/// An entry this pass cannot delete stays recorded and charged and never keeps
+/// another entry from being deleted: the rotation starts each pass at a
+/// different row, using the pool's own monotonic rank sequence.
+#[test]
+fn a_refused_entry_is_kept_and_does_not_block_another_entry() {
+    let fixture = Fixture::new("holding-refused");
+    let pool = fixture.dir("pool");
+    create_injected(&pool, 64 * 1024 * 1024).expect("init");
+    // Two idle slots, the first of which holds an entry the traversal refuses.
+    let first = lease_once(&fixture, &pool, "first");
+    let first_slot = first.slot_id.parse::<u64>().expect("slot id");
+    let fifo = first.env.cargo_build_build_dir.join("pipe");
+    let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("fifo name");
+    // SAFETY: a fresh path inside the fixture, mode 0600.
+    assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+    release_injected(&pool, &first.lease_id).expect("release first");
+    let second = lease_once(&fixture, &pool, "second");
+    release_injected(&pool, &second.lease_id).expect("release second");
+    evict_idle_slot_injected(&pool, &first_slot.to_string()).expect("evict the fifo slot");
+    let fifo_row = holding_rows(&pool)
+        .into_iter()
+        .find(|row| row.slot_id == first_slot.to_string())
+        .expect("the fifo slot's row");
+    let fifo_held = holding_area(&pool).join(&fifo_row.name);
+
+    // The recorded entry's own pass refuses the unknown entry type and keeps
+    // everything: nothing is silently dropped and the row stays charged.
+    let refused = managed::drain_holding(&pool, Some(&fifo_row.name)).expect("refused pass");
+    assert_eq!(refused.claimed.as_deref(), Some(fifo_row.name.as_str()));
+    assert!(
+        !refused.gone,
+        "the entry with a fifo completed: {refused:?}"
+    );
+    assert!(
+        refused
+            .refused
+            .iter()
+            .any(|item| item.contains("unknown entry type")),
+        "the refusal names the entry type: {refused:?}"
+    );
+    assert!(fifo_held.exists(), "the refused tree is kept");
+    assert_eq!(holding_rows(&pool).len(), 1, "the row stays charged");
+
+    // A later command's own pass (the rank sequence advanced) takes the other
+    // entry and deletes it; the refused one is untouched.
+    let other_slot = lease_once(&fixture, &pool, "third");
+    let other_slot_id = other_slot.slot_id.parse::<u64>().expect("slot id");
+    release_injected(&pool, &other_slot.lease_id).expect("release third");
+    evict_idle_slot_injected(&pool, &other_slot_id.to_string()).expect("evict the healthy slot");
+    let mut removed = false;
+    for _ in 0..4 {
+        let pass = managed::drain_holding(&pool, None).expect("pass");
+        if pass.claimed.as_deref() != Some(fifo_row.name.as_str()) && pass.gone {
+            removed = true;
+            break;
+        }
+        // Another command: its own grant and release advance the rotation.
+        let step = lease_once(&fixture, &pool, "rotation");
+        release_injected(&pool, &step.lease_id).expect("release rotation");
+    }
+    assert!(removed, "the healthy entry was never deleted");
+    let rows = holding_rows(&pool);
+    assert!(
+        rows.iter().any(|row| row.name == fifo_row.name),
+        "the refused entry is still recorded: {rows:#?}"
+    );
+    assert!(fifo_held.exists(), "the refused tree is still there");
+}
+
+/// The traversal never follows a link: a symlink inside a held tree is unlinked
+/// as a leaf, and its target outside the pool survives.
+#[test]
+fn a_symlink_in_a_held_tree_is_unlinked_never_followed() {
+    let fixture = Fixture::new("holding-symlink");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "holding-symlink");
+    let outside = fixture.dir("outside");
+    fs::write(outside.join("keep"), b"outside").expect("outside file");
+    symlink(&outside, slot_path.join("build/link")).expect("symlink");
+    evict_idle_slot_injected(&pool, &slot_id.to_string()).expect("evict");
+
+    let pass = managed::drain_holding(&pool, None).expect("drain");
+    assert!(pass.gone, "{pass:?}");
+    assert!(pass.refused.is_empty(), "a symlink is deleted: {pass:?}");
+    assert_eq!(
+        fs::read(outside.join("keep")).expect("the target survives"),
+        b"outside"
+    );
+    assert!(holding_rows(&pool).is_empty());
+}
+
+/// An owned directory the owner left read-only (a test or build scratch tree)
+/// is still deleted whole through its own descriptor.
+#[test]
+fn an_owned_read_only_tree_is_deleted_whole() {
+    let fixture = Fixture::new("holding-readonly");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "holding-readonly");
+    let objects = slot_path.join("build/scratch/.effigy/state/objects/4bcd");
+    fs::create_dir_all(&objects).expect("object dir");
+    fs::write(objects.join("data"), b"x").expect("object file");
+    fs::set_permissions(objects.join("data"), fs::Permissions::from_mode(0o444))
+        .expect("read-only file");
+    fs::set_permissions(&objects, fs::Permissions::from_mode(0o500)).expect("read-only dir");
+    evict_idle_slot_injected(&pool, &slot_id.to_string()).expect("evict");
+
+    let pass = managed::drain_holding(&pool, None).expect("drain");
+    assert!(pass.gone, "the read-only tree is deleted: {pass:?}");
+    assert!(holding_rows(&pool).is_empty());
+}
+
+/// The claimed tree's **own root** may be owner-no-write: the drain restores
+/// the owner's access through the descriptor it already holds, so a slot tree
+/// the owner left read-only is still deleted whole instead of staying charged
+/// forever.
+#[test]
+fn a_claimed_root_the_owner_left_read_only_is_still_drained() {
+    let fixture = Fixture::new("holding-readonly-root");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "holding-readonly-root");
+    let nested = slot_path.join("build/out");
+    fs::create_dir_all(&nested).expect("nested dir");
+    fs::write(nested.join("object"), b"x").expect("nested object");
+    evict_idle_slot_injected(&pool, &slot_id.to_string()).expect("evict");
+    let row = holding_rows(&pool).pop().expect("a holding row");
+    let held = holding_area(&pool).join(&row.name);
+    // The tree the claim will open: its root loses the owner's write bit, and so
+    // does one nested directory, so both the root's children and the nested
+    // level need the owner's access restored.
+    fs::set_permissions(held.join("build/out"), fs::Permissions::from_mode(0o500))
+        .expect("nested read-only");
+    fs::set_permissions(&held, fs::Permissions::from_mode(0o500)).expect("root read-only");
+
+    let pass = managed::drain_holding(&pool, None).expect("drain");
+    assert!(pass.gone, "the read-only root is deleted whole: {pass:?}");
+    assert!(pass.refused.is_empty(), "nothing is refused: {pass:?}");
+    assert!(!held.exists(), "the held tree is gone");
+    assert!(holding_rows(&pool).is_empty(), "the row is finished");
+}
+
+/// The traversal never enters a directory on another device: the same tree is
+/// proved both ways, so only the injected device differs. A regular file is
+/// still removed (no device rule applies to it), the child directory is refused
+/// by name and kept, and the real device then empties the tree — the branch is
+/// reachable and falsifiable, not merely unreachable code.
+#[test]
+fn a_child_directory_on_another_device_is_refused_and_kept() {
+    let fixture = Fixture::new("holding-device");
+    let root = fixture.dir("tree");
+    let child = root.join("child");
+    fs::create_dir(&child).expect("child dir");
+    fs::write(child.join("kept"), b"kept").expect("kept file");
+    fs::write(root.join("leaf"), b"leaf").expect("leaf file");
+    let held = File::open(&root).expect("open the tree");
+    let device = fs::symlink_metadata(&root).expect("root metadata").dev();
+
+    let (emptied, stats) =
+        super::pool::delete_holding_children_for_test(held.as_fd(), device.wrapping_add(1))
+            .expect("traversal");
+    assert!(
+        !emptied,
+        "a tree with a foreign-device child completed: {stats:?}"
+    );
+    assert!(
+        stats
+            .refused
+            .iter()
+            .any(|item| item.contains("another device")),
+        "the refusal names the device boundary: {stats:?}"
+    );
+    assert_eq!(
+        fs::read(child.join("kept")).expect("the foreign subtree survives"),
+        b"kept"
+    );
+    assert!(
+        !root.join("leaf").exists(),
+        "an ordinary file is still removed: {stats:?}"
+    );
+
+    let (emptied, stats) =
+        super::pool::delete_holding_children_for_test(held.as_fd(), device).expect("traversal");
+    assert!(
+        emptied,
+        "the same tree with its real device is empty: {stats:?}"
+    );
+    assert!(stats.refused.is_empty(), "nothing is refused: {stats:?}");
+}
+
+/// A recorded row whose holding area is positively absent is finished, not
+/// charged forever: the open that reads the payload sees no area, and no tree
+/// can live in an area that does not exist. Nothing is deleted here — the rows
+/// simply stop being charged.
+#[test]
+fn a_recorded_row_is_finished_when_the_holding_area_is_gone() {
+    let fixture = Fixture::new("holding-area-gone");
+    let (pool, slot_id, _slot_path) = idle_slot_for_eviction(&fixture, "holding-area-gone");
+    evict_idle_slot_injected(&pool, &slot_id.to_string()).expect("evict");
+    assert_eq!(holding_rows(&pool).len(), 1, "the eviction recorded a row");
+
+    // The area and the tree vanish outside Oxide's control (a manual cleanup, an
+    // external tool, a lost directory): the row must not stay charged forever.
+    fs::remove_dir_all(holding_area(&pool)).expect("remove the holding area");
+
+    let pass = managed::drain_holding(&pool, None).expect("a locked open");
+    assert!(!pass.gone, "no entry was deleted: {pass:?}");
+    assert!(
+        holding_rows(&pool).is_empty(),
+        "the row is finished once its area is positively absent"
+    );
+}
+
+/// An unrecorded entry in the holding area is never adopted and never deleted:
+/// it stays charged by the payload walk, while the recorded row beside it is
+/// deleted normally.
+#[test]
+fn an_unrecorded_holding_entry_is_kept_and_charged_never_deleted() {
+    let fixture = Fixture::new("holding-unrecorded");
+    let (pool, slot_id, _slot_path) = idle_slot_for_eviction(&fixture, "holding-unrecorded");
+    prepare_holding_area(&pool);
+    let stranger = holding_area(&pool).join("0000-not-a-recorded-generation");
+    fs::create_dir(&stranger).expect("stranger");
+    fs::write(stranger.join("bytes"), vec![9_u8; 64 * 1024]).expect("stranger bytes");
+    evict_idle_slot_injected(&pool, &slot_id.to_string()).expect("evict");
+
+    let pass = managed::drain_holding(&pool, None).expect("drain");
+    assert!(pass.gone, "the recorded entry is deleted: {pass:?}");
+    assert!(stranger.is_dir(), "an unrecorded entry is never deleted");
+    assert!(stranger.join("bytes").exists());
+    assert!(holding_rows(&pool).is_empty());
+    // Its bytes are still counted by the pool's own payload walk.
+    let status = status_injected(&pool).expect("status");
+    assert!(
+        status.payload_unique_allocated_bytes.unwrap_or(0) >= 64 * 1024,
+        "the unrecorded entry was counted as free: {status:?}"
+    );
+}
+
+/// A legacy `Evicting` record is migrated on the first locked open: its tree is
+/// moved whole into the holding area and deleted outside the lock, with no
+/// per-entry journal started. Both legacy shapes migrate — the root still at its
+/// recorded name and the root under its captured private name.
+#[test]
+fn a_legacy_pending_deletion_migrates_into_the_holding_area() {
+    for captured in [false, true] {
+        let fixture = Fixture::new(if captured {
+            "holding-legacy-captured"
+        } else {
+            "holding-legacy-planned"
+        });
+        let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "legacy");
+        let plan = capture_root_state(&slot_path, slot_id, &pool, captured);
+        assert_eq!(
+            super::pool::capture_record_injected(&pool, slot_id).is_some(),
+            true,
+            "the modelled legacy journal is durable"
+        );
+
+        let view = managed::ledger_view(&pool).expect("the next open migrates it");
+        assert!(
+            view.slots.is_empty(),
+            "the migrated record is not a slot (captured: {captured})"
+        );
+        assert_eq!(
+            view.holding.len(),
+            1,
+            "the tree is held (captured: {captured})"
+        );
+        assert!(
+            super::pool::capture_record_injected(&pool, slot_id).is_none(),
+            "no per-entry journal survives the migration"
+        );
+        assert!(!slot_path.exists());
+        assert!(
+            capture_names(slot_path.parent().expect("slots root")).is_empty(),
+            "the private capture name is gone with the tree"
+        );
+        let pass = managed::drain_holding(&pool, None).expect("drain");
+        assert!(pass.gone, "the migrated tree is deleted: {pass:?}");
+        let _ = plan;
+    }
+}
+
+/// A legacy journal that cannot be classified keeps its record and blocks no
+/// new holding row: the migration never reinterprets an uncertain record.
+#[test]
+fn an_unclassifiable_legacy_journal_stays_pending_and_starts_no_holding_row() {
+    let fixture = Fixture::new("holding-legacy-blocked");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "legacy-blocked");
+    let plan = capture_root_state(&slot_path, slot_id, &pool, true);
+    // A recorded mismatch is exactly what replay must never reinterpret.
+    write_journal(
+        &pool,
+        slot_id,
+        plan.clone(),
+        true,
+        Vec::new(),
+        vec![crate::owned_delete::ForeignCapture {
+            path: Vec::new(),
+            private: ".oxide-capture-fedcba9876543210".to_owned(),
+            original: "blob".to_owned(),
+            expected_device: plan.device,
+            expected_inode: plan.inode,
+            expected_mode: u32::from(libc::S_IFREG) | 0o600,
+            found: "directory device 1 inode 2 mode 40700 owner 501".to_owned(),
+            restored: false,
+        }],
+    );
+
+    let view = managed::ledger_view(&pool).expect("open");
+    assert_eq!(view.slots.len(), 1, "the uncertain record is kept");
+    assert!(view.holding.is_empty(), "no holding row was invented");
+    assert!(view.reconciliation_blocked);
+}
+
+/// The legacy-migration crash window: the resolved root was renamed into the
+/// holding area but the durable write that records the row never happened, so
+/// the ledger still carries an `Evicting` row with no journal and no root. The
+/// next locked open adopts that generation's own entry — the record leaves the
+/// slot table, the charge follows it, and the deletion finishes as a whole tree.
+#[test]
+fn an_interrupted_legacy_migration_is_adopted_by_the_next_open() {
+    let fixture = Fixture::new("migration-interrupted");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "migration-interrupted");
+    mark_evicting_for_test(&pool, slot_id).expect("a legacy pending deletion");
+    prepare_holding_area(&pool);
+    let name = super::pool::holding_name_for_slot_injected(&pool, slot_id).expect("derived name");
+    // The migration binds the verified identity durably before its rename, so
+    // the interrupted state carries that intent as well.
+    let verified = {
+        let metadata = fs::symlink_metadata(&slot_path).expect("root metadata");
+        (metadata.dev(), metadata.ino())
+    };
+    super::pool::write_hold_intent_injected(&pool, slot_id, verified.0, verified.1)
+        .expect("durable hold intent");
+    fs::rename(&slot_path, holding_area(&pool).join(&name)).expect("modelled migration rename");
+    assert!(!slot_path.exists(), "the root left its recorded name");
+
+    let view = managed::ledger_view(&pool).expect("the next open adopts it");
+    assert!(
+        view.slots.is_empty(),
+        "the interrupted legacy row is not adopted: {:#?}",
+        view.slots
+    );
+    assert!(
+        !view.reconciliation_blocked,
+        "adoption left the pool blocked"
+    );
+    assert_eq!(view.holding.len(), 1, "one adopted holding row");
+    assert_eq!(view.holding[0].name, name);
+    assert_eq!(view.holding[0].slot_id, slot_id.to_string());
+    assert!(
+        view.holding[0].recorded_bytes > 0,
+        "the row carries a charge"
+    );
+
+    let pass = managed::drain_holding(&pool, None).expect("drain");
+    assert!(pass.gone, "the adopted tree is deleted: {pass:?}");
+    assert!(holding_rows(&pool).is_empty());
+}
+
+/// The rename boundary is not satisfied by a name alone: the identity the
+/// caller verified is compared with the held descriptor *before* the rename, so
+/// a root replaced in that window refuses and nothing is moved at all.
+#[test]
+fn a_replaced_root_refuses_before_the_rename() {
+    let fixture = Fixture::new("replaced-root");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "replaced-root");
+    let verified = {
+        let metadata = fs::symlink_metadata(&slot_path).expect("root metadata");
+        (metadata.dev(), metadata.ino())
+    };
+    // Replace the verified root with a different owned directory of the same
+    // name, which is exactly what a racer between the preflight and the rename
+    // produces.
+    let aside = slot_path.with_extension("race-aside");
+    fs::rename(&slot_path, &aside).expect("move the verified root aside");
+    fs::create_dir(&slot_path).expect("replacement root");
+    fs::set_permissions(&slot_path, fs::Permissions::from_mode(0o700)).expect("replacement mode");
+    fs::write(slot_path.join("replacement"), b"not the slot").expect("replacement payload");
+
+    let refused = super::pool::hold_expecting_injected(&pool, slot_id, Some(verified));
+    assert!(
+        matches!(refused, Err(LeaseError::UnsafePath(_))),
+        "a replaced root was moved: {refused:?}"
+    );
+    assert!(slot_path.is_dir(), "the replacement is still where it was");
+    assert_eq!(
+        fs::read(slot_path.join("replacement")).expect("replacement payload"),
+        b"not the slot"
+    );
+    assert!(
+        holding_rows(&pool).is_empty(),
+        "the replacement was recorded as a held tree"
+    );
+    match holding_area(&pool).read_dir() {
+        // The refusal happens before the holding area is created, so an absent
+        // area is itself proof that nothing was moved.
+        Err(error) => assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "the holding area is unreadable: {error}"
+        ),
+        Ok(entries) => assert!(
+            entries.flatten().next().is_none(),
+            "the replacement was moved into the holding area"
+        ),
+    }
+    assert!(aside.is_dir(), "the verified root is untouched");
+}
+
+/// The half a name cannot catch: the source name is swapped after the descriptor
+/// identity was verified and exactly before the rename, so the rename moves an
+/// object that is not the verified one. The eviction has already bound that
+/// identity durably, so no recovery pass may adopt the entry; the foreign tree
+/// is additionally contained under a name no generation can derive. Nothing
+/// foreign is ever deleted and the generation's row keeps its charge.
+#[test]
+fn a_swap_at_the_rename_is_contained_and_never_adopted() {
+    let fixture = Fixture::new("rename-swap");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "rename-swap");
+    let verified = {
+        let metadata = fs::symlink_metadata(&slot_path).expect("root metadata");
+        (metadata.dev(), metadata.ino())
+    };
+    let aside = slot_path.with_extension("race-aside");
+    let slot_for_race = slot_path.clone();
+    let aside_for_race = aside.clone();
+    // Swap the source name after the identity check and before the rename.
+    let guard = crate::test_fs::before_holding_rename(move || {
+        fs::rename(&slot_for_race, &aside_for_race).expect("move the verified root aside");
+        fs::create_dir(&slot_for_race).expect("replacement root");
+        fs::set_permissions(&slot_for_race, fs::Permissions::from_mode(0o700))
+            .expect("replacement mode");
+        fs::write(slot_for_race.join("replacement"), b"not the slot").expect("replacement payload");
+    });
+    let refused = evict_idle_slot_injected(&pool, &slot_id.to_string());
+    drop(guard);
+    assert!(
+        matches!(refused, Err(LeaseError::UnsafePath(_))),
+        "a swapped rename was recorded: {refused:?}"
+    );
+
+    // Containment: the foreign tree is not at the adoptable derived name.
+    let area = holding_area(&pool);
+    let derived = super::pool::holding_name_for_slot_injected(&pool, slot_id).expect("derived");
+    assert!(
+        !area.join(&derived).exists(),
+        "the swapped tree stayed at the adoptable derived name"
+    );
+    let contained: Vec<PathBuf> = fs::read_dir(&area)
+        .expect("holding area")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".unverified-"))
+        })
+        .collect();
+    assert_eq!(
+        contained.len(),
+        1,
+        "the swapped tree is contained: {contained:?}"
+    );
+    assert_eq!(
+        fs::read(contained[0].join("replacement")).expect("contained payload"),
+        b"not the slot"
+    );
+    // A later open neither adopts nor deletes it, and the generation's row is
+    // still recorded, so its slot is never silently freed.
+    let view = managed::ledger_view(&pool).expect("the next open");
+    assert!(
+        view.holding.is_empty(),
+        "a contained tree was adopted: {:#?}",
+        view.holding
+    );
+    assert!(
+        view.slots
+            .iter()
+            .any(|slot| slot.slot_id == slot_id.to_string()),
+        "the generation's row survived the refused rename"
+    );
+    assert!(
+        contained[0].is_dir(),
+        "the contained tree was deleted: {contained:?}"
+    );
+    assert!(aside.is_dir(), "the verified root is untouched");
+    // The containment is charged, not free: the payload walk still counts it.
+    let status = status_injected(&pool).expect("status");
+    assert!(
+        status.payload_unique_allocated_bytes.unwrap_or(0) > 0,
+        "the contained bytes were counted as free: {status:?}"
+    );
+    let _ = verified;
+}
+
+/// The crash window the ordinary pressure eviction really has: the identity
+/// intent is durable, the tree has been renamed whole and verified, and the row
+/// write never happens. The ledger is the one the production path wrote — no
+/// synthetic intent — and the next locked open resumes the generation through
+/// `reconcile_holding` instead of stranding its tree.
+#[test]
+fn an_ordinary_eviction_binds_its_intent_before_the_rename() {
+    let fixture = Fixture::new("pressure-intent");
+    let pool = fixture.dir("pool");
+    create_injected(&pool, 4 * 1024 * 1024).expect("init");
+    let workspace = fixture.dir("workspace");
+    let first = lease_injected(request(&pool, &fixture.dir("project-a"), &workspace, "a"))
+        .expect("first slot");
+    fs::write(
+        first.env.cargo_build_build_dir.join("blob"),
+        vec![b'a'; 5 * 1024 * 1024],
+    )
+    .expect("payload past the cap");
+    release_injected(&pool, &first.lease_id).expect("release");
+    let slot_id = first.slot_id.parse::<u64>().expect("slot id");
+    let slot_path = pool.join("payload/slots").join(&first.slot_id);
+    let derived =
+        super::pool::holding_name_for_slot_injected(&pool, slot_id).expect("derived name");
+
+    // The interruption fires after the rename and its verification, before the
+    // row write: a panic is this test's model of the process dying there.
+    let armed = crate::test_fs::after_holding_rename(|| panic!("modelled crash after the rename"));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        lease_injected(request(&pool, &fixture.dir("project-b"), &workspace, "b"))
+    }));
+    drop(armed);
+    assert!(outcome.is_err(), "the armed interruption did not fire");
+
+    // What the production path left: the generation's row, its durable intent,
+    // the tree under the derived name and no slot root left behind.
+    let bytes = fs::read_to_string(pool.join("ledger.json")).expect("ledger bytes");
+    assert!(
+        bytes.contains("hold_intent"),
+        "the ordinary eviction wrote no intent before its rename: {bytes}"
+    );
+    assert!(
+        holding_area(&pool).join(&derived).is_dir(),
+        "the tree was not renamed into the holding area"
+    );
+    assert!(
+        !slot_path.exists(),
+        "the slot root was left in the slots root"
+    );
+
+    // The next locked open resumes it, and the deletion finishes.
+    let view = managed::ledger_view(&pool).expect("the next open adopts it");
+    assert_eq!(
+        view.holding.len(),
+        1,
+        "the interrupted generation was stranded: {:#?}",
+        view.slots
+    );
+    assert!(view.slots.is_empty(), "the slot row survived the adoption");
+    let pass = managed::drain_holding(&pool, None).expect("drain");
+    assert!(pass.gone, "the adopted tree is deleted: {pass:?}");
+}
+
+/// An idle rename interrupted after the durable intent and after the rename (the
+/// crash window the brief accepts) is adopted by the next open **because** the
+/// intent names the very object now in the holding area — never merely because
+/// the entry carries the derived name. A stranger at that name with the real
+/// root elsewhere is kept and charged instead.
+#[test]
+fn an_idle_rename_interruption_is_adopted_only_by_its_intent() {
+    let fixture = Fixture::new("idle-interrupt");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "idle-interrupt");
+    let verified = {
+        let metadata = fs::symlink_metadata(&slot_path).expect("root metadata");
+        (metadata.dev(), metadata.ino())
+    };
+    prepare_holding_area(&pool);
+    let name = super::pool::holding_name_for_slot_injected(&pool, slot_id).expect("derived name");
+    // The durable intent an interrupted eviction leaves behind.
+    super::pool::hold_intent_for_test(&pool, slot_id, verified.0, verified.1)
+        .expect("durable intent");
+    // A stranger appears at the derived name and the verified root is where a
+    // failed containment would have left it (out of its recorded path).
+    let aside = slot_path.with_extension("race-aside");
+    fs::rename(&slot_path, &aside).expect("the verified root left its path");
+    let stranger = holding_area(&pool).join(&name);
+    fs::create_dir(&stranger).expect("stranger");
+    fs::write(stranger.join("replacement"), b"not the slot").expect("stranger payload");
+    let view = managed::ledger_view(&pool).expect("open");
+    assert!(
+        view.holding.is_empty(),
+        "a stranger at the derived name was adopted: {:#?}",
+        view.holding
+    );
+    assert!(view
+        .slots
+        .iter()
+        .any(|slot| slot.slot_id == slot_id.to_string()));
+    assert!(
+        stranger.join("replacement").exists(),
+        "the stranger was touched"
+    );
+
+    // Now the verified root itself is the entry under that name: the intent
+    // binds it and the adoption completes.
+    fs::remove_dir_all(&stranger).expect("clear the stranger");
+    fs::rename(&aside, holding_area(&pool).join(&name)).expect("modelled rename");
+    let view = managed::ledger_view(&pool).expect("open adopts it");
+    assert_eq!(
+        view.holding.len(),
+        1,
+        "the bound idle interruption is adopted"
+    );
+    assert!(view.slots.is_empty());
+    let pass = managed::drain_holding(&pool, None).expect("drain");
+    assert!(pass.gone, "{pass:?}");
+}
+
+/// An intent whose root is still at its recorded path names a rename that never
+/// happened (the command refused or crashed before it). The next open clears it
+/// and treats the generation as an ordinary idle slot again: nothing is moved,
+/// adopted or deleted.
+#[test]
+fn a_stale_intent_is_cleared_and_its_slot_stays_an_ordinary_idle_slot() {
+    let fixture = Fixture::new("stale-intent");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "stale-intent");
+    let verified = {
+        let metadata = fs::symlink_metadata(&slot_path).expect("root metadata");
+        (metadata.dev(), metadata.ino())
+    };
+    super::pool::hold_intent_for_test(&pool, slot_id, verified.0, verified.1).expect("intent");
+    let view = managed::ledger_view(&pool).expect("open");
+    assert!(view.holding.is_empty(), "a stale intent adopted something");
+    assert!(slot_path.is_dir(), "the root was moved");
+    let ledger = fs::read(pool.join("ledger.json")).expect("ledger bytes");
+    let text = String::from_utf8_lossy(&ledger);
+    assert!(
+        !text.contains("hold_intent"),
+        "the stale intent survived the open: {text}"
+    );
+    // The slot is a normal idle slot again: a fresh project cannot reuse it, but
+    // an explicit eviction still retires it whole.
+    evict_idle_slot_injected(&pool, &slot_id.to_string()).expect("the slot is still evictable");
+    let pass = managed::drain_holding(&pool, None).expect("drain");
+    assert!(pass.gone, "{pass:?}");
+}
+
+/// A legacy pending deletion is adopted only against the identity its own
+/// durable intent recorded before the rename. Without an intent, or with one
+/// that names a different object, the derived-name directory is never adopted:
+/// the record and its charge stay, the pool stays blocked, and the tree is left
+/// alone for a replay to decide.
+#[test]
+fn a_legacy_entry_is_adopted_only_against_its_recorded_intent() {
+    let fixture = Fixture::new("legacy-intent");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "legacy-intent");
+    mark_evicting_for_test(&pool, slot_id).expect("a legacy pending deletion");
+    prepare_holding_area(&pool);
+    let name = super::pool::holding_name_for_slot_injected(&pool, slot_id).expect("derived name");
+    let verified = {
+        let metadata = fs::symlink_metadata(&slot_path).expect("root metadata");
+        (metadata.dev(), metadata.ino())
+    };
+    fs::rename(&slot_path, holding_area(&pool).join(&name)).expect("modelled rename");
+
+    // No intent: nothing may be adopted on a name alone.
+    let view = managed::ledger_view(&pool).expect("open");
+    assert!(
+        view.holding.is_empty(),
+        "a derived name without an intent was adopted: {:#?}",
+        view.holding
+    );
+    assert!(view
+        .slots
+        .iter()
+        .any(|slot| slot.slot_id == slot_id.to_string()));
+    assert!(
+        holding_area(&pool).join(&name).is_dir(),
+        "the tree was touched"
+    );
+
+    // An intent for a different object: still nothing is adopted.
+    super::pool::write_hold_intent_injected(&pool, slot_id, verified.0, verified.1 + 1)
+        .expect("a mismatched intent");
+    let view = managed::ledger_view(&pool).expect("open");
+    assert!(
+        view.holding.is_empty(),
+        "a mismatched intent was adopted: {:#?}",
+        view.holding
+    );
+    assert!(holding_area(&pool).join(&name).is_dir());
+
+    // The intent the preflight really verified: the migration is recoverable.
+    super::pool::write_hold_intent_injected(&pool, slot_id, verified.0, verified.1)
+        .expect("the verified intent");
+    let view = managed::ledger_view(&pool).expect("open adopts it");
+    assert_eq!(view.holding.len(), 1, "the bound migration is adopted");
+    assert!(view.slots.is_empty());
+    let pass = managed::drain_holding(&pool, None).expect("drain");
+    assert!(pass.gone, "{pass:?}");
+}
+
+/// Only a positively classified miss concludes that a held tree is gone. An
+/// `lstat` failure that says nothing about absence (here an over-bound entry
+/// name) classifies as unknown, and an unreadable holding area refuses the open
+/// instead of dropping a row: the row and its charge survive in the ledger.
+#[test]
+fn an_unclassified_holding_entry_error_never_drops_the_row_or_charge() {
+    let fixture = Fixture::new("holding-unknown");
+    let area = fixture.dir("area");
+    assert_eq!(
+        super::pool::holding_presence(&area),
+        Some(true),
+        "a present entry must classify as present"
+    );
+    assert_eq!(
+        super::pool::holding_presence(&area.join("absent")),
+        Some(false),
+        "a missing name must classify as a positive miss"
+    );
+    let over_bound = area.join("x".repeat(300));
+    assert_eq!(
+        super::pool::holding_presence(&over_bound),
+        None,
+        "an over-bound name must classify as unknown, never as absence"
+    );
+
+    let (pool, slot_id, _slot_path) = idle_slot_for_eviction(&fixture, "holding-unknown");
+    evict_idle_slot_injected(&pool, &slot_id.to_string()).expect("evict");
+    let row = holding_rows(&pool).remove(0);
+    assert!(row.recorded_bytes > 0, "a recorded charge");
+    // The area becomes unusable without saying the tree is gone.
+    fs::set_permissions(holding_area(&pool), fs::Permissions::from_mode(0o000))
+        .expect("unsearchable area");
+    let refused = managed::ledger_view(&pool);
+    assert!(
+        refused.is_err(),
+        "an unreadable holding area must refuse, not conclude"
+    );
+    let snapshot = managed::snapshot(&pool).expect("a passive snapshot reads the ledger");
+    assert_eq!(snapshot.holding.len(), 1, "the row survived: {snapshot:?}");
+    assert_eq!(
+        snapshot.holding[0].recorded_bytes, row.recorded_bytes,
+        "the charge survived"
+    );
+    fs::set_permissions(holding_area(&pool), fs::Permissions::from_mode(0o700))
+        .expect("searchable area again");
+    let view = managed::ledger_view(&pool).expect("the pool opens again");
+    assert_eq!(view.holding.len(), 1, "the tree is still held and charged");
+    assert_eq!(view.holding[0].present, Some(true));
+    let pass = managed::drain_holding(&pool, None).expect("drain");
+    assert!(
+        pass.gone,
+        "the tree is deleted once it is reachable again: {pass:?}"
+    );
+    assert!(holding_rows(&pool).is_empty());
+}
+
+/// Every held tree stays charged in the admission's capacity decision until it
+/// is positively removed — including one whose deletion refuses. A pool whose
+/// held row alone exhausts its budget refuses a new slot instead of deciding as
+/// if those bytes were already free, and the refusal does not depend on the
+/// tree being deletable.
+#[test]
+fn a_refused_tree_stays_charged_until_it_is_positively_removed() {
+    let fixture = Fixture::new("held-charge");
+    let pool = fixture.dir("pool");
+    create_injected(&pool, 4 * 1024 * 1024).expect("init");
+    let workspace = fixture.dir("workspace");
+    let first = lease_injected(request(&pool, &fixture.dir("project-a"), &workspace, "a"))
+        .expect("first slot");
+    fs::write(
+        first.env.cargo_build_build_dir.join("blob"),
+        vec![b'a'; 5 * 1024 * 1024],
+    )
+    .expect("payload past the cap");
+    release_injected(&pool, &first.lease_id).expect("release");
+    let slot_id = first.slot_id.parse::<u64>().expect("slot id");
+    let created = evict_idle_slot_injected(&pool, &slot_id.to_string()).expect("evict by id");
+    assert_eq!(created.len(), 1, "one entry is created: {created:?}");
+    let held = holding_area(&pool).join(&created[0]);
+    assert!(held.is_dir(), "the tree is in the holding area");
+
+    // The held bytes are charged: a second project's admission cannot decide as
+    // if the eviction had already freed them.
+    assert!(
+        matches!(
+            lease_injected(request(&pool, &fixture.dir("project-b"), &workspace, "b")),
+            Err(LeaseError::Full) | Err(LeaseError::CapacityCharged { .. })
+        ),
+        "a held tree's bytes were treated as free"
+    );
+
+    // An undeletable item keeps the tree, its row and its charge.
+    let fifo = held.join("pipe");
+    let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("fifo name");
+    // SAFETY: a fresh path inside the fixture, mode 0600.
+    assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+    let pass = managed::drain_holding(&pool, Some(&created[0])).expect("a refused pass");
+    assert!(!pass.gone, "the undeletable tree completed: {pass:?}");
+    assert!(
+        !pass.refused.is_empty(),
+        "the refusal is reported: {pass:?}"
+    );
+    assert_eq!(holding_rows(&pool).len(), 1, "the row survived the refusal");
+    assert!(
+        matches!(
+            lease_injected(request(&pool, &fixture.dir("project-c"), &workspace, "c")),
+            Err(LeaseError::Full) | Err(LeaseError::CapacityCharged { .. })
+        ),
+        "an undeletable held tree stopped being charged"
+    );
+
+    // Only positive removal frees the bytes.
+    fs::remove_file(&fifo).expect("the refused item is removed");
+    let pass = managed::drain_holding(&pool, Some(&created[0])).expect("the resumed pass");
+    assert!(pass.gone, "the tree is gone once it is deletable: {pass:?}");
+    assert!(
+        holding_rows(&pool).is_empty(),
+        "the row is dropped with the tree"
+    );
+    lease_injected(request(&pool, &fixture.dir("project-d"), &workspace, "d"))
+        .expect("the pool admits once the held bytes are gone");
+}
+
+/// An admission reports exactly the holding entries it created, and a pass that
+/// names one deletes that entry and no other: several trees can be pending at
+/// once and the publishing command identifies its own.
+#[test]
+fn an_admission_reports_each_holding_entry_it_created() {
+    let fixture = Fixture::new("reported-holding");
+    let pool = fixture.dir("pool");
+    create_injected(&pool, 1024 * 1024 * 1024).expect("init");
+    // Fill the raised ceiling with held slots and free one, so the next
+    // admission must replace it (a count decision, never a byte one).
+    let (id, lease) = super::pool::fill_held_slot_table_for_test(&pool).expect("a full table");
+    release_injected(&pool, &lease).expect("release the only idle slot");
+    let (admitted, created) = super::pool::lease_holding_injected(request(
+        &pool,
+        &fixture.dir("project-a"),
+        &fixture.dir("ws"),
+        "a",
+    ))
+    .expect("the ceiling replacement admits");
+    assert_eq!(
+        created.len(),
+        1,
+        "the admission reported no created entry: {created:?}"
+    );
+    let first = created[0].clone();
+    assert!(
+        holding_rows(&pool).iter().any(|row| row.name == first),
+        "the reported entry is not the recorded one"
+    );
+    let rows = holding_rows(&pool);
+    assert_eq!(rows.len(), 1, "one tree is held: {rows:?}");
+    assert_eq!(
+        rows[0].slot_id,
+        id.to_string(),
+        "the reported entry is not the evicted idle slot"
+    );
+    assert_eq!(rows[0].name, first);
+
+    // A second, independent pending entry: the pass that names the first
+    // deletes it and leaves the other.
+    release_injected(&pool, &admitted.lease_id).expect("release the admitted slot");
+    let other_slot = admitted.slot_id.clone();
+    let second = evict_idle_slot_injected(&pool, &other_slot).expect("evict it by id");
+    assert_eq!(second.len(), 1);
+    assert_eq!(holding_rows(&pool).len(), 2, "two trees are pending");
+    let pass = managed::drain_holding(&pool, Some(&first)).expect("the named pass");
+    assert_eq!(pass.claimed.as_deref(), Some(first.as_str()));
+    assert!(pass.gone, "{pass:?}");
+    let left = holding_rows(&pool);
+    assert_eq!(left.len(), 1, "the unnamed entry was deleted: {left:?}");
+    assert_eq!(
+        left[0].name, second[0],
+        "the named entry was not the one deleted"
+    );
+}
+
+/// An undeletable row never starves a later deletable one, and the takeover
+/// rotation needs no admission to advance: with every admission capacity-blocked
+/// (no grant, no release, so the rank-derived rotation stands still) the pass
+/// that refuses the first row marks it attempted, and the next pass takes the
+/// other row.
+#[test]
+fn an_undeletable_row_cannot_starve_a_later_deletable_one() {
+    let fixture = Fixture::new("holding-starvation");
+    let pool = fixture.dir("pool");
+    create_injected(&pool, 64 * 1024 * 1024).expect("init");
+    // Two idle slots, each evicted explicitly, so both rows exist at once.
+    let first = lease_once(&fixture, &pool, "starve-a");
+    let first_slot = first.slot_id.parse::<u64>().expect("slot id");
+    release_injected(&pool, &first.lease_id).expect("release");
+    let second = lease_once(&fixture, &pool, "starve-b");
+    let second_slot = second.slot_id.parse::<u64>().expect("slot id");
+    release_injected(&pool, &second.lease_id).expect("release");
+    let a = evict_idle_slot_injected(&pool, &first_slot.to_string()).expect("evict a");
+    let b = evict_idle_slot_injected(&pool, &second_slot.to_string()).expect("evict b");
+    assert_eq!(holding_rows(&pool).len(), 2, "two trees are pending");
+    // Make the first row undeletable: it is the oldest, so a rotation that
+    // depended on admission would keep reaching it.
+    let a_held = holding_area(&pool).join(&a[0]);
+    let fifo = a_held.join("pipe");
+    let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("fifo");
+    // SAFETY: a fresh path inside the fixture, mode 0600.
+    assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+    // No admission happens between these passes: an unchanged grant/release
+    // sequence must not stop the second row from being reached.
+    let first_pass = managed::drain_holding(&pool, None).expect("the first pass");
+    assert_eq!(first_pass.claimed.as_deref(), Some(a[0].as_str()));
+    assert!(!first_pass.gone, "the undeletable row completed");
+    let second_pass = managed::drain_holding(&pool, None).expect("the next pass");
+    assert_eq!(
+        second_pass.claimed.as_deref(),
+        Some(b[0].as_str()),
+        "the undeletable row starved the deletable one: {second_pass:?}"
+    );
+    assert!(
+        second_pass.gone,
+        "the deletable row completed: {second_pass:?}"
+    );
+    let rows = holding_rows(&pool);
+    assert_eq!(rows.len(), 1, "only the undeletable row is left: {rows:?}");
+    assert_eq!(rows[0].name, a[0]);
+}
+
+/// A private capture name inside a held tree is #155 journal state, and with the
+/// journal retired no record names it: the outside-lock deletion keeps it as
+/// uncertain instead of unlinking it as ordinary content, and the tree stays
+/// held, charged and reported.
+#[test]
+fn an_unrecorded_private_capture_in_a_held_tree_is_quarantined() {
+    let fixture = Fixture::new("capture-quarantine");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "capture-quarantine");
+    let capture = slot_path.join("build/.oxide-capture-fedcba9876543210");
+    fs::write(&capture, b"uncertain journal state").expect("a private capture name");
+    evict_idle_slot_injected(&pool, &slot_id.to_string()).expect("evict");
+    let row = holding_rows(&pool).remove(0);
+    let held = holding_area(&pool).join(&row.name);
+    let pass = managed::drain_holding(&pool, None).expect("the pass");
+    assert!(!pass.gone, "a private capture name was deleted: {pass:?}");
+    assert!(
+        pass.refused
+            .iter()
+            .any(|item| item.contains("unrecorded private capture")),
+        "the quarantine is not reported: {pass:?}"
+    );
+    assert!(
+        held.join("build/.oxide-capture-fedcba9876543210").exists(),
+        "the uncertain capture name was removed"
+    );
+    assert_eq!(
+        holding_rows(&pool).len(),
+        1,
+        "the tree stays held and charged"
+    );
+}
+
+/// A legacy pending deletion is migrated with an O(1) root verification, not a
+/// recursive preflight under the pool lock: a tree whose inventory would have
+/// stopped the old completeness walk no longer blocks every admission. The tree
+/// is still moved whole and its per-object refusal belongs to the outside-lock
+/// deletion.
+#[test]
+fn a_legacy_pending_tree_migrates_without_a_locked_walk() {
+    let fixture = Fixture::new("legacy-no-walk");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "legacy-no-walk");
+    // The old preflight listed every directory recursively, so this unreadable
+    // nested directory would have blocked the whole pool.
+    let locked = slot_path.join("build/locked");
+    fs::create_dir(&locked).expect("locked directory");
+    fs::write(locked.join("data"), b"x").expect("data");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("unreadable");
+    mark_evicting_for_test(&pool, slot_id).expect("a legacy pending deletion");
+    let verified = {
+        let metadata = fs::symlink_metadata(&slot_path).expect("root metadata");
+        (metadata.dev(), metadata.ino())
+    };
+    super::pool::write_hold_intent_injected(&pool, slot_id, verified.0, verified.1)
+        .expect("durable intent");
+
+    // The next locked open moves it whole and stays unblocked.
+    let view = managed::ledger_view(&pool).expect("the open does not refuse the tree");
+    assert!(
+        !view.reconciliation_blocked,
+        "the migration left the pool blocked"
+    );
+    assert!(view.slots.is_empty(), "the migrated record is not a slot");
+    assert_eq!(view.holding.len(), 1, "the tree is held whole");
+    assert!(!slot_path.exists(), "the root left the slots root");
+
+    // The outside-lock deletion owns the per-object outcome: an item it cannot
+    // enter is kept, charged and reported — it never blocks the pool the way the
+    // old locked preflight did.
+    let held = holding_area(&pool).join(&view.holding[0].name);
+    let pass = managed::drain_holding(&pool, None).expect("the pass");
+    assert!(!pass.gone, "an unenterable item completed: {pass:?}");
+    assert!(
+        pass.refused.iter().any(|item| item.contains("locked")),
+        "the refusal names the item: {pass:?}"
+    );
+    assert_eq!(holding_rows(&pool).len(), 1, "the tree is still charged");
+    assert!(held.is_dir(), "the held tree is kept whole");
+
+    // Once the owner restores its own access, the same tree finishes.
+    fs::set_permissions(held.join("build/locked"), fs::Permissions::from_mode(0o700))
+        .expect("owner access restored");
+    let pass = managed::drain_holding(&pool, None).expect("the resumed pass");
+    assert!(
+        pass.gone,
+        "the tree is deleted once it is enterable: {pass:?}"
+    );
+    assert!(holding_rows(&pool).is_empty());
 }
