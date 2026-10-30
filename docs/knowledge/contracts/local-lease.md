@@ -316,9 +316,12 @@ root adopts nothing, so an unreplayed legacy journal keeps its own record until
 the replay decides it.
 
 **Adoption is always identity-bound; a name alone adopts nothing.** Every
-generation that can be a rename source — an idle slot and a recorded legacy
-deletion — carries a durable `hold_intent` naming the derived entry and the root
-identity the writer verified before the rename. Recovery adopts an interrupted
+generation that can be a rename source — an **ordinary idle eviction** and a
+recorded legacy deletion, both through the same `retire_idle_slot`/migration
+call — carries a durable `hold_intent` naming the derived entry and the root
+identity the writer verified, written before the rename. On the ordinary path
+that is the one intent write the eviction makes before its rename; the row swap
+that drops the slot row and records the holding row follows the rename. Recovery adopts an interrupted
 rename only when the entry's own `(device, inode)` **is** that bound identity.
 A stranger at the derived name, an entry whose identity differs, and an entry an
 observation error could not classify are all never adopted: their record, its
@@ -439,7 +442,11 @@ session closure and the census that decides it belong to that supervisor. Each
 child it starts is waited for, or killed by its own PID and reaped, and only a
 positive reap counts as closure; an unreaped child stays tracked and ends the run
 rather than continuing with unknown custody, and no closure of a descendant is
-ever claimed.
+ever claimed. A recoverable oracle failure therefore continues the diagnostic
+only when the failed case never started a fixture command at all: once such a case
+has run a child, reaping the leader proves nothing about its descendants, whose
+closure belongs to the supervisor's census, so the run aborts and every case not
+reached stays `unexecuted`.
 
 The proof's lock figure is the **whole eviction transaction under the pool
 lock** — victim and rank checks, the intent write, the identity-verified rename

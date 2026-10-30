@@ -588,6 +588,48 @@ pub(crate) fn run_before_holding_rename() {
 }
 
 thread_local! {
+    static AFTER_HOLDING_RENAME: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
+/// Arm one action that runs inside a holding rename, immediately after the
+/// rename and its moved-identity verification and strictly before the caller's
+/// durable row write. This is how a unit test models the crash window between
+/// an eviction's rename and its row (oxide#190).
+#[must_use = "dropping the guard ends the armed action"]
+pub(crate) struct AfterHoldingRenameGuard {
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+pub(crate) fn after_holding_rename(action: impl FnOnce() + 'static) -> AfterHoldingRenameGuard {
+    AFTER_HOLDING_RENAME.with(|cell| {
+        assert!(
+            cell.borrow().is_none(),
+            "overlapping after-holding-rename injections"
+        );
+        *cell.borrow_mut() = Some(Box::new(action));
+    });
+    AfterHoldingRenameGuard {
+        _thread_bound: PhantomData,
+    }
+}
+
+impl Drop for AfterHoldingRenameGuard {
+    fn drop(&mut self) {
+        AFTER_HOLDING_RENAME.with(|cell| {
+            let _ = cell.borrow_mut().take();
+        });
+    }
+}
+
+/// Fire the armed after-holding-rename action, if any.
+pub(crate) fn run_after_holding_rename() {
+    let action = AFTER_HOLDING_RENAME.with(|cell| cell.borrow_mut().take());
+    if let Some(action) = action {
+        action();
+    }
+}
+
+thread_local! {
     static FORCED_INVALID_NAME: Cell<bool> = const { Cell::new(false) };
 }
 

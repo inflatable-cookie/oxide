@@ -6336,6 +6336,68 @@ fn a_swap_at_the_rename_is_contained_and_never_adopted() {
     let _ = verified;
 }
 
+/// The crash window the ordinary pressure eviction really has: the identity
+/// intent is durable, the tree has been renamed whole and verified, and the row
+/// write never happens. The ledger is the one the production path wrote — no
+/// synthetic intent — and the next locked open resumes the generation through
+/// `reconcile_holding` instead of stranding its tree.
+#[test]
+fn an_ordinary_eviction_binds_its_intent_before_the_rename() {
+    let fixture = Fixture::new("pressure-intent");
+    let pool = fixture.dir("pool");
+    create_injected(&pool, 4 * 1024 * 1024).expect("init");
+    let workspace = fixture.dir("workspace");
+    let first = lease_injected(request(&pool, &fixture.dir("project-a"), &workspace, "a"))
+        .expect("first slot");
+    fs::write(
+        first.env.cargo_build_build_dir.join("blob"),
+        vec![b'a'; 5 * 1024 * 1024],
+    )
+    .expect("payload past the cap");
+    release_injected(&pool, &first.lease_id).expect("release");
+    let slot_id = first.slot_id.parse::<u64>().expect("slot id");
+    let slot_path = pool.join("payload/slots").join(&first.slot_id);
+    let derived =
+        super::pool::holding_name_for_slot_injected(&pool, slot_id).expect("derived name");
+
+    // The interruption fires after the rename and its verification, before the
+    // row write: a panic is this test's model of the process dying there.
+    let armed = crate::test_fs::after_holding_rename(|| panic!("modelled crash after the rename"));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        lease_injected(request(&pool, &fixture.dir("project-b"), &workspace, "b"))
+    }));
+    drop(armed);
+    assert!(outcome.is_err(), "the armed interruption did not fire");
+
+    // What the production path left: the generation's row, its durable intent,
+    // the tree under the derived name and no slot root left behind.
+    let bytes = fs::read_to_string(pool.join("ledger.json")).expect("ledger bytes");
+    assert!(
+        bytes.contains("hold_intent"),
+        "the ordinary eviction wrote no intent before its rename: {bytes}"
+    );
+    assert!(
+        holding_area(&pool).join(&derived).is_dir(),
+        "the tree was not renamed into the holding area"
+    );
+    assert!(
+        !slot_path.exists(),
+        "the slot root was left in the slots root"
+    );
+
+    // The next locked open resumes it, and the deletion finishes.
+    let view = managed::ledger_view(&pool).expect("the next open adopts it");
+    assert_eq!(
+        view.holding.len(),
+        1,
+        "the interrupted generation was stranded: {:#?}",
+        view.slots
+    );
+    assert!(view.slots.is_empty(), "the slot row survived the adoption");
+    let pass = managed::drain_holding(&pool, None).expect("drain");
+    assert!(pass.gone, "the adopted tree is deleted: {pass:?}");
+}
+
 /// An idle rename interrupted after the durable intent and after the rename (the
 /// crash window the brief accepts) is adopted by the next open **because** the
 /// intent names the very object now in the holding area — never merely because

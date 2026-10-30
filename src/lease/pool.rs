@@ -3142,11 +3142,20 @@ impl Pool {
         let (path, identity) = self.validate_idle_slot_scope(id, incarnation, project, profile)?;
         // The slot tree is Oxide's own private directory, so it needs no
         // per-entry journal: one rename moves it whole into the payload's
-        // holding area on the same device, and one durable write records that
-        // entry while dropping the slot row (oxide#190). The tree is deleted
-        // outside this lock by the command that evicted it or by a later one.
-        // The identity this scope verified is carried into the rename, so a
-        // root replaced in between refuses instead of being held and deleted.
+        // holding area on the same device and one durable write records the
+        // holding row while dropping the slot row (oxide#190). The tree is
+        // deleted outside this lock by the command that evicted it or by a later
+        // one.
+        //
+        // The root identity this scope verified is bound **durably before** the
+        // rename, on this ordinary path as well as the legacy one. It costs one
+        // extra synced write per eviction and no per-entry work at all, and it is
+        // what makes a crash between the rename and the row write recoverable by
+        // identity rather than by a name: the next locked open finds the
+        // generation's row, its intent and the tree under the derived name, and
+        // `reconcile_holding` adopts it only because the entry is the very object
+        // the intent names.
+        self.record_hold_intent(id, identity)?;
         let row = self.hold_slot_tree(id, &path, Some(identity))?;
         self.holding_in_flight = self.holding_in_flight.saturating_add(row.bytes);
         self.ledger.slots.retain(|slot| slot.id != id);
@@ -4670,6 +4679,8 @@ impl Pool {
                 "the held tree is not the slot that was verified",
             ));
         }
+        #[cfg(test)]
+        crate::test_fs::run_after_holding_rename();
         Ok(HoldingRecord {
             name,
             slot: id,
@@ -4681,14 +4692,18 @@ impl Pool {
         })
     }
 
-    /// Bind a legacy pending deletion's rename durably **before** it happens:
-    /// the holding entry name and the root identity the completeness preflight
-    /// verified. Recovery then adopts an interrupted migration's entry only when
-    /// the entry is that exact object, so a directory that merely carries the
-    /// right name is never adopted and never deleted.
+    /// Bind a deletion's rename durably **before** it happens: the holding entry
+    /// name and the root identity the caller's own scope or completeness
+    /// preflight verified. Both rename sources use it — the ordinary idle
+    /// eviction and the legacy pending deletion — so recovery adopts an
+    /// interrupted rename only when the entry is that exact object and never
+    /// because a directory merely carries the right name.
     fn record_hold_intent(&mut self, id: u64, expected: (u64, u64)) -> Result<(), LeaseError> {
         let slot = self.slot(id).ok_or(LeaseError::UnknownAccounting)?;
-        if slot.state != SlotPersistState::Evicting {
+        if !matches!(
+            slot.state,
+            SlotPersistState::Idle | SlotPersistState::Evicting
+        ) {
             return Err(LeaseError::UnknownAccounting);
         }
         let name = self

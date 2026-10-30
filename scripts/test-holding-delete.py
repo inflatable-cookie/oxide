@@ -136,6 +136,12 @@ FIRST_FAULT: str | None = None
 # Fixture children this process started and has not yet reaped. A case may not
 # return while one is still running: its custody would be unknown.
 CHILDREN: list[tuple[str, subprocess.Popen]] = []
+# Whether the case being run started a fixture child at all. A descendant of a
+# fixture command (Oxide's own Cargo group) is outside this proof's signalling
+# authority, so once a child existed, a failed case cannot be followed by another
+# case: descendant closure is the shared supervisor's census, never this script's
+# assumption.
+CASE_STARTED_CHILD = False
 
 
 def fail(message: str) -> None:
@@ -310,6 +316,10 @@ def plan_document() -> dict:
             "mode": "--diagnostic",
             "counted": False,
             "receipt": "bounded qualified:false beside the guard's evidence",
+            "keep_going": "a recoverable oracle failure continues only when the "
+            "failed case started no fixture child; a case that ran a command "
+            "aborts the run (its descendants stay under the shared supervisor's "
+            "census, which this script cannot conclude)",
         },
         "cases": [
             {
@@ -530,6 +540,10 @@ def self_check() -> None:
     expect(plan["counted_only_without_argument"], "the counted-only rule changed")
     expect(not plan["diagnostic"]["counted"], "the diagnostic must never be counted")
     expect(
+        "aborts the run" in plan["diagnostic"]["keep_going"],
+        "the diagnostic keep-going rule changed",
+    )
+    expect(
         "not a live comparison" in plan["observations"]["legacy_reference"],
         "the historical reference must be labelled, not claimed as live",
     )
@@ -748,6 +762,8 @@ def start_check(subject: str, workspace: str, env: dict, label: str) -> subproce
         # supervisor, and an escape it did not create would be its finding, not
         # this script's.
     )
+    global CASE_STARTED_CHILD
+    CASE_STARTED_CHILD = True
     CHILDREN.append((label, handle))
     say(f"{label}: started (pid {handle.pid})")
     return handle
@@ -1180,12 +1196,14 @@ def run_cases() -> None:
         ("concurrent-admission", prove_concurrent_admission),
         ("killed-deleter-takeover", prove_killed_deleter_takeover),
     ]
+    global CASE_STARTED_CHILD
     facts: dict = {}
     started = time.perf_counter()
     for index, (name, prove) in enumerate(cases):
         root = private_dir(
             os.path.join(os.environ["OXIDE_TASK_SCRATCH_ROOT"], "case", f"{index}-{name}")
         )
+        CASE_STARTED_CHILD = False
         case(name)
         try:
             outcome = prove(root, SUBJECT)
@@ -1196,12 +1214,24 @@ def run_cases() -> None:
         except AssertionError as error:
             record_fault(name, str(error))
             mark(name, "failed", error=str(error)[:400])
-            if not close_children():
-                # A group this case started could not be confirmed closed, so
-                # its custody is unknown: keep-going is no longer safe.
+            started_child = CASE_STARTED_CHILD
+            reaped = close_children()
+            if not DIAGNOSTIC:
                 unexecuted([other for other, _ in cases[index + 1 :]])
                 raise
-            if not DIAGNOSTIC:
+            if started_child or not reaped:
+                # A fixture command ran, so descendants of it live outside this
+                # proof's signalling authority; their closure is the shared
+                # supervisor's census. Reaping the leader proves nothing about
+                # them, so keep-going would continue with unknown descendant
+                # custody. The run aborts and every case not reached stays
+                # `unexecuted`.
+                record_fault(
+                    "custody",
+                    "a case that started a fixture child failed: descendant "
+                    "closure belongs to the shared supervisor's census, so this "
+                    "diagnostic does not continue",
+                )
                 unexecuted([other for other, _ in cases[index + 1 :]])
                 raise
         except BaseException as error:  # noqa: BLE001 - unclassified outcome
@@ -1337,6 +1367,11 @@ def main(argv: list[str]) -> int:
             "group) are outside this proof's signalling authority; their closure "
             "is the shared supervisor's census, and no closure of theirs is "
             "claimed here",
+            "keep_going": "a recoverable oracle failure continues the diagnostic "
+            "only when the failed case never started a fixture child; once a "
+            "case that ran a command has failed, reaping its leader proves "
+            "nothing about its descendants, so the run aborts and the rest stay "
+            "unexecuted",
             "unreaped": [label for label, _ in CHILDREN],
         },
         "source_commit": commit,
