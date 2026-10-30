@@ -81,9 +81,9 @@ certain census. The receipt is written in every outcome, including a failure
 before the first case ran. It is never a counted PASS. `--plan` prints the case table, the
 allocation and the nine premise dispositions without any effect.
 `--self-check` is the pure apparatus check: no child, pool, image or scratch.
-Not a benchmark and not full QA. The script never removes its own run root: it stays
-inside the guard's owned root so the guard's post-leader census decides
-closure, and the guard's retention policy owns cleanup.
+Not a benchmark and not full QA. The script never removes its own staging
+tree or run root: both stay inside the guard's owned root so its post-leader
+census decides closure, and the guard's retention policy owns cleanup.
 """
 from __future__ import annotations
 
@@ -431,16 +431,29 @@ def fixture_environment(parent: str) -> dict:
     return env
 
 
+def run_staging(env: dict, target: str, log_handle) -> subprocess.CompletedProcess:
+    """One bounded Cargo staging call, the seam the pure check drives.
+
+    A staging build is a writer: its Cargo group can outlive the direct leader.
+    So the target tree is never removed here — the guard's post-leader census
+    decides closure and the guard's retention policy owns cleanup.
+    """
+    return subprocess.run(
+        ["cargo", "build", "--locked", "--offline", "--bin", "oxide"],
+        cwd=REPO,
+        env={**env, "CARGO_TARGET_DIR": target, "CARGO_BUILD_BUILD_DIR": target},
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        timeout=remaining(),
+    )
+
+
 def stage(parent: str, env: dict) -> str:
     target = os.path.join(parent, "stage")
     log = os.path.join(parent, "stage.log")
     with open(log, "w") as handle:
         try:
-            build = subprocess.run(
-                ["cargo", "build", "--locked", "--offline", "--bin", "oxide"],
-                cwd=REPO, env={**env, "CARGO_TARGET_DIR": target, "CARGO_BUILD_BUILD_DIR": target},
-                stdout=handle, stderr=subprocess.STDOUT, timeout=remaining(),
-            )
+            build = run_staging(env, target, handle)
         except subprocess.TimeoutExpired:
             uncertain_child("staging", "the staged build did not finish in its bound")
     with open(log) as handle:
@@ -455,7 +468,11 @@ def stage(parent: str, env: dict) -> str:
             need("the staged debug binary has no walk observer")
     say(f"staged {out}: sha256 {sha256(out)}")
     owned(parent, "after staging")
-    shutil.rmtree(target)
+    # The staging tree is retained inside the run root for the same reason the
+    # run root is: its Cargo group may still have a descendant writing, only
+    # the guard's post-leader census can establish closure, and the guard's
+    # retention policy owns cleanup. Removing it here would delete that
+    # evidence before the verdict.
     return out
 
 
@@ -1593,11 +1610,46 @@ def self_check() -> int:
         expect_true(receipt["failed"] == [] and receipt["unexecuted"] == outcome["unexecuted"],
                     f"receipt state {receipt.get('failed')} / {receipt.get('unexecuted')}")
 
-        # `run_proof` NEVER removes its own run root: only the guard's
+        # Staging is a writer too, so its target tree is retained for the
+        # guard's post-leader census as well. The pure check drives the real
+        # `stage` through the `run_staging` seam — no writer is launched — and
+        # asserts the tree and the copied binary are still there afterwards.
+        stage_source = inspect.getsource(stage)
+        expect_true(
+            "shutil.rmtree(target)" not in stage_source,
+            "stage removes its target tree before the guard's census",
+        )
+        expect_true("run_staging(" in stage_source, "stage does not use the staging seam")
+        staging_root = tempfile.mkdtemp(prefix="fd-staging-retained.")
+        saved_staging = globals()["run_staging"]
+        try:
+            def fake_staging(env, target, log_handle):
+                binary = os.path.join(target, "debug", "oxide")
+                os.makedirs(os.path.dirname(binary), exist_ok=True)
+                with open(binary, "wb") as handle:
+                    handle.write(b"OXIDE_TEST_WALK_LOG")
+                return subprocess.CompletedProcess(["cargo"], 0, stdout="", stderr="")
+
+            globals()["run_staging"] = fake_staging
+            staged = stage(staging_root, {})
+            expect_true(os.path.isfile(staged), f"stage did not copy {staged}")
+            expect_true(
+                os.path.isdir(os.path.join(staging_root, "stage")),
+                "stage removed its target tree before the guard's census",
+            )
+            expect_true(
+                os.path.isfile(os.path.join(staging_root, "stage", "debug", "oxide")),
+                "the staged target's binary was removed",
+            )
+        finally:
+            globals()["run_staging"] = saved_staging
+            shutil.rmtree(staging_root, ignore_errors=True)
+
+        # `run_proof` NEVER removes its own run root either: only the guard's
         # post-leader census can establish that no child descendant is still
-        # writing, and the guard's retention policy owns cleanup. The rule is
+        # writing, and the guard's retention policy owns cleanup. That rule is
         # pinned structurally and behaviourally, on both the aborted and the
-        # successful path.
+        # successful path; the staging tree is covered above.
         run_source = inspect.getsource(run_proof)
         expect_true(
             "shutil.rmtree(parent)" not in run_source,
