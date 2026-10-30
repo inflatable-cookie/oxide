@@ -75,22 +75,38 @@ SLOT_ENTRIES = 20_000
 SLOT_BYTES = 20 * MIB
 # A held tree stays charged until it is positively removed, so a byte-pressure
 # admission that evicts cannot admit in the same attempt: the command deletes the
-# pending tree outside the lock and retries once. The pending-tree cases
-# therefore plant one `PENDING_ENTRIES`-entry tree of `PENDING_ENTRY_BYTES`
-# (~16 MiB allocated) under a `PENDING_CAP` cap, which a later admission still
-# fits under once the tree is being deleted.
-PENDING_ENTRIES = 20_000
+# pending tree outside the lock and retries once. The pending-tree cases therefore
+# plant one large victim tree and one small competitor tree under a cap that only
+# the pair exceeds.
+# The fixture is **asymmetrical**, because the in-lock control only discriminates
+# when the pending deletion outlasts its bound: the bound is
+# `max(3 x control, control + 2 s)`, so the victim must delete for noticeably more
+# than two seconds even though a 20,000-entry tree finishes in about one. The
+# victim therefore carries `PENDING_VICTIM_ENTRIES` cheap entries (well above the
+# brief's 20,000-entry floor) and the competitor's own reusable slot stays small,
+# which keeps the whole fixture inside the 512 MiB monitored scratch.
+#
+# The cap sits strictly between the victim's own charge and the pair's sum, so both
+# seeds record without pressure and only the evicting admission must retire the
+# victim. Every half of that arithmetic is asserted in the pure self-check.
+PENDING_VICTIM_ENTRIES = 70_000
+PENDING_REUSABLE_ENTRIES = 8_000
 PENDING_ENTRY_BYTES = 1024
-PENDING_CAP = "100MiB"
-# Each 1 KiB entry occupies one filesystem block, so one recorded tree of
-# `PENDING_ENTRIES` = 20,000 entries is about 78 MiB (the brief's >=20,000-entry
-# fixture). TWO such idle trees exceed `PENDING_CAP` (100 MiB) so the eviction
-# admission must retire exactly one of them, while that row's own charge still
-# fits under the cap, so a later warm-reuse admission needs no capacity decision
-# and can proceed beside the deletion. Both halves are asserted in the pure
-# self-check.
+PENDING_CAP = "290MiB"
+# Each 1 KiB entry occupies one filesystem block, so a tree's recorded figure is
+# its entry count times this.
 PENDING_BLOCK_BYTES = 4096
 PENDING_TREES = 2
+# Per-tree allowance for the bucket directories and the tiny crate's own output,
+# and the staging allowance, used only by the pure self-check's sizing arithmetic.
+PENDING_TREE_OVERHEAD_BYTES = 1024 * 1024
+PENDING_STAGING_BYTES = 64 * MIB
+# Conservative floor for the deletion rate this fixture is sized against: the
+# measured figure on an idle internal volume is about 20,000 unlinks/s, so sizing
+# against 15,000 keeps the premise honest on a slower run.
+PROGRESS_FLOOR_UNLINKS_PER_S = 15_000
+# Entries one planted bucket holds (`write_entries` batches 500 per directory).
+PENDING_BUCKET_ENTRIES = 500
 STAGE_JOBS = 1
 FIXTURE_JOBS = 1
 LOCK_CEILING_MS = 1000
@@ -402,19 +418,21 @@ def plan_document() -> dict:
              "Cargo offline, target/build inside scratch, target deleted"},
             {"name": "evict", "allocation": f"one fixture root, one {SLOT_ENTRIES}-entry tree"},
             {"name": "refused", "allocation": "one fixture root, one small tree plus a FIFO"},
-            {"name": "concurrent", "allocation": "one fixture root, two "
-             f"{PENDING_ENTRIES}-entry trees of {PENDING_ENTRY_BYTES} bytes per "
-             f"entry under a {PENDING_CAP} cap (total over the cap, each under "
-             "it)"},
+            {"name": "concurrent", "allocation": "one fixture root, one "
+             f"{PENDING_VICTIM_ENTRIES}-entry victim tree and one "
+             f"{PENDING_REUSABLE_ENTRIES}-entry competitor tree of "
+             f"{PENDING_ENTRY_BYTES} bytes per entry under a {PENDING_CAP} cap "
+             "(the victim alone under the cap, the pair over it)"},
             {"name": "takeover", "allocation": f"one fixture root, one {SLOT_ENTRIES}-entry tree"},
         ],
         "disk": {
             "monitored_scratch_mib": SCRATCH_BUDGET_MIB,
             "fixture_roots": 4,
             "per_fixture": f"{SLOT_ENTRIES} planted entries with one "
-            f"{SLOT_BYTES // MIB} MiB entry, or two {PENDING_ENTRIES}-entry trees "
-            f"of {PENDING_ENTRY_BYTES} bytes for the eviction/competitor cases, "
-            "plus tiny std-only crate intermediates",
+            f"{SLOT_BYTES // MIB} MiB entry, or a "
+            f"{PENDING_VICTIM_ENTRIES}-entry victim tree beside a "
+            f"{PENDING_REUSABLE_ENTRIES}-entry competitor tree for the "
+            "eviction/competitor cases, plus tiny std-only crate intermediates",
             "staged_target": "deleted before any fixture",
         },
         "concurrency": {
@@ -438,10 +456,14 @@ def plan_document() -> dict:
             "progress_sample_s": PROGRESS_SAMPLE_S,
             "progress_budget_s": PROGRESS_BUDGET_S,
         },
-        "pending_row_premise": "two recorded trees of the brief's >=20,000 "
-        "entries exceed the cap (an eviction is forced) while one recorded tree "
-        "fits under it (its charged row leaves room for the competitor's warm "
-        "reuse); both halves are asserted in the pure self-check",
+        "pending_row_premise": "the fixture is asymmetrical: a victim tree well "
+        "above the brief's 20,000-entry floor (sized so its deletion outlasts the "
+        "bound's fixed slack even at a conservative unlink-rate floor) and a small "
+        "competitor tree, under a cap the victim alone stays below and only the "
+        "pair exceeds, so both seeds record without pressure and exactly one "
+        "eviction is forced; the cap window, the scratch peak and the "
+        "discriminating window (including a counterfactual where the old "
+        "20,000-entry victim fails it) are asserted in the pure self-check",
         "progress_observation": f"bounded sampling every {PROGRESS_SAMPLE_S}s "
         "of one cheap `listdir` count of the held tree's planted bucket "
         "directories (never a full 20,000-entry walk), estimated only once at "
@@ -786,7 +808,12 @@ def self_check_oracles(scratch: str) -> None:
     )
     # The concurrency case's own apparatus resolves: its cap, entry count and
     # control pool are the pending-tree shape, not a deleted constant.
-    expect(PENDING_ENTRIES > 0 and PENDING_ENTRY_BYTES > 0, "pending shape changed")
+    expect(
+        PENDING_VICTIM_ENTRIES > 0
+        and PENDING_REUSABLE_ENTRIES > 0
+        and PENDING_ENTRY_BYTES > 0,
+        "pending shape changed",
+    )
     expect(
         PENDING_CAP.endswith("MiB"),
         f"the concurrency cap is not a size: {PENDING_CAP}",
@@ -799,23 +826,50 @@ def self_check_oracles(scratch: str) -> None:
         "check" in control_names,
         f"the control admission does not run a fixture command: {sorted(control_names)}",
     )
-    # The fixture's arithmetic premise, which the failed run got wrong: two
-    # recorded trees must exceed the cap (so one eviction is forced) while a
-    # single recorded tree stays under it (so its charged row still leaves room
-    # for the competitor's warm reuse).
+    # The fixture's arithmetic premise, which two failed runs got wrong: the
+    # victim alone must stay under the cap (so both seeds record without
+    # pressure) while the pair exceeds it (so exactly one eviction is forced).
     expect(
-        PENDING_ENTRIES >= 20_000,
-        f"the pending fixture is below the brief's 20,000-entry size: {PENDING_ENTRIES}",
+        PENDING_VICTIM_ENTRIES >= 20_000,
+        f"the victim is below the brief's 20,000-entry floor: {PENDING_VICTIM_ENTRIES}",
     )
-    one_tree = PENDING_ENTRIES * PENDING_BLOCK_BYTES
+    cap = parse_size(PENDING_CAP)
+    victim_charge = PENDING_VICTIM_ENTRIES * PENDING_BLOCK_BYTES + PENDING_TREE_OVERHEAD_BYTES
+    reusable_charge = (
+        PENDING_REUSABLE_ENTRIES * PENDING_BLOCK_BYTES + PENDING_TREE_OVERHEAD_BYTES
+    )
     expect(
-        one_tree * PENDING_TREES > parse_size(PENDING_CAP),
-        f"the fixture never forces eviction: {one_tree} x {PENDING_TREES} <= {PENDING_CAP}",
+        victim_charge < cap,
+        f"the victim alone would trip the cap: {victim_charge} >= {cap}",
     )
     expect(
-        one_tree < parse_size(PENDING_CAP),
-        f"the pending row would not fit under the cap: {one_tree} >= {PENDING_CAP}",
+        victim_charge + reusable_charge > cap,
+        f"the fixture never forces eviction: {victim_charge} + {reusable_charge} <= {cap}",
     )
+    # Scratch: the pair plus staging stays inside the monitored 512 MiB budget,
+    # even with the run's earlier fixtures and the second case's own pair held.
+    expect(
+        victim_charge + reusable_charge + PENDING_STAGING_BYTES
+        < SCRATCH_BUDGET_MIB * MIB,
+        f"the fixture does not fit the scratch budget: "
+        f"{victim_charge + reusable_charge + PENDING_STAGING_BYTES}",
+    )
+    # Discriminating window: the deletion must outlast the bound's dominant term
+    # (the fixed slack) even at the conservative rate floor, with several buckets
+    # left *after* the measurement point. The old 20,000-entry victim fails this
+    # check at the measured 20,000 unlinks/s; the new one passes with margin.
+    for entries, expected in (
+        (PENDING_VICTIM_ENTRIES, True),
+        (20_000, False),
+    ):
+        buckets_left = entries // PENDING_BUCKET_ENTRIES - PROGRESS_MIN_BUCKETS
+        remaining_s = buckets_left * PENDING_BUCKET_ENTRIES / PROGRESS_FLOOR_UNLINKS_PER_S
+        dominating_bound = INLOCK_CONTROL_SLACK_S
+        expect(
+            (remaining_s > dominating_bound) is expected,
+            f"the {entries}-entry victim's discriminating window is wrong: "
+            f"{remaining_s:.2f}s against {dominating_bound:.2f}s",
+        )
     expect(
         parse_size("20MiB") == 20 * 1024 * 1024,
         "the size parser changed",
@@ -1449,8 +1503,9 @@ def seed_recorded_tree(
     label: str,
     workspace: str,
     env: dict,
+    entries: int,
 ) -> tuple[dict, str]:
-    """One idle whole slot with `PENDING_ENTRIES` recorded entries.
+    """One idle whole slot with `entries` recorded entries.
 
     The recording walk runs on the release, after the payload is planted, so the
     closed observation the eviction charges is the planted figure.
@@ -1461,7 +1516,7 @@ def seed_recorded_tree(
     mine = [row for row in slot_rows(pool) if row["workspace"] == workspace]
     expect(len(mine) == 1, f"expected one slot for {label}, found {mine}")
     planted = os.path.join(slot_path(pool, mine[0]), "build", "planted")
-    write_entries(planted, PENDING_ENTRIES, 0, PENDING_ENTRY_BYTES)
+    write_entries(planted, entries, 0, PENDING_ENTRY_BYTES)
     code, output, _ = check(subject, workspace, env, f"record-{label}")
     expect(code == 0, f"recording {label} exited {code}: {output[-2000:]}")
     mine = [row for row in slot_rows(pool) if row["workspace"] == workspace]
@@ -1488,11 +1543,21 @@ def seed_eviction_fixture(
     env = fixture_env(root, pool, os.path.join(root, "eviction-lock.log"), PENDING_CAP)
     victim_workspace = create_project(root, f"{label}-victim")
     victim, _planted = seed_recorded_tree(
-        root, subject, f"{label}-victim", victim_workspace, env
+        root,
+        subject,
+        f"{label}-victim",
+        victim_workspace,
+        env,
+        PENDING_VICTIM_ENTRIES,
     )
     reusable_workspace = create_project(root, "competitor")
     reusable, _ = seed_recorded_tree(
-        root, subject, f"{label}-reusable", reusable_workspace, env
+        root,
+        subject,
+        f"{label}-reusable",
+        reusable_workspace,
+        env,
+        PENDING_REUSABLE_ENTRIES,
     )
     expect(
         victim["id"] != reusable["id"],

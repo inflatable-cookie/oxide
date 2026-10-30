@@ -486,9 +486,14 @@ estimator is shown to fail where the corrected one is discriminating. Every nati
 run needs its own owner activation, and the counted run and the independent
 reviewer native of the Elevated gate are separate.
 
+Its concurrency fixture is asymmetrical: a 70,000-entry victim tree (above the
+brief's 20,000-entry floor, sized so its deletion outlasts the bound's two-second
+slack even at a conservative 15,000-unlinks/s floor) beside an 8,000-entry
+competitor tree, under a 290 MiB cap the victim alone stays below and only the pair
+exceeds — so both seeds record without pressure and exactly one eviction is forced.
 Its concurrency case measures progress under the deleter's own non-blocking
 custody with one cheap `listdir` count of the held tree's planted bucket
-directories — never a full 20,000-entry walk per sample — and estimates the rate
+directories — never a full-entry walk per sample — and estimates the rate
 only once at least three buckets are gone, as the average over the whole
 first-to-last window, so a single 20 ms tick cannot satisfy it (the counter is
 quantized: a bucket disappears only when its last entry is unlinked). The
