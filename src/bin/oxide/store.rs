@@ -10762,6 +10762,113 @@ pub(crate) mod tests {
         check_evictable_split("evictable");
     }
 
+    // A record lock is an `flock`, and `flock` belongs to the **open file
+    // description**: `fork` copies the descriptor table, not the locking
+    // state, so a child forked by a *parallel* test while this test holds a
+    // probe keeps the same description (and therefore the lock) after this
+    // test closes its own descriptor, until that child `exec`s and the
+    // descriptor's `O_CLOEXEC` bit closes it. `evictable_members` correctly
+    // refuses a lock it observes held (design §5.5.1: a held lock is a donor
+    // pin or a writer), so a free observation must wait out that inherited
+    // window rather than assume the release is instantaneous. Both bounds
+    // below are on the *observation*: an inherited description closes in
+    // milliseconds once the child runs, so a lock still held at the deadline
+    // is a real failure, not a scheduling artefact.
+    const FREE_PROBE_DEADLINE: Duration = Duration::from_secs(3);
+    const FREE_PROBE_STEP: Duration = Duration::from_millis(5);
+
+    /// Observe a free record lock, tolerating only an inherited description
+    /// (`Probe::Held`); a missing file or an error is reported as it is.
+    fn free_probe(path: &Path, create: bool) -> Probe {
+        let deadline = Instant::now() + FREE_PROBE_DEADLINE;
+        loop {
+            match probe_lock(path, create) {
+                Ok(Probe::Held) if Instant::now() < deadline => {
+                    std::thread::sleep(FREE_PROBE_STEP);
+                }
+                Ok(probe) => return probe,
+                Err(error) => panic!("cannot probe {}: {error}", path.display()),
+            }
+        }
+    }
+
+    /// Observe the eviction decision until it settles on an evictable member
+    /// or the deadline expires; the caller asserts on the result so the
+    /// product's own rejection reasons are in the failure. A member that never
+    /// becomes evictable is a real failure.
+    fn settled_evictable_members(
+        store: &Store,
+        state: &State,
+        slots: &[LedgerSlot],
+        members: &[ClassMember],
+        own: u64,
+    ) -> Vec<ClassMember> {
+        let deadline = Instant::now() + FREE_PROBE_DEADLINE;
+        loop {
+            let evictable = store.evictable_members(state, slots, members, own);
+            if !evictable.is_empty() || Instant::now() >= deadline {
+                return evictable;
+            }
+            std::thread::sleep(FREE_PROBE_STEP);
+        }
+    }
+
+    /// The mechanism above, made deterministic: a second descriptor from
+    /// `try_clone` shares this test's open file description exactly as a
+    /// `fork`ed child does, so the lock survives the original descriptor's
+    /// close. The product refuses that member (a held lock is protected); once
+    /// the shared description closes, the bounded observer sees it evictable.
+    /// This is the flaky-suite signature (`("1", "lock held")`) reproduced
+    /// on purpose in a controlled window.
+    #[test]
+    fn the_eviction_lock_probe_settles_after_an_inherited_description_closes() {
+        let (root, store, key) = class_fixture("evictable-inherited");
+        let held = lease_as(
+            &store,
+            &key,
+            WorkspaceAdmission::one_use("a temporary workspace"),
+            false,
+        )
+        .expect("one-use lease");
+        let record_id = held.record_id();
+        store.release(held, None).unwrap();
+        let state = store.load().unwrap();
+        let slots = store.ledger().unwrap().slots;
+        let membership = store.class_membership(&state, &slots);
+        assert_eq!(membership.members.len(), 1);
+        let pair = membership.members[0].clone();
+
+        let path = store.lock_path(record_id);
+        let probe = match free_probe(&path, true) {
+            Probe::Free(probe) => probe,
+            Probe::Held => panic!("the record lock is held with no writer"),
+            Probe::Missing => panic!("the record lock is missing"),
+        };
+        // What `fork` gives a child: another descriptor of the same open file
+        // description, so the lock outlives this descriptor.
+        let inherited = probe.try_clone().expect("inherit the open description");
+        drop(probe);
+        assert!(
+            store
+                .evictable_members(&state, &slots, &membership.members, 0)
+                .is_empty(),
+            "a lock held through an inherited description was evictable"
+        );
+        assert_eq!(
+            EVICTION_REJECTION.with(|value| value.borrow().clone()),
+            vec![(pair.slot_id.clone(), "lock held")],
+            "the product refused the member for a reason other than its held lock"
+        );
+
+        drop(inherited);
+        assert_eq!(
+            settled_evictable_members(&store, &state, &slots, &membership.members, 0),
+            vec![pair],
+            "the decision did not settle after the inherited description closed"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn check_evictable_split(label: &str) {
         let (root, store, key) = class_fixture(label);
         let held = lease_as(
@@ -10778,13 +10885,15 @@ pub(crate) mod tests {
         let membership = store.class_membership(&state, &slots);
         assert_eq!(membership.members.len(), 1);
         let pair = membership.members[0].clone();
-        let evictable = store.evictable_members(&state, &slots, &membership.members, 0);
+        let evictable = settled_evictable_members(&store, &state, &slots, &membership.members, 0);
         assert_eq!(evictable, vec![pair.clone()], "a closed idle member");
         // The caller's own record is excluded exactly as `checkout_custody`
         // does; here the member is that record and it is still idle.
         assert_eq!(
-            store.evictable_members(&state, &slots, &membership.members, record_id),
-            vec![pair.clone()]
+            settled_evictable_members(&store, &state, &slots, &membership.members, record_id),
+            vec![pair.clone()],
+            "actual eviction decision rejected: {:?}",
+            EVICTION_REJECTION.with(|value| value.borrow().clone())
         );
 
         // 1/2: an active phase or a recorded holder is protected.
@@ -10829,8 +10938,13 @@ pub(crate) mod tests {
         state.records[index].process_group = None;
         store.save(&state).unwrap();
         let path = store.lock_path(record_id);
-        let held_probe = probe_lock(&path, true).expect("lock");
-        assert!(matches!(&held_probe, Probe::Free(_)));
+        // A parallel test's `fork` may briefly hold an inherited description
+        // of the lease's record lock after `release` closed its own.
+        let held_probe = free_probe(&path, true);
+        assert!(
+            matches!(&held_probe, Probe::Free(_)),
+            "the record lock is not free after release"
+        );
         assert!(
             store
                 .evictable_members(&state, &slots, &membership.members, 0)
@@ -10850,11 +10964,10 @@ pub(crate) mod tests {
             "member mapping"
         );
         assert!(idle_member_record(member), "member record is not idle");
-        match probe_lock(&path, false) {
-            Ok(Probe::Free(probe)) => drop(probe),
-            Ok(Probe::Held) => panic!("member lock remains held after dropping the probe"),
-            Ok(Probe::Missing) => panic!("member lock is missing after dropping the probe"),
-            Err(error) => panic!("member lock probe failed after dropping the probe: {error}"),
+        match free_probe(&path, false) {
+            Probe::Free(probe) => drop(probe),
+            Probe::Held => panic!("member lock remains held after dropping the probe"),
+            Probe::Missing => panic!("member lock is missing after dropping the probe"),
         }
         assert!(
             !store.other_record_active(&state, member, 0, boot_session()),
@@ -10870,7 +10983,7 @@ pub(crate) mod tests {
             "member checkout has a clean mark"
         );
         assert_eq!(
-            store.evictable_members(&state, &slots, &membership.members, 0),
+            settled_evictable_members(&store, &state, &slots, &membership.members, 0),
             vec![pair.clone()],
             "actual eviction decision rejected: {:?}",
             EVICTION_REJECTION.with(|value| value.borrow().clone())
