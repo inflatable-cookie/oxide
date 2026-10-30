@@ -548,14 +548,16 @@ class Removal:
         ),
     )
 
-    def __init__(self, proof: Proof, repo: str, source: str | None = None):
+    def __init__(self, proof: Proof, repo: str, source: str):
         self.proof = proof
         self.state = {}
         name = "OxRm" + secrets.token_hex(4)
         self.mount = f"/Volumes/{name}"
-        self.source = source or proof.run(
-            ["git", "rev-parse", "HEAD"], cwd=repo, timeout=30
-        ).stdout.decode().strip()
+        # The caller resolves and validates the source (`resolve_source`)
+        # *before* this constructor stages or creates anything, so no path can
+        # attach an image to an unpinned source.
+        need(bool(re.fullmatch(r"[0-9a-f]{40}", source)), f"no exact source identity: {source!r}")
+        self.source = source
         print(f"removal proof {os.getpid()} source {self.source} ({layout.source_facts(repo)}) volume {name}")
         need(not os.path.lexists(self.mount), f"{self.mount} already exists; never touched")
         proof.phase("start")
@@ -811,20 +813,61 @@ def collect(session: Removal, diagnostic: bool, outcome: dict, bodies: dict | No
     return outcome
 
 
+def resolve_source(proof: Proof, repo: str) -> str:
+    """The exact source identity this run binds to, or an abort.
+
+    This runs before staging and before any image is created or attached, so a
+    run whose source cannot be pinned never touches the volume. A lookup that
+    times out, dies or is interrupted, an empty or non-exact identity and a
+    dirty tracked worktree are all outcomes this proof cannot classify: they
+    raise [`UnknownOutcome`] and the caller records the fault with every planned
+    case unexecuted.
+    """
+    try:
+        head = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30)
+        status = proof.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"], cwd=repo, timeout=30
+        )
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as failure:
+        raise UnknownOutcome(f"source lookup failed: {failure!r}") from failure
+    source = head.stdout.decode(errors="replace").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", source):
+        raise UnknownOutcome(f"no exact source identity: {source!r}")
+    dirty = status.stdout.decode(errors="replace").strip()
+    if dirty:
+        raise UnknownOutcome(
+            f"the tracked worktree is not clean: {dirty.splitlines()[:4]}"
+        )
+    return source
+
+
 def run(proof: Proof, repo: str, diagnostic: bool) -> dict:
     """The main (ephemeral, surprise-removal) mode. Returns its outcome
-    document; the diagnostic receipt is written here, in every outcome."""
+    document; the diagnostic receipt is written here, in every outcome.
+
+    The source gate and the setup both sit inside the receipt-writing `try`, so
+    a run that cannot pin its source, that is interrupted, or whose setup dies
+    still leaves one truthful receipt with the real fault and every planned
+    case unexecuted — and never stages or attaches anything first.
+    """
     outcome = diagnostic_outcome()
     outcome["root"] = proof.root
-    source = ""
-    try:
-        source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
-        outcome["source"] = source
-    except BaseException as failure:
-        # The abort below records why; a missing source is never invented.
-        print(f"source {failure!r} unresolved", file=sys.stderr)
     session = None
     try:
+        try:
+            source = resolve_source(proof, repo)
+        except (KeyboardInterrupt, SystemExit):
+            record_abort(outcome, "source", "interrupted")
+            raise
+        except BaseException as failure:
+            # No print-and-continue: a run that cannot pin its source aborts
+            # here, before staging or any image effect.
+            record_abort(outcome, "source", failure)
+            print(f"source: ABORTED {failure}", file=sys.stderr)
+            raise
+        outcome["source"] = source
         try:
             session = Removal(proof, repo, source)
         except OracleFailure as failure:
@@ -967,12 +1010,11 @@ class BootClosure:
     cases. Every quarantine is made by the product's own removal stop; no
     state file is edited."""
 
-    def __init__(self, proof: Proof, repo: str):
+    def __init__(self, proof: Proof, repo: str, source: str):
         self.proof = proof
         self.repo = repo
-        self.source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
-        dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
-        expect(not dirty, f"candidate checkout is not clean: {dirty}")
+        need(bool(re.fullmatch(r"[0-9a-f]{40}", source)), f"no exact source identity: {source!r}")
+        self.source = source
         self.name = "OxBc" + secrets.token_hex(4)
         self.mount = f"/Volumes/{self.name}"
         expect(not os.path.lexists(self.mount), f"{self.mount} already exists; never touched")
@@ -1265,8 +1307,27 @@ def boot_closure(proof: Proof, repo: str, diagnostic: bool) -> str:
     }
     session = None
     try:
-        session = BootClosure(proof, repo)
-        outcome["source"] = session.source
+        try:
+            source = resolve_source(proof, repo)
+        except (KeyboardInterrupt, SystemExit):
+            outcome["aborted"] = "source: interrupted"
+            raise
+        except BaseException as failure:
+            outcome["aborted"] = f"source: {failure}"
+            outcome["first_fault"] = outcome["first_fault"] or outcome["aborted"]
+            print(f"source: ABORTED {failure}", file=sys.stderr)
+            raise
+        outcome["source"] = source
+        try:
+            session = BootClosure(proof, repo, source)
+        except (KeyboardInterrupt, SystemExit):
+            outcome["aborted"] = outcome["aborted"] or "setup: interrupted"
+            raise
+        except BaseException as failure:
+            outcome["aborted"] = outcome["aborted"] or f"setup: {failure}"
+            outcome["first_fault"] = outcome["first_fault"] or outcome["aborted"]
+            print(f"setup: ABORTED {failure}", file=sys.stderr)
+            raise
         outcome["manifest_lock"] = layout.source_facts(repo)
         outcome["mount"] = session.mount
         outcome["device"] = session.volume.device
@@ -1284,6 +1345,7 @@ def boot_closure(proof: Proof, repo: str, diagnostic: bool) -> str:
                 continue
             except UnknownOutcome as failure:
                 outcome["aborted"] = f"{case}: {failure}"
+                outcome["first_fault"] = outcome["first_fault"] or outcome["aborted"]
                 raise
             outcome["completed"].append(case)
             proof.phase(f"after {case}")
@@ -1870,8 +1932,16 @@ def self_check() -> int:
             self.unclosed = set()
             self.mount = None
 
+        source = "deadbeef" * 5  # 40 hex characters: a valid exact identity
+
         def run(self, command, *, cwd=None, env=None, timeout=None):
-            return subprocess.CompletedProcess(command, 0, stdout=b"deadbeef\n", stderr=b"")
+            if command[:2] == ["git", "rev-parse"]:
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=(self.source + "\n").encode(), stderr=b""
+                )
+            if command[:2] == ["git", "status"]:
+                return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+            raise AssertionError(f"unexpected command {command}")
 
     for failure, expect_aborted in (
         (KeyError("OXIDE_PROOF_DEADLINE_NS"), True),
@@ -1902,7 +1972,7 @@ def self_check() -> int:
             os.environ.pop("OXIDE_PROOF_EVIDENCE", None)
             shutil.rmtree(evidence, ignore_errors=True)
         expect(receipt["qualified"] is False, "a setup receipt claimed qualification")
-        expect(receipt["source"] == "deadbeef", f"receipt source {receipt.get('source')!r}")
+        expect(receipt["source"] == "deadbeef" * 5, f"receipt source {receipt.get('source')!r}")
         expect(receipt["root"] == "/fixture/guard-root", f"receipt root {receipt.get('root')!r}")
         expect(
             receipt["unexecuted"] == ["idle", "held", "held-delete", "quarantine"],
@@ -1918,6 +1988,131 @@ def self_check() -> int:
                 f"a setup oracle failure was not recorded: {receipt['failed']}",
             )
             expect(receipt["aborted"] is None, f"a setup oracle failure recorded an abort: {receipt.get('aborted')}")
+
+    # The source gate runs before staging and before any image effect. A
+    # lookup that dies or is interrupted, a non-exact identity and a dirty
+    # tracked worktree each abort with the real fault recorded and every planned
+    # case unexecuted, and `Removal` (which stages and attaches) is never
+    # constructed. A clean identity lets setup begin with exactly that source.
+    class SourceProof:
+        root = "/fixture/guard-root"
+
+        def __init__(self, source: str = "a" * 40, status: str = "", failure=None, interrupt: bool = False):
+            self.source, self.status, self.failure, self.interrupt = source, status, failure, interrupt
+            self.unclosed = set()
+            self.mount = None
+            self.commands = []
+
+        def run(self, command, *, cwd=None, env=None, timeout=None):
+            self.commands.append(list(command))
+            if command[:2] == ["git", "rev-parse"]:
+                if self.interrupt:
+                    raise KeyboardInterrupt()
+                if self.failure is not None:
+                    raise self.failure
+                return subprocess.CompletedProcess(command, 0, stdout=(self.source + "\n").encode(), stderr=b"")
+            if command[:2] == ["git", "status"]:
+                return subprocess.CompletedProcess(command, 0, stdout=self.status.encode(), stderr=b"")
+            raise AssertionError(f"no command may run before the source gate: {command}")
+
+    original_removal = globals()["Removal"]
+    for label, case, needle in (
+        ("lookup timeout", SourceProof(failure=subprocess.TimeoutExpired("git rev-parse", 30)), "source lookup failed"),
+        ("interrupt", SourceProof(interrupt=True), "interrupted"),
+        ("empty identity", SourceProof(source=""), "no exact source identity"),
+        ("non-exact identity", SourceProof(source="deadbeef"), "no exact source identity"),
+        (
+            "dirty tracked worktree",
+            SourceProof(status=" M scripts/test-oxide-removable-removal.py\n"),
+            "tracked worktree is not clean",
+        ),
+    ):
+        built = []
+
+        def gate_stub(proof, repo, source, built=built):
+            built.append(source)
+            raise OracleFailure("stub removal reached")
+
+        gate_stub.CASES = original_removal.CASES
+        evidence = tempfile.mkdtemp(prefix="removal-source-check.")
+        os.environ["OXIDE_PROOF_EVIDENCE"] = evidence
+        globals()["Removal"] = gate_stub
+        try:
+            try:
+                run(case, "/fixture/repo", True)
+            except (UnknownOutcome, KeyboardInterrupt):
+                pass
+            else:
+                fail(f"{label}: the source gate did not abort")
+        finally:
+            globals()["Removal"] = original_removal
+            os.environ.pop("OXIDE_PROOF_EVIDENCE", None)
+        expect(built == [], f"{label}: setup was constructed before the gate: {built}")
+        expect(
+            case.commands and all(command[:2] in (["git", "rev-parse"], ["git", "status"]) for command in case.commands),
+            f"{label}: commands {case.commands}",
+        )
+        receipts = [name for name in os.listdir(evidence) if name.startswith("removal.diagnostic")]
+        expect(len(receipts) == 1, f"{label}: {len(receipts)} receipts")
+        with open(os.path.join(evidence, receipts[0]), encoding="utf-8") as handle:
+            receipt = json.load(handle)
+        shutil.rmtree(evidence, ignore_errors=True)
+        expect(receipt["qualified"] is False, f"{label}: receipt claimed qualification")
+        expect(
+            receipt["aborted"] is not None and needle in receipt["aborted"],
+            f"{label}: receipt abort {receipt.get('aborted')!r}",
+        )
+        expect(receipt["first_fault"] == receipt["aborted"], f"{label}: receipt fault {receipt.get('first_fault')!r}")
+        expect(receipt["completed"] == [] and receipt["failed"] == [], f"{label}: receipt cases {receipt}")
+        expect(
+            receipt["unexecuted"] == [name for name, _, _ in original_removal.CASES],
+            f"{label}: receipt unexecuted {receipt.get('unexecuted')}",
+        )
+        expect(receipt["root"] == "/fixture/guard-root", f"{label}: receipt root {receipt.get('root')!r}")
+
+    built = []
+
+    def gate_stub_ok(proof, repo, source, built=built):
+        built.append(source)
+        raise OracleFailure("stub removal reached")
+
+    gate_stub_ok.CASES = original_removal.CASES
+    clean_case = SourceProof()
+    evidence = tempfile.mkdtemp(prefix="removal-source-ok.")
+    os.environ["OXIDE_PROOF_EVIDENCE"] = evidence
+    globals()["Removal"] = gate_stub_ok
+    try:
+        clean = run(clean_case, "/fixture/repo", True)
+    finally:
+        globals()["Removal"] = original_removal
+        os.environ.pop("OXIDE_PROOF_EVIDENCE", None)
+    shutil.rmtree(evidence, ignore_errors=True)
+    expect(built == ["a" * 40], f"a clean source did not reach setup with its exact identity: {built}")
+    expect(
+        clean_case.commands
+        == [["git", "rev-parse", "HEAD"], ["git", "status", "--porcelain", "--untracked-files=no"]],
+        f"the source gate ran {clean_case.commands}",
+    )
+    expect(clean["source"] == "a" * 40, f"the outcome source is {clean.get('source')!r}")
+    expect([case for case, _ in clean["failed"]] == ["setup"], f"clean case failures {clean['failed']}")
+    expect(
+        clean["unexecuted"] == [name for name, _, _ in original_removal.CASES],
+        f"clean case unexecuted {clean['unexecuted']}",
+    )
+
+    # `Removal` itself refuses an unvalidated source before any child runs, so
+    # no direct construction can stage or attach an image to an unpinned source.
+    class BareProof:
+        def run(self, command, **kwargs):
+            raise AssertionError(f"no command may run before the source gate: {command}")
+
+    for bad in ("", "not-a-sha", "A" * 40, "a" * 39):
+        try:
+            original_removal(BareProof(), "/fixture/repo", bad)
+        except UnknownOutcome:
+            pass
+        else:
+            fail(f"Removal accepted the unvalidated source {bad!r}")
 
     # The premise checklist is complete, and its environment claims are
     # checked against `private_environment` with hostile inherited values.
