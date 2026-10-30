@@ -276,8 +276,11 @@ owner-only directory, so per-entry journaling was unnecessary.
 **Under the pool lock (milliseconds).** The victim is chosen exactly as before
 (an idle, positively writer-closed, verified slot; unknown or partial slots stay
 ineligible). The slot root is verified as the real owner-only directory the
-ledger records, on the slots root's own device, and `renameat` moves it **whole**
-into a private holding area on the same device:
+ledger records, on the slots root's own device; the descriptor of that root is
+opened without following a link and the identity it reports is **carried to the
+rename boundary**, so a root a racer replaced after the check refuses
+(`UnsafePath`) instead of being held and later deleted. `renameat` then moves the
+tree **whole** into a private holding area on the same device:
 `<payload>/.oxide-holding/<store>-<slot>-<incarnation>-<nonce>`. The area is
 created owner-only (`0700`) and verified (real directory, caller's own, payload
 device). One durable revised ledger write records one holding row — name, slot,
@@ -295,9 +298,27 @@ adopts it: the row is added and the slot row dropped in one write. A crash
 **after** the row leaves a charged, isolated row that a later command finishes.
 Nothing in either crash window is guessed from an absent name.
 
+**Recovery order and the legacy migration window.** `Pool::open` reconciles the
+holding area **before** it replays a recorded deletion. Adoption therefore
+covers every generation whose tree is already in the holding area, including a
+legacy `Evicting` row interrupted between its migration rename and the write
+that would have recorded the holding row: that row is adopted (its per-entry
+journal, if any was already resolved, is dropped with it) and the pool is not
+left blocked behind a root its own rename moved. A tree still at its recorded
+root adopts nothing, so an unreplayed legacy journal keeps its own record until
+the replay decides it.
+
+**Only a positively classified miss is absence.** A recorded holding row is
+dropped when its entry is gone with `NotFound`. Any other `lstat` failure
+(`EACCES`, `EIO`, an over-bound name) is **unknown**, never absence: the row and
+its charge are kept, the pool refuses rather than concluding, and a pass that
+cannot open a recorded entry keeps it, reports it and deletes nothing else. A
+holding entry is therefore never reported as deleted, and never stops being
+accounted, because an error could not be classified.
+
 **Asynchronous delete, outside the lock.** The command that evicted the slot
 deletes that tree on a worker thread it owns while its own writer runs, and
-joins it before exit with a bounded wait whose progress is printed (30 s, then
+joins it before exit with a bounded wait whose progress is printed (60 s, then
 the entry is left recorded for a later command). The traversal holds
 descriptors only: `unlinkat`/`AT_REMOVEDIR` against a held parent, `O_NOFOLLOW`
 directories, never a path lookup, never a followed link (a symlink is unlinked
@@ -366,17 +387,39 @@ other owned-delete callers keep their own rules: the holding approach is not
 applied to them by this change, because a workspace target tree can contain
 bytes whose ownership and writer closure are not a private slot's.
 
-**Selectors.** `effigy rust:holding-delete` is the focused native proof (one
-fixed script under the qualified shared supervisor, `--root-parent
-/private/tmp` for its genuine internal fixture pool, 300 s, 512 MiB),
-`effigy rust:holding-delete:diagnostic` its uncounted keep-going twin, and
-`effigy proof:holding-delete:test` its pure self-check. Every native run needs
-its own owner activation, and the counted run and the independent reviewer
-native of the Elevated gate are separate. The proof's throughput figures are
-observations of a 20,000-entry fixture, not a real pool's rate; the retired
-path's incident figure is recorded as a labelled historical reference, never as
-a live comparison. This is still not a latency guarantee: a short rename and one
-synced ledger write can take time on a slow volume.
+**Selectors and their oracles.** `effigy rust:holding-delete` is the focused
+native proof (one fixed script under the qualified shared supervisor,
+`--root-parent /private/tmp` for its genuine internal fixture pool, 300 s,
+512 MiB), `effigy rust:holding-delete:diagnostic` its uncounted keep-going twin,
+and `effigy proof:holding-delete:test` its self-check (one private temporary
+directory, removed before it returns; no child, pool or staging). Every native
+run needs its own owner activation, and the counted run and the independent
+reviewer native of the Elevated gate are separate.
+
+The proof's lock figure is the **whole eviction transaction under the pool
+lock** — victim and rank checks, the identity-verified rename and the one durable
+ledger write — timed from the start of that transaction by a debug-only
+observation armed only inside the supervisor's scratch layout, so an inner
+fragment cannot pass as the whole interval. Its concurrency oracle is positive
+and falsifiable: the competitor's admission is observed by the pool's own new
+ledger row appearing while the deleting process is alive and the held tree is
+provably still being deleted (a measured, decreasing, non-zero entry count under
+the deleter's custody), and that admission must stay inside three times the same
+admission measured on a separate pressure-free pool plus two seconds — an
+in-lock deletion would delay it by the whole deletion and fail that control, and
+the control's own numbers are recorded. Its diagnostic mode keeps explicit
+accounting: a recoverable oracle failure marks that case `failed` and the
+independent cases still run, an unclassified outcome (unexpected exception,
+unreaped child, exhausted deadline) marks the case `aborted` and the rest
+`unexecuted`, and a case that never ran is never a pass. Staging drops Cargo's
+encoded forms (including `CARGO_ENCODED_RUSTFLAGS`) and fixes every flag it
+sets.
+
+The proof's throughput figures are observations of a 20,000-entry fixture, not a
+real pool's rate; the retired path's incident figure is recorded as a labelled
+historical reference, never as a live comparison. This is still not a latency
+guarantee: a short rename and one synced ledger write can take time on a slow
+volume.
 
 
 Current pools are budget-only (`directory-budget-v1`, `apfs-volume-v1`):

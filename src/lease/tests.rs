@@ -6148,3 +6148,154 @@ fn an_unclassifiable_legacy_journal_stays_pending_and_starts_no_holding_row() {
     assert!(view.holding.is_empty(), "no holding row was invented");
     assert!(view.reconciliation_blocked);
 }
+
+/// The legacy-migration crash window: the resolved root was renamed into the
+/// holding area but the durable write that records the row never happened, so
+/// the ledger still carries an `Evicting` row with no journal and no root. The
+/// next locked open adopts that generation's own entry — the record leaves the
+/// slot table, the charge follows it, and the deletion finishes as a whole tree.
+#[test]
+fn an_interrupted_legacy_migration_is_adopted_by_the_next_open() {
+    let fixture = Fixture::new("migration-interrupted");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "migration-interrupted");
+    mark_evicting_for_test(&pool, slot_id).expect("a legacy pending deletion");
+    prepare_holding_area(&pool);
+    let name = super::pool::holding_name_for_slot_injected(&pool, slot_id).expect("derived name");
+    fs::rename(&slot_path, holding_area(&pool).join(&name)).expect("modelled migration rename");
+    assert!(!slot_path.exists(), "the root left its recorded name");
+
+    let view = managed::ledger_view(&pool).expect("the next open adopts it");
+    assert!(
+        view.slots.is_empty(),
+        "the interrupted legacy row is not adopted: {:#?}",
+        view.slots
+    );
+    assert!(
+        !view.reconciliation_blocked,
+        "adoption left the pool blocked"
+    );
+    assert_eq!(view.holding.len(), 1, "one adopted holding row");
+    assert_eq!(view.holding[0].name, name);
+    assert_eq!(view.holding[0].slot_id, slot_id.to_string());
+    assert!(
+        view.holding[0].recorded_bytes > 0,
+        "the row carries a charge"
+    );
+
+    let pass = managed::drain_holding(&pool, None).expect("drain");
+    assert!(pass.gone, "the adopted tree is deleted: {pass:?}");
+    assert!(holding_rows(&pool).is_empty());
+}
+
+/// The rename boundary is not satisfied by a name alone: the identity the
+/// caller verified is compared with the held descriptor *before* the rename and
+/// with the moved entry afterwards. A root replaced in that window refuses, and
+/// the replacement is neither held nor ever deleted.
+#[test]
+fn a_replaced_root_refuses_at_the_rename_boundary() {
+    let fixture = Fixture::new("replaced-root");
+    let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "replaced-root");
+    let verified = {
+        let metadata = fs::symlink_metadata(&slot_path).expect("root metadata");
+        (metadata.dev(), metadata.ino())
+    };
+    // Replace the verified root with a different owned directory of the same
+    // name, which is exactly what a racer between the preflight and the rename
+    // produces.
+    let aside = slot_path.with_extension("race-aside");
+    fs::rename(&slot_path, &aside).expect("move the verified root aside");
+    fs::create_dir(&slot_path).expect("replacement root");
+    fs::set_permissions(&slot_path, fs::Permissions::from_mode(0o700)).expect("replacement mode");
+    fs::write(slot_path.join("replacement"), b"not the slot").expect("replacement payload");
+
+    let refused = super::pool::hold_expecting_injected(&pool, slot_id, Some(verified));
+    assert!(
+        matches!(refused, Err(LeaseError::UnsafePath(_))),
+        "a replaced root was moved: {refused:?}"
+    );
+    assert!(slot_path.is_dir(), "the replacement is still where it was");
+    assert!(
+        holding_rows(&pool).is_empty(),
+        "the replacement was recorded as a held tree"
+    );
+    match holding_area(&pool).read_dir() {
+        // The refusal happens before the holding area is created, so an absent
+        // area is itself proof that nothing was moved.
+        Err(error) => assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "the holding area is unreadable: {error}"
+        ),
+        Ok(entries) => assert!(
+            !entries.flatten().next().is_some(),
+            "the replacement was moved into the holding area"
+        ),
+    }
+
+    // The same call with the identity the caller now really verified succeeds,
+    // so the guard refused the mismatch rather than the operation.
+    let replacement = {
+        let metadata = fs::symlink_metadata(&slot_path).expect("replacement metadata");
+        (metadata.dev(), metadata.ino())
+    };
+    let name = super::pool::hold_expecting_injected(&pool, slot_id, Some(replacement))
+        .expect("the verified replacement moves");
+    assert!(holding_area(&pool).join(&name).is_dir());
+    assert!(!slot_path.exists());
+}
+
+/// Only a positively classified miss concludes that a held tree is gone. An
+/// `lstat` failure that says nothing about absence (here an over-bound entry
+/// name) classifies as unknown, and an unreadable holding area refuses the open
+/// instead of dropping a row: the row and its charge survive in the ledger.
+#[test]
+fn an_unclassified_holding_entry_error_never_drops_the_row_or_charge() {
+    let fixture = Fixture::new("holding-unknown");
+    let area = fixture.dir("area");
+    assert_eq!(
+        super::pool::holding_presence(&area),
+        Some(true),
+        "a present entry must classify as present"
+    );
+    assert_eq!(
+        super::pool::holding_presence(&area.join("absent")),
+        Some(false),
+        "a missing name must classify as a positive miss"
+    );
+    let over_bound = area.join("x".repeat(300));
+    assert_eq!(
+        super::pool::holding_presence(&over_bound),
+        None,
+        "an over-bound name must classify as unknown, never as absence"
+    );
+
+    let (pool, slot_id, _slot_path) = idle_slot_for_eviction(&fixture, "holding-unknown");
+    evict_idle_slot_injected(&pool, &slot_id.to_string()).expect("evict");
+    let row = holding_rows(&pool).remove(0);
+    assert!(row.recorded_bytes > 0, "a recorded charge");
+    // The area becomes unusable without saying the tree is gone.
+    fs::set_permissions(holding_area(&pool), fs::Permissions::from_mode(0o000))
+        .expect("unsearchable area");
+    let refused = managed::ledger_view(&pool);
+    assert!(
+        refused.is_err(),
+        "an unreadable holding area must refuse, not conclude"
+    );
+    let snapshot = managed::snapshot(&pool).expect("a passive snapshot reads the ledger");
+    assert_eq!(snapshot.holding.len(), 1, "the row survived: {snapshot:?}");
+    assert_eq!(
+        snapshot.holding[0].recorded_bytes, row.recorded_bytes,
+        "the charge survived"
+    );
+    fs::set_permissions(holding_area(&pool), fs::Permissions::from_mode(0o700))
+        .expect("searchable area again");
+    let view = managed::ledger_view(&pool).expect("the pool opens again");
+    assert_eq!(view.holding.len(), 1, "the tree is still held and charged");
+    assert_eq!(view.holding[0].present, Some(true));
+    let pass = managed::drain_holding(&pool, None).expect("drain");
+    assert!(
+        pass.gone,
+        "the tree is deleted once it is reachable again: {pass:?}"
+    );
+    assert!(holding_rows(&pool).is_empty());
+}

@@ -1855,7 +1855,7 @@ fn report_holding_pass(pool: &Path) -> Option<oxide_storage::lease::HoldingDrain
                 );
             } else if !pass.refused.is_empty() {
                 eprintln!(
-                    "oxide: kept part of the held slot tree {name} ({}); it stays recorded and charged, and a later command reports it again",
+                    "oxide: kept the held slot tree {name} in the holding area ({}); it stays recorded and charged, and a later command reports it again",
                     pass.refused.join(", ")
                 );
             }

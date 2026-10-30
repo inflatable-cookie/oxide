@@ -57,6 +57,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -83,9 +84,14 @@ LOCK_CEILING_MS = 1000
 # Two commands that genuinely ran at the same time overlap for at least this
 # long. An in-lock deletion would serialise them completely (zero overlap), so
 # this is a real discriminator even though one fixture deletion is short.
-CONCURRENT_OVERLAP_S = 1.0
+# The falsifying in-lock control: the same new-slot admission is measured on a
+# separate, pressure-free pool, and the admission taken during a live deletion
+# must stay inside this multiple of it (plus this many seconds of slack). An
+# in-lock deletion would delay it by the whole deletion, far outside the bound.
+INLOCK_CONTROL_FACTOR = 3.0
+INLOCK_CONTROL_SLACK_S = 2.0
 # How long the deleter keeps custody before the competitor arrives, so the
-# deletion is genuinely in flight when the competitor takes the pool lock.
+# deletion is measurably in progress when the competitor takes the pool lock.
 CONCURRENT_CUSTODY_S = 0.5
 MAX_RECEIPT_BYTES = 64 * 1024
 SELECTOR = "rust:holding-delete"
@@ -109,11 +115,23 @@ root and bounds in keep-going mode and writes a bounded, unqualified receipt;
 it is never a counted PASS. --self-check runs pure argument, plan, oracle and
 constant checks in this process without staging, a child or a fixture.
 """
-CASES: list[dict] = []
+# The declared cases, in order, each with the result it has reached. A case is
+# recorded as `unexecuted` until the run reaches it, so a run that stops early
+# never lets an unreached case read as a pass.
+DECLARED_CASES = (
+    "evict-under-lock",
+    "refused-entry-kept",
+    "concurrent-admission",
+    "killed-deleter-takeover",
+)
+CASES: list[dict] = [{"name": name, "result": "unexecuted"} for name in DECLARED_CASES]
 RESULTS: list[dict] = []
 PHASE_STARTED = time.perf_counter()
 DIAGNOSTIC = False
 FIRST_FAULT: str | None = None
+# Fixture children this process started and has not yet reaped. A case may not
+# return while one is still running: its custody would be unknown.
+CHILDREN: list[tuple[str, subprocess.Popen]] = []
 
 
 def fail(message: str) -> None:
@@ -139,16 +157,48 @@ def say(message: str) -> None:
 
 
 def case(name: str) -> None:
-    CASES.append({"name": name, "result": "reached"})
+    mark(name, "reached")
     say(f"case {name}")
 
 
-def passed(name: str, **facts) -> None:
+def mark(name: str, result: str, **facts) -> None:
     for entry in CASES:
         if entry["name"] == name:
-            entry["result"] = "passed"
+            entry["result"] = result
             entry.update(facts)
+
+
+def passed(name: str, **_facts) -> None:
+    """Announce a case's own oracle results; the collector records the result."""
     say(f"case {name}: passed")
+
+
+def unexecuted(names: tuple[str, ...] | list[str]) -> None:
+    for name in names:
+        for entry in CASES:
+            if entry["name"] == name and entry["result"] == "unexecuted":
+                entry["result"] = "unexecuted"
+
+
+def child_faults() -> str | None:
+    """A child this process started and did not reap is unknown custody."""
+    if not CHILDREN:
+        return None
+    labels = ", ".join(label for label, _ in CHILDREN)
+    return f"a fixture child was not reaped: {labels}"
+
+
+def deadline_remaining() -> float | None:
+    """Seconds left before the supervisor's stop point, or `None` when the
+    supervisor exported no deadline. Never fails: it is a receipt field."""
+    value = os.environ.get("OXIDE_PROOF_DEADLINE_NS")
+    if not value:
+        return None
+    try:
+        left = (int(value) - time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)) / 1e9
+    except ValueError:
+        return None
+    return round(left, 1)
 
 
 def work_left() -> float:
@@ -267,10 +317,14 @@ def plan_document() -> dict:
             },
             {
                 "name": "concurrent-admission",
-                "oracle": "while a command deletes a held tree, another "
-                "project's command exits 0 and the two commands overlap for at "
-                f"least {CONCURRENT_OVERLAP_S}s (an in-lock deletion would "
-                "serialise them with zero overlap)",
+                "oracle": "a new-slot admission (observed by the pool's own "
+                "ledger row appearing) completes while the deleter is alive and "
+                "the held tree is provably still being deleted, and that "
+                "admission stays inside "
+                f"{INLOCK_CONTROL_FACTOR}x the same admission measured on a "
+                f"pressure-free pool plus {INLOCK_CONTROL_SLACK_S}s. An in-lock "
+                "deletion would delay it by the whole deletion and fail the "
+                "control; the control's own numbers are recorded.",
             },
             {
                 "name": "killed-deleter-takeover",
@@ -308,12 +362,17 @@ def plan_document() -> dict:
             "scratch_budget_mib": SCRATCH_BUDGET_MIB,
             "shutdown_margin_s": SHUTDOWN_MARGIN_S,
             "lock_ceiling_ms": LOCK_CEILING_MS,
-            "concurrent_overlap_s": CONCURRENT_OVERLAP_S,
+            "inlock_control_factor": INLOCK_CONTROL_FACTOR,
+            "inlock_control_slack_s": INLOCK_CONTROL_SLACK_S,
             "concurrent_custody_s": CONCURRENT_CUSTODY_S,
         },
         "observations": {
             "lock_held": "the product's debug-only OXIDE_TEST_HOLDING_LOCK_LOG "
-            "line per eviction, armed only inside the supervisor's scratch root",
+            "line per eviction, armed only inside the supervisor's scratch root. "
+            "The figure is the whole eviction transaction under the pool lock "
+            "(victim and rank checks, the identity-verified rename and the one "
+            "durable ledger write), timed from the start of that transaction, "
+            "not an inner fragment of it",
             "throughput": "entries/second and MiB/second of the outside-lock "
             "traversal, measured from the deleted figures and elapsed time",
             "legacy_reference": "the retired per-entry journaled path is not "
@@ -414,6 +473,11 @@ def tree_present(path: str) -> bool:
 
 
 def self_check() -> None:
+    """The script's own oracles, without staging, a child or a pool.
+
+    The only files it creates are inside one private `tempfile.mkdtemp`
+    directory, which it removes before it returns.
+    """
     expect(parse_arguments([]) == ("proof", None), "the bare invocation must run the proof")
     expect(parse_arguments(["--plan"]) == ("plan", None), "--plan must be effect-free")
     expect(parse_arguments(["--self-check"]) == ("self-check", None), "--self-check must parse")
@@ -431,8 +495,9 @@ def self_check() -> None:
     expect(plan["limits"]["shutdown_margin_s"] == 30, "the plan margin changed")
     expect(plan["limits"]["lock_ceiling_ms"] == 1000, "the plan lock ceiling changed")
     expect(
-        plan["limits"]["concurrent_overlap_s"] == 1.0,
-        "the concurrent overlap floor changed",
+        plan["limits"]["inlock_control_factor"] == 3.0
+        and plan["limits"]["inlock_control_slack_s"] == 2.0,
+        "the in-lock control bound changed",
     )
     expect(
         plan["limits"]["concurrent_custody_s"] == 0.5,
@@ -458,8 +523,17 @@ def self_check() -> None:
         sha256_file(os.path.abspath(__file__)) != "",
         "the script digest is unreadable",
     )
-    # The oracles on real fixture data.
-    scratch = private_dir(os.path.join(os.environ.get("TMPDIR", "/tmp"), "self-check"))
+    # The oracles on real fixture data, inside one private temporary directory
+    # created and removed by this process: nothing fixed, nothing left behind.
+    scratch = tempfile.mkdtemp(prefix="holding-delete-self-check.")
+    try:
+        self_check_oracles(scratch)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    print("self-check: ok (pure argument, plan, oracle and constant checks; not evidence)")
+
+
+def self_check_oracles(scratch: str) -> None:
     entries = os.path.join(scratch, "entries")
     write_entries(entries, 1000)
     expect(entry_count(entries) >= 1000, "the entry counter missed planted entries")
@@ -493,8 +567,6 @@ def self_check() -> None:
         readings == [{"slot": "7", "ms": 3}, {"slot": "x", "ms": 12}],
         f"the lock observation reader changed: {readings}",
     )
-    shutil.rmtree(scratch, ignore_errors=True)
-    print("self-check: ok (pure argument, plan, oracle and constant checks; not evidence)")
 
 
 # --------------------------------------------------------------------------
@@ -505,11 +577,25 @@ def stage_subject(root: str) -> str:
     """Stage this HEAD's debug `oxide` with plain Cargo, offline."""
     stage = os.path.join(root, "stage")
     log = os.path.join(root, "stage.log")
+    # A staging environment the caller's flags cannot steer: Cargo's encoded
+    # forms (`CARGO_ENCODED_RUSTFLAGS` especially) override the plain variables
+    # this script sets, so every encoded form is dropped along with the fixed
+    # flags themselves.
     env = {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith(("CARGO_TARGET_", "CARGO_BUILD_", "SCCACHE_", "OXIDE_", "XDG_"))
-        and key not in ("CARGO", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER")
+        if not key.startswith(
+            ("CARGO_TARGET_", "CARGO_BUILD_", "CARGO_ENCODED_", "SCCACHE_", "OXIDE_", "XDG_")
+        )
+        and key
+        not in (
+            "CARGO",
+            "RUSTC",
+            "RUSTFLAGS",
+            "RUSTDOCFLAGS",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+        )
     }
     env.update(
         {
@@ -626,15 +712,35 @@ def start_check(subject: str, workspace: str, env: dict, label: str) -> subproce
         stderr=subprocess.STDOUT,
         text=True,
     )
+    CHILDREN.append((label, handle))
     say(f"{label}: started (pid {handle.pid})")
     return handle
 
 
 def finish(handle: subprocess.Popen, label: str) -> tuple[int, str]:
     work_left()
-    output, _ = handle.communicate(timeout=work_left())
+    try:
+        output, _ = handle.communicate(timeout=work_left())
+    finally:
+        CHILDREN[:] = [entry for entry in CHILDREN if entry[1] is not handle]
     say(f"{label}: exit {handle.returncode}")
     return handle.returncode, output
+
+
+def discard(handle: subprocess.Popen, label: str) -> None:
+    """Wait for a child this process started; a stuck one is killed by PID.
+
+    Only PIDs this process started are ever signalled, and only after a bounded
+    wait, so an unknown custody outcome is recorded rather than leaked.
+    """
+    try:
+        handle.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        handle.kill()
+        handle.wait(timeout=30)
+    finally:
+        CHILDREN[:] = [entry for entry in CHILDREN if entry[1] is not handle]
+    say(f"{label}: discarded (exit {handle.returncode})")
 
 
 def wait_for_holding_row(pool: str, timeout: float = 20.0) -> dict | None:
@@ -778,13 +884,49 @@ def prove_refused_entry_kept(root: str, subject: str) -> dict:
     )
     expect(not holding_rows(pool), f"the row survived the takeover: {holding_rows(pool)}")
     expect(not tree_present(held), "the held tree survived the takeover")
-    passed(name, recorded_charge=row["bytes"], reported=True, takeover_deleted=True)
-    return {"recorded_charge": row["bytes"]}
+    held_facts = {
+        "recorded_charge": row["bytes"],
+        "reported_by_recorded_status": True,
+        "takeover_deleted": True,
+    }
+    passed(name, **held_facts)
+    return held_facts
+
+
+def measure_control_admission(root: str, subject: str) -> float:
+    """One comparable new-slot admission on its own pressure-free pool.
+
+    This is the falsifying control for the in-lock gate: the measured pool's
+    pressure is untouched by it, and an admission taken while a deletion holds
+    the pool lock would be delayed by that whole deletion, far outside the
+    bound this control establishes.
+    """
+    control = private_dir(os.path.join(root, "control"))
+    pool = os.path.join(control, "pool")
+    env = fixture_env(control, pool, os.path.join(control, "control-lock.log"), CONCURRENT_CAP)
+    first = create_project(control, "control-a")
+    code, output, _ = check(subject, first, env, "control-seed")
+    expect(code == 0, f"the control's seed admission exited {code}: {output[-2000:]}")
+    second = create_project(control, "control-b")
+    code, output, elapsed = check(subject, second, env, "control-admission")
+    expect(code == 0, f"the control admission exited {code}: {output[-2000:]}")
+    return elapsed
+
+
+def admission_row_appeared(pool: str, before: set[str]) -> bool:
+    """Whether a slot row the caller did not know about is now recorded."""
+    try:
+        rows = slot_rows(pool)
+    except (FileNotFoundError, ValueError):
+        return False
+    return any(str(row["id"]) not in before for row in rows)
 
 
 def prove_concurrent_admission(root: str, subject: str) -> dict:
     name = "concurrent-admission"
     case(name)
+    # The control first: the same kind of admission on a pool with no deletion.
+    control_elapsed = measure_control_admission(root, subject)
     # Two planted idle slots under a cap that one pending tree no longer
     # exhausts: the competitor must take the pool lock (its own eviction and
     # admission) while the first command is still deleting.
@@ -806,69 +948,84 @@ def prove_concurrent_admission(root: str, subject: str) -> dict:
     write_entries(planted_b, SLOT_ENTRIES, 0, CONCURRENT_ENTRY_BYTES)
     code, output, _ = check(subject, second, env, "record-concurrent-b")
     expect(code == 0, f"recording the second planted slot exited {code}: {output[-3000:]}")
-    victim = slot_path(pool, slot)
+    planted_total = entry_count(planted_b) + SLOT_ENTRIES
     deleter_workspace = create_project(root, "concurrent-deleter")
     competitor_workspace = create_project(root, "concurrent-competitor")
     deleter = start_check(subject, deleter_workspace, env, "deleter")
     row = wait_for_holding_row(pool)
     expect(row is not None, "the deleter never recorded a holding row")
-    # Let the deleter take custody and make progress first: the competitor then
-    # arrives while a deletion is genuinely in flight, and must not be held
-    # behind it.
+    held = os.path.join(pool, "payload", ".oxide-holding", row["name"])
+    # Let the deleter take custody and make measurable progress: from here the
+    # entry is provably mid-deletion and another command cannot claim it.
     time.sleep(CONCURRENT_CUSTODY_S)
     expect(
         deleter.poll() is None,
         "the deleter finished before the competitor started; the case is vacuous",
     )
-    competitor = start_check(subject, competitor_workspace, env, "competitor")
-    started = time.perf_counter()
-    competitor_end = None
-    deleter_end = None
-    while competitor_end is None or deleter_end is None:
-        work_left()
-        now = time.perf_counter()
-        if competitor_end is None and competitor.poll() is not None:
-            competitor_end = now
-        if deleter_end is None and deleter.poll() is not None:
-            deleter_end = now
-        if now - started > 120:
-            fail("the two concurrent commands did not finish inside their window")
-        if competitor_end is not None and deleter_end is not None:
-            break
-        time.sleep(0.01)
+    remaining_before = entry_count(held)
     expect(
-        competitor.poll() is not None and deleter.poll() is not None,
-        "a concurrent command did not report its exit",
+        0 < remaining_before < planted_total,
+        f"the deletion made no measurable progress before the control "
+        f"({remaining_before} of {planted_total} entries left)",
     )
-    overlap = min(competitor_end, deleter_end) - started
+    slots_before = {str(entry["id"]) for entry in slot_rows(pool)}
+    competitor = start_check(subject, competitor_workspace, env, "competitor")
+    admission_started = time.perf_counter()
+    admission_completed = None
+    while admission_completed is None:
+        work_left()
+        if admission_row_appeared(pool, slots_before):
+            admission_completed = time.perf_counter()
+            break
+        if competitor.poll() is not None:
+            fail("the competitor exited without admitting a slot")
+        if time.perf_counter() - admission_started > 120:
+            fail("the competitor's admission did not complete inside its window")
+        time.sleep(0.005)
+    # The oracle: this admission completed while the held tree was positively
+    # still being deleted, which an in-lock deletion could not allow.
+    deleter_alive = deleter.poll() is None
+    remaining_at_admission = entry_count(held) if tree_present(held) else 0
+    admission_elapsed = admission_completed - admission_started
+    expect(
+        deleter_alive,
+        "the deleting command had already exited when the competitor admitted",
+    )
+    expect(
+        remaining_at_admission > 0 and tree_present(held),
+        f"the held tree was already gone at the competitor's admission "
+        f"({remaining_at_admission} entries left)",
+    )
+    bound = max(
+        INLOCK_CONTROL_FACTOR * control_elapsed, control_elapsed + INLOCK_CONTROL_SLACK_S
+    )
+    expect(
+        admission_elapsed <= bound,
+        f"the admission took {admission_elapsed:.2f}s while a deletion was in "
+        f"progress; the in-lock control bound is {bound:.2f}s "
+        f"(control {control_elapsed:.2f}s)",
+    )
     code, output = finish(competitor, "competitor")
     expect(code == 0, f"the concurrent admission exited {code}: {output[-3000:]}")
     code, delet_output = finish(deleter, "deleter")
     expect(code == 0, f"the deleting command exited {code}: {delet_output[-3000:]}")
-    # Either command may win custody of the pending entry: the point is that one
-    # of them deleted it outside the lock while both were running.
-    deleted = deletion_figures(delet_output) + deletion_figures(output)
-    expect(
-        len(deleted) >= 1,
-        f"neither command reported a deletion: {delet_output[-1500:]}{output[-1500:]}",
-    )
-    expect(
-        overlap >= CONCURRENT_OVERLAP_S,
-        f"the two commands overlapped only {overlap:.2f}s; concurrency is unproven",
-    )
     expect(not holding_rows(pool), "a holding row survived the deleting command")
     expect(
-        not tree_present(victim),
+        not tree_present(slot_path(pool, slot)),
         "the evicted slot directory reappeared in the slots root",
     )
-    passed(
-        name,
-        pool_cap=CONCURRENT_CAP,
-        overlap_s=round(overlap, 2),
-        competitor_elapsed_s=round(competitor_end - started, 2),
-        deleter_elapsed_s=round(deleter_end - started, 2),
-    )
-    return {"overlap_s": round(overlap, 2)}
+    concurrent_facts = {
+        "pool_cap": CONCURRENT_CAP,
+        "control_admission_s": round(control_elapsed, 3),
+        "inlock_bound_s": round(bound, 3),
+        "admission_during_deletion_s": round(admission_elapsed, 3),
+        "remaining_before": remaining_before,
+        "remaining_at_admission": remaining_at_admission,
+        "deleter_alive_at_admission": deleter_alive,
+        "planted_entries": planted_total,
+    }
+    passed(name, **concurrent_facts)
+    return concurrent_facts
 
 
 def prove_killed_deleter_takeover(root: str, subject: str) -> dict:
@@ -901,8 +1058,13 @@ def prove_killed_deleter_takeover(root: str, subject: str) -> dict:
     )
     expect(not holding_rows(pool), f"the row survived the takeover: {holding_rows(pool)}")
     expect(not tree_present(held), "the held tree survived the takeover")
-    passed(name, killed_exit=deleter.returncode, tree_present_after_kill=present)
-    return {"tree_present_after_kill": present}
+    killed_facts = {
+        "killed_exit": deleter.returncode,
+        "tree_present_after_kill": present,
+        "next_command_finished_it": True,
+    }
+    passed(name, **killed_facts)
+    return killed_facts
 
 
 # --------------------------------------------------------------------------
@@ -937,7 +1099,18 @@ def run_proof(scratch: str, commit: str, tree: str, runner_sha: str, subject: st
 
 
 def run_cases() -> None:
-    global CASES
+    """Run the declared cases under the reported collection rules.
+
+    Counted mode is fail-fast: the first failed oracle ends the run. Diagnostic
+    mode is keep-going and keeps its own accounting — a recoverable oracle
+    failure is recorded, that case is marked `failed`, and the cases after it
+    that do not depend on it still run. Each case builds its own pool and
+    checkout, so no case depends on another's state. An unclassified outcome
+    (an unexpected exception, an unreaped child, an exhausted deadline) marks
+    the case and the rest `aborted`/`unexecuted` and stops: the receipt then
+    says exactly how far the run got, and a case that never ran is never a
+    pass.
+    """
     cases = [
         ("evict-under-lock", prove_evict_under_lock),
         ("refused-entry-kept", prove_refused_entry_kept),
@@ -948,21 +1121,31 @@ def run_cases() -> None:
     started = time.perf_counter()
     for index, (name, prove) in enumerate(cases):
         root = private_dir(
-            os.path.join(
-                os.environ["OXIDE_TASK_SCRATCH_ROOT"], "case", f"{index}-{name}"
-            )
+            os.path.join(os.environ["OXIDE_TASK_SCRATCH_ROOT"], "case", f"{index}-{name}")
         )
+        case(name)
         try:
-            facts[name] = prove(root, SUBJECT)
+            outcome = prove(root, SUBJECT)
+            custody = child_faults()
+            expect(custody is None, custody or "")
+            facts[name] = outcome if isinstance(outcome, dict) else {}
+            mark(name, "passed", **facts[name])
         except AssertionError as error:
             record_fault(name, str(error))
+            mark(name, "failed", error=str(error)[:400])
+            for label, handle in list(CHILDREN):
+                discard(handle, label)
             if not DIAGNOSTIC:
+                unexecuted([other for other, _ in cases[index + 1 :]])
                 raise
-            for entry in CASES:
-                if entry["name"] == name:
-                    entry["result"] = "failed"
-                    entry["error"] = str(error)[:400]
-            continue
+        except BaseException as error:  # noqa: BLE001 - unclassified outcome
+            fault = f"{name}: unclassified outcome {type(error).__name__}: {error}"
+            record_fault(name, fault)
+            mark(name, "aborted", error=fault[:400])
+            for label, handle in list(CHILDREN):
+                discard(handle, label)
+            unexecuted([other for other, _ in cases[index + 1 :]])
+            raise
     FACTS.update(facts)
     FACTS["elapsed_s"] = round(time.perf_counter() - started, 3)
 
@@ -1024,11 +1207,51 @@ def main(argv: list[str]) -> int:
     except subprocess.TimeoutExpired as error:
         fault = f"a fixture command exceeded the remaining work window: {error}"
         record_fault("proof", fault)
+    except BaseException as error:  # noqa: BLE001 - unclassified outcome
+        fault = f"unclassified outcome {type(error).__name__}: {error}"
+        record_fault("proof", fault)
+    finally:
+        for label, handle in list(CHILDREN):
+            discard(handle, label)
+    # Every case the run did not reach stays `unexecuted`, and a case that
+    # reached an unclassified outcome is `aborted`: neither is a pass.
+    if fault is not None:
+        for entry in CASES:
+            if entry["result"] == "reached":
+                entry["result"] = "aborted"
+    tally = {
+        result: sum(1 for entry in CASES if entry["result"] == result)
+        for result in ("passed", "failed", "aborted", "unexecuted", "reached")
+    }
+    evidence = os.environ.get("OXIDE_PROOF_EVIDENCE") or scratch
     receipt = {
         "task": "oxide#190",
         "selector": SELECTOR + (":diagnostic" if DIAGNOSTIC else ""),
         "qualified": bool(not DIAGNOSTIC and fault is None),
         "mode": "diagnostic" if DIAGNOSTIC else "counted",
+        "activation": "Uncounted diagnostic collection. The counted author "
+        "native and the independent reviewer native are owner-gated activations "
+        "and are not run by this mode; this receipt is never their evidence.",
+        "supervisor": {
+            "path": "scripts/bounded-test.py",
+            "sha256": runner_sha,
+            "role": "the qualified shared supervisor; its own receipt, the "
+            "caller's exit and the session closure stay separately "
+            "authoritative",
+        },
+        "provenance": {
+            "scratch_root": scratch,
+            "evidence_dir": evidence,
+            "branch": branch,
+            "worktree_clean_at_start": True,
+            "staging_env": "encoded Cargo forms dropped; RUSTFLAGS, RUSTDOCFLAGS, "
+            "RUSTC, RUSTC_WRAPPER and RUSTC_WORKSPACE_WRAPPER fixed; target and "
+            "build inside the monitored scratch and deleted after staging",
+            "fixture_env": "private HOME, CARGO_HOME, OXIDE_POOL, OXIDE_POOL_CAP, "
+            "TMPDIR/TMP/TEMP per fixture tree; the invoking RUSTUP_HOME passed "
+            "explicitly with RUSTUP_TOOLCHAIN pinned",
+        },
+        "case_tally": tally,
         "source_commit": commit,
         "source_tree": tree,
         "binary_sha256": sha256_file(SUBJECT) if SUBJECT and os.path.isfile(SUBJECT) else None,
@@ -1041,7 +1264,11 @@ def main(argv: list[str]) -> int:
         "cases": CASES,
         "facts": FACTS,
         "first_fault": fault or FIRST_FAULT,
+        "deadline_left_s": deadline_remaining(),
         "elapsed_s": round(time.perf_counter() - started, 3),
+        "lock_metric": "the whole eviction transaction under the pool lock "
+        "(victim and rank checks, identity-verified rename, one durable ledger "
+        "write), from the product's debug-only observation",
         "unmeasured": [
             "a real project's slot rate",
             "removable media",

@@ -1158,13 +1158,41 @@ pub(super) fn write_capture_record_injected(
     write_ledger(pool, &ledger)
 }
 
-/// Test-only: the holding entry name one idle generation derives from its own
-/// durable facts, so a test can model the crash between the rename and the row.
+/// Test-only: the holding entry name one generation derives from its own
+/// durable facts, read straight from the ledger so a test can model the crash
+/// between the rename and the row without opening (and therefore reconciling)
+/// the pool.
 #[cfg(test)]
 pub(super) fn holding_name_for_slot_injected(pool: &Path, slot_id: u64) -> Option<String> {
-    let opened = Pool::open(pool).ok()?;
-    let slot = opened.slot(slot_id)?;
-    opened.holding_name_for(slot.id, slot.incarnation, &slot.last_lease_id)
+    let ledger = read_ledger(pool).ok()?;
+    let slot = ledger.slots.iter().find(|slot| slot.id == slot_id)?;
+    derived_holding_name(
+        &ledger.store_id,
+        slot.id,
+        slot.incarnation,
+        &slot.last_lease_id,
+    )
+}
+
+/// Test-only: move one slot tree into the holding area with an explicit
+/// expected root identity, without reconciliation, so a test can prove the
+/// rename boundary refuses a replaced root. Writes nothing durable beyond the
+/// rename; the caller inspects the pool itself.
+#[cfg(test)]
+pub(super) fn hold_expecting_injected(
+    pool: &Path,
+    slot_id: u64,
+    expected: Option<(u64, u64)>,
+) -> Result<String, LeaseError> {
+    let mut opened = Pool::open_passive(pool, ACCOUNTING_MAX_ELAPSED_MS)?;
+    let slot = opened
+        .slot(slot_id)
+        .cloned()
+        .ok_or(LeaseError::UnknownAccounting)?;
+    let path = opened.slot_path_in(slot.id, slot.dir.as_deref())?;
+    opened
+        .hold_slot_tree(slot.id, &path, expected)
+        .map(|row| row.name)
 }
 
 #[cfg(test)]
@@ -1274,15 +1302,21 @@ impl Pool {
             reserve: None,
             holding_in_flight: 0,
         };
+        // Holding rows and the trees they name are reconciled first, in the
+        // same locked open: an entry a crash left before its row is adopted
+        // (including one interrupted between a legacy migration's rename and
+        // its row), and a row whose tree is positively gone is finished.
+        // Nothing here deletes. Running this before `reconcile_evicting` is
+        // what makes the migration window recoverable: the interrupted
+        // `Evicting` row is adopted here, so the legacy replay never meets a
+        // root that its own rename already moved.
         if trace_release {
+            crate::release_trace::phase("holding reconciliation", || pool.reconcile_holding())?;
             crate::release_trace::phase("pool reconciliation", || pool.reconcile_evicting())?;
         } else {
+            pool.reconcile_holding()?;
             pool.reconcile_evicting()?;
         }
-        // Holding rows and the trees they name are reconciled in the same
-        // locked open: an entry a crash left before its row is adopted, and a
-        // row whose tree is gone is finished. Nothing here deletes.
-        pool.reconcile_holding()?;
         Ok(pool)
     }
 
@@ -1603,7 +1637,7 @@ impl Pool {
         workspace: PathBuf,
         request: &LeaseRequest,
     ) -> Result<Leased, LeaseError> {
-        let slot_path =
+        let (slot_path, _identity) =
             self.validate_idle_slot_scope(idle, incarnation, &project, request.profile)?;
         // Compatible reuse needs this slot's own walk complete.
         let _unique = inventory_sizes(&slot_path).require_complete()?;
@@ -2988,6 +3022,15 @@ impl Pool {
         project: &Path,
         profile: Profile,
     ) -> Result<(), LeaseError> {
+        // Debug proof observation (oxide#190): this whole function runs while
+        // the pool lock is held, so its own elapsed time is the pool-lock-held
+        // part of one eviction — victim and rank checks, the identity-verified
+        // rename and the one durable write. It starts before the first check,
+        // so the figure a proof reads is the whole eviction transaction and not
+        // an inner fragment. Absent from release builds and armed only inside
+        // the supervisor's own scratch layout.
+        #[cfg(debug_assertions)]
+        let transaction = Instant::now();
         // One durable deletion journal at a time (oxide#177). An eviction is
         // the only path that starts a journal, and this check covers every
         // entry point, including the explicit `evict_idle_slot` that does not
@@ -3006,24 +3049,21 @@ impl Pool {
         // without deleting anything.
         self.ensure_capacity_policy()?;
         self.next_rank()?;
-        let path = self.validate_idle_slot_scope(id, incarnation, project, profile)?;
+        let (path, identity) = self.validate_idle_slot_scope(id, incarnation, project, profile)?;
         // The slot tree is Oxide's own private directory, so it needs no
         // per-entry journal: one rename moves it whole into the payload's
         // holding area on the same device, and one durable write records that
         // entry while dropping the slot row (oxide#190). The tree is deleted
         // outside this lock by the command that evicted it or by a later one.
-        let started = Instant::now();
-        let row = self.hold_slot_tree(id, &path)?;
+        // The identity this scope verified is carried into the rename, so a
+        // root replaced in between refuses instead of being held and deleted.
+        let row = self.hold_slot_tree(id, &path, Some(identity))?;
         self.holding_in_flight = self.holding_in_flight.saturating_add(row.bytes);
         self.ledger.slots.retain(|slot| slot.id != id);
         self.ledger.holding.push(row);
         self.persist_revised()?;
-        // Debug proof observation (oxide#190): the pool-lock-held part of one
-        // eviction, so a focused proof reports a measured figure instead of an
-        // inference. Absent from release builds and armed only inside the
-        // supervisor's own scratch layout.
         #[cfg(debug_assertions)]
-        record_eviction_lock_ms(&self.root, id, started.elapsed().as_millis());
+        record_eviction_lock_ms(&self.root, id, transaction.elapsed().as_millis());
         Ok(())
     }
 
@@ -3033,7 +3073,7 @@ impl Pool {
         incarnation: u64,
         project: &Path,
         profile: Profile,
-    ) -> Result<PathBuf, LeaseError> {
+    ) -> Result<(PathBuf, (u64, u64)), LeaseError> {
         let slot = self.slot(id).ok_or(LeaseError::UnknownAccounting)?;
         if slot.id != id
             || slot.incarnation != incarnation
@@ -3050,12 +3090,17 @@ impl Pool {
         let slots_root = canonical_existing_dir(&slots_root, true)?;
         require_slot_parent(&path, &slots_root)?;
         canonical_existing_dir(&path, true)?;
-        let slots_device = fs::symlink_metadata(&slots_root).map_err(io_error)?.dev();
-        let slot_device = fs::symlink_metadata(&path).map_err(io_error)?.dev();
-        if slots_device != slot_device {
+        let slots_root_metadata = fs::symlink_metadata(&slots_root).map_err(io_error)?;
+        let slot_metadata = fs::symlink_metadata(&path).map_err(io_error)?;
+        if slot_metadata.file_type().is_symlink()
+            || !slot_metadata.file_type().is_dir()
+            || slot_metadata.uid() != current_uid()
+            || slot_metadata.permissions().mode() & 0o077 != 0
+            || slots_root_metadata.dev() != slot_metadata.dev()
+        {
             return Err(LeaseError::UnknownAccounting);
         }
-        Ok(path)
+        Ok((path, (slot_metadata.dev(), slot_metadata.ino())))
     }
 
     fn reconcile_evicting(&mut self) -> Result<(), LeaseError> {
@@ -3107,7 +3152,14 @@ impl Pool {
             // path, so the pending deletion continues as a whole-tree move
             // into the holding area (oxide#190): no new per-entry journal is
             // started, and the tree is deleted outside the pool lock.
-            let held = self.hold_slot_tree(id, &path);
+            let expected = ready
+                .as_ref()
+                .and_then(|root| descriptor_identity(root.as_fd()).ok());
+            if ready.is_some() && expected.is_none() {
+                self.reconciliation_blocked = true;
+                continue;
+            }
+            let held = self.hold_slot_tree(id, &path, expected);
             drop(ready);
             let row = match held {
                 Ok(row) => row,
@@ -4329,7 +4381,7 @@ impl Pool {
         self.ledger
             .holding
             .iter()
-            .map(|row| holding_entry(row, Some(root.join(&row.name).symlink_metadata().is_ok())))
+            .map(|row| holding_entry(row, holding_presence(&root.join(&row.name))))
             .collect()
     }
 
@@ -4338,21 +4390,7 @@ impl Pool {
     /// ledger state, so a crash between the rename and the one durable write
     /// leaves an entry the next open can adopt without a second sync.
     fn holding_name_for(&self, id: u64, incarnation: u64, last_lease_id: &str) -> Option<String> {
-        let nonce: String = last_lease_id
-            .chars()
-            .map(|character| {
-                if character.is_ascii_alphanumeric() {
-                    character
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        let name = format!(
-            "{}-{id}-{incarnation}-{nonce}",
-            self.ledger.store_id.as_str()
-        );
-        holding_name_is_bounded(&name).then_some(name)
+        derived_holding_name(&self.ledger.store_id, id, incarnation, last_lease_id)
     }
 
     /// The private holding area's descriptor, created owner-only on first use.
@@ -4407,11 +4445,23 @@ impl Pool {
         Ok(Some(OwnedFd::from(held)))
     }
 
-    /// Move one verified idle slot tree whole into the holding area and return
-    /// its record. The caller writes the record and drops the slot row in one
-    /// durable write. Nothing here walks the tree: one rename, one identity
-    /// check.
-    fn hold_slot_tree(&mut self, id: u64, path: &Path) -> Result<HoldingRecord, LeaseError> {
+    /// Move one verified slot tree whole into the holding area and return its
+    /// record. The caller writes the record and drops the slot row in one
+    /// durable write. Nothing here walks the tree: one identity-verified rename.
+    ///
+    /// `expected` is the root identity the caller's own preflight verified (the
+    /// idle-scope check, or a legacy deletion's completeness preflight). The
+    /// root is opened by name without following a link, its descriptor identity
+    /// is compared against `expected` **before** the rename, and the moved
+    /// entry is compared against the same identity afterwards. A root replaced
+    /// in the window between the preflight and the rename therefore refuses:
+    /// nothing is held and nothing is later deleted.
+    fn hold_slot_tree(
+        &mut self,
+        id: u64,
+        path: &Path,
+        expected: Option<(u64, u64)>,
+    ) -> Result<HoldingRecord, LeaseError> {
         if self.ledger.holding.len() >= MAX_HOLDING_ENTRIES {
             return Err(LeaseError::UnknownAccounting);
         }
@@ -4435,23 +4485,6 @@ impl Pool {
         let slots_root = self.backing.payload_root().join(SLOTS_NAME);
         let slots_root = canonical_existing_dir(&slots_root, true)?;
         require_slot_parent(path, &slots_root)?;
-        let observed = fs::symlink_metadata(path).map_err(io_error)?;
-        if observed.file_type().is_symlink()
-            || !observed.file_type().is_dir()
-            || observed.uid() != current_uid()
-            || observed.permissions().mode() & 0o077 != 0
-        {
-            return Err(LeaseError::UnknownAccounting);
-        }
-        let holding = self
-            .open_holding_area(true)?
-            .ok_or(LeaseError::UnknownAccounting)?;
-        let holding_metadata = fs::symlink_metadata(self.holding_root()).map_err(io_error)?;
-        if holding_metadata.dev() != observed.dev() {
-            return Err(LeaseError::UnsafePath(
-                "the holding area is not on the slot's own device",
-            ));
-        }
         let parent_path = path.parent().ok_or(LeaseError::UnknownAccounting)?;
         let parent = open_verified_directory(parent_path)?;
         let source = std::ffi::CString::new(
@@ -4460,6 +4493,32 @@ impl Pool {
                 .as_bytes(),
         )
         .map_err(|_| LeaseError::UnknownAccounting)?;
+        let tree =
+            crate::owned_delete::open_directory_at(parent.as_fd(), &source).map_err(io_error)?;
+        let identity = descriptor_identity(tree.as_fd()).map_err(io_error)?;
+        let observed =
+            crate::owned_delete::observe_entry(parent.as_fd(), &source).map_err(io_error)?;
+        if !observed.is_directory()
+            || observed.uid != current_uid()
+            || observed.mode_bits() & 0o077 != 0
+            || (observed.device, observed.inode) != identity
+        {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        if expected.is_some_and(|expected| expected != identity) {
+            return Err(LeaseError::UnsafePath(
+                "the verified slot root was replaced before it was moved",
+            ));
+        }
+        let holding = self
+            .open_holding_area(true)?
+            .ok_or(LeaseError::UnknownAccounting)?;
+        let holding_metadata = fs::symlink_metadata(self.holding_root()).map_err(io_error)?;
+        if holding_metadata.dev() != identity.0 {
+            return Err(LeaseError::UnsafePath(
+                "the holding area is not on the slot's own device",
+            ));
+        }
         let target =
             std::ffi::CString::new(name.as_bytes()).map_err(|_| LeaseError::UnknownAccounting)?;
         // Nothing may exist under the derived name: a leftover from an earlier
@@ -4483,9 +4542,12 @@ impl Pool {
         if renamed != 0 {
             return Err(io_error(std::io::Error::last_os_error()));
         }
+        // The moved entry must be the very object whose descriptor was
+        // verified: a swap in the rename window is detected here and is never
+        // recorded as a held tree.
         let moved =
             crate::owned_delete::observe_entry(holding.as_fd(), &target).map_err(io_error)?;
-        if moved.device != observed.dev() || moved.inode != observed.ino() {
+        if (moved.device, moved.inode) != identity {
             return Err(LeaseError::UnsafePath(
                 "the held tree is not the slot that was verified",
             ));
@@ -4494,47 +4556,68 @@ impl Pool {
             name,
             slot: id,
             incarnation,
-            device: observed.dev(),
-            inode: observed.ino(),
+            device: identity.0,
+            inode: identity.1,
             bytes,
             at_ms: now_ms(),
         })
     }
 
-    /// Adopt holding entries a crash left before their row was durable, and
-    /// finish a recorded row whose tree is already gone. Never deletes
-    /// anything: an unrecorded entry is kept and charged by the payload walk.
+    /// Adopt a holding entry a crash left before its row was durable, and
+    /// finish a recorded row whose tree is positively gone.
+    ///
+    /// Two interruptions land here. The idle-eviction rename writes its row in
+    /// the following durable replacement, and a **legacy** deletion migrated by
+    /// `reconcile_evicting` renames the resolved root and then writes the row:
+    /// in both windows the slot row (idle or `Evicting`) is still recorded, its
+    /// root is gone, and the tree sits under the name that generation derives
+    /// from its own durable facts. Adoption is therefore not limited to idle
+    /// rows: a legacy `Evicting` row interrupted after its migration rename is
+    /// adopted exactly as an idle one, so the window is recoverable in one
+    /// write instead of staying pending forever. A tree that is still at its
+    /// recorded root never adopts anything.
+    ///
+    /// Only a positively classified `NotFound` means a recorded entry is gone.
+    /// Any other `lstat` error (`EACCES`, `EIO`, an over-bound name) is unknown,
+    /// not absence: the row and its charge are kept, so a tree that is still
+    /// there is never reported as deleted and never stops being accounted.
     fn reconcile_holding(&mut self) -> Result<(), LeaseError> {
-        let Some(_holding) = self.open_holding_area(false)? else {
+        let Some(holding) = self.open_holding_area(false)? else {
             return Ok(());
         };
         let root = self.holding_root();
         let mut changed = false;
-        // A recorded row whose entry is gone is finished: the tree was deleted
-        // before the row could be dropped.
-        let gone: Vec<String> = self
-            .ledger
-            .holding
-            .iter()
-            .filter(|row| root.join(&row.name).symlink_metadata().is_err())
-            .map(|row| row.name.clone())
-            .collect();
+        let mut gone: Vec<String> = Vec::new();
+        for row in &self.ledger.holding {
+            match holding_presence(&root.join(&row.name)) {
+                Some(true) | None => {}
+                Some(false) => gone.push(row.name.clone()),
+            }
+        }
         if !gone.is_empty() {
             self.ledger.holding.retain(|row| !gone.contains(&row.name));
             changed = true;
         }
-        // A crash between the rename and the row leaves the slot row in place
-        // with its root gone and the tree under the name this generation
-        // derives. Adopt exactly that: same store, slot and incarnation, and
-        // the generation's own recorded lease ID.
+        // The generation's own derived name, its recorded bytes and the entry's
+        // real identity are what an adoption records. Anything else (a
+        // stranger, a non-directory, a foreign owner, a group-writable entry)
+        // is left untouched and stays counted by the payload walk.
         let mut adopted: Vec<(u64, HoldingRecord)> = Vec::new();
         for slot in &self.ledger.slots {
-            if slot.state == SlotPersistState::Evicting {
+            // Only the two windows that rename a tree exist: an idle slot's
+            // eviction and a legacy pending deletion's migration. A held row's
+            // tree is this command's live build directory; it is never moved
+            // into the holding area, so a name that happens to match its
+            // generation must not be adopted as one.
+            if slot.state == SlotPersistState::Held {
                 continue;
             }
             let path = self.slot_path_in(slot.id, slot.dir.as_deref())?;
-            if path.symlink_metadata().is_ok() {
-                continue;
+            match holding_presence(&path) {
+                // The root is still there: nothing was renamed for this
+                // generation, so there is nothing to adopt.
+                Some(true) | None => continue,
+                Some(false) => {}
             }
             let Some(name) = self.holding_name_for(slot.id, slot.incarnation, &slot.last_lease_id)
             else {
@@ -4543,17 +4626,16 @@ impl Pool {
             if self.ledger.holding.iter().any(|row| row.name == name) {
                 continue;
             }
-            let entry = root.join(&name);
-            let Ok(observed) = crate::owned_delete::observe_entry(
-                _holding.as_fd(),
-                &std::ffi::CString::new(name.as_bytes())
-                    .map_err(|_| LeaseError::UnknownAccounting)?,
-            ) else {
+            let Ok(target) = std::ffi::CString::new(name.as_bytes()) else {
+                continue;
+            };
+            let Ok(observed) = crate::owned_delete::observe_entry(holding.as_fd(), &target) else {
                 continue;
             };
             if !observed.is_directory()
                 || observed.uid != current_uid()
                 || observed.mode_bits() & 0o077 != 0
+                || observed.device != self.holding_device()
             {
                 continue;
             }
@@ -4566,7 +4648,6 @@ impl Pool {
                     |record| record.unique_bytes,
                 )
                 .max(UNMEASURED_MIN_CHARGE_BYTES);
-            let _ = entry;
             adopted.push((
                 slot.id,
                 HoldingRecord {
@@ -4582,6 +4663,8 @@ impl Pool {
         }
         for (id, row) in adopted {
             self.ledger.slots.retain(|slot| slot.id != id);
+            // A record adopted after an interrupted legacy migration no longer
+            // names any per-entry journal: the tree is deleted whole.
             self.ledger.holding.push(row);
             changed = true;
         }
@@ -4589,6 +4672,52 @@ impl Pool {
             self.persist_revised()?;
         }
         Ok(())
+    }
+
+    /// The payload's holding area device, or 0 when it cannot be read. An
+    /// adoption refuses an entry on another device; the holding area is on the
+    /// payload's own device by construction, so this only ever narrows.
+    fn holding_device(&self) -> u64 {
+        fs::symlink_metadata(self.holding_root())
+            .map(|metadata| metadata.dev())
+            .unwrap_or(0)
+    }
+}
+
+/// The holding entry name one generation derives from its own durable ledger
+/// facts: store, slot, incarnation and the generation's lease ID. One function
+/// so the writer, the recovery adoption and the tests cannot drift.
+fn derived_holding_name(
+    store_id: &str,
+    id: u64,
+    incarnation: u64,
+    last_lease_id: &str,
+) -> Option<String> {
+    let nonce: String = last_lease_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let name = format!("{store_id}-{id}-{incarnation}-{nonce}");
+    holding_name_is_bounded(&name).then_some(name)
+}
+
+/// Whether one path is positively present. `Some(true)` is an observed entry,
+/// `Some(false)` is a positively classified `NotFound`, and `None` is a
+/// failure that says nothing about absence — an unreadable parent, an I/O
+/// error or an over-bound name. Only `Some(false)` may conclude that a tree is
+/// gone.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn holding_presence(path: &Path) -> Option<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Some(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
     }
 }
 
@@ -4840,14 +4969,26 @@ fn delete_holding_children(
     }
 }
 
+/// What one claim attempt produced.
+enum ClaimOutcome {
+    /// This pass has custody of the entry and must delete it.
+    Claimed(Box<HoldingClaim>),
+    /// Nothing to do: no entry, or every candidate is another deleter's.
+    Idle,
+    /// A recorded entry could not even be opened for a reason other than
+    /// `NotFound`. It stays in the holding area, stays charged and is reported;
+    /// this pass deletes nothing else, exactly as for a refused item.
+    Unreadable { name: String, reason: String },
+}
+
 /// Claim at most one recorded holding entry under a brief pool lock, taking a
 /// non-blocking custody lock on the entry's own descriptor. The lock is held
 /// for the whole deletion, so a second command skips an entry another process
 /// is already deleting instead of interleaving with it.
-fn claim_holding(pool: &Path, prefer: Option<&str>) -> Result<Option<HoldingClaim>, LeaseError> {
+fn claim_holding(pool: &Path, prefer: Option<&str>) -> Result<ClaimOutcome, LeaseError> {
     let opened = Pool::open(pool)?;
     let Some(area) = opened.open_holding_area(false)? else {
-        return Ok(None);
+        return Ok(ClaimOutcome::Idle);
     };
     // The pass's own entry first, then a rotating start. The rotation uses the
     // pool's own monotonic idle-rank sequence, which every grant and release
@@ -4874,18 +5015,40 @@ fn claim_holding(pool: &Path, prefer: Option<&str>) -> Result<Option<HoldingClai
         start = start.min(order.len() - 1);
     }
     order.rotate_left(start);
-    let Some((record, tree)) = order.into_iter().find_map(|index| {
-        let record = opened.ledger.holding.get(index)?.clone();
-        let target = std::ffi::CString::new(record.name.as_bytes()).ok()?;
-        let tree = crate::owned_delete::open_directory_at(area.as_fd(), &target).ok()?;
+    let mut claimed = None;
+    let mut unreadable = None;
+    for index in order {
+        let Some(record) = opened.ledger.holding.get(index).cloned() else {
+            continue;
+        };
+        let Ok(target) = std::ffi::CString::new(record.name.as_bytes()) else {
+            continue;
+        };
+        let tree = match crate::owned_delete::open_directory_at(area.as_fd(), &target) {
+            Ok(tree) => tree,
+            // A positively classified miss is a row a later reconciliation
+            // finishes; anything else is unknown, so the entry stays charged.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                if unreadable.is_none() {
+                    unreadable = Some((record.name, format!("unreadable entry ({error})")));
+                }
+                continue;
+            }
+        };
         // SAFETY: `tree` is a live descriptor for the duration of the deletion.
         if unsafe { libc::flock(tree.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             // Another command holds custody of this entry right now.
-            return None;
+            continue;
         }
-        Some((record, tree))
-    }) else {
-        return Ok(None);
+        claimed = Some((record, tree));
+        break;
+    }
+    let Some((record, tree)) = claimed else {
+        return Ok(match unreadable {
+            Some((name, reason)) => ClaimOutcome::Unreadable { name, reason },
+            None => ClaimOutcome::Idle,
+        });
     };
     let target = std::ffi::CString::new(record.name.as_bytes())
         .map_err(|_| LeaseError::UnknownAccounting)?;
@@ -4896,7 +5059,7 @@ fn claim_holding(pool: &Path, prefer: Option<&str>) -> Result<Option<HoldingClai
         && facts.mode_bits() & 0o077 == 0
         && facts.device == record.device
         && facts.is_directory();
-    Ok(Some(HoldingClaim {
+    Ok(ClaimOutcome::Claimed(Box::new(HoldingClaim {
         name: record.name,
         slot: record.slot,
         tree,
@@ -4904,7 +5067,7 @@ fn claim_holding(pool: &Path, prefer: Option<&str>) -> Result<Option<HoldingClai
         identity,
         trusted,
         recorded_bytes: record.bytes,
-    }))
+    })))
 }
 
 /// Delete one claimed holding tree outside the pool lock, then drop its record
@@ -4972,10 +5135,15 @@ fn drain_claimed(pool: &Path, claim: &HoldingClaim) -> Result<HoldingDrain, Leas
 /// release are never held behind a deletion. `prefer` names the entry this
 /// command just created, so its own eviction is what it finishes.
 pub(super) fn drain_holding(pool: &Path, prefer: Option<&str>) -> Result<HoldingDrain, LeaseError> {
-    let Some(claim) = claim_holding(pool, prefer)? else {
-        return Ok(HoldingDrain::nothing());
-    };
-    drain_claimed(pool, &claim)
+    match claim_holding(pool, prefer)? {
+        ClaimOutcome::Claimed(claim) => drain_claimed(pool, &claim),
+        ClaimOutcome::Idle => Ok(HoldingDrain::nothing()),
+        ClaimOutcome::Unreadable { name, reason } => Ok(HoldingDrain {
+            claimed: Some(name),
+            refused: vec![reason],
+            ..HoldingDrain::default()
+        }),
+    }
 }
 
 fn occupancy(state: SlotPersistState) -> SlotOccupancy {
