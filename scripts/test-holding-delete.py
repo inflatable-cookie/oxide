@@ -82,6 +82,14 @@ SLOT_BYTES = 20 * MIB
 PENDING_ENTRIES = 4000
 PENDING_ENTRY_BYTES = 1024
 PENDING_CAP = "20MiB"
+# Each 1 KiB entry occupies one filesystem block, so one recorded tree is about
+# `PENDING_ENTRIES * 4096` bytes (~15.6 MiB). TWO such idle trees exceed
+# `PENDING_CAP` (20 MiB) so the eviction admission must retire exactly one of
+# them, while that retried row's own charge still fits under the cap, so a later
+# warm-reuse admission needs no capacity decision and can proceed beside the
+# deletion. Both halves are asserted in the pure self-check.
+PENDING_BLOCK_BYTES = 4096
+PENDING_TREES = 2
 STAGE_JOBS = 1
 FIXTURE_JOBS = 1
 LOCK_CEILING_MS = 1000
@@ -358,13 +366,17 @@ def plan_document() -> dict:
             },
             {
                 "name": "concurrent-admission",
-                "oracle": "two entry-count samples of the held tree taken while "
-                "only the deleter runs strictly decrease (measured progress under "
-                "its non-blocking custody), then a new-slot admission (observed by "
-                "the pool's own ledger row appearing) completes with the deleter "
-                "still alive and that tree still non-empty, and that admission "
-                "stays inside "
-                f"{INLOCK_CONTROL_FACTOR}x the same admission measured on a "
+                "oracle": "two recorded idle trees exceed the pool cap while one "
+                "of them alone fits under it, so the eviction admission must "
+                "retire the older tree, refuse while its row is charged, and "
+                "delete that row in its own outside-the-lock pass; two "
+                "entry-count samples of that held tree taken while only the "
+                "evicting command runs strictly decrease (measured progress under "
+                "its non-blocking custody), then the competitor's own warm reuse "
+                "of its separate idle slot (observed by that slot's ledger row "
+                "becoming held) completes with the evicting command still alive "
+                "and the held tree still non-empty, and stays inside "
+                f"{INLOCK_CONTROL_FACTOR}x the same reuse measured on a "
                 f"pressure-free pool plus {INLOCK_CONTROL_SLACK_S}s. An in-lock "
                 "deletion would delay it by the whole deletion and fail the "
                 "control; the control's own numbers are recorded.",
@@ -380,18 +392,19 @@ def plan_document() -> dict:
              "Cargo offline, target/build inside scratch, target deleted"},
             {"name": "evict", "allocation": f"one fixture root, one {SLOT_ENTRIES}-entry tree"},
             {"name": "refused", "allocation": "one fixture root, one small tree plus a FIFO"},
-            {"name": "concurrent", "allocation": "one fixture root, one "
-             f"{PENDING_ENTRIES}-entry tree of {PENDING_ENTRY_BYTES} bytes per "
-             f"entry under a {PENDING_CAP} cap"},
+            {"name": "concurrent", "allocation": "one fixture root, two "
+             f"{PENDING_ENTRIES}-entry trees of {PENDING_ENTRY_BYTES} bytes per "
+             f"entry under a {PENDING_CAP} cap (total over the cap, each under "
+             "it)"},
             {"name": "takeover", "allocation": f"one fixture root, one {SLOT_ENTRIES}-entry tree"},
         ],
         "disk": {
             "monitored_scratch_mib": SCRATCH_BUDGET_MIB,
             "fixture_roots": 4,
             "per_fixture": f"{SLOT_ENTRIES} planted entries with one "
-            f"{SLOT_BYTES // MIB} MiB entry, or {PENDING_ENTRIES} entries of "
-            f"{PENDING_ENTRY_BYTES} bytes for the pending-tree cases, plus tiny "
-            "std-only crate intermediates",
+            f"{SLOT_BYTES // MIB} MiB entry, or two {PENDING_ENTRIES}-entry trees "
+            f"of {PENDING_ENTRY_BYTES} bytes for the eviction/competitor cases, "
+            "plus tiny std-only crate intermediates",
             "staged_target": "deleted before any fixture",
         },
         "concurrency": {
@@ -414,6 +427,10 @@ def plan_document() -> dict:
             "concurrent_custody_s": CONCURRENT_CUSTODY_S,
             "progress_interval_s": PROGRESS_INTERVAL_S,
         },
+        "pending_row_premise": "two recorded trees exceed the cap (an eviction "
+        "is forced) while one recorded tree fits under it (its charged row "
+        "leaves room for the competitor's warm reuse); both halves are asserted "
+        "in the pure self-check",
         "observations": {
             "lock_held": "the product's debug-only OXIDE_TEST_HOLDING_LOCK_LOG "
             "line per eviction, armed only inside the supervisor's scratch root. "
@@ -753,10 +770,50 @@ def self_check_oracles(scratch: str) -> None:
     # The control admission really resolves the concurrency fixture's cap (its
     # globals are looked up by name at call time, so the code names are the
     # authority here), and no retired concurrency constant survives.
-    control_names = set(measure_control_admission.__code__.co_names)
+    control_names = set(measure_reuse_admission.__code__.co_names)
     expect(
-        "PENDING_CAP" in control_names,
-        f"the control admission does not use the concurrency cap: {sorted(control_names)}",
+        "check" in control_names,
+        f"the control admission does not run a fixture command: {sorted(control_names)}",
+    )
+    # The fixture's arithmetic premise, which the failed run got wrong: two
+    # recorded trees must exceed the cap (so one eviction is forced) while a
+    # single recorded tree stays under it (so its charged row still leaves room
+    # for the competitor's warm reuse).
+    one_tree = PENDING_ENTRIES * PENDING_BLOCK_BYTES + PENDING_ENTRY_BYTES
+    expect(
+        one_tree * PENDING_TREES > parse_size(PENDING_CAP),
+        f"the fixture never forces eviction: {one_tree} x {PENDING_TREES} <= {PENDING_CAP}",
+    )
+    expect(
+        one_tree < parse_size(PENDING_CAP),
+        f"the pending row would not fit under the cap: {one_tree} >= {PENDING_CAP}",
+    )
+    expect(
+        parse_size("20MiB") == 20 * 1024 * 1024,
+        "the size parser changed",
+    )
+    # Both cases must use the deterministic eviction fixture and must observe
+    # the product's own row before acting on it; the concurrency case must
+    # observe the competitor's admission in the pool's own ledger rather than
+    # assuming it. Looked up through the functions' own code names, because a
+    # source substring could match this check itself.
+    for fn in (prove_concurrent_admission, prove_killed_deleter_takeover):
+        names = set(fn.__code__.co_names)
+        expect(
+            "seed_eviction_fixture" in names,
+            f"{fn.__name__} does not use the deterministic eviction fixture",
+        )
+        expect(
+            "start_eviction" in names,
+            f"{fn.__name__} does not start the observed eviction",
+        )
+    expect(
+        "wait_for_holding_row" in set(start_eviction.__code__.co_names),
+        "the eviction starter does not positively observe the published row",
+    )
+    expect(
+        "slot_state" in set(prove_concurrent_admission.__code__.co_names),
+        "the concurrency case does not observe the competitor's admission in the ledger",
     )
     retired = "CONCURRENT" + "_CAP"
     expect(retired not in source, "a retired concurrency constant is still referenced")
@@ -1158,147 +1215,222 @@ def prove_refused_entry_kept(root: str, subject: str) -> dict:
     return held_facts
 
 
-def measure_control_admission(root: str, subject: str) -> float:
-    """One comparable new-slot admission on its own pressure-free pool.
+def parse_size(text: str) -> int:
+    """A size the fixture passes to `OXIDE_POOL_CAP` (`20MiB`, `512KiB`, `3G`)."""
+    units = {"": 1, "B": 1, "K": 1024, "KB": 1024, "KIB": 1024}
+    units.update({"M": 1024**2, "MB": 1024**2, "MIB": 1024**2})
+    units.update({"G": 1024**3, "GB": 1024**3, "GIB": 1024**3})
+    body = text.strip()
+    digits = ""
+    while body and (body[0].isdigit() or body[0] == "."):
+        digits += body[0]
+        body = body[1:]
+    expect(bool(digits), f"not a size: {text}")
+    expect(body.upper() in units, f"unknown size unit: {text}")
+    return int(float(digits) * units[body.upper()])
 
-    This is the falsifying control for the in-lock gate: the measured pool's
-    pressure is untouched by it, and an admission taken while a deletion holds
-    the pool lock would be delayed by that whole deletion, far outside the
-    bound this control establishes.
+
+def seed_recorded_tree(
+    root: str,
+    subject: str,
+    label: str,
+    workspace: str,
+    env: dict,
+) -> tuple[dict, str]:
+    """One idle whole slot with `PENDING_ENTRIES` recorded entries.
+
+    The recording walk runs on the release, after the payload is planted, so the
+    closed observation the eviction charges is the planted figure.
     """
-    control = private_dir(os.path.join(root, "control"))
-    pool = os.path.join(control, "pool")
-    env = fixture_env(control, pool, os.path.join(control, "control-lock.log"), PENDING_CAP)
-    first = create_project(control, "control-a")
-    code, output, _ = check(subject, first, env, "control-seed")
-    expect(code == 0, f"the control's seed admission exited {code}: {output[-2000:]}")
-    second = create_project(control, "control-b")
-    code, output, elapsed = check(subject, second, env, "control-admission")
+    pool = os.path.join(root, "pool")
+    code, output, _ = check(subject, workspace, env, f"seed-{label}")
+    expect(code == 0, f"seeding {label} exited {code}: {output[-2000:]}")
+    mine = [row for row in slot_rows(pool) if row["workspace"] == workspace]
+    expect(len(mine) == 1, f"expected one slot for {label}, found {mine}")
+    planted = os.path.join(slot_path(pool, mine[0]), "build", "planted")
+    write_entries(planted, PENDING_ENTRIES, 0, PENDING_ENTRY_BYTES)
+    code, output, _ = check(subject, workspace, env, f"record-{label}")
+    expect(code == 0, f"recording {label} exited {code}: {output[-2000:]}")
+    mine = [row for row in slot_rows(pool) if row["workspace"] == workspace]
+    expect(len(mine) == 1, f"expected one recorded slot for {label}, found {mine}")
+    slot = mine[0]
+    expect(
+        slot["state"] == "idle" and not slot.get("lease_id"),
+        f"the recorded slot is not idle: {json.dumps(slot)[:300]}",
+    )
+    expect("recorded" in slot, f"the slot recorded no observation: {slot}")
+    return slot, planted
+
+
+def seed_eviction_fixture(
+    root: str, subject: str, label: str
+) -> tuple[str, dict, dict, dict, str, str]:
+    """Two recorded idle trees whose total exceeds the cap.
+
+    `victim` is the older idle slot (the rank-LRU eviction target) and `reusable`
+    is the newer one, owned by its own project so a later warm reuse needs no
+    capacity decision at all.
+    """
+    pool = os.path.join(root, "pool")
+    env = fixture_env(root, pool, os.path.join(root, "eviction-lock.log"), PENDING_CAP)
+    victim_workspace = create_project(root, f"{label}-victim")
+    victim, _planted = seed_recorded_tree(
+        root, subject, f"{label}-victim", victim_workspace, env
+    )
+    reusable_workspace = create_project(root, "competitor")
+    reusable, _ = seed_recorded_tree(
+        root, subject, f"{label}-reusable", reusable_workspace, env
+    )
+    expect(
+        victim["id"] != reusable["id"],
+        "the fixture seeded one slot instead of two",
+    )
+    expect(
+        int(victim["rank"]) < int(reusable["rank"]),
+        f"the reusable slot is not newer than the victim: {victim} {reusable}",
+    )
+    return pool, env, victim, reusable, victim_workspace, reusable_workspace
+
+
+def start_eviction(
+    root: str,
+    subject: str,
+    pool: str,
+    env: dict,
+    victim: dict,
+    label: str,
+) -> tuple[subprocess.Popen, dict, str]:
+    """Start the admission that must evict `victim`, and observe its row.
+
+    The admission's *own* publish pass starts as soon as the refusal is decided,
+    so the row exists for the whole deletion and is observed positively here
+    rather than raced for.
+    """
+    workspace = create_project(root, f"{label}-evictor")
+    evictor = start_check(subject, workspace, env, f"{label}-evictor")
+    row = wait_for_holding_row(pool)
+    expect(row is not None, "the evicting command never recorded a holding row")
+    expect(
+        row["slot"] == victim["id"],
+        f"the fixture's oldest idle tree was not the victim: {row} vs {victim}",
+    )
+    held = os.path.join(pool, "payload", ".oxide-holding", row["name"])
+    expect(tree_present(held), f"the held tree is missing: {held}")
+    expect(row["bytes"] > 0, f"the held row carries no charge: {row}")
+    return evictor, row, held
+
+
+def measure_reuse_admission(
+    subject: str,
+    workspace: str,
+    env: dict,
+    label: str,
+) -> float:
+    """One warm-reuse admission of the competitor, on its own idle slot.
+
+    This is the falsifying control for the in-lock gate: the same admission shape
+    is measured while no deletion runs, and again beside a live deletion. A reuse
+    needs no capacity decision, so it is measurable even while a charged holding
+    row sits above the pool's byte figure — which is exactly the side-by-side the
+    gate needs. An in-lock deletion would delay it by the whole deletion.
+    """
+    code, output, elapsed = check(subject, workspace, env, label)
     expect(code == 0, f"the control admission exited {code}: {output[-2000:]}")
     return elapsed
 
 
-def admission_row_appeared(pool: str, before: set[str]) -> bool:
-    """Whether a slot row the caller did not know about is now recorded."""
+def slot_state(pool: str, slot_id: str) -> str | None:
+    """One recorded slot's state, read from the pool's own ledger."""
     try:
         rows = slot_rows(pool)
     except (FileNotFoundError, ValueError):
-        return False
-    return any(str(row["id"]) not in before for row in rows)
-
-
-def abandon_pending_tree(
-    root: str,
-    subject: str,
-    label: str,
-) -> tuple[str, dict, dict, str, int]:
-    """Leave one recorded holding row whose tree nobody is deleting.
-
-    A byte-pressure admission now keeps every evicted tree charged, refuses in
-    that attempt, deletes one pending tree outside the lock and retries. This
-    helper seeds the tree, starts that admission, waits until its deletion is
-    measurably in progress under its custody and then kills that command: the row
-    and the partly deleted tree survive, which is the state a later command
-    resumes.
-    """
-    pool, env, _slot, _facts = seed_big_slot(
-        root,
-        subject,
-        label,
-        PENDING_ENTRIES,
-        cap=PENDING_CAP,
-        big_bytes=0,
-        entry_bytes=PENDING_ENTRY_BYTES,
-    )
-    evictor_workspace = create_project(root, f"{label}-evictor")
-    evictor = start_check(subject, evictor_workspace, env, f"{label}-evictor")
-    row = wait_for_holding_row(pool)
-    expect(row is not None, "the evicting command never recorded a holding row")
-    held = os.path.join(pool, "payload", ".oxide-holding", row["name"])
-    # Wait for the deletion to be measurably in progress, so the kill lands
-    # inside it rather than before it.
-    deadline = time.perf_counter() + 30
-    first = entry_count(held)
-    while time.perf_counter() < deadline:
-        work_left()
-        time.sleep(0.02)
-        now = entry_count(held) if tree_present(held) else 0
-        if 0 < now < first:
-            break
-        first = max(now, 1)
-    else:
-        fail("the evicting command's deletion never made progress")
-    evictor.kill()
-    reaped = discard(evictor, f"{label}-evictor")
-    expect(reaped, "the killed evicting command could not be confirmed reaped")
-    say(f"killed the evicting command for {label} (exit {evictor.returncode})")
-    rows = holding_rows(pool)
-    expect(len(rows) == 1, f"the killed command left no recorded row: {rows}")
-    expect(rows[0]["name"] == row["name"], "the recorded row changed")
-    expect(rows[0]["bytes"] > 0, "the surviving row carries no charge")
-    expect(tree_present(held), "the held tree is gone")
-    return pool, env, row, held, entry_count(held)
+        return None
+    for row in rows:
+        if str(row["id"]) == str(slot_id):
+            return row.get("state")
+    return None
 
 
 def prove_concurrent_admission(root: str, subject: str) -> dict:
     name = "concurrent-admission"
     case(name)
-    # The control first: the same kind of admission on a pool with no deletion.
-    control_elapsed = measure_control_admission(root, subject)
-    # A pending tree left by a killed command: a fresh command's own pass
-    # resumes it outside the pool lock, and a competitor's admission must
-    # complete while that deletion is still in progress.
-    pool, env, _row, held, remaining_start = abandon_pending_tree(
+    pool, env, victim, reusable, _victim_ws, competitor_ws = seed_eviction_fixture(
         root, subject, "concurrent"
     )
-    expect(remaining_start > 0, "the abandoned tree was already empty")
-    deleter_workspace = create_project(root, "concurrent-deleter")
-    competitor_workspace = create_project(root, "concurrent-competitor")
-    deleter = start_check(subject, deleter_workspace, env, "deleter")
-    # Two samples while only the deleter runs: measured progress under its own
-    # non-blocking custody, which no other pass can claim while it holds it.
+    reusable_slot = str(reusable["id"])
+    # The control first: the competitor's own warm-reuse admission, measured while
+    # no deletion runs (the fixture's total is over the cap, but a reuse needs no
+    # capacity decision). It leaves the competitor's slot idle again.
+    control_elapsed = measure_reuse_admission(
+        subject, competitor_ws, env, "control-reuse"
+    )
+    expect(
+        slot_state(pool, reusable_slot) == "idle",
+        "the control admission did not return the competitor's slot to idle",
+    )
+    # The eviction: the admission retires the older idle tree and its own publish
+    # pass deletes it outside the pool lock. The row is observed positively while
+    # that deletion runs.
+    evictor, row, held = start_eviction(
+        root, subject, pool, env, victim, "concurrent"
+    )
+    expect(
+        str(row["slot"]) == str(victim["id"]),
+        "the oldest idle tree was not the victim",
+    )
+    # Two samples while only the evicting command runs: measured progress under
+    # its own non-blocking custody, which no other pass can claim.
     first_sample = (time.perf_counter(), entry_count(held))
     time.sleep(PROGRESS_INTERVAL_S)
     second_sample = (time.perf_counter(), entry_count(held))
     expect(
         0 < second_sample[1] < first_sample[1],
-        f"the resumed deletion made no measurable progress "
+        f"the deletion made no measurable progress "
         f"({first_sample[1]} then {second_sample[1]} entries left)",
     )
     remaining_before = second_sample[1]
     progressed = first_sample[1] - second_sample[1]
     progress_rate = progressed / max(second_sample[0] - first_sample[0], 0.001)
     expect(
-        deleter.poll() is None,
-        "the deleter finished before the competitor started; the case is vacuous",
+        evictor.poll() is None,
+        "the evicting command finished before the competitor started; the case is vacuous",
     )
-    slots_before = {str(entry["id"]) for entry in slot_rows(pool)}
-    competitor = start_check(subject, competitor_workspace, env, "competitor")
+    # The competitor's admission, observed through the pool's own slot row: its
+    # idle slot becomes held while the held tree is still being deleted.
+    expect(
+        slot_state(pool, reusable_slot) == "idle",
+        "the competitor's slot was not idle before its admission",
+    )
+    competitor = start_check(subject, competitor_ws, env, "competitor")
     admission_started = time.perf_counter()
     admission_completed = None
     while admission_completed is None:
         work_left()
-        if admission_row_appeared(pool, slots_before):
+        if slot_state(pool, reusable_slot) == "held":
             admission_completed = time.perf_counter()
             break
         if competitor.poll() is not None:
-            fail("the competitor exited without admitting a slot")
+            fail("the competitor exited without taking its slot")
         if time.perf_counter() - admission_started > 120:
             fail("the competitor's admission did not complete inside its window")
         time.sleep(0.005)
     # The oracle: this admission completed while the held tree was positively
     # still being deleted, which an in-lock deletion could not allow.
-    deleter_alive = deleter.poll() is None
+    evictor_alive = evictor.poll() is None
     remaining_at_admission = entry_count(held) if tree_present(held) else 0
     admission_elapsed = admission_completed - admission_started
     expect(
-        deleter_alive,
+        evictor_alive,
         "the deleting command had already exited when the competitor admitted",
     )
     expect(
         remaining_at_admission > 0 and tree_present(held),
         f"the held tree was already gone at the competitor's admission "
         f"({remaining_at_admission} entries left)",
+    )
+    expect(
+        remaining_at_admission <= remaining_before,
+        "the sampled progress is not monotonic",
     )
     bound = max(
         INLOCK_CONTROL_FACTOR * control_elapsed, control_elapsed + INLOCK_CONTROL_SLACK_S
@@ -1311,12 +1443,19 @@ def prove_concurrent_admission(root: str, subject: str) -> dict:
     )
     code, output = finish(competitor, "competitor")
     expect(code == 0, f"the concurrent admission exited {code}: {output[-3000:]}")
-    code, delet_output = finish(deleter, "deleter")
-    expect(code == 0, f"the deleting command exited {code}: {delet_output[-3000:]}")
-    expect(not holding_rows(pool), "a holding row survived the deleting command")
-    expect(not tree_present(held), "the held tree survived the deleting command")
+    code, evict_output = finish(evictor, "evictor")
+    expect(code == 0, f"the evicting command exited {code}: {evict_output[-3000:]}")
+    expect(not holding_rows(pool), "a holding row survived the evicting command")
+    expect(not tree_present(held), "the held tree survived the evicting command")
+    expect(
+        tree_present(slot_path(pool, reusable)),
+        "the competitor's own tree was deleted",
+    )
     concurrent_facts = {
         "pool_cap": PENDING_CAP,
+        "victim_slot": str(victim["id"]),
+        "competitor_slot": reusable_slot,
+        "pending_row_bytes": row["bytes"],
         "control_admission_s": round(control_elapsed, 3),
         "inlock_bound_s": round(bound, 3),
         "admission_during_deletion_s": round(admission_elapsed, 3),
@@ -1325,7 +1464,8 @@ def prove_concurrent_admission(root: str, subject: str) -> dict:
         "progress_entries_per_s": round(progress_rate, 1),
         "remaining_before": remaining_before,
         "remaining_at_admission": remaining_at_admission,
-        "deleter_alive_at_admission": deleter_alive,
+        "evictor_alive_at_admission": evictor_alive,
+        "competitor_slot_held_at_admission": True,
     }
     passed(name, **concurrent_facts)
     return concurrent_facts
@@ -1334,12 +1474,14 @@ def prove_concurrent_admission(root: str, subject: str) -> dict:
 def prove_killed_deleter_takeover(root: str, subject: str) -> dict:
     name = "killed-deleter-takeover"
     case(name)
-    pool, env, _row, held, remaining_start = abandon_pending_tree(root, subject, "killed")
-    expect(remaining_start > 0, "the abandoned tree was already empty")
-    killer_workspace = create_project(root, "killed-deleter")
-    deleter = start_check(subject, killer_workspace, env, "killed-deleter")
-    # The resumed command takes custody and starts deleting; kill it inside that
-    # deletion so the row and the partly deleted tree survive again.
+    pool, env, victim, reusable, _victim_ws, _competitor_ws = seed_eviction_fixture(
+        root, subject, "killed"
+    )
+    # The evicting admission retires the older idle tree, and its own publish pass
+    # is what deletes it. Kill that command inside the deletion: the row and the
+    # partly deleted tree survive, which is exactly the state a later command
+    # resumes.
+    evictor, row, held = start_eviction(root, subject, pool, env, victim, "killed")
     deadline = time.perf_counter() + 30
     first = entry_count(held)
     while time.perf_counter() < deadline:
@@ -1350,15 +1492,20 @@ def prove_killed_deleter_takeover(root: str, subject: str) -> dict:
             break
         first = max(now, 1)
     else:
-        fail("the resumed deletion never made progress")
-    deleter.kill()
-    reaped = discard(deleter, "killed-deleter")
-    expect(reaped, "the killed deleter could not be confirmed reaped")
-    say(f"killed the deleter (exit {deleter.returncode})")
+        fail("the evicting command's deletion never made progress")
+    evictor.kill()
+    reaped = discard(evictor, "killed-evictor")
+    expect(reaped, "the killed evicting command could not be confirmed reaped")
+    say(f"killed the evicting command (exit {evictor.returncode})")
     rows = holding_rows(pool)
-    expect(len(rows) == 1, f"the killed deleter left no recorded row: {rows}")
+    expect(len(rows) == 1, f"the killed command left no recorded row: {rows}")
+    expect(rows[0]["name"] == row["name"], "the recorded row changed")
     expect(rows[0]["bytes"] > 0, "the surviving row carries no charge")
     expect(tree_present(held), "the held tree is gone")
+    remaining_after_kill = entry_count(held)
+    expect(remaining_after_kill > 0, "the held tree was already empty")
+    # A later command resumes it: its own pre-admission pass claims the row
+    # outside the pool lock and finishes the deletion.
     taker = create_project(root, "killed-takeover")
     code, output, _ = check(subject, taker, env, "takeover")
     expect(code == 0, f"the takeover command exited {code}: {output[-3000:]}")
@@ -1368,8 +1515,14 @@ def prove_killed_deleter_takeover(root: str, subject: str) -> dict:
     )
     expect(not holding_rows(pool), f"the row survived the takeover: {holding_rows(pool)}")
     expect(not tree_present(held), "the held tree survived the takeover")
+    expect(
+        tree_present(slot_path(pool, reusable)),
+        "the fixture's other tree was deleted by the takeover",
+    )
     killed_facts = {
-        "killed_exit": deleter.returncode,
+        "killed_exit": evictor.returncode,
+        "pending_row_bytes": row["bytes"],
+        "remaining_after_kill": remaining_after_kill,
         "next_command_finished_it": True,
     }
     passed(name, **killed_facts)
