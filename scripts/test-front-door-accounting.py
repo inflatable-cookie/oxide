@@ -791,7 +791,10 @@ def await_group_empty(group: int, label: str, seconds: float = 60) -> None:
         except PermissionError:
             pass
         if time.monotonic() > deadline:
-            fail(f"{label}: Cargo group {group} still has a member")
+            # A group that still has a member is a live writer. The script
+            # cannot conclude its closure, so this is an unknown outcome that
+            # aborts the collection; only the guard's later census decides.
+            need(f"{label}: Cargo group {group} still has a member after {seconds:.0f} s")
         time.sleep(0.1)
 
 
@@ -847,6 +850,10 @@ def prove_recovery(proof: Proof, app: str, app_slot: str) -> str:
         with open(release, "w"):
             pass
         holder_err.close()
+        # Best effort only: killing and reaping a direct leader does not prove
+        # its Cargo group has no descendant left. A failure on this path has
+        # already been converted to an unknown outcome, so the guard's census
+        # decides closure and the scratch is retained.
         for process in (holder, waiter):
             if process is not None and process.poll() is None:
                 process.kill()
@@ -941,14 +948,32 @@ def case_reuse(proof: Proof, checkouts: dict, state: dict) -> None:
 
 
 def case_recovery(proof: Proof, checkouts: dict, state: dict) -> None:
-    kept = prove_recovery(proof, checkouts["app"], state["app_slot"])
-    if kept not in proof.slots() or kept == state["big_slot"]:
-        fail(f"the recovered cold slot {kept} is not a new slot in {sorted(proof.slots())}")
-    state["kept_slot"] = kept
-    owned(proof.parent, "after recovery")
-    reserve(proof.parent, "after recovery")
-    recorded_status(proof, checkouts["app"], "after recovery")
-    status(proof, checkouts["app"], "after recovery", list(proof.slots()))
+    """The recovery case, whose failures are unknown writer outcomes.
+
+    This case starts fixture children (`oxide test` and `oxide build`) and can
+    only kill and reap the direct leaders. That does not prove their Cargo
+    group has no descendant still writing in the slot, so an oracle failure
+    here is not a recoverable one: it aborts the collection, records the fault
+    and leaves every later case unexecuted, and `run_proof` retains the scratch
+    instead of removing it. The guard's later certain census is the closure
+    authority, never this script.
+    """
+    try:
+        kept = prove_recovery(proof, checkouts["app"], state["app_slot"])
+        if kept not in proof.slots() or kept == state["big_slot"]:
+            fail(f"the recovered cold slot {kept} is not a new slot in {sorted(proof.slots())}")
+        state["kept_slot"] = kept
+        owned(proof.parent, "after recovery")
+        reserve(proof.parent, "after recovery")
+        recorded_status(proof, checkouts["app"], "after recovery")
+        status(proof, checkouts["app"], "after recovery", list(proof.slots()))
+    except UnknownOutcome:
+        raise
+    except OracleFailure as failure:
+        need(
+            "the recovery case cannot be concluded while its fixture group may still be "
+            f"writing: {failure}"
+        )
 
 
 def case_hardlink(proof: Proof, checkouts: dict, state: dict) -> None:
@@ -1029,8 +1054,9 @@ CASES = (
     ("recovery", ("reuse",), "a live holder refusal and its woken build, then the killed holder's recovery"),
     ("hardlink", (),
      "one retained slot holds four names for one 8 MiB inode: its release publishes the inode "
-     "union and an admission on a budget between that union and the per-name sum evicts the older "
-     "idle slot, keeps it, and admits a new slot"),
+     "union and an admission budgeted between that union plus a charged stray and the per-name sum "
+     "keeps the slot, its directory and all four names and admits a new slot, with nothing "
+     "evicted; a per-name record would evict the retained slot instead"),
 )
 
 BODIES = {
@@ -1460,6 +1486,138 @@ def self_check() -> int:
             "the hard-link case is missing or depends on an unrelated premise",
         )
         expect_true("hardlink" in BODIES, "the hard-link case has no body")
+
+        # A Cargo group that still has a member is a live writer: the wait is
+        # an unknown outcome, never a recoverable oracle failure. The check
+        # uses this process's own group, which always has a member, and sends
+        # no signal (`killpg(..., 0)` only probes).
+        try:
+            await_group_empty(os.getpgid(0), "self-check", seconds=0)
+        except UnknownOutcome as error:
+            expect_true("still has a member" in str(error), str(error))
+        except OracleFailure:
+            fail("a non-empty group was classified as a recoverable oracle failure")
+        else:
+            fail("a non-empty group did not abort")
+
+        # The recovery case starts fixture children and can only reap the
+        # direct leaders, so its oracle failures are unknown writer outcomes:
+        # the collection aborts, no later case (including the independent
+        # hard-link case) runs, and the receipt keeps the fault and the
+        # unexecuted set.
+        saved_recovery = globals()["prove_recovery"]
+        recovery_calls = []
+
+        def failing_recovery(proof, app, app_slot):
+            recovery_calls.append(app_slot)
+            raise OracleFailure("the woken build did not take slot 1 warm")
+
+        globals()["prove_recovery"] = failing_recovery
+        try:
+            outcome = diagnostic_outcome()
+            bodies = {case: (lambda *args: None) for case, _, _ in CASES}
+            bodies["recovery"] = lambda proof, checkouts, state: case_recovery(
+                proof, {"app": "/fixture/app"}, {"app_slot": "1", "big_slot": "2"}
+            )
+            try:
+                run_cases(True, None, {}, {}, outcome, bodies)
+            except UnknownOutcome as error:
+                expect_true("may still be writing" in str(error), str(error))
+            except OracleFailure:
+                fail("a recovery oracle failure was left recoverable")
+            else:
+                fail("a recovery oracle failure did not abort the collection")
+        finally:
+            globals()["prove_recovery"] = saved_recovery
+        expect_true(recovery_calls == ["1"], f"the recovery stub ran {recovery_calls}")
+        expect_true(outcome["failed"] == [],
+                    f"a recovery abort was recorded as a recoverable failure: {outcome['failed']}")
+        expect_true(outcome["aborted"] is not None and "may still be writing" in outcome["aborted"],
+                    f"aborted {outcome.get('aborted')!r}")
+        expect_true(
+            outcome["unexecuted"] == [case for case, _, _ in CASES if case not in outcome["reached"]],
+            f"unexecuted {outcome['unexecuted']}",
+        )
+        expect_true("hardlink" in outcome["unexecuted"] and "hardlink" not in outcome["completed"],
+                    f"the independent hard-link case followed an unclosed recovery: {outcome['completed']}")
+        holder = dict(os.environ)
+        evidence = tempfile.mkdtemp(prefix="fd-recovery-abort.")
+        os.environ["OXIDE_PROOF_EVIDENCE"] = evidence
+        try:
+            with open(diagnostic_receipt(outcome), encoding="utf-8") as handle:
+                receipt = json.load(handle)
+        finally:
+            os.environ.clear()
+            os.environ.update(holder)
+            shutil.rmtree(evidence, ignore_errors=True)
+        expect_true(receipt["qualified"] is False and receipt["aborted"] == outcome["aborted"],
+                    f"receipt abort {receipt.get('aborted')!r}")
+        expect_true(receipt["failed"] == [] and receipt["unexecuted"] == outcome["unexecuted"],
+                    f"receipt state {receipt.get('failed')} / {receipt.get('unexecuted')}")
+
+        # `run_proof` removes the scratch only after a completed collection;
+        # an aborted collection is retained for the guard's census. Both the
+        # order and the behaviour are pinned.
+        run_source = inspect.getsource(run_proof)
+        expect_true(
+            "run_cases(" in run_source
+            and run_source.index("run_cases(") < run_source.index("shutil.rmtree(parent)"),
+            "run_proof removes the scratch before the collection finishes",
+        )
+        expect_true(
+            "retained its owned scratch" in run_source
+            and "raise" in run_source[run_source.index("except Exception:"):],
+            "run_proof does not retain the scratch and re-raise on a failure",
+        )
+        if sys.platform == "darwin":
+            abort_root = tempfile.mkdtemp(prefix="fd-retain-check.")
+            canonical = os.path.realpath(abort_root)
+            saved_functions = {
+                name: globals()[name]
+                for name in ("resolve_source", "stage", "fixture_environment", "run_cases")
+            }
+            holder = dict(os.environ)
+            os.environ.update(
+                {
+                    "OXIDE_TASK_SCRATCH_ROOT": canonical,
+                    "OXIDE_PROOF_EVIDENCE": os.path.join(canonical, "evidence"),
+                    "TMPDIR": canonical,
+                    "TMP": canonical,
+                    "TEMP": canonical,
+                    "OXIDE_PROOF_DEADLINE_NS": str(
+                        time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) + 300 * 10**9
+                    ),
+                }
+            )
+            os.makedirs(os.environ["OXIDE_PROOF_EVIDENCE"], mode=0o700, exist_ok=True)
+
+            def aborting_cases(diagnostic, proof, checkouts, state, outcome):
+                raise UnknownOutcome(
+                    "the recovery case cannot be concluded while its fixture group may still be writing"
+                )
+
+            globals()["resolve_source"] = lambda: "a" * 40
+            globals()["stage"] = lambda parent, env: "/fixture/oxide"
+            globals()["fixture_environment"] = lambda parent: {}
+            globals()["run_cases"] = aborting_cases
+            outcome = diagnostic_outcome()
+            try:
+                try:
+                    run_proof(True, outcome)
+                except UnknownOutcome as error:
+                    expect_true("may still be writing" in str(error), str(error))
+                else:
+                    fail("an aborted collection did not fail the run")
+                roots = [name for name in os.listdir(canonical) if name.startswith("front-door.")]
+                expect_true(len(roots) == 1, f"the aborted run's scratch was not retained: {roots}")
+                expect_true(outcome["root"] is not None and outcome["root"].startswith(canonical),
+                            f"the abort did not name its retained root: {outcome.get('root')!r}")
+            finally:
+                for name, function in saved_functions.items():
+                    globals()[name] = function
+                os.environ.clear()
+                os.environ.update(holder)
+                shutil.rmtree(abort_root, ignore_errors=True)
 
         # The case map: every case has a body and a purpose, and every
         # dependency names an earlier case, so the diagnostic can skip only
