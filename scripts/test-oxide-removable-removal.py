@@ -832,6 +832,20 @@ def resolve_source(proof: Proof, repo: str) -> str:
         raise
     except BaseException as failure:
         raise UnknownOutcome(f"source lookup failed: {failure!r}") from failure
+    # A child that exited nonzero produced no trustworthy answer: an empty
+    # stdout from a failed `git status` is not a clean worktree, and a failed
+    # `git rev-parse` is not an identity. Both are checked before any output is
+    # interpreted, and both abort before staging or any image effect.
+    if head.returncode != 0:
+        raise UnknownOutcome(
+            f"the source lookup exited {head.returncode}: "
+            f"{head.stderr.decode(errors='replace').strip()[-400:]!r}"
+        )
+    if status.returncode != 0:
+        raise UnknownOutcome(
+            f"the worktree status exited {status.returncode} (its output is not a clean "
+            f"worktree): {status.stderr.decode(errors='replace').strip()[-400:]!r}"
+        )
     source = head.stdout.decode(errors="replace").strip()
     if not re.fullmatch(r"[0-9a-f]{40}", source):
         raise UnknownOutcome(f"no exact source identity: {source!r}")
@@ -1997,8 +2011,11 @@ def self_check() -> int:
     class SourceProof:
         root = "/fixture/guard-root"
 
-        def __init__(self, source: str = "a" * 40, status: str = "", failure=None, interrupt: bool = False):
+        def __init__(self, source: str = "a" * 40, status: str = "", failure=None, interrupt: bool = False,
+                     head_returncode: int = 0, status_returncode: int = 0, status_stderr: str = ""):
             self.source, self.status, self.failure, self.interrupt = source, status, failure, interrupt
+            self.head_returncode, self.status_returncode = head_returncode, status_returncode
+            self.status_stderr = status_stderr
             self.unclosed = set()
             self.mount = None
             self.commands = []
@@ -2010,9 +2027,16 @@ def self_check() -> int:
                     raise KeyboardInterrupt()
                 if self.failure is not None:
                     raise self.failure
-                return subprocess.CompletedProcess(command, 0, stdout=(self.source + "\n").encode(), stderr=b"")
+                return subprocess.CompletedProcess(
+                    command, self.head_returncode, stdout=(self.source + "\n").encode(), stderr=b""
+                )
             if command[:2] == ["git", "status"]:
-                return subprocess.CompletedProcess(command, 0, stdout=self.status.encode(), stderr=b"")
+                return subprocess.CompletedProcess(
+                    command,
+                    self.status_returncode,
+                    stdout=self.status.encode(),
+                    stderr=self.status_stderr.encode(),
+                )
             raise AssertionError(f"no command may run before the source gate: {command}")
 
     original_removal = globals()["Removal"]
@@ -2025,6 +2049,19 @@ def self_check() -> int:
             "dirty tracked worktree",
             SourceProof(status=" M scripts/test-oxide-removable-removal.py\n"),
             "tracked worktree is not clean",
+        ),
+        (
+            # The reviewer's case: `layout.Proof.run` can return a nonzero
+            # CompletedProcess with EMPTY stdout, which must never read as a
+            # clean worktree.
+            "nonzero status with empty stdout",
+            SourceProof(status="", status_returncode=1, status_stderr="fatal: not a git repository"),
+            "worktree status exited 1",
+        ),
+        (
+            "nonzero source lookup",
+            SourceProof(head_returncode=128),
+            "source lookup exited 128",
         ),
     ):
         built = []
@@ -2093,6 +2130,8 @@ def self_check() -> int:
         == [["git", "rev-parse", "HEAD"], ["git", "status", "--porcelain", "--untracked-files=no"]],
         f"the source gate ran {clean_case.commands}",
     )
+    expect(clean_case.head_returncode == 0 and clean_case.status_returncode == 0,
+           "the clean fixture did not exit 0 on both git calls")
     expect(clean["source"] == "a" * 40, f"the outcome source is {clean.get('source')!r}")
     expect([case for case, _ in clean["failed"]] == ["setup"], f"clean case failures {clean['failed']}")
     expect(
