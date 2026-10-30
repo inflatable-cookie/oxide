@@ -382,6 +382,16 @@ mode gains the owner bits, exactly as the retired path did. An already-missing
 entry counts as done, so a pass is idempotent. When the entry directory is gone,
 one brief locked write drops its row.
 
+**Progress does not depend on admission.** The refusal is re-evaluated for every
+positive removal, including one the *pre-admission* pass made after the refusal was
+decided (that pass runs beside the admission, so a removal — not a pass — is the
+trigger). A command therefore never retries against an unchanged figure and never
+gives up while a removal has already changed it. Takeover order is
+least-recently-attempted first, recorded as one O(1) write when a pass concludes
+with a row still in place, so an undeletable row cannot starve a later deletable
+one even while every admission is capacity-blocked and no grant or release
+advances the rotation.
+
 **Custody and publication.** The evicting admission reports exactly the holding
 entries it created, and a command that evicts a slot by ID names that entry
 through the same derivation, so a command always publishes **its own** eviction

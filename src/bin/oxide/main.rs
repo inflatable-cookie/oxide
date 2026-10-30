@@ -642,44 +642,35 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     );
     let lease = match lease {
         Ok(inner) => Ok(inner),
-        Err(mut error) => {
+        Err(error) => {
             // A capacity refusal can be caused by holding bytes this command is
             // able to free. The eviction decision takes **one** bounded victim
             // per attempt, so this command publishes one pending tree outside
             // the pool lock, retries, and re-evaluates from the resulting
-            // figure: each round deletes one tree and the admission decides
-            // again, so no warm slot is retired ahead of the decision that needs
-            // it. The loop is bounded; a pass that removes nothing, or the
+            // figure. The bound is small; a round that removes nothing, or the
             // bound, leaves the last refusal standing.
-            holding_sweep.finish();
-            let mut last: Result<Result<(store::Lease, Gate, Vec<String>), Stop>, String> =
-                Err(error);
-            for _ in 0..HOLDING_RECLAIM_ROUNDS {
-                let mut pass = HoldingSweep::start(store.pool.clone(), None);
-                if !pass.finish().is_some_and(|drain| drain.gone) {
-                    break;
-                }
-                eprintln!(
-                    "oxide: deleted a held slot tree in the holding area; re-evaluating the admission"
-                );
-                last = lease_with_gate(
-                    &store,
-                    &key,
-                    invocation.profile,
-                    admission,
-                    &resolution,
-                    label.as_deref(),
-                    &mut waits,
-                    &mut grants,
-                );
-                // A success, a stop or an execution failure ends the loop; a
-                // capacity refusal is re-evaluated after the next published
-                // tree, until one pass removes nothing or the bound is reached.
-                if last.is_ok() {
-                    break;
-                }
-            }
-            last
+            let first_removed = holding_sweep.finish().is_some_and(|drain| drain.gone);
+            reacquire_after_capacity(
+                error,
+                first_removed,
+                HOLDING_RECLAIM_ROUNDS,
+                || {
+                    let mut pass = HoldingSweep::start(store.pool.clone(), None);
+                    pass.finish().is_some_and(|drain| drain.gone)
+                },
+                || {
+                    lease_with_gate(
+                        &store,
+                        &key,
+                        invocation.profile,
+                        admission,
+                        &resolution,
+                        label.as_deref(),
+                        &mut waits,
+                        &mut grants,
+                    )
+                },
+            )
         }
     };
     let (mut held, mut gate, mut pending) = match lease? {
@@ -1872,6 +1863,46 @@ impl Drop for HoldingSweep {
     }
 }
 
+/// The bounded publish-and-re-evaluate loop after a capacity refusal.
+///
+/// `first_removed` is the **pre-admission** pass's own outcome. That pass runs
+/// beside the refused admission, so it may positively remove a tree *after* the
+/// refusal was decided; the charge has then changed even though a later pass
+/// would find nothing. The admission is therefore re-evaluated for that removal
+/// too — the figure, not a pass, decides. Each later round publishes one more
+/// tree and re-evaluates again, so a command never retries against an unchanged
+/// figure and never gives up while a removal has already changed it.
+fn reacquire_after_capacity<T, E>(
+    first_error: E,
+    first_removed: bool,
+    rounds: usize,
+    mut publish: impl FnMut() -> bool,
+    mut attempt: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    let mut changed = first_removed;
+    let mut last = Err(first_error);
+    for _ in 0..rounds {
+        if !changed {
+            // Nothing has been removed since the refusal: publish one tree.
+            changed = publish();
+            if !changed {
+                break;
+            }
+            eprintln!(
+                "oxide: deleted a held slot tree in the holding area; re-evaluating the admission"
+            );
+        }
+        // A removal has changed the figure, so re-evaluate before demanding
+        // another one.
+        last = attempt();
+        if last.is_ok() {
+            break;
+        }
+        changed = false;
+    }
+    last
+}
+
 /// One pass: claim a pending holding entry and delete it outside the pool
 /// lock. Progress goes to stderr, bounded to one line per pass.
 fn report_holding_pass(
@@ -2751,6 +2782,103 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::ffi::OsStr;
+
+    /// The pre-admission pass runs beside the refused admission, so it can
+    /// remove a tree *after* that refusal was decided. That removal changed the
+    /// charge, so the admission must be re-evaluated even if a later pass finds
+    /// nothing at all — a pass is not the trigger, a removal is.
+    #[test]
+    fn a_pre_admission_removal_re_evaluates_the_refused_admission() {
+        let mut attempts = 0;
+        let mut publishes = 0;
+        let outcome: Result<&'static str, &'static str> = super::reacquire_after_capacity(
+            "full",
+            // The pre-admission pass positively removed a tree.
+            true,
+            4,
+            || {
+                publishes += 1;
+                // Every later pass finds nothing.
+                false
+            },
+            || {
+                attempts += 1;
+                Ok("leased")
+            },
+        );
+        assert_eq!(outcome, Ok("leased"));
+        assert_eq!(attempts, 1, "the changed charge was not re-evaluated");
+        assert_eq!(
+            publishes, 0,
+            "a pass ran although nothing needed publishing"
+        );
+    }
+
+    /// A refused attempt whose pass removes nothing keeps its refusal and never
+    /// invents progress; a pass that removes a tree is re-evaluated once and then
+    /// one more tree is published before the next decision. The bound holds.
+    #[test]
+    fn the_capacity_loop_publishes_one_tree_per_round_and_is_bounded() {
+        // Nothing removed anywhere: no retry at all.
+        let mut attempts = 0;
+        let outcome: Result<(), &'static str> = super::reacquire_after_capacity(
+            "full",
+            false,
+            4,
+            || false,
+            || {
+                attempts += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(outcome, Err("full"));
+        assert_eq!(attempts, 0, "an unchanged figure was retried");
+
+        // One removal, still refused, no further tree: exactly one retry.
+        let mut attempts = 0;
+        let mut publishes = 0;
+        let outcome: Result<(), &'static str> = super::reacquire_after_capacity(
+            "full",
+            false,
+            4,
+            || {
+                publishes += 1;
+                publishes == 1
+            },
+            || {
+                attempts += 1;
+                Err("full")
+            },
+        );
+        assert_eq!(outcome, Err("full"));
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            publishes, 2,
+            "the second round published instead of retrying"
+        );
+
+        // Always over budget, always another tree: the bound stops it.
+        let mut attempts = 0;
+        let mut publishes = 0;
+        let outcome: Result<(), &'static str> = super::reacquire_after_capacity(
+            "full",
+            false,
+            3,
+            || {
+                publishes += 1;
+                true
+            },
+            || {
+                attempts += 1;
+                Err("full")
+            },
+        );
+        assert_eq!(outcome, Err("full"));
+        assert!(
+            attempts <= 3 && publishes <= 3,
+            "the loop exceeded its bound"
+        );
+    }
 
     #[test]
     fn cold_seed_gate_is_off_before_qualification_and_default_on_after() {

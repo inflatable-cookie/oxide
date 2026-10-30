@@ -335,6 +335,13 @@ struct HoldingRecord {
     bytes: u64,
     /// When the row was recorded (unix ms), for `oxide status`.
     at_ms: u64,
+    /// When a pass last concluded with this row still in place (unix ms): its
+    /// deletion refused something, or the entry could not be opened. It orders
+    /// the takeover rotation, so an undeletable row cannot starve a later
+    /// deletable one even while every admission is capacity-blocked and the
+    /// grant/release-derived rotation stands still.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attempted_ms: Option<u64>,
 }
 
 impl HoldingRecord {
@@ -4614,6 +4621,7 @@ impl Pool {
             inode: identity.1,
             bytes,
             at_ms: now_ms(),
+            attempted_ms: None,
         })
     }
 
@@ -4794,6 +4802,7 @@ impl Pool {
                     inode: observed.inode,
                     bytes,
                     at_ms: now_ms(),
+                    attempted_ms: None,
                 },
             ));
         }
@@ -5161,14 +5170,20 @@ fn claim_holding(pool: &Path, prefer: Option<&str>) -> Result<ClaimOutcome, Leas
             order.insert(0, index);
         }
     }
-    let mut start = 0;
-    if !order.is_empty() && prefer.is_none() {
-        start = usize::try_from(opened.ledger.next_rank.unwrap_or(0))
-            .unwrap_or(0)
-            .wrapping_rem(order.len());
-        start = start.min(order.len() - 1);
+    // Takeover order is least-recently-attempted first, then oldest row, so a
+    // row whose deletion refuses is retried only after the others have had their
+    // turn. It does not depend on any grant or release: progress must not stall
+    // just because every admission is capacity-blocked.
+    if prefer.is_none() {
+        order.sort_by_key(|index| {
+            opened
+                .ledger
+                .holding
+                .get(*index)
+                .map(|row| (row.attempted_ms.unwrap_or(0), row.at_ms, row.name.clone()))
+                .unwrap_or((0, 0, String::new()))
+        });
     }
-    order.rotate_left(start);
     let mut claimed = None;
     let mut unreadable = None;
     for index in order {
@@ -5290,14 +5305,45 @@ fn drain_claimed(pool: &Path, claim: &HoldingClaim) -> Result<HoldingDrain, Leas
 /// command just created, so its own eviction is what it finishes.
 pub(super) fn drain_holding(pool: &Path, prefer: Option<&str>) -> Result<HoldingDrain, LeaseError> {
     match claim_holding(pool, prefer)? {
-        ClaimOutcome::Claimed(claim) => drain_claimed(pool, &claim),
+        ClaimOutcome::Claimed(claim) => {
+            let drain = drain_claimed(pool, &claim)?;
+            if !drain.gone {
+                // The row stayed: record that this pass reached it, so the next
+                // takeover pass prefers another row and one undeletable tree
+                // cannot starve the rest.
+                mark_holding_attempted(pool, &claim.name)?;
+            }
+            Ok(drain)
+        }
         ClaimOutcome::Idle => Ok(HoldingDrain::nothing()),
-        ClaimOutcome::Unreadable { name, reason } => Ok(HoldingDrain {
-            claimed: Some(name),
-            refused: vec![reason],
-            ..HoldingDrain::default()
-        }),
+        ClaimOutcome::Unreadable { name, reason } => {
+            mark_holding_attempted(pool, &name)?;
+            Ok(HoldingDrain {
+                claimed: Some(name),
+                refused: vec![reason],
+                ..HoldingDrain::default()
+            })
+        }
     }
+}
+
+/// One O(1) write records that a pass reached this row without finishing it.
+fn mark_holding_attempted(pool: &Path, name: &str) -> Result<(), LeaseError> {
+    let mut opened = Pool::open(pool)?;
+    let stamp = now_ms();
+    let Some(row) = opened
+        .ledger
+        .holding
+        .iter_mut()
+        .find(|row| row.name == name)
+    else {
+        return Ok(());
+    };
+    if row.attempted_ms == Some(stamp) {
+        return Ok(());
+    }
+    row.attempted_ms = Some(stamp);
+    opened.persist_revised()
 }
 
 fn occupancy(state: SlotPersistState) -> SlotOccupancy {

@@ -6755,6 +6755,53 @@ fn an_admission_reports_each_holding_entry_it_created() {
     );
 }
 
+/// An undeletable row never starves a later deletable one, and the takeover
+/// rotation needs no admission to advance: with every admission capacity-blocked
+/// (no grant, no release, so the rank-derived rotation stands still) the pass
+/// that refuses the first row marks it attempted, and the next pass takes the
+/// other row.
+#[test]
+fn an_undeletable_row_cannot_starve_a_later_deletable_one() {
+    let fixture = Fixture::new("holding-starvation");
+    let pool = fixture.dir("pool");
+    create_injected(&pool, 64 * 1024 * 1024).expect("init");
+    // Two idle slots, each evicted explicitly, so both rows exist at once.
+    let first = lease_once(&fixture, &pool, "starve-a");
+    let first_slot = first.slot_id.parse::<u64>().expect("slot id");
+    release_injected(&pool, &first.lease_id).expect("release");
+    let second = lease_once(&fixture, &pool, "starve-b");
+    let second_slot = second.slot_id.parse::<u64>().expect("slot id");
+    release_injected(&pool, &second.lease_id).expect("release");
+    let a = evict_idle_slot_injected(&pool, &first_slot.to_string()).expect("evict a");
+    let b = evict_idle_slot_injected(&pool, &second_slot.to_string()).expect("evict b");
+    assert_eq!(holding_rows(&pool).len(), 2, "two trees are pending");
+    // Make the first row undeletable: it is the oldest, so a rotation that
+    // depended on admission would keep reaching it.
+    let a_held = holding_area(&pool).join(&a[0]);
+    let fifo = a_held.join("pipe");
+    let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("fifo");
+    // SAFETY: a fresh path inside the fixture, mode 0600.
+    assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+    // No admission happens between these passes: an unchanged grant/release
+    // sequence must not stop the second row from being reached.
+    let first_pass = managed::drain_holding(&pool, None).expect("the first pass");
+    assert_eq!(first_pass.claimed.as_deref(), Some(a[0].as_str()));
+    assert!(!first_pass.gone, "the undeletable row completed");
+    let second_pass = managed::drain_holding(&pool, None).expect("the next pass");
+    assert_eq!(
+        second_pass.claimed.as_deref(),
+        Some(b[0].as_str()),
+        "the undeletable row starved the deletable one: {second_pass:?}"
+    );
+    assert!(
+        second_pass.gone,
+        "the deletable row completed: {second_pass:?}"
+    );
+    let rows = holding_rows(&pool);
+    assert_eq!(rows.len(), 1, "only the undeletable row is left: {rows:?}");
+    assert_eq!(rows[0].name, a[0]);
+}
+
 /// A private capture name inside a held tree is #155 journal state, and with the
 /// journal retired no record names it: the outside-lock deletion keeps it as
 /// uncertain instead of unlinking it as ordinary content, and the tree stays
