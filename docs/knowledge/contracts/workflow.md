@@ -2314,8 +2314,18 @@ signalled. Each row is recorded before the round that reports it is sent and the
 census thread is joined (bounded, never past the deadline) before the receipt is
 published, so the evidence a verdict rests on is the evidence on disk. That is
 observation only: no message, no signal, no closure claim. An expired join is
-handled conservatively and truthfully: the survivor list is frozen at its
-published prefix (no row may land after publication), `census_join` records
+handled conservatively and truthfully. At the stop request the monitor **binds
+the deciding census**: `receipt.census` and `census_rounds` are the rounds that
+completed before it and never change again, `deciding_census` repeats that
+round's three facts, and any round that finishes later is a post-decision
+observation under `receipt.census_after_stop` (`rounds` plus the last round's
+facts) — so a stalled round can never be mistaken for the census the verdict
+rests on. Closure then requires **both** that the census thread finished inside
+its bounded join and that the last completed round is certainly empty
+(`census_settled`); a stalled round that returns with a member refuses closure
+with its own reason while its row is kept as evidence. On an expired join the
+survivor list is frozen at its published prefix (no row may land after
+publication), `census_join` records
 `joined: false`, `frozen: true`, `started` and `refused`, the summary says later
 rows may be missing — and an empty frozen prefix is still reported, never
 silently omitted — and **an incomplete join never yields certain closure** — a
@@ -2350,17 +2360,20 @@ path joins the census first (a structural guard over `run` and finalisation), an
 that an expired join refuses closure (persisted `UNCLOSED`, a latched reason, no
 pass exit) including under a full run whose census thread is still inside a round
 that later observes a member (that late row can never reach the published receipt
-and the owned scratch is kept); and a transient-survivor
+and the owned scratch is kept); and a *mid-join* interleaving where that round
+returns between the bound deciding census and the final publication, which must
+refuse closure on the final round's member, keep the row as evidence and leave the
+deciding census unchanged beside `census_after_stop`; and a transient-survivor
 regression (both pure and real: a recorded row followed by a certain-empty
 census closes the run and never reports `UNCLOSED`/kept). At this head the three
 sources are
 `bounded-test.py`
-`fbfc57962fdcd2feba6ccb5fee8119fd50baeb5ab30efad463a264d4eef717ba`,
+`02884cba5f19a5f28330e860ed49ee327197f85f5ab8aa47c22a47e7b580a298`,
 `test_supervisor.py`
-`1769f3b75435d5cbe0f663888e60e325ba9447c7e2a74fad8351683e2edfd349` and
+`f2484ccb3f641169ba163784f099ae3f76fbac7049ce1e06b5a2bab6daf0cc36` and
 `qualify-supervisor.py`
-`5433651a207c5b04ef27b34b336a7841b070618245b216f1fb0352648973822f`. The
-head's suite is 305 pure plus 49 real cases and is **unqualified** until one
+`d09a239b246b8768e036bbefe144e028953bc2dcf197da806bd4509b1a7f7e15`. The
+head's suite is 306 pure plus 49 real cases and is **unqualified** until one
 uncounted keep-going
 `effigy proof:supervisor:qualify:diagnostic` and then ONE counted author and
 ONE separate independent reviewer `effigy proof:supervisor:qualify` pass at the

@@ -1890,7 +1890,8 @@ class PureSurvivors(unittest.TestCase):
         monitor.census_thread = None
         record = monitor.join_census(1)
         self.assertEqual(record, {"joined": True, "started": False, "bound_s": 1.0,
-                                  "waited_ns": record["waited_ns"], "rows": 0})
+                                  "waited_ns": record["waited_ns"], "rows": 0,
+                                  "deciding": None, "final": None})
         monitor.publish("started: incomplete")
         published = json.loads((evidence / "receipt.json").read_text())
         self.assertEqual(published["census_join"]["joined"], True)
@@ -1918,7 +1919,7 @@ class PureSurvivors(unittest.TestCase):
         monitor, evidence, ctl_r = self.publishable_monitor()
         monitor.receipt["outcome"] = {"closure": "closed", "status": 0, "fault": None,
                                       "deadline": False, "launched": True}
-        self.assertIn('if decision == "cleanup" and join.get("joined") is not True:',
+        self.assertIn('if decision == "cleanup" and not settled:',
                       " ".join(inspect.getsource(bounded.Monitor.run).split()))
         join = {"joined": False, "frozen": True, "rows": 1, "bound_s": 0.05, "waited_ns": 1}
         reason = monitor.refuse_incomplete_closure(join)
@@ -2056,6 +2057,129 @@ class PureSurvivors(unittest.TestCase):
         self.assertIn("closure not established", custodian.guard.fault or "")
         self.assertEqual(bounded.exit_code(False, custodian.guard.fault, True, 0), 125)
 
+    def test_a_round_that_returns_during_the_join_binds_the_deciding_census(self):
+        # Reviewer finding: a stalled round may return between the stop and the
+        # final publication. It must never be mistaken for the deciding census,
+        # and a final round that reports a member must refuse closure while its
+        # row is kept as evidence. Releasing the round during the join (not after
+        # run() returns) is the interleaving this exercises.
+        sandbox = Path(tempfile.mkdtemp(prefix="mid-join.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(sandbox), True)
+        evidence = sandbox / "evidence"
+        ctx = {"run_id": "mid-join", "command": ["/bin/true"], "limit_s": 300,
+               "adopted": None, "evidence_arg": str(evidence), "root_parent": str(sandbox),
+               "budget": 512 * 1024 * 1024,
+               "start_ns": time.clock_gettime_ns(time.CLOCK_UPUPTIME_RAW)
+               if False else time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "inject": []}
+        ctl_r, ctl_w = os.pipe()
+        cmd_r, cmd_w = os.pipe()
+        out_r, out_w = os.pipe()
+        err_r, err_w = os.pipe()
+        for fd in (ctl_r, cmd_w, out_w, err_w):
+            self.addCleanup(os.close, fd)
+        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_r)
+        sent, lines, written = [], [], []
+        release = threading.Event()
+
+        class InterleavedCensus:
+            def __init__(self, sid, terminal_allowed=False):
+                self.stats = {}
+                self.rounds = 0
+
+            def round(self):
+                self.rounds += 1
+                if self.rounds == 1:
+                    return {"certain": True, "members": 0, "uncertain": 0, "member_rows": [],
+                            "uncertain_rows": [], "terminal_count_status": "valid",
+                            "terminal_nonwriters": 0}
+                release.wait(15)  # still inside the round when the stop is bound
+                return {"certain": False, "members": 1, "uncertain": 0,
+                        "member_rows": [row(900, start=5)], "uncertain_rows": [],
+                        "terminal_count_status": "valid", "terminal_nonwriters": 0}
+
+        def decide():
+            os.write(cmd_w, (json.dumps({
+                "type": "cleanup", "run": "mid-join", "seq": 3,
+                "outcome": {"closure": "closed", "status": 0, "fault": None,
+                            "deadline": False, "launched": True}}) + "\n").encode())
+
+        def send(message_type, **fields):
+            sent.append((message_type, dict(fields)))
+            if message_type == "census" and not written:
+                # The decision lands after the next round has started, so that
+                # round is still in flight when the deciding census is bound.
+                written.append(True)
+                threading.Timer(0.35, decide).start()
+
+        def releaser():
+            # Release only once the deciding census is bound: that is inside the
+            # bounded join, before the final publication.
+            until = time.monotonic() + 15
+            while not monitor.census_bound and time.monotonic() < until:
+                time.sleep(0.005)
+            release.set()
+
+        monitor.send = send
+        helper = threading.Thread(target=releaser)
+        try:
+            with patched(bounded, "report", lines.append), \
+                    patched(bounded, "Census", InterleavedCensus):
+                for number, command in enumerate((
+                        {"type": "leader", "pid": os.getpid()},
+                        {"type": "stopped", "sent": 0}), start=1):
+                    os.write(cmd_w, (json.dumps(dict(command, run="mid-join", seq=number))
+                                     + "\n").encode())
+                helper.start()
+                monitor.run()
+        finally:
+            release.set()
+            helper.join(15)
+            if monitor.census_thread is not None:
+                monitor.census_thread.join(15)
+        persisted = json.loads((evidence / "receipt.json").read_text())
+        # The deciding census is the certainly empty round, and it never changes.
+        self.assertEqual(persisted["deciding_census"],
+                         {"certain": True, "members": 0, "uncertain": 0})
+        self.assertEqual(persisted["census_rounds"], 1)
+        self.assertEqual(persisted["census_rounds_at_stop"], 1)
+        self.assertEqual(persisted["census"], {"certain": True, "members": 0, "uncertain": 0,
+                                               "member_rows": [], "uncertain_rows": [],
+                                               "terminal_count_status": "valid",
+                                               "terminal_nonwriters": 0})
+        # The late round is a post-decision observation, clearly labelled.
+        self.assertEqual(persisted["census_after_stop"],
+                         {"rounds": 1, "last": {"certain": False, "members": 1,
+                                                "uncertain": 0}})
+        join = persisted["census_join"]
+        self.assertIs(join["joined"], True)
+        self.assertIs(join["started"], True)
+        self.assertEqual(join["deciding"], {"certain": True, "members": 0, "uncertain": 0})
+        self.assertEqual(join["final"], {"certain": False, "members": 1, "uncertain": 0})
+        # Closure is refused on the FINAL census, not the stale deciding one, and
+        # the late row is kept as evidence instead of being dropped.
+        self.assertEqual(persisted["outcome"]["closure"], "UNCLOSED")
+        self.assertIn("final census round was not certainly empty",
+                      persisted["outcome"]["fault"])
+        self.assertEqual([item["pid"] for item in persisted["survivors"]], [900])
+        self.assertTrue(Path(ctx["scratch"]).is_dir(), "the refused run removed its scratch")
+        self.assertFalse(any("so the run closed" in line for line in lines), lines)
+        self.assertTrue(any("the run stays UNCLOSED and its scratch is kept" in line
+                            for line in lines), lines)
+        kinds = [kind for kind, _fields in sent]
+        self.assertIn("census_join_incomplete", kinds)
+        custodian, _cmd = self.custodian_stub()
+        custodian.run_id = "mid-join"
+        custodian.monitor_seq = 0
+        custodian.leader = monitor.leader[0]
+        custodian.leader_start = monitor.leader[1]
+        message = dict(next(fields for kind, fields in sent if kind == "census_join_incomplete"),
+                       type="census_join_incomplete", run="mid-join", seq=1,
+                       at=bounded.now_ns(), leader=monitor.leader)
+        self.assertIsNone(bounded.malformed(message))
+        custodian.accept(message)
+        self.assertIn("closure not established", custodian.guard.fault or "")
+        self.assertEqual(bounded.exit_code(False, custodian.guard.fault, True, 0), 125)
+
     def test_every_publication_path_joins_the_census_first(self):
         # Structural guard for the reviewer's "all publication paths" point: the
         # join must precede the first publication in the run and in finalisation.
@@ -2070,7 +2194,7 @@ class PureSurvivors(unittest.TestCase):
         self.assertLess(finish.find("join_census("), finish.find("publish("),
                         "finalisation publishes before it joins the census")
         self.assertTrue(hasattr(bounded.Monitor, "refuse_incomplete_closure"))
-        self.assertIn('if decision == "cleanup" and join.get("joined") is not True:',
+        self.assertIn('if decision == "cleanup" and not settled:',
                       " ".join(inspect.getsource(bounded.Monitor.run).split()))
 
     def test_an_empty_frozen_prefix_is_reported_and_never_closed(self):
@@ -6008,6 +6132,44 @@ class PureDetach(unittest.TestCase):
                        {"exit": 0, "timed_out": False, "truncated": False, "output": "not a plist"}):
             self.assertIsNone(bounded.image_attachments(backing, run=lambda *a, b=broken: b), broken)
 
+    @contextlib.contextmanager
+    def settled_census(self):
+        """A coherent certain-empty census for a run whose decision is scripted:
+        closure now requires a finished thread and a certainly empty final round,
+        so these tests give the monitor the census a real custodian would have."""
+
+        class SettledCensus:
+            def __init__(self, sid, terminal_allowed=False):
+                self.stats = {}
+
+            def round(self):
+                return {"certain": True, "members": 0, "uncertain": 0, "member_rows": [],
+                        "uncertain_rows": [], "terminal_count_status": "valid",
+                        "terminal_nonwriters": 0}
+
+        saved = bounded.Census
+        bounded.Census = SettledCensus
+        try:
+            yield
+        finally:
+            bounded.Census = saved
+
+    def start_census_then(self, cmd_w, run_id, decision, sent):
+        """Write a leader/stopped pair and `decision` once the first census round is
+        reported, so the scripted decision is as coherent as a real one."""
+        written = []
+
+        def send(kind, **fields):
+            sent.append(kind)
+            if kind == "census" and not written:
+                written.append(True)
+                os.write(cmd_w, (json.dumps(decision) + "\n").encode())
+
+        for number, command in enumerate(({"type": "leader", "pid": os.getpid()},
+                                          {"type": "stopped", "sent": 0}), start=1):
+            os.write(cmd_w, (json.dumps(dict(command, run=run_id, seq=number)) + "\n").encode())
+        return send
+
     def test_an_absent_child_whose_reap_fails_is_not_recorded_as_reaped(self):
         # P2: the absent-child branch wrote reaped/reaped_by as a success even when
         # the reap helper failed. Driven through the REAL `Monitor.run`.
@@ -6028,7 +6190,9 @@ class PureDetach(unittest.TestCase):
             self.addCleanup(os.close, fd)
         monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_r)
         sent = []
-        monitor.send = lambda kind, **fields: sent.append(kind)
+        monitor.send = self.start_census_then(
+            cmd_w, "absent-child",
+            {"type": "cleanup", "outcome": {"closure": "closed", "status": 0}}, sent)
 
         class Handle:
             pid = 0
@@ -6048,10 +6212,9 @@ class PureDetach(unittest.TestCase):
         bounded.process_row = lambda pid: (None, None)          # positively absent
         bounded.reap_own_child = lambda handle, window_end: (False, None)  # the reap fails
         bounded.cleanup_safety = lambda ctx, **k: None
-        os.write(cmd_w, (json.dumps({"type": "cleanup", "outcome": {"closure": "closed",
-                                                                   "status": 0}}) + "\n").encode())
         try:
-            monitor.run()
+            with self.settled_census():
+                monitor.run()
         finally:
             (bounded.post_census_detach, bounded.process_row, bounded.reap_own_child,
              bounded.cleanup_safety) = saved
@@ -6130,18 +6293,21 @@ class PureDetach(unittest.TestCase):
         monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_r)
         sent = []
 
+        base = self.start_census_then(
+            cmd_w, "both-paths",
+            {"type": "cleanup", "outcome": {"closure": "closed", "status": 0}}, sent)
+
         def send(kind, **fields):
-            sent.append(kind)
             if kind == "detach_ready":
                 # Answer every authorization request, as the custodian would.
                 os.write(cmd_w, (json.dumps({"type": "detach_go", "allowed": True,
                                              "budget_ns": 30 * bounded.NS}) + "\n").encode())
+            base(kind, **fields)
 
         monitor.send = send
-        os.write(cmd_w, (json.dumps({"type": "cleanup", "outcome": {"closure": "closed",
-                                                                   "status": 0}}) + "\n").encode())
         try:
-            monitor.run()
+            with self.settled_census():
+                monitor.run()
         finally:
             bounded.bounded_run = saved_run
             bounded.DefaultProbe.mount_point = saved_mount
