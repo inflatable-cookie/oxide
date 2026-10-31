@@ -2169,7 +2169,7 @@ with no earlier run migrated.
 
 **Post-census image detach request (oxide#191, decision `ee263cea`, unqualified
 source).** The current `bounded-test.py`
-(`950b1de4440398db1f5cb4b2099f2c5eca6cd2e2ca60211a8766ab01880a18d2`) adds one
+(`addaae5ac1434b3a6c623db3e0230c0a0607c192fc1f0e6055613f484d749b9d`) adds one
 opt-in control for a proof
 whose own test image must be detached, and it is the only route by which such a
 proof may detach after a launch; the qualified shared runner is otherwise
@@ -2281,8 +2281,8 @@ custodian keeps its filesystem-free decision path and the existing
 cooperative-session limits. These bytes are unqualified until one uncounted
 `effigy proof:supervisor:qualify:diagnostic` records a clean picture and then
 ONE counted author and ONE separate independent reviewer
-`effigy proof:supervisor:qualify` pass at the same head (282 pure plus 48 real
-cases, including the seventy-one pure detach cases and the eight real ones: a
+`effigy proof:supervisor:qualify` pass at the same head (284 pure plus 48 real
+cases, including the seventy-three pure detach cases and the eight real ones: a
 bound success, a refused identity, a failed attempt, an unrequested attachment
 whose opt-in custody keep is recorded separately, and a real stuck child the
 custodian pins, signals and observes closed), with independent exact-head source
@@ -5442,7 +5442,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
 - **Focused proof of absent checkout chains (oxide#135).** The one fixed proof
   is `effigy rust:prune-absence` (`scripts/test-prune-absence.py` under this
-  tree's shared supervisor `950b1de4…`, the merged oxide#151 guard plus
+  tree's shared supervisor `addaae5a…`, the merged oxide#151 guard plus
   oxide#191's opt-in post-census detach) with
   `--root-parent /private/tmp`, the owner-accepted internal-placement exception
   (decision `bd357a4c`): the missing-chain fixtures must be on the boot Data

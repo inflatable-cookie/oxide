@@ -5469,6 +5469,41 @@ class PureDetach(unittest.TestCase):
         self.assertEqual(sorted(record["unrequested"]), sorted([first, second]))
         self.assertIn("/Volumes/OxSecond", record["reason"])
 
+    def test_the_custody_scan_shares_the_remaining_custodian_window(self):
+        # The final custody scan must budget every declared backing inside what is
+        # left of the custodian's window, not restart a fresh per-backing allowance.
+        ctx, first = self.layout()
+        second = os.path.join(ctx["scratch"], "second.sparseimage")
+        with open(second, "wb") as handle:
+            handle.write(b"second backing")
+        self.declare_custody(ctx, first, second)
+        # ~0.6 s of window left, two backings.
+        ctx["start_ns"] = (time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
+                           - 300 * bounded.NS + int(0.6 * bounded.NS)
+                           + bounded.EXIT_MARGIN_S * bounded.NS + bounded.DETACH_GATE_MARGIN_NS)
+        timeouts = []
+
+        def facts(backing, timeout=None):
+            timeouts.append(timeout)
+            return []
+
+        record = bounded.cleanup_safety(ctx, self.facts(), facts=facts)
+        self.assertEqual(record["state"], "ok", record)
+        self.assertEqual(len(timeouts), 2, timeouts)
+        self.assertTrue(all(value is not None and value < 1.0 for value in timeouts), timeouts)
+        self.assertLessEqual(sum(timeouts), 0.7, timeouts)
+
+    def test_an_exhausted_window_scans_nothing(self):
+        ctx, backing = self.layout()
+        self.declare_custody(ctx, backing)
+        ctx["start_ns"] = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) - 300 * bounded.NS
+        calls = []
+        record = bounded.cleanup_safety(
+            ctx, self.facts(), facts=lambda backing_, timeout=None: calls.append(timeout) or [])
+        self.assertEqual(record["state"], "kept", record)
+        self.assertIn("no custodian wait window", record["reason"])
+        self.assertEqual(calls, [], "a spent window still read the custody indication")
+
     def test_an_unreaped_attachment_read_is_kept_as_a_child(self):
         backing = "/fixture/volume.sparseimage"
 

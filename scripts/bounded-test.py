@@ -1821,8 +1821,22 @@ def cleanup_safety(ctx, probe=None, facts=None):
         return None  # not opted in: no scan and no gate, so the default path is unchanged
     if problem is not None:
         return {"state": "kept", "reason": problem, "unrequested": [], "at_ns": now_ns()}
+    # Budget the whole scan inside what is left of the custodian's own window: the
+    # declared backings SHARE it, so no backing restarts a fresh allowance and the
+    # last read cannot outlive the monitor.
+    start_ns, limit_s = ctx.get("start_ns"), ctx.get("limit_s")
+    if typed(start_ns, int) and typed(limit_s, (int, float)):
+        deadline_ns = start_ns + int(limit_s * NS) - EXIT_MARGIN_S * NS
+        remaining = (deadline_ns - now_ns()) / NS - DETACH_GATE_MARGIN_NS / NS
+        if remaining <= 0.0:
+            return {"state": "kept", "at_ns": now_ns(), "unrequested": list(backings),
+                    "reason": ("no custodian wait window is left to read the custody indication;"
+                               " the root, its backings and the evidence are kept")}
+        read_timeout = max(0.05, min(DETACH_INFO_TIMEOUT_S, remaining / max(1, len(backings))))
+    else:
+        read_timeout = DETACH_INFO_TIMEOUT_S
     try:
-        problems = custody_problems(backings, probe, facts)
+        problems = custody_problems(backings, probe, facts, read_timeout)
     except BaseException as error:
         problems = [f"attachment facts failed: {type_name(error)}"]
     if not problems:
