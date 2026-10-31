@@ -5,17 +5,17 @@ The supervisor (`scripts/bounded-test.py`) is the candidate under test, not
 an already-qualified guard, and this bootstrap does not supply the
 qualification it evaluates. Its own bounds: Effigy heavy admission (before
 this script starts), a clean checkout, a reserve reading before and after,
-one fixed 300 s deadline on CLOCK_UPTIME_RAW, and fixtures with finite
+one fixed 420 s deadline on CLOCK_UPTIME_RAW, and fixtures with finite
 self-exit fallbacks.
 
 The deadline is enforced by `bounded`, a minimal outer actor: the process
 forks the whole bootstrap as a worker child and holds it unreaped, making
 only WNOHANG reaps, bounded sleeps and a KILL of that pinned child. All
 filesystem, hashing and stdout work happens in the worker, so a blocked
-stdout reader or slow read cannot extend the 300 s: at the deadline the
+stdout reader or slow read cannot extend the 420 s: at the deadline the
 worker is KILLed and the exit is 124 with whatever output was written.
 
-The worker runs the candidate with a 280 s limit and a 512 MiB monitored
+The worker runs the candidate with a 380 s limit and a 512 MiB monitored
 budget around `scripts/test_supervisor.py` and **no** `--root-parent` and no
 `--evidence`, so the candidate's default scratch routing is what runs: one
 owned root under `<mount>/scratch/oxide` on the volume the machine's
@@ -73,8 +73,8 @@ import time
 import traceback
 
 NS = 1_000_000_000
-WALL_NS = 300 * NS
-CANDIDATE_LIMIT = 280
+WALL_NS = 420 * NS  # oxide#191 amendment (Tom 2026-10-31): was 300 s
+CANDIDATE_LIMIT = 380  # oxide#191 amendment: was 280 s
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
 EXPECTED_CASES = 335  # 287 pure + 48 real (oxide#151 added the routing, marker,
@@ -106,9 +106,9 @@ LIMITATIONS = [
     "Deadlines are enforced by a single-threaded custodian on CLOCK_UPTIME_RAW with bounded calls; no hard real-time scheduling claim.",
     "The candidate's settlement diagnostics (receipt `settlement` and the custodian's decision-time `settlement` record) are bounded observations, not acceptance gates: they never decide classification, closure, EOF, the deadline or cleanup, and a lost or truncated observation only means missing evidence. The receipt object keeps accumulating after the decision, so only the custodian's record is the decision-time view.",
     "macOS only (kqueue NOTE_EXIT, sysctl kinfo_proc at self-checked offsets); Linux is not qualified.",
-    "Effigy admission waits happen before this script starts and are not inside its 300 s.",
+    "Effigy admission waits happen before this script starts and are not inside its 420 s.",
     "Nested candidate sessions are outside the outer session; their UNCLOSED cases are settled by no guardian. Their case directories, receipts and kept UNCLOSED scratch live in the outer candidate's own evidence directory inside its selected-volume owned root, so the outer monitored walk and 512 MiB budget cover them and cleanup never removes them; their fixture processes end only at the finite fallback, which is not closure.",
-    "The outer actor KILLs only its pinned worker at the deadline; a candidate still running then is bounded by its own 280 s limit, not by the actor.",
+    "The outer actor KILLs only its pinned worker at the deadline; a candidate still running then is bounded by its own 380 s limit, not by the actor.",
     "Synthetic fixtures model Cargo's setpgid groups; no real Cargo build or live application ran.",
     "Owned bytes are a non-atomic best-effort walk: an entry past the platform path limit is reached one descriptor-relative component at a time from its nearest nameable directory, and any error other than a vanished entry is a measurement fault, never a smaller total.",
 ]
@@ -828,7 +828,7 @@ def qualify(diagnostic=False):
     for number in (signal.SIGINT, signal.SIGTERM):
         signal.signal(number, lambda n, _f: forward.append(n))
     print("proof:supervisor:qualify: the supervisor is the candidate under test; this bootstrap (Effigy heavy"
-          " admission, reserve readings, fixed 300 s deadline, finite fixture fallbacks) does not qualify it",
+          " admission, reserve readings, fixed 420 s deadline, finite fixture fallbacks) does not qualify it",
           flush=True)
     if sys.platform != "darwin":
         return refusal("refused: macOS only", diagnostic)

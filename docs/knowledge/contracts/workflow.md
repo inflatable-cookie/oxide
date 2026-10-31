@@ -2651,13 +2651,15 @@ bounds:
 - reserve readings before and after, on the volume that actually holds the
   qualification's scratch, with the boot volume read and labelled separately
   (both keep the 22 GiB threshold);
-- a fixed 300 s `CLOCK_UPTIME_RAW` deadline held by a minimal outer actor.
+- a fixed 420 s `CLOCK_UPTIME_RAW` deadline held by a minimal outer actor
+  (oxide#191 amendment, Tom 2026-10-31: was 300 s, because the combined suite
+  needed 251-258 s against the former 250 s fixture alarm).
   The actor forks the whole bootstrap as a pinned worker and makes only
   WNOHANG reaps, bounded sleeps and signals to that worker. All file,
-  hashing and stdout work runs in the worker. At 298 s the actor KILLs the
+  hashing and stdout work runs in the worker. At 418 s the actor KILLs the
   worker and exits 124, so blocked output or a slow read cannot extend the
   deadline. A candidate still running then is bounded only by its own
-  280 s limit;
+  380 s limit (was 280 s);
 - on candidate overrun, TERM then KILL of its own unreaped candidate child
   only, from its own reap loop, so no signal can follow the reap.
 
