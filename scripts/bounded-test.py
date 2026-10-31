@@ -107,6 +107,7 @@ import threading
 import time
 
 NS = 1_000_000_000
+_MS = 1_000_000
 GIB = 1024 ** 3
 MIB = 1024 ** 2
 LIMIT_S = 300
@@ -205,6 +206,7 @@ INJECTIONS = {
     "pump-exception", "kqueue-exception", "malformed-message", "stop-exception",
     "reserve-delay-stall", "scratch-delay-stall",
     "detach-fail", "detach-timeout", "detach-ambiguous", "detach-withdraw",
+    "detach-reap-timeout",
 }
 RESERVE_DELAY_S, SCRATCH_DELAY_S = 0.5, 4.0  # injected publication delays before a sampler stall
 INJECT_AFTER_GATE_NS = 1_500_000_000  # post-gate injections wait for the fixture to start
@@ -1478,6 +1480,15 @@ DETACH_GATE_MARGIN_NS = 1 * NS
 DETACH_GATE_WAIT_S = 5.0
 DETACH_OUTPUT_MAX_BYTES = 4096
 DETACH_POLL_S = 0.2  # how often authority is re-checked while the detach child runs
+# The opt-in image-custody indication (oxide#191). A proof that creates an
+# attachable image publishes this BEFORE attaching it, so a request-free run can
+# still be kept when the image is mounted or attached-but-unmounted at cleanup.
+# No indication means no scan at all: the default runner path is unchanged and
+# gains no new failure mode.
+CUSTODY_NAME = "image-custody.json"
+CUSTODY_VERSION = 1
+CUSTODY_MAX_BYTES = 2048
+CUSTODY_MAX_BACKINGS = 8
 DETACH_MIN_BUDGET_NS = 8 * NS  # below this the whole sequence cannot fit the custodian's window
 DETACH_POST_RESERVE_S = 5.0  # kept for the post-state read after the child
 DETACH_STATES = ("refused", "detached", "failed", "timed_out", "withdrawn", "unknown")
@@ -1506,9 +1517,9 @@ def bounded_run(argv, timeout, cap=DETACH_OUTPUT_MAX_BYTES, still_allowed=None, 
                       stderr=subprocess.STDOUT, close_fds=True)
     except OSError as error:
         return {"exit": None, "timed_out": False, "error": errno_name(error), "output": "",
-                "truncated": False, "withdrawn": None}
+                "truncated": False, "withdrawn": None, "reap_timed_out": False}
     deadline = time.monotonic() + max(0.1, timeout)
-    tail, seen, timed_out, withdrawn = b"", 0, False, None
+    tail, seen, timed_out, withdrawn, reap_timed_out = b"", 0, False, None, False
     poll_at = time.monotonic() + DETACH_POLL_S
     fd = child.stdout.fileno()
     try:
@@ -1549,22 +1560,25 @@ def bounded_run(argv, timeout, cap=DETACH_OUTPUT_MAX_BYTES, still_allowed=None, 
             os.close(fd)
         except OSError:
             pass
+        # The reap is bounded by what is left of the SAME deadline, never by an
+        # extra fixed wait: a child that ignores KILL cannot extend the sequence.
         try:
-            child.wait(timeout=5)
+            child.wait(timeout=max(0.1, min(2.0, deadline - time.monotonic() + 0.5)))
         except subprocess.TimeoutExpired:
+            reap_timed_out = True
             try:
                 child.kill()
             except OSError:
                 pass
             try:
-                child.wait(timeout=5)
+                child.wait(timeout=0.5)
             except subprocess.TimeoutExpired:
                 pass
         child.stdout = None
     status = child.returncode
     return {"exit": status, "timed_out": timed_out, "error": None,
             "output": tail.decode("utf-8", "replace"), "truncated": seen > len(tail),
-            "withdrawn": withdrawn}
+            "withdrawn": withdrawn, "reap_timed_out": reap_timed_out}
 
 
 def detach_text(document, name):
@@ -1653,27 +1667,112 @@ def image_attachments(backing=None, timeout=DETACH_INFO_TIMEOUT_S):
     return rows
 
 
-def owned_root_attachments(ctx, timeout=DETACH_INFO_TIMEOUT_S, facts=None):
-    """Every image path still attached from this run's owned root or evidence
-    directory, or None when the attachment facts are unreadable. The fail-closed
-    check that keeps an owned root from being cleaned while its own image is
-    attached without a request. `facts` substitutes the whole-attachment read."""
-    rows = (facts or image_attachments)(None, timeout)
-    if rows is None:
-        return None
-    roots = [os.path.realpath(ctx["root"])]
-    if ctx.get("evidence"):
-        roots.append(os.path.realpath(ctx["evidence"]))
-    found = []
-    for row in rows:
-        path, mount = os.path.realpath(row[0]), row[2]
-        # Only a MOUNTED entity is custody: a forced detach can leave a stale
-        # detached entry behind, and that is not a live mount over the backing.
-        if mount is None:
+def read_custody(ctx, probe):
+    """(backings, problem) for this run's opt-in image-custody indication, or
+    (None, None) when the proof published none. Bounded, symlink-refusing and
+    never partly trusted: a present but unreadable indication is a problem, never
+    an absent one."""
+    path = os.path.join(ctx["evidence"], CUSTODY_NAME)
+    try:
+        info = probe.lstat(path)
+    except FileNotFoundError:
+        return None, None
+    except OSError as error:
+        return None, f"custody indication {errno_name(error)}"
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return None, "custody indication is not a regular file"
+    if info.st_size > CUSTODY_MAX_BYTES:
+        return None, f"custody indication is over {CUSTODY_MAX_BYTES} bytes"
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(CUSTODY_MAX_BYTES + 1)
+    except OSError as error:
+        return None, f"custody indication {errno_name(error)}"
+    if len(raw) > CUSTODY_MAX_BYTES:
+        return None, f"custody indication is over {CUSTODY_MAX_BYTES} bytes"
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None, "custody indication is not a JSON document"
+    if not isinstance(document, dict) or set(document) != {"version", "backings"}:
+        return None, "custody indication is not an object with exactly version and backings"
+    if not typed(document.get("version"), int) or document.get("version") != CUSTODY_VERSION:
+        return None, f"custody indication version is not {CUSTODY_VERSION}"
+    backings = document.get("backings")
+    if not isinstance(backings, list) or not backings or len(backings) > CUSTODY_MAX_BACKINGS:
+        return None, f"custody indication names no bounded non-empty backing list (max {CUSTODY_MAX_BACKINGS})"
+    root, evidence = probe.realpath(ctx["root"]), probe.realpath(ctx["evidence"])
+    for backing in backings:
+        if not isinstance(backing, str) or not backing or len(backing) > DETACH_TEXT_LIMITS["backing"]:
+            return None, "custody indication names an unbounded backing"
+        if any(ord(character) < 32 for character in backing):
+            return None, "custody indication names a backing with control characters"
+        if not os.path.isabs(backing) or os.path.normpath(backing) != backing:
+            return None, "custody indication names a non-canonical backing"
+        if probe.realpath(backing) != backing:
+            return None, "custody indication names a backing that resolves through a symlink"
+        if not (backing.startswith(root + os.sep) or backing.startswith(evidence + os.sep)):
+            return None, "custody indication names a backing outside this run's owned root and evidence"
+    return [str(backing) for backing in backings], None
+
+
+def custody_problems(paths, probe, facts=None, timeout=DETACH_INFO_TIMEOUT_S):
+    """Why a decayed custody record must keep the root, from attachment facts and
+    device nodes: a mounted entity is live, an entity without a mount point is
+    live when its /dev node still exists (attached but unmounted) and stale
+    metadata only when that node is positively gone; unreadable facts are
+    uncertain and keep. Am empty result means the backings are positively
+    detached."""
+    read = facts or image_attachments
+    problems = []
+    for backing in paths:
+        rows = read(backing, timeout)
+        if rows is None:
+            problems.append(f"{backing}: attachment facts are unreadable")
             continue
-        if any(path.startswith(root + os.sep) for root in roots) and path not in found:
-            found.append(path)
-    return found
+        for device, mount, _uuid in rows:
+            if mount is not None:
+                problems.append(f"{backing}: {device} is mounted at {mount}")
+                break
+            try:
+                probe.lstat(device)
+            except FileNotFoundError:
+                continue  # stale metadata: the device node is positively gone
+            except OSError as error:
+                problems.append(f"{backing}: {device} state is unreadable ({errno_name(error)})")
+                break
+            problems.append(f"{backing}: {device} is attached without a mount point")
+            break
+    return problems
+
+
+def cleanup_safety(ctx, probe=None, facts=None):
+    """The opt-in, fail-closed pre-cleanup check. It runs ONLY when the proof
+    published an image-custody indication, so a run without one performs no scan
+    and keeps the default path unchanged. With an indication, an owned root is
+    never cleaned while one of those backings is mounted or attached-but-unmounted
+    (a proof that failed before publishing its detach request can leave exactly
+    that); a positively absent device node is stale metadata and keeps nothing.
+    Returns a bounded `cleanup` record when the root must be kept, else None."""
+    probe = probe or DefaultProbe()
+    try:
+        backings, problem = read_custody(ctx, probe)
+    except BaseException as error:
+        backings, problem = None, f"custody indication unreadable: {type_name(error)}"
+    if backings is None and problem is None:
+        return None  # no indication: no scan, unchanged behaviour
+    if problem is not None:
+        return {"state": "kept", "reason": problem, "unrequested": [], "at_ns": now_ns()}
+    try:
+        problems = custody_problems(backings, probe, facts)
+    except BaseException as error:
+        problems = [f"attachment facts failed: {type_name(error)}"]
+    if not problems:
+        return None
+    return {"state": "kept", "at_ns": now_ns(),
+            "reason": ("this run's owned root still holds an image it declared in its custody"
+                       " indication and never positively detached: " + "; ".join(problems[:4])),
+            "unrequested": backings[:CUSTODY_MAX_BACKINGS]}
 
 
 def detach_image(mount, timeout, still_allowed=None):
@@ -1683,7 +1782,7 @@ def detach_image(mount, timeout, still_allowed=None):
                           still_allowed=still_allowed)
     return {"exit": attempt["exit"], "timed_out": attempt["timed_out"], "error": attempt["error"],
             "output": attempt["output"], "truncated": attempt["truncated"],
-            "withdrawn": attempt["withdrawn"]}
+            "withdrawn": attempt["withdrawn"], "reap_timed_out": attempt["reap_timed_out"]}
 
 
 def _free_bytes(path):
@@ -1804,6 +1903,7 @@ def detach_record(ctx, document):
               "timed_out": False, "withdrawn": None, "error": None, "post_state": "unknown",
               "reason": None, "backing": None, "mount": None, "device": None, "volume_uuid": None,
               "timeout_s": None, "budget_ns": None, "output": "", "output_truncated": False,
+              "reap_timed_out": False, "late_gate": None,
               # Only the cheap reserve read is sampled inside the custodial window;
               # no owned-byte walk runs here (the samplers already record the peak).
               "reserve_before": None, "reserve_after": None,
@@ -1881,14 +1981,22 @@ def post_census_detach(ctx, probe=None, authorize=None, still_allowed=None):
         elif "detach-withdraw" in inject:
             attempt = {"exit": None, "timed_out": False, "error": None, "output": "",
                        "truncated": False, "withdrawn": "injected withdrawal"}
+        elif "detach-reap-timeout" in inject:
+            attempt = {"exit": None, "timed_out": False, "error": None, "output": "",
+                       "truncated": False, "withdrawn": None, "reap_timed_out": True}
         else:
             attempt = probe.detach(record["mount"], timeout, still_allowed)
         record.update(attempted=True, exit=attempt.get("exit"), timed_out=bool(attempt.get("timed_out")),
-                      withdrawn=attempt.get("withdrawn"), error=attempt.get("error"),
+                      withdrawn=attempt.get("withdrawn"), reap_timed_out=bool(attempt.get("reap_timed_out")),
+                      error=attempt.get("error"),
                       output=_bounded_tail(b"", (attempt.get("output") or "").encode(
                           "utf-8", "replace")).decode("utf-8", "replace"),
                       output_truncated=bool(attempt.get("truncated")))
         record["at_ns"] = now_ns()
+        if still_allowed is not None:
+            allowed, reason = still_allowed()
+            if not allowed:
+                record["late_gate"] = reason or "authority withdrawn"
         try:
             mounted = probe.mount_point(record["mount"])
         except OSError:
@@ -1911,17 +2019,22 @@ def post_census_detach(ctx, probe=None, authorize=None, still_allowed=None):
             post_state = "detached"
         record["post_state"] = post_state
         record["reserve_after"] = _free_bytes(ctx["reserve_path"])
-        if record["withdrawn"] is not None:
+        if record["withdrawn"] is not None or record["late_gate"] is not None:
             record["state"] = "withdrawn"
         elif record["timed_out"]:
             record["state"] = "timed_out"
-        elif record["exit"] != 0 or record["error"] is not None or post_state != "detached":
+        elif record["reap_timed_out"] or record["exit"] != 0 or record["error"] is not None \
+                or post_state != "detached":
             record["state"] = "failed"
         else:
             record["state"], record["qualified"], record["reason"] = "detached", True, None
             return record
         if record["withdrawn"] is not None:
             record["reason"] = f"authority withdrawn mid-attempt ({record['withdrawn']}); post-state {post_state}"
+        elif record["late_gate"] is not None:
+            record["reason"] = f"authority withdrawn after the attempt ({record['late_gate']}); post-state {post_state}"
+        elif record["reap_timed_out"]:
+            record["reason"] = f"the detach child was not reaped inside the window; post-state {post_state}"
         else:
             record["reason"] = (f"detach exit {record['exit']}" if not record["timed_out"]
                                 else "detach timed out") + f"; post-state {post_state}"
@@ -1934,29 +2047,6 @@ def post_census_detach(ctx, probe=None, authorize=None, still_allowed=None):
         record["state"], record["qualified"] = "unknown", False
         record["reason"] = record["reason"] or f"detach attempt failed: {type_name(error)}"
         return record
-
-
-def cleanup_safety(ctx, facts=None):
-    """The fail-closed pre-cleanup check, separate from the detach protocol: an
-    owned root is never cleaned while a MOUNTED image still lives inside it (or
-    its evidence directory) -- a proof that failed before publishing its request
-    can leave exactly that. Returns a bounded `cleanup` record when the root must
-    be kept, else None. A stale detached `hdiutil` entry is not custody."""
-    try:
-        found = owned_root_attachments(ctx, facts=facts)
-    except BaseException as error:
-        found, detail = None, f"attachment facts failed: {type_name(error)}"
-    else:
-        detail = "attachment facts are unreadable before cleanup"
-    if found is None:
-        return {"state": "kept", "reason": detail, "unrequested": [], "at_ns": now_ns()}
-    if not found:
-        return None
-    return {"state": "kept", "at_ns": now_ns(),
-            "reason": ("this run's owned root still holds a mounted image its proof never requested;"
-                       " the root, its backing and the evidence are kept"),
-            "unrequested": found[:8]}
-
 
 def config_pool_path(text):
     """`[pool] path` from a user config, or None when it sets none.
@@ -3342,6 +3432,28 @@ class Monitor:
                     self.send("monitor_complete")
                     self.stop.set()
                     return
+            # Final gate: cleanup itself is destructive, so it needs one more
+            # authorization from the custodian's CURRENT fault/deadline state and
+            # what is left of its wait window. A fault latched during the detach,
+            # a reached deadline or a spent window keeps the root.
+            allowed, reason = self.detach_still_allowed()
+            remaining_ms = detach_budget(ctx) / _MS
+            if not allowed or remaining_ms <= 0:
+                kept = {"state": "kept", "at_ns": now_ns(),
+                        "reason": (f"the guard did not authorize cleanup: {reason}" if not allowed
+                                   else "no custodian wait window is left for cleanup"),
+                        "unrequested": []}
+                with self.lock:
+                    self.receipt["cleanup"] = kept
+                self.send("cleanup_kept", reason=kept["reason"][:200])
+                self.publish("cleanup_kept: scratch_kept")
+                self.receipt["scratch_marker"] = self.conclude_marker(
+                    False, reason="live-image", outcome="failed")
+                self.publish("monitor_complete: pending_custodian")
+                self.summary()
+                self.send("monitor_complete")
+                self.stop.set()
+                return
             self.publish("cleanup_partial_or_unknown")
             if ctx["owned"]:
                 if "cleanup-interrupt" in self.inject:
@@ -3413,7 +3525,7 @@ class Monitor:
         kept = receipt.get("cleanup")
         if kept is not None:
             lines.append(f"supervisor: cleanup kept the owned root: {kept['reason']}"
-                         f" ({len(kept.get('unrequested') or [])} mounted image(s) inside it)")
+                         f" ({len(kept.get('unrequested') or [])} declared backing(s) checked)")
         detach = receipt.get("detach")
         if detach is not None:  # only a run whose proof asked for one carries this
             lines.append(

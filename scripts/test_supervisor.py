@@ -4125,12 +4125,13 @@ class DetachFacts:
     true before and after its attempt and a refusal cannot pass by accident."""
 
     def __init__(self, mount="/Volumes/OxDetach", device="/dev/disk7", uuid=DETACH_UUID,
-                 mount_point=None, attachments=None, attempt=None, stats=None):
+                 mount_point=None, attachments=None, attempt=None, stats=None, nodes=()):
         self.mount, self.device, self.uuid = mount, device, uuid
         self.mount_point_value = mount_point
         self.attachments_value = attachments
         self.attempt = attempt or {"exit": 0, "timed_out": False, "error": None, "output": ""}
         self.stats = stats or {}
+        self.nodes = set(nodes)
         self.attempted = False
         self.detached = []
 
@@ -4138,6 +4139,8 @@ class DetachFacts:
         return os.path.realpath(path)
 
     def lstat(self, path):
+        if path in self.nodes:  # a device node this case declares present
+            return types.SimpleNamespace(st_mode=stat.S_IFCHR, st_rdev=42)
         return os.lstat(path)
 
     def stat(self, path):
@@ -4479,23 +4482,111 @@ class PureDetach(unittest.TestCase):
         monitor_ = monitor(None, close=True)
         self.assertFalse(monitor_.authorize_detach(5 * bounded.NS)[0])
 
-    def test_an_unrequested_attachment_keeps_the_owned_root(self):
+    def declare_custody(self, ctx, *backings):
+        path = os.path.join(ctx["evidence"], bounded.CUSTODY_NAME)
+        with open(path, "w") as handle:
+            json.dump({"version": bounded.CUSTODY_VERSION, "backings": list(backings)}, handle)
+        return path
+
+    def test_without_a_custody_indication_cleanup_performs_no_scan(self):
+        ctx, _backing = self.layout()
+        calls = []
+        self.assertIsNone(bounded.cleanup_safety(ctx, self.facts(), facts=lambda *a: calls.append(a) or []))
+        self.assertEqual(calls, [], "a run without an indication still scanned attachments")
+
+    def test_a_declared_mounted_image_keeps_the_owned_root(self):
         ctx, backing = self.layout()
-        rows = [(backing, "/dev/disk7", "/Volumes/OxDetach", None)]
-        record = bounded.cleanup_safety(ctx, facts=lambda *_args: rows)
+        self.declare_custody(ctx, backing)
+        rows = [("/dev/disk7", "/Volumes/OxDetach", None)]  # (device, mount, uuid)
+        record = bounded.cleanup_safety(ctx, self.facts(), facts=lambda *a: rows)
         self.assertEqual(record["state"], "kept")
         self.assertEqual(record["unrequested"], [backing])
-        self.assertIn("never requested", record["reason"])
-        outside = [("/private/tmp/other.sparseimage", "/dev/disk9", "/Volumes/OxOther", None)]
-        self.assertIsNone(bounded.cleanup_safety(ctx, facts=lambda *_args: outside))
-        # A stale entry a forced detach left behind is not a live mount: it must
-        # never keep a root.
-        stale = [(backing, "/dev/disk7", None, None)]
-        self.assertIsNone(bounded.cleanup_safety(ctx, facts=lambda *_args: stale))
-        unreadable = bounded.cleanup_safety(ctx, facts=lambda *_args: None)
-        self.assertEqual(unreadable["state"], "kept")
-        self.assertIn("unreadable", unreadable["reason"])
-        self.assertIsNone(bounded.cleanup_safety(ctx, facts=lambda *_args: []))
+        self.assertIn("mounted", record["reason"])
+
+    def test_attached_but_unmounted_is_not_positively_detached(self):
+        # The reviewer's second case: no mount point, but the device node still
+        # exists, so the image is attached. It must keep the root.
+        ctx, backing = self.layout()
+        self.declare_custody(ctx, backing)
+        facts = self.facts(nodes=("/dev/disk7s1",))
+        rows = [("/dev/disk7s1", None, None)]
+        record = bounded.cleanup_safety(ctx, facts, facts=lambda *a: rows)
+        self.assertEqual(record["state"], "kept")
+        self.assertIn("attached without a mount point", record["reason"])
+
+    def test_stale_metadata_with_no_device_node_keeps_nothing(self):
+        ctx, backing = self.layout()
+        self.declare_custody(ctx, backing)
+        rows = [("/dev/disk99s1", None, None)]  # no such node on this host
+        self.assertIsNone(bounded.cleanup_safety(ctx, self.facts(), facts=lambda *a: rows))
+
+    def test_uncertain_custody_state_keeps_the_owned_root(self):
+        # Unreadable attachment facts are uncertain, so the root is kept.
+        ctx, backing = self.layout()
+        self.declare_custody(ctx, backing)
+        self.assertIn("unreadable", bounded.cleanup_safety(
+            ctx, self.facts(), facts=lambda *a: None)["reason"])
+        # An unreadable device-node state is uncertain too.
+        ctx, backing = self.layout()
+        self.declare_custody(ctx, backing)
+        probe = self.facts()
+        real_lstat = os.lstat
+
+        def lstat(path):
+            if path == "/dev/disk7":
+                raise PermissionError("denied")
+            return real_lstat(path)
+
+        probe.lstat = lstat
+        record = bounded.cleanup_safety(ctx, probe, facts=lambda *a: [("/dev/disk7", None, None)])
+        self.assertEqual(record["state"], "kept")
+        self.assertIn("unreadable", record["reason"])
+
+    def test_the_post_attempt_gate_withdraws_success(self):
+        ctx, backing = self.layout()
+        self.request(ctx, backing)
+        answers = []
+
+        def still_allowed():
+            answers.append(1)
+            return False, "a fault latched after the attempt"
+
+        record = bounded.post_census_detach(ctx, self.facts(), still_allowed=still_allowed)
+        self.assertEqual((record["state"], record["qualified"]), ("withdrawn", False), record)
+        self.assertIn("after the attempt", record["reason"])
+        self.assertTrue(answers)
+
+    def test_an_unreaped_detach_child_is_not_a_detach(self):
+        ctx, backing = self.layout()
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, self.facts(), still_allowed=None)
+        self.assertTrue(record["qualified"], record)  # baseline for the injected case
+        ctx, backing = self.layout()
+        ctx["inject"] = ["detach-reap-timeout"]
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, self.facts())
+        self.assertEqual((record["state"], record["qualified"], record["reap_timed_out"]),
+                         ("failed", False, True), record)
+
+    def test_a_malformed_custody_indication_keeps_the_owned_root(self):
+        for payload in (b"null", b"[]", b'{"version": 1}', b'{"version": 1, "backings": []}',
+                        b'{"version": 2, "backings": ["/tmp/x"]}',
+                        b'{"version": 1, "backings": ["relative"]}'):
+            ctx, _backing = self.layout()
+            with open(os.path.join(ctx["evidence"], bounded.CUSTODY_NAME), "wb") as handle:
+                handle.write(payload)
+            record = bounded.cleanup_safety(ctx, self.facts(), facts=lambda *a: [])
+            self.assertEqual(record["state"], "kept", (payload, record))
+            self.assertIn("custody indication", record["reason"], (payload, record["reason"]))
+
+    def test_a_backing_outside_the_owned_layout_is_refused(self):
+        ctx, _backing = self.layout()
+        path = os.path.join(ctx["evidence"], bounded.CUSTODY_NAME)
+        with open(path, "w") as handle:
+            json.dump({"version": 1, "backings": ["/private/etc/passwd"]}, handle)
+        record = bounded.cleanup_safety(ctx, self.facts(), facts=lambda *a: [])
+        self.assertEqual(record["state"], "kept")
+        self.assertIn("outside this run's owned root", record["reason"])
 
     def test_a_diagnostic_receipt_is_never_qualified(self):
         rows = [{"check": "receipt-phase", "result": "pass", "problems": []},
@@ -6358,6 +6449,12 @@ if mode == "request":
     with open(temporary, "w") as handle:
         json.dump(request, handle)
     os.replace(temporary, os.path.join(evidence, "detach-request.json"))
+else:
+    # The opt-in custody indication, published before the attach, is what lets a
+    # request-free run be kept instead of cleaned. Without it the default path
+    # performs no scan at all.
+    with open(os.path.join(evidence, "image-custody.json"), "w") as handle:
+        json.dump({"version": 1, "backings": [os.path.realpath(image)]}, handle)
 with open(os.path.join(case, "volume.json"), "w") as handle:
     json.dump({"mount": mount, "device": wholes[0], "uuid": uuid, "image": image}, handle)
 print("detach fixture ready: " + mount + " " + wholes[0])

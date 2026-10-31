@@ -209,6 +209,30 @@ WRITERS = {"launched": False}
 # never an instruction to detach a path.
 DETACH_REQUEST = "detach-request.json"
 
+# The opt-in image-custody indication (oxide#191). Published BEFORE an attach, so
+# a request-free failure (for example a refused attach) still leaves the guard
+# able to keep a mounted or attached-but-unmounted backing instead of cleaning its
+# root. A proof that publishes none gets no scan at all.
+CUSTODY = "image-custody.json"
+
+
+def publish_image_custody(image: str) -> str:
+    """Declare the one backing this proof may attach, before any attach."""
+    evidence = os.environ.get("OXIDE_PROOF_EVIDENCE", "")
+    need(os.path.isdir(evidence), f"no OXIDE_PROOF_EVIDENCE directory for the custody indication: {evidence!r}")
+    path = os.path.join(evidence, CUSTODY)
+    body = {"version": 1, "backings": [os.path.realpath(image)]}
+    temporary = path + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(body, handle, sort_keys=True)
+        os.replace(temporary, path)
+    finally:
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+    print(f"image custody {path} names {body['backings'][0]}", flush=True)
+    return path
+
 
 def note_writer_launch() -> None:
     WRITERS["launched"] = True
@@ -709,6 +733,7 @@ class Removal:
             timeout=60,
         )
         need(created.returncode == 0, f"image creation failed: {created.stderr!r}")
+        publish_image_custody(self.image)
         self.volume = Volume(proof, self.image, self.mount)
         self.volume.attach()
         code, stdout, _ = proof.oxide(
@@ -1202,6 +1227,7 @@ class BootClosure:
             timeout=60,
         )
         need(created.returncode == 0, f"image creation failed: {created.stderr!r}")
+        publish_image_custody(image)
         # `-owners on` on every attach: the product judges the mounted root's
         # own ownership and mode, and a mount that ignores ownership would
         # make that judgement meaningless.
@@ -1829,6 +1855,11 @@ def self_check() -> int:
         "Volume.attach does not publish the post-census detach request",
     )
     expect(
+        "publish_image_custody" in inspect.getsource(Removal.__init__)
+        and "publish_image_custody" in inspect.getsource(BootClosure.__init__),
+        "a mode does not declare its image custody before attaching",
+    )
+    expect(
         "withdraw_detach_request" in inspect.getsource(Volume.force_detach),
         "Volume.force_detach does not withdraw the request it invalidates",
     )
@@ -1868,6 +1899,19 @@ def self_check() -> int:
                f"the request was not written atomically: {os.listdir(evidence)}")
         withdraw_detach_request("self-check")
         expect(os.listdir(evidence) == [], f"withdrawal left {os.listdir(evidence)}")
+        # The opt-in custody indication is separate from the request: it is
+        # published before an attach, it is atomic, and withdrawing the request
+        # never removes it.
+        custody = publish_image_custody("/fixture/volume.sparseimage")
+        with open(custody, encoding="utf-8") as handle:
+            declared = json.load(handle)
+        expect(sorted(declared) == ["backings", "version"] and declared["version"] == 1,
+               f"custody indication body {declared}")
+        expect(declared["backings"] == [os.path.realpath("/fixture/volume.sparseimage")],
+               f"custody indication backings {declared['backings']}")
+        expect(os.listdir(evidence) == [CUSTODY],
+               f"the custody indication was not written atomically: {os.listdir(evidence)}")
+        os.unlink(custody)
         withdraw_detach_request("self-check, already absent")  # idempotent, never an error
         os.environ.pop("OXIDE_PROOF_EVIDENCE", None)
         try:
