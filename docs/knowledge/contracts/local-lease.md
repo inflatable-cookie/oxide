@@ -1613,7 +1613,7 @@ reply as a size.
 | Walks and their bounds | `inventory.rs` `inventory_directory` (`:436`), the walk observer call (`:438`), directory descent vs file counting (`:640-716`), `Sizes::require_complete` (`:1854`), `walk_limits` (`:1523`), `extra_depth` (`:2072-2078`) |
 | Debug-only observations | `inventory::walk_observer` (`:1354`), `OXIDE_TEST_WALK_LOG`, `delay_before_read_dir`, plus the new debug-only `OXIDE_TEST_SCOPE_LOG` for `pool_scope()` |
 | Control state fence | `store.rs` `STATE_VERSION`: 8 is the raised-ceiling fence (oxide#177), 7 the eviction-accounting fence (oxide#175), 6 the [one-use workspaces](one-use-workspaces.md) fence, 5 the recorded-accounting fence; an owned-outputs successor alone is version 4 (`RECORDED_ACCOUNTING_FENCE`, `ONE_USE_FENCE`, `EVICTION_ACCOUNTING_FENCE`, `SLOT_CEILING_FENCE`, hand-off trigger in `handoff.rs`) |
-| Qualified guard | `scripts/bounded-test.py`, sha256 `bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924` ([oxide#151](workflow.md#shared-proof-supervisor)); this tree's `7acca44c…` bytes add oxide#191's opt-in post-census detach and oxide#197's ancestor-chain exclusion, and are unqualified until their own qualifications pass; the oxide#147 `5e5b6617…` and oxide#145 `a6d73326…` bytes are history |
+| Qualified guard | `scripts/bounded-test.py`, sha256 `bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924` ([oxide#151](workflow.md#shared-proof-supervisor)); this tree's `409d1edc…` bytes add oxide#191's opt-in post-census detach and oxide#197's ancestor and launcher-sibling exclusions, and are unqualified until their own qualifications pass; the oxide#147 `5e5b6617…` and oxide#145 `a6d73326…` bytes are history |
 
 #### Acceptance matrix
 
@@ -1758,7 +1758,7 @@ precedence.
 300 s total with the supervisor's 30 s stop margin and 512 MiB monitored
 scratch are unchanged; every write stays inside the owned root, no session,
 group or census is started. The supervisor this tree runs is `scripts/bounded-test.py` sha256
-`7acca44c5e115edf06763bd9a748498ee2f0cd839fc91ff816901cd9de198d35`: the
+`409d1edc82ec3991781a609e2ae85e7250f610bd835d8f334aec272b1c3daeb6`: the
 qualified oxide#151 guard (merged `af08749`, sha256 `bc24b238…`) plus
 oxide#191's opt-in post-census image detach and oxide#197's ancestor-chain
 exclusion, so those added bytes are

@@ -36,6 +36,7 @@ import shutil
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -478,10 +479,21 @@ class FakeTable:
         return next((r for r in self.rows if r["pid"] == pid), None)
 
 
-def census(table, sid=100, terminal_allowed=False, ancestors=()):
+AMBIENT_CLOCK = {"state": "ambiguous", "boot_us": None, "wall_us": None,
+                 "uptime_us": None, "skew_us": None}
+
+
+def cell_clock(boot_us=1, wall_us=1000, uptime_us=1, state="ok", skew_us=None):
+    """A fixed clock observation for the ordering rule (never reads the host)."""
+    return {"state": state, "boot_us": boot_us, "wall_us": wall_us,
+            "uptime_us": uptime_us, "skew_us": skew_us}
+
+
+def census(table, sid=100, terminal_allowed=False, ancestors=(), start_token=None, clock=None):
     return bounded.Census(sid, snapshot=table.snapshot, getsid=table.getsid, reread=table.reread,
                           pause=lambda _seconds: None, terminal_allowed=terminal_allowed,
-                          ancestors=ancestors)
+                          ancestors=ancestors, start_token=start_token,
+                          boot_evidence=(lambda: clock if clock is not None else dict(AMBIENT_CLOCK)))
 
 
 class PureCensus(unittest.TestCase):
@@ -570,6 +582,17 @@ class PureAncestors(unittest.TestCase):
         self.assertEqual(record["count"], 4)
         self.assertEqual([(i["pid"], i["start"], i["level"]) for i in record["identities"]],
                          [(700, 11, 1), (600, 12, 2), (500, 13, 3), (1, 14, 4)])
+        self.assertIsNone(record["self"], "a snapshot without this process recorded a start token")
+
+    def test_this_process_start_token_comes_from_the_same_snapshot(self):
+        me = os.getpid()
+        rows = self.chain([(me, 4242, 700), (700, 11, 1), (1, 14, 0)])
+        record = bounded.ancestor_identities(snapshot=lambda: rows, parent=lambda: 700)
+        self.assertEqual(record["self"], {"pid": me, "start": 4242})
+        self.assertEqual([i["pid"] for i in record["identities"]], [700, 1])
+        missing = [r for r in rows if r["pid"] != me]
+        self.assertIsNone(bounded.ancestor_identities(
+            snapshot=lambda: missing, parent=lambda: 700)["self"])
 
     def test_ancestors_are_excluded_without_a_read(self):
         table = FakeTable([row(700, start=11)], {700: ProcessLookupError(errno.ESRCH, "gone")})
@@ -640,18 +663,25 @@ class PureAncestors(unittest.TestCase):
         seen = []
 
         class Recording(bounded.Census):
-            def __init__(self, sid, terminal_allowed=False, ancestors=()):
-                seen.append((sid, tuple(ancestors)))
+            def __init__(self, sid, terminal_allowed=False, ancestors=(), start_token=None,
+                         boot_evidence=None):
+                seen.append((sid, tuple(ancestors), start_token))
 
             def round(self):
                 return {"certain": True, "members": 0, "uncertain": 0, "member_rows": [],
                         "uncertain_rows": [], "terminal_count_status": "valid",
-                        "terminal_nonwriters": 0}
+                        "terminal_nonwriters": 0,
+                        "ancestor_exclusions": {
+                            "rows": [{"pid": 900, "start": 5, "rule": "parent"}],
+                            "count": 1, "by_rule": {"ancestor": 0, "parent": 1,
+                                                     "pre-supervisor": 0},
+                            "clock": cell_clock()}}
 
         identities = [{"pid": 700, "start": 11, "level": 1}, {"pid": 1, "start": 14, "level": 2}]
         ctx = {"run_id": "r", "inject": [], "terminal_mode": {"mode": "strict"},
                "ancestors": {"state": "recorded", "count": 2, "stop": "pid-1",
-                             "identities": identities}}
+                             "identities": identities,
+                             "self": {"pid": 4242, "start": 77}}}
         ctl_r, ctl_w = os.pipe()
         cmd_r, cmd_w = os.pipe()
         out_r, out_w = os.pipe()
@@ -668,7 +698,179 @@ class PureAncestors(unittest.TestCase):
             monitor.census_loop(after=7)
         finally:
             bounded.Census = saved
-        self.assertEqual(seen, [(4242, tuple(identities))])
+        self.assertEqual(seen, [(4242, tuple(identities), 77)])
+        # The round's bounded positive evidence is merged into the receipt.
+        merged = monitor.receipt["ancestor_exclusions"]
+        self.assertEqual((merged["count"], merged["rounds"]), (1, 1), merged)
+        self.assertEqual(merged["rows"], [{"pid": 900, "start": 5, "rule": "parent"}], merged)
+        self.assertEqual(merged["by_rule"]["parent"], 1, merged)
+        self.assertEqual(merged["clock"]["state"], "ok", merged)
+
+    # Oxide#197 brief v2: the launcher-sibling rule.
+    LAUNCHER = (700, 11)  # a recorded ancestor (this suite, under the outer guard)
+
+    def launcher_rows(self, *extra):
+        """A snapshot with the recorded launcher and any additional rows."""
+        return [row(self.LAUNCHER[0], start=self.LAUNCHER[1], ppid=600)] + list(extra)
+
+    def test_a_launcher_sibling_is_excluded_by_its_positive_parent(self):
+        # The observed failure: a short-lived unrelated child of the launcher.
+        # Its zombie row fails getsid with ESRCH; the launcher-sibling rule
+        # excludes it because its parent row IS the recorded launcher identity.
+        sibling = row(900, start=12, ppid=self.LAUNCHER[0], zombie=True)
+        table = FakeTable(self.launcher_rows(sibling),
+                          {700: 7, 900: ProcessLookupError(errno.ESRCH, "gone")})
+        check = census(table, ancestors=[self.LAUNCHER])
+        result = check.round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
+        self.assertEqual(table.reads, 0, "an excluded sibling was confirmed with a read")
+        evidence = result["ancestor_exclusions"]
+        self.assertEqual(evidence["rows"], [{"pid": 700, "start": 11, "rule": "ancestor"},
+                                            {"pid": 900, "start": 12, "rule": "parent"}], evidence)
+        self.assertEqual(evidence["count"], 2, evidence)
+        self.assertEqual(evidence["by_rule"], {"ancestor": 1, "parent": 1, "pre-supervisor": 0})
+
+    def test_a_sibling_spawned_mid_run_is_excluded_and_recorded(self):
+        # Round 1: the launcher alone. Round 2: an unrelated sibling appears
+        # mid-run and exits, leaving an unreadable row. The same census must
+        # stay certain and record the bounded evidence.
+        launcher, sibling = row(700, start=11, ppid=600), row(904, start=40, ppid=700, zombie=True)
+        table = FakeTable([launcher], {700: 7})
+        check = census(table, ancestors=[self.LAUNCHER])
+        first = check.round()
+        self.assertEqual((first["certain"], first["ancestor_exclusions"]["count"]), (True, 1))
+        table.rows = [launcher, sibling]
+        table.sessions = {700: 7, 904: ProcessLookupError(errno.ESRCH, "gone")}
+        second = check.round()
+        self.assertEqual((second["certain"], second["uncertain"]), (True, 0))
+        self.assertEqual(second["ancestor_exclusions"]["rows"],
+                         [{"pid": 700, "start": 11, "rule": "ancestor"},
+                          {"pid": 904, "start": 40, "rule": "parent"}])
+
+    def test_a_reused_parent_pid_is_not_a_parent_exclusion(self):
+        # The row's parent PID is a recorded launcher PID, but the parent row's
+        # start token is different, so the parent is a different process.
+        rows = [row(700, start=99, ppid=600), row(900, start=12, ppid=700)]
+        table = FakeTable(rows, {700: 7, 900: ProcessLookupError(errno.ESRCH, "gone")},
+                          reread={900: row(900, start=12, ppid=700)})
+        result = census(table, ancestors=[self.LAUNCHER], start_token=100).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual(result["ancestor_exclusions"]["by_rule"]["parent"], 0)
+        self.assertEqual(result["ancestor_exclusions"]["rows"], [], result["ancestor_exclusions"])
+
+    def test_an_unknown_parent_is_never_excluded(self):
+        # Even with a usable ordering proof, a row whose parent row is absent
+        # from the snapshot stays unknown.
+        stranger = row(901, start=10, ppid=999)
+        table = FakeTable([stranger], {901: PermissionError(1, "denied")})
+        result = census(table, ancestors=[self.LAUNCHER], start_token=100,
+                        clock=cell_clock(boot_us=1, wall_us=1000)).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual(result["ancestor_exclusions"]["count"], 0)
+
+    def test_a_ppid_1_orphan_is_never_excluded(self):
+        orphan = row(902, start=10, ppid=1)
+        table = FakeTable([orphan], {902: PermissionError(1, "denied")})
+        result = census(table, ancestors=[self.LAUNCHER, (1, 14)], start_token=100,
+                        clock=cell_clock(boot_us=1, wall_us=1000)).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual(result["ancestor_exclusions"]["count"], 0)
+
+    def test_a_preexisting_stranger_is_excluded_by_a_positive_ordering(self):
+        # Its parent is known but is not a recorded ancestor; its own start is
+        # strictly earlier than this supervisor's inside one consistent boot
+        # window, so it cannot be a writer launched by a later leader.
+        rows = [row(800, start=5, ppid=600), row(903, start=10, ppid=800)]
+        table = FakeTable(rows, {800: 7, 903: PermissionError(1, "denied")})
+        result = census(table, ancestors=[self.LAUNCHER], start_token=100,
+                        clock=cell_clock(boot_us=1, wall_us=1000)).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (True, 0))
+        # 800's own parent is absent, so 800 is never excluded; it is foreign.
+        self.assertEqual(result["ancestor_exclusions"]["rows"],
+                         [{"pid": 903, "start": 10, "rule": "pre-supervisor"}])
+        self.assertEqual(result["ancestor_exclusions"]["count"], 1)
+        self.assertEqual(result["ancestor_exclusions"]["clock"]["state"], "ok")
+
+    def test_an_ambiguous_clock_never_excludes_on_ordering(self):
+        rows = [row(800, start=5, ppid=600), row(903, start=10, ppid=800)]
+        for clock in (cell_clock(state="ambiguous"), cell_clock(state="unreadable"),
+                      cell_clock(boot_us=50, wall_us=1000),  # start before the boot stamp
+                      cell_clock(boot_us=1, wall_us=50),  # supervisor after the wall clock
+                      None):
+            table = FakeTable(list(rows), {800: 7, 903: PermissionError(1, "denied")})
+            check = census(table, ancestors=[self.LAUNCHER], start_token=100, clock=clock)
+            if clock is None:
+                check.boot_evidence = lambda: (_ for _ in ()).throw(OSError(5, "injected"))
+            result = check.round()
+            self.assertEqual((result["certain"], result["uncertain"]), (False, 1), clock)
+            self.assertEqual(result["ancestor_exclusions"]["count"], 0, clock)
+
+    def test_ordering_needs_a_strictly_earlier_start_and_a_positive_own_token(self):
+        rows = [row(800, start=5, ppid=600), row(903, start=10, ppid=800)]
+        for own in (10, 9, None, 0, True):  # equal, later, absent, zero, bool
+            table = FakeTable(list(rows), {800: 7, 903: PermissionError(1, "denied")})
+            result = census(table, ancestors=[self.LAUNCHER], start_token=own,
+                            clock=cell_clock(boot_us=1, wall_us=1000)).round()
+            self.assertEqual((result["certain"], result["uncertain"]), (False, 1), own)
+
+    def test_the_bounded_evidence_keeps_a_capped_number_of_rows(self):
+        # 30 excludable siblings: every decision is counted, rows are capped.
+        siblings = [row(900 + n, start=20 + n, ppid=700) for n in range(30)]
+        sessions = {700: 7}
+        sessions.update({900 + n: PermissionError(1, "denied") for n in range(30)})
+        table = FakeTable([row(700, start=11, ppid=600)] + siblings, sessions)
+        result = census(table, ancestors=[self.LAUNCHER]).round()
+        evidence = result["ancestor_exclusions"]
+        self.assertEqual(evidence["count"], 31)  # the launcher row plus 30 siblings
+        self.assertEqual(len(evidence["rows"]), bounded.EXCLUSION_MAX_ROWS)
+        self.assertEqual(evidence["omitted"], 11, evidence)
+        self.assertEqual(evidence["rows"][0], {"pid": 700, "start": 11, "rule": "ancestor"})
+        self.assertEqual(evidence["by_rule"], {"ancestor": 1, "parent": 30, "pre-supervisor": 0})
+
+    def test_the_boot_domain_requires_the_wall_and_monotonic_clocks_to_agree(self):
+        raw = struct.pack("<qi", 1_000_000, 500_000) + b"\x00" * 4  # struct timeval
+        boot_us = 1_000_000 * 1_000_000 + 500_000
+        ok = bounded.boot_clock_evidence(reader=lambda _name, _size: raw,
+                                        wall_us=boot_us + 520_000_000,
+                                        uptime_us=500_000_000)
+        self.assertEqual((ok["state"], ok["boot_us"], ok["skew_us"]), ("ok", boot_us, 20_000_000))
+        # A wall clock stepped back past the accumulated sleep is ambiguous.
+        stepped = bounded.boot_clock_evidence(reader=lambda _name, _size: raw,
+                                             wall_us=boot_us + 400_000_000,
+                                             uptime_us=500_000_000)
+        self.assertEqual((stepped["state"], stepped["skew_us"]), ("ambiguous", -100_000_000))
+        # A boot stamp in the future of the wall clock is ambiguous.
+        future = bounded.boot_clock_evidence(reader=lambda _name, _size: raw,
+                                            wall_us=boot_us - 1, uptime_us=1)
+        self.assertEqual(future["state"], "ambiguous")
+        # Malformed, short or failing reads are unreadable, never guessed.
+        for reader in (lambda _name, _size: raw[:8], lambda _name, _size: raw + b"\x00",
+                       lambda _name, _size: (_ for _ in ()).throw(OSError(5, "denied")),
+                       lambda _name, _size: struct.pack("<qi", 0, 0) + b"\x00" * 4):
+            self.assertEqual(bounded.boot_clock_evidence(
+                reader=reader, wall_us=boot_us, uptime_us=1)["state"], "unreadable")
+
+    def test_the_receipt_evidence_merges_without_raising(self):
+        receipt = {}
+        report = {"rows": [{"pid": 900 + n, "start": n, "rule": "parent"} for n in range(25)],
+                  "count": 25, "by_rule": {"ancestor": 0, "parent": 25, "pre-supervisor": 0},
+                  "clock": cell_clock()}
+        bounded.merge_exclusions(receipt, report)
+        record = receipt["ancestor_exclusions"]
+        self.assertEqual((record["count"], len(record["rows"]), record["omitted"]),
+                         (25, bounded.EXCLUSION_MAX_ROWS, 5))
+        self.assertEqual(record["by_rule"]["parent"], 25)
+        # A repeat of the same identities adds to the counts but not the rows.
+        bounded.merge_exclusions(receipt, report)
+        self.assertEqual((record["count"], len(record["rows"])), (50, bounded.EXCLUSION_MAX_ROWS))
+        self.assertEqual(record["omitted"], 30, record)  # count == rows + omitted
+        # A malformed or absent report changes nothing and never raises.
+        for bad in (None, {}, {"rows": "x", "count": "1", "by_rule": [], "clock": 7}, 5):
+            bounded.merge_exclusions(receipt, bad)
+        self.assertEqual((record["count"], record["omitted"]), (50, 30))
+        bounded.merge_exclusions(None, report)
+        bounded.merge_exclusions({}, {"rows": [None, {"pid": True, "start": 1, "rule": "parent"},
+                                               {"pid": 1, "start": 1, "rule": "other"}], "count": 3})
 
 
 class PureCensusFinalAbsence(unittest.TestCase):
@@ -3882,7 +4084,7 @@ class PureQualificationTopology(unittest.TestCase):
         # Oxide#197: the real setup recorded this run's own ancestor chain in the
         # receipt, as positive identities, bounded, starting at our own parent.
         ancestors = persisted["ancestors"]
-        self.assertEqual(set(ancestors), {"state", "count", "identities", "stop"}, ancestors)
+        self.assertEqual(set(ancestors), {"state", "count", "identities", "self", "stop"}, ancestors)
         self.assertIn(ancestors["state"], ("recorded", "partial"), ancestors)
         self.assertEqual(ancestors["count"], len(ancestors["identities"]), ancestors)
         self.assertTrue(0 < ancestors["count"] <= bounded.ANCESTOR_MAX_LEVELS, ancestors)
@@ -3893,6 +4095,19 @@ class PureQualificationTopology(unittest.TestCase):
         parent = bounded.Kinfo.one(first["pid"])
         self.assertIsNotNone(parent, ancestors)
         self.assertEqual(parent["start"], first["start"], ancestors)
+        # The supervisor's own start token comes from the same snapshot, so the
+        # ordering rule (brief v2) has a comparable comparator.
+        self.assertEqual(ancestors["self"]["pid"], os.getpid(), ancestors)
+        own = bounded.Kinfo.one(os.getpid())
+        self.assertIsNotNone(own, ancestors)
+        self.assertEqual(own["start"], ancestors["self"]["start"], ancestors)
+        # The cumulative exclusion record exists, is bounded and starts empty
+        # for a run whose setup recorded the chain.
+        evidence = persisted["ancestor_exclusions"]
+        self.assertEqual(set(evidence), {"rows", "count", "omitted", "by_rule", "clock", "rounds"})
+        self.assertEqual(evidence["count"], evidence["omitted"] + len(evidence["rows"]), evidence)
+        self.assertEqual(len(evidence["rows"]), 0, evidence)
+        self.assertEqual(set(evidence["by_rule"]), {"ancestor", "parent", "pre-supervisor"})
 
     def test_the_drain_happens_before_the_final_publication(self):
         monitor, cmd_w = self.monitor_stub()
@@ -4397,9 +4612,10 @@ class FakeCensus:
 
     rounds = 0
 
-    def __init__(self, sid, terminal_allowed=False, ancestors=()):
+    def __init__(self, sid, terminal_allowed=False, ancestors=(), start_token=None,
+                 boot_evidence=None):
         self.sid, self.terminal_allowed = sid, terminal_allowed
-        self.ancestors = tuple(ancestors)
+        self.ancestors, self.start_token = tuple(ancestors), start_token
         self.stats = {"rows": 3, "esrch_rows": 1, "zombie_rows": 1, "confirm_reads": 2,
                       "pause_calls": 1, "terminal": 0, "snapshot_ns": 5, "scan_ns": 7,
                       "snapshot_error": False}
@@ -7221,6 +7437,48 @@ class Real(unittest.TestCase):
         self.assertEqual(self.guardian(fixture("open(os.environ['CASE_DIR'] + '/ran', 'w')\n")), 0)
         self.assertEqual(self.outcome()["closure"], "closed")
         self.assertEqual(self.receipt["phase"], "monitor_complete: pending_custodian")
+
+    def test_an_unrelated_launcher_sibling_does_not_block_closure(self):
+        # Oxide#197 brief v2. This suite is the nested supervisor's launcher, so
+        # it is one of the ancestors that supervisor records. A short-lived
+        # unrelated sibling spawned while the nested run is in flight leaves a
+        # zombie row whose parent is that recorded ancestor (a zombie fails
+        # getsid with ESRCH on this host), which the launcher-sibling rule must
+        # account for. The sibling is reaped only after the nested run ends, so
+        # its row really is present during the post-leader census.
+        sibling = []
+
+        def spawn_mid_run():
+            receipt = self.dir / "evidence" / "receipt.json"
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                try:
+                    phase = json.loads(receipt.read_text()).get("phase") or ""
+                except Exception:
+                    phase = ""
+                if phase.startswith("started"):
+                    break
+                time.sleep(0.02)
+            sibling.append(subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(0.3)"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+
+        thread = threading.Thread(target=spawn_mid_run, daemon=True)
+        thread.start()
+        try:
+            code = self.guardian(fixture("open(os.environ['CASE_DIR'] + '/ran', 'w')\n"))
+        finally:
+            thread.join(15)
+            for child in sibling:
+                try:
+                    child.wait(10)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(5)
+        self.assertFalse(thread.is_alive(), "the sibling was never spawned")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.outcome()["closure"], "closed")
+        self.assertTrue((self.dir / "ran").exists())
 
     def test_owned_scratch_cleanup(self):
         self.assertEqual(self.guardian(fixture("open(os.environ['TMPDIR'] + '/w', 'wb').write(bytes(65536))\n"),

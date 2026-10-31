@@ -77,7 +77,7 @@ WALL_NS = 420 * NS  # oxide#191 amendment (Tom 2026-10-31): was 300 s
 CANDIDATE_LIMIT = 380  # oxide#191 amendment: was 280 s
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 345  # 297 pure + 48 real (oxide#151 added the routing, marker,
+EXPECTED_CASES = 358  # 309 pure + 49 real (oxide#151 added the routing, marker,
                       # nested-window protection, bounded-sweep, qualify-entry,
                       # shared-ancestor/private-leaf and readiness cases; oxide#191
                       # adds seventy-six pure post-census detach cases and eight real
@@ -85,8 +85,12 @@ EXPECTED_CASES = 345  # 297 pure + 48 real (oxide#151 added the routing, marker,
                       # unrequested attachment whose opt-in custody keep is recorded
                       # separately, a stuck child the custodian closes itself, and the
                       # two unreadable-identity paths — closed by the monitor or
-                      # handed off by parentage; oxide#197 adds ten pure ancestor-chain
-                      # cases — exclusion, receipt shape, recycled PID, depth bound)
+                      # handed off by parentage; oxide#197 adds twelve more pure
+                      # launcher-rule cases (ancestor exclusion, positive parent
+                      # identity, pre-supervisor ordering with its clock domain,
+                      # recycled/unknown/PPID-1 refusals, evidence bounds and the
+                      # mid-run sibling regression) and one real launcher-sibling
+                      # case, on top of its first ten)
 ACTOR_MARGIN_NS = 2 * NS  # the actor's own KILL, reap and exit
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPTS)

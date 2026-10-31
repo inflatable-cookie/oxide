@@ -4,7 +4,7 @@
 One fixed script and the whole command of the shared proof supervisor
 (`bounded-test.py`, guard sha256 7acca44c..., the oxide#191 bytes that add the
 opt-in post-census image detach to the qualified oxide#151 guard, plus
-oxide#197's ancestor-chain exclusion). That pin is
+oxide#197's ancestor and launcher-sibling exclusions). That pin is
 checked against the actual runner file before any effect, so a branch that
 still carries different guard bytes refuses here instead of spending a run;
 these bytes are unqualified until their own author and reviewer qualifications
@@ -82,7 +82,7 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILDER = "1.97.1"
 # The qualified shared supervisor this proof's whole command runs under.
-GUARD_SHA256 = "7acca44c5e115edf06763bd9a748498ee2f0cd839fc91ff816901cd9de198d35"
+GUARD_SHA256 = "409d1edc82ec3991781a609e2ae85e7250f610bd835d8f334aec272b1c3daeb6"
 GUARD_PATH = os.path.join(REPO, "scripts", "bounded-test.py")
 
 # The product's serialized pool facts, bound to source by `--self-test`. The

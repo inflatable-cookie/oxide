@@ -298,8 +298,8 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # commands take Tom's answered internal-root exception explicitly
 # (`--root-parent /private/tmp`) rather than placing a pool on a selected
 # volume, where the product correctly refuses it. The supervisor is this tree's
-# `bounded-test.py` (sha256 7acca44c…, oxide#191's post-census detach and
-# oxide#197's ancestor-chain exclusion over
+# `bounded-test.py` (sha256 409d1edc…, oxide#191's post-census detach and
+# oxide#197's ancestor and launcher-sibling exclusions over
 # the qualified oxide#151 guard; those added bytes are unqualified until their
 # own qualifications pass); 300 s wall and
 # 512 MiB monitored scratch are unchanged and the fit stays unmeasured until
@@ -531,9 +531,9 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 
 # Owned-output prune (oxide#129, oxide#152): one fixed 22-case native proof
 # under the shared supervisor (`scripts/bounded-test.py` SHA-256
-# 7acca44c5e115edf06763bd9a748498ee2f0cd839fc91ff816901cd9de198d35,
+# 409d1edc82ec3991781a609e2ae85e7250f610bd835d8f334aec272b1c3daeb6,
 # the qualified oxide#151 guard plus oxide#191's opt-in post-census detach and
-# oxide#197's ancestor-chain exclusion,
+# oxide#197's ancestor and launcher-sibling exclusions,
 # unqualified until their own qualifications pass): 360 s, 512 MiB monitored scratch, 30 s work
 # shutdown margin, one
 # owned 128 MiB scratch image, ordinary detach. Fence and initialization, root
@@ -1092,8 +1092,8 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 
 # Slot headroom (oxide#118, oxide#177): under the shared proof supervisor
 # (oxide#109/#114/#151 plus oxide#191's opt-in post-census detach and oxide#197's
-# ancestor-chain exclusion, bounded-test.py
-# SHA-256 7acca44c5e115edf06763bd9a748498ee2f0cd839fc91ff816901cd9de198d35,
+# ancestor and launcher-sibling exclusions, bounded-test.py
+# SHA-256 409d1edc82ec3991781a609e2ae85e7250f610bd835d8f334aec272b1c3daeb6,
 # unqualified until their own qualifications pass), stages
 # `oxide` offline with 1.97.1 and proves the permanent ledger/control fences,
 # legacy read without migration, the raised-ceiling fence written at the 129th
