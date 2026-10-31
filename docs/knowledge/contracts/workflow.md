@@ -2310,7 +2310,10 @@ leader is reaped, every census round records, once per identity and up to
 sixteen rows, the exact rows it still classifies in the leader's own session
 (`PID`, `start`, `ppid`, `pgid`, `uid`, `zombie`) in the receipt's `survivors`
 list, and the summary line states how many same-session survivors were not
-signalled. That is observation only: no message, no signal, no closure claim.
+signalled. Each row is recorded before the round that reports it is sent and the
+census thread is joined before the receipt is published, so the evidence a
+verdict rests on is the evidence on disk. That is observation only: no message,
+no signal, no closure claim.
 A recorded row is observation, never a verdict: a survivor seen after the stop
 may exit by itself, so a LATER certain-empty census can still close the run, and
 the summary line states the run's own final closure — a closed run says the
@@ -2328,16 +2331,19 @@ Cargo-shaped case (a `setpgid` group leader in the leader's session and its own
 child in that group, both survivable past the deadline, both recorded and never
 signalled, both still live at the `UNCLOSED` verdict), and adds the pure rules
 that keep it that way, including an AST guard that every kill call site in the
-supervisor is a custody-bound one, and a pure regression for a transient
-survivor followed by a certain-empty census (so a closed run is never reported
-as `UNCLOSED`/kept). At this head the three sources are
+supervisor is a custody-bound one; pure regressions that a recorded row reaches
+the published receipt, that a round records its rows before it reports them and
+that the census thread is joined before publication; and a transient-survivor
+regression (both pure and real: a recorded row followed by a certain-empty
+census closes the run and never reports `UNCLOSED`/kept). At this head the three
+sources are
 `bounded-test.py`
-`bd5701e043523156647ccba21cb8058b69c62ec87b98260e84693bab01d1ce79`,
+`fc2451272320c86978245650789220541c50e47391cf1b732d203f68a127ec35`,
 `test_supervisor.py`
-`62c84b3111ece9f760b5fde0fdfb82193e5598ae012fa70126505acb6991527f` and
+`26ad33d3beb5952266061eb073f2cd136f57ab078798a3278294f3685941027e` and
 `qualify-supervisor.py`
-`3b33a8d89ce11d741223f58c6e9f7c6cccbf3d5902e2a3359094bb5fdbc5cde3`. The
-head's suite is 296 pure plus 48 real cases and is **unqualified** until one
+`9d76bec60d5a89e34ac5757bf688f0d62faedcb6d877ba9ea4b07e5f4ff0a73b`. The
+head's suite is 299 pure plus 49 real cases and is **unqualified** until one
 uncounted keep-going
 `effigy proof:supervisor:qualify:diagnostic` and then ONE counted author and
 ONE separate independent reviewer `effigy proof:supervisor:qualify` pass at the

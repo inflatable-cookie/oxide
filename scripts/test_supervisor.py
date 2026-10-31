@@ -132,6 +132,25 @@ CARGO_LEADER = fixture(
     "    time.sleep(0.02)\n"
     "time.sleep(3600)\n")
 
+# A transient same-session member: it leads its own group in the leader's session
+# (the Cargo shape), outlives the leader's deadline KILL, and then exits on its own
+# a few seconds later. The census must record its exact row and the run must close
+# truthfully, never claiming UNCLOSED for a survivor that was gone in time.
+TRANSIENT_MEMBER = fixture(
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "parent = os.getppid()\n"
+    "until = time.monotonic() + 25\n"
+    "while os.getppid() == parent and time.monotonic() < until:\n"
+    "    time.sleep(0.02)\n"
+    "time.sleep(3.0)\n"
+    "raise SystemExit(0)\n")
+TRANSIENT_LEADER = fixture(
+    "import subprocess, sys\n"
+    f"member = subprocess.Popen([sys.executable, '-c', {TRANSIENT_MEMBER!r}],"
+    " preexec_fn=lambda: os.setpgid(0, 0))\n"
+    "open(os.environ['CASE_DIR'] + '/member.pid', 'w').write(str(member.pid))\n"
+    "time.sleep(3600)\n")
+
 # An escaped writer: it leaves the nested session with setsid, keeps the nested
 # leader's stdout/stderr write descriptors open (the pipe therefore never
 # reaches EOF) and answers one fresh nonce after the verdict, which shows it was
@@ -1724,6 +1743,78 @@ class PureSurvivors(unittest.TestCase):
         # A second, certainly empty round adds nothing and closes nothing here.
         monitor.record_survivors({"certain": True, "members": 0, "uncertain": 0, "member_rows": []})
         self.assertEqual(len(monitor.receipt["survivors"]), 1)
+
+    def publishable_monitor(self):
+        monitor, ctl_r = self.monitor()
+        evidence = Path(tempfile.mkdtemp(prefix="survivors.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(evidence), True)
+        monitor.ctx = {"run_id": "r", "evidence": str(evidence)}
+        monitor.receipt.update({"phase": None, "custodian": [], "census": None, "census_rounds": 0})
+        return monitor, evidence, ctl_r
+
+    def test_a_recorded_survivor_reaches_the_published_receipt(self):
+        # Review finding: a row that never reaches the receipt on disk is not
+        # evidence. Recording plus publication must leave the row in the file.
+        monitor, evidence, _ctl_r = self.publishable_monitor()
+        monitor.record_survivors(self.members(row(900, start=5)))
+        monitor.publish("unclosed: scratch_kept")
+        published = json.loads((evidence / "receipt.json").read_text())
+        self.assertEqual([(item["pid"], item["start"], item["zombie"])
+                          for item in published["survivors"]], [(900, 5, False)])
+        self.assertEqual(published["phase"], "unclosed: scratch_kept")
+
+    def test_the_round_records_its_survivors_before_it_reports_them(self):
+        # The custodian can decide on the census message and the monitor can
+        # publish immediately after it, so the row must already be recorded when
+        # the message is sent. Driving the real loop pins the ordering.
+        monitor, _evidence, _ctl_r = self.publishable_monitor()
+        monitor.census_stop = OneShotStop()
+        seen = []
+
+        class SurvivorCensus(FakeCensus):
+            def round(self):
+                return {"certain": False, "members": 1, "uncertain": 0,
+                        "member_rows": [row(900, start=5)], "uncertain_rows": [],
+                        "terminal_count_status": "valid", "terminal_nonwriters": 0}
+
+        original_send = monitor.send
+
+        def send(message_type, **fields):
+            if message_type == "census":
+                seen.append(len(monitor.receipt["survivors"]))
+            return original_send(message_type, **fields)
+
+        monitor.send = send
+        saved = bounded.Census
+        bounded.Census = SurvivorCensus
+        try:
+            monitor.census_loop(7)
+        finally:
+            bounded.Census = saved
+        self.assertEqual(seen, [1], "the census message was sent before the survivor was recorded")
+        self.assertEqual([item["pid"] for item in monitor.receipt["survivors"]], [900])
+
+    def test_the_census_thread_is_joined_before_the_final_publication(self):
+        # A late append after publication would silently drop evidence: the join
+        # must land the row first, and the join itself never raises or hangs.
+        monitor, evidence, _ctl_r = self.publishable_monitor()
+        monitor.census_stop = OneShotStop()
+
+        def late_round():
+            time.sleep(0.05)
+            monitor.record_survivors(self.members(row(900, start=5)))
+
+        monitor.census_thread = threading.Thread(target=late_round)
+        monitor.census_thread.start()
+        self.assertTrue(monitor.join_census(5))
+        monitor.publish("unclosed: scratch_kept")
+        published = json.loads((evidence / "receipt.json").read_text())
+        self.assertEqual([item["pid"] for item in published["survivors"]], [900])
+        # Idempotent and never blocking: an absent thread and a spent bound are
+        # both non-verdicts, never exceptions.
+        self.assertTrue(monitor.join_census(5))
+        self.assertTrue(bounded.Monitor.join_census(self.monitor()[0], 0))
+        self.assertTrue(bounded.Monitor.join_census(self.monitor()[0], -5))
 
     def test_the_qualification_oracle_requires_the_survivor_record_and_no_signal(self):
         rows = survivor_case_rows("/x")
@@ -7463,6 +7554,42 @@ class Real(unittest.TestCase):
                           "the survivor's exact identity was not recorded")
             self.assertIn(pid, member_pids, "the survivor was not the census's own member row")
         self.assert_kept_outside_outer_cleanup()
+
+    def test_a_transient_member_records_a_row_and_the_run_closes(self):
+        # Reviewer finding: the transient case must be behavioural. A member that
+        # leads its own group in the leader's session outlives the deadline KILL
+        # and then exits by itself, so the census records its exact row and a
+        # later certainly-empty round closes the run. The summary must say the
+        # run closed, never that it stays UNCLOSED or kept a scratch, and no
+        # non-held identity may be signalled.
+        self.assertEqual(self.guardian(TRANSIENT_LEADER), 124)
+        outcome = self.outcome()
+        self.assertEqual(outcome["closure"], "closed")
+        self.assertIsNone(outcome["fault"])
+        self.assertTrue(outcome["deadline"])
+        census = self.receipt["census"]
+        self.assertEqual((census["certain"], census["members"], census["uncertain"]),
+                         (True, 0, 0), census)
+        member = int((self.dir / "member.pid").read_text())
+        recorded = [(item["pid"], item["start"], item["zombie"])
+                    for item in self.receipt["survivors"]]
+        self.assertTrue(recorded, "the transient member was never recorded")
+        self.assertIn(member, [pid for pid, _start, _zombie in recorded])
+        for pid, start, zombie in recorded:
+            self.assertGreater(start, 0)
+            self.assertIs(zombie, False)
+        signalled = {record["target"] for record in self.receipt["custodian"]
+                     if record["event"] == "signal"}
+        self.assertNotIn(member, signalled)
+        self.assertIsNone(bounded.Kinfo.one(member), "the transient member was still live")
+        log = (self.dir / "guardian.log").read_text()
+        survivor_line = [line for line in log.splitlines()
+                         if "same-session survivor(s) not signalled" in line]
+        self.assertEqual(len(survivor_line), 1, log)
+        self.assertIn("gone by the deciding census, so the run closed", survivor_line[0])
+        self.assertNotIn("UNCLOSED", survivor_line[0])
+        self.assertNotIn("scratch is kept", survivor_line[0])
+        self.assertFalse((self.dir / "oxide-proof.").exists())
 
     def test_escaped_pipe_holder_unclosed(self):
         # The escaped writer leaves the nested session, keeps the leader's

@@ -49,7 +49,10 @@ unreaped), the pinned monitor, and a direct child still held unreaped. After
 the leader is reaped, every census round records, once per identity and up to
 a fixed bound, the exact rows it still classifies in the leader's own session
 (PID, start, ppid, pgid, uid, zombie) in the receipt's `survivors` list for the
-owner; that is observation only, no message and no signal. The census still
+owner; that is observation only, no message and no signal. Each row is recorded
+before the round that reports it is sent, and the census thread is joined before
+the receipt is published, so the evidence a verdict rests on is always the
+evidence on disk. The census still
 decides closure, so a survivor that is still there when the deciding census runs
 keeps the run UNCLOSED with its scratch and evidence, while one that exits first
 leaves a recorded row and a closed run that honestly says so. Closing a
@@ -158,6 +161,7 @@ CONFIRM_TRIES, CONFIRM_PAUSE = 20, 0.05  # gone confirmation within one round, a
 # UNCLOSED. The bound keeps a forking tree's evidence finite.
 SURVIVOR_MAX = 16
 SURVIVOR_KEYS = ("pid", "start", "ppid", "pgid", "uid", "zombie")
+CENSUS_JOIN_S = 1.0  # bounded wait for the census thread before the receipt is published
 DIAG_MAX_BYTES = 16384  # compact UTF-8 JSON ceiling for the optional receipt census diagnostics
 DIAG_MAX_ROWS = 20  # at most 20 diagnostic summary rows; the rest count as omitted
 # Observation-only settlement diagnostics (oxide#147). Fixed schema, one record
@@ -3305,6 +3309,7 @@ class Monitor:
         # Cooperative-session survivors (oxide#195): identities already recorded in
         # the receipt's bounded `survivors` list. Observation only; never a signal.
         self.survivors = set()
+        self.census_thread = None
 
     def note(self, entry=_SETTLE_TOP, **fields):
         """One observation-only stamp, on the settlement object or on one
@@ -3489,6 +3494,7 @@ class Monitor:
         BEFORE the final publication so the persisted receipt carries the
         post-decision records. A run with neither a request nor a custody
         indication passes drain=False and reads nothing."""
+        self.join_census()  # idempotent backstop before every completion publication
         if not self.close_orphan_reads(ctx):
             # Unaccounted custody: keep everything and let the custodian end the run.
             self.publish("orphan_read_unaccounted: monitor_held")
@@ -3667,6 +3673,24 @@ class Monitor:
         except BaseException:
             pass
 
+    def join_census(self, timeout_s=CENSUS_JOIN_S):
+        """Wait, bounded, for the census thread to finish after `census_stop`
+        (oxide#195 review).
+
+        A round records its survivor rows before it reports them, and the thread
+        must be done before the receipt that carries them is published; otherwise
+        a late append could be missing from the persisted evidence. Observation
+        only: a thread that does not finish in the bound is not an error, the
+        publication still happens, and its `False` answer is never a verdict."""
+        thread = getattr(self, "census_thread", None)
+        if thread is None:
+            return True
+        try:
+            thread.join(max(0.0, timeout_s))
+            return not thread.is_alive()
+        except BaseException:
+            return False
+
     def census_loop(self, after):
         started = now_ns()
         self.note(thread_start_ns=started, phase="thread-start")
@@ -3709,10 +3733,14 @@ class Monitor:
                       certain=result["certain"], members=result["members"],
                       uncertain=result["uncertain"])
             self.note(phase="locked")
+            if result["members"] > 0:
+                # Record BEFORE reporting the round: the custodian may decide on this
+                # message and the monitor may publish its receipt straight after it,
+                # so a row appended after the send could be missing from the evidence
+                # that justified the verdict (oxide#195 review).
+                self.record_survivors(result)
             self.send("census", after=after, members=result["members"], uncertain=result["uncertain"],
                       certain=result["certain"])
-            if result["members"] > 0:
-                self.record_survivors(result)
             # `sent_ns` also covers the send's own lock acquisition and pipe write.
             sent = now_ns()
             self.note(entry, sent_ns=sent)
@@ -3858,7 +3886,9 @@ class Monitor:
                     with self.lock:  # every sender blocks: readings go stale
                         time.sleep(LIMIT_S)
                 if self.leader is not None:
-                    threading.Thread(target=self.census_loop, args=(command["seq"],), daemon=True).start()
+                    self.census_thread = threading.Thread(
+                        target=self.census_loop, args=(command["seq"],), daemon=True)
+                    self.census_thread.start()
             elif kind in ("cleanup", "keep"):
                 decision = kind
                 with self.lock:
@@ -3866,6 +3896,8 @@ class Monitor:
                 break
         self.note(stop_requested_ns=now_ns())
         self.census_stop.set()
+        # No survivor row may land after the receipt that records it is published.
+        self.join_census()
         # Only a run that took part in the image protocol drains at completion; a
         # keep/UNCLOSED decision never does, so the default is initialized here.
         opted_in = False
