@@ -29,6 +29,7 @@ import inspect
 import io
 import json
 import os
+import plistlib
 import secrets
 import shutil
 import signal
@@ -5136,6 +5137,113 @@ class PureDetach(unittest.TestCase):
         record = bounded.post_census_detach(ctx, leftover)
         self.assertEqual((record["state"], record["post_state"], record["qualified"]),
                          ("failed", "still_attached", False), record)
+
+    def test_the_attachment_parser_fails_closed_on_malformed_facts(self):
+        # The parser's own seam: a document either yields every relevant entity
+        # exactly, or it is unreadable (None). Never a smaller or empty set.
+        backing = "/fixture/volume.sparseimage"
+
+        def attempt(document):
+            import plistlib as _plistlib
+            payload = _plistlib.dumps(document) if not isinstance(document, bytes) else document
+            return {"exit": 0, "timed_out": False, "truncated": False,
+                    "output": payload.decode("utf-8", "replace") if isinstance(payload, bytes) else payload}
+
+        # A real `hdiutil info` plist omits `mount-point` on an unmounted entity and
+        # cannot carry nulls at all.
+        good = {"images": [{"image-path": backing,
+                            "system-entities": [{"dev-entry": "/dev/disk10"},
+                                                {"dev-entry": "/dev/disk10s1",
+                                                 "mount-point": "/Volumes/OxDetach",
+                                                 "volume-uuid": DETACH_UUID}]}]}
+        self.assertEqual(bounded.image_attachments(backing, run=lambda *a: attempt(good)),
+                         [("/dev/disk10", None, None),
+                          ("/dev/disk10s1", "/Volumes/OxDetach", DETACH_UUID)])
+        self.assertEqual(len(bounded.image_attachments(None, run=lambda *a: attempt(good))), 2)
+
+        # Every malformed shape is unreadable, including the declared backing's
+        # mounted entity losing its dev-entry.
+        for bad in (
+            {"images": "nope"},
+            {"not-images": []},
+            {"images": ["not an object"]},
+            {"images": [{"system-entities": []}]},                                  # no image path
+            {"images": [{"image-path": "", "system-entities": []}]},
+            {"images": [{"image-path": backing, "system-entities": "nope"}]},
+            {"images": [{"image-path": backing, "system-entities": ["nope"]}]},
+            {"images": [{"image-path": backing, "system-entities": [{"mount-point": "/Volumes/OxDetach"}]}]},
+            {"images": [{"image-path": backing,
+                         "system-entities": [{"dev-entry": "", "mount-point": "/Volumes/OxDetach"}]}]},
+            {"images": [{"image-path": backing,
+                         "system-entities": [{"dev-entry": "/dev/disk10s1", "mount-point": 7}]}]},
+            {"images": [{"image-path": backing,
+                         "system-entities": [{"dev-entry": "/dev/disk10s1", "volume-uuid": 7}]}]},
+            {"images": [{"image-path": backing, "system-entities": []}]},           # matched, no entities
+        ):
+            self.assertIsNone(bounded.image_attachments(backing, run=lambda *a: attempt(bad)), bad)
+            self.assertIsNone(bounded.image_attachments(None, run=lambda *a: attempt(bad)), bad)
+
+        # A malformed UNRELATED image is still unreadable, and an unreadable child
+        # or output is too.
+        unrelated = {"images": [{"image-path": "/other.sparseimage", "system-entities": "nope"}]}
+        self.assertIsNone(bounded.image_attachments(backing, run=lambda *a: attempt(unrelated)))
+        for broken in ({"exit": 3, "timed_out": False, "truncated": False, "output": ""},
+                       {"exit": 0, "timed_out": True, "truncated": False, "output": ""},
+                       {"exit": 0, "timed_out": False, "truncated": True, "output": ""},
+                       {"exit": 0, "timed_out": False, "truncated": False, "output": "not a plist"}):
+            self.assertIsNone(bounded.image_attachments(backing, run=lambda *a, b=broken: b), broken)
+
+    def test_a_malformed_attachment_keeps_the_request_free_root(self):
+        # Parser to the opt-in custody check: the declared backing's mounted entity
+        # loses its dev-entry, so nothing about it is provably clear.
+        ctx, backing = self.layout()
+        self.declare_custody(ctx, backing)
+        document = {"images": [{"image-path": backing,
+                                "system-entities": [{"mount-point": "/Volumes/OxDetach"}]}]}
+        payload = plistlib.dumps(document).decode()
+
+        def fake_run(*_args, **_kwargs):
+            return {"exit": 0, "timed_out": False, "truncated": False, "output": payload}
+
+        saved = bounded.bounded_run
+        try:
+            bounded.bounded_run = fake_run
+            record = bounded.cleanup_safety(ctx, self.facts())
+        finally:
+            bounded.bounded_run = saved
+        self.assertEqual(record["state"], "kept", record)
+        self.assertIn("unreadable", record["reason"])
+        # And with no custody indication the default path still performs no scan.
+        ctx, _backing = self.layout()
+        try:
+            bounded.bounded_run = fake_run
+            self.assertIsNone(bounded.cleanup_safety(ctx, self.facts()))
+        finally:
+            bounded.bounded_run = saved
+
+    def test_a_malformed_attachment_is_an_unknown_detach_post_state(self):
+        # Parser to the detach post-state: unreadable facts can never read as
+        # "detached", whatever the exit code says.
+        ctx, backing = self.layout()
+        self.request(ctx, backing)
+        document = {"images": [{"image-path": backing,
+                                "system-entities": [{"dev-entry": "/dev/disk7", "mount-point": "bad"}]}]}
+        payload = plistlib.dumps(document).decode()
+
+        def fake_run(*_args, **_kwargs):
+            return {"exit": 0, "timed_out": False, "truncated": False, "output": payload}
+
+        facts = self.facts(mount_point=lambda attempted: not attempted)
+        # Use the REAL parser for the post-state read.
+        facts.attachments = lambda target, timeout=None: bounded.image_attachments(target, timeout)
+        saved = bounded.bounded_run
+        try:
+            bounded.bounded_run = fake_run
+            record = bounded.post_census_detach(ctx, facts)
+        finally:
+            bounded.bounded_run = saved
+        self.assertEqual((record["post_state"], record["qualified"]), ("unknown", False), record)
+        self.assertNotEqual(record["state"], "detached", record)
 
     def test_the_fixture_child_imports_every_module_it_uses(self):
         # The fixture body is a fresh python child: a module it reaches through a

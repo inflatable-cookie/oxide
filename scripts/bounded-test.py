@@ -1655,45 +1655,67 @@ def read_detach_request(evidence, probe):
         return None, "request is not a JSON document"
 
 
-def image_attachments(backing=None, timeout=DETACH_INFO_TIMEOUT_S):
+def image_attachments(backing=None, timeout=DETACH_INFO_TIMEOUT_S, run=None):
     """[(device, mount-point, volume-uuid)] for the attached image whose path is
     exactly `backing` (or, with no backing, `[(image-path, device, mount-point,
     volume-uuid)]` for every attachment), or None when the facts are unreadable.
-    One bounded read-only `hdiutil info`; nothing is attached, mounted or
-    detached."""
-    attempt = bounded_run([HDIUTIL, "info", "-plist"], timeout, DETACH_INFO_MAX_BYTES)
+
+    Fail closed: one bounded read-only `hdiutil info`, and ANY malformed or
+    incomplete relevant structure -- a document without an images list, an image
+    that is not an object or has no path, a non-list entity list, an entity that
+    is not an object or has no device, a non-string mount or UUID, or a matching
+    image with no entities at all -- is unreadable facts (None), never a smaller
+    or empty attachment set. Callers treat None as uncertain: a detach post-state
+    is unknown and a custody check keeps the root. `run` substitutes the child
+    runner (the parser's own seam)."""
+    attempt = (run or bounded_run)([HDIUTIL, "info", "-plist"], timeout, DETACH_INFO_MAX_BYTES)
     if attempt["exit"] != 0 or attempt["timed_out"] or attempt["truncated"] or not attempt["output"]:
         return None
     try:
         document = plistlib.loads(attempt["output"].encode("utf-8"))
     except Exception:
         return None
-    images = document.get("images") if isinstance(document, dict) else None
+    if not isinstance(document, dict):
+        return None
+    images = document.get("images")
     if not isinstance(images, list):
         return None
     canonical = None if backing is None else os.path.realpath(backing)
-    rows = []
+    # Validate EVERY image and entity before filtering for the declared backing: a
+    # malformed unrelated entry could be the one that belongs to it, so it makes
+    # the whole answer unreadable rather than "this backing is not attached".
+    parsed, paths = [], []
     for image in images:
         if not isinstance(image, dict):
-            continue
+            return None
         path = image.get("image-path")
         if not isinstance(path, str) or not path:
-            continue
-        if canonical is not None and os.path.realpath(path) != canonical:
-            continue
-        for entity in image.get("system-entities") or []:
+            return None
+        paths.append(os.path.realpath(path))
+        entities = image.get("system-entities", [])
+        if not isinstance(entities, list) or not entities:
+            # An attached image with no entities (or a non-list) is not a fact that
+            # proves anything is detached or clear.
+            return None
+        for entity in entities:
             if not isinstance(entity, dict):
-                continue
+                return None
             device = entity.get("dev-entry")
             if not isinstance(device, str) or not device:
-                continue
+                return None
             mount = entity.get("mount-point")
+            if mount is not None and (not isinstance(mount, str) or not mount):
+                return None
             identifier = entity.get("volume-uuid")
-            mount = mount if isinstance(mount, str) and mount else None
-            identifier = identifier.lower() if isinstance(identifier, str) and identifier else None
-            rows.append((device, mount, identifier) if canonical is not None
-                        else (path, device, mount, identifier))
-    return rows
+            if identifier is not None and (not isinstance(identifier, str) or not identifier):
+                return None
+            parsed.append((path, device, mount, identifier.lower() if identifier else None))
+    if canonical is None:
+        return [(device, mount, identifier) for _path, device, mount, identifier in parsed]
+    mine = [row for row in parsed if os.path.realpath(row[0]) == canonical]
+    if canonical in paths and not mine:
+        return None  # the declared backing is attached with no entities at all
+    return [(device, mount, identifier) for _path, device, mount, identifier in mine]
 
 
 def read_custody(ctx, probe):
