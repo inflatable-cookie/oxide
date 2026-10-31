@@ -650,6 +650,31 @@ Cargo.
    stays with that reason. Cargo, execution and freshness-gate work are not
    measured as waits. A changed reason is printed, up to eight reason lines
    per command followed by one suppression notice.
+
+   **Supervised admission marker** (oxide#192). When the shared proof
+   supervisor armed this process — `OXIDE_PROOF_DEADLINE_NS` parses as an
+   absolute `CLOCK_UPTIME_RAW` value and the canonical `OXIDE_PROOF_EVIDENCE`
+   is nested in, or the `scratch`/`evidence` sibling of, the canonical
+   `OXIDE_TASK_SCRATCH_ROOT` — a granted lease publishes one bounded marker,
+   `admission.json`, carrying this command's own measured admission interval
+   (`{"schema":2,"source":"oxide","run":R,"command":C,"waited_ns":N}`, at most
+   512 bytes, written to a private temporary file and renamed). `R` is the
+   supervisor's exported run identity and `C` one bounded token for this
+   admission attempt, so a report can be paired with its own command and a file
+   left by an earlier run is recognisable. It exists so the supervisor can
+   report queue time separately instead of spending its work window on it
+   ([shared proof supervisor](#shared-proof-supervisor)). When the command
+   first observes that it has to wait it also publishes one
+   `admission-waiting.json`
+   (`{"schema":2,"source":"oxide","run":R,"command":C,"reason":"<token>"}`,
+   the same bounds, the reason being its own wait label such as `queue` or
+   `host limit`), so a wait that never ends before the supervisor stops is still
+   reported; that report grants nothing. Both writes are best effort and
+   observation only: an unarmed run writes nothing, a failed write changes
+   nothing, Oxide never reads either report back, and no slot, ledger, output or
+   exit-code state depends on them. They are compiled in every profile, because
+   an installed `oxide` runs the reported case too; they are the proof-facing
+   side effects that are not debug-only hooks.
    **Second-slot rule** (Tom, 2026-10-20, oxide#107): when this checkout's
    slot for the same key is busy (a live command such as a long `oxide exec
    -- tauri dev`, or an interrupted one whose group may still run), a further
@@ -2168,9 +2193,9 @@ no product, task or native evidence for any proof that uses them, and the
 with no earlier run migrated.
 
 **Post-census image detach request (oxide#191, decision `ee263cea`, unqualified
-source).** The current `bounded-test.py`
-(`0848974d79d84617070bd611da9503b48a0127e68c2965cebcd36e8d5fc13414`) adds one
-opt-in control for a proof
+source).** The oxide#191 runner bytes
+(`0848974d79d84617070bd611da9503b48a0127e68c2965cebcd36e8d5fc13414`, as merged on
+main) add one opt-in control for a proof
 whose own test image must be detached, and it is the only route by which such a
 proof may detach after a launch; the qualified shared runner is otherwise
 unchanged. A proof publishes ONE bounded atomic request (`detach-request.json`,
@@ -2289,6 +2314,101 @@ whose opt-in custody keep is recorded separately, and a real stuck child the
 custodian pins, signals and observes closed), with independent exact-head source
 review afterwards.
 
+**Admission reports on the integrated source (oxide#192, qualified at the native head).** The
+integrated head adds the admission reports described in the supervisor rule
+below: the completed-wait marker and its bounded grant, the correlated waiting
+report, and the stop-boundary drain with late-marker classification. Together
+with oxide#191's merged 287 pure and 48 real cases the suite is now 329 pure + 53
+real = 382 cases (39 pure and 5 real of them oxide#192's: the completed wait and its
+grant, the rejection control, the late grant, a wait that never ends before the
+stop, and the stale-run plus zero-duration-grant correlation), which the
+bootstrap's expected count and limitation list follow. The exported deadline,
+closure, census, reserve, scratch, cleanup, custody and signal rules are
+unchanged, a run with no admission report behaves exactly as before, and the
+detach protocol's own rules are oxide#191's. The native chain ran at native head
+`a19fb6c`: the owner-activated uncounted diagnostic passed 11/11 checks with zero
+problems, and the counted author qualification and the distinct independent
+reviewer qualification both passed, recorded in
+`/Volumes/Builds/scratch/oxide/evidence-192-a19fb6c-final-20261031T232038Z`
+(SHA256SUMS; the reviewer's own receipt is
+`oxide-supervisor-qualify.i729jh46`). The final head `71b7963` differs from that
+native head only in `AGENTS.md` and `workflow.md` Markdown; the independent
+review confirmed by `git diff a19fb6c..71b7963` that it changes no executable
+statement, non-docstring constant, test, fixture or proof-script behaviour, so
+those receipts bind to the final head under the brief-author source-immutable
+rule (decisions `7bb1089d` and `36ab646d`). The remaining end-to-end slow-setup
+launch-and-closure regression is assigned to oxide#197, not dropped. Earlier
+receipts stay historical, the `bc24b238…` (#151) bytes remain the qualified ones
+for their own runs, and no earlier evidence is migrated.
+
+**Historical receipts (superseded source).** At `93bb6db` the author side ran
+`effigy proof:supervisor:test` (227 pure), an uncounted diagnostic (270 reached
+of 270 expected, 270 completed, none failed or unexecuted, evidence kept at
+`/Volumes/Builds/scratch/oxide/oxide-supervisor-qualify._xqoizwl`) and then the
+counted `effigy proof:supervisor:qualify` (`result: pass`, no problems, 270/270
+cases, candidate `closed` status 0, no fault, no deadline, positive outer
+closure, 198.2 s, the 24 expected retained nested `UNCLOSED` case directories and
+the base kept at
+`/Volumes/Builds/scratch/oxide/oxide-supervisor-qualify.4sjmprvx`; scripts
+`supervisor` `a0d7fa83…`, `suite` `59916bd6…`, `bootstrap` `9ae2b84d…`). A
+reviewer qualification also passed at that source's documentation head
+`68faa7b`, reported by the review rather than by this file. Those receipts, and
+oxide#191's own receipts on its reviewed bytes, bind the source they ran under
+and are **history** only: the correlated waiting report (schema 2 with the run
+and command tokens) changed `bounded-test.py`, `test_supervisor.py` and
+`qualify-supervisor.py` again before integration, and a first diagnostic at
+`96f0767` recorded a fixture `NameError` as one failed case and continued
+(corrected, preserved as history).
+
+**Measured combined-suite basis (oxide#192, 2026-10-31).** After merging
+oxide#191's reviewed runner (which already raised the qualification's fixed
+deadline to 420 s and its candidate limit to 380 s, and the suite's own alarm to
+350 s), the combined 314 pure + 53 real suite was measured once, privately, as a
+development measurement (not a qualification): a clean, closed run of
+`bounded-test.py --root-parent <owned mktemp> --limit 380 --scratch-budget-mib 512
+-- python3 scripts/test_supervisor.py` finished the 53 real cases in **289.6 s**
+(guard wall 297 s; owned-byte peak 95.9 MiB of 512 MiB; reserve minimum 2207.7
+GiB; closed, status 0, no deadline) — 76.2 % of the 380 s candidate limit,
+80.4 % of the 360 s stop point and 82.7 % of the 350 s suite alarm. The earlier
+provisional estimate of about 241 s was under-measured because oxide#191's detach
+real cases were failing early there. Those figures describe that private run
+only: they are superseded by the direct diagnostic below, which ran longer inside
+the real qualification, and the brief-author correction then raised the bounds
+again.
+
+**Superseded the same day (oxide#192 amendment, Oxide Supervisor, 2026-10-31).**
+The first uncounted diagnostic at `5623edd` (direct, under Tom `d3d61247`)
+exceeded the 350 s suite alarm (candidate exit 142 = SIGALRM, 357 s wall, load
+about 9.5), so inside the real qualification the combined suite runs longer than
+the private 297 s measurement. That packet is **failed**: it is preserved as
+history with no native credit, and only its pure suite passed. The bounds are
+therefore raised to a 600 s fixed deadline (kill at 598 s), a 560 s candidate
+limit and a 530 s suite alarm; scratch stays 512 MiB and the margin semantics
+are unchanged. Earlier qualifications stay bound to the limits they ran under.
+Under Tom decision `d3d61247`, while Effigy's I2/I3 helper-process regression
+makes its session census uncertain, the owner may run the exact `effigy.toml`
+proof commands directly with the same bounds, environment, reserve and custody
+checks and a per-session executor/command/head/exit/load/log-hash envelope; that
+is no general waiver, and one clean uncounted diagnostic, one counted author
+qualification and one distinct independent reviewer qualification follow in that
+order at the final published head.
+
+**Integrated head: qualified, pending the final-head verdict.** The oxide#192
+bytes are qualified at native head `a19fb6c` by the owner-activated uncounted
+diagnostic (11/11 checks, zero problems) and by the counted author and distinct
+independent reviewer qualifications (receipts in
+`evidence-192-a19fb6c-final-20261031T232038Z`). The final head `71b7963` changes
+only `AGENTS.md` and `workflow.md` Markdown, and the independent review confirmed
+with `git diff a19fb6c..71b7963` that it carries no executable statement,
+non-docstring constant, test, fixture or proof-script behaviour change, so those
+receipts bind to it under the brief-author source-immutable rule. The reviewer's
+slow-setup regression finding is resolved by decision `7bb1089d` (the
+end-to-end case is assigned to oxide#197, not dropped). What remains is an
+independent final-head verdict before hold release; the covering checks at this
+head are `effigy proof:supervisor:test` (329 pure cases) and
+`effigy docs:check`, with the earlier `effigy rust:compile`,
+`effigy rust:format` and `effigy test rust` runs unchanged-input history.
+
 **Settlement observation (oxide#147, unqualified source).** The current
 `bounded-test.py` also carries observation-only settlement diagnostics, so a
 run that ends with no completed post-reap census round can be told apart from
@@ -2405,6 +2525,9 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   - It may read `OXIDE_PROOF_DEADLINE_NS`, the absolute `CLOCK_UPTIME_RAW`
     deadline, and write evidence to keep under `OXIDE_PROOF_EVIDENCE`, the
     evidence directory: counted in owned bytes, never removed by cleanup.
+  - It may publish one bounded `admission.json` marker in
+    `OXIDE_PROOF_EVIDENCE` when its own admission wait ends (below); the
+    supervisor reports that wait and grants bounded time for it.
   - It must leave no process outside its leader's group when it exits: such
     a process is never signalled and ends the run `UNCLOSED`.
   - It adds no supervision or accounting of its own.
@@ -2582,15 +2705,128 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   - Clock: a reading stamped later than the custodian's own clock reading
     when it arrives. Both sides use the same system-wide clock, so such a
     reading is never fresh.
+
+  Freshness measures the steady-state sampling window, and it begins when
+  sampling actually begins — the monitor's `ready`, after its first completed
+  readings — never at custodian start (decision `50acd33b`, papercut `90e93f06`).
+  A cold setup, whose bounded startup sweep of a shared parent can take longer
+  than 1 s, is owned by its own 10 s setup deadline and can never trip the 1 s
+  reserve window; the steady-state windows (1 s reserve, 10 s owned bytes) and
+  the setup deadline are unchanged. It also ends with the decision: once the
+  custodian has sent its `cleanup`/`keep` decision, the monitor's samplers stop as
+  it publishes `monitor_complete`, so the monitor's shutdown is not a freshness
+  window (oxide#192; a stalled sample during shutdown cannot turn a completed,
+  closed and cleaned run into exit 125). Threshold faults from readings that do
+  arrive, every closure rule and the whole settle phase are unchanged, and a
+  stale reading while the run is executing still latches.
 - **Clock and deadlines.** One clock everywhere: `CLOCK_UPTIME_RAW` integer
   nanoseconds. The supervisor refuses before any proof work if that clock,
   kqueue, macOS or the self-checked `kinfo_proc` layout is missing.
   - `stop_at` is the limit minus 20 s.
   - `exit_at` is the limit minus 2 s.
   - Every wait is a kevent or select timeout within the remaining budget.
+  - An admission marker can add at most its own reported wait, this run's own
+    elapsed wall clock and 600 s in total to the deadline, never shortening
+    it (below).
+- **Admission marker (oxide#192).** A supervised child that waited for
+  admission may publish one bounded marker, `admission.json`, in the evidence
+  directory: exactly the keys `schema`, `source`, `run`, `command` and
+  `waited_ns`, schema 2, where `source` and `command` are printable tokens of at
+  most 32 characters, `run` is this supervisor's own exported
+  `OXIDE_PROOF_RUN_ID` and `waited_ns` a non-negative wait inside `u64`, at most
+  512 bytes, published by rename. A document whose `run` is not this run is
+  rejected as `stale run` and never paired with this one (the runner rejects the
+  retired schema-1 three-key shape too). `oxide` writes it when a leased
+  command's own slot admission grant ends (its measured interval from the first
+  attempt to the grant), armed only by this supervisor's exported layout.
+  Admission sampling starts together with the reserve and owned-byte samplers,
+  before the monitor's `ready`: a pre-existing, malformed, stale or foreign
+  document is rejected and counted there (a rejection is also a control message
+  the custodian counts as an observation) and grants nothing, because only a
+  document carrying this run's identity can be paired and the child receives
+  that identity only after the gate opens. No marker path can fault the run,
+  refuse it or abandon its launch. The monitor polls the path every 0.25 s, opens only a regular file
+  without following a link, reports one marker per file identity and stamps
+  the moment it read it. Deduplication binds to the identity of the file it
+  actually opened (`fstat` on the open handle), never to an identity sampled
+  before the open, so an atomic replacement that lands between the sampler's
+  `lstat` and the read is reported once and never again on the next poll; and
+  the custodian grants one command's wait at most once, counting and ignoring a
+  duplicate completion. The custodian adds at most that reported wait, never
+  more than this run's own elapsed wall clock and never more than 600 s in
+  total, to `absolute`, and recomputes `stop_at` and `exit_at`. Nothing is
+  ever shortened and `OXIDE_PROOF_DEADLINE_NS` is not rewritten, so a proof
+  script that bounds its own work from it keeps its unextended cutoff and gets
+  no benefit from a grant.
+
+  **The stop boundary.** When the watch loop reaches its stop it makes one
+  bounded drain of the control pipe before it declares the deadline, so a
+  marker that was already published and is waiting to be read can still grant
+  and move the stop; the loop continues only when the grant moves the stop past
+  the current time, so a marker that grants nothing cannot spin it. A marker
+  that reaches the custodian after the stop decision or after a deadline was
+  declared cannot move anything: it is recorded as `admission_late` with its
+  reason (`deadline` or `stopped`), its observed stamp and its reported wait,
+  and the deadline classification stands. The summary says so in its own line.
+  A run that stopped as admission completed is therefore reported as a deadline
+  with a late admission, never as an unexplained timeout, and no clock is
+  moved after the decision. A marker the child could not publish before the
+  stop is simply absent: the supervisor never waits past its deadline for one,
+  and the product cancels its waiting lease on a signal rather than reporting a
+  grant it did not get.
+
+  **A wait that never ends, correlated per command.** Both schema-2 documents
+  name the run and one bounded command token. The monitor rejects any document
+  whose `run` is not this run (reason `stale run`) and keeps the rejection in
+  the report's own bounded list, so a file left by an earlier run is never
+  paired with this one. `admission-waiting.json` has exactly the keys
+  `schema`, `source`, `run`, `command` and `reason` (two printable tokens of at
+  most 32 characters), at most 512 bytes, and is published by the child when a
+  wait starts; it never moves `absolute`, `stop_at` or `exit_at`. The custodian
+  keeps a bounded pairing table (64 commands) and pairs a command's waiting
+  report only with that command's own completed report. Its wait **ended** when
+  its own completion arrived, at any duration: a zero-duration grant, a grant
+  clamped by the cap and a late grant all end it. An unpaired wait is **never**
+  described as a proven unfinished wait: missing terminal evidence is unknown.
+  The completion file has one fixed name, so a later admission-file observation —
+  another command's grant or waiting report, or a **rejected read** — may have
+  replaced a completion before the next 0.25 s poll, and a completion published
+  between the last poll and the sampler's stop can be missed entirely. The
+  decision record therefore carries only `unpaired` rows with a
+  `later_observation` fact, and the summary says either that a later admission
+  report or a rejected read may have overwritten the completion, or that no
+  admission-file observation followed the wait while its terminal evidence is
+  still missing; both are unclassified, and only the observed terminal reports
+  (a grant, a zero-duration or capped grant, a late grant) end a wait. A rejected
+  or overflowed report is unclassified in the same way. A terminal for a command
+  the bounded pairing table cannot retain (more than 64 commands) grants
+  **nothing**: without a record the custodian cannot tell a first terminal from a
+  duplicate, and a missed extension only makes the run stricter. A duplicate
+  terminal for a retained command is likewise counted and ignored, so one command
+  can never move the deadline twice for the same wait. Together with the grant and late
+  records this makes the states distinguishable in one receipt: granted before
+  the stop, granted after it (late, no clock moved), unpaired (nothing granted,
+  unclassified because its terminal may have been overwritten or missed), stale
+  (rejected by run), and rejected or overflowed (unclassified). A missing, malformed, oversized, linked or unreadable
+  marker is recorded in `receipt.admission` with a bounded rejection list and
+  nothing else happens: it never latches a fault and never changes closure,
+  EOF, cleanup or classification. The grant is cooperative evidence about the
+  child's own admission, not a claim about any other writer. `receipt.admission`
+  records the observations and the reported waits; each accepted grant and each
+  late marker is also a `receipt.custodian` event (at most 32 kept), and one
+  best-effort `admission_decision` record carries the decision-time totals, the
+  late reason and stamp, the cap and the effective deadline. The summary prints
+  the reported wait, the grant and the effective deadline separately, so a
+  queue wait is reported honestly rather than consumed from the work window.
+  The cap bounds the run: markers can never move the deadline by more than
+  600 s.
 - **Exit and receipt.**
   - Exit codes: 124 at a deadline; 125 for a fault, refusal or `UNCLOSED`;
-    otherwise the command's status (128+N for signal N).
+    otherwise the command's status (128+N for signal N). Every 125 is explainable
+    from one bounded stderr line (papercut `bc0d56cd`): a launch refusal prints
+    `not launched: <reason>`, a failed finish prints its deadline and latched
+    fault, and an unexpected monitor failure prints its exception class name —
+    never a traceback and never silence.
   - The monitor publishes `receipt.json` phases by atomic replacement:
     `started: incomplete`, then `closure_established: cleanup_pending` or
     `unclosed: scratch_kept`, `cleanup_partial_or_unknown` before deleting,
@@ -2651,16 +2887,18 @@ bounds:
 - reserve readings before and after, on the volume that actually holds the
   qualification's scratch, with the boot volume read and labelled separately
   (both keep the 22 GiB threshold);
-- a fixed 420 s `CLOCK_UPTIME_RAW` deadline held by a minimal outer actor
-  (oxide#191 amendment, Tom 2026-10-31: was 300 s, because the combined suite
-  needed 251-258 s against the former 250 s suite alarm, which is now 350 s,
-  the 380 s candidate limit less its 30 s margin).
+- a fixed 600 s `CLOCK_UPTIME_RAW` deadline held by a minimal outer actor
+  (oxide#192 amendment, 2026-10-31; history: 300 s originally, 420 s under
+  oxide#191 when the suite needed 251-258 s against the old 250 s alarm). The
+  suite's own alarm is now 530 s, the 560 s candidate limit less its 30 s
+  margin; the first direct diagnostic then exhausted oxide#191's 350 s alarm at
+  357 s wall (candidate exit 142 = SIGALRM, its pure suite OK).
   The actor forks the whole bootstrap as a pinned worker and makes only
   WNOHANG reaps, bounded sleeps and signals to that worker. All file,
-  hashing and stdout work runs in the worker. At 418 s the actor KILLs the
+  hashing and stdout work runs in the worker. At 598 s the actor KILLs the
   worker and exits 124, so blocked output or a slow read cannot extend the
   deadline. A candidate still running then is bounded only by its own
-  380 s limit (was 280 s);
+  560 s limit (380 s under oxide#191, 280 s before);
 - on candidate overrun, TERM then KILL of its own unreaped candidate child
   only, from its own reap loop, so no signal can follow the reap.
 
@@ -2678,7 +2916,7 @@ unconcluded with an honest reason even when the outer session closed and the
 suite passed, so it can never expire; only a fully concluded base or candidate
 root older than seven days is eligible for a later run's bounded sweep.
 
-It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
+It runs `bounded-test.py --limit 560 --scratch-budget-mib 512` around
 `scripts/test_supervisor.py` with **no** `--root-parent` **and no
 `--evidence`**: the candidate's own default scratch routing runs, and its
 evidence directory is its own `<root>/evidence`, so the suite's nested
@@ -2703,7 +2941,7 @@ with a recorded minimum. A fallback run, or a nested case outside the
 monitored root, fails the qualification. Its reserve readings identify the
 qualification's scratch volume and the boot volume separately. The suite
 runs in order:
-- 209 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 329 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -2961,7 +3199,10 @@ runs in order:
     SIGALRM inherited as ignored and blocked.
 
 Every fixture arms SIGALRM to `FIXTURE_DEADLINE_NS`. The order is case
-verdict 45 s < fixture fallback 60 s < qualification 420 s, and fallback
+verdict 45 s (the detach class's own outer window is 75 s, because its nested
+guard's stop is at 40 s and its exit at 58 s; a timeout there retains the mount,
+backing and evidence and infers no detach outcome) < fixture fallback 60 s <
+qualification 600 s, and fallback
 expiry never counts as closure. The bootstrap requires all of:
 - candidate exit 0;
 - phase `monitor_complete`;
@@ -2975,7 +3216,8 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 249 cases;
+- all 382 cases (329 pure + 53 real, including oxide#191's post-census detach
+  cases and oxide#192's five admission-report cases);
 - every real case directory and receipt still present after the
   candidate's cleanup.
 
@@ -2983,8 +3225,32 @@ It prints a receipt binding the commit, SHA-256 of all three sources, the
 platform, each case's exit, phase, outcome and signal custody, the suite's
 recorded layout, the prepared parent, both bounded sweep summaries, both
 marker states, the scratch-volume and boot-volume reserve readings, the kept
-base and `UNCLOSED` case directories, and the limitations. Admission waits fall outside its 300 s. `effigy
-proof:supervisor:test` runs the pure cases alone.
+base and `UNCLOSED` case directories, and the limitations. Admission waits
+fall outside its 600 s: that is the amended actor cap (oxide#192 raised it to
+600 s from #191's 420 s, itself from 300 s) with the 560 s candidate limit and the
+530 s suite alarm, and a candidate marker can only move the candidate's deadline (by at most
+600 s) inside it.
+`effigy proof:supervisor:test` runs the pure cases alone.
+
+**Uncounted keep-going diagnostic.** `effigy proof:supervisor:qualify:diagnostic`
+(heavy) runs the same bootstrap (`qualify-supervisor.py --diagnostic`), guard,
+fixed 600 s absolute deadline (oxide#192 amendment; 420 s under #191, 300 s
+before), the 560 s candidate limit, the 530 s suite alarm, selected-volume routing and the unchanged
+512 MiB monitored scratch with its 30 s shutdown margin, and is required before
+the counted author qualification at a changed head. It runs each named qualification oracle on its own — receipt phase,
+candidate outcome, reserve sampling, default scratch, sweep, protected root,
+nested cases, owned bytes, signal custody, the detach cases and the case total —
+so one failing check never hides the rest, records a bounded
+`qualified: false` receipt with its per-check rows (`checks_passed`,
+`checks_failed`, `claims`) and the case-level `collection` object (reached,
+completed, failed and unexecuted against the bootstrap's own count, with the
+first fault), and always exits non-zero. A precondition refusal in this mode
+also prints one bounded `qualified: false` receipt before exiting. The receipt
+is never a counted PASS, never a qualification and never evidence for another
+proof, and a skipped or unexecuted check is never a pass. Earlier history is
+preserved: the `96f0767` collection recorded a fixture `NameError` as one failed
+case and kept going (corrected, not excused), and the `93bb6db` diagnostic and
+counted receipts stay bound to their own bytes.
 
 `test rust`, the profile proofs, `rust:pool-scale`,
 `rust:oxide-exec` and `rust:front-door-accounting` keep their invocation and

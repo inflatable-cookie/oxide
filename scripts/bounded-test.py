@@ -42,6 +42,34 @@ fault (including SIGINT or SIGTERM to the custodian), refusal or UNCLOSED;
 otherwise the command's status (128+N for signal N). The receipt has no success phase: success is phase `monitor_complete`
 plus custodian exit 0, recorded by the caller.
 
+Admission reports (oxide#192). A supervised child that waited for admission may
+publish one bounded marker, `admission.json`, in the evidence directory, and one
+`admission-waiting.json` when it starts waiting. Schema 2 documents name this
+run (`OXIDE_PROOF_RUN_ID`) and one bounded command token, so a stale file from an
+earlier run is rejected instead of paired with this one, and each waiting report
+is paired only with its own command's completed marker. The monitor reads only a
+regular file without following a link, at most 512 bytes with an exact key set,
+and reports each once per file identity. The custodian grants at most the
+completed wait, never more than the run's own elapsed wall clock and never more
+than a fixed 600 s total, to its deadline; a waiting report grants nothing, and
+only an observed terminal report for that same command ends its wait (a
+zero-duration grant, a capped grant or a late grant all end it). Every unpaired
+wait is **unclassified**, including one that was the run's last admission-file
+observation: the fixed-name completion may have been overwritten by a later
+report or by a rejected read before a poll, or missed entirely between the last
+poll and the sampler's stop, so missing terminal evidence is never reported as a
+finished or unfinished conclusion. Nothing is shortened, the exported
+OXIDE_PROOF_DEADLINE_NS is not rewritten and classification is unchanged: a
+rejected or missing report removes nothing but the grant, and the receipt
+reports the wait, the pairing and the grant separately. One bounded drain reads
+what has already arrived before the deadline is declared, so
+a marker published just before the stop can still grant; a marker that reaches
+the custodian after the stop decision or a deadline is recorded as late with its
+reason and moves nothing, so a run that stopped as admission completed is
+classified honestly rather than as an unexplained timeout. The grant is
+cooperative evidence about a child's own admission, not a claim about any other
+writer.
+
 Scope: the cooperative session. A process that calls setsid leaves it and is
 seen only while tracked or holding an output pipe; arbitrary same-user
 writers are outside the promise. Host free space is a sampled abort
@@ -213,11 +241,35 @@ INJECTIONS = {
 RESERVE_DELAY_S, SCRATCH_DELAY_S = 0.5, 4.0  # injected publication delays before a sampler stall
 INJECT_AFTER_GATE_NS = 1_500_000_000  # post-gate injections wait for the fixture to start
 EXCEPTION_RECORDS = 8
+# Admission marker (oxide#192): a supervised child that waited for admission
+# publishes one bounded marker in the evidence directory. The custodian grants
+# at most the reported wait, never more than the run's own elapsed wall clock
+# and never more than ADMISSION_CAP_NS in total, so the work clock is not
+# consumed by a queue wait while the run stays hard-bounded. A marker is
+# cooperative evidence only: nothing about a rejected one faults the run.
+ADMISSION_NAME = "admission.json"
+# A waiting report (oxide#192): the child has started an admission wait and no
+# grant has ended it. It never moves a deadline; it exists so a wait that never
+# ends before the stop is reported and classified instead of leaving no trace.
+WAITING_NAME = "admission-waiting.json"
+ADMISSION_SCHEMA = 2
+ADMISSION_MAX_BYTES = 512
+ADMISSION_POLL_S = 0.25
+ADMISSION_CAP_NS = 600 * NS
+ADMISSION_RECORDS = 32  # per-report custodian records kept; the rest only move the counters
+ADMISSION_REJECTIONS = 8  # bounded rejection reasons kept in the receipt
+ADMISSION_COMMANDS = 64  # bounded pairing table: one entry per supervised command token
+ADMISSION_UNPAIRED = 8  # bounded unpaired list carried by the decision record
+ADMISSION_KEYS = frozenset({"schema", "source", "run", "command", "waited_ns"})
+WAITING_KEYS = frozenset({"schema", "source", "run", "command", "reason"})
 FIELDS = {  # required fields per monitor message type; bool is never accepted as int
     "reading": {"kind": str},
     "ready": {}, "monitor_complete": {}, "cleanup_failed": {},
     "output_eof": {"stream": str},
     "census": {"after": int, "members": int, "uncertain": int, "certain": bool},
+    "admission": {"waited_ns": int, "command": str, "completed": int, "marker": int},
+    "admission_waiting": {"reason": str, "command": str, "completed": int, "marker": int},
+    "admission_rejected": {"kind": str, "completed": int, "reason": str},
     "setup": {"root": str, "scratch": str, "evidence": str, "owned": bool},
     "detach": {"attempted": bool, "qualified": bool, "post_state": str},
     "detach_ready": {"budget_ns": int},
@@ -249,6 +301,84 @@ def settlement_record():
         "rounds_started": 0, "rounds_completed": 0, "omitted": 0,
         "phase": "none", "rounds": [],
     }
+
+
+def token_ok(value):
+    """A bounded, printable, non-empty token: the only text a report may carry."""
+    return isinstance(value, str) and 0 < len(value) <= 32 and value.isprintable()
+
+
+def admission_common_malformed(marker, keys, run_id):
+    """Why a report's shared fields are not usable, or None.
+
+    Fixed schema, exact keys, bounded types: schema 2, one printable source
+    token, this run's own identity and one printable command token. A report
+    from another run is stale and is never paired with this one."""
+    if not isinstance(marker, dict):
+        return "not an object"
+    if set(marker) != keys:
+        return "unexpected keys"
+    if not typed(marker["schema"], int) or marker["schema"] != ADMISSION_SCHEMA:
+        return "unsupported schema"
+    if not token_ok(marker["source"]):
+        return "ill-typed source"
+    if marker["run"] != run_id:
+        return "stale run"
+    if not token_ok(marker["command"]):
+        return "ill-typed command"
+    return None
+
+
+def admission_malformed(marker, run_id):
+    """Why a completed-wait marker is not usable, or None.
+
+    The shared fields, then a non-negative reported wait inside u64. A marker
+    is cooperative evidence for the custodian's bounded grant; anything else is
+    reported in the receipt and never latches a fault."""
+    problem = admission_common_malformed(marker, ADMISSION_KEYS, run_id)
+    if problem:
+        return problem
+    waited = marker["waited_ns"]
+    if not typed(waited, int) or not 0 <= waited <= U64MAX:
+        return "ill-typed waited_ns"
+    return None
+
+
+def admission_waiting_malformed(marker, run_id):
+    """Why a waiting report is not usable, or None. The shared fields, then its
+    own reason token instead of a wait. A waiting report never grants time:
+    anything wrong with it is reported in the receipt and never latches a
+    fault."""
+    problem = admission_common_malformed(marker, WAITING_KEYS, run_id)
+    if problem:
+        return problem
+    if not token_ok(marker["reason"]):
+        return "ill-typed reason"
+    return None
+
+
+def admission_record():
+    """The monitor's admission-marker observations (oxide#192).
+
+    Fixed shape: every stamp is an int CLOCK_UPTIME_RAW value or `None` when
+    no marker was observed, every count is a non-bool int, and the rejection
+    reasons are a bounded list. This is the observation side of the grant;
+    the custodian's own decision record carries what it actually granted."""
+    return {"schema": 1, "marker": ADMISSION_NAME, "observed": 0, "reported_wait_ns": 0,
+            "first_ns": None, "last_ns": None, "identity": None, "ignored": 0,
+            "rejections": [], "errors": 0}
+
+
+def admission_waiting_record():
+    """The monitor's waiting-report observations (oxide#192).
+
+    Fixed shape, same bounds: a stamp is an int CLOCK_UPTIME_RAW value or
+    `None`, counts are non-bool ints, the first reported reason is kept as an
+    opaque token and rejections are a bounded list. A waiting report grants
+    nothing; the custodian records its own decision-side facts separately."""
+    return {"schema": 1, "marker": WAITING_NAME, "observed": 0, "first_ns": None,
+            "last_ns": None, "reason": None, "identity": None, "ignored": 0,
+            "rejections": [], "errors": 0}
 
 
 def report(text, fd=2):
@@ -1181,11 +1311,18 @@ class Census:
 
 
 class Guard:
-    """Newest completed readings and the latched first fault."""
+    """Newest completed readings and the latched first fault.
+
+    Freshness measures the steady-state sampling window, so a kind with no
+    reading yet is stale only from `sampling_ns`, the moment sampling actually
+    began. Before that the bounded setup phase owns its own window
+    (`Custodian.setup_at`) and a cold setup sweep longer than the 1 s reserve
+    window is not a fault (decision 50acd33b, papercut 90e93f06)."""
 
     def __init__(self, start_ns, threshold=THRESHOLD, budget=SCRATCH_BUDGET):
         self.start_ns, self.threshold, self.budget = start_ns, threshold, budget
         self.reserve_at = self.scratch_at = None
+        self.sampling_ns = None
         self.fault = None
 
     def latch(self, fault):
@@ -1217,8 +1354,15 @@ class Guard:
     def check(self, now):
         for kind, at, stale in (("reserve", self.reserve_at, RESERVE_STALE_NS),
                                 ("scratch", self.scratch_at, SCRATCH_STALE_NS)):
-            if now - (self.start_ns if at is None else at) > stale:
-                self.latch(f"{kind} readings stale: none in {stale / NS:g} s")
+            if at is None:
+                # No reading of this kind has completed: before sampling began the
+                # setup deadline owns the window, and after it began the sampling
+                # window is measured from that start, never from custodian start.
+                if self.sampling_ns is None or now - self.sampling_ns <= stale:
+                    continue
+            elif now - at <= stale:
+                continue
+            self.latch(f"{kind} readings stale: none in {stale / NS:g} s")
         return self.fault
 
 
@@ -3353,7 +3497,9 @@ class Monitor:
             raise SetupRefused(f"reserve path {reserve_path}: {type_name(error)}")
         selection["device"] = selection["device"] if selection["device"] is not None else reserve_device
         ctx.update(root=root, scratch=scratch, evidence=os.path.realpath(evidence), owned=owned,
-                   reserve_path=reserve_path, reserve_device=reserve_device, selection=selection)
+                   reserve_path=reserve_path, reserve_device=reserve_device, selection=selection,
+                   admission_path=os.path.join(os.path.realpath(evidence), ADMISSION_NAME),
+                   waiting_path=os.path.join(os.path.realpath(evidence), WAITING_NAME))
         try:
             terminal_mode = _decide_terminal_mode()
         except BaseException:
@@ -3378,6 +3524,7 @@ class Monitor:
                         "path": ctx["reserve_path"], "device": ctx["reserve_device"]},
             "owned_bytes": {"samples": 0, "maximum": None, "budget": ctx["budget"], "last_ns": None},
             "output": {}, "census": None, "census_rounds": 0, "settlement": self.settlement,
+            "admission": admission_record(), "admission_waiting": admission_waiting_record(),
         }
 
     def close_orphan_reads(self, ctx):
@@ -3524,6 +3671,139 @@ class Monitor:
             except OSError as error:
                 self.send("reading", kind="scratch", complete=False, error=str(error))
             self.stop.wait(SCRATCH_INTERVAL)
+
+    def note_admission(self, error=False, key="admission"):
+        """One bounded, never-latched admission-observation failure."""
+        try:
+            record = self.receipt[key]
+            with self.lock:
+                if error:
+                    record["errors"] += 1
+        except BaseException:
+            pass
+
+    def reject_admission(self, reason, key="admission", observed=True):
+        """Record why one report was ignored, and tell the custodian.
+
+        Cooperative evidence only: a rejected report never faults the run. A
+        readable document that failed validation is still an observation of the
+        fixed-name completion file, so the custodian must count it: it can have
+        replaced a completion before the next poll. `observed=False` covers the
+        paths that never read a document (a vanished path, a non-regular file, an
+        open error), which are not observations of a write. At most one rejection
+        is reported per poll and file, so the control-message rate stays bounded
+        by the sampler."""
+        try:
+            record = self.receipt[key]
+            with self.lock:
+                record["ignored"] += 1
+                if len(record["rejections"]) < ADMISSION_REJECTIONS:
+                    record["rejections"].append(reason)
+            if observed:
+                self.send("admission_rejected", kind=key, completed=now_ns(), reason=reason[:64])
+        except BaseException:
+            pass
+
+    def read_admission(self, path, seen=None, key="admission"):
+        """One bounded read of an admission report (oxide#192).
+
+        Only a regular file opened without following a link, at most
+        ADMISSION_MAX_BYTES, validated against its own fixed schema: the
+        completed-wait marker or the waiting report. Deduplication is bound to
+        the identity of the file actually opened (`fstat` on the open handle),
+        never to an identity sampled before the open: a writer publishes by
+        atomic rename, so a replacement between the sampler's `lstat` and this
+        open would otherwise report the new file once and then report it again on
+        the next poll, and a duplicated completion would grant the same wait
+        twice. A valid report is sent to the custodian with its own completed
+        stamp; the extension decision is the custodian's. Every other outcome is
+        recorded here and nothing is sent.
+
+        Returns the identity this call consumed, or None when nothing was read."""
+        waiting = key == "admission_waiting"
+        try:
+            info = os.lstat(path)
+            if not stat.S_ISREG(info.st_mode):
+                self.reject_admission("not a regular file", key, observed=False)
+                return None
+            handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                opened = os.fstat(handle)
+                identity = (opened.st_dev, opened.st_ino)
+                if not stat.S_ISREG(opened.st_mode):
+                    self.reject_admission("not a regular file", key, observed=False)
+                    return None
+                if seen is not None and identity == seen:
+                    return identity  # already reported: one inode is one report
+                raw = os.read(handle, ADMISSION_MAX_BYTES + 1)
+            finally:
+                os.close(handle)
+        except OSError as error:
+            self.reject_admission("read: " + errno_name(error), key, observed=False)
+            return None
+        completed = now_ns()
+        if len(raw) > ADMISSION_MAX_BYTES:
+            self.reject_admission(f"larger than {ADMISSION_MAX_BYTES} bytes", key)
+            return None
+        try:
+            marker = json.loads(raw)
+        except ValueError:
+            self.reject_admission("not JSON", key)
+            return None
+        run_id = self.ctx.get("run_id")
+        problem = (admission_waiting_malformed(marker, run_id) if waiting
+                   else admission_malformed(marker, run_id))
+        if problem:
+            self.reject_admission(problem, key)
+            return None
+        try:
+            record = self.receipt[key]
+            with self.lock:
+                record["observed"] += 1
+                record["first_ns"] = completed if record["first_ns"] is None else record["first_ns"]
+                record["last_ns"] = completed
+                record["identity"] = None if identity is None else [int(identity[0]), int(identity[1])]
+                if waiting:
+                    record["reason"] = marker["reason"] if record["reason"] is None else record["reason"]
+                else:
+                    record["reported_wait_ns"] = min(U64MAX, record["reported_wait_ns"] + marker["waited_ns"])
+                index = record["observed"]
+            if waiting:
+                self.send("admission_waiting", reason=marker["reason"], command=marker["command"],
+                          completed=completed, marker=index)
+            else:
+                self.send("admission", waited_ns=marker["waited_ns"], command=marker["command"],
+                          completed=completed, marker=index)
+            return identity
+        except BaseException:
+            self.note_admission(error=True, key=key)
+            return None
+
+    def sample_admission(self):
+        """Poll both admission reports for a new identity (oxide#192).
+
+        A writer publishes a fresh file by rename, so one identity is one
+        report. Absence is not an event, and no failure here is latched."""
+        paths = (("admission", self.ctx.get("admission_path")),
+                 ("admission_waiting", self.ctx.get("waiting_path")))
+        seen = {"admission": None, "admission_waiting": None}
+        while not self.stop.is_set():
+            for key, path in paths:
+                if not path:
+                    continue
+                try:
+                    info = os.lstat(path)
+                    candidate = (info.st_dev, info.st_ino)
+                    if candidate != seen[key]:
+                        # Mark what the read actually consumed, so a rename that
+                        # lands between this stat and the open is reported once.
+                        consumed = self.read_admission(path, seen[key], key)
+                        seen[key] = candidate if consumed is None else consumed
+                except FileNotFoundError:
+                    seen[key] = None
+                except OSError:
+                    self.note_admission(error=True, key=key)
+            self.stop.wait(ADMISSION_POLL_S)
 
     def drain(self, fd, name, sink):
         counts = self.receipt["output"].setdefault(
@@ -3712,7 +3992,7 @@ class Monitor:
         self.send("setup", root=ctx["root"], scratch=ctx["scratch"], evidence=ctx["evidence"], owned=ctx["owned"])
         if "setup-stall" in self.inject:
             time.sleep(SETUP_S + 5)
-        for target in (self.sample_reserve, self.sample_owned):
+        for target in (self.sample_reserve, self.sample_owned, self.sample_admission):
             threading.Thread(target=target, daemon=True).start()
         for fd, name, sink in self.pipes:
             threading.Thread(target=self.drain, args=(fd, name, sink), daemon=True).start()
@@ -4014,6 +4294,54 @@ class Monitor:
                 + (f": {detach['reason']}" if detach.get("reason") else ""))
         for line in lines:  # one bounded write per line, so none truncates the rest
             report(line + "\n")
+        admission = next((record for record in reversed(receipt["custodian"])
+                          if isinstance(record, dict) and record.get("event") == "admission_decision"), None)
+        if admission is not None:
+            effective = (admission["absolute_ns"] - receipt["start_ns"]) / NS
+            report(f"supervisor: admission wait reported {admission['reported_wait_ns'] / NS:.1f} s in"
+                   f" {admission['counted']} marker(s), granted {admission['granted_ns'] / NS:.1f} s of the"
+                   f" {ADMISSION_CAP_NS / NS:.0f} s cap (limit {admission['limit_s']:.0f} s, deadline"
+                   f" {effective:.1f} s after start); {admission['ignored']} late;"
+                   f" observed {receipt['admission']['observed']}, rejected {receipt['admission']['ignored']}\n")
+            if admission["ignored"]:
+                reason = admission.get("late_reason") or "unknown"
+                report(f"supervisor: an admission marker reached the custodian after the stop decision"
+                       f" ({reason}), so its wait is reported and not granted; the deadline classification"
+                       " stands and no clock was moved\n")
+            pairs = admission.get("admission_waiting") or {}
+            rejected_waiting = receipt["admission_waiting"]["ignored"]
+            rejected_grants = receipt["admission"]["ignored"]
+            if pairs.get("commands") or rejected_waiting:
+                report(f"supervisor: admission waits reported by {pairs.get('commands', 0)} command(s):"
+                       f" {pairs.get('ended', 0)} ended, {pairs.get('unpaired_count', 0)} unpaired"
+                       f" ({pairs.get('possibly_overwritten_count', 0)} with a later admission report);"
+                       f" granted {admission['granted_ns'] / NS:.1f} s; {rejected_waiting} waiting and"
+                       f" {rejected_grants} completed report(s) rejected"
+                       + (f"; {admission['unclassified']} unclassified report(s)"
+                          if admission.get("unclassified") else "")
+                       + (f"; {admission['duplicates']} duplicate completion(s) ignored"
+                          if admission.get("duplicates") else "")
+                       + "\n")
+            for entry in (pairs.get("unpaired") or [])[:3]:
+                if entry["later_observation"] or rejected_waiting or rejected_grants:
+                    report(f"supervisor: command {entry['command']} reported waiting ({entry['reason']}) at"
+                           f" {(entry['waiting_ns'] - receipt['start_ns']) / NS:.1f} s; a later admission"
+                           " report or a rejected read may have overwritten its completion before the"
+                           " supervisor polled it, so that wait is unclassified, not a proven unfinished"
+                           " wait\n")
+                else:
+                    report(f"supervisor: command {entry['command']} reported waiting ({entry['reason']}) at"
+                           f" {(entry['waiting_ns'] - receipt['start_ns']) / NS:.1f} s; no admission-file"
+                           " observation followed it, but the fixed-name completion may have been missed"
+                           " between polls, so its terminal evidence is missing and the wait is"
+                           " unclassified, not a proven unfinished wait\n")
+            if pairs.get("unpaired_count"):
+                report("supervisor: the deadline classification stands for the unpaired command(s); no"
+                       " clock was moved for them\n")
+            if rejected_waiting:
+                report(f"supervisor: {rejected_waiting} waiting report(s) were rejected"
+                       f" ({', '.join(receipt['admission_waiting']['rejections'][:3])}); those waits are"
+                       " unclassified\n")
 
 
 class SetupRefused(Exception):
@@ -4028,8 +4356,11 @@ def monitor_main(ctx, ctl_w, cmd_r, out_r, err_r):
     except SetupRefused as refusal:
         report(f"bounded-test.py: refused before any proof work: {refusal}\n")
         code = 2
-    except BaseException:
-        pass
+    except BaseException as error:
+        # No traceback and no source lookup: the class name only. A silent exit
+        # here reached the custodian as an unexplained 125.
+        report("bounded-test.py: monitor failed before completion: " + type_name(error) + "\n")
+        code = 1
     finally:
         os._exit(code)
 
@@ -4072,6 +4403,27 @@ class Custodian:
         self.gate_opened = False
         self.gate_at = None
         self.pre_gate_killed = self.leader_killed = False
+        self.not_launched = None
+        # Admission grants (oxide#192): counted from the monitor's marker
+        # observations, bounded by the run's own elapsed time and the fixed cap.
+        self.admission_counted = 0
+        self.admission_ignored = 0
+        self.admission_reported = 0
+        self.admission_granted = 0
+        self.admission_records = 0
+        self.admission_clamped = self.admission_capped = False
+        self.admission_late_ns = None
+        self.admission_late_reason = None
+        self.admission_waiting_reports = 0
+        self.admission_waiting_ns = None
+        self.admission_waiting_reason = None
+        self.admission_pairs = {}
+        self.admission_unclassified = 0
+        self.admission_ordinal = 0
+        self.admission_last_ordinal = 0
+        self.admission_rejected_reports = 0
+        self.admission_duplicates = 0
+        self.sampling_ended = False
         self.exceptions = 0
         self.injected = set()
         self.paths = None  # from the monitor's setup message
@@ -4167,7 +4519,23 @@ class Custodian:
             self.guard.latch(f"cancelled by signal {self.cancelled}")
         if self.monitor_exited and not self.monitor_complete:
             self.guard.latch("monitor died")
-        self.guard.check(now_ns())
+        self.check_readings()
+
+    def check_readings(self):
+        """Enforce reading freshness only while the run still has a decision to
+        make (oxide#192).
+
+        The monitor stops its samplers when it publishes `monitor_complete`, so
+        from that point a missing reading is the designed shutdown, not a stalled
+        monitor: latching staleness there would turn a completed, closed and
+        cleaned run into exit 125 without changing any closure fact. Threshold
+        faults from readings that do arrive and every closure rule are unchanged,
+        and the whole settle phase still enforces freshness."""
+        try:
+            if not self.sampling_ended:
+                self.guard.check(now_ns())
+        except BaseException as error:
+            self.exception(error)
 
     def read_messages(self):
         while True:
@@ -4191,6 +4559,130 @@ class Custodian:
         if len(self.ctl_buffer) > MAX_LINE:
             self.guard.latch("protocol: control line overflow")
             self.ctl_buffer = b""
+
+    def admit(self, message, at):
+        """Grant bounded time for one reported admission wait (oxide#192).
+
+        A child's marker is cooperative evidence: the custodian adds at most
+        `waited_ns`, never more than this run's own elapsed wall clock and
+        never beyond ADMISSION_CAP_NS in total, to `absolute`. Nothing is
+        shortened, no exported deadline is rewritten and no classification
+        changes: the grant is reported separately in the receipt. A marker that
+        reaches the custodian after the stop decision, or after a deadline was
+        declared, cannot move anything; it is recorded as late with its reason
+        so the run is classified honestly rather than as an unexplained
+        timeout. A command the bounded pairing table cannot retain, and a second
+        terminal for a command that already has one, grant nothing at all."""
+        try:
+            self.admission_ordinal += 1
+            self.admission_last_ordinal = self.admission_ordinal
+            pair = self.admission_pair(message["command"])
+            if pair is None:
+                # The bounded table cannot retain this command, so a first terminal
+                # and a duplicate are indistinguishable. Grant nothing: a missed
+                # extension only makes the run stricter, while a double grant would
+                # move the deadline twice for one wait. The report stays counted as
+                # unclassified.
+                return
+            if pair["ended"] is not None:
+                # One terminal per command grants time at most once, whatever the
+                # monitor's deduplication does: a duplicate completion can never
+                # grant the same wait twice.
+                self.admission_duplicates += 1
+                return
+            if self.stopped_at is not None or self.deadline_hit:
+                self.admission_ignored += 1
+                self.admission_late_ns = at
+                self.admission_late_reason = "stopped" if self.stopped_at is not None else "deadline"
+                # The wait ended after the stop: still a completed wait for this
+                # command, so it is never reported as unfinished.
+                if pair is not None and pair["ended"] is None:
+                    pair.update(ended=self.admission_late_reason, ended_ns=at,
+                                waited_ns=message["waited_ns"])
+                if self.admission_records < ADMISSION_RECORDS:
+                    self.admission_records += 1
+                    self.record("admission_late", command=message["command"],
+                                waited_ns=message["waited_ns"], at=at,
+                                reason=self.admission_late_reason, deadline_hit=self.deadline_hit,
+                                stopped=self.stopped_at is not None)
+                return
+            # A completed wait ends this command's wait even when it grants no
+            # time: a zero-duration grant or a cap-refused grant is an ending,
+            # not an unfinished wait.
+            if pair is not None and pair["ended"] is None:
+                pair.update(ended="grant", ended_ns=at, waited_ns=message["waited_ns"])
+            waited = message["waited_ns"]
+            elapsed = max(0, at - self.start)
+            clamped = waited > elapsed
+            if clamped:
+                waited = elapsed
+            room = max(0, ADMISSION_CAP_NS - self.admission_granted)
+            grant = min(waited, room)
+            self.admission_counted += 1
+            self.admission_reported = min(U64MAX, self.admission_reported + message["waited_ns"])
+            self.admission_clamped = self.admission_clamped or clamped
+            if grant <= 0:
+                self.admission_capped = True
+                return
+            self.admission_granted += grant
+            self.admission_capped = self.admission_granted >= ADMISSION_CAP_NS
+            self.absolute = self.start + int(self.limit_s * NS) + self.admission_granted
+            self.stop_at = self.absolute - STOP_RESERVE_S * NS
+            self.exit_at = self.absolute - EXIT_MARGIN_S * NS
+            if self.admission_records < ADMISSION_RECORDS:
+                self.admission_records += 1
+                self.record("admission", command=message["command"], waited_ns=message["waited_ns"],
+                            grant_ns=grant, clamped=clamped, granted_ns=self.admission_granted,
+                            absolute_ns=self.absolute)
+        except BaseException as error:
+            self.exception(error)
+
+    def admission_pair(self, command):
+        """One command token's paired record, or None when the table is full.
+
+        A bounded table (ADMISSION_COMMANDS) pairs each supervised command's
+        waiting report with its own completion, so a stale file, a zero-duration
+        or late grant and a lost report are never reported as a proven
+        unfinished wait. Overflow is counted and treated as unclassified, never
+        as evidence, and a terminal for an overflowed command grants no time
+        because the custodian cannot distinguish it from a duplicate."""
+        entry = self.admission_pairs.get(command)
+        if entry is not None:
+            return entry
+        if len(self.admission_pairs) >= ADMISSION_COMMANDS:
+            self.admission_unclassified += 1
+            return None
+        entry = {"command": command, "waiting_ns": None, "reason": None,
+                 "waiting_ordinal": None, "ended": None, "ended_ns": None, "waited_ns": None}
+        self.admission_pairs[command] = entry
+        return entry
+
+    def note_waiting(self, message, at):
+        """Record that a child reported a wait that has not ended (oxide#192).
+
+        Report only: a waiting report never moves `absolute`, `stop_at` or
+        `exit_at`, before or after a stop decision. It exists so a wait that was
+        still outstanding when the run stopped is reported and left unclassified
+        instead of being lost inside an unexplained timeout; only an observed
+        terminal report ends a wait."""
+        try:
+            self.admission_ordinal += 1
+            self.admission_last_ordinal = self.admission_ordinal
+            self.admission_waiting_reports += 1
+            self.admission_waiting_ns = at
+            if self.admission_waiting_reason is None:
+                self.admission_waiting_reason = message["reason"]
+            pair = self.admission_pair(message["command"])
+            if pair is not None and pair["waiting_ns"] is None:
+                pair["waiting_ns"], pair["reason"] = at, message["reason"]
+                pair["waiting_ordinal"] = self.admission_ordinal
+            if self.admission_records < ADMISSION_RECORDS:
+                self.admission_records += 1
+                self.record("admission_waiting", command=message["command"], reason=message["reason"],
+                            at=at, after_stop=self.stopped_at is not None or self.deadline_hit,
+                            granted_ns=self.admission_granted)
+        except BaseException as error:
+            self.exception(error)
 
     def accept(self, message):
         problem = malformed(message)
@@ -4231,9 +4723,35 @@ class Custodian:
                 self.guard.latch("protocol: ready before setup")
             elif self.guard.reserve_at is None or self.guard.scratch_at is None:
                 self.guard.latch("protocol: ready before completed readings")
+            else:
+                # Freshness begins here: the samplers are live and have published.
+                self.guard.sampling_ns = now_ns()
             self.ready = True
         elif kind == "output_eof":
             self.eof.add(message["stream"])
+        elif kind == "admission":
+            at = now_ns()
+            if message["at"] > at:
+                self.guard.latch("admission message stamped in the future")
+            else:
+                self.admit(message, at)
+        elif kind == "admission_waiting":
+            at = now_ns()
+            if message["at"] > at:
+                self.guard.latch("admission message stamped in the future")
+            else:
+                self.note_waiting(message, at)
+        elif kind == "admission_rejected":
+            at = now_ns()
+            if message["at"] > at:
+                self.guard.latch("admission message stamped in the future")
+            else:
+                # An observation of the fixed-name file, not evidence about any
+                # command: it advances the ordinal so a wait before it can never
+                # be called provably unfinished.
+                self.admission_ordinal += 1
+                self.admission_last_ordinal = self.admission_ordinal
+                self.admission_rejected_reports += 1
         elif kind == "census":
             try:  # observation only, before the unchanged eligibility rule
                 self.census_messages += 1
@@ -4350,12 +4868,17 @@ class Custodian:
         # in its `setup` message. The leader opens /dev/null itself.
         self.env = dict(os.environ)
         self.env["OXIDE_PROOF_DEADLINE_NS"] = str(self.absolute)
+        self.env["OXIDE_PROOF_RUN_ID"] = self.run_id
         self.ctx = {
             "run_id": self.run_id, "command": self.command, "limit_s": self.limit_s,
             "adopted": os.environ.get("OXIDE_TASK_SCRATCH_ROOT") or None, "evidence_arg": self.evidence_arg,
             "root_parent": self.root_parent, "budget": self.budget, "start_ns": self.start,
             "inject": sorted(self.inject),
         }
+
+    def setup_expired(self, now):
+        """Setup is bounded by its own deadline, never by reading freshness."""
+        return now >= self.setup_at
 
     def launch_monitor(self):
         self.ctl_r, ctl_w = os.pipe()
@@ -4378,7 +4901,7 @@ class Custodian:
             select.kevent(pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_ONESHOT, select.KQ_NOTE_EXIT),
         ], 0, 0)
         while not self.ready and self.guard.fault is None and not self.monitor_exited and not self.cancelled:
-            if now_ns() >= self.setup_at:
+            if self.setup_expired(now_ns()):
                 break
             self.pump(self.setup_at - now_ns())
         if self.ready and self.guard.fault is None and not self.cancelled:
@@ -4422,7 +4945,7 @@ class Custodian:
         if "cancel-before-ack" in self.inject:
             self.cancelled = signal.SIGTERM
         ack = b""
-        while not self.cancelled and self.guard.fault is None and now_ns() < self.setup_at:
+        while not self.cancelled and self.guard.fault is None and not self.setup_expired(now_ns()):
             ready, _, _ = select.select([ack_r], [], [], max(0, min(self.setup_at - now_ns(), 50_000_000)) / NS)
             if ready:
                 try:
@@ -4533,7 +5056,11 @@ class Custodian:
             return self.last_resort()
 
     def abandon_launch(self):
-        """Setup slow or failed: launch nothing, stop the pinned monitor now."""
+        """Setup slow or failed: launch nothing, stop the pinned monitor now.
+
+        One bounded line names the reason before the pinned monitor is stopped, so
+        a launch refusal is never silent."""
+        report(f"bounded-test.py: not launched: {self.not_launched or 'setup did not finish'}\n")
         try:
             self.signal_pinned(self.monitor, signal.SIGKILL, group=False)
             status, end = None, min(now_ns() + NS, self.exit_at)
@@ -4549,8 +5076,16 @@ class Custodian:
     def watch(self):
         while not (self.leader_exited or self.cancelled or self.guard.fault):
             if now_ns() >= self.stop_at:
-                self.deadline_hit = True
-                break
+                # One bounded drain before the deadline is declared, so a marker
+                # that was already published and is waiting in the control pipe
+                # can still grant and move the stop (oxide#192). Only a grant
+                # that moves the stop past now continues the loop; a marker with
+                # no room cannot spin it.
+                self.pump(0)
+                if now_ns() >= self.stop_at:
+                    self.deadline_hit = True
+                    break
+                continue
             self.pump(self.stop_at - now_ns())
 
     def stop(self, launched):
@@ -4615,11 +5150,67 @@ class Custodian:
             elif len(self.eof) != 2:
                 self.guard.latch("closure not established: output EOF witness missing")
         self.observe_settlement(launched, census_end)
+        self.observe_admission(launched)
+
+    def admission_pairs_summary(self):
+        """The bounded per-command pairing view for the decision record.
+
+        Only commands whose waiting report was accepted are counted. A command
+        is finished when its own completed report arrived at all (`grant`, even
+        with a zero or clamped grant) or arrived after the stop (`late`). An
+        unpaired wait is **never** called a proven unfinished wait: the completion
+        file has one fixed name, so any later admission-file observation -
+        another command's grant, another command's waiting report, or a rejected
+        read - may have replaced a completion before the next 0.25 s poll, and a
+        completion published between the last poll and the sampler's stop can be
+        missed entirely. `later_observation` states whether such a later
+        observation exists in this run (the summary also treats any rejected
+        report as one). Both lists are bounded; the counts are the full ones."""
+        waiting = [entry for entry in self.admission_pairs.values() if entry["waiting_ns"] is not None]
+        ended = [entry for entry in waiting if entry["ended"] is not None]
+        unpaired = [entry for entry in waiting if entry["ended"] is None]
+        rows = [{"command": entry["command"], "reason": entry["reason"],
+                 "waiting_ns": entry["waiting_ns"],
+                 "later_observation": entry["waiting_ordinal"] != self.admission_last_ordinal}
+                for entry in unpaired]
+        overwritten = [row for row in rows if row["later_observation"]]
+        return {"commands": len(waiting), "ended": len(ended),
+                "unpaired_count": len(rows),
+                "unpaired": rows[:ADMISSION_UNPAIRED],
+                "possibly_overwritten_count": len(overwritten),
+                "rejected_reports": self.admission_rejected_reports}
+
+    def observe_admission(self, launched):
+        """Best-effort decision-time record of the admission grants
+        (oxide#192). A failed write is dropped and never latched, so this can
+        never fail a run, replace the first fault or change the deadline."""
+        try:
+            self.seq += 1
+            record = {"at": now_ns(), "event": "admission_decision", "launched": launched,
+                      "counted": self.admission_counted, "ignored": self.admission_ignored,
+                      "reported_wait_ns": self.admission_reported, "granted_ns": self.admission_granted,
+                      "clamped": self.admission_clamped, "capped": self.admission_capped,
+                      "late_ns": self.admission_late_ns, "late_reason": self.admission_late_reason,
+                      "waiting_reports": self.admission_waiting_reports,
+                      "waiting_ns": self.admission_waiting_ns,
+                      "waiting_reason": self.admission_waiting_reason,
+                      "admission_waiting": self.admission_pairs_summary(),
+                      "duplicates": self.admission_duplicates,
+                      "unclassified": self.admission_unclassified,
+                      "cap_ns": ADMISSION_CAP_NS, "limit_s": self.limit_s,
+                      "absolute_ns": self.absolute}
+            os.write(self.cmd_w, (json.dumps({"run": self.run_id, "seq": self.seq, "type": "record",
+                                              "record": record}) + "\n").encode())
+        except BaseException:
+            pass
 
     def last_resort(self):
         """finish raised: KILL the pinned monitor if still held, one WNOHANG
-        reap, and exit non-zero. Never raises."""
+        reap, and exit non-zero. Never raises, and one bounded line names the
+        reason."""
         try:
+            report("bounded-test.py: finish failed:"
+                   f" deadline {self.deadline_hit}; fault {self.guard.fault}\n")
             if self.monitor is not None and not self.monitor_reaped:
                 self.signal_pinned(self.monitor, signal.SIGKILL, group=False)
                 self.monitor_reaped = self.reap(self.monitor) is not None
@@ -4692,6 +5283,9 @@ class Custodian:
         outcome = {"closure": "closed" if self.closed else "UNCLOSED", "status": decoded,
                    "fault": self.guard.fault, "deadline": self.deadline_hit, "launched": launched}
         self.tell("cleanup" if self.closed else "keep", outcome=outcome)
+        # The monitor stops sampling once it publishes `monitor_complete`; its
+        # shutdown is not a freshness window (see check_readings).
+        self.sampling_ended = True
         if "custodian-timeout-after-monitor" in self.inject:
             self.exit_at = now_ns()  # injected: the custodian runs out right after deciding
         while not self.monitor_complete and not self.monitor_exited and now_ns() < self.exit_at:
