@@ -5793,28 +5793,31 @@ class Real(unittest.TestCase):
         self.assertEqual(self.receipt["phase"], "monitor_complete: pending_custodian")
 
     @staticmethod
-    def report_document(kind, command, waited_ns=None, reason=None):
-        """The exact bounded document a fixture publishes (schema 2, this run)."""
-        document = {"schema": 2, "source": "fixture",
-                    "run": os.environ["OXIDE_PROOF_RUN_ID"], "command": command}
-        if kind == "waiting":
-            document["reason"] = reason or "queue"
-        else:
-            document["waited_ns"] = waited_ns
-        return document
+    def report_source(kind, command, waited_ns=None, reason=None):
+        """Fixture source that builds one schema-2 report at run time.
+
+        The document must be built inside the fixture, never here: the nested
+        guardian a real case runs under exports ITS OWN run identity, and this
+        suite process only sees the outer supervisor's. A document built here
+        would name the wrong run and the nested guardian would reject it as
+        `stale run`."""
+        extra = (f"'reason': {reason or 'queue'!r}" if kind == "waiting"
+                 else f"'waited_ns': {int(waited_ns)}")
+        return ("{'schema': 2, 'source': 'fixture', "
+                f"'run': os.environ['OXIDE_PROOF_RUN_ID'], 'command': {command!r}, {extra}}}")
 
     def test_admission_marker_extends_the_work_window(self):
         # oxide#192: a reported slot-queue wait moves the supervisor's deadline
         # by that wait, so execution keeps its own window instead of being
         # killed inside it. Without the grant the leader is stopped at
         # limit - 20 s, well before it finishes.
-        document = self.report_document("grant", "fixture-1", waited_ns=10 * 1000000000)
+        document = self.report_source("grant", "fixture-1", waited_ns=10 * 1000000000)
         code = fixture(
             "import json\n"
             "path = os.path.join(os.environ['OXIDE_PROOF_EVIDENCE'], " + repr(bounded.ADMISSION_NAME) + ")\n"
             "time.sleep(10)\n"
             "with open(path + '.tmp', 'w') as handle:\n"
-            "    json.dump(" + repr(document) + ", handle)\n"
+            "    json.dump(" + document + ", handle)\n"
             "os.replace(path + '.tmp', path)\n"
             "time.sleep(12)\n"
             "open(os.environ['CASE_DIR'] + '/ran', 'w')\n")
@@ -5841,8 +5844,8 @@ class Real(unittest.TestCase):
         # The fixture ignores TERM, writes its marker after the stop instant and
         # stays in the group long enough for the sampler to read it while the
         # custodian is still in its bounded stop.
-        waiting = self.report_document("waiting", "fixture-late")
-        grant = self.report_document("grant", "fixture-late", waited_ns=13 * 1000000000)
+        waiting = self.report_source("waiting", "fixture-late")
+        grant = self.report_source("grant", "fixture-late", waited_ns=13 * 1000000000)
         code = fixture(
             "import json\n"
             "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
@@ -5851,11 +5854,11 @@ class Real(unittest.TestCase):
             "waiting = os.path.join(evidence, " + repr(bounded.WAITING_NAME) + ")\n"
             "time.sleep(5)\n"
             "with open(waiting + '.tmp', 'w') as handle:\n"
-            "    json.dump(" + repr(waiting) + ", handle)\n"
+            "    json.dump(" + waiting + ", handle)\n"
             "os.replace(waiting + '.tmp', waiting)\n"
             "time.sleep(8)\n"
             "with open(path + '.tmp', 'w') as handle:\n"
-            "    json.dump(" + repr(grant) + ", handle)\n"
+            "    json.dump(" + grant + ", handle)\n"
             "os.replace(path + '.tmp', path)\n"
             "open(os.environ['CASE_DIR'] + '/ran', 'w')\n"
             "time.sleep(1.5)\n")
@@ -5888,13 +5891,13 @@ class Real(unittest.TestCase):
         # admission marker and no separately classified queue wait. A waiting
         # report is published when the wait starts, so the run is classified as
         # a deadline with a reported, never-granted queue wait.
-        document = self.report_document("waiting", "fixture-1")
+        document = self.report_source("waiting", "fixture-1")
         code = fixture(
             "import json\n"
             "path = os.path.join(os.environ['OXIDE_PROOF_EVIDENCE'], "
             + repr(bounded.WAITING_NAME) + ")\n"
             "with open(path + '.tmp', 'w') as handle:\n"
-            "    json.dump(" + repr(document) + ", handle)\n"
+            "    json.dump(" + document + ", handle)\n"
             "os.replace(path + '.tmp', path)\n"
             "time.sleep(30)\n")
         self.assertEqual(self.guardian(code, limit=32), 124)
@@ -5927,8 +5930,8 @@ class Real(unittest.TestCase):
         (evidence / bounded.WAITING_NAME).write_text(json.dumps(
             {"schema": 2, "source": "fixture", "run": "stale-run", "command": "fixture-stale",
              "reason": "queue"}))
-        waiting = self.report_document("waiting", "fixture-1")
-        grant = self.report_document("grant", "fixture-1", waited_ns=0)
+        waiting = self.report_source("waiting", "fixture-1")
+        grant = self.report_source("grant", "fixture-1", waited_ns=0)
         code = fixture(
             "import json\n"
             "evidence = os.environ['OXIDE_PROOF_EVIDENCE']\n"
@@ -5936,10 +5939,10 @@ class Real(unittest.TestCase):
             "grant = os.path.join(evidence, " + repr(bounded.ADMISSION_NAME) + ")\n"
             "time.sleep(1)\n"
             "with open(waiting + '.tmp', 'w') as handle:\n"
-            "    json.dump(" + repr(waiting) + ", handle)\n"
+            "    json.dump(" + waiting + ", handle)\n"
             "os.replace(waiting + '.tmp', waiting)\n"
             "with open(grant + '.tmp', 'w') as handle:\n"
-            "    json.dump(" + repr(grant) + ", handle)\n"
+            "    json.dump(" + grant + ", handle)\n"
             "os.replace(grant + '.tmp', grant)\n"
             "open(os.environ['CASE_DIR'] + '/ran', 'w')\n"
             "time.sleep(30)\n")
