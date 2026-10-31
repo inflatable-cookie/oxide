@@ -195,7 +195,12 @@ macOS, and there is no deadline inheritance for nested `oxide` calls.
   existing registration with `oxide pool set-mode <ephemeral|permanent>`.
   The setting can be changed while the drive is absent. Both modes use the
   same availability checks and pool preference, and final outputs stay in
-  `<workspace>/target`.
+  `<workspace>/target`. A slot lost with an unplugged drive stays held:
+  `oxide pool recover-interrupted <slot>` releases an interrupted one, while a
+  slot quarantined in the current boot session refuses that command and is
+  released with `oxide pool release-quarantined <slot>
+  --confirm-writers-stopped` once its writers are stopped (`--dry-run` first
+  prints the same descriptor census and changes nothing).
 - If a permanent drive cannot be used, Oxide warns before admission with the
   actual fallback reason, then includes that reason in the command summary
   when one is produced. Ephemeral mode keeps the existing fallback line.

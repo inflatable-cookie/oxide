@@ -141,6 +141,7 @@ const USAGE: &str = "\
 usage: oxide pool register-removable <mount-point> --reserve <size> --cap <size> [--mode ephemeral|permanent]
        oxide pool set-mode <ephemeral|permanent>
        oxide pool recover-interrupted <slot>
+       oxide pool release-quarantined <slot> [--dry-run] --confirm-writers-stopped
        oxide pool describe --json
 
 register-removable registers a dedicated APFS volume mounted directly under
@@ -156,6 +157,17 @@ existing fallback diagnostic.
 recover-interrupted releases a slot `oxide status` shows held by an
 interrupted command whose Cargo group was not recorded or whose lease is not
 provably its own. Run it only when nothing still writes in that slot.
+
+release-quarantined releases a slot quarantined in this boot session (a
+removable volume lost while a writer could outlive its command, for example
+an `exec` tool or an allowed rustc wrapper) and deletes its tree whole through
+the holding area, outside the pool lock. --confirm-writers-stopped is always
+required: the command first checks that no process of this account holds a
+file open inside the slot tree, that no process's working directory is inside
+it and that the recorded holder pid is gone or is a different process. Any
+unreadable observation is unknown and refuses; an idempotent state (idle,
+lost with closed writers, closed by a later boot) refuses and names its own
+path. --dry-run prints the census verdict and changes nothing.
 
 describe --json prints the registered drive as stable, read-only JSON on
 stdout (schema oxide.pool.describe/1). It changes nothing.";
@@ -223,6 +235,7 @@ pub fn run(args: &[OsString]) -> Result<u8, String> {
             println!("released slot {slot} in {}", target.pool.display());
             Ok(0)
         }
+        ["release-quarantined", rest @ ..] => release_quarantined(parse_release_arguments(rest)?),
         // Debug builds only: the focused proof applies the real mount-parent
         // rule to an owned scratch directory.
         #[cfg(debug_assertions)]
@@ -705,6 +718,137 @@ pub fn previous_registration(internal: &Store) -> Option<PathBuf> {
                 && (fs::symlink_metadata(control.join(REGISTRATION)).is_ok()
                     || fs::symlink_metadata(control.join(POOL_DIR)).is_ok())
         })
+}
+
+/// The fixed facts `--confirm-writers-stopped` asserts and the command checks
+/// before any effect.
+const RELEASE_CHECKS: &str = "no process of this account holds a file open inside the slot tree; no process's working directory is inside it; the recorded holder pid is gone or is a different process; and the slot's record is retired, held and quarantined in this boot session";
+
+struct ReleaseArguments<'a> {
+    slot: &'a str,
+    dry_run: bool,
+    confirmed: bool,
+}
+
+/// `oxide pool release-quarantined`'s fixed argument grammar: one slot, at
+/// most one `--dry-run` and at most one `--confirm-writers-stopped`, in any
+/// order. Anything else refuses before any pool is opened.
+fn parse_release_arguments<'a>(arguments: &'a [&'a str]) -> Result<ReleaseArguments<'a>, String> {
+    let mut slot = None;
+    let mut dry_run = false;
+    let mut confirmed = false;
+    for argument in arguments {
+        match *argument {
+            "--dry-run" if !dry_run => dry_run = true,
+            "--confirm-writers-stopped" if !confirmed => confirmed = true,
+            other if other.starts_with('-') => {
+                return Err(format!("unknown option {other}\n{USAGE}"))
+            }
+            other if slot.is_none() => slot = Some(other),
+            _ => return Err(USAGE.to_owned()),
+        }
+    }
+    let slot = slot.ok_or_else(|| USAGE.to_owned())?;
+    Ok(ReleaseArguments {
+        slot,
+        dry_run,
+        confirmed,
+    })
+}
+
+/// Release and delete whole a slot quarantined in this boot session (oxide#196).
+/// The operator's flag is required before anything is read; the descriptor
+/// census and the record verification decide, and every refusal changes
+/// nothing.
+fn release_quarantined(arguments: ReleaseArguments<'_>) -> Result<u8, String> {
+    let slot = arguments.slot;
+    if !arguments.confirmed {
+        return Err(format!(
+            "refusing to release slot {slot}: --confirm-writers-stopped is required first.\nIt would check that {RELEASE_CHECKS}. Stop every writer, then re-run with --confirm-writers-stopped."
+        ));
+    }
+    if !cfg!(target_os = "macos") {
+        return Err("the removable apfs-volume-v1 backend is macOS-only".to_owned());
+    }
+    // The selected internal pool is read without its lock, reconciliation or
+    // any write: `--dry-run` must change nothing, and the selection only names
+    // the removable control to open.
+    let settings = store::settings()?;
+    let Some(internal) = Store::open_recorded(&settings)? else {
+        return Err("no pool exists".to_owned());
+    };
+    let Some(registration) = registration(&internal)? else {
+        return Err(format!(
+            "slot {slot} is not quarantined: no removable pool is registered in {}",
+            internal.pool.display()
+        ));
+    };
+    // The census reads the slot tree and the recorded holder, so the tree has
+    // to be present: an absent volume is named, never treated as "no
+    // writers".
+    let bound = Binding::open(
+        &registration.mount_point,
+        Some(&registration.volume_uuid),
+    )
+    .map_err(|error| {
+        format!(
+            "the removable volume {} is not attached ({error}); slot {slot}'s tree is not present, so nothing was released",
+            registration.mount_point.display()
+        )
+    })?;
+    drop(bound);
+    let root = internal.control().join(POOL_DIR);
+    if arguments.dry_run {
+        let target = Store::open_recorded_removable(&root, internal.max_active())?;
+        let quarantined = target.quarantined_slot(slot)?;
+        let summary = crate::census::verify(&quarantined.dir, quarantined.holder.as_ref())?;
+        println!(
+            "would release quarantined slot {slot} in {}: {}; census: {}; operator confirmed writers stopped; nothing changed",
+            target.pool.display(),
+            recorded_size(quarantined.recorded_bytes),
+            census_line(&summary)
+        );
+        return Ok(0);
+    }
+    let target = Store::open_removable(
+        &root,
+        registration.mount_point.join(PAYLOAD_DIR),
+        internal.max_active(),
+    )?;
+    let (summary, released) =
+        target.release_quarantined(slot, |path, holder| crate::census::verify(path, holder))?;
+    println!(
+        "released quarantined slot {} in {}: {}; census: {}; operator confirmed writers stopped",
+        released.slot_id,
+        target.pool.display(),
+        recorded_size(released.recorded_bytes),
+        census_line(&summary)
+    );
+    eprintln!(
+        "oxide: deleted slot {} {}",
+        released.slot_id, released.reported
+    );
+    // Delete the renamed tree outside the pool lock, named by this release.
+    // One bounded pass: a tree that cannot finish stays recorded and charged,
+    // and a later command resumes it.
+    let mut sweep =
+        crate::HoldingSweep::start(target.pool.clone(), released.holding.first().cloned());
+    sweep.finish();
+    Ok(0)
+}
+
+fn recorded_size(bytes: Option<u64>) -> String {
+    bytes.map_or_else(
+        || "size unknown".to_owned(),
+        |bytes| crate::cargo_home::size(bytes),
+    )
+}
+
+fn census_line(summary: &crate::census::Summary) -> String {
+    format!(
+        "{} same-uid processes, {} descriptors, {} platform-hidden, {} dead handles; {}",
+        summary.processes, summary.descriptors, summary.hidden, summary.dead, summary.holder
+    )
 }
 
 /// Whether the internal pool holds `slot`; otherwise a removable one may.
@@ -1217,5 +1361,54 @@ mod tests {
         assert_eq!(final_registration.reserve_bytes, 1 << 20);
         assert_eq!(final_registration.cap_bytes, 1 << 20);
         assert!(parse_registration(&fs::read(control.0.join(REGISTRATION)).unwrap()).is_ok());
+    }
+
+    /// Without the operator's flag the command refuses before it opens any
+    /// pool, and prints the checks it would make.
+    #[test]
+    fn a_release_without_the_flag_refuses_and_names_the_checks() {
+        let error = release_quarantined(ReleaseArguments {
+            slot: "7",
+            dry_run: false,
+            confirmed: false,
+        })
+        .unwrap_err();
+        assert!(error.contains("--confirm-writers-stopped"), "{error}");
+        assert!(error.contains("would check"), "{error}");
+        assert!(error.contains("holds a file open"), "{error}");
+    }
+
+    /// The release grammar is fixed: one slot, each flag at most once, and no
+    /// unknown option. The flag is parsed, never implied.
+    #[test]
+    fn release_arguments_are_bounded_and_explicit() {
+        let parsed = parse_release_arguments(&["--dry-run", "7", "--confirm-writers-stopped"])
+            .expect("a valid request");
+        assert_eq!(parsed.slot, "7");
+        assert!(parsed.dry_run && parsed.confirmed);
+        let parsed = parse_release_arguments(&["7", "--confirm-writers-stopped"])
+            .expect("a valid request without dry run");
+        assert_eq!(parsed.slot, "7");
+        assert!(!parsed.dry_run && parsed.confirmed);
+        for refused in [
+            vec![],
+            vec!["7", "8", "--confirm-writers-stopped"],
+            vec!["7", "--dry-run", "--dry-run", "--confirm-writers-stopped"],
+            vec![
+                "7",
+                "--confirm-writers-stopped",
+                "--confirm-writers-stopped",
+            ],
+            vec!["7", "--bogus"],
+            vec!["--dry-run", "--confirm-writers-stopped"],
+        ] {
+            let error = parse_release_arguments(&refused)
+                .err()
+                .unwrap_or_else(|| panic!("{refused:?} was accepted"));
+            assert!(
+                error.contains("usage: oxide pool") || error.contains("unknown option"),
+                "{refused:?}: {error}"
+            );
+        }
     }
 }

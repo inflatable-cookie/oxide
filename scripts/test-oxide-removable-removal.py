@@ -31,13 +31,21 @@ detach. Not a benchmark and not real-drive qualification.
 `--boot-closure` is the focused mode for oxide#161: a restart ends every
 process, so a quarantined lost slot whose holder started before the current
 boot session is positively closed. It stages the same candidate and uses the
-same owned image, and runs three independent cases over private checkouts:
+same owned image, and runs four independent cases over private checkouts:
 a quarantined `exec` slot whose override boot time follows its holder start
 is reported closed by `status`, an explicit `outputs adopt` of a whole-target
 fixture then migrates, and the next admission deletes the slot whole with
 `oxide: deleted slot <n> lost before this boot (...)`; a quarantined slot
 whose override boot time precedes its holder start stays kept with its
-bytes; and an unreadable override stays kept. The one seam is the debug-only
+bytes; an unreadable override stays kept; and an operator-confirmed
+`oxide pool release-quarantined <slot> --confirm-writers-stopped`
+(oxide#196) refuses while an escaped process keeps a file open inside the
+slot, then -- once that process is stopped -- a dry run is clean and the
+release deletes the slot whole through the holding area and forgets its
+record. The escaped writer is the fixture's own `oxide exec` tool forking a
+`setsid` child that holds a file open in its slot scratch; the proof stops it
+in a finally and the child's own lifetime is bounded. The one product seam is
+the debug-only
 `OXIDE_TEST_BOOT_MS` override, which the product honors only under this
 supervisor's own scratch/evidence/deadline layout. The quarantines are made by
 the product's own removal path: a blocked `oxide exec` tool loses the volume
@@ -101,7 +109,39 @@ BOOT_CASES = (
     ("before-boot", "a quarantined holder from an earlier boot session is deleted whole and its checkout adopts"),
     ("after-boot", "a holder from this boot session stays quarantined"),
     ("unreadable-boot", "an unreadable boot time stays quarantined"),
+    ("release-quarantined", "an operator-confirmed release refuses while an escaped writer holds the slot, then deletes it whole once that writer is stopped"),
 )
+# The operator-confirmed release (oxide#196): the tool leaves an escaped
+# process outside its group that keeps a file open inside the slot. The
+# process leaves the product's removal stop unable to end it, and holds the
+# handle until the proof writes the stop file. Its own lifetime is bounded so
+# a proof that dies cannot leave it for the supervisor's census.
+ESCAPE_TOOL = """#!/usr/bin/env python3
+import os, sys, time
+gate = os.environ["FIXTURE_GATE"]
+scratch = os.environ["TMPDIR"]
+with open(os.path.join(gate, "started"), "w", encoding="utf-8") as handle:
+    handle.write(scratch + "\n")
+if os.fork() == 0:
+    os.setsid()
+    with open(os.path.join(gate, "escaped"), "w", encoding="utf-8") as handle:
+        handle.write(str(os.getpid()) + "\n")
+    held = None
+    stop = os.path.join(gate, "stop")
+    end = time.monotonic() + 240.0
+    while time.monotonic() < end and not os.path.exists(stop):
+        if held is None:
+            try:
+                held = open(os.path.join(scratch, "escaped-writer"), "a")
+            except OSError:
+                pass
+        time.sleep(0.05)
+    if held is not None:
+        held.close()
+    os._exit(0)
+while True:
+    time.sleep(0.5)
+"""
 BOOT_APP = {
     "Cargo.toml": '[package]\nname = "bootapp"\nversion = "0.1.0"\nedition = "2021"\n',
     "src/main.rs": 'fn main() {\n    println!("bootapp ok");\n}\n',
@@ -552,11 +592,23 @@ def deletion_oracle_leaf(slots: str, slot: str, folder: str) -> str:
     return leaf
 
 
-def write_tool(path: str) -> str:
+def write_script(path: str, text: str) -> str:
     with open(path, "w", encoding="utf-8") as handle:
-        handle.write(HOLD_TOOL)
+        handle.write(text)
     os.chmod(path, 0o755)
     return os.path.realpath(path)
+
+
+def process_alive(pid: int) -> bool:
+    """Whether a pid this proof started is still running; a permission error
+    is not proof it is gone."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def git_fixture(proof: Proof, path: str, files: dict) -> str:
@@ -626,7 +678,8 @@ class BootClosure:
         self.env = private_environment(proof.root)
         proof.env = self.env
         self.pool = self.env["OXIDE_POOL"]
-        self.tool = write_tool(os.path.join(proof.root, "hold-tool"))
+        self.tool = write_script(os.path.join(proof.root, "hold-tool"), HOLD_TOOL)
+        self.escape_tool = write_script(os.path.join(proof.root, "escape-tool"), ESCAPE_TOOL)
         self.victims = {}
         for case, _ in BOOT_CASES:
             victim = git_fixture(proof, os.path.join(proof.root, f"victim-{case}"), BOOT_APP)
@@ -685,15 +738,78 @@ class BootClosure:
         need(code == 0, f"{label}: status exit {code}: {stderr[-800:]}")
         return stdout
 
-    def quarantine(self, case: str) -> dict:
+    def ledger(self) -> dict:
+        path = os.path.join(self.pool, "oxide-managed", "removable", "ledger.json")
+        need(os.path.isfile(path), f"no removable pool ledger at {path}; custody unknown")
+        return read_json(path)
+
+    def custody_digest(self) -> str:
+        """A bounded digest of the removable pool's state and ledger, so a
+        refusal can be shown to change nothing."""
+        digest = hashlib.sha256()
+        for path in (
+            os.path.join(self.pool, REMOVABLE_STATE),
+            os.path.join(self.pool, "oxide-managed", "removable", "ledger.json"),
+        ):
+            need(os.path.isfile(path), f"no custody document at {path}")
+            with open(path, "rb") as handle:
+                digest.update(handle.read())
+        return digest.hexdigest()
+
+    def stop_escaped(self, gate: str, pid: int) -> None:
+        """Stop the escaped writer and wait for it to be gone; a writer this
+        proof cannot positively end leaves custody unknown."""
+        try:
+            with open(os.path.join(gate, "stop"), "w", encoding="utf-8") as handle:
+                handle.write("stop\n")
+        except OSError as error:
+            raise UnknownOutcome(f"cannot write the escaped writer's stop file: {error}")
+        end = time.monotonic() + 10.0
+        while time.monotonic() < end:
+            if not process_alive(pid):
+                return
+            time.sleep(0.05)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        end = time.monotonic() + 5.0
+        while time.monotonic() < end:
+            if not process_alive(pid):
+                return
+            time.sleep(0.05)
+        raise UnknownOutcome(f"the escaped writer pid {pid} did not stop; custody unknown")
+
+    def quarantine(self, case: str, escaped: bool = False) -> dict:
         """Hold a removable slot with `oxide exec`, force the volume away, and
-        return the product's own quarantined record facts."""
+        return the product's own quarantined record facts. With `escaped`, the
+        tool leaves a process outside its group that keeps a file open inside
+        the slot until the case stops it."""
         env = self.child_env({"FIXTURE_GATE": os.path.join(self.proof.root, "gate", case)})
         os.makedirs(env["FIXTURE_GATE"], mode=0o700)
         victim = self.victims[case]
         before = set(os.listdir(self.slots))
-        child = self.proof.start(["exec", "--", self.tool], victim, env)
+        tool = self.escape_tool if escaped else self.tool
+        child = self.proof.start(["exec", "--", tool], victim, env)
         wait_for(os.path.join(env["FIXTURE_GATE"], "started"), f"{case} exec")
+        escaped_pid = None
+        if escaped:
+            # The slot scratch the product handed the tool is inside the slot;
+            # the escaped process keeps its file open there.
+            with open(os.path.join(env["FIXTURE_GATE"], "started"), encoding="utf-8") as handle:
+                scratch = handle.read().strip()
+            need(
+                scratch.startswith(self.slots + os.sep),
+                f"{case}: the exec tool's TMPDIR {scratch!r} is not inside the slot tree",
+            )
+            for _ in range(200):
+                path = os.path.join(env["FIXTURE_GATE"], "escaped")
+                if os.path.isfile(path):
+                    with open(path, encoding="utf-8") as handle:
+                        escaped_pid = int(handle.read().strip())
+                    break
+                time.sleep(0.01)
+            need(escaped_pid is not None, f"{case}: the escaped writer did not publish its pid")
         self.volume.force_detach(f"{case} removal")
         code, _, stderr = self.proof.finish(child, f"{case} exec after removal", WAIT_SECONDS)
         # A surviving exec, or a removal without the product's own quarantine
@@ -731,14 +847,22 @@ class BootClosure:
             f"{case}: quarantined slot {slot} leaf {directory} in project folder {folder}, "
             f"holder started {started} ms, state record {record.get('id')}"
         )
-        return {
+        found = {
             "case": case,
             "slot": slot,
             "folder": folder,
             "directory": directory,
             "started": started,
             "victim": victim,
+            "gate": env["FIXTURE_GATE"],
         }
+        if escaped:
+            need(
+                escaped_pid is not None and process_alive(escaped_pid),
+                f"{case}: the escaped writer did not survive the removal",
+            )
+            found["escaped"] = escaped_pid
+        return found
 
     def kept(self, found: dict, extra: dict) -> None:
         """The slot stays held with its bytes: no deletion, its project folder
@@ -872,6 +996,125 @@ class BootClosure:
         # A present but unusable override is an unknown boot time, never the
         # real one and never closure.
         self.kept(found, {BOOT_HOOK: "unreadable"})
+
+    def release_quarantined(self) -> None:
+        """The operator-confirmed release (oxide#196): an escaped writer keeps
+        a file open inside the quarantined slot, so every release refuses and
+        nothing changes; once the writer is stopped, a dry run is clean and
+        the release deletes the slot whole through the holding area."""
+        found = self.quarantine("release-quarantined", escaped=True)
+        case = found["case"]
+        slot, folder, directory, victim = found["slot"], found["folder"], found["directory"], found["victim"]
+        gate, escaped = found["gate"], found["escaped"]
+        try:
+            before = self.custody_digest()
+            # The escaped process is outside the product's removal stop and
+            # holds a file inside the slot; the product must see it.
+            need(os.path.isdir(directory), f"{case}: the quarantined slot leaf is already gone")
+            need(process_alive(escaped), f"{case}: the escaped writer is not running")
+            # Without the operator's flag: refused before any pool read.
+            code, _, stderr = self.proof.oxide(
+                ["pool", "release-quarantined", slot],
+                "release without the flag",
+                victim,
+                self.child_env({}),
+            )
+            oracle(
+                code != 0 and "--confirm-writers-stopped" in stderr and "would check" in stderr,
+                f"{case}: the unflagged release was not refused with its checks: {code} {stderr[-1200:]}",
+            )
+            # With the flag the census refuses, naming the escaped process.
+            code, _, stderr = self.proof.oxide(
+                ["pool", "release-quarantined", slot, "--confirm-writers-stopped"],
+                "release with an escaped writer",
+                victim,
+                self.child_env({}),
+            )
+            oracle(
+                code != 0 and f"pid {escaped}" in stderr and "inside" in stderr,
+                f"{case}: the census did not refuse the escaped writer {escaped}: {code} {stderr[-1600:]}",
+            )
+            oracle("nothing was released" in stderr, f"{case}: the refusal did not say nothing changed")
+            # A dry run makes the same check and changes nothing.
+            code, _, stderr = self.proof.oxide(
+                ["pool", "release-quarantined", slot, "--dry-run", "--confirm-writers-stopped"],
+                "dry run with an escaped writer",
+                victim,
+                self.child_env({}),
+            )
+            oracle(
+                code != 0 and f"pid {escaped}" in stderr,
+                f"{case}: the dry run did not refuse the escaped writer: {code} {stderr[-1200:]}",
+            )
+            oracle(
+                self.custody_digest() == before and os.path.isdir(directory),
+                f"{case}: a refusal changed the pool or the slot tree",
+            )
+            # Stop the escaped writer: no process holds a file in the slot.
+            self.stop_escaped(gate, escaped)
+            code, stdout, stderr = self.proof.oxide(
+                ["pool", "release-quarantined", slot, "--dry-run", "--confirm-writers-stopped"],
+                "clean dry run",
+                victim,
+                self.child_env({}),
+            )
+            oracle(code == 0, f"{case}: the clean dry run failed: {code} {stderr[-1200:]}")
+            oracle(
+                f"would release quarantined slot {slot}" in stdout
+                and "census:" in stdout
+                and "operator confirmed writers stopped" in stdout,
+                f"{case}: the dry-run line is incomplete: {stdout[-1200:]}",
+            )
+            oracle(
+                self.custody_digest() == before and os.path.isdir(directory),
+                f"{case}: the dry run changed the pool or the slot tree",
+            )
+            # The release deletes the slot whole through the holding area.
+            code, stdout, stderr = self.proof.oxide(
+                ["pool", "release-quarantined", slot, "--confirm-writers-stopped"],
+                "operator-confirmed release",
+                victim,
+                self.child_env({}),
+            )
+            oracle(code == 0, f"{case}: the release failed: {code} {stderr[-1600:]}")
+            oracle(
+                f"released quarantined slot {slot}" in stdout
+                and "census:" in stdout
+                and "operator confirmed writers stopped" in stdout,
+                f"{case}: the release line is incomplete: {stdout[-1200:]}",
+            )
+            oracle(
+                f"deleted slot {slot} quarantined:" in stderr,
+                f"{case}: no deletion line names the quarantined slot: {stderr[-1600:]}",
+            )
+            oracle(
+                "deleted the held slot tree" in stderr,
+                f"{case}: the holding-area pass did not delete the tree: {stderr[-1600:]}",
+            )
+            oracle(
+                not os.path.lexists(directory),
+                f"{case}: slot leaf {directory} still exists after the release",
+            )
+            oracle(os.path.isdir(folder), f"{case}: the project folder {folder} was removed")
+            records = [
+                record
+                for record in self.state().get("records", [])
+                if str((record.get("lost") or {}).get("slot_id")) == slot
+            ]
+            oracle(not records, f"{case}: the released slot's record is still in state: {records[:1]}")
+            ledger = self.ledger()
+            oracle(
+                all(str(row.get("slot_id")) != slot for row in ledger.get("slots", [])),
+                f"{case}: the released slot is still in the ledger",
+            )
+            oracle(
+                ledger.get("holding", []) == [],
+                f"{case}: the released tree is still charged in the holding area: {ledger.get('holding', [])[:2]}",
+            )
+            stdout = self.status("release status", victim, {})
+            oracle(f"slot {slot} " not in stdout, f"{case}: status still lists the released slot")
+        finally:
+            self.stop_escaped(gate, escaped)
 
 
 def boot_closure(proof: Proof, repo: str, diagnostic: bool) -> str:

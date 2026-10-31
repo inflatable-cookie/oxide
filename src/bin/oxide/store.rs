@@ -437,6 +437,35 @@ impl Lease {
     }
 }
 
+/// A slot `oxide pool release-quarantined` may release: retired, held and
+/// quarantined in the current boot session (oxide#196), verified read-only.
+#[derive(Debug)]
+pub struct QuarantinedSlot {
+    pub slot_id: String,
+    pub record: u64,
+    pub lease_id: String,
+    /// The slot tree on the removable pool, resolved and canonicalised.
+    pub dir: PathBuf,
+    /// The closed size observation the ledger holds for this generation.
+    pub recorded_bytes: Option<u64>,
+    /// The recorded holder the release must find gone or replaced.
+    pub holder: Option<crate::census::Holder>,
+    /// The product's own short quarantine reason, for the deletion line.
+    pub reported: String,
+}
+
+/// What a released quarantined slot left behind: its tree moved whole into
+/// the payload's holding area, pending deletion outside the pool lock.
+#[derive(Debug)]
+pub struct ReleasedQuarantined {
+    pub slot_id: String,
+    pub recorded_bytes: Option<u64>,
+    /// The product's own short quarantine reason, for the deletion line.
+    pub reported: String,
+    /// The holding entries this release created, in creation order.
+    pub holding: Vec<String>,
+}
+
 pub enum Acquired {
     Lease(Lease),
     Interrupted(i32),
@@ -4611,6 +4640,194 @@ impl Store {
         state.log_recovery(recovery);
         state.settle_idle(index);
         self.save(&state)
+    }
+
+    /// The current-boot-session quarantined slot `oxide pool
+    /// release-quarantined` acts on (oxide#196), verified read-only: its
+    /// record is retired with a lost marker whose writers were never
+    /// confirmed closed, the boot session has not closed it, and the ledger
+    /// still holds it on this record's own project. Every other state refuses
+    /// and names it. Nothing here takes a lock or writes.
+    pub fn quarantined_slot(&self, slot_id: &str) -> Result<QuarantinedSlot, String> {
+        let boot = boot_session();
+        let snapshot =
+            snapshot(&self.pool).map_err(|error| lease_error("cannot read the pool", &error))?;
+        let slot = snapshot
+            .slots
+            .iter()
+            .find(|slot| slot.slot_id == slot_id)
+            .ok_or_else(|| {
+                format!(
+                    "slot {slot_id} is not in the ledger of {} (nothing to release)",
+                    self.pool.display()
+                )
+            })?;
+        let state = self.load()?;
+        let record = state
+            .records
+            .iter()
+            .find(|record| self.affinity_dir(record.id) == slot.project)
+            .ok_or_else(|| {
+                format!(
+                    "slot {slot_id} has no Oxide command record in {}",
+                    self.control.display()
+                )
+            })?;
+        if record.phase != Phase::Retired {
+            return Err(format!(
+                "slot {slot_id} is {:?}, not retired; only a quarantined slot can be released",
+                record.phase
+            ));
+        }
+        let lost = record.lost.as_ref().ok_or_else(|| {
+            format!(
+                "slot {slot_id} is retired but was not lost with a removable volume; it is not quarantined"
+            )
+        })?;
+        if lost.slot_id != slot_id {
+            return Err(format!(
+                "slot {slot_id} has no quarantine record of its own (the record names slot {})",
+                lost.slot_id
+            ));
+        }
+        if lost.unclosed.is_none() {
+            return Err(format!(
+                "slot {slot_id} is lost with its writers positively closed; the next command that selects {} deletes it whole",
+                self.pool.display()
+            ));
+        }
+        if closed_by_boot(record, boot) {
+            return Err(format!(
+                "slot {slot_id}'s holder predates this boot session, so a restart ended its writers; the next command that selects {} deletes it whole",
+                self.pool.display()
+            ));
+        }
+        if slot.state != SlotOccupancy::Held {
+            return Err(format!(
+                "slot {slot_id} is not held in {} (its ledger state is {:?})",
+                self.pool.display(),
+                slot.state
+            ));
+        }
+        let lease_id = slot
+            .lease_id
+            .clone()
+            .ok_or_else(|| format!("slot {slot_id} has no lease ID"))?;
+        if record.lease_id.as_ref().is_some_and(|own| own != &lease_id) {
+            return Err(format!(
+                "slot {slot_id}'s record is not provably this slot's lease; refusing to release it"
+            ));
+        }
+        let dir = self.quarantined_slot_dir(slot_id, slot.dir.as_deref())?;
+        let dir = fs::canonicalize(&dir).map_err(|error| {
+            format!(
+                "slot {slot_id}'s tree {} is absent ({error}); is the removable volume attached? Nothing was released",
+                dir.display()
+            )
+        })?;
+        let metadata = fs::symlink_metadata(&dir)
+            .map_err(|error| format!("cannot inspect slot {slot_id}'s tree: {error}"))?;
+        if !metadata.is_dir() {
+            return Err(format!(
+                "slot {slot_id}'s tree {} is not a directory; nothing was released",
+                dir.display()
+            ));
+        }
+        let recorded_bytes = slot
+            .recorded
+            .as_ref()
+            .filter(|fact| fact.current)
+            .map(|fact| fact.unique_allocated_bytes);
+        Ok(QuarantinedSlot {
+            slot_id: slot_id.to_owned(),
+            record: record.id,
+            lease_id,
+            dir,
+            recorded_bytes,
+            holder: record.holder.as_ref().map(|holder| crate::census::Holder {
+                pid: holder.pid,
+                started_ms: holder.started_ms,
+            }),
+            reported: format!(
+                "quarantined: lost with the removable volume and {}; released on operator confirmation",
+                lost.unclosed
+                    .as_deref()
+                    .unwrap_or("its writers were never confirmed closed")
+            ),
+        })
+    }
+
+    /// The slot tree a ledger `dir` names. The recorded shape is exactly
+    /// `<project folder>/<profile>-<id>` (the legacy shape is the bare id), so
+    /// a tampered or malformed field refuses before any path is used.
+    fn quarantined_slot_dir(&self, slot_id: &str, dir: Option<&str>) -> Result<PathBuf, String> {
+        let id: u64 = slot_id
+            .parse()
+            .ok()
+            .filter(|id| *id > 0)
+            .ok_or_else(|| format!("slot {slot_id} has no usable numeric id"))?;
+        let relative = match dir {
+            None => PathBuf::from(id.to_string()),
+            Some(dir) => {
+                let (folder, leaf) = dir
+                    .split_once('/')
+                    .ok_or_else(|| format!("slot {slot_id}'s recorded directory is malformed"))?;
+                let valid = |name: &str| {
+                    !name.is_empty()
+                        && name != "."
+                        && name != ".."
+                        && !name.contains('/')
+                        && !name.contains('\0')
+                };
+                if !valid(folder)
+                    || !valid(leaf)
+                    || !leaf.ends_with(&format!("-{id}"))
+                    || leaf == format!("-{id}")
+                {
+                    return Err(format!("slot {slot_id}'s recorded directory is malformed"));
+                }
+                PathBuf::from(folder).join(leaf)
+            }
+        };
+        Ok(self.payload.join("slots").join(relative))
+    }
+
+    /// Release a verified quarantined slot and delete it whole through the
+    /// holding area (oxide#196). `verify` is the caller's positive writer
+    /// check; it runs under the admission lock and before any effect, and its
+    /// refusal changes nothing. The slot's ledger entry is released, its tree
+    /// is renamed whole into the payload's holding area and recorded there
+    /// outside the pool lock, and its record is forgotten. Space stays charged
+    /// until that deletion is gone.
+    pub fn release_quarantined(
+        &self,
+        slot_id: &str,
+        verify: impl FnOnce(
+            &Path,
+            Option<&crate::census::Holder>,
+        ) -> Result<crate::census::Summary, String>,
+    ) -> Result<(crate::census::Summary, ReleasedQuarantined), String> {
+        let _admission = self.admission()?;
+        let slot = self.quarantined_slot(slot_id)?;
+        let summary = verify(&slot.dir, slot.holder.as_ref())?;
+        let record = slot.record;
+        let lease_id = slot.lease_id.clone();
+        recover(&self.pool, &lease_id)
+            .map_err(|error| lease_error("cannot release the quarantined slot", &error))?;
+        let holding = evict_idle_slot(&self.pool, &slot.slot_id)
+            .map_err(|error| lease_error("cannot delete the quarantined slot", &error))?;
+        let mut state = self.load()?;
+        self.forget_record(&mut state, record);
+        self.save(&state)?;
+        Ok((
+            summary,
+            ReleasedQuarantined {
+                slot_id: slot.slot_id,
+                recorded_bytes: slot.recorded_bytes,
+                reported: slot.reported,
+                holding,
+            },
+        ))
     }
 
     fn forget_record(&self, state: &mut State, id: u64) {
@@ -11296,5 +11513,327 @@ pub(crate) mod tests {
             "a held tree survived the published pass"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// One quarantined fixture (oxide#196): a real directory-budget slot with
+    /// a real tree, a retired record and the ledger still holding it in this
+    /// boot session.
+    #[cfg(target_os = "macos")]
+    struct QuarantinedRelease {
+        root: PathBuf,
+        store: Store,
+        slot_id: String,
+        record: u64,
+        slot_dir: PathBuf,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl QuarantinedRelease {
+        fn new(label: &str) -> Self {
+            let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let root = base.join(format!(
+                "oxide-release-{label}-{}-{}",
+                std::process::id(),
+                process::now_ms()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let root = fs::canonicalize(root).unwrap();
+            let pool = root.join("pool");
+            init_budget_pool(&pool, 1 << 30).unwrap();
+            let store = Store {
+                control: pool.join(MANAGED_NAME),
+                payload: pool.join("payload"),
+                pool: pool.clone(),
+                backend: Backend::DirectoryBudget,
+                budget: Some(1 << 30),
+                recorded_budget: 1 << 30,
+                max_active: 16,
+                sibling: None,
+            };
+            store.ensure_control().unwrap();
+            let checkout = root.join("checkout");
+            fs::create_dir(&checkout).unwrap();
+            let key = SlotKey {
+                checkout,
+                identity: "identity".to_owned(),
+                compatibility: "quick-key".to_owned(),
+            };
+            let leased = lease(&store, &key, None).expect("a slot");
+            let record = leased.record_id();
+            let slot_id = leased.slot_id.clone();
+            let slot_dir = leased.build_dir.parent().expect("slot dir").to_path_buf();
+            drop(leased);
+            let fixture = Self {
+                root,
+                store,
+                slot_id,
+                record,
+                slot_dir,
+            };
+            fixture.quarantine(|_| {});
+            fixture
+        }
+
+        /// The fixture is quarantined by the product's own record shape: a
+        /// retired phase, a lost marker whose writers were never confirmed
+        /// closed, and a holder of this boot session.
+        fn quarantine(&self, change: impl FnOnce(&mut Record)) {
+            let mut state = self.store.load().unwrap();
+            let entry = state
+                .records
+                .iter_mut()
+                .find(|entry| entry.id == self.record)
+                .unwrap();
+            entry.phase = Phase::Retired;
+            entry.lost = Some(Lost {
+                slot_id: self.slot_id.clone(),
+                at_ms: 1,
+                unclosed: Some("exec tool may have started processes outside its group".to_owned()),
+            });
+            entry.holder.as_mut().unwrap().started_ms = process::now_ms();
+            change(entry);
+            self.store.save(&state).unwrap();
+        }
+
+        fn state_bytes(&self) -> Vec<u8> {
+            fs::read(self.store.control.join("state.json")).unwrap()
+        }
+
+        fn ledger_bytes(&self) -> Vec<u8> {
+            fs::read(self.store.pool.join("ledger.json")).unwrap()
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for QuarantinedRelease {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn release_summary() -> crate::census::Summary {
+        crate::census::Summary {
+            processes: 1,
+            descriptors: 2,
+            hidden: 0,
+            dead: 0,
+            holder: "no recorded holder".to_owned(),
+        }
+    }
+
+    /// The selection is read-only and names every other state: a live record,
+    /// a slot the boot session closed, a lost slot whose writers were
+    /// positively closed, a missing ledger entry and an absent tree.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_quarantined_slot_is_verified_read_only_and_every_other_state_refuses() {
+        let fixture = QuarantinedRelease::new("selection");
+        let before = (fixture.state_bytes(), fixture.ledger_bytes());
+        let verified = fixture
+            .store
+            .quarantined_slot(&fixture.slot_id)
+            .expect("the fixture is quarantined");
+        assert_eq!(verified.dir, fs::canonicalize(&fixture.slot_dir).unwrap());
+        assert_eq!(verified.record, fixture.record);
+        assert_eq!(
+            verified.holder.as_ref().map(|holder| holder.pid),
+            Some(std::process::id())
+        );
+        assert!(
+            verified.reported.contains("quarantined:"),
+            "{}",
+            verified.reported
+        );
+        assert_eq!(
+            before,
+            (fixture.state_bytes(), fixture.ledger_bytes()),
+            "the selection wrote something"
+        );
+        // A slot id the ledger does not know.
+        let error = fixture.store.quarantined_slot("999999").unwrap_err();
+        assert!(error.contains("not in the ledger"), "{error}");
+        // A later boot session closes it.
+        fixture.quarantine(|entry| {
+            entry.holder.as_mut().unwrap().started_ms = 1;
+        });
+        let error = fixture
+            .store
+            .quarantined_slot(&fixture.slot_id)
+            .unwrap_err();
+        assert!(error.contains("predates this boot session"), "{error}");
+        // Positively closed writers are the automatic path, not this command.
+        fixture.quarantine(|entry| {
+            entry.lost.as_mut().unwrap().unclosed = None;
+        });
+        let error = fixture
+            .store
+            .quarantined_slot(&fixture.slot_id)
+            .unwrap_err();
+        assert!(error.contains("positively closed"), "{error}");
+        // A retired record that is not a lost slot.
+        let mut state = fixture.store.load().unwrap();
+        state
+            .records
+            .iter_mut()
+            .find(|entry| entry.id == fixture.record)
+            .unwrap()
+            .lost = None;
+        fixture.store.save(&state).unwrap();
+        let error = fixture
+            .store
+            .quarantined_slot(&fixture.slot_id)
+            .unwrap_err();
+        assert!(error.contains("not lost"), "{error}");
+        // An absent tree (the volume went away after the ledger read).
+        fixture.quarantine(|_| {});
+        fs::remove_dir_all(&fixture.slot_dir).unwrap();
+        let error = fixture
+            .store
+            .quarantined_slot(&fixture.slot_id)
+            .unwrap_err();
+        assert!(error.contains("is absent"), "{error}");
+    }
+
+    /// A live command's slot is not a quarantine: the record phase refuses it
+    /// and nothing is changed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_live_slot_is_not_quarantined() {
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = base.join(format!(
+            "oxide-release-live-{}-{}",
+            std::process::id(),
+            process::now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let pool = root.join("pool");
+        init_budget_pool(&pool, 1 << 30).unwrap();
+        let store = Store {
+            control: pool.join(MANAGED_NAME),
+            payload: pool.join("payload"),
+            pool: pool.clone(),
+            backend: Backend::DirectoryBudget,
+            budget: Some(1 << 30),
+            recorded_budget: 1 << 30,
+            max_active: 16,
+            sibling: None,
+        };
+        store.ensure_control().unwrap();
+        let checkout = root.join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let key = SlotKey {
+            checkout,
+            identity: "identity".to_owned(),
+            compatibility: "quick-key".to_owned(),
+        };
+        let leased = lease(&store, &key, None).expect("a slot");
+        let slot_id = leased.slot_id.clone();
+        let state_before = fs::read(store.control.join("state.json")).unwrap();
+        let error = store.quarantined_slot(&slot_id).unwrap_err();
+        assert!(error.contains("not retired"), "{error}");
+        assert_eq!(
+            state_before,
+            fs::read(store.control.join("state.json")).unwrap(),
+            "the refusal wrote state"
+        );
+        drop(leased);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A census refusal is before every effect: the slot tree, the ledger and
+    /// the record are byte-identical afterwards.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_refused_writer_check_changes_nothing() {
+        let fixture = QuarantinedRelease::new("refused");
+        let before = (fixture.state_bytes(), fixture.ledger_bytes());
+        let error = fixture
+            .store
+            .release_quarantined(&fixture.slot_id, |_, _| {
+                Err("a stated open handle".to_owned())
+            })
+            .unwrap_err();
+        assert!(error.contains("a stated open handle"), "{error}");
+        assert!(fixture.slot_dir.is_dir(), "the slot tree was moved");
+        assert_eq!(
+            before,
+            (fixture.state_bytes(), fixture.ledger_bytes()),
+            "the refused release wrote something"
+        );
+        assert!(fixture.store.quarantined_slot(&fixture.slot_id).is_ok());
+    }
+
+    /// A successful release reaches oxide#190's holding path: the tree is
+    /// renamed whole, the holding row records it, the record is forgotten and
+    /// the bounded pass deletes it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn release_reaches_the_holding_path_and_forgets_the_record() {
+        let fixture = QuarantinedRelease::new("release");
+        assert!(fixture.slot_dir.is_dir());
+        let (summary, released) = fixture
+            .store
+            .release_quarantined(&fixture.slot_id, |path, holder| {
+                assert_eq!(path, fs::canonicalize(&fixture.slot_dir).unwrap());
+                assert_eq!(
+                    holder.map(|holder| holder.pid),
+                    Some(std::process::id()),
+                    "the census was not handed the recorded holder"
+                );
+                Ok(release_summary())
+            })
+            .expect("the release succeeds");
+        assert_eq!(summary.processes, 1);
+        assert_eq!(released.slot_id, fixture.slot_id);
+        assert!(
+            released.reported.contains("quarantined:"),
+            "{}",
+            released.reported
+        );
+        assert!(released
+            .reported
+            .contains("released on operator confirmation"));
+        assert_eq!(released.holding.len(), 1, "{:?}", released.holding);
+        let name = &released.holding[0];
+        assert!(
+            !fixture.slot_dir.exists(),
+            "the slot tree was not renamed whole"
+        );
+        let view = fixture.store.ledger().unwrap();
+        assert!(
+            view.slots
+                .iter()
+                .all(|slot| slot.slot_id != fixture.slot_id),
+            "the released slot is still in the ledger"
+        );
+        assert!(
+            view.holding
+                .iter()
+                .any(|entry| { entry.name == *name && entry.slot_id == fixture.slot_id }),
+            "the holding row does not name the release: {:?}",
+            view.holding
+        );
+        assert!(
+            fixture.store.load().unwrap().records.is_empty(),
+            "the quarantined record was not forgotten"
+        );
+        let drained = oxide_storage::lease::managed::drain_holding(&fixture.store.pool, Some(name))
+            .expect("the holding pass");
+        assert_eq!(drained.claimed.as_deref(), Some(name.as_str()));
+        assert!(
+            drained.gone,
+            "the held tree was not deleted (refused {:?})",
+            drained.refused
+        );
+        assert!(
+            fixture.store.ledger().unwrap().holding.is_empty(),
+            "the holding row survived its deletion"
+        );
     }
 }
