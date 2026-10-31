@@ -24,6 +24,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import errno
+import gc
 import importlib.util
 import inspect
 import io
@@ -4987,6 +4988,52 @@ class PureDetach(unittest.TestCase):
         self.assertIn("detach_child_closed_by_monitor: scratch_kept", source)
         self.assertNotIn("Kinfo.one", source)
 
+    def test_the_child_descriptor_is_closed_once_by_one_owner(self):
+        # The reviewed hazard: closing the raw descriptor while its buffered
+        # object still owned it, across a wait, could close a descriptor another
+        # thread had reused in the interval.
+        read_fd, write_fd = os.pipe()
+        stream = os.fdopen(read_fd, "rb", buffering=4096)
+        self.addCleanup(lambda: (os.close(read_fd) if False else None))
+
+        class FakeChild:
+            pid = 0
+
+            def __init__(self):
+                self.stdout = stream
+                self.returncode = 0
+                self.waits = []
+
+            def poll(self):
+                return 0
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                self.waits.append(timeout)
+                # While the parent waits, another thread may take the freed number.
+                return 0
+
+        child = FakeChild()
+        old_fd = stream.fileno()
+        os.write(write_fd, b"out")
+        os.close(write_fd)
+        result = bounded.bounded_run(["/bin/true"], 2, 64, spawn=lambda *a, **k: child)
+        self.assertEqual(result["exit"], 0, result)
+        self.assertIsNone(child.stdout, "the detached buffer was kept")
+        # The buffer was detached (so it can never finalise the descriptor) and the
+        # descriptor itself is closed by its single owner.
+        with self.assertRaises(ValueError):
+            stream.closed
+        with self.assertRaises(OSError):
+            os.fstat(old_fd)
+        # The descriptor number can be reused at once and survives collection.
+        keep = os.open(os.devnull, os.O_RDONLY)
+        self.addCleanup(os.close, keep)
+        gc.collect()
+        os.fstat(keep)  # raises if the stale stream closed a reused descriptor
+
     def test_the_own_child_close_is_bounded_and_never_raises(self):
         class FakeChild:
             pid = 0  # no signal is attempted for pid 0
@@ -5121,6 +5168,9 @@ class PureDetach(unittest.TestCase):
 
     def test_an_executor_exception_keeps_the_live_handle(self):
         class BrokenStdout:
+            def detach(self):
+                raise OSError("the pipe vanished")
+
             def fileno(self):
                 raise OSError("the pipe vanished")
 
@@ -5760,12 +5810,26 @@ class PureDetach(unittest.TestCase):
         class FakeChild:
             returncode = None
 
-            class _Stdout:
+            class _Raw:
                 def __init__(self, fd):
                     self.fd = fd
+                    self.closed = False
 
                 def fileno(self):
                     return self.fd
+
+                def close(self):
+                    self.closed = True
+
+            class _Stdout:
+                def __init__(self, fd):
+                    self.raw = FakeChild._Raw(fd)
+
+                def detach(self):
+                    return self.raw
+
+                def fileno(self):
+                    return self.raw.fd
 
             def __init__(self, fd):
                 self.stdout = self._Stdout(fd)

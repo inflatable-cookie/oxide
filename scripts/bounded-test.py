@@ -1540,7 +1540,12 @@ def bounded_run(argv, timeout, cap=DETACH_OUTPUT_MAX_BYTES, still_allowed=None, 
     tail, seen, timed_out, withdrawn, reap_timed_out, reaped = b"", 0, False, None, False, False
     poll_at = time.monotonic() + DETACH_POLL_S
     try:
-        fd = child.stdout.fileno()
+        # One owner for the descriptor: detaching the buffer gives this function
+        # the raw stream, so the descriptor is closed exactly once here and never
+        # left to a buffered object's finalizer while another thread may have
+        # reused the number.
+        raw = child.stdout.detach()
+        fd = raw.fileno()
     except BaseException as error:
         return _unreaped_record(child, error, deadline)
     try:
@@ -1575,13 +1580,19 @@ def bounded_run(argv, timeout, cap=DETACH_OUTPUT_MAX_BYTES, still_allowed=None, 
                 seen += len(chunk)
                 tail = _bounded_tail(tail, chunk, cap)
         finally:
+            # Close the descriptor through its single owner BEFORE any wait, then
+            # drop the detached buffer so nothing can close it a second time.
+            try:
+                raw.close()
+            except OSError:
+                pass
+            try:
+                child.stdout = None
+            except BaseException:
+                pass
             # The reap is bounded by what is left of the SAME deadline: no extra
             # fixed wait and no round that can run past it. Any exception here
             # still hands the live child back through the outer handler.
-            try:
-                os.close(fd)
-            except OSError:
-                pass
             if timed_out or withdrawn is not None:
                 try:
                     child.kill()
@@ -1604,7 +1615,6 @@ def bounded_run(argv, timeout, cap=DETACH_OUTPUT_MAX_BYTES, still_allowed=None, 
                     pass
     except BaseException as error:
         return _unreaped_record(child, error, deadline)
-    child.stdout = None
     status = child.returncode
     return {"exit": status, "timed_out": timed_out, "error": None,
             "output": tail.decode("utf-8", "replace"), "truncated": seen > len(tail),
@@ -1919,6 +1929,11 @@ def _unreaped_record(child, error, deadline):
         reaped = child.wait(timeout=max(0.0, deadline - time.monotonic())) is not None
     except BaseException:
         reaped = False
+    try:
+        if child.stdout is not None:  # still owning its descriptor: close it once
+            child.stdout.close()
+    except BaseException:
+        pass
     try:
         child.stdout = None
     except BaseException:

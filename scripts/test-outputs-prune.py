@@ -3,7 +3,7 @@
 
 Run only as an Effigy heavy task under the shared proof supervisor
 (`scripts/bounded-test.py`, SHA-256
-2f1954d8f75c9a143b99ea463babdf1ca5177ef1036d654cc29af5dc1c0501ef, which is
+0848974d79d84617070bd611da9503b48a0127e68c2965cebcd36e8d5fc13414, which is
 the qualified oxide#151 supervisor merged from main af08749c plus oxide#191's
 opt-in post-census image detach). Those added bytes are unqualified until their
 own uncounted diagnostic, one counted author and one separate independent
@@ -331,7 +331,7 @@ def _load(name: str, file: str):
     return module
 
 
-SUPERVISOR = "2f1954d8f75c9a143b99ea463babdf1ca5177ef1036d654cc29af5dc1c0501ef"
+SUPERVISOR = "0848974d79d84617070bd611da9503b48a0127e68c2965cebcd36e8d5fc13414"
 LIMIT_SECONDS = 360
 SCRATCH_MIB = 512
 CASES = 22

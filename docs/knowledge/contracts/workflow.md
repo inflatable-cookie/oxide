@@ -2169,7 +2169,7 @@ with no earlier run migrated.
 
 **Post-census image detach request (oxide#191, decision `ee263cea`, unqualified
 source).** The current `bounded-test.py`
-(`2f1954d8f75c9a143b99ea463babdf1ca5177ef1036d654cc29af5dc1c0501ef`) adds one
+(`0848974d79d84617070bd611da9503b48a0127e68c2965cebcd36e8d5fc13414`) adds one
 opt-in control for a proof
 whose own test image must be detached, and it is the only route by which such a
 proof may detach after a launch; the qualified shared runner is otherwise
@@ -2203,8 +2203,9 @@ declare the monitor incomplete, and it is asked again every 0.2 s while the chil
 runs, so authority withdrawn mid-attempt (a newly latched fault, the deadline, a
 lost answer) KILLs the child instead of letting it finish. An allowed attempt is
 ONE ORDINARY `hdiutil detach <mount>` of that exact image, clamped to that budget
-and to its own ceiling, with a bounded child and an output tail capped at 4096
-bytes however much the child writes; the request names the MOUNTED entity's own device, because an APFS
+and to its own ceiling, with a bounded child whose output descriptor has one owner (detached from its buffer and
+closed before any wait, so a reused descriptor number is never closed by a stale
+finalizer) and an output tail capped at 4096 bytes however much the child writes; the request names the MOUNTED entity's own device, because an APFS
 image attaches as a container whole disk plus a synthesized whole disk and the
 mount can live on either, so a container name is not the mount's device. The
 attachment facts fail closed: a malformed or incomplete relevant structure — a
@@ -2281,8 +2282,8 @@ custodian keeps its filesystem-free decision path and the existing
 cooperative-session limits. These bytes are unqualified until one uncounted
 `effigy proof:supervisor:qualify:diagnostic` records a clean picture and then
 ONE counted author and ONE separate independent reviewer
-`effigy proof:supervisor:qualify` pass at the same head (286 pure plus 48 real
-cases, including the seventy-five pure detach cases and the eight real ones: a
+`effigy proof:supervisor:qualify` pass at the same head (287 pure plus 48 real
+cases, including the seventy-six pure detach cases and the eight real ones: a
 bound success, a refused identity, a failed attempt, an unrequested attachment
 whose opt-in custody keep is recorded separately, and a real stuck child the
 custodian pins, signals and observes closed), with independent exact-head source
@@ -5442,7 +5443,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
 - **Focused proof of absent checkout chains (oxide#135).** The one fixed proof
   is `effigy rust:prune-absence` (`scripts/test-prune-absence.py` under this
-  tree's shared supervisor `2f1954d8…`, the merged oxide#151 guard plus
+  tree's shared supervisor `0848974d…`, the merged oxide#151 guard plus
   oxide#191's opt-in post-census detach) with
   `--root-parent /private/tmp`, the owner-accepted internal-placement exception
   (decision `bd357a4c`): the missing-chain fixtures must be on the boot Data
