@@ -3710,6 +3710,63 @@ class PureQualificationTopology(unittest.TestCase):
                                        None, KernelFactsForOracle(), None))
         return plan["detach-paths"]()
 
+    def monitor_stub(self, receipt=None):
+        monitor = bounded.Monitor.__new__(bounded.Monitor)
+        cmd_r, cmd_w = os.pipe()
+        self.addCleanup(os.close, cmd_r)
+        self.addCleanup(os.close, cmd_w)
+        monitor.cmd_r = cmd_r
+        monitor.lock = threading.Lock()
+        monitor.receipt = receipt if receipt is not None else {"custodian": []}
+        monitor.published = []
+        monitor.publish = lambda phase: monitor.published.append(
+            (phase, [r["event"] for r in monitor.receipt["custodian"]]))
+        monitor.summary = lambda: None
+        monitor.send = lambda *a, **k: monitor.published.append(("sent", None))
+        monitor.stop = threading.Event()
+        return monitor, cmd_w
+
+    def test_the_drain_happens_before_the_final_publication(self):
+        monitor, cmd_w = self.monitor_stub()
+        os.write(cmd_w, (json.dumps({"type": "record", "record": {"event": "detach_child_pinned"}}) + "\n").encode())
+        ctx = {"start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "limit_s": 300}
+        monitor.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
+        # The published receipt already carries the record, and completion follows.
+        self.assertEqual(monitor.published[0], ("monitor_complete: pending_custodian",
+                                                ["detach_child_pinned"]), monitor.published)
+        self.assertEqual(monitor.published[-1], ("sent", None))
+        self.assertTrue(monitor.stop.is_set())
+
+    def test_a_request_free_completion_drains_nothing_and_never_waits(self):
+        monitor, cmd_w = self.monitor_stub()
+        os.write(cmd_w, (json.dumps({"type": "record", "record": {"event": "detach_child_pinned"}}) + "\n").encode())
+        ctx = {"start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "limit_s": 300}
+        started = time.monotonic()
+        monitor.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=False)
+        self.assertLess(time.monotonic() - started, 0.05, "a request-free completion waited")
+        self.assertEqual(monitor.receipt["custodian"], [], "a request-free run read custodian records")
+        self.assertEqual(monitor.published[0], ("monitor_complete: pending_custodian", []))
+
+    def test_a_near_deadline_drain_reads_nothing(self):
+        monitor, cmd_w = self.monitor_stub()
+        os.write(cmd_w, (json.dumps({"type": "record", "record": {"event": "detach_child_pinned"}}) + "\n").encode())
+        # The custodian's wait window is already spent.
+        ctx = {"start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) - 300 * bounded.NS,
+               "limit_s": 300}
+        started = time.monotonic()
+        monitor.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
+        self.assertLess(time.monotonic() - started, 0.05, "an exhausted window still waited")
+        self.assertEqual(monitor.receipt["custodian"], [])
+        self.assertTrue(monitor.stop.is_set())
+
+    def test_await_command_keeps_records_it_meets(self):
+        monitor, cmd_w = self.monitor_stub()
+        os.write(cmd_w, (json.dumps({"type": "record", "record": {"event": "detach_child_signal"}}) + "\n").encode())
+        os.write(cmd_w, (json.dumps({"type": "detach_child_ack", "closed": True}) + "\n").encode())
+        answer = monitor.await_command("detach_child_ack", 0.5)
+        self.assertEqual(answer["type"], "detach_child_ack")
+        self.assertEqual([r["event"] for r in monitor.receipt["custodian"]], ["detach_child_signal"])
+
     def test_post_decision_records_are_drained_into_the_receipt(self):
         # The custodian sends its detach pin/signal/observation records after the
         # monitor stopped reading commands; the monitor drains them at completion.
@@ -3727,8 +3784,9 @@ class PureQualificationTopology(unittest.TestCase):
         monitor.drain_records(0.3)
         self.assertEqual([r["event"] for r in monitor.receipt["custodian"]],
                          ["detach_child_pinned", "detach_child_observed"])
-        self.assertIn('if message_type == "monitor_complete":', inspect.getsource(bounded.Monitor.send))
-        self.assertIn("self.drain_records(", inspect.getsource(bounded.Monitor.send))
+        # The drain is opt-in at completion (never unconditional in send()).
+        self.assertNotIn("drain_records", inspect.getsource(bounded.Monitor.send))
+        self.assertIn("drain=", inspect.getsource(bounded.Monitor.finish_monitor))
 
     def test_the_custodian_timeout_injection_keeps_deadline_semantics(self):
         absolute = 1000
@@ -7287,9 +7345,11 @@ class DetachReal(unittest.TestCase):
         detach = self.receipt["detach"]
         self.assertEqual((detach["qualified"], detach["reaped"]), (False, False), detach)
         self.assertEqual(self.code, 125)
-        # The monitor handed the child over by PID AND start time and never reaped
-        # it afterwards; the custodian pinned that identity, signalled it and
-        # observed it closed, and the monitor recorded that custody fact.
+        # `guard()` loaded the PERSISTED receipt, so this is an integrated
+        # receipt-path check: the monitor handed the child over by PID AND start
+        # time, never reaped it afterwards, and the custodian's pin, signal and
+        # observation reached the file because the drain runs before the final
+        # publication.
         self.assertEqual((detach.get("custodian_owned"), detach.get("custodian_closed")), (True, True), detach)
         records = [r for r in self.receipt["custodian"] if r["event"].startswith("detach_child_")]
         pinned = [r for r in records if r["event"] == "detach_child_pinned"]

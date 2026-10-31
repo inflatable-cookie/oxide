@@ -1501,6 +1501,7 @@ CUSTODY_VERSION = 1
 CUSTODY_MAX_BYTES = 2048
 CUSTODY_MAX_BACKINGS = 8
 DETACH_MIN_BUDGET_NS = 8 * NS  # below this the whole sequence cannot fit the custodian's window
+DRAIN_WAIT_S = 0.5  # one short bounded drain of post-decision records, inside the window
 DETACH_POST_RESERVE_S = 5.0  # kept for the post-state read after the child
 DETACH_STATES = ("refused", "detached", "failed", "timed_out", "withdrawn", "unknown")
 DETACH_POST_STATES = ("detached", "still_mounted", "still_attached", "unknown")
@@ -3332,6 +3333,30 @@ class Monitor:
             "output": {}, "census": None, "census_rounds": 0, "settlement": self.settlement,
         }
 
+    def finish_monitor(self, ctx, phase, drain=False):
+        """Complete this monitor. Only an image-protocol run drains, and only
+        inside what is left of the custodian's own wait window; the drain happens
+        BEFORE the final publication so the persisted receipt carries the
+        post-decision records. A run with neither a request nor a custody
+        indication passes drain=False and reads nothing."""
+        if drain:
+            remaining = (ctx["start_ns"] + int(ctx["limit_s"] * NS) - EXIT_MARGIN_S * NS
+                         - now_ns()) / NS
+            # One short drain: the custodian's records are already in the pipe by
+            # the time its last answer was read, and the wait never exceeds what is
+            # left of its own window.
+            self.drain_records(max(0.0, min(DRAIN_WAIT_S, remaining)))
+        self.publish(phase)
+        self.summary()
+        self.send("monitor_complete")
+        self.stop.set()
+
+    def keep_record(self, record):
+        """Append one custodian record to the receipt (anything else is ignored)."""
+        if isinstance(record, dict):
+            with self.lock:
+                self.receipt["custodian"].append(record)
+
     def drain_records(self, wait_s):
         """Append `record` messages the custodian sent after the decision (detach
         pin/signal/observation, cleanup keeps) to the receipt. Bounded, never
@@ -3361,16 +3386,10 @@ class Monitor:
                     command = json.loads(line)
                 except ValueError:
                     return
-                if isinstance(command, dict) and command.get("type") == "record" \
-                        and isinstance(command.get("record"), dict):
-                    with self.lock:
-                        self.receipt["custodian"].append(command["record"])
+                if isinstance(command, dict) and command.get("type") == "record":
+                    self.keep_record(command.get("record"))
 
     def send(self, message_type, **fields):
-        if message_type == "monitor_complete":
-            # Everything the custodian recorded after the decision (including the
-            # detach child's pin, signal and observation) belongs in the receipt.
-            self.drain_records(DETACH_GATE_WAIT_S)
         with self.lock:
             self.seq += 1
             message = {"run": self.ctx["run_id"], "leader": self.leader, "seq": self.seq,
@@ -3547,6 +3566,9 @@ class Monitor:
                     command = json.loads(line)
                 except ValueError:
                     return None
+                if isinstance(command, dict) and command.get("type") == "record":
+                    self.keep_record(command.get("record"))
+                    continue
                 if isinstance(command, dict) and command.get("type") == kind:
                     return command
 
@@ -3677,10 +3699,7 @@ class Monitor:
                     self.publish("cleanup_kept: scratch_kept")
                     self.receipt["scratch_marker"] = self.conclude_marker(
                         False, reason="live-image", outcome="failed")
-                    self.publish("monitor_complete: pending_custodian")
-                    self.summary()
-                    self.send("monitor_complete")
-                    self.stop.set()
+                    self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
                     return
             if detach is not None:
                 handle = detach.pop("_handle", None)  # a live child never reaches the receipt
@@ -3725,10 +3744,7 @@ class Monitor:
                                 detach["reap_timed_out"] = not absent_reaped
                                 self.receipt["detach"] = detach
                             self.publish("detach_child_absent: scratch_kept")
-                            self.publish("monitor_complete: pending_custodian")
-                            self.summary()
-                            self.send("monitor_complete")
-                            self.stop.set()
+                            self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
                             return
                         if identity_problem is not None:
                             # Its identity could not be read, so no PID is handed
@@ -3755,10 +3771,7 @@ class Monitor:
                                 # The direct child is positively closed by its own
                                 # parent; the detach itself still stays unqualified.
                                 self.publish("detach_child_closed_by_monitor: scratch_kept")
-                                self.publish("monitor_complete: pending_custodian")
-                                self.summary()
-                                self.send("monitor_complete")
-                                self.stop.set()
+                                self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
                                 return
                             # Not closed here: hand it to the custodian by PARENTAGE
                             # (no start time to check) while still holding it
@@ -3773,10 +3786,7 @@ class Monitor:
                                 self.receipt["detach"] = detach
                             if detach["custodian_closed"]:
                                 self.publish("detach_child_closed_by_custodian: scratch_kept")
-                                self.publish("monitor_complete: pending_custodian")
-                                self.summary()
-                                self.send("monitor_complete")
-                                self.stop.set()
+                                self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
                                 return
                             self.publish("detach_child_unaccounted: monitor_held")
                             self.summary()
@@ -3787,10 +3797,7 @@ class Monitor:
                         if detach["custodian_closed"]:
                             # The custodian positively closed the child it was handed.
                             self.publish("detach_child_closed_by_custodian: scratch_kept")
-                            self.publish("monitor_complete: pending_custodian")
-                            self.summary()
-                            self.send("monitor_complete")
-                            self.stop.set()
+                            self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
                             return
                         if not detach["custodian_owned"] and row is not None:
                             # Declined (already gone): the monitor may finish the
@@ -3810,10 +3817,7 @@ class Monitor:
                                 self.receipt["detach"] = detach
                             if status is not None:
                                 self.publish("detach_child_accounted: scratch_kept")
-                                self.publish("monitor_complete: pending_custodian")
-                                self.summary()
-                                self.send("monitor_complete")
-                                self.stop.set()
+                                self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
                                 return
                         # Still unaccounted: hold until the custodian ends the run,
                         # never claiming a closure nobody observed.
@@ -3823,10 +3827,7 @@ class Monitor:
                         while not self.stop.is_set() and now_ns() < end:
                             time.sleep(0.02)
                         return
-                    self.publish("monitor_complete: pending_custodian")
-                    self.summary()
-                    self.send("monitor_complete")
-                    self.stop.set()
+                    self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
                     return
             # Final gate, for an OPTED-IN run only: cleanup of a root that took
             # part in the image protocol is destructive and needs one more
@@ -3849,10 +3850,7 @@ class Monitor:
                 self.publish("cleanup_kept: scratch_kept")
                 self.receipt["scratch_marker"] = self.conclude_marker(
                     False, reason="live-image", outcome="failed")
-                self.publish("monitor_complete: pending_custodian")
-                self.summary()
-                self.send("monitor_complete")
-                self.stop.set()
+                self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
                 return
             self.publish("cleanup_partial_or_unknown")
             if ctx["owned"]:
@@ -3866,10 +3864,7 @@ class Monitor:
         else:
             self.publish("unclosed: scratch_kept")
         self.receipt["scratch_marker"] = self.conclude_marker(decision == "cleanup")
-        self.publish("monitor_complete: pending_custodian")
-        self.summary()
-        self.send("monitor_complete")
-        self.stop.set()
+        self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=opted_in)
 
     def conclude_marker(self, closed, reason=None, outcome=None):
         """Record this run's genuine conclusion on its owner marker, or leave it

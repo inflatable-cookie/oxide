@@ -2,7 +2,7 @@
 """Focused native proof for recorded per-slot accounting (oxide#146).
 
 One fixed script and the whole command of the shared proof supervisor
-(`bounded-test.py`, guard sha256 cdbd73ea..., the oxide#191 bytes that add the
+(`bounded-test.py`, guard sha256 3a40c3df..., the oxide#191 bytes that add the
 opt-in post-census image detach to the qualified oxide#151 guard). That pin is
 checked against the actual runner file before any effect, so a branch that
 still carries different guard bytes refuses here instead of spending a run;
@@ -81,7 +81,7 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILDER = "1.97.1"
 # The qualified shared supervisor this proof's whole command runs under.
-GUARD_SHA256 = "cdbd73ea5d37feaae0278e9f2fe3dc72d9bddf23b7e1822e87455a434c641702"
+GUARD_SHA256 = "3a40c3df3e006ae53a8308fd2a4706cbd6b501e7661b20a366252c0642443fc0"
 GUARD_PATH = os.path.join(REPO, "scripts", "bounded-test.py")
 
 # The product's serialized pool facts, bound to source by `--self-test`. The
