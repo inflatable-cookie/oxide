@@ -116,7 +116,7 @@ BOOT_CASES = (
 # process leaves the product's removal stop unable to end it, and holds the
 # handle until the proof writes the stop file. Its own lifetime is bounded so
 # a proof that dies cannot leave it for the supervisor's census.
-ESCAPE_TOOL = """#!/usr/bin/env python3
+ESCAPE_TOOL = r"""#!/usr/bin/env python3
 import os, sys, time
 gate = os.environ["FIXTURE_GATE"]
 scratch = os.environ["TMPDIR"]
@@ -599,6 +599,12 @@ def write_script(path: str, text: str) -> str:
     return os.path.realpath(path)
 
 
+def process_refusal(pid: int) -> str:
+    """The census message names a writer as `process <pid> ...`; the old
+    `pid <pid>` form never matches it."""
+    return f"process {pid}"
+
+
 def process_alive(pid: int) -> bool:
     """Whether a pid this proof started is still running; a permission error
     is not proof it is gone."""
@@ -1031,7 +1037,7 @@ class BootClosure:
                 self.child_env({}),
             )
             oracle(
-                code != 0 and f"pid {escaped}" in stderr and "inside" in stderr,
+                code != 0 and process_refusal(escaped) in stderr and "inside" in stderr,
                 f"{case}: the census did not refuse the escaped writer {escaped}: {code} {stderr[-1600:]}",
             )
             oracle("nothing was released" in stderr, f"{case}: the refusal did not say nothing changed")
@@ -1043,7 +1049,7 @@ class BootClosure:
                 self.child_env({}),
             )
             oracle(
-                code != 0 and f"pid {escaped}" in stderr,
+                code != 0 and process_refusal(escaped) in stderr,
                 f"{case}: the dry run did not refuse the escaped writer: {code} {stderr[-1200:]}",
             )
             oracle(
@@ -1213,8 +1219,9 @@ def self_check() -> int:
     and the full fixture environment every child (`status` included) receives
     — plus the deletion oracle's slot-leaf resolution (the slot's own leaf,
     never the project-label folder a build or an adopt also creates or
-    reuses), the dispatch, the product-message marker and the receipt
-    bound."""
+    reuses), the generated escape tool's syntax, the release oracle's
+    `process <pid>` form, the dispatch, the product-message marker and the
+    receipt bound."""
     fixture = {
         "OXIDE_POOL": "/fixture/pool",
         "HOME": "/fixture/home",
@@ -1242,6 +1249,16 @@ def self_check() -> int:
                 return 0, quarantine, ""
             return 0, "", "oxide: fixture build summary"
 
+    # The generated escape tool (oxide#196) must be valid Python as written:
+    # its `"\n"` escapes belong to the generated source, not to this
+    # generator's own string literal. The release oracle must match the
+    # product's `process <pid>` census message, never a `pid <pid>` form.
+    compile(ESCAPE_TOOL, "escape-tool", "exec")
+    expect("os.setsid()" in ESCAPE_TOOL, "the escape tool does not leave the process group")
+    expect('"escaped-writer"' in ESCAPE_TOOL, "the escape tool does not hold a file in the slot")
+    census_message = "process 4242 (python3) holds /slot/scratch/escaped-writer open inside /slot"
+    expect(process_refusal(4242) in census_message, "the release oracle does not match the census message")
+    expect(f"pid {4242}" not in census_message, "the old pid-only oracle would not match the census message")
     root = tempfile.mkdtemp(prefix="boot-closure-self-check.")
     try:
         case = BootClosure.__new__(BootClosure)

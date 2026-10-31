@@ -15,11 +15,11 @@
 //!   backoff; only a positive fact settles it — a later listing, the kernel
 //!   reporting the pid gone, a changed start identity or a changed effective
 //!   uid. The same identity still answering `EPERM` is UNKNOWN and refuses;
-//! - a vnode descriptor whose path and vnode facts both answer `EPERM` is the
-//!   platform's own blind spot, never "closed". It is counted and reported,
-//!   and does not refuse, only when the process's code-signing status carries
-//!   the platform binary flag and its kernel start identity is unchanged
-//!   around that read. Every other hidden descriptor is UNKNOWN and refuses;
+//! - a vnode descriptor whose path or vnode facts answer `EPERM`, and a
+//!   working directory whose read answers `EPERM`, are hidden: where the
+//!   platform does not let this account read the path, the census cannot say
+//!   what the process holds, so it is UNKNOWN and refuses. A hidden path is
+//!   never counted as "no hold", whatever the process's code identity;
 //! - a descriptor whose two reads both answer `ENOENT` is a dead handle (a
 //!   revoked or reclaimed vnode cannot do I/O): it is counted, not refused,
 //!   after the same identity is re-observed and both reads answer `ENOENT`
@@ -50,8 +50,6 @@ pub struct Holder {
 pub struct Summary {
     pub processes: usize,
     pub descriptors: usize,
-    /// Descriptors hidden by the platform on verified platform binaries.
-    pub hidden: usize,
     /// Descriptors whose vnode is revoked or reclaimed (a dead handle).
     pub dead: usize,
     /// What the recorded holder is now: gone, different or absent.
@@ -103,7 +101,6 @@ pub fn verify(slot: &Path, holder: Option<&Holder>) -> Result<Summary, String> {
 struct Scan {
     processes: usize,
     descriptors: usize,
-    hidden: usize,
     dead: usize,
     hits: Vec<Hit>,
 }
@@ -144,7 +141,6 @@ fn verdict(
     Ok(Summary {
         processes: scan.processes,
         descriptors: scan.descriptors,
-        hidden: scan.hidden,
         dead: scan.dead,
         holder,
     })
@@ -244,10 +240,6 @@ mod platform {
     const PROC_PIDTBSDINFO: libc::c_int = 3;
     const PROC_PIDVNODEPATHINFO: libc::c_int = 9;
     const PROX_FDTYPE_VNODE: u32 = 1;
-    const CS_OPS_STATUS: libc::c_uint = 0;
-    /// Apple's own platform binaries carry this flag; only their hidden
-    /// descriptors are the platform's blind spot instead of an unknown.
-    const CS_PLATFORM_BINARY: u32 = 0x0400_0000;
 
     // Sizes and field offsets read from the installed SDK's headers and
     // verified with `offsetof`: `struct proc_bsdinfo` (136),
@@ -293,15 +285,6 @@ mod platform {
         ) -> libc::c_int;
     }
 
-    extern "C" {
-        fn csops(
-            pid: libc::c_int,
-            ops: libc::c_uint,
-            useraddr: *mut libc::c_void,
-            usersize: libc::size_t,
-        ) -> libc::c_int;
-    }
-
     #[derive(Clone)]
     pub(super) struct Identity {
         pub(super) pid: i32,
@@ -318,17 +301,25 @@ mod platform {
         Foreign,
     }
 
-    enum Cwd {
+    #[derive(Debug)]
+    pub(super) enum Cwd {
         Path(PathBuf),
-        Hidden,
         None,
     }
 
     enum Observed {
         Path(PathBuf),
-        Hidden,
         Dead,
         Closed,
+    }
+
+    /// The production decision for one descriptor's two reads.
+    pub(super) enum Pair {
+        Path(PathBuf),
+        DeadCandidate,
+        Closed,
+        Refuse(String),
+        Retry,
     }
 
     /// One kernel path field: a resolved path, an empty name (the vnode has no
@@ -348,7 +339,7 @@ mod platform {
     pub(super) fn collect(roots: &[PathBuf]) -> Result<Scan, String> {
         let started = Instant::now();
         let uid = current_uid();
-        let pids = same_uid_pids(uid)?;
+        let pids = scan_pids(uid)?;
         let mut scan = Scan::default();
         for pid in pids {
             if started.elapsed() >= SCAN_TIMEOUT {
@@ -378,7 +369,6 @@ mod platform {
                         );
                     }
                 }
-                Cwd::Hidden => scan.hidden = scan.hidden.saturating_add(1),
                 Cwd::None => {}
             }
             let descriptors = match list_descriptors(&identity, uid, started)? {
@@ -415,7 +405,6 @@ mod platform {
                             );
                         }
                     }
-                    Observed::Hidden => scan.hidden = scan.hidden.saturating_add(1),
                     Observed::Dead => scan.dead = scan.dead.saturating_add(1),
                     Observed::Closed => {}
                 }
@@ -432,6 +421,46 @@ mod platform {
                 what,
             });
         }
+    }
+
+    /// The process table one scan observes: the kernel's same-uid table, or
+    /// (in the unit suite only) a stated table whose real descriptor and
+    /// working-directory reads are still this build's. The production path
+    /// states nothing.
+    fn scan_pids(uid: u32) -> Result<Vec<i32>, String> {
+        #[cfg(test)]
+        {
+            if let Some(pids) = STATED_PROCESSES.with(|stated| stated.borrow().clone()) {
+                return Ok(pids);
+            }
+        }
+        same_uid_pids(uid)
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static STATED_PROCESSES: std::cell::RefCell<Option<Vec<i32>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Test-only: run one census over a stated pid set. The real kernel
+    /// identity, descriptor, path and working-directory reads still run for
+    /// those pids, so a fixture writer is observed exactly as production
+    /// would observe it; only the table membership is stated. The full table
+    /// is restored even when the closure panics.
+    #[cfg(test)]
+    pub(super) fn with_stated_processes<T>(pids: Vec<i32>, run: impl FnOnce() -> T) -> T {
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                STATED_PROCESSES.with(|stated| *stated.borrow_mut() = None);
+            }
+        }
+        STATED_PROCESSES.with(|stated| *stated.borrow_mut() = Some(pids));
+        let clear = Clear;
+        let result = run();
+        drop(clear);
+        result
     }
 
     /// The kernel's same-uid process list, retried when the table grew
@@ -581,23 +610,18 @@ mod platform {
                 )),
             };
         }
-        let error = io::Error::last_os_error();
+        cwd_unreadable(identity.pid, &io::Error::last_os_error())
+    }
+
+    /// The decision for an unreadable working-directory read. A gone or
+    /// removed directory (`ESRCH`, `ENOENT`) cannot be a path inside the slot
+    /// tree; **every other answer, including a platform-hidden `EPERM`, is
+    /// UNKNOWN and refuses** rather than being counted as no hold.
+    pub(super) fn cwd_unreadable(pid: i32, error: &io::Error) -> Result<Cwd, String> {
         match error.raw_os_error() {
-            Some(libc::ESRCH) => Ok(Cwd::None),
-            Some(libc::ENOENT) => Ok(Cwd::None),
-            Some(libc::EPERM) => {
-                if verified_platform_binary(identity)? {
-                    Ok(Cwd::Hidden)
-                } else {
-                    Err(format!(
-                        "pid {}'s working directory is hidden by the platform and the process is not a verified platform binary; the census is unknown",
-                        identity.pid
-                    ))
-                }
-            }
+            Some(libc::ESRCH | libc::ENOENT) => Ok(Cwd::None),
             _ => Err(format!(
-                "pid {}'s working directory is unreadable ({error}); the census is unknown",
-                identity.pid
+                "pid {pid}'s working directory is unreadable ({error}); the census is unknown"
             )),
         }
     }
@@ -744,39 +768,20 @@ mod platform {
                 }
             }
             let (facts, path) = read_pair(identity.pid, descriptor);
-            match (facts, path) {
-                (Ok(()), Ok(Some(path))) => return Ok(Observed::Path(path)),
-                (Ok(()), Ok(None)) => return dead_handle(identity, descriptor, started),
-                (Err(left), Err(right))
-                    if left.raw_os_error() == Some(libc::EPERM)
-                        && right.raw_os_error() == Some(libc::EPERM) =>
-                {
-                    return if verified_platform_binary(identity)? {
-                        Ok(Observed::Hidden)
-                    } else {
-                        Err(format!(
-                            "pid {}'s descriptor {descriptor} is hidden by the platform and the process is not a verified platform binary; the census is unknown",
-                            identity.pid
-                        ))
-                    };
-                }
-                (Err(left), Err(right))
-                    if left.raw_os_error() == Some(libc::ENOENT)
-                        && right.raw_os_error() == Some(libc::ENOENT) =>
-                {
-                    return dead_handle(identity, descriptor, started);
-                }
-                (Err(left), _) if closed(&left) => return Ok(Observed::Closed),
-                (_, Err(right)) if closed(&right) => return Ok(Observed::Closed),
-                (left, right) => {
+            match classify_pair(identity.pid, descriptor, &facts, &path) {
+                Pair::Path(path) => return Ok(Observed::Path(path)),
+                Pair::DeadCandidate => return dead_handle(identity, descriptor, started),
+                Pair::Closed => return Ok(Observed::Closed),
+                Pair::Refuse(reason) => return Err(reason),
+                Pair::Retry => {
                     // A mixed pair is not an answer: the descriptor may have
                     // closed between the two flavors. Re-read it as a pair.
                     if attempt + 1 == PAIR_RETRY_ATTEMPTS {
                         return Err(format!(
                             "pid {}'s descriptor {descriptor} did not read as one observation ({}, {}); the census is unknown",
                             identity.pid,
-                            describe(&left),
-                            describe(&right)
+                            describe(&facts),
+                            describe(&path)
                         ));
                     }
                 }
@@ -805,34 +810,53 @@ mod platform {
             Some(_) => {}
         }
         let (facts, path) = read_pair(identity.pid, descriptor);
+        match classify_pair(identity.pid, descriptor, &facts, &path) {
+            Pair::Path(path) => Ok(Observed::Path(path)),
+            // Both-flavour `ENOENT` (or a second empty name) is the positive
+            // dead-handle fact; a hidden second read is UNKNOWN and refuses.
+            Pair::DeadCandidate => Ok(Observed::Dead),
+            Pair::Closed => Ok(Observed::Closed),
+            Pair::Refuse(reason) => Err(reason),
+            Pair::Retry => Err(format!(
+                "pid {}'s dead-handle descriptor {descriptor} was not readable on its second observation ({}, {}); the census is unknown",
+                identity.pid,
+                describe(&facts),
+                describe(&path)
+            )),
+        }
+    }
+
+    /// The one production decision for a descriptor's two reads. Both-flavour
+    /// `EPERM` is a hidden path: the census cannot say what the process holds,
+    /// so it is UNKNOWN and refuses. Both-flavour `ENOENT` is a dead-handle
+    /// candidate; either read reporting the descriptor closed means it is no
+    /// longer held; anything else is re-read as a pair.
+    pub(super) fn classify_pair(
+        pid: i32,
+        descriptor: i32,
+        facts: &Result<(), io::Error>,
+        path: &Result<Option<PathBuf>, io::Error>,
+    ) -> Pair {
         match (facts, path) {
-            (Ok(()), Ok(Some(path))) => Ok(Observed::Path(path)),
-            (Ok(()), Ok(None)) => Ok(Observed::Dead),
-            (Err(left), Err(right))
-                if left.raw_os_error() == Some(libc::ENOENT)
-                    && right.raw_os_error() == Some(libc::ENOENT) =>
-            {
-                Ok(Observed::Dead)
-            }
+            (Ok(()), Ok(Some(path))) => Pair::Path(path.clone()),
+            (Ok(()), Ok(None)) => Pair::DeadCandidate,
             (Err(left), Err(right))
                 if left.raw_os_error() == Some(libc::EPERM)
                     && right.raw_os_error() == Some(libc::EPERM) =>
             {
-                if verified_platform_binary(identity)? {
-                    Ok(Observed::Hidden)
-                } else {
-                    Err(format!(
-                        "pid {}'s descriptor {descriptor} is hidden by the platform and the process is not a verified platform binary; the census is unknown",
-                        identity.pid
-                    ))
-                }
+                Pair::Refuse(format!(
+                    "pid {pid}'s descriptor {descriptor} is hidden by the platform; the census is unknown"
+                ))
             }
-            (left, right) => Err(format!(
-                "pid {}'s dead-handle descriptor {descriptor} was not readable on its second observation ({}, {}); the census is unknown",
-                identity.pid,
-                describe(&left),
-                describe(&right)
-            )),
+            (Err(left), Err(right))
+                if left.raw_os_error() == Some(libc::ENOENT)
+                    && right.raw_os_error() == Some(libc::ENOENT) =>
+            {
+                Pair::DeadCandidate
+            }
+            (Err(left), _) if closed(left) => Pair::Closed,
+            (_, Err(right)) if closed(right) => Pair::Closed,
+            _ => Pair::Retry,
         }
     }
 
@@ -896,37 +920,6 @@ mod platform {
             Err(error) if error.raw_os_error() == Some(libc::EPERM) => "EPERM".to_owned(),
             Err(error) => format!("{error}"),
         }
-    }
-
-    /// The platform's own hidden-descriptor exemption, gated on the process's
-    /// code-signing status and an unchanged kernel start identity.
-    pub(super) fn verified_platform_binary(identity: &Identity) -> Result<bool, String> {
-        let mut status: u32 = 0;
-        set_errno(0);
-        // SAFETY: `status` is writable for exactly four bytes and outlives the
-        // call.
-        let read = unsafe {
-            csops(
-                identity.pid,
-                CS_OPS_STATUS,
-                (&mut status as *mut u32).cast(),
-                std::mem::size_of::<u32>(),
-            )
-        };
-        if read != 0 {
-            return Err(format!(
-                "the code-signing status of pid {} is unreadable ({}); the census is unknown",
-                identity.pid,
-                io::Error::last_os_error()
-            ));
-        }
-        let Some(after) = process_identity(identity.pid)? else {
-            return Ok(false);
-        };
-        if after.start != identity.start || after.uid != identity.uid {
-            return Ok(false);
-        }
-        Ok(status & CS_PLATFORM_BINARY != 0)
     }
 
     fn set_errno(value: libc::c_int) {
@@ -1052,6 +1045,10 @@ mod tests {
             fixture
         }
 
+        fn pid(&self) -> u32 {
+            self.child.as_ref().expect("a live writer child").id()
+        }
+
         /// Stop the writer and wait for it to be gone, so its descriptors are
         /// closed before the caller observes again.
         fn stop(mut self) {
@@ -1116,7 +1113,9 @@ mod tests {
         let ready = fixture.path("ready");
         let stop = fixture.path("stop");
         let writer = Writer::start(HOLD_SCRIPT, &[&held, &ready, &stop], &ready);
-        let error = verify(&slot, None).expect_err("an open handle must refuse");
+        let pid = writer.pid();
+        let error = platform::with_stated_processes(vec![pid as i32], || verify(&slot, None))
+            .expect_err("an open handle must refuse");
         assert!(error.contains("holds"), "{error}");
         assert!(error.contains(&held.display().to_string()), "{error}");
         assert!(error.contains("nothing was released"), "{error}");
@@ -1133,7 +1132,9 @@ mod tests {
         let ready = fixture.path("ready");
         let stop = fixture.path("stop");
         let writer = Writer::start(CWD_SCRIPT, &[&nested, &ready, &stop], &ready);
-        let error = verify(&slot, None).expect_err("a working directory must refuse");
+        let pid = writer.pid();
+        let error = platform::with_stated_processes(vec![pid as i32], || verify(&slot, None))
+            .expect_err("a working directory must refuse");
         assert!(error.contains("working directory"), "{error}");
         assert!(error.contains(&nested.display().to_string()), "{error}");
         writer.stop();
@@ -1155,7 +1156,9 @@ mod tests {
         let writer = Writer::start(HOLD_SCRIPT, &[&held, &ready, &stop], &ready);
         // One clean observation also shows the census counted the processes
         // and descriptors it read.
-        let summary = verify(&slot, None).expect("a prefixed sibling is not the slot");
+        let pid = writer.pid();
+        let summary = platform::with_stated_processes(vec![pid as i32], || verify(&slot, None))
+            .expect("a prefixed sibling is not the slot");
         assert!(summary.processes > 0, "{summary:?}");
         assert!(summary.descriptors > 0, "{summary:?}");
         assert_eq!(summary.holder, "no recorded holder");
@@ -1204,29 +1207,88 @@ mod tests {
             pid,
             started_ms: own.start / 1_000,
         };
-        let error = verify(&slot, Some(&live)).expect_err("a live holder must refuse");
+        let error =
+            platform::with_stated_processes(vec![pid as i32], || verify(&slot, Some(&live)))
+                .expect_err("a live holder must refuse");
         assert!(error.contains("still running"), "{error}");
         let different = Holder {
             pid,
             started_ms: own.start / 1_000 - 60_000,
         };
-        let summary = verify(&slot, Some(&different)).expect("a reused pid is a different process");
+        let summary =
+            platform::with_stated_processes(vec![pid as i32], || verify(&slot, Some(&different)))
+                .expect("a reused pid is a different process");
         assert!(summary.holder.contains("different process"), "{summary:?}");
         let unknown = Holder { pid, started_ms: 0 };
-        let error = verify(&slot, Some(&unknown)).expect_err("an unknown start must refuse");
+        let error =
+            platform::with_stated_processes(vec![pid as i32], || verify(&slot, Some(&unknown)))
+                .expect_err("an unknown start must refuse");
         assert!(error.contains("recorded start is unknown"), "{error}");
     }
 
-    /// A locally built binary is not an Apple platform binary: the blind-spot
-    /// exemption cannot be claimed by this process.
+    /// A platform-hidden working directory is UNKNOWN and refuses; a gone or
+    /// removed one is not a path in the slot. The production decision is
+    /// exercised directly so a hidden read needs no fault injection.
     #[test]
-    fn this_test_binary_is_not_a_platform_binary() {
-        let own = platform::process_identity(std::process::id() as i32)
-            .expect("identity read")
-            .expect("this process exists");
-        assert_eq!(
-            platform::verified_platform_binary(&own).expect("code-signing status"),
-            false
+    fn a_hidden_working_directory_refuses() {
+        let hidden = platform::cwd_unreadable(7, &std::io::Error::from_raw_os_error(libc::EPERM))
+            .expect_err("a hidden working directory must refuse");
+        assert!(hidden.contains("census is unknown"), "{hidden}");
+        assert!(hidden.contains("pid 7"), "{hidden}");
+        let other = platform::cwd_unreadable(7, &std::io::Error::from_raw_os_error(libc::EACCES))
+            .expect_err("any other unreadable working directory must refuse");
+        assert!(other.contains("census is unknown"), "{other}");
+        for gone in [libc::ESRCH, libc::ENOENT] {
+            assert!(matches!(
+                platform::cwd_unreadable(7, &std::io::Error::from_raw_os_error(gone)),
+                Ok(platform::Cwd::None)
+            ));
+        }
+    }
+
+    /// A vnode descriptor whose path and vnode facts are both hidden refuses;
+    /// only a readable path, a closed descriptor or both-flavour `ENOENT` is
+    /// an answer.
+    #[test]
+    fn a_hidden_descriptor_refuses() {
+        use std::io::Error;
+        let hidden = platform::classify_pair(
+            9,
+            4,
+            &Err(Error::from_raw_os_error(libc::EPERM)),
+            &Err(Error::from_raw_os_error(libc::EPERM)),
         );
+        match hidden {
+            platform::Pair::Refuse(reason) => {
+                assert!(reason.contains("hidden by the platform"), "{reason}");
+                assert!(reason.contains("census is unknown"), "{reason}");
+                assert!(reason.contains("pid 9"), "{reason}");
+            }
+            _ => panic!("a hidden descriptor was not refused"),
+        }
+        // A hidden read with the other flavour readable is not an answer
+        // either: it is re-read as a pair, then refused if it persists.
+        assert!(matches!(
+            platform::classify_pair(
+                9,
+                4,
+                &Err(Error::from_raw_os_error(libc::EPERM)),
+                &Ok(Some(PathBuf::from("/slot/file"))),
+            ),
+            platform::Pair::Retry
+        ));
+        assert!(matches!(
+            platform::classify_pair(
+                9,
+                4,
+                &Err(Error::from_raw_os_error(libc::ENOENT)),
+                &Err(Error::from_raw_os_error(libc::ENOENT)),
+            ),
+            platform::Pair::DeadCandidate
+        ));
+        assert!(matches!(
+            platform::classify_pair(9, 4, &Err(Error::from_raw_os_error(libc::EBADF)), &Ok(None),),
+            platform::Pair::Closed
+        ));
     }
 }

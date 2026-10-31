@@ -798,25 +798,31 @@ fn release_quarantined(arguments: ReleaseArguments<'_>) -> Result<u8, String> {
     })?;
     drop(bound);
     let root = internal.control().join(POOL_DIR);
+    // The preflight is read-only in both modes: the record and the census are
+    // read from a passive snapshot and the OS, so an invalid slot or an
+    // UNKNOWN census refuses before the effect store is opened, reconciled or
+    // fenced.
+    let recorded = Store::open_recorded_removable(&root, internal.max_active())?;
+    let (quarantined, summary) =
+        recorded.preflight_release(slot, |path, holder| crate::census::verify(path, holder))?;
     if arguments.dry_run {
-        let target = Store::open_recorded_removable(&root, internal.max_active())?;
-        let quarantined = target.quarantined_slot(slot)?;
-        let summary = crate::census::verify(&quarantined.dir, quarantined.holder.as_ref())?;
         println!(
             "would release quarantined slot {slot} in {}: {}; census: {}; operator confirmed writers stopped; nothing changed",
-            target.pool.display(),
+            recorded.pool.display(),
             recorded_size(quarantined.recorded_bytes),
             census_line(&summary)
         );
         return Ok(0);
     }
+    // Only a slot that passed both read-only checks is opened for the effect;
+    // `release_quarantined` re-reads the record before any fence and again
+    // under the admission lock.
     let target = Store::open_removable(
         &root,
         registration.mount_point.join(PAYLOAD_DIR),
         internal.max_active(),
     )?;
-    let (summary, released) =
-        target.release_quarantined(slot, |path, holder| crate::census::verify(path, holder))?;
+    let released = target.release_quarantined(&quarantined)?;
     println!(
         "released quarantined slot {} in {}: {}; census: {}; operator confirmed writers stopped",
         released.slot_id,
@@ -846,8 +852,8 @@ fn recorded_size(bytes: Option<u64>) -> String {
 
 fn census_line(summary: &crate::census::Summary) -> String {
     format!(
-        "{} same-uid processes, {} descriptors, {} platform-hidden, {} dead handles; {}",
-        summary.processes, summary.descriptors, summary.hidden, summary.dead, summary.holder
+        "{} same-uid processes, {} descriptors, {} dead handles; {}",
+        summary.processes, summary.descriptors, summary.dead, summary.holder
     )
 }
 
