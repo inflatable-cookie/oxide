@@ -459,12 +459,17 @@ class FakeTable:
         self.groups = groups or {}
         self.reads = 0
         self.reads_by_pid = {}
+        self.session_reads = {}
 
     def snapshot(self):
         return list(self.rows)
 
     def getsid(self, pid):
         value = self.sessions[pid]
+        if isinstance(value, list):  # per-PID sequence; the last entry repeats
+            index = self.session_reads.get(pid, 0)
+            self.session_reads[pid] = index + 1
+            value = value[min(index, len(value) - 1)]
         if isinstance(value, BaseException):
             raise value
         return value
@@ -865,6 +870,36 @@ class PureAncestors(unittest.TestCase):
             self.assertEqual(result["uncertain_rows"][0]["reason"],
                              "launcher observation ambiguous")
             self.assertEqual(result["ancestor_exclusions"]["by_rule"]["parent"], 0)
+
+    def test_an_inside_ancestor_pid_observation_is_carried_as_a_member(self):
+        # Review finding: a positively observed leader-session member identity
+        # must not be discarded before classification, or a repeated session read
+        # could report it foreign and skip it. The first session read is the
+        # bound observation (the leader's session); every later read is foreign.
+        replaced = row(700, start=99, ppid=600)
+        table = FakeTable([replaced], {700: [100, 7, 7]}, reread={700: replaced})
+        check = census(table, ancestors=[self.LAUNCHER])
+        result = check.round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 1, 0))
+        self.assertIn((700, 99), check.tracked)
+        # Carried evidence stays a member on the next round, whatever it now reads.
+        table.sessions = {700: 7}
+        follow = check.round()
+        self.assertEqual((follow["members"], follow["uncertain"]), (1, 0))
+
+    def test_an_inside_sibling_observation_is_carried_as_a_member(self):
+        # The same rule for the launcher-sibling branch: a positive in-session
+        # observation is carried as a member instead of being re-read.
+        sibling = row(900, start=12, ppid=self.LAUNCHER[0])
+        table = FakeTable(self.launcher_rows(sibling), {700: 7, 900: [100, 7, 7]})
+        check = census(table, ancestors=[self.LAUNCHER])
+        result = check.round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 1, 0))
+        self.assertIn((900, 12), check.tracked)
+        self.assertEqual(result["ancestor_exclusions"]["by_rule"]["parent"], 0)
+        table.sessions = {700: 7, 900: 7}
+        follow = check.round()
+        self.assertEqual((follow["members"], follow["uncertain"]), (1, 0))
 
     def test_a_sibling_spawned_mid_run_is_excluded_and_recorded(self):
         # Round 1: the launcher alone. Round 2: an unrelated sibling appears

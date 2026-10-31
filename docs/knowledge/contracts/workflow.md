@@ -2169,7 +2169,7 @@ with no earlier run migrated.
 
 **Post-census image detach request (oxide#191, decision `ee263cea`, unqualified
 source).** The current `bounded-test.py`
-(`b0e01213f8f58babef123cba25155cd6a120c7250c84bb9fc5ef6d0edb93732d`) adds one
+(`8fc1f114edb9d439259225b04c05a65b880a53fc5ee3628ef6e148e3ce9bb992`) adds one
 opt-in control for a proof
 whose own test image must be detached, and it is the only route by which such a
 proof may detach after a launch; the qualified shared runner is otherwise
@@ -2282,7 +2282,7 @@ custodian keeps its filesystem-free decision path and the existing
 cooperative-session limits. These bytes are unqualified until one uncounted
 `effigy proof:supervisor:qualify:diagnostic` records a clean picture and then
 ONE counted author and ONE separate independent reviewer
-`effigy proof:supervisor:qualify` pass at the same head (316 pure plus 49 real
+`effigy proof:supervisor:qualify` pass at the same head (318 pure plus 49 real
 cases, including the seventy-six pure detach cases and the eight real ones: a
 bound success, a refused identity, a failed attempt, an unrequested attachment
 whose opt-in custody keep is recorded separately, and a real stuck child the
@@ -2310,11 +2310,14 @@ nothing else:
 - **`ancestor`:** the row's own identity is exactly one recorded pair AND that
   identity is re-verified through the safe Kinfo reader after the census
   snapshot. A row whose PID is a recorded ancestor's PID is decided by this rule
-  alone and never falls through to its parent's rule. A different or
-  unverifiable identity at that PID is **ambiguous — uncertain — and never a
-  positively foreign row**, unless a readable session read proves it is in the
-  leader's session, which makes it a supervised descendant the ordinary census
-  counts (an ancestor predates the leader, so a descendant can never be one).
+  alone and never falls through to its parent's rule. A different identity at
+  that PID is decided by ONE bound session observation: if the identity held on
+  both sides of that read and the row is in the leader's session it is **carried
+  into the census as a member of exactly this identity and tracked** (an ancestor
+  predates the leader, so a descendant can never be one), so a later
+  contradictory read cannot turn it foreign; every other reading — including a
+  stable session that is not the leader's — is **ambiguous and uncertain**, and
+  a recorded ancestor's PID is never a positively foreign row.
 - **`parent` (the launcher sibling):** the row's observation-time parent row, in
   the same snapshot, has a PID above 1 and an identity that is exactly one
   recorded pair, and ONE sibling observation re-verifies the row's own
@@ -2324,8 +2327,9 @@ nothing else:
   name that parent in both re-reads. Only a positively **outside** observation
   excludes: the session and the group must both be readable and both different
   from the leader's PID (its session and group id). A row positively **inside**
-  the leader's session is a supervised process and the ordinary census
-  classifies it. Anything else — a recycled or missing parent row, a replaced
+  the leader's session is **carried into the census as a member of exactly this
+  identity and tracked**, so a later contradictory session read cannot make it a
+  foreign row. Anything else — a recycled or missing parent row, a replaced
   identity, a transiently failed re-verification, an unreadable session or
   group, or a leader group reading with a foreign session — is **ambiguous and
   stays uncertain**, never excluded and never positively foreign. A matching
@@ -2338,9 +2342,11 @@ A **tracked** identity — one this census already accepted as a member — is
 never excluded and never made ambiguous by either rule: both veto it before
 anything else, and no exclusion ever removes tracked attribution. A tracked row
 is therefore never reclassified, whatever its parent or its session/group read
-says. An ambiguous launcher decision is recorded as an uncertain row with reason
-`launcher observation ambiguous`, so an unknown launcher observation can never
-help establish closure.
+says. A `member` launcher observation is carried as a tracked member row of
+exactly the observed identity, so a positively observed member is never
+re-read into a foreign row. An ambiguous launcher decision is recorded as an
+uncertain row with reason `launcher observation ambiguous`, so an unknown
+launcher observation can never help establish closure.
 
 No wall, boot or uptime value participates anywhere in the census, so a row
 whose start token merely looks earlier is never excluded and a tracked
@@ -2356,11 +2362,11 @@ recorded chain in one bounded `ancestors` object with fixed keys — `state`
 every exclusion in one bounded cumulative `ancestor_exclusions` object: at most
 `EXCLUSION_MAX_ROWS` (20) distinct `pid`/`start`/`rule` rows, the total decision
 count, the omitted count (`count == rows + omitted`) and the per-rule counts. The
-current `bounded-test.py` (`b0e01213…`) adds this to the oxide#191 runner, so
+current `bounded-test.py` (`8fc1f114…`) adds this to the oxide#191 runner, so
 those controls are unqualified until that head's own uncounted
 `effigy proof:supervisor:qualify:diagnostic` and separate author and independent
-reviewer `effigy proof:supervisor:qualify` pass; the suite gains twenty-nine
-pure structural launcher-rule cases (316 pure plus 49 real = 365, and the
+reviewer `effigy proof:supervisor:qualify` pass; the suite gains thirty-one
+pure structural launcher-rule cases (318 pure plus 49 real = 367, and the
 bootstrap's expected case total follows the suite).
 
 **Settlement observation (oxide#147, unqualified source).** The current
@@ -2566,9 +2572,10 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
     a missing parent row, an unreadable session or group, a PPID 1 orphan, a
     descendant, a same-session stranger and any row not excluded above keep the
     classification above, an unreadable or empty record excludes nothing, and no
-    wall, boot or uptime value ever takes part. An ambiguous launcher decision
-    (`launcher observation ambiguous`) makes the row uncertain: it is never a
-    member and never a positively foreign row.
+    wall, boot or uptime value ever takes part. A `member` launcher observation
+    is carried as a tracked member row, and an ambiguous one
+    (`launcher observation ambiguous`) makes the row uncertain: neither is ever
+    a positively foreign row.
   - **Terminal nonwriter** (allowlisted kernels only): an actual `getsid`
     `ESRCH` (errno-checked, not any `ProcessLookupError`) whose snapshot
     row and FIRST existing confirmation read show the same complete
@@ -5553,7 +5560,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
 - **Focused proof of absent checkout chains (oxide#135).** The one fixed proof
   is `effigy rust:prune-absence` (`scripts/test-prune-absence.py` under this
-  tree's shared supervisor `b0e01213…`, the merged oxide#151 guard plus
+  tree's shared supervisor `8fc1f114…`, the merged oxide#151 guard plus
   oxide#191's opt-in post-census detach and oxide#197's ancestor-chain
   exclusion) with
   `--root-parent /private/tmp`, the owner-accepted internal-placement exception

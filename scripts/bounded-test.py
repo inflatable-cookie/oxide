@@ -934,10 +934,13 @@ class Census:
     - `ancestor` (a): the row's own identity is EXACTLY one recorded pair, and
       that identity is re-verified through the safe Kinfo reader after the
       snapshot. A row whose PID is a recorded ancestor's PID is decided by this
-      rule alone and never falls through to the parent rule. A different or
-      unverifiable identity at that PID is `ambiguous` — uncertain — unless a
-      readable session read proves it is in the leader's session, which makes it
-      a supervised descendant the ordinary census classifies.
+      rule alone and never falls through to the parent rule. A different
+      identity at that PID is decided by ONE bound session observation: a
+      `member` reading is carried into the census as a member of exactly this
+      identity (an ancestor predates the leader, so a descendant can never be one)
+      and the identity is tracked; any other reading — contradictory, unreadable
+      or simply not the leader's session — is `ambiguous` — uncertain — because a
+      recorded ancestor's PID must never end up positively foreign.
     - `parent` (b): the row's observation-time parent row (same snapshot) has a
       PID above 1, its identity is EXACTLY one recorded pair, and ONE sibling
       observation re-verifies the row's own PID/start identity AND that parent
@@ -946,8 +949,9 @@ class Census:
       to this row. Only a positively `outside` observation excludes: the row must
       be readable in both the session and the process group and both must differ
       from the leader's PID. A matching parent PID alone is not enough. A row
-      positively `inside` the leader's session is a supervised process and the
-      ordinary census classifies it; anything else — a recycled or missing parent
+      positively `inside` the leader's session is carried into the census as a
+      member of exactly this identity (tracked, so a later contradictory session
+      read cannot make it foreign); anything else — a recycled or missing parent
       row, a replaced identity, a transiently failed re-verification, an
       unreadable session or group — is `ambiguous` and stays uncertain. Every
       PPID 1 orphan and unknown parent is never excluded by this rule. The macOS
@@ -964,7 +968,9 @@ class Census:
     accepted, so both rules veto it before anything else and no exclusion ever
     removes tracked attribution. Every rule needs a positive, re-verified
     identity plus (for `parent`) one bound observation with positive session and
-    group exclusion. An `ambiguous` launcher decision makes the row UNCERTAIN
+    group exclusion. A `member` launcher observation is carried as a tracked
+    member row, so a positively observed member can never be lost to a later
+    contradictory read. An `ambiguous` launcher decision makes the row UNCERTAIN
     with reason `launcher observation ambiguous`: it is never a member and never
     a positively foreign row, so an unknown launcher observation can never help
     establish closure. A skipped row is neither a member nor uncertain, and each
@@ -1111,6 +1117,29 @@ class Census:
         except BaseException:
             return False
 
+    def member_observation(self, identity):
+        """One bound session observation: `member` or `ambiguous`.
+
+        Oxide#197 (design ruling ea5a3dc9): when a launcher rule has to read a
+        session, the row's own identity is re-verified through the safe reader on
+        BOTH sides of that read, so a positively observed member can never be
+        lost to a contradictory later read. `member` means the identity held on
+        both sides and the row is in the leader's session. Anything else — a
+        failed read, a replaced identity, an unreadable session or a stable
+        session that is not the leader's — is `ambiguous`, because a recorded
+        ancestor's PID must never end up positively foreign. Never raises."""
+        try:
+            if not self.identity_stable(identity):
+                return "ambiguous"
+            session = self.getsid(identity[0])
+            if session is None:
+                return "ambiguous"
+            if not self.identity_stable(identity):
+                return "ambiguous"
+            return "member" if session == self.sid else "ambiguous"
+        except BaseException:
+            return "ambiguous"
+
     def sibling_observation(self, identity, parent_identity):
         """One sibling observation: `outside`, `inside` or `ambiguous`.
 
@@ -1123,8 +1152,10 @@ class Census:
         - `outside`: every read succeeded, both identities held, the row still
           names that parent, and the session AND group are readable and both
           differ from the leader's PID (its session and group id).
-        - `inside`: the row is positively in the leader's session, so it is a
-          supervised process and the ordinary census classifies it.
+        - `inside`: every read succeeded, both identities held, and the row is
+          in the leader's session. That observation is carried into the census
+          as a member of exactly this identity, so it is tracked and a later
+          contradictory session read cannot turn it into a foreign row.
         - `ambiguous`: anything else — a failed read, a replaced identity, a
           parent that no longer matches, an unreadable session or group, or a
           group reading of the leader while the session differs. That is never
@@ -1156,14 +1187,16 @@ class Census:
     def exclusion_rule(self, row, by_pid):
         """The structural launcher decision for this row.
 
-        Returns `ancestor` or `parent` (excluded), `ambiguous` (a launcher rule
-        applies but cannot be positively decided, so the row must stay
+        Returns `ancestor` or `parent` (excluded), `member` (a bound session
+        observation positively put the row in the leader's session, so the caller
+        carries it as a member of exactly this identity), `ambiguous` (a launcher
+        rule applies but cannot be positively decided, so the row must stay
         uncertain), or None (no launcher rule applies and the ordinary census
         classifies the row). A tracked identity is never excluded and never made
         ambiguous by these rules: it is a member this census already accepted. A
         row whose PID is a recorded ancestor's PID is decided by the ancestor
-        rule alone, so a changed or unverifiable identity is ambiguous and never
-        falls through to its parent's rule. Pure classification over the
+        rule alone, so a changed or unverifiable identity is never excluded and
+        never falls through to its parent's rule. Pure classification over the
         injected readers: no pauses, never raises."""
         try:
             identity = (row["pid"], row["start"])
@@ -1174,16 +1207,12 @@ class Census:
                 # re-verified identity is excluded and never falls through.
                 if identity in self.ancestors and self.identity_stable(identity):
                     return "ancestor"
-                # A different identity at that PID is not an ancestor. A
-                # positively supervised session read proves it is a descendant
-                # (an ancestor predates the leader, so a descendant can never be
-                # one), and the ordinary census classifies it. Any other or
-                # unreadable session is ambiguous: never a foreign result.
-                try:
-                    session = self.getsid(row["pid"])
-                except BaseException:
-                    return "ambiguous"
-                return None if session == self.sid else "ambiguous"
+                # A different identity at that PID is not an ancestor. One
+                # bound session observation decides it: a member observation is
+                # carried into the census (an ancestor predates the leader, so a
+                # descendant can never be one) and anything else is ambiguous.
+                # A recorded ancestor's PID is never positively foreign.
+                return self.member_observation(identity)
             ppid = row.get("ppid")
             if type(ppid) is not int or ppid <= 1:  # an orphan is never excluded
                 return None
@@ -1196,7 +1225,9 @@ class Census:
             observed = self.sibling_observation(identity, parent_identity)
             if observed == "outside":
                 return "parent"
-            return "ambiguous" if observed == "ambiguous" else None
+            if observed == "inside":
+                return "member"
+            return "ambiguous"
         except BaseException:
             return "ambiguous"
 
@@ -1250,6 +1281,14 @@ class Census:
             # and is never excluded, so a launcher rule can never remove it.
             rule = (self.exclusion_rule(row, by_pid)
                     if by_pid and identity not in self.tracked else None)
+            if rule == "member":
+                # A bound session observation positively found this identity in
+                # the leader's session: carry it as a member and track it, so a
+                # later contradictory session read cannot turn it into a foreign
+                # row or let it vanish from the census.
+                self.tracked[identity] = row
+                records[index] = {"member": row}
+                continue
             if rule == "ambiguous":
                 # A launcher rule applied but could not be positively decided.
                 # Fail closed: never a member, never a positively foreign row.
