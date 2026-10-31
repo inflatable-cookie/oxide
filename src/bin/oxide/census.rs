@@ -164,18 +164,30 @@ fn holder_state(holder: Option<&Holder>) -> Result<String, String> {
     };
     let pid =
         i32::try_from(holder.pid).map_err(|_| "the recorded holder pid is invalid".to_owned())?;
-    let Some(identity) = process_identity(pid)? else {
-        return Ok(format!("recorded holder pid {} is gone", holder.pid));
+    let observed = process_identity(pid)?.map(|identity| (identity.uid, identity.command));
+    holder_verdict(holder.pid, observed, current_uid())
+}
+
+/// The holder decision over one observed kernel identity (or its absence):
+/// a gone pid and another account's process are the only positives; a
+/// same-account live pid is unidentifiable and refuses. Kept separate so the
+/// decision is exercised without relying on which host pids this account may
+/// inspect.
+fn holder_verdict(
+    pid: u32,
+    observed: Option<(u32, String)>,
+    self_uid: u32,
+) -> Result<String, String> {
+    let Some((uid, command)) = observed else {
+        return Ok(format!("recorded holder pid {pid} is gone"));
     };
-    if identity.uid != current_uid() {
+    if uid != self_uid {
         return Ok(format!(
-            "recorded holder pid {} now names another account's process",
-            holder.pid
+            "recorded holder pid {pid} now names another account's process"
         ));
     }
     Err(format!(
-        "the recorded holder pid {} ({}) is still running as this account's process; the record's wall-clock start cannot positively distinguish a reused pid, so the holder is unidentifiable and nothing was released",
-        holder.pid, identity.command
+        "the recorded holder pid {pid} ({command}) is still running as this account's process; the record's wall-clock start cannot positively distinguish a reused pid, so the holder is unidentifiable and nothing was released"
     ))
 }
 
@@ -1199,13 +1211,28 @@ mod tests {
             platform::with_stated_processes(vec![pid as i32], || verify(&slot, Some(&live)))
                 .expect_err("a live holder must refuse");
         assert!(error.contains("still running"), "{error}");
-        let gone = holder_state(Some(&Holder { pid: 4_000_000 })).expect("a missing pid is gone");
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("a one-shot child");
+        let gone_pid = child.id();
+        child.wait().expect("the one-shot child exits");
+        let gone = holder_state(Some(&Holder { pid: gone_pid })).expect("a reaped pid is gone");
         assert!(gone.contains("is gone"), "{gone}");
-        if platform::current_uid() != 0 {
-            let other = holder_state(Some(&Holder { pid: 1 }))
-                .expect("another account's process is positively different");
-            assert!(other.contains("another account"), "{other}");
-        }
+        // The decision over a stated kernel identity: another account's
+        // process is the other positive; a same-account process is not.
+        let other = holder_verdict(7, Some((501, "launchd".to_owned())), 501 + 1)
+            .expect("another account's process is positively different");
+        assert!(other.contains("another account"), "{other}");
+        let unidentifiable = holder_verdict(7, Some((501, "oxide".to_owned())), 501)
+            .expect_err("a same-account process is unidentifiable");
+        assert!(
+            unidentifiable.contains("unidentifiable"),
+            "{unidentifiable}"
+        );
+        assert_eq!(
+            holder_verdict(7, None, 501).unwrap(),
+            "recorded holder pid 7 is gone"
+        );
         assert_eq!(holder_state(None).expect("no holder"), "no recorded holder");
     }
 
