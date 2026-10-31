@@ -165,6 +165,7 @@ CONFIRM_TRIES, CONFIRM_PAUSE = 20, 0.05  # gone confirmation within one round, a
 # UNCLOSED. The bound keeps a forking tree's evidence finite.
 SURVIVOR_MAX = 16
 SURVIVOR_KEYS = ("pid", "start", "ppid", "pgid", "uid", "zombie")
+CENSUS_MESSAGE_KEEP = 64  # census messages whose facts stay addressable by sequence
 CENSUS_JOIN_S = 3.0  # bounded wait for the census thread before the receipt is published;
 # one round's own worst case is a full snapshot plus 19 shared confirmation pauses (about 1.4 s)
 DIAG_MAX_BYTES = 16384  # compact UTF-8 JSON ceiling for the optional receipt census diagnostics
@@ -2106,8 +2107,10 @@ def survivor_row(row):
 
 
 def census_summary(result):
-    """The three facts of one census round, or None. Used to bind the deciding
-    census and the final round beside a frozen survivor prefix (oxide#195)."""
+    """The three facts of one census round or census message, or None. Used to bind
+    the deciding census and the final round beside a frozen survivor prefix
+    (oxide#195). Only the fixed keys are copied, so a message or a round answers
+    the same way."""
     if not isinstance(result, dict):
         return None
     entry = {}
@@ -2122,15 +2125,15 @@ def census_summary(result):
     return entry
 
 
-def census_settled(join, final):
+def census_settled(join, final, deciding):
     """Whether closure may rest on the census evidence (oxide#195), pure.
 
-    True only when the census thread finished inside its bounded join AND the
-    last completed round is certainly empty. Anything else - a thread that
-    outlived the join, no completed round, or a final round that reported a
-    member or an uncertain row - refuses closure with its own reason, so a
-    stalled round can never leave a later member row beside an empty list and a
-    closed verdict."""
+    True only when all three hold: the census thread finished inside its bounded
+    join; the last completed round is certainly empty; and the census MESSAGE the
+    custodian's decision named is a certainly empty message this monitor really
+    sent. Anything else refuses closure with its own reason, so neither a stalled
+    round nor a decision without its own census evidence can leave a later member
+    row beside an empty list and a closed verdict."""
     if not isinstance(join, dict) or join.get("joined") is not True:
         return False, "the census thread did not finish before publication"
     if not isinstance(final, dict):
@@ -2140,6 +2143,11 @@ def census_settled(join, final):
                        f" ({final.get('members')} member(s), {final.get('uncertain')} uncertain)")
     if final.get("certain") is not True:
         return False, "no certainly empty census round completed before publication"
+    if not isinstance(deciding, dict):
+        return False, "the decision names no census message this monitor sent"
+    if deciding.get("members") or deciding.get("uncertain") or deciding.get("certain") is not True:
+        return False, ("the census message the decision rested on was not certainly empty"
+                       f" ({deciding.get('members')} member(s), {deciding.get('uncertain')} uncertain)")
     return True, None
 
 
@@ -3386,6 +3394,9 @@ class Monitor:
         # never be mistaken for the census the verdict rests on.
         self.census_bound = False
         self.census_last = None
+        # Every census message this monitor sent, by its own sequence number, so a
+        # decision can be bound to the exact message it rested on.
+        self.census_messages = {}
 
     def note(self, entry=_SETTLE_TOP, **fields):
         """One observation-only stamp, on the settlement object or on one
@@ -3630,11 +3641,24 @@ class Monitor:
                     self.keep_record(command.get("record"))
 
     def send(self, message_type, **fields):
+        """Write one message and return its sequence number. A census message's
+        three facts are recorded under the same lock BEFORE the write, so the
+        custodian can never point at a census message this monitor has not
+        recorded (oxide#195)."""
         with self.lock:
             self.seq += 1
-            message = {"run": self.ctx["run_id"], "leader": self.leader, "seq": self.seq,
+            seq = self.seq
+            if message_type == "census":
+                summary = census_summary(fields)
+                if summary is not None:
+                    self.census_messages[seq] = summary
+                    if len(self.census_messages) > CENSUS_MESSAGE_KEEP:
+                        for stale in sorted(self.census_messages)[:-CENSUS_MESSAGE_KEEP]:
+                            self.census_messages.pop(stale, None)
+            message = {"run": self.ctx["run_id"], "leader": self.leader, "seq": seq,
                        "at": now_ns(), "type": message_type, **fields}
             os.write(self.ctl_w, (json.dumps(message) + "\n").encode())
+        return seq
 
     def publish(self, phase):
         with self.lock:
@@ -3784,7 +3808,7 @@ class Monitor:
                 joined = False
         record = {"joined": joined, "started": thread is not None, "bound_s": bound,
                   "waited_ns": now_ns() - started, "rows": 0,
-                  "deciding": census_summary(self.receipt.get("census")),
+                  "deciding": census_summary(self.receipt.get("deciding_census")),
                   "final": census_summary(getattr(self, "census_last", None))}
         try:
             with self.lock:
@@ -3800,6 +3824,15 @@ class Monitor:
     def bind_deciding_census(self):
         """Bind the census the decision rests on, before the thread is stopped.
 
+        The deciding census is the census MESSAGE the custodian's own decision
+        named - not merely the last round this monitor happened to complete. The
+        custodian echoes the sequence number and facts of the last post-reap
+        census message it processed, and the monitor resolves that sequence
+        against its own record of the messages it sent, so the receipt's
+        `deciding_census` is exactly that message. A decision that names no
+        message, or one this monitor did not send, binds nothing and cannot
+        support closure.
+
         After this the persisted `receipt['census']` and `census_rounds` never
         change; a round that finishes later is recorded as a post-decision
         observation under `receipt['census_after_stop']`, so the deciding census
@@ -3807,7 +3840,13 @@ class Monitor:
         with self.lock:
             self.census_bound = True
             self.receipt["census_rounds_at_stop"] = self.receipt.get("census_rounds", 0)
-            self.receipt["deciding_census"] = census_summary(self.receipt.get("census"))
+            named = self.receipt.get("custodian_census")
+            seq = named.get("seq") if isinstance(named, dict) else None
+            if not typed(seq, int) or seq < 1:
+                seq = None
+            bound = self.census_messages.get(seq) if seq is not None else None
+            self.receipt["deciding_census"] = dict(bound) if isinstance(bound, dict) else None
+            self.receipt["deciding_census_seq"] = seq if isinstance(bound, dict) else None
 
     def refuse_incomplete_closure(self, join, reason=None):
         """Turn a cleanup decision into an honest non-closure after an expired join.
@@ -4044,6 +4083,7 @@ class Monitor:
                 decision = kind
                 with self.lock:
                     self.receipt["outcome"] = command.get("outcome")
+                    self.receipt["custodian_census"] = command.get("census")
                 break
         self.note(stop_requested_ns=now_ns())
         # Bind the deciding census first: after this, nothing a stalled round
@@ -4052,7 +4092,8 @@ class Monitor:
         self.census_stop.set()
         # No survivor row may land after the receipt that records it is published.
         join = self.join_census()
-        settled, unsettled_reason = census_settled(join, getattr(self, "census_last", None))
+        settled, unsettled_reason = census_settled(
+            join, getattr(self, "census_last", None), self.receipt.get("deciding_census"))
         if decision == "cleanup" and not settled:
             # The census evidence cannot be shown final and certainly empty, so
             # certain closure is not available: keep everything and say why.
@@ -4372,6 +4413,9 @@ class Custodian:
         self.eof = set()
         self.census_ok = False
         self.census_uncertain = False
+        # The last post-reap census message this custodian processed, as the
+        # decision's own evidence: seq plus its three facts (oxide#195).
+        self.census_decision = None
         # Observation-only settlement counters (oxide#147): what the custodian
         # itself saw before its closure decision. They never change
         # eligibility, closure or any fault.
@@ -4550,6 +4594,13 @@ class Custodian:
         elif kind == "output_eof":
             self.eof.add(message["stream"])
         elif kind == "census":
+            if self.reaped_seq is not None and message["after"] >= self.reaped_seq:
+                # Post-reap: this is the evidence a decision would rest on. Keep
+                # the LAST such message, so the receipt can name it exactly.
+                self.census_decision = {"seq": message["seq"], "after": message["after"],
+                                        "certain": message["certain"],
+                                        "members": message["members"],
+                                        "uncertain": message["uncertain"]}
             try:  # observation only, before the unchanged eligibility rule
                 self.census_messages += 1
                 if self.reaped_seq is not None and message["after"] >= self.reaped_seq:
@@ -5011,7 +5062,8 @@ class Custodian:
             os.WEXITSTATUS(status) if os.WIFEXITED(status) else -os.WTERMSIG(status) if os.WIFSIGNALED(status) else None)
         outcome = {"closure": "closed" if self.closed else "UNCLOSED", "status": decoded,
                    "fault": self.guard.fault, "deadline": self.deadline_hit, "launched": launched}
-        self.tell("cleanup" if self.closed else "keep", outcome=outcome)
+        self.tell("cleanup" if self.closed else "keep", outcome=outcome,
+                  census=self.census_decision)
         if "custodian-timeout-after-monitor" in self.inject:
             self.exit_at = now_ns()  # injected: the custodian runs out right after deciding
         while not self.monitor_complete and not self.monitor_exited and now_ns() < self.exit_at:

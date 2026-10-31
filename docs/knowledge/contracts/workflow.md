@@ -2314,16 +2314,23 @@ signalled. Each row is recorded before the round that reports it is sent and the
 census thread is joined (bounded, never past the deadline) before the receipt is
 published, so the evidence a verdict rests on is the evidence on disk. That is
 observation only: no message, no signal, no closure claim. An expired join is
-handled conservatively and truthfully. At the stop request the monitor **binds
-the deciding census**: `receipt.census` and `census_rounds` are the rounds that
-completed before it and never change again, `deciding_census` repeats that
-round's three facts, and any round that finishes later is a post-decision
-observation under `receipt.census_after_stop` (`rounds` plus the last round's
-facts) — so a stalled round can never be mistaken for the census the verdict
-rests on. Closure then requires **both** that the census thread finished inside
-its bounded join and that the last completed round is certainly empty
-(`census_settled`); a stalled round that returns with a member refuses closure
-with its own reason while its row is kept as evidence. On an expired join the
+handled conservatively and truthfully. The custodian echoes the sequence number
+and facts of the last post-reap census message it processed in its
+`cleanup`/`keep` command, and at the stop request the monitor **binds the
+deciding census to that message**: it resolves the sequence against its own
+record of the census messages it sent (recorded under the same lock, before the
+write, so a message exists before a decision can name it) and publishes
+`deciding_census` plus `deciding_census_seq` from that resolution.
+`receipt.census` and `census_rounds` remain the rounds that completed before the
+bind and never change afterwards, and any round that finishes later is a
+post-decision observation under `receipt.census_after_stop` (`rounds` plus the
+last round's facts). A decision that names no message, or one this monitor never
+sent, binds nothing. Closure then requires **all three**: the census thread
+finished inside its bounded join, the last completed round is certainly empty,
+and the named census message is itself certainly empty (`census_settled`); a
+stalled round that returns with a member, or a decision without its own census
+evidence, refuses closure with its own reason while any member row is kept as
+evidence. On an expired join the
 survivor list is frozen at its published prefix (no row may land after
 publication), `census_join` records
 `joined: false`, `frozen: true`, `started` and `refused`, the summary says later
@@ -2363,17 +2370,22 @@ that later observes a member (that late row can never reach the published receip
 and the owned scratch is kept); and a *mid-join* interleaving where that round
 returns between the bound deciding census and the final publication, which must
 refuse closure on the final round's member, keep the row as evidence and leave the
-deciding census unchanged beside `census_after_stop`; and a transient-survivor
+deciding census unchanged beside `census_after_stop`; a completed-but-unsent
+ordering where the decision names an earlier certainly empty message while a
+member round completed before the bind, so the deciding census is that named
+message (never the later round) and closure is refused on the final round; a
+decision that names no message or a message this monitor never sent, which
+cannot close; and a transient-survivor
 regression (both pure and real: a recorded row followed by a certain-empty
 census closes the run and never reports `UNCLOSED`/kept). At this head the three
 sources are
 `bounded-test.py`
-`02884cba5f19a5f28330e860ed49ee327197f85f5ab8aa47c22a47e7b580a298`,
+`5457436bd1899bb5c93187425dbf7e24bd727cecfc2f0c708c48acd9285afc19`,
 `test_supervisor.py`
-`f2484ccb3f641169ba163784f099ae3f76fbac7049ce1e06b5a2bab6daf0cc36` and
+`38b5513ed8e12e61cf0f8ec4c562922a42c8352b8e1cc900ca8a588b141c301a` and
 `qualify-supervisor.py`
-`d09a239b246b8768e036bbefe144e028953bc2dcf197da806bd4509b1a7f7e15`. The
-head's suite is 306 pure plus 49 real cases and is **unqualified** until one
+`e514e8cf379ed3044468712af61c178615ce985ee3ed85e1703d169bb42b6f51`. The
+head's suite is 308 pure plus 49 real cases and is **unqualified** until one
 uncounted keep-going
 `effigy proof:supervisor:qualify:diagnostic` and then ONE counted author and
 ONE separate independent reviewer `effigy proof:supervisor:qualify` pass at the

@@ -1745,6 +1745,26 @@ class PureSurvivors(unittest.TestCase):
         monitor.record_survivors({"certain": True, "members": 0, "uncertain": 0, "member_rows": []})
         self.assertEqual(len(monitor.receipt["survivors"]), 1)
 
+    @contextlib.contextmanager
+    def settled_census(self):
+        """A certain-empty census stand-in, for scripted decisions."""
+
+        class SettledCensus:
+            def __init__(self, sid, terminal_allowed=False):
+                self.stats = {}
+
+            def round(self):
+                return {"certain": True, "members": 0, "uncertain": 0, "member_rows": [],
+                        "uncertain_rows": [], "terminal_count_status": "valid",
+                        "terminal_nonwriters": 0}
+
+        saved = bounded.Census
+        bounded.Census = SettledCensus
+        try:
+            yield
+        finally:
+            bounded.Census = saved
+
     def publishable_monitor(self):
         monitor, ctl_r = self.monitor()
         evidence = Path(tempfile.mkdtemp(prefix="survivors.", dir=str(SCRATCH))).resolve()
@@ -2097,19 +2117,29 @@ class PureSurvivors(unittest.TestCase):
                         "member_rows": [row(900, start=5)], "uncertain_rows": [],
                         "terminal_count_status": "valid", "terminal_nonwriters": 0}
 
-        def decide():
+        real_send = monitor.send
+        census_seqs = []
+
+        def decide(seq):
             os.write(cmd_w, (json.dumps({
-                "type": "cleanup", "run": "mid-join", "seq": 3,
+                "type": "cleanup", "run": "mid-join",
+                "census": {"seq": seq, "after": 2, "certain": True, "members": 0,
+                           "uncertain": 0},
                 "outcome": {"closure": "closed", "status": 0, "fault": None,
                             "deadline": False, "launched": True}}) + "\n").encode())
 
         def send(message_type, **fields):
+            if monitor.stop.is_set():  # the run is over: never write to a closing pipe
+                return monitor.seq
+            seq = real_send(message_type, **fields)
             sent.append((message_type, dict(fields)))
             if message_type == "census" and not written:
                 # The decision lands after the next round has started, so that
                 # round is still in flight when the deciding census is bound.
                 written.append(True)
-                threading.Timer(0.35, decide).start()
+                census_seqs.append(seq)
+                threading.Timer(0.35, lambda: decide(seq)).start()
+            return seq
 
         def releaser():
             # Release only once the deciding census is bound: that is inside the
@@ -2155,6 +2185,12 @@ class PureSurvivors(unittest.TestCase):
         self.assertIs(join["started"], True)
         self.assertEqual(join["deciding"], {"certain": True, "members": 0, "uncertain": 0})
         self.assertEqual(join["final"], {"certain": False, "members": 1, "uncertain": 0})
+        # The deciding census is the message the decision named, resolved against
+        # the monitor's own record of what it sent.
+        self.assertEqual(persisted["deciding_census_seq"], census_seqs[0])
+        self.assertEqual(persisted["deciding_census"],
+                         {"certain": True, "members": 0, "uncertain": 0})
+        self.assertEqual(persisted["custodian_census"]["seq"], census_seqs[0])
         # Closure is refused on the FINAL census, not the stale deciding one, and
         # the late row is kept as evidence instead of being dropped.
         self.assertEqual(persisted["outcome"]["closure"], "UNCLOSED")
@@ -2179,6 +2215,165 @@ class PureSurvivors(unittest.TestCase):
         custodian.accept(message)
         self.assertIn("closure not established", custodian.guard.fault or "")
         self.assertEqual(bounded.exit_code(False, custodian.guard.fault, True, 0), 125)
+
+    def test_the_deciding_census_is_the_message_the_decision_named(self):
+        # Reviewer finding: the labelled deciding census must be the census
+        # MESSAGE the custodian's decision named, not merely the last round the
+        # monitor happened to complete. Here a member round completes (and is
+        # sent) BEFORE the decision arrives, while the decision names the earlier
+        # certainly empty message: the receipt must bind the deciding census to
+        # that message, keep the member round visible as the census at the stop,
+        # and refuse closure on the final round.
+        sandbox = Path(tempfile.mkdtemp(prefix="named-census.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(sandbox), True)
+        evidence = sandbox / "evidence"
+        ctx = {"run_id": "named-census", "command": ["/bin/true"], "limit_s": 300,
+               "adopted": None, "evidence_arg": str(evidence), "root_parent": str(sandbox),
+               "budget": 512 * 1024 * 1024,
+               "start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "inject": []}
+        ctl_r, ctl_w = os.pipe()
+        cmd_r, cmd_w = os.pipe()
+        out_r, out_w = os.pipe()
+        err_r, err_w = os.pipe()
+        for fd in (ctl_r, cmd_w, out_w, err_w):
+            self.addCleanup(os.close, fd)
+        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_r)
+        sent, lines, census_seqs = [], [], []
+        empty = {"certain": True, "members": 0, "uncertain": 0, "member_rows": [],
+                 "uncertain_rows": [], "terminal_count_status": "valid",
+                 "terminal_nonwriters": 0}
+        member = {"certain": False, "members": 1, "uncertain": 0,
+                  "member_rows": [row(900, start=5)], "uncertain_rows": [],
+                  "terminal_count_status": "valid", "terminal_nonwriters": 0}
+        state = {"rounds": 0}
+
+        class NamedCensus:
+            def __init__(self, sid, terminal_allowed=False):
+                self.stats = {}
+
+            def round(self):
+                state["rounds"] += 1
+                if state["rounds"] == 1:
+                    return dict(empty)
+                if state["rounds"] == 2:
+                    return dict(member)  # completes and is sent before the decision
+                # Round 3: the decision is written now, naming round 1's message,
+                # so the bind happens while this round is in flight.
+                os.write(cmd_w, (json.dumps({
+                    "type": "cleanup", "run": "named-census",
+                    "census": {"seq": census_seqs[0], "after": 2, "certain": True,
+                               "members": 0, "uncertain": 0},
+                    "outcome": {"closure": "closed", "status": 0, "fault": None,
+                                "deadline": False, "launched": True}}) + "\n").encode())
+                # Stay in flight until the deciding census is bound, so this round
+                # is unambiguously post-decision.
+                until = time.monotonic() + 15
+                while not monitor.census_bound and time.monotonic() < until:
+                    time.sleep(0.005)
+                return dict(member)
+
+        real_send = monitor.send
+
+        def send(message_type, **fields):
+            if monitor.stop.is_set():
+                return monitor.seq
+            seq = real_send(message_type, **fields)
+            sent.append((message_type, dict(fields)))
+            if message_type == "census":
+                census_seqs.append(seq)
+            return seq
+
+        monitor.send = send
+        try:
+            with patched(bounded, "report", lines.append), patched(bounded, "Census", NamedCensus):
+                for number, command in enumerate((
+                        {"type": "leader", "pid": os.getpid()},
+                        {"type": "stopped", "sent": 0}), start=1):
+                    os.write(cmd_w, (json.dumps(dict(command, run="named-census", seq=number))
+                                     + "\n").encode())
+                monitor.run()
+        finally:
+            release = getattr(monitor, "census_thread", None)
+            if release is not None:
+                release.join(15)
+        persisted = json.loads((evidence / "receipt.json").read_text())
+        # The decision named message 1, which is certainly empty: that is the
+        # deciding census, and it is bound by the monitor's own message record.
+        self.assertEqual(persisted["custodian_census"]["seq"], census_seqs[0])
+        self.assertEqual(persisted["deciding_census_seq"], census_seqs[0])
+        self.assertEqual(persisted["deciding_census"],
+                         {"certain": True, "members": 0, "uncertain": 0})
+        # The last round completed before the bind is the member round - clearly
+        # distinguished from the deciding census rather than relabelled as it.
+        self.assertEqual(persisted["census_rounds"], 2)
+        self.assertEqual(persisted["census"]["members"], 1)
+        self.assertNotEqual(persisted["deciding_census"], {"certain": False, "members": 1,
+                                                           "uncertain": 0})
+        # Round 3 (final) reports a member: closure is refused, on the record.
+        self.assertEqual(persisted["census_after_stop"]["rounds"], 1)
+        self.assertEqual(persisted["outcome"]["closure"], "UNCLOSED")
+        self.assertIn("final census round was not certainly empty", persisted["outcome"]["fault"])
+        self.assertEqual(persisted["census_join"]["deciding"],
+                         {"certain": True, "members": 0, "uncertain": 0})
+        self.assertTrue(Path(ctx["scratch"]).is_dir())
+        self.assertFalse(any("so the run closed" in line for line in lines), lines)
+
+    def test_a_decision_naming_no_sent_census_message_cannot_close(self):
+        # The other side of the binding: a decision that names nothing, or a
+        # message this monitor never sent, refuses closure even when the census
+        # thread finished and the final round is certainly empty.
+        for named in (None, {"seq": 999999, "after": 2, "certain": True, "members": 0,
+                             "uncertain": 0}, {"seq": True, "certain": True, "members": 0,
+                                              "uncertain": 0}, "not-an-object"):
+            with self.subTest(named=named):
+                sandbox = Path(tempfile.mkdtemp(prefix="unnamed-census.",
+                                                dir=str(SCRATCH))).resolve()
+                self.addCleanup(shutil.rmtree, str(sandbox), True)
+                evidence = sandbox / "evidence"
+                ctx = {"run_id": "unnamed-census", "command": ["/bin/true"], "limit_s": 300,
+                       "adopted": None, "evidence_arg": str(evidence),
+                       "root_parent": str(sandbox), "budget": 512 * 1024 * 1024,
+                       "start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "inject": []}
+                ctl_r, ctl_w = os.pipe()
+                cmd_r, cmd_w = os.pipe()
+                out_r, out_w = os.pipe()
+                err_r, err_w = os.pipe()
+                for fd in (ctl_r, cmd_w, out_w, err_w):
+                    self.addCleanup(os.close, fd)
+                monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_w)
+                sent = []
+                real_send = monitor.send
+
+                def send(message_type, **fields):
+                    if monitor.stop.is_set():
+                        return monitor.seq
+                    seq = real_send(message_type, **fields)
+                    sent.append(message_type)
+                    if message_type == "census" and not state.get("decided"):
+                        state["decided"] = True
+                        os.write(cmd_w, (json.dumps({
+                            "type": "cleanup", "census": named,
+                            "outcome": {"closure": "closed", "status": 0, "fault": None,
+                                        "deadline": False, "launched": True}}) + "\n").encode())
+                    return seq
+
+                state = {}
+                monitor.send = send
+                try:
+                    with self.settled_census():
+                        for number, command in enumerate(({"type": "leader", "pid": os.getpid()},
+                                                          {"type": "stopped", "sent": 0}), start=1):
+                            os.write(cmd_w, (json.dumps(dict(command, run="unnamed-census",
+                                                             seq=number)) + "\n").encode())
+                        monitor.run()
+                finally:
+                    if monitor.census_thread is not None:
+                        monitor.census_thread.join(15)
+                persisted = json.loads((evidence / "receipt.json").read_text())
+                self.assertEqual(persisted["outcome"]["closure"], "UNCLOSED", named)
+                self.assertIn("census message", persisted["outcome"]["fault"], named)
+                self.assertIsNone(persisted["deciding_census"], named)
+                self.assertTrue(Path(ctx["scratch"]).is_dir())
 
     def test_every_publication_path_joins_the_census_first(self):
         # Structural guard for the reviewer's "all publication paths" point: the
@@ -6154,16 +6349,25 @@ class PureDetach(unittest.TestCase):
         finally:
             bounded.Census = saved
 
-    def start_census_then(self, cmd_w, run_id, decision, sent):
+    def start_census_then(self, monitor, cmd_w, run_id, decision, sent):
         """Write a leader/stopped pair and `decision` once the first census round is
-        reported, so the scripted decision is as coherent as a real one."""
+        reported. The decision names that census message, as a real custodian does,
+        so the scripted run is as coherent as a real one."""
         written = []
+        real = monitor.send
 
         def send(kind, **fields):
+            if monitor.stop.is_set():  # the run is over: never write to a closing pipe
+                return monitor.seq
+            seq = real(kind, **fields)
             sent.append(kind)
             if kind == "census" and not written:
                 written.append(True)
-                os.write(cmd_w, (json.dumps(decision) + "\n").encode())
+                payload = dict(decision)
+                payload["census"] = {"seq": seq, "after": 2, "certain": True,
+                                     "members": 0, "uncertain": 0}
+                os.write(cmd_w, (json.dumps(payload) + "\n").encode())
+            return seq
 
         for number, command in enumerate(({"type": "leader", "pid": os.getpid()},
                                           {"type": "stopped", "sent": 0}), start=1):
@@ -6191,7 +6395,7 @@ class PureDetach(unittest.TestCase):
         monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_r)
         sent = []
         monitor.send = self.start_census_then(
-            cmd_w, "absent-child",
+            monitor, cmd_w, "absent-child",
             {"type": "cleanup", "outcome": {"closure": "closed", "status": 0}}, sent)
 
         class Handle:
@@ -6294,7 +6498,7 @@ class PureDetach(unittest.TestCase):
         sent = []
 
         base = self.start_census_then(
-            cmd_w, "both-paths",
+            monitor, cmd_w, "both-paths",
             {"type": "cleanup", "outcome": {"closure": "closed", "status": 0}}, sent)
 
         def send(kind, **fields):
