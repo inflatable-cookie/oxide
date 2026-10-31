@@ -4871,6 +4871,54 @@ class PureDetach(unittest.TestCase):
         self.assertIs(ack[1]["custodian_closes"], True)
         self.assertIs(ack[1]["closed"], True)
 
+    def test_a_positively_absent_child_is_acknowledged_without_signal(self):
+        child_pid = os.getpid() + 1
+        message = {"run": "run", "seq": 1, "at": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW),
+                   "type": "detach_child", "leader": None, "pid": child_pid, "start": None}
+        custodian = self.custodian_stub()
+
+        class AbsentKinfo:
+            @staticmethod
+            def one(pid):
+                return None
+
+        saved = bounded.Kinfo
+        try:
+            bounded.Kinfo = AbsentKinfo
+            custodian.accept(dict(message))
+        finally:
+            bounded.Kinfo = saved
+        self.assertIsNone(custodian.detach_child)
+        self.assertEqual([kind for kind, _f in custodian.records], ["detach_child_refused"])
+        self.assertEqual(custodian.records[0][1]["observation"], "positively absent")
+        ack = custodian.told[-1]
+        self.assertIs(ack[1]["custodian_closes"], False)
+        self.assertIs(ack[1]["closed"], True)
+        self.assertIn("positively gone", ack[1]["reason"])
+
+    def test_the_unreadable_injection_is_scoped_to_one_actor(self):
+        saved_role, saved_env = bounded._ROLE[0], os.environ.get("OXIDE_SUPERVISOR_INJECT")
+        try:
+            os.environ["OXIDE_SUPERVISOR_INJECT"] = "detach-identity-unreadable"
+            bounded._ROLE[0] = "monitor"
+            self.assertTrue(bounded.injected_unreadable())
+            bounded._ROLE[0] = "custodian"
+            self.assertFalse(bounded.injected_unreadable(),
+                             "the monitor's injection also blinded the custodian")
+            os.environ["OXIDE_SUPERVISOR_INJECT"] = "detach-custodian-identity-unreadable"
+            bounded._ROLE[0] = "monitor"
+            self.assertFalse(bounded.injected_unreadable())
+            bounded._ROLE[0] = "custodian"
+            self.assertTrue(bounded.injected_unreadable())
+            os.environ["OXIDE_SUPERVISOR_INJECT"] = ""
+            self.assertFalse(bounded.injected_unreadable())
+        finally:
+            bounded._ROLE[0] = saved_role
+            if saved_env is None:
+                os.environ.pop("OXIDE_SUPERVISOR_INJECT", None)
+            else:
+                os.environ["OXIDE_SUPERVISOR_INJECT"] = saved_env
+
     def test_a_parentage_mismatch_is_acknowledged_without_signalling(self):
         real = bounded.Kinfo.one(os.getpid())
         child_pid = os.getpid() + 1
@@ -6971,8 +7019,9 @@ class DetachReal(unittest.TestCase):
         self.remove_fixture_mount()
 
     def test_an_unreadable_identity_can_be_handed_off_by_parentage(self):
-        # The monitor cannot close it itself here, so it hands the child over by
-        # PARENTAGE while still holding it unreaped; the custodian signals and
+        # The monitor cannot close it itself here (and only ITS lookups are forced
+        # unreadable), so it hands the child over by PARENTAGE while still holding
+        # it unreaped; the custodian's own lookup is readable, so it signals and
         # positively observes it.
         self.guard(inject=["detach-stuck-child", "detach-identity-unreadable",
                            "detach-handoff-unreadable"])
@@ -6988,6 +7037,24 @@ class DetachReal(unittest.TestCase):
         self.assertTrue(observed and observed[0]["closed"] is True, records)
         with self.assertRaises(ProcessLookupError):
             os.kill(pinned[0]["pid"], 0)
+        self.assertTrue(os.path.exists(self.receipt["scratch"]), "the root was cleaned")
+        self.remove_fixture_mount()
+
+    def test_a_custodian_side_unreadable_lookup_refuses_without_signalling(self):
+        # Only the custodian's lookups are forced unreadable: the monitor's handoff
+        # is well formed, but the receiver cannot verify it, so it refuses, records
+        # that, and acknowledges without signalling; the run stays unqualified and
+        # the root is kept.
+        self.guard(inject=["detach-stuck-child", "detach-identity-unreadable",
+                           "detach-handoff-unreadable", "detach-custodian-identity-unreadable"])
+        detach = self.receipt["detach"]
+        self.assertEqual(self.code, 125)
+        self.assertEqual((detach.get("custodian_owned"), detach.get("custodian_closed")), (False, False),
+                         detach)
+        records = [r for r in self.receipt["custodian"] if r["event"].startswith("detach_child_")]
+        refused = [r for r in records if r["event"] == "detach_child_refused"]
+        self.assertTrue(refused and "cannot be read" in refused[0]["observation"], records)
+        self.assertFalse([r for r in records if r["event"] == "detach_child_signal"], records)
         self.assertTrue(os.path.exists(self.receipt["scratch"]), "the root was cleaned")
         self.remove_fixture_mount()
 

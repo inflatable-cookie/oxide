@@ -208,6 +208,7 @@ INJECTIONS = {
     "detach-fail", "detach-timeout", "detach-ambiguous", "detach-withdraw",
     "detach-reap-timeout", "detach-stuck-child",
     "detach-identity-unreadable", "detach-handoff-unreadable",
+    "detach-custodian-identity-unreadable",
 }
 RESERVE_DELAY_S, SCRATCH_DELAY_S = 0.5, 4.0  # injected publication delays before a sampler stall
 INJECT_AFTER_GATE_NS = 1_500_000_000  # post-gate injections wait for the fixture to start
@@ -1826,6 +1827,27 @@ def close_own_child(handle, window_end_ns):
         return False, None
 
 
+def reap_own_child(handle, window_end_ns):
+    """Reap a direct child this process may already have lost, WITHOUT signalling:
+    a positively absent child's PID can be reused, so nothing is ever killed here.
+    Bounded by the custodian's window; never raises. Returns (reaped, status)."""
+    try:
+        while True:
+            remaining = max(0.0, (window_end_ns - now_ns()) / NS)
+            try:
+                status = handle.wait(timeout=min(0.05, remaining))
+            except ChildProcessError:  # already reaped or otherwise not ours now
+                return True, None
+            except BaseException:
+                return False, None
+            if status is not None:
+                return True, status
+            if remaining <= 0.0:
+                return False, None
+    except BaseException:
+        return False, None
+
+
 def _unreaped_record(child, error, deadline):
     """A failure record that never loses a live child: one last bounded wait, and
     the handle is handed back whenever the child is not positively reaped."""
@@ -1886,8 +1908,21 @@ def detach_budget(ctx, now=None):
     return max(0, exit_at - now - DETACH_GATE_MARGIN_NS)
 
 
+_ROLE = [None]  # "monitor" or "custodian", set by each actor's constructor
+
+
 def injections():
     return set(filter(None, os.environ.get("OXIDE_SUPERVISOR_INJECT", "").split(",")))
+
+
+def injected_unreadable():
+    """Test-only: which actor's process lookups are forced unreadable. Scoped to
+    ONE actor, so the other actor's identity facts stay readable and each
+    handoff outcome can be exercised on its own."""
+    active = injections()
+    if _ROLE[0] == "monitor" and "detach-identity-unreadable" in active:
+        return True
+    return _ROLE[0] == "custodian" and "detach-custodian-identity-unreadable" in active
 
 
 def process_row(pid):
@@ -1897,7 +1932,7 @@ def process_row(pid):
     observation and is never silently turned into "gone" or into an identity."""
     if not typed(pid, int) or pid <= 0:
         return None, "no usable pid"
-    if "detach-identity-unreadable" in injections():
+    if injected_unreadable():
         return None, "injected unreadable identity"
     try:
         row = Kinfo.one(pid)
@@ -3093,6 +3128,7 @@ def sweep_one_root(path, device, probe, budget, now):
 
 class Monitor:
     def __init__(self, ctx, ctl_w, cmd_r, out_r, err_r):
+        _ROLE[0] = "monitor"
         self.ctx, self.ctl_w, self.cmd_r = ctx, ctl_w, cmd_r
         self.lock = threading.Lock()
         self.seq = 0
@@ -3609,6 +3645,23 @@ class Monitor:
                             detach["custodian_owned"] = bool(ack and ack.get("custodian_closes") is True)
                             detach["identity_problem"] = identity_problem
                             self.receipt["detach"] = detach
+                        if row is None and identity_problem is None:
+                            # Positively absent: no row to name and no foreign PID to
+                            # signal, so it is accounted here by reaping whatever the
+                            # kernel still holds for this child, and then reported.
+                            absent_reaped, _status = reap_own_child(handle, window_end)
+                            with self.lock:
+                                detach["reaped"] = True
+                                detach["reaped_by"] = "monitor"
+                                detach["child_absent"] = True
+                                detach["reap_timed_out"] = not absent_reaped
+                                self.receipt["detach"] = detach
+                            self.publish("detach_child_absent: scratch_kept")
+                            self.publish("monitor_complete: pending_custodian")
+                            self.summary()
+                            self.send("monitor_complete")
+                            self.stop.set()
+                            return
                         if identity_problem is not None:
                             # Its identity could not be read, so no PID is handed
                             # over and nothing is signalled by identity. The child is
@@ -3839,6 +3892,7 @@ def monitor_main(ctx, ctl_w, cmd_r, out_r, err_r):
 
 class Custodian:
     def __init__(self, command, limit_s=LIMIT_S, budget=SCRATCH_BUDGET, evidence=None, root_parent=None):
+        _ROLE[0] = "custodian"
         self.command, self.limit_s, self.budget, self.evidence_arg = command, limit_s, budget, evidence
         self.root_parent = root_parent
         self.inject = {item for item in os.environ.get("OXIDE_SUPERVISOR_INJECT", "").split(",") if item}
@@ -4085,6 +4139,14 @@ class Custodian:
                             observation=f"identity unreadable ({problem})")
                 self.tell("detach_child_ack", custodian_closes=False, closed=False,
                           reason=f"the child's identity could not be read ({problem})")
+                return
+            if row is None:
+                # Positively absent: there is nothing to signal, and that is a
+                # positive answer, not an unreadable one.
+                self.record("detach_child_refused", pid=pid, start=start,
+                            observation="positively absent")
+                self.tell("detach_child_ack", custodian_closes=False, closed=True,
+                          reason="the child is positively gone")
                 return
             # Positive identity: the same process (start time) and still this
             # monitor's child. A recycled bare PID can never match both, so it is
