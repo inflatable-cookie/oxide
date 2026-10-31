@@ -4303,7 +4303,8 @@ class Monitor:
                        f" ({pairs.get('possibly_overwritten_count', 0)} with a later admission report);"
                        f" granted {admission['granted_ns'] / NS:.1f} s; {rejected_waiting} waiting and"
                        f" {rejected_grants} completed report(s) rejected"
-                       + (f"; {admission['unclassified']} unpaired" if admission.get("unclassified") else "")
+                       + (f"; {admission['unclassified']} unclassified report(s)"
+                          if admission.get("unclassified") else "")
                        + (f"; {admission['duplicates']} duplicate completion(s) ignored"
                           if admission.get("duplicates") else "")
                        + "\n")
@@ -4556,12 +4557,20 @@ class Custodian:
         reaches the custodian after the stop decision, or after a deadline was
         declared, cannot move anything; it is recorded as late with its reason
         so the run is classified honestly rather than as an unexplained
-        timeout."""
+        timeout. A command the bounded pairing table cannot retain, and a second
+        terminal for a command that already has one, grant nothing at all."""
         try:
             self.admission_ordinal += 1
             self.admission_last_ordinal = self.admission_ordinal
             pair = self.admission_pair(message["command"])
-            if pair is not None and pair["ended"] is not None:
+            if pair is None:
+                # The bounded table cannot retain this command, so a first terminal
+                # and a duplicate are indistinguishable. Grant nothing: a missed
+                # extension only makes the run stricter, while a double grant would
+                # move the deadline twice for one wait. The report stays counted as
+                # unclassified.
+                return
+            if pair["ended"] is not None:
                 # One terminal per command grants time at most once, whatever the
                 # monitor's deduplication does: a duplicate completion can never
                 # grant the same wait twice.
@@ -4621,7 +4630,8 @@ class Custodian:
         waiting report with its own completion, so a stale file, a zero-duration
         or late grant and a lost report are never reported as a proven
         unfinished wait. Overflow is counted and treated as unclassified, never
-        as evidence."""
+        as evidence, and a terminal for an overflowed command grants no time
+        because the custodian cannot distinguish it from a duplicate."""
         entry = self.admission_pairs.get(command)
         if entry is not None:
             return entry

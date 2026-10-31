@@ -2318,8 +2318,8 @@ review afterwards.
 integrated head adds the admission reports described in the supervisor rule
 below: the completed-wait marker and its bounded grant, the correlated waiting
 report, and the stop-boundary drain with late-marker classification. Together
-with oxide#191's merged 287 pure and 48 real cases the suite is now 323 pure + 53
-real = 376 cases (33 pure and 5 real of them oxide#192's: the completed wait and its
+with oxide#191's merged 287 pure and 48 real cases the suite is now 324 pure + 53
+real = 377 cases (34 pure and 5 real of them oxide#192's: the completed wait and its
 grant, the rejection control, the late grant, a wait that never ends before the
 stop, and the stale-run plus zero-duration-grant correlation), which the
 bootstrap's expected count and limitation list follow. The exported deadline,
@@ -2391,7 +2391,7 @@ the independent reviewer qualification. Until those exist at that head the bytes
 are unqualified and carry no credit for any other proof. The covering checks run
 at this head are recorded in the pull request: `effigy rust:compile`,
 `effigy rust:format`, `effigy test rust`, `effigy proof:supervisor:test`
-(323 pure cases) and `effigy docs:check`.
+(324 pure cases) and `effigy docs:check`.
 
 **Settlement observation (oxide#147, unqualified source).** The current
 `bounded-test.py` also carries observation-only settlement diagnostics, so a
@@ -2773,7 +2773,12 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   admission-file observation followed the wait while its terminal evidence is
   still missing; both are unclassified, and only the observed terminal reports
   (a grant, a zero-duration or capped grant, a late grant) end a wait. A rejected
-  or overflowed report is unclassified in the same way. Together with the grant and late
+  or overflowed report is unclassified in the same way. A terminal for a command
+  the bounded pairing table cannot retain (more than 64 commands) grants
+  **nothing**: without a record the custodian cannot tell a first terminal from a
+  duplicate, and a missed extension only makes the run stricter. A duplicate
+  terminal for a retained command is likewise counted and ignored, so one command
+  can never move the deadline twice for the same wait. Together with the grant and late
   records this makes the states distinguishable in one receipt: granted before
   the stop, granted after it (late, no clock moved), unpaired (nothing granted,
   unclassified because its terminal may have been overwritten or missed), stale
@@ -2911,7 +2916,7 @@ with a recorded minimum. A fallback run, or a nested case outside the
 monitored root, fails the qualification. Its reserve readings identify the
 qualification's scratch volume and the boot volume separately. The suite
 runs in order:
-- 323 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 324 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -3186,7 +3191,7 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 376 cases (323 pure + 53 real, including oxide#191's post-census detach
+- all 377 cases (324 pure + 53 real, including oxide#191's post-census detach
   cases and oxide#192's five admission-report cases);
 - every real case directory and receipt still present after the
   candidate's cleanup.

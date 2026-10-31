@@ -2071,15 +2071,42 @@ class PureAdmission(unittest.TestCase):
             custodian.accept(self.message(custodian, 15 * NS, offset_s=20, command="dup"))
         with self.clock(custodian, 21):
             custodian.accept(self.message(custodian, 15 * NS, offset_s=21, command="dup"))
+        # A duplicate that arrives after a deadline is still a duplicate: it is
+        # neither granted nor recorded as a late grant.
+        custodian.deadline_hit = True
+        with self.clock(custodian, 22):
+            custodian.accept(self.message(custodian, 15 * NS, offset_s=22, command="dup"))
+        self.assertEqual(custodian.admission_ignored, 0, "a duplicate is not a late grant")
+        custodian.deadline_hit = False
         self.assertEqual(custodian.admission_granted, 15 * NS, "the second completion must not grant again")
         self.assertEqual(custodian.admission_counted, 1)
-        self.assertEqual(custodian.admission_duplicates, 1)
+        self.assertEqual(custodian.admission_duplicates, 2, "both duplicates are counted, neither granted")
         custodian.cmd_r, custodian.cmd_w = self.pipe()
         custodian.observe_admission(True)
         os.close(custodian.cmd_w)
         decision = [record["record"] for record in self.drain(custodian.cmd_r)
                     if record["record"]["event"] == "admission_decision"][0]
-        self.assertEqual(decision["duplicates"], 1)
+        self.assertEqual(decision["duplicates"], 2)
+
+    def test_an_overflowed_completion_never_grants(self):
+        # Review finding: at table capacity admission_pair returns None, so the
+        # custodian cannot tell a first terminal from a duplicate. An overflowed
+        # command therefore grants nothing at all (a missed extension is safe, a
+        # double grant is not), and the reports stay counted as unclassified.
+        custodian = self.custodian()
+        custodian.record = lambda kind, **fields: None
+        for index in range(bounded.ADMISSION_COMMANDS):
+            with self.clock(custodian, index):
+                custodian.accept(self.waiting(custodian, index, command=f"c{index}"))
+        before = custodian.absolute
+        for offset in (100, 101):
+            with self.clock(custodian, offset):
+                custodian.accept(self.message(custodian, 15 * NS, offset_s=offset, command="overflow"))
+        self.assertEqual(custodian.absolute, before, "an overflowed completion must not move the deadline")
+        self.assertEqual(custodian.admission_granted, 0)
+        self.assertEqual(custodian.admission_counted, 0)
+        self.assertEqual(custodian.admission_duplicates, 0)
+        self.assertGreaterEqual(custodian.admission_unclassified, 2)
 
     def test_a_rejected_waiting_report_is_recorded_without_a_message(self):
         directory = self.fixture()
