@@ -1426,6 +1426,11 @@ def boot_closure(proof: Proof, repo: str, diagnostic: bool) -> tuple:
             path = diagnostic_receipt(outcome)
             print(f"boot-closure diagnostic receipt {path}")
     elapsed = time.monotonic() - runner.STARTED
+    # The custody outcome is NOT claimed here: `main` evaluates
+    # `retain_for_census` after this returns, so the line carries a
+    # `{custody}` placeholder that the top-level decision fills in. Claiming
+    # one here would let a failed diagnostic that retains the mount report a
+    # detach that never happened.
     if diagnostic or outcome["failed"]:
         line = (
             f"boot-closure diagnostic collected (UNCOUNTED, never a PASS): "
@@ -1433,16 +1438,14 @@ def boot_closure(proof: Proof, repo: str, diagnostic: bool) -> tuple:
             f"{[case for case, _ in outcome['failed']]}, unexecuted {outcome['unexecuted']}; "
             f"{elapsed:.0f} s script time, peak owned {proof.peak // MIB} MiB at phase checks, "
             f"host free minimum {proof.low // MIB} MiB; one owned 128 MiB scratch image, "
-            f"ordinary detach; receipt {path if diagnostic else 'none'}"
+            f"{{custody}}; receipt {path if diagnostic else 'none'}"
         )
     else:
         line = (
             f"boot-closure proof held: {elapsed:.0f} s script time, peak owned "
             f"{proof.peak // MIB} MiB at phase checks, host free minimum {proof.low // MIB} MiB; "
-            f"one owned 128 MiB scratch image, ordinary detach"
+            f"one owned 128 MiB scratch image, {{custody}}"
         )
-    layout.record("result.txt", f"{'diagnostic (not a PASS)' if diagnostic else 'passed'}\n{line}\n")
-    print(line)
     return line, outcome
 
 
@@ -2368,6 +2371,7 @@ def self_check() -> int:
             shutil.rmtree(helper_root, ignore_errors=True)
     # Every removal-mode staging call opts in, so both modes keep the tree.
     source_text = open(os.path.abspath(__file__), encoding="utf-8").read()
+    main_source = source_text
     staging_calls = [
         line.strip()
         for line in source_text.splitlines()
@@ -2403,7 +2407,14 @@ def self_check() -> int:
     expect(cleanup_after_failure(unreaped) is True and not unreaped.detached,
            "a failure with an unreaped child detached the mount")
     WRITERS["launched"] = False
-    main_source = open(os.path.abspath(__file__), encoding="utf-8").read()
+    boot_source = inspect.getsource(boot_closure)
+    expect("ordinary detach" not in boot_source,
+           "boot_closure claims a detach before the top-level custody decision")
+    expect("{custody}" in boot_source,
+           "boot_closure does not carry the custody placeholder for the top-level decision")
+    expect("layout.record(" not in boot_source,
+           "boot_closure records its own result line before custody is decided")
+    source_text = open(os.path.abspath(__file__), encoding="utf-8").read()
     handler = main_source[main_source.index("    except BaseException as failure:\n        retained = "):]
     expect("cleanup_after_failure(proof)" in handler,
            "main's failure path does not use the custody decision")
@@ -2494,7 +2505,10 @@ def self_check() -> int:
                 return dict(body)
 
             def fake_boot(proof, repo, diagnostic, body=body):
-                return ("stub line", dict(body))
+                # The real `boot_closure` returns a `{custody}` template and
+                # never claims the detach itself; the top-level decision fills
+                # it in.
+                return ("boot-closure stub; one owned 128 MiB scratch image, {custody}", dict(body))
 
             globals()["run"] = fake_run
             globals()["boot_closure"] = fake_boot
@@ -2507,14 +2521,17 @@ def self_check() -> int:
                 instance.detached is expect_detach,
                 f"{label}: detach={instance.detached}, expected {expect_detach}",
             )
-            if main_mode:
-                line = recorded.get("result.txt", "")
-                if expect_detach:
-                    expect("ordinary detach" in line,
-                           f"{label}: the recorded line does not report the ordinary detach: {line!r}")
-                else:
-                    expect("retained for the guard" in line,
-                           f"{label}: the recorded line does not report retention: {line!r}")
+            line = recorded.get("result.txt", "")
+            if expect_detach:
+                expect("ordinary detach" in line,
+                       f"{label}: the recorded line does not report the ordinary detach: {line!r}")
+            else:
+                expect("retained for the guard" in line,
+                       f"{label}: the recorded line does not report retention: {line!r}")
+                expect("ordinary detach" not in line,
+                       f"{label}: the recorded line still claims a detach that did not happen: {line!r}")
+            expect("{custody}" not in line, f"{label}: the custody placeholder was recorded: {line!r}")
+
     finally:
         MainProof.extra_unclosed = ()
         globals()["Proof"] = saved_main["Proof"]
@@ -2588,12 +2605,15 @@ def main() -> int:
     proof = Proof(root)
     outcome = None
     retained = False
+    focused_line = ""
     try:
         if focused:
-            _, outcome = boot_closure(proof, repo, diagnostic)
+            focused_line, outcome = boot_closure(proof, repo, diagnostic)
         else:
             outcome = run(proof, repo, diagnostic)
         retained = retain_for_census(proof, outcome)
+        custody = ("mount and backing retained for the guard" if retained
+                   else "ordinary detach")
         if retained:
             print("collection recorded a failure or an unreaped child: keeping the mount and "
                   "backing for the guard's post-leader census", file=sys.stderr)
@@ -2608,8 +2628,11 @@ def main() -> int:
         signal.setitimer(signal.ITIMER_REAL, 0)
     proof.phase("end")
     if focused:
-        # The mode already recorded its own result line and, for a
-        # diagnostic, its unqualified receipt.
+        # The line is recorded here, after the top-level custody decision, so
+        # it can never claim a detach that was replaced by retention.
+        line = focused_line.format(custody=custody)
+        layout.record("result.txt", f"{'diagnostic (not a PASS)' if diagnostic else 'passed'}\n{line}\n")
+        print(line)
         return 0
     elapsed = time.monotonic() - runner.STARTED
     if diagnostic:
@@ -2620,7 +2643,7 @@ def main() -> int:
             f"{[case for case, _ in outcome['skipped']]}, unexecuted {outcome['unexecuted']}; "
             f"{elapsed:.0f} s script time, peak owned {proof.peak // MIB} MiB at phase checks, "
             f"host free minimum {proof.low // MIB} MiB; one owned 128 MiB scratch image, "
-            f"{'mount and backing retained for the guard' if retained else 'ordinary detach'}"
+            f"{custody}"
         )
         layout.record("result.txt", f"diagnostic (not a PASS)\n{line}\n")
         print(line)
@@ -2628,7 +2651,7 @@ def main() -> int:
     line = (
         f"removal proof held: {elapsed:.0f} s script time, peak owned {proof.peak // MIB} MiB at phase checks, "
         f"host free minimum {proof.low // MIB} MiB; scratch closure and cleanup are the shared runner's; "
-        f"{'mount and backing retained for the guard' if retained else 'ordinary detach'}"
+        f"{custody}"
     )
     layout.record("result.txt", f"passed\n{line}\n")
     print(line)
