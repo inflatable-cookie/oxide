@@ -44,16 +44,20 @@ plus custodian exit 0, recorded by the caller.
 
 Admission reports (oxide#192). A supervised child that waited for admission may
 publish one bounded marker, `admission.json`, in the evidence directory, and one
-`admission-waiting.json` when it starts waiting. The monitor reads only a
-regular file without following a link, at most 512 bytes with an exact
-three-key schema, and reports each once per file identity. The custodian grants
-at most the completed wait, never more than the run's own elapsed wall clock
-and never more than a fixed 600 s total, to its deadline; a waiting report
-grants nothing and is recorded so a wait that never ends before the stop is
-classified separately. Nothing is shortened, the exported
-OXIDE_PROOF_DEADLINE_NS is not rewritten and classification is unchanged: a
-rejected or missing report removes nothing but the grant, and the receipt
-reports the wait, the wait-not-ended report and the grant separately. One
+`admission-waiting.json` when it starts waiting. Schema 2 documents name this
+run (`OXIDE_PROOF_RUN_ID`) and one bounded command token, so a stale file from an
+earlier run is rejected instead of paired with this one, and each waiting report
+is paired only with its own command's completed marker. The monitor reads only a
+regular file without following a link, at most 512 bytes with an exact key set,
+and reports each once per file identity. The custodian grants at most the
+completed wait, never more than the run's own elapsed wall clock and never more
+than a fixed 600 s total, to its deadline; a waiting report grants nothing, and
+a command's wait counts as unfinished only when no terminal report for that same
+command arrived (a zero-duration grant, a capped grant or a late grant all end
+it). Nothing is shortened, the exported OXIDE_PROOF_DEADLINE_NS is not rewritten
+and classification is unchanged: a rejected or missing report removes nothing
+but the grant, and the receipt reports the wait, the pairing and the grant
+separately. One
 bounded drain reads what has already arrived before the deadline is declared, so
 a marker published just before the stop can still grant; a marker that reaches
 the custodian after the stop decision or a deadline is recorded as late with its
@@ -224,21 +228,23 @@ ADMISSION_NAME = "admission.json"
 # grant has ended it. It never moves a deadline; it exists so a wait that never
 # ends before the stop is reported and classified instead of leaving no trace.
 WAITING_NAME = "admission-waiting.json"
-ADMISSION_SCHEMA = 1
+ADMISSION_SCHEMA = 2
 ADMISSION_MAX_BYTES = 512
 ADMISSION_POLL_S = 0.25
 ADMISSION_CAP_NS = 600 * NS
-ADMISSION_RECORDS = 32  # per-grant custodian records kept; the rest only move the counters
+ADMISSION_RECORDS = 32  # per-report custodian records kept; the rest only move the counters
 ADMISSION_REJECTIONS = 8  # bounded rejection reasons kept in the receipt
-ADMISSION_KEYS = frozenset({"schema", "source", "waited_ns"})
-WAITING_KEYS = frozenset({"schema", "source", "reason"})
+ADMISSION_COMMANDS = 64  # bounded pairing table: one entry per supervised command token
+ADMISSION_UNFINISHED = 8  # bounded unfinished list carried by the decision record
+ADMISSION_KEYS = frozenset({"schema", "source", "run", "command", "waited_ns"})
+WAITING_KEYS = frozenset({"schema", "source", "run", "command", "reason"})
 FIELDS = {  # required fields per monitor message type; bool is never accepted as int
     "reading": {"kind": str},
     "ready": {}, "monitor_complete": {}, "cleanup_failed": {},
     "output_eof": {"stream": str},
     "census": {"after": int, "members": int, "uncertain": int, "certain": bool},
-    "admission": {"waited_ns": int, "completed": int, "marker": int},
-    "admission_waiting": {"reason": str, "completed": int, "marker": int},
+    "admission": {"waited_ns": int, "command": str, "completed": int, "marker": int},
+    "admission_waiting": {"reason": str, "command": str, "completed": int, "marker": int},
     "setup": {"root": str, "scratch": str, "evidence": str, "owned": bool},
 }
 
@@ -273,40 +279,50 @@ def token_ok(value):
     return isinstance(value, str) and 0 < len(value) <= 32 and value.isprintable()
 
 
-def admission_malformed(marker):
-    """Why an admission marker is not usable, or None.
+def admission_common_malformed(marker, keys, run_id):
+    """Why a report's shared fields are not usable, or None.
 
-    Fixed schema, exact keys, bounded types: schema 1, one printable source
-    token of at most 32 characters and a non-negative reported wait inside
-    u64. A marker is cooperative evidence for the custodian's bounded grant;
-    anything else is reported in the receipt and never latches a fault."""
+    Fixed schema, exact keys, bounded types: schema 2, one printable source
+    token, this run's own identity and one printable command token. A report
+    from another run is stale and is never paired with this one."""
     if not isinstance(marker, dict):
         return "not an object"
-    if set(marker) != ADMISSION_KEYS:
+    if set(marker) != keys:
         return "unexpected keys"
     if not typed(marker["schema"], int) or marker["schema"] != ADMISSION_SCHEMA:
         return "unsupported schema"
     if not token_ok(marker["source"]):
         return "ill-typed source"
+    if marker["run"] != run_id:
+        return "stale run"
+    if not token_ok(marker["command"]):
+        return "ill-typed command"
+    return None
+
+
+def admission_malformed(marker, run_id):
+    """Why a completed-wait marker is not usable, or None.
+
+    The shared fields, then a non-negative reported wait inside u64. A marker
+    is cooperative evidence for the custodian's bounded grant; anything else is
+    reported in the receipt and never latches a fault."""
+    problem = admission_common_malformed(marker, ADMISSION_KEYS, run_id)
+    if problem:
+        return problem
     waited = marker["waited_ns"]
     if not typed(waited, int) or not 0 <= waited <= U64MAX:
         return "ill-typed waited_ns"
     return None
 
 
-def admission_waiting_malformed(marker):
-    """Why a waiting report is not usable, or None. Same fixed shape and
-    bounds as the completed-wait marker, with its own reason token instead of a
-    wait. A waiting report never grants time: anything wrong with it is
-    reported in the receipt and never latches a fault."""
-    if not isinstance(marker, dict):
-        return "not an object"
-    if set(marker) != WAITING_KEYS:
-        return "unexpected keys"
-    if not typed(marker["schema"], int) or marker["schema"] != ADMISSION_SCHEMA:
-        return "unsupported schema"
-    if not token_ok(marker["source"]):
-        return "ill-typed source"
+def admission_waiting_malformed(marker, run_id):
+    """Why a waiting report is not usable, or None. The shared fields, then its
+    own reason token instead of a wait. A waiting report never grants time:
+    anything wrong with it is reported in the receipt and never latches a
+    fault."""
+    problem = admission_common_malformed(marker, WAITING_KEYS, run_id)
+    if problem:
+        return problem
     if not token_ok(marker["reason"]):
         return "ill-typed reason"
     return None
@@ -2730,7 +2746,9 @@ class Monitor:
         except ValueError:
             self.reject_admission("not JSON", key)
             return
-        problem = admission_waiting_malformed(marker) if waiting else admission_malformed(marker)
+        run_id = self.ctx.get("run_id")
+        problem = (admission_waiting_malformed(marker, run_id) if waiting
+                   else admission_malformed(marker, run_id))
         if problem:
             self.reject_admission(problem, key)
             return
@@ -2747,9 +2765,11 @@ class Monitor:
                     record["reported_wait_ns"] = min(U64MAX, record["reported_wait_ns"] + marker["waited_ns"])
                 index = record["observed"]
             if waiting:
-                self.send("admission_waiting", reason=marker["reason"], completed=completed, marker=index)
+                self.send("admission_waiting", reason=marker["reason"], command=marker["command"],
+                          completed=completed, marker=index)
             else:
-                self.send("admission", waited_ns=marker["waited_ns"], completed=completed, marker=index)
+                self.send("admission", waited_ns=marker["waited_ns"], command=marker["command"],
+                          completed=completed, marker=index)
         except BaseException:
             self.note_admission(error=True, key=key)
 
@@ -3000,18 +3020,32 @@ class Monitor:
                 report(f"supervisor: an admission marker reached the custodian after the stop decision"
                        f" ({reason}), so its wait is reported and not granted; the deadline classification"
                        " stands and no clock was moved\n")
-            waiting_reports = max(admission.get("waiting_reports") or 0,
-                                  receipt["admission_waiting"]["observed"])
-            if waiting_reports:
-                reason = admission.get("waiting_reason") or receipt["admission_waiting"]["reason"] or "unknown"
-                started = admission.get("waiting_ns")
-                offset = "" if started is None else f" at {(started - receipt['start_ns']) / NS:.1f} s"
-                report(f"supervisor: the command reported waiting for admission ({reason}){offset} in"
-                       f" {waiting_reports} report(s); granted {admission['granted_ns'] / NS:.1f} s;"
-                       f" rejected {receipt['admission_waiting']['ignored']}")
-                if admission["granted_ns"] == 0:
-                    report("supervisor: that wait never ended before the stop, so the deadline classification"
-                           " stands and the queue wait is reported separately; no clock was moved\n")
+            pairs = admission.get("admission_waiting") or {}
+            rejected_waiting = receipt["admission_waiting"]["ignored"]
+            rejected_grants = receipt["admission"]["ignored"]
+            if pairs.get("commands") or rejected_waiting:
+                report(f"supervisor: admission waits reported by {pairs.get('commands', 0)} command(s):"
+                       f" {pairs.get('ended', 0)} ended, {pairs.get('unfinished_count', 0)} unfinished;"
+                       f" granted {admission['granted_ns'] / NS:.1f} s; {rejected_waiting} waiting and"
+                       f" {rejected_grants} completed report(s) rejected"
+                       + (f"; {admission['unclassified']} unpaired" if admission.get("unclassified") else "")
+                       + "\n")
+            for entry in (pairs.get("unfinished") or [])[:3]:
+                report(f"supervisor: command {entry['command']} reported waiting ({entry['reason']}) at"
+                       f" {(entry['waiting_ns'] - receipt['start_ns']) / NS:.1f} s and no completion for"
+                       " that command was reported before the stop decision; that wait is reported, not"
+                       " granted\n")
+            if pairs.get("unfinished_count"):
+                report("supervisor: the deadline classification stands for the unfinished command(s); no"
+                       " clock was moved for them\n")
+                if rejected_grants:
+                    report(f"supervisor: {rejected_grants} completed report(s) were rejected, so an"
+                           " unfinished command above may have ended in one of them; those waits are"
+                           " unclassified rather than proven unfinished\n")
+            if rejected_waiting:
+                report(f"supervisor: {rejected_waiting} waiting report(s) were rejected"
+                       f" ({', '.join(receipt['admission_waiting']['rejections'][:3])}); those waits are"
+                       " unclassified\n")
 
 
 class SetupRefused(Exception):
@@ -3081,6 +3115,8 @@ class Custodian:
         self.admission_waiting_reports = 0
         self.admission_waiting_ns = None
         self.admission_waiting_reason = None
+        self.admission_pairs = {}
+        self.admission_unclassified = 0
         self.exceptions = 0
         self.injected = set()
         self.paths = None  # from the monitor's setup message
@@ -3214,16 +3250,28 @@ class Custodian:
         so the run is classified honestly rather than as an unexplained
         timeout."""
         try:
+            pair = self.admission_pair(message["command"])
             if self.stopped_at is not None or self.deadline_hit:
                 self.admission_ignored += 1
                 self.admission_late_ns = at
                 self.admission_late_reason = "stopped" if self.stopped_at is not None else "deadline"
+                # The wait ended after the stop: still a completed wait for this
+                # command, so it is never reported as unfinished.
+                if pair is not None and pair["ended"] is None:
+                    pair.update(ended=self.admission_late_reason, ended_ns=at,
+                                waited_ns=message["waited_ns"])
                 if self.admission_records < ADMISSION_RECORDS:
                     self.admission_records += 1
-                    self.record("admission_late", waited_ns=message["waited_ns"], at=at,
+                    self.record("admission_late", command=message["command"],
+                                waited_ns=message["waited_ns"], at=at,
                                 reason=self.admission_late_reason, deadline_hit=self.deadline_hit,
                                 stopped=self.stopped_at is not None)
                 return
+            # A completed wait ends this command's wait even when it grants no
+            # time: a zero-duration grant or a cap-refused grant is an ending,
+            # not an unfinished wait.
+            if pair is not None and pair["ended"] is None:
+                pair.update(ended="grant", ended_ns=at, waited_ns=message["waited_ns"])
             waited = message["waited_ns"]
             elapsed = max(0, at - self.start)
             clamped = waited > elapsed
@@ -3244,11 +3292,30 @@ class Custodian:
             self.exit_at = self.absolute - EXIT_MARGIN_S * NS
             if self.admission_records < ADMISSION_RECORDS:
                 self.admission_records += 1
-                self.record("admission", waited_ns=message["waited_ns"], grant_ns=grant,
-                            clamped=clamped, granted_ns=self.admission_granted,
+                self.record("admission", command=message["command"], waited_ns=message["waited_ns"],
+                            grant_ns=grant, clamped=clamped, granted_ns=self.admission_granted,
                             absolute_ns=self.absolute)
         except BaseException as error:
             self.exception(error)
+
+    def admission_pair(self, command):
+        """One command token's paired record, or None when the table is full.
+
+        A bounded table (ADMISSION_COMMANDS) pairs each supervised command's
+        waiting report with its own completion, so a stale file, a zero-duration
+        or late grant and a lost report are never reported as a proven
+        unfinished wait. Overflow is counted and treated as unclassified, never
+        as evidence."""
+        entry = self.admission_pairs.get(command)
+        if entry is not None:
+            return entry
+        if len(self.admission_pairs) >= ADMISSION_COMMANDS:
+            self.admission_unclassified += 1
+            return None
+        entry = {"command": command, "waiting_ns": None, "reason": None,
+                 "ended": None, "ended_ns": None, "waited_ns": None}
+        self.admission_pairs[command] = entry
+        return entry
 
     def note_waiting(self, message, at):
         """Record that a child reported a wait that has not ended (oxide#192).
@@ -3262,10 +3329,13 @@ class Custodian:
             self.admission_waiting_ns = at
             if self.admission_waiting_reason is None:
                 self.admission_waiting_reason = message["reason"]
+            pair = self.admission_pair(message["command"])
+            if pair is not None and pair["waiting_ns"] is None:
+                pair["waiting_ns"], pair["reason"] = at, message["reason"]
             if self.admission_records < ADMISSION_RECORDS:
                 self.admission_records += 1
-                self.record("admission_waiting", reason=message["reason"], at=at,
-                            after_stop=self.stopped_at is not None or self.deadline_hit,
+                self.record("admission_waiting", command=message["command"], reason=message["reason"],
+                            at=at, after_stop=self.stopped_at is not None or self.deadline_hit,
                             granted_ns=self.admission_granted)
         except BaseException as error:
             self.exception(error)
@@ -3366,6 +3436,7 @@ class Custodian:
         # in its `setup` message. The leader opens /dev/null itself.
         self.env = dict(os.environ)
         self.env["OXIDE_PROOF_DEADLINE_NS"] = str(self.absolute)
+        self.env["OXIDE_PROOF_RUN_ID"] = self.run_id
         self.ctx = {
             "run_id": self.run_id, "command": self.command, "limit_s": self.limit_s,
             "adopted": os.environ.get("OXIDE_TASK_SCRATCH_ROOT") or None, "evidence_arg": self.evidence_arg,
@@ -3641,6 +3712,24 @@ class Custodian:
         self.observe_settlement(launched, census_end)
         self.observe_admission(launched)
 
+    def admission_pairs_summary(self):
+        """The bounded per-command pairing view for the decision record.
+
+        Only commands whose waiting report was accepted are counted. A command
+        is finished when its own completed report arrived at all (`grant`, even
+        with a zero or clamped grant) or arrived after the stop (`late`), and
+        unfinished only when no terminal report for that same command was
+        received. `unfinished` keeps at most ADMISSION_UNFINISHED rows; the
+        count is always the full one."""
+        waiting = [entry for entry in self.admission_pairs.values() if entry["waiting_ns"] is not None]
+        ended = [entry for entry in waiting if entry["ended"] is not None]
+        unfinished = [entry for entry in waiting if entry["ended"] is None]
+        return {"commands": len(waiting), "ended": len(ended),
+                "unfinished_count": len(unfinished),
+                "unfinished": [{"command": entry["command"], "reason": entry["reason"],
+                                "waiting_ns": entry["waiting_ns"]}
+                               for entry in unfinished[:ADMISSION_UNFINISHED]]}
+
     def observe_admission(self, launched):
         """Best-effort decision-time record of the admission grants
         (oxide#192). A failed write is dropped and never latched, so this can
@@ -3655,6 +3744,8 @@ class Custodian:
                       "waiting_reports": self.admission_waiting_reports,
                       "waiting_ns": self.admission_waiting_ns,
                       "waiting_reason": self.admission_waiting_reason,
+                      "admission_waiting": self.admission_pairs_summary(),
+                      "unclassified": self.admission_unclassified,
                       "cap_ns": ADMISSION_CAP_NS, "limit_s": self.limit_s,
                       "absolute_ns": self.absolute}
             os.write(self.cmd_w, (json.dumps({"run": self.run_id, "seq": self.seq, "type": "record",

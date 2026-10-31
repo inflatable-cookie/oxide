@@ -1386,9 +1386,11 @@ class PureProtocol(unittest.TestCase):
 
 
 class PureAdmission(unittest.TestCase):
-    """The bounded admission-marker protocol: a reported slot-queue wait moves
-    the custodian's deadline by at most that wait, its own elapsed time and the
-    fixed cap, and nothing about a rejected marker faults a run."""
+    """The bounded admission-report protocol: a completed wait grants bounded
+    time, a waiting report never does, and each command's wait is paired only
+    with that command's own completion (oxide#192)."""
+
+    RUN = "r"
 
     def pipe(self):
         read_end, write_end = os.pipe()
@@ -1412,7 +1414,7 @@ class PureAdmission(unittest.TestCase):
 
     def custodian(self, limit=300, start=1000 * NS):
         custodian = bounded.Custodian(["true"], limit_s=limit)
-        custodian.run_id = "r"
+        custodian.run_id = self.RUN
         custodian.guard = bounded.Guard(start)
         custodian.cmd_r, custodian.cmd_w = self.pipe()
         custodian.leader = 4242
@@ -1422,17 +1424,29 @@ class PureAdmission(unittest.TestCase):
         custodian.exit_at = custodian.absolute - bounded.EXIT_MARGIN_S * NS
         return custodian
 
-    def message(self, custodian, waited_ns, offset_s=1):
-        # The message's own send stamp is the patched clock's, so the custodian's
-        # future-stamp rule is exercised separately from its grant arithmetic.
+    def message(self, custodian, waited_ns, offset_s=1, command="c1", kind="admission"):
+        # The send stamp is the patched clock's, so the future-stamp rule is
+        # exercised separately from the grant arithmetic.
         at = custodian.start + int(offset_s * NS)
-        return {"run": "r", "seq": custodian.monitor_seq + 1, "leader": None, "type": "admission",
-                "at": at, "waited_ns": waited_ns, "completed": at,
-                "marker": custodian.admission_counted + 1}
+        return {"run": self.RUN, "seq": custodian.monitor_seq + 1, "leader": None, "type": kind,
+                "at": at, "command": command,
+                "waited_ns": waited_ns if kind == "admission" else 0,
+                "reason": "queue" if kind == "admission_waiting" else None,
+                "completed": at, "marker": 1}
 
     def clock(self, custodian, offset_s):
         """Drive the custodian's own CLOCK_UPTIME_RAW seam at a fixed offset."""
         return patched(bounded, "now_ns", lambda: custodian.start + int(offset_s * NS))
+
+    def waiting(self, custodian, offset_s, command="c1"):
+        message = self.message(custodian, 0, offset_s, command, "admission_waiting")
+        message.pop("waited_ns")
+        return message
+
+    def pairs(self, custodian):
+        return custodian.admission_pairs_summary()
+
+    # Grants -----------------------------------------------------------------
 
     def test_a_reported_wait_moves_every_deadline_by_exactly_that_wait(self):
         custodian = self.custodian()
@@ -1447,8 +1461,8 @@ class PureAdmission(unittest.TestCase):
         os.close(custodian.cmd_w)
         records = self.drain(custodian.cmd_r)
         grants = [r["record"] for r in records if r["record"]["event"] == "admission"]
-        self.assertEqual([(g["waited_ns"], g["grant_ns"], g["clamped"]) for g in grants],
-                         [(120 * NS, 120 * NS, False)])
+        self.assertEqual([(g["command"], g["waited_ns"], g["grant_ns"], g["clamped"]) for g in grants],
+                         [("c1", 120 * NS, 120 * NS, False)])
 
     def test_a_wait_never_exceeds_this_runs_own_elapsed_time(self):
         custodian = self.custodian()
@@ -1465,12 +1479,12 @@ class PureAdmission(unittest.TestCase):
         for _ in range(10):  # every report is fully backed by elapsed time
             elapsed += 200
             with self.clock(custodian, elapsed):
-                custodian.accept(self.message(custodian, 200 * NS, offset_s=elapsed))
+                custodian.accept(self.message(custodian, 200 * NS, offset_s=elapsed, command=f"c{elapsed}"))
         self.assertEqual(custodian.admission_granted, bounded.ADMISSION_CAP_NS)
         self.assertTrue(custodian.admission_capped)
         self.assertEqual(custodian.absolute, custodian.start + 300 * NS + bounded.ADMISSION_CAP_NS)
         with self.clock(custodian, elapsed + 1):
-            custodian.accept(self.message(custodian, 1 * NS, offset_s=elapsed + 1))
+            custodian.accept(self.message(custodian, 1 * NS, offset_s=elapsed + 1, command="last"))
         self.assertEqual(custodian.admission_granted, bounded.ADMISSION_CAP_NS)
         self.assertEqual(custodian.admission_counted, 11)
         self.assertEqual(custodian.exit_at, custodian.absolute - bounded.EXIT_MARGIN_S * NS)
@@ -1508,9 +1522,6 @@ class PureAdmission(unittest.TestCase):
         self.assertEqual(custodian.admission_late_reason, "deadline")
 
     def test_a_late_grant_is_recorded_with_its_reason_and_decision_facts(self):
-        # Review finding: a marker that reaches the custodian after the stop was
-        # silently ignored. It is classified: the wait is reported, nothing is
-        # granted, and the deadline classification stands.
         custodian = self.custodian()
         custodian.deadline_hit = True
         recorded = []
@@ -1534,10 +1545,41 @@ class PureAdmission(unittest.TestCase):
         self.assertEqual(decision["counted"], 0)
         self.assertEqual(decision["absolute_ns"], custodian.start + 300 * NS)
 
+    def test_a_future_stamped_grant_latches_and_grants_nothing(self):
+        custodian = self.custodian()
+        future = now_ns() + 60 * NS
+        custodian.accept(self.message(custodian, 60 * NS, offset_s=1) | {"at": future})
+        self.assertIn("future", custodian.guard.fault or "")
+        self.assertEqual(custodian.admission_granted, 0)
+
+    def test_grant_records_are_capped_and_never_fault(self):
+        custodian = self.custodian()
+        recorded = []
+        custodian.record = lambda kind, **fields: recorded.append(fields)
+        elapsed = 0
+        for _ in range(bounded.ADMISSION_RECORDS + 5):
+            elapsed += 1
+            with self.clock(custodian, elapsed):
+                custodian.accept(self.message(custodian, NS, offset_s=elapsed, command=f"c{elapsed}"))
+        self.assertIsNone(custodian.guard.fault)
+        self.assertEqual(len(recorded), bounded.ADMISSION_RECORDS)
+        self.assertEqual(custodian.admission_granted, (bounded.ADMISSION_RECORDS + 5) * NS)
+
+    def test_the_decision_record_is_best_effort_and_never_latches(self):
+        custodian = self.custodian()
+        with self.clock(custodian, 90):
+            custodian.accept(self.message(custodian, 60 * NS, offset_s=90))
+        custodian.cmd_w = -1  # a failed write is dropped, never a fault
+        custodian.observe_admission(True)
+        self.assertIsNone(custodian.guard.fault)
+        custodian = self.custodian()
+        custodian.cmd_w = None
+        custodian.observe_admission(False)  # nothing to write to, nothing raised
+        self.assertIsNone(custodian.guard.fault)
+
+    # The stop boundary ------------------------------------------------------
+
     def test_a_marker_pending_at_the_stop_is_drained_before_the_deadline(self):
-        # Review finding: the watch loop could declare the deadline while a
-        # marker already published was still in the control pipe. One bounded
-        # drain runs first, so that marker still grants.
         custodian = self.custodian(limit=300)
         state = {"t": custodian.stop_at}
         pending = [self.message(custodian, 60 * NS, offset_s=280)]
@@ -1561,8 +1603,6 @@ class PureAdmission(unittest.TestCase):
         self.assertEqual(custodian.stop_at, custodian.start + 340 * NS)
 
     def test_a_grant_that_cannot_move_the_stop_cannot_spin_the_watch_loop(self):
-        # A zero-wait marker at the boundary grants nothing, so the next check
-        # declares the deadline instead of draining again.
         custodian = self.custodian(limit=300)
         state = {"t": custodian.stop_at}
         pending = [self.message(custodian, 0, offset_s=280)]
@@ -1581,58 +1621,24 @@ class PureAdmission(unittest.TestCase):
         self.assertTrue(custodian.deadline_hit)
         self.assertEqual(custodian.admission_granted, 0)
 
-    def test_a_future_stamped_grant_latches_and_grants_nothing(self):
-        custodian = self.custodian()
-        future = now_ns() + 60 * NS
-        custodian.accept(self.message(custodian, 60 * NS, offset_s=1) | {"at": future})
-        self.assertIn("future", custodian.guard.fault or "")
-        self.assertEqual(custodian.admission_granted, 0)
-
-    def test_grant_records_are_capped_and_never_fault(self):
-        custodian = self.custodian()
-        recorded = []
-        custodian.record = lambda kind, **fields: recorded.append(fields)
-        elapsed = 0
-        for _ in range(bounded.ADMISSION_RECORDS + 5):
-            elapsed += 1
-            with self.clock(custodian, elapsed):
-                custodian.accept(self.message(custodian, NS, offset_s=elapsed))
-        self.assertIsNone(custodian.guard.fault)
-        self.assertEqual(len(recorded), bounded.ADMISSION_RECORDS)
-        self.assertEqual(custodian.admission_granted, (bounded.ADMISSION_RECORDS + 5) * NS)
-
-    def test_the_decision_record_is_best_effort_and_never_latches(self):
-        custodian = self.custodian()
-        with self.clock(custodian, 90):
-            custodian.accept(self.message(custodian, 60 * NS, offset_s=90))
-        custodian.cmd_w = -1  # a failed write is dropped, never a fault
-        custodian.observe_admission(True)
-        self.assertIsNone(custodian.guard.fault)
-        custodian = self.custodian()
-        custodian.cmd_w = None
-        custodian.observe_admission(False)  # nothing to write to, nothing raised
-        self.assertIsNone(custodian.guard.fault)
+    # Waiting reports and per-command pairing --------------------------------
 
     def test_a_waiting_report_never_moves_a_deadline_and_is_recorded(self):
-        # Review finding: a wait that never ends before the stop left no trace.
-        # A waiting report is recorded before and after the stop alike, and it
-        # never grants time.
         custodian = self.custodian()
         recorded = []
         custodian.record = lambda kind, **fields: recorded.append(fields)
         before = (custodian.absolute, custodian.stop_at, custodian.exit_at)
         with self.clock(custodian, 5):
-            custodian.accept(self.message(custodian, 0, offset_s=5) | {
-                "type": "admission_waiting", "reason": "queue"})
+            custodian.accept(self.waiting(custodian, 5))
         self.assertEqual((custodian.absolute, custodian.stop_at, custodian.exit_at), before)
         self.assertEqual((custodian.admission_waiting_reports, custodian.admission_waiting_reason),
                          (1, "queue"))
         self.assertEqual(custodian.admission_waiting_ns, custodian.start + 5 * NS)
         self.assertEqual(recorded[0]["after_stop"], False)
+        self.assertEqual(recorded[0]["command"], "c1")
         custodian.stopped_at = custodian.start + 6 * NS
         with self.clock(custodian, 7):
-            custodian.accept(self.message(custodian, 0, offset_s=7) | {
-                "type": "admission_waiting", "reason": "host limit"})
+            custodian.accept(self.waiting(custodian, 7, command="c2"))
         self.assertEqual((custodian.absolute, custodian.stop_at, custodian.exit_at), before)
         self.assertEqual(custodian.admission_waiting_reports, 2)
         self.assertEqual(custodian.admission_waiting_reason, "queue", "the first reason is kept")
@@ -1640,11 +1646,60 @@ class PureAdmission(unittest.TestCase):
         self.assertEqual(custodian.admission_granted, 0)
         self.assertEqual(custodian.admission_counted, 0)
 
-    def test_the_decision_record_carries_the_waiting_facts(self):
+    def test_each_command_pairs_its_own_waiting_and_completion(self):
+        # Review finding: an unfinished wait may only be claimed for a command
+        # whose own completion was never reported. A zero-duration or late grant
+        # ends the wait; a waiting report for one command never pairs with the
+        # completion of another.
         custodian = self.custodian()
+        custodian.record = lambda kind, **fields: None
+        with self.clock(custodian, 10):
+            custodian.accept(self.waiting(custodian, 10, command="ended"))
+        with self.clock(custodian, 20):
+            custodian.accept(self.message(custodian, 25 * NS, offset_s=20, command="ended"))
+        with self.clock(custodian, 30):
+            custodian.accept(self.waiting(custodian, 30, command="zero"))
+        with self.clock(custodian, 40):
+            custodian.accept(self.message(custodian, 0, offset_s=40, command="zero"))
+        with self.clock(custodian, 50):
+            custodian.accept(self.waiting(custodian, 50, command="lost"))
+        with self.clock(custodian, 60):
+            custodian.accept(self.waiting(custodian, 60, command="lateonly"))
+        custodian.deadline_hit = True
+        with self.clock(custodian, 61):
+            custodian.accept(self.message(custodian, 5 * NS, offset_s=61, command="lateonly"))
+        pairs = self.pairs(custodian)
+        self.assertEqual(pairs["commands"], 4)
+        self.assertEqual(pairs["ended"], 3)
+        self.assertEqual(pairs["unfinished_count"], 1)
+        self.assertEqual([entry["command"] for entry in pairs["unfinished"]], ["lost"])
+        self.assertEqual(pairs["unfinished"][0]["reason"], "queue")
+        self.assertEqual(pairs["unfinished"][0]["waiting_ns"], custodian.start + 50 * NS)
+
+    def test_a_completion_without_a_waiting_report_is_never_unfinished(self):
+        custodian = self.custodian()
+        custodian.record = lambda kind, **fields: None
+        with self.clock(custodian, 10):
+            custodian.accept(self.message(custodian, 8 * NS, offset_s=10, command="only-grant"))
+        self.assertEqual(self.pairs(custodian)["commands"], 0, "only waiting reports are counted")
+        self.assertEqual(self.pairs(custodian)["unfinished_count"], 0)
+
+    def test_the_pairing_table_is_bounded_and_overflow_is_unclassified(self):
+        custodian = self.custodian()
+        custodian.record = lambda kind, **fields: None
+        for index in range(bounded.ADMISSION_COMMANDS + 3):
+            with self.clock(custodian, index):
+                custodian.accept(self.waiting(custodian, index, command=f"c{index}"))
+        self.assertEqual(custodian.admission_unclassified, 3)
+        self.assertEqual(len(custodian.admission_pairs), bounded.ADMISSION_COMMANDS)
+        self.assertEqual(self.pairs(custodian)["unfinished_count"], bounded.ADMISSION_COMMANDS)
+        self.assertEqual(len(self.pairs(custodian)["unfinished"]), bounded.ADMISSION_UNFINISHED)
+
+    def test_the_decision_record_carries_the_waiting_and_pairing_facts(self):
+        custodian = self.custodian()
+        custodian.record = lambda kind, **fields: None
         with self.clock(custodian, 9):
-            custodian.accept(self.message(custodian, 0, offset_s=9) | {
-                "type": "admission_waiting", "reason": "queue"})
+            custodian.accept(self.waiting(custodian, 9, command="c9"))
         custodian.cmd_r, custodian.cmd_w = self.pipe()
         custodian.observe_admission(True)
         os.close(custodian.cmd_w)
@@ -1652,81 +1707,61 @@ class PureAdmission(unittest.TestCase):
                     if record["record"]["event"] == "admission_decision"][0]
         self.assertEqual((decision["waiting_reports"], decision["waiting_reason"]), (1, "queue"))
         self.assertEqual(decision["waiting_ns"], custodian.start + 9 * NS)
+        self.assertEqual(decision["admission_waiting"]["commands"], 1)
+        self.assertEqual(decision["admission_waiting"]["ended"], 0)
+        self.assertEqual(decision["admission_waiting"]["unfinished_count"], 1)
+        self.assertEqual(decision["unclassified"], 0)
         self.assertEqual(decision["granted_ns"], 0)
         self.assertEqual(decision["absolute_ns"], custodian.start + 300 * NS)
 
-    def test_waiting_report_validation_matrix(self):
-        valid = {"schema": 1, "source": "oxide", "reason": "queue"}
-        self.assertIsNone(bounded.admission_waiting_malformed(valid))
-        self.assertIsNone(bounded.admission_waiting_malformed(dict(valid, reason="host limit")))
-        self.assertIsNone(bounded.admission_waiting_malformed(dict(valid, reason="x" * 32)))
-        cases = [
-            [], "report", 1, None, {},
-            {"schema": 1, "source": "oxide"},
-            {"schema": 1, "source": "oxide", "reason": "queue", "waited_ns": 1},
-            dict(valid, schema=0), dict(valid, schema="1"), dict(valid, schema=True),
-            dict(valid, source=""), dict(valid, source="x" * 33), dict(valid, source=1),
-            dict(valid, reason=""), dict(valid, reason="lin\ne"), dict(valid, reason="x" * 33),
-            dict(valid, reason=1), dict(valid, reason=True),
-        ]
-        for marker in cases:
-            self.assertIsNotNone(bounded.admission_waiting_malformed(marker), marker)
-
-    def test_the_waiting_reader_reports_its_own_message_and_record(self):
-        directory = self.fixture()
-        monitor = self.monitor(directory)
-        path = self.publish(directory, {"schema": 1, "source": "oxide", "reason": "queue"},
-                           name=bounded.WAITING_NAME)
-        info = os.lstat(str(path))
-        monitor.read_admission(str(path), (info.st_dev, info.st_ino), "admission_waiting")
-        os.close(monitor.ctl_w)
-        sent = self.drain(monitor.cmd_r)
-        self.assertEqual([m["type"] for m in sent], ["admission_waiting"])
-        self.assertEqual(sent[0]["reason"], "queue")
-        self.assertIsNone(bounded.malformed(sent[0]))
-        waiting = monitor.receipt["admission_waiting"]
-        self.assertEqual((waiting["observed"], waiting["reason"], waiting["ignored"]), (1, "queue", 0))
-        # The completed-wait record is untouched by a waiting report.
-        self.assertEqual(monitor.receipt["admission"]["observed"], 0)
-        self.assertEqual(monitor.receipt["admission"]["reported_wait_ns"], 0)
-
-    def test_a_rejected_waiting_report_is_recorded_without_a_message(self):
-        directory = self.fixture()
-        monitor = self.monitor(directory)
-        bad = self.publish(directory, {"schema": 1, "source": "oxide", "reason": "queue",
-                                       "waited_ns": 4}, name=bounded.WAITING_NAME)
-        monitor.read_admission(str(bad), None, "admission_waiting")
-        link = directory / "waiting-link"
-        os.symlink(str(bad), str(link))
-        monitor.read_admission(str(link), None, "admission_waiting")
-        self.assertEqual(self.drain(monitor.cmd_r), [])
-        waiting = monitor.receipt["admission_waiting"]
-        self.assertEqual((waiting["observed"], waiting["ignored"]), (0, 2))
-        self.assertEqual(waiting["reason"], None)
-        self.assertEqual(monitor.receipt["admission"]["ignored"], 0, "a waiting rejection is its own record")
+    # Documents --------------------------------------------------------------
 
     def test_malformed_marker_matrix(self):
-        valid = {"schema": 1, "source": "oxide", "waited_ns": 5}
-        self.assertIsNone(bounded.admission_malformed(valid))
-        self.assertIsNone(bounded.admission_malformed(dict(valid, waited_ns=bounded.U64MAX)))
-        self.assertIsNone(bounded.admission_malformed(dict(valid, source="x" * 32)))
+        valid = {"schema": 2, "source": "oxide", "run": self.RUN, "command": "4242-0", "waited_ns": 5}
+        self.assertIsNone(bounded.admission_malformed(valid, self.RUN))
+        self.assertIsNone(bounded.admission_malformed(dict(valid, waited_ns=bounded.U64MAX), self.RUN))
         cases = [
-            [], "marker", 1, None, {},
-            {key: valid[key] for key in ("schema", "source")},
-            dict(valid, extra=1),
-            dict(valid, schema=0), dict(valid, schema=2), dict(valid, schema="1"),
-            dict(valid, schema=True), dict(valid, schema=1.0),
-            dict(valid, source=""), dict(valid, source="x" * 33), dict(valid, source=1),
-            dict(valid, source="lin\ne"), dict(valid, source=True),
-            dict(valid, waited_ns=-1), dict(valid, waited_ns=True), dict(valid, waited_ns=1.5),
-            dict(valid, waited_ns=str(5)), dict(valid, waited_ns=bounded.U64MAX + 1),
+            ([], "not an object"), ("marker", "not an object"), (1, "not an object"),
+            ({}, "unexpected keys"),
+            ({key: valid[key] for key in ("schema", "source", "run", "command")}, "unexpected keys"),
+            (dict(valid, extra=1), "unexpected keys"),
+            (dict(valid, schema=1), "unsupported schema"), (dict(valid, schema=3), "unsupported schema"),
+            (dict(valid, schema="2"), "unsupported schema"), (dict(valid, schema=True), "unsupported schema"),
+            (dict(valid, source=""), "ill-typed source"), (dict(valid, source="x" * 33), "ill-typed source"),
+            (dict(valid, run="other"), "stale run"), (dict(valid, run=None), "stale run"),
+            (dict(valid, command=""), "ill-typed command"), (dict(valid, command="x" * 33), "ill-typed command"),
+            (dict(valid, command=1), "ill-typed command"),
+            (dict(valid, waited_ns=-1), "ill-typed waited_ns"), (dict(valid, waited_ns=True), "ill-typed waited_ns"),
+            (dict(valid, waited_ns=1.5), "ill-typed waited_ns"), (dict(valid, waited_ns=bounded.U64MAX + 1),
+                                                                  "ill-typed waited_ns"),
         ]
-        for marker in cases:
-            self.assertIsNotNone(bounded.admission_malformed(marker), marker)
+        for marker, expected in cases:
+            self.assertEqual(bounded.admission_malformed(marker, self.RUN), expected, marker)
+
+    def test_waiting_report_validation_matrix(self):
+        valid = {"schema": 2, "source": "oxide", "run": self.RUN, "command": "4242-0", "reason": "queue"}
+        self.assertIsNone(bounded.admission_waiting_malformed(valid, self.RUN))
+        self.assertIsNone(bounded.admission_waiting_malformed(dict(valid, reason="host limit"), self.RUN))
+        cases = [
+            ([], "not an object"), ({}, "unexpected keys"),
+            ({key: valid[key] for key in ("schema", "source", "run", "command")}, "unexpected keys"),
+            (dict(valid, waited_ns=1), "unexpected keys"),
+            (dict(valid, schema=1), "unsupported schema"), (dict(valid, schema="2"), "unsupported schema"),
+            (dict(valid, source=""), "ill-typed source"),
+            (dict(valid, run="other"), "stale run"),
+            (dict(valid, command=""), "ill-typed command"), (dict(valid, command=1), "ill-typed command"),
+            (dict(valid, reason=""), "ill-typed reason"), (dict(valid, reason="x" * 33), "ill-typed reason"),
+            (dict(valid, reason=1), "ill-typed reason"),
+        ]
+        for marker, expected in cases:
+            self.assertEqual(bounded.admission_waiting_malformed(marker, self.RUN), expected, marker)
+
+    # The monitor's readers --------------------------------------------------
 
     def monitor(self, directory):
-        monitor = bounded.Monitor({"inject": set(), "run_id": "r", "evidence": str(directory),
-                                   "admission_path": os.path.join(str(directory), bounded.ADMISSION_NAME)},
+        monitor = bounded.Monitor({"inject": set(), "run_id": self.RUN, "evidence": str(directory),
+                                   "admission_path": os.path.join(str(directory), bounded.ADMISSION_NAME),
+                                   "waiting_path": os.path.join(str(directory), bounded.WAITING_NAME)},
                                   None, None, None, None)
         monitor.cmd_r, monitor.ctl_w = self.pipe()
         monitor.receipt = {"admission": bounded.admission_record(),
@@ -1747,18 +1782,37 @@ class PureAdmission(unittest.TestCase):
     def test_a_valid_marker_is_reported_once_with_its_own_completion_stamp(self):
         directory = self.fixture()
         monitor = self.monitor(directory)
-        path = self.publish(directory, {"schema": 1, "source": "oxide", "waited_ns": 90 * NS})
+        path = self.publish(directory, {"schema": 2, "source": "oxide", "run": self.RUN,
+                                        "command": "4242-0", "waited_ns": 90 * NS})
         info = os.lstat(str(path))
         monitor.read_admission(str(path), (info.st_dev, info.st_ino))
         os.close(monitor.ctl_w)
         sent = self.drain(monitor.cmd_r)
         self.assertEqual([m["type"] for m in sent], ["admission"])
-        self.assertEqual(sent[0]["waited_ns"], 90 * NS)
+        self.assertEqual((sent[0]["waited_ns"], sent[0]["command"]), (90 * NS, "4242-0"))
         self.assertIsNone(bounded.malformed(sent[0]))
         self.assertEqual(monitor.receipt["admission"]["observed"], 1)
         self.assertEqual(monitor.receipt["admission"]["reported_wait_ns"], 90 * NS)
-        self.assertEqual(monitor.receipt["admission"]["ignored"], 0)
         self.assertLessEqual(monitor.receipt["admission"]["first_ns"], monitor.receipt["admission"]["last_ns"])
+
+    def test_a_stale_run_marker_is_rejected_without_a_message(self):
+        # Review finding: a marker left by an earlier run must never be paired
+        # with this one, whatever it claims.
+        directory = self.fixture()
+        monitor = self.monitor(directory)
+        stale = self.publish(directory, {"schema": 2, "source": "oxide", "run": "another-run",
+                                         "command": "4242-0", "waited_ns": 90 * NS})
+        monitor.read_admission(str(stale))
+        stale_waiting = self.publish(directory, {"schema": 2, "source": "oxide", "run": "another-run",
+                                                 "command": "4242-0", "reason": "queue"},
+                                     name=bounded.WAITING_NAME)
+        monitor.read_admission(str(stale_waiting), None, "admission_waiting")
+        self.assertEqual(self.drain(monitor.cmd_r), [])
+        self.assertEqual(monitor.receipt["admission"]["ignored"], 1)
+        self.assertIn("stale run", monitor.receipt["admission"]["rejections"])
+        self.assertEqual(monitor.receipt["admission_waiting"]["ignored"], 1)
+        self.assertIn("stale run", monitor.receipt["admission_waiting"]["rejections"])
+        self.assertEqual(monitor.receipt["admission_waiting"]["observed"], 0)
 
     def test_an_ignored_marker_is_recorded_and_never_sent(self):
         directory = self.fixture()
@@ -1767,7 +1821,8 @@ class PureAdmission(unittest.TestCase):
         monitor.read_admission(str(oversized))
         malformed = self.publish(directory, b"not json")
         monitor.read_admission(str(malformed))
-        wrong = self.publish(directory, {"schema": 2, "source": "oxide", "waited_ns": 1})
+        wrong = self.publish(directory, {"schema": 1, "source": "oxide", "run": self.RUN,
+                                         "command": "4242-0", "waited_ns": 1})
         monitor.read_admission(str(wrong))
         link = directory / "link"
         os.symlink(str(malformed), str(link))
@@ -1797,14 +1852,52 @@ class PureAdmission(unittest.TestCase):
         record = monitor.receipt["admission"]
         self.assertEqual((record["observed"], record["ignored"], record["errors"]), (0, 1, 0))
 
-    def test_the_receipt_object_is_bounded_and_typed(self):
+    def test_the_waiting_reader_reports_its_own_message_and_record(self):
+        directory = self.fixture()
+        monitor = self.monitor(directory)
+        path = self.publish(directory, {"schema": 2, "source": "oxide", "run": self.RUN,
+                                        "command": "4242-3", "reason": "queue"},
+                            name=bounded.WAITING_NAME)
+        info = os.lstat(str(path))
+        monitor.read_admission(str(path), (info.st_dev, info.st_ino), "admission_waiting")
+        os.close(monitor.ctl_w)
+        sent = self.drain(monitor.cmd_r)
+        self.assertEqual([m["type"] for m in sent], ["admission_waiting"])
+        self.assertEqual((sent[0]["reason"], sent[0]["command"]), ("queue", "4242-3"))
+        self.assertIsNone(bounded.malformed(sent[0]))
+        waiting = monitor.receipt["admission_waiting"]
+        self.assertEqual((waiting["observed"], waiting["reason"], waiting["ignored"]), (1, "queue", 0))
+        self.assertEqual(monitor.receipt["admission"]["observed"], 0)
+        self.assertEqual(monitor.receipt["admission"]["reported_wait_ns"], 0)
+
+    def test_a_rejected_waiting_report_is_recorded_without_a_message(self):
+        directory = self.fixture()
+        monitor = self.monitor(directory)
+        bad = self.publish(directory, {"schema": 2, "source": "oxide", "run": self.RUN,
+                                       "command": "4242-3", "reason": "queue", "waited_ns": 4},
+                           name=bounded.WAITING_NAME)
+        monitor.read_admission(str(bad), None, "admission_waiting")
+        link = directory / "waiting-link"
+        os.symlink(str(bad), str(link))
+        monitor.read_admission(str(link), None, "admission_waiting")
+        self.assertEqual(self.drain(monitor.cmd_r), [])
+        waiting = monitor.receipt["admission_waiting"]
+        self.assertEqual((waiting["observed"], waiting["ignored"]), (0, 2))
+        self.assertEqual(waiting["reason"], None)
+        self.assertEqual(monitor.receipt["admission"]["ignored"], 0, "a waiting rejection is its own record")
+
+    def test_the_receipt_objects_are_bounded_and_typed(self):
         record = bounded.admission_record()
         self.assertEqual(set(record), {"schema", "marker", "observed", "reported_wait_ns", "first_ns",
                                        "last_ns", "identity", "ignored", "rejections", "errors"})
         self.assertEqual(record["marker"], bounded.ADMISSION_NAME)
-        record["rejections"] = ["reason"] * bounded.ADMISSION_REJECTIONS
-        encoded = json.dumps(record)
-        self.assertLess(len(encoded), 1024)
+        waiting = bounded.admission_waiting_record()
+        self.assertEqual(set(waiting), {"schema", "marker", "observed", "first_ns", "last_ns", "reason",
+                                        "identity", "ignored", "rejections", "errors"})
+        self.assertEqual(waiting["marker"], bounded.WAITING_NAME)
+        for entry in (record, waiting):
+            entry["rejections"] = ["reason"] * bounded.ADMISSION_REJECTIONS
+            self.assertLess(len(json.dumps(entry)), 1024)
         self.assertLess(bounded.ADMISSION_MAX_BYTES, 4096)
 
 
@@ -5699,17 +5792,29 @@ class Real(unittest.TestCase):
         self.assertEqual(self.outcome()["closure"], "closed")
         self.assertEqual(self.receipt["phase"], "monitor_complete: pending_custodian")
 
+    @staticmethod
+    def report_document(kind, command, waited_ns=None, reason=None):
+        """The exact bounded document a fixture publishes (schema 2, this run)."""
+        document = {"schema": 2, "source": "fixture",
+                    "run": os.environ["OXIDE_PROOF_RUN_ID"], "command": command}
+        if kind == "waiting":
+            document["reason"] = reason or "queue"
+        else:
+            document["waited_ns"] = waited_ns
+        return document
+
     def test_admission_marker_extends_the_work_window(self):
         # oxide#192: a reported slot-queue wait moves the supervisor's deadline
         # by that wait, so execution keeps its own window instead of being
         # killed inside it. Without the grant the leader is stopped at
         # limit - 20 s, well before it finishes.
+        document = self.report_document("grant", "fixture-1", waited_ns=10 * 1000000000)
         code = fixture(
             "import json\n"
             "path = os.path.join(os.environ['OXIDE_PROOF_EVIDENCE'], " + repr(bounded.ADMISSION_NAME) + ")\n"
             "time.sleep(10)\n"
             "with open(path + '.tmp', 'w') as handle:\n"
-            "    json.dump({'schema': 1, 'source': 'fixture', 'waited_ns': 10 * 1000000000}, handle)\n"
+            "    json.dump(" + repr(document) + ", handle)\n"
             "os.replace(path + '.tmp', path)\n"
             "time.sleep(12)\n"
             "open(os.environ['CASE_DIR'] + '/ran', 'w')\n")
@@ -5727,6 +5832,7 @@ class Real(unittest.TestCase):
         self.assertGreaterEqual(decisions[0]["granted_ns"], 9 * NS)
         self.assertLessEqual(decisions[0]["granted_ns"], 11 * NS)
         self.assertFalse(decisions[0]["capped"])
+        self.assertEqual(decisions[0]["admission_waiting"]["commands"], 0)
 
     def test_a_late_admission_marker_is_classified_not_ignored(self):
         # Review finding: slot admission can reach the supervisor after its stop
@@ -5735,13 +5841,21 @@ class Real(unittest.TestCase):
         # The fixture ignores TERM, writes its marker after the stop instant and
         # stays in the group long enough for the sampler to read it while the
         # custodian is still in its bounded stop.
+        waiting = self.report_document("waiting", "fixture-late")
+        grant = self.report_document("grant", "fixture-late", waited_ns=13 * 1000000000)
         code = fixture(
             "import json\n"
             "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-            "path = os.path.join(os.environ['OXIDE_PROOF_EVIDENCE'], " + repr(bounded.ADMISSION_NAME) + ")\n"
-            "time.sleep(13)\n"
+            "evidence = os.environ['OXIDE_PROOF_EVIDENCE']\n"
+            "path = os.path.join(evidence, " + repr(bounded.ADMISSION_NAME) + ")\n"
+            "waiting = os.path.join(evidence, " + repr(bounded.WAITING_NAME) + ")\n"
+            "time.sleep(5)\n"
+            "with open(waiting + '.tmp', 'w') as handle:\n"
+            "    json.dump(" + repr(waiting) + ", handle)\n"
+            "os.replace(waiting + '.tmp', waiting)\n"
+            "time.sleep(8)\n"
             "with open(path + '.tmp', 'w') as handle:\n"
-            "    json.dump({'schema': 1, 'source': 'fixture', 'waited_ns': 13 * 1000000000}, handle)\n"
+            "    json.dump(" + repr(grant) + ", handle)\n"
             "os.replace(path + '.tmp', path)\n"
             "open(os.environ['CASE_DIR'] + '/ran', 'w')\n"
             "time.sleep(1.5)\n")
@@ -5763,18 +5877,24 @@ class Real(unittest.TestCase):
         self.assertEqual(decisions[0]["granted_ns"], 0)
         self.assertEqual(decisions[0]["late_reason"], "deadline")
         self.assertEqual(decisions[0]["absolute_ns"], self.receipt["start_ns"] + 32 * NS)
+        pairs = decisions[0]["admission_waiting"]
+        self.assertEqual((pairs["commands"], pairs["ended"], pairs["unfinished_count"]), (1, 1, 0),
+                         "a late grant ends its own command's wait, never leaving it unfinished")
+        self.assertEqual(self.receipt["admission_waiting"]["observed"], 1)
+        self.assertEqual(self.receipt["admission_waiting"]["reason"], "queue")
 
     def test_a_wait_that_never_ends_is_reported_and_classified(self):
         # Review finding: a wait ending at the supervisor stop could leave no
         # admission marker and no separately classified queue wait. A waiting
         # report is published when the wait starts, so the run is classified as
         # a deadline with a reported, never-granted queue wait.
+        document = self.report_document("waiting", "fixture-1")
         code = fixture(
             "import json\n"
             "path = os.path.join(os.environ['OXIDE_PROOF_EVIDENCE'], "
             + repr(bounded.WAITING_NAME) + ")\n"
             "with open(path + '.tmp', 'w') as handle:\n"
-            "    json.dump({'schema': 1, 'source': 'fixture', 'reason': 'queue'}, handle)\n"
+            "    json.dump(" + repr(document) + ", handle)\n"
             "os.replace(path + '.tmp', path)\n"
             "time.sleep(30)\n")
         self.assertEqual(self.guardian(code, limit=32), 124)
@@ -5792,6 +5912,52 @@ class Real(unittest.TestCase):
         self.assertEqual((decisions[0]["waiting_reports"], decisions[0]["waiting_reason"]), (1, "queue"))
         self.assertEqual(decisions[0]["granted_ns"], 0)
         self.assertEqual(decisions[0]["absolute_ns"], self.receipt["start_ns"] + 32 * NS)
+        pairs = decisions[0]["admission_waiting"]
+        self.assertEqual((pairs["commands"], pairs["ended"], pairs["unfinished_count"]), (1, 0, 1))
+        self.assertEqual(pairs["unfinished"][0]["command"], "fixture-1")
+        self.assertEqual(pairs["unfinished"][0]["reason"], "queue")
+
+    def test_a_stale_wait_and_a_zero_duration_grant_are_not_proven_unfinished(self):
+        # Review finding: a stale marker left by an earlier run, and a wait whose
+        # own completion arrived with a zero duration, must not be reported as a
+        # proven unfinished wait. The stale file is rejected by run identity and
+        # the zero-duration grant ends its command's wait.
+        evidence = self.dir / "evidence"
+        evidence.mkdir()
+        (evidence / bounded.WAITING_NAME).write_text(json.dumps(
+            {"schema": 2, "source": "fixture", "run": "stale-run", "command": "fixture-stale",
+             "reason": "queue"}))
+        waiting = self.report_document("waiting", "fixture-1")
+        grant = self.report_document("grant", "fixture-1", waited_ns=0)
+        code = fixture(
+            "import json\n"
+            "evidence = os.environ['OXIDE_PROOF_EVIDENCE']\n"
+            "waiting = os.path.join(evidence, " + repr(bounded.WAITING_NAME) + ")\n"
+            "grant = os.path.join(evidence, " + repr(bounded.ADMISSION_NAME) + ")\n"
+            "time.sleep(1)\n"
+            "with open(waiting + '.tmp', 'w') as handle:\n"
+            "    json.dump(" + repr(waiting) + ", handle)\n"
+            "os.replace(waiting + '.tmp', waiting)\n"
+            "with open(grant + '.tmp', 'w') as handle:\n"
+            "    json.dump(" + repr(grant) + ", handle)\n"
+            "os.replace(grant + '.tmp', grant)\n"
+            "open(os.environ['CASE_DIR'] + '/ran', 'w')\n"
+            "time.sleep(30)\n")
+        self.assertEqual(self.guardian(code, limit=31), 124)
+        self.assertTrue(self.outcome()["deadline"])
+        self.assertEqual(self.outcome()["closure"], "closed")
+        self.assertIsNone(self.outcome()["fault"])
+        self.assertTrue((self.dir / "ran").exists())
+        self.assertGreaterEqual(self.receipt["admission_waiting"]["ignored"], 1,
+                                "the stale waiting file was not rejected")
+        self.assertIn("stale run", self.receipt["admission_waiting"]["rejections"])
+        decisions = [r for r in self.receipt["custodian"] if r["event"] == "admission_decision"]
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["granted_ns"], 0, "a zero-duration grant moves no clock")
+        pairs = decisions[0]["admission_waiting"]
+        self.assertEqual((pairs["commands"], pairs["ended"], pairs["unfinished_count"]), (1, 1, 0),
+                         "the zero-duration grant ends its command's wait")
+        self.assertEqual(decisions[0]["unclassified"], 0)
 
     def test_a_malformed_admission_marker_changes_nothing(self):
         # Cooperative evidence only: a rejected marker is recorded and the run
@@ -5800,7 +5966,7 @@ class Real(unittest.TestCase):
             "import json\n"
             "path = os.path.join(os.environ['OXIDE_PROOF_EVIDENCE'], " + repr(bounded.ADMISSION_NAME) + ")\n"
             "with open(path, 'w') as handle:\n"
-            "    json.dump({'schema': 1, 'waited_ns': 10 * 1000000000}, handle)\n"
+            "    json.dump({'schema': 2, 'source': 'fixture', 'waited_ns': 10 * 1000000000}, handle)\n"
             "time.sleep(1)\n"
             "open(os.environ['CASE_DIR'] + '/ran', 'w')\n")
         self.assertEqual(self.guardian(code, limit=32), 0)

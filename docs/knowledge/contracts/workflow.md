@@ -657,20 +657,24 @@ Cargo.
    is nested in, or the `scratch`/`evidence` sibling of, the canonical
    `OXIDE_TASK_SCRATCH_ROOT` — a granted lease publishes one bounded marker,
    `admission.json`, carrying this command's own measured admission interval
-   (`{"schema":1,"source":"oxide","waited_ns":N}`, at most 512 bytes, written
-   to a private temporary file and renamed). It exists so the supervisor can
+   (`{"schema":2,"source":"oxide","run":R,"command":C,"waited_ns":N}`, at most
+   512 bytes, written to a private temporary file and renamed). `R` is the
+   supervisor's exported run identity and `C` one bounded token for this
+   admission attempt, so a report can be paired with its own command and a file
+   left by an earlier run is recognisable. It exists so the supervisor can
    report queue time separately instead of spending its work window on it
    ([shared proof supervisor](#shared-proof-supervisor)). When the command
    first observes that it has to wait it also publishes one
-   `admission-waiting.json` (`{"schema":1,"source":"oxide","reason":"<token>"}`,
+   `admission-waiting.json`
+   (`{"schema":2,"source":"oxide","run":R,"command":C,"reason":"<token>"}`,
    the same bounds, the reason being its own wait label such as `queue` or
    `host limit`), so a wait that never ends before the supervisor stops is still
-   reported and classified; that report grants nothing. Both writes are best
-   effort and observation only: an unarmed run writes nothing, a failed write
-   changes nothing, Oxide never reads either report back, and no slot, ledger,
-   output or exit-code state depends on them. They are compiled in every
-   profile, because an installed `oxide` runs the reported case too; they are
-   the proof-facing side effects that are not debug-only hooks.
+   reported; that report grants nothing. Both writes are best effort and
+   observation only: an unarmed run writes nothing, a failed write changes
+   nothing, Oxide never reads either report back, and no slot, ledger, output or
+   exit-code state depends on them. They are compiled in every profile, because
+   an installed `oxide` runs the reported case too; they are the proof-facing
+   side effects that are not debug-only hooks.
    **Second-slot rule** (Tom, 2026-10-20, oxide#107): when this checkout's
    slot for the same key is busy (a live command such as a long `oxide exec
    -- tauri dev`, or an interrupted one whose group may still run), a further
@@ -2192,10 +2196,10 @@ with no earlier run migrated.
 `bounded-test.py`, `test_supervisor.py` and `qualify-supervisor.py` bytes that
 carry the admission marker are **unqualified**: the `bc24b238…` bytes above stay
 the qualified ones for their own runs, and no earlier evidence is migrated.
-This change adds the marker protocol below, the waiting report, 23 pure cases
-and 4 real cases (232 pure + 44 real = 276 total, which the bootstrap's expected
-count and its limitation list follow), the stop-boundary drain and late-marker
-classification, and nothing else: the exported deadline, closure, census,
+This change adds the marker protocol below, the correlated waiting report, 27
+pure cases and 5 real cases (236 pure + 45 real = 281 total, which the
+bootstrap's expected count and its limitation list follow), the stop-boundary
+drain and late-marker classification, and nothing else: the exported deadline, closure, census,
 reserve, scratch, cleanup and signal rules are unchanged, and a run with no
 marker behaves exactly as before. It qualifies only once its own uncounted
 keep-going diagnostic and separate author and reviewer
@@ -2220,14 +2224,15 @@ first diagnostic at `96f0767` recorded a fixture `NameError` as one failed case
 and continued (corrected, preserved as history).
 
 **Current source: qualification pending separate activation.** The bytes that
-carry the waiting report have **no** exact-head author qualification yet, and
-this task's run did not run or claim one: the uncounted diagnostic and the
-counted qualification each need their own separate activation. Until those
-exist at this head, the bytes are unqualified and carry no credit for any other
-proof; the `bc24b238…` (#151) bytes remain the qualified ones for their own
-runs. The covering checks that did run are recorded in the pull request: the
-232 pure cases, the Rust unit suite, compile, release compile, format and
-`docs:check`.
+carry the correlated waiting report (schema 2 with the run and command tokens)
+have **no** exact-head author qualification yet, and this task's run did not run
+or claim one: the uncounted diagnostic and the counted qualification each need
+their own separate activation. Until those exist at this head, the bytes are
+unqualified and carry no credit for any other proof; the `bc24b238…` (#151)
+bytes remain the qualified ones for their own runs. The covering checks that did
+run are recorded in the pull request: the 236 pure cases, the Rust unit suite,
+compile, release compile, format and `docs:check`. The earlier receipts above
+were produced before the schema-2 correlation and bind those older bytes only.
 
 **Settlement observation (oxide#147, unqualified source).** The current
 `bounded-test.py` also carries observation-only settlement diagnostics, so a
@@ -2566,22 +2571,28 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   and the product cancels its waiting lease on a signal rather than reporting a
   grant it did not get.
 
-  **A wait that never ends.** `admission-waiting.json` has exactly the keys
-  `schema`, `source` and `reason` (schema 1, two printable tokens of at most 32
-  characters), at most 512 bytes, and is published by the child when a wait
-  starts. The monitor reports it once per identity into
-  `receipt.admission_waiting` (observations, first reason, bounded rejections)
-  and the custodian records each one as an `admission_waiting` event, before or
-  after the stop alike. It never moves `absolute`, `stop_at` or `exit_at`; it
-  exists so a wait that never ended before the stop is classified separately
-  from a plain timeout: the summary names the reason, its offset from start and the
-  granted time, and states that the deadline classification stands and the
-  queue wait was reported, not granted, when nothing was granted. A rejected
-  waiting report is recorded in its own bounded list and never faults the run.
-  Together with the grant and late records this makes the three cases
-  distinguishable in one receipt: granted before the stop, granted after it
-  (late, no clock moved), and still waiting when it fired (reported, nothing
-  granted). A missing, malformed, oversized, linked or unreadable
+  **A wait that never ends, correlated per command.** Both schema-2 documents
+  name the run and one bounded command token. The monitor rejects any document
+  whose `run` is not this run (reason `stale run`) and keeps the rejection in
+  the report's own bounded list, so a file left by an earlier run is never
+  paired with this one. `admission-waiting.json` has exactly the keys
+  `schema`, `source`, `run`, `command` and `reason` (two printable tokens of at
+  most 32 characters), at most 512 bytes, and is published by the child when a
+  wait starts; it never moves `absolute`, `stop_at` or `exit_at`. The custodian
+  keeps a bounded pairing table (64 commands) and pairs a command's waiting
+  report only with that command's own completed report. Its wait **ended** when
+  its own completion arrived, at any duration: a zero-duration grant, a grant
+  clamped by the cap and a late grant all end it. It is **unfinished** only when
+  no terminal report for that same command was received, and only then does the
+  summary say that no completion was reported before the stop decision and that
+  the deadline classification stands with nothing granted. A rejected or
+  overflowed report is **unclassified**, never unfinished: the summary counts
+  rejected waiting and completed reports and says a command listed as
+  unfinished may have ended in one of them. Together with the grant and late
+  records this makes the states distinguishable in one receipt: granted before
+  the stop, granted after it (late, no clock moved), still waiting when it fired
+  (paired, nothing granted), stale (rejected by run), and unclassified (a report
+  was lost or rejected). A missing, malformed, oversized, linked or unreadable
   marker is recorded in `receipt.admission` with a bounded rejection list and
   nothing else happens: it never latches a fault and never changes closure,
   EOF, cleanup or classification. The grant is cooperative evidence about the
@@ -2706,7 +2717,7 @@ with a recorded minimum. A fallback run, or a nested case outside the
 monitored root, fails the qualification. Its reserve readings identify the
 qualification's scratch volume and the boot volume separately. The suite
 runs in order:
-- 232 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 236 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -2978,7 +2989,7 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 276 cases;
+- all 281 cases;
 - every real case directory and receipt still present after the
   candidate's cleanup.
 
