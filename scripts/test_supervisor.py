@@ -3444,6 +3444,10 @@ def detach_case_rows(case):
     ]
 
 
+class KernelFactsForOracle:
+    """The detach-path oracle needs no kernel facts; this makes that explicit."""
+
+
 class PureQualificationTopology(unittest.TestCase):
     """The actual new-default qualification: nested case resources, evidence
     and reserve all on the selected volume inside the monitored owned root,
@@ -3697,6 +3701,52 @@ class PureQualificationTopology(unittest.TestCase):
                     "registration": registration, "pool": os.path.join(mount, "pool"),
                     "volume_uuid": DRIVE_UUID, "device": DRIVE_DEVICE}
         return (mount, parent, base, root, evidence, scratch, case, registration, facts, expected)
+
+    def detach_oracle(self, receipt, rows):
+        results = {"outcomes": [["zero", "pass"]], "cases": [{"case": "zero", "dir": "/x"}] + rows}
+        plan = dict(qualify.check_plan(receipt, results, {"source": "selected-volume"},
+                                       None, KernelFactsForOracle(), None))
+        return plan["detach-paths"]()
+
+    def test_the_receipt_path_checks_the_recorded_detach_and_cleanup_objects(self):
+        receipt = {"phase": "monitor_complete: pending_custodian",
+                   "outcome": {"closure": "closed", "status": 0, "fault": None, "deadline": False}}
+        rows = detach_case_rows("/x")
+        self.assertEqual(self.detach_oracle(receipt, rows), [], rows)
+
+        # The request-free keep must be recorded under `cleanup`, not `detach`.
+        swapped = [dict(row) for row in rows]
+        for index, row in enumerate(swapped):
+            if row["case"].endswith("unrequested_attachment_keeps_the_owned_root"):
+                swapped[index] = {"case": row["case"], "dir": "/x", "exit": 125,
+                                  "detach": row["cleanup"]}
+        problems = self.detach_oracle(receipt, swapped)
+        self.assertTrue(any("recorded a detach object for a request-free run" in p for p in problems),
+                        problems)
+        self.assertTrue(any("recorded no pre-cleanup keep" in p for p in problems), problems)
+
+        # A cleanup record that is not a keep is a problem too.
+        not_kept = [dict(row) for row in rows]
+        for index, row in enumerate(not_kept):
+            if row["case"].endswith("unrequested_attachment_keeps_the_owned_root"):
+                not_kept[index] = dict(row, cleanup={"state": "ok", "reason": None})
+        self.assertTrue(any("not kept" in p for p in self.detach_oracle(receipt, not_kept)),
+                        not_kept)
+
+        # Missing rows and mislabelled stuck-child outcomes are named.
+        without_stuck = [row for row in rows if "stuck_detach_child" not in row["case"]]
+        self.assertTrue(any("recorded no detach outcome" in p
+                            for p in self.detach_oracle(receipt, without_stuck)))
+        stuck_open = [dict(row) for row in rows]
+        for index, row in enumerate(stuck_open):
+            if "stuck_detach_child" in row["case"]:
+                stuck_open[index] = dict(row, detach=dict(row["detach"], custodian_closed=False))
+        self.assertTrue(any("custodian_closed" in p for p in self.detach_oracle(receipt, stuck_open)),
+                        stuck_open)
+
+        # An outer run that published a detach request of its own is a problem.
+        self.assertTrue(any("published a detach request" in p
+                            for p in self.detach_oracle(dict(receipt, detach={}), rows)))
 
     def test_the_owned_subtree_routing_and_marker_are_verified(self):
         mount, parent, base, root, evidence, scratch, case, registration, facts, expected = \
@@ -6924,6 +6974,10 @@ class DetachReal(unittest.TestCase):
         self.volume = json.loads((self.dir / "volume.json").read_text())
         CASES.append({"case": self._testMethodName, "exit": self.code, "phase": self.receipt["phase"],
                       "dir": str(self.dir), "detach": self.receipt.get("detach"),
+                      # The request-free keep is recorded under `cleanup`, which the
+                      # qualification oracle verifies; without it the row cannot be
+                      # checked at all.
+                      "cleanup": self.receipt.get("cleanup"),
                       "wall_s": round((now_ns() - self.started) / NS, 3), "kept": str(self.dir)})
 
     def remove_fixture_mount(self):
@@ -6967,8 +7021,10 @@ class DetachReal(unittest.TestCase):
         self.assertIsNone(self.receipt.get("detach"), "a request-free run recorded a detach object")
         kept = self.receipt["cleanup"]
         self.assertEqual(kept["state"], "kept")
-        self.assertIn("never requested", kept["reason"])
+        # Stable semantics, not a transcript phrase: the declared backing is named
+        # and the reason says nothing was positively detached.
         self.assertEqual(kept["unrequested"], [self.volume["image"]])
+        self.assertIn("never positively detached", kept["reason"])
         self.assertEqual(self.code, 125)
         self.assertTrue(os.path.exists(self.receipt["scratch"]), "the root holding the image was cleaned")
         self.assertTrue(os.path.isfile(self.volume["image"]), "the backing under the live mount was removed")
@@ -7011,10 +7067,13 @@ class DetachReal(unittest.TestCase):
         self.assertIsNotNone(detach.get("identity_problem"), detach)
         self.assertEqual((detach.get("reaped"), detach.get("reaped_by")), (True, "monitor"), detach)
         self.assertEqual(detach["qualified"], False)
-        self.assertIn("detach_child_identity_unreadable", self.receipt["phase"])
+        # Durable facts only: the monitor's own close is recorded in the detach
+        # object, whatever phase the monitor published last.
+        self.assertEqual(detach.get("reap_timed_out"), False, detach)
         records = [r for r in self.receipt["custodian"] if r["event"].startswith("detach_child_")]
         self.assertFalse([r for r in records if r["event"] == "detach_child_signal"],
                          "an identity-less child was handed to the custodian anyway")
+        self.assertFalse([r for r in records if r["event"] == "detach_child_pinned"], records)
         self.assertTrue(os.path.exists(self.receipt["scratch"]), "the root was cleaned")
         self.remove_fixture_mount()
 
@@ -7053,7 +7112,8 @@ class DetachReal(unittest.TestCase):
                          detach)
         records = [r for r in self.receipt["custodian"] if r["event"].startswith("detach_child_")]
         refused = [r for r in records if r["event"] == "detach_child_refused"]
-        self.assertTrue(refused and "cannot be read" in refused[0]["observation"], records)
+        self.assertTrue(refused and refused[0]["observation"].startswith("identity unreadable"),
+                        records)
         self.assertFalse([r for r in records if r["event"] == "detach_child_signal"], records)
         self.assertTrue(os.path.exists(self.receipt["scratch"]), "the root was cleaned")
         self.remove_fixture_mount()
