@@ -390,9 +390,10 @@ pub fn exit_code(status: ExitStatus) -> u8 {
 
 /// Test-only owner of a group a test spawned. Every exit path, including a
 /// panic unwinding through a failing assertion, KILLs whatever is still in the
-/// group and reaps the leader before the owner is gone. Without it a failed
-/// test leaves a member such as `sleep` behind, reparented to launchd and
-/// outside the runner's closure.
+/// group, then waits up to `OWNED_CLOSE` for the leader to be reaped and the
+/// group to empty. A survivor is printed to stderr; it is never reported as
+/// closed. Without the owner a failed test leaves a member such as `sleep`
+/// behind, reparented to launchd and outside the runner's closure.
 #[cfg(test)]
 pub struct OwnedGroup(Group);
 
@@ -433,14 +434,21 @@ impl Drop for OwnedGroup {
             return;
         }
         signal_group(id, libc::SIGKILL);
-        // KILL reaches the leader too, so this wait returns once it is gone.
-        let _ = self.0.child.wait();
+        // One bound covers both the leader's reap and the group's emptiness.
+        // A survivor is reported, never treated as closed.
         let started = Instant::now();
-        while !group_empty(id) && started.elapsed() < OWNED_CLOSE {
+        let mut reaped = false;
+        loop {
+            reaped = reaped || matches!(self.0.child.try_wait(), Ok(Some(_)));
+            if (reaped && group_empty(id)) || started.elapsed() >= OWNED_CLOSE {
+                break;
+            }
             std::thread::sleep(POLL);
         }
-        if !group_empty(id) {
-            eprintln!("oxide test: process group {id} did not close after KILL");
+        if !(reaped && group_empty(id)) {
+            eprintln!(
+                "oxide test: process group {id} did not close after KILL (leader reaped: {reaped})"
+            );
         }
     }
 }
