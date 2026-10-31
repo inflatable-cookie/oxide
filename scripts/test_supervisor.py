@@ -5137,6 +5137,40 @@ class PureDetach(unittest.TestCase):
         self.assertEqual((record["state"], record["post_state"], record["qualified"]),
                          ("failed", "still_attached", False), record)
 
+    def test_the_fixture_child_imports_every_module_it_uses(self):
+        # The fixture body is a fresh python child: a module it reaches through a
+        # dotted name must be imported there, or it dies with NameError before any
+        # mount exists. This parses the body, proves every such root is imported,
+        # and executes the import line so the binding is real.
+        body = DETACH_CASE
+        tree = ast.parse(body)
+        imported, assigned = set(), set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add((node.module or "").split(".")[0])
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                assigned.add(node.id)
+            elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                assigned.add(node.name)
+        roots = {node.value.id for node in ast.walk(tree)
+                 if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)} - assigned
+        missing = sorted(roots - imported)
+        self.assertEqual(missing, [], f"the fixture uses unimported modules: {missing}")
+        self.assertIn("re", imported)
+        # Execute every module-level import the child runs (the prologue's and the
+        # fixture's own) and prove the modules it reaches are really bound.
+        imports = [node for node in tree.body if isinstance(node, ast.Import)]
+        self.assertTrue(imports)
+        namespace = {}
+        for node in imports:
+            exec(compile(ast.Module(body=[node], type_ignores=[]), "<fixture-imports>", "exec"),
+                 namespace)
+        for name in sorted(roots):
+            self.assertIn(name, namespace, f"{name} is used but not bound by an import")
+        self.assertTrue(callable(namespace["re"].fullmatch), "the import line does not bind re")
+
     def test_the_fixture_accepts_the_two_disk_attachment(self):
         # The qualification fixture must accept an image with more than one
         # whole-disk entity and name the mounted one.
@@ -6943,7 +6977,7 @@ sys.exit(qualify.bounded(work, start + 2 * 10**9, start + 3 * 10**9))
 # `-owners on`, and (for the two refusal cases) removes its own fixture after the
 # nested guard has exited.
 DETACH_CASE = fixture("""
-import json, os, plistlib, subprocess, sys
+import json, os, plistlib, re, subprocess, sys
 case = os.environ["CASE_DIR"]
 evidence = os.environ["OXIDE_PROOF_EVIDENCE"]
 token = os.environ["CASE_TOKEN"]

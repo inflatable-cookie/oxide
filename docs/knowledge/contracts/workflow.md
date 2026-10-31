@@ -2266,7 +2266,7 @@ custodian keeps its filesystem-free decision path and the existing
 cooperative-session limits. These bytes are unqualified until one uncounted
 `effigy proof:supervisor:qualify:diagnostic` records a clean picture and then
 ONE counted author and ONE separate independent reviewer
-`effigy proof:supervisor:qualify` pass at the same head (267 pure plus 51 real
+`effigy proof:supervisor:qualify` pass at the same head (268 pure plus 51 real
 cases, including the fifty-seven pure detach cases and the eight real ones: a
 bound success, a refused identity, a failed attempt, an unrequested attachment
 whose opt-in custody keep is recorded separately, and a real stuck child the
