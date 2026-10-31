@@ -1026,6 +1026,18 @@ pub mod managed {
         Pool::open(pool)?.evict_idle(slot_id)
     }
 
+    /// Retire one held slot by ID and its exact lease, for the
+    /// operator-confirmed quarantined release (oxide#196). A failed rename or
+    /// row write leaves the slot held; only a completed transaction moves the
+    /// tree into the payload's private holding area.
+    pub fn evict_held_slot(
+        pool: &Path,
+        slot_id: &str,
+        lease_id: &str,
+    ) -> Result<Vec<String>, LeaseError> {
+        Pool::open(pool)?.evict_held(slot_id, lease_id)
+    }
+
     /// The holding entry name one generation derives, from facts a caller
     /// already holds (`store_id`, slot, incarnation and the generation's lease
     /// ID). A command that evicted a slot by ID therefore names the entry it
@@ -1087,6 +1099,15 @@ pub(super) fn evict_idle_slot_injected(
     slot_id: &str,
 ) -> Result<Vec<String>, LeaseError> {
     managed::evict_idle_slot(pool, slot_id)
+}
+
+#[cfg(test)]
+pub(super) fn evict_held_slot_injected(
+    pool: &Path,
+    slot_id: &str,
+    lease_id: &str,
+) -> Result<Vec<String>, LeaseError> {
+    managed::evict_held_slot(pool, slot_id, lease_id)
 }
 
 #[cfg(test)]
@@ -2139,6 +2160,48 @@ impl Pool {
             return Err(LeaseError::Busy);
         };
         self.retire_idle_slot(id, incarnation, &project, profile)?;
+        Ok(std::mem::take(&mut self.created_holding))
+    }
+
+    /// Retire one **held** recorded slot by ID and its lease (oxide#196). This
+    /// is the operator-confirmed quarantined release's deletion path: unlike
+    /// releasing the lease first, a failure before the rename leaves the row
+    /// held and the tree in place, so custody never becomes idle on an error.
+    /// The tree is renamed whole into the payload's holding area and the row
+    /// moves to the holding ledger in one durable write, under this lock.
+    fn evict_held(&mut self, slot_id: &str, lease_id: &str) -> Result<Vec<String>, LeaseError> {
+        let id =
+            slot_id
+                .parse::<u64>()
+                .ok()
+                .filter(|id| *id != 0)
+                .ok_or(LeaseError::InvalidInput(
+                    "slot ID must be a positive integer",
+                ))?;
+        let Some((incarnation, project, profile)) = self
+            .slot(id)
+            .filter(|slot| {
+                slot.state == SlotPersistState::Held && slot.lease_id.as_deref() == Some(lease_id)
+            })
+            .map(|slot| (slot.incarnation, slot.project.clone(), slot.profile))
+        else {
+            return Err(LeaseError::Busy);
+        };
+        if self.reconciliation_blocked
+            || self.ledger.slots.iter().any(|slot| slot.capture.is_some())
+        {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        self.ensure_capacity_policy()?;
+        self.next_rank()?;
+        let (path, identity) =
+            self.validate_held_slot_scope(id, incarnation, &project, profile, lease_id)?;
+        self.record_hold_intent(id, identity)?;
+        let row = self.hold_slot_tree(id, &path, Some(identity))?;
+        self.created_holding.push(row.name.clone());
+        self.ledger.slots.retain(|slot| slot.id != id);
+        self.ledger.holding.push(row);
+        self.persist_revised()?;
         Ok(std::mem::take(&mut self.created_holding))
     }
 
@@ -3239,7 +3302,35 @@ impl Pool {
         {
             return Err(LeaseError::UnknownAccounting);
         }
+        self.validate_slot_tree(id)
+    }
 
+    /// The held-slot form of the scope check (oxide#196): the row must still
+    /// be exactly the held generation this lease names. The tree checks are
+    /// the idle path's, so a quarantined tree is moved only when it is this
+    /// pool's own private, owner-only slot directory.
+    fn validate_held_slot_scope(
+        &self,
+        id: u64,
+        incarnation: u64,
+        project: &Path,
+        profile: Profile,
+        lease_id: &str,
+    ) -> Result<(PathBuf, (u64, u64)), LeaseError> {
+        let slot = self.slot(id).ok_or(LeaseError::UnknownAccounting)?;
+        if slot.id != id
+            || slot.incarnation != incarnation
+            || slot.state != SlotPersistState::Held
+            || slot.lease_id.as_deref() != Some(lease_id)
+            || slot.project.as_path() != project
+            || slot.profile != profile
+        {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        self.validate_slot_tree(id)
+    }
+
+    fn validate_slot_tree(&self, id: u64) -> Result<(PathBuf, (u64, u64)), LeaseError> {
         let path = self.slot_path(id)?;
         let slots_root = self.backing.payload_root().join(SLOTS_NAME);
         let slots_root = canonical_existing_dir(&slots_root, true)?;
@@ -4647,9 +4738,12 @@ impl Pool {
     /// because a directory merely carries the right name.
     fn record_hold_intent(&mut self, id: u64, expected: (u64, u64)) -> Result<(), LeaseError> {
         let slot = self.slot(id).ok_or(LeaseError::UnknownAccounting)?;
+        // Held is the operator-confirmed quarantined release's deletion path
+        // (oxide#196): the row stays held until the same transaction moves the
+        // tree into the holding area, so a failure here never releases it.
         if !matches!(
             slot.state,
-            SlotPersistState::Idle | SlotPersistState::Evicting
+            SlotPersistState::Idle | SlotPersistState::Evicting | SlotPersistState::Held
         ) {
             return Err(LeaseError::UnknownAccounting);
         }

@@ -28,8 +28,8 @@ use crate::process;
 use crate::watchdog::Watchdog;
 pub(crate) use oxide_storage::lease::control::*;
 use oxide_storage::lease::managed::{
-    evict_idle_slot, flush_volume, init_budget_pool, lease_measured, ledger_view, measure_within,
-    recover, release, snapshot, status as pool_status,
+    evict_held_slot, evict_idle_slot, flush_volume, init_budget_pool, lease_measured, ledger_view,
+    measure_within, recover, release, snapshot, status as pool_status,
 };
 use oxide_storage::lease::{
     AccountingScan, AdmissionClass, LeaseError, LeaseRequest, LedgerSlot, LedgerView, MemberPair,
@@ -4815,10 +4815,9 @@ impl Store {
     /// whole through the holding area (oxide#196). The admission lock is taken
     /// without fencing and the record is re-read under it, so a slot that
     /// changed after the preflight refuses before any fence, reconciliation or
-    /// write. The slot's ledger entry is released,
-    /// its tree is renamed whole into the payload's holding area and recorded
-    /// there outside the pool lock, and its record is forgotten. Space stays
-    /// charged until that deletion is gone.
+    /// write. The held ledger row and its tree move to the payload's holding
+    /// area in one library transaction, and its record is forgotten. Space
+    /// stays charged until that deletion is gone.
     pub fn release_quarantined(
         &self,
         slot: &QuarantinedSlot,
@@ -4839,14 +4838,13 @@ impl Store {
             ));
         }
         // Only a token that still matches reaches the durable fence and the
-        // effect. The library calls below reconcile and evict under this held
-        // admission lock.
+        // effect. The held row and the tree move to the holding area in one
+        // library transaction under this admission lock: there is no
+        // release-to-idle step, so a failed eviction leaves the slot held and
+        // its record quarantined rather than changing custody.
         self.fence_admission_state()?;
         let record = slot.record;
-        let lease_id = slot.lease_id.clone();
-        recover(&self.pool, &lease_id)
-            .map_err(|error| lease_error("cannot release the quarantined slot", &error))?;
-        let holding = evict_idle_slot(&self.pool, &slot.slot_id)
+        let holding = evict_held_slot(&self.pool, &slot.slot_id, &slot.lease_id)
             .map_err(|error| lease_error("cannot delete the quarantined slot", &error))?;
         let mut state = self.load()?;
         self.forget_record(&mut state, record);

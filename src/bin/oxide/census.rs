@@ -301,6 +301,29 @@ mod platform {
         Foreign,
     }
 
+    /// The one decision for a descriptor read that returned no bytes. Zero
+    /// bytes with errno zero is the positive empty listing; zero with `ESRCH`
+    /// is a gone process; zero with `EPERM` is the intermittent answer the
+    /// bounded identity re-observation settles; every other errno is
+    /// UNKNOWN and refuses. It is never silently an empty descriptor list.
+    pub(super) enum ZeroListing {
+        Empty,
+        Gone,
+        Retry,
+        Refuse(String),
+    }
+
+    pub(super) fn classify_zero_listing(pid: i32, errno: i32) -> ZeroListing {
+        match errno {
+            0 => ZeroListing::Empty,
+            libc::ESRCH => ZeroListing::Gone,
+            libc::EPERM => ZeroListing::Retry,
+            _ => ZeroListing::Refuse(format!(
+                "pid {pid}'s descriptor listing returned no bytes with errno {errno}; the census is unknown"
+            )),
+        }
+    }
+
     #[derive(Debug)]
     pub(super) enum Cwd {
         Path(PathBuf),
@@ -649,26 +672,27 @@ mod platform {
                 unsafe { proc_pidinfo(current.pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
             let sizing_error = io::Error::last_os_error();
             let sizing_errno = sizing_error.raw_os_error().unwrap_or(0);
-            if sized < 0 || (sized == 0 && sizing_errno != 0) {
+            if sized < 0 {
                 let error = sizing_error;
                 match error.raw_os_error() {
                     Some(libc::ESRCH) => return Ok(Listed::Gone),
                     Some(libc::EPERM) => continue,
-                    Some(_) => {
+                    _ => {
                         return Err(format!(
                             "pid {}'s descriptor listing is unreadable ({error}); the census is unknown",
                             current.pid
                         ))
                     }
-                    None => return Err(format!(
-                        "pid {}'s descriptor listing is unreadable ({error}); the census is unknown",
-                        current.pid
-                    )),
                 }
             }
             let needed = sized as usize;
             if needed == 0 {
-                return Ok(Listed::Descriptors(Vec::new()));
+                match classify_zero_listing(current.pid, sizing_errno) {
+                    ZeroListing::Empty => return Ok(Listed::Descriptors(Vec::new())),
+                    ZeroListing::Gone => return Ok(Listed::Gone),
+                    ZeroListing::Retry => continue,
+                    ZeroListing::Refuse(reason) => return Err(reason),
+                }
             }
             if needed / PROC_FDINFO_SIZE >= MAX_DESCRIPTORS_PER_PROCESS {
                 return Err(format!(
@@ -679,6 +703,7 @@ mod platform {
             // Slack for a descriptor opened between the size query and the
             // read; a listing that fills it is retried, then bounded.
             let mut buffer = vec![0u8; needed + 64 * PROC_FDINFO_SIZE];
+            let mut retry_outer = false;
             for _ in 0..2 {
                 set_errno(0);
                 // SAFETY: `buffer` is writable for its whole length and
@@ -692,10 +717,15 @@ mod platform {
                         buffer.len() as libc::c_int,
                     )
                 };
+                let written_errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 if written < 0 {
                     let error = io::Error::last_os_error();
                     match error.raw_os_error() {
                         Some(libc::ESRCH) => return Ok(Listed::Gone),
+                        Some(libc::EPERM) => {
+                            retry_outer = true;
+                            break;
+                        }
                         _ => {
                             return Err(format!(
                                 "pid {}'s descriptor listing is unreadable ({error}); the census is unknown",
@@ -705,6 +735,17 @@ mod platform {
                     }
                 }
                 let written = written as usize;
+                if written == 0 {
+                    match classify_zero_listing(current.pid, written_errno) {
+                        ZeroListing::Empty => return Ok(Listed::Descriptors(Vec::new())),
+                        ZeroListing::Gone => return Ok(Listed::Gone),
+                        ZeroListing::Retry => {
+                            retry_outer = true;
+                            break;
+                        }
+                        ZeroListing::Refuse(reason) => return Err(reason),
+                    }
+                }
                 if written == buffer.len() {
                     buffer.resize(written + 256 * PROC_FDINFO_SIZE, 0);
                     continue;
@@ -728,6 +769,9 @@ mod platform {
                     }
                 }
                 return Ok(Listed::Descriptors(descriptors));
+            }
+            if retry_outer {
+                continue;
             }
             return Err(format!(
                 "pid {}'s descriptor listing kept growing during the scan",
@@ -1250,6 +1294,32 @@ mod tests {
                 platform::cwd_unreadable(7, &std::io::Error::from_raw_os_error(gone)),
                 Ok(platform::Cwd::None)
             ));
+        }
+    }
+
+    /// A zero-byte descriptor read is only an empty listing when the kernel
+    /// reports no error: `ESRCH` is gone, `EPERM` is the bounded retry, and
+    /// every other errno is UNKNOWN and refuses.
+    #[test]
+    fn a_zero_descriptor_listing_is_never_silently_empty() {
+        assert!(matches!(
+            platform::classify_zero_listing(7, 0),
+            platform::ZeroListing::Empty
+        ));
+        assert!(matches!(
+            platform::classify_zero_listing(7, libc::ESRCH),
+            platform::ZeroListing::Gone
+        ));
+        assert!(matches!(
+            platform::classify_zero_listing(7, libc::EPERM),
+            platform::ZeroListing::Retry
+        ));
+        match platform::classify_zero_listing(7, libc::EACCES) {
+            platform::ZeroListing::Refuse(reason) => {
+                assert!(reason.contains("census is unknown"), "{reason}");
+                assert!(reason.contains("errno"), "{reason}");
+            }
+            _ => panic!("a zero listing with an unreadable errno was not refused"),
         }
     }
 
