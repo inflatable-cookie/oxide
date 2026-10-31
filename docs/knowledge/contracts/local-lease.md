@@ -643,9 +643,10 @@ that root is outside this accounting guarantee: the byte budget is soft and
 may overshoot the charge. The existing registered reserve and running-build
 reserve watchdog remain the free-space protection.
 
-**An unmeasured idle slot at admission is charged, not refused (oxide#186).**
-When an admission walks an idle slot that has no current record and that walk
-stops partial — an elapsed deadline, an entry, depth or mount bound, an
+**An unmeasured slot at admission is charged, not refused (oxide#186; extended
+to held slots and removable pools, Tom 2026-10-31).** When an admission walks
+another slot (an idle slot with no current record, or any held slot, on either
+backend) and that walk stops partial — an elapsed deadline, an entry, depth or mount bound, an
 unreadable entry — the slot is charged
 `max(the bytes it observed before it stopped, its current-generation record if
 any, the largest recorded slot in the pool)`, at least one byte and never the
@@ -715,7 +716,7 @@ defaults, which are unchanged. The callers:
 | --- | --- |
 | The matching idle slot's own walk before reuse | Must be complete, or the lease refuses |
 | The one slot a release or recovery closes (oxide#146) | Best effort: an incomplete walk publishes no record and never fails the release |
-| A slot with no current record, and every held slot, at admission | An idle slot on the internal directory pool that stops partial is charged conservatively for that admission and kept, never a victim (oxide#186); a held slot's live figure, a removable pool's bounded walks and a root that cannot be opened must be complete, or the lease refuses (`unknown_accounting`) |
+| A slot with no current record, and every held slot, at admission | Any such slot whose walk stops partial, idle or held, on either backend, is charged conservatively for that admission and kept, never a victim (oxide#186, extended 2026-10-31); only a slot root that cannot be opened or classified refuses the lease (`unknown_accounting`) |
 | `status --measure`: the whole payload and each slot | Observational; reports coverage, causes and time. Default `oxide status` walks nothing (oxide#128) |
 
 Admission itself no longer walks the payload: it sums the closed per-slot
@@ -1296,10 +1297,15 @@ lock in the same open that uses it:
    is false.
 
 Anything else is **not current**: never zero, never free space. A slot whose
-record is not current is walked before its number is used; an idle slot on the
-internal directory pool whose walk stops partial is charged conservatively for
-that admission and kept (oxide#186), and every other incomplete walk keeps
-today's `unknown_accounting` refusal exactly.
+record is not current is walked before its number is used; any slot whose walk
+stops partial, idle or held, on either backend, is charged conservatively for
+that admission and kept (oxide#186, extended 2026-10-31). Only a slot root that
+cannot be opened or classified keeps the `unknown_accounting` refusal. Every slot walk in one admission shares one elapsed budget; a slot measured
+completely earlier in the admission keeps that figure. Because a removable
+pool's admission now usually has a complete (charged) pressure figure, the
+unknown-size reserve route is reached only when the payload scope pass itself
+is incomplete; the volume reserve is still checked when a build starts and by
+the running build's watchdog.
 
 The one deliberate relaxation, restated because it is the whole point: a
 current record is trusted even though a same-UID process could have changed
