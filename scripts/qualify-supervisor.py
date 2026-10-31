@@ -77,12 +77,13 @@ WALL_NS = 300 * NS
 CANDIDATE_LIMIT = 280
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 277  # 233 pure + 44 real (oxide#151 added the routing, marker,
+EXPECTED_CASES = 279  # 235 pure + 44 real (oxide#151 added the routing, marker,
                       # nested-window protection, bounded-sweep, qualify-entry,
                       # shared-ancestor/private-leaf and readiness cases; oxide#191
-                      # adds twenty-four pure post-census detach cases and four real
+                      # adds twenty-six pure post-census detach cases and four real
                       # ones: success, a refused identity, a failed attempt and an
-                      # unrequested attachment the pre-cleanup scan must keep)
+                      # unrequested attachment whose pre-cleanup keep is recorded
+                      # separately from the detach protocol)
 ACTOR_MARGIN_NS = 2 * NS  # the actor's own KILL, reap and exit
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPTS)
@@ -330,7 +331,8 @@ CONTROL_CASES = {
 }
 ORDINARY_KEYS = {"case", "exit", "phase", "dir", "retained_unclosed", "outcome", "census", "wall_s",
                  "signals", "stale_latency_ns", "held_streams", "nonce_ok",
-                 "detach"}  # oxide#191: the post-census detach outcome that case recorded
+                 "detach",  # oxide#191: the post-census detach outcome that case recorded
+                 "cleanup"}  # oxide#191: the fail-closed pre-cleanup keep, when it fired
 
 
 def control_case(case, name, root, facts):
@@ -634,8 +636,9 @@ DETACH_CASES = (
     ("test_success_detaches_exactly_the_requested_volume", "detached", True),
     ("test_an_unbound_identity_is_refused_before_any_detach", "refused", False),
     ("test_a_failed_attempt_keeps_the_mount_and_is_unqualified", "failed", False),
-    ("test_an_unrequested_attachment_keeps_the_owned_root", "unexpected", False),
 )
+
+CLEANUP_CASE = "test_an_unrequested_attachment_keeps_the_owned_root"
 
 
 def check_plan(receipt, results, expected, record=None, facts=None, base=None):
@@ -686,10 +689,12 @@ def check_plan(receipt, results, expected, record=None, facts=None, base=None):
         problems = []
         if "detach" in receipt:
             problems.append("the qualification run itself published a detach request")
-        recorded = {}
+        recorded, kept = {}, {}
         for case in results.get("cases", []):
             if case.get("detach") is not None and case.get("case") not in recorded:
                 recorded[case["case"]] = case["detach"]
+            if case.get("cleanup") is not None and case.get("case") not in kept:
+                kept[case["case"]] = case["cleanup"]
         for name, state, qualified in DETACH_CASES:
             detach = recorded.get(name)
             if detach is None:
@@ -697,6 +702,12 @@ def check_plan(receipt, results, expected, record=None, facts=None, base=None):
             elif (detach.get("state"), bool(detach.get("qualified"))) != (state, qualified):
                 problems.append(f"detach case {name} recorded {detach.get('state')}/"
                                 f"{detach.get('qualified')}, not {state}/{qualified}")
+        if CLEANUP_CASE in recorded:
+            problems.append(f"{CLEANUP_CASE} recorded a detach object for a request-free run")
+        if CLEANUP_CASE not in kept:
+            problems.append(f"{CLEANUP_CASE} recorded no pre-cleanup keep")
+        elif kept[CLEANUP_CASE].get("state") != "kept":
+            problems.append(f"{CLEANUP_CASE} recorded {kept[CLEANUP_CASE].get('state')}, not kept")
         return problems
 
     def cases():

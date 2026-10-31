@@ -3434,7 +3434,7 @@ def detach_case_rows(case):
         {"case": "test_a_failed_attempt_keeps_the_mount_and_is_unqualified", "dir": case, "exit": 125,
          "detach": {"state": "failed", "qualified": False, "post_state": "still_mounted"}},
         {"case": "test_an_unrequested_attachment_keeps_the_owned_root", "dir": case, "exit": 125,
-         "detach": {"state": "unexpected", "qualified": False, "post_state": "attached"}},
+         "cleanup": {"state": "kept", "reason": "a mounted image the proof never requested"}},
     ]
 
 
@@ -4171,9 +4171,10 @@ class DetachFacts:
             return list(self.attachments_value)
         return self.rows(self.mount_point("/Volumes/OxDetach"))
 
-    def detach(self, mount, timeout):
+    def detach(self, mount, timeout, still_allowed=None):
         self.detached.append((mount, timeout))
         self.attempted = True
+        self.polled = still_allowed
         return dict(self.attempt)
 
 
@@ -4234,7 +4235,7 @@ class PureDetach(unittest.TestCase):
         self.assertIsNone(record["reason"])
         self.assertEqual(record["backing"], backing, "the record does not name the requested backing")
         self.assertIsNotNone(record["reserve_before"])
-        self.assertIsNotNone(record["owned_before"])
+        self.assertIsNone(record["reserve_after"] if record["state"] != "detached" else None)
         self.assertEqual(record["deadline_ns"], ctx["start_ns"] + 300 * bounded.NS)
 
     def test_a_wrong_uuid_device_or_mount_refuses_without_detaching(self):
@@ -4425,17 +4426,20 @@ class PureDetach(unittest.TestCase):
         self.request(ctx, backing)
         granted = []
         record = bounded.post_census_detach(
-            ctx, self.facts(), authorize=lambda budget: (granted.append(budget) or (True, None, 2 * bounded.NS)))
+            ctx, self.facts(), authorize=lambda budget, wait: (granted.append((budget, wait))
+                                                              or (True, None, 4 * bounded.NS)))
         self.assertTrue(record["qualified"], record)
-        self.assertLessEqual(record["timeout_s"], 2.0)
-        self.assertGreater(record["timeout_s"], 0.0)
+        # The granted four-second window clamps the whole remaining sequence.
+        self.assertLessEqual(record["timeout_s"], 4.0)
+        self.assertGreaterEqual(record["timeout_s"], 1.0)
+        self.assertEqual(granted[0][0] > 0, True)
 
     def test_a_withdrawn_authorization_detaches_nothing(self):
         ctx, backing = self.layout()
         facts = self.facts()
         self.request(ctx, backing)
         record = bounded.post_census_detach(
-            ctx, facts, authorize=lambda budget: (False, "a fault is latched (injected)", 0))
+            ctx, facts, authorize=lambda budget, wait: (False, "a fault is latched (injected)", 0))
         self.assertEqual(facts.detached, [], "a detach ran without the custodian's authorization")
         self.assertEqual((record["state"], record["attempted"], record["qualified"]),
                          ("refused", False, False), record)
@@ -4478,20 +4482,20 @@ class PureDetach(unittest.TestCase):
     def test_an_unrequested_attachment_keeps_the_owned_root(self):
         ctx, backing = self.layout()
         rows = [(backing, "/dev/disk7", "/Volumes/OxDetach", None)]
-        record = bounded.unrequested_attachment(ctx, facts=lambda *_args: rows)
-        self.assertEqual((record["state"], record["post_state"], record["qualified"]),
-                         ("unexpected", "attached", False), record)
+        record = bounded.cleanup_safety(ctx, facts=lambda *_args: rows)
+        self.assertEqual(record["state"], "kept")
         self.assertEqual(record["unrequested"], [backing])
         self.assertIn("never requested", record["reason"])
         outside = [("/private/tmp/other.sparseimage", "/dev/disk9", "/Volumes/OxOther", None)]
-        self.assertIsNone(bounded.unrequested_attachment(ctx, facts=lambda *_args: outside))
+        self.assertIsNone(bounded.cleanup_safety(ctx, facts=lambda *_args: outside))
         # A stale entry a forced detach left behind is not a live mount: it must
         # never keep a root.
         stale = [(backing, "/dev/disk7", None, None)]
-        self.assertIsNone(bounded.unrequested_attachment(ctx, facts=lambda *_args: stale))
-        unreadable = bounded.unrequested_attachment(ctx, facts=lambda *_args: None)
-        self.assertEqual(unreadable["state"], "unexpected")
+        self.assertIsNone(bounded.cleanup_safety(ctx, facts=lambda *_args: stale))
+        unreadable = bounded.cleanup_safety(ctx, facts=lambda *_args: None)
+        self.assertEqual(unreadable["state"], "kept")
         self.assertIn("unreadable", unreadable["reason"])
+        self.assertIsNone(bounded.cleanup_safety(ctx, facts=lambda *_args: []))
 
     def test_a_diagnostic_receipt_is_never_qualified(self):
         rows = [{"check": "receipt-phase", "result": "pass", "problems": []},
@@ -4504,6 +4508,82 @@ class PureDetach(unittest.TestCase):
         refused = qualify.diagnostic_receipt(["boom"], [])
         self.assertIs(refused["qualified"], False)
         self.assertEqual(refused["problems"], ["boom"])
+
+    def test_an_unmounted_but_still_attached_image_is_not_a_detach(self):
+        # The reviewer's case: the mount point can be gone while the image (or one
+        # of its slices) is still attached. Any entity of that backing means the
+        # attempt did not detach it.
+        ctx, backing = self.layout()
+        facts = self.facts(
+            mount_point=lambda attempted: not attempted,
+            attachments=lambda attempted: [("/dev/disk7s1", None, None)] if attempted else
+            [("/dev/disk7", None, None), ("/dev/disk7s1", "/Volumes/OxDetach", DETACH_UUID)])
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertEqual((record["state"], record["post_state"], record["qualified"]),
+                         ("failed", "still_attached", False), record)
+
+    def test_the_child_runner_polls_and_stops_on_withdrawal(self):
+        # A fake process over a real pipe: no child, so this stays pure. While the
+        # child still runs, a withdrawn authority must stop it; an allowed one must
+        # not. `bounded_run` owns and closes the read end.
+
+        class FakeChild:
+            returncode = None
+
+            class _Stdout:
+                def __init__(self, fd):
+                    self.fd = fd
+
+                def fileno(self):
+                    return self.fd
+
+            def __init__(self, fd):
+                self.stdout = self._Stdout(fd)
+                self.killed = False
+
+            def poll(self):
+                return self.returncode
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        def case(still_allowed, exit_code):
+            read_fd, write_fd = os.pipe()
+            child = FakeChild(read_fd)
+
+            def spawn(argv, **kwargs):
+                os.write(write_fd, b"partial output")
+                if exit_code is not None:  # a child that finished: EOF, no polling
+                    child.returncode = exit_code
+                    os.close(write_fd)
+                return child
+
+            result = bounded.bounded_run(["/bin/true"], 5, 64, still_allowed=still_allowed, spawn=spawn)
+            if exit_code is None:  # still "running" when it was stopped: close our end
+                os.close(write_fd)
+            return child, result
+
+        asked = []
+
+        def withdrawn():
+            asked.append(1)
+            return False, "a fault is latched mid-attempt"
+
+        child, result = case(withdrawn, None)
+        self.assertTrue(asked, "authority was never re-checked while the child ran")
+        self.assertTrue(child.killed, "withdrawn authority did not kill the running child")
+        self.assertEqual(result["withdrawn"], "a fault is latched mid-attempt")
+        self.assertFalse(result["timed_out"])
+
+        child, result = case(lambda: (True, None), 0)
+        self.assertFalse(child.killed, "an allowed, finished child was killed")
+        self.assertIsNone(result["withdrawn"])
+        self.assertEqual(result["exit"], 0)
 
     def test_success_requires_a_zero_exit_and_a_detached_post_state(self):
         for attempt, mount_point in (({"exit": None, "timed_out": False, "error": None, "output": ""}, False),
@@ -6357,11 +6437,13 @@ class DetachReal(unittest.TestCase):
         # image attached inside the guard's own scratch. Cleaning that root would
         # delete a backing under a live mount, so the fail-closed scan keeps it.
         self.guard(mode="unrequested")
-        detach = self.receipt["detach"]
-        self.assertEqual((detach["state"], detach["attempted"], detach["qualified"], detach["post_state"]),
-                         ("unexpected", False, False, "attached"), detach)
-        self.assertIn("never requested", detach["reason"])
-        self.assertEqual(detach["unrequested"], [self.volume["image"]])
+        # No request: no detach attempt and no `detach` object at all. The
+        # separate fail-closed cleanup check is what keeps the root.
+        self.assertIsNone(self.receipt.get("detach"), "a request-free run recorded a detach object")
+        kept = self.receipt["cleanup"]
+        self.assertEqual(kept["state"], "kept")
+        self.assertIn("never requested", kept["reason"])
+        self.assertEqual(kept["unrequested"], [self.volume["image"]])
         self.assertEqual(self.code, 125)
         self.assertTrue(os.path.exists(self.receipt["scratch"]), "the root holding the image was cleaned")
         self.assertTrue(os.path.isfile(self.volume["image"]), "the backing under the live mount was removed")
