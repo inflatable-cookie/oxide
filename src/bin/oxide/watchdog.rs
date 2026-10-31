@@ -262,8 +262,9 @@ mod tests {
         path
     }
 
-    fn group(script: &str) -> process::Group {
-        process::spawn_group(Command::new("/bin/sh").args(["-c", script])).expect("group")
+    /// Owned, so a failed assertion below cannot leave `sleep` in the group.
+    fn group(script: &str) -> process::OwnedGroup {
+        process::OwnedGroup::spawn(Command::new("/bin/sh").args(["-c", script]))
     }
 
     fn settle(watchdog: &mut Watchdog, group: &mut process::Group) -> Option<Instant> {
