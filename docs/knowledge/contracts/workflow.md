@@ -2169,7 +2169,7 @@ with no earlier run migrated.
 
 **Post-census image detach request (oxide#191, decision `ee263cea`, unqualified
 source).** The current `bounded-test.py`
-(`22ce1fc815ff8c0d5eceee348304f19a9ebf404925a5f12aebb9210e89683f55`) adds one
+(`77e87c6edfcef99ccabcfb5033e82079854b2cba20b3a65992b828c604694453`) adds one
 opt-in control for a proof
 whose own test image must be detached, and it is the only route by which such a
 proof may detach after a launch; the qualified shared runner is otherwise
@@ -2192,9 +2192,14 @@ and the final cleanup gate — is bounded by ONE absolute deadline taken from th
 custodian's own wait window, and each phase is clamped to what is left of it with
 no forced minimum (the reap included, so a child that ignores KILL cannot extend
 the sequence). A detach child that is not positively reaped inside that window is
-never reported as reaped: the attempt fails, the monitor holds itself open until
-the custodian's own deadline rather than exiting, and the custodian ends the run
-with the root, backing and evidence kept. It then asks the custodian — which alone holds the latched
+never reported as reaped: the attempt fails, the monitor publishes the child's PID
+and holds itself open inside the custodian's wait window rather than exiting, and
+the custodian pins that PID by identity (`kinfo_proc` start), signals it, observes
+it gone and records pin, signal and observation (with a post-timeout close as
+backstop), latching a fault when it cannot be observed closed; the root, backing
+and evidence stay kept either way. The reap, the post-state read and that final
+acknowledgment each fit inside what is left of the window, with no additive or
+forced minimum wait. It then asks the custodian — which alone holds the latched
 fault, the deadline and the closure verdict — to authorize the single attempt
 over the control pipe; the custodian answers from that state only (no filesystem
 call) with its verdict and the wait budget that remains before it would declare
@@ -2237,11 +2242,12 @@ custodian keeps its filesystem-free decision path and the existing
 cooperative-session limits. These bytes are unqualified until one uncounted
 `effigy proof:supervisor:qualify:diagnostic` records a clean picture and then
 ONE counted author and ONE separate independent reviewer
-`effigy proof:supervisor:qualify` pass at the same head (247 pure plus 44 real
-cases, including the thirty-eight pure detach cases and the four real ones: a
-bound success, a refused identity, a failed attempt, and an unrequested
-attachment whose opt-in custody keep is recorded separately), with independent
-exact-head source review afterwards.
+`effigy proof:supervisor:qualify` pass at the same head (247 pure plus 45 real
+cases, including the thirty-eight pure detach cases and the five real ones: a
+bound success, a refused identity, a failed attempt, an unrequested attachment
+whose opt-in custody keep is recorded separately, and a real stuck child the
+custodian pins, signals and observes closed), with independent exact-head source
+review afterwards.
 
 **Settlement observation (oxide#147, unqualified source).** The current
 `bounded-test.py` also carries observation-only settlement diagnostics, so a
@@ -5397,7 +5403,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
 - **Focused proof of absent checkout chains (oxide#135).** The one fixed proof
   is `effigy rust:prune-absence` (`scripts/test-prune-absence.py` under this
-  tree's shared supervisor `22ce1fc8…`, the merged oxide#151 guard plus
+  tree's shared supervisor `77e87c6e…`, the merged oxide#151 guard plus
   oxide#191's opt-in post-census detach) with
   `--root-parent /private/tmp`, the owner-accepted internal-placement exception
   (decision `bd357a4c`): the missing-chain fixtures must be on the boot Data

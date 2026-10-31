@@ -3435,6 +3435,8 @@ def detach_case_rows(case):
          "detach": {"state": "failed", "qualified": False, "post_state": "still_mounted"}},
         {"case": "test_an_unrequested_attachment_keeps_the_owned_root", "dir": case, "exit": 125,
          "cleanup": {"state": "kept", "reason": "a mounted image the proof never requested"}},
+        {"case": "test_a_stuck_detach_child_is_closed_by_the_custodian", "dir": case, "exit": 125,
+         "detach": {"state": "timed_out", "qualified": False, "reaped": False}},
     ]
 
 
@@ -6598,6 +6600,27 @@ class DetachReal(unittest.TestCase):
         self.assertTrue(os.path.exists(self.receipt["scratch"]), "the root holding the image was cleaned")
         self.assertTrue(os.path.isfile(self.volume["image"]), "the backing under the live mount was removed")
         self.assertTrue(os.path.exists(self.volume["mount"]), "the unrequested attachment was detached")
+        self.remove_fixture_mount()
+
+    def test_a_stuck_detach_child_is_closed_by_the_custodian(self):
+        # A REAL injected stuck child: the detach "child" is a live `sleep` the
+        # monitor cannot reap. The custodian must pin it by identity, signal it and
+        # observe it gone, and nothing may be cleaned up.
+        self.guard(inject=["detach-stuck-child"])
+        detach = self.receipt["detach"]
+        self.assertEqual((detach["qualified"], detach["reaped"]), (False, False), detach)
+        self.assertEqual(self.code, 125)
+        records = [r for r in self.receipt["custodian"] if r["event"].startswith("detach_child_")]
+        pinned = [r for r in records if r["event"] == "detach_child_pinned"]
+        self.assertTrue(pinned, records)
+        self.assertEqual(pinned[0]["observation"], "live", records)
+        self.assertTrue([r for r in records if r["event"] == "detach_child_signal"], records)
+        observed = [r for r in records if r["event"] == "detach_child_observed"]
+        self.assertTrue(observed and observed[0]["closed"] is True, records)
+        pid = pinned[0]["pid"]
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+        self.assertTrue(os.path.exists(self.receipt["scratch"]), "the root was cleaned under a live child")
         self.remove_fixture_mount()
 
     def test_a_failed_attempt_keeps_the_mount_and_is_unqualified(self):

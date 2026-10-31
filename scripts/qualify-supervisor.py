@@ -77,13 +77,13 @@ WALL_NS = 300 * NS
 CANDIDATE_LIMIT = 280
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 291  # 247 pure + 44 real (oxide#151 added the routing, marker,
+EXPECTED_CASES = 292  # 247 pure + 45 real (oxide#151 added the routing, marker,
                       # nested-window protection, bounded-sweep, qualify-entry,
                       # shared-ancestor/private-leaf and readiness cases; oxide#191
-                      # adds thirty-eight pure post-census detach cases and four real
-                      # ones: success, a refused identity, a failed attempt and an
+                      # adds thirty-eight pure post-census detach cases and five real
+                      # ones: success, a refused identity, a failed attempt, an
                       # unrequested attachment whose opt-in custody keep is recorded
-                      # separately from the detach protocol)
+                      # separately, and a stuck child the custodian closes itself)
 ACTOR_MARGIN_NS = 2 * NS  # the actor's own KILL, reap and exit
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPTS)
@@ -639,6 +639,7 @@ DETACH_CASES = (
 )
 
 CLEANUP_CASE = "test_an_unrequested_attachment_keeps_the_owned_root"
+STUCK_CASE = "test_a_stuck_detach_child_is_closed_by_the_custodian"
 
 
 def check_plan(receipt, results, expected, record=None, facts=None, base=None):
@@ -702,6 +703,12 @@ def check_plan(receipt, results, expected, record=None, facts=None, base=None):
             elif (detach.get("state"), bool(detach.get("qualified"))) != (state, qualified):
                 problems.append(f"detach case {name} recorded {detach.get('state')}/"
                                 f"{detach.get('qualified')}, not {state}/{qualified}")
+        stuck = recorded.get(STUCK_CASE)
+        if stuck is None:
+            problems.append(f"{STUCK_CASE} recorded no detach outcome")
+        elif (stuck.get("state"), bool(stuck.get("qualified")), stuck.get("reaped")) != ("timed_out", False, False):
+            problems.append(f"{STUCK_CASE} recorded {stuck.get('state')}/{stuck.get('qualified')}/"
+                            f"reaped {stuck.get('reaped')}, not timed_out/False/False")
         if CLEANUP_CASE in recorded:
             problems.append(f"{CLEANUP_CASE} recorded a detach object for a request-free run")
         if CLEANUP_CASE not in kept:

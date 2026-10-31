@@ -206,7 +206,7 @@ INJECTIONS = {
     "pump-exception", "kqueue-exception", "malformed-message", "stop-exception",
     "reserve-delay-stall", "scratch-delay-stall",
     "detach-fail", "detach-timeout", "detach-ambiguous", "detach-withdraw",
-    "detach-reap-timeout",
+    "detach-reap-timeout", "detach-stuck-child",
 }
 RESERVE_DELAY_S, SCRATCH_DELAY_S = 0.5, 4.0  # injected publication delays before a sampler stall
 INJECT_AFTER_GATE_NS = 1_500_000_000  # post-gate injections wait for the fixture to start
@@ -219,6 +219,7 @@ FIELDS = {  # required fields per monitor message type; bool is never accepted a
     "setup": {"root": str, "scratch": str, "evidence": str, "owned": bool},
     "detach": {"attempted": bool, "qualified": bool, "post_state": str},
     "detach_ready": {"budget_ns": int},
+    "detach_child": {"pid": int},
     "cleanup_kept": {"reason": str},
 }
 
@@ -1517,7 +1518,8 @@ def bounded_run(argv, timeout, cap=DETACH_OUTPUT_MAX_BYTES, still_allowed=None, 
                       stderr=subprocess.STDOUT, close_fds=True)
     except OSError as error:
         return {"exit": None, "timed_out": False, "error": errno_name(error), "output": "",
-                "truncated": False, "withdrawn": None, "reap_timed_out": False, "reaped": False}
+                "truncated": False, "withdrawn": None, "reap_timed_out": False, "reaped": False,
+                "handle": None}
     deadline = time.monotonic() + max(0.1, timeout)
     tail, seen, timed_out, withdrawn, reap_timed_out, reaped = b"", 0, False, None, False, False
     poll_at = time.monotonic() + DETACH_POLL_S
@@ -1560,28 +1562,34 @@ def bounded_run(argv, timeout, cap=DETACH_OUTPUT_MAX_BYTES, still_allowed=None, 
             os.close(fd)
         except OSError:
             pass
-        # The reap is bounded by what is left of the SAME deadline, never by an
-        # extra fixed wait: a child that ignores KILL cannot extend the sequence.
-        try:
-            reaped = child.wait(timeout=max(0.1, min(2.0, deadline - time.monotonic() + 0.5))) is not None
-        except subprocess.TimeoutExpired:
+        # The reap is bounded by what is left of the SAME deadline: no extra
+        # fixed wait, and no round that can run past it.
+        if timed_out or withdrawn is not None:
+            try:
+                child.kill()
+            except OSError:
+                pass
+        for _round in (1, 2, 3):  # three bounded rounds, each inside the deadline
+            remaining = deadline - time.monotonic()
+            try:
+                reaped = child.wait(timeout=max(0.02, remaining)) is not None
+            except subprocess.TimeoutExpired:
+                reaped = False
+            if reaped:
+                break
+            if remaining <= 0:
+                break  # the window is spent: the child stays unaccounted
             reap_timed_out = True
-            for _attempt in (1, 2):  # two bounded rounds, never an unbounded wait
-                try:
-                    child.kill()
-                except OSError:
-                    pass
-                try:
-                    reaped = child.wait(timeout=0.5) is not None
-                except subprocess.TimeoutExpired:
-                    reaped = False
-                if reaped:
-                    break
+            try:
+                child.kill()
+            except OSError:
+                pass
         child.stdout = None
     status = child.returncode
     return {"exit": status, "timed_out": timed_out, "error": None,
             "output": tail.decode("utf-8", "replace"), "truncated": seen > len(tail),
-            "withdrawn": withdrawn, "reap_timed_out": reap_timed_out, "reaped": reaped}
+            "withdrawn": withdrawn, "reap_timed_out": reap_timed_out, "reaped": reaped,
+            "handle": None if reaped else child}
 
 
 def detach_text(document, name):
@@ -1778,6 +1786,20 @@ def cleanup_safety(ctx, probe=None, facts=None):
             "unrequested": backings[:CUSTODY_MAX_BACKINGS]}
 
 
+def _stuck_child_attempt():
+    """A REAL unruly detach child for the injected stuck-child case: started,
+    left running and left unreaped on purpose, so the custodian must identify,
+    signal and observe it after the monitor's own timeout."""
+    try:
+        child = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+    except OSError as error:
+        return {"exit": None, "timed_out": False, "error": errno_name(error), "output": "",
+                "truncated": False, "withdrawn": None, "reaped": False, "handle": None}
+    return {"exit": None, "timed_out": True, "error": None, "output": "", "truncated": False,
+            "withdrawn": None, "reaped": False, "handle": child}
+
+
 def detach_image(mount, timeout, still_allowed=None):
     """One bounded ORDINARY detach of `mount`. Returns the attempt's own facts;
     the caller judges the post-state separately and never trusts a zero exit."""
@@ -1786,7 +1808,7 @@ def detach_image(mount, timeout, still_allowed=None):
     return {"exit": attempt["exit"], "timed_out": attempt["timed_out"], "error": attempt["error"],
             "output": attempt["output"], "truncated": attempt["truncated"],
             "withdrawn": attempt["withdrawn"], "reap_timed_out": attempt["reap_timed_out"],
-            "reaped": attempt["reaped"]}
+            "reaped": attempt["reaped"], "handle": attempt.get("handle")}
 
 
 def _free_bytes(path):
@@ -1985,6 +2007,8 @@ def post_census_detach(ctx, probe=None, authorize=None, still_allowed=None):
         elif "detach-withdraw" in inject:
             attempt = {"exit": None, "timed_out": False, "error": None, "output": "",
                        "truncated": False, "withdrawn": "injected withdrawal", "reaped": True}
+        elif "detach-stuck-child" in inject:
+            attempt = _stuck_child_attempt()
         elif "detach-reap-timeout" in inject:
             attempt = {"exit": None, "timed_out": False, "error": None, "output": "",
                        "truncated": False, "withdrawn": None, "reap_timed_out": True}
@@ -1993,6 +2017,7 @@ def post_census_detach(ctx, probe=None, authorize=None, still_allowed=None):
         record.update(attempted=True, exit=attempt.get("exit"), timed_out=bool(attempt.get("timed_out")),
                       withdrawn=attempt.get("withdrawn"), reap_timed_out=bool(attempt.get("reap_timed_out")),
                       reaped=bool(attempt.get("reaped")), error=attempt.get("error"),
+                      _handle=attempt.get("handle"),
                       output=_bounded_tail(b"", (attempt.get("output") or "").encode(
                           "utf-8", "replace")).decode("utf-8", "replace"),
                       output_truncated=bool(attempt.get("truncated")))
@@ -2050,6 +2075,7 @@ def post_census_detach(ctx, probe=None, authorize=None, still_allowed=None):
     except BaseException as error:
         if record is None:
             record = detach_record(ctx, document if isinstance(document, dict) else {})
+        record.pop("_handle", None)  # a live child never reaches the receipt
         record["state"], record["qualified"] = "unknown", False
         record["reason"] = record["reason"] or f"detach attempt failed: {type_name(error)}"
         return record
@@ -3425,6 +3451,7 @@ class Monitor:
                     self.stop.set()
                     return
             if detach is not None:
+                handle = detach.pop("_handle", None)  # a live child never reaches the receipt
                 with self.lock:
                     self.receipt["detach"] = detach
                 self.send("detach", attempted=detach["attempted"], qualified=detach["qualified"],
@@ -3437,14 +3464,41 @@ class Monitor:
                         False, reason="detach", outcome="failed")
                     if detach.get("attempted") and not detach.get("reaped"):
                         # The direct child was not positively reaped. The monitor
-                        # must not claim completion while it is unaccounted: it
-                        # stays alive until the custodian's own deadline, and the
-                        # custodian ends the run and keeps every resource.
+                        # may not claim completion while it is unaccounted: it keeps
+                        # trying to reap it inside the custodian's own wait window,
+                        # and if that closes still unaccounted it holds until the
+                        # custodian ends the run with every resource kept.
                         self.publish("detach_child_unaccounted: monitor_held")
+                        if handle is not None and typed(getattr(handle, "pid", None), int):
+                            # The custodian can still identify, signal and observe
+                            # it after this monitor's own timeout, so the child is
+                            # never left unowned.
+                            self.send("detach_child", pid=int(handle.pid))
+                        window_end = (ctx["start_ns"] + int(ctx["limit_s"] * NS)
+                                      - EXIT_MARGIN_S * NS - int(0.2 * NS))
+                        status = None
+                        while handle is not None and now_ns() < window_end and not self.stop.is_set():
+                            try:
+                                status = handle.wait(timeout=0.2)
+                            except BaseException:
+                                status = None
+                            if status is not None:
+                                break
+                        if status is not None:  # accounted after all: truthful keep
+                            with self.lock:
+                                detach["reaped"] = True
+                                detach["reap_timed_out"] = False
+                                self.receipt["detach"] = detach
+                            self.publish("detach_child_accounted: scratch_kept")
                         self.summary()
-                        end = ctx["start_ns"] + int(ctx["limit_s"] * NS)
+                        if status is not None:
+                            self.publish("monitor_complete: pending_custodian")
+                            self.send("monitor_complete")
+                            self.stop.set()
+                            return
+                        end = ctx["start_ns"] + int(ctx["limit_s"] * NS) - int(0.1 * NS)
                         while not self.stop.is_set() and now_ns() < end:
-                            time.sleep(0.05)
+                            time.sleep(0.02)
                         return
                     self.publish("monitor_complete: pending_custodian")
                     self.summary()
@@ -3610,6 +3664,7 @@ class Custodian:
         self.census_last_at = None
         self.reaped_seq = None
         self.monitor_complete = False
+        self.detach_child = None
         self.deadline_hit = False
         self.gate_opened = False
         self.gate_at = None
@@ -3811,6 +3866,25 @@ class Custodian:
                 self.guard.latch(f"post-census detach unqualified ({message['post_state']})")
         elif kind == "cleanup_kept":
             self.guard.latch(f"cleanup kept the owned root: {message['reason']}")
+        elif kind == "detach_child":
+            if not typed(message["pid"], int) or message["pid"] <= 0:
+                self.guard.latch("protocol: detach_child without a valid pid")
+                return
+            if self.detach_child is not None:
+                self.guard.latch("protocol: second detach_child")
+                return
+            row = Kinfo.one(message["pid"])
+            if row is None or row["stat"] == 5:  # 5 == SZOMB: nothing left to signal
+                self.record("detach_child_pinned", pid=message["pid"], start=None,
+                            observation="already gone")
+                return
+            self.detach_child = [message["pid"], row["start"]]
+            self.record("detach_child_pinned", pid=message["pid"], start=row["start"],
+                        observation="live")
+            # Signal it now, not only after the monitor times out: the monitor
+            # already reported it unaccounted and unqualified, so the child stops
+            # holding the run's window open.
+            self.signal_detach_child()
         elif kind == "cleanup_failed":
             self.guard.latch("cleanup: owned scratch not fully removed")
 
@@ -4110,6 +4184,43 @@ class Custodian:
             pass
         return 124 if self.deadline_hit else 125
 
+    def signal_detach_child(self):
+        """One identity-checked SIGKILL of the pinned detach child, recorded."""
+        if self.detach_child is None:
+            return
+        pid, start = self.detach_child
+        row = Kinfo.one(pid)
+        if row is None or row["start"] != start or row["stat"] == 5:
+            return
+        self.record("detach_child_signal", pid=pid, start=start)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError as error:
+            self.guard.latch(f"detach child {pid} could not be signalled: {errno_name(error)}")
+
+    def close_detach_child(self):
+        """A detach child the monitor could not reap is pinned by identity here:
+        the custodian signals it and observes it gone, so no direct child is left
+        unowned after the monitor's own timeout. Bounded by the absolute
+        deadline; an unobserved child is a latched fault, never a claim."""
+        if self.detach_child is None:
+            return
+        pid, start = self.detach_child
+        self.signal_detach_child()
+        end = min(now_ns() + NS, self.absolute)
+        closed = False
+        while now_ns() < end:
+            row = Kinfo.one(pid)
+            if row is None or row["start"] != start or row["stat"] == 5:
+                closed = True
+                break
+            self.pump(min(end - now_ns(), 20_000_000))
+        self.record("detach_child_observed", pid=pid, start=start, closed=closed)
+        if not closed:
+            self.guard.latch(f"detach child {pid} was not observed closed")
+
     def closure(self, launched):
         return (launched and self.guard.fault is None and not self.census_uncertain and self.census_ok
                 and len(self.eof) == 2)
@@ -4127,7 +4238,10 @@ class Custodian:
         while not self.monitor_complete and not self.monitor_exited and now_ns() < self.exit_at:
             self.pump(self.exit_at - now_ns())
         if not self.monitor_complete:
-            self.deadline_hit = self.deadline_hit or now_ns() >= self.exit_at
+            # Only the absolute deadline is a deadline hit; the earlier exit
+            # margin is where the custodian stops waiting for a monitor that may
+            # be holding an unaccounted child, which is a fault, not a deadline.
+            self.deadline_hit = self.deadline_hit or now_ns() >= self.absolute
             self.guard.latch("monitor did not complete")
         status = None
         end = min(now_ns() + NS // 2, self.absolute)
@@ -4145,6 +4259,7 @@ class Custodian:
         self.monitor_reaped = status is not None
         if status is None:
             self.guard.latch("monitor not reaped after KILL")
+        self.close_detach_child()
         if not launched:
             return 124 if self.deadline_hit else 125
         return exit_code(self.deadline_hit, self.guard.fault, self.closed, self.leader_status)
