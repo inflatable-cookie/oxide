@@ -2195,6 +2195,21 @@ with no marker behaves exactly as before. It qualifies only once its own
 uncounted keep-going diagnostic and separate author and reviewer
 `proof:supervisor:qualify` receipts exist.
 
+The **author side** ran once at source `c99fe6af0b66a24c05f9ddae417273ed45bde97b`:
+`effigy proof:supervisor:test` passed all 224 pure cases, and
+`effigy proof:supervisor:qualify` returned `result: pass` with no problems,
+266/266 cases, candidate `closed` status 0, no fault and no deadline, on the
+selected volume with positive outer closure (worker wall about 186.6 s; the
+receipt records `supervisor`
+`ee3ec8f5ce6531974a82eb361b35a57b2e5f3420961458f1a66d2e5c1a72702b`, `suite`
+`e9d9391317fd7fcb8c364ad030b32a0252e4493b96b7bb0dc66c308e65a17f19`, `bootstrap`
+`972b8b3011f25c66ebd974e32fb19b217fd333c1989d48c1e47bad2468ac9a30`; evidence
+kept at
+`/Volumes/Builds/scratch/oxide/oxide-supervisor-qualify.ksnrhoyy`). The
+uncounted keep-going diagnostic, the independent reviewer native and the
+exact-head source review are still missing, so nothing is qualified and these
+bytes carry no credit for any other proof.
+
 **Settlement observation (oxide#147, unqualified source).** The current
 `bounded-test.py` also carries observation-only settlement diagnostics, so a
 run that ends with no completed post-reap census round can be told apart from
