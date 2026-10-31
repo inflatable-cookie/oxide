@@ -2723,10 +2723,13 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   retired schema-1 three-key shape too). `oxide` writes it when a leased
   command's own slot admission grant ends (its measured interval from the first
   attempt to the grant), armed only by this supervisor's exported layout.
-  Markers are read only after the monitor is ready, by its own sampler: a
-  malformed, stale or foreign document is rejected and counted (a rejection is
-  also a control message the custodian counts as an observation) and can never
-  fault the run, refuse it or abandon its launch. The monitor polls the path every 0.25 s, opens only a regular file
+  Admission sampling starts together with the reserve and owned-byte samplers,
+  before the monitor's `ready`: a pre-existing, malformed, stale or foreign
+  document is rejected and counted there (a rejection is also a control message
+  the custodian counts as an observation) and grants nothing, because only a
+  document carrying this run's identity can be paired and the child receives
+  that identity only after the gate opens. No marker path can fault the run,
+  refuse it or abandon its launch. The monitor polls the path every 0.25 s, opens only a regular file
   without following a link, reports one marker per file identity and stamps
   the moment it read it. Deduplication binds to the identity of the file it
   actually opened (`fstat` on the open handle), never to an identity sampled
