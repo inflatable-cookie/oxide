@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Owned-output prune proof (oxide#129, oxide#152): the fixed 22-case script.
 
-Run only as an Effigy heavy task under the qualified shared supervisor
+Run only as an Effigy heavy task under the shared proof supervisor
 (`scripts/bounded-test.py`, SHA-256
-bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924, the
-oxide#151 supervisor merged from main af08749c with its exact qualification
-files — bootstrap `scripts/qualify-supervisor.py` 585e33956b0e9b0cce2d45bc85726e1202952c1b500d64da6fa630ade78e4a95
-and suite `scripts/test_supervisor.py` 37ea34f049341b28d7ca2ba4e87dd666527a0146d249e307f5c78b3461ccc9c7;
-earlier declarations named 5e5b6617 and d89115f1, which are historical):
+26a850ac38eb7c1afb7278e89921e100009700cc6a17b2f7cd5c52ba01a27e82, which is
+the qualified oxide#151 supervisor merged from main af08749c plus oxide#191's
+opt-in post-census image detach). Those added bytes are unqualified until their
+own uncounted diagnostic, one counted author and one separate independent
+reviewer `effigy proof:supervisor:qualify` pass at the merged head; the
+oxide#151 qualification files stay history for their own runs (bootstrap
+585e3395..., suite 37ea34f0..., runner bc24b238...; earlier declarations named
+5e5b6617 and d89115f1, which are historical):
 
   rust:outputs-prune             the counted proof (fail-fast)
   rust:outputs-prune:diagnostic  the same script with `--diagnostic`
@@ -328,7 +331,7 @@ def _load(name: str, file: str):
     return module
 
 
-SUPERVISOR = "bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924"
+SUPERVISOR = "26a850ac38eb7c1afb7278e89921e100009700cc6a17b2f7cd5c52ba01a27e82"
 LIMIT_SECONDS = 360
 SCRATCH_MIB = 512
 CASES = 22

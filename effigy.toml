@@ -297,8 +297,10 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # The proof needs a GENUINE internal directory pool, so both new heavy
 # commands take Tom's answered internal-root exception explicitly
 # (`--root-parent /private/tmp`) rather than placing a pool on a selected
-# volume, where the product correctly refuses it. The qualified supervisor is
-# this tree's `bounded-test.py` (sha256 bc24b238…, oxide#151); 300 s wall and
+# volume, where the product correctly refuses it. The supervisor is this tree's
+# `bounded-test.py` (sha256 26a850ac…, oxide#191's post-census detach bytes over
+# the qualified oxide#151 guard; those added bytes are unqualified until their
+# own qualifications pass); 300 s wall and
 # 512 MiB monitored scratch are unchanged and the fit stays unmeasured until
 # a separately activated diagnostic. Staging reuses the oxide#140 recipe (4
 # Cargo jobs, 16 codegen units, assertions on, no debug info, no incremental,
@@ -527,9 +529,10 @@ admission = "heavy"
 run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py auto-ineligible --diagnostic"
 
 # Owned-output prune (oxide#129, oxide#152): one fixed 22-case native proof
-# under the qualified shared supervisor (`scripts/bounded-test.py` SHA-256
-# bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924,
-# the merged oxide#151 supervisor): 360 s, 512 MiB monitored scratch, 30 s work
+# under the shared supervisor (`scripts/bounded-test.py` SHA-256
+# 26a850ac38eb7c1afb7278e89921e100009700cc6a17b2f7cd5c52ba01a27e82,
+# the qualified oxide#151 guard plus oxide#191's opt-in post-census detach,
+# unqualified until its own qualifications pass): 360 s, 512 MiB monitored scratch, 30 s work
 # shutdown margin, one
 # owned 128 MiB scratch image, ordinary detach. Fence and initialization, root
 # nonces, shared and cancelled reservations, snapshot, overflow, eligibility,
@@ -636,9 +639,27 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # (oxide#145). Prints a receipt binding sources, platform, cases, kept
 # resources and limitations. Deletes nothing. 512 MiB monitored scratch. Not a
 # benchmark and not full QA.
+#
+# Since oxide#191 the candidate also carries the opt-in post-census image detach
+# (Tom decision ee263cea) and the suite's three real detach cases, so this
+# receipt is the one that proves the new success, refusal and uncertainty
+# paths alongside the unchanged guard cases. The changed runner is unqualified
+# until one counted author and one separate independent reviewer run of this
+# selector pass at the same head.
 [tasks."proof:supervisor:qualify"]
 admission = "heavy"
 run = "python3 scripts/qualify-supervisor.py"
+
+# The uncounted keep-going diagnostic of that same qualification path
+# (oxide#191): the same bootstrap, heavy admission, 300 s absolute deadline and
+# 512 MiB monitored scratch, with `--diagnostic` on both the bootstrap and the
+# changed pass check. It runs each named qualification oracle on its own, so one
+# failing check never hides the rest, records a bounded `qualified: false`
+# receipt and always exits non-zero: it is never a counted PASS, and it is
+# required before the counted author qualification at a changed head.
+[tasks."proof:supervisor:qualify:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/qualify-supervisor.py --diagnostic"
 
 # SUSPENDED by oxide#102: provisions its pool with the retired standalone
 # lease CLI and APFS image backend, so it refuses before any effect until
@@ -696,8 +717,12 @@ run = "python3 scripts/test-oxide-removable-pool.py"
 # `hdiutil detach -force` of its own positively bound device in three cases:
 # idle slot kept warm, held build fails cleanly and its lost slot is deleted
 # whole after re-attach, wrapper-allowed build quarantined. No internal spill,
-# checkout-local outputs, run/test after fallback. Ordinary detach at the end.
-# Not a benchmark, real-drive qualification or full QA.
+# checkout-local outputs, run/test after fallback. The proof never detaches
+# after a launch: after every attach it publishes one post-census detach request
+# (oxide#191, decision ee263cea) and the qualified guard performs at most one
+# ordinary detach of exactly that image after its own post-leader census, keeping
+# the mount, backing and evidence when it cannot establish closure. Not a
+# benchmark, real-drive qualification or full QA.
 [tasks."rust:oxide-removable-removal"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-oxide-removable-removal.py"
@@ -717,6 +742,13 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # premise dispositions with no effect at all.
 [tasks."proof:removable-removal:plan"]
 run = "python3 scripts/test-oxide-removable-removal.py --plan"
+
+# The proof's pure apparatus check for both modes: no child, pool, image, device
+# or supervisor. It pins the owners-on attach and mount observation, the
+# post-census detach request writer (schema, canonical backing, atomic write,
+# withdrawal, no-evidence refusal) and that no success path detaches in-script.
+[tasks."proof:removable-removal:test"]
+run = "python3 scripts/test-oxide-removable-removal.py --self-check"
 
 # Boot-session closure (oxide#161): the removable-removal proof's focused
 # mode. A restart ends every process, so a quarantined lost slot whose holder
@@ -1050,9 +1082,10 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-freshness-submodules.py"
 
-# Slot headroom (oxide#118, oxide#177): under the qualified shared proof
-# supervisor (oxide#109/#114/#151, bounded-test.py SHA-256
-# bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924), stages
+# Slot headroom (oxide#118, oxide#177): under the shared proof supervisor
+# (oxide#109/#114/#151 plus oxide#191's opt-in post-census detach, bounded-test.py
+# SHA-256 26a850ac38eb7c1afb7278e89921e100009700cc6a17b2f7cd5c52ba01a27e82,
+# unqualified until its own qualifications pass), stages
 # `oxide` offline with 1.97.1 and proves the permanent ledger/control fences,
 # legacy read without migration, the raised-ceiling fence written at the 129th
 # slot, rank exhaustion, a 256-slot pool whose 257th and 258th admissions

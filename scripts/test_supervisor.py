@@ -3422,6 +3422,20 @@ class QualifyEntry(unittest.TestCase):
         self.assertEqual(observed["forbidden"], [], "the broken entry attempted an effect")
 
 
+def detach_case_rows(case):
+    """The three real detach case rows a qualification receipt must carry, in
+    the shape the suite publishes them (oxide#191): each inside the monitored
+    root and carrying its own recorded detach outcome."""
+    return [
+        {"case": "test_success_detaches_exactly_the_requested_volume", "dir": case, "exit": 0,
+         "detach": {"state": "detached", "qualified": True, "post_state": "detached"}},
+        {"case": "test_an_unbound_identity_is_refused_before_any_detach", "dir": case, "exit": 125,
+         "detach": {"state": "refused", "qualified": False, "post_state": "unknown"}},
+        {"case": "test_a_failed_attempt_keeps_the_mount_and_is_unqualified", "dir": case, "exit": 125,
+         "detach": {"state": "failed", "qualified": False, "post_state": "still_mounted"}},
+    ]
+
+
 class PureQualificationTopology(unittest.TestCase):
     """The actual new-default qualification: nested case resources, evidence
     and reserve all on the selected volume inside the monitored owned root,
@@ -3561,7 +3575,8 @@ class PureQualificationTopology(unittest.TestCase):
         self.assertEqual(record["root"], root)
         self.assertEqual(qualify.nested_cases({"cases": [{"case": "zero", "dir": case}]}, record), [])
         receipt = self.receipt(parent, root, evidence, scratch, registration, case)
-        results = {"outcomes": [["zero", "pass"]], "cases": [{"case": "zero", "dir": case}]}
+        results = {"outcomes": [["zero", "pass"]],
+                   "cases": [{"case": "zero", "dir": case}] + detach_case_rows(case)}
         problems = qualify.check(receipt, results, expected, record, facts)
         self.assertEqual([p for p in problems if "cases:" not in p], [], problems)
 
@@ -3682,9 +3697,22 @@ class PureQualificationTopology(unittest.TestCase):
         self.assertEqual(problems, [], problems)
         receipt = self.receipt(parent, root, evidence, scratch, registration, case)
         receipt["scratch_default"].update(mount=mount, volume_uuid=DRIVE_UUID)
-        results = {"outcomes": [["zero", "pass"]], "cases": [{"case": "zero", "dir": case}]}
+        results = {"outcomes": [["zero", "pass"]],
+                   "cases": [{"case": "zero", "dir": case}] + detach_case_rows(case)}
         problems = qualify.check(receipt, results, expected, record, facts, base)
         self.assertEqual([p for p in problems if "cases:" not in p], [], problems)
+        # oxide#191: the receipt must exercise the detach success, refusal and
+        # failure paths, and an absent or mislabelled one is a named problem.
+        stripped = dict(results, cases=[{"case": "zero", "dir": case}])
+        self.assertTrue(any("recorded no detach outcome" in p for p in
+                            qualify.check(receipt, stripped, expected, record, facts, base)))
+        rows = detach_case_rows(case)
+        wrong = dict(results, cases=[{"case": "zero", "dir": case}] + [
+            dict(rows[0], detach={"state": "refused", "qualified": True, "post_state": "detached"})]
+            + rows[1:])
+        self.assertTrue(any("detach case test_success_detaches_exactly_the_requested_volume" in p
+                            and "not detached/True" in p
+                            for p in qualify.check(receipt, wrong, expected, record, facts, base)))
         # The drive root is not the contract: neither the bare mount as parent
         # nor a root created directly on it is accepted as the new default.
         drive_expected = dict(expected, root_parent=mount)
@@ -4083,6 +4111,274 @@ class OneShotStop:
 
     def set(self):
         self.stopped = True
+
+
+DETACH_UUID = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+
+
+class DetachFacts:
+    """Substituted detach seams: the kernel and `hdiutil` facts the runner reads,
+    plus the one detach attempt. `mount_point` and `attachments` take either a
+    fixed answer or a function of `attempted`, so a case states exactly what was
+    true before and after its attempt and a refusal cannot pass by accident."""
+
+    def __init__(self, mount="/Volumes/OxDetach", device="/dev/disk7", uuid=DETACH_UUID,
+                 mount_point=None, attachments=None, attempt=None, stats=None):
+        self.mount, self.device, self.uuid = mount, device, uuid
+        self.mount_point_value = mount_point
+        self.attachments_value = attachments
+        self.attempt = attempt or {"exit": 0, "timed_out": False, "error": None, "output": ""}
+        self.stats = stats or {}
+        self.attempted = False
+        self.detached = []
+
+    def realpath(self, path):
+        return os.path.realpath(path)
+
+    def lstat(self, path):
+        return os.lstat(path)
+
+    def stat(self, path):
+        return self.stats[path] if path in self.stats else os.stat(path)
+
+    def bound_stats(self):
+        return {"/dev/disk7s1": types.SimpleNamespace(st_rdev=42),
+                "/Volumes/OxDetach": types.SimpleNamespace(st_dev=42)}
+
+    def rows(self, mounted):
+        return ([(self.device, None, None), (self.device + "s1", self.mount, self.uuid)]
+                if mounted else [])
+
+    def mount_point(self, path):
+        if callable(self.mount_point_value):
+            return self.mount_point_value(self.attempted)
+        if self.mount_point_value is not None:
+            return self.mount_point_value
+        # Unstated: mounted before the attempt and, by default, detached by a
+        # successful one.
+        success = self.attempt.get("exit") == 0 and not self.attempt.get("timed_out")
+        return not (self.attempted and success)
+
+    def volume_uuid(self, path):
+        return self.uuid
+
+    def attachments(self, backing, timeout=None):
+        if callable(self.attachments_value):
+            return self.attachments_value(self.attempted)
+        if self.attachments_value is not None:
+            return list(self.attachments_value)
+        return self.rows(self.mount_point("/Volumes/OxDetach"))
+
+    def detach(self, mount, timeout):
+        self.detached.append((mount, timeout))
+        self.attempted = True
+        return dict(self.attempt)
+
+
+class PureDetach(unittest.TestCase):
+    """Oxide#191: the opt-in post-census detach a proof requests. Pure: no image,
+    no mount, no child, no supervisor. It proves the request is bounded and
+    never partly trusted, that only a positively re-derived identity is detached,
+    that exactly one ordinary attempt can happen, and that every refusal, failure,
+    timeout or ambiguity keeps the mount and is unqualified."""
+
+    def layout(self):
+        sandbox = Path(tempfile.mkdtemp(prefix="detach.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(sandbox), True)
+        root = os.path.join(str(sandbox), "oxide-proof.aaa")
+        evidence = os.path.join(root, "evidence")
+        os.makedirs(os.path.join(root, "scratch"), 0o700)
+        os.makedirs(evidence, 0o700)
+        backing = os.path.join(root, "scratch", "volume.sparseimage")
+        with open(backing, "wb") as handle:
+            handle.write(b"sparse image placeholder")
+        ctx = {"owned": True, "root": root, "scratch": os.path.join(root, "scratch"),
+               "evidence": evidence, "reserve_path": root, "inject": [],
+               "start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "limit_s": 300}
+        return ctx, backing
+
+    def facts(self, **changes):
+        facts = DetachFacts(**changes)
+        facts.stats.update(facts.bound_stats())
+        return facts
+
+    def request(self, ctx, backing, **changes):
+        document = {"version": 1, "backing": backing, "mount": "/Volumes/OxDetach",
+                    "device": "/dev/disk7", "volume_uuid": DETACH_UUID.upper(),
+                    "note": "self-check"}
+        document.update(changes)
+        path = os.path.join(ctx["evidence"], bounded.DETACH_REQUEST_NAME)
+        with open(path, "w") as handle:
+            json.dump(document, handle)
+        return path
+
+    def test_no_request_is_the_unchanged_runner(self):
+        ctx, _backing = self.layout()
+        facts = self.facts()
+        self.assertIsNone(bounded.post_census_detach(ctx, facts))
+        self.assertEqual(facts.detached, [], "a detach ran without a request")
+
+    def test_a_bound_request_detaches_exactly_once(self):
+        ctx, backing = self.layout()
+        facts = self.facts()
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertEqual(facts.detached[0][0], "/Volumes/OxDetach")
+        self.assertLessEqual(facts.detached[0][1], bounded.DETACH_TIMEOUT_S)
+        self.assertEqual(len(facts.detached), 1, "more than one detach attempt")
+        self.assertEqual((record["state"], record["qualified"], record["post_state"]),
+                         ("detached", True, "detached"))
+        self.assertEqual((record["attempted"], record["exit"], record["timed_out"]), (True, 0, False))
+        self.assertIsNone(record["reason"])
+        self.assertEqual(record["backing"], backing, "the record does not name the requested backing")
+        self.assertIsNotNone(record["reserve_before"])
+        self.assertIsNotNone(record["owned_before"])
+        self.assertEqual(record["deadline_ns"], ctx["start_ns"] + 300 * bounded.NS)
+
+    def test_a_wrong_uuid_device_or_mount_refuses_without_detaching(self):
+        for changes, expected in (({"volume_uuid": "11111111-2222-3333-4444-555555555555"}, "uuid"),
+                                  ({"device": "/dev/disk9"}, "device"),
+                                  ({"mount": "/Volumes/OxOther"}, "mount"),
+                                  ({"backing": "/private/etc/passwd"}, "outside"),
+                                  ({"backing": "/Volumes"}, "regular file"),
+                                  ({"version": 2}, "version"),
+                                  ({"device": "/dev/disk7s1s9"}, "device"),
+                                  ({"mount": "/Volumes/../Volumes/OxDetach"}, "canonical"),
+                                  ({"extra": "unexpected"}, "unknown fields")):
+            ctx, backing = self.layout()
+            facts = self.facts()
+            changes = dict(changes)
+            self.request(ctx, changes.pop("backing", backing), **changes)
+            record = bounded.post_census_detach(ctx, facts)
+            self.assertEqual(facts.detached, [], f"{changes} was detached")
+            self.assertEqual((record["state"], record["qualified"], record["attempted"]),
+                             ("refused", False, False), f"{changes}: {record}")
+            self.assertIn(expected, (record["reason"] or "").lower(), f"{changes}: {record['reason']}")
+
+    def test_a_mount_that_is_not_this_image_or_not_mounted_refuses(self):
+        for changes, expected in (({"mount_point": False}, "mount point"),
+                                  ({"attachments": lambda attempted: []}, "not attached")):
+            ctx, backing = self.layout()
+            facts = self.facts(**changes)
+            self.request(ctx, backing)
+            record = bounded.post_census_detach(ctx, facts)
+            self.assertEqual(facts.detached, [], f"{changes} was detached")
+            self.assertEqual(record["state"], "refused", record)
+            self.assertIn(expected, record["reason"], record["reason"])
+
+    def test_a_symlinked_backing_or_request_is_refused(self):
+        ctx, backing = self.layout()
+        link = os.path.join(ctx["scratch"], "link.sparseimage")
+        os.symlink(backing, link)
+        facts = self.facts()
+        self.request(ctx, link)
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertEqual(facts.detached, [], "a symlinked backing was detached")
+        self.assertIn("symlink", record["reason"])
+
+        ctx, backing = self.layout()
+        target = os.path.join(ctx["evidence"], "elsewhere.json")
+        with open(target, "w") as handle:
+            json.dump({"version": 1, "backing": backing, "mount": "/Volumes/OxDetach",
+                       "device": "/dev/disk7", "volume_uuid": DETACH_UUID}, handle)
+        os.symlink(target, os.path.join(ctx["evidence"], bounded.DETACH_REQUEST_NAME))
+        record = bounded.post_census_detach(ctx, self.facts())
+        self.assertEqual(record["state"], "refused")
+        self.assertIn("regular file", record["reason"])
+
+    def test_an_oversize_or_malformed_request_is_refused(self):
+        for payload, expected in ((b"{" + b" " * bounded.DETACH_REQUEST_MAX_BYTES + b"}", "bytes"),
+                                  (b"not json", "JSON"), (b"[]", "object"),
+                                  (b'{"version": 1, "mount": "\\u0000"}', "bounded single-line")):
+            ctx, _backing = self.layout()
+            with open(os.path.join(ctx["evidence"], bounded.DETACH_REQUEST_NAME), "wb") as handle:
+                handle.write(payload)
+            facts = self.facts()
+            record = bounded.post_census_detach(ctx, facts)
+            self.assertEqual((record["state"], record["attempted"]), ("refused", False), record)
+            self.assertEqual(facts.detached, [], f"{payload} was detached")
+            self.assertIn(expected, record["reason"], record["reason"])
+
+    def test_a_caller_owned_root_detaches_nothing(self):
+        ctx, backing = self.layout()
+        ctx["owned"] = False
+        self.request(ctx, backing)
+        facts = self.facts()
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertEqual(record["state"], "refused")
+        self.assertEqual(facts.detached, [], "a caller-owned root detached an image")
+        self.assertIn("belongs to the caller", record["reason"])
+
+    def test_a_deadline_reserve_refuses_before_any_attempt(self):
+        ctx, backing = self.layout()
+        ctx["limit_s"] = 1
+        facts = self.facts()
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertEqual(facts.detached, [], "a detach ran past the deadline reserve")
+        self.assertEqual((record["state"], record["qualified"]), ("refused", False))
+        self.assertIn("deadline", record["reason"])
+
+    def test_a_failed_or_timed_out_attempt_keeps_the_mount(self):
+        for attempt, state in (({"exit": 1, "timed_out": False, "error": None, "output": "busy"}, "failed"),
+                               ({"exit": None, "timed_out": True, "error": None, "output": ""}, "timed_out")):
+            ctx, backing = self.layout()
+            facts = self.facts(attempt=attempt, mount_point=True)
+            self.request(ctx, backing)
+            record = bounded.post_census_detach(ctx, facts)
+            self.assertEqual((record["state"], record["qualified"], record["post_state"]),
+                             (state, False, "still_mounted"), record)
+            self.assertIsNotNone(record["reason"])
+
+    def test_a_zero_exit_that_leaves_the_mount_is_ambiguous(self):
+        ctx, backing = self.layout()
+        facts = self.facts(mount_point=True)
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertEqual((record["state"], record["post_state"], record["qualified"]),
+                         ("failed", "still_mounted", False), record)
+
+    def test_a_detach_that_leaves_the_device_attached_is_not_detached(self):
+        ctx, backing = self.layout()
+        facts = self.facts(
+            mount_point=lambda attempted: not attempted,
+            attachments=lambda attempted: [("/dev/disk7", None, None),
+                                           ("/dev/disk7s1", "/Volumes/OxDetach", DETACH_UUID)])
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertEqual((record["state"], record["post_state"], record["qualified"]),
+                         ("failed", "still_attached", False), record)
+
+    def test_unreadable_attachment_facts_refuse(self):
+        ctx, backing = self.layout()
+        facts = self.facts(attachments=lambda attempted: None)
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertEqual(facts.detached, [], "unreadable attachment facts still detached")
+        self.assertIn("attachment facts are unreadable", record["reason"])
+
+    def test_an_unknown_mount_post_state_is_unqualified(self):
+        ctx, backing = self.layout()
+        facts = self.facts(mount_point=lambda attempted: None if attempted else True)
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertEqual((record["state"], record["post_state"], record["qualified"]),
+                         ("failed", "unknown", False), record)
+
+    def test_the_marker_records_a_failed_detach_as_unconcluded(self):
+        self.assertIn("detach", bounded.MARKER_REASONS)
+        self.assertNotIn("detach", bounded.MARKER_EXPIRABLE_REASONS)
+        sandbox = Path(tempfile.mkdtemp(prefix="detach-marker.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(sandbox), True)
+        root = os.path.join(str(sandbox), "oxide-proof.bbb")
+        os.mkdir(root, 0o700)
+        document = bounded.marker_document(bounded.new_run_id(), root, FixtureProbe())
+        bounded.write_marker(root, document, FixtureProbe())
+        updated = bounded.record_conclusion(root, document["run_id"], FixtureProbe(), "failed", "none",
+                                            "detach")
+        self.assertEqual((updated["outcome"], updated["closure"], updated["kept_reason"]),
+                         ("failed", "none", "detach"))
+        self.assertIsNone(updated["concluded_unix"])
 
 
 class PureSettlement(unittest.TestCase):
@@ -5787,6 +6083,133 @@ sys.exit(qualify.bounded(work, start + 2 * 10**9, start + 3 * 10**9))
         CASES.append({"case": "fixture_deadline", "exit": [result.returncode, late.returncode]})
 
 
+# Post-census detach (oxide#191): the runner detaches, at most once, the exact
+# image a proof publishes a request for -- and only after its own certain empty
+# census. These are the only cases here that attach a real volume; each uses a
+# tiny 8 MiB sparse image in the case's own evidence directory, attaches it with
+# `-owners on`, and (for the two refusal cases) removes its own fixture after the
+# nested guard has exited.
+DETACH_CASE = fixture("""
+import json, os, plistlib, subprocess, sys
+case = os.environ["CASE_DIR"]
+evidence = os.environ["OXIDE_PROOF_EVIDENCE"]
+token = os.environ["CASE_TOKEN"]
+mount = "/Volumes/OxD" + token[:8]
+image = os.path.join(evidence, "detach.sparseimage")
+def run(*argv, timeout=90):
+    return subprocess.run(list(argv), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, timeout=timeout)
+created = run("/usr/bin/hdiutil", "create", "-size", "8m", "-fs", "APFS", "-volname", "OxD" + token[:8],
+              "-type", "SPARSE", image)
+if created.returncode != 0:
+    print("image create failed: " + created.stderr.decode(errors="replace"), file=sys.stderr)
+    raise SystemExit(3)
+attached = run("/usr/bin/hdiutil", "attach", "-owners", "on", "-nobrowse", "-noverify", "-plist", image)
+if attached.returncode != 0:
+    print("attach failed: " + attached.stderr.decode(errors="replace"), file=sys.stderr)
+    raise SystemExit(3)
+entities = plistlib.loads(attached.stdout)["system-entities"]
+wholes = [entity["dev-entry"] for entity in entities
+          if entity.get("dev-entry", "").rsplit("/dev/disk", 1)[-1].isdigit()]
+mounts = [entity["mount-point"] for entity in entities if entity.get("mount-point")]
+if len(wholes) != 1 or mounts != [mount]:
+    print("unexpected attachment " + repr((wholes, mounts)), file=sys.stderr)
+    raise SystemExit(3)
+uuid = plistlib.loads(run("/usr/sbin/diskutil", "info", "-plist", mount).stdout)["VolumeUUID"]
+request = {"version": 1, "backing": os.path.realpath(image), "mount": mount, "device": wholes[0],
+           "volume_uuid": uuid, "note": "supervisor suite detach case"}
+request.update(json.loads(os.environ.get("CASE_DETACH_OVERRIDE") or "{}"))
+temporary = os.path.join(evidence, "detach-request.json.tmp")
+with open(temporary, "w") as handle:
+    json.dump(request, handle)
+os.replace(temporary, os.path.join(evidence, "detach-request.json"))
+with open(os.path.join(case, "volume.json"), "w") as handle:
+    json.dump({"mount": mount, "device": wholes[0], "uuid": uuid, "image": image}, handle)
+print("detach fixture ready: " + mount + " " + wholes[0])
+""")
+
+
+class DetachReal(unittest.TestCase):
+    """The three real post-census detach cases. Each one owns its image, keeps
+    its evidence, and removes its own fixture mount after the nested guard has
+    exited (a successful case finds it already gone)."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="detach_case.", dir=nested_root())).resolve()
+        self.started = now_ns()
+        self.token = secrets.token_hex(4)
+
+    def guard(self, override=None, inject=()):
+        extra = {"CASE_TOKEN": self.token}
+        if override is not None:
+            extra["CASE_DETACH_OVERRIDE"] = json.dumps(override)
+        env = dict(os.environ, CASE_DIR=str(self.dir), CASE_TOKEN=self.token,
+                   FIXTURE_DEADLINE_NS=str(self.started + FALLBACK_S * NS),
+                   OXIDE_SUPERVISOR_INJECT=",".join(inject))
+        # An inherited root would make the nested guard adopt it, and an adopted
+        # root owns no image to detach: this case needs the owned `--root-parent`.
+        env.pop("OXIDE_TASK_SCRATCH_ROOT", None)
+        env.update(extra)
+        args = [sys.executable, str(SUPERVISOR), "--limit", "40", "--root-parent", str(self.dir),
+                "--evidence", str(self.dir / "evidence"), "--", sys.executable, "-c", DETACH_CASE]
+        with open(self.dir / "guardian.log", "wb") as log:
+            guardian = subprocess.Popen(args, env=env, stdout=subprocess.DEVNULL, stderr=log)
+            try:
+                self.code = guardian.wait(timeout=VERDICT_S - (now_ns() - self.started) / NS)
+            finally:
+                if guardian.poll() is None:
+                    guardian.kill()
+                    guardian.wait(5)
+        self.receipt = json.loads((self.dir / "evidence" / "receipt.json").read_text())
+        self.volume = json.loads((self.dir / "volume.json").read_text())
+        CASES.append({"case": self._testMethodName, "exit": self.code, "phase": self.receipt["phase"],
+                      "dir": str(self.dir), "detach": self.receipt.get("detach"),
+                      "wall_s": round((now_ns() - self.started) / NS, 3), "kept": str(self.dir)})
+
+    def remove_fixture_mount(self):
+        # This case's own image, after the nested guard exited: fixture hygiene,
+        # never a closure claim about the guard's session.
+        subprocess.run(["/usr/bin/hdiutil", "detach", self.volume["mount"]], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        self.assertFalse(os.path.exists(self.volume["mount"]), "the fixture mount survived its own detach")
+
+    def test_success_detaches_exactly_the_requested_volume(self):
+        self.guard()
+        detach = self.receipt["detach"]
+        self.assertEqual((detach["state"], detach["qualified"], detach["post_state"]),
+                         ("detached", True, "detached"), detach)
+        self.assertEqual((detach["backing"], detach["mount"], detach["device"]),
+                         (self.volume["image"], self.volume["mount"], self.volume["device"]))
+        self.assertTrue(detach["attempted"])
+        self.assertEqual(self.code, 0, self.receipt["outcome"])
+        self.assertFalse(os.path.exists(self.volume["mount"]), "the requested mount was not detached")
+        self.assertFalse(os.path.exists(self.receipt["scratch"]), "owned scratch was kept")
+        self.assertTrue(os.path.isfile(self.volume["image"]), "the evidence backing was removed")
+
+    def test_an_unbound_identity_is_refused_before_any_detach(self):
+        self.guard(override={"volume_uuid": "11111111-2222-3333-4444-555555555555"})
+        detach = self.receipt["detach"]
+        self.assertEqual((detach["state"], detach["attempted"], detach["qualified"]),
+                         ("refused", False, False), detach)
+        self.assertIn("UUID", detach["reason"], detach["reason"])
+        self.assertEqual(self.code, 125)
+        self.assertTrue(os.path.exists(self.volume["mount"]), "a refused request still detached")
+        self.assertTrue(os.path.exists(self.receipt["scratch"]), "the refused root was cleaned")
+        self.remove_fixture_mount()
+
+    def test_a_failed_attempt_keeps_the_mount_and_is_unqualified(self):
+        self.guard(inject=["detach-fail"])
+        detach = self.receipt["detach"]
+        self.assertEqual((detach["state"], detach["qualified"], detach["post_state"]),
+                         ("failed", False, "still_mounted"), detach)
+        self.assertEqual(self.code, 125)
+        self.assertIn("detach", (self.receipt["outcome"] or {}).get("fault") or "")
+        self.assertTrue(os.path.exists(self.volume["mount"]), "a failed detach removed the mount")
+        self.assertTrue(os.path.exists(self.receipt["scratch"]), "the kept root was cleaned")
+        self.remove_fixture_mount()
+
+
+
 class Results(unittest.TextTestResult):
     outcomes = []
 
@@ -5828,7 +6251,7 @@ def main():
                                            PureMarker, PureSweep, PureExistingParent,
                                            PureProtectionAndLifecycle, QualifyEntry,
                                            PureQualificationTopology, PureClosureDecision,
-                                           PureSettlement, PureInterleavedConfirmation))
+                                           PureSettlement, PureInterleavedConfirmation, PureDetach))
     ok = runner.run(pure).wasSuccessful()
     if sys.argv[1:] != ["--pure"]:
         # Writers before and after a simulated staging step, in the outer
@@ -5838,7 +6261,8 @@ def main():
         subprocess.run([sys.executable, "-c", f"open({staged!r}, 'wb').write(bytes(4 * 1024 * 1024))"],
                        check=True, timeout=30)
         time.sleep(2.5)
-        ok = runner.run(loader.loadTestsFromTestCase(Real)).wasSuccessful() and ok
+        ok = runner.run(unittest.TestSuite([loader.loadTestsFromTestCase(Real),
+                                              loader.loadTestsFromTestCase(DetachReal)])).wasSuccessful() and ok
         write("after.bin", 1024 * 1024)
         path = os.environ.get("OXIDE_SUPERVISOR_CASES")
         if path:

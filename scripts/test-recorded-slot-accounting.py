@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Focused native proof for recorded per-slot accounting (oxide#146).
 
-One fixed script and the whole command of the qualified shared proof
-supervisor (`bounded-test.py`, guard sha256 bc24b238..., oxide#151). That pin
-is checked against the actual runner file before any effect, so a branch that
-still carries an older guard refuses here instead of spending a run. The
+One fixed script and the whole command of the shared proof supervisor
+(`bounded-test.py`, guard sha256 26a850ac..., the oxide#191 bytes that add the
+opt-in post-census image detach to the qualified oxide#151 guard). That pin is
+checked against the actual runner file before any effect, so a branch that
+still carries different guard bytes refuses here instead of spending a run;
+these bytes are unqualified until their own author and reviewer qualifications
+pass at the merged head. The
 approved recipe is an INTERNAL directory pool, so both heavy selectors pass
 `--root-parent /private/tmp` explicitly (Tom's internal-root exception): a
 pool inside a selected-volume root would be refused by the product itself.
@@ -78,7 +81,7 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILDER = "1.97.1"
 # The qualified shared supervisor this proof's whole command runs under.
-GUARD_SHA256 = "bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924"
+GUARD_SHA256 = "26a850ac38eb7c1afb7278e89921e100009700cc6a17b2f7cd5c52ba01a27e82"
 GUARD_PATH = os.path.join(REPO, "scripts", "bounded-test.py")
 
 # The product's serialized pool facts, bound to source by `--self-test`. The

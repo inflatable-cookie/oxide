@@ -48,6 +48,18 @@ writers are outside the promise. Host free space is a sampled abort
 threshold; the owned-byte budget is monitored, not a hard ceiling. macOS
 only.
 
+Post-census image detach (oxide#191, decision ee263cea): a proof whose own
+test image must be detached publishes ONE bounded atomic `detach-request.json`
+under OXIDE_PROOF_EVIDENCE naming that image's backing, mount, device and volume
+UUID. Only on the `cleanup` decision (a certain empty census after the leader was
+reaped, with no fault) does the monitor re-derive every binding from kernel and
+`hdiutil` facts and make at most one ORDINARY detach of exactly that image,
+inside the same absolute deadline and under the still-running reserve and
+owned-byte samplers, before the owned-scratch cleanup. A refusal, failure,
+timeout, identity change or ambiguous post-state is never retried, keeps the
+mount, backing and evidence, is recorded in the receipt's `detach` object and
+ends the run unqualified (exit 125). No request means nothing changes.
+
 Default scratch (oxide#145, oxide#151): with no caller `OXIDE_TASK_SCRATCH_ROOT`
 and no `--root-parent`, the owned root is created under the owned subtree
 `<mount>/scratch/oxide` of the volume the effect-free pool selection names,
@@ -79,13 +91,16 @@ import errno
 import json
 import math
 import os
+import plistlib
 import pwd
+import re
 import secrets
 import select
 import shutil
 import signal
 import stat
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -177,7 +192,7 @@ MARKER_OUTCOMES = ("running", "closed", "unclosed", "failed", "retained")
 MARKER_SCOPES = ("exclusive", "hosting")
 MARKER_CLOSURES = ("positive", "none")
 MARKER_REASONS = ("none", "evidence", "unclosed", "exception", "nested-unclosed",
-                  "qualify-base", "qualify-failed")
+                  "qualify-base", "qualify-failed", "detach")
 MARKER_EXPIRABLE_REASONS = ("evidence", "qualify-base")
 EXPIRY_S = 7 * 24 * 60 * 60
 SWEEP_TIME_BUDGET_NS = 1 * NS  # of the 10 s setup budget, checked between filesystem steps
@@ -189,6 +204,7 @@ INJECTIONS = {
     "census-uncertain-first", "reserve-low-after", "cancel-after-ack", "cancel-at-gate",
     "pump-exception", "kqueue-exception", "malformed-message", "stop-exception",
     "reserve-delay-stall", "scratch-delay-stall",
+    "detach-fail", "detach-timeout", "detach-ambiguous",
 }
 RESERVE_DELAY_S, SCRATCH_DELAY_S = 0.5, 4.0  # injected publication delays before a sampler stall
 INJECT_AFTER_GATE_NS = 1_500_000_000  # post-gate injections wait for the fixture to start
@@ -199,6 +215,7 @@ FIELDS = {  # required fields per monitor message type; bool is never accepted a
     "output_eof": {"stream": str},
     "census": {"after": int, "members": int, "uncertain": int, "certain": bool},
     "setup": {"root": str, "scratch": str, "evidence": str, "owned": bool},
+    "detach": {"attempted": bool, "qualified": bool, "post_state": str},
 }
 
 
@@ -1369,6 +1386,20 @@ class DefaultProbe:
         with open(path, "rb") as handle:
             return handle.read(limit + 1)
 
+    def mount_point(self, path):
+        """Whether `path` is currently a mount point (a kernel fact, not a
+        remembered path)."""
+        return os.path.ismount(path)
+
+    def attachments(self, backing, timeout=None):
+        """[(device, mount-point, volume-uuid)] of the attached image whose
+        path is exactly `backing`, or None when that is unreadable."""
+        return image_attachments(backing, DETACH_INFO_TIMEOUT_S if timeout is None else timeout)
+
+    def detach(self, mount, timeout):
+        """One bounded ORDINARY detach attempt; never a forced one."""
+        return detach_image(mount, timeout)
+
 
 _ATTR_BIT_MAP_COUNT = 5
 _ATTR_VOL_UUID = 0x00040000  # sys/attr.h
@@ -1408,6 +1439,314 @@ def volume_uuid(path):
         return None
     data = raw[4:20]
     return "-".join((data[0:4].hex(), data[4:6].hex(), data[6:8].hex(), data[8:10].hex(), data[10:16].hex()))
+
+
+# Post-census image detach (oxide#191, Tom decision ee263cea) ---------------------
+#
+# A proof that created its own attachable image publishes ONE bounded atomic
+# request under OXIDE_PROOF_EVIDENCE after that image exists. Only then, and only
+# on the monitor's `cleanup` decision (a positive descendant census after the
+# leader was reaped), may this runner attempt exactly one ORDINARY detach of that
+# exact image -- inside the same absolute deadline and under the same sampled
+# reserve and owned-byte bounds -- before the owned scratch cleanup. A static
+# command-line mount path could not identify a volume minted by the child, so the
+# child names it and the runner re-derives every binding from kernel and
+# `hdiutil` facts. No request means the runner's behaviour is unchanged and the
+# receipt gains no detach object.
+#
+# A refusal, a failed or timed-out attempt, an ambiguous post-state or an
+# unreadable identity never detaches, is never retried and never removes a
+# backing: the mount, backing and evidence are kept and the run is unqualified.
+DETACH_REQUEST_NAME = "detach-request.json"
+DETACH_REQUEST_VERSION = 1
+DETACH_REQUEST_MAX_BYTES = 4096
+DETACH_REQUEST_KEYS = frozenset({"version", "backing", "mount", "device", "volume_uuid", "note"})
+DETACH_TEXT_LIMITS = {"backing": 1024, "mount": 256, "device": 64, "volume_uuid": 64, "note": 256}
+DETACH_DEVICE_RE = re.compile(r"^/dev/disk[0-9]{1,4}(s[0-9]{1,3})?$")  # a whole disk or one mounted slice
+DETACH_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+DETACH_INFO_TIMEOUT_S = 10
+DETACH_TIMEOUT_S = 30
+DETACH_DEADLINE_RESERVE_NS = 3 * NS
+DETACH_OUTPUT_MAX_BYTES = 4096
+DETACH_STATES = ("refused", "detached", "failed", "timed_out", "unknown")
+DETACH_POST_STATES = ("detached", "still_mounted", "still_attached", "unknown")
+HDIUTIL = "/usr/bin/hdiutil"
+
+
+def detach_text(document, name):
+    """One bounded, single-line request field, or None when it is not one."""
+    value = document.get(name)
+    if not isinstance(value, str) or not value:
+        return None
+    if len(value.encode("utf-8", "replace")) > DETACH_TEXT_LIMITS[name]:
+        return None
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        return None
+    return value
+
+
+def read_detach_request(evidence, probe):
+    """(document, problem) for this run's request, or (None, None) when the
+    proof published none. Bounded, symlink-refusing and never partly trusted."""
+    path = os.path.join(evidence, DETACH_REQUEST_NAME)
+    try:
+        info = probe.lstat(path)
+    except FileNotFoundError:
+        return None, None
+    except OSError as error:
+        return None, f"request {errno_name(error)}"
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return None, "request is not a regular file"
+    if info.st_size > DETACH_REQUEST_MAX_BYTES:
+        return None, f"request is over {DETACH_REQUEST_MAX_BYTES} bytes"
+    if os.path.dirname(os.path.realpath(path)) != os.path.realpath(evidence):
+        return None, "request is not directly inside this run's evidence directory"
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(DETACH_REQUEST_MAX_BYTES + 1)
+    except OSError as error:
+        return None, f"request {errno_name(error)}"
+    if len(raw) > DETACH_REQUEST_MAX_BYTES:
+        return None, f"request is over {DETACH_REQUEST_MAX_BYTES} bytes"
+    try:
+        return json.loads(raw.decode("utf-8")), None
+    except (UnicodeDecodeError, ValueError):
+        return None, "request is not a JSON document"
+
+
+def image_attachments(backing, timeout=DETACH_INFO_TIMEOUT_S):
+    """[(device, mount-point, volume-uuid)] for the attached image whose path is
+    exactly `backing`, or None when the attachment facts are unreadable. One
+    bounded read-only `hdiutil info`; nothing is attached, mounted or detached."""
+    canonical = os.path.realpath(backing)
+    try:
+        result = subprocess.run([HDIUTIL, "info", "-plist"], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0 or not result.stdout:
+        return None
+    try:
+        document = plistlib.loads(result.stdout)
+    except Exception:
+        return None
+    images = document.get("images") if isinstance(document, dict) else None
+    if not isinstance(images, list):
+        return None
+    rows = []
+    for image in images:
+        if not isinstance(image, dict):
+            continue
+        path = image.get("image-path")
+        if not isinstance(path, str) or os.path.realpath(path) != canonical:
+            continue
+        for entity in image.get("system-entities") or []:
+            if not isinstance(entity, dict):
+                continue
+            device = entity.get("dev-entry")
+            if not isinstance(device, str) or not device:
+                continue
+            mount = entity.get("mount-point")
+            identifier = entity.get("volume-uuid")
+            rows.append((device, mount if isinstance(mount, str) and mount else None,
+                         identifier.lower() if isinstance(identifier, str) and identifier else None))
+    return rows
+
+
+def _detach_output(raw):
+    if not raw:
+        return ""
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8", "replace")
+    return raw[-DETACH_OUTPUT_MAX_BYTES:].decode("utf-8", "replace")
+
+
+def detach_image(mount, timeout):
+    """One bounded ORDINARY detach of `mount`. Returns the attempt's own facts;
+    the caller judges the post-state separately and never trusts a zero exit."""
+    try:
+        result = subprocess.run([HDIUTIL, "detach", mount], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+    except subprocess.TimeoutExpired as expired:
+        return {"exit": None, "timed_out": True, "error": None,
+                "output": _detach_output(getattr(expired, "stdout", None))}
+    except OSError as error:
+        return {"exit": None, "timed_out": False, "error": errno_name(error), "output": ""}
+    return {"exit": result.returncode, "timed_out": False, "error": None,
+            "output": _detach_output(result.stdout)}
+
+
+def _free_bytes(path):
+    try:
+        reading = os.statvfs(path)
+        return reading.f_bavail * reading.f_frsize
+    except OSError:
+        return None
+
+
+def detach_request_problems(ctx, document, probe):
+    """Why this request must not be honoured; empty only when every binding is
+    positively established from the owned layout, the kernel and `hdiutil`."""
+    problems = []
+    if not isinstance(document, dict):
+        return ["request is not an object"]
+    if set(document) - DETACH_REQUEST_KEYS:
+        problems.append("request names unknown fields")
+    if not typed(document.get("version"), int) or document.get("version") != DETACH_REQUEST_VERSION:
+        problems.append(f"request version is not {DETACH_REQUEST_VERSION}")
+    text = {}
+    for name in ("backing", "mount", "device", "volume_uuid"):
+        value = detach_text(document, name)
+        if value is None:
+            problems.append(f"request {name} is not a bounded single-line value")
+        else:
+            text[name] = value
+    if "note" in document and detach_text(document, "note") is None:
+        problems.append("request note is not a bounded single-line value")
+    if not ctx.get("owned"):
+        problems.append("this run's scratch root belongs to the caller, so it owns no image to detach")
+    if len(text) != 4:
+        return problems
+    backing, mount, device = text["backing"], text["mount"], text["device"]
+    identifier = text["volume_uuid"].lower()
+    root, evidence = probe.realpath(ctx["root"]), probe.realpath(ctx["evidence"])
+    if not os.path.isabs(backing) or os.path.normpath(backing) != backing:
+        problems.append("backing is not an absolute canonical path")
+    elif probe.realpath(backing) != backing:
+        problems.append("backing resolves through a symlink")
+    else:
+        try:
+            info = probe.lstat(backing)
+        except OSError as error:
+            problems.append(f"backing is unreadable: {errno_name(error)}")
+        else:
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                problems.append("backing is not a regular file")
+            elif not (backing.startswith(root + os.sep) or backing.startswith(evidence + os.sep)):
+                problems.append("backing is outside this run's owned root and evidence directory")
+    if not os.path.isabs(mount) or os.path.normpath(mount) != mount:
+        problems.append("mount is not an absolute canonical path")
+    elif os.path.dirname(mount) != VOLUMES or not os.path.basename(mount):
+        problems.append(f"mount is not one volume directly under {VOLUMES}")
+    elif probe.realpath(mount) != mount:
+        problems.append("mount resolves through a symlink")
+    elif not probe.mount_point(mount):
+        problems.append("mount is not a mount point")
+    if not DETACH_DEVICE_RE.match(device):
+        problems.append("device is not one /dev/disk node")
+    if not DETACH_UUID_RE.match(identifier):
+        problems.append("volume_uuid is not a UUID")
+    if problems:
+        return problems
+    rows = probe.attachments(backing)
+    if rows is None:
+        return ["the attachment facts are unreadable"]
+    if not [row for row in rows if row[0] == device]:
+        problems.append("the requested device is not attached from the requested backing")
+    mounted = [row for row in rows if row[1] == mount]
+    if len(mounted) != 1:
+        problems.append(f"{mount} is mounted {len(mounted)} times from the requested backing")
+    else:
+        mount_device_node, _attached_mount, attached_uuid = mounted[0]
+        if mount_device_node != device and not mount_device_node.startswith(device + "s"):
+            problems.append("the mount point is not this image's own device")
+        if attached_uuid is not None and attached_uuid != identifier:
+            problems.append("the attachment's volume UUID is not the requested UUID")
+        try:
+            node, mounted_device = probe.stat(mount_device_node).st_rdev, probe.stat(mount).st_dev
+        except OSError as error:
+            problems.append(f"the mount or device identity is unreadable: {errno_name(error)}")
+        else:
+            if node != mounted_device:
+                problems.append("the mount's device is not the attachment's own /dev node")
+    if probe.volume_uuid(mount) != identifier:
+        problems.append("the mount's volume UUID is not the requested UUID")
+    return problems
+
+
+def post_census_detach(ctx, probe=None):
+    """This run's one post-census detach, or None when its proof asked for none.
+    Only the `cleanup` branch calls it, so it can only run after a positive
+    descendant census. Never raises: an unknown outcome stays unknown, is kept
+    and is unqualified."""
+    probe = probe or DefaultProbe()
+    try:
+        document, problem = read_detach_request(ctx["evidence"], probe)
+    except BaseException as error:
+        document, problem = None, f"request read failed: {type_name(error)}"
+    if document is None and problem is None:
+        return None
+    record = {"request": os.path.join(os.path.realpath(ctx["evidence"]), DETACH_REQUEST_NAME),
+              "state": "refused", "qualified": False, "attempted": False, "exit": None,
+              "timed_out": False, "error": None, "post_state": "unknown", "reason": problem,
+              "backing": None, "mount": None, "device": None, "volume_uuid": None,
+              "timeout_s": None, "output": "", "reserve_before": None, "reserve_after": None,
+              "owned_before": None, "owned_after": None,
+              "deadline_ns": ctx["start_ns"] + int(ctx["limit_s"] * NS), "at_ns": now_ns()}
+    try:
+        if isinstance(document, dict):
+            for name in ("backing", "mount", "device", "volume_uuid"):
+                record[name] = detach_text(document, name)
+        if problem is not None:
+            return record
+        problems = detach_request_problems(ctx, document, probe)
+        if problems:
+            record["reason"] = "; ".join(problems)
+            return record
+        remaining = record["deadline_ns"] - now_ns()
+        if remaining <= DETACH_DEADLINE_RESERVE_NS:
+            record["reason"] = "not enough of the absolute deadline left for one bounded detach"
+            return record
+        record["reserve_before"] = _free_bytes(ctx["reserve_path"])
+        record["owned_before"] = tree_bytes(ctx["root"])
+        timeout = max(1.0, min(DETACH_TIMEOUT_S, remaining / NS - 1.0))
+        record["timeout_s"] = round(timeout, 3)
+        inject = set(ctx.get("inject") or ())
+        if "detach-fail" in inject:
+            attempt = {"exit": 1, "timed_out": False, "error": None, "output": "injected failing detach"}
+        elif "detach-timeout" in inject:
+            attempt = {"exit": None, "timed_out": True, "error": None, "output": "injected timeout"}
+        elif "detach-ambiguous" in inject:
+            attempt = {"exit": 0, "timed_out": False, "error": None, "output": "injected no-op"}
+        else:
+            attempt = probe.detach(record["mount"], timeout)
+        record.update(attempted=True, exit=attempt.get("exit"), timed_out=bool(attempt.get("timed_out")),
+                      error=attempt.get("error"), output=_detach_output(attempt.get("output")))
+        record["at_ns"] = now_ns()
+        try:
+            mounted = probe.mount_point(record["mount"])
+        except OSError:
+            mounted = None
+        attached = None
+        if mounted is False:
+            attached = probe.attachments(record["backing"])
+        if mounted is None:
+            post_state = "unknown"
+        elif mounted:
+            post_state = "still_mounted"
+        elif attached is None:
+            post_state = "unknown"
+        elif [row for row in attached if row[0] == record["device"]]:
+            post_state = "still_attached"
+        else:
+            post_state = "detached"
+        record["post_state"] = post_state
+        record["reserve_after"] = _free_bytes(ctx["reserve_path"])
+        record["owned_after"] = tree_bytes(ctx["root"])
+        if record["timed_out"]:
+            record["state"] = "timed_out"
+        elif record["exit"] not in (0, None) or post_state != "detached":
+            record["state"] = "failed"
+        else:
+            record["state"], record["qualified"], record["reason"] = "detached", True, None
+            return record
+        record["reason"] = (f"detach exit {record['exit']}" if not record["timed_out"]
+                            else "detach timed out") + f"; post-state {post_state}"
+        return record
+    except BaseException as error:
+        record["state"], record["qualified"] = "unknown", False
+        record["reason"] = record["reason"] or f"detach attempt failed: {type_name(error)}"
+        return record
 
 
 def config_pool_path(text):
@@ -2706,6 +3045,23 @@ class Monitor:
         self.census_stop.set()
         if decision == "cleanup":
             self.publish("closure_established: cleanup_pending")
+            detach = post_census_detach(ctx)  # None unless this proof published a request
+            if detach is not None:
+                with self.lock:
+                    self.receipt["detach"] = detach
+                self.send("detach", attempted=detach["attempted"], qualified=detach["qualified"],
+                          post_state=detach["post_state"])
+                if not detach["qualified"]:
+                    # Never retried, never cleaned up and never a positive conclusion:
+                    # the mount, its backing and the evidence are kept.
+                    self.publish("detach_unqualified: scratch_kept")
+                    self.receipt["scratch_marker"] = self.conclude_marker(
+                        False, reason="detach", outcome="failed")
+                    self.publish("monitor_complete: pending_custodian")
+                    self.summary()
+                    self.send("monitor_complete")
+                    self.stop.set()
+                    return
             self.publish("cleanup_partial_or_unknown")
             if ctx["owned"]:
                 if "cleanup-interrupt" in self.inject:
@@ -2723,10 +3079,12 @@ class Monitor:
         self.send("monitor_complete")
         self.stop.set()
 
-    def conclude_marker(self, closed):
+    def conclude_marker(self, closed, reason=None, outcome=None):
         """Record this run's genuine conclusion on its owner marker, or leave it
         honestly unconcluded. Only the monitor's own closure decision (the
-        custodian's, taken after the leader was reaped) is passed here.
+        custodian's, taken after the leader was reaped) is passed here, and a
+        post-census detach that did not positively detach its own image is never
+        a positive conclusion.
 
         A root the qualification apparatus protected as `hosting` before any
         nested case existed is never concluded from that outer closure: the
@@ -2740,9 +3098,9 @@ class Monitor:
             return record
         try:
             document = record_conclusion(self.ctx["root"], marker["run_id"], DefaultProbe(),
-                                         "closed" if closed else "unclosed",
+                                         outcome or ("closed" if closed else "unclosed"),
                                          "positive" if closed else "none",
-                                         "evidence" if closed else "unclosed")
+                                         reason or ("evidence" if closed else "unclosed"))
             record.update(state="concluded" if closed else "kept",
                           kept_reason=document["kept_reason"],
                           concluded_unix=document["concluded_unix"])
@@ -2771,6 +3129,13 @@ class Monitor:
             f"supervisor: owned bytes peak {peak / MIB:.1f} MiB of {receipt['owned_bytes']['budget'] // MIB} MiB"
             f" monitored budget; evidence {receipt['evidence']}",
         ]
+        detach = receipt.get("detach")
+        if detach is not None:  # only a run whose proof asked for one carries this
+            lines.append(
+                f"supervisor: post-census detach {detach['state']} of {detach.get('mount')}"
+                f" (device {detach.get('device')}, exit {detach['exit']}, timed out {detach['timed_out']},"
+                f" post-state {detach['post_state']}, qualified {detach['qualified']})"
+                + (f": {detach['reason']}" if detach.get("reason") else ""))
         for line in lines:  # one bounded write per line, so none truncates the rest
             report(line + "\n")
 
@@ -3011,6 +3376,11 @@ class Custodian:
                                   and message["members"] == 0 and message["uncertain"] == 0)
         elif kind == "monitor_complete":
             self.monitor_complete = True
+        elif kind == "detach":
+            # A post-census detach that did not positively detach its own image
+            # leaves the mount and backing in place and the run unqualified.
+            if not message["qualified"]:
+                self.guard.latch(f"post-census detach unqualified ({message['post_state']})")
         elif kind == "cleanup_failed":
             self.guard.latch("cleanup: owned scratch not fully removed")
 

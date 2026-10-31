@@ -28,8 +28,15 @@ predeclared cases:
   could outlive the build): after re-attach the slot is kept held with its
   bytes, never reused or deleted.
 
-Final outputs stay in `<checkout>/target` throughout. Cleanup is an ordinary
-detach. Not a benchmark and not real-drive qualification.
+Final outputs stay in `<checkout>/target` throughout. Custody of this proof's
+own image is the qualified guard's, not this script's: after each attach the
+script publishes one bounded request under `OXIDE_PROOF_EVIDENCE` naming the
+backing, mount, device and volume UUID, and the guard performs at most ONE
+ordinary detach of exactly that image after its own post-leader census
+(oxide#191, Tom decision ee263cea). The script withdraws the request before
+any detach it performs itself (only when no child was ever launched) and the
+guard keeps the mount, backing and evidence whenever it cannot establish
+closure. Not a benchmark and not real-drive qualification.
 
 `--boot-closure` is the focused mode for oxide#161: a restart ends every
 process, so a quarantined lost slot whose holder started before the current
@@ -190,23 +197,79 @@ def held_fixture(name: str) -> dict:
 
 # Every child this proof launches may be writing to the removable image, and
 # `Proof.reap`/the shared runner's `close` reap direct leaders only: neither
-# proves the Cargo group has no descendant left. So after ANY launch a failure
-# is an unknown writer outcome — the mount and its backing are retained for the
-# qualified guard's post-leader census instead of being detached here. A normal
-# successful collection still detaches ordinarily.
+# proves the Cargo group has no descendant left. So this script never detaches
+# after a launch. Its image is detached at most once, by the qualified guard,
+# after the guard's own post-leader census (the request published by
+# `publish_detach_request`), and any collection that left a child unreaped is
+# kept whole by that guard.
 WRITERS = {"launched": False}
+
+# The one post-census detach request (oxide#191). The guard re-derives every
+# binding itself, so this document is a request for an identity it must confirm,
+# never an instruction to detach a path.
+DETACH_REQUEST = "detach-request.json"
 
 
 def note_writer_launch() -> None:
     WRITERS["launched"] = True
 
 
+def detach_request_path() -> str:
+    evidence = os.environ.get("OXIDE_PROOF_EVIDENCE", "")
+    need(os.path.isdir(evidence), f"no OXIDE_PROOF_EVIDENCE directory for the detach request: {evidence!r}")
+    return os.path.join(evidence, DETACH_REQUEST)
+
+
+def publish_detach_request(proof, image: str, mount: str, device: str, uuid: str) -> str:
+    """Ask the qualified guard for one ordinary detach of exactly this image.
+
+    Written atomically after the image exists and every identity is known. The
+    guard validates containment, the attachment and the volume UUID before it
+    detaches anything, and only after its own post-leader census; no request
+    means it does nothing.
+    """
+    path = detach_request_path()
+    body = {
+        "version": 1,
+        "backing": os.path.realpath(image),
+        "mount": mount,
+        "device": device,
+        "volume_uuid": uuid.lower(),
+        "note": f"test-oxide-removable-removal.py pid {os.getpid()}",
+    }
+    temporary = path + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(body, handle, sort_keys=True)
+        os.replace(temporary, path)
+    finally:
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+    print(f"detach request {path} names {mount} ({device}, {uuid}) for the guard's post-census step", flush=True)
+    return path
+
+
+def withdraw_detach_request(reason: str) -> None:
+    """Remove this run's request before a detach this script performs itself
+    (only possible before any child launch), so the guard never reads a stale
+    request for an image that is already gone."""
+    evidence = os.environ.get("OXIDE_PROOF_EVIDENCE", "")
+    if not os.path.isdir(evidence):
+        return
+    try:
+        os.unlink(os.path.join(evidence, DETACH_REQUEST))
+    except FileNotFoundError:
+        return
+    print(f"detach request withdrawn ({reason}); this script detaches before any child launch", flush=True)
+
+
 def cleanup_after_failure(proof) -> bool:
     """Clean up a failed collection without presuming writer closure.
 
     Returns True when the mount was retained for the guard. Nothing is
-    detached once a child was launched or one is unreaped; otherwise the
-    ordinary detach runs exactly as before.
+    detached once a child was launched or one is unreaped; with no launch there
+    is no possible descendant writer, so the request is withdrawn and the
+    ordinary detach runs here.
     """
     if WRITERS["launched"] or proof.unclosed:
         print(
@@ -215,6 +278,7 @@ def cleanup_after_failure(proof) -> bool:
             file=sys.stderr,
         )
         return True
+    withdraw_detach_request("failure before any child launch")
     try:
         proof.detach()
     except BaseException as error:
@@ -223,13 +287,14 @@ def cleanup_after_failure(proof) -> bool:
 
 
 def retain_for_census(proof, outcome) -> bool:
-    """Whether the mount and its backing stay for the guard's post-leader
-    census instead of being detached after the collection returns.
+    """Whether this collection reports its image as retained for the guard
+    rather than answered by one request the guard made after its census.
 
     A collection that recorded ANY failure, abort, skip or unexecuted case —
-    or that left a child unreaped — is not a positive-closure state: the
-    direct leaders were reaped, which proves nothing about their Cargo
-    descendants. Only a fully clean collection detaches ordinarily.
+    or that left a child unreaped — is not a state this script vouches for, so
+    its result line claims no detach: the guard's own census decides whether
+    the mount is detached or the whole root kept. This is reporting only; the
+    detach request is never withdrawn on this path.
     """
     if proof.unclosed:
         return True
@@ -379,6 +444,10 @@ class Volume:
         expect(self.uuid is None or info["VolumeUUID"] == self.uuid, "re-attached volume UUID changed")
         self.uuid = info["VolumeUUID"]
         owners_honored(self.proof, self.mount, "attach")
+        # The guard detaches this image at most once, after its own census: every
+        # attach (and re-attach) leaves exactly one request naming the identities
+        # the guard must re-derive for itself.
+        publish_detach_request(self.proof, self.image, self.mount, self.device, self.uuid)
         print(f"attached {self.image} as {self.device} at {self.mount}, volume {self.uuid}")
 
     def bound(self) -> None:
@@ -396,6 +465,10 @@ class Volume:
 
     def force_detach(self, label: str) -> None:
         self.bound()
+        # The surprise removal this case proves is this script's own forced
+        # detach, so its request must not survive it: a stale request would name
+        # an image that is already gone.
+        withdraw_detach_request(f"{label}: forced removal of this run's own image")
         result = self.proof.run(["/usr/bin/hdiutil", "detach", "-force", self.device], timeout=60)
         expect(result.returncode == 0, f"{label}: forced detach of {self.device} failed; evidence kept: {result.stderr!r}")
         self.proof.mount = None
@@ -1494,7 +1567,9 @@ PREMISE_CHECKLIST = (
         "owned images",
         "applicable: every attach and re-attach uses `hdiutil -owners on` and is observed read-only "
         "in /sbin/mount as carrying no `noowners` flag; identity is positively bound before each "
-        "forced detach and cleanup is an ordinary detach that keeps unknown custody",
+        "forced detach, each attach publishes one post-census detach request the qualified guard "
+        "re-derives and performs at most once after its own census, and an in-script detach (only "
+        "before any child launch) withdraws that request first",
     ),
     (
         "compiler flags",
@@ -1530,7 +1605,9 @@ def plan() -> int:
     print("allocation: one owned 128 MiB scratch APFS image at a unique /Volumes/<name> and one "
           "private budget-only internal directory pool, four fixture checkouts, inside one owned "
           "scratch inside OXIDE_TASK_SCRATCH_ROOT (monitored peak 99.7 MiB of the 512 MiB budget)")
-    print("limits: 300 s wall including cleanup, 512 MiB monitored scratch, ordinary detach only")
+    print("limits: 300 s wall including cleanup, 512 MiB monitored scratch, at most one ordinary "
+          "detach of this run's own image, performed by the qualified guard after its post-leader "
+          "census (never by this script once a child has launched)")
     print("cases (main mode):")
     for case, deps, purpose in Removal.CASES:
         print(f"  {case}: {purpose} (after {', '.join(deps) or 'nothing'})")
@@ -1743,6 +1820,69 @@ def self_check() -> int:
         "*attach_options()" in inspect.getsource(Volume.attach),
         "Volume.attach does not use the shared owners option list",
     )
+    # Custody of this proof's own image is the qualified guard's (oxide#191):
+    # every attach publishes one bounded request naming the identities the guard
+    # re-derives itself, the success path never detaches in-script, and any
+    # detach this script does perform withdraws that request first.
+    expect(
+        "publish_detach_request" in inspect.getsource(Volume.attach),
+        "Volume.attach does not publish the post-census detach request",
+    )
+    expect(
+        "withdraw_detach_request" in inspect.getsource(Volume.force_detach),
+        "Volume.force_detach does not withdraw the request it invalidates",
+    )
+    expect(
+        "withdraw_detach_request" in inspect.getsource(cleanup_after_failure),
+        "cleanup_after_failure detaches without withdrawing the request",
+    )
+    expect(
+        "proof.detach()" not in inspect.getsource(main),
+        "the success path detaches in-script instead of requesting the guard's post-census step",
+    )
+    holder = dict(os.environ)
+    evidence = tempfile.mkdtemp(prefix="removal-detach-request.")
+    try:
+        os.environ["OXIDE_PROOF_EVIDENCE"] = evidence
+        published = publish_detach_request(
+            object(),
+            "/fixture/volume.sparseimage",
+            "/Volumes/OxSelf",
+            "/dev/disk4s1",
+            "0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0",
+        )
+        with open(published, encoding="utf-8") as handle:
+            body = json.load(handle)
+        expect(
+            sorted(body) == ["backing", "device", "mount", "note", "version", "volume_uuid"],
+            f"request fields {sorted(body)}",
+        )
+        expect(body["version"] == 1, f"request version {body['version']!r}")
+        expect(body["mount"] == "/Volumes/OxSelf" and body["device"] == "/dev/disk4s1",
+               f"request identity {body}")
+        expect(body["volume_uuid"] == "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+               f"request UUID is not the lowercased volume identity: {body['volume_uuid']}")
+        expect(body["backing"].startswith("/") and os.path.normpath(body["backing"]) == body["backing"],
+               f"request backing is not canonical: {body['backing']}")
+        expect(os.listdir(evidence) == [DETACH_REQUEST],
+               f"the request was not written atomically: {os.listdir(evidence)}")
+        withdraw_detach_request("self-check")
+        expect(os.listdir(evidence) == [], f"withdrawal left {os.listdir(evidence)}")
+        withdraw_detach_request("self-check, already absent")  # idempotent, never an error
+        os.environ.pop("OXIDE_PROOF_EVIDENCE", None)
+        try:
+            publish_detach_request(object(), "/fixture/volume.sparseimage", "/Volumes/OxSelf",
+                                   "/dev/disk4s1", "0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0")
+        except UnknownOutcome as refused:
+            expect("OXIDE_PROOF_EVIDENCE" in str(refused), f"refusal {refused}")
+        else:
+            expect(False, "a detach request was published without an evidence directory")
+        expect(withdraw_detach_request("self-check, no evidence") is None,
+               "withdrawal without an evidence directory is not silent")
+    finally:
+        os.environ.clear()
+        os.environ.update(holder)
+        shutil.rmtree(evidence, ignore_errors=True)
 
     class MountListing:
         def __init__(self, line: str):
@@ -2423,11 +2563,12 @@ def self_check() -> int:
         "main records the failure before deciding custody",
     )
 
-    # The REAL `main` failure path, for both applicable modes: a diagnostic
-    # collection that RETURNS with a recorded failure (no exception propagates)
-    # must still keep the mount and backing for the guard's post-leader census
-    # instead of detaching, while a fully clean counted collection detaches
-    # ordinarily and an unexecuted child alone also retains.
+    # The REAL `main` path, for both applicable modes: a diagnostic collection
+    # that RETURNS with a recorded failure (no exception propagates) must claim
+    # no detach and leave the image to the guard's post-leader census, while a
+    # fully clean counted collection reports the guard's post-census request —
+    # and neither path detaches in-script (oxide#191), because a direct-child
+    # reap is not descendant-writer closure.
     class MainProof:
         instances = []
         extra_unclosed = ()
@@ -2489,7 +2630,7 @@ def self_check() -> int:
         layout.record = lambda name, body: recorded.update({name: body})
         layout.work_left = lambda: 300.0
         globals()["Proof"] = MainProof
-        for argv, body, unclosed, expect_detach, label, main_mode in (
+        for argv, body, unclosed, expect_request, label, main_mode in (
             (["x", "--diagnostic"], failing, (), False, "main-mode diagnostic failure", True),
             (["x", "--boot-closure", "--diagnostic"], failing, (), False,
              "boot-closure diagnostic failure", False),
@@ -2517,19 +2658,19 @@ def self_check() -> int:
             code = main()
             expect(code == 0, f"{label}: main returned {code}")
             instance = MainProof.instances[-1]
-            expect(
-                instance.detached is expect_detach,
-                f"{label}: detach={instance.detached}, expected {expect_detach}",
-            )
+            expect(not instance.detached,
+                   f"{label}: main detached in-script; custody belongs to the guard's post-census step")
             line = recorded.get("result.txt", "")
-            if expect_detach:
-                expect("ordinary detach" in line,
-                       f"{label}: the recorded line does not report the ordinary detach: {line!r}")
+            if expect_request:
+                expect("ordinary detach requested for the qualified guard's post-census step" in line,
+                       f"{label}: the recorded line does not report the guard's post-census request: {line!r}")
+                expect("left to the qualified guard" not in line,
+                       f"{label}: a clean collection claims retention: {line!r}")
             else:
-                expect("retained for the guard" in line,
-                       f"{label}: the recorded line does not report retention: {line!r}")
-                expect("ordinary detach" not in line,
-                       f"{label}: the recorded line still claims a detach that did not happen: {line!r}")
+                expect("detach request left to the qualified guard" in line,
+                       f"{label}: the recorded line does not report the retained custody: {line!r}")
+                expect("ordinary detach requested" not in line,
+                       f"{label}: the recorded line claims a detach this script did not request: {line!r}")
             expect("{custody}" not in line, f"{label}: the custody placeholder was recorded: {line!r}")
 
     finally:
@@ -2612,13 +2753,13 @@ def main() -> int:
         else:
             outcome = run(proof, repo, diagnostic)
         retained = retain_for_census(proof, outcome)
-        custody = ("mount and backing retained for the guard" if retained
-                   else "ordinary detach")
         if retained:
-            print("collection recorded a failure or an unreaped child: keeping the mount and "
-                  "backing for the guard's post-leader census", file=sys.stderr)
+            custody = ("detach request left to the qualified guard, which detaches only after its "
+                       "post-leader census and otherwise keeps the mount, backing and evidence")
+            print("collection recorded a failure or an unreaped child: the guard's post-census decision, "
+                  "not this script, decides whether the mount is detached", file=sys.stderr)
         else:
-            proof.detach()
+            custody = "ordinary detach requested for the qualified guard's post-census step"
     except BaseException as failure:
         retained = cleanup_after_failure(proof)
         layout.record("result.txt", f"failed: {failure!r}\nunclosed children: {sorted(proof.unclosed)}\nmount: {proof.mount}\nbacking retained for the guard: {retained}\nroot: {root}\n")
