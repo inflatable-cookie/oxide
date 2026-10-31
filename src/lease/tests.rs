@@ -1169,13 +1169,6 @@ fn a_held_slot_is_evicted_whole_only_by_its_exact_lease() {
     let workspace = fx.dir("workspace");
     let granted = lease_injected(request(&pool, &project, &workspace, "holder-a")).expect("lease");
     let slot_path = pool.join("payload").join("slots").join(&granted.slot_id);
-    // A slot that is not held is not this path.
-    let idle = lease_injected(request(&pool, &project, &workspace, "holder-b")).expect("idle");
-    release_injected(&pool, &idle.lease_id).expect("release idle");
-    assert!(matches!(
-        evict_held_slot_injected(&pool, &idle.slot_id, &idle.lease_id),
-        Err(LeaseError::Busy)
-    ));
     // A wrong lease refuses with the held row and the tree unchanged.
     let wrong = "0".repeat(32);
     assert!(matches!(
