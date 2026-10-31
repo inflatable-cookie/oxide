@@ -5641,6 +5641,7 @@ class Real(unittest.TestCase):
         # stays in the group long enough for the sampler to read it while the
         # custodian is still in its bounded stop.
         code = fixture(
+            "import json\n"
             "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
             "path = os.path.join(os.environ['OXIDE_PROOF_EVIDENCE'], " + repr(bounded.ADMISSION_NAME) + ")\n"
             "time.sleep(13)\n"
