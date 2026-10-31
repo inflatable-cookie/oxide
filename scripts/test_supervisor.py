@@ -1380,6 +1380,262 @@ class PureProtocol(unittest.TestCase):
         self.assertEqual([r["held_unreaped"] for r in records], [False, False])
 
 
+# Admission grants (oxide#192) ---------------------------------------------------
+
+
+class PureAdmission(unittest.TestCase):
+    """The bounded admission-marker protocol: a reported slot-queue wait moves
+    the custodian's deadline by at most that wait, its own elapsed time and the
+    fixed cap, and nothing about a rejected marker faults a run."""
+
+    def pipe(self):
+        read_end, write_end = os.pipe()
+        os.set_blocking(read_end, False)
+        self.addCleanup(os.close, read_end)
+        return read_end, write_end
+
+    def drain(self, read_end):
+        lines, buffer = [], b""
+        while True:
+            try:
+                chunk = os.read(read_end, 65536)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            buffer += chunk
+        for line in buffer.splitlines():
+            lines.append(json.loads(line))
+        return lines
+
+    def custodian(self, limit=300, start=1000 * NS):
+        custodian = bounded.Custodian(["true"], limit_s=limit)
+        custodian.run_id = "r"
+        custodian.guard = bounded.Guard(start)
+        custodian.cmd_r, custodian.cmd_w = self.pipe()
+        custodian.leader = 4242
+        custodian.start = start
+        custodian.absolute = start + int(limit * NS)
+        custodian.stop_at = custodian.absolute - bounded.STOP_RESERVE_S * NS
+        custodian.exit_at = custodian.absolute - bounded.EXIT_MARGIN_S * NS
+        return custodian
+
+    def message(self, custodian, waited_ns, offset_s=1):
+        # The message's own send stamp is the patched clock's, so the custodian's
+        # future-stamp rule is exercised separately from its grant arithmetic.
+        at = custodian.start + int(offset_s * NS)
+        return {"run": "r", "seq": custodian.monitor_seq + 1, "leader": None, "type": "admission",
+                "at": at, "waited_ns": waited_ns, "completed": at,
+                "marker": custodian.admission_counted + 1}
+
+    def clock(self, custodian, offset_s):
+        """Drive the custodian's own CLOCK_UPTIME_RAW seam at a fixed offset."""
+        return patched(bounded, "now_ns", lambda: custodian.start + int(offset_s * NS))
+
+    def test_a_reported_wait_moves_every_deadline_by_exactly_that_wait(self):
+        custodian = self.custodian()
+        with self.clock(custodian, 150):
+            custodian.accept(self.message(custodian, 120 * NS, offset_s=150))
+        self.assertIsNone(custodian.guard.fault)
+        self.assertEqual(custodian.admission_granted, 120 * NS)
+        self.assertEqual(custodian.absolute, custodian.start + 420 * NS)
+        self.assertEqual(custodian.stop_at, custodian.start + 400 * NS)
+        self.assertEqual(custodian.exit_at, custodian.start + 418 * NS)
+        self.assertFalse(custodian.deadline_hit)
+        os.close(custodian.cmd_w)
+        records = self.drain(custodian.cmd_r)
+        grants = [r["record"] for r in records if r["record"]["event"] == "admission"]
+        self.assertEqual([(g["waited_ns"], g["grant_ns"], g["clamped"]) for g in grants],
+                         [(120 * NS, 120 * NS, False)])
+
+    def test_a_wait_never_exceeds_this_runs_own_elapsed_time(self):
+        custodian = self.custodian()
+        with self.clock(custodian, 50):
+            custodian.accept(self.message(custodian, 10_000 * NS, offset_s=50))
+        self.assertEqual(custodian.admission_granted, 50 * NS)
+        self.assertTrue(custodian.admission_clamped)
+        self.assertEqual(custodian.absolute, custodian.start + 350 * NS)
+
+    def test_the_total_grant_never_passes_the_fixed_cap(self):
+        custodian = self.custodian()
+        custodian.record = lambda kind, **fields: None  # one grant record is already proved
+        elapsed = 0
+        for _ in range(10):  # every report is fully backed by elapsed time
+            elapsed += 200
+            with self.clock(custodian, elapsed):
+                custodian.accept(self.message(custodian, 200 * NS, offset_s=elapsed))
+        self.assertEqual(custodian.admission_granted, bounded.ADMISSION_CAP_NS)
+        self.assertTrue(custodian.admission_capped)
+        self.assertEqual(custodian.absolute, custodian.start + 300 * NS + bounded.ADMISSION_CAP_NS)
+        with self.clock(custodian, elapsed + 1):
+            custodian.accept(self.message(custodian, 1 * NS, offset_s=elapsed + 1))
+        self.assertEqual(custodian.admission_granted, bounded.ADMISSION_CAP_NS)
+        self.assertEqual(custodian.admission_counted, 11)
+        self.assertEqual(custodian.exit_at, custodian.absolute - bounded.EXIT_MARGIN_S * NS)
+
+    def test_nothing_is_ever_shortened(self):
+        custodian = self.custodian()
+        before = (custodian.absolute, custodian.stop_at, custodian.exit_at)
+        with self.clock(custodian, 10):
+            custodian.accept(self.message(custodian, 0, offset_s=10))
+        self.assertEqual((custodian.absolute, custodian.stop_at, custodian.exit_at), before)
+        self.assertEqual(custodian.admission_granted, 0)
+
+    def test_a_grant_after_the_stop_decision_changes_nothing(self):
+        custodian = self.custodian()
+        custodian.stopped_at = custodian.start + 2 * NS
+        before = (custodian.absolute, custodian.stop_at, custodian.exit_at)
+        with self.clock(custodian, 3):
+            custodian.accept(self.message(custodian, 60 * NS, offset_s=3))
+        self.assertEqual((custodian.absolute, custodian.stop_at, custodian.exit_at), before)
+        self.assertEqual(custodian.admission_granted, 0)
+        self.assertEqual(custodian.admission_ignored, 1)
+        self.assertEqual(custodian.admission_counted, 0)
+
+    def test_a_grant_after_a_deadline_hit_changes_nothing(self):
+        custodian = self.custodian()
+        custodian.deadline_hit = True
+        before = custodian.absolute
+        with self.clock(custodian, 3):
+            custodian.accept(self.message(custodian, 60 * NS, offset_s=3))
+        self.assertEqual(custodian.absolute, before)
+        self.assertEqual(custodian.admission_granted, 0)
+        self.assertEqual(custodian.admission_ignored, 1)
+
+    def test_a_future_stamped_grant_latches_and_grants_nothing(self):
+        custodian = self.custodian()
+        future = now_ns() + 60 * NS
+        custodian.accept(self.message(custodian, 60 * NS, offset_s=1) | {"at": future})
+        self.assertIn("future", custodian.guard.fault or "")
+        self.assertEqual(custodian.admission_granted, 0)
+
+    def test_grant_records_are_capped_and_never_fault(self):
+        custodian = self.custodian()
+        recorded = []
+        custodian.record = lambda kind, **fields: recorded.append(fields)
+        elapsed = 0
+        for _ in range(bounded.ADMISSION_RECORDS + 5):
+            elapsed += 1
+            with self.clock(custodian, elapsed):
+                custodian.accept(self.message(custodian, NS, offset_s=elapsed))
+        self.assertIsNone(custodian.guard.fault)
+        self.assertEqual(len(recorded), bounded.ADMISSION_RECORDS)
+        self.assertEqual(custodian.admission_granted, (bounded.ADMISSION_RECORDS + 5) * NS)
+
+    def test_the_decision_record_is_best_effort_and_never_latches(self):
+        custodian = self.custodian()
+        with self.clock(custodian, 90):
+            custodian.accept(self.message(custodian, 60 * NS, offset_s=90))
+        custodian.cmd_w = -1  # a failed write is dropped, never a fault
+        custodian.observe_admission(True)
+        self.assertIsNone(custodian.guard.fault)
+        custodian = self.custodian()
+        custodian.cmd_w = None
+        custodian.observe_admission(False)  # nothing to write to, nothing raised
+        self.assertIsNone(custodian.guard.fault)
+
+    def test_malformed_marker_matrix(self):
+        valid = {"schema": 1, "source": "oxide", "waited_ns": 5}
+        self.assertIsNone(bounded.admission_malformed(valid))
+        self.assertIsNone(bounded.admission_malformed(dict(valid, waited_ns=bounded.U64MAX)))
+        self.assertIsNone(bounded.admission_malformed(dict(valid, source="x" * 32)))
+        cases = [
+            [], "marker", 1, None, {},
+            {key: valid[key] for key in ("schema", "source")},
+            dict(valid, extra=1),
+            dict(valid, schema=0), dict(valid, schema=2), dict(valid, schema="1"),
+            dict(valid, schema=True), dict(valid, schema=1.0),
+            dict(valid, source=""), dict(valid, source="x" * 33), dict(valid, source=1),
+            dict(valid, source="lin\ne"), dict(valid, source=True),
+            dict(valid, waited_ns=-1), dict(valid, waited_ns=True), dict(valid, waited_ns=1.5),
+            dict(valid, waited_ns=str(5)), dict(valid, waited_ns=bounded.U64MAX + 1),
+        ]
+        for marker in cases:
+            self.assertIsNotNone(bounded.admission_malformed(marker), marker)
+
+    def monitor(self, directory):
+        monitor = bounded.Monitor({"inject": set(), "run_id": "r", "evidence": str(directory),
+                                   "admission_path": os.path.join(str(directory), bounded.ADMISSION_NAME)},
+                                  None, None, None, None)
+        monitor.cmd_r, monitor.ctl_w = self.pipe()
+        monitor.receipt = {"admission": bounded.admission_record()}
+        return monitor
+
+    def fixture(self):
+        directory = Path(tempfile.mkdtemp(prefix="admission.", dir=str(SCRATCH)))
+        self.addCleanup(shutil.rmtree, str(directory), True)
+        return directory
+
+    def publish(self, directory, payload, name=None):
+        path = directory / (name or bounded.ADMISSION_NAME)
+        with open(path, "wb") as handle:
+            handle.write(payload if isinstance(payload, bytes) else json.dumps(payload).encode())
+        return path
+
+    def test_a_valid_marker_is_reported_once_with_its_own_completion_stamp(self):
+        directory = self.fixture()
+        monitor = self.monitor(directory)
+        path = self.publish(directory, {"schema": 1, "source": "oxide", "waited_ns": 90 * NS})
+        info = os.lstat(str(path))
+        monitor.read_admission(str(path), (info.st_dev, info.st_ino))
+        os.close(monitor.ctl_w)
+        sent = self.drain(monitor.cmd_r)
+        self.assertEqual([m["type"] for m in sent], ["admission"])
+        self.assertEqual(sent[0]["waited_ns"], 90 * NS)
+        self.assertIsNone(bounded.malformed(sent[0]))
+        self.assertEqual(monitor.receipt["admission"]["observed"], 1)
+        self.assertEqual(monitor.receipt["admission"]["reported_wait_ns"], 90 * NS)
+        self.assertEqual(monitor.receipt["admission"]["ignored"], 0)
+        self.assertLessEqual(monitor.receipt["admission"]["first_ns"], monitor.receipt["admission"]["last_ns"])
+
+    def test_an_ignored_marker_is_recorded_and_never_sent(self):
+        directory = self.fixture()
+        monitor = self.monitor(directory)
+        oversized = self.publish(directory, b"{" + b" " * bounded.ADMISSION_MAX_BYTES)
+        monitor.read_admission(str(oversized))
+        malformed = self.publish(directory, b"not json")
+        monitor.read_admission(str(malformed))
+        wrong = self.publish(directory, {"schema": 2, "source": "oxide", "waited_ns": 1})
+        monitor.read_admission(str(wrong))
+        link = directory / "link"
+        os.symlink(str(malformed), str(link))
+        monitor.read_admission(str(link))
+        self.assertEqual(self.drain(monitor.cmd_r), [])
+        record = monitor.receipt["admission"]
+        self.assertEqual(record["observed"], 0)
+        self.assertEqual(record["ignored"], 4)
+        self.assertEqual(len(record["rejections"]), 4)
+        self.assertEqual(record["reported_wait_ns"], 0)
+
+    def test_the_rejection_list_is_bounded(self):
+        directory = self.fixture()
+        monitor = self.monitor(directory)
+        bad = self.publish(directory, b"not json")
+        for _ in range(bounded.ADMISSION_REJECTIONS + 3):
+            monitor.read_admission(str(bad))
+        record = monitor.receipt["admission"]
+        self.assertEqual(record["ignored"], bounded.ADMISSION_REJECTIONS + 3)
+        self.assertEqual(len(record["rejections"]), bounded.ADMISSION_REJECTIONS)
+        self.assertEqual(self.drain(monitor.cmd_r), [])
+
+    def test_an_absent_marker_is_not_an_event(self):
+        directory = self.fixture()
+        monitor = self.monitor(directory)
+        monitor.read_admission(str(directory / bounded.ADMISSION_NAME))
+        record = monitor.receipt["admission"]
+        self.assertEqual((record["observed"], record["ignored"], record["errors"]), (0, 1, 0))
+
+    def test_the_receipt_object_is_bounded_and_typed(self):
+        record = bounded.admission_record()
+        self.assertEqual(set(record), {"schema", "marker", "observed", "reported_wait_ns", "first_ns",
+                                       "last_ns", "identity", "ignored", "rejections", "errors"})
+        self.assertEqual(record["marker"], bounded.ADMISSION_NAME)
+        record["rejections"] = ["reason"] * bounded.ADMISSION_REJECTIONS
+        encoded = json.dumps(record)
+        self.assertLess(len(encoded), 1024)
+        self.assertLess(bounded.ADMISSION_MAX_BYTES, 4096)
+
+
 # Owned-byte traversal (oxide#142) ----------------------------------------------
 
 try:
@@ -5271,6 +5527,56 @@ class Real(unittest.TestCase):
         self.assertEqual(self.outcome()["closure"], "closed")
         self.assertEqual(self.receipt["phase"], "monitor_complete: pending_custodian")
 
+    def test_admission_marker_extends_the_work_window(self):
+        # oxide#192: a reported slot-queue wait moves the supervisor's deadline
+        # by that wait, so execution keeps its own window instead of being
+        # killed inside it. Without the grant the leader is stopped at
+        # limit - 20 s, well before it finishes.
+        code = fixture(
+            "import json\n"
+            "path = os.path.join(os.environ['OXIDE_PROOF_EVIDENCE'], " + repr(bounded.ADMISSION_NAME) + ")\n"
+            "time.sleep(10)\n"
+            "with open(path + '.tmp', 'w') as handle:\n"
+            "    json.dump({'schema': 1, 'source': 'fixture', 'waited_ns': 10 * 1000000000}, handle)\n"
+            "os.replace(path + '.tmp', path)\n"
+            "time.sleep(12)\n"
+            "open(os.environ['CASE_DIR'] + '/ran', 'w')\n")
+        self.assertEqual(self.guardian(code, limit=36), 0)
+        self.assertEqual(self.outcome()["closure"], "closed")
+        self.assertIsNone(self.outcome()["fault"])
+        self.assertFalse(self.outcome()["deadline"])
+        self.assertTrue((self.dir / "ran").exists(), "the command did not keep its work window")
+        self.assertEqual(self.receipt["admission"]["observed"], 1)
+        self.assertEqual(self.receipt["admission"]["ignored"], 0)
+        self.assertIsNotNone(self.receipt["admission"]["first_ns"])
+        decisions = [r for r in self.receipt["custodian"] if r["event"] == "admission_decision"]
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["counted"], 1)
+        self.assertGreaterEqual(decisions[0]["granted_ns"], 9 * NS)
+        self.assertLessEqual(decisions[0]["granted_ns"], 11 * NS)
+        self.assertFalse(decisions[0]["capped"])
+
+    def test_a_malformed_admission_marker_changes_nothing(self):
+        # Cooperative evidence only: a rejected marker is recorded and the run
+        # keeps its unextended deadline.
+        code = fixture(
+            "import json\n"
+            "path = os.path.join(os.environ['OXIDE_PROOF_EVIDENCE'], " + repr(bounded.ADMISSION_NAME) + ")\n"
+            "with open(path, 'w') as handle:\n"
+            "    json.dump({'schema': 1, 'waited_ns': 10 * 1000000000}, handle)\n"
+            "time.sleep(1)\n"
+            "open(os.environ['CASE_DIR'] + '/ran', 'w')\n")
+        self.assertEqual(self.guardian(code, limit=32), 0)
+        self.assertEqual(self.outcome()["closure"], "closed")
+        self.assertIsNone(self.outcome()["fault"])
+        self.assertTrue((self.dir / "ran").exists())
+        self.assertEqual(self.receipt["admission"]["observed"], 0)
+        self.assertGreaterEqual(self.receipt["admission"]["ignored"], 1)
+        self.assertIn("unexpected keys", self.receipt["admission"]["rejections"])
+        decisions = [r for r in self.receipt["custodian"] if r["event"] == "admission_decision"]
+        self.assertEqual(decisions[0]["counted"], 0)
+        self.assertEqual(decisions[0]["granted_ns"], 0)
+
     def test_owned_scratch_cleanup(self):
         self.assertEqual(self.guardian(fixture("open(os.environ['TMPDIR'] + '/w', 'wb').write(bytes(65536))\n"),
                                        owned=True), 0)
@@ -5824,6 +6130,7 @@ def main():
     pure = unittest.TestSuite(loader.loadTestsFromTestCase(case)
                               for case in (PureGuard, PurePrecedence, PureCensus, PureCensusFinalAbsence,
                                            PureDiagnostics, PureAllowlist, PureTerminalCounts, PureProtocol,
+                                           PureAdmission,
                                            PureTraversal, PureDefaultScratch, PureScratchPreparation,
                                            PureMarker, PureSweep, PureExistingParent,
                                            PureProtectionAndLifecycle, QualifyEntry,

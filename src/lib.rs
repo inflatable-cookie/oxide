@@ -24,6 +24,13 @@ pub mod owned_delete;
 #[cfg(debug_assertions)]
 pub mod proof;
 
+/// The shared proof supervisor's arming layout: its deadline, its canonical
+/// owned scratch root and its evidence directory nested in it or its
+/// `scratch`/`evidence` sibling (oxide#192). One definition decides every
+/// proof seam, in every profile.
+#[cfg(unix)]
+pub mod supervisor;
+
 /// Bounded source verification for cold-slot seeding: the registry archive
 /// reader, the canonical tree digest, the verification cache and the git
 /// adapter (oxide#166, slice 1).

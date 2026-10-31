@@ -42,6 +42,17 @@ fault (including SIGINT or SIGTERM to the custodian), refusal or UNCLOSED;
 otherwise the command's status (128+N for signal N). The receipt has no success phase: success is phase `monitor_complete`
 plus custodian exit 0, recorded by the caller.
 
+Admission marker (oxide#192): a supervised child that waited for admission may
+publish one bounded marker, `admission.json`, in the evidence directory. The
+monitor reads only a regular file without following a link, at most 512 bytes
+with an exact three-key schema, and reports it; the custodian grants at most
+the reported wait, never more than the run's own elapsed wall clock and never
+more than a fixed 600 s total, to its deadline. Nothing is shortened, the
+exported OXIDE_PROOF_DEADLINE_NS is not rewritten and classification is
+unchanged: a rejected or missing marker removes nothing but the grant, and the
+receipt reports the wait and the grant separately. The grant is cooperative
+evidence about a child's own admission, not a claim about any other writer.
+
 Scope: the cooperative session. A process that calls setsid leaves it and is
 seen only while tracked or holding an output pipe; arbitrary same-user
 writers are outside the promise. Host free space is a sampled abort
@@ -193,11 +204,26 @@ INJECTIONS = {
 RESERVE_DELAY_S, SCRATCH_DELAY_S = 0.5, 4.0  # injected publication delays before a sampler stall
 INJECT_AFTER_GATE_NS = 1_500_000_000  # post-gate injections wait for the fixture to start
 EXCEPTION_RECORDS = 8
+# Admission marker (oxide#192): a supervised child that waited for admission
+# publishes one bounded marker in the evidence directory. The custodian grants
+# at most the reported wait, never more than the run's own elapsed wall clock
+# and never more than ADMISSION_CAP_NS in total, so the work clock is not
+# consumed by a queue wait while the run stays hard-bounded. A marker is
+# cooperative evidence only: nothing about a rejected one faults the run.
+ADMISSION_NAME = "admission.json"
+ADMISSION_SCHEMA = 1
+ADMISSION_MAX_BYTES = 512
+ADMISSION_POLL_S = 0.25
+ADMISSION_CAP_NS = 600 * NS
+ADMISSION_RECORDS = 32  # per-grant custodian records kept; the rest only move the counters
+ADMISSION_REJECTIONS = 8  # bounded rejection reasons kept in the receipt
+ADMISSION_KEYS = frozenset({"schema", "source", "waited_ns"})
 FIELDS = {  # required fields per monitor message type; bool is never accepted as int
     "reading": {"kind": str},
     "ready": {}, "monitor_complete": {}, "cleanup_failed": {},
     "output_eof": {"stream": str},
     "census": {"after": int, "members": int, "uncertain": int, "certain": bool},
+    "admission": {"waited_ns": int, "completed": int, "marker": int},
     "setup": {"root": str, "scratch": str, "evidence": str, "owned": bool},
 }
 
@@ -225,6 +251,40 @@ def settlement_record():
         "rounds_started": 0, "rounds_completed": 0, "omitted": 0,
         "phase": "none", "rounds": [],
     }
+
+
+def admission_malformed(marker):
+    """Why an admission marker is not usable, or None.
+
+    Fixed schema, exact keys, bounded types: schema 1, one printable source
+    token of at most 32 characters and a non-negative reported wait inside
+    u64. A marker is cooperative evidence for the custodian's bounded grant;
+    anything else is reported in the receipt and never latches a fault."""
+    if not isinstance(marker, dict):
+        return "not an object"
+    if set(marker) != ADMISSION_KEYS:
+        return "unexpected keys"
+    if not typed(marker["schema"], int) or marker["schema"] != ADMISSION_SCHEMA:
+        return "unsupported schema"
+    source = marker["source"]
+    if not isinstance(source, str) or not 0 < len(source) <= 32 or not source.isprintable():
+        return "ill-typed source"
+    waited = marker["waited_ns"]
+    if not typed(waited, int) or not 0 <= waited <= U64MAX:
+        return "ill-typed waited_ns"
+    return None
+
+
+def admission_record():
+    """The monitor's admission-marker observations (oxide#192).
+
+    Fixed shape: every stamp is an int CLOCK_UPTIME_RAW value or `None` when
+    no marker was observed, every count is a non-bool int, and the rejection
+    reasons are a bounded list. This is the observation side of the grant;
+    the custodian's own decision record carries what it actually granted."""
+    return {"schema": 1, "marker": ADMISSION_NAME, "observed": 0, "reported_wait_ns": 0,
+            "first_ns": None, "last_ns": None, "identity": None, "ignored": 0,
+            "rejections": [], "errors": 0}
 
 
 def report(text, fd=2):
@@ -2472,7 +2532,8 @@ class Monitor:
             raise SetupRefused(f"reserve path {reserve_path}: {type_name(error)}")
         selection["device"] = selection["device"] if selection["device"] is not None else reserve_device
         ctx.update(root=root, scratch=scratch, evidence=os.path.realpath(evidence), owned=owned,
-                   reserve_path=reserve_path, reserve_device=reserve_device, selection=selection)
+                   reserve_path=reserve_path, reserve_device=reserve_device, selection=selection,
+                   admission_path=os.path.join(os.path.realpath(evidence), ADMISSION_NAME))
         try:
             terminal_mode = _decide_terminal_mode()
         except BaseException:
@@ -2497,6 +2558,7 @@ class Monitor:
                         "path": ctx["reserve_path"], "device": ctx["reserve_device"]},
             "owned_bytes": {"samples": 0, "maximum": None, "budget": ctx["budget"], "last_ns": None},
             "output": {}, "census": None, "census_rounds": 0, "settlement": self.settlement,
+            "admission": admission_record(),
         }
 
     def send(self, message_type, **fields):
@@ -2563,6 +2625,97 @@ class Monitor:
             except OSError as error:
                 self.send("reading", kind="scratch", complete=False, error=str(error))
             self.stop.wait(SCRATCH_INTERVAL)
+
+    def note_admission(self, error=False):
+        """One bounded, never-latched admission-observation failure."""
+        try:
+            record = self.receipt["admission"]
+            with self.lock:
+                if error:
+                    record["errors"] += 1
+        except BaseException:
+            pass
+
+    def reject_admission(self, reason):
+        """Record why one marker was ignored. Cooperative evidence only: a
+        rejected marker never faults the run and is never sent."""
+        try:
+            record = self.receipt["admission"]
+            with self.lock:
+                record["ignored"] += 1
+                if len(record["rejections"]) < ADMISSION_REJECTIONS:
+                    record["rejections"].append(reason)
+        except BaseException:
+            pass
+
+    def read_admission(self, path, identity=None):
+        """One bounded read of the admission marker (oxide#192).
+
+        Only a regular file opened without following a link, at most
+        ADMISSION_MAX_BYTES, validated against the fixed schema. A valid
+        marker is reported to the custodian with its own completed stamp; the
+        extension decision is the custodian's. Every other outcome is recorded
+        here and nothing is sent."""
+        try:
+            info = os.lstat(path)
+            if not stat.S_ISREG(info.st_mode):
+                self.reject_admission("not a regular file")
+                return
+            handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                raw = os.read(handle, ADMISSION_MAX_BYTES + 1)
+            finally:
+                os.close(handle)
+        except OSError as error:
+            self.reject_admission("read: " + errno_name(error))
+            return
+        completed = now_ns()
+        if len(raw) > ADMISSION_MAX_BYTES:
+            self.reject_admission(f"larger than {ADMISSION_MAX_BYTES} bytes")
+            return
+        try:
+            marker = json.loads(raw)
+        except ValueError:
+            self.reject_admission("not JSON")
+            return
+        problem = admission_malformed(marker)
+        if problem:
+            self.reject_admission(problem)
+            return
+        try:
+            record = self.receipt["admission"]
+            with self.lock:
+                record["observed"] += 1
+                record["reported_wait_ns"] = min(U64MAX, record["reported_wait_ns"] + marker["waited_ns"])
+                record["first_ns"] = completed if record["first_ns"] is None else record["first_ns"]
+                record["last_ns"] = completed
+                record["identity"] = None if identity is None else [int(identity[0]), int(identity[1])]
+                index = record["observed"]
+            self.send("admission", waited_ns=marker["waited_ns"], completed=completed, marker=index)
+        except BaseException:
+            self.note_admission(error=True)
+
+    def sample_admission(self):
+        """Poll the admission marker for a new identity (oxide#192).
+
+        A writer publishes a fresh file by rename, so one identity is one
+        report. Absence is not an event, and no failure here is latched."""
+        path = self.ctx.get("admission_path")
+        if not path:
+            return
+        seen = None
+        while not self.stop.is_set():
+            try:
+                info = os.lstat(path)
+                identity = (info.st_dev, info.st_ino, info.st_mode)
+                if identity != seen:
+                    seen = identity
+                    self.read_admission(path, identity)
+            except FileNotFoundError:
+                seen = None
+            except OSError:
+                self.note_admission(error=True)
+            self.stop.wait(ADMISSION_POLL_S)
 
     def drain(self, fd, name, sink):
         counts = self.receipt["output"].setdefault(
@@ -2667,7 +2820,7 @@ class Monitor:
         self.send("setup", root=ctx["root"], scratch=ctx["scratch"], evidence=ctx["evidence"], owned=ctx["owned"])
         if "setup-stall" in self.inject:
             time.sleep(SETUP_S + 5)
-        for target in (self.sample_reserve, self.sample_owned):
+        for target in (self.sample_reserve, self.sample_owned, self.sample_admission):
             threading.Thread(target=target, daemon=True).start()
         for fd, name, sink in self.pipes:
             threading.Thread(target=self.drain, args=(fd, name, sink), daemon=True).start()
@@ -2773,6 +2926,15 @@ class Monitor:
         ]
         for line in lines:  # one bounded write per line, so none truncates the rest
             report(line + "\n")
+        admission = next((record for record in reversed(receipt["custodian"])
+                          if isinstance(record, dict) and record.get("event") == "admission_decision"), None)
+        if admission is not None:
+            effective = (admission["absolute_ns"] - receipt["start_ns"]) / NS
+            report(f"supervisor: admission wait reported {admission['reported_wait_ns'] / NS:.1f} s in"
+                   f" {admission['counted']} marker(s), granted {admission['granted_ns'] / NS:.1f} s of the"
+                   f" {ADMISSION_CAP_NS / NS:.0f} s cap (limit {admission['limit_s']:.0f} s, deadline"
+                   f" {effective:.1f} s after start); {admission['ignored']} ignored;"
+                   f" observed {receipt['admission']['observed']}, rejected {receipt['admission']['ignored']}\n")
 
 
 class SetupRefused(Exception):
@@ -2829,6 +2991,14 @@ class Custodian:
         self.gate_opened = False
         self.gate_at = None
         self.pre_gate_killed = self.leader_killed = False
+        # Admission grants (oxide#192): counted from the monitor's marker
+        # observations, bounded by the run's own elapsed time and the fixed cap.
+        self.admission_counted = 0
+        self.admission_ignored = 0
+        self.admission_reported = 0
+        self.admission_granted = 0
+        self.admission_records = 0
+        self.admission_clamped = self.admission_capped = False
         self.exceptions = 0
         self.injected = set()
         self.paths = None  # from the monitor's setup message
@@ -2949,6 +3119,46 @@ class Custodian:
             self.guard.latch("protocol: control line overflow")
             self.ctl_buffer = b""
 
+    def admit(self, message, at):
+        """Grant bounded time for one reported admission wait (oxide#192).
+
+        A child's marker is cooperative evidence: the custodian adds at most
+        `waited_ns`, never more than this run's own elapsed wall clock and
+        never beyond ADMISSION_CAP_NS in total, to `absolute`. Nothing is
+        shortened, no exported deadline is rewritten and no classification
+        changes: the grant is reported separately in the receipt. A message
+        after the stop decision or after a deadline hit cannot move anything,
+        so it is only counted."""
+        try:
+            if self.stopped_at is not None or self.deadline_hit:
+                self.admission_ignored += 1
+                return
+            waited = message["waited_ns"]
+            elapsed = max(0, at - self.start)
+            clamped = waited > elapsed
+            if clamped:
+                waited = elapsed
+            room = max(0, ADMISSION_CAP_NS - self.admission_granted)
+            grant = min(waited, room)
+            self.admission_counted += 1
+            self.admission_reported = min(U64MAX, self.admission_reported + message["waited_ns"])
+            self.admission_clamped = self.admission_clamped or clamped
+            if grant <= 0:
+                self.admission_capped = True
+                return
+            self.admission_granted += grant
+            self.admission_capped = self.admission_granted >= ADMISSION_CAP_NS
+            self.absolute = self.start + int(self.limit_s * NS) + self.admission_granted
+            self.stop_at = self.absolute - STOP_RESERVE_S * NS
+            self.exit_at = self.absolute - EXIT_MARGIN_S * NS
+            if self.admission_records < ADMISSION_RECORDS:
+                self.admission_records += 1
+                self.record("admission", waited_ns=message["waited_ns"], grant_ns=grant,
+                            clamped=clamped, granted_ns=self.admission_granted,
+                            absolute_ns=self.absolute)
+        except BaseException as error:
+            self.exception(error)
+
     def accept(self, message):
         problem = malformed(message)
         if problem:
@@ -2991,6 +3201,12 @@ class Custodian:
             self.ready = True
         elif kind == "output_eof":
             self.eof.add(message["stream"])
+        elif kind == "admission":
+            at = now_ns()
+            if message["at"] > at:
+                self.guard.latch("admission message stamped in the future")
+            else:
+                self.admit(message, at)
         elif kind == "census":
             try:  # observation only, before the unchanged eligibility rule
                 self.census_messages += 1
@@ -3298,6 +3514,24 @@ class Custodian:
             elif len(self.eof) != 2:
                 self.guard.latch("closure not established: output EOF witness missing")
         self.observe_settlement(launched, census_end)
+        self.observe_admission(launched)
+
+    def observe_admission(self, launched):
+        """Best-effort decision-time record of the admission grants
+        (oxide#192). A failed write is dropped and never latched, so this can
+        never fail a run, replace the first fault or change the deadline."""
+        try:
+            self.seq += 1
+            record = {"at": now_ns(), "event": "admission_decision", "launched": launched,
+                      "counted": self.admission_counted, "ignored": self.admission_ignored,
+                      "reported_wait_ns": self.admission_reported, "granted_ns": self.admission_granted,
+                      "clamped": self.admission_clamped, "capped": self.admission_capped,
+                      "cap_ns": ADMISSION_CAP_NS, "limit_s": self.limit_s,
+                      "absolute_ns": self.absolute}
+            os.write(self.cmd_w, (json.dumps({"run": self.run_id, "seq": self.seq, "type": "record",
+                                              "record": record}) + "\n").encode())
+        except BaseException:
+            pass
 
     def last_resort(self):
         """finish raised: KILL the pinned monitor if still held, one WNOHANG

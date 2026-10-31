@@ -2089,6 +2089,7 @@ impl Store {
         waits: &mut WaitAccounting,
     ) -> Result<Acquired, String> {
         let max_active = self.max_active;
+        let admission_started = Instant::now();
         let ticket = self.register_ticket()?;
         loop {
             if crate::budget::admission_expired() {
@@ -2117,6 +2118,10 @@ impl Store {
                         self.release(lease, origin)?;
                         return Ok(Acquired::AdmissionExpired);
                     }
+                    // Report this command's own admission wait to a supervising
+                    // proof, best effort: unarmed or unwritable means the wait is
+                    // simply not reported (oxide#192).
+                    crate::admission::report_wait(admission_started.elapsed());
                     return Ok(Acquired::Lease(lease));
                 }
                 Ok(Err(wait)) => {
