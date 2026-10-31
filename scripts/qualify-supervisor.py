@@ -77,7 +77,7 @@ WALL_NS = 420 * NS  # oxide#191 amendment (Tom 2026-10-31): was 300 s
 CANDIDATE_LIMIT = 380  # oxide#191 amendment: was 280 s
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 362  # 313 pure + 49 real (oxide#151 added the routing, marker,
+EXPECTED_CASES = 365  # 316 pure + 49 real (oxide#151 added the routing, marker,
                       # nested-window protection, bounded-sweep, qualify-entry,
                       # shared-ancestor/private-leaf and readiness cases; oxide#191
                       # adds seventy-six pure post-census detach cases and eight real
@@ -85,11 +85,13 @@ EXPECTED_CASES = 362  # 313 pure + 49 real (oxide#151 added the routing, marker,
                       # unrequested attachment whose opt-in custody keep is recorded
                       # separately, a stuck child the custodian closes itself, and the
                       # two unreadable-identity paths — closed by the monitor or
-                      # handed off by parentage; oxide#197 adds twenty-six pure
+                      # handed off by parentage; oxide#197 adds 29 pure
                       # structural launcher-rule cases (re-verified ancestor
                       # exclusion with no parent fall-through, a bound sibling
                       # observation with identity/parentage re-verification around
-                      # the session/group reads, the tracked-member veto, the
+                      # the session/group reads, the tracked-member veto, a
+                      # distinct ambiguous outcome for a changed ancestor identity
+                      # or an unreadable sibling session/group (never foreign), the
                       # masked/back-and-forth/forward wall-step refusals,
                       # recycled/unknown/PPID-1 refusals, evidence bounds and the
                       # mid-run sibling regression) and one real launcher-sibling
