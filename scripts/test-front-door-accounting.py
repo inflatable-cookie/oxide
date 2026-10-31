@@ -94,6 +94,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -604,6 +605,13 @@ class Proof:
         self.logs = 0
         self.dirs = {}
         self.last_log = ""
+        # `log_path()` writes under `<parent>/walks`, so every Proof parent
+        # owns that directory. The main run root gets it from
+        # `fixture_environment`; a second fixture pool (the hard-link case's
+        # `<run>/hardlink`) only exists because this creates it. Without it the
+        # debug walk observer cannot append, the product warns honestly, and
+        # the case aborts as an unknown outcome.
+        os.makedirs(os.path.join(parent, "walks"), mode=0o700, exist_ok=True)
 
     def payload(self) -> str:
         return os.path.realpath(os.path.join(self.pool, "payload"))
@@ -1609,6 +1617,47 @@ def self_check() -> int:
                     f"receipt abort {receipt.get('aborted')!r}")
         expect_true(receipt["failed"] == [] and receipt["unexecuted"] == outcome["unexecuted"],
                     f"receipt state {receipt.get('failed')} / {receipt.get('unexecuted')}")
+
+        # Every Proof parent owns the `walks` directory its walk log needs —
+        # including the hard-link case's second pool root, which is the only
+        # one not created by `fixture_environment`. The check is effect-free:
+        # no child is started, only the directories are inspected.
+        proof_source = inspect.getsource(Proof.__init__)
+        expect_true('os.makedirs(os.path.join(parent, "walks")' in proof_source,
+                    "Proof.__init__ does not create its parent's walks directory")
+        expect_true('mode=0o700' in proof_source and "exist_ok=True" in proof_source,
+                    "the walks directory is not created 0700 with exist_ok")
+        hardlink_source = inspect.getsource(case_hardlink)
+        expect_true(
+            hardlink_source.index('os.makedirs(root, mode=0o700') < hardlink_source.index("Proof(root,"),
+            "case_hardlink constructs its second Proof before its parent exists",
+        )
+        walks_holder = os.path.realpath(tempfile.mkdtemp(prefix="fd-walks-check."))
+        try:
+            for label, parent in (
+                ("main run root", os.path.join(walks_holder, "run")),
+                ("hard-link second pool", os.path.join(walks_holder, "run", "hardlink")),
+            ):
+                if label == "main run root":
+                    os.makedirs(parent, mode=0o700)
+                else:
+                    os.makedirs(parent, mode=0o700)
+                case = Proof(parent, "/fixture/oxide", {})
+                walks = os.path.join(parent, "walks")
+                expect_true(os.path.isdir(walks), f"{label}: no walks directory at {walks}")
+                expect_true(stat.S_IMODE(os.stat(walks).st_mode) == 0o700,
+                            f"{label}: walks directory is {oct(os.stat(walks).st_mode)}")
+                log = case.log_path()
+                expect_true(os.path.dirname(log) == walks,
+                            f"{label}: log_path {log} is not inside {walks}")
+                # The directory is usable for the observer's append, and the
+                # oracle reads it back.
+                with open(log, "a") as handle:
+                    handle.write(os.path.realpath(parent) + "\n")
+                expect_true(read_roots(log, case.payload())[-1] == os.path.realpath(parent),
+                            f"{label}: the walk log is not readable back")
+        finally:
+            shutil.rmtree(walks_holder, ignore_errors=True)
 
         # Staging is a writer too, so its target tree is retained for the
         # guard's post-leader census as well. The pure check drives the real
