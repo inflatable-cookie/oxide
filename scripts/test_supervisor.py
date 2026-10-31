@@ -4632,15 +4632,78 @@ class PureDetach(unittest.TestCase):
         self.assertIn("wait window", record["reason"])
 
     def test_a_recycled_or_reparented_pid_is_never_signalled(self):
-        monitor_pid = 4242
-        child = {"pid": 77, "start": 99, "ppid": monitor_pid, "stat": 2}
-        self.assertTrue(bounded.detach_child_identity(child, 77, 99, monitor_pid))
-        for row, pid, start, parent in ((dict(child, start=100), 77, 99, monitor_pid),   # recycled PID
-                                        (dict(child, ppid=1), 77, 99, monitor_pid),      # reparented
-                                        (dict(child, stat=5), 77, 99, monitor_pid),      # zombie
-                                        (None, 77, 99, monitor_pid),                     # gone
-                                        (dict(child, pid=78), 77, 99, monitor_pid)):     # other process
-            self.assertFalse(bounded.detach_child_identity(row, pid, start, parent), (row, pid, start))
+        # The row is the REAL `Kinfo.parse` shape: pid, start, zombie (boolean),
+        # uid, ppid, pgid — there is no `stat` key at all.
+        real = bounded.Kinfo.one(os.getpid())
+        self.assertIsNotNone(real)
+        self.assertEqual(sorted(real), ["pgid", "pid", "ppid", "start", "uid", "zombie"])
+        self.assertIsInstance(real["zombie"], bool)
+        self.assertNotIn("stat", real)
+        self.assertTrue(bounded.detach_child_identity(real, os.getpid(), real["start"], os.getppid()))
+        for row, pid, start, parent in ((dict(real, start=real["start"] + 1), real["pid"], real["start"],
+                                         os.getppid()),                                  # recycled PID
+                                        (dict(real, ppid=1), real["pid"], real["start"], os.getppid()),
+                                        (dict(real, zombie=True), real["pid"], real["start"], os.getppid()),
+                                        (None, real["pid"], real["start"], os.getppid()),  # gone
+                                        (dict(real, pid=real["pid"] + 1), real["pid"], real["start"],
+                                         os.getppid())):                                   # other process
+            self.assertFalse(bounded.detach_child_identity(row, pid, start, parent), row)
+
+    def test_observation_reads_the_real_row_shape(self):
+        # `observe_detach_child` must accept the real row shape (no `stat`) and
+        # treat a zombie row as closed.
+        class FakeKinfo:
+            rows = []
+
+            @staticmethod
+            def one(pid):
+                return FakeKinfo.rows[0] if FakeKinfo.rows else None
+
+        real = bounded.Kinfo.one(os.getpid())
+        custodian = bounded.Custodian.__new__(bounded.Custodian)
+        custodian.detach_child = [real["pid"], real["start"]]
+        custodian.absolute = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) + 2 * bounded.NS
+        custodian.pump = lambda _timeout: None
+        recorded = []
+        custodian.record = lambda kind, **fields: recorded.append((kind, fields))
+        saved = bounded.Kinfo
+        try:
+            bounded.Kinfo = FakeKinfo
+            FakeKinfo.rows = [dict(real, zombie=False)]
+            self.assertFalse(custodian.observe_detach_child(bounded.NS // 10))
+            FakeKinfo.rows = [dict(real, zombie=True)]
+            self.assertTrue(custodian.observe_detach_child(bounded.NS // 10))
+            FakeKinfo.rows = []
+            self.assertTrue(custodian.observe_detach_child(bounded.NS // 10))
+        finally:
+            bounded.Kinfo = saved
+        self.assertTrue(all(kind == "detach_child_observed" for kind, _f in recorded), recorded)
+
+    def test_an_executor_exception_keeps_the_live_handle(self):
+        class BrokenStdout:
+            def fileno(self):
+                raise OSError("the pipe vanished")
+
+        class FakeChild:
+            returncode = None
+            stdout = BrokenStdout()
+            killed = False
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                self.killed = True
+
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired("child", timeout or 0)
+
+        child = FakeChild()
+        result = bounded.bounded_run(["/bin/true"], 2, 64, spawn=lambda *a, **k: child)
+        self.assertIs(result["handle"], child, "the live child handle was lost")
+        self.assertFalse(result["reaped"])
+        self.assertEqual(result["error"], "OSError")
+        self.assertTrue(result["reap_timed_out"])
         self.assertIn('self.send("detach_child", pid=int(row["pid"]), start=int(row["start"]))',
                       inspect.getsource(bounded.Monitor.run))
 

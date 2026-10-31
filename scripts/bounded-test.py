@@ -1527,68 +1527,72 @@ def bounded_run(argv, timeout, cap=DETACH_OUTPUT_MAX_BYTES, still_allowed=None, 
     deadline = time.monotonic() + timeout
     tail, seen, timed_out, withdrawn, reap_timed_out, reaped = b"", 0, False, None, False, False
     poll_at = time.monotonic() + DETACH_POLL_S
-    fd = child.stdout.fileno()
     try:
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                timed_out = True
-                break
-            if still_allowed is not None and time.monotonic() >= poll_at:
-                allowed, reason = still_allowed()
-                poll_at = time.monotonic() + DETACH_POLL_S
-                if not allowed:
-                    withdrawn = reason or "authority withdrawn"
-                    break
-            try:
-                ready, _, _ = select.select([fd], [], [], min(0.25, max(0.01, min(remaining, poll_at - time.monotonic()))))
-            except OSError:
-                ready = [fd]  # readable in the failing sense: the read reports it
-            if not ready:
-                if child.poll() is not None:
-                    continue  # drain what is left, then EOF ends the loop
-                continue
-            try:
-                chunk = os.read(fd, 65536)
-            except OSError:
-                break
-            if not chunk:
-                break
-            seen += len(chunk)
-            tail = _bounded_tail(tail, chunk, cap)
-        if timed_out or withdrawn is not None:
-            try:
-                child.kill()
-            except OSError:
-                pass
-    finally:
+        fd = child.stdout.fileno()
+    except BaseException as error:
+        return _unreaped_record(child, error, deadline)
+    try:
         try:
-            os.close(fd)
-        except OSError:
-            pass
-        # The reap is bounded by what is left of the SAME deadline: no extra
-        # fixed wait, and no round that can run past it.
-        if timed_out or withdrawn is not None:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                if still_allowed is not None and time.monotonic() >= poll_at:
+                    allowed, reason = still_allowed()
+                    poll_at = time.monotonic() + DETACH_POLL_S
+                    if not allowed:
+                        withdrawn = reason or "authority withdrawn"
+                        break
+                try:
+                    ready, _, _ = select.select(
+                        [fd], [], [], max(0.0, min(0.25, remaining,
+                                                   max(0.0, poll_at - time.monotonic()))))
+                except OSError:
+                    ready = [fd]  # readable in the failing sense: the read reports it
+                if not ready:
+                    if child.poll() is not None:
+                        continue  # drain what is left, then EOF ends the loop
+                    continue
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                seen += len(chunk)
+                tail = _bounded_tail(tail, chunk, cap)
+        finally:
+            # The reap is bounded by what is left of the SAME deadline: no extra
+            # fixed wait and no round that can run past it. Any exception here
+            # still hands the live child back through the outer handler.
             try:
-                child.kill()
+                os.close(fd)
             except OSError:
                 pass
-        for _round in (1, 2, 3):  # three bounded rounds, each inside the deadline
-            remaining = max(0.0, deadline - time.monotonic())
-            try:
-                reaped = child.wait(timeout=remaining) is not None
-            except subprocess.TimeoutExpired:
-                reaped = False
-            if reaped:
-                break
-            if remaining <= 0:
-                break  # the window is spent: the child stays unaccounted
-            reap_timed_out = True
-            try:
-                child.kill()
-            except OSError:
-                pass
-        child.stdout = None
+            if timed_out or withdrawn is not None:
+                try:
+                    child.kill()
+                except OSError:
+                    pass
+            for _round in (1, 2, 3):  # three bounded rounds, each inside the deadline
+                remaining = max(0.0, deadline - time.monotonic())
+                try:
+                    reaped = child.wait(timeout=remaining) is not None
+                except subprocess.TimeoutExpired:
+                    reaped = False
+                if reaped:
+                    break
+                if remaining <= 0:
+                    break  # the window is spent: the child stays unaccounted
+                reap_timed_out = True
+                try:
+                    child.kill()
+                except OSError:
+                    pass
+    except BaseException as error:
+        return _unreaped_record(child, error, deadline)
+    child.stdout = None
     status = child.returncode
     return {"exit": status, "timed_out": timed_out, "error": None,
             "output": tail.decode("utf-8", "replace"), "truncated": seen > len(tail),
@@ -1790,6 +1794,23 @@ def cleanup_safety(ctx, probe=None, facts=None):
             "unrequested": backings[:CUSTODY_MAX_BACKINGS]}
 
 
+def _unreaped_record(child, error, deadline):
+    """A failure record that never loses a live child: one last bounded wait, and
+    the handle is handed back whenever the child is not positively reaped."""
+    reaped = False
+    try:
+        reaped = child.wait(timeout=max(0.0, deadline - time.monotonic())) is not None
+    except BaseException:
+        reaped = False
+    try:
+        child.stdout = None
+    except BaseException:
+        pass
+    return {"exit": child.returncode if reaped else None, "timed_out": False,
+            "error": type_name(error), "output": "", "truncated": False, "withdrawn": None,
+            "reap_timed_out": not reaped, "reaped": reaped, "handle": None if reaped else child}
+
+
 def _stuck_child_attempt():
     """A REAL unruly detach child for the injected stuck-child case: started,
     left running and left unreaped on purpose, so the custodian must identify,
@@ -1835,10 +1856,12 @@ def detach_budget(ctx, now=None):
 
 def detach_child_identity(row, pid, start, monitor_pid):
     """Whether an observed kinfo_proc row is still the exact child a monitor handed
-    over: same PID, same start time and still that monitor's child. A recycled bare
-    PID fails at least one of the three, so it is never signalled."""
+    over: same PID, same start time, still that monitor's child and not a zombie.
+    A recycled bare PID fails at least one of those, so it is never signalled.
+    The row is the real `Kinfo.parse` shape, whose liveness field is the boolean
+    `zombie` (there is no `stat` key)."""
     return bool(row is not None and row.get("pid") == pid and row.get("start") == start
-                and row.get("ppid") == monitor_pid and row.get("stat") != 5)
+                and row.get("ppid") == monitor_pid and row.get("zombie") is False)
 
 
 def detach_authorization(fault, deadline_hit, now, exit_at):
@@ -3542,7 +3565,8 @@ class Monitor:
                             status = None
                             while now_ns() < window_end and not self.stop.is_set():
                                 try:
-                                    status = handle.wait(timeout=0.0 if now_ns() >= window_end else 0.05)
+                                    left_s = max(0.0, (window_end - now_ns()) / NS)
+                                    status = handle.wait(timeout=min(0.05, left_s))
                                 except BaseException:
                                     status = None
                                 if status is not None:
@@ -4282,7 +4306,7 @@ class Custodian:
         closed = False
         while now_ns() < end:
             row = Kinfo.one(pid)
-            if row is None or row["start"] != start or row["stat"] == 5:
+            if row is None or row["start"] != start or row.get("zombie") is not False:
                 closed = True
                 break
             self.pump(min(end - now_ns(), 20_000_000))

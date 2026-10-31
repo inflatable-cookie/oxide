@@ -2169,7 +2169,7 @@ with no earlier run migrated.
 
 **Post-census image detach request (oxide#191, decision `ee263cea`, unqualified
 source).** The current `bounded-test.py`
-(`9af104440f4b30d4c5df3828861cb10889cdd5afd315d15a940d5dfb66784e14`) adds one
+(`38c3f53e3aa819f191ad57d710255f79a4155ef41a562e8ac7ec67a57d6dbb06`) adds one
 opt-in control for a proof
 whose own test image must be detached, and it is the only route by which such a
 proof may detach after a launch; the qualified shared runner is otherwise
@@ -2210,11 +2210,14 @@ as reaped, and its live handle survives every exception path (authorization, the
 attempt and the post-state read): the monitor publishes the child's PID **and
 start time**, stops touching the handle and waits for the custodian's
 acknowledgement before it may reap again, because a reaped PID can be recycled and
-a bare PID is never signalled. The custodian re-reads `kinfo_proc`, requires the
-same PID, the same start time and still this monitor as parent, then signals,
-observes it gone and acknowledges (a post-timeout close is the backstop); only a
-declined handoff (the child is already gone) lets the monitor finish the reap
-itself. Pin, signal and observation are recorded, an unobserved child is a latched
+a bare PID is never signalled. The custodian re-reads the real `Kinfo.one()` row — whose
+liveness field is the boolean `zombie`; there is no `stat` key — and requires the
+same PID, the same start time, still this monitor as parent and a non-zombie
+before it signals; then it signals, observes it gone under that same identity and
+acknowledges (a post-timeout close is the backstop); only a declined handoff (the
+child is already gone) lets the monitor finish the reap itself. The live handle
+also survives an exception raised inside the child executor after spawn: the
+failure record carries it, so custody is never dropped on an error path. Pin, signal and observation are recorded, an unobserved child is a latched
 fault, and the root, backing and evidence stay kept either way. A request that is
 present but not an object (including JSON `null`) is a refusal, never an
 absent request. A refusal, failure, timeout, identity change or
@@ -5407,7 +5410,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
 - **Focused proof of absent checkout chains (oxide#135).** The one fixed proof
   is `effigy rust:prune-absence` (`scripts/test-prune-absence.py` under this
-  tree's shared supervisor `9af10444…`, the merged oxide#151 guard plus
+  tree's shared supervisor `38c3f53e…`, the merged oxide#151 guard plus
   oxide#191's opt-in post-census detach) with
   `--root-parent /private/tmp`, the owner-accepted internal-placement exception
   (decision `bd357a4c`): the missing-chain fixtures must be on the boot Data
