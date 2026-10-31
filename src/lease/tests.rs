@@ -1397,6 +1397,92 @@ fn a_failed_containment_rename_leaves_the_foreign_object_at_the_derived_name() {
     );
 }
 
+/// oxide#196: the containment rename is an atomic no-replace operation. A
+/// pre-existing entry under the containment name is preserved byte for byte;
+/// the swapped object remains at the derived name and is reported truthfully,
+/// never replacing the existing entry and never adopted or deleted as a slot
+/// tree.
+#[test]
+fn a_pre_existing_containment_name_is_preserved() {
+    let fx = Fixture::new("held-containment-collision");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let granted = lease_injected(request(&pool, &project, &workspace, "holder-a")).expect("lease");
+    let id: u64 = granted.slot_id.parse().expect("slot id");
+    let slot_path = pool.join("payload").join("slots").join(&granted.slot_id);
+    let aside = fx.dir("aside").join("verified-tree");
+    let name = holding_name_for_slot_injected(&pool, id).expect("holding name");
+    let holding = pool.join("payload").join(".oxide-holding");
+    fs::create_dir_all(&holding).expect("holding area");
+    fs::set_permissions(&holding, fs::Permissions::from_mode(0o700)).expect("private holding");
+    let contained = holding.join(format!(".unverified-{name}"));
+    fs::create_dir(&contained).expect("pre-existing containment entry");
+    fs::write(contained.join("marker"), b"pre-existing containment").expect("marker");
+    let moved = slot_path.clone();
+    let parked = aside.clone();
+    let guard = crate::test_fs::before_holding_rename(move || {
+        fs::rename(&moved, &parked).expect("park the verified tree");
+        fs::create_dir(&moved).expect("foreign tree");
+        fs::write(moved.join("foreign"), b"foreign object").expect("foreign marker");
+    });
+    let failure = evict_held_slot_injected(&pool, &granted.slot_id, &granted.lease_id)
+        .expect_err("a swapped source is not the verified tree");
+    drop(guard);
+    match failure {
+        HeldEvictionFailure::PostCommit(reason) => {
+            assert!(reason.contains("containment rename failed"), "{reason}");
+            assert!(
+                reason.contains("without replacing any existing entry"),
+                "{reason}"
+            );
+            assert!(reason.contains("remains at"), "{reason}");
+            assert!(reason.contains("not this slot's"), "{reason}");
+        }
+        HeldEvictionFailure::PreCommit(error) => {
+            panic!("a containment collision was classified pre-commit: {error}")
+        }
+    }
+    assert!(
+        contained.is_dir(),
+        "the pre-existing containment entry was replaced"
+    );
+    assert_eq!(
+        fs::read(contained.join("marker")).expect("marker"),
+        b"pre-existing containment",
+        "the pre-existing containment entry was modified"
+    );
+    let derived = holding.join(&name);
+    assert!(derived.is_dir(), "the foreign object left the derived name");
+    assert_eq!(
+        fs::read(derived.join("foreign")).expect("foreign marker"),
+        b"foreign object"
+    );
+    assert!(!slot_path.exists());
+    assert!(aside.is_dir());
+    assert_eq!(
+        slot_state_injected(&pool, &granted.slot_id).as_deref(),
+        Some("held")
+    );
+    assert!(hold_intent_present_injected(&pool, id));
+    let view = status_injected(&pool).expect("the next locked open reconciles");
+    assert!(
+        view.slots
+            .iter()
+            .any(|slot| slot.slot_id == granted.slot_id && slot.state == SlotOccupancy::Held),
+        "the slot did not stay held"
+    );
+    assert!(view.holding.is_empty(), "a foreign object was adopted");
+    assert!(contained.is_dir());
+    assert!(derived.is_dir());
+    assert_eq!(
+        fs::read(contained.join("marker")).expect("marker"),
+        b"pre-existing containment",
+        "the next open modified the pre-existing containment entry"
+    );
+}
+
 /// oxide#196: a pre-existing entry under the derived holding name is a
 /// pre-rename collision. The failure must say the tree was not moved and must
 /// not attribute the existing entry to this slot by name; the next open clears

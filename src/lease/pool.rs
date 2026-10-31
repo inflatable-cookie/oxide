@@ -1429,7 +1429,7 @@ fn post_commit_failure(phase: MovePhase, error: &LeaseError) -> HeldEvictionFail
             "the hold intent is durable but a different object was moved into the holding area and contained as {name}; the verified slot tree was not moved, and that object is not this slot's, never adopted or deleted as one; the slot stays held ({error})"
         ),
         MovePhase::ContainmentFailed(name) => format!(
-            "the hold intent is durable but a different object was moved into the holding area and its containment rename failed; it remains at {name}, the verified slot tree was not moved, and that object is not this slot's, never adopted or deleted as one; the slot stays held ({error})"
+            "the hold intent is durable but a different object was moved into the holding area and its containment rename failed without replacing any existing entry; it remains at {name}, the verified slot tree was not moved, and that object is not this slot's, never adopted or deleted as one; the slot stays held ({error})"
         ),
     };
     HeldEvictionFailure::PostCommit(reason)
@@ -4855,16 +4855,30 @@ impl Pool {
                 #[cfg(not(test))]
                 let inject_failure = false;
                 if !inject_failure {
-                    // SAFETY: both names are inside the held holding-area
-                    // descriptor.
-                    contained_ok = unsafe {
-                        libc::renameat(
-                            holding.as_raw_fd(),
-                            target.as_ptr(),
-                            holding.as_raw_fd(),
-                            contained.as_ptr(),
-                        )
-                    } == 0;
+                    // The containment must never replace a pre-existing entry:
+                    // an atomic no-replace rename preserves unknown ownership
+                    // at the containment name.
+                    #[cfg(target_os = "macos")]
+                    {
+                        // SAFETY: both names are inside the held holding-area
+                        // descriptor.
+                        contained_ok = unsafe {
+                            libc::renameatx_np(
+                                holding.as_raw_fd(),
+                                target.as_ptr(),
+                                holding.as_raw_fd(),
+                                contained.as_ptr(),
+                                libc::RENAME_EXCL,
+                            )
+                        } == 0;
+                    }
+                    // The removable backend is macOS-only; without an atomic
+                    // no-replace rename the object is left at the derived name
+                    // and reported as uncontained.
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        let _ = (&holding, &target, &contained);
+                    }
                 }
             }
             *phase = if contained_ok {
