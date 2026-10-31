@@ -50,9 +50,13 @@ the leader is reaped, every census round records, once per identity and up to
 a fixed bound, the exact rows it still classifies in the leader's own session
 (PID, start, ppid, pgid, uid, zombie) in the receipt's `survivors` list for the
 owner; that is observation only, no message and no signal. Each row is recorded
-before the round that reports it is sent, and the census thread is joined before
-the receipt is published, so the evidence a verdict rests on is always the
-evidence on disk. The census still
+before the round that reports it is sent, and the census thread is joined
+(bounded, never past the deadline) before the receipt is published, so the
+evidence a verdict rests on is the evidence on disk. If that join expires the
+list is frozen at its published prefix and the receipt and summary say so
+(`census_join.joined: false`), never claiming a complete record; a `cleanup`
+decision in that state is refused outright, so an incomplete join never yields
+certain closure and the run is kept `UNCLOSED`. The census still
 decides closure, so a survivor that is still there when the deciding census runs
 keeps the run UNCLOSED with its scratch and evidence, while one that exits first
 leaves a recorded row and a closed run that honestly says so. Closing a
@@ -161,7 +165,8 @@ CONFIRM_TRIES, CONFIRM_PAUSE = 20, 0.05  # gone confirmation within one round, a
 # UNCLOSED. The bound keeps a forking tree's evidence finite.
 SURVIVOR_MAX = 16
 SURVIVOR_KEYS = ("pid", "start", "ppid", "pgid", "uid", "zombie")
-CENSUS_JOIN_S = 1.0  # bounded wait for the census thread before the receipt is published
+CENSUS_JOIN_S = 3.0  # bounded wait for the census thread before the receipt is published;
+# one round's own worst case is a full snapshot plus 19 shared confirmation pauses (about 1.4 s)
 DIAG_MAX_BYTES = 16384  # compact UTF-8 JSON ceiling for the optional receipt census diagnostics
 DIAG_MAX_ROWS = 20  # at most 20 diagnostic summary rows; the rest count as omitted
 # Observation-only settlement diagnostics (oxide#147). Fixed schema, one record
@@ -261,6 +266,10 @@ FIELDS = {  # required fields per monitor message type; bool is never accepted a
     "detach_ready": {"budget_ns": int},
     "detach_child": {"pid": int},  # `start` is optional: a parentage-only handoff has none
     "cleanup_kept": {"reason": str},
+    # oxide#195: the bounded census join expired with a cleanup decision, so the
+    # deciding census cannot be shown final. The custodian latches this reason,
+    # which makes the run UNCLOSED whatever its earlier verdict was.
+    "census_join_incomplete": {"reason": str},
 }
 
 
@@ -2096,7 +2105,7 @@ def survivor_row(row):
     return entry if entry["pid"] > 0 and entry["start"] > 0 else None
 
 
-def survivors_line(rows, closure=None):
+def survivors_line(rows, closure=None, joined=None):
     """One bounded summary line for the recorded survivors, or None when the run
     recorded none. Pure.
 
@@ -2105,8 +2114,10 @@ def survivors_line(rows, closure=None):
     can close. The line therefore never invents a closure verdict - it takes
     the run's own final `closure` (`closed` / `UNCLOSED` / unknown) and states
     only that: a closed run says the survivors were gone by the deciding
-    census, and only an UNCLOSED run says the scratch was kept. It never claims
-    a signal."""
+    census, and only an UNCLOSED run says the scratch was kept. `joined is False`
+    adds that the census thread outlived its bounded join, so the list is a
+    frozen prefix and later rows may be missing; it never claims completeness it
+    does not have, and it never claims a signal."""
     rows = [row for row in (rows or []) if isinstance(row, dict)]
     if not rows:
         return None
@@ -2115,10 +2126,16 @@ def survivors_line(rows, closure=None):
     head = (f"supervisor: {len(rows)} same-session survivor(s) not signalled (no custody):"
             f" {shown}{more}")
     if closure == "closed":
-        return head + "; they were gone by the deciding census, so the run closed"
-    if closure == "UNCLOSED":
-        return head + "; the run stays UNCLOSED and its scratch is kept"
-    return head + "; the deciding census fixes the outcome"
+        line = head + "; they were gone by the deciding census, so the run closed"
+    elif closure == "UNCLOSED":
+        line = head + "; the run stays UNCLOSED and its scratch is kept"
+    else:
+        line = head + "; the deciding census fixes the outcome"
+    if joined is False:
+        # The census thread outlived its bounded join, so the published list is a
+        # frozen prefix: say so rather than implying a complete record.
+        line += "; the census thread had not finished at publication, so later rows may be missing"
+    return line
 
 
 def detach_authorization(fault, deadline_hit, now, exit_at):
@@ -3310,6 +3327,10 @@ class Monitor:
         # the receipt's bounded `survivors` list. Observation only; never a signal.
         self.survivors = set()
         self.census_thread = None
+        # Set only when the bounded join expires: the persisted list is then an
+        # honest prefix, no row may land after the receipt is published, and the
+        # receipt records `census_join.frozen`.
+        self.census_frozen = False
 
     def note(self, entry=_SETTLE_TOP, **fields):
         """One observation-only stamp, on the settlement object or on one
@@ -3661,6 +3682,11 @@ class Monitor:
         try:
             rows = [survivor_row(row) for row in (result.get("member_rows") or [])]
             with self.lock:
+                if self.census_frozen:
+                    # The bounded join expired: the published receipt already
+                    # carries this list as an honest, explicitly incomplete
+                    # prefix, so a late row must not appear behind it.
+                    return
                 kept = self.receipt.setdefault("survivors", [])
                 for row in rows:
                     if row is None or len(kept) >= SURVIVOR_MAX:
@@ -3674,22 +3700,68 @@ class Monitor:
             pass
 
     def join_census(self, timeout_s=CENSUS_JOIN_S):
-        """Wait, bounded, for the census thread to finish after `census_stop`
-        (oxide#195 review).
+        """Wait, bounded, for the census thread after `census_stop`, and record
+        whether the receipt's survivor list was final when it was published.
 
-        A round records its survivor rows before it reports them, and the thread
-        must be done before the receipt that carries them is published; otherwise
-        a late append could be missing from the persisted evidence. Observation
-        only: a thread that does not finish in the bound is not an error, the
-        publication still happens, and its `False` answer is never a verdict."""
+        A round records its survivor rows before it reports them, so the list is
+        complete only once the thread has returned. The wait is bounded (a round's
+        own worst case is a full snapshot plus its shared confirmation pauses) and
+        never extends the deadline. A thread that does not finish in the bound is
+        not an error, but the receipt may not claim a complete record: the list is
+        frozen so no row can land after the receipt that carries it is published,
+        and `receipt['census_join']` states `joined: false`, `frozen: true` and how
+        many rows were kept. Returns that record; the join never changes closure,
+        a signal or any other verdict."""
+        stored = self.receipt.get("census_join") if isinstance(self.receipt, dict) else None
+        if isinstance(stored, dict) and (stored.get("joined") is True or stored.get("frozen")):
+            # A concluded join and a frozen prefix are both final: a later call
+            # must never rewrite the receipt after it was published.
+            return stored
         thread = getattr(self, "census_thread", None)
-        if thread is None:
-            return True
+        bound = max(0.0, float(timeout_s))
+        started = now_ns()
+        joined = True
+        if thread is not None:
+            try:
+                thread.join(bound)
+                joined = not thread.is_alive()
+            except BaseException:
+                joined = False
+        record = {"joined": joined, "bound_s": bound, "waited_ns": now_ns() - started,
+                  "rows": 0}
         try:
-            thread.join(max(0.0, timeout_s))
-            return not thread.is_alive()
+            with self.lock:
+                if not joined:
+                    self.census_frozen = True
+                    record["frozen"] = True
+                record["rows"] = len(self.receipt.get("survivors") or [])
+                self.receipt["census_join"] = record
         except BaseException:
-            return False
+            pass
+        return record
+
+    def refuse_incomplete_closure(self, join):
+        """Turn a cleanup decision into an honest non-closure after an expired join.
+
+        The custodian's ceiling is a certain empty census; a census thread that
+        did not finish cannot show that the deciding round was the last one, so a
+        later in-flight round could still have seen a member. The persisted
+        verdict is rewritten to `UNCLOSED` with the reason, and the custodian is
+        told the same reason so it latches a fault and cannot exit as a pass. No
+        signal, no cleanup and no bound changes: the root, backing and evidence
+        are simply kept."""
+        reason = "the census thread did not finish before publication"
+        with self.lock:
+            record = dict(join or {})
+            record["refused"] = True
+            self.receipt["census_join"] = record
+            outcome = dict(self.receipt.get("outcome") or {})
+            outcome["closure"] = "UNCLOSED"
+            if not outcome.get("fault"):
+                outcome["fault"] = "closure not established: " + reason
+            self.receipt["outcome"] = outcome
+        self.send("census_join_incomplete", reason=reason)
+        return reason
 
     def census_loop(self, after):
         started = now_ns()
@@ -3897,7 +3969,13 @@ class Monitor:
         self.note(stop_requested_ns=now_ns())
         self.census_stop.set()
         # No survivor row may land after the receipt that records it is published.
-        self.join_census()
+        join = self.join_census()
+        if decision == "cleanup" and join.get("joined") is not True:
+            # The deciding census cannot be shown final, so certain closure is not
+            # available: keep everything and make the persisted verdict say so.
+            decision = "keep"
+            self.refuse_incomplete_closure(join)
+            self.publish("census_join_incomplete: scratch_kept")
         # Only a run that took part in the image protocol drains at completion; a
         # keep/UNCLOSED decision never does, so the default is initialized here.
         opted_in = False
@@ -4161,7 +4239,9 @@ class Monitor:
                 f" (device {detach.get('device')}, exit {detach['exit']}, timed out {detach['timed_out']},"
                 f" post-state {detach['post_state']}, qualified {detach['qualified']})"
                 + (f": {detach['reason']}" if detach.get("reason") else ""))
-        survivors = survivors_line(receipt.get("survivors"), outcome.get("closure"))
+        join = receipt.get("census_join") or {}
+        survivors = survivors_line(receipt.get("survivors"), outcome.get("closure"),
+                                   join.get("joined"))
         if survivors is not None:  # oxide#195: recorded, never signalled
             lines.append(survivors)
         for line in lines:  # one bounded write per line, so none truncates the rest
@@ -4482,6 +4562,11 @@ class Custodian:
                       reason=None if closed else "not observed closed yet")
         elif kind == "cleanup_failed":
             self.guard.latch("cleanup: owned scratch not fully removed")
+        elif kind == "census_join_incomplete":
+            # A bound on the census thread expired, so the deciding census cannot
+            # be shown final: closure is not established, whatever was decided.
+            self.census_uncertain = True
+            self.guard.latch(f"closure not established: {message['reason']}")
 
     def setup(self):
         missing = capability()

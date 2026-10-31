@@ -1723,8 +1723,9 @@ class PureSurvivors(unittest.TestCase):
         self.assertNotIn("closed;", unknown)
         # The summary composes the line from the receipt's own outcome, so the
         # transient case closes truthfully end to end.
-        source = inspect.getsource(bounded.Monitor.summary)
-        self.assertIn('survivors_line(receipt.get("survivors"), outcome.get("closure"))', source)
+        source = " ".join(inspect.getsource(bounded.Monitor.summary).split())
+        self.assertIn('survivors_line(receipt.get("survivors"), outcome.get("closure"),'
+                      ' join.get("joined"))', source)
         self.assertNotIn('survivors_line(receipt.get("survivors"), "UNCLOSED")', source)
         # And the persistent-survivor regression still holds: the same rows with
         # an UNCLOSED outcome keep the honest residual.
@@ -1795,8 +1796,8 @@ class PureSurvivors(unittest.TestCase):
         self.assertEqual([item["pid"] for item in monitor.receipt["survivors"]], [900])
 
     def test_the_census_thread_is_joined_before_the_final_publication(self):
-        # A late append after publication would silently drop evidence: the join
-        # must land the row first, and the join itself never raises or hangs.
+        # A late append after publication would silently drop evidence: a prompt
+        # join must land the row first and record that the list is complete.
         monitor, evidence, _ctl_r = self.publishable_monitor()
         monitor.census_stop = OneShotStop()
 
@@ -1806,15 +1807,158 @@ class PureSurvivors(unittest.TestCase):
 
         monitor.census_thread = threading.Thread(target=late_round)
         monitor.census_thread.start()
-        self.assertTrue(monitor.join_census(5))
+        record = monitor.join_census(5)
+        self.assertEqual(record["joined"], True)
+        self.assertNotIn("frozen", record)
+        self.assertEqual(record["rows"], 1)
         monitor.publish("unclosed: scratch_kept")
         published = json.loads((evidence / "receipt.json").read_text())
         self.assertEqual([item["pid"] for item in published["survivors"]], [900])
+        self.assertEqual(published["census_join"]["joined"], True)
         # Idempotent and never blocking: an absent thread and a spent bound are
         # both non-verdicts, never exceptions.
-        self.assertTrue(monitor.join_census(5))
-        self.assertTrue(bounded.Monitor.join_census(self.monitor()[0], 0))
-        self.assertTrue(bounded.Monitor.join_census(self.monitor()[0], -5))
+        self.assertTrue(monitor.join_census(5)["joined"])
+        self.assertTrue(bounded.Monitor.join_census(self.monitor()[0], 0)["joined"])
+        self.assertTrue(bounded.Monitor.join_census(self.monitor()[0], -5)["joined"])
+
+    def test_an_expired_join_freezes_the_published_list_and_says_so(self):
+        # Reviewer finding: a bounded join may expire. The published receipt must
+        # then be an honest, explicitly incomplete prefix: no row may land after
+        # the publication, the receipt records `joined: false`/`frozen: true`, and
+        # the summary says later rows may be missing instead of implying a
+        # complete record. This is the discriminating timeout-path regression.
+        monitor, evidence, _ctl_r = self.publishable_monitor()
+        monitor.census_stop = OneShotStop()
+        monitor.record_survivors(self.members(row(900, start=5)))  # prefix before the stall
+        release = threading.Event()
+        appended = []
+
+        def stalled_round():
+            release.wait(5)
+            monitor.record_survivors(self.members(row(901, start=6)))
+            appended.append(True)
+
+        monitor.census_thread = threading.Thread(target=stalled_round)
+        monitor.census_thread.start()
+        record = monitor.join_census(0.05)
+        self.assertEqual(record["joined"], False)
+        self.assertIs(record["frozen"], True)
+        self.assertEqual(record["rows"], 1)
+        self.assertIs(monitor.census_frozen, True)
+        try:
+            monitor.publish("unclosed: scratch_kept")
+            published = json.loads((evidence / "receipt.json").read_text())
+            self.assertEqual([item["pid"] for item in published["survivors"]], [900])
+            self.assertEqual(published["census_join"]["joined"], False)
+            self.assertIs(published["census_join"]["frozen"], True)
+            line = bounded.survivors_line(published["survivors"], "UNCLOSED",
+                                          published["census_join"].get("joined"))
+            self.assertIn("may be missing", line)
+            self.assertIn("the run stays UNCLOSED and its scratch is kept", line)
+            self.assertNotIn("the run closed", line)
+            # The stalled round finishes late: its row must never appear behind
+            # the published receipt, and the receipt stays the frozen prefix.
+            release.set()
+            monitor.census_thread.join(5)
+            self.assertFalse(monitor.census_thread.is_alive())
+            self.assertEqual(appended, [True])
+            self.assertEqual([item["pid"] for item in monitor.receipt["survivors"]], [900])
+            on_disk = json.loads((evidence / "receipt.json").read_text())
+            self.assertEqual([item["pid"] for item in on_disk["survivors"]], [900])
+            # A later join call never rewrites the published record, even though
+            # the thread has now finished: the frozen prefix stays the record.
+            again = monitor.join_census(5)
+            self.assertIs(again["joined"], False)
+            self.assertIs(again["frozen"], True)
+            self.assertEqual(monitor.receipt["census_join"]["rows"], 1)
+            # A completed join adds no caveat, and a completed closed run still
+            # reports the truth without one.
+            self.assertNotIn("may be missing",
+                             bounded.survivors_line([{"pid": 900, "start": 5}], "closed", True))
+            self.assertIn("may be missing",
+                          bounded.survivors_line([{"pid": 900, "start": 5}], "closed", False))
+        finally:
+            release.set()
+
+    def test_the_join_record_is_published_and_never_decides_closure(self):
+        # The join record is evidence about the record, not a verdict: a monitor
+        # that produced it makes no closure claim of its own.
+        monitor, evidence, _ctl_r = self.publishable_monitor()
+        monitor.census_thread = None
+        record = monitor.join_census(1)
+        self.assertEqual(record, {"joined": True, "bound_s": 1.0, "waited_ns": record["waited_ns"],
+                                  "rows": 0})
+        monitor.publish("started: incomplete")
+        published = json.loads((evidence / "receipt.json").read_text())
+        self.assertEqual(published["census_join"]["joined"], True)
+        self.assertNotIn("outcome", published)
+        self.assertNotIn("frozen", published["census_join"])
+
+    def custodian_stub(self):
+        custodian = bounded.Custodian(["true"])
+        custodian.run_id = "r"
+        read_end, custodian.cmd_w = os.pipe()
+        self.addCleanup(os.close, read_end)
+        self.addCleanup(os.close, custodian.cmd_w)
+        os.set_blocking(read_end, False)
+        custodian.guard = bounded.Guard(0)
+        custodian.leader = 4242
+        custodian.leader_start = 77
+        return custodian, read_end
+
+    def test_an_expired_join_turns_a_cleanup_decision_into_an_honest_non_closure(self):
+        # Supervisor invariant: an incomplete join NEVER yields certain closure.
+        # The run keeps its root, the persisted verdict becomes UNCLOSED with the
+        # reason, and the custodian latches the same reason so it cannot exit as a
+        # pass. This fails on the pre-fix source, where the join answer was
+        # ignored and the closed outcome stood.
+        monitor, evidence, ctl_r = self.publishable_monitor()
+        monitor.receipt["outcome"] = {"closure": "closed", "status": 0, "fault": None,
+                                      "deadline": False, "launched": True}
+        self.assertIn('if decision == "cleanup" and join.get("joined") is not True:',
+                      " ".join(inspect.getsource(bounded.Monitor.run).split()))
+        join = {"joined": False, "frozen": True, "rows": 1, "bound_s": 0.05, "waited_ns": 1}
+        reason = monitor.refuse_incomplete_closure(join)
+        self.assertIs(monitor.receipt["census_join"]["refused"], True)
+        # The refusal is final: a later join (or a second refusal pass) cannot make
+        # the record look complete again.
+        self.assertIs(monitor.join_census(5)["joined"], False)
+        outcome = monitor.receipt["outcome"]
+        self.assertEqual(outcome["closure"], "UNCLOSED")
+        self.assertEqual(outcome["fault"], "closure not established: " + reason)
+        self.assertIs(outcome["deadline"], False)
+        monitor.publish("census_join_incomplete: scratch_kept")
+        published = json.loads((evidence / "receipt.json").read_text())
+        self.assertEqual(published["outcome"]["closure"], "UNCLOSED")
+        self.assertEqual(published["phase"], "census_join_incomplete: scratch_kept")
+        # The message is well formed and the custodian turns it into a latched
+        # fault: closure is refused and the exit is not a pass.
+        blob = os.read(ctl_r, 1 << 16).decode()
+        lines = [line for line in blob.splitlines() if '"census_join_incomplete"' in line]
+        self.assertEqual(len(lines), 1, blob)
+        message = json.loads(lines[0])
+        self.assertIsNone(bounded.malformed(message))
+        custodian, _cmd = self.custodian_stub()
+        custodian.monitor_seq = 0
+        custodian.accept(message)
+        self.assertIn("closure not established", custodian.guard.fault or "")
+        self.assertTrue(custodian.census_uncertain)
+        self.assertFalse(custodian.closure(True))
+        self.assertEqual(bounded.exit_code(False, custodian.guard.fault, True, 0), 125)
+        self.assertEqual(bounded.exit_code(True, custodian.guard.fault, True, 0), 124)
+        # A completed join takes none of this path: the closed outcome stands and
+        # no message is sent.
+        clean, clean_evidence, clean_ctl = self.publishable_monitor()
+        clean.receipt["outcome"] = {"closure": "closed", "status": 0, "fault": None,
+                                    "deadline": False, "launched": True}
+        clean.census_thread = None
+        self.assertIs(clean.join_census(1)["joined"], True)
+        clean.publish("closure_established: cleanup_pending")
+        kept = json.loads((clean_evidence / "receipt.json").read_text())
+        self.assertEqual(kept["outcome"]["closure"], "closed")
+        self.assertNotIn("refused", kept["census_join"])
+        with self.assertRaises(BlockingIOError):  # nothing was sent: no message
+            os.read(clean_ctl, 1 << 16)
 
     def test_the_qualification_oracle_requires_the_survivor_record_and_no_signal(self):
         rows = survivor_case_rows("/x")

@@ -2311,9 +2311,17 @@ sixteen rows, the exact rows it still classifies in the leader's own session
 (`PID`, `start`, `ppid`, `pgid`, `uid`, `zombie`) in the receipt's `survivors`
 list, and the summary line states how many same-session survivors were not
 signalled. Each row is recorded before the round that reports it is sent and the
-census thread is joined before the receipt is published, so the evidence a
-verdict rests on is the evidence on disk. That is observation only: no message,
-no signal, no closure claim.
+census thread is joined (bounded, never past the deadline) before the receipt is
+published, so the evidence a verdict rests on is the evidence on disk. That is
+observation only: no message, no signal, no closure claim. An expired join is
+handled conservatively and truthfully: the survivor list is frozen at its
+published prefix (no row may land after publication), `census_join` records
+`joined: false` and `frozen: true`, the summary says later rows may be missing,
+and **an incomplete join never yields certain closure** — a `cleanup` decision
+in that state is refused, the persisted verdict becomes `UNCLOSED` with
+`closure not established: the census thread did not finish before publication`,
+the custodian latches the same reason, and the root, backing and evidence are
+kept.
 A recorded row is observation, never a verdict: a survivor seen after the stop
 may exit by itself, so a LATER certain-empty census can still close the run, and
 the summary line states the run's own final closure — a closed run says the
@@ -2333,17 +2341,20 @@ signalled, both still live at the `UNCLOSED` verdict), and adds the pure rules
 that keep it that way, including an AST guard that every kill call site in the
 supervisor is a custody-bound one; pure regressions that a recorded row reaches
 the published receipt, that a round records its rows before it reports them and
-that the census thread is joined before publication; and a transient-survivor
+that the census thread is joined before publication, that an expired join freezes
+the published list, records `joined: false`/`frozen: true` and says later rows may
+be missing, and that an expired join refuses closure (persisted `UNCLOSED`, a
+latched reason, no pass exit); and a transient-survivor
 regression (both pure and real: a recorded row followed by a certain-empty
 census closes the run and never reports `UNCLOSED`/kept). At this head the three
 sources are
 `bounded-test.py`
-`fc2451272320c86978245650789220541c50e47391cf1b732d203f68a127ec35`,
+`33568bb6cfe413fb41662e8d1709e39a382a522a3e4233c8ab14534e1f065dbe`,
 `test_supervisor.py`
-`26ad33d3beb5952266061eb073f2cd136f57ab078798a3278294f3685941027e` and
+`467f549b623f2c18cfdd9a31e568907a0cabfd7ca33f13cf891aecc20282ca1a` and
 `qualify-supervisor.py`
-`9d76bec60d5a89e34ac5757bf688f0d62faedcb6d877ba9ea4b07e5f4ff0a73b`. The
-head's suite is 299 pure plus 49 real cases and is **unqualified** until one
+`26ad26be112bd9d8f6d532f6eec9dbab907aa938a0900ee89916fcff12da96b4`. The
+head's suite is 302 pure plus 49 real cases and is **unqualified** until one
 uncounted keep-going
 `effigy proof:supervisor:qualify:diagnostic` and then ONE counted author and
 ONE separate independent reviewer `effigy proof:supervisor:qualify` pass at the
