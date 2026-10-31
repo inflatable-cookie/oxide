@@ -645,9 +645,10 @@ that root is outside this accounting guarantee: the byte budget is soft and
 may overshoot the charge. The existing registered reserve and running-build
 reserve watchdog remain the free-space protection.
 
-**An unmeasured idle slot at admission is charged, not refused (oxide#186).**
-When an admission walks an idle slot that has no current record and that walk
-stops partial — an elapsed deadline, an entry, depth or mount bound, an
+**An unmeasured slot at admission is charged, not refused (oxide#186; extended
+to held slots and removable pools, Tom 2026-10-31).** When an admission walks
+another slot (an idle slot with no current record, or any held slot, on either
+backend) and that walk stops partial — an elapsed deadline, an entry, depth or mount bound, an
 unreadable entry — the slot is charged
 `max(the bytes it observed before it stopped, its current-generation record if
 any, the largest recorded slot in the pool)`, at least one byte and never the
@@ -717,7 +718,7 @@ defaults, which are unchanged. The callers:
 | --- | --- |
 | The matching idle slot's own walk before reuse | Must be complete, or the lease refuses |
 | The one slot a release or recovery closes (oxide#146) | Best effort: an incomplete walk publishes no record and never fails the release |
-| A slot with no current record, and every held slot, at admission | An idle slot on the internal directory pool that stops partial is charged conservatively for that admission and kept, never a victim (oxide#186); a held slot's live figure, a removable pool's bounded walks and a root that cannot be opened must be complete, or the lease refuses (`unknown_accounting`) |
+| A slot with no current record, and every held slot, at admission | Any such slot whose walk stops partial, idle or held, on either backend, is charged conservatively for that admission and kept, never a victim (oxide#186, extended 2026-10-31); only a slot root that cannot be opened or classified refuses the lease (`unknown_accounting`) |
 | `status --measure`: the whole payload and each slot | Observational; reports coverage, causes and time. Default `oxide status` walks nothing (oxide#128) |
 
 Admission itself no longer walks the payload: it sums the closed per-slot
@@ -1300,10 +1301,15 @@ lock in the same open that uses it:
    is false.
 
 Anything else is **not current**: never zero, never free space. A slot whose
-record is not current is walked before its number is used; an idle slot on the
-internal directory pool whose walk stops partial is charged conservatively for
-that admission and kept (oxide#186), and every other incomplete walk keeps
-today's `unknown_accounting` refusal exactly.
+record is not current is walked before its number is used; any slot whose walk
+stops partial, idle or held, on either backend, is charged conservatively for
+that admission and kept (oxide#186, extended 2026-10-31). Only a slot root that
+cannot be opened or classified keeps the `unknown_accounting` refusal. Every slot walk in one admission shares one elapsed budget; a slot measured
+completely earlier in the admission keeps that figure. Because a removable
+pool's admission now usually has a complete (charged) pressure figure, the
+unknown-size reserve route is reached only when the payload scope pass itself
+is incomplete; the volume reserve is still checked when a build starts and by
+the running build's watchdog.
 
 The one deliberate relaxation, restated because it is the whole point: a
 current record is trusted even though a same-UID process could have changed
@@ -1607,7 +1613,7 @@ reply as a size.
 | Walks and their bounds | `inventory.rs` `inventory_directory` (`:436`), the walk observer call (`:438`), directory descent vs file counting (`:640-716`), `Sizes::require_complete` (`:1854`), `walk_limits` (`:1523`), `extra_depth` (`:2072-2078`) |
 | Debug-only observations | `inventory::walk_observer` (`:1354`), `OXIDE_TEST_WALK_LOG`, `delay_before_read_dir`, plus the new debug-only `OXIDE_TEST_SCOPE_LOG` for `pool_scope()` |
 | Control state fence | `store.rs` `STATE_VERSION`: 8 is the raised-ceiling fence (oxide#177), 7 the eviction-accounting fence (oxide#175), 6 the [one-use workspaces](one-use-workspaces.md) fence, 5 the recorded-accounting fence; an owned-outputs successor alone is version 4 (`RECORDED_ACCOUNTING_FENCE`, `ONE_USE_FENCE`, `EVICTION_ACCOUNTING_FENCE`, `SLOT_CEILING_FENCE`, hand-off trigger in `handoff.rs`) |
-| Qualified guard | `scripts/bounded-test.py`, sha256 `bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924` ([oxide#151](workflow.md#shared-proof-supervisor)); this tree's `d69ae16a…` bytes add oxide#191's opt-in post-census detach and are unqualified until their own qualifications pass; the oxide#147 `5e5b6617…` and oxide#145 `a6d73326…` bytes are history |
+| Qualified guard | `scripts/bounded-test.py`, sha256 `bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924` ([oxide#151](workflow.md#shared-proof-supervisor)); this tree's `0848974d…` bytes add oxide#191's opt-in post-census detach and are unqualified until their own qualifications pass; the oxide#147 `5e5b6617…` and oxide#145 `a6d73326…` bytes are history |
 
 #### Acceptance matrix
 
@@ -1752,7 +1758,7 @@ precedence.
 300 s total with the supervisor's 30 s stop margin and 512 MiB monitored
 scratch are unchanged; every write stays inside the owned root, no session,
 group or census is started. The supervisor this tree runs is `scripts/bounded-test.py` sha256
-`d69ae16a6c27651979109aecc88cadb139a653278b21104cd478157350934028`: the
+`0848974d79d84617070bd611da9503b48a0127e68c2965cebcd36e8d5fc13414`: the
 qualified oxide#151 guard (merged `af08749`, sha256 `bc24b238…`) plus
 oxide#191's opt-in post-census image detach, so those added bytes are
 unqualified until their own diagnostic, author and reviewer qualifications pass

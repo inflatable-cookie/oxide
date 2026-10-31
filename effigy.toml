@@ -298,7 +298,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # commands take Tom's answered internal-root exception explicitly
 # (`--root-parent /private/tmp`) rather than placing a pool on a selected
 # volume, where the product correctly refuses it. The supervisor is this tree's
-# `bounded-test.py` (sha256 d69ae16a…, oxide#191's post-census detach bytes over
+# `bounded-test.py` (sha256 0848974d…, oxide#191's post-census detach bytes over
 # the qualified oxide#151 guard; those added bytes are unqualified until their
 # own qualifications pass); 300 s wall and
 # 512 MiB monitored scratch are unchanged and the fit stays unmeasured until
@@ -530,7 +530,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 
 # Owned-output prune (oxide#129, oxide#152): one fixed 22-case native proof
 # under the shared supervisor (`scripts/bounded-test.py` SHA-256
-# d69ae16a6c27651979109aecc88cadb139a653278b21104cd478157350934028,
+# 0848974d79d84617070bd611da9503b48a0127e68c2965cebcd36e8d5fc13414,
 # the qualified oxide#151 guard plus oxide#191's opt-in post-census detach,
 # unqualified until its own qualifications pass): 360 s, 512 MiB monitored scratch, 30 s work
 # shutdown margin, one
@@ -626,7 +626,7 @@ admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-drive-mode.py"
 
 # Shared session supervisor qualification (oxide#109): a short bootstrap
-# (healthy reserve readings, fixed 300 s wall limit held by a minimal outer
+# (healthy reserve readings, fixed 420 s wall limit held by a minimal outer
 # actor) runs the candidate `bounded-test.py` around its synthetic suite:
 # pure fault injection first, then tiny real Python children and fixture
 # writers in owned scratch. The candidate runs with no --root-parent and no
@@ -656,16 +656,14 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 admission = "heavy"
 run = "python3 scripts/qualify-supervisor.py"
 
-# The uncounted keep-going diagnostic of the same qualification path
-# (oxide#191, with oxide#192's admission-report checks): the same bootstrap,
-# heavy admission, 300 s absolute deadline, selected-volume routing and 512 MiB
-# monitored scratch with `--diagnostic`. It runs each named qualification oracle
-# on its own, so one failing check never hides the rest, records a bounded
-# `qualified: false` receipt with its per-check rows and case-level collection
-# and always exits non-zero: it is never a counted PASS, a qualification or
-# evidence for another proof, and a skipped check is never a pass. Required
-# before the counted author qualification at a changed head. Not a benchmark and
-# not full QA.
+# The uncounted keep-going diagnostic of that same qualification path
+# (oxide#191): the same bootstrap, heavy admission, 420 s absolute deadline and
+# 512 MiB monitored scratch, with `--diagnostic` on both the bootstrap and the
+# changed pass check. It runs each named qualification oracle on its own, so one
+# failing check never hides the rest, records a bounded `qualified: false`
+# receipt with its per-check rows (including oxide#192's admission-report checks and its
+# case-level collection) and always exits non-zero: it is never a counted PASS, and it is
+# required before the counted author qualification at a changed head.
 [tasks."proof:supervisor:qualify:diagnostic"]
 admission = "heavy"
 run = "python3 scripts/qualify-supervisor.py --diagnostic"
@@ -1093,7 +1091,7 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 
 # Slot headroom (oxide#118, oxide#177): under the shared proof supervisor
 # (oxide#109/#114/#151 plus oxide#191's opt-in post-census detach, bounded-test.py
-# SHA-256 d69ae16a6c27651979109aecc88cadb139a653278b21104cd478157350934028,
+# SHA-256 0848974d79d84617070bd611da9503b48a0127e68c2965cebcd36e8d5fc13414,
 # unqualified until its own qualifications pass), stages
 # `oxide` offline with 1.97.1 and proves the permanent ledger/control fences,
 # legacy read without migration, the raised-ceiling fence written at the 129th

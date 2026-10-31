@@ -388,10 +388,92 @@ pub fn exit_code(status: ExitStatus) -> u8 {
     }
 }
 
+/// Test-only owner of a group a test spawned. Every exit path, including a
+/// panic unwinding through a failing assertion, KILLs whatever is still in the
+/// group, then waits up to `OWNED_CLOSE` for the leader to be reaped and the
+/// group to empty. A survivor is printed to stderr; it is never reported as
+/// closed. Without the owner a failed test leaves a member such as `sleep`
+/// behind, reparented to launchd and outside the runner's closure.
+#[cfg(test)]
+pub struct OwnedGroup(Group);
+
+#[cfg(test)]
+const OWNED_CLOSE: Duration = Duration::from_secs(5);
+
+#[cfg(test)]
+impl OwnedGroup {
+    pub fn spawn(command: &mut Command) -> Self {
+        Self(spawn_group(command).expect("a test group"))
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for OwnedGroup {
+    type Target = Group;
+
+    fn deref(&self) -> &Group {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for OwnedGroup {
+    fn deref_mut(&mut self) -> &mut Group {
+        &mut self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for OwnedGroup {
+    fn drop(&mut self) {
+        let id = self.0.id;
+        if group_empty(id) {
+            // Nothing left to signal. Collect the leader if it has exited but
+            // was not yet reaped; this never blocks on a live child.
+            let _ = self.0.child.try_wait();
+            return;
+        }
+        signal_group(id, libc::SIGKILL);
+        // One bound covers both the leader's reap and the group's emptiness.
+        // A survivor is reported, never treated as closed.
+        let started = Instant::now();
+        let mut reaped = false;
+        loop {
+            reaped = reaped || matches!(self.0.child.try_wait(), Ok(Some(_)));
+            if (reaped && group_empty(id)) || started.elapsed() >= OWNED_CLOSE {
+                break;
+            }
+            std::thread::sleep(POLL);
+        }
+        if !(reaped && group_empty(id)) {
+            eprintln!(
+                "oxide test: process group {id} did not close after KILL (leader reaped: {reaped})"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::budget::{self, Options};
+
+    #[test]
+    fn a_panic_through_an_owned_group_closes_it() {
+        // `sh` ignores TERM and leaves `sleep` as a member, the shape the
+        // watchdog tests spawn. The panic stands for a failing assertion.
+        let mut pid = 0;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let group =
+                OwnedGroup::spawn(Command::new("/bin/sh").args(["-c", "trap '' TERM; sleep 30"]));
+            pid = group.id;
+            std::thread::sleep(Duration::from_millis(50));
+            panic!("a failing assertion while the group is alive");
+        }));
+        assert!(outcome.is_err(), "the panic must reach the caller");
+        assert!(pid > 1, "the group was spawned");
+        assert!(group_empty(pid), "the owned group {pid} outlived its panic");
+    }
 
     fn due_execution_clock() {
         budget::clear();
@@ -426,7 +508,7 @@ mod tests {
         due_execution_clock();
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "exit 0"]);
-        let mut group = spawn_group(&mut command).expect("a child");
+        let mut group = OwnedGroup::spawn(&mut command);
         // Let the child exit so the harvest below is deterministic.
         std::thread::sleep(Duration::from_millis(100));
         let status = wait_leader_budgeted(&mut group, &mut Stop::new())
@@ -446,7 +528,7 @@ mod tests {
         due_execution_clock();
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "exec sleep 30"]);
-        let mut group = spawn_group(&mut command).expect("a child");
+        let mut group = OwnedGroup::spawn(&mut command);
         let started = Instant::now();
         let status = wait_leader_budgeted(&mut group, &mut Stop::new()).expect("a result");
         // The stop is a trigger: the leader may be reaped as a signal status

@@ -1665,7 +1665,12 @@ def bounded_run(argv, timeout, cap=DETACH_OUTPUT_MAX_BYTES, still_allowed=None, 
     tail, seen, timed_out, withdrawn, reap_timed_out, reaped = b"", 0, False, None, False, False
     poll_at = time.monotonic() + DETACH_POLL_S
     try:
-        fd = child.stdout.fileno()
+        # One owner for the descriptor: detaching the buffer gives this function
+        # the raw stream, so the descriptor is closed exactly once here and never
+        # left to a buffered object's finalizer while another thread may have
+        # reused the number.
+        raw = child.stdout.detach()
+        fd = raw.fileno()
     except BaseException as error:
         return _unreaped_record(child, error, deadline)
     try:
@@ -1700,13 +1705,19 @@ def bounded_run(argv, timeout, cap=DETACH_OUTPUT_MAX_BYTES, still_allowed=None, 
                 seen += len(chunk)
                 tail = _bounded_tail(tail, chunk, cap)
         finally:
+            # Close the descriptor through its single owner BEFORE any wait, then
+            # drop the detached buffer so nothing can close it a second time.
+            try:
+                raw.close()
+            except OSError:
+                pass
+            try:
+                child.stdout = None
+            except BaseException:
+                pass
             # The reap is bounded by what is left of the SAME deadline: no extra
             # fixed wait and no round that can run past it. Any exception here
             # still hands the live child back through the outer handler.
-            try:
-                os.close(fd)
-            except OSError:
-                pass
             if timed_out or withdrawn is not None:
                 try:
                     child.kill()
@@ -1729,7 +1740,6 @@ def bounded_run(argv, timeout, cap=DETACH_OUTPUT_MAX_BYTES, still_allowed=None, 
                     pass
     except BaseException as error:
         return _unreaped_record(child, error, deadline)
-    child.stdout = None
     status = child.returncode
     return {"exit": status, "timed_out": timed_out, "error": None,
             "output": tail.decode("utf-8", "replace"), "truncated": seen > len(tail),
@@ -1899,17 +1909,31 @@ def read_custody(ctx, probe):
     return [str(backing) for backing in backings], None
 
 
-def custody_problems(paths, probe, facts=None, timeout=DETACH_INFO_TIMEOUT_S):
+def custody_problems(paths, probe, facts=None, timeout=DETACH_INFO_TIMEOUT_S, deadline_ns=None):
     """Why a decayed custody record must keep the root, from attachment facts and
     device nodes: a mounted entity is live, an entity without a mount point is
     live when its /dev node still exists (attached but unmounted) and stale
     metadata only when that node is positively gone; unreadable facts are
-    uncertain and keep. Am empty result means the backings are positively
-    detached."""
+    uncertain and keep. An empty result means the backings are positively
+    detached. With an absolute `deadline_ns`, the deadline is rechecked before
+    EVERY backing read and each read gets only what is left, so earlier reads can
+    never buy a later one a fresh allowance."""
     read = facts or image_attachments
     problems = []
-    for backing in paths:
-        rows = read(backing, timeout)
+    for index, backing in enumerate(paths):
+        budget = timeout
+        if deadline_ns is not None:
+            remaining = (deadline_ns - now_ns()) / NS
+            if remaining <= 0.0:
+                problems.append(f"{backing}: no custodian wait window is left to read its facts")
+                break
+            # The deadline is rechecked here AND the remainder is shared with the
+            # backings still to read, so neither a slow earlier read nor several
+            # reads can outlive the custodian's window.
+            # No floor: a floor larger than a small positive remainder would grant a
+            # read more time than the custodian's window still allows.
+            budget = min(timeout, remaining / max(1, len(paths) - index))
+        rows = read(backing, budget)
         if rows is None:
             problems.append(f"{backing}: attachment facts are unreadable")
             continue
@@ -1946,8 +1970,20 @@ def cleanup_safety(ctx, probe=None, facts=None):
         return None  # not opted in: no scan and no gate, so the default path is unchanged
     if problem is not None:
         return {"state": "kept", "reason": problem, "unrequested": [], "at_ns": now_ns()}
+    # Budget the whole scan inside what is left of the custodian's own window: the
+    # declared backings SHARE it, so no backing restarts a fresh allowance and the
+    # last read cannot outlive the monitor.
+    start_ns, limit_s = ctx.get("start_ns"), ctx.get("limit_s")
+    deadline_ns = None
+    if typed(start_ns, int) and typed(limit_s, (int, float)):
+        deadline_ns = (start_ns + int(limit_s * NS) - EXIT_MARGIN_S * NS
+                       - DETACH_GATE_MARGIN_NS)
+        if (deadline_ns - now_ns()) <= 0:
+            return {"state": "kept", "at_ns": now_ns(), "unrequested": list(backings),
+                    "reason": ("no custodian wait window is left to read the custody indication;"
+                               " the root, its backings and the evidence are kept")}
     try:
-        problems = custody_problems(backings, probe, facts)
+        problems = custody_problems(backings, probe, facts, DETACH_INFO_TIMEOUT_S, deadline_ns)
     except BaseException as error:
         problems = [f"attachment facts failed: {type_name(error)}"]
     if not problems:
@@ -2018,6 +2054,11 @@ def _unreaped_record(child, error, deadline):
         reaped = child.wait(timeout=max(0.0, deadline - time.monotonic())) is not None
     except BaseException:
         reaped = False
+    try:
+        if child.stdout is not None:  # still owning its descriptor: close it once
+            child.stdout.close()
+    except BaseException:
+        pass
     try:
         child.stdout = None
     except BaseException:
@@ -3951,32 +3992,8 @@ class Monitor:
             detach = post_census_detach(ctx, authorize=self.authorize_detach,
                                         still_allowed=self.detach_still_allowed)
             opted_in = detach is not None
-            # A refused or failed attempt is recorded BEFORE the custody gate: a
-            # kept root must never erase what the attempt established. The live
-            # child handle stays out of the receipt and is used below.
-            detach_handle = detach.pop("_handle", None) if detach is not None else None
             if detach is not None:
-                with self.lock:
-                    self.receipt["detach"] = dict(detach)
-            # The custody indication is checked for EVERY cleanup run, whether or
-            # not a detach request succeeded: a proof can declare more than one
-            # backing, and a second live one must never be cleaned just because the
-            # requested image detached. Without an indication this is one lstat and
-            # no scan, so a run that published neither keeps the default path.
-            custody = cleanup_safety(ctx)
-            if custody is not None:
-                opted_in = True
-                if custody["state"] == "kept":
-                    with self.lock:
-                        self.receipt["cleanup"] = custody
-                    self.send("cleanup_kept", reason=custody["reason"][:200])
-                    self.publish("cleanup_kept: scratch_kept")
-                    self.receipt["scratch_marker"] = self.conclude_marker(
-                        False, reason="live-image", outcome="failed")
-                    self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
-                    return
-            if detach is not None:
-                handle = detach_handle  # a live child never reaches the receipt
+                handle = detach.pop("_handle", None)  # a live child never reaches the receipt
                 with self.lock:
                     self.receipt["detach"] = detach
                 self.send("detach", attempted=detach["attempted"], qualified=detach["qualified"],
@@ -4009,14 +4026,23 @@ class Monitor:
                         if row is None and identity_problem is None:
                             # Positively absent: no row to name and no foreign PID to
                             # signal, so it is accounted here by reaping whatever the
-                            # kernel still holds for this child, and then reported.
+                            # kernel still holds for this child. The receipt is only
+                            # truthful when that reap actually succeeded; a failed
+                            # reap is unaccounted custody and the monitor holds.
                             absent_reaped, _status = reap_own_child(handle, window_end)
                             with self.lock:
-                                detach["reaped"] = True
-                                detach["reaped_by"] = "monitor"
+                                detach["reaped"] = bool(absent_reaped)
+                                detach["reaped_by"] = "monitor" if absent_reaped else None
                                 detach["child_absent"] = True
                                 detach["reap_timed_out"] = not absent_reaped
                                 self.receipt["detach"] = detach
+                            if not absent_reaped:
+                                self.publish("detach_child_unaccounted: monitor_held")
+                                self.summary()
+                                end = ctx["start_ns"] + int(ctx["limit_s"] * NS) - int(0.1 * NS)
+                                while not self.stop.is_set() and now_ns() < end:
+                                    time.sleep(0.02)
+                                return
                             self.publish("detach_child_absent: scratch_kept")
                             self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
                             return
@@ -4101,6 +4127,23 @@ class Monitor:
                         while not self.stop.is_set() and now_ns() < end:
                             time.sleep(0.02)
                         return
+                    self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
+                    return
+            # The custody indication is checked for EVERY cleanup run, whether or
+            # not a detach request succeeded: a proof can declare more than one
+            # backing, and a second live one must never be cleaned just because the
+            # requested image detached. Without an indication this is one lstat and
+            # no scan, so a run that published neither keeps the default path.
+            custody = cleanup_safety(ctx)
+            if custody is not None:
+                opted_in = True
+                if custody["state"] == "kept":
+                    with self.lock:
+                        self.receipt["cleanup"] = custody
+                    self.send("cleanup_kept", reason=custody["reason"][:200])
+                    self.publish("cleanup_kept: scratch_kept")
+                    self.receipt["scratch_marker"] = self.conclude_marker(
+                        False, reason="live-image", outcome="failed")
                     self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
                     return
             # Final gate, for an OPTED-IN run only: cleanup of a root that took

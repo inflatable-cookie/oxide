@@ -2193,9 +2193,9 @@ no product, task or native evidence for any proof that uses them, and the
 with no earlier run migrated.
 
 **Post-census image detach request (oxide#191, decision `ee263cea`, unqualified
-source).** The oxide#191 bytes
-(`d69ae16a6c27651979109aecc88cadb139a653278b21104cd478157350934028`) add one
-opt-in control for a proof
+source).** The oxide#191 runner bytes
+(`0848974d79d84617070bd611da9503b48a0127e68c2965cebcd36e8d5fc13414`, as merged on
+main) add one opt-in control for a proof
 whose own test image must be detached, and it is the only route by which such a
 proof may detach after a launch; the qualified shared runner is otherwise
 unchanged. A proof publishes ONE bounded atomic request (`detach-request.json`,
@@ -2228,8 +2228,9 @@ declare the monitor incomplete, and it is asked again every 0.2 s while the chil
 runs, so authority withdrawn mid-attempt (a newly latched fault, the deadline, a
 lost answer) KILLs the child instead of letting it finish. An allowed attempt is
 ONE ORDINARY `hdiutil detach <mount>` of that exact image, clamped to that budget
-and to its own ceiling, with a bounded child and an output tail capped at 4096
-bytes however much the child writes; the request names the MOUNTED entity's own device, because an APFS
+and to its own ceiling, with a bounded child whose output descriptor has one owner (detached from its buffer and
+closed before any wait, so a reused descriptor number is never closed by a stale
+finalizer) and an output tail capped at 4096 bytes however much the child writes; the request names the MOUNTED entity's own device, because an APFS
 image attaches as a container whole disk plus a synthesized whole disk and the
 mount can live on either, so a container name is not the mount's device. The
 attachment facts fail closed: a malformed or incomplete relevant structure — a
@@ -2283,15 +2284,16 @@ followed by the ordinary owned-scratch cleanup; an UNCLOSED, uncertain or
 faulted run never enters that branch. Separately from the detach
 protocol, cleanup is fail-closed but **opt-in**: a proof that created an image
 publishes a bounded `image-custody.json` naming its backings before attaching,
-and only then does the monitor check those backings once before cleaning,
+and only then does the monitor check those backings once before cleaning, rechecking the absolute deadline before EVERY backing read and giving each read only what is left of the custodian's own wait window, shared with the backings still to read and with no floor above that remainder,
 keeping the whole root with a `cleanup` object (`state: kept`) and exit 125 when
 one is mounted, attached without a mount point (its `/dev` node still exists) or
 uncertain (unreadable facts, an unreadable device state, a malformed indication,
 or a UUID that does not match the request); a stale `hdiutil` entry whose device
 node is positively gone keeps nothing, and a positively clear backing set records
-`state: ok`. The custody indication is consulted for EVERY cleanup run, including after a successful detach,
-because a proof can declare more than one backing and a second live one must never be cleaned just
-because the requested image detached. A run that publishes **neither** an indication nor a request is
+`state: ok`. The custody indication is consulted for every cleanup run AFTER the detach receipt and its
+unreaped-child custody are settled, so a custody keep can never hide a detach object; it covers
+runs whose requested image detached too, because a proof can declare more than one backing and a
+second live one must never be cleaned just because the requested image detached. A run that publishes **neither** an indication nor a request is
 never scanned and never gated, so the default cleanup path is byte-for-byte
 unchanged and gains no new failure mode. An opted-in run additionally requires
 one final custodian authorization, taken after the detach from its current
@@ -2305,8 +2307,8 @@ custodian keeps its filesystem-free decision path and the existing
 cooperative-session limits. These bytes are unqualified until one uncounted
 `effigy proof:supervisor:qualify:diagnostic` records a clean picture and then
 ONE counted author and ONE separate independent reviewer
-`effigy proof:supervisor:qualify` pass at the same head (280 pure plus 48 real
-cases, including the sixty-nine pure detach cases and the eight real ones: a
+`effigy proof:supervisor:qualify` pass at the same head (287 pure plus 48 real
+cases, including the seventy-six pure detach cases and the eight real ones: a
 bound success, a refused identity, a failed attempt, an unrequested attachment
 whose opt-in custody keep is recorded separately, and a real stuck child the
 custodian pins, signals and observes closed), with independent exact-head source
@@ -2316,8 +2318,8 @@ review afterwards.
 integrated head adds the admission reports described in the supervisor rule
 below: the completed-wait marker and its bounded grant, the correlated waiting
 report, and the stop-boundary drain with late-marker classification. Together
-with oxide#191's 69 pure and 8 real cases the suite is now 307 pure + 53 real =
-360 cases (27 pure and 5 real of them oxide#192's: the completed wait and its
+with oxide#191's merged 287 pure and 48 real cases the suite is now 314 pure + 53
+real = 367 cases (27 pure and 5 real of them oxide#192's: the completed wait and its
 grant, the rejection control, the late grant, a wait that never ends before the
 stop, and the stale-run plus zero-duration-grant correlation), which the
 bootstrap's expected count and limitation list follow. The exported deadline,
@@ -2348,6 +2350,22 @@ and command tokens) changed `bounded-test.py`, `test_supervisor.py` and
 `96f0767` recorded a fixture `NameError` as one failed case and continued
 (corrected, preserved as history).
 
+**Measured combined-suite basis (oxide#192, 2026-10-31).** After merging
+oxide#191's reviewed runner (which already raised the qualification's fixed
+deadline to 420 s and its candidate limit to 380 s, and the suite's own alarm to
+350 s), the combined 314 pure + 53 real suite was measured once, privately, as a
+development measurement (not a qualification): a clean, closed run of
+`bounded-test.py --root-parent <owned mktemp> --limit 380 --scratch-budget-mib 512
+-- python3 scripts/test_supervisor.py` finished the 53 real cases in **289.6 s**
+(guard wall 297 s; owned-byte peak 95.9 MiB of 512 MiB; reserve minimum 2207.7
+GiB; closed, status 0, no deadline) — 76.2 % of the 380 s candidate limit,
+80.4 % of the 360 s stop point and 82.7 % of the 350 s suite alarm. The earlier
+provisional estimate of about 241 s was under-measured because oxide#191's detach
+real cases were failing early there. The measured basis therefore fits the
+raised bound with about 60 s of alarm margin and needs no further change; the
+scoped amendment caps the deadline at 420 s and the candidate limit at 380 s, so
+no larger bound is permitted here either.
+
 **Integrated head: qualification pending separate activation.** The merged
 bytes have **no** exact-head author qualification, and this task's run did not
 run or claim one: the owner separately activates the uncounted diagnostic and
@@ -2356,7 +2374,7 @@ the independent reviewer qualification. Until those exist at that head the bytes
 are unqualified and carry no credit for any other proof. The covering checks run
 at this head are recorded in the pull request: `effigy rust:compile`,
 `effigy rust:format`, `effigy test rust`, `effigy proof:supervisor:test`
-(307 pure cases) and `effigy docs:check`.
+(314 pure cases) and `effigy docs:check`.
 
 **Settlement observation (oxide#147, unqualified source).** The current
 `bounded-test.py` also carries observation-only settlement diagnostics, so a
@@ -2792,13 +2810,16 @@ bounds:
 - reserve readings before and after, on the volume that actually holds the
   qualification's scratch, with the boot volume read and labelled separately
   (both keep the 22 GiB threshold);
-- a fixed 300 s `CLOCK_UPTIME_RAW` deadline held by a minimal outer actor.
+- a fixed 420 s `CLOCK_UPTIME_RAW` deadline held by a minimal outer actor
+  (oxide#191 amendment, Tom 2026-10-31: was 300 s, because the combined suite
+  needed 251-258 s against the former 250 s suite alarm, which is now 350 s,
+  the 380 s candidate limit less its 30 s margin).
   The actor forks the whole bootstrap as a pinned worker and makes only
   WNOHANG reaps, bounded sleeps and signals to that worker. All file,
-  hashing and stdout work runs in the worker. At 298 s the actor KILLs the
+  hashing and stdout work runs in the worker. At 418 s the actor KILLs the
   worker and exits 124, so blocked output or a slow read cannot extend the
   deadline. A candidate still running then is bounded only by its own
-  280 s limit;
+  380 s limit (was 280 s);
 - on candidate overrun, TERM then KILL of its own unreaped candidate child
   only, from its own reap loop, so no signal can follow the reap.
 
@@ -2841,7 +2862,7 @@ with a recorded minimum. A fallback run, or a nested case outside the
 monitored root, fails the qualification. Its reserve readings identify the
 qualification's scratch volume and the boot volume separately. The suite
 runs in order:
-- 307 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 314 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -3099,7 +3120,7 @@ runs in order:
     SIGALRM inherited as ignored and blocked.
 
 Every fixture arms SIGALRM to `FIXTURE_DEADLINE_NS`. The order is case
-verdict 45 s < fixture fallback 60 s < qualification 300 s, and fallback
+verdict 45 s < fixture fallback 60 s < qualification 420 s, and fallback
 expiry never counts as closure. The bootstrap requires all of:
 - candidate exit 0;
 - phase `monitor_complete`;
@@ -3113,7 +3134,7 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 360 cases (307 pure + 53 real, including oxide#191's post-census detach
+- all 367 cases (314 pure + 53 real, including oxide#191's post-census detach
   cases and oxide#192's five admission-report cases);
 - every real case directory and receipt still present after the
   candidate's cleanup.
@@ -3123,8 +3144,9 @@ platform, each case's exit, phase, outcome and signal custody, the suite's
 recorded layout, the prepared parent, both bounded sweep summaries, both
 marker states, the scratch-volume and boot-volume reserve readings, the kept
 base and `UNCLOSED` case directories, and the limitations. Admission waits
-fall outside its 300 s: the actor's own cap is unchanged, and a candidate
-marker can only move the candidate's deadline (by at most 600 s) inside it.
+fall outside its 420 s: the actor's own cap is unchanged (oxide#191 raised it from
+300 s before this integration), and a candidate marker can only move the
+candidate's deadline (by at most 600 s) inside it.
 `effigy proof:supervisor:test` runs the pure cases alone.
 
 **Uncounted keep-going diagnostic.** `effigy proof:supervisor:qualify:diagnostic`
@@ -5606,7 +5628,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
 - **Focused proof of absent checkout chains (oxide#135).** The one fixed proof
   is `effigy rust:prune-absence` (`scripts/test-prune-absence.py` under this
-  tree's shared supervisor `d69ae16a…`, the merged oxide#151 guard plus
+  tree's shared supervisor `0848974d…`, the merged oxide#151 guard plus
   oxide#191's opt-in post-census detach) with
   `--root-parent /private/tmp`, the owner-accepted internal-placement exception
   (decision `bd357a4c`): the missing-chain fixtures must be on the boot Data

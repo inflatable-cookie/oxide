@@ -12,7 +12,7 @@ disk is never filled.
 Every fixture process first resets and unblocks SIGALRM and arms an interval
 timer to FIXTURE_DEADLINE_NS, an absolute CLOCK_UPTIME_RAW deadline in the
 environment, so a late descendant exits at once. Ordering: case verdict
-(45 s) < fixture fallback (60 s) < qualification (300 s). A case asserts its
+(45 s) < fixture fallback (60 s) < qualification (420 s). A case asserts its
 verdict before the fallback; fallback expiry never counts as closure.
 
 Real case directories go in the outer supervisor's evidence directory
@@ -24,6 +24,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import errno
+import gc
 import importlib.util
 import inspect
 import io
@@ -5508,6 +5509,52 @@ class PureDetach(unittest.TestCase):
         self.assertIn("detach_child_closed_by_monitor: scratch_kept", source)
         self.assertNotIn("Kinfo.one", source)
 
+    def test_the_child_descriptor_is_closed_once_by_one_owner(self):
+        # The reviewed hazard: closing the raw descriptor while its buffered
+        # object still owned it, across a wait, could close a descriptor another
+        # thread had reused in the interval.
+        read_fd, write_fd = os.pipe()
+        stream = os.fdopen(read_fd, "rb", buffering=4096)
+        self.addCleanup(lambda: (os.close(read_fd) if False else None))
+
+        class FakeChild:
+            pid = 0
+
+            def __init__(self):
+                self.stdout = stream
+                self.returncode = 0
+                self.waits = []
+
+            def poll(self):
+                return 0
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                self.waits.append(timeout)
+                # While the parent waits, another thread may take the freed number.
+                return 0
+
+        child = FakeChild()
+        old_fd = stream.fileno()
+        os.write(write_fd, b"out")
+        os.close(write_fd)
+        result = bounded.bounded_run(["/bin/true"], 2, 64, spawn=lambda *a, **k: child)
+        self.assertEqual(result["exit"], 0, result)
+        self.assertIsNone(child.stdout, "the detached buffer was kept")
+        # The buffer was detached (so it can never finalise the descriptor) and the
+        # descriptor itself is closed by its single owner.
+        with self.assertRaises(ValueError):
+            stream.closed
+        with self.assertRaises(OSError):
+            os.fstat(old_fd)
+        # The descriptor number can be reused at once and survives collection.
+        keep = os.open(os.devnull, os.O_RDONLY)
+        self.addCleanup(os.close, keep)
+        gc.collect()
+        os.fstat(keep)  # raises if the stale stream closed a reused descriptor
+
     def test_the_own_child_close_is_bounded_and_never_raises(self):
         class FakeChild:
             pid = 0  # no signal is attempted for pid 0
@@ -5642,6 +5689,9 @@ class PureDetach(unittest.TestCase):
 
     def test_an_executor_exception_keeps_the_live_handle(self):
         class BrokenStdout:
+            def detach(self):
+                raise OSError("the pipe vanished")
+
             def fileno(self):
                 raise OSError("the pipe vanished")
 
@@ -5828,6 +5878,153 @@ class PureDetach(unittest.TestCase):
                        {"exit": 0, "timed_out": False, "truncated": False, "output": "not a plist"}):
             self.assertIsNone(bounded.image_attachments(backing, run=lambda *a, b=broken: b), broken)
 
+    def test_an_absent_child_whose_reap_fails_is_not_recorded_as_reaped(self):
+        # P2: the absent-child branch wrote reaped/reaped_by as a success even when
+        # the reap helper failed. Driven through the REAL `Monitor.run`.
+        sandbox = Path(tempfile.mkdtemp(prefix="absent-child.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(sandbox), True)
+        evidence = sandbox / "evidence"
+        evidence.mkdir(parents=True)
+        # A short limit keeps the (correct) hold bounded inside this test.
+        ctx = {"run_id": "absent-child", "command": ["/bin/true"], "limit_s": 2,
+               "adopted": None, "evidence_arg": str(evidence), "root_parent": str(sandbox),
+               "budget": 512 * 1024 * 1024,
+               "start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "inject": []}
+        ctl_r, ctl_w = os.pipe()
+        cmd_r, cmd_w = os.pipe()
+        out_r, out_w = os.pipe()
+        err_r, err_w = os.pipe()
+        for fd in (ctl_r, cmd_w, out_w, err_w):
+            self.addCleanup(os.close, fd)
+        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_r)
+        sent = []
+        monitor.send = lambda kind, **fields: sent.append(kind)
+
+        class Handle:
+            pid = 0
+
+            def wait(self, timeout=None):
+                return None
+
+        record = {"state": "failed", "qualified": False, "attempted": True, "exit": None,
+                  "timed_out": False, "withdrawn": None, "error": None, "post_state": "still_mounted",
+                  "reason": "fixture", "backing": None, "mount": None, "device": None,
+                  "volume_uuid": None, "timeout_s": None, "budget_ns": None, "output": "",
+                  "output_truncated": False, "reap_timed_out": False, "reaped": False,
+                  "late_gate": None, "_handle": Handle()}
+        saved = (bounded.post_census_detach, bounded.process_row, bounded.reap_own_child,
+                 bounded.cleanup_safety)
+        bounded.post_census_detach = lambda *a, **k: dict(record)
+        bounded.process_row = lambda pid: (None, None)          # positively absent
+        bounded.reap_own_child = lambda handle, window_end: (False, None)  # the reap fails
+        bounded.cleanup_safety = lambda ctx, **k: None
+        os.write(cmd_w, (json.dumps({"type": "cleanup", "outcome": {"closure": "closed",
+                                                                   "status": 0}}) + "\n").encode())
+        try:
+            monitor.run()
+        finally:
+            (bounded.post_census_detach, bounded.process_row, bounded.reap_own_child,
+             bounded.cleanup_safety) = saved
+        with open(evidence / "receipt.json") as handle:
+            persisted = json.load(handle)
+        detach = persisted["detach"]
+        self.assertEqual((detach["reaped"], detach["reaped_by"], detach["reap_timed_out"]),
+                         (False, None, True), detach)
+        self.assertEqual(persisted["phase"], "detach_child_unaccounted: monitor_held",
+                         persisted["phase"])
+        self.assertNotIn("monitor_complete", sent, sent)
+
+    def test_a_detach_receipt_is_recorded_before_a_custody_keep_returns(self):
+        # Ordering, driven through the REAL `Monitor.run`: a run with BOTH a detach
+        # request and a custody indication whose second backing is live must record
+        # the detach object (and settle its child) before the custody keep returns.
+        sandbox = Path(tempfile.mkdtemp(prefix="both-paths.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(sandbox), True)
+        evidence = sandbox / "evidence"
+        evidence.mkdir(parents=True)
+        # The declared backings live in the evidence directory, which the detach
+        # request's containment rule accepts alongside the owned root.
+        first = str(evidence / "first.sparseimage")
+        second = str(evidence / "second.sparseimage")
+        for path_ in (first, second):
+            with open(path_, "wb") as handle:
+                handle.write(b"backing")
+        with open(evidence / "detach-request.json", "w") as handle:
+            json.dump({"version": 1, "backing": first, "mount": "/Volumes/OxDetach",
+                       "device": "/dev/disk7s1", "volume_uuid": DETACH_UUID}, handle)
+        with open(evidence / "image-custody.json", "w") as handle:
+            json.dump({"version": 1, "backings": [first, second]}, handle)
+
+        def router(argv, *_args, **_kwargs):
+            if "info" not in argv:
+                router.calls["detach"] = router.calls.get("detach", 0) + 1
+                return {"exit": 0, "timed_out": False, "truncated": False, "output": "",
+                        "error": None, "withdrawn": None, "reap_timed_out": False,
+                        "reaped": True, "handle": None}
+            # First read: the requested backing is attached and mounted. Later
+            # reads for the requested backing: nothing left (detached). The second
+            # declared backing stays mounted throughout.
+            target = router.calls.get("info", 0)
+            router.calls["info"] = target + 1
+            if target == 0:
+                images = [{"image-path": first, "system-entities": [
+                    {"dev-entry": "/dev/disk7s1", "mount-point": "/Volumes/OxDetach",
+                     "volume-uuid": DETACH_UUID}]}]
+            else:
+                images = [{"image-path": second, "system-entities": [
+                    {"dev-entry": "/dev/disk9s1", "mount-point": "/Volumes/OxSecond"}]}]
+            payload = plistlib.dumps({"images": images}).decode()
+            return {"exit": 0, "timed_out": False, "truncated": False, "output": payload,
+                    "reaped": True, "handle": None}
+
+        router.calls = {}
+        saved_run, saved_mount = bounded.bounded_run, bounded.DefaultProbe.mount_point
+        saved_stat, saved_uuid = bounded.DefaultProbe.stat, bounded.DefaultProbe.volume_uuid
+        bounded.bounded_run = router
+        # The requested node and volume exist for this fixture.
+        bounded.DefaultProbe.stat = lambda self, path: types.SimpleNamespace(st_dev=42, st_rdev=42)
+        bounded.DefaultProbe.volume_uuid = lambda self, path: DETACH_UUID
+        # The mount is a mount point until the requested image is detached.
+        bounded.DefaultProbe.mount_point = (
+            lambda self, path: not router.calls.get("detach"))
+        ctx = {"run_id": "both-paths", "command": ["/bin/true"], "limit_s": 300,
+               "adopted": None, "evidence_arg": str(evidence), "root_parent": str(sandbox),
+               "budget": 512 * 1024 * 1024,
+               "start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "inject": []}
+        ctl_r, ctl_w = os.pipe()
+        cmd_r, cmd_w = os.pipe()
+        out_r, out_w = os.pipe()
+        err_r, err_w = os.pipe()
+        for fd in (ctl_r, cmd_w, out_w, err_w):
+            self.addCleanup(os.close, fd)
+        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_r)
+        sent = []
+
+        def send(kind, **fields):
+            sent.append(kind)
+            if kind == "detach_ready":
+                # Answer every authorization request, as the custodian would.
+                os.write(cmd_w, (json.dumps({"type": "detach_go", "allowed": True,
+                                             "budget_ns": 30 * bounded.NS}) + "\n").encode())
+
+        monitor.send = send
+        os.write(cmd_w, (json.dumps({"type": "cleanup", "outcome": {"closure": "closed",
+                                                                   "status": 0}}) + "\n").encode())
+        try:
+            monitor.run()
+        finally:
+            bounded.bounded_run = saved_run
+            bounded.DefaultProbe.mount_point = saved_mount
+            bounded.DefaultProbe.stat = saved_stat
+            bounded.DefaultProbe.volume_uuid = saved_uuid
+        with open(evidence / "receipt.json") as handle:
+            persisted = json.load(handle)
+        self.assertIn("detach", persisted, "the detach receipt was lost to the custody keep")
+        self.assertEqual(persisted["detach"]["qualified"], True, persisted["detach"])
+        self.assertEqual(persisted["cleanup"]["state"], "kept", persisted["cleanup"])
+        self.assertIn("cleanup_kept", sent, sent)
+        self.assertEqual(persisted["phase"], "monitor_complete: pending_custodian", persisted["phase"])
+
     def test_a_second_declared_backing_is_checked_after_a_successful_detach(self):
         # A proof may declare more than one backing. Detaching the requested image
         # must not skip the custody check for the other one.
@@ -5842,6 +6039,100 @@ class PureDetach(unittest.TestCase):
         self.assertEqual(record["state"], "kept", record)
         self.assertEqual(sorted(record["unrequested"]), sorted([first, second]))
         self.assertIn("/Volumes/OxSecond", record["reason"])
+
+    def test_the_custody_scan_shares_the_remaining_custodian_window(self):
+        # The final custody scan must budget every declared backing inside what is
+        # left of the custodian's window, not restart a fresh per-backing allowance.
+        ctx, first = self.layout()
+        second = os.path.join(ctx["scratch"], "second.sparseimage")
+        with open(second, "wb") as handle:
+            handle.write(b"second backing")
+        self.declare_custody(ctx, first, second)
+        # ~0.6 s of window left, two backings.
+        ctx["start_ns"] = (time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
+                           - 300 * bounded.NS + int(0.6 * bounded.NS)
+                           + bounded.EXIT_MARGIN_S * bounded.NS + bounded.DETACH_GATE_MARGIN_NS)
+        timeouts = []
+
+        def facts(backing, timeout=None):
+            timeouts.append(timeout)
+            return []
+
+        record = bounded.cleanup_safety(ctx, self.facts(), facts=facts)
+        self.assertEqual(record["state"], "ok", record)
+        self.assertEqual(len(timeouts), 2, timeouts)
+        # Every grant stays inside the window that was left when it started (the
+        # remainder is also shared with the backings still to read), so no read can
+        # be given a fresh full allowance.
+        self.assertTrue(all(value is not None and value < 0.7 for value in timeouts), timeouts)
+        self.assertLessEqual(timeouts[0], 0.35, timeouts)
+
+    def test_the_deadline_is_rechecked_before_every_backing_read(self):
+        # A first read that consumes the window must not buy a later backing a
+        # fresh allowance: the deadline is rechecked before each read.
+        ctx, first = self.layout()
+        second = os.path.join(ctx["scratch"], "second.sparseimage")
+        with open(second, "wb") as handle:
+            handle.write(b"second backing")
+        self.declare_custody(ctx, first, second)
+        # ~0.3 s of window left; the first read consumes it.
+        ctx["start_ns"] = (time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
+                           - 300 * bounded.NS + int(0.3 * bounded.NS)
+                           + bounded.EXIT_MARGIN_S * bounded.NS + bounded.DETACH_GATE_MARGIN_NS)
+        reads = []
+
+        def facts(backing, timeout=None):
+            reads.append((backing, timeout))
+            time.sleep(0.35)  # this read uses up the window
+            return []
+
+        record = bounded.cleanup_safety(ctx, self.facts(), facts=facts)
+        self.assertEqual(record["state"], "kept", record)
+        self.assertEqual(len(reads), 1, reads)
+        self.assertLessEqual(reads[0][1], 0.35, reads)
+        self.assertIn("no custodian wait window is left", record["reason"])
+
+    def test_a_sub_50ms_remainder_is_not_rounded_up(self):
+        # No floor may exceed a smaller positive remainder. The clock is fixed so
+        # the boundary is deterministic: 30 ms shared across two backings grants at
+        # most 15 ms each, never a 50 ms floor.
+        ctx, first = self.layout()
+        second = os.path.join(ctx["scratch"], "second.sparseimage")
+        with open(second, "wb") as handle:
+            handle.write(b"second backing")
+        grants = []
+
+        def facts(backing, timeout=None):
+            grants.append(timeout)
+            return []
+
+        fixed = 1_000 * bounded.NS
+        saved_now = bounded.now_ns
+        bounded.now_ns = lambda: fixed
+        try:
+            problems = bounded.custody_problems(
+                [first, second], self.facts(), facts, timeout=bounded.DETACH_INFO_TIMEOUT_S,
+                deadline_ns=fixed + 30_000_000)
+        finally:
+            bounded.now_ns = saved_now
+        self.assertEqual(problems, [], problems)
+        self.assertEqual(len(grants), 2, grants)
+        # Each grant is bounded by the 30 ms remainder (the first is shared down to
+        # half), and none is widened to the old 50 ms floor.
+        self.assertTrue(all(value is not None and value <= 0.03 for value in grants), grants)
+        self.assertEqual(grants[0], 0.015, grants)
+        self.assertTrue(all(value < 0.05 for value in grants), grants)
+
+    def test_an_exhausted_window_scans_nothing(self):
+        ctx, backing = self.layout()
+        self.declare_custody(ctx, backing)
+        ctx["start_ns"] = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) - 300 * bounded.NS
+        calls = []
+        record = bounded.cleanup_safety(
+            ctx, self.facts(), facts=lambda backing_, timeout=None: calls.append(timeout) or [])
+        self.assertEqual(record["state"], "kept", record)
+        self.assertIn("no custodian wait window", record["reason"])
+        self.assertEqual(calls, [], "a spent window still read the custody indication")
 
     def test_an_unreaped_attachment_read_is_kept_as_a_child(self):
         backing = "/fixture/volume.sparseimage"
@@ -6040,12 +6331,26 @@ class PureDetach(unittest.TestCase):
         class FakeChild:
             returncode = None
 
-            class _Stdout:
+            class _Raw:
                 def __init__(self, fd):
                     self.fd = fd
+                    self.closed = False
 
                 def fileno(self):
                     return self.fd
+
+                def close(self):
+                    self.closed = True
+
+            class _Stdout:
+                def __init__(self, fd):
+                    self.raw = FakeChild._Raw(fd)
+
+                def detach(self):
+                    return self.raw
+
+                def fileno(self):
+                    return self.raw.fd
 
             def __init__(self, fd):
                 self.stdout = self._Stdout(fd)
@@ -8302,7 +8607,9 @@ def write(name, size):
 
 
 def main():
-    signal.alarm(250)  # secondary bound; the supervisor's deadline is primary
+    # Secondary bound; the supervisor's deadline is primary. It is the 380 s
+    # candidate limit less its 30 s margin (oxide#191 amendment: was 250 s).
+    signal.alarm(350)
     PROTECTION.update(protect_outer_root())
     if PROTECTION.get("state") == "failed":
         # No nested case may run when the outer root could not be protected:
