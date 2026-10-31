@@ -77,12 +77,12 @@ WALL_NS = 300 * NS
 CANDIDATE_LIMIT = 280
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 270  # 227 pure + 43 real. oxide#151 added the routing, marker,
+EXPECTED_CASES = 276  # 232 pure + 44 real. oxide#151 added the routing, marker,
                       # nested-window protection, bounded-sweep, qualify-entry,
                       # shared-ancestor/private-leaf and readiness cases; oxide#192
-                      # added 18 pure and 3 real admission-marker cases (the wait
-                      # report, the rejection control and the late-admission
-                      # classification).
+                      # added 23 pure and 4 real admission cases (the wait report,
+                      # the rejection control, the late-admission classification and
+                      # a wait that never ends before the stop).
 ACTOR_MARGIN_NS = 2 * NS  # the actor's own KILL, reap and exit
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPTS)
@@ -101,7 +101,7 @@ LIMITATIONS = [
     "Owner markers and bounded self-expiry: each run root in the owned parent carries one private\n    .oxide-scratch.json written before any child or run resource. The fixed startup sweep\n    (1 s and 4096 steps, checked between filesystem steps) removes only real owner-marked roots\n    whose marker records a positive conclusion of all their owned resources strictly older than\n    seven days; unmarked, foreign, corrupt, future-dated, unconcluded, nested-UNCLOSED or\n    otherwise non-expirable roots are never touched, and an exhausted budget leaves the rest for\n    a later run. There is no background reaper, and a partial deletion keeps the marker and the\n    root. The marker is not a liveness probe.",
     "The candidate root that holds a retained nested UNCLOSED fixture stays unconcluded\n    (nested-unclosed) even when the outer session closed and the suite passed; a failed\n    qualification keeps the bootstrap base unconcluded. Neither can expire while that holds.",
     "Deadlines are enforced by a single-threaded custodian on CLOCK_UPTIME_RAW with bounded calls; no hard real-time scheduling claim.",
-    "An admission marker (admission.json in the evidence directory) can move the candidate's deadline by at most the wait it reports, never more than the run's own elapsed wall clock and never more than a fixed 600 s total. It is cooperative evidence about the child's own admission: a rejected or absent marker removes nothing but the grant, the exported OXIDE_PROOF_DEADLINE_NS is not rewritten, and the receipt reports the reported wait and the grant separately. One bounded drain reads what already arrived before the deadline is declared, so a marker published just before the stop can still grant; a marker that reaches the custodian after the stop decision or a deadline is recorded as late with its reason and its reported wait and moves nothing, so a run that stopped as admission completed is classified honestly. A marker the child could not publish before the stop is simply absent, and the supervisor never waits past its deadline for one. This case suite's own outer 300 s actor is not extended by it.",
+    "An admission marker (admission.json in the evidence directory) can move the candidate's deadline by at most the wait it reports, never more than the run's own elapsed wall clock and never more than a fixed 600 s total. It is cooperative evidence about the child's own admission: a rejected or absent marker removes nothing but the grant, the exported OXIDE_PROOF_DEADLINE_NS is not rewritten, and the receipt reports the reported wait and the grant separately. One bounded drain reads what already arrived before the deadline is declared, so a marker published just before the stop can still grant; a marker that reaches the custodian after the stop decision or a deadline is recorded as late with its reason and its reported wait and moves nothing, so a run that stopped as admission completed is classified honestly. A waiting report (admission-waiting.json) grants nothing and is recorded before or after the stop, so a wait that never ends before the stop is reported and classified separately from a plain timeout; a marker or waiting report the child could not publish before the stop is simply absent, and the supervisor never waits past its deadline for one. This case suite's own outer 300 s actor is not extended by it.",
     "The candidate's settlement diagnostics (receipt `settlement` and the custodian's decision-time `settlement` record) are bounded observations, not acceptance gates: they never decide classification, closure, EOF, the deadline or cleanup, and a lost or truncated observation only means missing evidence. The receipt object keeps accumulating after the decision, so only the custodian's record is the decision-time view.",
     "macOS only (kqueue NOTE_EXIT, sysctl kinfo_proc at self-checked offsets); Linux is not qualified.",
     "Effigy admission waits happen before this script starts and are not inside its 300 s.",

@@ -2090,6 +2090,7 @@ impl Store {
     ) -> Result<Acquired, String> {
         let max_active = self.max_active;
         let admission_started = Instant::now();
+        let mut reported_waiting = false;
         let ticket = self.register_ticket()?;
         loop {
             if crate::budget::admission_expired() {
@@ -2125,6 +2126,13 @@ impl Store {
                     return Ok(Acquired::Lease(lease));
                 }
                 Ok(Err(wait)) => {
+                    // One bounded report at the start of the wait, so a wait that
+                    // never ends before a supervising proof stops is still
+                    // classified; it grants nothing (oxide#192).
+                    if !reported_waiting {
+                        reported_waiting = true;
+                        crate::admission::report_waiting(wait.category().label());
+                    }
                     waits.observe(&wait, max_active, Instant::now());
                     std::thread::sleep(WAIT_POLL);
                 }

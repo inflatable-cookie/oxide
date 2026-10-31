@@ -42,21 +42,25 @@ fault (including SIGINT or SIGTERM to the custodian), refusal or UNCLOSED;
 otherwise the command's status (128+N for signal N). The receipt has no success phase: success is phase `monitor_complete`
 plus custodian exit 0, recorded by the caller.
 
-Admission marker (oxide#192): a supervised child that waited for admission may
-publish one bounded marker, `admission.json`, in the evidence directory. The
-monitor reads only a regular file without following a link, at most 512 bytes
-with an exact three-key schema, and reports it; the custodian grants at most
-the reported wait, never more than the run's own elapsed wall clock and never
-more than a fixed 600 s total, to its deadline. Nothing is shortened, the
-exported OXIDE_PROOF_DEADLINE_NS is not rewritten and classification is
-unchanged: a rejected or missing marker removes nothing but the grant, and the
-receipt reports the wait and the grant separately. One bounded drain reads what
-has already arrived before the deadline is declared, so a marker published just
-before the stop can still grant; a marker that reaches the custodian after the
-stop decision or a deadline is recorded as late with its reason and moves
-nothing, so a run that stopped as admission completed is classified honestly
-rather than as an unexplained timeout. The grant is cooperative evidence about a
-child's own admission, not a claim about any other writer.
+Admission reports (oxide#192). A supervised child that waited for admission may
+publish one bounded marker, `admission.json`, in the evidence directory, and one
+`admission-waiting.json` when it starts waiting. The monitor reads only a
+regular file without following a link, at most 512 bytes with an exact
+three-key schema, and reports each once per file identity. The custodian grants
+at most the completed wait, never more than the run's own elapsed wall clock
+and never more than a fixed 600 s total, to its deadline; a waiting report
+grants nothing and is recorded so a wait that never ends before the stop is
+classified separately. Nothing is shortened, the exported
+OXIDE_PROOF_DEADLINE_NS is not rewritten and classification is unchanged: a
+rejected or missing report removes nothing but the grant, and the receipt
+reports the wait, the wait-not-ended report and the grant separately. One
+bounded drain reads what has already arrived before the deadline is declared, so
+a marker published just before the stop can still grant; a marker that reaches
+the custodian after the stop decision or a deadline is recorded as late with its
+reason and moves nothing, so a run that stopped as admission completed is
+classified honestly rather than as an unexplained timeout. The grant is
+cooperative evidence about a child's own admission, not a claim about any other
+writer.
 
 Scope: the cooperative session. A process that calls setsid leaves it and is
 seen only while tracked or holding an output pipe; arbitrary same-user
@@ -216,6 +220,10 @@ EXCEPTION_RECORDS = 8
 # consumed by a queue wait while the run stays hard-bounded. A marker is
 # cooperative evidence only: nothing about a rejected one faults the run.
 ADMISSION_NAME = "admission.json"
+# A waiting report (oxide#192): the child has started an admission wait and no
+# grant has ended it. It never moves a deadline; it exists so a wait that never
+# ends before the stop is reported and classified instead of leaving no trace.
+WAITING_NAME = "admission-waiting.json"
 ADMISSION_SCHEMA = 1
 ADMISSION_MAX_BYTES = 512
 ADMISSION_POLL_S = 0.25
@@ -223,12 +231,14 @@ ADMISSION_CAP_NS = 600 * NS
 ADMISSION_RECORDS = 32  # per-grant custodian records kept; the rest only move the counters
 ADMISSION_REJECTIONS = 8  # bounded rejection reasons kept in the receipt
 ADMISSION_KEYS = frozenset({"schema", "source", "waited_ns"})
+WAITING_KEYS = frozenset({"schema", "source", "reason"})
 FIELDS = {  # required fields per monitor message type; bool is never accepted as int
     "reading": {"kind": str},
     "ready": {}, "monitor_complete": {}, "cleanup_failed": {},
     "output_eof": {"stream": str},
     "census": {"after": int, "members": int, "uncertain": int, "certain": bool},
     "admission": {"waited_ns": int, "completed": int, "marker": int},
+    "admission_waiting": {"reason": str, "completed": int, "marker": int},
     "setup": {"root": str, "scratch": str, "evidence": str, "owned": bool},
 }
 
@@ -258,6 +268,11 @@ def settlement_record():
     }
 
 
+def token_ok(value):
+    """A bounded, printable, non-empty token: the only text a report may carry."""
+    return isinstance(value, str) and 0 < len(value) <= 32 and value.isprintable()
+
+
 def admission_malformed(marker):
     """Why an admission marker is not usable, or None.
 
@@ -271,12 +286,29 @@ def admission_malformed(marker):
         return "unexpected keys"
     if not typed(marker["schema"], int) or marker["schema"] != ADMISSION_SCHEMA:
         return "unsupported schema"
-    source = marker["source"]
-    if not isinstance(source, str) or not 0 < len(source) <= 32 or not source.isprintable():
+    if not token_ok(marker["source"]):
         return "ill-typed source"
     waited = marker["waited_ns"]
     if not typed(waited, int) or not 0 <= waited <= U64MAX:
         return "ill-typed waited_ns"
+    return None
+
+
+def admission_waiting_malformed(marker):
+    """Why a waiting report is not usable, or None. Same fixed shape and
+    bounds as the completed-wait marker, with its own reason token instead of a
+    wait. A waiting report never grants time: anything wrong with it is
+    reported in the receipt and never latches a fault."""
+    if not isinstance(marker, dict):
+        return "not an object"
+    if set(marker) != WAITING_KEYS:
+        return "unexpected keys"
+    if not typed(marker["schema"], int) or marker["schema"] != ADMISSION_SCHEMA:
+        return "unsupported schema"
+    if not token_ok(marker["source"]):
+        return "ill-typed source"
+    if not token_ok(marker["reason"]):
+        return "ill-typed reason"
     return None
 
 
@@ -289,6 +321,18 @@ def admission_record():
     the custodian's own decision record carries what it actually granted."""
     return {"schema": 1, "marker": ADMISSION_NAME, "observed": 0, "reported_wait_ns": 0,
             "first_ns": None, "last_ns": None, "identity": None, "ignored": 0,
+            "rejections": [], "errors": 0}
+
+
+def admission_waiting_record():
+    """The monitor's waiting-report observations (oxide#192).
+
+    Fixed shape, same bounds: a stamp is an int CLOCK_UPTIME_RAW value or
+    `None`, counts are non-bool ints, the first reported reason is kept as an
+    opaque token and rejections are a bounded list. A waiting report grants
+    nothing; the custodian records its own decision-side facts separately."""
+    return {"schema": 1, "marker": WAITING_NAME, "observed": 0, "first_ns": None,
+            "last_ns": None, "reason": None, "identity": None, "ignored": 0,
             "rejections": [], "errors": 0}
 
 
@@ -2538,7 +2582,8 @@ class Monitor:
         selection["device"] = selection["device"] if selection["device"] is not None else reserve_device
         ctx.update(root=root, scratch=scratch, evidence=os.path.realpath(evidence), owned=owned,
                    reserve_path=reserve_path, reserve_device=reserve_device, selection=selection,
-                   admission_path=os.path.join(os.path.realpath(evidence), ADMISSION_NAME))
+                   admission_path=os.path.join(os.path.realpath(evidence), ADMISSION_NAME),
+                   waiting_path=os.path.join(os.path.realpath(evidence), WAITING_NAME))
         try:
             terminal_mode = _decide_terminal_mode()
         except BaseException:
@@ -2563,7 +2608,7 @@ class Monitor:
                         "path": ctx["reserve_path"], "device": ctx["reserve_device"]},
             "owned_bytes": {"samples": 0, "maximum": None, "budget": ctx["budget"], "last_ns": None},
             "output": {}, "census": None, "census_rounds": 0, "settlement": self.settlement,
-            "admission": admission_record(),
+            "admission": admission_record(), "admission_waiting": admission_waiting_record(),
         }
 
     def send(self, message_type, **fields):
@@ -2631,21 +2676,21 @@ class Monitor:
                 self.send("reading", kind="scratch", complete=False, error=str(error))
             self.stop.wait(SCRATCH_INTERVAL)
 
-    def note_admission(self, error=False):
+    def note_admission(self, error=False, key="admission"):
         """One bounded, never-latched admission-observation failure."""
         try:
-            record = self.receipt["admission"]
+            record = self.receipt[key]
             with self.lock:
                 if error:
                     record["errors"] += 1
         except BaseException:
             pass
 
-    def reject_admission(self, reason):
-        """Record why one marker was ignored. Cooperative evidence only: a
-        rejected marker never faults the run and is never sent."""
+    def reject_admission(self, reason, key="admission"):
+        """Record why one report was ignored. Cooperative evidence only: a
+        rejected report never faults the run and is never sent."""
         try:
-            record = self.receipt["admission"]
+            record = self.receipt[key]
             with self.lock:
                 record["ignored"] += 1
                 if len(record["rejections"]) < ADMISSION_REJECTIONS:
@@ -2653,18 +2698,20 @@ class Monitor:
         except BaseException:
             pass
 
-    def read_admission(self, path, identity=None):
-        """One bounded read of the admission marker (oxide#192).
+    def read_admission(self, path, identity=None, key="admission"):
+        """One bounded read of an admission report (oxide#192).
 
         Only a regular file opened without following a link, at most
-        ADMISSION_MAX_BYTES, validated against the fixed schema. A valid
-        marker is reported to the custodian with its own completed stamp; the
-        extension decision is the custodian's. Every other outcome is recorded
-        here and nothing is sent."""
+        ADMISSION_MAX_BYTES, validated against its own fixed schema: the
+        completed-wait marker or the waiting report. A valid report is sent to
+        the custodian with its own completed stamp; the extension decision is
+        the custodian's. Every other outcome is recorded here and nothing is
+        sent."""
+        waiting = key == "admission_waiting"
         try:
             info = os.lstat(path)
             if not stat.S_ISREG(info.st_mode):
-                self.reject_admission("not a regular file")
+                self.reject_admission("not a regular file", key)
                 return
             handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
             try:
@@ -2672,54 +2719,62 @@ class Monitor:
             finally:
                 os.close(handle)
         except OSError as error:
-            self.reject_admission("read: " + errno_name(error))
+            self.reject_admission("read: " + errno_name(error), key)
             return
         completed = now_ns()
         if len(raw) > ADMISSION_MAX_BYTES:
-            self.reject_admission(f"larger than {ADMISSION_MAX_BYTES} bytes")
+            self.reject_admission(f"larger than {ADMISSION_MAX_BYTES} bytes", key)
             return
         try:
             marker = json.loads(raw)
         except ValueError:
-            self.reject_admission("not JSON")
+            self.reject_admission("not JSON", key)
             return
-        problem = admission_malformed(marker)
+        problem = admission_waiting_malformed(marker) if waiting else admission_malformed(marker)
         if problem:
-            self.reject_admission(problem)
+            self.reject_admission(problem, key)
             return
         try:
-            record = self.receipt["admission"]
+            record = self.receipt[key]
             with self.lock:
                 record["observed"] += 1
-                record["reported_wait_ns"] = min(U64MAX, record["reported_wait_ns"] + marker["waited_ns"])
                 record["first_ns"] = completed if record["first_ns"] is None else record["first_ns"]
                 record["last_ns"] = completed
                 record["identity"] = None if identity is None else [int(identity[0]), int(identity[1])]
+                if waiting:
+                    record["reason"] = marker["reason"] if record["reason"] is None else record["reason"]
+                else:
+                    record["reported_wait_ns"] = min(U64MAX, record["reported_wait_ns"] + marker["waited_ns"])
                 index = record["observed"]
-            self.send("admission", waited_ns=marker["waited_ns"], completed=completed, marker=index)
+            if waiting:
+                self.send("admission_waiting", reason=marker["reason"], completed=completed, marker=index)
+            else:
+                self.send("admission", waited_ns=marker["waited_ns"], completed=completed, marker=index)
         except BaseException:
-            self.note_admission(error=True)
+            self.note_admission(error=True, key=key)
 
     def sample_admission(self):
-        """Poll the admission marker for a new identity (oxide#192).
+        """Poll both admission reports for a new identity (oxide#192).
 
         A writer publishes a fresh file by rename, so one identity is one
         report. Absence is not an event, and no failure here is latched."""
-        path = self.ctx.get("admission_path")
-        if not path:
-            return
-        seen = None
+        paths = (("admission", self.ctx.get("admission_path")),
+                 ("admission_waiting", self.ctx.get("waiting_path")))
+        seen = {"admission": None, "admission_waiting": None}
         while not self.stop.is_set():
-            try:
-                info = os.lstat(path)
-                identity = (info.st_dev, info.st_ino, info.st_mode)
-                if identity != seen:
-                    seen = identity
-                    self.read_admission(path, identity)
-            except FileNotFoundError:
-                seen = None
-            except OSError:
-                self.note_admission(error=True)
+            for key, path in paths:
+                if not path:
+                    continue
+                try:
+                    info = os.lstat(path)
+                    identity = (info.st_dev, info.st_ino, info.st_mode)
+                    if identity != seen[key]:
+                        seen[key] = identity
+                        self.read_admission(path, identity, key)
+                except FileNotFoundError:
+                    seen[key] = None
+                except OSError:
+                    self.note_admission(error=True, key=key)
             self.stop.wait(ADMISSION_POLL_S)
 
     def drain(self, fd, name, sink):
@@ -2945,6 +3000,18 @@ class Monitor:
                 report(f"supervisor: an admission marker reached the custodian after the stop decision"
                        f" ({reason}), so its wait is reported and not granted; the deadline classification"
                        " stands and no clock was moved\n")
+            waiting_reports = max(admission.get("waiting_reports") or 0,
+                                  receipt["admission_waiting"]["observed"])
+            if waiting_reports:
+                reason = admission.get("waiting_reason") or receipt["admission_waiting"]["reason"] or "unknown"
+                started = admission.get("waiting_ns")
+                offset = "" if started is None else f" at {(started - receipt['start_ns']) / NS:.1f} s"
+                report(f"supervisor: the command reported waiting for admission ({reason}){offset} in"
+                       f" {waiting_reports} report(s); granted {admission['granted_ns'] / NS:.1f} s;"
+                       f" rejected {receipt['admission_waiting']['ignored']}")
+                if admission["granted_ns"] == 0:
+                    report("supervisor: that wait never ended before the stop, so the deadline classification"
+                           " stands and the queue wait is reported separately; no clock was moved\n")
 
 
 class SetupRefused(Exception):
@@ -3011,6 +3078,9 @@ class Custodian:
         self.admission_clamped = self.admission_capped = False
         self.admission_late_ns = None
         self.admission_late_reason = None
+        self.admission_waiting_reports = 0
+        self.admission_waiting_ns = None
+        self.admission_waiting_reason = None
         self.exceptions = 0
         self.injected = set()
         self.paths = None  # from the monitor's setup message
@@ -3180,6 +3250,26 @@ class Custodian:
         except BaseException as error:
             self.exception(error)
 
+    def note_waiting(self, message, at):
+        """Record that a child reported a wait that has not ended (oxide#192).
+
+        Report only: a waiting report never moves `absolute`, `stop_at` or
+        `exit_at`, before or after a stop decision. It exists so a wait that
+        never ends before the stop is classified separately from a plain
+        timeout instead of leaving no trace."""
+        try:
+            self.admission_waiting_reports += 1
+            self.admission_waiting_ns = at
+            if self.admission_waiting_reason is None:
+                self.admission_waiting_reason = message["reason"]
+            if self.admission_records < ADMISSION_RECORDS:
+                self.admission_records += 1
+                self.record("admission_waiting", reason=message["reason"], at=at,
+                            after_stop=self.stopped_at is not None or self.deadline_hit,
+                            granted_ns=self.admission_granted)
+        except BaseException as error:
+            self.exception(error)
+
     def accept(self, message):
         problem = malformed(message)
         if problem:
@@ -3228,6 +3318,12 @@ class Custodian:
                 self.guard.latch("admission message stamped in the future")
             else:
                 self.admit(message, at)
+        elif kind == "admission_waiting":
+            at = now_ns()
+            if message["at"] > at:
+                self.guard.latch("admission message stamped in the future")
+            else:
+                self.note_waiting(message, at)
         elif kind == "census":
             try:  # observation only, before the unchanged eligibility rule
                 self.census_messages += 1
@@ -3556,6 +3652,9 @@ class Custodian:
                       "reported_wait_ns": self.admission_reported, "granted_ns": self.admission_granted,
                       "clamped": self.admission_clamped, "capped": self.admission_capped,
                       "late_ns": self.admission_late_ns, "late_reason": self.admission_late_reason,
+                      "waiting_reports": self.admission_waiting_reports,
+                      "waiting_ns": self.admission_waiting_ns,
+                      "waiting_reason": self.admission_waiting_reason,
                       "cap_ns": ADMISSION_CAP_NS, "limit_s": self.limit_s,
                       "absolute_ns": self.absolute}
             os.write(self.cmd_w, (json.dumps({"run": self.run_id, "seq": self.seq, "type": "record",

@@ -660,12 +660,17 @@ Cargo.
    (`{"schema":1,"source":"oxide","waited_ns":N}`, at most 512 bytes, written
    to a private temporary file and renamed). It exists so the supervisor can
    report queue time separately instead of spending its work window on it
-   ([shared proof supervisor](#shared-proof-supervisor)). It is best effort
-   and observation only: an unarmed run writes nothing, a failed write changes
-   nothing, Oxide never reads the marker back, and no slot, ledger, output or
-   exit-code state depends on it. The write is compiled in every profile,
-   because an installed `oxide` runs the reported case too; it is the one
-   proof-facing side effect that is not a debug-only hook.
+   ([shared proof supervisor](#shared-proof-supervisor)). When the command
+   first observes that it has to wait it also publishes one
+   `admission-waiting.json` (`{"schema":1,"source":"oxide","reason":"<token>"}`,
+   the same bounds, the reason being its own wait label such as `queue` or
+   `host limit`), so a wait that never ends before the supervisor stops is still
+   reported and classified; that report grants nothing. Both writes are best
+   effort and observation only: an unarmed run writes nothing, a failed write
+   changes nothing, Oxide never reads either report back, and no slot, ledger,
+   output or exit-code state depends on them. They are compiled in every
+   profile, because an installed `oxide` runs the reported case too; they are
+   the proof-facing side effects that are not debug-only hooks.
    **Second-slot rule** (Tom, 2026-10-20, oxide#107): when this checkout's
    slot for the same key is busy (a live command such as a long `oxide exec
    -- tauri dev`, or an interrupted one whose group may still run), a further
@@ -2187,40 +2192,42 @@ with no earlier run migrated.
 `bounded-test.py`, `test_supervisor.py` and `qualify-supervisor.py` bytes that
 carry the admission marker are **unqualified**: the `bc24b238…` bytes above stay
 the qualified ones for their own runs, and no earlier evidence is migrated.
-This change adds the marker protocol below, 18 pure cases and 3 real cases
-(227 pure + 43 real = 270 total, which the bootstrap's expected count and its
-limitation list follow), the stop-boundary drain and late-marker
+This change adds the marker protocol below, the waiting report, 23 pure cases
+and 4 real cases (232 pure + 44 real = 276 total, which the bootstrap's expected
+count and its limitation list follow), the stop-boundary drain and late-marker
 classification, and nothing else: the exported deadline, closure, census,
 reserve, scratch, cleanup and signal rules are unchanged, and a run with no
 marker behaves exactly as before. It qualifies only once its own uncounted
 keep-going diagnostic and separate author and reviewer
 `proof:supervisor:qualify` receipts exist.
 
-The **author side** ran at source `93bb6dbc5c3c0e5febac4c4680081b47dc3ceee8`
-(scripts `supervisor` `a0d7fa8386cd594017167a8d6d777c53900c0f5de3086f1f9d83e3404fed0419`,
-`suite` `59916bd698d23a56ef55bc1f901391e67c8bed5afd18b98a924027fdf4de86c1`,
-`bootstrap` `9ae2b84d0e0cbfd15468d02ee3933aad411d228a8bce4a0d85cbf97913b48ec3`):
+**Historical receipts (superseded source).** At `93bb6db` the author side ran
+`effigy proof:supervisor:test` (227 pure), the uncounted keep-going diagnostic
+(270 reached of 270 expected, 270 completed, none failed or unexecuted, not
+aborted, evidence kept at
+`/Volumes/Builds/scratch/oxide/oxide-supervisor-qualify._xqoizwl`) and then the
+counted `effigy proof:supervisor:qualify` (`result: pass`, no problems, 270/270
+cases, candidate `closed` status 0, no fault, no deadline, positive outer
+closure, 198.2 s, the 24 expected retained nested `UNCLOSED` case directories and
+the base kept at
+`/Volumes/Builds/scratch/oxide/oxide-supervisor-qualify.4sjmprvx`; scripts
+`supervisor` `a0d7fa83…`, `suite` `59916bd6…`, `bootstrap` `9ae2b84d…`). A
+reviewer qualification also passed at that source's documentation head
+`68faa7b`, reported by the review rather than by this file. Those receipts bind
+the bytes they ran under and are **history**: the waiting report below changes
+`bounded-test.py`, `test_supervisor.py` and `qualify-supervisor.py` again, and a
+first diagnostic at `96f0767` recorded a fixture `NameError` as one failed case
+and continued (corrected, preserved as history).
 
-- `effigy proof:supervisor:test` passed all 227 pure cases.
-- `effigy proof:supervisor:qualify:diagnostic` was complete and not aborted:
-  270 reached of 270 expected, 270 completed, no failed case, none unexecuted,
-  `"qualified": false`, 211.6 s, evidence kept at
-  `/Volumes/Builds/scratch/oxide/oxide-supervisor-qualify._xqoizwl`. An earlier
-  diagnostic at `96f0767` recorded its fixture's own `NameError` as one failed
-  case and continued; that fixture bug was corrected, not excused.
-- `effigy proof:supervisor:qualify` then returned `result: pass` with no
-  problems on that same source: 270/270 cases, candidate `closed` status 0, no
-  fault and no deadline, positive outer closure, worker wall 198.2 s, the 24
-  expected retained nested `UNCLOSED` case directories and the bootstrap base
-  kept; evidence kept at
-  `/Volumes/Builds/scratch/oxide/oxide-supervisor-qualify.4sjmprvx`.
-
-The earlier author receipt at `c99fe6a` (224 pure, 266 cases, digests
-`ee3ec8f5…`/`e9d93913…`/`972b8b30…`) is historical and superseded by the
-stop-boundary and diagnostic work; it is not a qualification of these bytes.
-The independent reviewer native and the exact-head source review are still
-missing, so nothing is qualified and these bytes carry no credit for any other
-proof.
+**Current source: qualification pending separate activation.** The bytes that
+carry the waiting report have **no** exact-head author qualification yet, and
+this task's run did not run or claim one: the uncounted diagnostic and the
+counted qualification each need their own separate activation. Until those
+exist at this head, the bytes are unqualified and carry no credit for any other
+proof; the `bc24b238…` (#151) bytes remain the qualified ones for their own
+runs. The covering checks that did run are recorded in the pull request: the
+232 pure cases, the Rust unit suite, compile, release compile, format and
+`docs:check`.
 
 **Settlement observation (oxide#147, unqualified source).** The current
 `bounded-test.py` also carries observation-only settlement diagnostics, so a
@@ -2557,7 +2564,24 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   moved after the decision. A marker the child could not publish before the
   stop is simply absent: the supervisor never waits past its deadline for one,
   and the product cancels its waiting lease on a signal rather than reporting a
-  grant it did not get. A missing, malformed, oversized, linked or unreadable
+  grant it did not get.
+
+  **A wait that never ends.** `admission-waiting.json` has exactly the keys
+  `schema`, `source` and `reason` (schema 1, two printable tokens of at most 32
+  characters), at most 512 bytes, and is published by the child when a wait
+  starts. The monitor reports it once per identity into
+  `receipt.admission_waiting` (observations, first reason, bounded rejections)
+  and the custodian records each one as an `admission_waiting` event, before or
+  after the stop alike. It never moves `absolute`, `stop_at` or `exit_at`; it
+  exists so a wait that never ended before the stop is classified separately
+  from a plain timeout: the summary names the reason, its offset from start and the
+  granted time, and states that the deadline classification stands and the
+  queue wait was reported, not granted, when nothing was granted. A rejected
+  waiting report is recorded in its own bounded list and never faults the run.
+  Together with the grant and late records this makes the three cases
+  distinguishable in one receipt: granted before the stop, granted after it
+  (late, no clock moved), and still waiting when it fired (reported, nothing
+  granted). A missing, malformed, oversized, linked or unreadable
   marker is recorded in `receipt.admission` with a bounded rejection list and
   nothing else happens: it never latches a fault and never changes closure,
   EOF, cleanup or classification. The grant is cooperative evidence about the
@@ -2682,7 +2706,7 @@ with a recorded minimum. A fallback run, or a nested case outside the
 monitored root, fails the qualification. Its reserve readings identify the
 qualification's scratch volume and the boot volume separately. The suite
 runs in order:
-- 227 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 232 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -2954,7 +2978,7 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 270 cases;
+- all 276 cases;
 - every real case directory and receipt still present after the
   candidate's cleanup.
 

@@ -1200,6 +1200,8 @@ class PureProtocol(unittest.TestCase):
             {"type": "census", "after": True, "members": 0, "uncertain": 0, "certain": True},
             {"type": "output_eof", "stream": "bogus"},
             {"type": "output_eof"},
+            {"type": "admission_waiting"},
+            {"type": "admission_waiting", "waited": 1},
             {"type": "reading", "kind": "reserve", "value": "big"},
             {"type": "reading", "kind": "scratch", "value": 1},
             {"type": "reading", "kind": "other", "value": 1},
@@ -1611,6 +1613,98 @@ class PureAdmission(unittest.TestCase):
         custodian.observe_admission(False)  # nothing to write to, nothing raised
         self.assertIsNone(custodian.guard.fault)
 
+    def test_a_waiting_report_never_moves_a_deadline_and_is_recorded(self):
+        # Review finding: a wait that never ends before the stop left no trace.
+        # A waiting report is recorded before and after the stop alike, and it
+        # never grants time.
+        custodian = self.custodian()
+        recorded = []
+        custodian.record = lambda kind, **fields: recorded.append(fields)
+        before = (custodian.absolute, custodian.stop_at, custodian.exit_at)
+        with self.clock(custodian, 5):
+            custodian.accept(self.message(custodian, 0, offset_s=5) | {
+                "type": "admission_waiting", "reason": "queue"})
+        self.assertEqual((custodian.absolute, custodian.stop_at, custodian.exit_at), before)
+        self.assertEqual((custodian.admission_waiting_reports, custodian.admission_waiting_reason),
+                         (1, "queue"))
+        self.assertEqual(custodian.admission_waiting_ns, custodian.start + 5 * NS)
+        self.assertEqual(recorded[0]["after_stop"], False)
+        custodian.stopped_at = custodian.start + 6 * NS
+        with self.clock(custodian, 7):
+            custodian.accept(self.message(custodian, 0, offset_s=7) | {
+                "type": "admission_waiting", "reason": "host limit"})
+        self.assertEqual((custodian.absolute, custodian.stop_at, custodian.exit_at), before)
+        self.assertEqual(custodian.admission_waiting_reports, 2)
+        self.assertEqual(custodian.admission_waiting_reason, "queue", "the first reason is kept")
+        self.assertEqual(recorded[1]["after_stop"], True)
+        self.assertEqual(custodian.admission_granted, 0)
+        self.assertEqual(custodian.admission_counted, 0)
+
+    def test_the_decision_record_carries_the_waiting_facts(self):
+        custodian = self.custodian()
+        with self.clock(custodian, 9):
+            custodian.accept(self.message(custodian, 0, offset_s=9) | {
+                "type": "admission_waiting", "reason": "queue"})
+        custodian.cmd_r, custodian.cmd_w = self.pipe()
+        custodian.observe_admission(True)
+        os.close(custodian.cmd_w)
+        decision = [record["record"] for record in self.drain(custodian.cmd_r)
+                    if record["record"]["event"] == "admission_decision"][0]
+        self.assertEqual((decision["waiting_reports"], decision["waiting_reason"]), (1, "queue"))
+        self.assertEqual(decision["waiting_ns"], custodian.start + 9 * NS)
+        self.assertEqual(decision["granted_ns"], 0)
+        self.assertEqual(decision["absolute_ns"], custodian.start + 300 * NS)
+
+    def test_waiting_report_validation_matrix(self):
+        valid = {"schema": 1, "source": "oxide", "reason": "queue"}
+        self.assertIsNone(bounded.admission_waiting_malformed(valid))
+        self.assertIsNone(bounded.admission_waiting_malformed(dict(valid, reason="host limit")))
+        self.assertIsNone(bounded.admission_waiting_malformed(dict(valid, reason="x" * 32)))
+        cases = [
+            [], "report", 1, None, {},
+            {"schema": 1, "source": "oxide"},
+            {"schema": 1, "source": "oxide", "reason": "queue", "waited_ns": 1},
+            dict(valid, schema=0), dict(valid, schema="1"), dict(valid, schema=True),
+            dict(valid, source=""), dict(valid, source="x" * 33), dict(valid, source=1),
+            dict(valid, reason=""), dict(valid, reason="lin\ne"), dict(valid, reason="x" * 33),
+            dict(valid, reason=1), dict(valid, reason=True),
+        ]
+        for marker in cases:
+            self.assertIsNotNone(bounded.admission_waiting_malformed(marker), marker)
+
+    def test_the_waiting_reader_reports_its_own_message_and_record(self):
+        directory = self.fixture()
+        monitor = self.monitor(directory)
+        path = self.publish(directory, {"schema": 1, "source": "oxide", "reason": "queue"},
+                           name=bounded.WAITING_NAME)
+        info = os.lstat(str(path))
+        monitor.read_admission(str(path), (info.st_dev, info.st_ino), "admission_waiting")
+        os.close(monitor.ctl_w)
+        sent = self.drain(monitor.cmd_r)
+        self.assertEqual([m["type"] for m in sent], ["admission_waiting"])
+        self.assertEqual(sent[0]["reason"], "queue")
+        self.assertIsNone(bounded.malformed(sent[0]))
+        waiting = monitor.receipt["admission_waiting"]
+        self.assertEqual((waiting["observed"], waiting["reason"], waiting["ignored"]), (1, "queue", 0))
+        # The completed-wait record is untouched by a waiting report.
+        self.assertEqual(monitor.receipt["admission"]["observed"], 0)
+        self.assertEqual(monitor.receipt["admission"]["reported_wait_ns"], 0)
+
+    def test_a_rejected_waiting_report_is_recorded_without_a_message(self):
+        directory = self.fixture()
+        monitor = self.monitor(directory)
+        bad = self.publish(directory, {"schema": 1, "source": "oxide", "reason": "queue",
+                                       "waited_ns": 4}, name=bounded.WAITING_NAME)
+        monitor.read_admission(str(bad), None, "admission_waiting")
+        link = directory / "waiting-link"
+        os.symlink(str(bad), str(link))
+        monitor.read_admission(str(link), None, "admission_waiting")
+        self.assertEqual(self.drain(monitor.cmd_r), [])
+        waiting = monitor.receipt["admission_waiting"]
+        self.assertEqual((waiting["observed"], waiting["ignored"]), (0, 2))
+        self.assertEqual(waiting["reason"], None)
+        self.assertEqual(monitor.receipt["admission"]["ignored"], 0, "a waiting rejection is its own record")
+
     def test_malformed_marker_matrix(self):
         valid = {"schema": 1, "source": "oxide", "waited_ns": 5}
         self.assertIsNone(bounded.admission_malformed(valid))
@@ -1635,7 +1729,8 @@ class PureAdmission(unittest.TestCase):
                                    "admission_path": os.path.join(str(directory), bounded.ADMISSION_NAME)},
                                   None, None, None, None)
         monitor.cmd_r, monitor.ctl_w = self.pipe()
-        monitor.receipt = {"admission": bounded.admission_record()}
+        monitor.receipt = {"admission": bounded.admission_record(),
+                           "admission_waiting": bounded.admission_waiting_record()}
         return monitor
 
     def fixture(self):
@@ -5667,6 +5762,35 @@ class Real(unittest.TestCase):
         self.assertEqual(decisions[0]["ignored"], 1)
         self.assertEqual(decisions[0]["granted_ns"], 0)
         self.assertEqual(decisions[0]["late_reason"], "deadline")
+        self.assertEqual(decisions[0]["absolute_ns"], self.receipt["start_ns"] + 32 * NS)
+
+    def test_a_wait_that_never_ends_is_reported_and_classified(self):
+        # Review finding: a wait ending at the supervisor stop could leave no
+        # admission marker and no separately classified queue wait. A waiting
+        # report is published when the wait starts, so the run is classified as
+        # a deadline with a reported, never-granted queue wait.
+        code = fixture(
+            "import json\n"
+            "path = os.path.join(os.environ['OXIDE_PROOF_EVIDENCE'], "
+            + repr(bounded.WAITING_NAME) + ")\n"
+            "with open(path + '.tmp', 'w') as handle:\n"
+            "    json.dump({'schema': 1, 'source': 'fixture', 'reason': 'queue'}, handle)\n"
+            "os.replace(path + '.tmp', path)\n"
+            "time.sleep(30)\n")
+        self.assertEqual(self.guardian(code, limit=32), 124)
+        self.assertTrue(self.outcome()["deadline"])
+        self.assertEqual(self.outcome()["closure"], "closed")
+        self.assertIsNone(self.outcome()["fault"])
+        self.assertEqual(self.receipt["admission"]["observed"], 0, "no completed wait was reported")
+        waiting = self.receipt["admission_waiting"]
+        self.assertEqual((waiting["observed"], waiting["reason"], waiting["ignored"]), (1, "queue", 0))
+        reports = [record for record in self.receipt["custodian"] if record["event"] == "admission_waiting"]
+        self.assertEqual(len(reports), 1)
+        self.assertEqual((reports[0]["reason"], reports[0]["after_stop"]), ("queue", False))
+        decisions = [r for r in self.receipt["custodian"] if r["event"] == "admission_decision"]
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual((decisions[0]["waiting_reports"], decisions[0]["waiting_reason"]), (1, "queue"))
+        self.assertEqual(decisions[0]["granted_ns"], 0)
         self.assertEqual(decisions[0]["absolute_ns"], self.receipt["start_ns"] + 32 * NS)
 
     def test_a_malformed_admission_marker_changes_nothing(self):
