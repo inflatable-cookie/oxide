@@ -2316,8 +2316,10 @@ published, so the evidence a verdict rests on is the evidence on disk. That is
 observation only: no message, no signal, no closure claim. An expired join is
 handled conservatively and truthfully: the survivor list is frozen at its
 published prefix (no row may land after publication), `census_join` records
-`joined: false` and `frozen: true`, the summary says later rows may be missing,
-and **an incomplete join never yields certain closure** — a `cleanup` decision
+`joined: false`, `frozen: true`, `started` and `refused`, the summary says later
+rows may be missing — and an empty frozen prefix is still reported, never
+silently omitted — and **an incomplete join never yields certain closure** — a
+`cleanup` decision
 in that state is refused, the persisted verdict becomes `UNCLOSED` with
 `closure not established: the census thread did not finish before publication`,
 the custodian latches the same reason, and the root, backing and evidence are
@@ -2343,18 +2345,22 @@ supervisor is a custody-bound one; pure regressions that a recorded row reaches
 the published receipt, that a round records its rows before it reports them and
 that the census thread is joined before publication, that an expired join freezes
 the published list, records `joined: false`/`frozen: true` and says later rows may
-be missing, and that an expired join refuses closure (persisted `UNCLOSED`, a
-latched reason, no pass exit); and a transient-survivor
+be missing, that an empty frozen prefix is still reported, that every publication
+path joins the census first (a structural guard over `run` and finalisation), and
+that an expired join refuses closure (persisted `UNCLOSED`, a latched reason, no
+pass exit) including under a full run whose census thread is still inside a round
+that later observes a member (that late row can never reach the published receipt
+and the owned scratch is kept); and a transient-survivor
 regression (both pure and real: a recorded row followed by a certain-empty
 census closes the run and never reports `UNCLOSED`/kept). At this head the three
 sources are
 `bounded-test.py`
-`33568bb6cfe413fb41662e8d1709e39a382a522a3e4233c8ab14534e1f065dbe`,
+`fbfc57962fdcd2feba6ccb5fee8119fd50baeb5ab30efad463a264d4eef717ba`,
 `test_supervisor.py`
-`467f549b623f2c18cfdd9a31e568907a0cabfd7ca33f13cf891aecc20282ca1a` and
+`1769f3b75435d5cbe0f663888e60e325ba9447c7e2a74fad8351683e2edfd349` and
 `qualify-supervisor.py`
-`26ad26be112bd9d8f6d532f6eec9dbab907aa938a0900ee89916fcff12da96b4`. The
-head's suite is 302 pure plus 49 real cases and is **unqualified** until one
+`5433651a207c5b04ef27b34b336a7841b070618245b216f1fb0352648973822f`. The
+head's suite is 305 pure plus 49 real cases and is **unqualified** until one
 uncounted keep-going
 `effigy proof:supervisor:qualify:diagnostic` and then ONE counted author and
 ONE separate independent reviewer `effigy proof:supervisor:qualify` pass at the

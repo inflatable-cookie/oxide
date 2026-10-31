@@ -2120,7 +2120,12 @@ def survivors_line(rows, closure=None, joined=None):
     does not have, and it never claims a signal."""
     rows = [row for row in (rows or []) if isinstance(row, dict)]
     if not rows:
-        return None
+        if joined is not False:
+            return None
+        # An incomplete join is reported even when the prefix is empty: the
+        # operator must never have to infer a missing census from silence.
+        return ("supervisor: no same-session survivor row was recorded; the census thread had"
+                " not finished at publication, so this record cannot show the run closed")
     shown = ", ".join(f"{row.get('pid')}/{row.get('start')}" for row in rows[:8])
     more = "" if len(rows) <= 8 else f" (+{len(rows) - 8} more)"
     head = (f"supervisor: {len(rows)} same-session survivor(s) not signalled (no custody):"
@@ -2133,8 +2138,14 @@ def survivors_line(rows, closure=None, joined=None):
         line = head + "; the deciding census fixes the outcome"
     if joined is False:
         # The census thread outlived its bounded join, so the published list is a
-        # frozen prefix: say so rather than implying a complete record.
-        line += "; the census thread had not finished at publication, so later rows may be missing"
+        # frozen prefix: say so rather than implying a complete record. Such a
+        # record can never be a closed run - closure is refused when the join is
+        # incomplete - so a contradictory pair must not be reported as closed.
+        if closure == "closed":
+            line = head + "; the census thread had not finished at publication, so the run is not closed"
+        else:
+            line += ("; the census thread had not finished at publication, so later rows may be"
+                     " missing")
     return line
 
 
@@ -3727,8 +3738,8 @@ class Monitor:
                 joined = not thread.is_alive()
             except BaseException:
                 joined = False
-        record = {"joined": joined, "bound_s": bound, "waited_ns": now_ns() - started,
-                  "rows": 0}
+        record = {"joined": joined, "started": thread is not None, "bound_s": bound,
+                  "waited_ns": now_ns() - started, "rows": 0}
         try:
             with self.lock:
                 if not joined:

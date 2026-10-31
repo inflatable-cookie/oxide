@@ -1875,8 +1875,11 @@ class PureSurvivors(unittest.TestCase):
             # reports the truth without one.
             self.assertNotIn("may be missing",
                              bounded.survivors_line([{"pid": 900, "start": 5}], "closed", True))
+            false_closed = bounded.survivors_line([{"pid": 900, "start": 5}], "closed", False)
+            self.assertNotIn("so the run closed", false_closed)
+            self.assertIn("the run is not closed", false_closed)
             self.assertIn("may be missing",
-                          bounded.survivors_line([{"pid": 900, "start": 5}], "closed", False))
+                          bounded.survivors_line([{"pid": 900, "start": 5}], "UNCLOSED", False))
         finally:
             release.set()
 
@@ -1886,8 +1889,8 @@ class PureSurvivors(unittest.TestCase):
         monitor, evidence, _ctl_r = self.publishable_monitor()
         monitor.census_thread = None
         record = monitor.join_census(1)
-        self.assertEqual(record, {"joined": True, "bound_s": 1.0, "waited_ns": record["waited_ns"],
-                                  "rows": 0})
+        self.assertEqual(record, {"joined": True, "started": False, "bound_s": 1.0,
+                                  "waited_ns": record["waited_ns"], "rows": 0})
         monitor.publish("started: incomplete")
         published = json.loads((evidence / "receipt.json").read_text())
         self.assertEqual(published["census_join"]["joined"], True)
@@ -1959,6 +1962,130 @@ class PureSurvivors(unittest.TestCase):
         self.assertNotIn("refused", kept["census_join"])
         with self.assertRaises(BlockingIOError):  # nothing was sent: no message
             os.read(clean_ctl, 1 << 16)
+
+    def test_a_late_census_round_cannot_be_omitted_or_pass_through_run(self):
+        # Reviewer finding: exercise the whole run path, including finalisation.
+        # A cleanup decision arrives while the census thread is still inside a
+        # round that will later observe a member. The bounded join expires, the
+        # decision is refused, the late row can never reach the published receipt,
+        # the owned scratch is kept, and nothing may pass.
+        sandbox = Path(tempfile.mkdtemp(prefix="late-census.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(sandbox), True)
+        evidence = sandbox / "evidence"
+        ctx = {"run_id": "late-census", "command": ["/bin/true"], "limit_s": 300,
+               "adopted": None, "evidence_arg": str(evidence), "root_parent": str(sandbox),
+               "budget": 512 * 1024 * 1024,
+               "start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "inject": []}
+        ctl_r, ctl_w = os.pipe()
+        cmd_r, cmd_w = os.pipe()
+        out_r, out_w = os.pipe()
+        err_r, err_w = os.pipe()
+        for fd in (ctl_r, cmd_w, out_w, err_w):
+            self.addCleanup(os.close, fd)
+        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_r)
+        sent, lines = [], []
+        release = threading.Event()
+
+        def send(message_type, **fields):
+            sent.append((message_type, dict(fields)))
+
+        class LateCensus:
+            def __init__(self, sid, terminal_allowed=False):
+                self.stats = {}
+
+            def round(self):
+                release.wait(15)  # still inside a round when the join expires
+                return {"certain": False, "members": 1, "uncertain": 0,
+                        "member_rows": [row(900, start=5)], "uncertain_rows": [],
+                        "terminal_count_status": "valid", "terminal_nonwriters": 0}
+
+        monitor.send = send
+        try:
+            with patched(bounded, "report", lines.append), patched(bounded, "Census", LateCensus):
+                for number, command in enumerate((
+                        {"type": "leader", "pid": os.getpid()},
+                        {"type": "stopped", "sent": 0},
+                        {"type": "cleanup", "outcome": {"closure": "closed", "status": 0,
+                                                        "fault": None, "deadline": False,
+                                                        "launched": True}}), start=1):
+                    os.write(cmd_w, (json.dumps(dict(command, run="late-census", seq=number))
+                                     + "\n").encode())
+                monitor.run()
+        finally:
+            release.set()
+            if monitor.census_thread is not None:
+                monitor.census_thread.join(15)
+        persisted = json.loads((evidence / "receipt.json").read_text())
+        # No pass: the refused decision is UNCLOSED, with the reason on the record.
+        self.assertEqual(persisted["phase"], "monitor_complete: pending_custodian")
+        self.assertEqual(persisted["outcome"]["closure"], "UNCLOSED")
+        self.assertIn("census thread did not finish before publication",
+                      persisted["outcome"]["fault"])
+        join = persisted["census_join"]
+        self.assertIs(join["joined"], False)
+        self.assertIs(join["frozen"], True)
+        self.assertIs(join["refused"], True)
+        self.assertIs(join["started"], True)
+        # The late round observed a member, but it cannot land behind the receipt.
+        self.assertEqual(persisted["survivors"], [])
+        scratch = Path(ctx["scratch"])
+        self.assertTrue(scratch.is_dir(), "the refused run removed its owned scratch")
+        self.assertEqual(sorted(path.name for path in scratch.iterdir()), [])
+        # The summary names the incomplete census and never claims closure, even
+        # with an empty survivor prefix.
+        self.assertTrue(any("no same-session survivor row was recorded" in line for line in lines),
+                        lines)
+        self.assertFalse(any("so the run closed" in line for line in lines), lines)
+        self.assertFalse(any("closure_established" in line for line in lines), lines)
+        # No cleanup was attempted: no cleanup phase was ever published.
+        self.assertNotIn("cleanup: owned scratch not fully removed", " ".join(lines))
+        kinds = [kind for kind, _fields in sent]
+        self.assertIn("census_join_incomplete", kinds)
+        self.assertIn("monitor_complete", kinds)
+        # The custodian turns that message into a latched fault: not a pass.
+        custodian, _cmd = self.custodian_stub()
+        custodian.run_id = "late-census"
+        custodian.monitor_seq = 0
+        custodian.leader = monitor.leader[0]
+        custodian.leader_start = monitor.leader[1]
+        message = dict(next(fields for kind, fields in sent if kind == "census_join_incomplete"),
+                       type="census_join_incomplete", run="late-census", seq=1,
+                       at=bounded.now_ns(), leader=monitor.leader)
+        self.assertIsNone(bounded.malformed(message))
+        custodian.accept(message)
+        self.assertIn("closure not established", custodian.guard.fault or "")
+        self.assertEqual(bounded.exit_code(False, custodian.guard.fault, True, 0), 125)
+
+    def test_every_publication_path_joins_the_census_first(self):
+        # Structural guard for the reviewer's "all publication paths" point: the
+        # join must precede the first publication in the run and in finalisation.
+        run = inspect.getsource(bounded.Monitor.run).split("\n", 1)[1]
+        joined = run.find("join_census(")
+        decision = run.find('if decision == "cleanup"')
+        self.assertGreaterEqual(joined, 0)
+        self.assertGreaterEqual(decision, 0)
+        self.assertLess(joined, decision, "run can publish a decision before it joins the census")
+        finish = inspect.getsource(bounded.Monitor.finish_monitor).split("\n", 1)[1]
+        self.assertGreaterEqual(finish.find("join_census("), 0)
+        self.assertLess(finish.find("join_census("), finish.find("publish("),
+                        "finalisation publishes before it joins the census")
+        self.assertTrue(hasattr(bounded.Monitor, "refuse_incomplete_closure"))
+        self.assertIn('if decision == "cleanup" and join.get("joined") is not True:',
+                      " ".join(inspect.getsource(bounded.Monitor.run).split()))
+
+    def test_an_empty_frozen_prefix_is_reported_and_never_closed(self):
+        empty = bounded.survivors_line([], "UNCLOSED", False)
+        self.assertIn("no same-session survivor row was recorded", empty)
+        self.assertIn("cannot show the run closed", empty)
+        self.assertIsNone(bounded.survivors_line([], "UNCLOSED", True))
+        self.assertIsNone(bounded.survivors_line([], None))
+        # A contradictory pair (closed with an incomplete join) is never reported
+        # as a closed run, with or without rows.
+        for rows in ([], [{"pid": 900, "start": 5}]):
+            line = bounded.survivors_line(rows, "closed", False)
+            self.assertNotIn("so the run closed", line)
+            self.assertTrue("the run is not closed" in line or "cannot show the run closed" in line,
+                            line)
 
     def test_the_qualification_oracle_requires_the_survivor_record_and_no_signal(self):
         rows = survivor_case_rows("/x")
