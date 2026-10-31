@@ -634,3 +634,19 @@ pub(crate) fn arm_post_rename_observation_failure() {
 pub(crate) fn take_post_rename_observation_failure() -> bool {
     POST_RENAME_OBSERVATION_FAILURE.with(|armed| armed.replace(false))
 }
+
+thread_local! {
+    /// One injected containment-rename failure, armed by a library test. It
+    /// leaves a swapped object at the derived holding name.
+    static CONTAINMENT_RENAME_FAILURE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Arm one injected containment-rename failure.
+pub(crate) fn arm_containment_rename_failure() {
+    CONTAINMENT_RENAME_FAILURE.with(|armed| armed.set(true));
+}
+
+/// Consume the armed containment-rename failure, if any.
+pub(crate) fn take_containment_rename_failure() -> bool {
+    CONTAINMENT_RENAME_FAILURE.with(|armed| armed.replace(false))
+}

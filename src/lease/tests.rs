@@ -1230,6 +1230,173 @@ fn a_held_slot_is_evicted_whole_only_by_its_exact_lease() {
     );
 }
 
+/// oxide#196: a source swapped between the pre-rename verification and the
+/// rename moves a foreign object. The command must not call it the slot tree:
+/// it reports the containment, the verified tree as not moved and the object
+/// as not this slot's, leaves the slot held and the object never adopted or
+/// deleted as the slot's.
+#[test]
+fn a_swapped_source_is_contained_and_never_reported_as_the_slot_tree() {
+    let fx = Fixture::new("held-swap-contained");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let granted = lease_injected(request(&pool, &project, &workspace, "holder-a")).expect("lease");
+    let id: u64 = granted.slot_id.parse().expect("slot id");
+    let slot_path = pool.join("payload").join("slots").join(&granted.slot_id);
+    let aside = fx.dir("aside").join("verified-tree");
+    let name = holding_name_for_slot_injected(&pool, id).expect("holding name");
+    let moved = slot_path.clone();
+    let parked = aside.clone();
+    let guard = crate::test_fs::before_holding_rename(move || {
+        fs::rename(&moved, &parked).expect("park the verified tree");
+        fs::create_dir(&moved).expect("foreign tree");
+        fs::write(moved.join("foreign"), b"foreign object").expect("foreign marker");
+    });
+    let failure = evict_held_slot_injected(&pool, &granted.slot_id, &granted.lease_id)
+        .expect_err("a swapped source is not the verified tree");
+    drop(guard);
+    match failure {
+        HeldEvictionFailure::PostCommit(reason) => {
+            assert!(reason.contains("different object"), "{reason}");
+            assert!(reason.contains("contained as"), "{reason}");
+            assert!(reason.contains("not this slot's"), "{reason}");
+            assert!(
+                reason.contains("verified slot tree was not moved"),
+                "{reason}"
+            );
+            assert!(
+                !reason.contains("the tree was moved into the holding area"),
+                "{reason}"
+            );
+        }
+        HeldEvictionFailure::PreCommit(error) => {
+            panic!("a swapped source was classified pre-commit: {error}")
+        }
+    }
+    let contained = pool
+        .join("payload")
+        .join(".oxide-holding")
+        .join(format!(".unverified-{name}"));
+    assert!(contained.is_dir(), "the foreign object was not contained");
+    assert_eq!(
+        fs::read(contained.join("foreign")).expect("foreign marker"),
+        b"foreign object"
+    );
+    assert!(!pool
+        .join("payload")
+        .join(".oxide-holding")
+        .join(&name)
+        .exists());
+    assert!(!slot_path.exists());
+    assert!(
+        aside.is_dir(),
+        "the verified tree was not parked by the fixture"
+    );
+    assert_eq!(
+        slot_state_injected(&pool, &granted.slot_id).as_deref(),
+        Some("held")
+    );
+    assert!(hold_intent_present_injected(&pool, id));
+    let view = status_injected(&pool).expect("the next locked open reconciles");
+    assert!(
+        view.slots
+            .iter()
+            .any(|slot| slot.slot_id == granted.slot_id && slot.state == SlotOccupancy::Held),
+        "the slot did not stay held"
+    );
+    assert!(
+        view.holding.is_empty(),
+        "the foreign object was adopted as a slot tree"
+    );
+    assert!(
+        contained.is_dir(),
+        "the foreign object was deleted as a slot tree"
+    );
+    assert!(aside.is_dir(), "the verified tree was touched");
+}
+
+/// oxide#196: when the containment rename itself fails, the foreign object
+/// remains at the derived holding name and the command reports that truth,
+/// never the slot tree's location, and never adopts or deletes it as the
+/// slot's.
+#[test]
+fn a_failed_containment_rename_leaves_the_foreign_object_at_the_derived_name() {
+    let fx = Fixture::new("held-swap-uncontained");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let granted = lease_injected(request(&pool, &project, &workspace, "holder-a")).expect("lease");
+    let id: u64 = granted.slot_id.parse().expect("slot id");
+    let slot_path = pool.join("payload").join("slots").join(&granted.slot_id);
+    let aside = fx.dir("aside").join("verified-tree");
+    let name = holding_name_for_slot_injected(&pool, id).expect("holding name");
+    let moved = slot_path.clone();
+    let parked = aside.clone();
+    let guard = crate::test_fs::before_holding_rename(move || {
+        fs::rename(&moved, &parked).expect("park the verified tree");
+        fs::create_dir(&moved).expect("foreign tree");
+        fs::write(moved.join("foreign"), b"foreign object").expect("foreign marker");
+    });
+    crate::test_fs::arm_containment_rename_failure();
+    let failure = evict_held_slot_injected(&pool, &granted.slot_id, &granted.lease_id)
+        .expect_err("a swapped source is not the verified tree");
+    drop(guard);
+    match failure {
+        HeldEvictionFailure::PostCommit(reason) => {
+            assert!(reason.contains("containment rename failed"), "{reason}");
+            assert!(reason.contains("remains at"), "{reason}");
+            assert!(reason.contains("not this slot's"), "{reason}");
+            assert!(
+                reason.contains("verified slot tree was not moved"),
+                "{reason}"
+            );
+            assert!(
+                !reason.contains("the tree was moved into the holding area"),
+                "{reason}"
+            );
+        }
+        HeldEvictionFailure::PreCommit(error) => {
+            panic!("a failed containment was classified pre-commit: {error}")
+        }
+    }
+    let derived = pool.join("payload").join(".oxide-holding").join(&name);
+    assert!(derived.is_dir(), "the foreign object left the holding area");
+    assert_eq!(
+        fs::read(derived.join("foreign")).expect("foreign marker"),
+        b"foreign object"
+    );
+    assert!(
+        !derived
+            .parent()
+            .expect("holding area")
+            .join(format!(".unverified-{name}"))
+            .exists(),
+        "a failed containment left a contained name"
+    );
+    assert!(!slot_path.exists());
+    assert!(aside.is_dir());
+    assert_eq!(
+        slot_state_injected(&pool, &granted.slot_id).as_deref(),
+        Some("held")
+    );
+    assert!(hold_intent_present_injected(&pool, id));
+    let view = status_injected(&pool).expect("the next locked open reconciles");
+    assert!(
+        view.slots
+            .iter()
+            .any(|slot| slot.slot_id == granted.slot_id && slot.state == SlotOccupancy::Held),
+        "the slot did not stay held"
+    );
+    assert!(view.holding.is_empty(), "the foreign object was adopted");
+    assert!(
+        derived.is_dir(),
+        "the foreign object was deleted as a slot tree"
+    );
+}
+
 /// oxide#196: a pre-existing entry under the derived holding name is a
 /// pre-rename collision. The failure must say the tree was not moved and must
 /// not attribute the existing entry to this slot by name; the next open clears
@@ -1393,6 +1560,10 @@ fn a_post_rename_observation_failure_reports_the_holding_area_and_recovers() {
         HeldEvictionFailure::PostCommit(reason) => {
             assert!(reason.contains("holding area"), "{reason}");
             assert!(reason.contains(&name), "{reason}");
+            assert!(
+                reason.contains("not verified as this slot's tree"),
+                "{reason}"
+            );
             assert!(!reason.contains("tree was not moved"), "{reason}");
         }
         HeldEvictionFailure::PreCommit(error) => {
