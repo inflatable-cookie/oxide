@@ -3620,7 +3620,12 @@ class Monitor:
                             reaped_here = False
                             status = None
                             if "detach-handoff-unreadable" not in injections():
-                                reaped_here, status = close_own_child(handle, window_end)
+                                # Spend at most three fifths of the remaining window
+                                # on the monitor's own close, so a failed or slow
+                                # reap still leaves budget for the handoff.
+                                left_ns = max(0, window_end - now_ns())
+                                own_deadline = now_ns() + (left_ns * 3) // 5
+                                reaped_here, status = close_own_child(handle, own_deadline)
                             with self.lock:
                                 detach["reaped"] = bool(reaped_here)
                                 detach["reaped_by"] = "monitor" if reaped_here else None
@@ -4064,16 +4069,15 @@ class Custodian:
         elif kind == "cleanup_kept":
             self.guard.latch(f"cleanup kept the owned root: {message['reason']}")
         elif kind == "detach_child":
-            if (not typed(message["pid"], int) or not typed(message["start"], int)
-                    or message["pid"] <= 0 or message["start"] <= 0):
+            # `start` is optional: a parentage-only handoff carries none. Only a
+            # present, malformed start is a protocol fault.
+            pid, start = message["pid"], message.get("start")
+            if not typed(pid, int) or pid <= 0 or (
+                    start is not None and (not typed(start, int) or start <= 0)):
                 self.guard.latch("protocol: detach_child without a valid pid and start")
                 return
             if self.detach_child is not None:
                 self.guard.latch("protocol: second detach_child")
-                return
-            pid, start = message["pid"], message.get("start")
-            if start is not None and (not typed(start, int) or start <= 0):
-                self.guard.latch("protocol: detach_child with a malformed start")
                 return
             row, problem = process_row(pid)
             if problem is not None:

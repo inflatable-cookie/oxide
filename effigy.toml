@@ -298,7 +298,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # commands take Tom's answered internal-root exception explicitly
 # (`--root-parent /private/tmp`) rather than placing a pool on a selected
 # volume, where the product correctly refuses it. The supervisor is this tree's
-# `bounded-test.py` (sha256 b6c86d3d…, oxide#191's post-census detach bytes over
+# `bounded-test.py` (sha256 c9052c2d…, oxide#191's post-census detach bytes over
 # the qualified oxide#151 guard; those added bytes are unqualified until their
 # own qualifications pass); 300 s wall and
 # 512 MiB monitored scratch are unchanged and the fit stays unmeasured until
@@ -530,7 +530,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 
 # Owned-output prune (oxide#129, oxide#152): one fixed 22-case native proof
 # under the shared supervisor (`scripts/bounded-test.py` SHA-256
-# b6c86d3df833d0a857d65371e3aacb6308897737fbb302a0334d15e1ed0a8e9e,
+# c9052c2dd0516a33b55aed1f3b3169e5d6bbb315e451703c566157899316ab9c,
 # the qualified oxide#151 guard plus oxide#191's opt-in post-census detach,
 # unqualified until its own qualifications pass): 360 s, 512 MiB monitored scratch, 30 s work
 # shutdown margin, one
@@ -1090,7 +1090,7 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 
 # Slot headroom (oxide#118, oxide#177): under the shared proof supervisor
 # (oxide#109/#114/#151 plus oxide#191's opt-in post-census detach, bounded-test.py
-# SHA-256 b6c86d3df833d0a857d65371e3aacb6308897737fbb302a0334d15e1ed0a8e9e,
+# SHA-256 c9052c2dd0516a33b55aed1f3b3169e5d6bbb315e451703c566157899316ab9c,
 # unqualified until its own qualifications pass), stages
 # `oxide` offline with 1.97.1 and proves the permanent ledger/control fences,
 # legacy read without migration, the raised-ceiling fence written at the 129th

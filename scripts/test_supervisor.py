@@ -4807,7 +4807,8 @@ class PureDetach(unittest.TestCase):
         # parentage-only handoff that carries no start time.
         source = inspect.getsource(bounded.Monitor.run)
         self.assertIn("process_row(getattr(handle", source)
-        self.assertIn("close_own_child(handle, window_end)", source)
+        self.assertIn("close_own_child(handle, own_deadline)", source)
+        self.assertIn("left_ns * 3", source)  # part of the window is kept for the handoff
         self.assertIn("start=None", source)
         self.assertIn("detach_child_identity_unreadable: closing_own_child", source)
         self.assertIn("detach_child_closed_by_monitor: scratch_kept", source)
@@ -4838,6 +4839,64 @@ class PureDetach(unittest.TestCase):
         message = {"run": "run", "seq": 1, "at": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW),
                    "type": "detach_child", "leader": None, "pid": 4242, "start": None}
         self.assertIsNone(bounded.malformed(message))
+
+    def test_the_receiver_accepts_a_parentage_only_handoff(self):
+        # End-to-end through `Custodian.accept`: no start time at all, a row that
+        # shows this monitor as parent, so it pins by parentage, signals, observes
+        # and acknowledges closure.
+        real = bounded.Kinfo.one(os.getpid())
+        child_pid = os.getpid() + 1
+        message = {"run": "run", "seq": 1, "at": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW),
+                   "type": "detach_child", "leader": None, "pid": child_pid, "start": None}
+        custodian = self.custodian_stub()
+
+        class FakeKinfo:
+            @staticmethod
+            def one(pid):
+                if pid != child_pid:
+                    return None
+                return dict(real, pid=child_pid, start=real["start"], ppid=os.getpid(), zombie=False)
+
+        saved = bounded.Kinfo
+        try:
+            bounded.Kinfo = FakeKinfo
+            custodian.accept(dict(message))
+        finally:
+            bounded.Kinfo = saved
+        self.assertEqual(custodian.detach_child, [child_pid, real["start"]])
+        self.assertEqual([kind for kind, _f in custodian.records],
+                         ["detach_child_pinned", "detach_child_signal"])
+        self.assertEqual(custodian.records[0][1]["identity"], "parentage")
+        ack = custodian.told[-1]
+        self.assertIs(ack[1]["custodian_closes"], True)
+        self.assertIs(ack[1]["closed"], True)
+
+    def test_a_parentage_mismatch_is_acknowledged_without_signalling(self):
+        real = bounded.Kinfo.one(os.getpid())
+        child_pid = os.getpid() + 1
+        message = {"run": "run", "seq": 1, "at": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW),
+                   "type": "detach_child", "leader": None, "pid": child_pid, "start": None}
+        custodian = self.custodian_stub()
+
+        class FakeKinfo:
+            @staticmethod
+            def one(pid):
+                # Same PID, but reparented: it is no longer this monitor's child.
+                return dict(real, pid=child_pid, start=real["start"], ppid=1, zombie=False)
+
+        saved = bounded.Kinfo
+        try:
+            bounded.Kinfo = FakeKinfo
+            custodian.accept(dict(message))
+        finally:
+            bounded.Kinfo = saved
+        self.assertIsNone(custodian.detach_child)
+        self.assertEqual([kind for kind, _f in custodian.records], ["detach_child_refused"])
+        self.assertEqual(custodian.records[0][1]["observation"], "parentage no longer matches")
+        ack = custodian.told[-1]
+        self.assertIs(ack[1]["custodian_closes"], False)
+        self.assertIs(ack[1]["closed"], True)
+        self.assertNotIn("detach_child_signal", [kind for kind, _f in custodian.records])
 
     def test_an_executor_exception_keeps_the_live_handle(self):
         class BrokenStdout:
