@@ -2314,7 +2314,7 @@ whose opt-in custody keep is recorded separately, and a real stuck child the
 custodian pins, signals and observes closed), with independent exact-head source
 review afterwards.
 
-**Admission reports on the integrated source (oxide#192, unqualified).** The
+**Admission reports on the integrated source (oxide#192, qualified at the native head).** The
 integrated head adds the admission reports described in the supervisor rule
 below: the completed-wait marker and its bounded grant, the correlated waiting
 report, and the stop-boundary drain with late-marker classification. Together
@@ -2325,11 +2325,21 @@ stop, and the stale-run plus zero-duration-grant correlation), which the
 bootstrap's expected count and limitation list follow. The exported deadline,
 closure, census, reserve, scratch, cleanup, custody and signal rules are
 unchanged, a run with no admission report behaves exactly as before, and the
-detach protocol's own rules are oxide#191's. Nothing here is qualified: the
-`bc24b238…` (#151) bytes remain the qualified ones for their own runs, no
-earlier evidence is migrated, and this head needs its own owner-activated
-uncounted diagnostic and then one counted author and one separate independent
-reviewer `effigy proof:supervisor:qualify` at the same head.
+detach protocol's own rules are oxide#191's. The native chain ran at native head
+`a19fb6c`: the owner-activated uncounted diagnostic passed 11/11 checks with zero
+problems, and the counted author qualification and the distinct independent
+reviewer qualification both passed, recorded in
+`/Volumes/Builds/scratch/oxide/evidence-192-a19fb6c-final-20261031T232038Z`
+(SHA256SUMS; the reviewer's own receipt is
+`oxide-supervisor-qualify.i729jh46`). The final head `71b7963` differs from that
+native head only in `AGENTS.md` and `workflow.md` Markdown; the independent
+review confirmed by `git diff a19fb6c..71b7963` that it changes no executable
+statement, non-docstring constant, test, fixture or proof-script behaviour, so
+those receipts bind to the final head under the brief-author source-immutable
+rule (decisions `7bb1089d` and `36ab646d`). The remaining end-to-end slow-setup
+launch-and-closure regression is assigned to oxide#197, not dropped. Earlier
+receipts stay historical, the `bc24b238…` (#151) bytes remain the qualified ones
+for their own runs, and no earlier evidence is migrated.
 
 **Historical receipts (superseded source).** At `93bb6db` the author side ran
 `effigy proof:supervisor:test` (227 pure), an uncounted diagnostic (270 reached
@@ -2383,15 +2393,21 @@ is no general waiver, and one clean uncounted diagnostic, one counted author
 qualification and one distinct independent reviewer qualification follow in that
 order at the final published head.
 
-**Integrated head: qualification pending separate activation.** The merged
-bytes have **no** exact-head author qualification, and this task's run did not
-run or claim one: the owner separately activates the uncounted diagnostic and
-then the counted author qualification at the final integrated head, followed by
-the independent reviewer qualification. Until those exist at that head the bytes
-are unqualified and carry no credit for any other proof. The covering checks run
-at this head are recorded in the pull request: `effigy rust:compile`,
-`effigy rust:format`, `effigy test rust`, `effigy proof:supervisor:test`
-(329 pure cases) and `effigy docs:check`.
+**Integrated head: qualified, pending the final-head verdict.** The oxide#192
+bytes are qualified at native head `a19fb6c` by the owner-activated uncounted
+diagnostic (11/11 checks, zero problems) and by the counted author and distinct
+independent reviewer qualifications (receipts in
+`evidence-192-a19fb6c-final-20261031T232038Z`). The final head `71b7963` changes
+only `AGENTS.md` and `workflow.md` Markdown, and the independent review confirmed
+with `git diff a19fb6c..71b7963` that it carries no executable statement,
+non-docstring constant, test, fixture or proof-script behaviour change, so those
+receipts bind to it under the brief-author source-immutable rule. The reviewer's
+slow-setup regression finding is resolved by decision `7bb1089d` (the
+end-to-end case is assigned to oxide#197, not dropped). What remains is an
+independent final-head verdict before hold release; the covering checks at this
+head are `effigy proof:supervisor:test` (329 pure cases) and
+`effigy docs:check`, with the earlier `effigy rust:compile`,
+`effigy rust:format` and `effigy test rust` runs unchanged-input history.
 
 **Settlement observation (oxide#147, unqualified source).** The current
 `bounded-test.py` also carries observation-only settlement diagnostics, so a
