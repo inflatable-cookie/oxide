@@ -1293,9 +1293,10 @@ def diagnostic_receipt(outcome: dict, prefix: str = DIAGNOSTIC_RECEIPT) -> str:
 
 
 class BootClosure:
-    """The focused session: one candidate, one owned image, three independent
-    cases. Every quarantine is made by the product's own removal stop; no
-    state file is edited."""
+    """The focused session: one candidate, one owned image, four independent
+    cases (three boot-session cases and the operator-confirmed release). Every
+    quarantine is made by the product's own removal stop; no state file is
+    edited."""
 
     def __init__(self, proof: Proof, repo: str, source: str):
         self.proof = proof
@@ -1325,6 +1326,9 @@ class BootClosure:
         proof.env = self.env
         self.pool = self.env["OXIDE_POOL"]
         self.tool = write_script(os.path.join(proof.root, "hold-tool"), HOLD_TOOL)
+        # The operator-confirmed release case (oxide#196) starts this escaped
+        # exec writer; without it the case cannot run.
+        self.escape_tool = write_script(os.path.join(proof.root, "escape-tool"), ESCAPE_TOOL)
         self.victims = {}
         for case, _ in BOOT_CASES:
             victim = git_fixture(proof, os.path.join(proof.root, f"victim-{case}"), BOOT_APP)
@@ -2048,6 +2052,14 @@ def self_check() -> int:
     # one. The release oracle must match the product's `process <pid>` census
     # message, never a `pid <pid>` form.
     compile(ESCAPE_TOOL, "escape-tool", "exec")
+    # The release case starts this tool from the constructor's own attribute.
+    # A missing initialization passes every string pin but makes the case
+    # unrunnable, so the actual initializer source is pinned here.
+    init_source = inspect.getsource(BootClosure.__init__)
+    expect(
+        "self.escape_tool = write_script(" in init_source and "ESCAPE_TOOL" in init_source,
+        "BootClosure does not initialize the escaped writer tool",
+    )
     expect("os.setpgid(0, leader)" in ESCAPE_TOOL, "the escaped writer does not leave the exec group")
     expect("FIXTURE_LEADER_PGID" in ESCAPE_TOOL, "the escaped writer does not join the supervisor's leader group")
     expect("setsid" not in ESCAPE_TOOL, "the escaped writer must not leave the supervisor's session")
