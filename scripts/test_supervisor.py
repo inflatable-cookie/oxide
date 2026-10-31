@@ -29,6 +29,7 @@ import inspect
 import io
 import json
 import os
+import plistlib
 import secrets
 import shutil
 import signal
@@ -37,6 +38,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import textwrap
 import types
@@ -3943,6 +3945,32 @@ class QualifyEntry(unittest.TestCase):
         self.assertEqual(observed["forbidden"], [], "the broken entry attempted an effect")
 
 
+def typed_int(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def detach_case_rows(case):
+    """The three real detach case rows a qualification receipt must carry, in
+    the shape the suite publishes them (oxide#191): each inside the monitored
+    root and carrying its own recorded detach outcome."""
+    return [
+        {"case": "test_success_detaches_exactly_the_requested_volume", "dir": case, "exit": 0,
+         "detach": {"state": "detached", "qualified": True, "post_state": "detached"}},
+        {"case": "test_an_unbound_identity_is_refused_before_any_detach", "dir": case, "exit": 125,
+         "detach": {"state": "refused", "qualified": False, "post_state": "unknown"}},
+        {"case": "test_a_failed_attempt_keeps_the_mount_and_is_unqualified", "dir": case, "exit": 125,
+         "detach": {"state": "failed", "qualified": False, "post_state": "still_mounted"}},
+        {"case": "test_an_unrequested_attachment_keeps_the_owned_root", "dir": case, "exit": 125,
+         "cleanup": {"state": "kept", "reason": "a mounted image the proof never requested"}},
+        {"case": "test_a_stuck_detach_child_is_closed_by_the_custodian", "dir": case, "exit": 125,
+         "detach": {"state": "timed_out", "qualified": False, "reaped": False, "custodian_closed": True}},
+    ]
+
+
+class KernelFactsForOracle:
+    """The detach-path oracle needs no kernel facts; this makes that explicit."""
+
+
 class PureQualificationTopology(unittest.TestCase):
     """The actual new-default qualification: nested case resources, evidence
     and reserve all on the selected volume inside the monitored owned root,
@@ -4082,7 +4110,8 @@ class PureQualificationTopology(unittest.TestCase):
         self.assertEqual(record["root"], root)
         self.assertEqual(qualify.nested_cases({"cases": [{"case": "zero", "dir": case}]}, record), [])
         receipt = self.receipt(parent, root, evidence, scratch, registration, case)
-        results = {"outcomes": [["zero", "pass"]], "cases": [{"case": "zero", "dir": case}]}
+        results = {"outcomes": [["zero", "pass"]],
+                   "cases": [{"case": "zero", "dir": case}] + detach_case_rows(case)}
         problems = qualify.check(receipt, results, expected, record, facts)
         self.assertEqual([p for p in problems if "cases:" not in p], [], problems)
 
@@ -4196,6 +4225,173 @@ class PureQualificationTopology(unittest.TestCase):
                     "volume_uuid": DRIVE_UUID, "device": DRIVE_DEVICE}
         return (mount, parent, base, root, evidence, scratch, case, registration, facts, expected)
 
+    def detach_oracle(self, receipt, rows):
+        results = {"outcomes": [["zero", "pass"]], "cases": [{"case": "zero", "dir": "/x"}] + rows}
+        plan = dict(qualify.check_plan(receipt, results, {"source": "selected-volume"},
+                                       None, KernelFactsForOracle(), None))
+        return plan["detach-paths"]()
+
+    def monitor_stub(self, receipt=None):
+        monitor = bounded.Monitor.__new__(bounded.Monitor)
+        cmd_r, cmd_w = os.pipe()
+        self.addCleanup(os.close, cmd_r)
+        self.addCleanup(os.close, cmd_w)
+        monitor.cmd_r = cmd_r
+        monitor.lock = threading.Lock()
+        monitor.receipt = receipt if receipt is not None else {"custodian": []}
+        monitor.published = []
+        monitor.publish = lambda phase: monitor.published.append(
+            (phase, [r["event"] for r in monitor.receipt["custodian"]]))
+        monitor.summary = lambda: None
+        monitor.send = lambda *a, **k: monitor.published.append(("sent", None))
+        monitor.stop = threading.Event()
+        return monitor, cmd_w
+
+    def test_an_unclosed_decision_completes_and_persists_through_run(self):
+        # The REAL `Monitor.run` with the real setup, publish and send: a keep
+        # (UNCLOSED) decision must still write the final receipt and announce
+        # completion. This is the path an uninitialized `opted_in` used to kill.
+        sandbox = Path(tempfile.mkdtemp(prefix="unclosed-run.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(sandbox), True)
+        evidence = sandbox / "evidence"
+        ctx = {"run_id": "unclosed-run", "command": ["/bin/true"], "limit_s": 300,
+               "adopted": str(sandbox), "evidence_arg": str(evidence), "root_parent": None,
+               "budget": 512 * 1024 * 1024, "start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW),
+               "inject": []}
+        ctl_r, ctl_w = os.pipe()
+        cmd_r, cmd_w = os.pipe()
+        out_r, out_w = os.pipe()
+        err_r, err_w = os.pipe()
+        for fd in (ctl_r, cmd_w, out_w, err_w):
+            self.addCleanup(os.close, fd)
+        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_r)
+        messages = []
+
+        def send(message_type, **fields):
+            messages.append(message_type)
+
+        monitor.send = send
+        os.write(cmd_w, (json.dumps({"type": "keep", "outcome": {"closure": "UNCLOSED",
+                                                                "status": 7}}) + "\n").encode())
+        monitor.run()
+        phases = []
+        with open(os.path.join(str(evidence), "receipt.json")) as handle:
+            persisted = json.load(handle)
+        self.assertEqual(persisted["phase"], "monitor_complete: pending_custodian", persisted["phase"])
+        self.assertEqual(persisted["outcome"]["closure"], "UNCLOSED")
+        self.assertIn("monitor_complete", messages, messages)
+        self.assertTrue(monitor.stop.is_set())
+
+    def test_the_drain_happens_before_the_final_publication(self):
+        monitor, cmd_w = self.monitor_stub()
+        os.write(cmd_w, (json.dumps({"type": "record", "record": {"event": "detach_child_pinned"}}) + "\n").encode())
+        ctx = {"start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "limit_s": 300}
+        monitor.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
+        # The published receipt already carries the record, and completion follows.
+        self.assertEqual(monitor.published[0], ("monitor_complete: pending_custodian",
+                                                ["detach_child_pinned"]), monitor.published)
+        self.assertEqual(monitor.published[-1], ("sent", None))
+        self.assertTrue(monitor.stop.is_set())
+
+    def test_a_request_free_completion_drains_nothing_and_never_waits(self):
+        monitor, cmd_w = self.monitor_stub()
+        os.write(cmd_w, (json.dumps({"type": "record", "record": {"event": "detach_child_pinned"}}) + "\n").encode())
+        ctx = {"start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "limit_s": 300}
+        started = time.monotonic()
+        monitor.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=False)
+        self.assertLess(time.monotonic() - started, 0.05, "a request-free completion waited")
+        self.assertEqual(monitor.receipt["custodian"], [], "a request-free run read custodian records")
+        self.assertEqual(monitor.published[0], ("monitor_complete: pending_custodian", []))
+
+    def test_a_near_deadline_drain_reads_nothing(self):
+        monitor, cmd_w = self.monitor_stub()
+        os.write(cmd_w, (json.dumps({"type": "record", "record": {"event": "detach_child_pinned"}}) + "\n").encode())
+        # The custodian's wait window is already spent.
+        ctx = {"start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) - 300 * bounded.NS,
+               "limit_s": 300}
+        started = time.monotonic()
+        monitor.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
+        self.assertLess(time.monotonic() - started, 0.05, "an exhausted window still waited")
+        self.assertEqual(monitor.receipt["custodian"], [])
+        self.assertTrue(monitor.stop.is_set())
+
+    def test_await_command_keeps_records_it_meets(self):
+        monitor, cmd_w = self.monitor_stub()
+        os.write(cmd_w, (json.dumps({"type": "record", "record": {"event": "detach_child_signal"}}) + "\n").encode())
+        os.write(cmd_w, (json.dumps({"type": "detach_child_ack", "closed": True}) + "\n").encode())
+        answer = monitor.await_command("detach_child_ack", 0.5)
+        self.assertEqual(answer["type"], "detach_child_ack")
+        self.assertEqual([r["event"] for r in monitor.receipt["custodian"]], ["detach_child_signal"])
+
+    def test_post_decision_records_are_drained_into_the_receipt(self):
+        # The custodian sends its detach pin/signal/observation records after the
+        # monitor stopped reading commands; the monitor drains them at completion.
+        monitor = bounded.Monitor.__new__(bounded.Monitor)
+        cmd_r, cmd_w = os.pipe()
+        self.addCleanup(os.close, cmd_r)
+        self.addCleanup(os.close, cmd_w)
+        monitor.cmd_r = cmd_r
+        monitor.lock = threading.Lock()
+        monitor.receipt = {"custodian": []}
+        for record in ({"event": "detach_child_pinned", "pid": 7},
+                       {"event": "detach_child_observed", "closed": True}):
+            os.write(cmd_w, (json.dumps({"type": "record", "record": record}) + "\n").encode())
+        os.write(cmd_w, (json.dumps({"type": "detach_go", "allowed": True}) + "\n").encode())
+        monitor.drain_records(0.3)
+        self.assertEqual([r["event"] for r in monitor.receipt["custodian"]],
+                         ["detach_child_pinned", "detach_child_observed"])
+        # The drain is opt-in at completion (never unconditional in send()).
+        self.assertNotIn("drain_records", inspect.getsource(bounded.Monitor.send))
+        self.assertIn("drain=", inspect.getsource(bounded.Monitor.finish_monitor))
+
+    def test_the_custodian_timeout_injection_keeps_deadline_semantics(self):
+        absolute = 1000
+        self.assertTrue(bounded.custodian_deadline_hit(absolute, absolute, ()))
+        self.assertFalse(bounded.custodian_deadline_hit(absolute - 1, absolute, ()))
+        self.assertTrue(bounded.custodian_deadline_hit(
+            absolute - 1, absolute, ("custodian-timeout-after-monitor",)))
+        self.assertFalse(bounded.custodian_deadline_hit(absolute - 1, absolute, ("other",)))
+
+    def test_the_receipt_path_checks_the_recorded_detach_and_cleanup_objects(self):
+        receipt = {"phase": "monitor_complete: pending_custodian",
+                   "outcome": {"closure": "closed", "status": 0, "fault": None, "deadline": False}}
+        rows = detach_case_rows("/x")
+        self.assertEqual(self.detach_oracle(receipt, rows), [], rows)
+
+        # The request-free keep must be recorded under `cleanup`, not `detach`.
+        swapped = [dict(row) for row in rows]
+        for index, row in enumerate(swapped):
+            if row["case"].endswith("unrequested_attachment_keeps_the_owned_root"):
+                swapped[index] = {"case": row["case"], "dir": "/x", "exit": 125,
+                                  "detach": row["cleanup"]}
+        problems = self.detach_oracle(receipt, swapped)
+        self.assertTrue(any("recorded a detach object for a request-free run" in p for p in problems),
+                        problems)
+        self.assertTrue(any("recorded no pre-cleanup keep" in p for p in problems), problems)
+
+        # A cleanup record that is not a keep is a problem too.
+        not_kept = [dict(row) for row in rows]
+        for index, row in enumerate(not_kept):
+            if row["case"].endswith("unrequested_attachment_keeps_the_owned_root"):
+                not_kept[index] = dict(row, cleanup={"state": "ok", "reason": None})
+        self.assertTrue(any("not kept" in p for p in self.detach_oracle(receipt, not_kept)),
+                        not_kept)
+
+        # Missing rows and mislabelled stuck-child outcomes are named.
+        without_stuck = [row for row in rows if "stuck_detach_child" not in row["case"]]
+        self.assertTrue(any("recorded no detach outcome" in p
+                            for p in self.detach_oracle(receipt, without_stuck)))
+        stuck_open = [dict(row) for row in rows]
+        for index, row in enumerate(stuck_open):
+            if "stuck_detach_child" in row["case"]:
+                stuck_open[index] = dict(row, detach=dict(row["detach"], custodian_closed=False))
+        self.assertTrue(any("custodian_closed" in p for p in self.detach_oracle(receipt, stuck_open)),
+                        stuck_open)
+
+        # An outer run that published a detach request of its own is a problem.
+        self.assertTrue(any("published a detach request" in p
+                            for p in self.detach_oracle(dict(receipt, detach={}), rows)))
+
     def test_the_owned_subtree_routing_and_marker_are_verified(self):
         mount, parent, base, root, evidence, scratch, case, registration, facts, expected = \
             self.nested_layout()
@@ -4203,9 +4399,22 @@ class PureQualificationTopology(unittest.TestCase):
         self.assertEqual(problems, [], problems)
         receipt = self.receipt(parent, root, evidence, scratch, registration, case)
         receipt["scratch_default"].update(mount=mount, volume_uuid=DRIVE_UUID)
-        results = {"outcomes": [["zero", "pass"]], "cases": [{"case": "zero", "dir": case}]}
+        results = {"outcomes": [["zero", "pass"]],
+                   "cases": [{"case": "zero", "dir": case}] + detach_case_rows(case)}
         problems = qualify.check(receipt, results, expected, record, facts, base)
         self.assertEqual([p for p in problems if "cases:" not in p], [], problems)
+        # oxide#191: the receipt must exercise the detach success, refusal and
+        # failure paths, and an absent or mislabelled one is a named problem.
+        stripped = dict(results, cases=[{"case": "zero", "dir": case}])
+        self.assertTrue(any("recorded no detach outcome" in p for p in
+                            qualify.check(receipt, stripped, expected, record, facts, base)))
+        rows = detach_case_rows(case)
+        wrong = dict(results, cases=[{"case": "zero", "dir": case}] + [
+            dict(rows[0], detach={"state": "refused", "qualified": True, "post_state": "detached"})]
+            + rows[1:])
+        self.assertTrue(any("detach case test_success_detaches_exactly_the_requested_volume" in p
+                            and "not detached/True" in p
+                            for p in qualify.check(receipt, wrong, expected, record, facts, base)))
         # The drive root is not the contract: neither the bare mount as parent
         # nor a root created directly on it is accepted as the new default.
         drive_expected = dict(expected, root_parent=mount)
@@ -4604,6 +4813,1310 @@ class OneShotStop:
 
     def set(self):
         self.stopped = True
+
+
+DETACH_UUID = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+
+
+class DetachFacts:
+    """Substituted detach seams: the kernel and `hdiutil` facts the runner reads,
+    plus the one detach attempt. `mount_point` and `attachments` take either a
+    fixed answer or a function of `attempted`, so a case states exactly what was
+    true before and after its attempt and a refusal cannot pass by accident."""
+
+    def __init__(self, mount="/Volumes/OxDetach", device="/dev/disk7", uuid=DETACH_UUID,
+                 mount_point=None, attachments=None, attempt=None, stats=None, nodes=()):
+        self.mount, self.device, self.uuid = mount, device, uuid
+        self.mount_point_value = mount_point
+        self.attachments_value = attachments
+        self.attempt = attempt or {"exit": 0, "timed_out": False, "error": None, "output": ""}
+        self.stats = stats or {}
+        self.nodes = set(nodes)
+        self.attempted = False
+        self.detached = []
+
+    def realpath(self, path):
+        return os.path.realpath(path)
+
+    def lstat(self, path):
+        if path in self.nodes:  # a device node this case declares present
+            return types.SimpleNamespace(st_mode=stat.S_IFCHR, st_rdev=42)
+        return os.lstat(path)
+
+    def stat(self, path):
+        return self.stats[path] if path in self.stats else os.stat(path)
+
+    def bound_stats(self):
+        return {"/dev/disk7s1": types.SimpleNamespace(st_rdev=42),
+                "/Volumes/OxDetach": types.SimpleNamespace(st_dev=42)}
+
+    def rows(self, mounted):
+        return ([(self.device, None, None), (self.device + "s1", self.mount, self.uuid)]
+                if mounted else [])
+
+    def mount_point(self, path):
+        if callable(self.mount_point_value):
+            return self.mount_point_value(self.attempted)
+        if self.mount_point_value is not None:
+            return self.mount_point_value
+        # Unstated: mounted before the attempt and, by default, detached by a
+        # successful one.
+        success = self.attempt.get("exit") == 0 and not self.attempt.get("timed_out")
+        return not (self.attempted and success)
+
+    def volume_uuid(self, path):
+        return self.uuid
+
+    def attachments(self, backing, timeout=None):
+        if callable(self.attachments_value):
+            return self.attachments_value(self.attempted)
+        if self.attachments_value is not None:
+            return list(self.attachments_value)
+        return self.rows(self.mount_point("/Volumes/OxDetach"))
+
+    def detach(self, mount, timeout, still_allowed=None):
+        self.detached.append((mount, timeout))
+        self.attempted = True
+        self.polled = still_allowed
+        attempt = {"reaped": True}
+        attempt.update(self.attempt)
+        return attempt
+
+
+class PureDetach(unittest.TestCase):
+    """Oxide#191: the opt-in post-census detach a proof requests. Pure: no image,
+    no mount, no child, no supervisor. It proves the request is bounded and
+    never partly trusted, that only a positively re-derived identity is detached,
+    that exactly one ordinary attempt can happen, and that every refusal, failure,
+    timeout or ambiguity keeps the mount and is unqualified."""
+
+    def layout(self):
+        sandbox = Path(tempfile.mkdtemp(prefix="detach.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(sandbox), True)
+        root = os.path.join(str(sandbox), "oxide-proof.aaa")
+        evidence = os.path.join(root, "evidence")
+        os.makedirs(os.path.join(root, "scratch"), 0o700)
+        os.makedirs(evidence, 0o700)
+        backing = os.path.join(root, "scratch", "volume.sparseimage")
+        with open(backing, "wb") as handle:
+            handle.write(b"sparse image placeholder")
+        ctx = {"owned": True, "root": root, "scratch": os.path.join(root, "scratch"),
+               "evidence": evidence, "reserve_path": root, "inject": [],
+               "start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "limit_s": 300}
+        return ctx, backing
+
+    def facts(self, **changes):
+        facts = DetachFacts(**changes)
+        facts.stats.update(facts.bound_stats())
+        return facts
+
+    def request(self, ctx, backing, **changes):
+        document = {"version": 1, "backing": backing, "mount": "/Volumes/OxDetach",
+                    "device": "/dev/disk7", "volume_uuid": DETACH_UUID.upper(),
+                    "note": "self-check"}
+        document.update(changes)
+        path = os.path.join(ctx["evidence"], bounded.DETACH_REQUEST_NAME)
+        with open(path, "w") as handle:
+            json.dump(document, handle)
+        return path
+
+    def test_no_request_is_the_unchanged_runner(self):
+        ctx, _backing = self.layout()
+        facts = self.facts()
+        self.assertIsNone(bounded.post_census_detach(ctx, facts))
+        self.assertEqual(facts.detached, [], "a detach ran without a request")
+
+    def test_a_bound_request_detaches_exactly_once(self):
+        ctx, backing = self.layout()
+        facts = self.facts()
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertEqual(facts.detached[0][0], "/Volumes/OxDetach")
+        self.assertLessEqual(facts.detached[0][1], bounded.DETACH_TIMEOUT_S)
+        self.assertEqual(len(facts.detached), 1, "more than one detach attempt")
+        self.assertEqual((record["state"], record["qualified"], record["post_state"]),
+                         ("detached", True, "detached"))
+        self.assertEqual((record["attempted"], record["exit"], record["timed_out"]), (True, 0, False))
+        self.assertIsNone(record["reason"])
+        self.assertEqual(record["backing"], backing, "the record does not name the requested backing")
+        self.assertIsNotNone(record["reserve_before"])
+        self.assertIsNone(record["reserve_after"] if record["state"] != "detached" else None)
+        self.assertEqual(record["deadline_ns"], ctx["start_ns"] + 300 * bounded.NS)
+
+    def test_a_wrong_uuid_device_or_mount_refuses_without_detaching(self):
+        for changes, expected in (({"volume_uuid": "11111111-2222-3333-4444-555555555555"}, "uuid"),
+                                  ({"device": "/dev/disk9"}, "device"),
+                                  ({"mount": "/Volumes/OxOther"}, "mount"),
+                                  ({"backing": "/private/etc/passwd"}, "outside"),
+                                  ({"backing": "/Volumes"}, "regular file"),
+                                  ({"version": 2}, "version"),
+                                  ({"device": "/dev/disk7s1s9"}, "device"),
+                                  ({"mount": "/Volumes/../Volumes/OxDetach"}, "canonical"),
+                                  ({"extra": "unexpected"}, "unknown fields")):
+            ctx, backing = self.layout()
+            facts = self.facts()
+            changes = dict(changes)
+            self.request(ctx, changes.pop("backing", backing), **changes)
+            record = bounded.post_census_detach(ctx, facts)
+            self.assertEqual(facts.detached, [], f"{changes} was detached")
+            self.assertEqual((record["state"], record["qualified"], record["attempted"]),
+                             ("refused", False, False), f"{changes}: {record}")
+            self.assertIn(expected, (record["reason"] or "").lower(), f"{changes}: {record['reason']}")
+
+    def test_a_mount_that_is_not_this_image_or_not_mounted_refuses(self):
+        for changes, expected in (({"mount_point": False}, "mount point"),
+                                  ({"attachments": lambda attempted: []}, "not attached")):
+            ctx, backing = self.layout()
+            facts = self.facts(**changes)
+            self.request(ctx, backing)
+            record = bounded.post_census_detach(ctx, facts)
+            self.assertEqual(facts.detached, [], f"{changes} was detached")
+            self.assertEqual(record["state"], "refused", record)
+            self.assertIn(expected, record["reason"], record["reason"])
+
+    def test_a_symlinked_backing_or_request_is_refused(self):
+        ctx, backing = self.layout()
+        link = os.path.join(ctx["scratch"], "link.sparseimage")
+        os.symlink(backing, link)
+        facts = self.facts()
+        self.request(ctx, link)
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertEqual(facts.detached, [], "a symlinked backing was detached")
+        self.assertIn("symlink", record["reason"])
+
+        ctx, backing = self.layout()
+        target = os.path.join(ctx["evidence"], "elsewhere.json")
+        with open(target, "w") as handle:
+            json.dump({"version": 1, "backing": backing, "mount": "/Volumes/OxDetach",
+                       "device": "/dev/disk7", "volume_uuid": DETACH_UUID}, handle)
+        os.symlink(target, os.path.join(ctx["evidence"], bounded.DETACH_REQUEST_NAME))
+        record = bounded.post_census_detach(ctx, self.facts())
+        self.assertEqual(record["state"], "refused")
+        self.assertIn("regular file", record["reason"])
+
+    def test_an_oversize_or_malformed_request_is_refused(self):
+        for payload, expected in ((b"{" + b" " * bounded.DETACH_REQUEST_MAX_BYTES + b"}", "bytes"),
+                                  (b"not json", "JSON"), (b"[]", "object"),
+                                  (b'{"version": 1, "mount": "\\u0000"}', "bounded single-line")):
+            ctx, _backing = self.layout()
+            with open(os.path.join(ctx["evidence"], bounded.DETACH_REQUEST_NAME), "wb") as handle:
+                handle.write(payload)
+            facts = self.facts()
+            record = bounded.post_census_detach(ctx, facts)
+            self.assertEqual((record["state"], record["attempted"]), ("refused", False), record)
+            self.assertEqual(facts.detached, [], f"{payload} was detached")
+            self.assertIn(expected, record["reason"], record["reason"])
+
+    def test_a_caller_owned_root_detaches_nothing(self):
+        ctx, backing = self.layout()
+        ctx["owned"] = False
+        self.request(ctx, backing)
+        facts = self.facts()
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertEqual(record["state"], "refused")
+        self.assertEqual(facts.detached, [], "a caller-owned root detached an image")
+        self.assertIn("belongs to the caller", record["reason"])
+
+    def test_a_deadline_reserve_refuses_before_any_attempt(self):
+        ctx, backing = self.layout()
+        ctx["limit_s"] = 1  # the custodian's wait window has already closed
+        facts = self.facts()
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertEqual(facts.detached, [], "a detach ran past the custodian's wait window")
+        self.assertEqual((record["state"], record["qualified"]), ("refused", False))
+        self.assertIn("wait window", record["reason"])
+
+    def test_a_failed_or_timed_out_attempt_keeps_the_mount(self):
+        for attempt, state in (({"exit": 1, "timed_out": False, "error": None, "output": "busy"}, "failed"),
+                               ({"exit": None, "timed_out": True, "error": None, "output": ""}, "timed_out")):
+            ctx, backing = self.layout()
+            facts = self.facts(attempt=attempt, mount_point=True)
+            self.request(ctx, backing)
+            record = bounded.post_census_detach(ctx, facts)
+            self.assertEqual((record["state"], record["qualified"], record["post_state"]),
+                             (state, False, "still_mounted"), record)
+            self.assertIsNotNone(record["reason"])
+
+    def test_a_zero_exit_that_leaves_the_mount_is_ambiguous(self):
+        ctx, backing = self.layout()
+        facts = self.facts(mount_point=True)
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertEqual((record["state"], record["post_state"], record["qualified"]),
+                         ("failed", "still_mounted", False), record)
+
+    def test_a_detach_that_leaves_the_device_attached_is_not_detached(self):
+        ctx, backing = self.layout()
+        facts = self.facts(
+            mount_point=lambda attempted: not attempted,
+            attachments=lambda attempted: [("/dev/disk7", None, None),
+                                           ("/dev/disk7s1", "/Volumes/OxDetach", DETACH_UUID)])
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertEqual((record["state"], record["post_state"], record["qualified"]),
+                         ("failed", "still_attached", False), record)
+
+    def test_unreadable_attachment_facts_refuse(self):
+        ctx, backing = self.layout()
+        facts = self.facts(attachments=lambda attempted: None)
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertEqual(facts.detached, [], "unreadable attachment facts still detached")
+        self.assertIn("attachment facts are unreadable", record["reason"])
+
+    def test_an_unknown_mount_post_state_is_unqualified(self):
+        ctx, backing = self.layout()
+        facts = self.facts(mount_point=lambda attempted: None if attempted else True)
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertEqual((record["state"], record["post_state"], record["qualified"]),
+                         ("failed", "unknown", False), record)
+
+    def test_a_null_or_non_object_request_is_refused(self):
+        for payload in (b"null", b"[]", b'"text"', b"7", b"true"):
+            ctx, _backing = self.layout()
+            with open(os.path.join(ctx["evidence"], bounded.DETACH_REQUEST_NAME), "wb") as handle:
+                handle.write(payload)
+            facts = self.facts()
+            record = bounded.post_census_detach(ctx, facts)
+            self.assertIsNotNone(record, f"{payload} was read as an absent request")
+            self.assertEqual((record["state"], record["attempted"], record["qualified"]),
+                             ("refused", False, False), record)
+            self.assertIn("not an object", record["reason"])
+            self.assertEqual(facts.detached, [], f"{payload} was detached")
+
+    def test_the_kept_output_is_bounded(self):
+        big = b"x" * (4 * bounded.DETACH_OUTPUT_MAX_BYTES)
+        tail = b""
+        for index in range(0, len(big), 1024):
+            tail = bounded._bounded_tail(tail, big[index:index + 1024])
+            self.assertLessEqual(len(tail), bounded.DETACH_OUTPUT_MAX_BYTES)
+        self.assertEqual(tail, big[-bounded.DETACH_OUTPUT_MAX_BYTES:])
+        self.assertLessEqual(len(bounded.bounded_run.__doc__), 4096)
+
+    def test_the_authorization_gate_is_the_custodians_verdict(self):
+        now, exit_at = 1000 * bounded.NS, 1060 * bounded.NS
+        allowed, reason, budget = bounded.detach_authorization(None, False, now, exit_at)
+        self.assertTrue(allowed, reason)
+        self.assertGreater(budget, 0)
+        self.assertLessEqual(budget, 60 * bounded.NS)
+        for fault, deadline, when, text in (("a fault", False, now, "fault is latched"),
+                                            (None, True, now, "deadline"),
+                                            (None, False, exit_at, "wait budget")):
+            allowed, reason, budget = bounded.detach_authorization(fault, deadline, when, exit_at)
+            self.assertFalse(allowed, (fault, deadline, when))
+            self.assertEqual(budget, 0)
+            self.assertIn(text, reason)
+
+    def test_the_detach_budget_ends_before_the_custodian_wait_ends(self):
+        ctx, _backing = self.layout()
+        start = ctx["start_ns"]
+        self.assertEqual(bounded.detach_budget(ctx, start), 300 * bounded.NS - bounded.EXIT_MARGIN_S * bounded.NS
+                         - bounded.DETACH_GATE_MARGIN_NS)
+        late = start + (300 - bounded.EXIT_MARGIN_S) * bounded.NS
+        self.assertEqual(bounded.detach_budget(ctx, late), 0)
+        # A spent budget refuses before any attempt, never past the custodian's wait.
+        ctx, backing = self.layout()
+        ctx["start_ns"] = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) - int(300 * bounded.NS)
+        facts = self.facts()
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertEqual(facts.detached, [], "a detach ran past the custodian's wait window")
+        self.assertEqual(record["state"], "refused")
+        self.assertIn("wait window", record["reason"])
+
+    def test_the_attempt_is_clamped_by_the_authorized_budget(self):
+        ctx, backing = self.layout()
+        self.request(ctx, backing)
+        granted = []
+        record = bounded.post_census_detach(
+            ctx, self.facts(), authorize=lambda budget, wait: (granted.append((budget, wait))
+                                                              or (True, None, 4 * bounded.NS)))
+        self.assertTrue(record["qualified"], record)
+        # The granted four-second window clamps the whole remaining sequence.
+        self.assertLessEqual(record["timeout_s"], 4.0)
+        self.assertGreaterEqual(record["timeout_s"], 1.0)
+        self.assertEqual(granted[0][0] > 0, True)
+
+    def test_a_withdrawn_authorization_detaches_nothing(self):
+        ctx, backing = self.layout()
+        facts = self.facts()
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(
+            ctx, facts, authorize=lambda budget, wait: (False, "a fault is latched (injected)", 0))
+        self.assertEqual(facts.detached, [], "a detach ran without the custodian's authorization")
+        self.assertEqual((record["state"], record["attempted"], record["qualified"]),
+                         ("refused", False, False), record)
+        self.assertIn("a fault is latched", record["reason"])
+
+    def test_the_monitor_takes_no_detach_without_a_usable_answer(self):
+        def monitor(answer, close=False):
+            monitor = bounded.Monitor.__new__(bounded.Monitor)
+            _ctl_r, _ctl_w = os.pipe()
+            cmd_r, cmd_w = os.pipe()
+            self.addCleanup(os.close, _ctl_r)
+            self.addCleanup(os.close, _ctl_w)
+            self.addCleanup(os.close, cmd_r)
+            monitor.cmd_r = cmd_r
+            monitor.sent = []
+            monitor.send = lambda kind, **fields: monitor.sent.append((kind, fields))
+            if answer is not None:
+                os.write(cmd_w, (json.dumps(answer) + "\n").encode())
+            if close:
+                os.close(cmd_w)
+            else:
+                self.addCleanup(os.close, cmd_w)
+            return monitor
+
+        monitor_ = monitor({"type": "detach_go", "allowed": True, "budget_ns": 5 * bounded.NS})
+        self.assertEqual(monitor_.authorize_detach(10 * bounded.NS), (True, None, 5 * bounded.NS))
+        self.assertEqual(monitor_.sent[0][0], "detach_ready")
+        self.assertEqual(monitor_.sent[0][1], {"budget_ns": 10 * bounded.NS})
+        for answer, expected in (({"type": "detach_go", "allowed": False, "reason": "the deadline"},
+                                  "the deadline"),
+                                 ({"type": "detach_go", "allowed": True, "budget_ns": "lots"},
+                                  "no usable budget"),
+                                 ({"type": "other"}, "in time"),
+                                 ("not an object", "in time")):
+            monitor_ = monitor(answer)
+            self.assertFalse(monitor_.authorize_detach(200_000_000)[0], (answer, expected))
+        monitor_ = monitor(None, close=True)
+        self.assertFalse(monitor_.authorize_detach(5 * bounded.NS)[0])
+
+    def declare_custody(self, ctx, *backings):
+        path = os.path.join(ctx["evidence"], bounded.CUSTODY_NAME)
+        with open(path, "w") as handle:
+            json.dump({"version": bounded.CUSTODY_VERSION, "backings": list(backings)}, handle)
+        return path
+
+    def test_without_a_custody_indication_cleanup_performs_no_scan(self):
+        ctx, _backing = self.layout()
+        calls = []
+        self.assertIsNone(bounded.cleanup_safety(ctx, self.facts(), facts=lambda *a: calls.append(a) or []))
+        self.assertEqual(calls, [], "a run without an indication still scanned attachments")
+
+    def test_a_declared_mounted_image_keeps_the_owned_root(self):
+        ctx, backing = self.layout()
+        self.declare_custody(ctx, backing)
+        rows = [("/dev/disk7", "/Volumes/OxDetach", None)]  # (device, mount, uuid)
+        record = bounded.cleanup_safety(ctx, self.facts(), facts=lambda *a: rows)
+        self.assertEqual(record["state"], "kept")
+        self.assertEqual(record["unrequested"], [backing])
+        self.assertIn("mounted", record["reason"])
+
+    def test_attached_but_unmounted_is_not_positively_detached(self):
+        # The reviewer's second case: no mount point, but the device node still
+        # exists, so the image is attached. It must keep the root.
+        ctx, backing = self.layout()
+        self.declare_custody(ctx, backing)
+        facts = self.facts(nodes=("/dev/disk7s1",))
+        rows = [("/dev/disk7s1", None, None)]
+        record = bounded.cleanup_safety(ctx, facts, facts=lambda *a: rows)
+        self.assertEqual(record["state"], "kept")
+        self.assertIn("attached without a mount point", record["reason"])
+
+    def test_stale_metadata_with_no_device_node_keeps_nothing(self):
+        ctx, backing = self.layout()
+        self.declare_custody(ctx, backing)
+        rows = [("/dev/disk99s1", None, None)]  # no such node on this host
+        self.assertEqual(bounded.cleanup_safety(ctx, self.facts(), facts=lambda *a: rows)["state"], "ok")
+
+    def test_uncertain_custody_state_keeps_the_owned_root(self):
+        # Unreadable attachment facts are uncertain, so the root is kept.
+        ctx, backing = self.layout()
+        self.declare_custody(ctx, backing)
+        self.assertIn("unreadable", bounded.cleanup_safety(
+            ctx, self.facts(), facts=lambda *a: None)["reason"])
+        # An unreadable device-node state is uncertain too.
+        ctx, backing = self.layout()
+        self.declare_custody(ctx, backing)
+        probe = self.facts()
+        real_lstat = os.lstat
+
+        def lstat(path):
+            if path == "/dev/disk7":
+                raise PermissionError("denied")
+            return real_lstat(path)
+
+        probe.lstat = lstat
+        record = bounded.cleanup_safety(ctx, probe, facts=lambda *a: [("/dev/disk7", None, None)])
+        self.assertEqual(record["state"], "kept")
+        self.assertIn("unreadable", record["reason"])
+
+    def test_the_post_attempt_gate_withdraws_success(self):
+        ctx, backing = self.layout()
+        self.request(ctx, backing)
+        answers = []
+
+        def still_allowed():
+            answers.append(1)
+            return False, "a fault latched after the attempt"
+
+        record = bounded.post_census_detach(ctx, self.facts(), still_allowed=still_allowed)
+        self.assertEqual((record["state"], record["qualified"]), ("withdrawn", False), record)
+        self.assertIn("after the attempt", record["reason"])
+        self.assertTrue(answers)
+
+    def test_an_unreaped_detach_child_is_not_a_detach(self):
+        ctx, backing = self.layout()
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, self.facts(), still_allowed=None)
+        self.assertTrue(record["qualified"], record)  # baseline for the injected case
+        ctx, backing = self.layout()
+        ctx["inject"] = ["detach-reap-timeout"]
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, self.facts())
+        self.assertEqual((record["state"], record["qualified"], record["reap_timed_out"]),
+                         ("failed", False, True), record)
+
+    def test_an_opted_in_but_clear_root_reports_ok_and_is_the_only_case_gated(self):
+        ctx, backing = self.layout()
+        self.declare_custody(ctx, backing)
+        record = bounded.cleanup_safety(ctx, self.facts(), facts=lambda *a: [])
+        self.assertEqual(record["state"], "ok")
+        self.assertEqual(record["unrequested"], [backing])
+        # Not opted in: no indication means no record at all, so the monitor never
+        # gated, scanned or changed this run's cleanup path.
+        ctx, _backing = self.layout()
+        self.assertIsNone(bounded.cleanup_safety(ctx, self.facts(), facts=lambda *a: []))
+
+    def test_an_attached_volume_with_an_unexpected_uuid_still_keeps(self):
+        # A UUID mismatch is not evidence of a detach: any live entity keeps the
+        # root, so a failed parse or a wrong UUID can never delete a backing.
+        ctx, backing = self.layout()
+        self.declare_custody(ctx, backing)
+        rows = [("/dev/disk7s1", None, "ffffffff-1111-2222-3333-444444444444")]
+        record = bounded.cleanup_safety(ctx, self.facts(nodes=("/dev/disk7s1",)), facts=lambda *a: rows)
+        self.assertEqual(record["state"], "kept")
+        self.assertIn("attached without a mount point", record["reason"])
+
+    def test_an_unreaped_detach_child_is_never_claimed_as_reaped(self):
+        ctx, backing = self.layout()
+        ctx["inject"] = ["detach-reap-timeout"]
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, self.facts())
+        self.assertFalse(record["reaped"])
+        self.assertFalse(record["qualified"])
+
+    def test_a_spent_window_spawns_nothing(self):
+        spawned = []
+        result = bounded.bounded_run(["/bin/true"], 0.0, 64,
+                                     spawn=lambda *a, **k: spawned.append(1) or None)
+        self.assertEqual(spawned, [], "a spent window still spawned a child")
+        self.assertEqual(result["error"], "no time left in the window")
+        self.assertFalse(result["reaped"])
+
+    def test_no_wait_exceeds_the_granted_window(self):
+        ctx, backing = self.layout()
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, self.facts(), authorize=lambda b, w: (True, None, b))
+        self.assertTrue(record["qualified"], record)
+        self.assertLessEqual(record["timeout_s"] * bounded.NS, record["budget_ns"] + bounded.NS // 100)
+        # A budget that cannot hold the attempt refuses instead of spawning one.
+        ctx, backing = self.layout()
+        # One second short of the minimum: the window cannot hold a bounded attempt.
+        ctx["start_ns"] = (time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
+                           - (300 * bounded.NS - bounded.DETACH_MIN_BUDGET_NS - bounded.NS))
+        facts = self.facts()
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertEqual(facts.detached, [], "an attempt ran below the minimum budget")
+        self.assertEqual(record["state"], "refused")
+        self.assertIn("wait window", record["reason"])
+
+    def test_a_recycled_or_reparented_pid_is_never_signalled(self):
+        # The row is the REAL `Kinfo.parse` shape: pid, start, zombie (boolean),
+        # uid, ppid, pgid — there is no `stat` key at all.
+        real = bounded.Kinfo.one(os.getpid())
+        self.assertIsNotNone(real)
+        self.assertEqual(sorted(real), ["pgid", "pid", "ppid", "start", "uid", "zombie"])
+        self.assertIsInstance(real["zombie"], bool)
+        self.assertNotIn("stat", real)
+        self.assertTrue(bounded.detach_child_identity(real, os.getpid(), real["start"], os.getppid()))
+        for row, pid, start, parent in ((dict(real, start=real["start"] + 1), real["pid"], real["start"],
+                                         os.getppid()),                                  # recycled PID
+                                        (dict(real, ppid=1), real["pid"], real["start"], os.getppid()),
+                                        (dict(real, zombie=True), real["pid"], real["start"], os.getppid()),
+                                        (None, real["pid"], real["start"], os.getppid()),  # gone
+                                        (dict(real, pid=real["pid"] + 1), real["pid"], real["start"],
+                                         os.getppid())):                                   # other process
+            self.assertFalse(bounded.detach_child_identity(row, pid, start, parent), row)
+
+    def test_observation_reads_the_real_row_shape(self):
+        # `observe_detach_child` must accept the real row shape (no `stat`) and
+        # treat a zombie row as closed.
+        class FakeKinfo:
+            rows = []
+
+            @staticmethod
+            def one(pid):
+                return FakeKinfo.rows[0] if FakeKinfo.rows else None
+
+        real = bounded.Kinfo.one(os.getpid())
+        custodian = bounded.Custodian.__new__(bounded.Custodian)
+        custodian.detach_child = [real["pid"], real["start"]]
+        custodian.absolute = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) + 2 * bounded.NS
+        custodian.pump = lambda _timeout: None
+        recorded = []
+        custodian.record = lambda kind, **fields: recorded.append((kind, fields))
+        saved = bounded.Kinfo
+        try:
+            bounded.Kinfo = FakeKinfo
+            FakeKinfo.rows = [dict(real, zombie=False)]
+            self.assertFalse(custodian.observe_detach_child(bounded.NS // 10))
+            FakeKinfo.rows = [dict(real, zombie=True)]
+            self.assertTrue(custodian.observe_detach_child(bounded.NS // 10))
+            FakeKinfo.rows = []
+            self.assertTrue(custodian.observe_detach_child(bounded.NS // 10))
+        finally:
+            bounded.Kinfo = saved
+        self.assertTrue(all(kind == "detach_child_observed" for kind, _f in recorded), recorded)
+
+    def test_an_unreadable_identity_is_never_read_as_gone(self):
+        # Real row, then the same pid unreadable: the safe read reports a problem
+        # and the caller can never mistake it for absence.
+        real = bounded.Kinfo.one(os.getpid())
+        row, problem = bounded.process_row(os.getpid())
+        self.assertIsNone(problem)
+        self.assertEqual(row["pid"], real["pid"])
+
+        class BrokenKinfo:
+            @staticmethod
+            def one(pid):
+                raise OSError("sysctl read failed")
+
+        class MalformedKinfo:
+            @staticmethod
+            def one(pid):
+                return {"pid": pid, "start": None}
+
+        saved = bounded.Kinfo
+        try:
+            bounded.Kinfo = BrokenKinfo
+            self.assertEqual(bounded.process_row(4242), (None, "OSError"))
+            bounded.Kinfo = MalformedKinfo
+            self.assertEqual(bounded.process_row(4242), (None, "malformed process row"))
+        finally:
+            bounded.Kinfo = saved
+        self.assertEqual(bounded.process_row(0), (None, "no usable pid"))
+
+    def custodian_stub(self):
+        custodian = bounded.Custodian.__new__(bounded.Custodian)
+        custodian.guard = bounded.Guard(time.clock_gettime_ns(time.CLOCK_UPTIME_RAW))
+        custodian.run_id = "run"
+        custodian.monitor_seq = 0
+        custodian.monitor = os.getpid()
+        custodian.leader = None
+        custodian.leader_bound = False
+        custodian.detach_child = None
+        custodian.records, custodian.told = [], []
+        custodian.record = lambda kind, **fields: custodian.records.append((kind, fields))
+        custodian.tell = lambda kind, **fields: custodian.told.append((kind, fields))
+        custodian.signal_detach_child = lambda: custodian.records.append(("detach_child_signal", {}))
+        custodian.observe_detach_child = lambda limit: True
+        return custodian
+
+    def test_the_handoff_refuses_an_unreadable_identity_without_signing(self):
+        real = bounded.Kinfo.one(os.getpid())
+        message = {"run": "run", "seq": 1, "at": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW),
+                   "type": "detach_child", "leader": None, "pid": real["pid"], "start": real["start"]}
+
+        class BrokenKinfo:
+            @staticmethod
+            def one(pid):
+                raise OSError("sysctl read failed")
+
+        custodian = self.custodian_stub()
+        saved = bounded.Kinfo
+        try:
+            bounded.Kinfo = BrokenKinfo
+            custodian.accept(dict(message))
+        finally:
+            bounded.Kinfo = saved
+        self.assertIsNone(custodian.detach_child, "an unreadable identity was pinned")
+        self.assertNotIn("detach_child_signal", [kind for kind, _f in custodian.records])
+        self.assertEqual([kind for kind, _f in custodian.records], ["detach_child_refused"])
+        ack = custodian.told[-1]
+        self.assertEqual(ack[0], "detach_child_ack")
+        self.assertIs(ack[1]["custodian_closes"], False)
+        self.assertIs(ack[1]["closed"], False)
+        self.assertIn("could not be read", ack[1]["reason"])
+
+    def test_the_handoff_pins_signals_and_acknowledges_a_live_child(self):
+        # The pinned child must still be this (stubbed) monitor's own child.
+        real = dict(bounded.Kinfo.one(os.getpid()), pid=os.getpid() + 1, start=1234,
+                    ppid=os.getpid(), zombie=False)
+        message = {"run": "run", "seq": 1, "at": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW),
+                   "type": "detach_child", "leader": None, "pid": real["pid"], "start": real["start"]}
+        custodian = self.custodian_stub()
+
+        class FakeKinfo:
+            @staticmethod
+            def one(pid):
+                return dict(real) if pid == real["pid"] else None
+
+        saved = bounded.Kinfo
+        try:
+            bounded.Kinfo = FakeKinfo
+            custodian.accept(dict(message))
+        finally:
+            bounded.Kinfo = saved
+        self.assertEqual(custodian.detach_child, [real["pid"], real["start"]])
+        self.assertEqual([kind for kind, _f in custodian.records],
+                         ["detach_child_pinned", "detach_child_signal"])
+        ack = custodian.told[-1]
+        self.assertIs(ack[1]["custodian_closes"], True)
+        self.assertIs(ack[1]["closed"], True)
+
+    def test_an_unreadable_observation_is_uncertain_not_closed(self):
+        real = bounded.Kinfo.one(os.getpid())
+
+        class BrokenKinfo:
+            @staticmethod
+            def one(pid):
+                raise OSError("sysctl read failed")
+
+        custodian = bounded.Custodian.__new__(bounded.Custodian)
+        custodian.detach_child = [real["pid"], real["start"]]
+        custodian.absolute = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) + 2 * bounded.NS
+        custodian.pump = lambda _timeout: None
+        recorded = []
+        custodian.record = lambda kind, **fields: recorded.append((kind, fields))
+        saved = bounded.Kinfo
+        try:
+            bounded.Kinfo = BrokenKinfo
+            self.assertFalse(custodian.observe_detach_child(bounded.NS // 50),
+                             "an unreadable observation was reported closed")
+        finally:
+            bounded.Kinfo = saved
+        kind, fields = recorded[-1]
+        self.assertEqual(kind, "detach_child_observed")
+        self.assertIs(fields["closed"], False)
+        self.assertEqual(fields["uncertain"], "OSError")
+
+    def test_the_monitor_closes_or_hands_off_an_identity_less_child(self):
+        # Behaviour is covered end-to-end by the two injected real cases; this
+        # pins the shape: the safe reader, the bounded own-child close, and the
+        # parentage-only handoff that carries no start time.
+        source = inspect.getsource(bounded.Monitor.run)
+        self.assertIn("process_row(getattr(handle", source)
+        self.assertIn("close_own_child(handle, own_deadline)", source)
+        self.assertIn("left_ns * 3", source)  # part of the window is kept for the handoff
+        self.assertIn("start=None", source)
+        self.assertIn("detach_child_identity_unreadable: closing_own_child", source)
+        self.assertIn("detach_child_closed_by_monitor: scratch_kept", source)
+        self.assertNotIn("Kinfo.one", source)
+
+    def test_the_own_child_close_is_bounded_and_never_raises(self):
+        class FakeChild:
+            pid = 0  # no signal is attempted for pid 0
+
+            def __init__(self, statuses):
+                self.statuses = list(statuses)
+
+            def wait(self, timeout=None):
+                if not self.statuses:
+                    return None
+                value = self.statuses.pop(0)
+                if isinstance(value, BaseException):
+                    raise value
+                return value
+
+        window = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) + 2 * bounded.NS
+        self.assertEqual(bounded.close_own_child(FakeChild([7]), window), (True, 7))
+        self.assertEqual(bounded.close_own_child(FakeChild([OSError("wait failed")]), window), (False, None))
+        expired = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) - bounded.NS
+        self.assertEqual(bounded.close_own_child(FakeChild([None]), expired), (False, None))
+
+    def test_a_parentage_handoff_needs_no_start_time(self):
+        message = {"run": "run", "seq": 1, "at": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW),
+                   "type": "detach_child", "leader": None, "pid": 4242, "start": None}
+        self.assertIsNone(bounded.malformed(message))
+
+    def test_the_receiver_accepts_a_parentage_only_handoff(self):
+        # End-to-end through `Custodian.accept`: no start time at all, a row that
+        # shows this monitor as parent, so it pins by parentage, signals, observes
+        # and acknowledges closure.
+        real = bounded.Kinfo.one(os.getpid())
+        child_pid = os.getpid() + 1
+        message = {"run": "run", "seq": 1, "at": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW),
+                   "type": "detach_child", "leader": None, "pid": child_pid, "start": None}
+        custodian = self.custodian_stub()
+
+        class FakeKinfo:
+            @staticmethod
+            def one(pid):
+                if pid != child_pid:
+                    return None
+                return dict(real, pid=child_pid, start=real["start"], ppid=os.getpid(), zombie=False)
+
+        saved = bounded.Kinfo
+        try:
+            bounded.Kinfo = FakeKinfo
+            custodian.accept(dict(message))
+        finally:
+            bounded.Kinfo = saved
+        self.assertEqual(custodian.detach_child, [child_pid, real["start"]])
+        self.assertEqual([kind for kind, _f in custodian.records],
+                         ["detach_child_pinned", "detach_child_signal"])
+        self.assertEqual(custodian.records[0][1]["identity"], "parentage")
+        ack = custodian.told[-1]
+        self.assertIs(ack[1]["custodian_closes"], True)
+        self.assertIs(ack[1]["closed"], True)
+
+    def test_a_positively_absent_child_is_acknowledged_without_signal(self):
+        child_pid = os.getpid() + 1
+        message = {"run": "run", "seq": 1, "at": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW),
+                   "type": "detach_child", "leader": None, "pid": child_pid, "start": None}
+        custodian = self.custodian_stub()
+
+        class AbsentKinfo:
+            @staticmethod
+            def one(pid):
+                return None
+
+        saved = bounded.Kinfo
+        try:
+            bounded.Kinfo = AbsentKinfo
+            custodian.accept(dict(message))
+        finally:
+            bounded.Kinfo = saved
+        self.assertIsNone(custodian.detach_child)
+        self.assertEqual([kind for kind, _f in custodian.records], ["detach_child_refused"])
+        self.assertEqual(custodian.records[0][1]["observation"], "positively absent")
+        ack = custodian.told[-1]
+        self.assertIs(ack[1]["custodian_closes"], False)
+        self.assertIs(ack[1]["closed"], True)
+        self.assertIn("positively gone", ack[1]["reason"])
+
+    def test_the_unreadable_injection_is_scoped_to_one_actor(self):
+        saved_role, saved_env = bounded._ROLE[0], os.environ.get("OXIDE_SUPERVISOR_INJECT")
+        try:
+            os.environ["OXIDE_SUPERVISOR_INJECT"] = "detach-identity-unreadable"
+            bounded._ROLE[0] = "monitor"
+            self.assertTrue(bounded.injected_unreadable())
+            bounded._ROLE[0] = "custodian"
+            self.assertFalse(bounded.injected_unreadable(),
+                             "the monitor's injection also blinded the custodian")
+            os.environ["OXIDE_SUPERVISOR_INJECT"] = "detach-custodian-identity-unreadable"
+            bounded._ROLE[0] = "monitor"
+            self.assertFalse(bounded.injected_unreadable())
+            bounded._ROLE[0] = "custodian"
+            self.assertTrue(bounded.injected_unreadable())
+            os.environ["OXIDE_SUPERVISOR_INJECT"] = ""
+            self.assertFalse(bounded.injected_unreadable())
+        finally:
+            bounded._ROLE[0] = saved_role
+            if saved_env is None:
+                os.environ.pop("OXIDE_SUPERVISOR_INJECT", None)
+            else:
+                os.environ["OXIDE_SUPERVISOR_INJECT"] = saved_env
+
+    def test_a_parentage_mismatch_is_acknowledged_without_signalling(self):
+        real = bounded.Kinfo.one(os.getpid())
+        child_pid = os.getpid() + 1
+        message = {"run": "run", "seq": 1, "at": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW),
+                   "type": "detach_child", "leader": None, "pid": child_pid, "start": None}
+        custodian = self.custodian_stub()
+
+        class FakeKinfo:
+            @staticmethod
+            def one(pid):
+                # Same PID, but reparented: it is no longer this monitor's child.
+                return dict(real, pid=child_pid, start=real["start"], ppid=1, zombie=False)
+
+        saved = bounded.Kinfo
+        try:
+            bounded.Kinfo = FakeKinfo
+            custodian.accept(dict(message))
+        finally:
+            bounded.Kinfo = saved
+        self.assertIsNone(custodian.detach_child)
+        self.assertEqual([kind for kind, _f in custodian.records], ["detach_child_refused"])
+        self.assertEqual(custodian.records[0][1]["observation"], "parentage no longer matches")
+        ack = custodian.told[-1]
+        self.assertIs(ack[1]["custodian_closes"], False)
+        self.assertIs(ack[1]["closed"], True)
+        self.assertNotIn("detach_child_signal", [kind for kind, _f in custodian.records])
+
+    def test_an_executor_exception_keeps_the_live_handle(self):
+        class BrokenStdout:
+            def fileno(self):
+                raise OSError("the pipe vanished")
+
+        class FakeChild:
+            returncode = None
+            stdout = BrokenStdout()
+            killed = False
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                self.killed = True
+
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired("child", timeout or 0)
+
+        child = FakeChild()
+        result = bounded.bounded_run(["/bin/true"], 2, 64, spawn=lambda *a, **k: child)
+        self.assertIs(result["handle"], child, "the live child handle was lost")
+        self.assertFalse(result["reaped"])
+        self.assertEqual(result["error"], "OSError")
+        self.assertTrue(result["reap_timed_out"])
+        self.assertIn('self.send("detach_child", pid=int(row["pid"]), start=int(row["start"]))',
+                      inspect.getsource(bounded.Monitor.run))
+
+    def test_the_post_state_read_has_no_forced_minimum(self):
+        ctx, backing = self.layout()
+        self.request(ctx, backing)
+        seen = []
+
+        def facts_call(backing_, timeout=None):
+            seen.append(timeout)
+            return [("/dev/disk7", None, None), ("/dev/disk7s1", "/Volumes/OxDetach", DETACH_UUID)]
+
+        facts = self.facts()
+        facts.attachments = facts_call
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertTrue(record["attempted"])
+        # Whatever the value, it is what the window allowed: never above the cap
+        # and never a forced one-second floor imposed by the runner.
+        self.assertTrue(all(value is None or value <= bounded.DETACH_INFO_TIMEOUT_S for value in seen), seen)
+
+    def test_a_malformed_custody_indication_keeps_the_owned_root(self):
+        for payload in (b"null", b"[]", b'{"version": 1}', b'{"version": 1, "backings": []}',
+                        b'{"version": 2, "backings": ["/tmp/x"]}',
+                        b'{"version": 1, "backings": ["relative"]}'):
+            ctx, _backing = self.layout()
+            with open(os.path.join(ctx["evidence"], bounded.CUSTODY_NAME), "wb") as handle:
+                handle.write(payload)
+            record = bounded.cleanup_safety(ctx, self.facts(), facts=lambda *a: [])
+            self.assertEqual(record["state"], "kept", (payload, record))
+            self.assertIn("custody indication", record["reason"], (payload, record["reason"]))
+
+    def test_a_backing_outside_the_owned_layout_is_refused(self):
+        ctx, _backing = self.layout()
+        path = os.path.join(ctx["evidence"], bounded.CUSTODY_NAME)
+        with open(path, "w") as handle:
+            json.dump({"version": 1, "backings": ["/private/etc/passwd"]}, handle)
+        record = bounded.cleanup_safety(ctx, self.facts(), facts=lambda *a: [])
+        self.assertEqual(record["state"], "kept")
+        self.assertIn("outside this run's owned root", record["reason"])
+
+    def test_a_diagnostic_receipt_is_never_qualified(self):
+        rows = [{"check": "receipt-phase", "result": "pass", "problems": []},
+                {"check": "detach-paths", "result": "pass", "problems": []}]
+        receipt = qualify.diagnostic_receipt([], rows)
+        self.assertIs(receipt["qualified"], False)
+        self.assertEqual(receipt["result"], "diagnostic")
+        self.assertEqual((receipt["checks_passed"], receipt["checks_failed"]), (2, 0))
+        self.assertIn("never a counted native PASS", receipt["claims"])
+        refused = qualify.diagnostic_receipt(["boom"], [])
+        self.assertIs(refused["qualified"], False)
+        self.assertEqual(refused["problems"], ["boom"])
+
+    def test_an_unmounted_but_still_attached_image_is_not_a_detach(self):
+        # The reviewer's case: the mount point can be gone while the image (or one
+        # of its slices) is still attached. Any entity of that backing means the
+        # attempt did not detach it.
+        ctx, backing = self.layout()
+        facts = self.facts(
+            mount_point=lambda attempted: not attempted,
+            attachments=lambda attempted: [("/dev/disk7s1", None, None)] if attempted else
+            [("/dev/disk7", None, None), ("/dev/disk7s1", "/Volumes/OxDetach", DETACH_UUID)])
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertEqual((record["state"], record["post_state"], record["qualified"]),
+                         ("failed", "still_attached", False), record)
+
+    def test_the_apfs_container_and_synthesized_disk_shape(self):
+        # A real APFS attach: entities are a container whole disk, a synthesized
+        # whole disk and the mounted slice. The request must name the MOUNTED
+        # entity; the container's whole-disk name is not that mount's device, and
+        # any entity left behind after the attempt is not a detach.
+        container = ("/dev/disk10", None, None)
+        synthesized = ("/dev/disk11", None, None)
+        mounted = ("/dev/disk11s1", "/Volumes/OxDetach", DETACH_UUID)
+
+        def shape(requested):
+            def attachments(attempted):
+                if attempted:
+                    return [] if requested == mounted[0] else [container, synthesized]
+                return [container, synthesized, mounted]
+            return attachments
+
+        ctx, backing = self.layout()
+        mounted_facts = self.facts(attachments=shape(mounted[0]))
+        mounted_facts.stats["/dev/disk11s1"] = types.SimpleNamespace(st_rdev=42)
+        self.request(ctx, backing, device=mounted[0])
+        record = bounded.post_census_detach(ctx, mounted_facts)
+        self.assertEqual((record["state"], record["qualified"]), ("detached", True), record)
+
+        # The container's whole-disk name is attached from the backing, but it is
+        # not the device the mount is bound to.
+        ctx, backing = self.layout()
+        container_facts = self.facts(attachments=shape(container[0]))
+        self.request(ctx, backing, device=container[0])
+        record = bounded.post_census_detach(ctx, container_facts)
+        self.assertEqual((record["state"], record["qualified"]), ("refused", False), record)
+        self.assertIn("not this image's own device", record["reason"])
+
+        # Naming the mounted device but leaving the container/synthesized entities
+        # attached is still not a detach.
+        ctx, backing = self.layout()
+        leftover = self.facts(attachments=shape("other"))
+        leftover.stats["/dev/disk11s1"] = types.SimpleNamespace(st_rdev=42)
+        self.request(ctx, backing, device=mounted[0])
+        record = bounded.post_census_detach(ctx, leftover)
+        self.assertEqual((record["state"], record["post_state"], record["qualified"]),
+                         ("failed", "still_attached", False), record)
+
+    def test_the_attachment_parser_fails_closed_on_malformed_facts(self):
+        # The parser's own seam: a document either yields every relevant entity
+        # exactly, or it is unreadable (None). Never a smaller or empty set.
+        backing = "/fixture/volume.sparseimage"
+
+        def attempt(document):
+            import plistlib as _plistlib
+            payload = _plistlib.dumps(document) if not isinstance(document, bytes) else document
+            return {"exit": 0, "timed_out": False, "truncated": False,
+                    "output": payload.decode("utf-8", "replace") if isinstance(payload, bytes) else payload}
+
+        # A real `hdiutil info` plist omits `mount-point` on an unmounted entity and
+        # cannot carry nulls at all.
+        good = {"images": [{"image-path": backing,
+                            "system-entities": [{"dev-entry": "/dev/disk10"},
+                                                {"dev-entry": "/dev/disk10s1",
+                                                 "mount-point": "/Volumes/OxDetach",
+                                                 "volume-uuid": DETACH_UUID}]}]}
+        self.assertEqual(bounded.image_attachments(backing, run=lambda *a: attempt(good)),
+                         [("/dev/disk10", None, None),
+                          ("/dev/disk10s1", "/Volumes/OxDetach", DETACH_UUID)])
+        self.assertEqual(len(bounded.image_attachments(None, run=lambda *a: attempt(good))), 2)
+
+        # Every malformed shape is unreadable, including the declared backing's
+        # mounted entity losing its dev-entry.
+        for bad in (
+            {"images": "nope"},
+            {"not-images": []},
+            {"images": ["not an object"]},
+            {"images": [{"system-entities": []}]},                                  # no image path
+            {"images": [{"image-path": "", "system-entities": []}]},
+            {"images": [{"image-path": backing, "system-entities": "nope"}]},
+            {"images": [{"image-path": backing, "system-entities": ["nope"]}]},
+            {"images": [{"image-path": backing, "system-entities": [{"mount-point": "/Volumes/OxDetach"}]}]},
+            {"images": [{"image-path": backing,
+                         "system-entities": [{"dev-entry": "", "mount-point": "/Volumes/OxDetach"}]}]},
+            {"images": [{"image-path": backing,
+                         "system-entities": [{"dev-entry": "/dev/disk10s1", "mount-point": 7}]}]},
+            {"images": [{"image-path": backing,
+                         "system-entities": [{"dev-entry": "/dev/disk10s1", "volume-uuid": 7}]}]},
+            {"images": [{"image-path": backing, "system-entities": []}]},           # matched, no entities
+        ):
+            self.assertIsNone(bounded.image_attachments(backing, run=lambda *a: attempt(bad)), bad)
+            self.assertIsNone(bounded.image_attachments(None, run=lambda *a: attempt(bad)), bad)
+
+        # A malformed UNRELATED image is still unreadable, and an unreadable child
+        # or output is too.
+        unrelated = {"images": [{"image-path": "/other.sparseimage", "system-entities": "nope"}]}
+        self.assertIsNone(bounded.image_attachments(backing, run=lambda *a: attempt(unrelated)))
+        for broken in ({"exit": 3, "timed_out": False, "truncated": False, "output": ""},
+                       {"exit": 0, "timed_out": True, "truncated": False, "output": ""},
+                       {"exit": 0, "timed_out": False, "truncated": True, "output": ""},
+                       {"exit": 0, "timed_out": False, "truncated": False, "output": "not a plist"}):
+            self.assertIsNone(bounded.image_attachments(backing, run=lambda *a, b=broken: b), broken)
+
+    def test_a_second_declared_backing_is_checked_after_a_successful_detach(self):
+        # A proof may declare more than one backing. Detaching the requested image
+        # must not skip the custody check for the other one.
+        ctx, first = self.layout()
+        second = os.path.join(ctx["scratch"], "second.sparseimage")
+        with open(second, "wb") as handle:
+            handle.write(b"second backing")
+        self.declare_custody(ctx, first, second)
+        rows = {first: [], second: [("/dev/disk9s1", "/Volumes/OxSecond", None)]}
+        record = bounded.cleanup_safety(
+            ctx, self.facts(), facts=lambda backing, timeout=None: rows[os.path.realpath(backing)])
+        self.assertEqual(record["state"], "kept", record)
+        self.assertEqual(sorted(record["unrequested"]), sorted([first, second]))
+        self.assertIn("/Volumes/OxSecond", record["reason"])
+
+    def test_an_unreaped_attachment_read_is_kept_as_a_child(self):
+        backing = "/fixture/volume.sparseimage"
+
+        class FakeChild:
+            pid = 0
+
+            def __init__(self, statuses):
+                self.statuses = list(statuses)
+
+            def wait(self, timeout=None):
+                if not self.statuses:
+                    return None
+                value = self.statuses.pop(0)
+                if isinstance(value, BaseException):
+                    raise value
+                return value
+
+        handle = FakeChild([4242])
+        bounded.INFO_ORPHANS.clear()
+        try:
+            self.assertIsNone(bounded.image_attachments(backing, run=lambda *a: {
+                "exit": 0, "timed_out": False, "truncated": False, "output": "",
+                "reaped": False, "handle": handle}))
+            self.assertEqual(bounded.INFO_ORPHANS, [handle], "an unreaped read child was dropped")
+        finally:
+            bounded.INFO_ORPHANS.clear()
+
+    def monitor_stub(self):
+        monitor = bounded.Monitor.__new__(bounded.Monitor)
+        cmd_r, cmd_w = os.pipe()
+        self.addCleanup(os.close, cmd_r)
+        self.addCleanup(os.close, cmd_w)
+        monitor.cmd_r = cmd_r
+        monitor.lock = threading.Lock()
+        monitor.receipt = {"custodian": []}
+        monitor.published = []
+        monitor.publish = lambda phase: monitor.published.append(
+            (phase, [r["event"] for r in monitor.receipt["custodian"]]))
+        monitor.summary = lambda: None
+        monitor.send = lambda *a, **k: monitor.published.append(("sent", None))
+        monitor.stop = threading.Event()
+        return monitor, cmd_w
+
+    def test_an_orphan_read_is_closed_before_completion_or_the_monitor_holds(self):
+        class FakeChild:
+            pid = 0
+
+            def __init__(self, reaped):
+                self.reaped = reaped
+
+            def wait(self, timeout=None):
+                return 7 if self.reaped else None
+
+        ctx = {"start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "limit_s": 300}
+        monitor, _cmd_w = self.monitor_stub()
+        bounded.INFO_ORPHANS.clear()
+        try:
+            bounded.INFO_ORPHANS.append(FakeChild(True))
+            monitor.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=False)
+            self.assertEqual(bounded.INFO_ORPHANS, [], "a closed orphan was kept")
+            self.assertEqual([phase for phase, _r in monitor.published][0],
+                             "monitor_complete: pending_custodian")
+            self.assertTrue(monitor.stop.is_set())
+
+            # Unreaped: the monitor must not claim completion.
+            monitor, _cmd_w = self.monitor_stub()
+            ctx_late = {"start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) - 300 * bounded.NS,
+                        "limit_s": 300}
+            bounded.INFO_ORPHANS.append(FakeChild(False))
+            monitor.finish_monitor(ctx_late, "monitor_complete: pending_custodian", drain=False)
+            self.assertEqual([phase for phase, _r in monitor.published],
+                             ["orphan_read_unaccounted: monitor_held"], monitor.published)
+            self.assertFalse(monitor.stop.is_set())
+        finally:
+            bounded.INFO_ORPHANS.clear()
+
+    def test_a_malformed_attachment_keeps_the_request_free_root(self):
+        # Parser to the opt-in custody check: the declared backing's mounted entity
+        # loses its dev-entry, so nothing about it is provably clear.
+        ctx, backing = self.layout()
+        self.declare_custody(ctx, backing)
+        document = {"images": [{"image-path": backing,
+                                "system-entities": [{"mount-point": "/Volumes/OxDetach"}]}]}
+        payload = plistlib.dumps(document).decode()
+
+        def fake_run(*_args, **_kwargs):
+            return {"exit": 0, "timed_out": False, "truncated": False, "output": payload}
+
+        saved = bounded.bounded_run
+        try:
+            bounded.bounded_run = fake_run
+            record = bounded.cleanup_safety(ctx, self.facts())
+        finally:
+            bounded.bounded_run = saved
+        self.assertEqual(record["state"], "kept", record)
+        self.assertIn("unreadable", record["reason"])
+        # And with no custody indication the default path still performs no scan.
+        ctx, _backing = self.layout()
+        try:
+            bounded.bounded_run = fake_run
+            self.assertIsNone(bounded.cleanup_safety(ctx, self.facts()))
+        finally:
+            bounded.bounded_run = saved
+
+    def test_a_malformed_attachment_is_an_unknown_detach_post_state(self):
+        # Parser to the detach POST-STATE only: the pre-attempt binding is valid,
+        # so the one attempt really begins, and then the post-state read is
+        # malformed. Unreadable facts can never read as "detached", whatever the
+        # exit code says, and the backing is retained.
+        ctx, backing = self.layout()
+        self.request(ctx, backing)
+        good = {"images": [{"image-path": backing,
+                            "system-entities": [{"dev-entry": "/dev/disk7"},
+                                                {"dev-entry": "/dev/disk7s1",
+                                                 "mount-point": "/Volumes/OxDetach",
+                                                 "volume-uuid": DETACH_UUID}]}]}
+        # Genuinely malformed: a non-string mount point is not a readable fact.
+        malformed = {"images": [{"image-path": backing,
+                                 "system-entities": [{"dev-entry": "/dev/disk7s1", "mount-point": 7}]}]}
+        calls = []
+
+        def fake_run(*_args, **_kwargs):
+            calls.append(len(calls))
+            payload = plistlib.dumps(good if len(calls) == 1 else malformed).decode()
+            return {"exit": 0, "timed_out": False, "truncated": False, "output": payload}
+
+        facts = self.facts(mount_point=lambda attempted: not attempted)
+        # Use the REAL parser for both reads (binding and post-state).
+        facts.attachments = lambda target, timeout=None: bounded.image_attachments(target, timeout)
+        facts.stats["/dev/disk7s1"] = types.SimpleNamespace(st_rdev=42)
+        saved = bounded.bounded_run
+        try:
+            bounded.bounded_run = fake_run
+            record = bounded.post_census_detach(ctx, facts)
+        finally:
+            bounded.bounded_run = saved
+        # The request bound and exactly one attempt really ran…
+        self.assertTrue(record["attempted"], record)
+        self.assertEqual(len(facts.detached), 1, facts.detached)
+        self.assertGreaterEqual(len(calls), 2, "the post-state read did not happen")
+        # …and its post-state is unknown, not detached, with the backing retained.
+        self.assertEqual((record["post_state"], record["qualified"]), ("unknown", False), record)
+        self.assertEqual(record["state"], "failed", record)
+        self.assertTrue(os.path.isfile(backing), "the backing was removed")
+
+    def test_the_fixture_child_imports_every_module_it_uses(self):
+        # The fixture body is a fresh python child: a module it reaches through a
+        # dotted name must be imported there, or it dies with NameError before any
+        # mount exists. This parses the body, proves every such root is imported,
+        # and executes the import line so the binding is real.
+        body = DETACH_CASE
+        tree = ast.parse(body)
+        imported, assigned = set(), set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add((node.module or "").split(".")[0])
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                assigned.add(node.id)
+            elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                assigned.add(node.name)
+        roots = {node.value.id for node in ast.walk(tree)
+                 if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)} - assigned
+        missing = sorted(roots - imported)
+        self.assertEqual(missing, [], f"the fixture uses unimported modules: {missing}")
+        self.assertIn("re", imported)
+        # Execute every module-level import the child runs (the prologue's and the
+        # fixture's own) and prove the modules it reaches are really bound.
+        imports = [node for node in tree.body if isinstance(node, ast.Import)]
+        self.assertTrue(imports)
+        namespace = {}
+        for node in imports:
+            exec(compile(ast.Module(body=[node], type_ignores=[]), "<fixture-imports>", "exec"),
+                 namespace)
+        for name in sorted(roots):
+            self.assertIn(name, namespace, f"{name} is used but not bound by an import")
+        self.assertTrue(callable(namespace["re"].fullmatch), "the import line does not bind re")
+
+    def test_the_fixture_accepts_the_two_disk_attachment(self):
+        # The qualification fixture must accept an image with more than one
+        # whole-disk entity and name the mounted one.
+        source = inspect.getsource(bounded)  # keep the import used
+        fixture_source = DETACH_CASE
+        self.assertIn("mounted = [entity for entity in entities", fixture_source)
+        self.assertIn('device = mounted[0]["dev-entry"]', fixture_source)
+        self.assertNotIn("if len(wholes) != 1", fixture_source)
+        self.assertNotIn('"device": wholes[0]', fixture_source)
+
+    def test_the_child_runner_polls_and_stops_on_withdrawal(self):
+        # A fake process over a real pipe: no child, so this stays pure. While the
+        # child still runs, a withdrawn authority must stop it; an allowed one must
+        # not. `bounded_run` owns and closes the read end.
+
+        class FakeChild:
+            returncode = None
+
+            class _Stdout:
+                def __init__(self, fd):
+                    self.fd = fd
+
+                def fileno(self):
+                    return self.fd
+
+            def __init__(self, fd):
+                self.stdout = self._Stdout(fd)
+                self.killed = False
+
+            def poll(self):
+                return self.returncode
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        def case(still_allowed, exit_code):
+            read_fd, write_fd = os.pipe()
+            child = FakeChild(read_fd)
+
+            def spawn(argv, **kwargs):
+                os.write(write_fd, b"partial output")
+                if exit_code is not None:  # a child that finished: EOF, no polling
+                    child.returncode = exit_code
+                    os.close(write_fd)
+                return child
+
+            result = bounded.bounded_run(["/bin/true"], 5, 64, still_allowed=still_allowed, spawn=spawn)
+            if exit_code is None:  # still "running" when it was stopped: close our end
+                os.close(write_fd)
+            return child, result
+
+        asked = []
+
+        def withdrawn():
+            asked.append(1)
+            return False, "a fault is latched mid-attempt"
+
+        child, result = case(withdrawn, None)
+        self.assertTrue(asked, "authority was never re-checked while the child ran")
+        self.assertTrue(child.killed, "withdrawn authority did not kill the running child")
+        self.assertEqual(result["withdrawn"], "a fault is latched mid-attempt")
+        self.assertFalse(result["timed_out"])
+
+        child, result = case(lambda: (True, None), 0)
+        self.assertFalse(child.killed, "an allowed, finished child was killed")
+        self.assertIsNone(result["withdrawn"])
+        self.assertEqual(result["exit"], 0)
+
+    def test_success_requires_a_zero_exit_and_a_detached_post_state(self):
+        for attempt, mount_point in (({"exit": None, "timed_out": False, "error": None, "output": ""}, False),
+                                     ({"exit": 0, "timed_out": False, "error": "ENOENT", "output": ""}, False)):
+            ctx, backing = self.layout()
+            self.request(ctx, backing)
+            record = bounded.post_census_detach(ctx, self.facts(attempt=attempt, mount_point=mount_point))
+            self.assertFalse(record["qualified"], record)
+            self.assertNotEqual(record["state"], "detached", record)
+
+    def test_the_marker_records_a_failed_detach_as_unconcluded(self):
+        self.assertIn("detach", bounded.MARKER_REASONS)
+        self.assertNotIn("detach", bounded.MARKER_EXPIRABLE_REASONS)
+        sandbox = Path(tempfile.mkdtemp(prefix="detach-marker.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(sandbox), True)
+        root = os.path.join(str(sandbox), "oxide-proof.bbb")
+        os.mkdir(root, 0o700)
+        document = bounded.marker_document(bounded.new_run_id(), root, FixtureProbe())
+        bounded.write_marker(root, document, FixtureProbe())
+        updated = bounded.record_conclusion(root, document["run_id"], FixtureProbe(), "failed", "none",
+                                            "detach")
+        self.assertEqual((updated["outcome"], updated["closure"], updated["kept_reason"]),
+                         ("failed", "none", "detach"))
+        self.assertIsNone(updated["concluded_unix"])
 
 
 class PureSettlement(unittest.TestCase):
@@ -6499,6 +8012,274 @@ sys.exit(qualify.bounded(work, start + 2 * 10**9, start + 3 * 10**9))
         CASES.append({"case": "fixture_deadline", "exit": [result.returncode, late.returncode]})
 
 
+# Post-census detach (oxide#191): the runner detaches, at most once, the exact
+# image a proof publishes a request for -- and only after its own certain empty
+# census. These are the only cases here that attach a real volume; each uses a
+# tiny 8 MiB sparse image in the case's own evidence directory, attaches it with
+# `-owners on`, and (for the two refusal cases) removes its own fixture after the
+# nested guard has exited.
+DETACH_CASE = fixture("""
+import json, os, plistlib, re, subprocess, sys
+case = os.environ["CASE_DIR"]
+evidence = os.environ["OXIDE_PROOF_EVIDENCE"]
+token = os.environ["CASE_TOKEN"]
+# "request": the image lives in the evidence directory and a request is
+# published. "unrequested": the image lives in the guard's own scratch and no
+# request is published, so the fail-closed pre-cleanup scan must keep the root.
+mode = os.environ.get("CASE_DETACH_MODE", "request")
+mount = "/Volumes/OxD" + token[:8]
+image = os.path.join(evidence if mode == "request" else os.environ["OXIDE_TASK_SCRATCH_ROOT"],
+                     "detach.sparseimage")
+def run(*argv, timeout=90):
+    return subprocess.run(list(argv), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, timeout=timeout)
+created = run("/usr/bin/hdiutil", "create", "-size", "8m", "-fs", "APFS", "-volname", "OxD" + token[:8],
+              "-type", "SPARSE", image)
+if created.returncode != 0:
+    print("image create failed: " + created.stderr.decode(errors="replace"), file=sys.stderr)
+    raise SystemExit(3)
+# The opt-in custody indication is published ATOMICALLY BEFORE the attach, so an
+# ambiguous attach, a failed parse or a wrong UUID below still leaves the guard
+# able to keep this root instead of cleaning a live backing.
+_custody = os.path.join(evidence, "image-custody.json")
+with open(_custody + ".tmp", "w") as handle:
+    json.dump({"version": 1, "backings": [os.path.realpath(image)]}, handle)
+os.replace(_custody + ".tmp", _custody)
+if not os.path.isfile(_custody):
+    print("custody indication was not published before attach", file=sys.stderr)
+    raise SystemExit(3)
+attached = run("/usr/bin/hdiutil", "attach", "-owners", "on", "-nobrowse", "-noverify", "-plist", image)
+if attached.returncode != 0:
+    print("attach failed: " + attached.stderr.decode(errors="replace"), file=sys.stderr)
+    raise SystemExit(3)
+entities = plistlib.loads(attached.stdout)["system-entities"]
+wholes = [entity["dev-entry"] for entity in entities
+          if re.fullmatch(r"/dev/disk\d+", entity.get("dev-entry", ""))]
+mounts = [entity["mount-point"] for entity in entities if entity.get("mount-point")]
+# An APFS image attaches as a container whole disk PLUS a synthesized whole disk,
+# with the volume mounted from a slice of one of them. Any number of whole-disk
+# entities is fine; exactly one mounted entity is not.
+mounted = [entity for entity in entities if entity.get("mount-point") == mount]
+if not wholes or mounts != [mount] or len(mounted) != 1 or not mounted[0].get("dev-entry"):
+    print("unexpected attachment " + repr((wholes, mounts)), file=sys.stderr)
+    raise SystemExit(3)
+# The detach request names the MOUNTED entity's own device: a whole-disk name can
+# be the container, which is not what the mount is bound to.
+device = mounted[0]["dev-entry"]
+uuid = plistlib.loads(run("/usr/sbin/diskutil", "info", "-plist", mount).stdout)["VolumeUUID"]
+if mode == "request":
+    request = {"version": 1, "backing": os.path.realpath(image), "mount": mount, "device": device,
+               "volume_uuid": uuid, "note": "supervisor suite detach case"}
+    request.update(json.loads(os.environ.get("CASE_DETACH_OVERRIDE") or "{}"))
+    temporary = os.path.join(evidence, "detach-request.json.tmp")
+    with open(temporary, "w") as handle:
+        json.dump(request, handle)
+    os.replace(temporary, os.path.join(evidence, "detach-request.json"))
+
+with open(os.path.join(case, "volume.json"), "w") as handle:
+    json.dump({"mount": mount, "device": device, "uuid": uuid, "image": image,
+               "wholes": wholes}, handle)
+print("detach fixture ready: " + mount + " " + device + " wholes " + repr(wholes))
+""")
+
+
+class DetachReal(unittest.TestCase):
+    """The three real post-census detach cases. Each one owns its image, keeps
+    its evidence, and removes its own fixture mount after the nested guard has
+    exited (a successful case finds it already gone)."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="detach_case.", dir=nested_root())).resolve()
+        self.started = now_ns()
+        self.token = secrets.token_hex(4)
+
+    def guard(self, override=None, inject=(), mode="request"):
+        extra = {"CASE_TOKEN": self.token, "CASE_DETACH_MODE": mode}
+        if override is not None:
+            extra["CASE_DETACH_OVERRIDE"] = json.dumps(override)
+        env = dict(os.environ, CASE_DIR=str(self.dir), CASE_TOKEN=self.token,
+                   FIXTURE_DEADLINE_NS=str(self.started + FALLBACK_S * NS),
+                   OXIDE_SUPERVISOR_INJECT=",".join(inject))
+        # An inherited root would make the nested guard adopt it, and an adopted
+        # root owns no image to detach: this case needs the owned `--root-parent`.
+        env.pop("OXIDE_TASK_SCRATCH_ROOT", None)
+        env.update(extra)
+        args = [sys.executable, str(SUPERVISOR), "--limit", "40", "--root-parent", str(self.dir),
+                "--evidence", str(self.dir / "evidence"), "--", sys.executable, "-c", DETACH_CASE]
+        with open(self.dir / "guardian.log", "wb") as log:
+            guardian = subprocess.Popen(args, env=env, stdout=subprocess.DEVNULL, stderr=log)
+            try:
+                self.code = guardian.wait(timeout=VERDICT_S - (now_ns() - self.started) / NS)
+            finally:
+                if guardian.poll() is None:
+                    guardian.kill()
+                    guardian.wait(5)
+        self.receipt = json.loads((self.dir / "evidence" / "receipt.json").read_text())
+        self.volume = json.loads((self.dir / "volume.json").read_text())
+        CASES.append({"case": self._testMethodName, "exit": self.code, "phase": self.receipt["phase"],
+                      "dir": str(self.dir), "detach": self.receipt.get("detach"),
+                      # The request-free keep is recorded under `cleanup`, which the
+                      # qualification oracle verifies; without it the row cannot be
+                      # checked at all.
+                      "cleanup": self.receipt.get("cleanup"),
+                      "wall_s": round((now_ns() - self.started) / NS, 3), "kept": str(self.dir)})
+
+    def remove_fixture_mount(self):
+        # This case's own image, after the nested guard exited: fixture hygiene,
+        # never a closure claim about the guard's session.
+        subprocess.run(["/usr/bin/hdiutil", "detach", self.volume["mount"]], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        self.assertFalse(os.path.exists(self.volume["mount"]), "the fixture mount survived its own detach")
+
+    def test_success_detaches_exactly_the_requested_volume(self):
+        self.guard()
+        detach = self.receipt["detach"]
+        self.assertEqual((detach["state"], detach["qualified"], detach["post_state"]),
+                         ("detached", True, "detached"), detach)
+        self.assertEqual((detach["backing"], detach["mount"], detach["device"]),
+                         (self.volume["image"], self.volume["mount"], self.volume["device"]))
+        self.assertTrue(detach["attempted"])
+        self.assertEqual(self.code, 0, self.receipt["outcome"])
+        self.assertFalse(os.path.exists(self.volume["mount"]), "the requested mount was not detached")
+        self.assertFalse(os.path.exists(self.receipt["scratch"]), "owned scratch was kept")
+        self.assertTrue(os.path.isfile(self.volume["image"]), "the evidence backing was removed")
+
+    def test_an_unbound_identity_is_refused_before_any_detach(self):
+        self.guard(override={"volume_uuid": "11111111-2222-3333-4444-555555555555"})
+        detach = self.receipt["detach"]
+        self.assertEqual((detach["state"], detach["attempted"], detach["qualified"]),
+                         ("refused", False, False), detach)
+        self.assertIn("UUID", detach["reason"], detach["reason"])
+        self.assertEqual(self.code, 125)
+        self.assertTrue(os.path.exists(self.volume["mount"]), "a refused request still detached")
+        self.assertTrue(os.path.exists(self.receipt["scratch"]), "the refused root was cleaned")
+        self.remove_fixture_mount()
+
+    def test_an_unrequested_attachment_keeps_the_owned_root(self):
+        # A proof that failed before publishing its request may still have its
+        # image attached inside the guard's own scratch. Cleaning that root would
+        # delete a backing under a live mount, so the fail-closed scan keeps it.
+        self.guard(mode="unrequested")
+        # No request: no detach attempt and no `detach` object at all. The
+        # separate fail-closed cleanup check is what keeps the root.
+        self.assertIsNone(self.receipt.get("detach"), "a request-free run recorded a detach object")
+        kept = self.receipt["cleanup"]
+        self.assertEqual(kept["state"], "kept")
+        # Stable semantics, not a transcript phrase: the declared backing is named
+        # and the reason says nothing was positively detached.
+        self.assertEqual(kept["unrequested"], [self.volume["image"]])
+        self.assertIn("never positively detached", kept["reason"])
+        self.assertEqual(self.code, 125)
+        self.assertTrue(os.path.exists(self.receipt["scratch"]), "the root holding the image was cleaned")
+        self.assertTrue(os.path.isfile(self.volume["image"]), "the backing under the live mount was removed")
+        self.assertTrue(os.path.exists(self.volume["mount"]), "the unrequested attachment was detached")
+        self.remove_fixture_mount()
+
+    def test_a_stuck_detach_child_is_closed_by_the_custodian(self):
+        # A REAL injected stuck child: the detach "child" is a live `sleep` the
+        # monitor cannot reap. The custodian must pin it by identity, signal it and
+        # observe it gone, and nothing may be cleaned up.
+        self.guard(inject=["detach-stuck-child"])
+        detach = self.receipt["detach"]
+        self.assertEqual((detach["qualified"], detach["reaped"]), (False, False), detach)
+        self.assertEqual(self.code, 125)
+        # `guard()` loaded the PERSISTED receipt, so this is an integrated
+        # receipt-path check: the monitor handed the child over by PID AND start
+        # time, never reaped it afterwards, and the custodian's pin, signal and
+        # observation reached the file because the drain runs before the final
+        # publication.
+        self.assertEqual((detach.get("custodian_owned"), detach.get("custodian_closed")), (True, True), detach)
+        records = [r for r in self.receipt["custodian"] if r["event"].startswith("detach_child_")]
+        pinned = [r for r in records if r["event"] == "detach_child_pinned"]
+        self.assertTrue(pinned, records)
+        self.assertEqual(pinned[0]["observation"], "live", records)
+        self.assertTrue(typed_int(pinned[0]["start"]), pinned)
+        self.assertTrue([r for r in records if r["event"] == "detach_child_signal"], records)
+        observed = [r for r in records if r["event"] == "detach_child_observed"]
+        self.assertTrue(observed and observed[0]["closed"] is True, records)
+        pid = pinned[0]["pid"]
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+        self.assertTrue(os.path.exists(self.receipt["scratch"]), "the root was cleaned under a live child")
+        self.remove_fixture_mount()
+
+    def test_an_unreadable_identity_closes_the_child_in_the_monitor(self):
+        # A REAL live detach child plus an unreadable identity lookup: the monitor
+        # cannot name it by start, so it stops and reaps its own direct child
+        # inside the custodian's window and reports that closure truthfully.
+        self.guard(inject=["detach-stuck-child", "detach-identity-unreadable"])
+        detach = self.receipt["detach"]
+        self.assertEqual(self.code, 125)
+        self.assertIsNotNone(detach.get("identity_problem"), detach)
+        self.assertEqual((detach.get("reaped"), detach.get("reaped_by")), (True, "monitor"), detach)
+        self.assertEqual(detach["qualified"], False)
+        # Durable facts only: the monitor's own close is recorded in the detach
+        # object, whatever phase the monitor published last.
+        self.assertEqual(detach.get("reap_timed_out"), False, detach)
+        records = [r for r in self.receipt["custodian"] if r["event"].startswith("detach_child_")]
+        self.assertFalse([r for r in records if r["event"] == "detach_child_signal"],
+                         "an identity-less child was handed to the custodian anyway")
+        self.assertFalse([r for r in records if r["event"] == "detach_child_pinned"], records)
+        self.assertTrue(os.path.exists(self.receipt["scratch"]), "the root was cleaned")
+        self.remove_fixture_mount()
+
+    def test_an_unreadable_identity_can_be_handed_off_by_parentage(self):
+        # The monitor cannot close it itself here (and only ITS lookups are forced
+        # unreadable), so it hands the child over by PARENTAGE while still holding
+        # it unreaped; the custodian's own lookup is readable, so it signals and
+        # positively observes it.
+        self.guard(inject=["detach-stuck-child", "detach-identity-unreadable",
+                           "detach-handoff-unreadable"])
+        detach = self.receipt["detach"]
+        self.assertEqual(self.code, 125)
+        self.assertIsNotNone(detach.get("identity_problem"), detach)
+        self.assertEqual((detach.get("custodian_owned"), detach.get("custodian_closed")), (True, True),
+                         detach)
+        records = [r for r in self.receipt["custodian"] if r["event"].startswith("detach_child_")]
+        pinned = [r for r in records if r["event"] == "detach_child_pinned"]
+        self.assertTrue(pinned and pinned[0].get("identity") == "parentage", records)
+        observed = [r for r in records if r["event"] == "detach_child_observed"]
+        self.assertTrue(observed and observed[0]["closed"] is True, records)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pinned[0]["pid"], 0)
+        self.assertTrue(os.path.exists(self.receipt["scratch"]), "the root was cleaned")
+        self.remove_fixture_mount()
+
+    def test_a_custodian_side_unreadable_lookup_refuses_without_signalling(self):
+        # Only the custodian's lookups are forced unreadable: the monitor's handoff
+        # is well formed, but the receiver cannot verify it, so it refuses, records
+        # that, and acknowledges without signalling; the run stays unqualified and
+        # the root is kept.
+        self.guard(inject=["detach-stuck-child", "detach-identity-unreadable",
+                           "detach-handoff-unreadable", "detach-custodian-identity-unreadable"])
+        detach = self.receipt["detach"]
+        self.assertEqual(self.code, 125)
+        self.assertEqual((detach.get("custodian_owned"), detach.get("custodian_closed")), (False, False),
+                         detach)
+        records = [r for r in self.receipt["custodian"] if r["event"].startswith("detach_child_")]
+        refused = [r for r in records if r["event"] == "detach_child_refused"]
+        self.assertTrue(refused and refused[0]["observation"].startswith("identity unreadable"),
+                        records)
+        self.assertFalse([r for r in records if r["event"] == "detach_child_signal"], records)
+        self.assertTrue(os.path.exists(self.receipt["scratch"]), "the root was cleaned")
+        self.remove_fixture_mount()
+
+    def test_a_failed_attempt_keeps_the_mount_and_is_unqualified(self):
+        self.guard(inject=["detach-fail"])
+        detach = self.receipt["detach"]
+        self.assertEqual((detach["state"], detach["qualified"], detach["post_state"]),
+                         ("failed", False, "still_mounted"), detach)
+        self.assertEqual(self.code, 125)
+        # The published outcome is decided before the detach message latches its
+        # fault, so the failure is durable in the detach object and the exit code.
+        self.assertEqual((detach["state"], detach["qualified"], detach["post_state"]),
+                         ("failed", False, "still_mounted"), detach)
+        self.assertTrue(os.path.exists(self.volume["mount"]), "a failed detach removed the mount")
+        self.assertTrue(os.path.exists(self.receipt["scratch"]), "the kept root was cleaned")
+        self.remove_fixture_mount()
+
+
+
 class Results(unittest.TextTestResult):
     outcomes = []
 
@@ -6541,7 +8322,7 @@ def main():
                                            PureMarker, PureSweep, PureExistingParent,
                                            PureProtectionAndLifecycle, QualifyEntry,
                                            PureQualificationTopology, PureClosureDecision,
-                                           PureSettlement, PureInterleavedConfirmation))
+                                           PureSettlement, PureInterleavedConfirmation, PureDetach))
     ok = runner.run(pure).wasSuccessful()
     if sys.argv[1:] != ["--pure"]:
         # Writers before and after a simulated staging step, in the outer
@@ -6551,7 +8332,8 @@ def main():
         subprocess.run([sys.executable, "-c", f"open({staged!r}, 'wb').write(bytes(4 * 1024 * 1024))"],
                        check=True, timeout=30)
         time.sleep(2.5)
-        ok = runner.run(loader.loadTestsFromTestCase(Real)).wasSuccessful() and ok
+        ok = runner.run(unittest.TestSuite([loader.loadTestsFromTestCase(Real),
+                                              loader.loadTestsFromTestCase(DetachReal)])).wasSuccessful() and ok
         write("after.bin", 1024 * 1024)
         path = os.environ.get("OXIDE_SUPERVISOR_CASES")
         if path:

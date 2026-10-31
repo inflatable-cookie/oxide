@@ -72,6 +72,18 @@ writers are outside the promise. Host free space is a sampled abort
 threshold; the owned-byte budget is monitored, not a hard ceiling. macOS
 only.
 
+Post-census image detach (oxide#191, decision ee263cea): a proof whose own
+test image must be detached publishes ONE bounded atomic `detach-request.json`
+under OXIDE_PROOF_EVIDENCE naming that image's backing, mount, device and volume
+UUID. Only on the `cleanup` decision (a certain empty census after the leader was
+reaped, with no fault) does the monitor re-derive every binding from kernel and
+`hdiutil` facts and make at most one ORDINARY detach of exactly that image,
+inside the same absolute deadline and under the still-running reserve and
+owned-byte samplers, before the owned-scratch cleanup. A refusal, failure,
+timeout, identity change or ambiguous post-state is never retried, keeps the
+mount, backing and evidence, is recorded in the receipt's `detach` object and
+ends the run unqualified (exit 125). No request means nothing changes.
+
 Default scratch (oxide#145, oxide#151): with no caller `OXIDE_TASK_SCRATCH_ROOT`
 and no `--root-parent`, the owned root is created under the owned subtree
 `<mount>/scratch/oxide` of the volume the effect-free pool selection names,
@@ -103,19 +115,23 @@ import errno
 import json
 import math
 import os
+import plistlib
 import pwd
+import re
 import secrets
 import select
 import shutil
 import signal
 import stat
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 
 NS = 1_000_000_000
+_MS = 1_000_000
 GIB = 1024 ** 3
 MIB = 1024 ** 2
 LIMIT_S = 300
@@ -201,7 +217,7 @@ MARKER_OUTCOMES = ("running", "closed", "unclosed", "failed", "retained")
 MARKER_SCOPES = ("exclusive", "hosting")
 MARKER_CLOSURES = ("positive", "none")
 MARKER_REASONS = ("none", "evidence", "unclosed", "exception", "nested-unclosed",
-                  "qualify-base", "qualify-failed")
+                  "qualify-base", "qualify-failed", "detach", "live-image")
 MARKER_EXPIRABLE_REASONS = ("evidence", "qualify-base")
 EXPIRY_S = 7 * 24 * 60 * 60
 SWEEP_TIME_BUDGET_NS = 1 * NS  # of the 10 s setup budget, checked between filesystem steps
@@ -213,6 +229,10 @@ INJECTIONS = {
     "census-uncertain-first", "reserve-low-after", "cancel-after-ack", "cancel-at-gate",
     "pump-exception", "kqueue-exception", "malformed-message", "stop-exception",
     "reserve-delay-stall", "scratch-delay-stall",
+    "detach-fail", "detach-timeout", "detach-ambiguous", "detach-withdraw",
+    "detach-reap-timeout", "detach-stuck-child",
+    "detach-identity-unreadable", "detach-handoff-unreadable",
+    "detach-custodian-identity-unreadable",
 }
 RESERVE_DELAY_S, SCRATCH_DELAY_S = 0.5, 4.0  # injected publication delays before a sampler stall
 INJECT_AFTER_GATE_NS = 1_500_000_000  # post-gate injections wait for the fixture to start
@@ -246,6 +266,10 @@ FIELDS = {  # required fields per monitor message type; bool is never accepted a
     "admission": {"waited_ns": int, "command": str, "completed": int, "marker": int},
     "admission_waiting": {"reason": str, "command": str, "completed": int, "marker": int},
     "setup": {"root": str, "scratch": str, "evidence": str, "owned": bool},
+    "detach": {"attempted": bool, "qualified": bool, "post_state": str},
+    "detach_ready": {"budget_ns": int},
+    "detach_child": {"pid": int},  # `start` is optional: a parentage-only handoff has none
+    "cleanup_kept": {"reason": str},
 }
 
 
@@ -1323,6 +1347,14 @@ class Guard:
         return self.fault
 
 
+def custodian_deadline_hit(now, absolute, inject):
+    """The custodian's deadline flag. The injected `custodian-timeout-after-monitor`
+    stands in for the deadline actor firing right after the decision, so it keeps
+    deadline semantics (exit 124); a real monitor that has not completed by the
+    exit margin is a fault, and only the absolute deadline is a real deadline."""
+    return now >= absolute or "custodian-timeout-after-monitor" in inject
+
+
 def exit_code(deadline_hit, fault, closed, status):
     """124 deadline; 125 fault or UNCLOSED; else the command's own status."""
     if deadline_hit:
@@ -1494,6 +1526,20 @@ class DefaultProbe:
         with open(path, "rb") as handle:
             return handle.read(limit + 1)
 
+    def mount_point(self, path):
+        """Whether `path` is currently a mount point (a kernel fact, not a
+        remembered path)."""
+        return os.path.ismount(path)
+
+    def attachments(self, backing, timeout=None):
+        """[(device, mount-point, volume-uuid)] of the attached image whose
+        path is exactly `backing`, or None when that is unreadable."""
+        return image_attachments(backing, DETACH_INFO_TIMEOUT_S if timeout is None else timeout)
+
+    def detach(self, mount, timeout, still_allowed=None):
+        """One bounded ORDINARY detach attempt; never a forced one."""
+        return detach_image(mount, timeout, still_allowed)
+
 
 _ATTR_BIT_MAP_COUNT = 5
 _ATTR_VOL_UUID = 0x00040000  # sys/attr.h
@@ -1534,6 +1580,799 @@ def volume_uuid(path):
     data = raw[4:20]
     return "-".join((data[0:4].hex(), data[4:6].hex(), data[6:8].hex(), data[8:10].hex(), data[10:16].hex()))
 
+
+#
+# A proof that created its own attachable image publishes ONE bounded atomic
+# request under OXIDE_PROOF_EVIDENCE after that image exists. Only then, and only
+# on the monitor's `cleanup` decision (a positive descendant census after the
+# leader was reaped), may this runner attempt exactly one ORDINARY detach of that
+# exact image -- inside the same absolute deadline and under the same sampled
+# reserve and owned-byte bounds -- before the owned scratch cleanup. A static
+# command-line mount path could not identify a volume minted by the child, so the
+# child names it and the runner re-derives every binding from kernel and
+# `hdiutil` facts. No request means the runner's behaviour is unchanged and the
+# receipt gains no detach object -- except for one fail-closed safety check: an
+# owned root that still holds an attached image it was never asked about is kept,
+# never cleaned.
+#
+# The custodian, which alone holds the fault, deadline and closure state, must
+# also AUTHORIZE the single attempt: the monitor asks over the control pipe and
+# the custodian answers with its own verdict and the wait budget that remains
+# before it would declare the monitor incomplete. A refusal, a failed or
+# timed-out attempt, an ambiguous post-state or an unreadable identity never
+# detaches, is never retried and never removes a backing: the mount, backing and
+# evidence are kept and the run is unqualified.
+DETACH_REQUEST_NAME = "detach-request.json"
+DETACH_REQUEST_VERSION = 1
+DETACH_REQUEST_MAX_BYTES = 4096
+DETACH_REQUEST_KEYS = frozenset({"version", "backing", "mount", "device", "volume_uuid", "note"})
+DETACH_TEXT_LIMITS = {"backing": 1024, "mount": 256, "device": 64, "volume_uuid": 64, "note": 256}
+DETACH_DEVICE_RE = re.compile(r"^/dev/disk[0-9]{1,4}(s[0-9]{1,3})?$")  # a whole disk or one mounted slice
+DETACH_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+DETACH_INFO_TIMEOUT_S = 10
+DETACH_INFO_MAX_BYTES = 1 * MIB  # a bounded `hdiutil info -plist` read, never an unbounded buffer
+DETACH_TIMEOUT_S = 30
+DETACH_GATE_MARGIN_NS = 1 * NS
+DETACH_GATE_WAIT_S = 5.0
+DETACH_OUTPUT_MAX_BYTES = 4096
+DETACH_POLL_S = 0.2  # how often authority is re-checked while the detach child runs
+# The opt-in image-custody indication (oxide#191). A proof that creates an
+# attachable image publishes this BEFORE attaching it, so a request-free run can
+# still be kept when the image is mounted or attached-but-unmounted at cleanup.
+# No indication means no scan at all: the default runner path is unchanged and
+# gains no new failure mode.
+CUSTODY_NAME = "image-custody.json"
+CUSTODY_VERSION = 1
+CUSTODY_MAX_BYTES = 2048
+CUSTODY_MAX_BACKINGS = 8
+DETACH_MIN_BUDGET_NS = 8 * NS  # below this the whole sequence cannot fit the custodian's window
+DRAIN_WAIT_S = 0.5  # one short bounded drain of post-decision records, inside the window
+INFO_ORPHANS = []  # attachment reads whose child was not reaped; custody is never dropped
+DETACH_POST_RESERVE_S = 5.0  # kept for the post-state read after the child
+DETACH_STATES = ("refused", "detached", "failed", "timed_out", "withdrawn", "unknown")
+DETACH_POST_STATES = ("detached", "still_mounted", "still_attached", "unknown")
+HDIUTIL = "/usr/bin/hdiutil"
+_ABSENT = object()  # a request file that does not exist, distinct from one that is not an object
+
+
+def _bounded_tail(tail, chunk, cap=DETACH_OUTPUT_MAX_BYTES):
+    """The last `cap` bytes of `tail + chunk`, so peak memory is one cap plus one
+    read, whatever a child writes."""
+    combined = tail + chunk
+    return combined[-cap:] if len(combined) > cap else combined
+
+
+def bounded_run(argv, timeout, cap=DETACH_OUTPUT_MAX_BYTES, still_allowed=None, spawn=None):
+    """One bounded child: at most `timeout` seconds and at most `cap` bytes kept,
+    however much it writes. `still_allowed()` is asked at `DETACH_POLL_S`
+    intervals while the child runs, so authority withdrawn mid-attempt stops it
+    instead of waiting out the bound; a False answer KILLs and reaps the child
+    here and is reported as `withdrawn`. Returns the attempt's own facts (never
+    raises for a spawn failure). `spawn` substitutes the process factory."""
+    if timeout <= 0:  # a spent window never spawns a child at all
+        return {"exit": None, "timed_out": False, "error": "no time left in the window", "output": "",
+                "truncated": False, "withdrawn": None, "reap_timed_out": False, "reaped": False,
+                "handle": None}
+    spawn = spawn or subprocess.Popen
+    try:
+        child = spawn(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT, close_fds=True)
+    except OSError as error:
+        return {"exit": None, "timed_out": False, "error": errno_name(error), "output": "",
+                "truncated": False, "withdrawn": None, "reap_timed_out": False, "reaped": False,
+                "handle": None}
+    deadline = time.monotonic() + timeout
+    tail, seen, timed_out, withdrawn, reap_timed_out, reaped = b"", 0, False, None, False, False
+    poll_at = time.monotonic() + DETACH_POLL_S
+    try:
+        fd = child.stdout.fileno()
+    except BaseException as error:
+        return _unreaped_record(child, error, deadline)
+    try:
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                if still_allowed is not None and time.monotonic() >= poll_at:
+                    allowed, reason = still_allowed()
+                    poll_at = time.monotonic() + DETACH_POLL_S
+                    if not allowed:
+                        withdrawn = reason or "authority withdrawn"
+                        break
+                try:
+                    ready, _, _ = select.select(
+                        [fd], [], [], max(0.0, min(0.25, remaining,
+                                                   max(0.0, poll_at - time.monotonic()))))
+                except OSError:
+                    ready = [fd]  # readable in the failing sense: the read reports it
+                if not ready:
+                    if child.poll() is not None:
+                        continue  # drain what is left, then EOF ends the loop
+                    continue
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                seen += len(chunk)
+                tail = _bounded_tail(tail, chunk, cap)
+        finally:
+            # The reap is bounded by what is left of the SAME deadline: no extra
+            # fixed wait and no round that can run past it. Any exception here
+            # still hands the live child back through the outer handler.
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            if timed_out or withdrawn is not None:
+                try:
+                    child.kill()
+                except OSError:
+                    pass
+            for _round in (1, 2, 3):  # three bounded rounds, each inside the deadline
+                remaining = max(0.0, deadline - time.monotonic())
+                try:
+                    reaped = child.wait(timeout=remaining) is not None
+                except subprocess.TimeoutExpired:
+                    reaped = False
+                if reaped:
+                    break
+                if remaining <= 0:
+                    break  # the window is spent: the child stays unaccounted
+                reap_timed_out = True
+                try:
+                    child.kill()
+                except OSError:
+                    pass
+    except BaseException as error:
+        return _unreaped_record(child, error, deadline)
+    child.stdout = None
+    status = child.returncode
+    return {"exit": status, "timed_out": timed_out, "error": None,
+            "output": tail.decode("utf-8", "replace"), "truncated": seen > len(tail),
+            "withdrawn": withdrawn, "reap_timed_out": reap_timed_out, "reaped": reaped,
+            "handle": None if reaped else child}
+
+
+def detach_text(document, name):
+    """One bounded, single-line request field, or None when it is not one."""
+    if not isinstance(document, dict):
+        return None
+    value = document.get(name)
+    if not isinstance(value, str) or not value:
+        return None
+    if len(value.encode("utf-8", "replace")) > DETACH_TEXT_LIMITS[name]:
+        return None
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        return None
+    return value
+
+
+def read_detach_request(evidence, probe):
+    """(document, problem) for this run's request, or (_ABSENT, None) when the
+    proof published none. Bounded, symlink-refusing and never partly trusted; a
+    document that is present but not an object (including JSON `null`) is a
+    refusal, never an absent request."""
+    path = os.path.join(evidence, DETACH_REQUEST_NAME)
+    try:
+        info = probe.lstat(path)
+    except FileNotFoundError:
+        return _ABSENT, None
+    except OSError as error:
+        return None, f"request {errno_name(error)}"
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return None, "request is not a regular file"
+    if info.st_size > DETACH_REQUEST_MAX_BYTES:
+        return None, f"request is over {DETACH_REQUEST_MAX_BYTES} bytes"
+    if os.path.dirname(os.path.realpath(path)) != os.path.realpath(evidence):
+        return None, "request is not directly inside this run's evidence directory"
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(DETACH_REQUEST_MAX_BYTES + 1)
+    except OSError as error:
+        return None, f"request {errno_name(error)}"
+    if len(raw) > DETACH_REQUEST_MAX_BYTES:
+        return None, f"request is over {DETACH_REQUEST_MAX_BYTES} bytes"
+    try:
+        return json.loads(raw.decode("utf-8")), None
+    except (UnicodeDecodeError, ValueError):
+        return None, "request is not a JSON document"
+
+
+def image_attachments(backing=None, timeout=DETACH_INFO_TIMEOUT_S, run=None):
+    """[(device, mount-point, volume-uuid)] for the attached image whose path is
+    exactly `backing` (or, with no backing, `[(image-path, device, mount-point,
+    volume-uuid)]` for every attachment), or None when the facts are unreadable.
+
+    Fail closed: one bounded read-only `hdiutil info`, and ANY malformed or
+    incomplete relevant structure -- a document without an images list, an image
+    that is not an object or has no path, a non-list entity list, an entity that
+    is not an object or has no device, a non-string mount or UUID, or a matching
+    image with no entities at all -- is unreadable facts (None), never a smaller
+    or empty attachment set. Callers treat None as uncertain: a detach post-state
+    is unknown and a custody check keeps the root. `run` substitutes the child
+    runner (the parser's own seam)."""
+    attempt = (run or bounded_run)([HDIUTIL, "info", "-plist"], timeout, DETACH_INFO_MAX_BYTES)
+    if attempt.get("handle") is not None:
+        # A read whose child could not be reaped is unreadable AND its custody is
+        # kept: the caller must close or hand it over before completing.
+        INFO_ORPHANS.append(attempt["handle"])
+        return None
+    if attempt["exit"] != 0 or attempt["timed_out"] or attempt["truncated"] or not attempt["output"]:
+        return None
+    try:
+        document = plistlib.loads(attempt["output"].encode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(document, dict):
+        return None
+    images = document.get("images")
+    if not isinstance(images, list):
+        return None
+    canonical = None if backing is None else os.path.realpath(backing)
+    # Validate EVERY image and entity before filtering for the declared backing: a
+    # malformed unrelated entry could be the one that belongs to it, so it makes
+    # the whole answer unreadable rather than "this backing is not attached".
+    parsed, paths = [], []
+    for image in images:
+        if not isinstance(image, dict):
+            return None
+        path = image.get("image-path")
+        if not isinstance(path, str) or not path:
+            return None
+        paths.append(os.path.realpath(path))
+        entities = image.get("system-entities", [])
+        if not isinstance(entities, list) or not entities:
+            # An attached image with no entities (or a non-list) is not a fact that
+            # proves anything is detached or clear.
+            return None
+        for entity in entities:
+            if not isinstance(entity, dict):
+                return None
+            device = entity.get("dev-entry")
+            if not isinstance(device, str) or not device:
+                return None
+            mount = entity.get("mount-point")
+            if mount is not None and (not isinstance(mount, str) or not mount):
+                return None
+            identifier = entity.get("volume-uuid")
+            if identifier is not None and (not isinstance(identifier, str) or not identifier):
+                return None
+            parsed.append((path, device, mount, identifier.lower() if identifier else None))
+    if canonical is None:
+        return [(device, mount, identifier) for _path, device, mount, identifier in parsed]
+    mine = [row for row in parsed if os.path.realpath(row[0]) == canonical]
+    if canonical in paths and not mine:
+        return None  # the declared backing is attached with no entities at all
+    return [(device, mount, identifier) for _path, device, mount, identifier in mine]
+
+
+def read_custody(ctx, probe):
+    """(backings, problem) for this run's opt-in image-custody indication, or
+    (None, None) when the proof published none. Bounded, symlink-refusing and
+    never partly trusted: a present but unreadable indication is a problem, never
+    an absent one."""
+    path = os.path.join(ctx["evidence"], CUSTODY_NAME)
+    try:
+        info = probe.lstat(path)
+    except FileNotFoundError:
+        return None, None
+    except OSError as error:
+        return None, f"custody indication {errno_name(error)}"
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return None, "custody indication is not a regular file"
+    if info.st_size > CUSTODY_MAX_BYTES:
+        return None, f"custody indication is over {CUSTODY_MAX_BYTES} bytes"
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(CUSTODY_MAX_BYTES + 1)
+    except OSError as error:
+        return None, f"custody indication {errno_name(error)}"
+    if len(raw) > CUSTODY_MAX_BYTES:
+        return None, f"custody indication is over {CUSTODY_MAX_BYTES} bytes"
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None, "custody indication is not a JSON document"
+    if not isinstance(document, dict) or set(document) != {"version", "backings"}:
+        return None, "custody indication is not an object with exactly version and backings"
+    if not typed(document.get("version"), int) or document.get("version") != CUSTODY_VERSION:
+        return None, f"custody indication version is not {CUSTODY_VERSION}"
+    backings = document.get("backings")
+    if not isinstance(backings, list) or not backings or len(backings) > CUSTODY_MAX_BACKINGS:
+        return None, f"custody indication names no bounded non-empty backing list (max {CUSTODY_MAX_BACKINGS})"
+    root, evidence = probe.realpath(ctx["root"]), probe.realpath(ctx["evidence"])
+    for backing in backings:
+        if not isinstance(backing, str) or not backing or len(backing) > DETACH_TEXT_LIMITS["backing"]:
+            return None, "custody indication names an unbounded backing"
+        if any(ord(character) < 32 for character in backing):
+            return None, "custody indication names a backing with control characters"
+        if not os.path.isabs(backing) or os.path.normpath(backing) != backing:
+            return None, "custody indication names a non-canonical backing"
+        if probe.realpath(backing) != backing:
+            return None, "custody indication names a backing that resolves through a symlink"
+        if not (backing.startswith(root + os.sep) or backing.startswith(evidence + os.sep)):
+            return None, "custody indication names a backing outside this run's owned root and evidence"
+    return [str(backing) for backing in backings], None
+
+
+def custody_problems(paths, probe, facts=None, timeout=DETACH_INFO_TIMEOUT_S):
+    """Why a decayed custody record must keep the root, from attachment facts and
+    device nodes: a mounted entity is live, an entity without a mount point is
+    live when its /dev node still exists (attached but unmounted) and stale
+    metadata only when that node is positively gone; unreadable facts are
+    uncertain and keep. Am empty result means the backings are positively
+    detached."""
+    read = facts or image_attachments
+    problems = []
+    for backing in paths:
+        rows = read(backing, timeout)
+        if rows is None:
+            problems.append(f"{backing}: attachment facts are unreadable")
+            continue
+        for device, mount, _uuid in rows:
+            if mount is not None:
+                problems.append(f"{backing}: {device} is mounted at {mount}")
+                break
+            try:
+                probe.lstat(device)
+            except FileNotFoundError:
+                continue  # stale metadata: the device node is positively gone
+            except OSError as error:
+                problems.append(f"{backing}: {device} state is unreadable ({errno_name(error)})")
+                break
+            problems.append(f"{backing}: {device} is attached without a mount point")
+            break
+    return problems
+
+
+def cleanup_safety(ctx, probe=None, facts=None):
+    """The opt-in, fail-closed pre-cleanup check. It runs ONLY when the proof
+    published an image-custody indication, so a run without one performs no scan
+    and keeps the default path unchanged. With an indication, an owned root is
+    never cleaned while one of those backings is mounted or attached-but-unmounted
+    (a proof that failed before publishing its detach request can leave exactly
+    that); a positively absent device node is stale metadata and keeps nothing.
+    Returns a bounded `cleanup` record when the root must be kept, else None."""
+    probe = probe or DefaultProbe()
+    try:
+        backings, problem = read_custody(ctx, probe)
+    except BaseException as error:
+        backings, problem = None, f"custody indication unreadable: {type_name(error)}"
+    if backings is None and problem is None:
+        return None  # not opted in: no scan and no gate, so the default path is unchanged
+    if problem is not None:
+        return {"state": "kept", "reason": problem, "unrequested": [], "at_ns": now_ns()}
+    try:
+        problems = custody_problems(backings, probe, facts)
+    except BaseException as error:
+        problems = [f"attachment facts failed: {type_name(error)}"]
+    if not problems:
+        return {"state": "ok", "reason": None, "unrequested": list(backings), "at_ns": now_ns()}
+    return {"state": "kept", "at_ns": now_ns(),
+            "reason": ("this run's owned root still holds an image it declared in its custody"
+                       " indication and never positively detached: " + "; ".join(problems[:4])),
+            "unrequested": backings[:CUSTODY_MAX_BACKINGS]}
+
+
+def close_own_child(handle, window_end_ns):
+    """Stop and reap a direct child this process still holds unreaped, bounded by
+    the custodian's window. While the parent holds the child unreaped, its PID
+    cannot be recycled, so signalling it needs no identity lookup; SIGKILL cannot
+    be ignored. Returns (reaped, status) and never raises."""
+    try:
+        pid = int(getattr(handle, "pid", 0) or 0)
+    except BaseException:
+        return False, None
+    if pid > 0:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except BaseException:
+            pass
+    try:
+        while True:
+            remaining = max(0.0, (window_end_ns - now_ns()) / NS)
+            try:
+                status = handle.wait(timeout=min(0.05, remaining))
+            except BaseException:
+                return False, None
+            if status is not None:
+                return True, status
+            if remaining <= 0.0:
+                return False, None
+    except BaseException:
+        return False, None
+
+
+def reap_own_child(handle, window_end_ns):
+    """Reap a direct child this process may already have lost, WITHOUT signalling:
+    a positively absent child's PID can be reused, so nothing is ever killed here.
+    Bounded by the custodian's window; never raises. Returns (reaped, status)."""
+    try:
+        while True:
+            remaining = max(0.0, (window_end_ns - now_ns()) / NS)
+            try:
+                status = handle.wait(timeout=min(0.05, remaining))
+            except ChildProcessError:  # already reaped or otherwise not ours now
+                return True, None
+            except BaseException:
+                return False, None
+            if status is not None:
+                return True, status
+            if remaining <= 0.0:
+                return False, None
+    except BaseException:
+        return False, None
+
+
+def _unreaped_record(child, error, deadline):
+    """A failure record that never loses a live child: one last bounded wait, and
+    the handle is handed back whenever the child is not positively reaped."""
+    reaped = False
+    try:
+        reaped = child.wait(timeout=max(0.0, deadline - time.monotonic())) is not None
+    except BaseException:
+        reaped = False
+    try:
+        child.stdout = None
+    except BaseException:
+        pass
+    return {"exit": child.returncode if reaped else None, "timed_out": False,
+            "error": type_name(error), "output": "", "truncated": False, "withdrawn": None,
+            "reap_timed_out": not reaped, "reaped": reaped, "handle": None if reaped else child}
+
+
+def _stuck_child_attempt():
+    """A REAL unruly detach child for the injected stuck-child case: started,
+    left running and left unreaped on purpose, so the custodian must identify,
+    signal and observe it after the monitor's own timeout."""
+    try:
+        child = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+    except OSError as error:
+        return {"exit": None, "timed_out": False, "error": errno_name(error), "output": "",
+                "truncated": False, "withdrawn": None, "reaped": False, "handle": None}
+    return {"exit": None, "timed_out": True, "error": None, "output": "", "truncated": False,
+            "withdrawn": None, "reaped": False, "handle": child}
+
+
+def detach_image(mount, timeout, still_allowed=None):
+    """One bounded ORDINARY detach of `mount`. Returns the attempt's own facts;
+    the caller judges the post-state separately and never trusts a zero exit."""
+    attempt = bounded_run([HDIUTIL, "detach", mount], timeout, DETACH_OUTPUT_MAX_BYTES,
+                          still_allowed=still_allowed)
+    return {"exit": attempt["exit"], "timed_out": attempt["timed_out"], "error": attempt["error"],
+            "output": attempt["output"], "truncated": attempt["truncated"],
+            "withdrawn": attempt["withdrawn"], "reap_timed_out": attempt["reap_timed_out"],
+            "reaped": attempt["reaped"], "handle": attempt.get("handle")}
+
+
+def _free_bytes(path):
+    try:
+        reading = os.statvfs(path)
+        return reading.f_bavail * reading.f_frsize
+    except OSError:
+        return None
+
+
+def detach_budget(ctx, now=None):
+    """Nanoseconds left for one detach attempt: the custodian's own wait window
+    (EXIT_MARGIN_S before the absolute deadline) less one gate margin, so a
+    bounded attempt always finishes and reports before the custodian would
+    declare the monitor incomplete."""
+    now = now_ns() if now is None else now
+    exit_at = ctx["start_ns"] + int(ctx["limit_s"] * NS) - EXIT_MARGIN_S * NS
+    return max(0, exit_at - now - DETACH_GATE_MARGIN_NS)
+
+
+_ROLE = [None]  # "monitor" or "custodian", set by each actor's constructor
+
+
+def injections():
+    return set(filter(None, os.environ.get("OXIDE_SUPERVISOR_INJECT", "").split(",")))
+
+
+def injected_unreadable():
+    """Test-only: which actor's process lookups are forced unreadable. Scoped to
+    ONE actor, so the other actor's identity facts stay readable and each
+    handoff outcome can be exercised on its own."""
+    active = injections()
+    if _ROLE[0] == "monitor" and "detach-identity-unreadable" in active:
+        return True
+    return _ROLE[0] == "custodian" and "detach-custodian-identity-unreadable" in active
+
+
+def process_row(pid):
+    """(row, problem) from `Kinfo.one(pid)`, never raising. `problem is None`
+    means the facts were readable (and `row is None` that the process is
+    positively absent); a failed size/read or a malformed row is an unreadable
+    observation and is never silently turned into "gone" or into an identity."""
+    if not typed(pid, int) or pid <= 0:
+        return None, "no usable pid"
+    if injected_unreadable():
+        return None, "injected unreadable identity"
+    try:
+        row = Kinfo.one(pid)
+    except BaseException as error:
+        return None, f"{type_name(error)}"
+    if row is None:
+        return None, None
+    if not (typed(row.get("pid"), int) and typed(row.get("start"), int)
+            and isinstance(row.get("zombie"), bool) and typed(row.get("ppid"), int)):
+        return None, "malformed process row"
+    return row, None
+
+
+def detach_child_identity(row, pid, start, monitor_pid):
+    """Whether an observed kinfo_proc row is still the exact child a monitor handed
+    over: same PID, same start time, still that monitor's child and not a zombie.
+    A recycled bare PID fails at least one of those, so it is never signalled.
+    The row is the real `Kinfo.parse` shape, whose liveness field is the boolean
+    `zombie` (there is no `stat` key)."""
+    return bool(row is not None and row.get("pid") == pid and row.get("start") == start
+                and row.get("ppid") == monitor_pid and row.get("zombie") is False)
+
+
+def detach_authorization(fault, deadline_hit, now, exit_at):
+    """The custodian's verdict for one post-census detach attempt, and the wait
+    budget it may spend. Pure: the custodian holds the only authority over
+    latched faults and the deadline, and never touches the filesystem here."""
+    budget = max(0, exit_at - now - DETACH_GATE_MARGIN_NS)
+    if fault is not None:
+        return False, f"a fault is latched ({fault})", 0
+    if deadline_hit:
+        return False, "the deadline was reached before the detach", 0
+    if budget <= 0:
+        return False, "no custodian wait budget is left for one bounded detach", 0
+    return True, None, budget
+
+
+def detach_request_problems(ctx, document, probe, info_timeout=None):
+    """Why this request must not be honoured; empty only when every binding is
+    positively established from the owned layout, the kernel and `hdiutil`."""
+    problems = []
+    if not isinstance(document, dict):
+        return ["request is not an object"]
+    if set(document) - DETACH_REQUEST_KEYS:
+        problems.append("request names unknown fields")
+    if not typed(document.get("version"), int) or document.get("version") != DETACH_REQUEST_VERSION:
+        problems.append(f"request version is not {DETACH_REQUEST_VERSION}")
+    text = {}
+    for name in ("backing", "mount", "device", "volume_uuid"):
+        value = detach_text(document, name)
+        if value is None:
+            problems.append(f"request {name} is not a bounded single-line value")
+        else:
+            text[name] = value
+    if "note" in document and detach_text(document, "note") is None:
+        problems.append("request note is not a bounded single-line value")
+    if not ctx.get("owned"):
+        problems.append("this run's scratch root belongs to the caller, so it owns no image to detach")
+    if len(text) != 4:
+        return problems
+    backing, mount, device = text["backing"], text["mount"], text["device"]
+    identifier = text["volume_uuid"].lower()
+    root, evidence = probe.realpath(ctx["root"]), probe.realpath(ctx["evidence"])
+    if not os.path.isabs(backing) or os.path.normpath(backing) != backing:
+        problems.append("backing is not an absolute canonical path")
+    elif probe.realpath(backing) != backing:
+        problems.append("backing resolves through a symlink")
+    else:
+        try:
+            info = probe.lstat(backing)
+        except OSError as error:
+            problems.append(f"backing is unreadable: {errno_name(error)}")
+        else:
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                problems.append("backing is not a regular file")
+            elif not (backing.startswith(root + os.sep) or backing.startswith(evidence + os.sep)):
+                problems.append("backing is outside this run's owned root and evidence directory")
+    if not os.path.isabs(mount) or os.path.normpath(mount) != mount:
+        problems.append("mount is not an absolute canonical path")
+    elif os.path.dirname(mount) != VOLUMES or not os.path.basename(mount):
+        problems.append(f"mount is not one volume directly under {VOLUMES}")
+    elif probe.realpath(mount) != mount:
+        problems.append("mount resolves through a symlink")
+    elif not probe.mount_point(mount):
+        problems.append("mount is not a mount point")
+    if not DETACH_DEVICE_RE.match(device):
+        problems.append("device is not one /dev/disk node")
+    if not DETACH_UUID_RE.match(identifier):
+        problems.append("volume_uuid is not a UUID")
+    if problems:
+        return problems
+    rows = probe.attachments(backing, info_timeout)
+    if rows is None:
+        return ["the attachment facts are unreadable"]
+    if not [row for row in rows if row[0] == device]:
+        problems.append("the requested device is not attached from the requested backing")
+    mounted = [row for row in rows if row[1] == mount]
+    if len(mounted) != 1:
+        problems.append(f"{mount} is mounted {len(mounted)} times from the requested backing")
+    else:
+        mount_device_node, _attached_mount, attached_uuid = mounted[0]
+        if mount_device_node != device and not mount_device_node.startswith(device + "s"):
+            problems.append("the mount point is not this image's own device")
+        if attached_uuid is not None and attached_uuid != identifier:
+            problems.append("the attachment's volume UUID is not the requested UUID")
+        try:
+            node, mounted_device = probe.stat(mount_device_node).st_rdev, probe.stat(mount).st_dev
+        except OSError as error:
+            problems.append(f"the mount or device identity is unreadable: {errno_name(error)}")
+        else:
+            if node != mounted_device:
+                problems.append("the mount's device is not the attachment's own /dev node")
+    if probe.volume_uuid(mount) != identifier:
+        problems.append("the mount's volume UUID is not the requested UUID")
+    return problems
+
+
+def detach_record(ctx, document):
+    record = {"request": os.path.join(os.path.realpath(ctx["evidence"]), DETACH_REQUEST_NAME),
+              "state": "refused", "qualified": False, "attempted": False, "exit": None,
+              "timed_out": False, "withdrawn": None, "error": None, "post_state": "unknown",
+              "reason": None, "backing": None, "mount": None, "device": None, "volume_uuid": None,
+              "timeout_s": None, "budget_ns": None, "output": "", "output_truncated": False,
+              "reap_timed_out": False, "reaped": False, "late_gate": None,
+              # Only the cheap reserve read is sampled inside the custodial window;
+              # no owned-byte walk runs here (the samplers already record the peak).
+              "reserve_before": None, "reserve_after": None,
+              "deadline_ns": ctx["start_ns"] + int(ctx["limit_s"] * NS), "at_ns": now_ns()}
+    if isinstance(document, dict):
+        for name in ("backing", "mount", "device", "volume_uuid"):
+            record[name] = detach_text(document, name)
+    return record
+
+
+def post_census_detach(ctx, probe=None, authorize=None, still_allowed=None):
+    """This run's one post-census detach, or None when its proof asked for none.
+    Only the `cleanup` branch calls it, so it can only run after a positive
+    descendant census. The WHOLE sequence -- request read, identity re-derivation,
+    the custodian's authorization, the single ordinary detach and the post-state
+    read -- is bounded by one absolute deadline taken from the custodian's own
+    wait window, and each phase is clamped to what is left of it. `authorize`
+    is the one-time gate; `still_allowed` is asked again while the child runs, so
+    authority withdrawn mid-attempt kills it. Never raises: an unknown outcome
+    stays unknown, is kept and is unqualified."""
+    probe = probe or DefaultProbe()
+    record = None
+    try:
+        document, problem = read_detach_request(ctx["evidence"], probe)
+    except BaseException as error:
+        document, problem = None, f"request read failed: {type_name(error)}"
+    if document is _ABSENT and problem is None:
+        return None
+    try:
+        record = detach_record(ctx, document)
+        record["reason"] = problem
+        budget_ns = detach_budget(ctx)
+        record["budget_ns"] = budget_ns
+        if problem is not None:
+            return record
+        if budget_ns < DETACH_MIN_BUDGET_NS:
+            record["reason"] = "not enough of the custodian's wait window left for one bounded detach"
+            return record
+        deadline = time.monotonic() + budget_ns / NS
+
+        def left():
+            return max(0.0, deadline - time.monotonic())
+
+        problems = detach_request_problems(ctx, document, probe,
+                                           max(0.0, min(DETACH_INFO_TIMEOUT_S, left() * 0.25)))
+        if problems:
+            record["reason"] = "; ".join(problems)
+            return record
+        if authorize is not None:
+            wait = max(0.0, min(DETACH_GATE_WAIT_S, left() - DETACH_POST_RESERVE_S - 0.5))
+            if wait <= 0.0:
+                record["reason"] = "not enough of the custodian's wait window left to authorize a detach"
+                return record
+            allowed, reason, granted = authorize(max(0, int((left() - DETACH_POST_RESERVE_S) * NS)), wait)
+            if not allowed:
+                record["reason"] = f"the guard withdrew the authorization: {reason}"
+                return record
+            if granted:
+                deadline = min(deadline, time.monotonic() + granted / NS)
+        post_reserve = max(0.0, min(DETACH_POST_RESERVE_S, 0.25 * left()))
+        timeout = min(DETACH_TIMEOUT_S, left() - post_reserve)
+        if timeout <= 0.0:
+            record["reason"] = "not enough of the custodian's wait window left for the attempt and its post-state"
+            return record
+        record["timeout_s"] = round(timeout, 3)
+        record["reserve_before"] = _free_bytes(ctx["reserve_path"])
+        record["at_ns"] = now_ns()
+        inject = set(ctx.get("inject") or ())
+        if "detach-fail" in inject:
+            attempt = {"exit": 1, "timed_out": False, "error": None, "output": "injected failing detach",
+                       "truncated": False, "withdrawn": None, "reaped": True}
+        elif "detach-timeout" in inject:
+            attempt = {"exit": None, "timed_out": True, "error": None, "output": "injected timeout",
+                       "truncated": False, "withdrawn": None}
+        elif "detach-ambiguous" in inject:
+            attempt = {"exit": 0, "timed_out": False, "error": None, "output": "injected no-op",
+                       "truncated": False, "withdrawn": None, "reaped": True}
+        elif "detach-withdraw" in inject:
+            attempt = {"exit": None, "timed_out": False, "error": None, "output": "",
+                       "truncated": False, "withdrawn": "injected withdrawal", "reaped": True}
+        elif "detach-stuck-child" in inject:
+            attempt = _stuck_child_attempt()
+        elif "detach-reap-timeout" in inject:
+            attempt = {"exit": None, "timed_out": False, "error": None, "output": "",
+                       "truncated": False, "withdrawn": None, "reap_timed_out": True}
+        else:
+            attempt = probe.detach(record["mount"], timeout, still_allowed)
+        record.update(attempted=True, exit=attempt.get("exit"), timed_out=bool(attempt.get("timed_out")),
+                      withdrawn=attempt.get("withdrawn"), reap_timed_out=bool(attempt.get("reap_timed_out")),
+                      reaped=bool(attempt.get("reaped")), error=attempt.get("error"),
+                      _handle=attempt.get("handle"),
+                      output=_bounded_tail(b"", (attempt.get("output") or "").encode(
+                          "utf-8", "replace")).decode("utf-8", "replace"),
+                      output_truncated=bool(attempt.get("truncated")))
+        record["at_ns"] = now_ns()
+        if still_allowed is not None:
+            allowed, reason = still_allowed()
+            if not allowed:
+                record["late_gate"] = reason or "authority withdrawn"
+        try:
+            mounted = probe.mount_point(record["mount"])
+        except OSError:
+            mounted = None
+        attached = None
+        if mounted is False:
+            attached = probe.attachments(record["backing"],
+                                         max(0.0, min(DETACH_INFO_TIMEOUT_S, left())))
+        if mounted is None:
+            post_state = "unknown"
+        elif mounted:
+            post_state = "still_mounted"
+        elif attached is None:
+            post_state = "unknown"
+        elif attached:
+            # ANY entity of that backing still attached -- an unmounted volume, a
+            # slice of the requested whole disk or a second attachment -- is not a
+            # detach, whatever the requested device's own row says.
+            post_state = "still_attached"
+        else:
+            post_state = "detached"
+        record["post_state"] = post_state
+        record["reserve_after"] = _free_bytes(ctx["reserve_path"])
+        if record["withdrawn"] is not None or record["late_gate"] is not None:
+            record["state"] = "withdrawn"
+        elif record["timed_out"]:
+            record["state"] = "timed_out"
+        elif (record["reap_timed_out"] or not record["reaped"] or record["exit"] != 0
+              or record["error"] is not None or post_state != "detached"):
+            record["state"] = "failed"
+        else:
+            record["state"], record["qualified"], record["reason"] = "detached", True, None
+            return record
+        if record["withdrawn"] is not None:
+            record["reason"] = f"authority withdrawn mid-attempt ({record['withdrawn']}); post-state {post_state}"
+        elif record["late_gate"] is not None:
+            record["reason"] = f"authority withdrawn after the attempt ({record['late_gate']}); post-state {post_state}"
+        elif record["reap_timed_out"] or not record["reaped"]:
+            record["reason"] = (f"the detach child was not positively reaped inside the window"
+                                f" (reaped {record['reaped']}); post-state {post_state}")
+        else:
+            record["reason"] = (f"detach exit {record['exit']}" if not record["timed_out"]
+                                else "detach timed out") + f"; post-state {post_state}"
+            if record["error"] is not None:
+                record["reason"] += f"; spawn error {record['error']}"
+        return record
+    except BaseException as error:
+        if record is None:
+            record = detach_record(ctx, document if isinstance(document, dict) else {})
+        # Keep `_handle`: a live child is never discarded on an error path. The
+        # monitor owns closing it (or handing it to the custodian) and pops it
+        # before the record is stored.
+        record["state"], record["qualified"] = "unknown", False
+        record["reason"] = record["reason"] or f"detach attempt failed: {type_name(error)}"
+        return record
 
 def config_pool_path(text):
     """`[pool] path` from a user config, or None when it sets none.
@@ -2451,6 +3290,7 @@ def sweep_one_root(path, device, probe, budget, now):
 
 class Monitor:
     def __init__(self, ctx, ctl_w, cmd_r, out_r, err_r):
+        _ROLE[0] = "monitor"
         self.ctx, self.ctl_w, self.cmd_r = ctx, ctl_w, cmd_r
         self.lock = threading.Lock()
         self.seq = 0
@@ -2626,6 +3466,86 @@ class Monitor:
             "output": {}, "census": None, "census_rounds": 0, "settlement": self.settlement,
             "admission": admission_record(), "admission_waiting": admission_waiting_record(),
         }
+
+    def close_orphan_reads(self, ctx):
+        """Attachment reads whose child was never reaped are closed here, bounded
+        by what is left of the custodian's wait window. An orphan that cannot be
+        closed is unaccounted custody: the monitor holds instead of completing."""
+        if not INFO_ORPHANS:
+            return True
+        window_end = (ctx["start_ns"] + int(ctx["limit_s"] * NS) - EXIT_MARGIN_S * NS
+                      - int(0.2 * NS))
+        while INFO_ORPHANS:
+            handle = INFO_ORPHANS.pop(0)
+            reaped, _status = close_own_child(handle, window_end)
+            if not reaped:
+                INFO_ORPHANS.insert(0, handle)
+                return False
+        return True
+
+    def finish_monitor(self, ctx, phase, drain=False):
+        """Complete this monitor. Only an image-protocol run drains, and only
+        inside what is left of the custodian's own wait window; the drain happens
+        BEFORE the final publication so the persisted receipt carries the
+        post-decision records. A run with neither a request nor a custody
+        indication passes drain=False and reads nothing."""
+        if not self.close_orphan_reads(ctx):
+            # Unaccounted custody: keep everything and let the custodian end the run.
+            self.publish("orphan_read_unaccounted: monitor_held")
+            self.summary()
+            end = ctx["start_ns"] + int(ctx["limit_s"] * NS) - int(0.1 * NS)
+            while not self.stop.is_set() and now_ns() < end:
+                time.sleep(0.02)
+            return
+        if drain:
+            remaining = (ctx["start_ns"] + int(ctx["limit_s"] * NS) - EXIT_MARGIN_S * NS
+                         - now_ns()) / NS
+            # One short drain: the custodian's records are already in the pipe by
+            # the time its last answer was read, and the wait never exceeds what is
+            # left of its own window.
+            self.drain_records(max(0.0, min(DRAIN_WAIT_S, remaining)))
+        self.publish(phase)
+        self.summary()
+        self.send("monitor_complete")
+        self.stop.set()
+
+    def keep_record(self, record):
+        """Append one custodian record to the receipt (anything else is ignored)."""
+        if isinstance(record, dict):
+            with self.lock:
+                self.receipt["custodian"].append(record)
+
+    def drain_records(self, wait_s):
+        """Append `record` messages the custodian sent after the decision (detach
+        pin/signal/observation, cleanup keeps) to the receipt. Bounded, never
+        blocks past `wait_s`, and other command types are ignored."""
+        deadline = time.monotonic() + max(0.0, wait_s)
+        buffer = b""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                ready, _, _ = select.select([self.cmd_r], [], [], remaining)
+            except OSError:
+                return
+            if not ready:
+                return
+            try:
+                chunk = os.read(self.cmd_r, 4096)
+            except OSError:
+                return
+            if not chunk:
+                return
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                try:
+                    command = json.loads(line)
+                except ValueError:
+                    return
+                if isinstance(command, dict) and command.get("type") == "record":
+                    self.keep_record(command.get("record"))
 
     def send(self, message_type, **fields):
         with self.lock:
@@ -2881,6 +3801,90 @@ class Monitor:
         except BaseException:
             pass
 
+    def await_command(self, kind, wait_s):
+        """One bounded read of a specific command from the custodian. A missing,
+        late, malformed or different answer is None: no authority is inferred."""
+        deadline = time.monotonic() + max(0.0, wait_s)
+        buffer = b""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                ready, _, _ = select.select([self.cmd_r], [], [], remaining)
+            except OSError:
+                return None
+            if not ready:
+                continue
+            try:
+                chunk = os.read(self.cmd_r, 4096)
+            except OSError:
+                return None
+            if not chunk:
+                return None
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                try:
+                    command = json.loads(line)
+                except ValueError:
+                    return None
+                if isinstance(command, dict) and command.get("type") == "record":
+                    self.keep_record(command.get("record"))
+                    continue
+                if isinstance(command, dict) and command.get("type") == kind:
+                    return command
+
+    def detach_still_allowed(self):
+        """Asked while the detach child runs: authority withdrawn mid-attempt
+        (a fault latched, the deadline reached, the custodian gone) stops it."""
+        allowed, reason, _granted = self.authorize_detach(0, DETACH_POLL_S)
+        return allowed, reason
+
+    def authorize_detach(self, budget_ns, wait_s=None):
+        """Ask the custodian -- the only holder of the latched fault, the deadline
+        and the closure verdict -- before the one detach attempt and again while it
+        runs. Bounded by the budget itself: a missing, late, malformed or refused
+        answer authorizes nothing, so the mount, backing and evidence are kept."""
+        try:
+            self.send("detach_ready", budget_ns=int(budget_ns))
+        except OSError:
+            return False, "the authorization request could not be sent", 0
+        wait = DETACH_GATE_WAIT_S if wait_s is None else wait_s
+        deadline = time.monotonic() + (min(wait, budget_ns / NS) if budget_ns else wait)
+        buffer = b""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False, "the guard did not answer in time", 0
+            try:
+                ready, _, _ = select.select([self.cmd_r], [], [], remaining)
+            except OSError:
+                return False, "the authorization channel is unreadable", 0
+            if not ready:
+                continue
+            try:
+                chunk = os.read(self.cmd_r, 4096)
+            except OSError:
+                return False, "the authorization channel is unreadable", 0
+            if not chunk:
+                return False, "the guard closed the authorization channel", 0
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                try:
+                    command = json.loads(line)
+                except ValueError:
+                    return False, "the authorization answer is malformed", 0
+                if not isinstance(command, dict) or command.get("type") != "detach_go":
+                    continue
+                granted = command.get("budget_ns")
+                if not typed(granted, int) or granted < 0:
+                    return False, "the authorization answer carries no usable budget", 0
+                if command.get("allowed") is not True:
+                    return False, str(command.get("reason") or "the guard refused"), 0
+                return True, None, min(granted, budget_ns)
+
     def commands(self):
         buffer = b""
         while True:
@@ -2914,7 +3918,7 @@ class Monitor:
         for command in self.commands():
             kind = command["type"]
             if kind == "leader":
-                row = Kinfo.one(command["pid"])
+                row, _problem = process_row(command["pid"])
                 with self.lock:
                     self.leader = [command["pid"], None if row is None else row["start"]]
                     self.receipt["leader"] = self.leader
@@ -2937,8 +3941,191 @@ class Monitor:
                 break
         self.note(stop_requested_ns=now_ns())
         self.census_stop.set()
+        # Only a run that took part in the image protocol drains at completion; a
+        # keep/UNCLOSED decision never does, so the default is initialized here.
+        opted_in = False
         if decision == "cleanup":
             self.publish("closure_established: cleanup_pending")
+            # None unless this proof published a request; the custodian must also
+            # authorize the one attempt from its own fault/deadline state.
+            detach = post_census_detach(ctx, authorize=self.authorize_detach,
+                                        still_allowed=self.detach_still_allowed)
+            opted_in = detach is not None
+            # A refused or failed attempt is recorded BEFORE the custody gate: a
+            # kept root must never erase what the attempt established. The live
+            # child handle stays out of the receipt and is used below.
+            detach_handle = detach.pop("_handle", None) if detach is not None else None
+            if detach is not None:
+                with self.lock:
+                    self.receipt["detach"] = dict(detach)
+            # The custody indication is checked for EVERY cleanup run, whether or
+            # not a detach request succeeded: a proof can declare more than one
+            # backing, and a second live one must never be cleaned just because the
+            # requested image detached. Without an indication this is one lstat and
+            # no scan, so a run that published neither keeps the default path.
+            custody = cleanup_safety(ctx)
+            if custody is not None:
+                opted_in = True
+                if custody["state"] == "kept":
+                    with self.lock:
+                        self.receipt["cleanup"] = custody
+                    self.send("cleanup_kept", reason=custody["reason"][:200])
+                    self.publish("cleanup_kept: scratch_kept")
+                    self.receipt["scratch_marker"] = self.conclude_marker(
+                        False, reason="live-image", outcome="failed")
+                    self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
+                    return
+            if detach is not None:
+                handle = detach_handle  # a live child never reaches the receipt
+                with self.lock:
+                    self.receipt["detach"] = detach
+                self.send("detach", attempted=detach["attempted"], qualified=detach["qualified"],
+                          post_state=detach["post_state"])
+                if not detach["qualified"]:
+                    # Never retried, never cleaned up and never a positive conclusion:
+                    # the mount, its backing and the evidence are kept.
+                    self.publish("detach_unqualified: scratch_kept")
+                    self.receipt["scratch_marker"] = self.conclude_marker(
+                        False, reason="detach", outcome="failed")
+                    if handle is not None and not detach.get("reaped"):
+                        # The direct child is live and unreaped. The monitor may not
+                        # reap it after handing custody over (a reaped PID can be
+                        # recycled, and a bare PID must never be signalled), so it
+                        # names the child by PID AND start time, then waits for the
+                        # custodian's acknowledgement before touching it again.
+                        row, identity_problem = process_row(getattr(handle, "pid", 0) or 0)
+                        window_end = (ctx["start_ns"] + int(ctx["limit_s"] * NS)
+                                      - EXIT_MARGIN_S * NS - int(0.2 * NS))
+                        ack = None
+                        if row is not None:
+                            self.send("detach_child", pid=int(row["pid"]), start=int(row["start"]))
+                            ack = self.await_command("detach_child_ack",
+                                                    max(0.0, (window_end - now_ns()) / NS))
+                        with self.lock:
+                            detach["custodian_closed"] = bool(ack and ack.get("closed") is True)
+                            detach["custodian_owned"] = bool(ack and ack.get("custodian_closes") is True)
+                            detach["identity_problem"] = identity_problem
+                            self.receipt["detach"] = detach
+                        if row is None and identity_problem is None:
+                            # Positively absent: no row to name and no foreign PID to
+                            # signal, so it is accounted here by reaping whatever the
+                            # kernel still holds for this child, and then reported.
+                            absent_reaped, _status = reap_own_child(handle, window_end)
+                            with self.lock:
+                                detach["reaped"] = True
+                                detach["reaped_by"] = "monitor"
+                                detach["child_absent"] = True
+                                detach["reap_timed_out"] = not absent_reaped
+                                self.receipt["detach"] = detach
+                            self.publish("detach_child_absent: scratch_kept")
+                            self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
+                            return
+                        if identity_problem is not None:
+                            # Its identity could not be read, so no PID is handed
+                            # over and nothing is signalled by identity. The child is
+                            # still this monitor's own direct child, though: while it
+                            # is held unreaped its PID cannot be recycled, so it is
+                            # stopped and reaped here, positively, inside the
+                            # custodian's remaining deadline.
+                            self.publish("detach_child_identity_unreadable: closing_own_child")
+                            reaped_here = False
+                            status = None
+                            if "detach-handoff-unreadable" not in injections():
+                                # Spend at most three fifths of the remaining window
+                                # on the monitor's own close, so a failed or slow
+                                # reap still leaves budget for the handoff.
+                                left_ns = max(0, window_end - now_ns())
+                                own_deadline = now_ns() + (left_ns * 3) // 5
+                                reaped_here, status = close_own_child(handle, own_deadline)
+                            with self.lock:
+                                detach["reaped"] = bool(reaped_here)
+                                detach["reaped_by"] = "monitor" if reaped_here else None
+                                self.receipt["detach"] = detach
+                            if reaped_here:
+                                # The direct child is positively closed by its own
+                                # parent; the detach itself still stays unqualified.
+                                self.publish("detach_child_closed_by_monitor: scratch_kept")
+                                self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
+                                return
+                            # Not closed here: hand it to the custodian by PARENTAGE
+                            # (no start time to check) while still holding it
+                            # unreaped, so it can signal and positively observe it.
+                            self.send("detach_child", pid=int(getattr(handle, "pid", 0) or 0),
+                                      start=None)
+                            ack = self.await_command("detach_child_ack",
+                                                    max(0.0, (window_end - now_ns()) / NS))
+                            with self.lock:
+                                detach["custodian_closed"] = bool(ack and ack.get("closed") is True)
+                                detach["custodian_owned"] = bool(ack and ack.get("custodian_closes") is True)
+                                self.receipt["detach"] = detach
+                            if detach["custodian_closed"]:
+                                self.publish("detach_child_closed_by_custodian: scratch_kept")
+                                self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
+                                return
+                            self.publish("detach_child_unaccounted: monitor_held")
+                            self.summary()
+                            end = ctx["start_ns"] + int(ctx["limit_s"] * NS) - int(0.1 * NS)
+                            while not self.stop.is_set() and now_ns() < end:
+                                time.sleep(0.02)
+                            return
+                        if detach["custodian_closed"]:
+                            # The custodian positively closed the child it was handed.
+                            self.publish("detach_child_closed_by_custodian: scratch_kept")
+                            self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
+                            return
+                        if not detach["custodian_owned"] and row is not None:
+                            # Declined (already gone): the monitor may finish the
+                            # reap itself, still only inside the window.
+                            status = None
+                            while now_ns() < window_end and not self.stop.is_set():
+                                try:
+                                    left_s = max(0.0, (window_end - now_ns()) / NS)
+                                    status = handle.wait(timeout=min(0.05, left_s))
+                                except BaseException:
+                                    status = None
+                                if status is not None:
+                                    break
+                            with self.lock:
+                                detach["reaped"] = status is not None
+                                detach["reap_timed_out"] = status is None
+                                self.receipt["detach"] = detach
+                            if status is not None:
+                                self.publish("detach_child_accounted: scratch_kept")
+                                self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
+                                return
+                        # Still unaccounted: hold until the custodian ends the run,
+                        # never claiming a closure nobody observed.
+                        self.publish("detach_child_unaccounted: monitor_held")
+                        self.summary()
+                        end = ctx["start_ns"] + int(ctx["limit_s"] * NS) - int(0.1 * NS)
+                        while not self.stop.is_set() and now_ns() < end:
+                            time.sleep(0.02)
+                        return
+                    self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
+                    return
+            # Final gate, for an OPTED-IN run only: cleanup of a root that took
+            # part in the image protocol is destructive and needs one more
+            # authorization from the custodian's CURRENT fault/deadline state and
+            # what is left of its wait window. A run with neither indication nor
+            # request is not gated, so its cleanup is unchanged.
+            if opted_in:
+                allowed, reason = self.detach_still_allowed()
+                remaining_ms = detach_budget(ctx) / _MS
+            else:
+                allowed, reason, remaining_ms = True, None, 1.0
+            if not allowed or remaining_ms <= 0:
+                kept = {"state": "kept", "at_ns": now_ns(),
+                        "reason": (f"the guard did not authorize cleanup: {reason}" if not allowed
+                                   else "no custodian wait window is left for cleanup"),
+                        "unrequested": []}
+                with self.lock:
+                    self.receipt["cleanup"] = kept
+                self.send("cleanup_kept", reason=kept["reason"][:200])
+                self.publish("cleanup_kept: scratch_kept")
+                self.receipt["scratch_marker"] = self.conclude_marker(
+                    False, reason="live-image", outcome="failed")
+                self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
+                return
             self.publish("cleanup_partial_or_unknown")
             if ctx["owned"]:
                 if "cleanup-interrupt" in self.inject:
@@ -2951,15 +4138,15 @@ class Monitor:
         else:
             self.publish("unclosed: scratch_kept")
         self.receipt["scratch_marker"] = self.conclude_marker(decision == "cleanup")
-        self.publish("monitor_complete: pending_custodian")
-        self.summary()
-        self.send("monitor_complete")
-        self.stop.set()
+        self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=opted_in)
 
-    def conclude_marker(self, closed):
+    def conclude_marker(self, closed, reason=None, outcome=None):
         """Record this run's genuine conclusion on its owner marker, or leave it
         honestly unconcluded. Only the monitor's own closure decision (the
-        custodian's, taken after the leader was reaped) is passed here.
+        custodian's, taken after the leader was reaped) is passed here, and a
+        post-census detach that did not positively detach its own image -- or a
+        cleanup that kept the root because it still held a mounted image -- is
+        never a positive conclusion.
 
         A root the qualification apparatus protected as `hosting` before any
         nested case existed is never concluded from that outer closure: the
@@ -2973,9 +4160,9 @@ class Monitor:
             return record
         try:
             document = record_conclusion(self.ctx["root"], marker["run_id"], DefaultProbe(),
-                                         "closed" if closed else "unclosed",
+                                         outcome or ("closed" if closed else "unclosed"),
                                          "positive" if closed else "none",
-                                         "evidence" if closed else "unclosed")
+                                         reason or ("evidence" if closed else "unclosed"))
             record.update(state="concluded" if closed else "kept",
                           kept_reason=document["kept_reason"],
                           concluded_unix=document["concluded_unix"])
@@ -3004,6 +4191,17 @@ class Monitor:
             f"supervisor: owned bytes peak {peak / MIB:.1f} MiB of {receipt['owned_bytes']['budget'] // MIB} MiB"
             f" monitored budget; evidence {receipt['evidence']}",
         ]
+        kept = receipt.get("cleanup")
+        if kept is not None:
+            lines.append(f"supervisor: cleanup kept the owned root: {kept['reason']}"
+                         f" ({len(kept.get('unrequested') or [])} declared backing(s) checked)")
+        detach = receipt.get("detach")
+        if detach is not None:  # only a run whose proof asked for one carries this
+            lines.append(
+                f"supervisor: post-census detach {detach['state']} of {detach.get('mount')}"
+                f" (device {detach.get('device')}, exit {detach['exit']}, timed out {detach['timed_out']},"
+                f" post-state {detach['post_state']}, qualified {detach['qualified']})"
+                + (f": {detach['reason']}" if detach.get("reason") else ""))
         for line in lines:  # one bounded write per line, so none truncates the rest
             report(line + "\n")
         admission = next((record for record in reversed(receipt["custodian"])
@@ -3071,6 +4269,7 @@ def monitor_main(ctx, ctl_w, cmd_r, out_r, err_r):
 
 class Custodian:
     def __init__(self, command, limit_s=LIMIT_S, budget=SCRATCH_BUDGET, evidence=None, root_parent=None):
+        _ROLE[0] = "custodian"
         self.command, self.limit_s, self.budget, self.evidence_arg = command, limit_s, budget, evidence
         self.root_parent = root_parent
         self.inject = {item for item in os.environ.get("OXIDE_SUPERVISOR_INJECT", "").split(",") if item}
@@ -3098,6 +4297,7 @@ class Custodian:
         self.census_last_at = None
         self.reaped_seq = None
         self.monitor_complete = False
+        self.detach_child = None
         self.deadline_hit = False
         self.gate_opened = False
         self.gate_at = None
@@ -3414,6 +4614,80 @@ class Custodian:
                                   and message["members"] == 0 and message["uncertain"] == 0)
         elif kind == "monitor_complete":
             self.monitor_complete = True
+        elif kind == "detach_ready":
+            # The monitor asks once, after its own validation, before any attempt.
+            # The custodian answers from its own state only and never touches the
+            # filesystem: a latched fault, a reached deadline or a spent wait
+            # budget authorizes nothing.
+            allowed, reason, budget = detach_authorization(self.guard.fault, self.deadline_hit,
+                                                           now_ns(), self.exit_at)
+            self.tell("detach_go", allowed=allowed, reason=reason, budget_ns=int(budget))
+        elif kind == "detach":
+            # A post-census detach that did not positively detach its own image
+            # leaves the mount and backing in place and the run unqualified.
+            if not message["qualified"]:
+                self.guard.latch(f"post-census detach unqualified ({message['post_state']})")
+        elif kind == "cleanup_kept":
+            self.guard.latch(f"cleanup kept the owned root: {message['reason']}")
+        elif kind == "detach_child":
+            # `start` is optional: a parentage-only handoff carries none. Only a
+            # present, malformed start is a protocol fault.
+            pid, start = message["pid"], message.get("start")
+            if not typed(pid, int) or pid <= 0 or (
+                    start is not None and (not typed(start, int) or start <= 0)):
+                self.guard.latch("protocol: detach_child without a valid pid and start")
+                return
+            if self.detach_child is not None:
+                self.guard.latch("protocol: second detach_child")
+                return
+            row, problem = process_row(pid)
+            if problem is not None:
+                self.record("detach_child_refused", pid=pid, start=start,
+                            observation=f"identity unreadable ({problem})")
+                self.tell("detach_child_ack", custodian_closes=False, closed=False,
+                          reason=f"the child's identity could not be read ({problem})")
+                return
+            if row is None:
+                # Positively absent: there is nothing to signal, and that is a
+                # positive answer, not an unreadable one.
+                self.record("detach_child_refused", pid=pid, start=start,
+                            observation="positively absent")
+                self.tell("detach_child_ack", custodian_closes=False, closed=True,
+                          reason="the child is positively gone")
+                return
+            # Positive identity: the same process (start time) and still this
+            # monitor's child. A recycled bare PID can never match both, so it is
+            # never signalled.
+            if start is None:
+                # Parentage-only handoff: the monitor could not read a start time,
+                # so identity is this monitor's still-unreaped direct child.
+                if not (row.get("pid") == pid and row.get("ppid") == self.monitor
+                        and row.get("zombie") is False):
+                    self.record("detach_child_refused", pid=pid, start=None,
+                                observation="parentage no longer matches")
+                    self.tell("detach_child_ack", custodian_closes=False, closed=True,
+                              reason="the child is already gone or is not this monitor's")
+                    return
+                self.detach_child = [pid, row["start"]]
+                self.record("detach_child_pinned", pid=pid, start=row["start"],
+                            observation="live", identity="parentage")
+                self.signal_detach_child()
+                closed = self.observe_detach_child(NS)
+                self.tell("detach_child_ack", custodian_closes=True, closed=closed,
+                          reason=None if closed else "not observed closed yet")
+                return
+            if not detach_child_identity(row, pid, start, self.monitor):
+                self.record("detach_child_refused", pid=pid, start=start,
+                            observation="identity or parentage no longer matches")
+                self.tell("detach_child_ack", custodian_closes=False, closed=True,
+                          reason="the child is already gone or is not this monitor's")
+                return
+            self.detach_child = [pid, start]
+            self.record("detach_child_pinned", pid=pid, start=start, observation="live")
+            self.signal_detach_child()
+            closed = self.observe_detach_child(NS)
+            self.tell("detach_child_ack", custodian_closes=True, closed=closed,
+                      reason=None if closed else "not observed closed yet")
         elif kind == "cleanup_failed":
             self.guard.latch("cleanup: owned scratch not fully removed")
 
@@ -3764,6 +5038,59 @@ class Custodian:
             pass
         return 124 if self.deadline_hit else 125
 
+    def signal_detach_child(self):
+        """One identity-checked SIGKILL of the pinned detach child, recorded."""
+        if self.detach_child is None:
+            return
+        pid, start = self.detach_child
+        row, problem = process_row(pid)
+        if problem is not None:
+            self.guard.latch(f"detach child {pid} identity unreadable ({problem}); not signalled")
+            return
+        if not detach_child_identity(row, pid, start, self.monitor):
+            return
+        self.record("detach_child_signal", pid=pid, start=start)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError as error:
+            self.guard.latch(f"detach child {pid} could not be signalled: {errno_name(error)}")
+
+    def observe_detach_child(self, limit_ns):
+        """Bounded observation that the pinned child is gone (or a zombie), by the
+        same PID and start identity. Records the observation and never claims a
+        closure it did not see."""
+        if self.detach_child is None:
+            return True
+        pid, start = self.detach_child
+        end = min(now_ns() + limit_ns, self.absolute)
+        closed, uncertain = False, None
+        while now_ns() < end:
+            row, problem = process_row(pid)
+            if problem is not None:
+                # Unreadable facts are uncertainty, never closure.
+                uncertain = problem
+                break
+            if row is None or row["start"] != start or row.get("zombie") is not False:
+                closed = True
+                break
+            self.pump(min(end - now_ns(), 20_000_000))
+        self.record("detach_child_observed", pid=pid, start=start, closed=closed,
+                    uncertain=uncertain)
+        return closed
+
+    def close_detach_child(self):
+        """Backstop for a monitor that ended before its child did: signal the
+        pinned child again and observe it gone, bounded by the absolute deadline.
+        An unobserved child is a latched fault, never a claim."""
+        if self.detach_child is None:
+            return
+        pid, _start = self.detach_child
+        self.signal_detach_child()
+        if not self.observe_detach_child(NS):
+            self.guard.latch(f"detach child {pid} was not observed closed")
+
     def closure(self, launched):
         return (launched and self.guard.fault is None and not self.census_uncertain and self.census_ok
                 and len(self.eof) == 2)
@@ -3781,7 +5108,8 @@ class Custodian:
         while not self.monitor_complete and not self.monitor_exited and now_ns() < self.exit_at:
             self.pump(self.exit_at - now_ns())
         if not self.monitor_complete:
-            self.deadline_hit = self.deadline_hit or now_ns() >= self.exit_at
+            self.deadline_hit = self.deadline_hit or custodian_deadline_hit(
+                now_ns(), self.absolute, self.inject)
             self.guard.latch("monitor did not complete")
         status = None
         end = min(now_ns() + NS // 2, self.absolute)
@@ -3799,6 +5127,7 @@ class Custodian:
         self.monitor_reaped = status is not None
         if status is None:
             self.guard.latch("monitor not reaped after KILL")
+        self.close_detach_child()
         if not launched:
             return 124 if self.deadline_hit else 125
         return exit_code(self.deadline_hit, self.guard.fault, self.closed, self.leader_status)

@@ -341,10 +341,15 @@ non-`/Volumes` placement, which no scratch pool replaces):
 | the `AGENTS.md` unit-suite recipe (`OXIDE_TEST_INTERNAL_ROOT`) | three macOS fixtures take the boot Data volume and `MNT_IGNORE_OWNERSHIP` premises; `config::tests::git_work_trees_and_aliases_refuse` needs a root off `/Volumes` |
 
 Not in scope: proofs that never carried `bd357a4c` but assert their own
-`/private/tmp` scratch (`rust:oxide-exec`, `rust:front-door-accounting`,
-`rust:pool-scale`, `rust:accounting-vanished`, `rust:accounting-guards`,
-`rust:status-fast`, `rust:oxide-finder-metadata`, `rust:oxide-pool-layout`).
-They migrate, if at all, in their own briefs with their own activations.
+`/private/tmp` scratch (`rust:oxide-exec`, `rust:pool-scale`,
+`rust:accounting-vanished`, `rust:accounting-guards`, `rust:status-fast`,
+`rust:oxide-finder-metadata`, `rust:oxide-pool-layout`). They migrate, if at
+all, in their own briefs with their own activations. `rust:front-door-accounting`
+used to be one of them; oxide#191 moved it onto the explicit internal root
+(`--root-parent /private/tmp`, the `bd357a4c` exception, because its one pool is
+a genuine `directory-budget-v1` pool) with every fixture inside
+`OXIDE_TASK_SCRATCH_ROOT`, so it now meets this document's premise rule but is
+not part of the ten sub-slices listed below.
 
 ## Recipe changes (design, not applied)
 

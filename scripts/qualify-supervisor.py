@@ -77,13 +77,19 @@ WALL_NS = 300 * NS
 CANDIDATE_LIMIT = 280
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 281  # 236 pure + 45 real. oxide#151 added the routing, marker,
+EXPECTED_CASES = 360  # 307 pure + 53 real. oxide#151 added the routing, marker,
                       # nested-window protection, bounded-sweep, qualify-entry,
-                      # shared-ancestor/private-leaf and readiness cases; oxide#192
-                      # added 27 pure and 5 real admission cases (the wait report,
-                      # the rejection control, the late-admission classification, a
-                      # wait that never ends before the stop, and the stale-marker
-                      # plus zero-duration-grant distinction).
+                      # shared-ancestor/private-leaf and readiness cases; oxide#191
+                      # adds sixty-nine pure post-census detach cases and eight real
+                      # ones: success, a refused identity, a failed attempt, an
+                      # unrequested attachment whose opt-in custody keep is recorded
+                      # separately, a stuck child the custodian closes itself, and the
+                      # two unreadable-identity paths — closed by the monitor or
+                      # handed off by parentage. oxide#192 adds 27 pure and 5 real
+                      # admission-report cases (the completed wait and its grant, the
+                      # rejection control, the late grant, a wait that never ends
+                      # before the stop, and the stale-run plus zero-duration-grant
+                      # correlation).
 ACTOR_MARGIN_NS = 2 * NS  # the actor's own KILL, reap and exit
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPTS)
@@ -102,7 +108,7 @@ LIMITATIONS = [
     "Owner markers and bounded self-expiry: each run root in the owned parent carries one private\n    .oxide-scratch.json written before any child or run resource. The fixed startup sweep\n    (1 s and 4096 steps, checked between filesystem steps) removes only real owner-marked roots\n    whose marker records a positive conclusion of all their owned resources strictly older than\n    seven days; unmarked, foreign, corrupt, future-dated, unconcluded, nested-UNCLOSED or\n    otherwise non-expirable roots are never touched, and an exhausted budget leaves the rest for\n    a later run. There is no background reaper, and a partial deletion keeps the marker and the\n    root. The marker is not a liveness probe.",
     "The candidate root that holds a retained nested UNCLOSED fixture stays unconcluded\n    (nested-unclosed) even when the outer session closed and the suite passed; a failed\n    qualification keeps the bootstrap base unconcluded. Neither can expire while that holds.",
     "Deadlines are enforced by a single-threaded custodian on CLOCK_UPTIME_RAW with bounded calls; no hard real-time scheduling claim.",
-    "An admission marker (admission.json in the evidence directory) can move the candidate's deadline by at most the wait it reports, never more than the run's own elapsed wall clock and never more than a fixed 600 s total. Schema 2 documents name the supervisor's run and one bounded command token, and a waiting report (admission-waiting.json, grants nothing) is paired only with its own command's completed marker: a stale file from an earlier run is rejected by run identity, a failed or unreadable report is counted as unclassified, and only a command whose own completion was never reported is described as unfinished. A zero-duration grant, a capped grant and a late grant all end their command's wait, and the receipt reports the waiting report, the pairing and the grant separately. One bounded drain reads what already arrived before the deadline is declared, so a marker published just before the stop can still grant; a marker that reaches the custodian after the stop decision or a deadline is recorded as late with its reason and its reported wait and moves nothing. A marker or waiting report the child could not publish before the stop is simply absent, and the supervisor never waits past its deadline for one. This case suite's own outer 300 s actor is not extended by it.",
+    "Admission reports (oxide#192): a completed admission marker (admission.json) can move the candidate's deadline by at most the wait it reports, never more than the run's own elapsed wall clock and never more than a fixed 600 s total; schema 2 documents name the run and one bounded command token. A waiting report (admission-waiting.json) grants nothing and is paired only with its own command's completed marker: a foreign run is rejected as stale, a zero-duration, capped or late grant ends its command's wait, a rejected or unpaired report is unclassified, and only a command whose own completion was never reported is described as unfinished. A marker the child could not publish before the stop is simply absent, and the supervisor never waits past its deadline for one. This case suite's own outer 300 s actor is not extended by it.",
     "The candidate's settlement diagnostics (receipt `settlement` and the custodian's decision-time `settlement` record) are bounded observations, not acceptance gates: they never decide classification, closure, EOF, the deadline or cleanup, and a lost or truncated observation only means missing evidence. The receipt object keeps accumulating after the decision, so only the custodian's record is the decision-time view.",
     "macOS only (kqueue NOTE_EXIT, sysctl kinfo_proc at self-checked offsets); Linux is not qualified.",
     "Effigy admission waits happen before this script starts and are not inside its 300 s.",
@@ -331,7 +337,10 @@ CONTROL_CASES = {
     "fixture_deadline": {"exit": [-14, -14], "keys": {"case", "exit"}},
 }
 ORDINARY_KEYS = {"case", "exit", "phase", "dir", "retained_unclosed", "outcome", "census", "wall_s",
-                 "signals", "stale_latency_ns", "held_streams", "nonce_ok"}
+                 "signals", "stale_latency_ns", "held_streams", "nonce_ok",
+                 "detach",  # oxide#191: the post-census detach outcome that case recorded
+                 "cleanup",  # oxide#191: the fail-closed pre-cleanup keep, when it fired
+                 "kept"}  # the suite's retained-resource path for a focused case
 
 
 def control_case(case, name, root, facts):
@@ -630,40 +639,124 @@ def finish_base(guard, probe, base, run_id, qualified, retained, candidate_concl
     return []
 
 
-def check(receipt, results, expected, record=None, facts=None, base=None):
+DETACH_CASES = (
+    # (suite case, the detach state it must record, whether that detach qualified)
+    ("test_success_detaches_exactly_the_requested_volume", "detached", True),
+    ("test_an_unbound_identity_is_refused_before_any_detach", "refused", False),
+    ("test_a_failed_attempt_keeps_the_mount_and_is_unqualified", "failed", False),
+)
+
+CLEANUP_CASE = "test_an_unrequested_attachment_keeps_the_owned_root"
+STUCK_CASE = "test_a_stuck_detach_child_is_closed_by_the_custodian"
+
+
+def check_plan(receipt, results, expected, record=None, facts=None, base=None):
+    """The qualification's named oracles, in order. `check` flattens them; the
+    uncounted diagnostic runs them one at a time so one failing oracle cannot
+    hide the rest. Every oracle returns its own problem list."""
     facts = facts if facts is not None else KernelFacts()
+
+    def receipt_phase():
+        if receipt.get("phase") != "monitor_complete: pending_custodian":
+            return [f"receipt phase {receipt.get('phase')}"]
+        return []
+
+    def candidate_outcome():
+        outcome = receipt.get("outcome") or {}
+        if (outcome.get("closure"), outcome.get("status"), outcome.get("fault"), outcome.get("deadline")) != (
+                "closed", 0, None, False):
+            return [f"candidate outcome {outcome}"]
+        return []
+
+    def reserve_sampling():
+        reserve = receipt["reserve"]
+        gate = [r["at"] for r in receipt["custodian"] if r["event"] == "gate_open"]
+        problems = []
+        if not reserve["samples"] or not gate or reserve["first_ns"] >= gate[0]:
+            problems.append("reserve sampling did not start before the gate opened")
+        if reserve["max_gap_ns"] > NS:
+            problems.append(f"reserve sample gap {reserve['max_gap_ns']} ns over 1 s")
+        return problems
+
+    def owned_bytes():
+        owned = receipt["owned_bytes"]
+        if owned["maximum"] is None or not 5 * MIB <= owned["maximum"] <= owned["budget"]:
+            return [f"owned-byte peak {owned['maximum']} does not show the fixture writers within budget"]
+        return []
+
+    def signal_custody():
+        problems = []
+        for entry in receipt["custodian"]:
+            if entry["event"] == "signal" and not (entry["held_unreaped"] and entry["pin"] in ("leader", "monitor")):
+                problems.append(f"signal without custody: {entry}")
+        return problems
+
+    def detach_paths():
+        """Oxide#191: the qualification receipt must exercise the new post-census
+        detach success, refusal and uncertainty paths, through the suite's own
+        nested runs, and the outer run must itself publish no request."""
+        problems = []
+        if "detach" in receipt:
+            problems.append("the qualification run itself published a detach request")
+        recorded, kept = {}, {}
+        for case in results.get("cases", []):
+            if case.get("detach") is not None and case.get("case") not in recorded:
+                recorded[case["case"]] = case["detach"]
+            if case.get("cleanup") is not None and case.get("case") not in kept:
+                kept[case["case"]] = case["cleanup"]
+        for name, state, qualified in DETACH_CASES:
+            detach = recorded.get(name)
+            if detach is None:
+                problems.append(f"detach case {name} recorded no detach outcome")
+            elif (detach.get("state"), bool(detach.get("qualified"))) != (state, qualified):
+                problems.append(f"detach case {name} recorded {detach.get('state')}/"
+                                f"{detach.get('qualified')}, not {state}/{qualified}")
+        stuck = recorded.get(STUCK_CASE)
+        if stuck is None:
+            problems.append(f"{STUCK_CASE} recorded no detach outcome")
+        elif (stuck.get("state"), bool(stuck.get("qualified")), stuck.get("reaped"),
+              stuck.get("custodian_closed")) != ("timed_out", False, False, True):
+            problems.append(f"{STUCK_CASE} recorded {stuck.get('state')}/{stuck.get('qualified')}/"
+                            f"reaped {stuck.get('reaped')}/custodian_closed "
+                            f"{stuck.get('custodian_closed')}, not timed_out/False/False/True")
+        if CLEANUP_CASE in recorded:
+            problems.append(f"{CLEANUP_CASE} recorded a detach object for a request-free run")
+        if CLEANUP_CASE not in kept:
+            problems.append(f"{CLEANUP_CASE} recorded no pre-cleanup keep")
+        elif kept[CLEANUP_CASE].get("state") != "kept":
+            problems.append(f"{CLEANUP_CASE} recorded {kept[CLEANUP_CASE].get('state')}, not kept")
+        return problems
+
+    def cases():
+        outcomes = results.get("outcomes", [])
+        failed = [case for case, verdict in outcomes if verdict != "pass"]
+        if failed or len(outcomes) != EXPECTED_CASES:
+            return [f"cases: {len(outcomes)} of {EXPECTED_CASES} recorded, failed {failed}"]
+        return []
+
+    return [
+        ("receipt-phase", receipt_phase),
+        ("candidate-outcome", candidate_outcome),
+        ("reserve-sampling", reserve_sampling),
+        ("default-scratch", lambda: default_scratch(receipt, expected, record, facts)),
+        ("scratch-sweep", lambda: scratch_sweep(receipt, expected, base, facts)),
+        ("protected-root", lambda: protected_root(receipt, record)),
+        ("nested-cases", lambda: nested_cases(results, record, facts)),
+        ("owned-bytes", owned_bytes),
+        ("signal-custody", signal_custody),
+        ("detach-paths", detach_paths),
+        ("cases", cases),
+    ]
+
+
+def check(receipt, results, expected, record=None, facts=None, base=None):
     problems = []
-    outcome = receipt.get("outcome") or {}
-    if receipt.get("phase") != "monitor_complete: pending_custodian":
-        problems.append(f"receipt phase {receipt.get('phase')}")
-    if (outcome.get("closure"), outcome.get("status"), outcome.get("fault"), outcome.get("deadline")) != (
-            "closed", 0, None, False):
-        problems.append(f"candidate outcome {outcome}")
-    reserve = receipt["reserve"]
-    gate = [r["at"] for r in receipt["custodian"] if r["event"] == "gate_open"]
-    if not reserve["samples"] or not gate or reserve["first_ns"] >= gate[0]:
-        problems.append("reserve sampling did not start before the gate opened")
-    if reserve["max_gap_ns"] > NS:
-        problems.append(f"reserve sample gap {reserve['max_gap_ns']} ns over 1 s")
-    problems += default_scratch(receipt, expected, record, facts)
-    problems += scratch_sweep(receipt, expected, base, facts)
-    problems += protected_root(receipt, record)
-    problems += nested_cases(results, record, facts)
-    owned = receipt["owned_bytes"]
-    if owned["maximum"] is None or not 5 * MIB <= owned["maximum"] <= owned["budget"]:
-        problems.append(f"owned-byte peak {owned['maximum']} does not show the fixture writers within budget")
-    for entry in receipt["custodian"]:
-        if entry["event"] == "signal" and not (entry["held_unreaped"] and entry["pin"] in ("leader", "monitor")):
-            problems.append(f"signal without custody: {entry}")
-    outcomes = results.get("outcomes", [])
-    failed = [case for case, verdict in outcomes if verdict != "pass"]
-    if failed or len(outcomes) != EXPECTED_CASES:
-        problems.append(f"cases: {len(outcomes)} of {EXPECTED_CASES} recorded, failed {failed}")
+    for _name, oracle in check_plan(receipt, results, expected, record, facts, base):
+        problems += oracle()
     return problems
 
 
 PREFLIGHT_FLAG = "--preflight"
-DIAGNOSTIC_FLAG = "--diagnostic"
 
 
 def preflight(argv):
@@ -686,61 +779,83 @@ def preflight(argv):
     return 0 if result["readiness"]["ready"] else 2
 
 
+DIAGNOSTIC_FLAG = "--diagnostic"
+
+
+def diagnostic_receipt(problems, rows, extra=None):
+    """The diagnostic mode's receipt. Pure, so the suite can prove the one
+    property that matters: an uncounted collection is NEVER `qualified`, not even
+    when every named oracle passed. `result` is never `pass` either."""
+    receipt = {"selector": "proof:supervisor:qualify:diagnostic", "result": "diagnostic",
+               "qualified": False, "claims": ("diagnostic coverage and oracle outcomes only; "
+                                              "never a counted native PASS, closure, census or custody claim"),
+               "problems": list(problems),
+               "checks": list(rows),
+               "checks_passed": sum(1 for row in rows if row.get("result") == "pass"),
+               "checks_failed": sum(1 for row in rows if row.get("result") != "pass"),
+               "limitations": LIMITATIONS}
+    receipt.update(extra or {})
+    return receipt
+
+
 def main(argv=None):
-    if argv is None:
-        argv = sys.argv[1:]
+    argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == PREFLIGHT_FLAG:
         return preflight(list(argv))
-    if argv[:1] == [DIAGNOSTIC_FLAG]:
-        if len(argv) != 1:
-            raise SystemExit(f"qualify-supervisor.py: {DIAGNOSTIC_FLAG} takes no further arguments")
-        return bounded(lambda: qualify(diagnostic=True), DEADLINE - ACTOR_MARGIN_NS, DEADLINE - NS // 2)
+    diagnostic = DIAGNOSTIC_FLAG in argv
+    if diagnostic:
+        argv.remove(DIAGNOSTIC_FLAG)
     if argv:
         raise SystemExit(f"qualify-supervisor.py: unknown argument {argv[0]}")
-    return bounded(qualify, DEADLINE - ACTOR_MARGIN_NS, DEADLINE - NS // 2)
+    return bounded(lambda: qualify(diagnostic=diagnostic), DEADLINE - ACTOR_MARGIN_NS, DEADLINE - NS // 2)
+
+
+def refusal(message, diagnostic, extra=None):
+    """A precondition refusal. Nothing was created. In diagnostic mode it also
+    prints one bounded `qualified: false` receipt and returns 1, because an
+    uncounted collection never wears the counted bootstrap's exit codes."""
+    print(message, file=sys.stderr)
+    if not diagnostic:
+        return 2
+    receipt = diagnostic_receipt([message], [], {"result": "refused"})
+    try:
+        receipt["head"] = git("rev-parse", "HEAD").strip()
+    except Exception:
+        receipt["head"] = None
+    receipt.update(extra or {})
+    print("qualification diagnostic receipt:", json.dumps(receipt, indent=1), flush=True)
+    print("diagnostic (UNCOUNTED, never a PASS): refused before any effect", file=sys.stderr, flush=True)
+    return 1
 
 
 def qualify(diagnostic=False):
-    """The bootstrap around the candidate, in one of two modes.
-
-    Counted (`qualify`) is the qualification: any problem fails it and the
-    receipt says pass or fail. Diagnostic (`--diagnostic`) is the uncounted,
-    keep-going collection that must precede it: case failures and check
-    observations are recorded and collection continues, unknown custody (a
-    missing or malformed receipt, a candidate that was not closed, a fault or
-    an overrun) aborts and marks the rest unexecuted, and the receipt is never a
-    PASS, never a qualification and never evidence for another proof."""
     forward = []  # INT and TERM go to the candidate, which cancels itself
     for number in (signal.SIGINT, signal.SIGTERM):
         signal.signal(number, lambda n, _f: forward.append(n))
-    print(f"proof:supervisor:qualify{':diagnostic' if diagnostic else ''}: the supervisor is the candidate"
-          " under test; this bootstrap (Effigy heavy admission, reserve readings, fixed 300 s deadline,"
-          " finite fixture fallbacks) does not qualify it"
-          + ("; this is the uncounted keep-going collection, never a PASS" if diagnostic else ""),
+    print("proof:supervisor:qualify: the supervisor is the candidate under test; this bootstrap (Effigy heavy"
+          " admission, reserve readings, fixed 300 s deadline, finite fixture fallbacks) does not qualify it",
           flush=True)
     if sys.platform != "darwin":
-        print("refused: macOS only", file=sys.stderr)
-        return 2
+        return refusal("refused: macOS only", diagnostic)
     head = git("rev-parse", "HEAD").strip()
     if git("status", "--porcelain").strip():
-        print("refused: the checkout is not clean, so HEAD does not name the tested source", file=sys.stderr)
-        return 2
+        return refusal("refused: the checkout is not clean, so HEAD does not name the tested source",
+                       diagnostic)
     expected = selection()
     print(f"default scratch selection: {json.dumps(expected)}", flush=True)
     if expected.get("source") != "selected-volume":
-        print(f"refused: the candidate default would fall back to {expected.get('root_parent')}"
-              f" ({expected.get('reason')}), so this qualification could not exercise the selected-volume"
-              " default; run it where the machine's passive pool selection names the registered drive"
-              " (account config or OXIDE_POOL). Nothing was created.", file=sys.stderr)
-        return 2
+        return refusal(f"refused: the candidate default would fall back to {expected.get('root_parent')}"
+                       f" ({expected.get('reason')}), so this qualification could not exercise the"
+                       " selected-volume default; run it where the machine's passive pool selection names"
+                       " the registered drive (account config or OXIDE_POOL). Nothing was created.",
+                       diagnostic, {"selection": expected})
     guard = candidate()
     probe = guard.DefaultProbe()
     try:
         parent = guard.prepare_scratch_parent(expected, probe)
     except (guard.SelectionRefused, OSError) as error:
-        print(f"refused: the owned scratch parent {expected.get('root_parent')} cannot be prepared: {error!r}."
-              " Nothing was created.", file=sys.stderr)
-        return 2
+        return refusal(f"refused: the owned scratch parent {expected.get('root_parent')} cannot be prepared:"
+                       f" {error!r}. Nothing was created.", diagnostic)
     print(f"owned scratch parent {parent} (0700 inside the selected volume; a new subfolder is not a new"
           " volume)", flush=True)
     facts = KernelFacts()
@@ -749,11 +864,10 @@ def qualify(diagnostic=False):
           f" {opening['scratch_volume']['path']} (abort threshold 22 GiB); boot-volume free"
           f" {opening['boot_volume']['free'] / GIB:.1f} GiB on {opening['boot_volume']['path']}", flush=True)
     if opening["scratch_volume"]["free"] < THRESHOLD:
-        print("refused: the selected qualification scratch volume has less than 22 GiB free", file=sys.stderr)
-        return 2
+        return refusal("refused: the selected qualification scratch volume has less than 22 GiB free",
+                       diagnostic)
     if opening["boot_volume"]["free"] < THRESHOLD:
-        print("refused: the boot volume has less than 22 GiB free", file=sys.stderr)
-        return 2
+        return refusal("refused: the boot volume has less than 22 GiB free", diagnostic)
     sweep = guard.sweep_concluded_roots(parent, expected["device"], probe)
     print(f"bounded startup sweep: examined {sweep['examined']}, removed {sweep['removed_total']},"
           f" skipped {sweep['skipped_total']}, steps {sweep['steps']} of {sweep['entry_budget']},"
@@ -763,9 +877,8 @@ def qualify(diagnostic=False):
     try:
         guard.write_marker(base, guard.marker_document(run_id, base, probe), probe)
     except (guard.MarkerInvalid, OSError) as error:
-        print(f"refused: the bootstrap base {base} could not be marked ({error!r}); it is kept and never"
-              " swept, so an owner must remove it", file=sys.stderr)
-        return 2
+        return refusal(f"refused: the bootstrap base {base} could not be marked ({error!r}); it is kept"
+                       " and never swept, so an owner must remove it", diagnostic)
     print(f"scratch base {base} on the selected volume (marked, kept: never deleted by this bootstrap)",
           flush=True)
     env = {k: v for k, v in os.environ.items() if k not in ("OXIDE_TASK_SCRATCH_ROOT", "OXIDE_SUPERVISOR_INJECT")}
@@ -796,72 +909,73 @@ def qualify(diagnostic=False):
                         " below 22 GiB")
     if closing["boot_volume"]["free"] < THRESHOLD:
         problems.append(f"boot volume free {closing['boot_volume']['free']} below 22 GiB")
-    receipt, results, record = {}, {}, None
-    evidence_error = None
-    observations = []
-    try:
-        record, topology_problems = topology(base, expected, facts)
-        observations += topology_problems
-        layout = record or {"evidence": os.path.join(base, "missing")}
-        with open(os.path.join(layout["evidence"], "receipt.json")) as handle:
-            receipt = json.load(handle)
-        with open(env["OXIDE_SUPERVISOR_CASES"]) as handle:
-            results = json.load(handle)
-        observations += check(receipt, results, expected, record, facts, base)
-    except (OSError, ValueError, KeyError, TypeError) as error:
-        evidence_error = f"missing or malformed candidate evidence: {error!r}"
-        observations.append(evidence_error)
-    problems += observations
-    # Diagnostic mode never turns an observation into a verdict; the counted
-    # mode keeps every observation as its problem. A diagnostic aborts only on
-    # custody it cannot classify, and still records everything it saw.
-    abort = None
+    receipt, results, record, rows = {}, {}, None, []
     if diagnostic:
-        observations = list(problems)
-        problems = []
-        outcome = receipt.get("outcome") or {}
-        if code is None:
-            abort = "the candidate overran the bootstrap deadline"
-        elif evidence_error is not None:
-            abort = evidence_error
-        elif outcome.get("closure") != "closed" or outcome.get("fault") is not None:
-            abort = f"candidate custody is unknown: {json.dumps(outcome)}"[:400]
-    outcomes = results.get("outcomes") or []
-    failed = [{"case": case, "verdict": verdict} for case, verdict in outcomes if verdict != "pass"]
-    collection = {
-        "reached": len(outcomes), "expected": EXPECTED_CASES,
-        "completed": len(outcomes) - len(failed), "failed": failed,
-        "unexecuted": max(0, EXPECTED_CASES - len(outcomes)),
-        "first_fault": failed[0] if failed else None,
-        "note": "uncounted keep-going collection; never a PASS and never qualification evidence",
-    }
+        # Uncounted keep-going: one unreadable phase or failing oracle must not
+        # hide the rest, and a skipped check is never a pass.
+        try:
+            record, topology_problems = topology(base, expected, facts)
+        except Exception as error:
+            record, topology_problems = None, [f"candidate topology unreadable: {error!r}"]
+        problems += topology_problems
+        layout = record or {"evidence": os.path.join(base, "missing")}
+        try:
+            with open(os.path.join(layout["evidence"], "receipt.json")) as handle:
+                receipt = json.load(handle)
+            with open(env["OXIDE_SUPERVISOR_CASES"]) as handle:
+                results = json.load(handle)
+        except Exception as error:
+            problems.append(f"missing or malformed candidate evidence: {error!r}")
+        if receipt and results:
+            for name, oracle in check_plan(receipt, results, expected, record, facts, base):
+                try:
+                    found = oracle()
+                except Exception as error:
+                    found = [f"unreadable: {error!r}"]
+                rows.append({"check": name, "result": "fail" if found else "pass", "problems": found})
+                problems += found
+    else:
+        try:
+            record, topology_problems = topology(base, expected, facts)
+            problems += topology_problems
+            layout = record or {"evidence": os.path.join(base, "missing")}
+            with open(os.path.join(layout["evidence"], "receipt.json")) as handle:
+                receipt = json.load(handle)
+            with open(env["OXIDE_SUPERVISOR_CASES"]) as handle:
+                results = json.load(handle)
+            problems += check(receipt, results, expected, record, facts, base)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            problems.append(f"missing or malformed candidate evidence: {error!r}")
     nested_unclosed = [case["dir"] for case in results.get("cases", []) if case.get("retained_unclosed")]
     # The suite result and the custody of the owned resources are separate
     # facts: intentional retained nested UNCLOSED fixtures are an expected PASS,
     # and they never flip the result. They do keep every marker above them
     # unconcluded, because a positive conclusion of ALL owned resources was not
     # established.
-    qualified = (not diagnostic and not problems and code == 0
-                 and (receipt.get("outcome") or {}).get("closure") == "closed")
+    qualified = not problems and code == 0 and (receipt.get("outcome") or {}).get("closure") == "closed"
     candidate_concluded = False
     if record is not None:
-        candidate_problems, candidate_concluded = finish_candidate(
-            guard, probe, record, nested_unclosed, (record or {}).get("protection"))
+        try:
+            candidate_problems, candidate_concluded = finish_candidate(
+                guard, probe, record, nested_unclosed, (record or {}).get("protection"))
+        except Exception as error:
+            if not diagnostic:
+                raise
+            candidate_problems, candidate_concluded = [f"candidate conclusion unreadable: {error!r}"], False
         problems += candidate_problems
-    base_problems = finish_base(guard, probe, base, run_id, qualified, bool(nested_unclosed),
-                                candidate_concluded, (record or {}).get("protection"))
+    try:
+        base_problems = finish_base(guard, probe, base, run_id, qualified, bool(nested_unclosed),
+                                    candidate_concluded, (record or {}).get("protection"))
+    except Exception as error:
+        if not diagnostic:
+            raise
+        base_problems = [f"bootstrap conclusion unreadable: {error!r}"]
     problems += base_problems
     reserve, owned = receipt.get("reserve", {}), receipt.get("owned_bytes", {})
     qualification = {
-        "selector": "proof:supervisor:qualify:diagnostic" if diagnostic else "proof:supervisor:qualify",
-        "mode": "diagnostic" if diagnostic else "counted",
-        "qualified": False if diagnostic else not problems,
+        "selector": ("proof:supervisor:qualify:diagnostic" if diagnostic else "proof:supervisor:qualify"),
         "result": "diagnostic" if diagnostic else ("fail" if problems else "pass"),
         "problems": problems,
-        "observations": observations if diagnostic else None,
-        "collection": collection if diagnostic else None,
-        "aborted": (abort is not None) if diagnostic else None,
-        "abort_reason": abort if diagnostic else None,
         "head": head,
         "sha256": {name: sha256(path) for name, path in SOURCES.items()},
         "platform": {"system": platform.platform(), "machine": platform.machine(), "python": platform.python_version()},
@@ -894,15 +1008,27 @@ def qualify(diagnostic=False):
         "outcomes": results.get("outcomes"),
         "limitations": LIMITATIONS,
     }
+    outcomes = results.get("outcomes") or []
+    failed_cases = [{"case": case, "verdict": verdict} for case, verdict in outcomes if verdict != "pass"]
+    collection = {
+        "reached": len(outcomes), "expected": EXPECTED_CASES,
+        "completed": len(outcomes) - len(failed_cases), "failed": failed_cases,
+        "unexecuted": max(0, EXPECTED_CASES - len(outcomes)),
+        "first_fault": failed_cases[0] if failed_cases else None,
+        "note": "uncounted keep-going collection; never a PASS and never qualification evidence",
+    }
+    if diagnostic:  # an uncounted collection is never `qualified`, even when clean
+        qualification.update(diagnostic_receipt(problems, rows, {"collection": collection}))
+        qualification["mode"] = "diagnostic"
+        qualification["selector"] = "proof:supervisor:qualify:diagnostic"
+        qualification["result"] = "diagnostic"
     qualification["worker_wall_ns_before_print"] = now_ns() - START
-    print(("diagnostic receipt:" if diagnostic else "qualification receipt:"),
-          json.dumps(qualification, indent=1), flush=True)
+    print("qualification receipt:", json.dumps(qualification, indent=1), flush=True)
     if diagnostic:
-        # Exit 0 means the collection and its receipt completed, never a PASS:
-        # case failures are recorded facts and unknown custody is the abort.
-        print(f"diagnostic {'aborted: ' + abort if abort else 'complete'}; never a PASS; evidence kept in"
-              f" {base}", file=sys.stderr, flush=True)
-        return 1 if abort else 0
+        print(f"diagnostic (UNCOUNTED, never a PASS): {len(rows)} named checks, "
+              f"{sum(1 for row in rows if row['result'] == 'pass')} passed, {len(problems)} problems;"
+              f" evidence kept in {base}", file=sys.stderr, flush=True)
+        return 1
     print(f"{'FAIL' if problems else 'pass'}; evidence kept in {base}", file=sys.stderr, flush=True)
     return 1 if problems else 0
 

@@ -254,9 +254,11 @@ allocation (§16). Each finding is dispositioned in §3.3.
 Written against clean pushed `main` at
 `cec65daff49a2961c9b9d1dd2cad235251c02e48`. Every `file:line` anchor below is
 against that commit; re-check the anchors before trusting them after any
-rebind. The qualified shared proof supervisor is `scripts/bounded-test.py`
-SHA-256 `bc24b238a2ec6f0a68719f59b14bce2d69df0e30c2a351366fdab07db4975924`
-(the earlier `d89115f1…` pin is historical and qualifies only its own bytes).
+rebind. The shared proof supervisor is `scripts/bounded-test.py`
+SHA-256 `d69ae16a6c27651979109aecc88cadb139a653278b21104cd478157350934028`
+(the qualified oxide#151 guard `bc24b238…` plus oxide#191's opt-in post-census
+image detach, unqualified until its own qualifications pass; the earlier
+`d89115f1…` pin is historical and qualifies only its own bytes).
 Prerequisite oxide#136 (child temporary files) is merged at the `7d6e992`
 merge; oxide#155's capture-and-verify deletion is in `main`.
 
@@ -2268,7 +2270,7 @@ Elevated merge hold are unchanged.
   The private pool is a genuine internal `directory-budget-v1` pool, so the
   recipe declares the owner-accepted internal-placement exception (decision
   `bd357a4c`) inside the same monitored owned root; the supervisor bytes are
-  the `bc24b238…` pin above, with `--limit 600` (Tom's decision `1527723f`, this selector and its diagnostic twin only; any higher bound needs another operator ruling) and a 512 MiB monitored
+  the `d69ae16a…` pin above, with `--limit 600` (Tom's decision `1527723f`, this selector and its diagnostic twin only; any higher bound needs another operator ruling) and a 512 MiB monitored
   scratch budget including cleanup and the one owned image.
 - `effigy rust:cold-slot-seeding:diagnostic` appends the script's
   `--diagnostic`: the uncounted keep-going collection required before a counted
@@ -2302,6 +2304,13 @@ Elevated merge hold are unchanged.
 - The nine-item [proof-authoring premise checklist](workflow.md#proof-authoring-premise-checklist)
   is traced through the case bodies and helpers in the script, not in plan
   text.
+
+**Run history.** A counted author native of `effigy rust:cold-slot-seeding`
+passed **24/24 cases at `cb7cd97`** (#169), after the case-21 canonical-source
+correction and the 600 s bound; that run's guard receipt holds its time,
+scratch and reserve figures. The earlier 480 s uncounted diagnostic at
+`86208d1` stays historical with no credit. A further native at a changed head
+still needs its own owner activation.
 
 ### 16.4 Fixed-script time and disk allocation (source-derived, UNMEASURED)
 
@@ -2361,8 +2370,9 @@ about 135 s), leaving 29 s at the top of the range. That is the arithmetic of a
 plausible accounting, **not** a demonstrated fit: the script prints the phase
 and case tables, and if the first required uncounted **diagnostic** run's
 projection or measurement exceeds 275 s it **stops and reports**. The
-diagnostic remains mandatory and fit remains UNMEASURED; no counted native is
-implied. If the
+diagnostic remains mandatory before a further counted native at a changed
+head; these allocation figures were never measured at the head that wrote
+them (the counted pass at `cb7cd97` is recorded in 16.3). If the
 required SQLite and offered-run cases cannot fit even so, the conflict returns
 to the Supervisor for a scoped bound amendment before freeze; this design does
 not substitute a cheaper fixture and does not treat the separate real-project
