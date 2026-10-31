@@ -3718,23 +3718,6 @@ class Monitor:
             detach = post_census_detach(ctx, authorize=self.authorize_detach,
                                         still_allowed=self.detach_still_allowed)
             opted_in = detach is not None
-            # The custody indication is checked for EVERY cleanup run, whether or
-            # not a detach request succeeded: a proof can declare more than one
-            # backing, and a second live one must never be cleaned just because the
-            # requested image detached. Without an indication this is one lstat and
-            # no scan, so a run that published neither keeps the default path.
-            custody = cleanup_safety(ctx)
-            if custody is not None:
-                opted_in = True
-                if custody["state"] == "kept":
-                    with self.lock:
-                        self.receipt["cleanup"] = custody
-                    self.send("cleanup_kept", reason=custody["reason"][:200])
-                    self.publish("cleanup_kept: scratch_kept")
-                    self.receipt["scratch_marker"] = self.conclude_marker(
-                        False, reason="live-image", outcome="failed")
-                    self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
-                    return
             if detach is not None:
                 handle = detach.pop("_handle", None)  # a live child never reaches the receipt
                 with self.lock:
@@ -3861,6 +3844,23 @@ class Monitor:
                         while not self.stop.is_set() and now_ns() < end:
                             time.sleep(0.02)
                         return
+                    self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
+                    return
+            # The custody indication is checked for EVERY cleanup run, whether or
+            # not a detach request succeeded: a proof can declare more than one
+            # backing, and a second live one must never be cleaned just because the
+            # requested image detached. Without an indication this is one lstat and
+            # no scan, so a run that published neither keeps the default path.
+            custody = cleanup_safety(ctx)
+            if custody is not None:
+                opted_in = True
+                if custody["state"] == "kept":
+                    with self.lock:
+                        self.receipt["cleanup"] = custody
+                    self.send("cleanup_kept", reason=custody["reason"][:200])
+                    self.publish("cleanup_kept: scratch_kept")
+                    self.receipt["scratch_marker"] = self.conclude_marker(
+                        False, reason="live-image", outcome="failed")
                     self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
                     return
             # Final gate, for an OPTED-IN run only: cleanup of a root that took

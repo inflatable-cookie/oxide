@@ -2169,7 +2169,7 @@ with no earlier run migrated.
 
 **Post-census image detach request (oxide#191, decision `ee263cea`, unqualified
 source).** The current `bounded-test.py`
-(`d69ae16a6c27651979109aecc88cadb139a653278b21104cd478157350934028`) adds one
+(`7c0a3156028a460f81d766c8e3d173ec8be22e30fe70ee4dc221a6fcfec12a2a`) adds one
 opt-in control for a proof
 whose own test image must be detached, and it is the only route by which such a
 proof may detach after a launch; the qualified shared runner is otherwise
@@ -2264,9 +2264,10 @@ one is mounted, attached without a mount point (its `/dev` node still exists) or
 uncertain (unreadable facts, an unreadable device state, a malformed indication,
 or a UUID that does not match the request); a stale `hdiutil` entry whose device
 node is positively gone keeps nothing, and a positively clear backing set records
-`state: ok`. The custody indication is consulted for EVERY cleanup run, including after a successful detach,
-because a proof can declare more than one backing and a second live one must never be cleaned just
-because the requested image detached. A run that publishes **neither** an indication nor a request is
+`state: ok`. The custody indication is consulted for every cleanup run AFTER the detach receipt and its
+unreaped-child custody are settled, so a custody keep can never hide a detach object; it covers
+runs whose requested image detached too, because a proof can declare more than one backing and a
+second live one must never be cleaned just because the requested image detached. A run that publishes **neither** an indication nor a request is
 never scanned and never gated, so the default cleanup path is byte-for-byte
 unchanged and gains no new failure mode. An opted-in run additionally requires
 one final custodian authorization, taken after the detach from its current
@@ -2280,8 +2281,8 @@ custodian keeps its filesystem-free decision path and the existing
 cooperative-session limits. These bytes are unqualified until one uncounted
 `effigy proof:supervisor:qualify:diagnostic` records a clean picture and then
 ONE counted author and ONE separate independent reviewer
-`effigy proof:supervisor:qualify` pass at the same head (280 pure plus 48 real
-cases, including the sixty-nine pure detach cases and the eight real ones: a
+`effigy proof:supervisor:qualify` pass at the same head (281 pure plus 48 real
+cases, including the seventy pure detach cases and the eight real ones: a
 bound success, a refused identity, a failed attempt, an unrequested attachment
 whose opt-in custody keep is recorded separately, and a real stuck child the
 custodian pins, signals and observes closed), with independent exact-head source
@@ -5441,7 +5442,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
 - **Focused proof of absent checkout chains (oxide#135).** The one fixed proof
   is `effigy rust:prune-absence` (`scripts/test-prune-absence.py` under this
-  tree's shared supervisor `d69ae16a…`, the merged oxide#151 guard plus
+  tree's shared supervisor `7c0a3156…`, the merged oxide#151 guard plus
   oxide#191's opt-in post-census detach) with
   `--root-parent /private/tmp`, the owner-accepted internal-placement exception
   (decision `bd357a4c`): the missing-chain fixtures must be on the boot Data

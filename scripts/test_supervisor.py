@@ -5307,6 +5307,97 @@ class PureDetach(unittest.TestCase):
                        {"exit": 0, "timed_out": False, "truncated": False, "output": "not a plist"}):
             self.assertIsNone(bounded.image_attachments(backing, run=lambda *a, b=broken: b), broken)
 
+    def test_a_detach_receipt_is_recorded_before_a_custody_keep_returns(self):
+        # Ordering, driven through the REAL `Monitor.run`: a run with BOTH a detach
+        # request and a custody indication whose second backing is live must record
+        # the detach object (and settle its child) before the custody keep returns.
+        sandbox = Path(tempfile.mkdtemp(prefix="both-paths.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(sandbox), True)
+        evidence = sandbox / "evidence"
+        evidence.mkdir(parents=True)
+        # The declared backings live in the evidence directory, which the detach
+        # request's containment rule accepts alongside the owned root.
+        first = str(evidence / "first.sparseimage")
+        second = str(evidence / "second.sparseimage")
+        for path_ in (first, second):
+            with open(path_, "wb") as handle:
+                handle.write(b"backing")
+        with open(evidence / "detach-request.json", "w") as handle:
+            json.dump({"version": 1, "backing": first, "mount": "/Volumes/OxDetach",
+                       "device": "/dev/disk7s1", "volume_uuid": DETACH_UUID}, handle)
+        with open(evidence / "image-custody.json", "w") as handle:
+            json.dump({"version": 1, "backings": [first, second]}, handle)
+
+        def router(argv, *_args, **_kwargs):
+            if "info" not in argv:
+                router.calls["detach"] = router.calls.get("detach", 0) + 1
+                return {"exit": 0, "timed_out": False, "truncated": False, "output": "",
+                        "error": None, "withdrawn": None, "reap_timed_out": False,
+                        "reaped": True, "handle": None}
+            # First read: the requested backing is attached and mounted. Later
+            # reads for the requested backing: nothing left (detached). The second
+            # declared backing stays mounted throughout.
+            target = router.calls.get("info", 0)
+            router.calls["info"] = target + 1
+            if target == 0:
+                images = [{"image-path": first, "system-entities": [
+                    {"dev-entry": "/dev/disk7s1", "mount-point": "/Volumes/OxDetach",
+                     "volume-uuid": DETACH_UUID}]}]
+            else:
+                images = [{"image-path": second, "system-entities": [
+                    {"dev-entry": "/dev/disk9s1", "mount-point": "/Volumes/OxSecond"}]}]
+            payload = plistlib.dumps({"images": images}).decode()
+            return {"exit": 0, "timed_out": False, "truncated": False, "output": payload,
+                    "reaped": True, "handle": None}
+
+        router.calls = {}
+        saved_run, saved_mount = bounded.bounded_run, bounded.DefaultProbe.mount_point
+        saved_stat, saved_uuid = bounded.DefaultProbe.stat, bounded.DefaultProbe.volume_uuid
+        bounded.bounded_run = router
+        # The requested node and volume exist for this fixture.
+        bounded.DefaultProbe.stat = lambda self, path: types.SimpleNamespace(st_dev=42, st_rdev=42)
+        bounded.DefaultProbe.volume_uuid = lambda self, path: DETACH_UUID
+        # The mount is a mount point until the requested image is detached.
+        bounded.DefaultProbe.mount_point = (
+            lambda self, path: not router.calls.get("detach"))
+        ctx = {"run_id": "both-paths", "command": ["/bin/true"], "limit_s": 300,
+               "adopted": None, "evidence_arg": str(evidence), "root_parent": str(sandbox),
+               "budget": 512 * 1024 * 1024,
+               "start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "inject": []}
+        ctl_r, ctl_w = os.pipe()
+        cmd_r, cmd_w = os.pipe()
+        out_r, out_w = os.pipe()
+        err_r, err_w = os.pipe()
+        for fd in (ctl_r, cmd_w, out_w, err_w):
+            self.addCleanup(os.close, fd)
+        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_r)
+        sent = []
+
+        def send(kind, **fields):
+            sent.append(kind)
+            if kind == "detach_ready":
+                # Answer every authorization request, as the custodian would.
+                os.write(cmd_w, (json.dumps({"type": "detach_go", "allowed": True,
+                                             "budget_ns": 30 * bounded.NS}) + "\n").encode())
+
+        monitor.send = send
+        os.write(cmd_w, (json.dumps({"type": "cleanup", "outcome": {"closure": "closed",
+                                                                   "status": 0}}) + "\n").encode())
+        try:
+            monitor.run()
+        finally:
+            bounded.bounded_run = saved_run
+            bounded.DefaultProbe.mount_point = saved_mount
+            bounded.DefaultProbe.stat = saved_stat
+            bounded.DefaultProbe.volume_uuid = saved_uuid
+        with open(evidence / "receipt.json") as handle:
+            persisted = json.load(handle)
+        self.assertIn("detach", persisted, "the detach receipt was lost to the custody keep")
+        self.assertEqual(persisted["detach"]["qualified"], True, persisted["detach"])
+        self.assertEqual(persisted["cleanup"]["state"], "kept", persisted["cleanup"])
+        self.assertIn("cleanup_kept", sent, sent)
+        self.assertEqual(persisted["phase"], "monitor_complete: pending_custodian", persisted["phase"])
+
     def test_a_second_declared_backing_is_checked_after_a_successful_detach(self):
         # A proof may declare more than one backing. Detaching the requested image
         # must not skip the custody check for the other one.
