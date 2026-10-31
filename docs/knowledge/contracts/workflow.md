@@ -2196,13 +2196,31 @@ marker behaves exactly as before. It qualifies only once its own uncounted
 keep-going diagnostic and separate author and reviewer
 `proof:supervisor:qualify` receipts exist.
 
-The **author side** evidence for these bytes is recorded after the final
-stop-boundary source: `effigy proof:supervisor:test`, then
-`effigy proof:supervisor:qualify:diagnostic` (which must be complete), then
-`effigy proof:supervisor:qualify` on that same exact source. Until those three
-exist at the committed head, the bytes above carry no credit, and the
-independent reviewer native and exact-head source review are missing in any
-case.
+The **author side** ran at source `93bb6dbc5c3c0e5febac4c4680081b47dc3ceee8`
+(scripts `supervisor` `a0d7fa8386cd594017167a8d6d777c53900c0f5de3086f1f9d83e3404fed0419`,
+`suite` `59916bd698d23a56ef55bc1f901391e67c8bed5afd18b98a924027fdf4de86c1`,
+`bootstrap` `9ae2b84d0e0cbfd15468d02ee3933aad411d228a8bce4a0d85cbf97913b48ec3`):
+
+- `effigy proof:supervisor:test` passed all 227 pure cases.
+- `effigy proof:supervisor:qualify:diagnostic` was complete and not aborted:
+  270 reached of 270 expected, 270 completed, no failed case, none unexecuted,
+  `"qualified": false`, 211.6 s, evidence kept at
+  `/Volumes/Builds/scratch/oxide/oxide-supervisor-qualify._xqoizwl`. An earlier
+  diagnostic at `96f0767` recorded its fixture's own `NameError` as one failed
+  case and continued; that fixture bug was corrected, not excused.
+- `effigy proof:supervisor:qualify` then returned `result: pass` with no
+  problems on that same source: 270/270 cases, candidate `closed` status 0, no
+  fault and no deadline, positive outer closure, worker wall 198.2 s, the 24
+  expected retained nested `UNCLOSED` case directories and the bootstrap base
+  kept; evidence kept at
+  `/Volumes/Builds/scratch/oxide/oxide-supervisor-qualify.4sjmprvx`.
+
+The earlier author receipt at `c99fe6a` (224 pure, 266 cases, digests
+`ee3ec8f5…`/`e9d93913…`/`972b8b30…`) is historical and superseded by the
+stop-boundary and diagnostic work; it is not a qualification of these bytes.
+The independent reviewer native and the exact-head source review are still
+missing, so nothing is qualified and these bytes carry no credit for any other
+proof.
 
 **Settlement observation (oxide#147, unqualified source).** The current
 `bounded-test.py` also carries observation-only settlement diagnostics, so a
