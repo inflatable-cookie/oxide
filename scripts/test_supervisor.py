@@ -1652,10 +1652,10 @@ class PureAdmission(unittest.TestCase):
         self.assertEqual(custodian.admission_counted, 0)
 
     def test_each_command_pairs_its_own_waiting_and_completion(self):
-        # Review finding: an unfinished wait may only be claimed for a command
-        # whose own completion was never reported. A zero-duration or late grant
-        # ends the wait; a waiting report for one command never pairs with the
-        # completion of another.
+        # Review finding: only a command's own terminal report ends its wait, and
+        # an unpaired wait is never called finished or unfinished. A zero-duration
+        # or late grant ends the wait; a waiting report for one command never pairs
+        # with the completion of another.
         custodian = self.custodian()
         custodian.record = lambda kind, **fields: None
         with self.clock(custodian, 10):
@@ -1689,9 +1689,9 @@ class PureAdmission(unittest.TestCase):
     def test_a_completion_overwritten_before_a_poll_is_not_a_proven_unfinished_wait(self):
         # Review finding: the completion file has one fixed name, so two
         # completions inside one 0.25 s poll leave only the later inode visible.
-        # An unpaired wait that is not the run's last accepted report is
-        # therefore an unknown (possibly overwritten), never a proven unfinished
-        # wait.
+        # An unpaired wait is therefore an unknown (possibly overwritten, rejected
+        # or missed), never a proven unfinished wait - including one that was the
+        # run's last observation.
         custodian = self.custodian()
         custodian.record = lambda kind, **fields: None
         with self.clock(custodian, 10):
@@ -1845,7 +1845,7 @@ class PureAdmission(unittest.TestCase):
         # possible overwrite, an unknown, and none is a proven unfinished wait.
         self.assertEqual(pairs["unpaired_count"], bounded.ADMISSION_COMMANDS)
         self.assertEqual(pairs["possibly_overwritten_count"], bounded.ADMISSION_COMMANDS)
-        self.assertEqual(len(pairs["unpaired"]), bounded.ADMISSION_UNFINISHED)
+        self.assertEqual(len(pairs["unpaired"]), bounded.ADMISSION_UNPAIRED)
         self.assertTrue(all(entry["later_observation"] for entry in pairs["unpaired"]))
 
     def test_the_decision_record_carries_the_waiting_and_pairing_facts(self):

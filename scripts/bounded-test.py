@@ -52,15 +52,17 @@ regular file without following a link, at most 512 bytes with an exact key set,
 and reports each once per file identity. The custodian grants at most the
 completed wait, never more than the run's own elapsed wall clock and never more
 than a fixed 600 s total, to its deadline; a waiting report grants nothing, and
-a command's wait counts as unfinished only when no terminal report for that same
-command arrived and its waiting report was the last accepted admission report (a
-zero-duration grant, a capped grant or a late grant all end it; any later report
-makes the fixed-name completion file a possible overwrite, so such a wait is
-`possibly_overwritten` and unclassified rather than proven unfinished). Nothing is shortened, the exported OXIDE_PROOF_DEADLINE_NS is not rewritten
-and classification is unchanged: a rejected or missing report removes nothing
-but the grant, and the receipt reports the wait, the pairing and the grant
-separately. One
-bounded drain reads what has already arrived before the deadline is declared, so
+only an observed terminal report for that same command ends its wait (a
+zero-duration grant, a capped grant or a late grant all end it). Every unpaired
+wait is **unclassified**, including one that was the run's last admission-file
+observation: the fixed-name completion may have been overwritten by a later
+report or by a rejected read before a poll, or missed entirely between the last
+poll and the sampler's stop, so missing terminal evidence is never reported as a
+finished or unfinished conclusion. Nothing is shortened, the exported
+OXIDE_PROOF_DEADLINE_NS is not rewritten and classification is unchanged: a
+rejected or missing report removes nothing but the grant, and the receipt
+reports the wait, the pairing and the grant separately. One bounded drain reads
+what has already arrived before the deadline is declared, so
 a marker published just before the stop can still grant; a marker that reaches
 the custodian after the stop decision or a deadline is recorded as late with its
 reason and moves nothing, so a run that stopped as admission completed is
@@ -257,7 +259,7 @@ ADMISSION_CAP_NS = 600 * NS
 ADMISSION_RECORDS = 32  # per-report custodian records kept; the rest only move the counters
 ADMISSION_REJECTIONS = 8  # bounded rejection reasons kept in the receipt
 ADMISSION_COMMANDS = 64  # bounded pairing table: one entry per supervised command token
-ADMISSION_UNFINISHED = 8  # bounded unfinished list carried by the decision record
+ADMISSION_UNPAIRED = 8  # bounded unpaired list carried by the decision record
 ADMISSION_KEYS = frozenset({"schema", "source", "run", "command", "waited_ns"})
 WAITING_KEYS = frozenset({"schema", "source", "run", "command", "reason"})
 FIELDS = {  # required fields per monitor message type; bool is never accepted as int
@@ -4635,9 +4637,10 @@ class Custodian:
         """Record that a child reported a wait that has not ended (oxide#192).
 
         Report only: a waiting report never moves `absolute`, `stop_at` or
-        `exit_at`, before or after a stop decision. It exists so a wait that
-        never ends before the stop is classified separately from a plain
-        timeout instead of leaving no trace."""
+        `exit_at`, before or after a stop decision. It exists so a wait that was
+        still outstanding when the run stopped is reported and left unclassified
+        instead of being lost inside an unexplained timeout; only an observed
+        terminal report ends a wait."""
         try:
             self.admission_ordinal += 1
             self.admission_last_ordinal = self.admission_ordinal
@@ -5142,7 +5145,7 @@ class Custodian:
         overwritten = [row for row in rows if row["later_observation"]]
         return {"commands": len(waiting), "ended": len(ended),
                 "unpaired_count": len(rows),
-                "unpaired": rows[:ADMISSION_UNFINISHED],
+                "unpaired": rows[:ADMISSION_UNPAIRED],
                 "possibly_overwritten_count": len(overwritten),
                 "rejected_reports": self.admission_rejected_reports}
 
