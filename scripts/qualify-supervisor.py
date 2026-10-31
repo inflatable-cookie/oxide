@@ -77,10 +77,12 @@ WALL_NS = 300 * NS
 CANDIDATE_LIMIT = 280
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 266  # 224 pure + 42 real. oxide#151 added the routing, marker,
+EXPECTED_CASES = 270  # 227 pure + 43 real. oxide#151 added the routing, marker,
                       # nested-window protection, bounded-sweep, qualify-entry,
                       # shared-ancestor/private-leaf and readiness cases; oxide#192
-                      # added 15 pure and 2 real admission-marker cases.
+                      # added 18 pure and 3 real admission-marker cases (the wait
+                      # report, the rejection control and the late-admission
+                      # classification).
 ACTOR_MARGIN_NS = 2 * NS  # the actor's own KILL, reap and exit
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPTS)
@@ -660,6 +662,7 @@ def check(receipt, results, expected, record=None, facts=None, base=None):
 
 
 PREFLIGHT_FLAG = "--preflight"
+DIAGNOSTIC_FLAG = "--diagnostic"
 
 
 def preflight(argv):
@@ -687,17 +690,32 @@ def main(argv=None):
         argv = sys.argv[1:]
     if argv and argv[0] == PREFLIGHT_FLAG:
         return preflight(list(argv))
+    if argv[:1] == [DIAGNOSTIC_FLAG]:
+        if len(argv) != 1:
+            raise SystemExit(f"qualify-supervisor.py: {DIAGNOSTIC_FLAG} takes no further arguments")
+        return bounded(lambda: qualify(diagnostic=True), DEADLINE - ACTOR_MARGIN_NS, DEADLINE - NS // 2)
     if argv:
         raise SystemExit(f"qualify-supervisor.py: unknown argument {argv[0]}")
     return bounded(qualify, DEADLINE - ACTOR_MARGIN_NS, DEADLINE - NS // 2)
 
 
-def qualify():
+def qualify(diagnostic=False):
+    """The bootstrap around the candidate, in one of two modes.
+
+    Counted (`qualify`) is the qualification: any problem fails it and the
+    receipt says pass or fail. Diagnostic (`--diagnostic`) is the uncounted,
+    keep-going collection that must precede it: case failures and check
+    observations are recorded and collection continues, unknown custody (a
+    missing or malformed receipt, a candidate that was not closed, a fault or
+    an overrun) aborts and marks the rest unexecuted, and the receipt is never a
+    PASS, never a qualification and never evidence for another proof."""
     forward = []  # INT and TERM go to the candidate, which cancels itself
     for number in (signal.SIGINT, signal.SIGTERM):
         signal.signal(number, lambda n, _f: forward.append(n))
-    print("proof:supervisor:qualify: the supervisor is the candidate under test; this bootstrap (Effigy heavy"
-          " admission, reserve readings, fixed 300 s deadline, finite fixture fallbacks) does not qualify it",
+    print(f"proof:supervisor:qualify{':diagnostic' if diagnostic else ''}: the supervisor is the candidate"
+          " under test; this bootstrap (Effigy heavy admission, reserve readings, fixed 300 s deadline,"
+          " finite fixture fallbacks) does not qualify it"
+          + ("; this is the uncounted keep-going collection, never a PASS" if diagnostic else ""),
           flush=True)
     if sys.platform != "darwin":
         print("refused: macOS only", file=sys.stderr)
@@ -778,24 +796,52 @@ def qualify():
     if closing["boot_volume"]["free"] < THRESHOLD:
         problems.append(f"boot volume free {closing['boot_volume']['free']} below 22 GiB")
     receipt, results, record = {}, {}, None
+    evidence_error = None
+    observations = []
     try:
         record, topology_problems = topology(base, expected, facts)
-        problems += topology_problems
+        observations += topology_problems
         layout = record or {"evidence": os.path.join(base, "missing")}
         with open(os.path.join(layout["evidence"], "receipt.json")) as handle:
             receipt = json.load(handle)
         with open(env["OXIDE_SUPERVISOR_CASES"]) as handle:
             results = json.load(handle)
-        problems += check(receipt, results, expected, record, facts, base)
+        observations += check(receipt, results, expected, record, facts, base)
     except (OSError, ValueError, KeyError, TypeError) as error:
-        problems.append(f"missing or malformed candidate evidence: {error!r}")
+        evidence_error = f"missing or malformed candidate evidence: {error!r}"
+        observations.append(evidence_error)
+    problems += observations
+    # Diagnostic mode never turns an observation into a verdict; the counted
+    # mode keeps every observation as its problem. A diagnostic aborts only on
+    # custody it cannot classify, and still records everything it saw.
+    abort = None
+    if diagnostic:
+        observations = list(problems)
+        problems = []
+        outcome = receipt.get("outcome") or {}
+        if code is None:
+            abort = "the candidate overran the bootstrap deadline"
+        elif evidence_error is not None:
+            abort = evidence_error
+        elif outcome.get("closure") != "closed" or outcome.get("fault") is not None:
+            abort = f"candidate custody is unknown: {json.dumps(outcome)}"[:400]
+    outcomes = results.get("outcomes") or []
+    failed = [{"case": case, "verdict": verdict} for case, verdict in outcomes if verdict != "pass"]
+    collection = {
+        "reached": len(outcomes), "expected": EXPECTED_CASES,
+        "completed": len(outcomes) - len(failed), "failed": failed,
+        "unexecuted": max(0, EXPECTED_CASES - len(outcomes)),
+        "first_fault": failed[0] if failed else None,
+        "note": "uncounted keep-going collection; never a PASS and never qualification evidence",
+    }
     nested_unclosed = [case["dir"] for case in results.get("cases", []) if case.get("retained_unclosed")]
     # The suite result and the custody of the owned resources are separate
     # facts: intentional retained nested UNCLOSED fixtures are an expected PASS,
     # and they never flip the result. They do keep every marker above them
     # unconcluded, because a positive conclusion of ALL owned resources was not
     # established.
-    qualified = not problems and code == 0 and (receipt.get("outcome") or {}).get("closure") == "closed"
+    qualified = (not diagnostic and not problems and code == 0
+                 and (receipt.get("outcome") or {}).get("closure") == "closed")
     candidate_concluded = False
     if record is not None:
         candidate_problems, candidate_concluded = finish_candidate(
@@ -806,9 +852,15 @@ def qualify():
     problems += base_problems
     reserve, owned = receipt.get("reserve", {}), receipt.get("owned_bytes", {})
     qualification = {
-        "selector": "proof:supervisor:qualify",
-        "result": "fail" if problems else "pass",
+        "selector": "proof:supervisor:qualify:diagnostic" if diagnostic else "proof:supervisor:qualify",
+        "mode": "diagnostic" if diagnostic else "counted",
+        "qualified": False if diagnostic else not problems,
+        "result": "diagnostic" if diagnostic else ("fail" if problems else "pass"),
         "problems": problems,
+        "observations": observations if diagnostic else None,
+        "collection": collection if diagnostic else None,
+        "aborted": (abort is not None) if diagnostic else None,
+        "abort_reason": abort if diagnostic else None,
         "head": head,
         "sha256": {name: sha256(path) for name, path in SOURCES.items()},
         "platform": {"system": platform.platform(), "machine": platform.machine(), "python": platform.python_version()},
@@ -842,7 +894,14 @@ def qualify():
         "limitations": LIMITATIONS,
     }
     qualification["worker_wall_ns_before_print"] = now_ns() - START
-    print("qualification receipt:", json.dumps(qualification, indent=1), flush=True)
+    print(("diagnostic receipt:" if diagnostic else "qualification receipt:"),
+          json.dumps(qualification, indent=1), flush=True)
+    if diagnostic:
+        # Exit 0 means the collection and its receipt completed, never a PASS:
+        # case failures are recorded facts and unknown custody is the abort.
+        print(f"diagnostic {'aborted: ' + abort if abort else 'complete'}; never a PASS; evidence kept in"
+              f" {base}", file=sys.stderr, flush=True)
+        return 1 if abort else 0
     print(f"{'FAIL' if problems else 'pass'}; evidence kept in {base}", file=sys.stderr, flush=True)
     return 1 if problems else 0
 

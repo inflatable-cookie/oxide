@@ -640,6 +640,20 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 admission = "heavy"
 run = "python3 scripts/qualify-supervisor.py"
 
+# The uncounted keep-going twin of the qualification (oxide#192): the same
+# bootstrap, guard, 300 s actor, selected-volume routing and 512 MiB monitored
+# scratch, with `--diagnostic` appended. It records every reached, completed,
+# failed and unexecuted case plus the first fault in a bounded receipt and
+# continues only into independent cases; unknown custody (a missing or
+# malformed candidate receipt, a candidate that was not closed, a fault or an
+# overrun) aborts and marks the rest unexecuted. Its receipt is
+# `qualified: false` and is never a PASS, never a qualification and never
+# evidence for another proof. It must be complete before the counted
+# qualification runs. Not a benchmark and not full QA.
+[tasks."proof:supervisor:qualify:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/qualify-supervisor.py --diagnostic"
+
 # SUSPENDED by oxide#102: provisions its pool with the retired standalone
 # lease CLI and APFS image backend, so it refuses before any effect until
 # migrated to a directory pool. Not a benchmark and not full QA.

@@ -50,8 +50,13 @@ the reported wait, never more than the run's own elapsed wall clock and never
 more than a fixed 600 s total, to its deadline. Nothing is shortened, the
 exported OXIDE_PROOF_DEADLINE_NS is not rewritten and classification is
 unchanged: a rejected or missing marker removes nothing but the grant, and the
-receipt reports the wait and the grant separately. The grant is cooperative
-evidence about a child's own admission, not a claim about any other writer.
+receipt reports the wait and the grant separately. One bounded drain reads what
+has already arrived before the deadline is declared, so a marker published just
+before the stop can still grant; a marker that reaches the custodian after the
+stop decision or a deadline is recorded as late with its reason and moves
+nothing, so a run that stopped as admission completed is classified honestly
+rather than as an unexplained timeout. The grant is cooperative evidence about a
+child's own admission, not a claim about any other writer.
 
 Scope: the cooperative session. A process that calls setsid leaves it and is
 seen only while tracked or holding an output pipe; arbitrary same-user
@@ -2933,8 +2938,13 @@ class Monitor:
             report(f"supervisor: admission wait reported {admission['reported_wait_ns'] / NS:.1f} s in"
                    f" {admission['counted']} marker(s), granted {admission['granted_ns'] / NS:.1f} s of the"
                    f" {ADMISSION_CAP_NS / NS:.0f} s cap (limit {admission['limit_s']:.0f} s, deadline"
-                   f" {effective:.1f} s after start); {admission['ignored']} ignored;"
+                   f" {effective:.1f} s after start); {admission['ignored']} late;"
                    f" observed {receipt['admission']['observed']}, rejected {receipt['admission']['ignored']}\n")
+            if admission["ignored"]:
+                reason = admission.get("late_reason") or "unknown"
+                report(f"supervisor: an admission marker reached the custodian after the stop decision"
+                       f" ({reason}), so its wait is reported and not granted; the deadline classification"
+                       " stands and no clock was moved\n")
 
 
 class SetupRefused(Exception):
@@ -2999,6 +3009,8 @@ class Custodian:
         self.admission_granted = 0
         self.admission_records = 0
         self.admission_clamped = self.admission_capped = False
+        self.admission_late_ns = None
+        self.admission_late_reason = None
         self.exceptions = 0
         self.injected = set()
         self.paths = None  # from the monitor's setup message
@@ -3126,12 +3138,21 @@ class Custodian:
         `waited_ns`, never more than this run's own elapsed wall clock and
         never beyond ADMISSION_CAP_NS in total, to `absolute`. Nothing is
         shortened, no exported deadline is rewritten and no classification
-        changes: the grant is reported separately in the receipt. A message
-        after the stop decision or after a deadline hit cannot move anything,
-        so it is only counted."""
+        changes: the grant is reported separately in the receipt. A marker that
+        reaches the custodian after the stop decision, or after a deadline was
+        declared, cannot move anything; it is recorded as late with its reason
+        so the run is classified honestly rather than as an unexplained
+        timeout."""
         try:
             if self.stopped_at is not None or self.deadline_hit:
                 self.admission_ignored += 1
+                self.admission_late_ns = at
+                self.admission_late_reason = "stopped" if self.stopped_at is not None else "deadline"
+                if self.admission_records < ADMISSION_RECORDS:
+                    self.admission_records += 1
+                    self.record("admission_late", waited_ns=message["waited_ns"], at=at,
+                                reason=self.admission_late_reason, deadline_hit=self.deadline_hit,
+                                stopped=self.stopped_at is not None)
                 return
             waited = message["waited_ns"]
             elapsed = max(0, at - self.start)
@@ -3448,8 +3469,16 @@ class Custodian:
     def watch(self):
         while not (self.leader_exited or self.cancelled or self.guard.fault):
             if now_ns() >= self.stop_at:
-                self.deadline_hit = True
-                break
+                # One bounded drain before the deadline is declared, so a marker
+                # that was already published and is waiting in the control pipe
+                # can still grant and move the stop (oxide#192). Only a grant
+                # that moves the stop past now continues the loop; a marker with
+                # no room cannot spin it.
+                self.pump(0)
+                if now_ns() >= self.stop_at:
+                    self.deadline_hit = True
+                    break
+                continue
             self.pump(self.stop_at - now_ns())
 
     def stop(self, launched):
@@ -3526,6 +3555,7 @@ class Custodian:
                       "counted": self.admission_counted, "ignored": self.admission_ignored,
                       "reported_wait_ns": self.admission_reported, "granted_ns": self.admission_granted,
                       "clamped": self.admission_clamped, "capped": self.admission_capped,
+                      "late_ns": self.admission_late_ns, "late_reason": self.admission_late_reason,
                       "cap_ns": ADMISSION_CAP_NS, "limit_s": self.limit_s,
                       "absolute_ns": self.absolute}
             os.write(self.cmd_w, (json.dumps({"run": self.run_id, "seq": self.seq, "type": "record",

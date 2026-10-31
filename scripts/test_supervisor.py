@@ -1491,6 +1491,8 @@ class PureAdmission(unittest.TestCase):
         self.assertEqual(custodian.admission_granted, 0)
         self.assertEqual(custodian.admission_ignored, 1)
         self.assertEqual(custodian.admission_counted, 0)
+        self.assertEqual(custodian.admission_late_reason, "stopped")
+        self.assertEqual(custodian.admission_late_ns, custodian.start + 3 * NS)
 
     def test_a_grant_after_a_deadline_hit_changes_nothing(self):
         custodian = self.custodian()
@@ -1501,6 +1503,81 @@ class PureAdmission(unittest.TestCase):
         self.assertEqual(custodian.absolute, before)
         self.assertEqual(custodian.admission_granted, 0)
         self.assertEqual(custodian.admission_ignored, 1)
+        self.assertEqual(custodian.admission_late_reason, "deadline")
+
+    def test_a_late_grant_is_recorded_with_its_reason_and_decision_facts(self):
+        # Review finding: a marker that reaches the custodian after the stop was
+        # silently ignored. It is classified: the wait is reported, nothing is
+        # granted, and the deadline classification stands.
+        custodian = self.custodian()
+        custodian.deadline_hit = True
+        recorded = []
+        custodian.record = lambda kind, **fields: recorded.append(fields)
+        with self.clock(custodian, 300):
+            custodian.accept(self.message(custodian, 126_900_000_000, offset_s=300))
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual((recorded[0]["reason"], recorded[0]["deadline_hit"], recorded[0]["stopped"]),
+                         ("deadline", True, False))
+        self.assertEqual(recorded[0]["waited_ns"], 126_900_000_000)
+        self.assertEqual(recorded[0]["at"], custodian.start + 300 * NS)
+        custodian.cmd_r, custodian.cmd_w = self.pipe()
+        custodian.observe_admission(True)
+        os.close(custodian.cmd_w)
+        decision = [record["record"] for record in self.drain(custodian.cmd_r)
+                    if record["record"]["event"] == "admission_decision"][0]
+        self.assertEqual(decision["ignored"], 1)
+        self.assertEqual(decision["late_reason"], "deadline")
+        self.assertEqual(decision["late_ns"], custodian.start + 300 * NS)
+        self.assertEqual(decision["granted_ns"], 0)
+        self.assertEqual(decision["counted"], 0)
+        self.assertEqual(decision["absolute_ns"], custodian.start + 300 * NS)
+
+    def test_a_marker_pending_at_the_stop_is_drained_before_the_deadline(self):
+        # Review finding: the watch loop could declare the deadline while a
+        # marker already published was still in the control pipe. One bounded
+        # drain runs first, so that marker still grants.
+        custodian = self.custodian(limit=300)
+        state = {"t": custodian.stop_at}
+        pending = [self.message(custodian, 60 * NS, offset_s=280)]
+        calls = []
+
+        def pump(timeout):
+            calls.append(timeout)
+            state["t"] += 1
+            if pending:
+                custodian.accept(pending.pop())
+            elif len(calls) == 2:  # no marker left: run out the (moved) stop
+                state["t"] = custodian.stop_at
+
+        custodian.pump = pump
+        with patched(bounded, "now_ns", lambda: state["t"]):
+            custodian.watch()
+        self.assertIn(0, calls, "the stop instant did not drain the control pipe")
+        self.assertTrue(custodian.deadline_hit)
+        self.assertEqual(custodian.admission_granted, 60 * NS)
+        self.assertEqual(custodian.admission_ignored, 0)
+        self.assertEqual(custodian.stop_at, custodian.start + 340 * NS)
+
+    def test_a_grant_that_cannot_move_the_stop_cannot_spin_the_watch_loop(self):
+        # A zero-wait marker at the boundary grants nothing, so the next check
+        # declares the deadline instead of draining again.
+        custodian = self.custodian(limit=300)
+        state = {"t": custodian.stop_at}
+        pending = [self.message(custodian, 0, offset_s=280)]
+        calls = []
+
+        def pump(timeout):
+            calls.append(timeout)
+            state["t"] += 1
+            if pending:
+                custodian.accept(pending.pop())
+
+        custodian.pump = pump
+        with patched(bounded, "now_ns", lambda: state["t"]):
+            custodian.watch()
+        self.assertEqual(calls, [0])
+        self.assertTrue(custodian.deadline_hit)
+        self.assertEqual(custodian.admission_granted, 0)
 
     def test_a_future_stamped_grant_latches_and_grants_nothing(self):
         custodian = self.custodian()
@@ -5555,6 +5632,41 @@ class Real(unittest.TestCase):
         self.assertGreaterEqual(decisions[0]["granted_ns"], 9 * NS)
         self.assertLessEqual(decisions[0]["granted_ns"], 11 * NS)
         self.assertFalse(decisions[0]["capped"])
+
+    def test_a_late_admission_marker_is_classified_not_ignored(self):
+        # Review finding: slot admission can reach the supervisor after its stop
+        # decision. The wait is reported, nothing is granted, and the deadline
+        # classification stands instead of becoming an unexplained timeout.
+        # The fixture ignores TERM, writes its marker after the stop instant and
+        # stays in the group long enough for the sampler to read it while the
+        # custodian is still in its bounded stop.
+        code = fixture(
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "path = os.path.join(os.environ['OXIDE_PROOF_EVIDENCE'], " + repr(bounded.ADMISSION_NAME) + ")\n"
+            "time.sleep(13)\n"
+            "with open(path + '.tmp', 'w') as handle:\n"
+            "    json.dump({'schema': 1, 'source': 'fixture', 'waited_ns': 13 * 1000000000}, handle)\n"
+            "os.replace(path + '.tmp', path)\n"
+            "open(os.environ['CASE_DIR'] + '/ran', 'w')\n"
+            "time.sleep(1.5)\n")
+        self.assertEqual(self.guardian(code, limit=32), 124)
+        self.assertTrue(self.outcome()["deadline"], "a late marker must not look like an ordinary exit")
+        self.assertEqual(self.outcome()["closure"], "closed")
+        self.assertIsNone(self.outcome()["fault"])
+        self.assertTrue((self.dir / "ran").exists(), "the fixture never reached its late write")
+        self.assertEqual(self.receipt["admission"]["observed"], 1)
+        late = [record for record in self.receipt["custodian"] if record["event"] == "admission_late"]
+        self.assertEqual(len(late), 1)
+        self.assertEqual(late[0]["reason"], "deadline")
+        self.assertEqual(late[0]["waited_ns"], 13 * NS)
+        self.assertGreaterEqual(late[0]["at"], self.receipt["start_ns"] + 12 * NS)
+        decisions = [r for r in self.receipt["custodian"] if r["event"] == "admission_decision"]
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["counted"], 0)
+        self.assertEqual(decisions[0]["ignored"], 1)
+        self.assertEqual(decisions[0]["granted_ns"], 0)
+        self.assertEqual(decisions[0]["late_reason"], "deadline")
+        self.assertEqual(decisions[0]["absolute_ns"], self.receipt["start_ns"] + 32 * NS)
 
     def test_a_malformed_admission_marker_changes_nothing(self):
         # Cooperative evidence only: a rejected marker is recorded and the run
