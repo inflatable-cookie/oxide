@@ -1222,6 +1222,14 @@ class Guard:
         return self.fault
 
 
+def custodian_deadline_hit(now, absolute, inject):
+    """The custodian's deadline flag. The injected `custodian-timeout-after-monitor`
+    stands in for the deadline actor firing right after the decision, so it keeps
+    deadline semantics (exit 124); a real monitor that has not completed by the
+    exit margin is a fault, and only the absolute deadline is a real deadline."""
+    return now >= absolute or "custodian-timeout-after-monitor" in inject
+
+
 def exit_code(deadline_hit, fault, closed, status):
     """124 deadline; 125 fault or UNCLOSED; else the command's own status."""
     if deadline_hit:
@@ -4550,10 +4558,8 @@ class Custodian:
         while not self.monitor_complete and not self.monitor_exited and now_ns() < self.exit_at:
             self.pump(self.exit_at - now_ns())
         if not self.monitor_complete:
-            # Only the absolute deadline is a deadline hit; the earlier exit
-            # margin is where the custodian stops waiting for a monitor that may
-            # be holding an unaccounted child, which is a fault, not a deadline.
-            self.deadline_hit = self.deadline_hit or now_ns() >= self.absolute
+            self.deadline_hit = self.deadline_hit or custodian_deadline_hit(
+                now_ns(), self.absolute, self.inject)
             self.guard.latch("monitor did not complete")
         status = None
         end = min(now_ns() + NS // 2, self.absolute)

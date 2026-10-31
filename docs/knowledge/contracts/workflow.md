@@ -2169,7 +2169,7 @@ with no earlier run migrated.
 
 **Post-census image detach request (oxide#191, decision `ee263cea`, unqualified
 source).** The current `bounded-test.py`
-(`f864294f759ae29ee31e31d01ac38d5a147a50cf7ba1a751edb2efab87b17220`) adds one
+(`e9e2d6437d29e484db0a53a5d9008fc8c1fbc0bf69b8670725a9a852d7ec16fb`) adds one
 opt-in control for a proof
 whose own test image must be detached, and it is the only route by which such a
 proof may detach after a launch; the qualified shared runner is otherwise
@@ -2192,7 +2192,10 @@ and the final cleanup gate — is bounded by ONE absolute deadline taken from th
 custodian's own wait window; every cap in it is a MINIMUM with what is left, a
 spent window spawns and waits for nothing, and no phase has a fixed floor that
 could exceed the remainder (the reap included, so a child that ignores KILL
-cannot extend the sequence). It then asks the custodian — which alone holds the
+cannot extend the sequence). The test-only `custodian-timeout-after-monitor` injection stands in for
+the deadline actor firing after the decision and keeps deadline semantics (exit 124); a real monitor
+that has not completed at the exit margin remains a fault (125), so the injection cannot weaken child
+custody. It then asks the custodian — which alone holds the
 latched fault, the deadline and the closure verdict — to authorize the single
 attempt over the control pipe; the custodian answers from that state only (no
 filesystem call) with its verdict and the wait budget that remains before it would
@@ -2201,11 +2204,13 @@ runs, so authority withdrawn mid-attempt (a newly latched fault, the deadline, a
 lost answer) KILLs the child instead of letting it finish. An allowed attempt is
 ONE ORDINARY `hdiutil detach <mount>` of that exact image, clamped to that budget
 and to its own ceiling, with a bounded child and an output tail capped at 4096
-bytes however much the child writes; success is every fact at once — exit zero, no
-spawn error, no timeout, no withdrawal, the child positively reaped, the mount
-gone *and* no entity of that backing still attached (an unmounted volume or a
-leftover slice of the requested whole disk is not a detach) — never a zero or
-missing exit on its own. A child that is not positively reaped is never reported
+bytes however much the child writes; the request names the MOUNTED entity's own device, because an APFS
+image attaches as a container whole disk plus a synthesized whole disk and the
+mount can live on either, so a container name is not the mount's device; success
+is every fact at once — exit zero, no spawn error, no timeout, no withdrawal, the
+child positively reaped, the mount gone *and* no entity of that backing still
+attached (an unmounted volume, a leftover container or a synthesized disk is not a
+detach) — never a zero or missing exit on its own. A child that is not positively reaped is never reported
 as reaped, and its live handle survives every exception path (authorization, the
 attempt and the post-state read): the monitor publishes the child's PID **and
 start time**, stops touching the handle and waits for the custodian's
@@ -2261,8 +2266,8 @@ custodian keeps its filesystem-free decision path and the existing
 cooperative-session limits. These bytes are unqualified until one uncounted
 `effigy proof:supervisor:qualify:diagnostic` records a clean picture and then
 ONE counted author and ONE separate independent reviewer
-`effigy proof:supervisor:qualify` pass at the same head (264 pure plus 51 real
-cases, including the fifty-four pure detach cases and the eight real ones: a
+`effigy proof:supervisor:qualify` pass at the same head (267 pure plus 51 real
+cases, including the fifty-seven pure detach cases and the eight real ones: a
 bound success, a refused identity, a failed attempt, an unrequested attachment
 whose opt-in custody keep is recorded separately, and a real stuck child the
 custodian pins, signals and observes closed), with independent exact-head source
@@ -5422,7 +5427,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
 - **Focused proof of absent checkout chains (oxide#135).** The one fixed proof
   is `effigy rust:prune-absence` (`scripts/test-prune-absence.py` under this
-  tree's shared supervisor `f864294f…`, the merged oxide#151 guard plus
+  tree's shared supervisor `e9e2d643…`, the merged oxide#151 guard plus
   oxide#191's opt-in post-census detach) with
   `--root-parent /private/tmp`, the owner-accepted internal-placement exception
   (decision `bd357a4c`): the missing-chain fixtures must be on the boot Data

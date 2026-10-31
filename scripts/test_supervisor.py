@@ -3708,6 +3708,14 @@ class PureQualificationTopology(unittest.TestCase):
                                        None, KernelFactsForOracle(), None))
         return plan["detach-paths"]()
 
+    def test_the_custodian_timeout_injection_keeps_deadline_semantics(self):
+        absolute = 1000
+        self.assertTrue(bounded.custodian_deadline_hit(absolute, absolute, ()))
+        self.assertFalse(bounded.custodian_deadline_hit(absolute - 1, absolute, ()))
+        self.assertTrue(bounded.custodian_deadline_hit(
+            absolute - 1, absolute, ("custodian-timeout-after-monitor",)))
+        self.assertFalse(bounded.custodian_deadline_hit(absolute - 1, absolute, ("other",)))
+
     def test_the_receipt_path_checks_the_recorded_detach_and_cleanup_objects(self):
         receipt = {"phase": "monitor_complete: pending_custodian",
                    "outcome": {"closure": "closed", "status": 0, "fault": None, "deadline": False}}
@@ -5086,6 +5094,58 @@ class PureDetach(unittest.TestCase):
         record = bounded.post_census_detach(ctx, facts)
         self.assertEqual((record["state"], record["post_state"], record["qualified"]),
                          ("failed", "still_attached", False), record)
+
+    def test_the_apfs_container_and_synthesized_disk_shape(self):
+        # A real APFS attach: entities are a container whole disk, a synthesized
+        # whole disk and the mounted slice. The request must name the MOUNTED
+        # entity; the container's whole-disk name is not that mount's device, and
+        # any entity left behind after the attempt is not a detach.
+        container = ("/dev/disk10", None, None)
+        synthesized = ("/dev/disk11", None, None)
+        mounted = ("/dev/disk11s1", "/Volumes/OxDetach", DETACH_UUID)
+
+        def shape(requested):
+            def attachments(attempted):
+                if attempted:
+                    return [] if requested == mounted[0] else [container, synthesized]
+                return [container, synthesized, mounted]
+            return attachments
+
+        ctx, backing = self.layout()
+        mounted_facts = self.facts(attachments=shape(mounted[0]))
+        mounted_facts.stats["/dev/disk11s1"] = types.SimpleNamespace(st_rdev=42)
+        self.request(ctx, backing, device=mounted[0])
+        record = bounded.post_census_detach(ctx, mounted_facts)
+        self.assertEqual((record["state"], record["qualified"]), ("detached", True), record)
+
+        # The container's whole-disk name is attached from the backing, but it is
+        # not the device the mount is bound to.
+        ctx, backing = self.layout()
+        container_facts = self.facts(attachments=shape(container[0]))
+        self.request(ctx, backing, device=container[0])
+        record = bounded.post_census_detach(ctx, container_facts)
+        self.assertEqual((record["state"], record["qualified"]), ("refused", False), record)
+        self.assertIn("not this image's own device", record["reason"])
+
+        # Naming the mounted device but leaving the container/synthesized entities
+        # attached is still not a detach.
+        ctx, backing = self.layout()
+        leftover = self.facts(attachments=shape("other"))
+        leftover.stats["/dev/disk11s1"] = types.SimpleNamespace(st_rdev=42)
+        self.request(ctx, backing, device=mounted[0])
+        record = bounded.post_census_detach(ctx, leftover)
+        self.assertEqual((record["state"], record["post_state"], record["qualified"]),
+                         ("failed", "still_attached", False), record)
+
+    def test_the_fixture_accepts_the_two_disk_attachment(self):
+        # The qualification fixture must accept an image with more than one
+        # whole-disk entity and name the mounted one.
+        source = inspect.getsource(bounded)  # keep the import used
+        fixture_source = DETACH_CASE
+        self.assertIn("mounted = [entity for entity in entities", fixture_source)
+        self.assertIn('device = mounted[0]["dev-entry"]', fixture_source)
+        self.assertNotIn("if len(wholes) != 1", fixture_source)
+        self.assertNotIn('"device": wholes[0]', fixture_source)
 
     def test_the_child_runner_polls_and_stops_on_withdrawal(self):
         # A fake process over a real pipe: no child, so this stays pure. While the
@@ -6918,14 +6978,21 @@ if attached.returncode != 0:
     raise SystemExit(3)
 entities = plistlib.loads(attached.stdout)["system-entities"]
 wholes = [entity["dev-entry"] for entity in entities
-          if entity.get("dev-entry", "").rsplit("/dev/disk", 1)[-1].isdigit()]
+          if re.fullmatch(r"/dev/disk\d+", entity.get("dev-entry", ""))]
 mounts = [entity["mount-point"] for entity in entities if entity.get("mount-point")]
-if len(wholes) != 1 or mounts != [mount]:
+# An APFS image attaches as a container whole disk PLUS a synthesized whole disk,
+# with the volume mounted from a slice of one of them. Any number of whole-disk
+# entities is fine; exactly one mounted entity is not.
+mounted = [entity for entity in entities if entity.get("mount-point") == mount]
+if not wholes or mounts != [mount] or len(mounted) != 1 or not mounted[0].get("dev-entry"):
     print("unexpected attachment " + repr((wholes, mounts)), file=sys.stderr)
     raise SystemExit(3)
+# The detach request names the MOUNTED entity's own device: a whole-disk name can
+# be the container, which is not what the mount is bound to.
+device = mounted[0]["dev-entry"]
 uuid = plistlib.loads(run("/usr/sbin/diskutil", "info", "-plist", mount).stdout)["VolumeUUID"]
 if mode == "request":
-    request = {"version": 1, "backing": os.path.realpath(image), "mount": mount, "device": wholes[0],
+    request = {"version": 1, "backing": os.path.realpath(image), "mount": mount, "device": device,
                "volume_uuid": uuid, "note": "supervisor suite detach case"}
     request.update(json.loads(os.environ.get("CASE_DETACH_OVERRIDE") or "{}"))
     temporary = os.path.join(evidence, "detach-request.json.tmp")
@@ -6934,8 +7001,9 @@ if mode == "request":
     os.replace(temporary, os.path.join(evidence, "detach-request.json"))
 
 with open(os.path.join(case, "volume.json"), "w") as handle:
-    json.dump({"mount": mount, "device": wholes[0], "uuid": uuid, "image": image}, handle)
-print("detach fixture ready: " + mount + " " + wholes[0])
+    json.dump({"mount": mount, "device": device, "uuid": uuid, "image": image,
+               "wholes": wholes}, handle)
+print("detach fixture ready: " + mount + " " + device + " wholes " + repr(wholes))
 """)
 
 

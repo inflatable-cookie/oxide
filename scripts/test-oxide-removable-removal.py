@@ -429,6 +429,7 @@ class Volume:
     def __init__(self, proof: Proof, image: str, mount: str):
         self.proof, self.image, self.mount = proof, image, mount
         self.device = None
+        self.mount_device = None
         self.uuid = None
 
     def attachment_entries(self) -> list:
@@ -464,6 +465,14 @@ class Volume:
         )
         expect(bool(wholes), f"no whole-disk device in {entities}")
         self.device = wholes[0]
+        # An APFS image attaches as a container whole disk PLUS a synthesized whole
+        # disk; the mounted volume is one entity's own device. The detach request
+        # names THAT entity, which is what the guard binds to the mount (a
+        # whole-disk name can be the container, which the mount is not on).
+        mounted = [entity for entity in entities if entity.get("mount-point") == self.mount]
+        expect(len(mounted) == 1 and mounted[0].get("dev-entry"),
+               f"the volume is not exactly one entity of {self.image}: {mounted}")
+        self.mount_device = mounted[0]["dev-entry"]
         info = plistlib.loads(self.proof.run(["/usr/sbin/diskutil", "info", "-plist", self.mount], timeout=30).stdout)
         expect(self.uuid is None or info["VolumeUUID"] == self.uuid, "re-attached volume UUID changed")
         self.uuid = info["VolumeUUID"]
@@ -471,7 +480,7 @@ class Volume:
         # The guard detaches this image at most once, after its own census: every
         # attach (and re-attach) leaves exactly one request naming the identities
         # the guard must re-derive for itself.
-        publish_detach_request(self.proof, self.image, self.mount, self.device, self.uuid)
+        publish_detach_request(self.proof, self.image, self.mount, self.mount_device, self.uuid)
         print(f"attached {self.image} as {self.device} at {self.mount}, volume {self.uuid}")
 
     def bound(self) -> None:
@@ -1853,6 +1862,12 @@ def self_check() -> int:
     expect(
         "publish_detach_request" in inspect.getsource(Volume.attach),
         "Volume.attach does not publish the post-census detach request",
+    )
+    expect(
+        "self.mount_device" in inspect.getsource(Volume.attach)
+        and "publish_detach_request(self.proof, self.image, self.mount, self.mount_device, self.uuid)"
+        in inspect.getsource(Volume.attach),
+        "Volume.attach does not name the mounted entity's own device in the request",
     )
     expect(
         "publish_image_custody" in inspect.getsource(Removal.__init__)
