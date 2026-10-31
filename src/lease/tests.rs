@@ -2,13 +2,14 @@ use super::managed;
 use super::pool::{
     create_injected, evict_held_slot_injected, evict_idle_slot_injected, hold_expecting_injected,
     hold_intent_for_test, hold_intent_present_injected, lease_injected, mark_evicting_for_test,
-    recover_injected, release_injected, status_injected, with_accounting_limits,
+    recover_injected, release_injected, slot_state_injected, status_injected,
+    with_accounting_limits,
 };
 use super::{
-    AccountingCoverage, AccountingGapKind, AccountingScan, AdmissionClass, LeaseError,
-    LeaseRequest, Profile, SlotLayout, SlotOccupancy, VictimPolicy, BUDGET_BACKEND_DIRECTORY_V1,
-    MANAGED_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_LEDGER_BYTES, MAX_REFUSAL_SLOTS,
-    RAISED_CAPACITY_POLICY_VERSION,
+    AccountingCoverage, AccountingGapKind, AccountingScan, AdmissionClass, HeldEvictionFailure,
+    LeaseError, LeaseRequest, Profile, SlotLayout, SlotOccupancy, VictimPolicy,
+    BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES,
+    MAX_LEDGER_BYTES, MAX_REFUSAL_SLOTS, RAISED_CAPACITY_POLICY_VERSION,
 };
 use std::fs::{self, File};
 use std::io::Write;
@@ -1169,12 +1170,33 @@ fn a_held_slot_is_evicted_whole_only_by_its_exact_lease() {
     let workspace = fx.dir("workspace");
     let granted = lease_injected(request(&pool, &project, &workspace, "holder-a")).expect("lease");
     let slot_path = pool.join("payload").join("slots").join(&granted.slot_id);
-    // A wrong lease refuses with the held row and the tree unchanged.
+    // A wrong lease refuses with the held row, the ledger bytes, the control
+    // state and the tree identity unchanged: a pre-commit refusal writes
+    // nothing.
     let wrong = "0".repeat(32);
+    let ledger_before = fs::read(pool.join("ledger.json")).expect("ledger bytes");
+    let control_before = fs::read(pool.join(MANAGED_NAME).join("state.json")).ok();
+    let tree_before = fs::metadata(&slot_path).expect("slot tree");
     assert!(matches!(
         evict_held_slot_injected(&pool, &granted.slot_id, &wrong),
-        Err(LeaseError::Busy)
+        Err(HeldEvictionFailure::PreCommit(LeaseError::Busy))
     ));
+    assert_eq!(
+        fs::read(pool.join("ledger.json")).expect("ledger bytes"),
+        ledger_before,
+        "a pre-commit refusal wrote the ledger"
+    );
+    assert_eq!(
+        fs::read(pool.join(MANAGED_NAME).join("state.json")).ok(),
+        control_before,
+        "a pre-commit refusal wrote the control state"
+    );
+    let tree_after = fs::metadata(&slot_path).expect("slot tree");
+    assert_eq!(
+        (tree_after.dev(), tree_after.ino()),
+        (tree_before.dev(), tree_before.ino()),
+        "a pre-commit refusal replaced the slot tree"
+    );
     assert!(slot_path.is_dir(), "a refused held eviction moved the tree");
     let view = managed::ledger_view(&pool).expect("ledger");
     assert_eq!(
@@ -1206,6 +1228,55 @@ fn a_held_slot_is_evicted_whole_only_by_its_exact_lease() {
             .any(|entry| entry.name == holding[0] && entry.slot_id == granted.slot_id),
         "the holding row does not name the held eviction"
     );
+}
+
+/// oxide#196: an injected rename failure after the durable hold intent is
+/// reported as post-commit, never as a pre-commit refusal. The slot stays
+/// held and charged, the intent is durable, the tree stays at its path, and
+/// the next locked open clears the stale intent so a retry evicts it whole.
+#[test]
+fn a_post_intent_rename_failure_is_committed_and_recovers() {
+    let fx = Fixture::new("held-rename-failure");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let granted = lease_injected(request(&pool, &project, &workspace, "holder-a")).expect("lease");
+    let id: u64 = granted.slot_id.parse().expect("slot id");
+    let slot_path = pool.join("payload").join("slots").join(&granted.slot_id);
+    crate::test_fs::arm_holding_rename_failure();
+    let failure = evict_held_slot_injected(&pool, &granted.slot_id, &granted.lease_id)
+        .expect_err("the injected rename failure");
+    match failure {
+        HeldEvictionFailure::PostCommit(reason) => {
+            assert!(reason.contains("hold intent"), "{reason}");
+            assert!(reason.contains("tree was not moved"), "{reason}");
+        }
+        other => panic!("a post-intent failure was classified as {other:?}"),
+    }
+    // Conservatively charged and never idle: the held row, its durable intent
+    // and its tree are all still recorded.
+    assert_eq!(
+        slot_state_injected(&pool, &granted.slot_id).as_deref(),
+        Some("held")
+    );
+    assert!(hold_intent_present_injected(&pool, id));
+    assert!(slot_path.is_dir(), "the failed rename removed the tree");
+    let view = status_injected(&pool).expect("the next locked open reconciles");
+    assert!(
+        view.slots
+            .iter()
+            .any(|slot| slot.slot_id == granted.slot_id && slot.state == SlotOccupancy::Held),
+        "the committed slot is not charged as held"
+    );
+    assert!(
+        !hold_intent_present_injected(&pool, id),
+        "the stale intent survived the next open"
+    );
+    let holding = evict_held_slot_injected(&pool, &granted.slot_id, &granted.lease_id)
+        .expect("the retry evicts the held slot");
+    assert_eq!(holding.len(), 1);
+    assert!(!slot_path.exists());
 }
 
 /// oxide#196 crash window A: a held eviction's durable intent exists but the

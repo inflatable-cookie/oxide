@@ -587,3 +587,20 @@ pub(crate) fn faulted_readdir(listed: u64) -> Option<libc::c_int> {
         Some(armed.1)
     })
 }
+
+thread_local! {
+    /// One injected holding-rename failure, armed by a library test after the
+    /// durable hold intent so the post-commit window can be exercised.
+    static HOLDING_RENAME_FAILURE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Arm one injected holding-rename failure. It fires after the durable hold
+/// intent, at the rename itself, so the failure is post-commit.
+pub(crate) fn arm_holding_rename_failure() {
+    HOLDING_RENAME_FAILURE.with(|armed| armed.set(true));
+}
+
+/// Consume the armed holding-rename failure, if any.
+pub(crate) fn take_holding_rename_failure() -> bool {
+    HOLDING_RENAME_FAILURE.with(|armed| armed.replace(false))
+}

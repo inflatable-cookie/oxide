@@ -32,10 +32,11 @@ use oxide_storage::lease::managed::{
     measure_within, recover, release, snapshot, status as pool_status,
 };
 use oxide_storage::lease::{
-    AccountingScan, AdmissionClass, LeaseError, LeaseRequest, LedgerSlot, LedgerView, MemberPair,
-    MemberSet, OneUseSlice, PoolStatus, Profile as LeaseProfile, RestoreOutcome, ReuseMeasurement,
-    SliceAdmission, SliceReport, SlotLayout, SlotOccupancy, UnmeasuredSlot, VictimPolicy,
-    BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME, VOLUME_BACKEND_APFS_V1,
+    AccountingScan, AdmissionClass, HeldEvictionFailure, LeaseError, LeaseRequest, LedgerSlot,
+    LedgerView, MemberPair, MemberSet, OneUseSlice, PoolStatus, Profile as LeaseProfile,
+    RestoreOutcome, ReuseMeasurement, SliceAdmission, SliceReport, SlotLayout, SlotOccupancy,
+    UnmeasuredSlot, VictimPolicy, BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME,
+    VOLUME_BACKEND_APFS_V1,
 };
 use oxide_storage::volume::Binding;
 use serde::{Deserialize, Serialize};
@@ -4837,18 +4838,46 @@ impl Store {
                 slot.slot_id
             ));
         }
-        // Only a token that still matches reaches the durable fence and the
-        // effect. The held row and the tree move to the holding area in one
-        // library transaction under this admission lock: there is no
-        // release-to-idle step, so a failed eviction leaves the slot held and
-        // its record quarantined rather than changing custody.
-        self.fence_admission_state()?;
+        // Only a token that still matches reaches the effect. The held row and
+        // the tree move to the holding area in one library transaction whose
+        // durable hold intent is the commit point: every failure before it is
+        // pre-commit and leaves the pool bytes and identity unchanged, while a
+        // post-commit failure names the recorded partial state the next locked
+        // open recovers. There is no release-to-idle step.
         let record = slot.record;
-        let holding = evict_held_slot(&self.pool, &slot.slot_id, &slot.lease_id)
-            .map_err(|error| lease_error("cannot delete the quarantined slot", &error))?;
-        let mut state = self.load()?;
+        let holding = match evict_held_slot(&self.pool, &slot.slot_id, &slot.lease_id) {
+            Ok(holding) => holding,
+            Err(HeldEvictionFailure::PreCommit(error)) => {
+                return Err(lease_error("cannot delete the quarantined slot", &error))
+            }
+            Err(HeldEvictionFailure::PostCommit(reason)) => {
+                return Err(format!(
+                    "the quarantined slot's eviction is committed but did not finish: {reason}; the slot is never idle and its record stays held, and the next oxide command resumes or rolls back the eviction"
+                ))
+            }
+        };
+        // The durable eviction is complete. The admission fence and the
+        // record removal are post-commit follow-ups; a failure here is
+        // reported as committed-but-unfinished, never as a pre-commit refusal.
+        if let Err(error) = self.fence_admission_state() {
+            return Err(format!(
+                "the quarantined slot's eviction is committed but the pool admission fence did not finish ({error}); the slot is never idle, and the next oxide command writes the fence and resumes the record"
+            ));
+        }
+        let mut state = match self.load() {
+            Ok(state) => state,
+            Err(error) => {
+                return Err(format!(
+                    "the quarantined slot's eviction is committed but its control record could not be read ({error}); the slot is never idle, and a later command or boot clears the stale record"
+                ))
+            }
+        };
         self.forget_record(&mut state, record);
-        self.save(&state)?;
+        if let Err(error) = self.save(&state) {
+            return Err(format!(
+                "the quarantined slot's eviction is committed but its record could not be forgotten ({error}); the slot is never idle, and a later boot clears the stale record"
+            ));
+        }
         Ok(ReleasedQuarantined {
             slot_id: slot.slot_id.clone(),
             recorded_bytes: slot.recorded_bytes,
