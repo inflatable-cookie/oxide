@@ -2169,7 +2169,7 @@ with no earlier run migrated.
 
 **Post-census image detach request (oxide#191, decision `ee263cea`, unqualified
 source).** The current `bounded-test.py`
-(`77e87c6edfcef99ccabcfb5033e82079854b2cba20b3a65992b828c604694453`) adds one
+(`9af104440f4b30d4c5df3828861cb10889cdd5afd315d15a940d5dfb66784e14`) adds one
 opt-in control for a proof
 whose own test image must be detached, and it is the only route by which such a
 proof may detach after a launch; the qualified shared runner is otherwise
@@ -2189,30 +2189,34 @@ volume UUID, the mount bound to that node's device, and a caller-owned run root
 detaching nothing. The WHOLE sequence — the request read, the identity re-derivation, the
 authorization round trip, the child's output drain, the reap, the post-state read
 and the final cleanup gate — is bounded by ONE absolute deadline taken from the
-custodian's own wait window, and each phase is clamped to what is left of it with
-no forced minimum (the reap included, so a child that ignores KILL cannot extend
-the sequence). A detach child that is not positively reaped inside that window is
-never reported as reaped: the attempt fails, the monitor publishes the child's PID
-and holds itself open inside the custodian's wait window rather than exiting, and
-the custodian pins that PID by identity (`kinfo_proc` start), signals it, observes
-it gone and records pin, signal and observation (with a post-timeout close as
-backstop), latching a fault when it cannot be observed closed; the root, backing
-and evidence stay kept either way. The reap, the post-state read and that final
-acknowledgment each fit inside what is left of the window, with no additive or
-forced minimum wait. It then asks the custodian — which alone holds the latched
-fault, the deadline and the closure verdict — to authorize the single attempt
-over the control pipe; the custodian answers from that state only (no filesystem
-call) with its verdict and the wait budget that remains before it would declare
-the monitor incomplete, and it is asked again every 0.2 s while the child runs, so
-authority withdrawn mid-attempt (a newly latched fault, the deadline, a lost
-answer) KILLs the child instead of letting it finish. An allowed attempt is ONE
-ORDINARY `hdiutil detach <mount>` of that exact image, clamped to that budget and
-to its own ceiling, with a bounded child and an output tail capped at 4096 bytes
-however much the child writes; success is every fact at once — exit zero, no
-spawn error, no timeout, no withdrawal, the mount gone *and* no entity of that
-backing still attached (an unmounted volume or a leftover slice of the requested
-whole disk is not a detach) — never a zero or missing exit on its own. A request
-that is present but not an object (including JSON `null`) is a refusal, never an
+custodian's own wait window; every cap in it is a MINIMUM with what is left, a
+spent window spawns and waits for nothing, and no phase has a fixed floor that
+could exceed the remainder (the reap included, so a child that ignores KILL
+cannot extend the sequence). It then asks the custodian — which alone holds the
+latched fault, the deadline and the closure verdict — to authorize the single
+attempt over the control pipe; the custodian answers from that state only (no
+filesystem call) with its verdict and the wait budget that remains before it would
+declare the monitor incomplete, and it is asked again every 0.2 s while the child
+runs, so authority withdrawn mid-attempt (a newly latched fault, the deadline, a
+lost answer) KILLs the child instead of letting it finish. An allowed attempt is
+ONE ORDINARY `hdiutil detach <mount>` of that exact image, clamped to that budget
+and to its own ceiling, with a bounded child and an output tail capped at 4096
+bytes however much the child writes; success is every fact at once — exit zero, no
+spawn error, no timeout, no withdrawal, the child positively reaped, the mount
+gone *and* no entity of that backing still attached (an unmounted volume or a
+leftover slice of the requested whole disk is not a detach) — never a zero or
+missing exit on its own. A child that is not positively reaped is never reported
+as reaped, and its live handle survives every exception path (authorization, the
+attempt and the post-state read): the monitor publishes the child's PID **and
+start time**, stops touching the handle and waits for the custodian's
+acknowledgement before it may reap again, because a reaped PID can be recycled and
+a bare PID is never signalled. The custodian re-reads `kinfo_proc`, requires the
+same PID, the same start time and still this monitor as parent, then signals,
+observes it gone and acknowledges (a post-timeout close is the backstop); only a
+declined handoff (the child is already gone) lets the monitor finish the reap
+itself. Pin, signal and observation are recorded, an unobserved child is a latched
+fault, and the root, backing and evidence stay kept either way. A request that is
+present but not an object (including JSON `null`) is a refusal, never an
 absent request. A refusal, failure, timeout, identity change or
 ambiguous/unreadable post-state is never retried, never removes a backing,
 keeps the mount, its backing and the evidence, records the attempt in the
@@ -5403,7 +5407,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
 - **Focused proof of absent checkout chains (oxide#135).** The one fixed proof
   is `effigy rust:prune-absence` (`scripts/test-prune-absence.py` under this
-  tree's shared supervisor `77e87c6e…`, the merged oxide#151 guard plus
+  tree's shared supervisor `9af10444…`, the merged oxide#151 guard plus
   oxide#191's opt-in post-census detach) with
   `--root-parent /private/tmp`, the owner-accepted internal-placement exception
   (decision `bd357a4c`): the missing-chain fixtures must be on the boot Data

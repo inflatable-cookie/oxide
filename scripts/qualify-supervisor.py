@@ -77,10 +77,10 @@ WALL_NS = 300 * NS
 CANDIDATE_LIMIT = 280
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 292  # 247 pure + 45 real (oxide#151 added the routing, marker,
+EXPECTED_CASES = 295  # 250 pure + 45 real (oxide#151 added the routing, marker,
                       # nested-window protection, bounded-sweep, qualify-entry,
                       # shared-ancestor/private-leaf and readiness cases; oxide#191
-                      # adds thirty-eight pure post-census detach cases and five real
+                      # adds forty-one pure post-census detach cases and five real
                       # ones: success, a refused identity, a failed attempt, an
                       # unrequested attachment whose opt-in custody keep is recorded
                       # separately, and a stuck child the custodian closes itself)
@@ -706,9 +706,11 @@ def check_plan(receipt, results, expected, record=None, facts=None, base=None):
         stuck = recorded.get(STUCK_CASE)
         if stuck is None:
             problems.append(f"{STUCK_CASE} recorded no detach outcome")
-        elif (stuck.get("state"), bool(stuck.get("qualified")), stuck.get("reaped")) != ("timed_out", False, False):
+        elif (stuck.get("state"), bool(stuck.get("qualified")), stuck.get("reaped"),
+              stuck.get("custodian_closed")) != ("timed_out", False, False, True):
             problems.append(f"{STUCK_CASE} recorded {stuck.get('state')}/{stuck.get('qualified')}/"
-                            f"reaped {stuck.get('reaped')}, not timed_out/False/False")
+                            f"reaped {stuck.get('reaped')}/custodian_closed "
+                            f"{stuck.get('custodian_closed')}, not timed_out/False/False/True")
         if CLEANUP_CASE in recorded:
             problems.append(f"{CLEANUP_CASE} recorded a detach object for a request-free run")
         if CLEANUP_CASE not in kept:

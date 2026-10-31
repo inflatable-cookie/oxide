@@ -3422,6 +3422,10 @@ class QualifyEntry(unittest.TestCase):
         self.assertEqual(observed["forbidden"], [], "the broken entry attempted an effect")
 
 
+def typed_int(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
 def detach_case_rows(case):
     """The three real detach case rows a qualification receipt must carry, in
     the shape the suite publishes them (oxide#191): each inside the monitored
@@ -3436,7 +3440,7 @@ def detach_case_rows(case):
         {"case": "test_an_unrequested_attachment_keeps_the_owned_root", "dir": case, "exit": 125,
          "cleanup": {"state": "kept", "reason": "a mounted image the proof never requested"}},
         {"case": "test_a_stuck_detach_child_is_closed_by_the_custodian", "dir": case, "exit": 125,
-         "detach": {"state": "timed_out", "qualified": False, "reaped": False}},
+         "detach": {"state": "timed_out", "qualified": False, "reaped": False, "custodian_closed": True}},
     ]
 
 
@@ -4600,6 +4604,45 @@ class PureDetach(unittest.TestCase):
         record = bounded.post_census_detach(ctx, self.facts())
         self.assertFalse(record["reaped"])
         self.assertFalse(record["qualified"])
+
+    def test_a_spent_window_spawns_nothing(self):
+        spawned = []
+        result = bounded.bounded_run(["/bin/true"], 0.0, 64,
+                                     spawn=lambda *a, **k: spawned.append(1) or None)
+        self.assertEqual(spawned, [], "a spent window still spawned a child")
+        self.assertEqual(result["error"], "no time left in the window")
+        self.assertFalse(result["reaped"])
+
+    def test_no_wait_exceeds_the_granted_window(self):
+        ctx, backing = self.layout()
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, self.facts(), authorize=lambda b, w: (True, None, b))
+        self.assertTrue(record["qualified"], record)
+        self.assertLessEqual(record["timeout_s"] * bounded.NS, record["budget_ns"] + bounded.NS // 100)
+        # A budget that cannot hold the attempt refuses instead of spawning one.
+        ctx, backing = self.layout()
+        # One second short of the minimum: the window cannot hold a bounded attempt.
+        ctx["start_ns"] = (time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
+                           - (300 * bounded.NS - bounded.DETACH_MIN_BUDGET_NS - bounded.NS))
+        facts = self.facts()
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertEqual(facts.detached, [], "an attempt ran below the minimum budget")
+        self.assertEqual(record["state"], "refused")
+        self.assertIn("wait window", record["reason"])
+
+    def test_a_recycled_or_reparented_pid_is_never_signalled(self):
+        monitor_pid = 4242
+        child = {"pid": 77, "start": 99, "ppid": monitor_pid, "stat": 2}
+        self.assertTrue(bounded.detach_child_identity(child, 77, 99, monitor_pid))
+        for row, pid, start, parent in ((dict(child, start=100), 77, 99, monitor_pid),   # recycled PID
+                                        (dict(child, ppid=1), 77, 99, monitor_pid),      # reparented
+                                        (dict(child, stat=5), 77, 99, monitor_pid),      # zombie
+                                        (None, 77, 99, monitor_pid),                     # gone
+                                        (dict(child, pid=78), 77, 99, monitor_pid)):     # other process
+            self.assertFalse(bounded.detach_child_identity(row, pid, start, parent), (row, pid, start))
+        self.assertIn('self.send("detach_child", pid=int(row["pid"]), start=int(row["start"]))',
+                      inspect.getsource(bounded.Monitor.run))
 
     def test_the_post_state_read_has_no_forced_minimum(self):
         ctx, backing = self.layout()
@@ -6610,10 +6653,15 @@ class DetachReal(unittest.TestCase):
         detach = self.receipt["detach"]
         self.assertEqual((detach["qualified"], detach["reaped"]), (False, False), detach)
         self.assertEqual(self.code, 125)
+        # The monitor handed the child over by PID AND start time and never reaped
+        # it afterwards; the custodian pinned that identity, signalled it and
+        # observed it closed, and the monitor recorded that custody fact.
+        self.assertEqual((detach.get("custodian_owned"), detach.get("custodian_closed")), (True, True), detach)
         records = [r for r in self.receipt["custodian"] if r["event"].startswith("detach_child_")]
         pinned = [r for r in records if r["event"] == "detach_child_pinned"]
         self.assertTrue(pinned, records)
         self.assertEqual(pinned[0]["observation"], "live", records)
+        self.assertTrue(typed_int(pinned[0]["start"]), pinned)
         self.assertTrue([r for r in records if r["event"] == "detach_child_signal"], records)
         observed = [r for r in records if r["event"] == "detach_child_observed"]
         self.assertTrue(observed and observed[0]["closed"] is True, records)
