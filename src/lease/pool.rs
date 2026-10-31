@@ -697,6 +697,12 @@ pub(super) struct Pool {
     /// bound), so many slow slots cost one bound, not one bound each; once it
     /// is spent, a further slot is charged conservatively without a walk.
     walk_started: Option<std::time::Instant>,
+    /// Slots this admission walked completely, with the figure it measured
+    /// and, for an idle slot, the record that walk would publish. A later
+    /// pressure figure in the same admission reuses it, so a measured slot is
+    /// never re-charged below its measurement once the shared walk budget is
+    /// spent. Cleared with `unmeasured` at the start of every admission.
+    measured: BTreeMap<u64, (u64, Option<RecordedSize>)>,
     /// The caller's registered free-space reserve for a removable payload.
     /// Read only by the unknown-size admission route; never a cap input.
     reserve: Option<u64>,
@@ -1438,6 +1444,7 @@ impl Pool {
             admission_note: None,
             unmeasured: BTreeMap::new(),
             walk_started: None,
+            measured: BTreeMap::new(),
             reserve: None,
             created_holding: Vec::new(),
             #[cfg(debug_assertions)]
@@ -1499,6 +1506,7 @@ impl Pool {
             admission_note: None,
             unmeasured: BTreeMap::new(),
             walk_started: None,
+            measured: BTreeMap::new(),
             reserve: None,
             created_holding: Vec::new(),
             #[cfg(debug_assertions)]
@@ -1621,6 +1629,7 @@ impl Pool {
         // it normally.
         self.unmeasured.clear();
         self.walk_started = None;
+        self.measured.clear();
         // A journaled deletion whose recorded root is at neither of its names
         // leaves the ledger uncertain: no new lease is admitted until it is
         // resolved (oxide#175 capture recovery, oxide#177 single-journal
@@ -2675,10 +2684,11 @@ impl Pool {
     }
 
     /// The bounds an admission's own walks use. A removable pool keeps the
-    /// `VOLUME_WALK_MS` bound on the walks a pool figure needs, so a payload
-    /// too large to measure in 5 s reaches the unknown-size reserve route
-    /// instead of timing out mid-measurement; an internal directory pool keeps
-    /// the full accounting bound.
+    /// `VOLUME_WALK_MS` bound and an internal directory pool the full
+    /// accounting bound. Its elapsed bound is ONE budget shared by every slot
+    /// walk in the admission (see [`Pool::slot_figure`]); a slot whose walk
+    /// stops short is charged conservatively, and only an incomplete payload
+    /// scope pass still reaches the removable unknown-size reserve route.
     fn pressure_limits(&self) -> InventoryLimits {
         let mut limits = self.walk_limits();
         if self.is_removable() {
@@ -2692,8 +2702,10 @@ impl Pool {
     /// Both backings use the recorded sum — `pool_scope()` plus one figure
     /// per ledger slot, where a held slot is always walked fresh, a current
     /// idle record is trusted, and a missing or invalid record is walked once
-    /// and published (or, on an internal pool, charged conservatively when
-    /// that walk stops short: oxide#186). A shared removable volume's other
+    /// and published. Any slot walk that stops short, idle or held, on either
+    /// backend, is charged conservatively instead (oxide#186, extended
+    /// 2026-10-31), and a slot already measured in this admission keeps its
+    /// figure. A shared removable volume's other
     /// occupants (caches,
     /// scratch, another tool's files) are **not** this pool's usage and can
     /// never push it over its cap, so they are not part of this figure; the
@@ -2737,8 +2749,9 @@ impl Pool {
     /// Completed walks are published in **one** revised write before the
     /// caller decides anything, so progress survives a refusal. A slot whose
     /// own walk is partial at admission is not something the whole pool can
-    /// fail on: an idle slot on an internal pool is charged conservatively
-    /// into [`Pool::unmeasured`] (oxide#186) and published nowhere, so its
+    /// fail on: any such slot, idle or held, on either backend, is charged
+    /// conservatively into [`Pool::unmeasured`] (oxide#186, extended
+    /// 2026-10-31) and published nowhere, so its
     /// number is never zero, never free space and never a record.
     fn recorded_total(&mut self) -> Result<u64, LeaseError> {
         // Held trees pending deletion are charged their recorded bytes until
@@ -2770,16 +2783,18 @@ impl Pool {
     /// completion recheck refuses to publish a figure for a generation that
     /// changed while it was measured.
     ///
-    /// An **idle** slot on an internal pool whose walk stopped partial with an
-    /// observed figure is charged conservatively instead of refusing: max(the
-    /// bytes observed before it stopped, its current-generation record if any,
-    /// the largest recorded slot), at least one byte and never the whole
-    /// budget. It is kept, marked unmeasured for this admission and never
-    /// evicted on that charge. Everything else keeps its refusal: the slot a
-    /// reuse would take (its own walk is a separate requirement), a held
-    /// slot's live figure, a root that could not even be opened, a removable
-    /// pool (whose documented unknown-size reserve route owns its bounded
-    /// walks) and every shared ledger, backing or fence failure.
+    /// Any non-target slot (idle or held, internal or removable) whose walk
+    /// stopped partial with an observed figure is charged conservatively
+    /// instead of refusing: max(the bytes observed before it stopped, its
+    /// current-generation record if any, the largest recorded slot), at least
+    /// one byte. It is kept, marked unmeasured for this admission and never
+    /// evicted on that charge (oxide#186, extended 2026-10-31). Every slot walk
+    /// in one admission shares ONE elapsed budget; once it is spent a further
+    /// unmeasured slot is charged without a walk, while a slot already walked
+    /// completely in this admission keeps its measured figure. Everything else
+    /// keeps its refusal: the slot a reuse would take (its own walk is a
+    /// separate requirement), a root that could not even be opened, and every
+    /// shared ledger, backing or fence failure.
     fn slot_figure(
         &mut self,
         index: usize,
@@ -2829,6 +2844,12 @@ impl Pool {
         if let Some(charge) = cached {
             return Ok(charge);
         }
+        if let Some((figure, record)) = self.measured.get(&id).cloned() {
+            if let Some(record) = record {
+                pending.push((id, record));
+            }
+            return Ok(figure);
+        }
         let mut limits = self.pressure_limits();
         let started = *self
             .walk_started
@@ -2859,18 +2880,17 @@ impl Pool {
             self.unmeasured.insert(id, charge);
             return Ok(charge);
         }
-        if idle {
-            pending.push((
-                id,
-                RecordedSize {
-                    for_lease: last_lease_id,
-                    unique_bytes: observed,
-                    logical_bytes: sizes.logical.unwrap_or(0),
-                    entries: sizes.scan.entries_visited,
-                    at_ms: now_ms(),
-                },
-            ));
+        let record = idle.then(|| RecordedSize {
+            for_lease: last_lease_id,
+            unique_bytes: observed,
+            logical_bytes: sizes.logical.unwrap_or(0),
+            entries: sizes.scan.entries_visited,
+            at_ms: now_ms(),
+        });
+        if let Some(record) = &record {
+            pending.push((id, record.clone()));
         }
+        self.measured.insert(id, (observed, record));
         Ok(observed)
     }
 
@@ -6157,6 +6177,7 @@ pub(super) fn volume_pool_for_test(
         admission_note: None,
         unmeasured: BTreeMap::new(),
         walk_started: None,
+        measured: BTreeMap::new(),
         reserve,
         created_holding: Vec::new(),
         #[cfg(debug_assertions)]

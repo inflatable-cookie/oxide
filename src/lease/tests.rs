@@ -4096,6 +4096,71 @@ fn a_held_slot_whose_admission_walk_elapses_is_charged_not_refused() {
 }
 
 #[test]
+fn a_measured_held_slot_keeps_its_figure_after_the_shared_walk_budget_is_spent() {
+    // Independent review F1 (2026-10-31): once one slow walk spends the
+    // admission's shared budget, a held slot this admission already measured
+    // must keep that measurement, never fall back to a smaller conservative
+    // guess that would let an over-budget admission through.
+    let fx = Fixture::new("measured-kept");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 3_500 * 1024).expect("init");
+    let workspace = fx.dir("workspace");
+    let held = lease_injected(request(&pool, &fx.dir("held-project"), &workspace, "held"))
+        .expect("held lease");
+    let held_path = pool.join("payload/slots").join(&held.slot_id);
+    fs::write(
+        held_path.join("build").join("blob"),
+        vec![b'a'; 3 * 1024 * 1024],
+    )
+    .expect("blob");
+    let slow = lease_injected(request(&pool, &fx.dir("slow-project"), &workspace, "slow"))
+        .expect("slow lease");
+    release_injected(&pool, &slow.lease_id).expect("release slow");
+    let slow_id = slow.slot_id.parse::<u64>().expect("slot id");
+    super::pool::drop_record_for_test(&pool, slow_id).expect("drop the slow record");
+    let slow_path = pool.join("payload/slots").join(&slow.slot_id);
+    let spare = lease_injected(request(
+        &pool,
+        &fx.dir("spare-project"),
+        &workspace,
+        "spare",
+    ))
+    .expect("spare lease");
+    let spare_path = pool.join("payload/slots").join(&spare.slot_id);
+    fs::write(
+        spare_path.join("build").join("blob"),
+        vec![b'c'; 512 * 1024],
+    )
+    .expect("blob");
+    release_injected(&pool, &spare.lease_id).expect("release spare");
+    let held_before = snapshot_tree(&held_path);
+    let result = elapsed_admission(&fx, &slow_path, || {
+        super::pool::lease_with_charges_injected(request(
+            &pool,
+            &fx.dir("next-project"),
+            &workspace,
+            "next",
+        ))
+    });
+    assert!(
+        matches!(
+            result,
+            Err(LeaseError::Full | LeaseError::CapacityCharged { .. })
+        ),
+        "the held slot's measured 3 MiB must still count after the budget is spent: {:?}",
+        result
+            .as_ref()
+            .map(|(leased, charges)| (&leased.grant.slot_id, charges))
+    );
+    assert_eq!(
+        snapshot_tree(&held_path),
+        held_before,
+        "the held slot was touched"
+    );
+    release_injected(&pool, &held.lease_id).expect("the held lease still releases");
+}
+
+#[test]
 fn a_partial_slot_walk_is_charged_the_bytes_it_observed() {
     let fx = Fixture::new("unmeasured-observed");
     let (pool, slot_id, slot_path, workspace) =

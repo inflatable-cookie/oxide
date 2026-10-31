@@ -1300,7 +1300,12 @@ Anything else is **not current**: never zero, never free space. A slot whose
 record is not current is walked before its number is used; any slot whose walk
 stops partial, idle or held, on either backend, is charged conservatively for
 that admission and kept (oxide#186, extended 2026-10-31). Only a slot root that
-cannot be opened or classified keeps the `unknown_accounting` refusal.
+cannot be opened or classified keeps the `unknown_accounting` refusal. Every slot walk in one admission shares one elapsed budget; a slot measured
+completely earlier in the admission keeps that figure. Because a removable
+pool's admission now usually has a complete (charged) pressure figure, the
+unknown-size reserve route is reached only when the payload scope pass itself
+is incomplete; the volume reserve is still checked when a build starts and by
+the running build's watchdog.
 
 The one deliberate relaxation, restated because it is the whole point: a
 current record is trusted even though a same-UID process could have changed
