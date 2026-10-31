@@ -1772,7 +1772,11 @@ fn vanished_paths_allow_only_the_needed_whole_idle_slot_eviction() {
 }
 
 #[test]
-fn a_real_gap_still_refuses_before_whole_idle_slot_deletion() {
+fn a_real_gap_in_a_held_slot_is_charged_and_only_a_verified_idle_slot_is_evicted() {
+    // Superseded semantics (Tom 2026-10-31, extending oxide#186 to held
+    // slots): an unreadable entry inside a HELD slot no longer refuses an
+    // unrelated admission. The held slot is charged conservatively and never
+    // touched; byte pressure may then evict only a verified idle whole slot.
     let fx = Fixture::new("vanished-gap");
     let pool = fx.dir("pool");
     let budget = 1024 * 1024;
@@ -1797,7 +1801,7 @@ fn a_real_gap_still_refuses_before_whole_idle_slot_deletion() {
     managed::release(&pool, &idle.lease_id).expect("release idle slot");
     let next_project = fx.dir("next-project");
 
-    let refused = crate::inventory::walk_observer::with_mutations(
+    let admitted = crate::inventory::walk_observer::with_mutations(
         fx.path(),
         serde_json::json!([
             {"path": blocked_dir, "action": "permission_denied_before_read_dir"},
@@ -1805,28 +1809,26 @@ fn a_real_gap_still_refuses_before_whole_idle_slot_deletion() {
         ])
         .to_string(),
         || lease_after_publishing(&pool, request(&pool, &next_project, &workspace, "next")),
+    )
+    .expect("a partial walk of a held slot no longer refuses the admission");
+    assert_ne!(admitted.slot_id, held.slot_id);
+    assert!(
+        held.env.cargo_build_build_dir.exists(),
+        "the held slot was touched"
     );
-    let scan = incomplete(refused);
-    assert_eq!(scan.coverage, AccountingCoverage::Partial);
-    assert_eq!(gap_kinds(&scan), vec![AccountingGapKind::UnreadableEntry]);
-    assert_eq!(scan.vanished, 1);
-    assert!(scan.to_string().contains("unreadable_entry x1"));
-    assert!(scan.to_string().contains("vanished x1"));
-    assert!(idle.env.cargo_build_build_dir.exists());
-    assert!(held.env.cargo_build_build_dir.exists());
-    assert!(blocked_dir.exists());
+    assert!(blocked_dir.exists(), "the unreadable entry was touched");
+    assert!(held_stable.exists());
     assert!(!vanished_file.exists());
-
-    let status = managed::status(&pool).expect("status after conservative refusal");
-    assert_eq!(status.slots.len(), 2);
+    assert!(
+        !idle.env.cargo_build_build_dir.exists(),
+        "byte pressure evicts the verified idle whole slot"
+    );
+    let status = managed::status(&pool).expect("status after the admission");
     assert!(status
         .slots
         .iter()
-        .any(|slot| { slot.slot_id == idle.slot_id && slot.state == SlotOccupancy::Idle }));
-    assert!(status
-        .slots
-        .iter()
-        .any(|slot| { slot.slot_id == held.slot_id && slot.state == SlotOccupancy::Held }));
+        .any(|slot| slot.slot_id == held.slot_id && slot.state == SlotOccupancy::Held));
+    assert!(!status.slots.iter().any(|slot| slot.slot_id == idle.slot_id));
 }
 
 #[test]
@@ -4040,6 +4042,57 @@ fn an_unrecorded_slot_whose_admission_walk_elapses_is_charged_and_kept() {
         .slots
         .iter()
         .any(|slot| slot.slot_id == slot_id.to_string() && slot.state == SlotOccupancy::Idle));
+}
+
+#[test]
+fn a_held_slot_whose_admission_walk_elapses_is_charged_not_refused() {
+    // Tom 2026-10-31 (an Effigy block on the live Builds pool): a slot that is
+    // HELD by another command is walked fresh at admission. When that walk
+    // stops at its elapsed bound, the slot is charged conservatively exactly
+    // as an unrecorded idle slot is (oxide#186), never a refusal of an
+    // unrelated admission, and it is never touched.
+    let fx = Fixture::new("held-elapsed");
+    let pool = fx.dir("held-pool");
+    create_injected(&pool, 64 * 1024 * 1024).expect("init");
+    let workspace = fx.dir("held-workspace");
+    let held = lease_injected(request(
+        &pool,
+        &fx.dir("held-project"),
+        &workspace,
+        "holder",
+    ))
+    .expect("the held lease");
+    let held_id = held.slot_id.parse::<u64>().expect("slot id");
+    let held_path = pool.join("payload/slots").join(&held.slot_id);
+    fs::write(held_path.join("build").join("blob"), vec![b'h'; 64 * 1024]).expect("blob");
+    let before = snapshot_tree(&held_path);
+    let (admitted, charges) = elapsed_admission(&fx, &held_path, || {
+        super::pool::lease_with_charges_injected(request(
+            &pool,
+            &fx.dir("other-project"),
+            &workspace,
+            "other",
+        ))
+    })
+    .expect("a partial walk of a held slot no longer refuses an unrelated admission");
+    assert!(!admitted.grant.reused_slot);
+    assert_ne!(admitted.grant.slot_id, held.slot_id);
+    assert_eq!(
+        charges.len(),
+        1,
+        "exactly the held slot is charged: {charges:?}"
+    );
+    assert_eq!(charges[0].0, held_id);
+    assert!(
+        charges[0].1 >= 1,
+        "the held slot is charged, never read as free"
+    );
+    assert_eq!(
+        snapshot_tree(&held_path),
+        before,
+        "the held slot was touched"
+    );
+    release_injected(&pool, &held.lease_id).expect("the held lease still releases");
 }
 
 #[test]

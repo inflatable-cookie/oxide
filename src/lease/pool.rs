@@ -692,6 +692,11 @@ pub(super) struct Pool {
     /// the slot. It is cleared at the start of every admission: a later one
     /// measures the slot again and may evict it normally.
     unmeasured: BTreeMap<u64, u64>,
+    /// When this admission's first slot walk started. Every slot walk in one
+    /// admission shares ONE elapsed budget (the pressure limits' elapsed
+    /// bound), so many slow slots cost one bound, not one bound each; once it
+    /// is spent, a further slot is charged conservatively without a walk.
+    walk_started: Option<std::time::Instant>,
     /// The caller's registered free-space reserve for a removable payload.
     /// Read only by the unknown-size admission route; never a cap input.
     reserve: Option<u64>,
@@ -1432,6 +1437,7 @@ impl Pool {
             reconciliation_unresolved: false,
             admission_note: None,
             unmeasured: BTreeMap::new(),
+            walk_started: None,
             reserve: None,
             created_holding: Vec::new(),
             #[cfg(debug_assertions)]
@@ -1492,6 +1498,7 @@ impl Pool {
             reconciliation_unresolved: false,
             admission_note: None,
             unmeasured: BTreeMap::new(),
+            walk_started: None,
             reserve: None,
             created_holding: Vec::new(),
             #[cfg(debug_assertions)]
@@ -1613,6 +1620,7 @@ impl Pool {
         // (oxide#186), so the next admission measures it again and may evict
         // it normally.
         self.unmeasured.clear();
+        self.walk_started = None;
         // A journaled deletion whose recorded root is at neither of its names
         // leaves the ledger uncertain: no new lease is admitted until it is
         // resolved (oxide#175 capture recovery, oxide#177 single-journal
@@ -2808,11 +2816,7 @@ impl Pool {
         // A slot this admission already charged keeps that figure: the walk is
         // not repeated, so one slow slot costs one bounded walk, not one per
         // pressure decision.
-        let cached = if idle {
-            self.unmeasured.get(&id).copied()
-        } else {
-            None
-        };
+        let cached = self.unmeasured.get(&id).copied();
         let Some(path) = self.recorded_slot_root(id)? else {
             // A missing or non-directory recorded root has no observation. The
             // scope pass counts it exactly as the whole-payload walk counted
@@ -2825,19 +2829,35 @@ impl Pool {
         if let Some(charge) = cached {
             return Ok(charge);
         }
-        let sizes = self.inventory_slot_with(&path, self.pressure_limits())?;
+        let mut limits = self.pressure_limits();
+        let started = *self
+            .walk_started
+            .get_or_insert_with(std::time::Instant::now);
+        let spent = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let left = limits.max_elapsed_ms.saturating_sub(spent);
+        if left == 0 {
+            // This admission's shared walk budget is spent: charge the slot
+            // without walking it (oxide#186's conservative charge, observed 0).
+            let charge = self.conservative_charge(recorded, 0);
+            self.unmeasured.insert(id, charge);
+            return Ok(charge);
+        }
+        limits.max_elapsed_ms = left;
+        let sizes = self.inventory_slot_with(&path, limits)?;
         let Some(observed) = sizes.unique else {
             // The walk could not open or classify the slot root itself. That is
             // a root-identity failure, never a size this admission may charge.
             return Err(LeaseError::AccountingIncomplete(Box::new(sizes.scan)));
         };
         if sizes.scan.coverage != AccountingCoverage::Complete {
-            if idle && !self.is_removable() {
-                let charge = self.conservative_charge(recorded, observed);
-                self.unmeasured.insert(id, charge);
-                return Ok(charge);
-            }
-            return Err(LeaseError::AccountingIncomplete(Box::new(sizes.scan)));
+            // A partial walk of another slot, idle or held, on either backend,
+            // is charged conservatively instead of refusing this admission
+            // (oxide#186, extended to held and removable slots, Tom
+            // 2026-10-31). One slow slot never blocks an unrelated build, and
+            // an unmeasured slot is never an eviction candidate.
+            let charge = self.conservative_charge(recorded, observed);
+            self.unmeasured.insert(id, charge);
+            return Ok(charge);
         }
         if idle {
             pending.push((
@@ -6136,6 +6156,7 @@ pub(super) fn volume_pool_for_test(
         reconciliation_unresolved: false,
         admission_note: None,
         unmeasured: BTreeMap::new(),
+        walk_started: None,
         reserve,
         created_holding: Vec::new(),
         #[cfg(debug_assertions)]
