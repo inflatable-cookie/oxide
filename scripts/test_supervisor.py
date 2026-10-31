@@ -4178,7 +4178,9 @@ class DetachFacts:
         self.detached.append((mount, timeout))
         self.attempted = True
         self.polled = still_allowed
-        return dict(self.attempt)
+        attempt = {"reaped": True}
+        attempt.update(self.attempt)
+        return attempt
 
 
 class PureDetach(unittest.TestCase):
@@ -4518,7 +4520,7 @@ class PureDetach(unittest.TestCase):
         ctx, backing = self.layout()
         self.declare_custody(ctx, backing)
         rows = [("/dev/disk99s1", None, None)]  # no such node on this host
-        self.assertIsNone(bounded.cleanup_safety(ctx, self.facts(), facts=lambda *a: rows))
+        self.assertEqual(bounded.cleanup_safety(ctx, self.facts(), facts=lambda *a: rows)["state"], "ok")
 
     def test_uncertain_custody_state_keeps_the_owned_root(self):
         # Unreadable attachment facts are uncertain, so the root is kept.
@@ -4567,6 +4569,52 @@ class PureDetach(unittest.TestCase):
         record = bounded.post_census_detach(ctx, self.facts())
         self.assertEqual((record["state"], record["qualified"], record["reap_timed_out"]),
                          ("failed", False, True), record)
+
+    def test_an_opted_in_but_clear_root_reports_ok_and_is_the_only_case_gated(self):
+        ctx, backing = self.layout()
+        self.declare_custody(ctx, backing)
+        record = bounded.cleanup_safety(ctx, self.facts(), facts=lambda *a: [])
+        self.assertEqual(record["state"], "ok")
+        self.assertEqual(record["unrequested"], [backing])
+        # Not opted in: no indication means no record at all, so the monitor never
+        # gated, scanned or changed this run's cleanup path.
+        ctx, _backing = self.layout()
+        self.assertIsNone(bounded.cleanup_safety(ctx, self.facts(), facts=lambda *a: []))
+
+    def test_an_attached_volume_with_an_unexpected_uuid_still_keeps(self):
+        # A UUID mismatch is not evidence of a detach: any live entity keeps the
+        # root, so a failed parse or a wrong UUID can never delete a backing.
+        ctx, backing = self.layout()
+        self.declare_custody(ctx, backing)
+        rows = [("/dev/disk7s1", None, "ffffffff-1111-2222-3333-444444444444")]
+        record = bounded.cleanup_safety(ctx, self.facts(nodes=("/dev/disk7s1",)), facts=lambda *a: rows)
+        self.assertEqual(record["state"], "kept")
+        self.assertIn("attached without a mount point", record["reason"])
+
+    def test_an_unreaped_detach_child_is_never_claimed_as_reaped(self):
+        ctx, backing = self.layout()
+        ctx["inject"] = ["detach-reap-timeout"]
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, self.facts())
+        self.assertFalse(record["reaped"])
+        self.assertFalse(record["qualified"])
+
+    def test_the_post_state_read_has_no_forced_minimum(self):
+        ctx, backing = self.layout()
+        self.request(ctx, backing)
+        seen = []
+
+        def facts_call(backing_, timeout=None):
+            seen.append(timeout)
+            return [("/dev/disk7", None, None), ("/dev/disk7s1", "/Volumes/OxDetach", DETACH_UUID)]
+
+        facts = self.facts()
+        facts.attachments = facts_call
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertTrue(record["attempted"])
+        # Whatever the value, it is what the window allowed: never above the cap
+        # and never a forced one-second floor imposed by the runner.
+        self.assertTrue(all(value is None or value <= bounded.DETACH_INFO_TIMEOUT_S for value in seen), seen)
 
     def test_a_malformed_custody_indication_keeps_the_owned_root(self):
         for payload in (b"null", b"[]", b'{"version": 1}', b'{"version": 1, "backings": []}',
@@ -6429,6 +6477,16 @@ created = run("/usr/bin/hdiutil", "create", "-size", "8m", "-fs", "APFS", "-voln
 if created.returncode != 0:
     print("image create failed: " + created.stderr.decode(errors="replace"), file=sys.stderr)
     raise SystemExit(3)
+# The opt-in custody indication is published ATOMICALLY BEFORE the attach, so an
+# ambiguous attach, a failed parse or a wrong UUID below still leaves the guard
+# able to keep this root instead of cleaning a live backing.
+_custody = os.path.join(evidence, "image-custody.json")
+with open(_custody + ".tmp", "w") as handle:
+    json.dump({"version": 1, "backings": [os.path.realpath(image)]}, handle)
+os.replace(_custody + ".tmp", _custody)
+if not os.path.isfile(_custody):
+    print("custody indication was not published before attach", file=sys.stderr)
+    raise SystemExit(3)
 attached = run("/usr/bin/hdiutil", "attach", "-owners", "on", "-nobrowse", "-noverify", "-plist", image)
 if attached.returncode != 0:
     print("attach failed: " + attached.stderr.decode(errors="replace"), file=sys.stderr)
@@ -6449,12 +6507,7 @@ if mode == "request":
     with open(temporary, "w") as handle:
         json.dump(request, handle)
     os.replace(temporary, os.path.join(evidence, "detach-request.json"))
-else:
-    # The opt-in custody indication, published before the attach, is what lets a
-    # request-free run be kept instead of cleaned. Without it the default path
-    # performs no scan at all.
-    with open(os.path.join(evidence, "image-custody.json"), "w") as handle:
-        json.dump({"version": 1, "backings": [os.path.realpath(image)]}, handle)
+
 with open(os.path.join(case, "volume.json"), "w") as handle:
     json.dump({"mount": mount, "device": wholes[0], "uuid": uuid, "image": image}, handle)
 print("detach fixture ready: " + mount + " " + wholes[0])

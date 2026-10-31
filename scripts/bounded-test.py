@@ -1517,9 +1517,9 @@ def bounded_run(argv, timeout, cap=DETACH_OUTPUT_MAX_BYTES, still_allowed=None, 
                       stderr=subprocess.STDOUT, close_fds=True)
     except OSError as error:
         return {"exit": None, "timed_out": False, "error": errno_name(error), "output": "",
-                "truncated": False, "withdrawn": None, "reap_timed_out": False}
+                "truncated": False, "withdrawn": None, "reap_timed_out": False, "reaped": False}
     deadline = time.monotonic() + max(0.1, timeout)
-    tail, seen, timed_out, withdrawn, reap_timed_out = b"", 0, False, None, False
+    tail, seen, timed_out, withdrawn, reap_timed_out, reaped = b"", 0, False, None, False, False
     poll_at = time.monotonic() + DETACH_POLL_S
     fd = child.stdout.fileno()
     try:
@@ -1563,22 +1563,25 @@ def bounded_run(argv, timeout, cap=DETACH_OUTPUT_MAX_BYTES, still_allowed=None, 
         # The reap is bounded by what is left of the SAME deadline, never by an
         # extra fixed wait: a child that ignores KILL cannot extend the sequence.
         try:
-            child.wait(timeout=max(0.1, min(2.0, deadline - time.monotonic() + 0.5)))
+            reaped = child.wait(timeout=max(0.1, min(2.0, deadline - time.monotonic() + 0.5))) is not None
         except subprocess.TimeoutExpired:
             reap_timed_out = True
-            try:
-                child.kill()
-            except OSError:
-                pass
-            try:
-                child.wait(timeout=0.5)
-            except subprocess.TimeoutExpired:
-                pass
+            for _attempt in (1, 2):  # two bounded rounds, never an unbounded wait
+                try:
+                    child.kill()
+                except OSError:
+                    pass
+                try:
+                    reaped = child.wait(timeout=0.5) is not None
+                except subprocess.TimeoutExpired:
+                    reaped = False
+                if reaped:
+                    break
         child.stdout = None
     status = child.returncode
     return {"exit": status, "timed_out": timed_out, "error": None,
             "output": tail.decode("utf-8", "replace"), "truncated": seen > len(tail),
-            "withdrawn": withdrawn, "reap_timed_out": reap_timed_out}
+            "withdrawn": withdrawn, "reap_timed_out": reap_timed_out, "reaped": reaped}
 
 
 def detach_text(document, name):
@@ -1760,7 +1763,7 @@ def cleanup_safety(ctx, probe=None, facts=None):
     except BaseException as error:
         backings, problem = None, f"custody indication unreadable: {type_name(error)}"
     if backings is None and problem is None:
-        return None  # no indication: no scan, unchanged behaviour
+        return None  # not opted in: no scan and no gate, so the default path is unchanged
     if problem is not None:
         return {"state": "kept", "reason": problem, "unrequested": [], "at_ns": now_ns()}
     try:
@@ -1768,7 +1771,7 @@ def cleanup_safety(ctx, probe=None, facts=None):
     except BaseException as error:
         problems = [f"attachment facts failed: {type_name(error)}"]
     if not problems:
-        return None
+        return {"state": "ok", "reason": None, "unrequested": list(backings), "at_ns": now_ns()}
     return {"state": "kept", "at_ns": now_ns(),
             "reason": ("this run's owned root still holds an image it declared in its custody"
                        " indication and never positively detached: " + "; ".join(problems[:4])),
@@ -1782,7 +1785,8 @@ def detach_image(mount, timeout, still_allowed=None):
                           still_allowed=still_allowed)
     return {"exit": attempt["exit"], "timed_out": attempt["timed_out"], "error": attempt["error"],
             "output": attempt["output"], "truncated": attempt["truncated"],
-            "withdrawn": attempt["withdrawn"], "reap_timed_out": attempt["reap_timed_out"]}
+            "withdrawn": attempt["withdrawn"], "reap_timed_out": attempt["reap_timed_out"],
+            "reaped": attempt["reaped"]}
 
 
 def _free_bytes(path):
@@ -1903,7 +1907,7 @@ def detach_record(ctx, document):
               "timed_out": False, "withdrawn": None, "error": None, "post_state": "unknown",
               "reason": None, "backing": None, "mount": None, "device": None, "volume_uuid": None,
               "timeout_s": None, "budget_ns": None, "output": "", "output_truncated": False,
-              "reap_timed_out": False, "late_gate": None,
+              "reap_timed_out": False, "reaped": False, "late_gate": None,
               # Only the cheap reserve read is sampled inside the custodial window;
               # no owned-byte walk runs here (the samplers already record the peak).
               "reserve_before": None, "reserve_after": None,
@@ -1948,21 +1952,21 @@ def post_census_detach(ctx, probe=None, authorize=None, still_allowed=None):
             return max(0.0, deadline - time.monotonic())
 
         problems = detach_request_problems(ctx, document, probe,
-                                           min(DETACH_INFO_TIMEOUT_S, max(1.0, left() * 0.25)))
+                                           min(DETACH_INFO_TIMEOUT_S, max(0.05, left() * 0.25)))
         if problems:
             record["reason"] = "; ".join(problems)
             return record
         if authorize is not None:
-            wait = min(DETACH_GATE_WAIT_S, max(0.5, left() - DETACH_POST_RESERVE_S - 1.0))
+            wait = min(DETACH_GATE_WAIT_S, max(0.05, left() - DETACH_POST_RESERVE_S - 1.0))
             allowed, reason, granted = authorize(max(0, int((left() - DETACH_POST_RESERVE_S) * NS)), wait)
             if not allowed:
                 record["reason"] = f"the guard withdrew the authorization: {reason}"
                 return record
             if granted:
                 deadline = min(deadline, time.monotonic() + granted / NS)
-        post_reserve = min(DETACH_POST_RESERVE_S, max(0.5, 0.25 * left()))
+        post_reserve = min(DETACH_POST_RESERVE_S, max(0.05, 0.25 * left()))
         timeout = min(DETACH_TIMEOUT_S, left() - post_reserve)
-        if timeout < 1.0:
+        if timeout <= 0.05:
             record["reason"] = "not enough of the custodian's wait window left for the attempt and its post-state"
             return record
         record["timeout_s"] = round(timeout, 3)
@@ -1971,16 +1975,16 @@ def post_census_detach(ctx, probe=None, authorize=None, still_allowed=None):
         inject = set(ctx.get("inject") or ())
         if "detach-fail" in inject:
             attempt = {"exit": 1, "timed_out": False, "error": None, "output": "injected failing detach",
-                       "truncated": False, "withdrawn": None}
+                       "truncated": False, "withdrawn": None, "reaped": True}
         elif "detach-timeout" in inject:
             attempt = {"exit": None, "timed_out": True, "error": None, "output": "injected timeout",
                        "truncated": False, "withdrawn": None}
         elif "detach-ambiguous" in inject:
             attempt = {"exit": 0, "timed_out": False, "error": None, "output": "injected no-op",
-                       "truncated": False, "withdrawn": None}
+                       "truncated": False, "withdrawn": None, "reaped": True}
         elif "detach-withdraw" in inject:
             attempt = {"exit": None, "timed_out": False, "error": None, "output": "",
-                       "truncated": False, "withdrawn": "injected withdrawal"}
+                       "truncated": False, "withdrawn": "injected withdrawal", "reaped": True}
         elif "detach-reap-timeout" in inject:
             attempt = {"exit": None, "timed_out": False, "error": None, "output": "",
                        "truncated": False, "withdrawn": None, "reap_timed_out": True}
@@ -1988,7 +1992,7 @@ def post_census_detach(ctx, probe=None, authorize=None, still_allowed=None):
             attempt = probe.detach(record["mount"], timeout, still_allowed)
         record.update(attempted=True, exit=attempt.get("exit"), timed_out=bool(attempt.get("timed_out")),
                       withdrawn=attempt.get("withdrawn"), reap_timed_out=bool(attempt.get("reap_timed_out")),
-                      error=attempt.get("error"),
+                      reaped=bool(attempt.get("reaped")), error=attempt.get("error"),
                       output=_bounded_tail(b"", (attempt.get("output") or "").encode(
                           "utf-8", "replace")).decode("utf-8", "replace"),
                       output_truncated=bool(attempt.get("truncated")))
@@ -2003,7 +2007,8 @@ def post_census_detach(ctx, probe=None, authorize=None, still_allowed=None):
             mounted = None
         attached = None
         if mounted is False:
-            attached = probe.attachments(record["backing"], max(1.0, min(DETACH_INFO_TIMEOUT_S, left())))
+            attached = probe.attachments(record["backing"],
+                                         max(0.05, min(DETACH_INFO_TIMEOUT_S, left())))
         if mounted is None:
             post_state = "unknown"
         elif mounted:
@@ -2023,8 +2028,8 @@ def post_census_detach(ctx, probe=None, authorize=None, still_allowed=None):
             record["state"] = "withdrawn"
         elif record["timed_out"]:
             record["state"] = "timed_out"
-        elif record["reap_timed_out"] or record["exit"] != 0 or record["error"] is not None \
-                or post_state != "detached":
+        elif (record["reap_timed_out"] or not record["reaped"] or record["exit"] != 0
+              or record["error"] is not None or post_state != "detached"):
             record["state"] = "failed"
         else:
             record["state"], record["qualified"], record["reason"] = "detached", True, None
@@ -2033,8 +2038,9 @@ def post_census_detach(ctx, probe=None, authorize=None, still_allowed=None):
             record["reason"] = f"authority withdrawn mid-attempt ({record['withdrawn']}); post-state {post_state}"
         elif record["late_gate"] is not None:
             record["reason"] = f"authority withdrawn after the attempt ({record['late_gate']}); post-state {post_state}"
-        elif record["reap_timed_out"]:
-            record["reason"] = f"the detach child was not reaped inside the window; post-state {post_state}"
+        elif record["reap_timed_out"] or not record["reaped"]:
+            record["reason"] = (f"the detach child was not positively reaped inside the window"
+                                f" (reaped {record['reaped']}); post-state {post_state}")
         else:
             record["reason"] = (f"detach exit {record['exit']}" if not record["timed_out"]
                                 else "detach timed out") + f"; post-state {post_state}"
@@ -3398,16 +3404,18 @@ class Monitor:
             # authorize the one attempt from its own fault/deadline state.
             detach = post_census_detach(ctx, authorize=self.authorize_detach,
                                         still_allowed=self.detach_still_allowed)
+            opted_in = detach is not None
             if detach is None:
-                # Separate from the detach protocol: a proof that failed before
-                # publishing its request can still leave its image mounted inside
-                # this run's owned root, and cleaning that root would delete a
-                # backing under a live mount.
-                kept = cleanup_safety(ctx)
-                if kept is not None:
+                # Separate from the detach protocol and strictly OPT-IN: only a
+                # proof that published an image-custody indication is checked, so a
+                # run with neither indication nor request keeps the default
+                # cleanup path exactly (no scan, no gate, no new failure mode).
+                custody = cleanup_safety(ctx)
+                opted_in = custody is not None
+                if custody is not None and custody["state"] == "kept":
                     with self.lock:
-                        self.receipt["cleanup"] = kept
-                    self.send("cleanup_kept", reason=kept["reason"][:200])
+                        self.receipt["cleanup"] = custody
+                    self.send("cleanup_kept", reason=custody["reason"][:200])
                     self.publish("cleanup_kept: scratch_kept")
                     self.receipt["scratch_marker"] = self.conclude_marker(
                         False, reason="live-image", outcome="failed")
@@ -3427,17 +3435,32 @@ class Monitor:
                     self.publish("detach_unqualified: scratch_kept")
                     self.receipt["scratch_marker"] = self.conclude_marker(
                         False, reason="detach", outcome="failed")
+                    if detach.get("attempted") and not detach.get("reaped"):
+                        # The direct child was not positively reaped. The monitor
+                        # must not claim completion while it is unaccounted: it
+                        # stays alive until the custodian's own deadline, and the
+                        # custodian ends the run and keeps every resource.
+                        self.publish("detach_child_unaccounted: monitor_held")
+                        self.summary()
+                        end = ctx["start_ns"] + int(ctx["limit_s"] * NS)
+                        while not self.stop.is_set() and now_ns() < end:
+                            time.sleep(0.05)
+                        return
                     self.publish("monitor_complete: pending_custodian")
                     self.summary()
                     self.send("monitor_complete")
                     self.stop.set()
                     return
-            # Final gate: cleanup itself is destructive, so it needs one more
+            # Final gate, for an OPTED-IN run only: cleanup of a root that took
+            # part in the image protocol is destructive and needs one more
             # authorization from the custodian's CURRENT fault/deadline state and
-            # what is left of its wait window. A fault latched during the detach,
-            # a reached deadline or a spent window keeps the root.
-            allowed, reason = self.detach_still_allowed()
-            remaining_ms = detach_budget(ctx) / _MS
+            # what is left of its wait window. A run with neither indication nor
+            # request is not gated, so its cleanup is unchanged.
+            if opted_in:
+                allowed, reason = self.detach_still_allowed()
+                remaining_ms = detach_budget(ctx) / _MS
+            else:
+                allowed, reason, remaining_ms = True, None, 1.0
             if not allowed or remaining_ms <= 0:
                 kept = {"state": "kept", "at_ns": now_ns(),
                         "reason": (f"the guard did not authorize cleanup: {reason}" if not allowed

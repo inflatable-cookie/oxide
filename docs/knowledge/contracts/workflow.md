@@ -2169,7 +2169,7 @@ with no earlier run migrated.
 
 **Post-census image detach request (oxide#191, decision `ee263cea`, unqualified
 source).** The current `bounded-test.py`
-(`d000a445632ba9e4817b9f3251856abc6ca051408c60acb46eb094aaa11ff76f`) adds one
+(`22ce1fc815ff8c0d5eceee348304f19a9ebf404925a5f12aebb9210e89683f55`) adds one
 opt-in control for a proof
 whose own test image must be detached, and it is the only route by which such a
 proof may detach after a launch; the qualified shared runner is otherwise
@@ -2189,8 +2189,12 @@ volume UUID, the mount bound to that node's device, and a caller-owned run root
 detaching nothing. The WHOLE sequence — the request read, the identity re-derivation, the
 authorization round trip, the child's output drain, the reap, the post-state read
 and the final cleanup gate — is bounded by ONE absolute deadline taken from the
-custodian's own wait window, and each phase is clamped to what is left of it (the
-reap included, so a child that ignores KILL cannot extend the sequence). It then asks the custodian — which alone holds the latched
+custodian's own wait window, and each phase is clamped to what is left of it with
+no forced minimum (the reap included, so a child that ignores KILL cannot extend
+the sequence). A detach child that is not positively reaped inside that window is
+never reported as reaped: the attempt fails, the monitor holds itself open until
+the custodian's own deadline rather than exiting, and the custodian ends the run
+with the root, backing and evidence kept. It then asks the custodian — which alone holds the latched
 fault, the deadline and the closure verdict — to authorize the single attempt
 over the control pipe; the custodian answers from that state only (no filesystem
 call) with its verdict and the wait budget that remains before it would declare
@@ -2216,13 +2220,15 @@ publishes a bounded `image-custody.json` naming its backings before attaching,
 and only then does the monitor check those backings once before cleaning,
 keeping the whole root with a `cleanup` object (`state: kept`) and exit 125 when
 one is mounted, attached without a mount point (its `/dev` node still exists) or
-uncertain (unreadable facts, an unreadable device state, or a malformed
-indication); a stale `hdiutil` entry whose device node is positively gone keeps
-nothing. A run that publishes no indication is never scanned, so the default
-cleanup path is unchanged and gains no new failure mode. Cleanup additionally
-requires one final custodian authorization, taken after the detach from its
-current fault/deadline state, plus a non-zero remainder of its wait window; a
-late fault, a reached deadline or a spent window keeps the root. A run whose
+uncertain (unreadable facts, an unreadable device state, a malformed indication,
+or a UUID that does not match the request); a stale `hdiutil` entry whose device
+node is positively gone keeps nothing, and a positively clear backing set records
+`state: ok`. A run that publishes **neither** an indication nor a request is
+never scanned and never gated, so the default cleanup path is byte-for-byte
+unchanged and gains no new failure mode. An opted-in run additionally requires
+one final custodian authorization, taken after the detach from its current
+fault/deadline state, plus a non-zero remainder of its wait window; a late
+fault, a reached deadline or a spent window keeps the root. A run whose
 proof published no request therefore gains no `detach` object and makes no
 detach attempt. A qualification diagnostic receipt is always `qualified:
 false`, even when every named oracle passed, and its `result` is never
@@ -2231,8 +2237,8 @@ custodian keeps its filesystem-free decision path and the existing
 cooperative-session limits. These bytes are unqualified until one uncounted
 `effigy proof:supervisor:qualify:diagnostic` records a clean picture and then
 ONE counted author and ONE separate independent reviewer
-`effigy proof:supervisor:qualify` pass at the same head (243 pure plus 44 real
-cases, including the thirty-four pure detach cases and the four real ones: a
+`effigy proof:supervisor:qualify` pass at the same head (247 pure plus 44 real
+cases, including the thirty-eight pure detach cases and the four real ones: a
 bound success, a refused identity, a failed attempt, and an unrequested
 attachment whose opt-in custody keep is recorded separately), with independent
 exact-head source review afterwards.
@@ -5391,7 +5397,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
 - **Focused proof of absent checkout chains (oxide#135).** The one fixed proof
   is `effigy rust:prune-absence` (`scripts/test-prune-absence.py` under this
-  tree's shared supervisor `d000a445…`, the merged oxide#151 guard plus
+  tree's shared supervisor `22ce1fc8…`, the merged oxide#151 guard plus
   oxide#191's opt-in post-census detach) with
   `--root-parent /private/tmp`, the owner-accepted internal-placement exception
   (decision `bd357a4c`): the missing-chain fixtures must be on the boot Data

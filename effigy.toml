@@ -298,7 +298,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # commands take Tom's answered internal-root exception explicitly
 # (`--root-parent /private/tmp`) rather than placing a pool on a selected
 # volume, where the product correctly refuses it. The supervisor is this tree's
-# `bounded-test.py` (sha256 d000a445…, oxide#191's post-census detach bytes over
+# `bounded-test.py` (sha256 22ce1fc8…, oxide#191's post-census detach bytes over
 # the qualified oxide#151 guard; those added bytes are unqualified until their
 # own qualifications pass); 300 s wall and
 # 512 MiB monitored scratch are unchanged and the fit stays unmeasured until
@@ -530,7 +530,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 
 # Owned-output prune (oxide#129, oxide#152): one fixed 22-case native proof
 # under the shared supervisor (`scripts/bounded-test.py` SHA-256
-# d000a445632ba9e4817b9f3251856abc6ca051408c60acb46eb094aaa11ff76f,
+# 22ce1fc815ff8c0d5eceee348304f19a9ebf404925a5f12aebb9210e89683f55,
 # the qualified oxide#151 guard plus oxide#191's opt-in post-census detach,
 # unqualified until its own qualifications pass): 360 s, 512 MiB monitored scratch, 30 s work
 # shutdown margin, one
@@ -642,11 +642,12 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 #
 # Since oxide#191 the candidate also carries the opt-in post-census image detach
 # (Tom decision ee263cea) — one custodian-authorized, repeatedly re-checked
-# attempt (drained, reaped, gate-checked and post-stated inside one window) —
-# plus the opt-in image-custody indication and its separate fail-closed cleanup
-# keep, and the suite's four real detach cases (bound success, refused identity,
-# failed attempt, and an unrequested attachment whose keep is recorded as a
-# `cleanup` object), so this receipt is the one that proves the new success,
+# attempt (drained, positively reaped, gate-checked and post-stated inside one
+# window, with no forced minimum waits) — plus the strictly opt-in image-custody
+# indication (published atomically before the attach) and its separate fail-closed
+# cleanup keep, and the suite's four real detach cases (bound success, refused
+# identity, failed attempt, and an unrequested attachment whose keep is recorded
+# as a `cleanup` object), so this receipt is the one that proves the new success,
 # refusal and uncertainty paths alongside the unchanged guard cases. The changed runner is unqualified
 # until one counted author and one separate independent reviewer run of this
 # selector pass at the same head.
@@ -1088,7 +1089,7 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 
 # Slot headroom (oxide#118, oxide#177): under the shared proof supervisor
 # (oxide#109/#114/#151 plus oxide#191's opt-in post-census detach, bounded-test.py
-# SHA-256 d000a445632ba9e4817b9f3251856abc6ca051408c60acb46eb094aaa11ff76f,
+# SHA-256 22ce1fc815ff8c0d5eceee348304f19a9ebf404925a5f12aebb9210e89683f55,
 # unqualified until its own qualifications pass), stages
 # `oxide` offline with 1.97.1 and proves the permanent ledger/control fences,
 # legacy read without migration, the raised-ceiling fence written at the 129th
