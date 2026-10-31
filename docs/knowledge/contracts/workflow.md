@@ -2683,12 +2683,15 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
     it (below).
 - **Admission marker (oxide#192).** A supervised child that waited for
   admission may publish one bounded marker, `admission.json`, in the evidence
-  directory: exactly the keys `schema`, `source` and `waited_ns`, schema 1, a
-  printable source token of at most 32 characters and a non-negative wait
-  inside `u64`, at most 512 bytes, published by rename. `oxide` writes it when
-  a leased command's own slot admission grant ends (its measured interval from
-  the first attempt to the grant), armed only by this supervisor's exported
-  layout. The monitor polls the path every 0.25 s, opens only a regular file
+  directory: exactly the keys `schema`, `source`, `run`, `command` and
+  `waited_ns`, schema 2, where `source` and `command` are printable tokens of at
+  most 32 characters, `run` is this supervisor's own exported
+  `OXIDE_PROOF_RUN_ID` and `waited_ns` a non-negative wait inside `u64`, at most
+  512 bytes, published by rename. A document whose `run` is not this run is
+  rejected as `stale run` and never paired with this one (the runner rejects the
+  retired schema-1 three-key shape too). `oxide` writes it when a leased
+  command's own slot admission grant ends (its measured interval from the first
+  attempt to the grant), armed only by this supervisor's exported layout. The monitor polls the path every 0.25 s, opens only a regular file
   without following a link, reports one marker per file identity and stamps
   the moment it read it; the custodian adds at most that reported wait, never
   more than this run's own elapsed wall clock and never more than 600 s in
@@ -3144,16 +3147,18 @@ platform, each case's exit, phase, outcome and signal custody, the suite's
 recorded layout, the prepared parent, both bounded sweep summaries, both
 marker states, the scratch-volume and boot-volume reserve readings, the kept
 base and `UNCLOSED` case directories, and the limitations. Admission waits
-fall outside its 420 s: the actor's own cap is unchanged (oxide#191 raised it from
-300 s before this integration), and a candidate marker can only move the
-candidate's deadline (by at most 600 s) inside it.
+fall outside its 420 s: that is the amended actor cap (oxide#191 raised it from
+300 s before this integration) with the 380 s candidate limit and the 350 s suite
+alarm, and a candidate marker can only move the candidate's deadline (by at most
+600 s) inside it.
 `effigy proof:supervisor:test` runs the pure cases alone.
 
 **Uncounted keep-going diagnostic.** `effigy proof:supervisor:qualify:diagnostic`
 (heavy) runs the same bootstrap (`qualify-supervisor.py --diagnostic`), guard,
-fixed 300 s absolute deadline, selected-volume routing and 512 MiB monitored
-scratch, and is required before the counted author qualification at a changed
-head. It runs each named qualification oracle on its own — receipt phase,
+fixed 420 s absolute deadline (oxide#191 raised it from 300 s), the 380 s
+candidate limit, the 350 s suite alarm, selected-volume routing and the unchanged
+512 MiB monitored scratch with its 30 s shutdown margin, and is required before
+the counted author qualification at a changed head. It runs each named qualification oracle on its own — receipt phase,
 candidate outcome, reserve sampling, default scratch, sweep, protected root,
 nested cases, owned bytes, signal custody, the detach cases and the case total —
 so one failing check never hides the rest, records a bounded
