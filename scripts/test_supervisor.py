@@ -3726,6 +3726,41 @@ class PureQualificationTopology(unittest.TestCase):
         monitor.stop = threading.Event()
         return monitor, cmd_w
 
+    def test_an_unclosed_decision_completes_and_persists_through_run(self):
+        # The REAL `Monitor.run` with the real setup, publish and send: a keep
+        # (UNCLOSED) decision must still write the final receipt and announce
+        # completion. This is the path an uninitialized `opted_in` used to kill.
+        sandbox = Path(tempfile.mkdtemp(prefix="unclosed-run.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(sandbox), True)
+        evidence = sandbox / "evidence"
+        ctx = {"run_id": "unclosed-run", "command": ["/bin/true"], "limit_s": 300,
+               "adopted": str(sandbox), "evidence_arg": str(evidence), "root_parent": None,
+               "budget": 512 * 1024 * 1024, "start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW),
+               "inject": []}
+        ctl_r, ctl_w = os.pipe()
+        cmd_r, cmd_w = os.pipe()
+        out_r, out_w = os.pipe()
+        err_r, err_w = os.pipe()
+        for fd in (ctl_r, cmd_w, out_w, err_w):
+            self.addCleanup(os.close, fd)
+        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_r)
+        messages = []
+
+        def send(message_type, **fields):
+            messages.append(message_type)
+
+        monitor.send = send
+        os.write(cmd_w, (json.dumps({"type": "keep", "outcome": {"closure": "UNCLOSED",
+                                                                "status": 7}}) + "\n").encode())
+        monitor.run()
+        phases = []
+        with open(os.path.join(str(evidence), "receipt.json")) as handle:
+            persisted = json.load(handle)
+        self.assertEqual(persisted["phase"], "monitor_complete: pending_custodian", persisted["phase"])
+        self.assertEqual(persisted["outcome"]["closure"], "UNCLOSED")
+        self.assertIn("monitor_complete", messages, messages)
+        self.assertTrue(monitor.stop.is_set())
+
     def test_the_drain_happens_before_the_final_publication(self):
         monitor, cmd_w = self.monitor_stub()
         os.write(cmd_w, (json.dumps({"type": "record", "record": {"event": "detach_child_pinned"}}) + "\n").encode())

@@ -3678,6 +3678,9 @@ class Monitor:
                 break
         self.note(stop_requested_ns=now_ns())
         self.census_stop.set()
+        # Only a run that took part in the image protocol drains at completion; a
+        # keep/UNCLOSED decision never does, so the default is initialized here.
+        opted_in = False
         if decision == "cleanup":
             self.publish("closure_established: cleanup_pending")
             # None unless this proof published a request; the custodian must also
