@@ -77,10 +77,10 @@ WALL_NS = 300 * NS
 CANDIDATE_LIMIT = 280
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 322  # 271 pure + 51 real (oxide#151 added the routing, marker,
+EXPECTED_CASES = 323  # 272 pure + 51 real (oxide#151 added the routing, marker,
                       # nested-window protection, bounded-sweep, qualify-entry,
                       # shared-ancestor/private-leaf and readiness cases; oxide#191
-                      # adds sixty pure post-census detach cases and eight real
+                      # adds sixty-one pure post-census detach cases and eight real
                       # ones: success, a refused identity, a failed attempt, an
                       # unrequested attachment whose opt-in custody keep is recorded
                       # separately, a stuck child the custodian closes itself, and the
@@ -334,7 +334,8 @@ CONTROL_CASES = {
 ORDINARY_KEYS = {"case", "exit", "phase", "dir", "retained_unclosed", "outcome", "census", "wall_s",
                  "signals", "stale_latency_ns", "held_streams", "nonce_ok",
                  "detach",  # oxide#191: the post-census detach outcome that case recorded
-                 "cleanup"}  # oxide#191: the fail-closed pre-cleanup keep, when it fired
+                 "cleanup",  # oxide#191: the fail-closed pre-cleanup keep, when it fired
+                 "kept"}  # the suite's retained-resource path for a focused case
 
 
 def control_case(case, name, root, facts):

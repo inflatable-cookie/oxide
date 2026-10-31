@@ -3332,7 +3332,45 @@ class Monitor:
             "output": {}, "census": None, "census_rounds": 0, "settlement": self.settlement,
         }
 
+    def drain_records(self, wait_s):
+        """Append `record` messages the custodian sent after the decision (detach
+        pin/signal/observation, cleanup keeps) to the receipt. Bounded, never
+        blocks past `wait_s`, and other command types are ignored."""
+        deadline = time.monotonic() + max(0.0, wait_s)
+        buffer = b""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                ready, _, _ = select.select([self.cmd_r], [], [], remaining)
+            except OSError:
+                return
+            if not ready:
+                return
+            try:
+                chunk = os.read(self.cmd_r, 4096)
+            except OSError:
+                return
+            if not chunk:
+                return
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                try:
+                    command = json.loads(line)
+                except ValueError:
+                    return
+                if isinstance(command, dict) and command.get("type") == "record" \
+                        and isinstance(command.get("record"), dict):
+                    with self.lock:
+                        self.receipt["custodian"].append(command["record"])
+
     def send(self, message_type, **fields):
+        if message_type == "monitor_complete":
+            # Everything the custodian recorded after the decision (including the
+            # detach child's pin, signal and observation) belongs in the receipt.
+            self.drain_records(DETACH_GATE_WAIT_S)
         with self.lock:
             self.seq += 1
             message = {"run": self.ctx["run_id"], "leader": self.leader, "seq": self.seq,

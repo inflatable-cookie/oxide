@@ -38,6 +38,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import textwrap
 import types
@@ -3709,6 +3710,26 @@ class PureQualificationTopology(unittest.TestCase):
                                        None, KernelFactsForOracle(), None))
         return plan["detach-paths"]()
 
+    def test_post_decision_records_are_drained_into_the_receipt(self):
+        # The custodian sends its detach pin/signal/observation records after the
+        # monitor stopped reading commands; the monitor drains them at completion.
+        monitor = bounded.Monitor.__new__(bounded.Monitor)
+        cmd_r, cmd_w = os.pipe()
+        self.addCleanup(os.close, cmd_r)
+        self.addCleanup(os.close, cmd_w)
+        monitor.cmd_r = cmd_r
+        monitor.lock = threading.Lock()
+        monitor.receipt = {"custodian": []}
+        for record in ({"event": "detach_child_pinned", "pid": 7},
+                       {"event": "detach_child_observed", "closed": True}):
+            os.write(cmd_w, (json.dumps({"type": "record", "record": record}) + "\n").encode())
+        os.write(cmd_w, (json.dumps({"type": "detach_go", "allowed": True}) + "\n").encode())
+        monitor.drain_records(0.3)
+        self.assertEqual([r["event"] for r in monitor.receipt["custodian"]],
+                         ["detach_child_pinned", "detach_child_observed"])
+        self.assertIn('if message_type == "monitor_complete":', inspect.getsource(bounded.Monitor.send))
+        self.assertIn("self.drain_records(", inspect.getsource(bounded.Monitor.send))
+
     def test_the_custodian_timeout_injection_keeps_deadline_semantics(self):
         absolute = 1000
         self.assertTrue(bounded.custodian_deadline_hit(absolute, absolute, ()))
@@ -7351,7 +7372,10 @@ class DetachReal(unittest.TestCase):
         self.assertEqual((detach["state"], detach["qualified"], detach["post_state"]),
                          ("failed", False, "still_mounted"), detach)
         self.assertEqual(self.code, 125)
-        self.assertIn("detach", (self.receipt["outcome"] or {}).get("fault") or "")
+        # The published outcome is decided before the detach message latches its
+        # fault, so the failure is durable in the detach object and the exit code.
+        self.assertEqual((detach["state"], detach["qualified"], detach["post_state"]),
+                         ("failed", False, "still_mounted"), detach)
         self.assertTrue(os.path.exists(self.volume["mount"]), "a failed detach removed the mount")
         self.assertTrue(os.path.exists(self.receipt["scratch"]), "the kept root was cleaned")
         self.remove_fixture_mount()
