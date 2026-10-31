@@ -1311,11 +1311,18 @@ class Census:
 
 
 class Guard:
-    """Newest completed readings and the latched first fault."""
+    """Newest completed readings and the latched first fault.
+
+    Freshness measures the steady-state sampling window, so a kind with no
+    reading yet is stale only from `sampling_ns`, the moment sampling actually
+    began. Before that the bounded setup phase owns its own window
+    (`Custodian.setup_at`) and a cold setup sweep longer than the 1 s reserve
+    window is not a fault (decision 50acd33b, papercut 90e93f06)."""
 
     def __init__(self, start_ns, threshold=THRESHOLD, budget=SCRATCH_BUDGET):
         self.start_ns, self.threshold, self.budget = start_ns, threshold, budget
         self.reserve_at = self.scratch_at = None
+        self.sampling_ns = None
         self.fault = None
 
     def latch(self, fault):
@@ -1347,8 +1354,15 @@ class Guard:
     def check(self, now):
         for kind, at, stale in (("reserve", self.reserve_at, RESERVE_STALE_NS),
                                 ("scratch", self.scratch_at, SCRATCH_STALE_NS)):
-            if now - (self.start_ns if at is None else at) > stale:
-                self.latch(f"{kind} readings stale: none in {stale / NS:g} s")
+            if at is None:
+                # No reading of this kind has completed: before sampling began the
+                # setup deadline owns the window, and after it began the sampling
+                # window is measured from that start, never from custodian start.
+                if self.sampling_ns is None or now - self.sampling_ns <= stale:
+                    continue
+            elif now - at <= stale:
+                continue
+            self.latch(f"{kind} readings stale: none in {stale / NS:g} s")
         return self.fault
 
 
@@ -4709,6 +4723,9 @@ class Custodian:
                 self.guard.latch("protocol: ready before setup")
             elif self.guard.reserve_at is None or self.guard.scratch_at is None:
                 self.guard.latch("protocol: ready before completed readings")
+            else:
+                # Freshness begins here: the samplers are live and have published.
+                self.guard.sampling_ns = now_ns()
             self.ready = True
         elif kind == "output_eof":
             self.eof.add(message["stream"])
@@ -4859,6 +4876,10 @@ class Custodian:
             "inject": sorted(self.inject),
         }
 
+    def setup_expired(self, now):
+        """Setup is bounded by its own deadline, never by reading freshness."""
+        return now >= self.setup_at
+
     def launch_monitor(self):
         self.ctl_r, ctl_w = os.pipe()
         cmd_r, self.cmd_w = os.pipe()
@@ -4880,7 +4901,7 @@ class Custodian:
             select.kevent(pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_ONESHOT, select.KQ_NOTE_EXIT),
         ], 0, 0)
         while not self.ready and self.guard.fault is None and not self.monitor_exited and not self.cancelled:
-            if now_ns() >= self.setup_at:
+            if self.setup_expired(now_ns()):
                 break
             self.pump(self.setup_at - now_ns())
         if self.ready and self.guard.fault is None and not self.cancelled:
@@ -4924,7 +4945,7 @@ class Custodian:
         if "cancel-before-ack" in self.inject:
             self.cancelled = signal.SIGTERM
         ack = b""
-        while not self.cancelled and self.guard.fault is None and now_ns() < self.setup_at:
+        while not self.cancelled and self.guard.fault is None and not self.setup_expired(now_ns()):
             ready, _, _ = select.select([ack_r], [], [], max(0, min(self.setup_at - now_ns(), 50_000_000)) / NS)
             if ready:
                 try:

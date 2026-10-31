@@ -2318,8 +2318,8 @@ review afterwards.
 integrated head adds the admission reports described in the supervisor rule
 below: the completed-wait marker and its bounded grant, the correlated waiting
 report, and the stop-boundary drain with late-marker classification. Together
-with oxide#191's merged 287 pure and 48 real cases the suite is now 324 pure + 53
-real = 377 cases (34 pure and 5 real of them oxide#192's: the completed wait and its
+with oxide#191's merged 287 pure and 48 real cases the suite is now 329 pure + 53
+real = 382 cases (39 pure and 5 real of them oxide#192's: the completed wait and its
 grant, the rejection control, the late grant, a wait that never ends before the
 stop, and the stale-run plus zero-duration-grant correlation), which the
 bootstrap's expected count and limitation list follow. The exported deadline,
@@ -2391,7 +2391,7 @@ the independent reviewer qualification. Until those exist at that head the bytes
 are unqualified and carry no credit for any other proof. The covering checks run
 at this head are recorded in the pull request: `effigy rust:compile`,
 `effigy rust:format`, `effigy test rust`, `effigy proof:supervisor:test`
-(324 pure cases) and `effigy docs:check`.
+(329 pure cases) and `effigy docs:check`.
 
 **Settlement observation (oxide#147, unqualified source).** The current
 `bounded-test.py` also carries observation-only settlement diagnostics, so a
@@ -2690,13 +2690,19 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
     when it arrives. Both sides use the same system-wide clock, so such a
     reading is never fresh.
 
-  Freshness is enforced for as long as the run still has a decision to make:
-  once the custodian has sent its `cleanup`/`keep` decision, the monitor's
-  samplers stop as it publishes `monitor_complete`, so the monitor's shutdown is
-  not a freshness window (oxide#192; a stalled sample during shutdown cannot
-  turn a completed, closed and cleaned run into exit 125). Threshold faults from
-  readings that do arrive, every closure rule and the whole settle phase are
-  unchanged, and a stale reading before the decision still latches.
+  Freshness measures the steady-state sampling window, and it begins when
+  sampling actually begins — the monitor's `ready`, after its first completed
+  readings — never at custodian start (decision `50acd33b`, papercut `90e93f06`).
+  A cold setup, whose bounded startup sweep of a shared parent can take longer
+  than 1 s, is owned by its own 10 s setup deadline and can never trip the 1 s
+  reserve window; the steady-state windows (1 s reserve, 10 s owned bytes) and
+  the setup deadline are unchanged. It also ends with the decision: once the
+  custodian has sent its `cleanup`/`keep` decision, the monitor's samplers stop as
+  it publishes `monitor_complete`, so the monitor's shutdown is not a freshness
+  window (oxide#192; a stalled sample during shutdown cannot turn a completed,
+  closed and cleaned run into exit 125). Threshold faults from readings that do
+  arrive, every closure rule and the whole settle phase are unchanged, and a
+  stale reading while the run is executing still latches.
 - **Clock and deadlines.** One clock everywhere: `CLOCK_UPTIME_RAW` integer
   nanoseconds. The supervisor refuses before any proof work if that clock,
   kqueue, macOS or the self-checked `kinfo_proc` layout is missing.
@@ -2916,7 +2922,7 @@ with a recorded minimum. A fallback run, or a nested case outside the
 monitored root, fails the qualification. Its reserve readings identify the
 qualification's scratch volume and the boot volume separately. The suite
 runs in order:
-- 324 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 329 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -3191,7 +3197,7 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 377 cases (324 pure + 53 real, including oxide#191's post-census detach
+- all 382 cases (329 pure + 53 real, including oxide#191's post-census detach
   cases and oxide#192's five admission-report cases);
 - every real case directory and receipt still present after the
   candidate's cleanup.

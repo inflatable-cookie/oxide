@@ -330,7 +330,11 @@ class _ReleasedReceiver:
 
 class PureGuard(unittest.TestCase):
     def guard(self):
-        return bounded.Guard(start_ns=1000 * NS)
+        # Steady-state cases: sampling began with the run, so the freshness window
+        # is measured from the first reading exactly as before this correction.
+        guard = bounded.Guard(start_ns=1000 * NS)
+        guard.sampling_ns = 1000 * NS
+        return guard
 
     def test_low_reading_latches_and_never_clears(self):
         guard = self.guard()
@@ -407,6 +411,120 @@ class PureGuard(unittest.TestCase):
         guard = self.guard()
         guard.reading({"kind": "scratch", "value": 513 * 1024 * 1024, "complete": True, "at": 1000 * NS, "completed": 1000 * NS})
         self.assertIn("over the", guard.fault)
+
+
+class PureFreshnessClock(unittest.TestCase):
+    """Decision 50acd33b: freshness measures the steady-state sampling window
+    from when sampling actually began; setup is bounded by its own deadline."""
+
+    START = 1000 * NS
+
+    def test_a_bounded_setup_longer_than_one_second_does_not_latch(self):
+        # (a) A cold setup (the bounded startup sweep can take >1 s) inside its own
+        # deadline launches and closes: no reading exists yet, and nothing is stale.
+        guard = bounded.Guard(self.START)
+        self.assertIsNone(guard.check(self.START + 2 * bounded.NS),
+                          "a bounded setup must not be a freshness fault")
+        # Sampling begins (the monitor's ready) with its first completed readings.
+        guard.sampling_ns = self.START + 2 * bounded.NS
+        guard.reading({"kind": "reserve", "value": 500 * bounded.GIB,
+                       "at": self.START + 2 * bounded.NS, "completed": self.START + 2 * bounded.NS})
+        guard.reading({"kind": "scratch", "value": 0, "complete": True,
+                       "at": self.START + 2 * bounded.NS, "completed": self.START + 2 * bounded.NS})
+        self.assertIsNone(guard.check(self.START + 2 * bounded.NS + bounded.NS // 2))
+        self.assertIsNone(guard.fault)
+
+    def test_the_custodian_start_counterfactual_would_have_refused_that_setup(self):
+        # (b) The old rule measured an absent reading from custodian start_ns; it
+        # would call this healthy 2 s setup stale, so the two rules are
+        # discriminating rather than both permissive.
+        def old_rule(guard, now):
+            for at, stale in ((guard.reserve_at, bounded.RESERVE_STALE_NS),
+                              (guard.scratch_at, bounded.SCRATCH_STALE_NS)):
+                if now - (guard.start_ns if at is None else at) > stale:
+                    return True
+            return False
+
+        guard = bounded.Guard(self.START)
+        now = self.START + 2 * bounded.NS
+        self.assertTrue(old_rule(guard, now), "the superseded start-based rule must fail this case")
+        self.assertIsNone(guard.check(now), "the corrected sampling-based rule must not")
+
+    def test_no_sample_within_one_second_after_sampling_began_still_latches(self):
+        # (c) Once sampling began, an absent reserve reading is stale after 1 s.
+        guard = bounded.Guard(self.START)
+        guard.sampling_ns = self.START + 2 * bounded.NS
+        self.assertIsNone(guard.check(self.START + 2 * bounded.NS + bounded.NS))
+        self.assertIn("reserve readings stale",
+                      guard.check(self.START + 2 * bounded.NS + bounded.NS + 1))
+        # The owned-byte window is unchanged at 10 s; keep the reserve reading
+        # fresh so only the scratch rule is under test.
+        guard = bounded.Guard(self.START)
+        guard.sampling_ns = self.START
+        guard.reading({"kind": "reserve", "value": 500 * bounded.GIB,
+                       "at": self.START + 10_900_000_000, "completed": self.START + 10_900_000_000})
+        self.assertIsNone(guard.check(self.START + 10 * bounded.NS))
+        self.assertIn("scratch readings stale", guard.check(self.START + 11 * bounded.NS))
+
+    def test_a_setup_stall_beyond_its_deadline_still_launches_nothing(self):
+        # (d) The setup deadline is unchanged and independent of freshness: past it
+        # the launch is abandoned with one bounded reason, whatever the readings.
+        custodian = bounded.Custodian(["true"], limit_s=300)
+        custodian.start = self.START
+        custodian.absolute = self.START + 300 * bounded.NS
+        custodian.stop_at = custodian.absolute - bounded.STOP_RESERVE_S * bounded.NS
+        custodian.exit_at = custodian.absolute - bounded.EXIT_MARGIN_S * bounded.NS
+        custodian.setup_at = min(self.START + bounded.SETUP_S * bounded.NS, custodian.stop_at)
+        self.assertFalse(custodian.setup_expired(self.START + bounded.SETUP_S * bounded.NS - 1))
+        self.assertTrue(custodian.setup_expired(self.START + bounded.SETUP_S * bounded.NS))
+        # Freshness state cannot move the setup deadline.
+        before = custodian.setup_at
+        custodian.guard = bounded.Guard(self.START)
+        custodian.guard.sampling_ns = self.START
+        self.assertEqual(custodian.setup_at, before)
+        custodian.monitor = 1234
+        custodian.not_launched = "monitor setup failed or slow"
+        custodian.signal_pinned = lambda pid, number, group: None
+        custodian.reap = lambda pid: 0
+        custodian.pump = lambda timeout: None
+        captured = []
+        with patched(bounded, "report", lambda text, fd=2: captured.append(text)):
+            with patched(bounded, "now_ns", lambda: self.START + 11 * bounded.NS):
+                self.assertEqual(custodian.abandon_launch(), 125)
+        self.assertEqual(len(captured), 1)
+        self.assertIn("not launched", captured[0])
+
+    def test_ready_starts_the_freshness_clock_at_the_custodian(self):
+        # Wiring: only a valid `ready` starts sampling, and a refused one does not.
+        custodian = bounded.Custodian(["true"], limit_s=300)
+        custodian.start = self.START
+        custodian.guard = bounded.Guard(self.START)
+        read_end, custodian.cmd_w = os.pipe()
+        self.addCleanup(os.close, read_end)
+        self.addCleanup(os.close, custodian.cmd_w)
+        custodian.run_id = "r"
+        custodian.leader = 4242
+        ready = {"run": "r", "seq": custodian.monitor_seq + 1, "leader": None, "type": "ready",
+                 "at": self.START + 2 * bounded.NS}
+        custodian.accept(ready)
+        self.assertIn("ready before setup", custodian.guard.fault or "")
+        self.assertIsNone(custodian.guard.sampling_ns, "a refused ready must not start the clock")
+        custodian.guard.fault = None
+        custodian.paths = {"owned": False}
+        custodian.accept({"run": "r", "seq": custodian.monitor_seq + 1, "leader": None, "type": "ready",
+                          "at": self.START + 2 * bounded.NS})
+        self.assertIn("ready before completed readings", custodian.guard.fault or "")
+        self.assertIsNone(custodian.guard.sampling_ns)
+        custodian.guard.fault = None
+        custodian.guard.reading({"kind": "reserve", "value": 500 * bounded.GIB,
+                                 "at": self.START + 2 * bounded.NS, "completed": self.START + 2 * bounded.NS})
+        custodian.guard.reading({"kind": "scratch", "value": 0, "complete": True,
+                                 "at": self.START + 2 * bounded.NS, "completed": self.START + 2 * bounded.NS})
+        with patched(bounded, "now_ns", lambda: self.START + 2 * bounded.NS):
+            custodian.accept({"run": "r", "seq": custodian.monitor_seq + 1, "leader": None,
+                              "type": "ready", "at": self.START + 2 * bounded.NS})
+        self.assertTrue(custodian.ready)
+        self.assertEqual(custodian.guard.sampling_ns, self.START + 2 * bounded.NS)
 
 
 class PurePrecedence(unittest.TestCase):
@@ -8893,7 +9011,8 @@ def main():
     loader = unittest.defaultTestLoader
     runner = unittest.TextTestRunner(verbosity=2, resultclass=Results)
     pure = unittest.TestSuite(loader.loadTestsFromTestCase(case)
-                              for case in (PureGuard, PurePrecedence, PureCensus, PureCensusFinalAbsence,
+                              for case in (PureGuard, PureFreshnessClock, PurePrecedence, PureCensus,
+                                           PureCensusFinalAbsence,
                                            PureDiagnostics, PureAllowlist, PureTerminalCounts, PureProtocol,
                                            PureAdmission,
                                            PureTraversal, PureDefaultScratch, PureScratchPreparation,
