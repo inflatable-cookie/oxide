@@ -4368,21 +4368,39 @@ fn a_slot_ceiling_refusal_names_the_unmeasured_idle_slot() {
         } => {
             assert_eq!(*measured, None, "a count refusal claimed a byte figure");
             assert_eq!(*limit, None, "a count refusal claimed a byte budget");
-            assert_eq!(named.len(), 1, "the refusal names more than the kept slot");
-            assert_eq!(named[0].slot_id, idle_id);
-            let generation = managed::ledger_view(&pool)
-                .expect("ledger view")
+            // One walk budget is shared by the whole admission (Tom
+            // 2026-10-31), so on a loaded host some held slots may also be
+            // charged without a walk; they are named too. The kept idle slot
+            // must be among them, and nothing named is an idle victim.
+            let kept = named
+                .iter()
+                .find(|slot| slot.slot_id == idle_id)
+                .expect("the refusal names the kept idle slot");
+            let view = managed::ledger_view(&pool).expect("ledger view");
+            let generation = view
                 .slots
                 .iter()
                 .find(|slot| slot.slot_id == idle_id)
                 .cloned()
                 .expect("the unmeasured slot is still in the ledger");
-            assert_eq!(named[0].incarnation, generation.incarnation);
-            assert_eq!(named[0].dir, generation.dir);
+            assert_eq!(kept.incarnation, generation.incarnation);
+            assert_eq!(kept.dir, generation.dir);
+            for other in named.iter().filter(|slot| slot.slot_id != idle_id) {
+                let slot = view
+                    .slots
+                    .iter()
+                    .find(|slot| slot.slot_id == other.slot_id)
+                    .expect("a named slot is in the ledger");
+                assert_eq!(
+                    slot.state,
+                    SlotOccupancy::Held,
+                    "a named extra slot is not held"
+                );
+            }
             let text = refused.to_string();
             assert!(
-                text.contains(&format!("slot(s) {idle_id}")),
-                "the refusal does not name the unmeasured slot: {text}"
+                text.contains("unmeasured slot(s)"),
+                "the refusal does not name the unmeasured slots: {text}"
             );
             assert!(text.len() < 400, "the refusal is not bounded: {text}");
         }
