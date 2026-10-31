@@ -2318,8 +2318,8 @@ review afterwards.
 integrated head adds the admission reports described in the supervisor rule
 below: the completed-wait marker and its bounded grant, the correlated waiting
 report, and the stop-boundary drain with late-marker classification. Together
-with oxide#191's merged 287 pure and 48 real cases the suite is now 314 pure + 53
-real = 367 cases (27 pure and 5 real of them oxide#192's: the completed wait and its
+with oxide#191's merged 287 pure and 48 real cases the suite is now 319 pure + 53
+real = 372 cases (29 pure and 5 real of them oxide#192's: the completed wait and its
 grant, the rejection control, the late grant, a wait that never ends before the
 stop, and the stale-run plus zero-duration-grant correlation), which the
 bootstrap's expected count and limitation list follow. The exported deadline,
@@ -2391,7 +2391,7 @@ the independent reviewer qualification. Until those exist at that head the bytes
 are unqualified and carry no credit for any other proof. The covering checks run
 at this head are recorded in the pull request: `effigy rust:compile`,
 `effigy rust:format`, `effigy test rust`, `effigy proof:supervisor:test`
-(314 pure cases) and `effigy docs:check`.
+(319 pure cases) and `effigy docs:check`.
 
 **Settlement observation (oxide#147, unqualified source).** The current
 `bounded-test.py` also carries observation-only settlement diagnostics, so a
@@ -2752,18 +2752,19 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   keeps a bounded pairing table (64 commands) and pairs a command's waiting
   report only with that command's own completed report. Its wait **ended** when
   its own completion arrived, at any duration: a zero-duration grant, a grant
-  clamped by the cap and a late grant all end it. It is **unfinished** only when
-  no terminal report for that same command was received *and* that waiting report
-  was the run's last accepted admission report; only then does the summary say
-  that no completion was reported before the stop decision and that the deadline
-  classification stands with nothing granted. The completion file has one fixed
-  name, so a later accepted report (another command's grant or waiting report)
-  may have replaced an earlier completion before the next 0.25 s poll: such a
-  wait is **possibly overwritten**, an unknown the summary reports as
-  unclassified, never as a proven unfinished wait. A rejected or overflowed
-  report is unclassified in the same way: the summary counts rejected waiting and
-  completed reports and says a command listed as unfinished may have ended in
-  one of them. Together with the grant and late
+  clamped by the cap and a late grant all end it. An unpaired wait is **never**
+  described as a proven unfinished wait: missing terminal evidence is unknown.
+  The completion file has one fixed name, so a later admission-file observation —
+  another command's grant or waiting report, or a **rejected read** — may have
+  replaced a completion before the next 0.25 s poll, and a completion published
+  between the last poll and the sampler's stop can be missed entirely. The
+  decision record therefore carries only `unpaired` rows with a
+  `later_observation` fact, and the summary says either that a later admission
+  report or a rejected read may have overwritten the completion, or that no
+  admission-file observation followed the wait while its terminal evidence is
+  still missing; both are unclassified, and only the observed terminal reports
+  (a grant, a zero-duration or capped grant, a late grant) end a wait. A rejected
+  or overflowed report is unclassified in the same way. Together with the grant and late
   records this makes the states distinguishable in one receipt: granted before
   the stop, granted after it (late, no clock moved), still waiting when it fired
   (paired, nothing granted), stale (rejected by run), and unclassified (a report
@@ -2897,7 +2898,7 @@ with a recorded minimum. A fallback run, or a nested case outside the
 monitored root, fails the qualification. Its reserve readings identify the
 qualification's scratch volume and the boot volume separately. The suite
 runs in order:
-- 314 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 319 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -3155,7 +3156,10 @@ runs in order:
     SIGALRM inherited as ignored and blocked.
 
 Every fixture arms SIGALRM to `FIXTURE_DEADLINE_NS`. The order is case
-verdict 45 s < fixture fallback 60 s < qualification 600 s, and fallback
+verdict 45 s (the detach class's own outer window is 75 s, because its nested
+guard's stop is at 40 s and its exit at 58 s; a timeout there retains the mount,
+backing and evidence and infers no detach outcome) < fixture fallback 60 s <
+qualification 600 s, and fallback
 expiry never counts as closure. The bootstrap requires all of:
 - candidate exit 0;
 - phase `monitor_complete`;
@@ -3169,7 +3173,7 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 367 cases (314 pure + 53 real, including oxide#191's post-census detach
+- all 372 cases (319 pure + 53 real, including oxide#191's post-census detach
   cases and oxide#192's five admission-report cases);
 - every real case directory and receipt still present after the
   candidate's cleanup.

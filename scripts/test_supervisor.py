@@ -12,7 +12,9 @@ disk is never filled.
 Every fixture process first resets and unblocks SIGALRM and arms an interval
 timer to FIXTURE_DEADLINE_NS, an absolute CLOCK_UPTIME_RAW deadline in the
 environment, so a late descendant exits at once. Ordering: case verdict
-(45 s) < fixture fallback (60 s) < qualification (600 s). A case asserts its
+(45 s; the detach class uses its own 75 s outer window, because its nested guard
+has a 40 s stop and a 58 s exit) < fixture fallback (60 s) < qualification
+(600 s). A case asserts its
 verdict before the fallback; fallback expiry never counts as closure.
 
 Real case directories go in the outer supervisor's evidence directory
@@ -1669,19 +1671,20 @@ class PureAdmission(unittest.TestCase):
         custodian.deadline_hit = True
         with self.clock(custodian, 51):
             custodian.accept(self.message(custodian, 5 * NS, offset_s=51, command="lateonly"))
-        # The last accepted report is this waiting report, so nothing later could
-        # have overwritten a completion for it: that is the provable unfinished
-        # case.
+        # Nothing later was observed, but a completion can still have been missed
+        # between the last poll and the sampler's stop, so the wait stays unpaired
+        # and unclassified rather than proven unfinished.
         with self.clock(custodian, 60):
             custodian.accept(self.waiting(custodian, 60, command="lost"))
         pairs = self.pairs(custodian)
         self.assertEqual(pairs["commands"], 4)
         self.assertEqual(pairs["ended"], 3)
-        self.assertEqual(pairs["unfinished_count"], 1)
-        self.assertEqual([entry["command"] for entry in pairs["unfinished"]], ["lost"])
+        self.assertEqual(pairs["unpaired_count"], 1)
+        self.assertEqual([entry["command"] for entry in pairs["unpaired"]], ["lost"])
+        self.assertFalse(pairs["unpaired"][0]["later_observation"])
         self.assertEqual(pairs["possibly_overwritten_count"], 0)
-        self.assertEqual(pairs["unfinished"][0]["reason"], "queue")
-        self.assertEqual(pairs["unfinished"][0]["waiting_ns"], custodian.start + 60 * NS)
+        self.assertEqual(pairs["unpaired"][0]["reason"], "queue")
+        self.assertEqual(pairs["unpaired"][0]["waiting_ns"], custodian.start + 60 * NS)
 
     def test_a_completion_overwritten_before_a_poll_is_not_a_proven_unfinished_wait(self):
         # Review finding: the completion file has one fixed name, so two
@@ -1700,10 +1703,44 @@ class PureAdmission(unittest.TestCase):
         pairs = self.pairs(custodian)
         self.assertEqual(pairs["commands"], 1)
         self.assertEqual(pairs["ended"], 0)
-        self.assertEqual(pairs["unfinished_count"], 0, "a possibly overwritten wait is not proven unfinished")
+        self.assertEqual(pairs["unpaired_count"], 1)
         self.assertEqual(pairs["possibly_overwritten_count"], 1)
-        self.assertEqual([entry["command"] for entry in pairs["possibly_overwritten"]], ["first"])
-        self.assertEqual(pairs["possibly_overwritten"][0]["waiting_ns"], custodian.start + 10 * NS)
+        self.assertTrue(pairs["unpaired"][0]["later_observation"])
+        self.assertEqual(pairs["unpaired"][0]["command"], "first")
+        self.assertEqual(pairs["unpaired"][0]["waiting_ns"], custodian.start + 10 * NS)
+
+    def test_a_rejected_read_after_a_wait_is_also_a_later_observation(self):
+        # A rejected read still observed the fixed-name file: it may have
+        # replaced the completion, so the earlier wait stays unclassified even
+        # though no later report was accepted.
+        custodian = self.custodian()
+        custodian.record = lambda kind, **fields: None
+        with self.clock(custodian, 10):
+            custodian.accept(self.waiting(custodian, 10, command="first"))
+        with self.clock(custodian, 11):
+            custodian.accept({"run": self.RUN, "seq": custodian.monitor_seq + 1, "leader": None,
+                              "type": "admission_rejected", "at": custodian.start + 11 * NS,
+                              "kind": "admission", "completed": custodian.start + 11 * NS,
+                              "reason": "unexpected keys"})
+        pairs = self.pairs(custodian)
+        self.assertEqual((pairs["unpaired_count"], pairs["possibly_overwritten_count"]), (1, 1))
+        self.assertTrue(pairs["unpaired"][0]["later_observation"])
+        self.assertEqual(pairs["rejected_reports"], 1)
+        self.assertIsNone(custodian.guard.fault, "a rejected report is cooperative evidence, never a fault")
+
+    def test_an_entirely_missed_completion_is_unclassified_not_unfinished(self):
+        # No later observation exists, but a completion written between the last
+        # poll and the sampler's stop can be missed entirely. Missing terminal
+        # evidence is unknown: nothing here may be called a proven unfinished
+        # wait, and the decision record says so.
+        custodian = self.custodian()
+        custodian.record = lambda kind, **fields: None
+        with self.clock(custodian, 10):
+            custodian.accept(self.waiting(custodian, 10, command="only"))
+        pairs = self.pairs(custodian)
+        self.assertEqual(pairs["unpaired_count"], 1)
+        self.assertFalse(pairs["unpaired"][0]["later_observation"])
+        self.assertNotIn("unfinished", pairs)
 
     def test_reading_freshness_is_not_latched_after_the_closure_decision(self):
         # Review finding: a completed, closed run was reported as exit 125 when
@@ -1753,7 +1790,7 @@ class PureAdmission(unittest.TestCase):
         with self.clock(custodian, 10):
             custodian.accept(self.message(custodian, 8 * NS, offset_s=10, command="only-grant"))
         self.assertEqual(self.pairs(custodian)["commands"], 0, "only waiting reports are counted")
-        self.assertEqual(self.pairs(custodian)["unfinished_count"], 0)
+        self.assertEqual(self.pairs(custodian)["unpaired_count"], 0)
 
     def test_the_pairing_table_is_bounded_and_overflow_is_unclassified(self):
         custodian = self.custodian()
@@ -1767,10 +1804,10 @@ class PureAdmission(unittest.TestCase):
         # An overflow report still advances the ordinal, so the last *stored*
         # waiting report is not provably last: every unpaired wait here is a
         # possible overwrite, an unknown, and none is a proven unfinished wait.
-        self.assertEqual(pairs["unfinished_count"], 0)
+        self.assertEqual(pairs["unpaired_count"], bounded.ADMISSION_COMMANDS)
         self.assertEqual(pairs["possibly_overwritten_count"], bounded.ADMISSION_COMMANDS)
-        self.assertEqual(len(pairs["unfinished"]), 0)
-        self.assertEqual(len(pairs["possibly_overwritten"]), bounded.ADMISSION_UNFINISHED)
+        self.assertEqual(len(pairs["unpaired"]), bounded.ADMISSION_UNFINISHED)
+        self.assertTrue(all(entry["later_observation"] for entry in pairs["unpaired"]))
 
     def test_the_decision_record_carries_the_waiting_and_pairing_facts(self):
         custodian = self.custodian()
@@ -1786,7 +1823,8 @@ class PureAdmission(unittest.TestCase):
         self.assertEqual(decision["waiting_ns"], custodian.start + 9 * NS)
         self.assertEqual(decision["admission_waiting"]["commands"], 1)
         self.assertEqual(decision["admission_waiting"]["ended"], 0)
-        self.assertEqual(decision["admission_waiting"]["unfinished_count"], 1)
+        self.assertEqual(decision["admission_waiting"]["unpaired_count"], 1)
+        self.assertFalse(decision["admission_waiting"]["unpaired"][0]["later_observation"])
         self.assertEqual(decision["unclassified"], 0)
         self.assertEqual(decision["granted_ns"], 0)
         self.assertEqual(decision["absolute_ns"], custodian.start + 300 * NS)
@@ -1884,7 +1922,8 @@ class PureAdmission(unittest.TestCase):
                                                  "command": "4242-0", "reason": "queue"},
                                      name=bounded.WAITING_NAME)
         monitor.read_admission(str(stale_waiting), None, "admission_waiting")
-        self.assertEqual(self.drain(monitor.cmd_r), [])
+        sent = self.drain(monitor.cmd_r)
+        self.assertEqual([m["type"] for m in sent], ["admission_rejected", "admission_rejected"])
         self.assertEqual(monitor.receipt["admission"]["ignored"], 1)
         self.assertIn("stale run", monitor.receipt["admission"]["rejections"])
         self.assertEqual(monitor.receipt["admission_waiting"]["ignored"], 1)
@@ -1904,7 +1943,11 @@ class PureAdmission(unittest.TestCase):
         link = directory / "link"
         os.symlink(str(malformed), str(link))
         monitor.read_admission(str(link))
-        self.assertEqual(self.drain(monitor.cmd_r), [])
+        # Every readable-but-invalid document is reported as a rejection (an
+        # observation of the fixed-name file), never as an accepted marker; the
+        # symlink and other non-document paths are recorded only.
+        sent = self.drain(monitor.cmd_r)
+        self.assertEqual([m["type"] for m in sent], ["admission_rejected"] * 3)
         record = monitor.receipt["admission"]
         self.assertEqual(record["observed"], 0)
         self.assertEqual(record["ignored"], 4)
@@ -1920,7 +1963,8 @@ class PureAdmission(unittest.TestCase):
         record = monitor.receipt["admission"]
         self.assertEqual(record["ignored"], bounded.ADMISSION_REJECTIONS + 3)
         self.assertEqual(len(record["rejections"]), bounded.ADMISSION_REJECTIONS)
-        self.assertEqual(self.drain(monitor.cmd_r), [])
+        sent = self.drain(monitor.cmd_r)
+        self.assertEqual([m["type"] for m in sent], ["admission_rejected"] * (bounded.ADMISSION_REJECTIONS + 3))
 
     def test_an_absent_marker_is_not_an_event(self):
         directory = self.fixture()
@@ -1957,7 +2001,10 @@ class PureAdmission(unittest.TestCase):
         link = directory / "waiting-link"
         os.symlink(str(bad), str(link))
         monitor.read_admission(str(link), None, "admission_waiting")
-        self.assertEqual(self.drain(monitor.cmd_r), [])
+        # The invalid document is reported as a rejection; the symlink is only
+        # recorded.
+        sent = self.drain(monitor.cmd_r)
+        self.assertEqual([m["type"] for m in sent], ["admission_rejected"])
         waiting = monitor.receipt["admission_waiting"]
         self.assertEqual((waiting["observed"], waiting["ignored"]), (0, 2))
         self.assertEqual(waiting["reason"], None)
@@ -7773,8 +7820,8 @@ class Real(unittest.TestCase):
         self.assertEqual(decisions[0]["late_reason"], "deadline")
         self.assertEqual(decisions[0]["absolute_ns"], self.receipt["start_ns"] + 32 * NS)
         pairs = decisions[0]["admission_waiting"]
-        self.assertEqual((pairs["commands"], pairs["ended"], pairs["unfinished_count"]), (1, 1, 0),
-                         "a late grant ends its own command's wait, never leaving it unfinished")
+        self.assertEqual((pairs["commands"], pairs["ended"], pairs["unpaired_count"]), (1, 1, 0),
+                         "a late grant ends its own command's wait, never leaving it unpaired")
         self.assertEqual(self.receipt["admission_waiting"]["observed"], 1)
         self.assertEqual(self.receipt["admission_waiting"]["reason"], "queue")
 
@@ -7808,9 +7855,10 @@ class Real(unittest.TestCase):
         self.assertEqual(decisions[0]["granted_ns"], 0)
         self.assertEqual(decisions[0]["absolute_ns"], self.receipt["start_ns"] + 32 * NS)
         pairs = decisions[0]["admission_waiting"]
-        self.assertEqual((pairs["commands"], pairs["ended"], pairs["unfinished_count"]), (1, 0, 1))
-        self.assertEqual(pairs["unfinished"][0]["command"], "fixture-1")
-        self.assertEqual(pairs["unfinished"][0]["reason"], "queue")
+        self.assertEqual((pairs["commands"], pairs["ended"], pairs["unpaired_count"]), (1, 0, 1))
+        self.assertEqual(pairs["unpaired"][0]["command"], "fixture-1")
+        self.assertEqual(pairs["unpaired"][0]["reason"], "queue")
+        self.assertFalse(pairs["unpaired"][0]["later_observation"])
 
     def test_a_stale_wait_and_a_zero_duration_grant_are_not_proven_unfinished(self):
         # Review finding: a stale marker left by an earlier run, and a wait whose
@@ -8471,6 +8519,14 @@ print("detach fixture ready: " + mount + " " + device + " wholes " + repr(wholes
 """)
 
 
+# The nested detach guard runs `--limit 60`: its own stop is at 40 s and its
+# exit at 58 s. This class's outer window must cover both plus a bounded settle:
+# killing it at the Real class's 45 s verdict would decide nothing and would
+# leave its mount and custody unknown. A timeout therefore retains the resources
+# and fails as unknown, never as a detach outcome.
+DETACH_CASE_VERDICT_S = 75
+
+
 class DetachReal(unittest.TestCase):
     """The three real post-census detach cases. Each one owns its image, keeps
     its evidence, and removes its own fixture mount after the nested guard has
@@ -8497,7 +8553,14 @@ class DetachReal(unittest.TestCase):
         with open(self.dir / "guardian.log", "wb") as log:
             guardian = subprocess.Popen(args, env=env, stdout=subprocess.DEVNULL, stderr=log)
             try:
-                self.code = guardian.wait(timeout=VERDICT_S - (now_ns() - self.started) / NS)
+                self.code = guardian.wait(timeout=DETACH_CASE_VERDICT_S - (now_ns() - self.started) / NS)
+            except subprocess.TimeoutExpired:
+                if guardian.poll() is None:
+                    guardian.kill()
+                    guardian.wait(5)
+                self.fail("the nested detach guard did not settle inside its outer window"
+                          f" ({DETACH_CASE_VERDICT_S} s); its mount, backing and evidence are retained"
+                          " and no detach outcome is inferred from a forced kill")
             finally:
                 if guardian.poll() is None:
                     guardian.kill()

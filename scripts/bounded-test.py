@@ -267,6 +267,7 @@ FIELDS = {  # required fields per monitor message type; bool is never accepted a
     "census": {"after": int, "members": int, "uncertain": int, "certain": bool},
     "admission": {"waited_ns": int, "command": str, "completed": int, "marker": int},
     "admission_waiting": {"reason": str, "command": str, "completed": int, "marker": int},
+    "admission_rejected": {"kind": str, "completed": int, "reason": str},
     "setup": {"root": str, "scratch": str, "evidence": str, "owned": bool},
     "detach": {"attempted": bool, "qualified": bool, "post_state": str},
     "detach_ready": {"budget_ns": int},
@@ -3665,15 +3666,25 @@ class Monitor:
         except BaseException:
             pass
 
-    def reject_admission(self, reason, key="admission"):
-        """Record why one report was ignored. Cooperative evidence only: a
-        rejected report never faults the run and is never sent."""
+    def reject_admission(self, reason, key="admission", observed=True):
+        """Record why one report was ignored, and tell the custodian.
+
+        Cooperative evidence only: a rejected report never faults the run. A
+        readable document that failed validation is still an observation of the
+        fixed-name completion file, so the custodian must count it: it can have
+        replaced a completion before the next poll. `observed=False` covers the
+        paths that never read a document (a vanished path, a non-regular file, an
+        open error), which are not observations of a write. At most one rejection
+        is reported per poll and file, so the control-message rate stays bounded
+        by the sampler."""
         try:
             record = self.receipt[key]
             with self.lock:
                 record["ignored"] += 1
                 if len(record["rejections"]) < ADMISSION_REJECTIONS:
                     record["rejections"].append(reason)
+            if observed:
+                self.send("admission_rejected", kind=key, completed=now_ns(), reason=reason[:64])
         except BaseException:
             pass
 
@@ -3690,7 +3701,7 @@ class Monitor:
         try:
             info = os.lstat(path)
             if not stat.S_ISREG(info.st_mode):
-                self.reject_admission("not a regular file", key)
+                self.reject_admission("not a regular file", key, observed=False)
                 return
             handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
             try:
@@ -3698,7 +3709,7 @@ class Monitor:
             finally:
                 os.close(handle)
         except OSError as error:
-            self.reject_admission("read: " + errno_name(error), key)
+            self.reject_admission("read: " + errno_name(error), key, observed=False)
             return
         completed = now_ns()
         if len(raw) > ADMISSION_MAX_BYTES:
@@ -4268,29 +4279,28 @@ class Monitor:
             rejected_grants = receipt["admission"]["ignored"]
             if pairs.get("commands") or rejected_waiting:
                 report(f"supervisor: admission waits reported by {pairs.get('commands', 0)} command(s):"
-                       f" {pairs.get('ended', 0)} ended, {pairs.get('unfinished_count', 0)} unfinished,"
-                       f" {pairs.get('possibly_overwritten_count', 0)} possibly overwritten;"
+                       f" {pairs.get('ended', 0)} ended, {pairs.get('unpaired_count', 0)} unpaired"
+                       f" ({pairs.get('possibly_overwritten_count', 0)} with a later admission report);"
                        f" granted {admission['granted_ns'] / NS:.1f} s; {rejected_waiting} waiting and"
                        f" {rejected_grants} completed report(s) rejected"
                        + (f"; {admission['unclassified']} unpaired" if admission.get("unclassified") else "")
                        + "\n")
-            for entry in (pairs.get("unfinished") or [])[:3]:
-                report(f"supervisor: command {entry['command']} reported waiting ({entry['reason']}) at"
-                       f" {(entry['waiting_ns'] - receipt['start_ns']) / NS:.1f} s and no completion for"
-                       " that command was reported before the stop decision; that wait is reported, not"
-                       " granted\n")
-            for entry in (pairs.get("possibly_overwritten") or [])[:3]:
-                report(f"supervisor: command {entry['command']} reported waiting ({entry['reason']}) at"
-                       f" {(entry['waiting_ns'] - receipt['start_ns']) / NS:.1f} s, but a later admission"
-                       " report may have overwritten its completion before the supervisor polled it, so"
-                       " that wait is unclassified, not a proven unfinished wait\n")
-            if pairs.get("unfinished_count") or pairs.get("possibly_overwritten_count"):
-                report("supervisor: the deadline classification stands for the unfinished command(s); no"
+            for entry in (pairs.get("unpaired") or [])[:3]:
+                if entry["later_observation"] or rejected_waiting or rejected_grants:
+                    report(f"supervisor: command {entry['command']} reported waiting ({entry['reason']}) at"
+                           f" {(entry['waiting_ns'] - receipt['start_ns']) / NS:.1f} s; a later admission"
+                           " report or a rejected read may have overwritten its completion before the"
+                           " supervisor polled it, so that wait is unclassified, not a proven unfinished"
+                           " wait\n")
+                else:
+                    report(f"supervisor: command {entry['command']} reported waiting ({entry['reason']}) at"
+                           f" {(entry['waiting_ns'] - receipt['start_ns']) / NS:.1f} s; no admission-file"
+                           " observation followed it, but the fixed-name completion may have been missed"
+                           " between polls, so its terminal evidence is missing and the wait is"
+                           " unclassified, not a proven unfinished wait\n")
+            if pairs.get("unpaired_count"):
+                report("supervisor: the deadline classification stands for the unpaired command(s); no"
                        " clock was moved for them\n")
-                if rejected_grants:
-                    report(f"supervisor: {rejected_grants} completed report(s) were rejected, so an"
-                           " unfinished command above may have ended in one of them; those waits are"
-                           " unclassified rather than proven unfinished\n")
             if rejected_waiting:
                 report(f"supervisor: {rejected_waiting} waiting report(s) were rejected"
                        f" ({', '.join(receipt['admission_waiting']['rejections'][:3])}); those waits are"
@@ -4370,6 +4380,7 @@ class Custodian:
         self.admission_unclassified = 0
         self.admission_ordinal = 0
         self.admission_last_ordinal = 0
+        self.admission_rejected_reports = 0
         self.sampling_ended = False
         self.exceptions = 0
         self.injected = set()
@@ -4669,6 +4680,17 @@ class Custodian:
                 self.guard.latch("admission message stamped in the future")
             else:
                 self.note_waiting(message, at)
+        elif kind == "admission_rejected":
+            at = now_ns()
+            if message["at"] > at:
+                self.guard.latch("admission message stamped in the future")
+            else:
+                # An observation of the fixed-name file, not evidence about any
+                # command: it advances the ordinal so a wait before it can never
+                # be called provably unfinished.
+                self.admission_ordinal += 1
+                self.admission_last_ordinal = self.admission_ordinal
+                self.admission_rejected_reports += 1
         elif kind == "census":
             try:  # observation only, before the unchanged eligibility rule
                 self.census_messages += 1
@@ -5066,28 +5088,28 @@ class Custodian:
 
         Only commands whose waiting report was accepted are counted. A command
         is finished when its own completed report arrived at all (`grant`, even
-        with a zero or clamped grant) or arrived after the stop (`late`). It is
-        `unfinished` only when no terminal report for that same command arrived
-        AND its waiting report was the run's last accepted admission report: the
-        completion file has one fixed name, so any later accepted report (another
-        command's grant or waiting report) may have replaced a completion before
-        the next 0.25 s poll. Such an earlier wait is `possibly_overwritten`, an
-        unknown, never a proven unfinished wait. Both lists are bounded; the
-        counts are always the full ones."""
+        with a zero or clamped grant) or arrived after the stop (`late`). An
+        unpaired wait is **never** called a proven unfinished wait: the completion
+        file has one fixed name, so any later admission-file observation -
+        another command's grant, another command's waiting report, or a rejected
+        read - may have replaced a completion before the next 0.25 s poll, and a
+        completion published between the last poll and the sampler's stop can be
+        missed entirely. `later_observation` states whether such a later
+        observation exists in this run (the summary also treats any rejected
+        report as one). Both lists are bounded; the counts are the full ones."""
         waiting = [entry for entry in self.admission_pairs.values() if entry["waiting_ns"] is not None]
         ended = [entry for entry in waiting if entry["ended"] is not None]
         unpaired = [entry for entry in waiting if entry["ended"] is None]
-        unfinished = [entry for entry in unpaired if entry["waiting_ordinal"] == self.admission_last_ordinal]
-        overwritten = [entry for entry in unpaired if entry["waiting_ordinal"] != self.admission_last_ordinal]
+        rows = [{"command": entry["command"], "reason": entry["reason"],
+                 "waiting_ns": entry["waiting_ns"],
+                 "later_observation": entry["waiting_ordinal"] != self.admission_last_ordinal}
+                for entry in unpaired]
+        overwritten = [row for row in rows if row["later_observation"]]
         return {"commands": len(waiting), "ended": len(ended),
-                "unfinished_count": len(unfinished),
-                "unfinished": [{"command": entry["command"], "reason": entry["reason"],
-                                "waiting_ns": entry["waiting_ns"]}
-                               for entry in unfinished[:ADMISSION_UNFINISHED]],
+                "unpaired_count": len(rows),
+                "unpaired": rows[:ADMISSION_UNFINISHED],
                 "possibly_overwritten_count": len(overwritten),
-                "possibly_overwritten": [{"command": entry["command"], "reason": entry["reason"],
-                                          "waiting_ns": entry["waiting_ns"]}
-                                         for entry in overwritten[:ADMISSION_UNFINISHED]]}
+                "rejected_reports": self.admission_rejected_reports}
 
     def observe_admission(self, launched):
         """Best-effort decision-time record of the admission grants
