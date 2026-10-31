@@ -4854,10 +4854,11 @@ impl Pool {
         // is left untouched and stays counted by the payload walk.
         let mut adopted: Vec<(u64, HoldingRecord)> = Vec::new();
         for slot in &self.ledger.slots {
-            // Only the two windows that rename a tree exist: an idle slot's
-            // eviction and a legacy pending deletion's migration. A held row's
-            // tree is this command's live build directory; it is never moved
-            // into the holding area, so a name that happens to match its
+            // Three windows can rename a tree: an idle slot's eviction, a
+            // legacy pending deletion's migration, and the operator-confirmed
+            // quarantined release's held eviction (oxide#196). A held row
+            // without a recorded intent is a live build directory; it is never
+            // moved into the holding area, so a name that happens to match its
             // generation must not be adopted as one (see the match below).
             let path = self.slot_path_in(slot.id, slot.dir.as_deref())?;
             match holding_presence(&path) {
@@ -4881,13 +4882,12 @@ impl Pool {
             // charged by the payload walk and left to a replay, never deleted on
             // a name alone.
             let bound = match slot.state {
-                SlotPersistState::Idle | SlotPersistState::Evicting => {
+                SlotPersistState::Idle | SlotPersistState::Evicting | SlotPersistState::Held => {
                     match self.recorded_hold_intent(slot) {
                         Some(intent) => (intent.device, intent.inode),
                         None => continue,
                     }
                 }
-                SlotPersistState::Held => continue,
             };
             let Ok(target) = std::ffi::CString::new(name.as_bytes()) else {
                 continue;
@@ -6003,13 +6003,15 @@ fn validate_ledger_read(ledger: &Ledger) -> Result<(), LeaseError> {
             return Err(LeaseError::UnknownAccounting);
         }
         // A hold intent names a rename a deletion is about to perform and the
-        // root identity it verified. Only the two states that can be a rename
+        // root identity it verified. Only the states that can be a rename
         // source may carry one: an idle slot waiting for its eviction's write,
-        // and a recorded legacy deletion. A held row can never carry it.
+        // a recorded legacy deletion, and the operator-confirmed quarantined
+        // release's held eviction (oxide#196), which stays held until the same
+        // transaction moves it.
         if slot.hold_intent.is_some()
             && (!matches!(
                 slot.state,
-                SlotPersistState::Idle | SlotPersistState::Evicting
+                SlotPersistState::Idle | SlotPersistState::Evicting | SlotPersistState::Held
             ) || !slot
                 .hold_intent
                 .as_ref()
