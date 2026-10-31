@@ -1774,17 +1774,29 @@ def read_custody(ctx, probe):
     return [str(backing) for backing in backings], None
 
 
-def custody_problems(paths, probe, facts=None, timeout=DETACH_INFO_TIMEOUT_S):
+def custody_problems(paths, probe, facts=None, timeout=DETACH_INFO_TIMEOUT_S, deadline_ns=None):
     """Why a decayed custody record must keep the root, from attachment facts and
     device nodes: a mounted entity is live, an entity without a mount point is
     live when its /dev node still exists (attached but unmounted) and stale
     metadata only when that node is positively gone; unreadable facts are
-    uncertain and keep. Am empty result means the backings are positively
-    detached."""
+    uncertain and keep. An empty result means the backings are positively
+    detached. With an absolute `deadline_ns`, the deadline is rechecked before
+    EVERY backing read and each read gets only what is left, so earlier reads can
+    never buy a later one a fresh allowance."""
     read = facts or image_attachments
     problems = []
-    for backing in paths:
-        rows = read(backing, timeout)
+    for index, backing in enumerate(paths):
+        budget = timeout
+        if deadline_ns is not None:
+            remaining = (deadline_ns - now_ns()) / NS
+            if remaining <= 0.0:
+                problems.append(f"{backing}: no custodian wait window is left to read its facts")
+                break
+            # The deadline is rechecked here AND the remainder is shared with the
+            # backings still to read, so neither a slow earlier read nor several
+            # reads can outlive the custodian's window.
+            budget = max(0.05, min(timeout, remaining / max(1, len(paths) - index)))
+        rows = read(backing, budget)
         if rows is None:
             problems.append(f"{backing}: attachment facts are unreadable")
             continue
@@ -1825,18 +1837,16 @@ def cleanup_safety(ctx, probe=None, facts=None):
     # declared backings SHARE it, so no backing restarts a fresh allowance and the
     # last read cannot outlive the monitor.
     start_ns, limit_s = ctx.get("start_ns"), ctx.get("limit_s")
+    deadline_ns = None
     if typed(start_ns, int) and typed(limit_s, (int, float)):
-        deadline_ns = start_ns + int(limit_s * NS) - EXIT_MARGIN_S * NS
-        remaining = (deadline_ns - now_ns()) / NS - DETACH_GATE_MARGIN_NS / NS
-        if remaining <= 0.0:
+        deadline_ns = (start_ns + int(limit_s * NS) - EXIT_MARGIN_S * NS
+                       - DETACH_GATE_MARGIN_NS)
+        if (deadline_ns - now_ns()) <= 0:
             return {"state": "kept", "at_ns": now_ns(), "unrequested": list(backings),
                     "reason": ("no custodian wait window is left to read the custody indication;"
                                " the root, its backings and the evidence are kept")}
-        read_timeout = max(0.05, min(DETACH_INFO_TIMEOUT_S, remaining / max(1, len(backings))))
-    else:
-        read_timeout = DETACH_INFO_TIMEOUT_S
     try:
-        problems = custody_problems(backings, probe, facts, read_timeout)
+        problems = custody_problems(backings, probe, facts, DETACH_INFO_TIMEOUT_S, deadline_ns)
     except BaseException as error:
         problems = [f"attachment facts failed: {type_name(error)}"]
     if not problems:

@@ -5490,8 +5490,36 @@ class PureDetach(unittest.TestCase):
         record = bounded.cleanup_safety(ctx, self.facts(), facts=facts)
         self.assertEqual(record["state"], "ok", record)
         self.assertEqual(len(timeouts), 2, timeouts)
-        self.assertTrue(all(value is not None and value < 1.0 for value in timeouts), timeouts)
-        self.assertLessEqual(sum(timeouts), 0.7, timeouts)
+        # Every grant stays inside the window that was left when it started (the
+        # remainder is also shared with the backings still to read), so no read can
+        # be given a fresh full allowance.
+        self.assertTrue(all(value is not None and value < 0.7 for value in timeouts), timeouts)
+        self.assertLessEqual(timeouts[0], 0.35, timeouts)
+
+    def test_the_deadline_is_rechecked_before_every_backing_read(self):
+        # A first read that consumes the window must not buy a later backing a
+        # fresh allowance: the deadline is rechecked before each read.
+        ctx, first = self.layout()
+        second = os.path.join(ctx["scratch"], "second.sparseimage")
+        with open(second, "wb") as handle:
+            handle.write(b"second backing")
+        self.declare_custody(ctx, first, second)
+        # ~0.3 s of window left; the first read consumes it.
+        ctx["start_ns"] = (time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
+                           - 300 * bounded.NS + int(0.3 * bounded.NS)
+                           + bounded.EXIT_MARGIN_S * bounded.NS + bounded.DETACH_GATE_MARGIN_NS)
+        reads = []
+
+        def facts(backing, timeout=None):
+            reads.append((backing, timeout))
+            time.sleep(0.35)  # this read uses up the window
+            return []
+
+        record = bounded.cleanup_safety(ctx, self.facts(), facts=facts)
+        self.assertEqual(record["state"], "kept", record)
+        self.assertEqual(len(reads), 1, reads)
+        self.assertLessEqual(reads[0][1], 0.35, reads)
+        self.assertIn("no custodian wait window is left", record["reason"])
 
     def test_an_exhausted_window_scans_nothing(self):
         ctx, backing = self.layout()
