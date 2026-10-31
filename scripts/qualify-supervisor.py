@@ -77,7 +77,7 @@ WALL_NS = 300 * NS
 CANDIDATE_LIMIT = 280
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 328  # 277 pure + 51 real (oxide#151 added the routing, marker,
+EXPECTED_CASES = 325  # 277 pure + 48 real (oxide#151 added the routing, marker,
                       # nested-window protection, bounded-sweep, qualify-entry,
                       # shared-ancestor/private-leaf and readiness cases; oxide#191
                       # adds sixty-six pure post-census detach cases and eight real
