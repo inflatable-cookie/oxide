@@ -4679,6 +4679,134 @@ class PureDetach(unittest.TestCase):
             bounded.Kinfo = saved
         self.assertTrue(all(kind == "detach_child_observed" for kind, _f in recorded), recorded)
 
+    def test_an_unreadable_identity_is_never_read_as_gone(self):
+        # Real row, then the same pid unreadable: the safe read reports a problem
+        # and the caller can never mistake it for absence.
+        real = bounded.Kinfo.one(os.getpid())
+        row, problem = bounded.process_row(os.getpid())
+        self.assertIsNone(problem)
+        self.assertEqual(row["pid"], real["pid"])
+
+        class BrokenKinfo:
+            @staticmethod
+            def one(pid):
+                raise OSError("sysctl read failed")
+
+        class MalformedKinfo:
+            @staticmethod
+            def one(pid):
+                return {"pid": pid, "start": None}
+
+        saved = bounded.Kinfo
+        try:
+            bounded.Kinfo = BrokenKinfo
+            self.assertEqual(bounded.process_row(4242), (None, "OSError"))
+            bounded.Kinfo = MalformedKinfo
+            self.assertEqual(bounded.process_row(4242), (None, "malformed process row"))
+        finally:
+            bounded.Kinfo = saved
+        self.assertEqual(bounded.process_row(0), (None, "no usable pid"))
+
+    def custodian_stub(self):
+        custodian = bounded.Custodian.__new__(bounded.Custodian)
+        custodian.guard = bounded.Guard(time.clock_gettime_ns(time.CLOCK_UPTIME_RAW))
+        custodian.run_id = "run"
+        custodian.monitor_seq = 0
+        custodian.monitor = os.getpid()
+        custodian.leader = None
+        custodian.leader_bound = False
+        custodian.detach_child = None
+        custodian.records, custodian.told = [], []
+        custodian.record = lambda kind, **fields: custodian.records.append((kind, fields))
+        custodian.tell = lambda kind, **fields: custodian.told.append((kind, fields))
+        custodian.signal_detach_child = lambda: custodian.records.append(("detach_child_signal", {}))
+        custodian.observe_detach_child = lambda limit: True
+        return custodian
+
+    def test_the_handoff_refuses_an_unreadable_identity_without_signing(self):
+        real = bounded.Kinfo.one(os.getpid())
+        message = {"run": "run", "seq": 1, "at": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW),
+                   "type": "detach_child", "leader": None, "pid": real["pid"], "start": real["start"]}
+
+        class BrokenKinfo:
+            @staticmethod
+            def one(pid):
+                raise OSError("sysctl read failed")
+
+        custodian = self.custodian_stub()
+        saved = bounded.Kinfo
+        try:
+            bounded.Kinfo = BrokenKinfo
+            custodian.accept(dict(message))
+        finally:
+            bounded.Kinfo = saved
+        self.assertIsNone(custodian.detach_child, "an unreadable identity was pinned")
+        self.assertNotIn("detach_child_signal", [kind for kind, _f in custodian.records])
+        self.assertEqual([kind for kind, _f in custodian.records], ["detach_child_refused"])
+        ack = custodian.told[-1]
+        self.assertEqual(ack[0], "detach_child_ack")
+        self.assertIs(ack[1]["custodian_closes"], False)
+        self.assertIs(ack[1]["closed"], False)
+        self.assertIn("could not be read", ack[1]["reason"])
+
+    def test_the_handoff_pins_signals_and_acknowledges_a_live_child(self):
+        # The pinned child must still be this (stubbed) monitor's own child.
+        real = dict(bounded.Kinfo.one(os.getpid()), pid=os.getpid() + 1, start=1234,
+                    ppid=os.getpid(), zombie=False)
+        message = {"run": "run", "seq": 1, "at": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW),
+                   "type": "detach_child", "leader": None, "pid": real["pid"], "start": real["start"]}
+        custodian = self.custodian_stub()
+
+        class FakeKinfo:
+            @staticmethod
+            def one(pid):
+                return dict(real) if pid == real["pid"] else None
+
+        saved = bounded.Kinfo
+        try:
+            bounded.Kinfo = FakeKinfo
+            custodian.accept(dict(message))
+        finally:
+            bounded.Kinfo = saved
+        self.assertEqual(custodian.detach_child, [real["pid"], real["start"]])
+        self.assertEqual([kind for kind, _f in custodian.records],
+                         ["detach_child_pinned", "detach_child_signal"])
+        ack = custodian.told[-1]
+        self.assertIs(ack[1]["custodian_closes"], True)
+        self.assertIs(ack[1]["closed"], True)
+
+    def test_an_unreadable_observation_is_uncertain_not_closed(self):
+        real = bounded.Kinfo.one(os.getpid())
+
+        class BrokenKinfo:
+            @staticmethod
+            def one(pid):
+                raise OSError("sysctl read failed")
+
+        custodian = bounded.Custodian.__new__(bounded.Custodian)
+        custodian.detach_child = [real["pid"], real["start"]]
+        custodian.absolute = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) + 2 * bounded.NS
+        custodian.pump = lambda _timeout: None
+        recorded = []
+        custodian.record = lambda kind, **fields: recorded.append((kind, fields))
+        saved = bounded.Kinfo
+        try:
+            bounded.Kinfo = BrokenKinfo
+            self.assertFalse(custodian.observe_detach_child(bounded.NS // 50),
+                             "an unreadable observation was reported closed")
+        finally:
+            bounded.Kinfo = saved
+        kind, fields = recorded[-1]
+        self.assertEqual(kind, "detach_child_observed")
+        self.assertIs(fields["closed"], False)
+        self.assertEqual(fields["uncertain"], "OSError")
+
+    def test_the_monitor_holds_when_the_child_identity_is_unreadable(self):
+        source = inspect.getsource(bounded.Monitor.run)
+        self.assertIn("process_row(getattr(handle", source)
+        self.assertIn("detach_child_identity_unreadable: monitor_held", source)
+        self.assertNotIn("Kinfo.one", source)
+
     def test_an_executor_exception_keeps_the_live_handle(self):
         class BrokenStdout:
             def fileno(self):

@@ -1854,6 +1854,25 @@ def detach_budget(ctx, now=None):
     return max(0, exit_at - now - DETACH_GATE_MARGIN_NS)
 
 
+def process_row(pid):
+    """(row, problem) from `Kinfo.one(pid)`, never raising. `problem is None`
+    means the facts were readable (and `row is None` that the process is
+    positively absent); a failed size/read or a malformed row is an unreadable
+    observation and is never silently turned into "gone" or into an identity."""
+    if not typed(pid, int) or pid <= 0:
+        return None, "no usable pid"
+    try:
+        row = Kinfo.one(pid)
+    except BaseException as error:
+        return None, f"{type_name(error)}"
+    if row is None:
+        return None, None
+    if not (typed(row.get("pid"), int) and typed(row.get("start"), int)
+            and isinstance(row.get("zombie"), bool) and typed(row.get("ppid"), int)):
+        return None, "malformed process row"
+    return row, None
+
+
 def detach_child_identity(row, pid, start, monitor_pid):
     """Whether an observed kinfo_proc row is still the exact child a monitor handed
     over: same PID, same start time, still that monitor's child and not a zombie.
@@ -3472,7 +3491,7 @@ class Monitor:
         for command in self.commands():
             kind = command["type"]
             if kind == "leader":
-                row = Kinfo.one(command["pid"])
+                row, _problem = process_row(command["pid"])
                 with self.lock:
                     self.leader = [command["pid"], None if row is None else row["start"]]
                     self.receipt["leader"] = self.leader
@@ -3539,7 +3558,7 @@ class Monitor:
                         # recycled, and a bare PID must never be signalled), so it
                         # names the child by PID AND start time, then waits for the
                         # custodian's acknowledgement before touching it again.
-                        row = Kinfo.one(getattr(handle, "pid", 0) or 0)
+                        row, identity_problem = process_row(getattr(handle, "pid", 0) or 0)
                         window_end = (ctx["start_ns"] + int(ctx["limit_s"] * NS)
                                       - EXIT_MARGIN_S * NS - int(0.2 * NS))
                         ack = None
@@ -3550,7 +3569,19 @@ class Monitor:
                         with self.lock:
                             detach["custodian_closed"] = bool(ack and ack.get("closed") is True)
                             detach["custodian_owned"] = bool(ack and ack.get("custodian_closes") is True)
+                            detach["identity_problem"] = identity_problem
                             self.receipt["detach"] = detach
+                        if identity_problem is not None:
+                            # Its identity could not be read, so nothing is handed
+                            # over and no PID is signalled. The live handle is kept
+                            # and the run is held to the custodian's window, which
+                            # never claims a closure nobody observed.
+                            self.publish("detach_child_identity_unreadable: monitor_held")
+                            self.summary()
+                            end = ctx["start_ns"] + int(ctx["limit_s"] * NS) - int(0.1 * NS)
+                            while not self.stop.is_set() and now_ns() < end:
+                                time.sleep(0.02)
+                            return
                         if detach["custodian_closed"]:
                             # The custodian positively closed the child it was handed.
                             self.publish("detach_child_closed_by_custodian: scratch_kept")
@@ -3965,7 +3996,13 @@ class Custodian:
                 self.guard.latch("protocol: second detach_child")
                 return
             pid, start = message["pid"], message["start"]
-            row = Kinfo.one(pid)
+            row, problem = process_row(pid)
+            if problem is not None:
+                self.record("detach_child_refused", pid=pid, start=start,
+                            observation=f"identity unreadable ({problem})")
+                self.tell("detach_child_ack", custodian_closes=False, closed=False,
+                          reason=f"the child's identity could not be read ({problem})")
+                return
             # Positive identity: the same process (start time) and still this
             # monitor's child. A recycled bare PID can never match both, so it is
             # never signalled.
@@ -4285,7 +4322,11 @@ class Custodian:
         if self.detach_child is None:
             return
         pid, start = self.detach_child
-        if not detach_child_identity(Kinfo.one(pid), pid, start, self.monitor):
+        row, problem = process_row(pid)
+        if problem is not None:
+            self.guard.latch(f"detach child {pid} identity unreadable ({problem}); not signalled")
+            return
+        if not detach_child_identity(row, pid, start, self.monitor):
             return
         self.record("detach_child_signal", pid=pid, start=start)
         try:
@@ -4303,14 +4344,19 @@ class Custodian:
             return True
         pid, start = self.detach_child
         end = min(now_ns() + limit_ns, self.absolute)
-        closed = False
+        closed, uncertain = False, None
         while now_ns() < end:
-            row = Kinfo.one(pid)
+            row, problem = process_row(pid)
+            if problem is not None:
+                # Unreadable facts are uncertainty, never closure.
+                uncertain = problem
+                break
             if row is None or row["start"] != start or row.get("zombie") is not False:
                 closed = True
                 break
             self.pump(min(end - now_ns(), 20_000_000))
-        self.record("detach_child_observed", pid=pid, start=start, closed=closed)
+        self.record("detach_child_observed", pid=pid, start=start, closed=closed,
+                    uncertain=uncertain)
         return closed
 
     def close_detach_child(self):

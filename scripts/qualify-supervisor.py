@@ -77,10 +77,10 @@ WALL_NS = 300 * NS
 CANDIDATE_LIMIT = 280
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 297  # 252 pure + 45 real (oxide#151 added the routing, marker,
+EXPECTED_CASES = 302  # 257 pure + 45 real (oxide#151 added the routing, marker,
                       # nested-window protection, bounded-sweep, qualify-entry,
                       # shared-ancestor/private-leaf and readiness cases; oxide#191
-                      # adds forty-three pure post-census detach cases and five real
+                      # adds forty-eight pure post-census detach cases and five real
                       # ones: success, a refused identity, a failed attempt, an
                       # unrequested attachment whose opt-in custody keep is recorded
                       # separately, and a stuck child the custodian closes itself)

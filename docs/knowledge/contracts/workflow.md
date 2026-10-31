@@ -2169,7 +2169,7 @@ with no earlier run migrated.
 
 **Post-census image detach request (oxide#191, decision `ee263cea`, unqualified
 source).** The current `bounded-test.py`
-(`38c3f53e3aa819f191ad57d710255f79a4155ef41a562e8ac7ec67a57d6dbb06`) adds one
+(`e6613e0d381eafa4082e9df5da7f48cd157916007f458cadc91e2c1bb2fdecf7`) adds one
 opt-in control for a proof
 whose own test image must be detached, and it is the only route by which such a
 proof may detach after a launch; the qualified shared runner is otherwise
@@ -2210,10 +2210,14 @@ as reaped, and its live handle survives every exception path (authorization, the
 attempt and the post-state read): the monitor publishes the child's PID **and
 start time**, stops touching the handle and waits for the custodian's
 acknowledgement before it may reap again, because a reaped PID can be recycled and
-a bare PID is never signalled. The custodian re-reads the real `Kinfo.one()` row — whose
-liveness field is the boolean `zombie`; there is no `stat` key — and requires the
-same PID, the same start time, still this monitor as parent and a non-zombie
-before it signals; then it signals, observes it gone under that same identity and
+a bare PID is never signalled. Every custody lookup goes through one safe reader: a
+failed `sysctl` size/read or a malformed row is an unreadable observation — never
+`gone`, never an identity — so the monitor hands nothing over and holds, and the
+custodian refuses, records and acknowledges without signalling; an unreadable
+observation is also never read as closed. When the facts are readable the custodian
+re-reads the real `Kinfo.one()` row (liveness field is the boolean `zombie`; there is
+no `stat` key) and requires the same PID, the same start time, still this monitor as
+parent and a non-zombie before it signals; then it signals, observes it gone under that same identity and
 acknowledges (a post-timeout close is the backstop); only a declined handoff (the
 child is already gone) lets the monitor finish the reap itself. The live handle
 also survives an exception raised inside the child executor after spawn: the
@@ -2249,8 +2253,8 @@ custodian keeps its filesystem-free decision path and the existing
 cooperative-session limits. These bytes are unqualified until one uncounted
 `effigy proof:supervisor:qualify:diagnostic` records a clean picture and then
 ONE counted author and ONE separate independent reviewer
-`effigy proof:supervisor:qualify` pass at the same head (247 pure plus 45 real
-cases, including the thirty-eight pure detach cases and the five real ones: a
+`effigy proof:supervisor:qualify` pass at the same head (257 pure plus 45 real
+cases, including the forty-eight pure detach cases and the five real ones: a
 bound success, a refused identity, a failed attempt, an unrequested attachment
 whose opt-in custody keep is recorded separately, and a real stuck child the
 custodian pins, signals and observes closed), with independent exact-head source
@@ -5410,7 +5414,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
 - **Focused proof of absent checkout chains (oxide#135).** The one fixed proof
   is `effigy rust:prune-absence` (`scripts/test-prune-absence.py` under this
-  tree's shared supervisor `38c3f53e…`, the merged oxide#151 guard plus
+  tree's shared supervisor `e6613e0d…`, the merged oxide#151 guard plus
   oxide#191's opt-in post-census detach) with
   `--root-parent /private/tmp`, the owner-accepted internal-placement exception
   (decision `bd357a4c`): the missing-chain fixtures must be on the boot Data
