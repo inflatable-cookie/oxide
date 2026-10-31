@@ -2217,9 +2217,12 @@ The child is still the monitor's own direct child, so while the monitor holds it
 unreaped its PID cannot be recycled: it stops and reaps it itself inside the
 custodian's remaining window and records that closure
 (`detach_child_closed_by_monitor`); if that cannot close it, the monitor hands it
-over by PARENTAGE — no start time — while still holding it, and the custodian
-signals and positively observes it, refusing and acknowledging without signalling
-when parentage no longer matches. When the facts are readable the custodian
+over by PARENTAGE — no start time — while still holding it. The custodian accepts
+that parentage-only message, signals and positively observes it, refuses with an
+acknowledgement but no signal when parentage no longer matches, and acknowledges a
+positively absent child as gone without signalling or indexing any row. The
+test-only unreadable injection is scoped to one actor, so the monitor-side and
+custodian-side outcomes are each exercised end to end. When the facts are readable the custodian
 re-reads the real `Kinfo.one()` row (liveness field is the boolean `zombie`; there is
 no `stat` key) and requires the same PID, the same start time, still this monitor as
 parent and a non-zombie before it signals; then it signals, observes it gone under that same identity and
@@ -2258,8 +2261,8 @@ custodian keeps its filesystem-free decision path and the existing
 cooperative-session limits. These bytes are unqualified until one uncounted
 `effigy proof:supervisor:qualify:diagnostic` records a clean picture and then
 ONE counted author and ONE separate independent reviewer
-`effigy proof:supervisor:qualify` pass at the same head (261 pure plus 50 real
-cases, including the fifty-two pure detach cases and the seven real ones: a
+`effigy proof:supervisor:qualify` pass at the same head (263 pure plus 51 real
+cases, including the fifty-four pure detach cases and the eight real ones: a
 bound success, a refused identity, a failed attempt, an unrequested attachment
 whose opt-in custody keep is recorded separately, and a real stuck child the
 custodian pins, signals and observes closed), with independent exact-head source
