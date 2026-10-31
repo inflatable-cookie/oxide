@@ -2169,7 +2169,7 @@ with no earlier run migrated.
 
 **Post-census image detach request (oxide#191, decision `ee263cea`, unqualified
 source).** The current `bounded-test.py`
-(`409d1edc82ec3991781a609e2ae85e7250f610bd835d8f334aec272b1c3daeb6`) adds one
+(`d7bc4de3bf3e494cb7b5cefe6e185bdc08d26d1dd5f78ebfbc2fc44cdd733190`) adds one
 opt-in control for a proof
 whose own test image must be detached, and it is the only route by which such a
 proof may detach after a launch; the qualified shared runner is otherwise
@@ -2282,7 +2282,7 @@ custodian keeps its filesystem-free decision path and the existing
 cooperative-session limits. These bytes are unqualified until one uncounted
 `effigy proof:supervisor:qualify:diagnostic` records a clean picture and then
 ONE counted author and ONE separate independent reviewer
-`effigy proof:supervisor:qualify` pass at the same head (309 pure plus 49 real
+`effigy proof:supervisor:qualify` pass at the same head (310 pure plus 49 real
 cases, including the seventy-six pure detach cases and the eight real ones: a
 bound success, a refused identity, a failed attempt, an unrequested attachment
 whose opt-in custody keep is recorded separately, and a real stuck child the
@@ -2296,52 +2296,52 @@ reported by `kinfo_proc` as stable and not zombie while `getsid` fails with
 `ESRCH`, so every nested case under the installed Effigy could end `UNCLOSED`
 with `census uncertain: N unvalidated rows` while the same bytes passed when run
 directly. A direct-run diagnostic then saw one unvalidated row from a
-short-lived unrelated Node CLI call that shared the launcher shell's session and
-exited mid-census, so the exclusion is widened by exactly three positive
-launcher rules. In its bounded setup, before the leader exists, the monitor
-walks its own `ppid` chain from its owner parent through PID 1, bounded to
-`ANCESTOR_MAX_LEVELS` (64) levels, and records each level's positive identity:
-the exact `(PID, start)` pair the snapshot names, the same start token the
-census already uses. It also records its own start token from that same
-snapshot. The post-leader census then skips, without a read, and nothing else:
+short-lived unrelated Node CLI call that shared the launcher shell's session.
+Brief v2's start-time ordering rule was then withdrawn by design ruling
+`ea5a3dc9`: a wall/boot/uptime comparison cannot prove the absence of a masked
+backward, back-and-forth or forward wall step, so no clock fact may exclude a
+row. Only two structural facts remain. In its bounded setup, before the leader
+exists, the monitor walks its own `ppid` chain from its owner parent through PID
+1, bounded to `ANCESTOR_MAX_LEVELS` (64) levels, and records each level's
+positive identity: the exact `(PID, start)` pair the snapshot names, the same
+start token the census already uses. The post-leader census then skips and
+nothing else:
 
-- **`ancestor`:** the row's own identity is exactly one recorded pair. A row
-  with a recorded PID but a different start token is a different process and
-  keeps its existing handling.
-- **`parent` (the launcher sibling):** the row's observation-time parent row,
-  in the same snapshot, has a PID above 1 and an identity that is exactly one
-  recorded pair. A matching parent PID alone is not enough: the parent row must
-  be present and its start token must match, so a recycled parent PID, a
-  missing parent row and every PPID 1 orphan stay unknown.
-- **`pre-supervisor`:** the row's own start token is strictly earlier than the
-  supervisor's own recorded start token, and both lie inside one boot window
-  from a single clock observation (`boot <= token <= wall`) in which the wall
-  clock and the monotonic uptime agree with the kernel boot stamp: while the
-  wall clock is unstepped the wall time since boot is the monotonic uptime plus
-  any sleep, so `wall - boot - uptime` is that sleep and a wall clock stepped
-  backwards by more than the accumulated sleep is refused as `ambiguous`
-  (`CLOCK_AGREEMENT_US`). A strictly earlier creation in that domain cannot be
-  a writer launched by a leader that started later. An absent supervisor token,
-  an unreadable, incomparable or ambiguous observation, an unknown parent and
-  every PPID 1 row keep the row unknown.
+- **`ancestor`:** the row's own identity is exactly one recorded pair AND that
+  identity is re-verified through the safe Kinfo reader after the census
+  snapshot. A row with a recorded PID but a different start token, a recycled
+  identity or an unreadable re-read is not excluded and keeps its existing
+  handling.
+- **`parent` (the launcher sibling):** the row's observation-time parent row, in
+  the same snapshot, has a PID above 1, an identity that is exactly one recorded
+  pair, that parent identity is re-verified through the safe Kinfo reader after
+  the snapshot, and the row itself is positively outside the supervised leader's
+  session AND process group (both readable and both different from the leader's
+  PID, which is its session and group id). The macOS rule that a supervised
+  descendant can only be reparented to launchd — never to a supervisor ancestor
+  — makes such parentage incompatible with supervised descent. A matching
+  parent PID alone is not enough: a recycled parent PID, a missing parent row,
+  an unreadable session or group and every PPID 1 orphan stay unknown.
 
+No wall, boot or uptime value participates anywhere in the census, so a row
+whose start token merely looks earlier is never excluded and a tracked
+descendant keeps its existing classification however its token compares.
 Descendants, same-session strangers, first-seen unreadable rows and every
 identity that was never read are classified exactly as before, an unreadable or
 empty ancestor record excludes nothing, and the walk stops at the first level
 the snapshot does not name instead of guessing a parent. The receipt records the
 recorded chain in one bounded `ancestors` object with fixed keys — `state`
 (`recorded`/`partial`/`unreadable`), `count`, the `identities` rows (PID, start,
-1-based level), `self` (the supervisor's own PID and start token) and `stop`
-(`pid-1`, `depth-bound`, `not-in-snapshot`, `malformed-row`, `cycle`,
-`read-error` or null) — and the positive evidence for every exclusion in one
-bounded cumulative `ancestor_exclusions` object: at most `EXCLUSION_MAX_ROWS`
-(20) distinct `pid`/`start`/`rule` rows, the total decision count, the omitted
-count (`count == rows + omitted`), per-rule counts and the last clock
-observation. The current `bounded-test.py` (`409d1edc…`) adds this to the
-oxide#191 runner, so those controls are unqualified until that head's own
-uncounted `effigy proof:supervisor:qualify:diagnostic` and separate author and
-independent reviewer `effigy proof:supervisor:qualify` pass; the suite gains
-twenty-two pure launcher-rule cases (309 pure plus 49 real = 358, and the
+1-based level) and `stop` (`pid-1`, `depth-bound`, `not-in-snapshot`,
+`malformed-row`, `cycle`, `read-error` or null) — and the positive evidence for
+every exclusion in one bounded cumulative `ancestor_exclusions` object: at most
+`EXCLUSION_MAX_ROWS` (20) distinct `pid`/`start`/`rule` rows, the total decision
+count, the omitted count (`count == rows + omitted`) and the per-rule counts. The
+current `bounded-test.py` (`d7bc4de3…`) adds this to the oxide#191 runner, so
+those controls are unqualified until that head's own uncounted
+`effigy proof:supervisor:qualify:diagnostic` and separate author and independent
+reviewer `effigy proof:supervisor:qualify` pass; the suite gains twenty-three
+pure structural launcher-rule cases (310 pure plus 49 real = 359, and the
 bootstrap's expected case total follows the suite).
 
 **Settlement observation (oxide#147, unqualified source).** The current
@@ -2535,20 +2535,19 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
     foreign or member by inference.
   - **Uncertain:** everything else, including first-seen unreadable rows,
     failed re-reads and unconfirmed zombies.
-  - **Launcher (oxide#197):** a row a positive launcher rule excludes, in this
-    order: its own `(PID, start)` identity is exactly one the monitor recorded
-    for its own `ppid` chain in setup (`ancestor`); or its observation-time
-    parent row has a PID above 1 and exactly one of those recorded identities
-    (`parent`, the launcher sibling); or its own start token is strictly
-    earlier than the supervisor's, both inside one boot window whose wall clock
-    and monotonic uptime agree with the kernel boot stamp (`pre-supervisor`, so
-    it was created before this supervisor and cannot be a writer launched
-    later). Each is skipped without a read and is neither a member nor
-    uncertain. Only those positive facts qualify: a recycled PID or parent PID
-    with a different start token, a missing parent row, a PPID 1 orphan, an
-    absent supervisor token, an ambiguous or unreadable clock observation, a
+  - **Launcher (oxide#197):** a row a positive structural launcher rule
+    excludes, in this order: its own `(PID, start)` identity is exactly one the
+    monitor recorded for its own `ppid` chain in setup and is re-verified
+    through the safe reader after the snapshot (`ancestor`); or its
+    observation-time parent row has a PID above 1, exactly one of those recorded
+    identities, re-verified the same way, and the row is positively outside the
+    leader's session AND process group (`parent`, the launcher sibling). Each is
+    neither a member nor uncertain. Only those positive facts qualify: a
+    recycled PID or parent PID with a different start token, a changed identity,
+    a missing parent row, an unreadable session or group, a PPID 1 orphan, a
     descendant, a same-session stranger and any row not excluded above keep the
-    classification above, and an unreadable or empty record excludes nothing.
+    classification above, an unreadable or empty record excludes nothing, and no
+    wall, boot or uptime value ever takes part.
   - **Terminal nonwriter** (allowlisted kernels only): an actual `getsid`
     `ESRCH` (errno-checked, not any `ProcessLookupError`) whose snapshot
     row and FIRST existing confirmation read show the same complete
@@ -2569,27 +2568,29 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
     non-`ESRCH` `errno`) can never qualify. In strict mode terminal
     acceptance never fires and every `ESRCH` row keeps the old uncertain
     handling, while the terminal count stays the accountably known valid
-    0. Apart from the recorded ancestor identities above, no live process is
-    excluded by parent, and a replacement identity is never declared foreign
-    or member by inference.
+    0. Apart from the two structural launcher rules above (a re-verified
+    recorded ancestor identity, and a launcher sibling whose re-verified parent
+    is one of those identities and which is positively outside the leader's
+    session and process group), no live process is excluded by parent, and a
+    replacement identity is never declared foreign or member by inference.
 
-  The launcher rules are the only parent- or start-token-based exclusions: the
-  monitor records its own chain once in bounded setup (at most 64 levels, from
-  its owner parent through PID 1) plus its own start token, and the census
-  skips only the positive identities, the positive parent identities and the
-  positively earlier creations described above. The receipt carries that record
-  as the bounded `ancestors` object and the positive exclusion evidence as the
-  bounded `ancestor_exclusions` object, both described above.
+  The launcher rules are the only parent-based exclusions: the monitor records
+  its own chain once in bounded setup (at most 64 levels, from its owner parent
+  through PID 1) and the census skips only a re-verified recorded identity or a
+  re-verified recorded parent identity on a row that is also positively outside
+  the leader's session and process group. The receipt carries that record as the
+  bounded `ancestors` object and the positive exclusion evidence as the bounded
+  `ancestor_exclusions` object, both described above.
 
   An uncertain or failed census after `stopped` latches a fault at once. A
   later certain empty census never clears it or authorizes cleanup.
 
-  Start time is an identity token, never a liveness signal: the only
-  exclusions it takes part in are the whole `(PID, start)` identity of a
-  recorded ancestor or its child, and the strictly-earlier creation inside one
-  clock observation whose wall clock and monotonic uptime agree with the kernel
-  boot stamp. Any missing, malformed, incomparable or ambiguous value excludes
-  nothing. Owned scratch is removed only after established closure.
+  Start time is an identity token, never a liveness or ordering signal: the
+  only exclusions it takes part in are the whole `(PID, start)` identity of a
+  recorded ancestor or of a recorded parent of a launcher sibling. No wall,
+  boot or uptime comparison excludes anything, because a masked backward,
+  back-and-forth or forward wall step cannot be ruled out. Owned scratch is
+  removed only after established closure.
 
   Kernel allowlist: once in monitor setup, three fixed-buffer `sysctlbyname`
   reads (`kern.uuid` 64 B, `kern.osversion` 64 B, `kern.version` 1024 B)
@@ -5528,7 +5529,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
 - **Focused proof of absent checkout chains (oxide#135).** The one fixed proof
   is `effigy rust:prune-absence` (`scripts/test-prune-absence.py` under this
-  tree's shared supervisor `409d1edc…`, the merged oxide#151 guard plus
+  tree's shared supervisor `d7bc4de3…`, the merged oxide#151 guard plus
   oxide#191's opt-in post-census detach and oxide#197's ancestor-chain
   exclusion) with
   `--root-parent /private/tmp`, the owner-accepted internal-placement exception
