@@ -37,12 +37,13 @@
 
 use std::path::{Path, PathBuf};
 
-/// A recorded holder that the release must find gone or replaced.
+/// A recorded holder pid that the release must find positively gone (or,
+/// when the kernel's own table says the pid now names another account's
+/// process, positively different). A same-account live pid is unidentifiable
+/// from the record's userspace wall-clock sample and refuses.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Holder {
     pub pid: u32,
-    /// The holder start this record wrote, milliseconds since the epoch.
-    pub started_ms: u64,
 }
 
 /// What a complete census observed, for the release log line.
@@ -52,7 +53,8 @@ pub struct Summary {
     pub descriptors: usize,
     /// Descriptors whose vnode is revoked or reclaimed (a dead handle).
     pub dead: usize,
-    /// What the recorded holder is now: gone, different or absent.
+    /// What the recorded holder is now: positively gone, positively another
+    /// account's process, or absent.
     pub holder: String,
 }
 
@@ -146,18 +148,17 @@ fn verdict(
     })
 }
 
-/// Whether the recorded holder is gone or is a different process. A live pid
-/// whose recorded start is missing, unreadable or inside the safety tolerance
-/// is refused: only a positive "different process" answer is safe.
+/// Whether the recorded holder is positively gone or positively a different
+/// process. A same-account live pid is unidentifiable: the record's start is
+/// a userspace wall-clock sample, not the kernel's process identity, so a
+/// two-second tolerance would not distinguish the holder from a reused pid.
+/// Only two positive facts pass: the kernel reports no such pid, or the pid
+/// now names another account's process (which the recorded holder, an Oxide
+/// process of this account, cannot be).
 #[cfg(target_os = "macos")]
 fn holder_state(holder: Option<&Holder>) -> Result<String, String> {
     use platform::{current_uid, process_identity};
 
-    /// A holder start and a kernel process start share the wall clock. The
-    /// record's start is written just after the process starts, so a same
-    /// process differs by a few milliseconds; anything inside this window is
-    /// treated as the same (and therefore refuses), never as proof.
-    const HOLDER_START_TOLERANCE_MS: u64 = 2_000;
     let Some(holder) = holder else {
         return Ok("no recorded holder".to_owned());
     };
@@ -172,22 +173,9 @@ fn holder_state(holder: Option<&Holder>) -> Result<String, String> {
             holder.pid
         ));
     }
-    if holder.started_ms == 0 {
-        return Err(format!(
-            "recorded holder pid {} ({}) is running and its recorded start is unknown; nothing was released",
-            holder.pid, identity.command
-        ));
-    }
-    let observed_ms = identity.start / 1_000;
-    if observed_ms.abs_diff(holder.started_ms) <= HOLDER_START_TOLERANCE_MS {
-        return Err(format!(
-            "the recorded holder pid {} ({}) is still running; nothing was released",
-            holder.pid, identity.command
-        ));
-    }
-    Ok(format!(
-        "recorded holder pid {} is a different process now",
-        holder.pid
+    Err(format!(
+        "the recorded holder pid {} ({}) is still running as this account's process; the record's wall-clock start cannot positively distinguish a reused pid, so the holder is unidentifiable and nothing was released",
+        holder.pid, identity.command
     ))
 }
 
@@ -1192,38 +1180,33 @@ mod tests {
         assert!(error.contains("process 7"), "{error}");
     }
 
-    /// The recorded holder's own live pid refuses; the same pid with a start
-    /// far from the kernel's is a different process and passes.
+    /// A same-account live holder is unidentifiable and refuses (the record's
+    /// wall-clock sample is not a kernel identity); a gone pid or another
+    /// account's process is a positive fact and passes.
     #[test]
-    fn a_live_holder_refuses_and_a_different_process_at_the_pid_passes() {
+    fn a_live_holder_refuses_and_only_positive_identities_pass() {
         let fixture = Fixture::new("holder");
         let slot = fixture.path("slot");
         std::fs::create_dir(&slot).expect("slot");
         let pid = std::process::id();
-        let own = platform::process_identity(pid as i32)
-            .expect("identity read")
-            .expect("this process exists");
-        let live = Holder {
-            pid,
-            started_ms: own.start / 1_000,
-        };
+        let live = Holder { pid };
+        let error = holder_state(Some(&live)).expect_err("a live holder must refuse");
+        assert!(error.contains("still running"), "{error}");
+        assert!(error.contains("unidentifiable"), "{error}");
+        // The whole check refuses the live holder too. The stated table keeps
+        // the real descriptor reads deterministic.
         let error =
             platform::with_stated_processes(vec![pid as i32], || verify(&slot, Some(&live)))
                 .expect_err("a live holder must refuse");
         assert!(error.contains("still running"), "{error}");
-        let different = Holder {
-            pid,
-            started_ms: own.start / 1_000 - 60_000,
-        };
-        let summary =
-            platform::with_stated_processes(vec![pid as i32], || verify(&slot, Some(&different)))
-                .expect("a reused pid is a different process");
-        assert!(summary.holder.contains("different process"), "{summary:?}");
-        let unknown = Holder { pid, started_ms: 0 };
-        let error =
-            platform::with_stated_processes(vec![pid as i32], || verify(&slot, Some(&unknown)))
-                .expect_err("an unknown start must refuse");
-        assert!(error.contains("recorded start is unknown"), "{error}");
+        let gone = holder_state(Some(&Holder { pid: 4_000_000 })).expect("a missing pid is gone");
+        assert!(gone.contains("is gone"), "{gone}");
+        if platform::current_uid() != 0 {
+            let other = holder_state(Some(&Holder { pid: 1 }))
+                .expect("another account's process is positively different");
+            assert!(other.contains("another account"), "{other}");
+        }
+        assert_eq!(holder_state(None).expect("no holder"), "no recorded holder");
     }
 
     /// A platform-hidden working directory is UNKNOWN and refuses; a gone or

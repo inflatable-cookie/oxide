@@ -814,19 +814,15 @@ fn release_quarantined(arguments: ReleaseArguments<'_>) -> Result<u8, String> {
         );
         return Ok(0);
     }
-    // Only a slot that passed both read-only checks is opened for the effect;
-    // `release_quarantined` re-reads the record before any fence and again
-    // under the admission lock.
-    let target = Store::open_removable(
-        &root,
-        registration.mount_point.join(PAYLOAD_DIR),
-        internal.max_active(),
-    )?;
-    let released = target.release_quarantined(&quarantined)?;
+    // Only a slot that passed the read-only preflight reaches the effect. The
+    // recorded store takes the admission lock without fencing and re-reads the
+    // record under it before any fence, reconciliation or write, so a racing
+    // change refuses with no effect.
+    let released = recorded.release_quarantined(&quarantined)?;
     println!(
         "released quarantined slot {} in {}: {}; census: {}; operator confirmed writers stopped",
         released.slot_id,
-        target.pool.display(),
+        recorded.pool.display(),
         recorded_size(released.recorded_bytes),
         census_line(&summary)
     );
@@ -838,7 +834,7 @@ fn release_quarantined(arguments: ReleaseArguments<'_>) -> Result<u8, String> {
     // One bounded pass: a tree that cannot finish stays recorded and charged,
     // and a later command resumes it.
     let mut sweep =
-        crate::HoldingSweep::start(target.pool.clone(), released.holding.first().cloned());
+        crate::HoldingSweep::start(recorded.pool.clone(), released.holding.first().cloned());
     sweep.finish();
     Ok(0)
 }

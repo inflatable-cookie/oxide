@@ -448,7 +448,8 @@ pub struct QuarantinedSlot {
     pub dir: PathBuf,
     /// The closed size observation the ledger holds for this generation.
     pub recorded_bytes: Option<u64>,
-    /// The recorded holder the release must find gone or replaced.
+    /// The recorded holder the release must find positively gone or
+    /// positively replaced.
     pub holder: Option<crate::census::Holder>,
     /// The product's own short quarantine reason, for the deletion line.
     pub reported: String,
@@ -4744,10 +4745,10 @@ impl Store {
             lease_id,
             dir,
             recorded_bytes,
-            holder: record.holder.as_ref().map(|holder| crate::census::Holder {
-                pid: holder.pid,
-                started_ms: holder.started_ms,
-            }),
+            holder: record
+                .holder
+                .as_ref()
+                .map(|holder| crate::census::Holder { pid: holder.pid }),
             reported: format!(
                 "quarantined: lost with the removable volume and {}; released on operator confirmation",
                 lost.unclosed
@@ -4811,10 +4812,10 @@ impl Store {
     }
 
     /// Release a slot that passed [`Store::preflight_release`] and delete it
-    /// whole through the holding area (oxide#196). The record is re-read
-    /// without a lock first, so a slot that changed after the preflight
-    /// refuses before the admission fence; it is re-read again under the
-    /// admission lock before the effect. The slot's ledger entry is released,
+    /// whole through the holding area (oxide#196). The admission lock is taken
+    /// without fencing and the record is re-read under it, so a slot that
+    /// changed after the preflight refuses before any fence, reconciliation or
+    /// write. The slot's ledger entry is released,
     /// its tree is renamed whole into the payload's holding area and recorded
     /// there outside the pool lock, and its record is forgotten. Space stays
     /// charged until that deletion is gone.
@@ -4822,17 +4823,11 @@ impl Store {
         &self,
         slot: &QuarantinedSlot,
     ) -> Result<ReleasedQuarantined, String> {
-        let current = self.quarantined_slot(&slot.slot_id)?;
-        if current.record != slot.record
-            || current.lease_id != slot.lease_id
-            || current.dir != slot.dir
-        {
-            return Err(format!(
-                "slot {} changed while its writers were checked; nothing was released",
-                slot.slot_id
-            ));
-        }
-        let _admission = self.admission()?;
+        // Take the admission lock without fencing, and re-read the record
+        // under it before any write: a stale preflight token refuses with no
+        // state, ledger, slot-tree or fence effect, even if the record changed
+        // while the command was opening this store.
+        let _admission = lock_admission(&self.control)?;
         let locked = self.quarantined_slot(&slot.slot_id)?;
         if locked.record != slot.record
             || locked.lease_id != slot.lease_id
@@ -4843,6 +4838,10 @@ impl Store {
                 slot.slot_id
             ));
         }
+        // Only a token that still matches reaches the durable fence and the
+        // effect. The library calls below reconcile and evict under this held
+        // admission lock.
+        self.fence_admission_state()?;
         let record = slot.record;
         let lease_id = slot.lease_id.clone();
         recover(&self.pool, &lease_id)
@@ -11886,9 +11885,16 @@ pub(crate) mod tests {
         entry.phase = Phase::Idle;
         entry.lost = None;
         fixture.store.save(&state).unwrap();
+        // The stale refusal happens under the admission lock before the fence:
+        // no state, ledger or slot-tree effect.
+        let before = custody_snapshot(&fixture);
         let error = fixture.store.release_quarantined(&verified).unwrap_err();
         assert!(error.contains("not retired"), "{error}");
-        assert!(fixture.slot_dir.is_dir(), "the slot tree was moved");
+        assert_eq!(
+            before,
+            custody_snapshot(&fixture),
+            "the stale-token refusal wrote state or moved the tree"
+        );
         assert_eq!(
             fixture.store.load().unwrap().records.len(),
             1,

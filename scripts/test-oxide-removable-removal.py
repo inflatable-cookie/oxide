@@ -42,9 +42,10 @@ bytes; an unreadable override stays kept; and an operator-confirmed
 (oxide#196) refuses while an escaped process keeps a file open inside the
 slot, then -- once that process is stopped -- a dry run is clean and the
 release deletes the slot whole through the holding area and forgets its
-record. The escaped writer is the fixture's own `oxide exec` tool forking a
-`setsid` child that holds a file open in its slot scratch; the proof stops it
-in a finally and the child's own lifetime is bounded. The one product seam is
+record. The escaped writer is a process the proof starts after re-attach in
+the supervisor's leader process group (never a setsid escape), holding a file
+in the slot leaf; the product's exec group never owned it, the proof stops and
+reaps it in a finally, and it is bounded by its stop file. The one product seam is
 the debug-only
 `OXIDE_TEST_BOOT_MS` override, which the product honors only under this
 supervisor's own scratch/evidence/deadline layout. The quarantines are made by
@@ -111,36 +112,21 @@ BOOT_CASES = (
     ("unreadable-boot", "an unreadable boot time stays quarantined"),
     ("release-quarantined", "an operator-confirmed release refuses while an escaped writer holds the slot, then deletes it whole once that writer is stopped"),
 )
-# The operator-confirmed release (oxide#196): the tool leaves an escaped
-# process outside its group that keeps a file open inside the slot. The
-# process leaves the product's removal stop unable to end it, and holds the
-# handle until the proof writes the stop file. Its own lifetime is bounded so
-# a proof that dies cannot leave it for the supervisor's census.
-ESCAPE_TOOL = r"""#!/usr/bin/env python3
+# The operator-confirmed release (oxide#196): the proof itself starts this
+# writer after re-attach, so it stays inside the qualified supervisor's leader
+# process group — never a setsid escape the supervisor could neither census nor
+# signal. The product's `oxide exec` group never owned it, which is exactly the
+# escaped-writer state the release must refuse. It holds one file in the slot
+# leaf until the proof writes its stop file.
+ESCAPED_WRITER = r"""#!/usr/bin/env python3
 import os, sys, time
-gate = os.environ["FIXTURE_GATE"]
-scratch = os.environ["TMPDIR"]
-with open(os.path.join(gate, "started"), "w", encoding="utf-8") as handle:
-    handle.write(scratch + "\n")
-if os.fork() == 0:
-    os.setsid()
-    with open(os.path.join(gate, "escaped"), "w", encoding="utf-8") as handle:
-        handle.write(str(os.getpid()) + "\n")
-    held = None
-    stop = os.path.join(gate, "stop")
-    end = time.monotonic() + 240.0
-    while time.monotonic() < end and not os.path.exists(stop):
-        if held is None:
-            try:
-                held = open(os.path.join(scratch, "escaped-writer"), "a")
-            except OSError:
-                pass
-        time.sleep(0.05)
-    if held is not None:
-        held.close()
-    os._exit(0)
-while True:
-    time.sleep(0.5)
+held, ready, stop = sys.argv[1], sys.argv[2], sys.argv[3]
+handle = open(held, "a")
+with open(ready, "w", encoding="utf-8") as marker:
+    marker.write("ready\n")
+while not os.path.exists(stop):
+    time.sleep(0.05)
+handle.close()
 """
 BOOT_APP = {
     "Cargo.toml": '[package]\nname = "bootapp"\nversion = "0.1.0"\nedition = "2021"\n',
@@ -685,7 +671,6 @@ class BootClosure:
         proof.env = self.env
         self.pool = self.env["OXIDE_POOL"]
         self.tool = write_script(os.path.join(proof.root, "hold-tool"), HOLD_TOOL)
-        self.escape_tool = write_script(os.path.join(proof.root, "escape-tool"), ESCAPE_TOOL)
         self.victims = {}
         for case, _ in BOOT_CASES:
             victim = git_fixture(proof, os.path.join(proof.root, f"victim-{case}"), BOOT_APP)
@@ -762,60 +747,55 @@ class BootClosure:
                 digest.update(handle.read())
         return digest.hexdigest()
 
-    def stop_escaped(self, gate: str, pid: int) -> None:
-        """Stop the escaped writer and wait for it to be gone; a writer this
-        proof cannot positively end leaves custody unknown."""
+    def start_escaped_writer(self, directory: str) -> tuple:
+        """Start the escaped writer in this proof's own process group (the
+        supervisor's leader group), holding one file inside the quarantined
+        slot leaf. The product's exec group never owned it."""
+        script = write_script(os.path.join(self.proof.root, "escaped-writer.py"), ESCAPED_WRITER)
+        held = os.path.join(directory, "escaped-writer")
+        ready = os.path.join(self.proof.root, "escaped-ready")
+        stop = os.path.join(self.proof.root, "escaped-stop")
+        for path in (ready, stop):
+            if os.path.lexists(path):
+                os.remove(path)
+        child = subprocess.Popen(
+            [sys.executable, script, held, ready, stop],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        wait_for(ready, "escaped writer")
+        need(process_alive(child.pid), f"the escaped writer pid {child.pid} is not running")
+        print(f"escaped writer pid {child.pid} holds {held} in the supervisor's leader group")
+        return child, held, stop
+
+    def stop_escaped_writer(self, child: subprocess.Popen, stop: str) -> None:
+        """Stop the proof-owned writer and reap it; a writer this proof cannot
+        positively end leaves custody unknown."""
         try:
-            with open(os.path.join(gate, "stop"), "w", encoding="utf-8") as handle:
+            with open(stop, "w", encoding="utf-8") as handle:
                 handle.write("stop\n")
         except OSError as error:
             raise UnknownOutcome(f"cannot write the escaped writer's stop file: {error}")
-        end = time.monotonic() + 10.0
-        while time.monotonic() < end:
-            if not process_alive(pid):
-                return
-            time.sleep(0.05)
         try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return
-        end = time.monotonic() + 5.0
-        while time.monotonic() < end:
-            if not process_alive(pid):
-                return
-            time.sleep(0.05)
-        raise UnknownOutcome(f"the escaped writer pid {pid} did not stop; custody unknown")
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired as error:
+                raise UnknownOutcome(f"the escaped writer pid {child.pid} did not stop: {error}")
+        need(child.returncode is not None, "the escaped writer was not reaped")
 
-    def quarantine(self, case: str, escaped: bool = False) -> dict:
+    def quarantine(self, case: str) -> dict:
         """Hold a removable slot with `oxide exec`, force the volume away, and
-        return the product's own quarantined record facts. With `escaped`, the
-        tool leaves a process outside its group that keeps a file open inside
-        the slot until the case stops it."""
+        return the product's own quarantined record facts."""
         env = self.child_env({"FIXTURE_GATE": os.path.join(self.proof.root, "gate", case)})
         os.makedirs(env["FIXTURE_GATE"], mode=0o700)
         victim = self.victims[case]
         before = set(os.listdir(self.slots))
-        tool = self.escape_tool if escaped else self.tool
-        child = self.proof.start(["exec", "--", tool], victim, env)
+        child = self.proof.start(["exec", "--", self.tool], victim, env)
         wait_for(os.path.join(env["FIXTURE_GATE"], "started"), f"{case} exec")
-        escaped_pid = None
-        if escaped:
-            # The slot scratch the product handed the tool is inside the slot;
-            # the escaped process keeps its file open there.
-            with open(os.path.join(env["FIXTURE_GATE"], "started"), encoding="utf-8") as handle:
-                scratch = handle.read().strip()
-            need(
-                scratch.startswith(self.slots + os.sep),
-                f"{case}: the exec tool's TMPDIR {scratch!r} is not inside the slot tree",
-            )
-            for _ in range(200):
-                path = os.path.join(env["FIXTURE_GATE"], "escaped")
-                if os.path.isfile(path):
-                    with open(path, encoding="utf-8") as handle:
-                        escaped_pid = int(handle.read().strip())
-                    break
-                time.sleep(0.01)
-            need(escaped_pid is not None, f"{case}: the escaped writer did not publish its pid")
         self.volume.force_detach(f"{case} removal")
         code, _, stderr = self.proof.finish(child, f"{case} exec after removal", WAIT_SECONDS)
         # A surviving exec, or a removal without the product's own quarantine
@@ -860,14 +840,7 @@ class BootClosure:
             "directory": directory,
             "started": started,
             "victim": victim,
-            "gate": env["FIXTURE_GATE"],
         }
-        if escaped:
-            need(
-                escaped_pid is not None and process_alive(escaped_pid),
-                f"{case}: the escaped writer did not survive the removal",
-            )
-            found["escaped"] = escaped_pid
         return found
 
     def kept(self, found: dict, extra: dict) -> None:
@@ -1004,19 +977,25 @@ class BootClosure:
         self.kept(found, {BOOT_HOOK: "unreadable"})
 
     def release_quarantined(self) -> None:
-        """The operator-confirmed release (oxide#196): an escaped writer keeps
-        a file open inside the quarantined slot, so every release refuses and
-        nothing changes; once the writer is stopped, a dry run is clean and
-        the release deletes the slot whole through the holding area."""
-        found = self.quarantine("release-quarantined", escaped=True)
+        """The operator-confirmed release (oxide#196): a proof-owned escaped
+        writer, outside the product's exec group but inside the supervisor's
+        leader group, keeps a file open inside the quarantined slot, so every
+        release refuses and nothing changes; once the writer is stopped, a dry
+        run is clean and the release deletes the slot whole through the holding
+        area."""
+        found = self.quarantine("release-quarantined")
         case = found["case"]
         slot, folder, directory, victim = found["slot"], found["folder"], found["directory"], found["victim"]
-        gate, escaped = found["gate"], found["escaped"]
+        writer = None
+        stop = None
         try:
             before = self.custody_digest()
-            # The escaped process is outside the product's removal stop and
-            # holds a file inside the slot; the product must see it.
             need(os.path.isdir(directory), f"{case}: the quarantined slot leaf is already gone")
+            # The product's exec group never owned this writer: the proof
+            # starts it after re-attach, so it stays in the supervisor's leader
+            # group and holds a file in the slot leaf.
+            writer, held, stop = self.start_escaped_writer(directory)
+            escaped = writer.pid
             need(process_alive(escaped), f"{case}: the escaped writer is not running")
             # Without the operator's flag: refused before any pool read.
             code, _, stderr = self.proof.oxide(
@@ -1057,7 +1036,8 @@ class BootClosure:
                 f"{case}: a refusal changed the pool or the slot tree",
             )
             # Stop the escaped writer: no process holds a file in the slot.
-            self.stop_escaped(gate, escaped)
+            self.stop_escaped_writer(writer, stop)
+            writer = None
             code, stdout, stderr = self.proof.oxide(
                 ["pool", "release-quarantined", slot, "--dry-run", "--confirm-writers-stopped"],
                 "clean dry run",
@@ -1120,7 +1100,8 @@ class BootClosure:
             stdout = self.status("release status", victim, {})
             oracle(f"slot {slot} " not in stdout, f"{case}: status still lists the released slot")
         finally:
-            self.stop_escaped(gate, escaped)
+            if writer is not None:
+                self.stop_escaped_writer(writer, stop)
 
 
 def boot_closure(proof: Proof, repo: str, diagnostic: bool) -> str:
@@ -1219,9 +1200,9 @@ def self_check() -> int:
     and the full fixture environment every child (`status` included) receives
     — plus the deletion oracle's slot-leaf resolution (the slot's own leaf,
     never the project-label folder a build or an adopt also creates or
-    reuses), the generated escape tool's syntax, the release oracle's
-    `process <pid>` form, the dispatch, the product-message marker and the
-    receipt bound."""
+    reuses), the proof-owned escaped writer's syntax and leader-group
+    membership, the release oracle's `process <pid>` form, the dispatch, the
+    product-message marker and the receipt bound."""
     fixture = {
         "OXIDE_POOL": "/fixture/pool",
         "HOME": "/fixture/home",
@@ -1249,13 +1230,14 @@ def self_check() -> int:
                 return 0, quarantine, ""
             return 0, "", "oxide: fixture build summary"
 
-    # The generated escape tool (oxide#196) must be valid Python as written:
-    # its `"\n"` escapes belong to the generated source, not to this
-    # generator's own string literal. The release oracle must match the
-    # product's `process <pid>` census message, never a `pid <pid>` form.
-    compile(ESCAPE_TOOL, "escape-tool", "exec")
-    expect("os.setsid()" in ESCAPE_TOOL, "the escape tool does not leave the process group")
-    expect('"escaped-writer"' in ESCAPE_TOOL, "the escape tool does not hold a file in the slot")
+    # The proof-owned escaped writer (oxide#196) must be valid Python and must
+    # stay in the process group it is started in: the qualified supervisor can
+    # only census and signal its leader group, so a setsid escape is forbidden.
+    # The release oracle must match the product's `process <pid>` census
+    # message, never a `pid <pid>` form.
+    compile(ESCAPED_WRITER, "escaped-writer", "exec")
+    expect("setsid" not in ESCAPED_WRITER, "the escaped writer leaves the supervisor's leader group")
+    expect('open(held, "a")' in ESCAPED_WRITER, "the escaped writer does not hold the slot file")
     census_message = "process 4242 (python3) holds /slot/scratch/escaped-writer open inside /slot"
     expect(process_refusal(4242) in census_message, "the release oracle does not match the census message")
     expect(f"pid {4242}" not in census_message, "the old pid-only oracle would not match the census message")

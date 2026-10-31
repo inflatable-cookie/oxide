@@ -708,10 +708,10 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # explicit adopt of a whole-target fixture then migrates, and the next
 # admission deletes the slot whole; a slot whose override boot time precedes
 # its holder start stays kept with its bytes; an unreadable override stays
-# kept; and the operator-confirmed release (oxide#196) refuses while an
-# `oxide exec` tool's escaped `setsid` child holds a file open in its slot
-# scratch, then deletes the slot whole through the holding area once that
-# writer is stopped. The explicit internal root is the owner-accepted
+# kept; and the operator-confirmed release (oxide#196) refuses while a
+# proof-owned escaped writer, started in the supervisor's leader process group
+# outside the product's exec group, holds a file in the slot leaf, then deletes
+# the slot whole through the holding area once that writer is stopped. The explicit internal root is the owner-accepted
 # exception for this fixture's genuine directory-budget internal pool (a pool
 # under /Volumes refuses). 300 s, 512 MiB monitored scratch, ordinary detach.
 # No reinstall, live pool or live slot mutation. Not a benchmark or full QA.
