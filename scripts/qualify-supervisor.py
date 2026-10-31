@@ -50,12 +50,13 @@ topology agreeing on one owned root whose scratch and evidence are its
 members, every nested case directory inside that root with its receipt still
 present after cleanup, a reserve sampled on the scratch's own device, reserve
 sampling from before the gate with no gap over 1 s, the fixture writers
-counted, custody at every signal (a proved cooperative-session signal carries
-its own identity, never a group), the two cooperative-session-stop cases
-(oxide#195: a Cargo-shaped same-session group closed and a changed identity
-refused), the post-census detach paths, and every expected case passing.
-Reserve readings identify the qualification's scratch volume; the boot volume
-is read and labelled separately.
+counted, custody at every signal (only the pinned leader group, the pinned
+monitor and a held direct child are ever signalled), the survivor case
+(oxide#195: a Cargo-shaped same-session group recorded in the receipt and
+never signalled, with the run honestly UNCLOSED), the post-census detach
+paths, and every expected case passing. Reserve readings identify the
+qualification's scratch volume; the boot volume is read and labelled
+separately.
 On overrun it TERMs, then KILLs, only its own unreaped candidate child.
 Nothing is ever deleted: nested UNCLOSED cases leave live fixture processes
 whose only bound is their fallback, which is not closure, so the whole
@@ -80,7 +81,7 @@ WALL_NS = 420 * NS  # oxide#191 amendment (Tom 2026-10-31): was 300 s
 CANDIDATE_LIMIT = 380  # oxide#191 amendment: was 280 s
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 354  # 305 pure + 49 real (oxide#151 added the routing, marker,
+EXPECTED_CASES = 342  # 294 pure + 48 real (oxide#151 added the routing, marker,
                       # nested-window protection, bounded-sweep, qualify-entry,
                       # shared-ancestor/private-leaf and readiness cases; oxide#191
                       # adds seventy-six pure post-census detach cases and eight real
@@ -88,13 +89,12 @@ EXPECTED_CASES = 354  # 305 pure + 49 real (oxide#151 added the routing, marker,
                       # unrequested attachment whose opt-in custody keep is recorded
                       # separately, a stuck child the custodian closes itself, and the
                       # two unreadable-identity paths — closed by the monitor or
-                      # handed off by parentage. Oxide#195 adds eighteen pure
-                      # cooperative-session-stop cases and replaces one real
-                      # separate-group survivor case with the two real ones: a
-                      # Cargo-shaped same-session group closed after the deadline,
-                      # and a changed identity refused and never signalled)
-SESSION_CASES = ("test_cargo_shaped_group_is_closed_at_the_deadline",
-                 "test_a_changed_member_identity_is_never_signalled")
+                      # handed off by parentage. Oxide#195 adds seven pure
+                      # survivor cases and replaces one real separate-group
+                      # survivor case with one: a Cargo-shaped same-session group
+                      # that reaches the deadline, is recorded, is never
+                      # signalled and stays UNCLOSED)
+SURVIVOR_CASES = ("test_cargo_shaped_group_survivor_is_recorded_and_never_signalled",)
 ACTOR_MARGIN_NS = 2 * NS  # the actor's own KILL, reap and exit
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPTS)
@@ -105,7 +105,7 @@ SOURCES = {
 }
 LIMITATIONS = [
     "Cooperative session scope: a process that calls setsid is seen only if tracked as a member earlier or while it holds an output pipe, is never signalled, and arbitrary same-user writers are outside the promise.",
-    "Only the pinned leader's group is ever signalled as a group, and the pinned monitor by PID. After the leader is reaped a member of the leader's own session may additionally be SIGKILLed by PID, but only while the custodian re-reads the announced PID and start token and finds this user's non-zombie process in that same session, never as a group and never outside the session; a refused, changed, zombie or unreadable identity is not signalled and keeps the run UNCLOSED with its scratch. The set is bounded per round, per identity and per run.",
+    "Only identities the runner positively holds unreaped across the signal are ever signalled: the pinned leader's group, the pinned monitor and a held direct child. A same-user process that is not this run's child is not held, so its PID could be recycled between the identity read and a signal and it is NEVER signalled (Tom's 2026-10-31 ruling c096c8fc); the exact row is recorded in the receipt's bounded `survivors` list and the run stays UNCLOSED with its scratch. Closing such a survivor needs a boundary that holds it, which is outside this runner.",
     "The census treats every unvalidated process on the host as uncertain, including zombies of unrelated parents, so such a process present after the stop yields a false UNCLOSED (fails closed).",
     "Host free space is a sampled abort threshold (0.25 s, 22 GiB = 20 GiB reserve + 2 GiB margin) read on the filesystem actually holding the scratch, so on the selected drive it is that volume's free space, not the internal disk's; no instantaneous guarantee. Owned bytes are walked every 2 s against a monitored budget, not a hard ceiling.",
     "The default scratch parent is the owned subtree <mount>/scratch/oxide, read passively from OXIDE_POOL, the user config file's [pool] path or the built-in pool, and the pool's removable registration, with one kernel volume-UUID read; that is not the product's verified build-time selection (no diskutil container/role check), the config reader understands only a simple [pool] path entry, and anything unreadable or unsupported falls back to /private/tmp with a warning. The bootstrap refuses to qualify on a fallback.",
@@ -342,7 +342,9 @@ CONTROL_CASES = {
 }
 ORDINARY_KEYS = {"case", "exit", "phase", "dir", "retained_unclosed", "outcome", "census", "wall_s",
                  "signals", "stale_latency_ns", "held_streams", "nonce_ok",
-                 "session_signals",  # oxide#195: the proved session identities a case signalled
+                 "survivors",  # oxide#195: the same-session identities the case recorded, never signalled
+                 "signal_targets",  # oxide#195: every PID the case's guard signalled
+                 "session_signals",  # oxide#195: the witness that no non-held session record exists
                  "detach",  # oxide#191: the post-census detach outcome that case recorded
                  "cleanup",  # oxide#191: the fail-closed pre-cleanup keep, when it fired
                  "kept"}  # the suite's retained-resource path for a focused case
@@ -690,50 +692,56 @@ def check_plan(receipt, results, expected, record=None, facts=None, base=None):
         return []
 
     def signal_custody():
+        """Oxide#195 ruling c096c8fc: only an identity the runner holds unreaped is
+        ever signalled, so every signal record must be a held leader/monitor or a
+        held detach child, and no non-held session signal may appear at all."""
         problems = []
         for entry in receipt["custodian"]:
-            if entry["event"] == "signal" and not (entry["held_unreaped"] and entry["pin"] in ("leader", "monitor")):
+            event = entry.get("event")
+            if event == "signal" and not (entry["held_unreaped"] and entry["pin"] in ("leader", "monitor")):
                 problems.append(f"signal without custody: {entry}")
-            elif entry["event"] == "session_signal" and not (
-                    entry["killpg"] is False and entry["held_unreaped"] is False
-                    and entry["pin"] == "session-member" and entry["signal"] == "SIGKILL"
-                    and entry["target"] > 1 and entry["start"] > 0):
-                problems.append(f"session signal without a proved identity: {entry}")
+            elif event == "detach_child_signal" and not (
+                    entry.get("pid", 0) > 1 and entry.get("start", 0) > 0):
+                problems.append(f"detach signal without a held identity: {entry}")
+            elif isinstance(event, str) and event.startswith("session_"):
+                problems.append(f"a non-held session signal appears in the receipt: {entry}")
         return problems
 
-    def session_stop_paths():
-        """Oxide#195: the cooperative-session stop must be exercised through the
-        suite's own nested runs. A Cargo-shaped group in the leader's session is
-        closed after a deadline by proved per-identity signals and the run closes
-        on a certain empty census; a changed identity is refused, never signalled,
-        and leaves the run honestly UNCLOSED."""
+    def survivor_paths():
+        """Oxide#195 under Tom's ruling: the cooperative-session survivor must be
+        recorded, never signalled, and must leave the run honestly UNCLOSED. The
+        suite's own nested Cargo-shaped run is the evidence, and a row that
+        claims closure, drops the survivor record or carries any signal to a
+        non-held identity fails."""
         problems = []
         recorded = {}
         for case in results.get("cases", []):
-            if case.get("case") in SESSION_CASES and case["case"] not in recorded:
+            if case.get("case") in SURVIVOR_CASES and case["case"] not in recorded:
                 recorded[case["case"]] = case
-        closed = recorded.get(SESSION_CASES[0])
-        if closed is None:
-            problems.append(f"{SESSION_CASES[0]} recorded no case outcome")
-        else:
-            if (closed.get("outcome") or {}).get("closure") != "closed":
-                problems.append(f"{SESSION_CASES[0]} did not close: {closed.get('outcome')}")
-            if closed.get("census") != 0:
-                problems.append(f"{SESSION_CASES[0]} left {closed.get('census')} census member(s)")
-            if len(closed.get("session_signals") or []) < 2:
-                problems.append(f"{SESSION_CASES[0]} signalled "
-                                f"{len(closed.get('session_signals') or [])} session member(s), not the group")
-        refused = recorded.get(SESSION_CASES[1])
-        if refused is None:
-            problems.append(f"{SESSION_CASES[1]} recorded no case outcome")
-        else:
-            if (refused.get("outcome") or {}).get("closure") != "UNCLOSED":
-                problems.append(f"{SESSION_CASES[1]} claimed closure: {refused.get('outcome')}")
-            if refused.get("session_signals"):
-                problems.append(f"{SESSION_CASES[1]} signalled an unproved identity: "
-                                f"{refused.get('session_signals')}")
-            if not refused.get("census"):
-                problems.append(f"{SESSION_CASES[1]} kept no census member to prove the negative")
+        case = recorded.get(SURVIVOR_CASES[0])
+        if case is None:
+            problems.append(f"{SURVIVOR_CASES[0]} recorded no case outcome")
+            return problems
+        outcome = case.get("outcome") or {}
+        if outcome.get("closure") != "UNCLOSED":
+            problems.append(f"{SURVIVOR_CASES[0]} claimed closure: {outcome}")
+        if outcome.get("deadline") is not True:
+            problems.append(f"{SURVIVOR_CASES[0]} did not reach the deadline: {outcome}")
+        if not case.get("census"):
+            problems.append(f"{SURVIVOR_CASES[0]} kept no census member to prove the residual")
+        survivors = case.get("survivors") or []
+        if len(survivors) < 2:
+            problems.append(f"{SURVIVOR_CASES[0]} recorded {len(survivors)} survivor row(s), not the group")
+        for row in survivors:
+            if not (isinstance(row, dict) and row.get("pid", 0) > 1 and row.get("start", 0) > 0):
+                problems.append(f"{SURVIVOR_CASES[0]} recorded a survivor row without an identity: {row}")
+        signalled = set(case.get("signal_targets") or [])
+        for row in survivors:
+            if row.get("pid") in signalled:
+                problems.append(f"{SURVIVOR_CASES[0]} signalled a non-held survivor: {row.get('pid')}")
+        if case.get("session_signals"):
+            problems.append(f"{SURVIVOR_CASES[0]} carries a non-held session signal: "
+                            f"{case.get('session_signals')}")
         return problems
 
     def detach_paths():
@@ -789,7 +797,7 @@ def check_plan(receipt, results, expected, record=None, facts=None, base=None):
         ("nested-cases", lambda: nested_cases(results, record, facts)),
         ("owned-bytes", owned_bytes),
         ("signal-custody", signal_custody),
-        ("session-stop-paths", session_stop_paths),
+        ("survivor-paths", survivor_paths),
         ("detach-paths", detach_paths),
         ("cases", cases),
     ]

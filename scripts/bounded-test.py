@@ -35,22 +35,23 @@ after the stop latches a fault that no later census clears. Anything else is
 UNCLOSED and scratch is kept. The command gets OXIDE_PROOF_EVIDENCE, the
 evidence directory, which cleanup never removes.
 
-Cooperative-session stop (oxide#195): the leader's group is not the whole
-session. Oxide starts Cargo as the leader of its own process group in the
-same session, so a leader-group KILL leaves that group running (oxide#182's
+Cooperative-session survivors (oxide#195, Tom's 2026-10-31 signal-custody
+ruling, Queue decision c096c8fc): the leader's group is not the whole session.
+Oxide starts Cargo as the leader of its own process group in the same
+session, so a leader-group KILL leaves that group running (oxide#182's
 archived packet ended UNCLOSED with exactly one such survivor, a unit-test
-binary in Cargo's group). After the leader is reaped, every census round
-announces, once per identity within a bounded retry budget, the members it
-still classifies in the leader's own session. The custodian re-reads each
-announced identity itself and SIGKILLs it only while the same PID and start
-token, this user, a non-zombie state and that same session all hold; it
-records the signal and one immediate post-signal observation. A refused,
-absent, zombie or unreadable identity is recorded and never signalled, and a
-changed post-signal identity latches a fault. Closure still needs the certain
-empty census afterwards, so a member that cannot be closed ends the run
-UNCLOSED. Nothing outside the leader's session is ever signalled: a process
-that calls setsid leaves the cooperative session and is never signalled, and
-only the pinned leader's group is ever signalled as a group.
+binary in Cargo's group). The supervisor does NOT signal it. A same-user
+process that is not this run's child is never held unreaped, so its PID could
+be recycled between any identity read and a signal; a merely observed non-child
+PID is never enough. Only an identity the runner positively holds across the
+signal may be signalled: the pinned leader group (its leader is held
+unreaped), the pinned monitor, and a direct child still held unreaped. After
+the leader is reaped, every census round records, once per identity and up to
+a fixed bound, the exact rows it still classifies in the leader's own session
+(PID, start, ppid, pgid, uid, zombie) in the receipt's `survivors` list for the
+owner; that is observation only, no message and no signal. The census still
+decides closure, so a survivor keeps the run UNCLOSED with its scratch and
+evidence.
 
 An exception in any phase after setup, or a monitor message with a missing
 or ill-typed field, latches a fault; the bounded pinned stop, WNOHANG reap,
@@ -64,11 +65,11 @@ plus custodian exit 0, recorded by the caller.
 
 Scope: the cooperative session. A process that calls setsid leaves it and is
 seen only while tracked or holding an output pipe; arbitrary same-user
-writers are outside the promise. A same-session member is stopped only by the
-identity-proved single kill above, so the promise is one live process per
-announced identity, not a group or a session number. Host free space is a
-sampled abort threshold; the owned-byte budget is monitored, not a hard
-ceiling. macOS only.
+writers are outside the promise. A same-session survivor that is not held by
+the runner is recorded, never signalled, and ends the run UNCLOSED; closing
+it needs a boundary that holds it (oxide#195's reported design conflict).
+Host free space is a sampled abort threshold; the owned-byte budget is
+monitored, not a hard ceiling. macOS only.
 
 Post-census image detach (oxide#191, decision ee263cea): a proof whose own
 test image must be detached publishes ONE bounded atomic `detach-request.json`
@@ -146,16 +147,14 @@ PERSIST = 8 * MIB
 FORWARD = 32 * MIB
 CENSUS_INTERVAL = 0.2
 CONFIRM_TRIES, CONFIRM_PAUSE = 20, 0.05  # gone confirmation within one round, at most 1 s
-# Cooperative-session stop (oxide#195): after the leader is reaped, the monitor
-# announces the members a census round still classifies in the leader's own
-# session and the custodian signals each one it can re-prove. Both bounds are
-# fixed so an announcement burst or a forking tree stays bounded: at most this
-# many identities per round, this many announcements per identity (a refused or
-# unreadable identity may be retried), and this many signals in a whole run.
-SESSION_ANNOUNCE_MAX = 16
-SESSION_ANNOUNCE_TRIES = 3
-SESSION_SIGNAL_CAP = 512
-SESSION_VERDICTS = ("signal", "absent", "dead", "refused", "unknown")
+# Cooperative-session survivors (oxide#195, Tom's 2026-10-31 ruling c096c8fc):
+# after the leader is reaped, the monitor records the members a census round
+# still classifies in the leader's own session, once per identity and up to this
+# many rows. Nothing is announced and nothing is signalled: a same-user
+# non-child PID is not held unreaped, so it is never signalled and the run stays
+# UNCLOSED. The bound keeps a forking tree's evidence finite.
+SURVIVOR_MAX = 16
+SURVIVOR_KEYS = ("pid", "start", "ppid", "pgid", "uid", "zombie")
 DIAG_MAX_BYTES = 16384  # compact UTF-8 JSON ceiling for the optional receipt census diagnostics
 DIAG_MAX_ROWS = 20  # at most 20 diagnostic summary rows; the rest count as omitted
 # Observation-only settlement diagnostics (oxide#147). Fixed schema, one record
@@ -241,7 +240,6 @@ INJECTIONS = {
     "detach-reap-timeout", "detach-stuck-child",
     "detach-identity-unreadable", "detach-handoff-unreadable",
     "detach-custodian-identity-unreadable",
-    "session-identity-stale",
 }
 RESERVE_DELAY_S, SCRATCH_DELAY_S = 0.5, 4.0  # injected publication delays before a sampler stall
 INJECT_AFTER_GATE_NS = 1_500_000_000  # post-gate injections wait for the fixture to start
@@ -255,7 +253,6 @@ FIELDS = {  # required fields per monitor message type; bool is never accepted a
     "detach": {"attempted": bool, "qualified": bool, "post_state": str},
     "detach_ready": {"budget_ns": int},
     "detach_child": {"pid": int},  # `start` is optional: a parentage-only handoff has none
-    "session_stop": {"members": list},
     "cleanup_kept": {"reason": str},
 }
 
@@ -365,17 +362,6 @@ def malformed(message):
             return f"missing {name}"
         if not typed(message[name], kind_):
             return f"ill-typed {name}"
-    if kind == "session_stop":
-        # Every announced member is one [pid, start] identity pair, counted and
-        # bounded before any use: an oversized list or a non-identity entry is a
-        # malformed message, never a wider signal set.
-        members = message["members"]
-        if len(members) > SESSION_ANNOUNCE_MAX:
-            return "ill-typed members"
-        for entry in members:
-            if not (isinstance(entry, list) and len(entry) == 2 and typed(entry[0], int)
-                    and typed(entry[1], int) and entry[0] > 1 and entry[1] > 0):
-                return "ill-typed member"
     return None
 
 
@@ -2079,44 +2065,41 @@ def detach_child_identity(row, pid, start, monitor_pid):
                 and row.get("ppid") == monitor_pid and row.get("zombie") is False)
 
 
-def session_member_verdict(pid, start, row, problem, session, session_problem, sid, uid, reserved):
-    """Whether one announced cooperative-session member may be signalled, pure.
+def survivor_row(row):
+    """One bounded receipt row for a cooperative-session member (oxide#195), or
+    None when the row carries no usable identity.
 
-    `row`/`problem` are the caller's own `process_row` read of `pid` and
-    `session`/`session_problem` its own `getsid` read (`session_problem` is
-    `"gone"` for an errno-checked ESRCH, else a bounded name). The verdicts are:
+    `SURVIVOR_KEYS` only: an identity token and the facts that made the process a
+    member, never text, never a path and never a conclusion. A row is recorded so
+    the owner can see exactly which process outlived the stop; it is never
+    evidence that anything was signalled."""
+    if not isinstance(row, dict):
+        return None
+    entry = {}
+    for key in SURVIVOR_KEYS:
+        value = row.get(key)
+        if key == "zombie":
+            if not isinstance(value, bool):
+                return None
+            entry[key] = value
+            continue
+        if not typed(value, int) or value < 0:
+            return None
+        entry[key] = value
+    return entry if entry["pid"] > 0 and entry["start"] > 0 else None
 
-      - `signal`: `problem is None`, the row is still the exact announced
-        identity, it is this user's non-zombie process and `getsid` says the
-        leader's own session. Only this verdict is ever signalled.
-      - `absent`: the identity is positively gone (no row, or ESRCH) — nothing to
-        signal, and never a closure claim on its own.
-      - `dead`: the same identity is already a zombie. It cannot run, so it is
-        never signalled; the census decides when it is gone.
-      - `refused`: a readable row that is not eligible (another user, another
-        session, this run's own process, another process now holding the PID).
-      - `unknown`: the facts could not be read. Never `absent`, never an
-        identity, never a signal.
 
-    Start time alone never broadens the set, and a session lookup that is not
-    provably the leader's session never authorises a signal."""
-    if problem is not None:
-        return "unknown", problem
-    if row is None:
-        return "absent", None
-    if pid in reserved:
-        return "refused", "this run's own process"
-    if row.get("pid") != pid or row.get("start") != start:
-        return "refused", "identity changed"
-    if row.get("uid") != uid:
-        return "refused", "not this user's process"
-    if row.get("zombie") is not False:
-        return "dead", "already a zombie"
-    if session_problem is not None:
-        return ("absent", None) if session_problem == "gone" else ("unknown", session_problem)
-    if session != sid:
-        return "refused", "not in the leader's session"
-    return "signal", None
+def survivors_line(rows):
+    """One bounded summary line for the recorded survivors, or None when the run
+    recorded none. Pure: the monitor prints it, and it claims only what was
+    observed (never a signal, never a closure)."""
+    rows = [row for row in (rows or []) if isinstance(row, dict)]
+    if not rows:
+        return None
+    shown = ", ".join(f"{row.get('pid')}/{row.get('start')}" for row in rows[:8])
+    more = "" if len(rows) <= 8 else f" (+{len(rows) - 8} more)"
+    return (f"supervisor: {len(rows)} same-session survivor(s) not signalled (no custody):"
+            f" {shown}{more}; the run stays UNCLOSED and its scratch is kept")
 
 
 def detach_authorization(fault, deadline_hit, now, exit_at):
@@ -3304,10 +3287,9 @@ class Monitor:
         # Observation-only settlement diagnostics; the receipt carries this
         # same object, so publishing includes it without extra work.
         self.settlement = settlement_record()
-        # Cooperative-session stop (oxide#195): announced (PID, start) identities
-        # and how many times each was announced. Bounded by
-        # SESSION_ANNOUNCE_TRIES, and never a signal of its own.
-        self.announced = {}
+        # Cooperative-session survivors (oxide#195): identities already recorded in
+        # the receipt's bounded `survivors` list. Observation only; never a signal.
+        self.survivors = set()
 
     def note(self, entry=_SETTLE_TOP, **fields):
         """One observation-only stamp, on the settlement object or on one
@@ -3467,6 +3449,7 @@ class Monitor:
                         "path": ctx["reserve_path"], "device": ctx["reserve_device"]},
             "owned_bytes": {"samples": 0, "maximum": None, "budget": ctx["budget"], "last_ns": None},
             "output": {}, "census": None, "census_rounds": 0, "settlement": self.settlement,
+            "survivors": [],
         }
 
     def close_orphan_reads(self, ctx):
@@ -3641,32 +3624,29 @@ class Monitor:
         os.close(fd)
         self.send("output_eof", stream=name)
 
-    def announce_session_members(self, result):
-        """Announce, once per identity within a bounded retry budget, the members
-        a post-stop round still classifies in the leader's own cooperative
-        session, so the custodian can re-prove and stop them (oxide#195). The
-        monitor never signals and never concludes: it sends the exact (PID,
-        start) identity pair and the custodian decides. Only a non-zombie row
-        with both identity parts is announced; a zombie cannot run and is left
-        to the census, and an unreadable row is not a member at all."""
+    def record_survivors(self, result):
+        """Record, once per identity and up to `SURVIVOR_MAX`, the members a
+        post-stop census round still classifies in the leader's own cooperative
+        session (oxide#195).
+
+        Observation only. Tom's 2026-10-31 ruling (Queue decision c096c8fc) is
+        that a same-user process which is not this run's child is not held
+        unreaped across the signal, so its PID could be recycled between the
+        identity read and a signal: such an identity is never signalled, and the
+        run stays UNCLOSED. Recording its exact row is what makes the residual
+        legible to the owner without widening the signal set."""
         try:
-            rows = [row for row in (result.get("member_rows") or [])
-                    if isinstance(row, dict) and row.get("zombie") is not True
-                    and typed(row.get("pid"), int) and typed(row.get("start"), int)]
-            if "session-identity-stale" in self.inject:  # test-only: never a real identity
-                rows = [dict(row, start=row["start"] + 1) for row in rows]
-            fresh = []
+            rows = [survivor_row(row) for row in (result.get("member_rows") or [])]
             with self.lock:
+                kept = self.receipt.setdefault("survivors", [])
                 for row in rows:
-                    identity = (row["pid"], row["start"])
-                    if self.announced.get(identity, 0) >= SESSION_ANNOUNCE_TRIES:
+                    if row is None or len(kept) >= SURVIVOR_MAX:
                         continue
-                    self.announced[identity] = self.announced.get(identity, 0) + 1
-                    fresh.append([row["pid"], row["start"]])
-                    if len(fresh) >= SESSION_ANNOUNCE_MAX:
-                        break
-            if fresh:  # outside the lock: `send` takes it
-                self.send("session_stop", members=fresh)
+                    identity = (row["pid"], row["start"])
+                    if identity in self.survivors:
+                        continue
+                    self.survivors.add(identity)
+                    kept.append(row)
         except BaseException:
             pass
 
@@ -3715,7 +3695,7 @@ class Monitor:
             self.send("census", after=after, members=result["members"], uncertain=result["uncertain"],
                       certain=result["certain"])
             if result["members"] > 0:
-                self.announce_session_members(result)
+                self.record_survivors(result)
             # `sent_ns` also covers the send's own lock acquisition and pipe write.
             sent = now_ns()
             self.note(entry, sent_ns=sent)
@@ -4132,14 +4112,9 @@ class Monitor:
                 f" (device {detach.get('device')}, exit {detach['exit']}, timed out {detach['timed_out']},"
                 f" post-state {detach['post_state']}, qualified {detach['qualified']})"
                 + (f": {detach['reason']}" if detach.get("reason") else ""))
-        session = [record for record in (receipt.get("custodian") or [])
-                   if isinstance(record, dict) and str(record.get("event", "")).startswith("session_")]
-        if session:  # oxide#195: every cooperative-session signal carries its own record
-            lines.append(
-                "supervisor: cooperative-session stop"
-                f" signalled {sum(1 for r in session if r['event'] == 'session_signal')} member(s)"
-                f" by proved identity, refused {sum(1 for r in session if r['event'] == 'session_member_refused')}"
-                f" (observed {len([r for r in session if r['event'] == 'session_observed'])})")
+        survivors = survivors_line(receipt.get("survivors"))
+        if survivors is not None:  # oxide#195: recorded, never signalled
+            lines.append(survivors)
         for line in lines:  # one bounded write per line, so none truncates the rest
             report(line + "\n")
 
@@ -4196,7 +4171,6 @@ class Custodian:
         self.reaped_seq = None
         self.monitor_complete = False
         self.detach_child = None
-        self.session_signals = 0
         self.deadline_hit = False
         self.gate_opened = False
         self.gate_at = None
@@ -4459,11 +4433,6 @@ class Custodian:
                       reason=None if closed else "not observed closed yet")
         elif kind == "cleanup_failed":
             self.guard.latch("cleanup: owned scratch not fully removed")
-        elif kind == "session_stop":
-            # Post-reap only: members the monitor still classifies in the
-            # leader's own cooperative session. Every identity is re-proved
-            # here before any signal; a refusal is recorded, never closure.
-            self.stop_session_members(message)
 
     def setup(self):
         missing = capability()
@@ -4760,79 +4729,6 @@ class Custodian:
         except BaseException:
             pass
         return 124 if self.deadline_hit else 125
-
-    def stop_session_members(self, message):
-        """One bounded, identity-proved stop of the announced cooperative-session
-        members (oxide#195).
-
-        The monitor only announces; the custodian re-reads everything itself.
-        Only a verdict of `signal` from `session_member_verdict` is signalled, by
-        PID and never by group, and only while the run still holds authority (no
-        latched fault, the exit margin not reached). Every other answer is
-        recorded and left to the census: an absent, zombie, refused, unreadable
-        or already-out-of-budget member is never signalled and never closure. A
-        changed identity right after the signal is a latched fault, so a signal
-        that cannot be bound to the announced member can never pass as one."""
-        if self.leader is None or self.leader_status is None:
-            self.record("session_member_refused", count=len(message["members"]),
-                        verdict="refused", reason="the leader is not reaped")
-            return
-        sid, owner = self.leader, os.getuid()
-        reserved = {os.getpid(), self.monitor, self.leader}
-        for pid, start in message["members"]:
-            if self.guard.fault is not None or now_ns() >= self.exit_at:
-                self.record("session_member_refused", target=pid, start=start, verdict="refused",
-                            reason="the run holds no further authority to signal")
-                continue
-            row, problem = process_row(pid)
-            session, session_problem = None, None
-            try:
-                session = os.getsid(pid)
-            except ProcessLookupError as error:
-                try:
-                    gone = _ERRNO.__get__(error) == errno.ESRCH
-                except BaseException:
-                    gone = False
-                session_problem = "gone" if gone else "getsid: ESRCH"
-            except OSError as error:
-                session_problem = "getsid: " + errno_name(error)
-            verdict, reason = session_member_verdict(pid, start, row, problem, session,
-                                                     session_problem, sid, owner, reserved)
-            if verdict != "signal":
-                self.record("session_member_refused", target=pid, start=start, verdict=verdict,
-                            reason=None if reason is None else str(reason)[:200])
-                continue
-            if self.session_signals >= SESSION_SIGNAL_CAP:
-                self.record("session_member_refused", target=pid, start=start, verdict="refused",
-                            reason="the run's session-signal budget is spent")
-                continue
-            self.session_signals += 1
-            self.record("session_signal", target=pid, start=start, signal="SIGKILL", killpg=False,
-                        pin="session-member", held_unreaped=False, session=sid)
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError as error:
-                self.record("session_observed", target=pid, start=start,
-                            observation="signal " + errno_name(error))
-                continue
-            observation = self.observe_session_member(pid, start)
-            self.record("session_observed", target=pid, start=start, observation=observation)
-            if observation == "changed":
-                self.guard.latch(f"session signal {pid}: the identity changed after the signal")
-
-    def observe_session_member(self, pid, start):
-        """One immediate, non-blocking read of the identity just signalled. It
-        never waits (the census decides closure), and it never reports closure of
-        its own: a still-present, zombie, unreadable or replaced identity is
-        recorded as it is."""
-        row, problem = process_row(pid)
-        if problem is not None:
-            return "unreadable"
-        if row is None:
-            return "gone"
-        if row.get("start") != start:
-            return "changed"
-        return "zombie" if row.get("zombie") is not False else "present"
 
     def signal_detach_child(self):
         """One identity-checked SIGKILL of the pinned detach child, recorded."""

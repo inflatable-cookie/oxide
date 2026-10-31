@@ -2289,52 +2289,59 @@ unrequested attachment whose opt-in custody keep is recorded separately, and a
 real stuck child the custodian pins, signals and observes closed), with
 independent exact-head source review afterwards.
 
-**Cooperative-session stop (oxide#195, queue approval Tom decision
-`9b5a2cfa`, decision `ee263cea` context; unqualified source).** The stop now
-reaches the leader's own cooperative session, not only its pinned group.
-Oxide starts Cargo as the leader of its own process group
+**Cooperative-session survivors (oxide#195, queue approval Tom decision
+`9b5a2cfa`; signal-custody ruling `c096c8fc`; unqualified source).** The stop
+reaches the leader's own cooperative session only through identities the runner
+holds. Oxide starts Cargo as the leader of its own process group
 (`process_group(0)`) inside the leader's session, so the pinned leader-group
 KILL cannot reach it: oxide#182's archived packet
 (`/Volumes/Builds/scratch/oxide/evidence-182-20261029T134114Z`) ended
 `UNCLOSED` after its 300 s deadline with exactly one surviving session member,
-PID 15391 (ppid 1, pgid 80401), a unit-test binary in Cargo's group, and
-nothing could close it afterwards. That packet is historical evidence and is
-not reclassified, re-signalled or deleted here. After the leader is reaped,
-the monitor announces (at most sixteen identities per round, at most two
-announcements per identity) the non-zombie members the census still classifies
-in the leader's session, and the custodian itself re-reads each announced
-`(PID, start)` and sends one SIGKILL only while the exact PID and start token,
-this user, a non-zombie row, `getsid` equal to the leader's PID and "not one
-of this run's own processes" all hold at that moment. Refusals, absence, a
-zombie and an unreadable row are recorded (`session_member_refused`) and never
-signalled; a signal is recorded as `session_signal` with `pin:
-session-member`, `killpg: false` and `held_unreaped: false`, followed by one
-immediate post-signal observation, and a changed identity there latches a
-fault. Nothing outside the leader's session is ever signalled, no group other
-than the pinned leader's is ever signalled, and the per-run signal count is
-capped. Closure is unchanged: a certain empty post-reap census decides it, so
-an identity that cannot be re-proved leaves the run `UNCLOSED` with its
-scratch kept, never a false PASS. The receipt keeps every announcement's
-answer and the summary line reports how many members were closed by proved
-identity. This head's suite adds eighteen pure cases and replaces the one
-real separate-group survivor case with two real ones: a Cargo-shaped
-same-session group (a group leader and its own child) closed at the deadline on
-a certain empty census, and the same fixture with a changed start token
-offered on every announcement, which is refused, never signalled and left
-`UNCLOSED`; the escaped-`setsid` writer case additionally proves no session
-signal targets a process outside the leader's session. At this head the three
-sources are `bounded-test.py`
-`d6e599be6d831f3f83a9545c694335ef28fab4ec712f99aaa13142f8f13e0d18`,
+PID 15391 (ppid 1, pgid 80401), a unit-test binary in Cargo's group. That
+packet is historical evidence; it is not reclassified, re-signalled or deleted
+here. Tom's 2026-10-31 ruling rejected the first correction (identity re-read,
+then `SIGKILL` by PID): a same-user process that is not this run's child is not
+held unreaped, so its PID could be recycled between the read and the signal. A
+merely observed non-child PID is therefore **never** signalled, and that path
+does not exist in the source. Only an identity the runner positively holds
+across the signal may be signalled: the pinned leader group (its leader is held
+unreaped), the pinned monitor, and a direct child still held unreaped. After the
+leader is reaped, every census round records, once per identity and up to
+sixteen rows, the exact rows it still classifies in the leader's own session
+(`PID`, `start`, `ppid`, `pgid`, `uid`, `zombie`) in the receipt's `survivors`
+list, and the summary line states how many same-session survivors were not
+signalled. That is observation only: no message, no signal, no closure claim.
+Closure is unchanged, so a survivor keeps the run `UNCLOSED` with its scratch
+and evidence, and the recorded identity is what the owner needs to act on it.
+The residual is a real design conflict, reported for an operator ruling: the
+supervisor no longer closes such a survivor, and closing it needs a boundary
+that holds it — either the product keeps its command tree inside the pinned
+leader group, or a holder the runner can pin must own that group. This head's
+suite replaces the former separate-group survivor case with one real
+Cargo-shaped case (a `setpgid` group leader in the leader's session and its own
+child in that group, both survivable past the deadline, both recorded and never
+signalled, both still live at the `UNCLOSED` verdict), and adds the pure rules
+that keep it that way, including an AST guard that every kill call site in the
+supervisor is a custody-bound one. At this head the three sources are
+`bounded-test.py`
+`b00867a3eb771b1f164df88897d20e312ea0fc9fda398649878f04e512f3d31d`,
 `test_supervisor.py`
-`0714a6282fb8b0ae2c32290ca22434c8f121127f5b9c7d2df21236225667549a` and
+`452c4fc63b1fdb803b14101907f96926657f2b2ec0b8f34b0b99da9502f0f50b` and
 `qualify-supervisor.py`
-`ac55f3ee75efe0e5c7fa522be38cba3b53cfa9f58613cfa8fd87f0be234d2478`. The
-head's suite is 305 pure plus 49 real cases and is **unqualified** until one
-uncounted keep-going `effigy proof:supervisor:qualify:diagnostic` and then ONE
-counted author and ONE separate independent reviewer
-`effigy proof:supervisor:qualify` pass at the exact head, with independent
-exact-head source review afterwards; the `#191`, `#151` and `#147` receipts
-stay bound to their own bytes.
+`4a6e73056e0faab59e81eb2d2a4085238ea9c1dcea15397f561b57d895702697`. The
+head's suite is 294 pure plus 48 real cases and is **unqualified** until one
+uncounted keep-going
+`effigy proof:supervisor:qualify:diagnostic` and then ONE counted author and
+ONE separate independent reviewer `effigy proof:supervisor:qualify` pass at the
+exact head after independent exact-head source review; the `#191`, `#151` and
+`#147` receipts stay bound to their own bytes. **Activation bounds need an
+operator ruling:** the brief for this change names a 300 s wall clock per
+qualification run, while the selector's recorded bound is the oxide#191
+amendment of 2026-10-31 — a 420 s outer deadline with a 380 s candidate limit —
+and the suite at this head measured 285-305 s on a quiet shared host and did not
+finish inside its own 350 s secondary alarm under the current contention, so a
+300 s outer bound cannot complete. No bound was changed by this change; the
+activation must use the recorded amendment or an operator amendment to 300 s.
 
 **Settlement observation (oxide#147, unqualified source).** The current
 `bounded-test.py` also carries observation-only settlement diagnostics, so a
@@ -2453,10 +2460,9 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
     deadline, and write evidence to keep under `OXIDE_PROOF_EVIDENCE`, the
     evidence directory: counted in owned bytes, never removed by cleanup.
   - It must leave no process outside the leader's cooperative session when it
-    exits. A survivor in that session is stopped by the identity-proved
-    session stop below; a process that leaves the session with `setsid` is never
-    signalled, and either kind of survivor that cannot be closed ends the run
-    `UNCLOSED` (oxide#195).
+    exits. A survivor in that session is recorded but never signalled, and it
+    ends the run `UNCLOSED` (oxide#195); a process that leaves the session with
+    `setsid` is never signalled either.
   - It adds no supervision or accounting of its own.
 - **Processes.**
   - The single-threaded custodian owns the absolute deadline, the two pins
@@ -2501,36 +2507,28 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   - SIGCHLD is set to default before any fork, so no pin is auto-reaped.
   - The child resets inherited signal dispositions and the signal mask
     before `exec`. An exec failure exits 127.
-- **Signals.** Only the pinned leader's group (TERM, then KILL after at most
-  5 s) and, at the end, the pinned monitor are ever signalled as a pinned
-  child. Each signal is recorded with its target, pin and `held_unreaped`
+- **Signals.** Only an identity the runner holds unreaped across the signal is
+  ever signalled: the pinned leader's group (TERM, then KILL after at most 5 s),
+  the pinned monitor, and a direct child still held unreaped (the detach
+  handoff). Each signal is recorded with its target, pin and `held_unreaped`
   custody at that moment. On macOS a group whose only member is the unreaped
-  leader answers `EPERM`, which is recorded and not a fault. After the leader
-  is reaped, a member of the leader's own session may additionally be
-  SIGKILLed **by PID only**, under the identity rule below; no other group is
-  ever signalled, and nothing outside that session is ever signalled.
-- **Cooperative-session stop (oxide#195).** The leader's group is not the
+  leader answers `EPERM`, which is recorded and not a fault. No other group and
+  no observed non-child PID is ever signalled (oxide#195, Tom's 2026-10-31
+  ruling `c096c8fc`).
+- **Cooperative-session survivors (oxide#195).** The leader's group is not the
   whole session: Oxide starts Cargo as the leader of its own process group in
   the same session, so a leader-group KILL leaves Cargo's group running.
-  Oxide#182's archived packet ended `UNCLOSED` with exactly one such survivor
-  (a unit-test binary in Cargo's group), and nothing could close it. After the
-  leader is reaped, each census round announces, at most two times per
-  identity and sixteen identities per round, the non-zombie members it still
-  classifies; the custodian re-reads each announced `(PID, start)` itself and
-  sends one SIGKILL only while all of the following hold at that moment: the
-  row is that exact PID and start token, its UID is this user's, it is not a
-  zombie, `getsid` is the leader's PID, and it is not one of this run's own
-  processes. A refused, absent, zombie or unreadable identity is recorded
-  (`session_member_refused`) and never signalled; a signal is recorded with
-  `pin: session-member` and `held_unreaped: false`, followed by one immediate
-  post-signal observation, and a changed identity there latches a fault. The
-  run's session signals are capped. Every stop is still decided by the
-  census: closure needs a certain empty census after the reaping, so an
-  identity that cannot be re-proved leaves the run `UNCLOSED` with its
-  scratch-kept evidence, never a false PASS. The residual limitation is the
-  ordinary one of a non-child PID: identity is re-read immediately before the
-  signal and again immediately after it, and the census is the closure
-  authority, but the process is not held unreaped.
+  Oxide#182's archived packet ended `UNCLOSED` with exactly one such survivor (a
+  unit-test binary in Cargo's group). Such a process is not this run's child, so
+  it is not held unreaped and its PID could be recycled between an identity read
+  and a signal: it is **never** signalled, and the supervisor has no path that
+  converts an observation into a signal. After the leader is reaped, each census
+  round records, once per identity and up to sixteen rows, the exact member rows
+  it still classifies in the leader's session (`pid`, `start`, `ppid`, `pgid`,
+  `uid`, `zombie`) in the receipt's `survivors` list, and the summary line states
+  how many were not signalled. Closure is unchanged, so a survivor leaves the
+  run `UNCLOSED` with its scratch and evidence kept; disposing of the recorded
+  process needs a boundary that holds it, which this runner does not have.
 - **Closure.** The leader is reaped first. Only after that does the custodian
   send `stopped`, so the final census never sees the leader. Closure is
   established when all of the following hold:
@@ -2991,8 +2989,8 @@ runs in order:
   must latch exactly the missing-EOF refusal after a certainly empty census,
   and the paired control that releases both closes with status 0 and no fault;
 - real cases with tiny Python fixtures and injected faults (39 at the oxide#151
-  head; the current head has 49, the oxide#191 detach cases and the oxide#195
-  session-stop pair below):
+  head; the current head has 48, the oxide#191 detach cases and the oxide#195
+  survivor case below):
   - exit 0, owned cleanup, nonzero, exec 127, output saturation;
   - a case directory that already holds the owned long-path fixture: the
     first scratch reading counts it, closure holds and the command runs (before
@@ -3003,13 +3001,12 @@ runs in order:
     error blocking with terminal `invalid`/null;
   - a group cascading to `closed` at the deadline;
   - oxide#195: a Cargo-shaped group (a `setpgid` group leader in the leader's
-    own cooperative session and its own child in that group) closed at the
-    deadline by proved per-identity session signals, with a certain empty
-    post-reap census, no group signal to either member and both gone at the
-    verdict; and the same fixture with every announcement's start token
-    changed, which the custodian refuses, never signals and leaves `UNCLOSED`
-    with both survivors alive and the case directory and receipt outside the
-    outer cleanup (this pair replaces the former separate-group survivor case);
+    own cooperative session and its own child in that group) that reaches the
+    deadline: both members are recorded in the receipt's bounded `survivors`
+    list with their exact identities, neither is signalled, and both are still
+    live (non-zombie, census-owned) at the `UNCLOSED` verdict, whose case
+    directory and receipt stay outside the outer cleanup (this replaces the
+    former separate-group survivor case);
   - an escaped pipe holder, kept the same way;
   - a latched fault with an empty census (kept, not cleaned);
   - SIGTERM and SIGINT to the custodian;

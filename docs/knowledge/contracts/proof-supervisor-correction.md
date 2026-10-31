@@ -26,16 +26,18 @@ Nothing here qualifies anything.
 
 **Amended by oxide#195 (2026-11-01).** This reviewed text is the historical
 design, and its "only pinned children are ever signalled" contract was
-corrected after oxide#182's packet ended `UNCLOSED` with a live Cargo-shaped
-group inside the leader's own cooperative session. Current behaviour is the
+re-opened by oxide#182's packet, which ended `UNCLOSED` with a live
+Cargo-shaped group inside the leader's own cooperative session. Tom's
+2026-10-31 signal-custody ruling (Queue decision `c096c8fc`) settled it: a
+same-user process that is not the runner's child is not held unreaped, so a
+merely observed non-child PID is never signalled, and the supervisor has no
+path that converts an observation into a signal. Current behaviour is the
 [shared proof supervisor](workflow.md#shared-proof-supervisor) section's
-*Cooperative-session stop* description: after the leader is reaped, a
-same-session member may additionally be SIGKILLed **by PID**, and only while
-the custodian has itself re-read the exact announced PID and start token, this
-user, a non-zombie state and `getsid` equal to the leader's PID. A process
-outside that session, and every other process group, is still never signalled,
-and the census alone decides closure. Read the table rows below about
-"survivors" with that amendment.
+*Cooperative-session survivors* description: after the leader is reaped the
+monitor records the survivor's exact row in the receipt's bounded `survivors`
+list, signals nothing, and the run stays `UNCLOSED`. Read the table rows below
+about "survivors" with that amendment: a survivor is recorded and left to a
+boundary that can hold it, never signalled by this runner.
 
 ## Contract
 

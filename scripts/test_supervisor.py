@@ -131,9 +131,6 @@ CARGO_LEADER = fixture(
     "while not os.path.exists(os.environ['CASE_DIR'] + '/cargo.ready') and time.monotonic() < deadline:\n"
     "    time.sleep(0.02)\n"
     "time.sleep(3600)\n")
-# The same tree with a leader that exits on its own, so the stop is the leader's
-# exit rather than the deadline: the faster shape for the refusal case.
-CARGO_LEADER_EXITS = CARGO_LEADER.replace("time.sleep(3600)\n", "")
 
 # An escaped writer: it leaves the nested session with setsid, keeps the nested
 # leader's stdout/stderr write descriptors open (the pipe therefore never
@@ -274,10 +271,10 @@ def escaped_writer_problems(facts):
         if target in (child, suite):
             problems.append(f"a signal targeted the escaped writer or the suite: {target}")
     for target in facts.get("session_targets") or []:
-        # oxide#195: the session stop is identity-proved and session-bounded, so
-        # a writer outside the leader's session is never signalled by it either.
-        if target in (child, suite):
-            problems.append(f"a session signal targeted the escaped writer or the suite: {target}")
+        # oxide#195 (ruling c096c8fc): no non-held session identity is ever
+        # signalled, so no such record may exist at all - least of all for the
+        # escaped writer or the suite.
+        problems.append(f"a non-held session signal record exists: {target}")
     for pin in facts.get("signal_pins") or []:
         if pin not in ("leader", "monitor"):
             problems.append(f"a signal targeted an unexpected pin: {pin}")
@@ -1545,255 +1542,30 @@ def seam_fixture(base, referent):
             "tail": tail, "link": os.path.join(anchor, tail)}
 
 
-class PureSessionStop(unittest.TestCase):
-    """Oxide#195: the cooperative-session stop. The monitor only announces a
-    member's (PID, start); the custodian re-proves the exact identity, user,
-    session and non-zombie state itself, signals only that, and records every
-    other answer without ever signalling or claiming closure. Nothing outside
-    the leader's own session is signalled, and the announcement is bounded."""
+class PureSurvivors(unittest.TestCase):
+    """Oxide#195 under Tom's 2026-10-31 ruling (Queue decision c096c8fc): a
+    same-user process that is not held unreaped by the runner is never
+    signalled, because its PID could be recycled between the identity read and
+    the signal. The monitor records the survivor's exact identity in the
+    receipt and the census still decides UNCLOSED; no announcement and no
+    non-held signal exists on this path."""
 
-    def custodian(self, leader=4242, monitor=4343, reaped=True, fault=None, exit_at=None):
-        read_end, cmd_w = os.pipe()
-        self.addCleanup(os.close, read_end)
-        self.addCleanup(os.close, cmd_w)
-        os.set_blocking(read_end, False)
-        custodian = bounded.Custodian(["true"])
-        custodian.run_id = "r"
-        custodian.cmd_w = cmd_w
-        custodian.guard = bounded.Guard(0)
-        custodian.monitor = monitor
-        custodian.leader = leader
-        custodian.leader_status = 0 if reaped else None
-        custodian.exit_at = (bounded.now_ns() + 60 * bounded.NS) if exit_at is None else exit_at
-        if fault is not None:
-            custodian.guard.latch(fault)
-        return custodian, read_end
-
-    def records(self, read_end):
-        blob = b""
-        while True:
-            try:
-                chunk = os.read(read_end, 1 << 20)
-            except BlockingIOError:
-                break
-            if not chunk:
-                break
-            blob += chunk
-        out = []
-        for line in blob.decode().splitlines():
-            message = json.loads(line)
-            if message.get("type") == "record":
-                out.append(message["record"])
-        return out
-
-    def stop(self, custodian, announced, rows=None, sessions=None, uid=None, kill=None):
-        """Run one announcement against fake reads. `rows` maps pid ->
-        (row, problem), `sessions` maps pid -> sid or an exception to raise."""
-        rows, sessions = rows or {}, sessions or {}
-        owner = os.getuid() if uid is None else uid
-        calls = []
-
-        def process_row(pid):
-            return rows.get(pid, (None, None))
-
-        def getsid(pid):
-            value = sessions.get(pid, 0)
-            if isinstance(value, BaseException):
-                raise value
-            return value
-
-        def do_kill(pid, number):
-            calls.append((pid, number))
-            if kill is not None:
-                kill(pid, number)
-
-        with patched(bounded, "process_row", process_row), patched(os, "getsid", getsid), \
-                patched(os, "kill", do_kill), patched(os, "getuid", lambda: owner):
-            custodian.stop_session_members({"members": list(announced)})
-        return calls
-
-    def test_every_verdict_is_in_the_fixed_enum(self):
-        live = row(900, start=5, uid=501)
-        cases = {
-            "signal": ((900, 5, live, None, 4242, None, 4242, 501, set()),),
-            "absent": ((900, 5, None, None, 4242, None, 4242, 501, set()),
-                       (900, 5, live, None, 4242, "gone", 4242, 501, set())),
-            "dead": ((900, 5, dict(live, zombie=True), None, 4242, None, 4242, 501, set()),),
-            "refused": ((900, 5, live, None, 999, None, 4242, 501, set()),),
-            "unknown": ((900, 5, None, "injected unreadable identity", 4242, None, 4242, 501, set()),),
-        }
-        self.assertEqual(set(bounded.SESSION_VERDICTS), set(cases))
-        for expected, arguments in cases.items():
-            for argument in arguments:
-                verdict, _reason = bounded.session_member_verdict(*argument)
-                self.assertEqual(verdict, expected)
-                self.assertIn(verdict, bounded.SESSION_VERDICTS)
-
-    def signals(self, records):
-        return [record for record in records if record["event"] == "session_signal"]
-
-    def refusals(self, records):
-        return [record for record in records if record["event"] == "session_member_refused"]
-
-    def test_only_the_reproved_identity_is_signalled(self):
-        custodian, read_end = self.custodian()
-        live = row(900, start=5, uid=os.getuid())
-        calls = self.stop(custodian, [[900, 5]], {900: (live, None)}, {900: 4242})
-        self.assertEqual(calls, [(900, signal.SIGKILL)])
-        records = self.records(read_end)
-        self.assertEqual(
-            [(record["target"], record["start"], record["signal"], record["killpg"],
-              record["pin"], record["held_unreaped"], record["session"])
-             for record in self.signals(records)],
-            [(900, 5, "SIGKILL", False, "session-member", False, 4242)])
-        observed = [record["observation"] for record in records if record["event"] == "session_observed"]
-        self.assertEqual(observed, ["present"])  # the read after the signal is truthfully kept
-        self.assertIsNone(custodian.guard.fault)
-        self.assertFalse(custodian.census_ok, "a signal is never a closure claim")
-
-    def test_a_changed_start_token_is_refused_without_a_signal(self):
-        custodian, read_end = self.custodian()
-        replaced = row(900, start=6, uid=os.getuid())
-        calls = self.stop(custodian, [[900, 5]], {900: (replaced, None)}, {900: 4242})
-        self.assertEqual(calls, [])
-        [refusal] = self.refusals(self.records(read_end))
-        self.assertEqual((refusal["target"], refusal["start"], refusal["verdict"]),
-                         (900, 5, "refused"))
-        self.assertEqual(refusal["reason"], "identity changed")
-        self.assertIsNone(custodian.guard.fault)
-
-    def test_a_foreign_session_is_refused_and_never_signalled(self):
-        custodian, read_end = self.custodian()
-        live = row(900, start=5, uid=os.getuid())
-        self.assertEqual(self.stop(custodian, [[900, 5]], {900: (live, None)}, {900: 999}), [])
-        [refusal] = self.refusals(self.records(read_end))
-        self.assertEqual(refusal["verdict"], "refused")
-        self.assertEqual(refusal["reason"], "not in the leader's session")
-
-    def test_a_zombie_member_is_never_signalled(self):
-        custodian, read_end = self.custodian()
-        dead = row(900, start=5, uid=os.getuid(), zombie=True)
-        self.assertEqual(self.stop(custodian, [[900, 5]], {900: (dead, None)}, {900: 4242}), [])
-        [refusal] = self.refusals(self.records(read_end))
-        self.assertEqual(refusal["verdict"], "dead")
-
-    def test_this_runs_own_processes_and_other_users_are_refused(self):
-        custodian, read_end = self.custodian()
-        mine = row(os.getpid(), start=5, uid=os.getuid())
-        self.assertEqual(self.stop(custodian, [[os.getpid(), 5]], {os.getpid(): (mine, None)},
-                                  {os.getpid(): 4242}), [])
-        monitor = row(4343, start=5, uid=os.getuid())
-        self.assertEqual(self.stop(custodian, [[4343, 5]], {4343: (monitor, None)}, {4343: 4242}), [])
-        other = row(900, start=5, uid=os.getuid() + 1)
-        self.assertEqual(self.stop(custodian, [[900, 5]], {900: (other, None)}, {900: 4242}), [])
-        verdicts = [record["reason"] for record in self.refusals(self.records(read_end))]
-        self.assertEqual(verdicts, ["this run's own process", "this run's own process",
-                                    "not this user's process"])
-
-    def test_absent_and_unreadable_answers_are_never_signals(self):
-        custodian, read_end = self.custodian()
-        absent = self.stop(custodian, [[900, 5]], {900: (None, None)}, {900: 4242})
-        unreadable = self.stop(custodian, [[901, 5]], {901: (None, "injected unreadable identity")},
-                               {901: 4242})
-        gone = self.stop(custodian, [[902, 5]], {902: (row(902, start=5), None)},
-                         {902: ProcessLookupError(errno.ESRCH, "gone")})
-        other_error = self.stop(custodian, [[903, 5]], {903: (row(903, start=5), None)},
-                                {903: PermissionError(errno.EPERM, "denied")})
-        self.assertEqual([absent, unreadable, gone, other_error], [[], [], [], []])
-        verdicts = [record["verdict"] for record in self.refusals(self.records(read_end))]
-        self.assertEqual(verdicts, ["absent", "unknown", "absent", "unknown"])
-
-    def test_no_signal_before_the_reap_or_without_authority(self):
-        live = row(900, start=5, uid=os.getuid())
-        unreaped, read_end = self.custodian(reaped=False)
-        self.assertEqual(self.stop(unreaped, [[900, 5]], {900: (live, None)}, {900: 4242}), [])
-        faulty, fault_end = self.custodian(fault="injected fault")
-        self.assertEqual(self.stop(faulty, [[900, 5]], {900: (live, None)}, {900: 4242}), [])
-        spent, spent_end = self.custodian(exit_at=bounded.now_ns() - 1)
-        self.assertEqual(self.stop(spent, [[900, 5]], {900: (live, None)}, {900: 4242}), [])
-        unreaped_records = self.records(read_end)
-        faulty_records = self.records(fault_end)
-        spent_records = self.records(spent_end)
-        for records in (unreaped_records, faulty_records, spent_records):
-            self.assertEqual([record["verdict"] for record in self.refusals(records)], ["refused"])
-        self.assertEqual(self.refusals(unreaped_records)[0]["reason"], "the leader is not reaped")
-        self.assertEqual(self.refusals(faulty_records)[0]["reason"],
-                         "the run holds no further authority to signal")
-        self.assertEqual(self.refusals(spent_records)[0]["reason"],
-                         "the run holds no further authority to signal")
-
-    def test_the_signal_budget_is_bounded(self):
-        custodian, read_end = self.custodian()
-        custodian.session_signals = bounded.SESSION_SIGNAL_CAP
-        live = row(900, start=5, uid=os.getuid())
-        self.assertEqual(self.stop(custodian, [[900, 5]], {900: (live, None)}, {900: 4242}), [])
-        [refusal] = self.refusals(self.records(read_end))
-        self.assertEqual(refusal["reason"], "the run's session-signal budget is spent")
-
-    def test_a_changed_identity_after_the_signal_latches_a_fault(self):
-        # The one case where a signal cannot be bound to the announced member:
-        # it is reported as a fault, never as a closed member.
-        custodian, read_end = self.custodian()
-        live = row(900, start=5, uid=os.getuid())
-        replaced = row(900, start=6, uid=os.getuid())
-        replies = iter([(live, None), (replaced, None)])
-        with patched(bounded, "process_row", lambda _pid: next(replies)), \
-                patched(os, "getsid", lambda _pid: 4242), \
-                patched(os, "kill", lambda _pid, _number: None), \
-                patched(os, "getuid", os.getuid):
-            custodian.stop_session_members({"members": [[900, 5]]})
-        self.assertIn("identity changed after the signal", custodian.guard.fault or "")
-        self.assertEqual([record["observation"] for record in self.records(read_end)
-                          if record["event"] == "session_observed"], ["changed"])
-
-    def test_a_member_still_present_after_the_signal_is_not_closure(self):
-        custodian, read_end = self.custodian()
-        live = row(900, start=5, uid=os.getuid())
-        self.stop(custodian, [[900, 5]], {900: (live, None)}, {900: 4242})
-        self.assertIsNone(custodian.guard.fault)
-        self.assertEqual([record["observation"] for record in self.records(read_end)
-                          if record["event"] == "session_observed"], ["present"])
-        self.assertFalse(custodian.closure(True))
-
-    def test_the_announcement_schema_bounds_the_message(self):
-        base = {"run": "r", "seq": 1, "at": 1, "type": "session_stop", "members": [[900, 5]]}
-        self.assertIsNone(bounded.malformed(base))
-        missing = {key: value for key, value in base.items() if key != "members"}
-        self.assertEqual(bounded.malformed(missing), "missing members")
-        mutations = [
-            ("ill-typed members", {"members": None}),
-            ("ill-typed members", {"members": "900"}),
-            ("ill-typed members", {"members": [[900, 5]] * (bounded.SESSION_ANNOUNCE_MAX + 1)}),
-            ("ill-typed member", {"members": [[900]]}),
-            ("ill-typed member", {"members": [[900, 5, 6]]}),
-            ("ill-typed member", {"members": [[True, 5]]}),
-            ("ill-typed member", {"members": [[900, True]]}),
-            ("ill-typed member", {"members": [[0, 5]]}),
-            ("ill-typed member", {"members": [[900, 0]]}),
-            ("ill-typed member", {"members": [[-900, 5]]}),
-            ("ill-typed member", {"members": ["900"]}),
-        ]
-        for expected, mutation in mutations:
-            with self.subTest(mutation=mutation):
-                self.assertEqual(bounded.malformed(dict(base, **mutation)), expected)
-        largest = {"members": [[900 + index, 5] for index in range(bounded.SESSION_ANNOUNCE_MAX)]}
-        self.assertIsNone(bounded.malformed(dict(base, **largest)))
-
-    def monitor(self, inject=()):
+    def monitor(self, survivors=None):
         ctl_r, ctl_w = os.pipe()
         cmd_r, cmd_w = os.pipe()
         out_r, out_w = os.pipe()
         err_r, err_w = os.pipe()
         for fd in (ctl_r, cmd_r, out_r, err_r, ctl_w, cmd_w, out_w, err_w):
             self.addCleanup(os.close, fd)
-        monitor = bounded.Monitor({"run_id": "r", "inject": list(inject),
+        monitor = bounded.Monitor({"run_id": "r", "inject": [],
                                    "terminal_mode": {"mode": "strict"}},
                                   ctl_w, cmd_r, out_r, err_r)
         monitor.leader = [4242, 77]
+        monitor.receipt = {"survivors": [] if survivors is None else survivors}
         os.set_blocking(ctl_r, False)
         return monitor, ctl_r
 
-    def announcements(self, ctl_r):
+    def sent(self, ctl_r):
         blob = b""
         while True:
             try:
@@ -1803,50 +1575,169 @@ class PureSessionStop(unittest.TestCase):
             if not chunk:
                 break
             blob += chunk
-        return [json.loads(line) for line in blob.decode().splitlines()
-                if json.loads(line).get("type") == "session_stop"]
+        return blob
 
-    def members(self, *rows, **extra):
-        return dict({"certain": False, "members": len(rows), "uncertain": 0,
-                     "member_rows": list(rows)}, **extra)
+    def members(self, *rows):
+        return {"certain": False, "members": len(rows), "uncertain": 0,
+                "member_rows": list(rows)}
 
-    def test_the_monitor_announces_only_live_member_identities(self):
+    def test_a_survivor_row_carries_only_a_bounded_identity(self):
+        live = row(900, start=5, uid=501)
+        self.assertEqual(bounded.survivor_row(live),
+                         {"pid": 900, "start": 5, "ppid": 1, "pgid": 900, "uid": 501,
+                          "zombie": False})
+        self.assertEqual(set(bounded.survivor_row(live)), set(bounded.SURVIVOR_KEYS))
+        # Extra or textual fields are dropped, never copied into the receipt.
+        self.assertEqual(set(bounded.survivor_row(dict(live, command="/bin/x", note="text"))),
+                         set(bounded.SURVIVOR_KEYS))
+        for broken in (None, "row", {}, {"pid": 900}, dict(live, pid=0),
+                       dict(live, start=0), dict(live, pid=-1), dict(live, start="5"),
+                       dict(live, pid=True), dict(live, zombie="no"), dict(live, zombie=1),
+                       dict(live, uid=None), dict(live, pgid="1")):
+            with self.subTest(broken=broken):
+                self.assertIsNone(bounded.survivor_row(broken))
+
+    def test_the_monitor_records_each_identity_once_within_the_bound(self):
+        monitor, _ctl_r = self.monitor()
+        monitor.record_survivors(self.members(row(900, start=5), row(900, start=5),
+                                              {"pid": 901}, "not-a-row", None))
+        self.assertEqual(monitor.receipt["survivors"],
+                         [{"pid": 900, "start": 5, "ppid": 1, "pgid": 900, "uid": 501,
+                           "zombie": False}])
+        monitor.record_survivors(self.members(row(900, start=5)))  # same identity: no duplicate
+        self.assertEqual(len(monitor.receipt["survivors"]), 1)
+        # The first observation of one identity wins; a new identity is a new row.
+        monitor.record_survivors(self.members(row(900, start=5, zombie=True), row(901, start=6)))
+        self.assertEqual([(item["pid"], item["start"], item["zombie"])
+                          for item in monitor.receipt["survivors"]],
+                         [(900, 5, False), (901, 6, False)])
+        monitor, _ctl_r = self.monitor()
+        rows = [row(1000 + index, start=index + 1) for index in range(bounded.SURVIVOR_MAX + 6)]
+        monitor.record_survivors(self.members(*rows))
+        self.assertEqual(len(monitor.receipt["survivors"]), bounded.SURVIVOR_MAX)
+        self.assertEqual([item["pid"] for item in monitor.receipt["survivors"]],
+                         [1000 + index for index in range(bounded.SURVIVOR_MAX)])
+
+    def test_recording_a_survivor_sends_and_signals_nothing(self):
         monitor, ctl_r = self.monitor()
-        result = self.members(row(900, start=5), row(901, start=6, zombie=True),
-                              {"pid": 902},  # no identity: never announced
-                              "not-a-row")
-        monitor.announce_session_members(result)
-        [message] = self.announcements(ctl_r)
-        self.assertEqual(message["members"], [[900, 5]])
-        self.assertEqual(message["leader"], [4242, 77])
-        empty = self.members()
-        monitor.announce_session_members(empty)
-        self.assertEqual(self.announcements(ctl_r), [])
-        self.assertEqual(monitor.receipt, None)  # announcement never touches the receipt
+        calls = []
 
-    def test_each_identity_is_announced_a_bounded_number_of_times(self):
-        monitor, ctl_r = self.monitor()
-        result = self.members(row(900, start=5))
-        for _ in range(bounded.SESSION_ANNOUNCE_TRIES + 2):
-            monitor.announce_session_members(result)
-        announced = self.announcements(ctl_r)
-        self.assertEqual(len(announced), bounded.SESSION_ANNOUNCE_TRIES)
-        self.assertEqual({tuple(item) for message in announced for item in message["members"]},
-                         {(900, 5)})
+        def refuse(*args):
+            calls.append(args)
+            raise AssertionError("the survivor path must never signal")
 
-    def test_one_round_announces_at_most_the_fixed_cap(self):
-        monitor, ctl_r = self.monitor()
-        rows = [row(900 + index, start=5) for index in range(bounded.SESSION_ANNOUNCE_MAX + 6)]
-        monitor.announce_session_members(self.members(*rows))
-        [message] = self.announcements(ctl_r)
-        self.assertEqual(len(message["members"]), bounded.SESSION_ANNOUNCE_MAX)
-        self.assertEqual(message["members"][0], [900, 5])
+        with patched(os, "kill", refuse), patched(os, "killpg", refuse):
+            monitor.record_survivors(self.members(row(900, start=5), row(901, start=6)))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.sent(ctl_r), b"", "the survivor path must never send a message")
+        self.assertEqual(len(monitor.receipt["survivors"]), 2)
+        # No closure claim either: the census/receipt decision is untouched.
+        self.assertNotIn("census", monitor.receipt)
 
-    def test_the_stale_identity_injection_announces_a_wrong_start(self):
-        monitor, ctl_r = self.monitor(inject=["session-identity-stale"])
-        monitor.announce_session_members(self.members(row(900, start=5)))
-        [message] = self.announcements(ctl_r)
-        self.assertEqual(message["members"], [[900, 6]])
+    def test_no_supervisor_path_signals_an_unheld_process(self):
+        # The structural regression for the ruling: every kill/killpg call site
+        # in the supervisor must be one of the custody-bound functions, so a
+        # checked-then-signalled non-child PID cannot be reintroduced.
+        source = Path(bounded.__file__).read_text()
+        tree = ast.parse(source)
+        def callee(node):
+            if isinstance(node, ast.Attribute):
+                return {f"{getattr(node.value, 'id', '?')}.{node.attr}"}
+            if isinstance(node, ast.IfExp):  # `(os.killpg if group else os.kill)(...)`
+                return callee(node.body) | callee(node.orelse)
+            return set()
+
+        sites = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                for inner in ast.walk(node):
+                    if not isinstance(inner, ast.Call):
+                        continue
+                    for name in callee(inner.func) & {"os.kill", "os.killpg"}:
+                        sites.setdefault(node.name, set()).add(name)
+        self.assertEqual(sites, {
+            # a direct child this process still holds unreaped (pid cannot be reused)
+            "close_own_child": {"os.kill"},
+            # the pinned leader/monitor, checked with held_unreaped before the call
+            "signal_pinned": {"os.kill", "os.killpg"},
+            # the pinned detach child, identity- and parentage-checked
+            "signal_detach_child": {"os.kill"},
+            # a signal to its own PID inside the fork child (injections)
+            "launch_leader": {"os.kill"},
+            # a liveness probe of the pinned group, never a signal
+            "stop_leader": {"os.killpg"},
+        }, sites)
+        self.assertNotIn("session_stop", bounded.FIELDS)
+        for forbidden in ("session_signal", "session_member_refused", "session_stop_attempt"):
+            self.assertNotIn(forbidden, source)
+
+    def test_the_summary_line_states_the_residual_without_claiming_a_signal(self):
+        self.assertIsNone(bounded.survivors_line([]))
+        self.assertIsNone(bounded.survivors_line(None))
+        one = bounded.survivors_line([{"pid": 900, "start": 5}])
+        self.assertIn("1 same-session survivor(s) not signalled", one)
+        self.assertIn("900/5", one)
+        self.assertIn("UNCLOSED", one)
+        self.assertNotIn("limit", one)
+        many = bounded.survivors_line([{"pid": 900 + index, "start": 5}
+                                       for index in range(10)])
+        self.assertIn("900/5", many)
+        self.assertIn("+2 more", many)
+        self.assertEqual(many.count("/5"), 8)
+
+    def test_the_qualification_oracle_requires_the_survivor_record_and_no_signal(self):
+        rows = survivor_case_rows("/x")
+        self.assertEqual(self.survivor_oracle(rows), [], rows)
+        self.assertTrue(any("recorded no case outcome" in p
+                            for p in self.survivor_oracle([])))
+        closed = [dict(rows[0], outcome={"closure": "closed", "deadline": True})]
+        self.assertTrue(any("claimed closure" in p for p in self.survivor_oracle(closed)))
+        early = [dict(rows[0], outcome={"closure": "UNCLOSED", "deadline": False})]
+        self.assertTrue(any("did not reach the deadline" in p for p in self.survivor_oracle(early)))
+        dropped = [dict(rows[0], survivors=[])]
+        self.assertTrue(any("survivor row(s)" in p for p in self.survivor_oracle(dropped)))
+        anonymous = [dict(rows[0], survivors=[{"pid": 0, "start": 0}])]
+        self.assertTrue(any("without an identity" in p for p in self.survivor_oracle(anonymous)))
+        signalled = [dict(rows[0], signal_targets=[4100])]
+        self.assertTrue(any("signalled a non-held survivor" in p
+                            for p in self.survivor_oracle(signalled)))
+        no_census = [dict(rows[0], census=0)]
+        self.assertTrue(any("no census member" in p for p in self.survivor_oracle(no_census)))
+
+    def test_the_signal_custody_oracle_rejects_any_non_held_signal(self):
+        receipt = {"phase": "monitor_complete: pending_custodian", "custodian": [
+            {"event": "signal", "target": 9, "pin": "leader", "held_unreaped": True},
+            {"event": "detach_child_signal", "pid": 4100, "start": 77}],
+            "outcome": {"closure": "closed", "status": 0, "fault": None, "deadline": False}}
+        self.assertEqual(self.custody_oracle(receipt), [])
+        for mutation in ({"pin": "session-member"}, {"held_unreaped": False}):
+            with self.subTest(mutation=mutation):
+                broken = dict(receipt)
+                broken["custodian"] = [dict(receipt["custodian"][0], **mutation)]
+                self.assertTrue(any("without custody" in p for p in self.custody_oracle(broken)))
+        extra = dict(receipt)
+        extra["custodian"] = receipt["custodian"] + [
+            {"event": "session_signal", "target": 4100, "start": 77, "killpg": False,
+             "held_unreaped": False, "pin": "session-member", "signal": "SIGKILL"}]
+        self.assertTrue(any("non-held session signal" in p for p in self.custody_oracle(extra)))
+        anonymous = dict(receipt)
+        anonymous["custodian"] = [{"event": "detach_child_signal", "pid": 0, "start": 0}]
+        self.assertTrue(any("held identity" in p for p in self.custody_oracle(anonymous)))
+
+    def custody_oracle(self, receipt):
+        results = {"outcomes": [["zero", "pass"]], "cases": [{"case": "zero", "dir": "/x"}]}
+        plan = dict(qualify.check_plan(receipt, results, {"source": "selected-volume"},
+                                       None, KernelFactsForOracle(), None))
+        return plan["signal-custody"]()
+
+    def survivor_oracle(self, rows):
+        receipt = {"phase": "monitor_complete: pending_custodian", "custodian": [],
+                   "outcome": {"closure": "UNCLOSED", "status": -15, "fault": CENSUS_FAULT,
+                               "deadline": True}}
+        results = {"outcomes": [["zero", "pass"]], "cases": [{"case": "zero", "dir": "/x"}] + rows}
+        plan = dict(qualify.check_plan(receipt, results, {"source": "selected-volume"},
+                                       None, KernelFactsForOracle(), None))
+        return plan["survivor-paths"]()
 
 
 class TraversalSeam:
@@ -3784,19 +3675,22 @@ def detach_case_rows(case):
     ]
 
 
-def session_case_rows(case):
-    """The two real cooperative-session-stop case rows a qualification receipt
-    must carry, in the shape the suite publishes them (oxide#195): the closed
-    Cargo-shaped group with its two proved identities, and the changed identity
-    that is refused and never signalled."""
+def survivor_case_rows(case):
+    """The real cooperative-session survivor case row a qualification receipt
+    must carry, in the shape the suite publishes it (oxide#195): a Cargo-shaped
+    same-session group that reached the deadline, is recorded in the receipt's
+    bounded `survivors` list and is never signalled, with the run honestly
+    UNCLOSED."""
     return [
-        {"case": "test_cargo_shaped_group_is_closed_at_the_deadline", "dir": case, "exit": 124,
-         "outcome": {"closure": "closed", "status": -15, "fault": None, "deadline": True},
-         "census": 0, "session_signals": [[4100, 77], [4101, 78]]},
-        {"case": "test_a_changed_member_identity_is_never_signalled", "dir": case, "exit": 124,
+        {"case": "test_cargo_shaped_group_survivor_is_recorded_and_never_signalled",
+         "dir": case, "exit": 124, "census": 2,
          "outcome": {"closure": "UNCLOSED", "status": -15, "fault": CENSUS_FAULT,
                      "deadline": True},
-         "census": 1, "session_signals": []},
+         "survivors": [{"pid": 4100, "start": 77, "ppid": 1, "pgid": 4100, "uid": 501,
+                        "zombie": False},
+                       {"pid": 4101, "start": 78, "ppid": 4100, "pgid": 4100, "uid": 501,
+                        "zombie": False}],
+         "session_signals": []},
     ]
 
 
@@ -3945,7 +3839,7 @@ class PureQualificationTopology(unittest.TestCase):
         receipt = self.receipt(parent, root, evidence, scratch, registration, case)
         results = {"outcomes": [["zero", "pass"]],
                    "cases": [{"case": "zero", "dir": case}]
-                            + detach_case_rows(case) + session_case_rows(case)}
+                            + detach_case_rows(case) + survivor_case_rows(case)}
         problems = qualify.check(receipt, results, expected, record, facts)
         self.assertEqual([p for p in problems if "cases:" not in p], [], problems)
 
@@ -4064,58 +3958,6 @@ class PureQualificationTopology(unittest.TestCase):
         plan = dict(qualify.check_plan(receipt, results, {"source": "selected-volume"},
                                        None, KernelFactsForOracle(), None))
         return plan["detach-paths"]()
-
-    def session_oracle(self, rows):
-        receipt = {"phase": "monitor_complete: pending_custodian", "custodian": [],
-                   "outcome": {"closure": "closed", "status": 0, "fault": None, "deadline": False}}
-        results = {"outcomes": [["zero", "pass"]], "cases": [{"case": "zero", "dir": "/x"}] + rows}
-        plan = dict(qualify.check_plan(receipt, results, {"source": "selected-volume"},
-                                       None, KernelFactsForOracle(), None))
-        return plan["session-stop-paths"]()
-
-    def test_the_receipt_path_checks_the_cooperative_session_cases(self):
-        # oxide#195: the qualification receipt must show the session stop closing
-        # a Cargo-shaped group and refusing a changed identity, and must reject a
-        # missing, mislabelled or silently-signalling row.
-        rows = session_case_rows("/x")
-        self.assertEqual(self.session_oracle(rows), [], rows)
-        self.assertTrue(any("recorded no case outcome" in p
-                            for p in self.session_oracle(rows[:1])))
-        unclosed = [dict(rows[0], outcome=dict(rows[1]["outcome"])), rows[1]]
-        self.assertTrue(any("did not close" in p for p in self.session_oracle(unclosed)), unclosed)
-        members = [dict(rows[0], census=2), rows[1]]
-        self.assertTrue(any("census member" in p for p in self.session_oracle(members)), members)
-        one = [dict(rows[0], session_signals=[[4100, 77]]), rows[1]]
-        self.assertTrue(any("not the group" in p for p in self.session_oracle(one)), one)
-        claimed = [rows[0], dict(rows[1], outcome=dict(rows[0]["outcome"]))]
-        self.assertTrue(any("claimed closure" in p for p in self.session_oracle(claimed)), claimed)
-        signalled = [rows[0], dict(rows[1], session_signals=[[4100, 77]])]
-        self.assertTrue(any("unproved identity" in p
-                            for p in self.session_oracle(signalled)), signalled)
-        empty = [rows[0], dict(rows[1], census=0)]
-        self.assertTrue(any("prove the negative" in p for p in self.session_oracle(empty)), empty)
-
-    def test_the_session_signal_custody_oracle_rejects_an_unproved_signal(self):
-        receipt = {"phase": "monitor_complete: pending_custodian", "custodian": [
-            {"event": "signal", "target": 9, "pin": "leader", "held_unreaped": True},
-            {"event": "session_signal", "target": 4100, "start": 77, "signal": "SIGKILL",
-             "killpg": False, "held_unreaped": False, "pin": "session-member"}],
-            "outcome": {"closure": "closed", "status": 0, "fault": None, "deadline": False}}
-        results = {"outcomes": [["zero", "pass"]],
-                   "cases": [{"case": "zero", "dir": "/x"}] + session_case_rows("/x")}
-        plan = dict(qualify.check_plan(receipt, results, {"source": "selected-volume"},
-                                       None, KernelFactsForOracle(), None))
-        self.assertEqual(plan["signal-custody"](), [])
-        for mutation in ({"killpg": True}, {"held_unreaped": True}, {"pin": "leader"},
-                         {"signal": "SIGTERM"}, {"start": 0}, {"target": 1}):
-            with self.subTest(mutation=mutation):
-                broken = dict(receipt)
-                broken["custodian"] = [dict(entry) for entry in receipt["custodian"]]
-                broken["custodian"][1] = dict(broken["custodian"][1], **mutation)
-                plan = dict(qualify.check_plan(broken, results, {"source": "selected-volume"},
-                                               None, KernelFactsForOracle(), None))
-                self.assertTrue(any("without a proved identity" in p
-                                    for p in plan["signal-custody"]()), mutation)
 
     def monitor_stub(self, receipt=None):
         monitor = bounded.Monitor.__new__(bounded.Monitor)
@@ -4287,7 +4129,7 @@ class PureQualificationTopology(unittest.TestCase):
         receipt["scratch_default"].update(mount=mount, volume_uuid=DRIVE_UUID)
         results = {"outcomes": [["zero", "pass"]],
                    "cases": [{"case": "zero", "dir": case}]
-                            + detach_case_rows(case) + session_case_rows(case)}
+                            + detach_case_rows(case) + survivor_case_rows(case)}
         problems = qualify.check(receipt, results, expected, record, facts, base)
         self.assertEqual([p for p in problems if "cases:" not in p], [], problems)
         # oxide#191: the receipt must exercise the detach success, refusal and
@@ -7466,9 +7308,11 @@ class Real(unittest.TestCase):
                       "wall_s": round((self.verdict_ns - self.started) / NS, 3),
                       "signals": [[s["signal"], s["pin"], s["killpg"], s["held_unreaped"], s["result"]]
                                   for s in signals],
-                      "session_signals": [[r["target"], r["start"]]
+                      "signal_targets": [s["target"] for s in signals],
+                      "survivors": self.receipt.get("survivors"),
+                      "session_signals": [[r.get("target"), r.get("start")]
                                           for r in self.receipt["custodian"]
-                                          if r["event"] == "session_signal"],
+                                          if str(r.get("event", "")).startswith("session_")],
                       "held_streams": sorted(getattr(receiver, "held_names", []))})
         for entry in signals:  # custody at every signal
             self.assertTrue(entry["held_unreaped"], entry)
@@ -7543,60 +7387,41 @@ class Real(unittest.TestCase):
         self.assertEqual(self.outcome()["closure"], "closed")
         self.assertFalse(alive(self.child()))
 
-    def test_cargo_shaped_group_is_closed_at_the_deadline(self):
-        # oxide#195 regression, the oxide#182 shape: a Cargo-shaped process group
-        # leads its own group in the leader's cooperative session and the leader
-        # reaches the supervisor's deadline. The pinned leader-group KILL cannot
-        # reach it, so closure must come from the identity-proved session stop:
-        # the run closes on a certain empty post-reap census and both members are
-        # gone at the verdict.
+    def test_cargo_shaped_group_survivor_is_recorded_and_never_signalled(self):
+        # oxide#195 regression, the oxide#182 shape under Tom's 2026-10-31 ruling
+        # (c096c8fc): a Cargo-shaped process group leads its own group in the
+        # leader's cooperative session and the leader reaches the deadline. The
+        # pinned leader-group KILL cannot reach it, and the supervisor must NOT
+        # signal it either - it is not this run's child, so it is not held
+        # unreaped and a checked-then-signalled PID could be recycled. The run is
+        # honestly UNCLOSED, the survivor's exact identity is recorded, and the
+        # process is still alive at the verdict.
         self.assertEqual(self.guardian(CARGO_LEADER), 124)
         outcome = self.outcome()
-        self.assertEqual(outcome["closure"], "closed")
-        self.assertIsNone(outcome["fault"])
+        self.assertEqual(outcome["closure"], "UNCLOSED")
         self.assertTrue(outcome["deadline"])
+        self.assertIn(CENSUS_FAULT, outcome["fault"])
         census = self.receipt["census"]
-        self.assertEqual((census["certain"], census["members"], census["uncertain"]),
-                         (True, 0, 0), census)
+        self.assertGreaterEqual(census["members"], 2, census)
         cargo = int((self.dir / "cargo.pid").read_text())
         test = int((self.dir / "test.pid").read_text())
-        records = self.receipt["custodian"]
-        signalled = {r["target"]: r for r in records if r["event"] == "session_signal"}
-        self.assertEqual(sorted(signalled), sorted({cargo, test}), signalled)
-        for record in signalled.values():
-            self.assertEqual((record["signal"], record["killpg"], record["held_unreaped"],
-                              record["pin"]), ("SIGKILL", False, False, "session-member"))
-            self.assertGreater(record["start"], 0, "an announced member needs its identity")
-        group_targets = {r["target"] for r in records if r["event"] == "signal"}
-        self.assertNotIn(cargo, group_targets, "a session member is never a pinned group target")
-        self.assertNotIn(test, group_targets)
-        self.assertFalse(alive(cargo), "the Cargo-shaped group survived the session stop")
-        self.assertFalse(alive(test), "the Cargo-shaped group's own child survived")
-
-    def test_a_changed_member_identity_is_never_signalled(self):
-        # The paired negative: every announcement carries a wrong start token, so
-        # the custodian refuses every member and no signal is sent. The survivors
-        # stay alive and the run is honestly UNCLOSED, never a false PASS. The
-        # leader exits by itself here, so the stop is not a deadline stop.
-        self.assertEqual(self.guardian(CARGO_LEADER_EXITS, inject=["session-identity-stale"]), 125)
-        outcome = self.outcome()
-        self.assertEqual(outcome["closure"], "UNCLOSED")
-        self.assertFalse(outcome["deadline"])
-        self.assertIn(CENSUS_FAULT, outcome["fault"])
-        records = self.receipt["custodian"]
-        self.assertEqual([r for r in records if r["event"] == "session_signal"], [])
-        refusals = [r for r in records if r["event"] == "session_member_refused"]
-        self.assertTrue(refusals, "every announcement must be answered and recorded")
-        self.assertEqual({r["verdict"] for r in refusals}, {"refused"})
-        self.assertEqual({r["reason"] for r in refusals}, {"identity changed"})
-        self.assertGreaterEqual(self.receipt["census"]["members"], 1)
-        member_pids = {row.get("pid") for row in (self.receipt["census"].get("member_rows") or [])}
-        for name in ("cargo", "test"):
-            pid = int((self.dir / f"{name}.pid").read_text())
-            self.assertIn(pid, member_pids, f"the {name} member was not the census's own row")
+        # No signal may name either survivor, and no non-held session signal exists.
+        signalled = {record["target"] for record in self.receipt["custodian"]
+                     if record["event"] == "signal"}
+        self.assertNotIn(cargo, signalled)
+        self.assertNotIn(test, signalled)
+        self.assertEqual([record for record in self.receipt["custodian"]
+                          if str(record.get("event", "")).startswith("session_")], [])
+        # The exact identity is recorded for the owner, and it is still running.
+        recorded = {(row["pid"], row["start"]) for row in self.receipt["survivors"]}
+        member_pids = {row.get("pid") for row in (census.get("member_rows") or [])}
+        for pid in (cargo, test):
             row = bounded.Kinfo.one(pid)
-            self.assertIsNotNone(row, f"the unproved {name} member left the process table")
-            self.assertIs(row.get("zombie"), False, f"the unproved {name} member is not running")
+            self.assertIsNotNone(row, f"survivor {pid} left the process table")
+            self.assertIs(row.get("zombie"), False, f"survivor {pid} is not live")
+            self.assertIn((pid, row["start"]), recorded,
+                          "the survivor's exact identity was not recorded")
+            self.assertIn(pid, member_pids, "the survivor was not the census's own member row")
         self.assert_kept_outside_outer_cleanup()
 
     def test_escaped_pipe_holder_unclosed(self):
@@ -8370,7 +8195,7 @@ def main():
     pure = unittest.TestSuite(loader.loadTestsFromTestCase(case)
                               for case in (PureGuard, PurePrecedence, PureCensus, PureCensusFinalAbsence,
                                            PureDiagnostics, PureAllowlist, PureTerminalCounts, PureProtocol,
-                                           PureSessionStop,
+                                           PureSurvivors,
                                            PureTraversal, PureDefaultScratch, PureScratchPreparation,
                                            PureMarker, PureSweep, PureExistingParent,
                                            PureProtectionAndLifecycle, QualifyEntry,
