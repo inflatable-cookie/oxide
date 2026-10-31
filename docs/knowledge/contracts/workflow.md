@@ -2366,6 +2366,15 @@ raised bound with about 60 s of alarm margin and needs no further change; the
 scoped amendment caps the deadline at 420 s and the candidate limit at 380 s, so
 no larger bound is permitted here either.
 
+**Superseded the same day (oxide#192 amendment, Oxide Supervisor, 2026-10-31).**
+The first uncounted diagnostic at `5623edd` (direct, under Tom `d3d61247`)
+exceeded the 350 s suite alarm (candidate exit 142 = SIGALRM, 357 s wall, load
+about 9.5), so inside the real qualification the combined suite runs longer than
+the private 297 s measurement. The bounds are therefore raised to a 600 s fixed
+deadline (kill at 598 s), a 560 s candidate limit and a 530 s suite alarm;
+scratch stays 512 MiB and the margin semantics are unchanged. Earlier
+qualifications stay bound to the limits they ran under.
+
 **Integrated head: qualification pending separate activation.** The merged
 bytes have **no** exact-head author qualification, and this task's run did not
 run or claim one: the owner separately activates the uncounted diagnostic and
@@ -2813,16 +2822,16 @@ bounds:
 - reserve readings before and after, on the volume that actually holds the
   qualification's scratch, with the boot volume read and labelled separately
   (both keep the 22 GiB threshold);
-- a fixed 420 s `CLOCK_UPTIME_RAW` deadline held by a minimal outer actor
+- a fixed 600 s `CLOCK_UPTIME_RAW` deadline held by a minimal outer actor
   (oxide#191 amendment, Tom 2026-10-31: was 300 s, because the combined suite
   needed 251-258 s against the former 250 s suite alarm, which is now 350 s,
   the 380 s candidate limit less its 30 s margin).
   The actor forks the whole bootstrap as a pinned worker and makes only
   WNOHANG reaps, bounded sleeps and signals to that worker. All file,
-  hashing and stdout work runs in the worker. At 418 s the actor KILLs the
+  hashing and stdout work runs in the worker. At 598 s the actor KILLs the
   worker and exits 124, so blocked output or a slow read cannot extend the
   deadline. A candidate still running then is bounded only by its own
-  380 s limit (was 280 s);
+  560 s limit (380 s under oxide#191, 280 s before);
 - on candidate overrun, TERM then KILL of its own unreaped candidate child
   only, from its own reap loop, so no signal can follow the reap.
 
@@ -3123,7 +3132,7 @@ runs in order:
     SIGALRM inherited as ignored and blocked.
 
 Every fixture arms SIGALRM to `FIXTURE_DEADLINE_NS`. The order is case
-verdict 45 s < fixture fallback 60 s < qualification 420 s, and fallback
+verdict 45 s < fixture fallback 60 s < qualification 600 s, and fallback
 expiry never counts as closure. The bootstrap requires all of:
 - candidate exit 0;
 - phase `monitor_complete`;
@@ -3147,16 +3156,16 @@ platform, each case's exit, phase, outcome and signal custody, the suite's
 recorded layout, the prepared parent, both bounded sweep summaries, both
 marker states, the scratch-volume and boot-volume reserve readings, the kept
 base and `UNCLOSED` case directories, and the limitations. Admission waits
-fall outside its 420 s: that is the amended actor cap (oxide#191 raised it from
-300 s before this integration) with the 380 s candidate limit and the 350 s suite
-alarm, and a candidate marker can only move the candidate's deadline (by at most
+fall outside its 600 s: that is the amended actor cap (oxide#192 raised it to
+600 s from #191's 420 s, itself from 300 s) with the 560 s candidate limit and the
+530 s suite alarm, and a candidate marker can only move the candidate's deadline (by at most
 600 s) inside it.
 `effigy proof:supervisor:test` runs the pure cases alone.
 
 **Uncounted keep-going diagnostic.** `effigy proof:supervisor:qualify:diagnostic`
 (heavy) runs the same bootstrap (`qualify-supervisor.py --diagnostic`), guard,
-fixed 420 s absolute deadline (oxide#191 raised it from 300 s), the 380 s
-candidate limit, the 350 s suite alarm, selected-volume routing and the unchanged
+fixed 600 s absolute deadline (oxide#192 amendment; 420 s under #191, 300 s
+before), the 560 s candidate limit, the 530 s suite alarm, selected-volume routing and the unchanged
 512 MiB monitored scratch with its 30 s shutdown margin, and is required before
 the counted author qualification at a changed head. It runs each named qualification oracle on its own — receipt phase,
 candidate outcome, reserve sampling, default scratch, sweep, protected root,

@@ -626,7 +626,7 @@ admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-drive-mode.py"
 
 # Shared session supervisor qualification (oxide#109): a short bootstrap
-# (healthy reserve readings, fixed 420 s wall limit held by a minimal outer
+# (healthy reserve readings, fixed 600 s wall limit held by a minimal outer
 # actor) runs the candidate `bounded-test.py` around its synthetic suite:
 # pure fault injection first, then tiny real Python children and fixture
 # writers in owned scratch. The candidate runs with no --root-parent and no
@@ -657,7 +657,7 @@ admission = "heavy"
 run = "python3 scripts/qualify-supervisor.py"
 
 # The uncounted keep-going diagnostic of that same qualification path
-# (oxide#191): the same bootstrap, heavy admission, 420 s absolute deadline and
+# (oxide#191): the same bootstrap, heavy admission, 600 s absolute deadline and
 # 512 MiB monitored scratch, with `--diagnostic` on both the bootstrap and the
 # changed pass check. It runs each named qualification oracle on its own, so one
 # failing check never hides the rest, records a bounded `qualified: false`
