@@ -2169,7 +2169,7 @@ with no earlier run migrated.
 
 **Post-census image detach request (oxide#191, decision `ee263cea`, unqualified
 source).** The current `bounded-test.py`
-(`e6613e0d381eafa4082e9df5da7f48cd157916007f458cadc91e2c1bb2fdecf7`) adds one
+(`b6c86d3df833d0a857d65371e3aacb6308897737fbb302a0334d15e1ed0a8e9e`) adds one
 opt-in control for a proof
 whose own test image must be detached, and it is the only route by which such a
 proof may detach after a launch; the qualified shared runner is otherwise
@@ -2212,9 +2212,14 @@ start time**, stops touching the handle and waits for the custodian's
 acknowledgement before it may reap again, because a reaped PID can be recycled and
 a bare PID is never signalled. Every custody lookup goes through one safe reader: a
 failed `sysctl` size/read or a malformed row is an unreadable observation — never
-`gone`, never an identity — so the monitor hands nothing over and holds, and the
-custodian refuses, records and acknowledges without signalling; an unreadable
-observation is also never read as closed. When the facts are readable the custodian
+`gone`, never an identity — and an unreadable observation is never read as closed.
+The child is still the monitor's own direct child, so while the monitor holds it
+unreaped its PID cannot be recycled: it stops and reaps it itself inside the
+custodian's remaining window and records that closure
+(`detach_child_closed_by_monitor`); if that cannot close it, the monitor hands it
+over by PARENTAGE — no start time — while still holding it, and the custodian
+signals and positively observes it, refusing and acknowledging without signalling
+when parentage no longer matches. When the facts are readable the custodian
 re-reads the real `Kinfo.one()` row (liveness field is the boolean `zombie`; there is
 no `stat` key) and requires the same PID, the same start time, still this monitor as
 parent and a non-zombie before it signals; then it signals, observes it gone under that same identity and
@@ -5414,7 +5419,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
 - **Focused proof of absent checkout chains (oxide#135).** The one fixed proof
   is `effigy rust:prune-absence` (`scripts/test-prune-absence.py` under this
-  tree's shared supervisor `e6613e0d…`, the merged oxide#151 guard plus
+  tree's shared supervisor `b6c86d3d…`, the merged oxide#151 guard plus
   oxide#191's opt-in post-census detach) with
   `--root-parent /private/tmp`, the owner-accepted internal-placement exception
   (decision `bd357a4c`): the missing-chain fixtures must be on the boot Data

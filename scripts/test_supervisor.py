@@ -4801,11 +4801,43 @@ class PureDetach(unittest.TestCase):
         self.assertIs(fields["closed"], False)
         self.assertEqual(fields["uncertain"], "OSError")
 
-    def test_the_monitor_holds_when_the_child_identity_is_unreadable(self):
+    def test_the_monitor_closes_or_hands_off_an_identity_less_child(self):
+        # Behaviour is covered end-to-end by the two injected real cases; this
+        # pins the shape: the safe reader, the bounded own-child close, and the
+        # parentage-only handoff that carries no start time.
         source = inspect.getsource(bounded.Monitor.run)
         self.assertIn("process_row(getattr(handle", source)
-        self.assertIn("detach_child_identity_unreadable: monitor_held", source)
+        self.assertIn("close_own_child(handle, window_end)", source)
+        self.assertIn("start=None", source)
+        self.assertIn("detach_child_identity_unreadable: closing_own_child", source)
+        self.assertIn("detach_child_closed_by_monitor: scratch_kept", source)
         self.assertNotIn("Kinfo.one", source)
+
+    def test_the_own_child_close_is_bounded_and_never_raises(self):
+        class FakeChild:
+            pid = 0  # no signal is attempted for pid 0
+
+            def __init__(self, statuses):
+                self.statuses = list(statuses)
+
+            def wait(self, timeout=None):
+                if not self.statuses:
+                    return None
+                value = self.statuses.pop(0)
+                if isinstance(value, BaseException):
+                    raise value
+                return value
+
+        window = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) + 2 * bounded.NS
+        self.assertEqual(bounded.close_own_child(FakeChild([7]), window), (True, 7))
+        self.assertEqual(bounded.close_own_child(FakeChild([OSError("wait failed")]), window), (False, None))
+        expired = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) - bounded.NS
+        self.assertEqual(bounded.close_own_child(FakeChild([None]), expired), (False, None))
+
+    def test_a_parentage_handoff_needs_no_start_time(self):
+        message = {"run": "run", "seq": 1, "at": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW),
+                   "type": "detach_child", "leader": None, "pid": 4242, "start": None}
+        self.assertIsNone(bounded.malformed(message))
 
     def test_an_executor_exception_keeps_the_live_handle(self):
         class BrokenStdout:
@@ -6860,6 +6892,44 @@ class DetachReal(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
         self.assertTrue(os.path.exists(self.receipt["scratch"]), "the root was cleaned under a live child")
+        self.remove_fixture_mount()
+
+    def test_an_unreadable_identity_closes_the_child_in_the_monitor(self):
+        # A REAL live detach child plus an unreadable identity lookup: the monitor
+        # cannot name it by start, so it stops and reaps its own direct child
+        # inside the custodian's window and reports that closure truthfully.
+        self.guard(inject=["detach-stuck-child", "detach-identity-unreadable"])
+        detach = self.receipt["detach"]
+        self.assertEqual(self.code, 125)
+        self.assertIsNotNone(detach.get("identity_problem"), detach)
+        self.assertEqual((detach.get("reaped"), detach.get("reaped_by")), (True, "monitor"), detach)
+        self.assertEqual(detach["qualified"], False)
+        self.assertIn("detach_child_identity_unreadable", self.receipt["phase"])
+        records = [r for r in self.receipt["custodian"] if r["event"].startswith("detach_child_")]
+        self.assertFalse([r for r in records if r["event"] == "detach_child_signal"],
+                         "an identity-less child was handed to the custodian anyway")
+        self.assertTrue(os.path.exists(self.receipt["scratch"]), "the root was cleaned")
+        self.remove_fixture_mount()
+
+    def test_an_unreadable_identity_can_be_handed_off_by_parentage(self):
+        # The monitor cannot close it itself here, so it hands the child over by
+        # PARENTAGE while still holding it unreaped; the custodian signals and
+        # positively observes it.
+        self.guard(inject=["detach-stuck-child", "detach-identity-unreadable",
+                           "detach-handoff-unreadable"])
+        detach = self.receipt["detach"]
+        self.assertEqual(self.code, 125)
+        self.assertIsNotNone(detach.get("identity_problem"), detach)
+        self.assertEqual((detach.get("custodian_owned"), detach.get("custodian_closed")), (True, True),
+                         detach)
+        records = [r for r in self.receipt["custodian"] if r["event"].startswith("detach_child_")]
+        pinned = [r for r in records if r["event"] == "detach_child_pinned"]
+        self.assertTrue(pinned and pinned[0].get("identity") == "parentage", records)
+        observed = [r for r in records if r["event"] == "detach_child_observed"]
+        self.assertTrue(observed and observed[0]["closed"] is True, records)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pinned[0]["pid"], 0)
+        self.assertTrue(os.path.exists(self.receipt["scratch"]), "the root was cleaned")
         self.remove_fixture_mount()
 
     def test_a_failed_attempt_keeps_the_mount_and_is_unqualified(self):

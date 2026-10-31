@@ -207,6 +207,7 @@ INJECTIONS = {
     "reserve-delay-stall", "scratch-delay-stall",
     "detach-fail", "detach-timeout", "detach-ambiguous", "detach-withdraw",
     "detach-reap-timeout", "detach-stuck-child",
+    "detach-identity-unreadable", "detach-handoff-unreadable",
 }
 RESERVE_DELAY_S, SCRATCH_DELAY_S = 0.5, 4.0  # injected publication delays before a sampler stall
 INJECT_AFTER_GATE_NS = 1_500_000_000  # post-gate injections wait for the fixture to start
@@ -219,7 +220,7 @@ FIELDS = {  # required fields per monitor message type; bool is never accepted a
     "setup": {"root": str, "scratch": str, "evidence": str, "owned": bool},
     "detach": {"attempted": bool, "qualified": bool, "post_state": str},
     "detach_ready": {"budget_ns": int},
-    "detach_child": {"pid": int, "start": int},
+    "detach_child": {"pid": int},  # `start` is optional: a parentage-only handoff has none
     "cleanup_kept": {"reason": str},
 }
 
@@ -1794,6 +1795,37 @@ def cleanup_safety(ctx, probe=None, facts=None):
             "unrequested": backings[:CUSTODY_MAX_BACKINGS]}
 
 
+def close_own_child(handle, window_end_ns):
+    """Stop and reap a direct child this process still holds unreaped, bounded by
+    the custodian's window. While the parent holds the child unreaped, its PID
+    cannot be recycled, so signalling it needs no identity lookup; SIGKILL cannot
+    be ignored. Returns (reaped, status) and never raises."""
+    try:
+        pid = int(getattr(handle, "pid", 0) or 0)
+    except BaseException:
+        return False, None
+    if pid > 0:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except BaseException:
+            pass
+    try:
+        while True:
+            remaining = max(0.0, (window_end_ns - now_ns()) / NS)
+            try:
+                status = handle.wait(timeout=min(0.05, remaining))
+            except BaseException:
+                return False, None
+            if status is not None:
+                return True, status
+            if remaining <= 0.0:
+                return False, None
+    except BaseException:
+        return False, None
+
+
 def _unreaped_record(child, error, deadline):
     """A failure record that never loses a live child: one last bounded wait, and
     the handle is handed back whenever the child is not positively reaped."""
@@ -1854,6 +1886,10 @@ def detach_budget(ctx, now=None):
     return max(0, exit_at - now - DETACH_GATE_MARGIN_NS)
 
 
+def injections():
+    return set(filter(None, os.environ.get("OXIDE_SUPERVISOR_INJECT", "").split(",")))
+
+
 def process_row(pid):
     """(row, problem) from `Kinfo.one(pid)`, never raising. `problem is None`
     means the facts were readable (and `row is None` that the process is
@@ -1861,6 +1897,8 @@ def process_row(pid):
     observation and is never silently turned into "gone" or into an identity."""
     if not typed(pid, int) or pid <= 0:
         return None, "no usable pid"
+    if "detach-identity-unreadable" in injections():
+        return None, "injected unreadable identity"
     try:
         row = Kinfo.one(pid)
     except BaseException as error:
@@ -3572,11 +3610,49 @@ class Monitor:
                             detach["identity_problem"] = identity_problem
                             self.receipt["detach"] = detach
                         if identity_problem is not None:
-                            # Its identity could not be read, so nothing is handed
-                            # over and no PID is signalled. The live handle is kept
-                            # and the run is held to the custodian's window, which
-                            # never claims a closure nobody observed.
-                            self.publish("detach_child_identity_unreadable: monitor_held")
+                            # Its identity could not be read, so no PID is handed
+                            # over and nothing is signalled by identity. The child is
+                            # still this monitor's own direct child, though: while it
+                            # is held unreaped its PID cannot be recycled, so it is
+                            # stopped and reaped here, positively, inside the
+                            # custodian's remaining deadline.
+                            self.publish("detach_child_identity_unreadable: closing_own_child")
+                            reaped_here = False
+                            status = None
+                            if "detach-handoff-unreadable" not in injections():
+                                reaped_here, status = close_own_child(handle, window_end)
+                            with self.lock:
+                                detach["reaped"] = bool(reaped_here)
+                                detach["reaped_by"] = "monitor" if reaped_here else None
+                                self.receipt["detach"] = detach
+                            if reaped_here:
+                                # The direct child is positively closed by its own
+                                # parent; the detach itself still stays unqualified.
+                                self.publish("detach_child_closed_by_monitor: scratch_kept")
+                                self.publish("monitor_complete: pending_custodian")
+                                self.summary()
+                                self.send("monitor_complete")
+                                self.stop.set()
+                                return
+                            # Not closed here: hand it to the custodian by PARENTAGE
+                            # (no start time to check) while still holding it
+                            # unreaped, so it can signal and positively observe it.
+                            self.send("detach_child", pid=int(getattr(handle, "pid", 0) or 0),
+                                      start=None)
+                            ack = self.await_command("detach_child_ack",
+                                                    max(0.0, (window_end - now_ns()) / NS))
+                            with self.lock:
+                                detach["custodian_closed"] = bool(ack and ack.get("closed") is True)
+                                detach["custodian_owned"] = bool(ack and ack.get("custodian_closes") is True)
+                                self.receipt["detach"] = detach
+                            if detach["custodian_closed"]:
+                                self.publish("detach_child_closed_by_custodian: scratch_kept")
+                                self.publish("monitor_complete: pending_custodian")
+                                self.summary()
+                                self.send("monitor_complete")
+                                self.stop.set()
+                                return
+                            self.publish("detach_child_unaccounted: monitor_held")
                             self.summary()
                             end = ctx["start_ns"] + int(ctx["limit_s"] * NS) - int(0.1 * NS)
                             while not self.stop.is_set() and now_ns() < end:
@@ -3995,7 +4071,10 @@ class Custodian:
             if self.detach_child is not None:
                 self.guard.latch("protocol: second detach_child")
                 return
-            pid, start = message["pid"], message["start"]
+            pid, start = message["pid"], message.get("start")
+            if start is not None and (not typed(start, int) or start <= 0):
+                self.guard.latch("protocol: detach_child with a malformed start")
+                return
             row, problem = process_row(pid)
             if problem is not None:
                 self.record("detach_child_refused", pid=pid, start=start,
@@ -4006,6 +4085,24 @@ class Custodian:
             # Positive identity: the same process (start time) and still this
             # monitor's child. A recycled bare PID can never match both, so it is
             # never signalled.
+            if start is None:
+                # Parentage-only handoff: the monitor could not read a start time,
+                # so identity is this monitor's still-unreaped direct child.
+                if not (row.get("pid") == pid and row.get("ppid") == self.monitor
+                        and row.get("zombie") is False):
+                    self.record("detach_child_refused", pid=pid, start=None,
+                                observation="parentage no longer matches")
+                    self.tell("detach_child_ack", custodian_closes=False, closed=True,
+                              reason="the child is already gone or is not this monitor's")
+                    return
+                self.detach_child = [pid, row["start"]]
+                self.record("detach_child_pinned", pid=pid, start=row["start"],
+                            observation="live", identity="parentage")
+                self.signal_detach_child()
+                closed = self.observe_detach_child(NS)
+                self.tell("detach_child_ack", custodian_closes=True, closed=closed,
+                          reason=None if closed else "not observed closed yet")
+                return
             if not detach_child_identity(row, pid, start, self.monitor):
                 self.record("detach_child_refused", pid=pid, start=start,
                             observation="identity or parentage no longer matches")
