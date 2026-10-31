@@ -1402,6 +1402,22 @@ pub(super) fn lease_with_charges_injected(
     Ok((leased, charges))
 }
 
+/// Classify a held eviction's failure after its durable intent, from the
+/// rename phase the move actually reached. The tree is reported as in the
+/// holding area only after a successful rename; a pre-existing holding entry
+/// found before it is never attributed to this slot by name.
+fn post_commit_failure(moved: Option<String>, error: &LeaseError) -> HeldEvictionFailure {
+    let reason = match moved {
+        Some(name) => format!(
+            "the hold intent is durable and the tree was moved into the holding area as {name}, but the move did not complete ({error})"
+        ),
+        None => format!(
+            "the hold intent is durable but the tree was not moved ({error}); an existing holding entry of the same name is not this slot's"
+        ),
+    };
+    HeldEvictionFailure::PostCommit(reason)
+}
+
 impl Pool {
     /// Open a budget-only directory or removable-volume pool. Any other
     /// recorded backend, including the retired `apfs-sparse-image-v1`,
@@ -2268,9 +2284,10 @@ impl Pool {
                 HeldEvictionFailure::PreCommit(error)
             });
         }
-        let row = match self.hold_slot_tree(id, &path, Some(identity)) {
+        let mut moved = None;
+        let row = match self.hold_slot_tree_with_phase(id, &path, Some(identity), &mut moved) {
             Ok(row) => row,
-            Err(error) => return Err(self.post_rename_failure(id, &error)),
+            Err(error) => return Err(post_commit_failure(moved, &error)),
         };
         let name = row.name.clone();
         self.created_holding.push(row.name.clone());
@@ -2282,44 +2299,6 @@ impl Pool {
             )));
         }
         Ok(std::mem::take(&mut self.created_holding))
-    }
-
-    /// Classify a held eviction's failure after its durable intent. The tree
-    /// may have been renamed into the holding area even when the later
-    /// observation failed, so the message never claims "not moved" without
-    /// checking the holding area (and its containment name).
-    fn post_rename_failure(&self, id: u64, error: &LeaseError) -> HeldEvictionFailure {
-        let Some(slot) = self.slot(id) else {
-            return HeldEvictionFailure::PostCommit(format!(
-                "the hold intent is durable and the tree's location in the holding area is unknown ({error})"
-            ));
-        };
-        let Some(name) = self.holding_name_for(id, slot.incarnation, &slot.last_lease_id) else {
-            return HeldEvictionFailure::PostCommit(format!(
-                "the hold intent is durable and the tree's location in the holding area is unknown ({error})"
-            ));
-        };
-        match holding_presence(&self.holding_root().join(&name)) {
-            Some(true) => HeldEvictionFailure::PostCommit(format!(
-                "the hold intent is durable and the tree is in the holding area as {name} but its post-rename observation failed ({error})"
-            )),
-            None => HeldEvictionFailure::PostCommit(format!(
-                "the hold intent is durable and the tree's location in the holding area is unknown; it may have been moved as {name} ({error})"
-            )),
-            Some(false) => {
-                let contained =
-                    holding_presence(&self.holding_root().join(unverified_holding_name(&name)));
-                if contained == Some(true) {
-                    HeldEvictionFailure::PostCommit(format!(
-                        "the hold intent is durable and the moved object was not the verified slot; it is contained in the holding area ({error})"
-                    ))
-                } else {
-                    HeldEvictionFailure::PostCommit(format!(
-                        "the hold intent is durable but the tree was not moved ({error})"
-                    ))
-                }
-            }
-        }
     }
 
     fn take_idle(
@@ -4727,6 +4706,22 @@ impl Pool {
         path: &Path,
         expected: Option<(u64, u64)>,
     ) -> Result<HoldingRecord, LeaseError> {
+        let mut phase = None;
+        self.hold_slot_tree_with_phase(id, path, expected, &mut phase)
+    }
+
+    /// [`Pool::hold_slot_tree`] with the rename phase reported in `moved`:
+    /// `None` while the tree is still at its slot path, and the holding entry
+    /// name once the rename succeeded (the derived name, or the containment
+    /// name if a swapped object was contained). A caller never infers an
+    /// entry's ownership from its name.
+    fn hold_slot_tree_with_phase(
+        &mut self,
+        id: u64,
+        path: &Path,
+        expected: Option<(u64, u64)>,
+        phase: &mut Option<String>,
+    ) -> Result<HoldingRecord, LeaseError> {
         if self.ledger.holding.len() >= MAX_HOLDING_ENTRIES {
             return Err(LeaseError::UnknownAccounting);
         }
@@ -4817,6 +4812,7 @@ impl Pool {
         if renamed != 0 {
             return Err(io_error(std::io::Error::last_os_error()));
         }
+        *phase = Some(name.clone());
         // oxide#196: an injected post-rename observation failure leaves the
         // tree in the holding area while the ledger row stays held.
         #[cfg(test)]
@@ -4845,6 +4841,7 @@ impl Pool {
                     contained.as_ptr(),
                 );
             }
+            *phase = Some(unverified_holding_name(&name));
             return Err(LeaseError::UnsafePath(
                 "the held tree is not the slot that was verified",
             ));

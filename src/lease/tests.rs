@@ -1230,6 +1230,87 @@ fn a_held_slot_is_evicted_whole_only_by_its_exact_lease() {
     );
 }
 
+/// oxide#196: a pre-existing entry under the derived holding name is a
+/// pre-rename collision. The failure must say the tree was not moved and must
+/// not attribute the existing entry to this slot by name; the next open clears
+/// the stale intent without adopting it, and a retry succeeds once the entry
+/// is removed.
+#[test]
+fn a_pre_existing_holding_entry_is_not_attributed_to_the_slot() {
+    let fx = Fixture::new("held-name-collision");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let granted = lease_injected(request(&pool, &project, &workspace, "holder-a")).expect("lease");
+    let id: u64 = granted.slot_id.parse().expect("slot id");
+    let slot_path = pool.join("payload").join("slots").join(&granted.slot_id);
+    let name = holding_name_for_slot_injected(&pool, id).expect("holding name");
+    let holding = pool.join("payload").join(".oxide-holding");
+    fs::create_dir_all(&holding).expect("holding area");
+    fs::set_permissions(&holding, fs::Permissions::from_mode(0o700)).expect("private holding");
+    let foreign = holding.join(&name);
+    fs::create_dir(&foreign).expect("pre-existing entry");
+    fs::write(foreign.join("marker"), b"another command's tree").expect("marker");
+    let failure = evict_held_slot_injected(&pool, &granted.slot_id, &granted.lease_id)
+        .expect_err("a pre-existing derived name refuses the rename");
+    match failure {
+        HeldEvictionFailure::PostCommit(reason) => {
+            assert!(reason.contains("tree was not moved"), "{reason}");
+            assert!(!reason.contains("moved into the holding area"), "{reason}");
+            assert!(reason.contains("not this slot's"), "{reason}");
+        }
+        HeldEvictionFailure::PreCommit(error) => {
+            panic!("a pre-existing holding entry was classified pre-commit: {error}")
+        }
+    }
+    assert!(slot_path.is_dir(), "the collision moved the slot tree");
+    assert_eq!(
+        fs::read(foreign.join("marker")).expect("marker"),
+        b"another command's tree",
+        "the pre-existing entry was touched"
+    );
+    assert_eq!(
+        slot_state_injected(&pool, &granted.slot_id).as_deref(),
+        Some("held")
+    );
+    assert!(hold_intent_present_injected(&pool, id));
+    // The next open clears the stale intent and never adopts the foreign entry.
+    let view = status_injected(&pool).expect("the next locked open reconciles");
+    assert!(
+        view.slots
+            .iter()
+            .any(|slot| slot.slot_id == granted.slot_id && slot.state == SlotOccupancy::Held),
+        "the slot did not stay held"
+    );
+    assert!(!hold_intent_present_injected(&pool, id));
+    assert!(
+        view.holding.is_empty(),
+        "the pre-existing entry was adopted as this slot's"
+    );
+    assert_eq!(
+        fs::read(foreign.join("marker")).expect("marker"),
+        b"another command's tree",
+        "the pre-existing entry was touched by the next open"
+    );
+    fs::remove_dir_all(&foreign).expect("remove the foreign entry");
+    let rows = evict_held_slot_injected(&pool, &granted.slot_id, &granted.lease_id)
+        .expect("the retry evicts once the name is free");
+    assert_eq!(rows, vec![name.clone()]);
+    assert!(!slot_path.exists());
+    assert!(
+        foreign.is_dir(),
+        "the retried tree is not in the holding area"
+    );
+    let drained = managed::drain_holding(&pool, Some(&name)).expect("the holding deletion");
+    assert!(
+        drained.gone,
+        "the retried tree was not deleted: {:?}",
+        drained.refused
+    );
+    assert!(!foreign.exists());
+}
+
 /// oxide#196: a failed ledger write **after** the ledger replacement but
 /// before its parent-directory sync has already replaced the ledger, so it is
 /// classified post-commit (the intent may be durable), never as a
