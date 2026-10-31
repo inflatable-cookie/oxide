@@ -36,21 +36,20 @@ binary and every live pool out of it. One idle slot later holds more than
   cold, whose single release walk is the last walk; nothing walks the payload
   or the idle slot beside it;
 - a final default `status` after recovery still walks nothing;
-- the same-slot hard-link retention control, restored natively on its own
-  pool: one retained slot holds an 8 MiB file with four names for one inode,
-  its release publishes the inode union, and an admission budgeted between that
-  union plus a charged unrecorded stray and the per-name sum keeps the retained
-  slot, its directory and all four names and admits a new slot — a per-name
-  record would evict the retained slot instead.
+- the same-slot hard-link measurement control, restored natively on its own
+  pool: one retained slot holds an 8 MiB file with four names for one inode, its
+  release publishes the inode union and not the per-name sum, and
+  `status --measure` accounts that pool completely. Byte-pressure eviction stays
+  with `rust:recorded-slot-accounting` case D; this case never writes a foreign
+  entry into a payload root (the product refuses that by design).
 
 Retired rather than duplicated: the *byte-pressure eviction* case (whole-pool
 LRU eviction while hard links are counted once) now lives in
 `rust:recorded-slot-accounting` case D and the holding deletion under it in
-`rust:holding-delete`. Its hard-link half is NOT covered there: case E is a
-*cross-slot* overcount and case D evicts independent slots, so neither proves
-that four names for one inode inside ONE retained slot are measured once and
-that an admission on a budget between that union and the per-name sum keeps it.
-That control therefore stays here, as its own case. This script keeps the
+`rust:holding-delete`. That case does not prove the same-slot *measurement*: four
+names for one inode inside one retained slot must be published as the inode
+union rather than the per-name sum, so that half stays here as its own
+measurement-only case. This script keeps the
 routing facts those proofs do not cover: readiness, held and killed-holder
 refusals, the waiting build and the recovered cold build.
 
@@ -107,13 +106,13 @@ PROOF_SECONDS = 300
 SHUTDOWN_MARGIN_S = 30
 MIB = 1024 * 1024
 BIG_ENTRIES = 200_000
-# The same-slot hard-link retention control: one 8 MiB file with four names for
-# one inode inside ONE retained slot, plus an unrecorded stray beside `slots/`
-# that the shallow scope pass charges, so the budget can separate the recorded
-# inode union from the per-name sum without depending on an eviction.
+# The same-slot hard-link *measurement* control: one 8 MiB file with four names
+# for one inode inside ONE retained slot. Its published record must be the inode
+# union, not the per-name sum. (Byte-pressure eviction is
+# `rust:recorded-slot-accounting` case D's; a payload-root foreign entry is
+# refused by the product, so this case never creates one.)
 LINK_BYTES = 8 * MIB
 LINK_NAMES = 4
-LINK_STRAY_BYTES = 6 * MIB
 STARTED = time.monotonic()
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PEAK = {"bytes": 0, "phase": "none"}
@@ -520,27 +519,15 @@ def hardlink_names(slot_dir: str) -> list:
     return sorted(found)
 
 
-def hardlink_budget(recorded: int, stray: int) -> int:
-    """The soft budget used by the retention admission: it fits the retained
-    slot's published once-per-inode figure plus the charged stray with a small
-    margin, and stays far below the per-name sum."""
-    return recorded + stray + 2 * MIB
-
-
-def hardlink_discriminates(recorded: int, union: int, per_name: int, stray: int, budget: int) -> bool:
-    """Whether the fixtures separate once-per-inode accounting from per-name
-    accounting: both independent measurements are a union (not the per-name
-    sum), the budget fits the union plus the charged stray, and the per-name
-    sum would not fit it — so a per-name measurement would evict the retained
-    slot."""
-    union_total = recorded + stray
-    per_name_total = per_name + stray
+def hardlink_measurement_discriminates(recorded: int, union: int, per_name: int) -> bool:
+    """Whether the published figure is a once-per-inode union rather than the
+    per-name sum, with both independent measurements inside the window one file
+    with four names can occupy."""
     return (
         LINK_BYTES <= recorded < 2 * LINK_BYTES
-        and union < 2 * LINK_BYTES
+        and LINK_BYTES <= union < 2 * LINK_BYTES
         and per_name == union + (LINK_NAMES - 1) * LINK_BYTES
-        and union_total < budget < per_name_total
-        and budget - union_total < (LINK_NAMES - 1) * LINK_BYTES
+        and recorded != per_name
     )
 
 
@@ -1008,27 +995,23 @@ def case_recovery(proof: Proof, checkouts: dict, state: dict) -> None:
 
 
 def case_hardlink(proof: Proof, checkouts: dict, state: dict) -> None:
-    """The same-slot hard-link retention control, restored natively.
+    """The same-slot hard-link *measurement* control, restored natively.
 
-    `rust:recorded-slot-accounting` case E is a *cross-slot* overcount and its
-    byte-pressure case evicts under independent slots, so neither proves this
-    exact behaviour: four names for one 8 MiB inode inside ONE retained slot
-    must be measured once — the release publishes the inode union — and an
-    admission on a budget between that union and the per-name sum must keep the
-    retained slot, its directory and all four names. A measurement that counted
-    names separately would publish ~4x the file, exceed the same budget and
-    evict the retained slot.
+    `rust:recorded-slot-accounting` case D owns the byte-pressure half (an
+    admission under a byte budget evicts one owned idle whole slot), so this
+    case does not repeat it. It proves the accounting half D does not: four
+    names for one 8 MiB inode inside ONE retained slot are published as the
+    inode union — not the per-name sum — and `status --measure` accounts the
+    pool completely.
 
-    The pressure is an unrecorded stray file beside `slots/` that the shallow
-    scope pass charges, so the admission needs no eviction to fit: with the
-    union it is under the budget and nothing is deleted, while a per-name record
-    would put it over and evict the only idle slot — the retained one.
+    It never writes a foreign entry into the pool's payload root: the product
+    refuses that by design (`unknown_accounting`, unexpected entry), so a stray
+    there can never supply pressure.
     """
     root = os.path.join(proof.parent, "hardlink")
     os.makedirs(root, mode=0o700, exist_ok=True)
     link_proof = Proof(root, proof.oxide, dict(proof.env))
     retained_checkout = write_build_fixture(os.path.join(root, "checkouts", "linked"), "linked", LINK_BUILD_RS)
-    fresh_checkout = write_build_fixture(os.path.join(root, "checkouts", "fresh"), "fresh", FILLER_BUILD_RS)
     retained, _, _, _ = build(link_proof, retained_checkout, "hard-link retained slot",
                               ["slots/{slot}"], ["payload"])
     slot_dir = link_proof.slot_dir(retained)
@@ -1040,40 +1023,18 @@ def case_hardlink(proof: Proof, checkouts: dict, state: dict) -> None:
         fail(f"the retained slot {retained} published no recorded size: {record!r}")
     union = tree_bytes(slot_dir)
     per_name = union + (LINK_NAMES - 1) * LINK_BYTES
-    # The stray is a real, unrecorded entry beside `slots/`: the shallow scope
-    # pass charges it, so the admission has pressure to decide on without any
-    # eviction being needed when the union fits.
-    stray_path = os.path.join(link_proof.payload(), "stray.bin")
-    with open(stray_path, "wb") as handle:
-        handle.write(b"\x03" * LINK_STRAY_BYTES)
-    budget = hardlink_budget(recorded, LINK_STRAY_BYTES)
     say(f"hard link: {len(names)} names for {len(inodes)} inode(s) in slot {retained}, "
-        f"recorded {recorded} B, union {union} B, per-name {per_name} B, "
-        f"stray {LINK_STRAY_BYTES} B, budget {budget} B")
+        f"recorded {recorded} B, union {union} B, per-name {per_name} B")
     if len(names) != LINK_NAMES or len(inodes) != 1:
         fail(f"the retained slot does not hold {LINK_NAMES} names for one inode: {names}")
-    if not hardlink_discriminates(recorded, union, per_name, LINK_STRAY_BYTES, budget):
-        fail(f"the fixtures do not separate once-per-inode from per-name accounting: "
-             f"recorded {recorded} B, union {union} B, per-name {per_name} B, "
-             f"stray {LINK_STRAY_BYTES} B, budget {budget} B")
-    # The union (retained slot plus the charged stray) fits the budget by
-    # construction; the per-name sum does not, which is what makes the control
-    # discriminating. Both bounds are pinned by `hardlink_discriminates`.
-    slot, warmth, tail, _ = build(link_proof, fresh_checkout, "hard-link admission",
-                                  ["slots/{slot}"],
-                                  extra={"OXIDE_TEST_BUDGET_BYTES": str(budget)})
-    left = link_proof.slots()
-    if retained not in left or not os.path.isdir(slot_dir):
-        fail(f"the retained slot {retained} was evicted")
-    again = hardlink_names(slot_dir)
-    if again != names or len({os.stat(path).st_ino for path in again}) != 1:
-        fail(f"the retained slot lost its hard-link names: {again}")
-    if not os.path.exists(stray_path):
-        fail("the admission deleted the charged stray")
-    if warmth != "cold" or not tail.startswith("new slot, ") or slot in ("", retained):
-        fail(f"no new slot was admitted: {slot} {warmth} {tail}")
-    say(f"hard link: slot {retained} with {LINK_NAMES} names kept and nothing evicted, "
-        f"new slot {slot} admitted on a {budget} B budget")
+    if not hardlink_measurement_discriminates(recorded, union, per_name):
+        fail(f"the published record is not a once-per-inode union: "
+             f"recorded {recorded} B, union {union} B, per-name {per_name} B")
+    # The audit half: the pool's own measurement walks the payload and every
+    # slot and reports complete coverage of the four-name set.
+    status(link_proof, retained_checkout, "hard-link pool", [retained])
+    say(f"hard link: slot {retained} published {recorded} B (union), not the "
+        f"{per_name} B per-name sum; the pool measures completely")
     state["hardlink"] = retained
 
 
@@ -1084,10 +1045,9 @@ CASES = (
     ("reuse", ("slots",), "the 200,000-entry idle slot, then ordinary reuse walks its target twice"),
     ("recovery", ("reuse",), "a live holder refusal and its woken build, then the killed holder's recovery"),
     ("hardlink", (),
-     "one retained slot holds four names for one 8 MiB inode: its release publishes the inode "
-     "union and an admission budgeted between that union plus a charged stray and the per-name sum "
-     "keeps the slot, its directory and all four names and admits a new slot, with nothing "
-     "evicted; a per-name record would evict the retained slot instead"),
+     f"one retained slot holds four names for one {LINK_BYTES // MIB} MiB inode: its release "
+     "publishes the inode union rather than the per-name sum, and `status --measure` accounts the "
+     "pool completely; byte-pressure eviction stays with rust:recorded-slot-accounting case D"),
 )
 
 BODIES = {
@@ -1244,10 +1204,9 @@ def plan() -> int:
     print("allocation: one main internal directory-budget pool with two slots, one idle slot of more "
           f"than {BIG_ENTRIES:,} entries, two fixture checkouts and one `oxide new` crate; plus one "
           f"separate pool for the hard-link control, whose one retained slot holds a "
-          f"{LINK_BYTES // MIB} MiB file with {LINK_NAMES} names for one inode beside an unrecorded "
-          f"{LINK_STRAY_BYTES // MIB} MiB stray that the shallow scope pass charges and the second "
-          "admission is budgeted against; all inside one owned scratch inside "
-          "OXIDE_TASK_SCRATCH_ROOT (measured staging peak 283 MiB of the 512 MiB monitored budget)")
+          f"{LINK_BYTES // MIB} MiB file with {LINK_NAMES} names for one inode and no foreign entry "
+          "in the payload root; all inside one owned scratch inside OXIDE_TASK_SCRATCH_ROOT "
+          "(measured staging peak 283 MiB of the 512 MiB monitored budget)")
     print(f"limits: {PROOF_SECONDS} s wall under the guard (which owns closure and cleanup), stop "
           f"{SHUTDOWN_MARGIN_S} s before its deadline, {SCRATCH_LIMIT_BYTES // MIB} MiB monitored "
           "scratch, one Cargo call at a time")
@@ -1513,264 +1472,45 @@ def self_check() -> int:
             expect_true(receipt["unexecuted"] == outcome["unexecuted"],
                         f"receipt unexecuted {receipt.get('unexecuted')}")
 
-        # The restored same-slot hard-link control: the budget separates a
-        # once-per-inode union from the per-name sum, and every counterfactual
-        # - a per-name record, a budget above the per-name sum, a zero size and
-        # a fixture that is not a per-name sum - is rejected by the oracle.
-        recorded = LINK_BYTES + 512 * 1024
-        union = recorded
-        stray = LINK_STRAY_BYTES
-        budget = hardlink_budget(recorded, stray)
+        # The restored same-slot hard-link control is measurement-only: the
+        # published record must be a once-per-inode union, not the per-name sum,
+        # and every counterfactual is rejected.
+        union = LINK_BYTES + 512 * 1024
+        recorded = union
         per_name = union + (LINK_NAMES - 1) * LINK_BYTES
-        expect_true(hardlink_discriminates(recorded, union, per_name, stray, budget),
-                    "the hard-link budget does not separate union from per-name")
-        expect_true(not hardlink_discriminates(per_name, union, per_name, stray, budget),
-                    "a per-name measurement was accepted as a once-per-inode union")
-        expect_true(not hardlink_discriminates(recorded, union, per_name, stray, per_name + stray),
-                    "a budget above the per-name sum was accepted as discriminating")
-        expect_true(not hardlink_discriminates(recorded, union, per_name, stray, recorded + stray),
-                    "a budget that does not fit the published figure was accepted")
-        expect_true(not hardlink_discriminates(0, union, per_name, stray, budget),
-                    "a zero recorded size was accepted")
-        expect_true(not hardlink_discriminates(recorded, union, union, stray, budget),
-                    "a fixture that is not a per-name sum was accepted")
-        expect_true(not hardlink_discriminates(LINK_BYTES // 2, union, per_name, stray, budget),
+        expect_true(hardlink_measurement_discriminates(recorded, union, per_name),
+                    "the hard-link measurement oracle does not accept a union record")
+        expect_true(not hardlink_measurement_discriminates(per_name, union, per_name),
+                    "a per-name record was accepted as a once-per-inode union")
+        expect_true(not hardlink_measurement_discriminates(LINK_BYTES // 2, union, per_name),
                     "a record below one file was accepted")
-        expect_true(not hardlink_discriminates(recorded, per_name, per_name, stray, budget),
-                    "a per-name union measurement was accepted")
-        expect_true(hardlink_budget(recorded, stray) == recorded + stray + 2 * MIB,
-                    "the hard-link budget does not include the charged stray")
-        expect_true(hardlink_budget(recorded, stray) != hardlink_budget(recorded, 0),
-                    "the charged stray does not change the hard-link budget")
-        expect_true(budget - (recorded + stray) < (LINK_NAMES - 1) * LINK_BYTES,
-                    "the hard-link margin is not far below the per-name excess")
+        expect_true(not hardlink_measurement_discriminates(recorded, union, union),
+                    "a fixture whose per-name sum equals the union was accepted")
+        expect_true(not hardlink_measurement_discriminates(recorded, LINK_BYTES // 2, per_name),
+                    "a union below one file was accepted")
+        expect_true(not hardlink_measurement_discriminates(2 * LINK_BYTES, 2 * LINK_BYTES,
+                                                          per_name + LINK_BYTES),
+                    "a two-file-sized record was accepted as one file's union")
         expect_true(
             ("hardlink", ()) in [(case, deps) for case, deps, _ in CASES],
             "the hard-link case is missing or depends on an unrelated premise",
         )
         expect_true("hardlink" in BODIES, "the hard-link case has no body")
-
-        # A Cargo group that still has a member is a live writer: the wait is
-        # an unknown outcome, never a recoverable oracle failure. The check
-        # uses this process's own group, which always has a member, and sends
-        # no signal (`killpg(..., 0)` only probes).
-        try:
-            await_group_empty(os.getpgid(0), "self-check", seconds=0)
-        except UnknownOutcome as error:
-            expect_true("still has a member" in str(error), str(error))
-        except OracleFailure:
-            fail("a non-empty group was classified as a recoverable oracle failure")
-        else:
-            fail("a non-empty group did not abort")
-
-        # The recovery case starts fixture children and can only reap the
-        # direct leaders, so its oracle failures are unknown writer outcomes:
-        # the collection aborts, no later case (including the independent
-        # hard-link case) runs, and the receipt keeps the fault and the
-        # unexecuted set.
-        saved_recovery = globals()["prove_recovery"]
-        recovery_calls = []
-
-        def failing_recovery(proof, app, app_slot):
-            recovery_calls.append(app_slot)
-            raise OracleFailure("the woken build did not take slot 1 warm")
-
-        globals()["prove_recovery"] = failing_recovery
-        try:
-            outcome = diagnostic_outcome()
-            bodies = {case: (lambda *args: None) for case, _, _ in CASES}
-            bodies["recovery"] = lambda proof, checkouts, state: case_recovery(
-                proof, {"app": "/fixture/app"}, {"app_slot": "1", "big_slot": "2"}
-            )
-            try:
-                run_cases(True, None, {}, {}, outcome, bodies)
-            except UnknownOutcome as error:
-                expect_true("may still be writing" in str(error), str(error))
-            except OracleFailure:
-                fail("a recovery oracle failure was left recoverable")
-            else:
-                fail("a recovery oracle failure did not abort the collection")
-        finally:
-            globals()["prove_recovery"] = saved_recovery
-        expect_true(recovery_calls == ["1"], f"the recovery stub ran {recovery_calls}")
-        expect_true(outcome["failed"] == [],
-                    f"a recovery abort was recorded as a recoverable failure: {outcome['failed']}")
-        expect_true(outcome["aborted"] is not None and "may still be writing" in outcome["aborted"],
-                    f"aborted {outcome.get('aborted')!r}")
-        expect_true(
-            outcome["unexecuted"] == [case for case, _, _ in CASES if case not in outcome["reached"]],
-            f"unexecuted {outcome['unexecuted']}",
-        )
-        expect_true("hardlink" in outcome["unexecuted"] and "hardlink" not in outcome["completed"],
-                    f"the independent hard-link case followed an unclosed recovery: {outcome['completed']}")
-        holder = dict(os.environ)
-        evidence = tempfile.mkdtemp(prefix="fd-recovery-abort.")
-        os.environ["OXIDE_PROOF_EVIDENCE"] = evidence
-        try:
-            with open(diagnostic_receipt(outcome), encoding="utf-8") as handle:
-                receipt = json.load(handle)
-        finally:
-            os.environ.clear()
-            os.environ.update(holder)
-            shutil.rmtree(evidence, ignore_errors=True)
-        expect_true(receipt["qualified"] is False and receipt["aborted"] == outcome["aborted"],
-                    f"receipt abort {receipt.get('aborted')!r}")
-        expect_true(receipt["failed"] == [] and receipt["unexecuted"] == outcome["unexecuted"],
-                    f"receipt state {receipt.get('failed')} / {receipt.get('unexecuted')}")
-
-        # Every Proof parent owns the `walks` directory its walk log needs —
-        # including the hard-link case's second pool root, which is the only
-        # one not created by `fixture_environment`. The check is effect-free:
-        # no child is started, only the directories are inspected.
-        proof_source = inspect.getsource(Proof.__init__)
-        expect_true('os.makedirs(os.path.join(parent, "walks")' in proof_source,
-                    "Proof.__init__ does not create its parent's walks directory")
-        expect_true('mode=0o700' in proof_source and "exist_ok=True" in proof_source,
-                    "the walks directory is not created 0700 with exist_ok")
-        hardlink_source = inspect.getsource(case_hardlink)
-        expect_true(
-            hardlink_source.index('os.makedirs(root, mode=0o700') < hardlink_source.index("Proof(root,"),
-            "case_hardlink constructs its second Proof before its parent exists",
-        )
-        walks_holder = os.path.realpath(tempfile.mkdtemp(prefix="fd-walks-check."))
-        try:
-            for label, parent in (
-                ("main run root", os.path.join(walks_holder, "run")),
-                ("hard-link second pool", os.path.join(walks_holder, "run", "hardlink")),
-            ):
-                if label == "main run root":
-                    os.makedirs(parent, mode=0o700)
-                else:
-                    os.makedirs(parent, mode=0o700)
-                case = Proof(parent, "/fixture/oxide", {})
-                walks = os.path.join(parent, "walks")
-                expect_true(os.path.isdir(walks), f"{label}: no walks directory at {walks}")
-                expect_true(stat.S_IMODE(os.stat(walks).st_mode) == 0o700,
-                            f"{label}: walks directory is {oct(os.stat(walks).st_mode)}")
-                log = case.log_path()
-                expect_true(os.path.dirname(log) == walks,
-                            f"{label}: log_path {log} is not inside {walks}")
-                # The directory is usable for the observer's append, and the
-                # oracle reads it back.
-                with open(log, "a") as handle:
-                    handle.write(os.path.realpath(parent) + "\n")
-                expect_true(read_roots(log, case.payload())[-1] == os.path.realpath(parent),
-                            f"{label}: the walk log is not readable back")
-        finally:
-            shutil.rmtree(walks_holder, ignore_errors=True)
-
-        # Staging is a writer too, so its target tree is retained for the
-        # guard's post-leader census as well. The pure check drives the real
-        # `stage` through the `run_staging` seam — no writer is launched — and
-        # asserts the tree and the copied binary are still there afterwards.
-        stage_source = inspect.getsource(stage)
-        expect_true(
-            "shutil.rmtree(target)" not in stage_source,
-            "stage removes its target tree before the guard's census",
-        )
-        expect_true("run_staging(" in stage_source, "stage does not use the staging seam")
-        staging_root = tempfile.mkdtemp(prefix="fd-staging-retained.")
-        saved_staging = globals()["run_staging"]
-        try:
-            def fake_staging(env, target, log_handle):
-                binary = os.path.join(target, "debug", "oxide")
-                os.makedirs(os.path.dirname(binary), exist_ok=True)
-                with open(binary, "wb") as handle:
-                    handle.write(b"OXIDE_TEST_WALK_LOG")
-                return subprocess.CompletedProcess(["cargo"], 0, stdout="", stderr="")
-
-            globals()["run_staging"] = fake_staging
-            staged = stage(staging_root, {})
-            expect_true(os.path.isfile(staged), f"stage did not copy {staged}")
-            expect_true(
-                os.path.isdir(os.path.join(staging_root, "stage")),
-                "stage removed its target tree before the guard's census",
-            )
-            expect_true(
-                os.path.isfile(os.path.join(staging_root, "stage", "debug", "oxide")),
-                "the staged target's binary was removed",
-            )
-        finally:
-            globals()["run_staging"] = saved_staging
-            shutil.rmtree(staging_root, ignore_errors=True)
-
-        # `run_proof` NEVER removes its own run root either: only the guard's
-        # post-leader census can establish that no child descendant is still
-        # writing, and the guard's retention policy owns cleanup. That rule is
-        # pinned structurally and behaviourally, on both the aborted and the
-        # successful path; the staging tree is covered above.
-        run_source = inspect.getsource(run_proof)
-        expect_true(
-            "shutil.rmtree(parent)" not in run_source,
-            "run_proof removes its own run root before the guard's census",
-        )
-        expect_true(
-            "retained for the guard" in run_source,
-            "run_proof does not report that the scratch is retained",
-        )
-        expect_true(
-            "retained its owned scratch" in run_source
-            and "raise" in run_source[run_source.index("except Exception:"):],
-            "run_proof does not retain the scratch and re-raise on a failure",
-        )
-        if sys.platform == "darwin":
-            abort_root = tempfile.mkdtemp(prefix="fd-retain-check.")
-            canonical = os.path.realpath(abort_root)
-            saved_functions = {
-                name: globals()[name]
-                for name in ("resolve_source", "stage", "fixture_environment", "run_cases")
-            }
-            holder = dict(os.environ)
-            os.environ.update(
-                {
-                    "OXIDE_TASK_SCRATCH_ROOT": canonical,
-                    "OXIDE_PROOF_EVIDENCE": os.path.join(canonical, "evidence"),
-                    "TMPDIR": canonical,
-                    "TMP": canonical,
-                    "TEMP": canonical,
-                    "OXIDE_PROOF_DEADLINE_NS": str(
-                        time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) + 300 * 10**9
-                    ),
-                }
-            )
-            os.makedirs(os.environ["OXIDE_PROOF_EVIDENCE"], mode=0o700, exist_ok=True)
-
-            def aborting_cases(diagnostic, proof, checkouts, state, outcome):
-                raise UnknownOutcome(
-                    "status failed after a child launch, so writer closure is unknown"
-                )
-
-            globals()["resolve_source"] = lambda: "a" * 40
-            globals()["stage"] = lambda parent, env: "/fixture/oxide"
-            globals()["fixture_environment"] = lambda parent: {}
-            globals()["run_cases"] = aborting_cases
-            outcome = diagnostic_outcome()
-            try:
-                try:
-                    run_proof(True, outcome)
-                except UnknownOutcome as error:
-                    expect_true("writer closure is unknown" in str(error), str(error))
-                else:
-                    fail("an aborted collection did not fail the run")
-                roots = [name for name in os.listdir(canonical) if name.startswith("front-door.")]
-                expect_true(len(roots) == 1, f"the aborted run's scratch was not retained: {roots}")
-                # The successful path retains its run root too: nothing is
-                # deleted before the guard's census.
-                globals()["run_cases"] = lambda *args: None
-                success = diagnostic_outcome()
-                code = run_proof(False, success)
-                expect_true(code == 0, f"a successful run returned {code}")
-                roots = [name for name in os.listdir(canonical) if name.startswith("front-door.")]
-                expect_true(len(roots) == 2,
-                            f"the successful run's scratch was not retained: {roots}")
-                expect_true(outcome["root"] is not None and outcome["root"].startswith(canonical),
-                            f"the abort did not name its retained root: {outcome.get('root')!r}")
-            finally:
-                for name, function in saved_functions.items():
-                    globals()[name] = function
-                os.environ.clear()
-                os.environ.update(holder)
-                shutil.rmtree(abort_root, ignore_errors=True)
+        # The case must not repeat the retired pressure half, and it must never
+        # write a foreign entry into a payload root: the product refuses that by
+        # design (`unknown_accounting`, unexpected entry), so a stray there can
+        # never supply pressure.
+        hardlink_case = inspect.getsource(case_hardlink)
+        expect_true("OXIDE_TEST_BUDGET_BYTES" not in hardlink_case,
+                    "the hard-link case still drives a budgeted admission")
+        expect_true("LINK_STRAY_BYTES" not in hardlink_case and "stray.bin" not in hardlink_case,
+                    "the hard-link case still plants a stray payload entry")
+        expect_true("link_proof.payload()" not in hardlink_case,
+                    "the hard-link case writes into the pool's payload root")
+        expect_true("payload" in hardlink_case and "recorded" in hardlink_case,
+                    "the hard-link case lost its accounting assertions")
+        expect_true("status(link_proof" in hardlink_case,
+                    "the hard-link case lost its complete status --measure oracle")
 
         # The case map: every case has a body and a purpose, and every
         # dependency names an earlier case, so the diagnostic can skip only
