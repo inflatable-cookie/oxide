@@ -32,6 +32,14 @@ UNCLOSED and scratch is kept. The command gets OXIDE_PROOF_EVIDENCE, the
 evidence directory, which cleanup never removes. Groups other than the
 pinned leader's are never signalled.
 
+Supervisor ancestors (oxide#197): in its bounded setup, before the leader
+exists, the monitor walks its own ppid chain up to ANCESTOR_MAX_LEVELS levels
+and records each level's positive identity (PID plus the same start token the
+census uses) in the receipt. The post-leader census excludes exactly those
+recorded (PID, start) pairs and nothing else: a recycled PID, a same-session
+stranger, a descendant and any other unreadable row keep their existing
+handling, so unknown stays unknown.
+
 An exception in any phase after setup, or a monitor message with a missing
 or ill-typed field, latches a fault; the bounded pinned stop, WNOHANG reap,
 census and keep still run, each phase under its own guard. An uncaught
@@ -124,6 +132,9 @@ PERSIST = 8 * MIB
 FORWARD = 32 * MIB
 CENSUS_INTERVAL = 0.2
 CONFIRM_TRIES, CONFIRM_PAUSE = 20, 0.05  # gone confirmation within one round, at most 1 s
+# Oxide#197: the supervisor's own ancestor chain is recorded once, before the
+# leader exists, as positive (PID, start) identities, at most this many levels.
+ANCESTOR_MAX_LEVELS = 64
 DIAG_MAX_BYTES = 16384  # compact UTF-8 JSON ceiling for the optional receipt census diagnostics
 DIAG_MAX_ROWS = 20  # at most 20 diagnostic summary rows; the rest count as omitted
 # Observation-only settlement diagnostics (oxide#147). Fixed schema, one record
@@ -405,6 +416,57 @@ class Kinfo:
         row = cls.one(os.getpid())
         if row is None or (row["ppid"], row["pgid"], row["uid"]) != (os.getppid(), os.getpgid(0), os.getuid()):
             raise ValueError("layout does not match this process")
+
+
+def ancestor_identities(snapshot=Kinfo.all, parent=os.getppid, max_levels=ANCESTOR_MAX_LEVELS):
+    """This supervisor's own ancestor chain, as positive (PID, start) identities.
+
+    Oxide#197: walks the ppid chain from our own parent through PID 1 and
+    records, for each level, the identity the snapshot actually names (PID plus
+    the same start token the census uses), bounded to `max_levels` levels. The
+    census excludes exactly these identities, and only while a row's own
+    (PID, start) still matches, so a recycled PID is never excluded.
+
+    Records nothing it did not read: a snapshot failure is `unreadable`, and
+    the walk stops at the first level the snapshot does not name (never a
+    guessed parent). The returned object has fixed keys: `state`
+    (`recorded`/`partial`/`unreadable`), `count`, the bounded `identities`
+    rows (PID, start and 1-based level) and `stop` (an enumerated reason or
+    None). `partial` means an unexpected error ended the walk after some
+    positives were recorded."""
+    try:
+        by_pid = {row["pid"]: row for row in snapshot()}
+    except Exception:
+        return {"state": "unreadable", "count": 0, "identities": [], "stop": None}
+    identities, seen, stop = [], set(), None
+    try:
+        pid = parent()
+        while True:
+            if len(identities) >= max_levels:
+                stop = "depth-bound"
+                break
+            row = by_pid.get(pid)
+            if row is None:
+                stop = "not-in-snapshot"
+                break
+            identity = (row["pid"], row["start"])
+            if type(identity[0]) is not int or type(identity[1]) is not int or identity[0] <= 0:
+                stop = "malformed-row"
+                break
+            if identity in seen:
+                stop = "cycle"
+                break
+            seen.add(identity)
+            identities.append({"pid": identity[0], "start": identity[1],
+                               "level": len(identities) + 1})
+            if pid == 1:
+                stop = "pid-1"
+                break
+            pid = row["ppid"]
+    except BaseException:
+        return {"state": "partial", "count": len(identities), "identities": identities,
+                "stop": "read-error"}
+    return {"state": "recorded", "count": len(identities), "identities": identities, "stop": stop}
 
 
 def _diag_u64(value):
@@ -767,6 +829,30 @@ def _fit_witnesses(witnesses, diag_kept_count, diag_compact_len):
         return []
 
 
+def _ancestor_identity_set(identities):
+    """The exact (PID, start) identities a census may skip (oxide#197).
+
+    Accepts the recorded rows (mappings with `pid`/`start`) or plain pairs, and
+    keeps only exact non-bool positive-PID integer pairs. Anything else is
+    dropped rather than coerced, so a malformed record excludes nothing.
+    Never raises."""
+    kept = set()
+    try:
+        for entry in identities or ():
+            try:
+                if isinstance(entry, dict):
+                    pid, start = entry.get("pid"), entry.get("start")
+                else:
+                    pid, start = entry
+                if type(pid) is int and type(start) is int and pid > 0:
+                    kept.add((pid, start))
+            except BaseException:
+                continue
+    except BaseException:
+        return frozenset()
+    return frozenset(kept)
+
+
 class Census:
     """Classifies every process against session `sid` (the leader's PID).
 
@@ -824,8 +910,21 @@ class Census:
 
     Everything else (other getsid errors, identity change, failed or
     missing metadata, unconfirmed zombies, a failed snapshot) is uncertain
-    and blocks closure, first-seen rows included. Start time is never used
-    to exclude a process.
+    and blocks closure, first-seen rows included. Start time is not a proxy
+    for liveness: the only thing it helps exclude is a recorded supervisor
+    ancestor, and only when the whole (PID, start) pair matches.
+
+    Supervisor ancestors (oxide#197): the supervisor records its own ppid
+    chain, up to ANCESTOR_MAX_LEVELS levels, before the leader exists, as
+    positive (PID, start) identities. A row whose identity is EXACTLY one of
+    those recorded pairs is neither a member nor uncertain: it is skipped
+    without a read, because it is this run's own supervising chain and not a
+    writer in the leader's session. Nothing else is relaxed. A row with a
+    recorded PID but a different start token is a different process and keeps
+    its existing handling, and any row never recorded (including every
+    same-session stranger, descendant or unrelated unreadable row) is
+    classified exactly as before. An empty or unreadable ancestor record
+    excludes nothing, so unknown stays unknown.
 
     The round also builds an optional, monitor-receipt-only diagnostics
     object summarizing ESRCH rows (confirm attempts/outcome and the final
@@ -849,9 +948,10 @@ class Census:
     and they never change classification."""
 
     def __init__(self, sid, snapshot=Kinfo.all, getsid=os.getsid, reread=Kinfo.one, pause=time.sleep,
-                 terminal_allowed=False):
+                 terminal_allowed=False, ancestors=()):
         self.sid, self.snapshot, self.getsid, self.reread, self.pause = sid, snapshot, getsid, reread, pause
         self.terminal_allowed = terminal_allowed if terminal_allowed is True else False
+        self.ancestors = _ancestor_identity_set(ancestors)
         self.tracked = {}
         # Observation-only per-round counters (oxide#147). They are reset at the
         # start of every round, are never added to the round's returned object
@@ -933,6 +1033,18 @@ class Census:
         except BaseException:
             return False
 
+    def excludes_ancestor(self, identity):
+        """Whether this identity is one recorded supervisor ancestor.
+
+        Oxide#197: positive identity only, so the exact (PID, start) pair
+        recorded at startup. Never a PID alone, never a recycled PID and never
+        an identity that was not read. Pure predicate: no reads or writes,
+        never raises."""
+        try:
+            return identity in self.ancestors
+        except BaseException:
+            return False
+
     def round(self):
         self.reset_stats()
         begun = now_ns()
@@ -969,6 +1081,14 @@ class Census:
         pending = []  # (index, row, identity, state) still being confirmed, snapshot order
         for index, row in enumerate(rows):
             identity = (row["pid"], row["start"])
+            if self.excludes_ancestor(identity):
+                # This run's own supervising chain: positively identified at
+                # startup, so never a member and never an unknown row. No read,
+                # no pause. A recycled PID has a different start token and
+                # falls through to the unchanged classification.
+                self.tracked.pop(identity, None)
+                records[index] = {"skip": True}
+                continue
             failure, getsid_error = None, None
             try:
                 session = self.getsid(row["pid"])
@@ -3216,6 +3336,9 @@ class Monitor:
         self.inject = set(ctx["inject"])
         self.pipes = [(out_r, "stdout", 1), (err_r, "stderr", 2)]
         self.receipt = None
+        # Oxide#197: the recorded ancestor chain, filled by setup before the
+        # leader exists. Nothing is excluded until it is recorded.
+        self.ancestors = {"state": "unreadable", "count": 0, "identities": [], "stop": None}
         # Observation-only settlement diagnostics; the receipt carries this
         # same object, so publishing includes it without extra work.
         self.settlement = settlement_record()
@@ -3328,6 +3451,11 @@ class Monitor:
             Kinfo.check()
         except Exception as error:
             raise SetupRefused(f"missing kinfo_proc ({type_name(error)})")
+        # Oxide#197: record this run's own ancestor chain before anything is
+        # launched, so the post-leader census can exclude exactly those
+        # positive identities and nothing else.
+        self.ancestors = ancestor_identities()
+        ctx["ancestors"] = self.ancestors
         if ctx["adopted"]:
             scratch = os.path.realpath(ctx["adopted"])
             if not os.path.isdir(scratch):
@@ -3370,6 +3498,7 @@ class Monitor:
             "root": ctx["root"], "scratch": ctx["scratch"], "evidence": ctx["evidence"],
             "scratch_owned": ctx["owned"], "start_ns": ctx["start_ns"], "abort_threshold": THRESHOLD,
             "terminal_mode": dict(terminal_mode),
+            "ancestors": dict(self.ancestors, identities=list(self.ancestors["identities"])),
             "scratch_default": dict(ctx["selection"]),
             "scratch_sweep": marker.get("sweep"),
             "scratch_marker": {key: marker.get(key) for key in ("path", "state", "run_id", "reason")},
@@ -3562,7 +3691,8 @@ class Monitor:
         except BaseException:
             pass
         census = Census(self.leader[0], terminal_allowed=(
-            self.ctx.get("terminal_mode", {}).get("mode") == "allowlisted"))
+            self.ctx.get("terminal_mode", {}).get("mode") == "allowlisted"),
+            ancestors=(self.ctx.get("ancestors") or {}).get("identities") or ())
         self.note(census_built_ns=now_ns())
         while not self.census_stop.is_set():
             begin = now_ns()

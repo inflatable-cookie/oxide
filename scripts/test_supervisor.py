@@ -478,9 +478,10 @@ class FakeTable:
         return next((r for r in self.rows if r["pid"] == pid), None)
 
 
-def census(table, sid=100, terminal_allowed=False):
+def census(table, sid=100, terminal_allowed=False, ancestors=()):
     return bounded.Census(sid, snapshot=table.snapshot, getsid=table.getsid, reread=table.reread,
-                          pause=lambda _seconds: None, terminal_allowed=terminal_allowed)
+                          pause=lambda _seconds: None, terminal_allowed=terminal_allowed,
+                          ancestors=ancestors)
 
 
 class PureCensus(unittest.TestCase):
@@ -551,6 +552,123 @@ class PureCensus(unittest.TestCase):
 
         result = bounded.Census(100, snapshot=broken).round()
         self.assertFalse(result["certain"])
+
+
+class PureAncestors(unittest.TestCase):
+    """Oxide#197: a supervisor's own positively identified ancestor chain is
+    excluded from the post-leader census, and nothing else is relaxed."""
+
+    @staticmethod
+    def chain(levels):
+        """Snapshot rows for a real ppid chain of (pid, start, ppid) levels."""
+        return [row(pid, start=start, ppid=ppid) for pid, start, ppid in levels]
+
+    def test_every_ancestor_to_pid_1_is_recorded(self):
+        rows = self.chain([(700, 11, 600), (600, 12, 500), (500, 13, 1), (1, 14, 0)])
+        record = bounded.ancestor_identities(snapshot=lambda: rows, parent=lambda: 700)
+        self.assertEqual((record["state"], record["stop"]), ("recorded", "pid-1"))
+        self.assertEqual(record["count"], 4)
+        self.assertEqual([(i["pid"], i["start"], i["level"]) for i in record["identities"]],
+                         [(700, 11, 1), (600, 12, 2), (500, 13, 3), (1, 14, 4)])
+
+    def test_ancestors_are_excluded_without_a_read(self):
+        table = FakeTable([row(700, start=11)], {700: ProcessLookupError(errno.ESRCH, "gone")})
+        check = census(table, ancestors=[(700, 11)])
+        result = check.round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
+        self.assertEqual(table.reads, 0, "an excluded ancestor was confirmed with a read")
+        self.assertNotIn((700, 11), check.tracked)
+
+    def test_an_ancestor_is_not_a_member_even_in_the_leader_session(self):
+        table = FakeTable([row(700, start=11)], {700: 100})
+        result = census(table, ancestors=[(700, 11)]).round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
+
+    def test_a_recycled_pid_with_a_different_start_is_not_excluded(self):
+        table = FakeTable([row(700, start=99)], {700: ProcessLookupError(errno.ESRCH, "gone")},
+                          reread={700: row(700, start=99)})
+        result = census(table, ancestors=[(700, 11)]).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual(result["uncertain_rows"][0]["pid"], 700)
+        member = FakeTable([row(700, start=99)], {700: 100})
+        self.assertEqual(census(member, ancestors=[(700, 11)]).round()["members"], 1)
+
+    def test_a_non_ancestor_unreadable_row_stays_unknown(self):
+        table = FakeTable([row(700, start=11), row(701, start=5)],
+                          {700: ProcessLookupError(errno.ESRCH, "gone"),
+                           701: PermissionError(1, "denied")})
+        result = census(table, ancestors=[(700, 11)]).round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (False, 0, 1))
+        self.assertEqual(result["uncertain_rows"][0]["pid"], 701)
+
+    def test_an_unreadable_chain_excludes_nothing(self):
+        def broken():
+            raise OSError(12, "injected")
+        record = bounded.ancestor_identities(snapshot=broken, parent=lambda: 700)
+        self.assertEqual((record["state"], record["count"], record["identities"]),
+                         ("unreadable", 0, []))
+        table = FakeTable([row(700, start=11)], {700: ProcessLookupError(errno.ESRCH, "gone")},
+                          reread={700: row(700, start=11)})
+        result = census(table, ancestors=record["identities"]).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+
+    def test_the_depth_bound_holds(self):
+        rows = self.chain([(pid, pid, pid - 1) for pid in range(1000, 800, -1)])
+        record = bounded.ancestor_identities(snapshot=lambda: rows, parent=lambda: 1000)
+        self.assertEqual(bounded.ANCESTOR_MAX_LEVELS, 64)
+        self.assertEqual((record["count"], record["stop"]), (64, "depth-bound"))
+        self.assertEqual(len(record["identities"]), 64)
+        self.assertEqual((record["identities"][-1]["pid"], record["identities"][-1]["level"]),
+                         (1000 - 63, 64))
+        small = bounded.ancestor_identities(snapshot=lambda: rows, parent=lambda: 1000, max_levels=3)
+        self.assertEqual((small["count"], small["stop"]), (3, "depth-bound"))
+
+    def test_the_walk_never_guesses_a_missing_level(self):
+        rows = self.chain([(700, 11, 600)])  # 600 is not in the snapshot
+        record = bounded.ancestor_identities(snapshot=lambda: rows, parent=lambda: 700)
+        self.assertEqual((record["count"], record["stop"]), (1, "not-in-snapshot"))
+        self.assertEqual(record["identities"], [{"pid": 700, "start": 11, "level": 1}])
+
+    def test_a_malformed_record_excludes_nothing(self):
+        table = FakeTable([row(700, start=11)], {700: 100})
+        for bad in ([(700,)], [(700, "11")], [(True, 11)], [(0, 11)], [("700", 11)], [None], "700"):
+            result = census(table, ancestors=bad).round()
+            self.assertEqual(result["members"], 1, bad)
+            self.assertEqual(result["uncertain"], 0, bad)
+
+    def test_the_monitor_hands_the_recorded_chain_to_the_census(self):
+        seen = []
+
+        class Recording(bounded.Census):
+            def __init__(self, sid, terminal_allowed=False, ancestors=()):
+                seen.append((sid, tuple(ancestors)))
+
+            def round(self):
+                return {"certain": True, "members": 0, "uncertain": 0, "member_rows": [],
+                        "uncertain_rows": [], "terminal_count_status": "valid",
+                        "terminal_nonwriters": 0}
+
+        identities = [{"pid": 700, "start": 11, "level": 1}, {"pid": 1, "start": 14, "level": 2}]
+        ctx = {"run_id": "r", "inject": [], "terminal_mode": {"mode": "strict"},
+               "ancestors": {"state": "recorded", "count": 2, "stop": "pid-1",
+                             "identities": identities}}
+        ctl_r, ctl_w = os.pipe()
+        cmd_r, cmd_w = os.pipe()
+        out_r, out_w = os.pipe()
+        err_r, err_w = os.pipe()
+        for fd in (ctl_r, cmd_r, out_r, err_r, ctl_w, cmd_w, out_w, err_w):
+            self.addCleanup(os.close, fd)
+        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_r)
+        monitor.receipt = {"census": None, "census_rounds": 0, "settlement": monitor.settlement}
+        monitor.leader = [4242, 77]
+        monitor.census_stop = OneShotStop()
+        saved = bounded.Census
+        bounded.Census = Recording
+        try:
+            monitor.census_loop(after=7)
+        finally:
+            bounded.Census = saved
+        self.assertEqual(seen, [(4242, tuple(identities))])
 
 
 class PureCensusFinalAbsence(unittest.TestCase):
@@ -3761,6 +3879,20 @@ class PureQualificationTopology(unittest.TestCase):
         self.assertEqual(persisted["outcome"]["closure"], "UNCLOSED")
         self.assertIn("monitor_complete", messages, messages)
         self.assertTrue(monitor.stop.is_set())
+        # Oxide#197: the real setup recorded this run's own ancestor chain in the
+        # receipt, as positive identities, bounded, starting at our own parent.
+        ancestors = persisted["ancestors"]
+        self.assertEqual(set(ancestors), {"state", "count", "identities", "stop"}, ancestors)
+        self.assertIn(ancestors["state"], ("recorded", "partial"), ancestors)
+        self.assertEqual(ancestors["count"], len(ancestors["identities"]), ancestors)
+        self.assertTrue(0 < ancestors["count"] <= bounded.ANCESTOR_MAX_LEVELS, ancestors)
+        self.assertEqual([i["level"] for i in ancestors["identities"]],
+                         list(range(1, ancestors["count"] + 1)), ancestors)
+        first = ancestors["identities"][0]
+        self.assertEqual(first["pid"], os.getppid(), ancestors)
+        parent = bounded.Kinfo.one(first["pid"])
+        self.assertIsNotNone(parent, ancestors)
+        self.assertEqual(parent["start"], first["start"], ancestors)
 
     def test_the_drain_happens_before_the_final_publication(self):
         monitor, cmd_w = self.monitor_stub()
@@ -4265,8 +4397,9 @@ class FakeCensus:
 
     rounds = 0
 
-    def __init__(self, sid, terminal_allowed=False):
+    def __init__(self, sid, terminal_allowed=False, ancestors=()):
         self.sid, self.terminal_allowed = sid, terminal_allowed
+        self.ancestors = tuple(ancestors)
         self.stats = {"rows": 3, "esrch_rows": 1, "zombie_rows": 1, "confirm_reads": 2,
                       "pause_calls": 1, "terminal": 0, "snapshot_ns": 5, "scan_ns": 7,
                       "snapshot_error": False}
@@ -7910,7 +8043,8 @@ def main():
     loader = unittest.defaultTestLoader
     runner = unittest.TextTestRunner(verbosity=2, resultclass=Results)
     pure = unittest.TestSuite(loader.loadTestsFromTestCase(case)
-                              for case in (PureGuard, PurePrecedence, PureCensus, PureCensusFinalAbsence,
+                              for case in (PureGuard, PurePrecedence, PureCensus, PureAncestors,
+                                           PureCensusFinalAbsence,
                                            PureDiagnostics, PureAllowlist, PureTerminalCounts, PureProtocol,
                                            PureTraversal, PureDefaultScratch, PureScratchPreparation,
                                            PureMarker, PureSweep, PureExistingParent,
