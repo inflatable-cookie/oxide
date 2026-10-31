@@ -53,8 +53,10 @@ and reports each once per file identity. The custodian grants at most the
 completed wait, never more than the run's own elapsed wall clock and never more
 than a fixed 600 s total, to its deadline; a waiting report grants nothing, and
 a command's wait counts as unfinished only when no terminal report for that same
-command arrived (a zero-duration grant, a capped grant or a late grant all end
-it). Nothing is shortened, the exported OXIDE_PROOF_DEADLINE_NS is not rewritten
+command arrived and its waiting report was the last accepted admission report (a
+zero-duration grant, a capped grant or a late grant all end it; any later report
+makes the fixed-name completion file a possible overwrite, so such a wait is
+`possibly_overwritten` and unclassified rather than proven unfinished). Nothing is shortened, the exported OXIDE_PROOF_DEADLINE_NS is not rewritten
 and classification is unchanged: a rejected or missing report removes nothing
 but the grant, and the receipt reports the wait, the pairing and the grant
 separately. One
@@ -4266,7 +4268,8 @@ class Monitor:
             rejected_grants = receipt["admission"]["ignored"]
             if pairs.get("commands") or rejected_waiting:
                 report(f"supervisor: admission waits reported by {pairs.get('commands', 0)} command(s):"
-                       f" {pairs.get('ended', 0)} ended, {pairs.get('unfinished_count', 0)} unfinished;"
+                       f" {pairs.get('ended', 0)} ended, {pairs.get('unfinished_count', 0)} unfinished,"
+                       f" {pairs.get('possibly_overwritten_count', 0)} possibly overwritten;"
                        f" granted {admission['granted_ns'] / NS:.1f} s; {rejected_waiting} waiting and"
                        f" {rejected_grants} completed report(s) rejected"
                        + (f"; {admission['unclassified']} unpaired" if admission.get("unclassified") else "")
@@ -4276,7 +4279,12 @@ class Monitor:
                        f" {(entry['waiting_ns'] - receipt['start_ns']) / NS:.1f} s and no completion for"
                        " that command was reported before the stop decision; that wait is reported, not"
                        " granted\n")
-            if pairs.get("unfinished_count"):
+            for entry in (pairs.get("possibly_overwritten") or [])[:3]:
+                report(f"supervisor: command {entry['command']} reported waiting ({entry['reason']}) at"
+                       f" {(entry['waiting_ns'] - receipt['start_ns']) / NS:.1f} s, but a later admission"
+                       " report may have overwritten its completion before the supervisor polled it, so"
+                       " that wait is unclassified, not a proven unfinished wait\n")
+            if pairs.get("unfinished_count") or pairs.get("possibly_overwritten_count"):
                 report("supervisor: the deadline classification stands for the unfinished command(s); no"
                        " clock was moved for them\n")
                 if rejected_grants:
@@ -4360,6 +4368,9 @@ class Custodian:
         self.admission_waiting_reason = None
         self.admission_pairs = {}
         self.admission_unclassified = 0
+        self.admission_ordinal = 0
+        self.admission_last_ordinal = 0
+        self.sampling_ended = False
         self.exceptions = 0
         self.injected = set()
         self.paths = None  # from the monitor's setup message
@@ -4455,7 +4466,23 @@ class Custodian:
             self.guard.latch(f"cancelled by signal {self.cancelled}")
         if self.monitor_exited and not self.monitor_complete:
             self.guard.latch("monitor died")
-        self.guard.check(now_ns())
+        self.check_readings()
+
+    def check_readings(self):
+        """Enforce reading freshness only while the run still has a decision to
+        make (oxide#192).
+
+        The monitor stops its samplers when it publishes `monitor_complete`, so
+        from that point a missing reading is the designed shutdown, not a stalled
+        monitor: latching staleness there would turn a completed, closed and
+        cleaned run into exit 125 without changing any closure fact. Threshold
+        faults from readings that do arrive and every closure rule are unchanged,
+        and the whole settle phase still enforces freshness."""
+        try:
+            if not self.sampling_ended:
+                self.guard.check(now_ns())
+        except BaseException as error:
+            self.exception(error)
 
     def read_messages(self):
         while True:
@@ -4493,6 +4520,8 @@ class Custodian:
         so the run is classified honestly rather than as an unexplained
         timeout."""
         try:
+            self.admission_ordinal += 1
+            self.admission_last_ordinal = self.admission_ordinal
             pair = self.admission_pair(message["command"])
             if self.stopped_at is not None or self.deadline_hit:
                 self.admission_ignored += 1
@@ -4556,7 +4585,7 @@ class Custodian:
             self.admission_unclassified += 1
             return None
         entry = {"command": command, "waiting_ns": None, "reason": None,
-                 "ended": None, "ended_ns": None, "waited_ns": None}
+                 "waiting_ordinal": None, "ended": None, "ended_ns": None, "waited_ns": None}
         self.admission_pairs[command] = entry
         return entry
 
@@ -4568,6 +4597,8 @@ class Custodian:
         never ends before the stop is classified separately from a plain
         timeout instead of leaving no trace."""
         try:
+            self.admission_ordinal += 1
+            self.admission_last_ordinal = self.admission_ordinal
             self.admission_waiting_reports += 1
             self.admission_waiting_ns = at
             if self.admission_waiting_reason is None:
@@ -4575,6 +4606,7 @@ class Custodian:
             pair = self.admission_pair(message["command"])
             if pair is not None and pair["waiting_ns"] is None:
                 pair["waiting_ns"], pair["reason"] = at, message["reason"]
+                pair["waiting_ordinal"] = self.admission_ordinal
             if self.admission_records < ADMISSION_RECORDS:
                 self.admission_records += 1
                 self.record("admission_waiting", command=message["command"], reason=message["reason"],
@@ -5034,18 +5066,28 @@ class Custodian:
 
         Only commands whose waiting report was accepted are counted. A command
         is finished when its own completed report arrived at all (`grant`, even
-        with a zero or clamped grant) or arrived after the stop (`late`), and
-        unfinished only when no terminal report for that same command was
-        received. `unfinished` keeps at most ADMISSION_UNFINISHED rows; the
-        count is always the full one."""
+        with a zero or clamped grant) or arrived after the stop (`late`). It is
+        `unfinished` only when no terminal report for that same command arrived
+        AND its waiting report was the run's last accepted admission report: the
+        completion file has one fixed name, so any later accepted report (another
+        command's grant or waiting report) may have replaced a completion before
+        the next 0.25 s poll. Such an earlier wait is `possibly_overwritten`, an
+        unknown, never a proven unfinished wait. Both lists are bounded; the
+        counts are always the full ones."""
         waiting = [entry for entry in self.admission_pairs.values() if entry["waiting_ns"] is not None]
         ended = [entry for entry in waiting if entry["ended"] is not None]
-        unfinished = [entry for entry in waiting if entry["ended"] is None]
+        unpaired = [entry for entry in waiting if entry["ended"] is None]
+        unfinished = [entry for entry in unpaired if entry["waiting_ordinal"] == self.admission_last_ordinal]
+        overwritten = [entry for entry in unpaired if entry["waiting_ordinal"] != self.admission_last_ordinal]
         return {"commands": len(waiting), "ended": len(ended),
                 "unfinished_count": len(unfinished),
                 "unfinished": [{"command": entry["command"], "reason": entry["reason"],
                                 "waiting_ns": entry["waiting_ns"]}
-                               for entry in unfinished[:ADMISSION_UNFINISHED]]}
+                               for entry in unfinished[:ADMISSION_UNFINISHED]],
+                "possibly_overwritten_count": len(overwritten),
+                "possibly_overwritten": [{"command": entry["command"], "reason": entry["reason"],
+                                          "waiting_ns": entry["waiting_ns"]}
+                                         for entry in overwritten[:ADMISSION_UNFINISHED]]}
 
     def observe_admission(self, launched):
         """Best-effort decision-time record of the admission grants
@@ -5146,6 +5188,9 @@ class Custodian:
         outcome = {"closure": "closed" if self.closed else "UNCLOSED", "status": decoded,
                    "fault": self.guard.fault, "deadline": self.deadline_hit, "launched": launched}
         self.tell("cleanup" if self.closed else "keep", outcome=outcome)
+        # The monitor stops sampling once it publishes `monitor_complete`; its
+        # shutdown is not a freshness window (see check_readings).
+        self.sampling_ended = True
         if "custodian-timeout-after-monitor" in self.inject:
             self.exit_at = now_ns()  # injected: the custodian runs out right after deciding
         while not self.monitor_complete and not self.monitor_exited and now_ns() < self.exit_at:

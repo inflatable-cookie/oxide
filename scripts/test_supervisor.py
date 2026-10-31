@@ -1665,19 +1665,87 @@ class PureAdmission(unittest.TestCase):
         with self.clock(custodian, 40):
             custodian.accept(self.message(custodian, 0, offset_s=40, command="zero"))
         with self.clock(custodian, 50):
-            custodian.accept(self.waiting(custodian, 50, command="lost"))
-        with self.clock(custodian, 60):
-            custodian.accept(self.waiting(custodian, 60, command="lateonly"))
+            custodian.accept(self.waiting(custodian, 50, command="lateonly"))
         custodian.deadline_hit = True
-        with self.clock(custodian, 61):
-            custodian.accept(self.message(custodian, 5 * NS, offset_s=61, command="lateonly"))
+        with self.clock(custodian, 51):
+            custodian.accept(self.message(custodian, 5 * NS, offset_s=51, command="lateonly"))
+        # The last accepted report is this waiting report, so nothing later could
+        # have overwritten a completion for it: that is the provable unfinished
+        # case.
+        with self.clock(custodian, 60):
+            custodian.accept(self.waiting(custodian, 60, command="lost"))
         pairs = self.pairs(custodian)
         self.assertEqual(pairs["commands"], 4)
         self.assertEqual(pairs["ended"], 3)
         self.assertEqual(pairs["unfinished_count"], 1)
         self.assertEqual([entry["command"] for entry in pairs["unfinished"]], ["lost"])
+        self.assertEqual(pairs["possibly_overwritten_count"], 0)
         self.assertEqual(pairs["unfinished"][0]["reason"], "queue")
-        self.assertEqual(pairs["unfinished"][0]["waiting_ns"], custodian.start + 50 * NS)
+        self.assertEqual(pairs["unfinished"][0]["waiting_ns"], custodian.start + 60 * NS)
+
+    def test_a_completion_overwritten_before_a_poll_is_not_a_proven_unfinished_wait(self):
+        # Review finding: the completion file has one fixed name, so two
+        # completions inside one 0.25 s poll leave only the later inode visible.
+        # An unpaired wait that is not the run's last accepted report is
+        # therefore an unknown (possibly overwritten), never a proven unfinished
+        # wait.
+        custodian = self.custodian()
+        custodian.record = lambda kind, **fields: None
+        with self.clock(custodian, 10):
+            custodian.accept(self.waiting(custodian, 10, command="first"))
+        # The later command's completion replaces the fixed-name file before a
+        # poll: only this grant is observed.
+        with self.clock(custodian, 20):
+            custodian.accept(self.message(custodian, 8 * NS, offset_s=20, command="second"))
+        pairs = self.pairs(custodian)
+        self.assertEqual(pairs["commands"], 1)
+        self.assertEqual(pairs["ended"], 0)
+        self.assertEqual(pairs["unfinished_count"], 0, "a possibly overwritten wait is not proven unfinished")
+        self.assertEqual(pairs["possibly_overwritten_count"], 1)
+        self.assertEqual([entry["command"] for entry in pairs["possibly_overwritten"]], ["first"])
+        self.assertEqual(pairs["possibly_overwritten"][0]["waiting_ns"], custodian.start + 10 * NS)
+
+    def test_reading_freshness_is_not_latched_after_the_closure_decision(self):
+        # Review finding: a completed, closed run was reported as exit 125 when
+        # a reserve sample stalled after the decision, because the monitor stops
+        # sampling as it publishes `monitor_complete`. The shutdown is not a
+        # freshness window; a stale reading before the decision still latches.
+        custodian = self.custodian()
+        custodian.guard = bounded.Guard(custodian.start)
+        custodian.guard.reading({"kind": "reserve", "value": 500 * bounded.GIB,
+                                 "at": custodian.start, "completed": custodian.start})
+        custodian.guard.reading({"kind": "scratch", "value": 0, "complete": True,
+                                 "at": custodian.start, "completed": custodian.start})
+        stale = custodian.start + 5 * bounded.NS
+        with patched(bounded, "now_ns", lambda: stale):
+            custodian.sampling_ended = False
+            custodian.check_readings()
+        self.assertIn("stale", custodian.guard.fault or "", "a stale reading before the decision must latch")
+        custodian.guard.fault = None
+        with patched(bounded, "now_ns", lambda: stale):
+            custodian.sampling_ended = True
+            custodian.check_readings()
+        self.assertIsNone(custodian.guard.fault, "the shutdown must not latch freshness")
+
+    def test_finish_ends_sampling_before_waiting_for_the_monitor(self):
+        custodian = self.custodian()
+        custodian.record = lambda kind, **fields: None
+        custodian.tell = lambda kind, **fields: None
+        custodian.pump = lambda timeout: None
+        custodian.reap = lambda pid: 0
+        custodian.signal_pinned = lambda pid, number, group: None  # never signal a live host PID
+        custodian.monitor = 1234
+        custodian.monitor_complete = True
+        custodian.leader_status = 0
+        custodian.census_ok = True
+        custodian.eof = {"stdout", "stderr"}
+        custodian.guard = bounded.Guard(custodian.start)
+        custodian.guard.reading({"kind": "reserve", "value": 500 * bounded.GIB,
+                                 "at": custodian.start, "completed": custodian.start})
+        with patched(bounded, "now_ns", lambda: custodian.start):
+            self.assertEqual(custodian.finish(True), 0)
+        self.assertTrue(custodian.sampling_ended)
+        self.assertIsNone(custodian.guard.fault)
 
     def test_a_completion_without_a_waiting_report_is_never_unfinished(self):
         custodian = self.custodian()
@@ -1695,8 +1763,14 @@ class PureAdmission(unittest.TestCase):
                 custodian.accept(self.waiting(custodian, index, command=f"c{index}"))
         self.assertEqual(custodian.admission_unclassified, 3)
         self.assertEqual(len(custodian.admission_pairs), bounded.ADMISSION_COMMANDS)
-        self.assertEqual(self.pairs(custodian)["unfinished_count"], bounded.ADMISSION_COMMANDS)
-        self.assertEqual(len(self.pairs(custodian)["unfinished"]), bounded.ADMISSION_UNFINISHED)
+        pairs = self.pairs(custodian)
+        # An overflow report still advances the ordinal, so the last *stored*
+        # waiting report is not provably last: every unpaired wait here is a
+        # possible overwrite, an unknown, and none is a proven unfinished wait.
+        self.assertEqual(pairs["unfinished_count"], 0)
+        self.assertEqual(pairs["possibly_overwritten_count"], bounded.ADMISSION_COMMANDS)
+        self.assertEqual(len(pairs["unfinished"]), 0)
+        self.assertEqual(len(pairs["possibly_overwritten"]), bounded.ADMISSION_UNFINISHED)
 
     def test_the_decision_record_carries_the_waiting_and_pairing_facts(self):
         custodian = self.custodian()
@@ -7790,9 +7864,16 @@ class Real(unittest.TestCase):
             "    json.dump({'schema': 2, 'source': 'fixture', 'waited_ns': 10 * 1000000000}, handle)\n"
             "time.sleep(1)\n"
             "open(os.environ['CASE_DIR'] + '/ran', 'w')\n")
-        self.assertEqual(self.guardian(code, limit=32), 0)
+        # The limit must leave the fixture a real execution window: 32 s put the
+        # stop only 12 s in, so a loaded host could end the run before the
+        # fixture finished and the failure would say nothing about the marker.
+        code = self.guardian(code, limit=45)
+        # Read the marker's no-effect invariant from the receipt first: a guard
+        # shutdown fault must never be confused with an admission effect, and an
+        # admission effect must never hide behind a closed exit.
         self.assertEqual(self.outcome()["closure"], "closed")
         self.assertIsNone(self.outcome()["fault"])
+        self.assertFalse(self.outcome()["deadline"])
         self.assertTrue((self.dir / "ran").exists())
         self.assertEqual(self.receipt["admission"]["observed"], 0)
         self.assertGreaterEqual(self.receipt["admission"]["ignored"], 1)
@@ -7800,6 +7881,8 @@ class Real(unittest.TestCase):
         decisions = [r for r in self.receipt["custodian"] if r["event"] == "admission_decision"]
         self.assertEqual(decisions[0]["counted"], 0)
         self.assertEqual(decisions[0]["granted_ns"], 0)
+        self.assertEqual(code, 0, "the malformed marker had no effect (closed, no fault, no grant),"
+                                  " so a non-zero guard exit is a guard-side fault, not this case's")
 
     def test_owned_scratch_cleanup(self):
         self.assertEqual(self.guardian(fixture("open(os.environ['TMPDIR'] + '/w', 'wb').write(bytes(65536))\n"),
@@ -8409,7 +8492,7 @@ class DetachReal(unittest.TestCase):
         # root owns no image to detach: this case needs the owned `--root-parent`.
         env.pop("OXIDE_TASK_SCRATCH_ROOT", None)
         env.update(extra)
-        args = [sys.executable, str(SUPERVISOR), "--limit", "40", "--root-parent", str(self.dir),
+        args = [sys.executable, str(SUPERVISOR), "--limit", "60", "--root-parent", str(self.dir),
                 "--evidence", str(self.dir / "evidence"), "--", sys.executable, "-c", DETACH_CASE]
         with open(self.dir / "guardian.log", "wb") as log:
             guardian = subprocess.Popen(args, env=env, stdout=subprocess.DEVNULL, stderr=log)
@@ -8420,7 +8503,14 @@ class DetachReal(unittest.TestCase):
                     guardian.kill()
                     guardian.wait(5)
         self.receipt = json.loads((self.dir / "evidence" / "receipt.json").read_text())
-        self.volume = json.loads((self.dir / "volume.json").read_text())
+        volume_path = self.dir / "volume.json"
+        if not volume_path.exists():
+            # The fixture publishes its own attachment facts; without them no
+            # detach oracle can be evaluated, and saying so is truthful (a
+            # missing volume identity is not a detach outcome).
+            self.fail(f"the detach fixture never published its attachment facts (guard exit {self.code},"
+                      f" outcome {self.receipt.get('outcome')}); no detach oracle can be evaluated")
+        self.volume = json.loads(volume_path.read_text())
         CASES.append({"case": self._testMethodName, "exit": self.code, "phase": self.receipt["phase"],
                       "dir": str(self.dir), "detach": self.receipt.get("detach"),
                       # The request-free keep is recorded under `cleanup`, which the

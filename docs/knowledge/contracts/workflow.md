@@ -2689,6 +2689,14 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   - Clock: a reading stamped later than the custodian's own clock reading
     when it arrives. Both sides use the same system-wide clock, so such a
     reading is never fresh.
+
+  Freshness is enforced for as long as the run still has a decision to make:
+  once the custodian has sent its `cleanup`/`keep` decision, the monitor's
+  samplers stop as it publishes `monitor_complete`, so the monitor's shutdown is
+  not a freshness window (oxide#192; a stalled sample during shutdown cannot
+  turn a completed, closed and cleaned run into exit 125). Threshold faults from
+  readings that do arrive, every closure rule and the whole settle phase are
+  unchanged, and a stale reading before the decision still latches.
 - **Clock and deadlines.** One clock everywhere: `CLOCK_UPTIME_RAW` integer
   nanoseconds. The supervisor refuses before any proof work if that clock,
   kqueue, macOS or the self-checked `kinfo_proc` layout is missing.
@@ -2745,12 +2753,17 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   report only with that command's own completed report. Its wait **ended** when
   its own completion arrived, at any duration: a zero-duration grant, a grant
   clamped by the cap and a late grant all end it. It is **unfinished** only when
-  no terminal report for that same command was received, and only then does the
-  summary say that no completion was reported before the stop decision and that
-  the deadline classification stands with nothing granted. A rejected or
-  overflowed report is **unclassified**, never unfinished: the summary counts
-  rejected waiting and completed reports and says a command listed as
-  unfinished may have ended in one of them. Together with the grant and late
+  no terminal report for that same command was received *and* that waiting report
+  was the run's last accepted admission report; only then does the summary say
+  that no completion was reported before the stop decision and that the deadline
+  classification stands with nothing granted. The completion file has one fixed
+  name, so a later accepted report (another command's grant or waiting report)
+  may have replaced an earlier completion before the next 0.25 s poll: such a
+  wait is **possibly overwritten**, an unknown the summary reports as
+  unclassified, never as a proven unfinished wait. A rejected or overflowed
+  report is unclassified in the same way: the summary counts rejected waiting and
+  completed reports and says a command listed as unfinished may have ended in
+  one of them. Together with the grant and late
   records this makes the states distinguishable in one receipt: granted before
   the stop, granted after it (late, no clock moved), still waiting when it fired
   (paired, nothing granted), stale (rejected by run), and unclassified (a report
@@ -2859,7 +2872,7 @@ unconcluded with an honest reason even when the outer session closed and the
 suite passed, so it can never expire; only a fully concluded base or candidate
 root older than seven days is eligible for a later run's bounded sweep.
 
-It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
+It runs `bounded-test.py --limit 560 --scratch-budget-mib 512` around
 `scripts/test_supervisor.py` with **no** `--root-parent` **and no
 `--evidence`**: the candidate's own default scratch routing runs, and its
 evidence directory is its own `<root>/evidence`, so the suite's nested
