@@ -24,6 +24,19 @@ design keeps that baseline's guards:
 All earlier findings, deviations and failed evidence stand as recorded.
 Nothing here qualifies anything.
 
+**Amended by oxide#195 (2026-11-01).** This reviewed text is the historical
+design, and its "only pinned children are ever signalled" contract was
+corrected after oxide#182's packet ended `UNCLOSED` with a live Cargo-shaped
+group inside the leader's own cooperative session. Current behaviour is the
+[shared proof supervisor](workflow.md#shared-proof-supervisor) section's
+*Cooperative-session stop* description: after the leader is reaped, a
+same-session member may additionally be SIGKILLed **by PID**, and only while
+the custodian has itself re-read the exact announced PID and start token, this
+user, a non-zombie state and `getsid` equal to the leader's PID. A process
+outside that session, and every other process group, is still never signalled,
+and the census alone decides closure. Read the table rows below about
+"survivors" with that amendment.
+
 ## Contract
 
 Pinned-leader cooperative closure (Tom, "Yes, (2)", Queue decision
