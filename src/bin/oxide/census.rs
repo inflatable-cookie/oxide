@@ -15,11 +15,14 @@
 //!   backoff; only a positive fact settles it — a later listing, the kernel
 //!   reporting the pid gone, a changed start identity or a changed effective
 //!   uid. The same identity still answering `EPERM` is UNKNOWN and refuses;
-//! - a vnode descriptor whose path or vnode facts answer `EPERM`, and a
-//!   working directory whose read answers `EPERM`, are hidden: where the
-//!   platform does not let this account read the path, the census cannot say
-//!   what the process holds, so it is UNKNOWN and refuses. A hidden path is
-//!   never counted as "no hold", whatever the process's code identity;
+//! - a vnode descriptor whose path and vnode facts both answer `EPERM` is the
+//!   platform's own blind spot, never "closed". It is counted and reported,
+//!   and does not refuse, only when the process's own `csops(CS_OPS_STATUS)`
+//!   reports `CS_PLATFORM_BINARY` and its kernel start identity is positively
+//!   the same before and after that status read. Every other hidden descriptor
+//!   is UNKNOWN and refuses, and every readable descriptor of the same process
+//!   is still checked (an in-slot one refuses). A working directory whose read
+//!   answers `EPERM` is likewise hidden and always UNKNOWN/refuses;
 //! - a descriptor whose two reads both answer `ENOENT` is a dead handle (a
 //!   revoked or reclaimed vnode cannot do I/O): it is counted, not refused,
 //!   after the same identity is re-observed and both reads answer `ENOENT`
@@ -51,6 +54,9 @@ pub struct Holder {
 pub struct Summary {
     pub processes: usize,
     pub descriptors: usize,
+    /// Descriptors hidden by the platform on verified platform binaries and
+    /// counted as the OS blind spot.
+    pub hidden: usize,
     /// Descriptors whose vnode is revoked or reclaimed (a dead handle).
     pub dead: usize,
     /// What the recorded holder is now: positively gone, positively another
@@ -103,6 +109,7 @@ pub fn verify(slot: &Path, holder: Option<&Holder>) -> Result<Summary, String> {
 struct Scan {
     processes: usize,
     descriptors: usize,
+    hidden: usize,
     dead: usize,
     hits: Vec<Hit>,
 }
@@ -143,6 +150,7 @@ fn verdict(
     Ok(Summary {
         processes: scan.processes,
         descriptors: scan.descriptors,
+        hidden: scan.hidden,
         dead: scan.dead,
         holder,
     })
@@ -239,6 +247,11 @@ mod platform {
     const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
     const PROC_PIDTBSDINFO: libc::c_int = 3;
     const PROC_PIDVNODEPATHINFO: libc::c_int = 9;
+    /// `CS_OPS_STATUS` from `sys/codesign.h`: the process's code-signing flags.
+    const CS_OPS_STATUS: libc::c_uint = 0;
+    /// `CS_PLATFORM_BINARY`: the flag Apple's own platform binaries carry. It
+    /// is the only fact that explains a hidden descriptor path (Tom e528a712).
+    pub(super) const CS_PLATFORM_BINARY: u32 = 0x0400_0000;
     const PROX_FDTYPE_VNODE: u32 = 1;
 
     // Sizes and field offsets read from the installed SDK's headers and
@@ -262,6 +275,15 @@ mod platform {
     const MAX_PATH_BYTES: usize = 1024;
 
     #[link(name = "proc")]
+    extern "C" {
+        fn csops(
+            pid: libc::c_int,
+            ops: libc::c_uint,
+            useraddr: *mut libc::c_void,
+            usersize: libc::size_t,
+        ) -> libc::c_int;
+    }
+
     extern "C" {
         fn proc_listpids(
             kind: u32,
@@ -330,8 +352,10 @@ mod platform {
         None,
     }
 
-    enum Observed {
+    #[derive(Debug)]
+    pub(super) enum Observed {
         Path(PathBuf),
+        Hidden,
         Dead,
         Closed,
     }
@@ -339,9 +363,11 @@ mod platform {
     /// The production decision for one descriptor's two reads.
     pub(super) enum Pair {
         Path(PathBuf),
+        /// Both reads are platform-hidden: a blind-spot candidate that only a
+        /// verified platform binary with an unchanged identity may keep.
+        Opaque,
         DeadCandidate,
         Closed,
-        Refuse(String),
         Retry,
     }
 
@@ -428,6 +454,7 @@ mod platform {
                             );
                         }
                     }
+                    Observed::Hidden => scan.hidden = scan.hidden.saturating_add(1),
                     Observed::Dead => scan.dead = scan.dead.saturating_add(1),
                     Observed::Closed => {}
                 }
@@ -816,7 +843,10 @@ mod platform {
                 Pair::Path(path) => return Ok(Observed::Path(path)),
                 Pair::DeadCandidate => return dead_handle(identity, descriptor, started),
                 Pair::Closed => return Ok(Observed::Closed),
-                Pair::Refuse(reason) => return Err(reason),
+                Pair::Opaque => {
+                    let verified = verified_platform_binary(identity)?;
+                    return opaque_verdict(identity, descriptor, verified);
+                }
                 Pair::Retry => {
                     // A mixed pair is not an answer: the descriptor may have
                     // closed between the two flavors. Re-read it as a pair.
@@ -860,7 +890,10 @@ mod platform {
             // dead-handle fact; a hidden second read is UNKNOWN and refuses.
             Pair::DeadCandidate => Ok(Observed::Dead),
             Pair::Closed => Ok(Observed::Closed),
-            Pair::Refuse(reason) => Err(reason),
+            Pair::Opaque => {
+                let verified = verified_platform_binary(identity)?;
+                opaque_verdict(identity, descriptor, verified)
+            }
             Pair::Retry => Err(format!(
                 "pid {}'s dead-handle descriptor {descriptor} was not readable on its second observation ({}, {}); the census is unknown",
                 identity.pid,
@@ -876,8 +909,8 @@ mod platform {
     /// candidate; either read reporting the descriptor closed means it is no
     /// longer held; anything else is re-read as a pair.
     pub(super) fn classify_pair(
-        pid: i32,
-        descriptor: i32,
+        _pid: i32,
+        _descriptor: i32,
         facts: &Result<(), io::Error>,
         path: &Result<Option<PathBuf>, io::Error>,
     ) -> Pair {
@@ -888,9 +921,7 @@ mod platform {
                 if left.raw_os_error() == Some(libc::EPERM)
                     && right.raw_os_error() == Some(libc::EPERM) =>
             {
-                Pair::Refuse(format!(
-                    "pid {pid}'s descriptor {descriptor} is hidden by the platform; the census is unknown"
-                ))
+                Pair::Opaque
             }
             (Err(left), Err(right))
                 if left.raw_os_error() == Some(libc::ENOENT)
@@ -902,6 +933,79 @@ mod platform {
             (_, Err(right)) if closed(right) => Pair::Closed,
             _ => Pair::Retry,
         }
+    }
+
+    /// The caller's decision for a platform-hidden descriptor: a verified
+    /// platform binary's opaque descriptor is a counted blind spot, every other
+    /// non-platform answer refuses.
+    pub(super) fn opaque_verdict(
+        identity: &Identity,
+        descriptor: i32,
+        verified: bool,
+    ) -> Result<Observed, String> {
+        if verified {
+            Ok(Observed::Hidden)
+        } else {
+            Err(format!(
+                "pid {}'s descriptor {descriptor} is hidden by the platform and the process is not a verified platform binary; the census is unknown",
+                identity.pid
+            ))
+        }
+    }
+
+    /// Whether a platform-hidden descriptor belongs to a verified platform
+    /// binary with the same kernel start identity around the status read. Any
+    /// failed status read, disappeared/changed identity or non-platform answer
+    /// is a refusal, never a blind spot.
+    pub(super) fn verified_platform_binary(identity: &Identity) -> Result<bool, String> {
+        let mut status: u32 = 0;
+        set_errno(0);
+        // SAFETY: `status` is writable for exactly four bytes and outlives the
+        // call.
+        let read = unsafe {
+            csops(
+                identity.pid,
+                CS_OPS_STATUS,
+                (&mut status as *mut u32).cast(),
+                std::mem::size_of::<u32>(),
+            )
+        };
+        let status = if read == 0 {
+            Ok(status)
+        } else {
+            Err(format!(
+                "the code-signing status of pid {} is unreadable ({}); the census is unknown",
+                identity.pid,
+                io::Error::last_os_error()
+            ))
+        };
+        let after =
+            process_identity(identity.pid).map(|option| option.map(|next| (next.start, next.uid)));
+        platform_status_verdict(identity, status, after)
+    }
+
+    /// The pure platform-binary decision: a readable platform flag with the
+    /// same start identity and uid before and after the status read. Any other
+    /// answer refuses; the caller then treats the hidden descriptor as UNKNOWN.
+    pub(super) fn platform_status_verdict(
+        identity: &Identity,
+        status: Result<u32, String>,
+        after: Result<Option<(u64, u32)>, String>,
+    ) -> Result<bool, String> {
+        let status = status?;
+        let Some((start, uid)) = after? else {
+            return Err(format!(
+                "pid {}'s kernel identity disappeared around its code-signing read; the census is unknown",
+                identity.pid
+            ));
+        };
+        if start != identity.start || uid != identity.uid {
+            return Err(format!(
+                "pid {}'s kernel identity changed around its code-signing read; the census is unknown",
+                identity.pid
+            ));
+        }
+        Ok(status & CS_PLATFORM_BINARY != 0)
     }
 
     fn read_pair(
@@ -1323,28 +1427,22 @@ mod tests {
         }
     }
 
-    /// A vnode descriptor whose path and vnode facts are both hidden refuses;
-    /// only a readable path, a closed descriptor or both-flavour `ENOENT` is
-    /// an answer.
+    /// A vnode descriptor whose path and vnode facts are both hidden is only
+    /// a blind-spot candidate; the platform-binary decision separately accepts
+    /// it or refuses. Only a readable path, a closed descriptor or both-flavour
+    /// `ENOENT` is a direct answer.
     #[test]
-    fn a_hidden_descriptor_refuses() {
+    fn a_hidden_descriptor_is_only_a_blind_spot_candidate() {
         use std::io::Error;
-        let hidden = platform::classify_pair(
-            9,
-            4,
-            &Err(Error::from_raw_os_error(libc::EPERM)),
-            &Err(Error::from_raw_os_error(libc::EPERM)),
-        );
-        match hidden {
-            platform::Pair::Refuse(reason) => {
-                assert!(reason.contains("hidden by the platform"), "{reason}");
-                assert!(reason.contains("census is unknown"), "{reason}");
-                assert!(reason.contains("pid 9"), "{reason}");
-            }
-            _ => panic!("a hidden descriptor was not refused"),
-        }
-        // A hidden read with the other flavour readable is not an answer
-        // either: it is re-read as a pair, then refused if it persists.
+        assert!(matches!(
+            platform::classify_pair(
+                9,
+                4,
+                &Err(Error::from_raw_os_error(libc::EPERM)),
+                &Err(Error::from_raw_os_error(libc::EPERM)),
+            ),
+            platform::Pair::Opaque
+        ));
         assert!(matches!(
             platform::classify_pair(
                 9,
@@ -1367,5 +1465,76 @@ mod tests {
             platform::classify_pair(9, 4, &Err(Error::from_raw_os_error(libc::EBADF)), &Ok(None),),
             platform::Pair::Closed
         ));
+    }
+
+    /// The verified-platform blind spot is tolerated only for a readable
+    /// `CS_PLATFORM_BINARY` status with the same kernel start and uid before
+    /// and after the read; every other answer refuses.
+    #[test]
+    fn a_verified_platform_blind_spot_is_tolerated_and_everything_else_refuses() {
+        let identity = platform::Identity {
+            pid: 7,
+            uid: 501,
+            start: 1_000,
+            command: "platform".to_owned(),
+        };
+        let status = platform::CS_PLATFORM_BINARY;
+        assert!(
+            platform::platform_status_verdict(&identity, Ok(status), Ok(Some((1_000, 501))))
+                .expect("a verified platform binary")
+        );
+        assert!(
+            !platform::platform_status_verdict(&identity, Ok(0), Ok(Some((1_000, 501))))
+                .expect("a non-platform answer is a refusal at the caller")
+        );
+        for (label, status, after) in [
+            (
+                "unreadable status",
+                Err("code-signing read failed".to_owned()),
+                Ok(Some((1_000, 501))),
+            ),
+            ("disappeared", Ok(status), Ok(None)),
+            ("changed", Ok(status), Ok(Some((2_000, 501)))),
+            ("changed uid", Ok(status), Ok(Some((1_000, 502)))),
+            (
+                "unreadable identity",
+                Ok(status),
+                Err("identity read failed".to_owned()),
+            ),
+        ] {
+            let error = platform::platform_status_verdict(&identity, status, after)
+                .expect_err(&format!("{label} must refuse"));
+            assert!(error.contains("unknown"), "{label}: {error}");
+        }
+    }
+
+    /// A platform-hidden descriptor of a non-platform process is a refusal;
+    /// only a verified platform binary's opaque descriptor is tolerated.
+    #[test]
+    fn a_non_platform_hidden_descriptor_refuses() {
+        let identity = platform::Identity {
+            pid: 7,
+            uid: 501,
+            start: 1_000,
+            command: "user".to_owned(),
+        };
+        let error = platform::opaque_verdict(&identity, 4, false)
+            .expect_err("a non-platform hidden descriptor must refuse");
+        assert!(error.contains("not a verified platform binary"), "{error}");
+        assert!(error.contains("census is unknown"), "{error}");
+        assert!(platform::opaque_verdict(&identity, 4, true).is_ok());
+    }
+
+    /// A locally built test binary is not an Apple platform binary: the
+    /// blind-spot exemption cannot be claimed by this process.
+    #[test]
+    fn this_test_binary_is_not_a_platform_binary() {
+        let own = platform::process_identity(std::process::id() as i32)
+            .expect("identity read")
+            .expect("this process exists");
+        assert_eq!(
+            platform::verified_platform_binary(&own).expect("code-signing status"),
+            false
+        );
     }
 }

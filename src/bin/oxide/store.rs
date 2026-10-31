@@ -11674,6 +11674,7 @@ pub(crate) mod tests {
         crate::census::Summary {
             processes: 1,
             descriptors: 2,
+            hidden: 0,
             dead: 0,
             holder: "no recorded holder".to_owned(),
         }

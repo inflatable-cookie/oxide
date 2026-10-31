@@ -848,8 +848,8 @@ fn recorded_size(bytes: Option<u64>) -> String {
 
 fn census_line(summary: &crate::census::Summary) -> String {
     format!(
-        "{} same-uid processes, {} descriptors, {} dead handles; {}",
-        summary.processes, summary.descriptors, summary.dead, summary.holder
+        "{} same-uid processes, {} descriptors, {} platform-hidden, {} dead handles; {}",
+        summary.processes, summary.descriptors, summary.hidden, summary.dead, summary.holder
     )
 }
 
