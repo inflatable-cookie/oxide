@@ -1674,16 +1674,56 @@ class PureSurvivors(unittest.TestCase):
     def test_the_summary_line_states_the_residual_without_claiming_a_signal(self):
         self.assertIsNone(bounded.survivors_line([]))
         self.assertIsNone(bounded.survivors_line(None))
-        one = bounded.survivors_line([{"pid": 900, "start": 5}])
+        self.assertIsNone(bounded.survivors_line([], "closed"))
+        one = bounded.survivors_line([{"pid": 900, "start": 5}], "UNCLOSED")
         self.assertIn("1 same-session survivor(s) not signalled", one)
         self.assertIn("900/5", one)
         self.assertIn("UNCLOSED", one)
+        self.assertIn("scratch is kept", one)
         self.assertNotIn("limit", one)
         many = bounded.survivors_line([{"pid": 900 + index, "start": 5}
-                                       for index in range(10)])
+                                       for index in range(10)], "UNCLOSED")
         self.assertIn("900/5", many)
         self.assertIn("+2 more", many)
         self.assertEqual(many.count("/5"), 8)
+
+    def test_a_transient_survivor_then_a_certain_empty_census_reports_closed(self):
+        # Exact-head review: a survivor observed after the stop may exit by
+        # itself, so a later certain-empty census closes the run. The line must
+        # never claim UNCLOSED or a kept scratch for a closed run, and the
+        # summary must take the run's own final closure rather than the rows.
+        transient = bounded.survivors_line([{"pid": 900, "start": 5}], "closed")
+        self.assertIn("900/5", transient)
+        self.assertIn("gone by the deciding census", transient)
+        self.assertIn("the run closed", transient)
+        self.assertNotIn("UNCLOSED", transient)
+        self.assertNotIn("kept", transient)
+        unknown = bounded.survivors_line([{"pid": 900, "start": 5}])
+        self.assertIn("the deciding census fixes the outcome", unknown)
+        self.assertNotIn("UNCLOSED", unknown)
+        self.assertNotIn("closed;", unknown)
+        # The summary composes the line from the receipt's own outcome, so the
+        # transient case closes truthfully end to end.
+        source = inspect.getsource(bounded.Monitor.summary)
+        self.assertIn('survivors_line(receipt.get("survivors"), outcome.get("closure"))', source)
+        self.assertNotIn('survivors_line(receipt.get("survivors"), "UNCLOSED")', source)
+        # And the persistent-survivor regression still holds: the same rows with
+        # an UNCLOSED outcome keep the honest residual.
+        persistent = bounded.survivors_line([{"pid": 900, "start": 5}], "UNCLOSED")
+        self.assertIn("the run stays UNCLOSED and its scratch is kept", persistent)
+        self.assertNotIn("the run closed", persistent)
+
+    def test_a_transient_survivor_records_a_row_and_does_not_decide_closure(self):
+        # The monitor records the row and makes no closure claim of its own: the
+        # receipt decision stays with the census, so a later empty round can win.
+        monitor, _ctl_r = self.monitor()
+        monitor.record_survivors(self.members(row(900, start=5)))
+        self.assertEqual([item["pid"] for item in monitor.receipt["survivors"]], [900])
+        self.assertNotIn("outcome", monitor.receipt)
+        self.assertNotIn("census", monitor.receipt)
+        # A second, certainly empty round adds nothing and closes nothing here.
+        monitor.record_survivors({"certain": True, "members": 0, "uncertain": 0, "member_rows": []})
+        self.assertEqual(len(monitor.receipt["survivors"]), 1)
 
     def test_the_qualification_oracle_requires_the_survivor_record_and_no_signal(self):
         rows = survivor_case_rows("/x")
@@ -7444,8 +7484,8 @@ class Real(unittest.TestCase):
                  "deadline": self.outcome().get("deadline"), "ready": True,
                  "nonce_ok": reply == token, "child_pid": child_pid, "suite_pid": os.getpid(),
                  "signal_targets": [r["target"] for r in signals], "signal_pins": [r["pin"] for r in signals],
-                 "session_targets": [r["target"] for r in self.receipt["custodian"]
-                                     if r["event"] == "session_signal"],
+                 "session_targets": [r.get("target") for r in self.receipt["custodian"]
+                                     if str(r.get("event", "")).startswith("session_")],
                  "retained": (self.dir / "evidence" / "receipt.json").exists()}
         CASES[-1]["nonce_ok"] = facts["nonce_ok"]
         self.assertEqual(escaped_writer_problems(facts), [], facts)

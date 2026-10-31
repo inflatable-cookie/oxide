@@ -2311,37 +2311,45 @@ sixteen rows, the exact rows it still classifies in the leader's own session
 (`PID`, `start`, `ppid`, `pgid`, `uid`, `zombie`) in the receipt's `survivors`
 list, and the summary line states how many same-session survivors were not
 signalled. That is observation only: no message, no signal, no closure claim.
-Closure is unchanged, so a survivor keeps the run `UNCLOSED` with its scratch
-and evidence, and the recorded identity is what the owner needs to act on it.
-The residual is a real design conflict, reported for an operator ruling: the
-supervisor no longer closes such a survivor, and closing it needs a boundary
-that holds it — either the product keeps its command tree inside the pinned
-leader group, or a holder the runner can pin must own that group. This head's
+A recorded row is observation, never a verdict: a survivor seen after the stop
+may exit by itself, so a LATER certain-empty census can still close the run, and
+the summary line states the run's own final closure — a closed run says the
+survivors were gone by the deciding census, and only an `UNCLOSED` run says the
+scratch was kept. A survivor that is still there when the deciding census runs
+keeps the run `UNCLOSED` with its scratch and evidence, and the recorded
+identity is what the owner needs to act on it. This change is **observation-only
+custody hardening**: it does not close the historical Cargo-group survivor and
+does not claim to. Identity-held closure is deferred to Queue papercut
+`9ff7386d-c70e-49c7-880a-2e6c676b2eb9`, because closing such a survivor needs a
+boundary that holds the identity (the product keeping its command tree inside
+the pinned leader group, or a pin-able holder owning that group). This head's
 suite replaces the former separate-group survivor case with one real
 Cargo-shaped case (a `setpgid` group leader in the leader's session and its own
 child in that group, both survivable past the deadline, both recorded and never
 signalled, both still live at the `UNCLOSED` verdict), and adds the pure rules
 that keep it that way, including an AST guard that every kill call site in the
-supervisor is a custody-bound one. At this head the three sources are
+supervisor is a custody-bound one, and a pure regression for a transient
+survivor followed by a certain-empty census (so a closed run is never reported
+as `UNCLOSED`/kept). At this head the three sources are
 `bounded-test.py`
-`b00867a3eb771b1f164df88897d20e312ea0fc9fda398649878f04e512f3d31d`,
+`bd5701e043523156647ccba21cb8058b69c62ec87b98260e84693bab01d1ce79`,
 `test_supervisor.py`
-`452c4fc63b1fdb803b14101907f96926657f2b2ec0b8f34b0b99da9502f0f50b` and
+`62c84b3111ece9f760b5fde0fdfb82193e5598ae012fa70126505acb6991527f` and
 `qualify-supervisor.py`
-`4a6e73056e0faab59e81eb2d2a4085238ea9c1dcea15397f561b57d895702697`. The
-head's suite is 294 pure plus 48 real cases and is **unqualified** until one
+`3b33a8d89ce11d741223f58c6e9f7c6cccbf3d5902e2a3359094bb5fdbc5cde3`. The
+head's suite is 296 pure plus 48 real cases and is **unqualified** until one
 uncounted keep-going
 `effigy proof:supervisor:qualify:diagnostic` and then ONE counted author and
 ONE separate independent reviewer `effigy proof:supervisor:qualify` pass at the
 exact head after independent exact-head source review; the `#191`, `#151` and
-`#147` receipts stay bound to their own bytes. **Activation bounds need an
-operator ruling:** the brief for this change names a 300 s wall clock per
-qualification run, while the selector's recorded bound is the oxide#191
-amendment of 2026-10-31 — a 420 s outer deadline with a 380 s candidate limit —
-and the suite at this head measured 285-305 s on a quiet shared host and did not
-finish inside its own 350 s secondary alarm under the current contention, so a
-300 s outer bound cannot complete. No bound was changed by this change; the
-activation must use the recorded amendment or an operator amendment to 300 s.
+`#147` receipts stay bound to their own bytes. **Activation bounds are the
+current main #191 values and are unchanged by this change:** a 420 s fixed outer
+deadline, a 380 s candidate limit and a 350 s suite alarm, with 512 MiB
+monitored scratch and the existing reserve/custody checks. The 300 s bound named
+in earlier documents — including the historical #182 packet — stays historical
+and labels those runs only. If another runner-bound task merges first, its
+values are integrated through a separately reviewed source update, never
+silently.
 
 **Settlement observation (oxide#147, unqualified source).** The current
 `bounded-test.py` also carries observation-only settlement diagnostics, so a

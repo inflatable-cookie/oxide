@@ -10,12 +10,12 @@ Implements docs/knowledge/contracts/proof-supervisor-correction.md (revision
   deadline, both pins (the monitor and the proof leader, held unreaped) and
   every signal. After setup it makes only bounded calls: fork, kevent and
   select with a zero or remaining-budget timeout, waitpid WNOHANG, one
-  process-table read per custody decision, kill or killpg on a pinned child,
-  and non-blocking pipe I/O. It never touches files or stdio after setup and
-  never signals a number whose identity it has not re-read itself at that
-  moment: a child it holds unreaped, or an announced session member whose
-  exact identity, user, session and non-zombie state it has just re-read
-  (oxide#195).
+  process-table read per custody decision, kill or killpg on a child it holds
+  unreaped, and non-blocking pipe I/O. It never touches files or stdio after
+  setup and never signals a number it does not hold unreaped: a merely
+  observed same-user process - a same-session survivor included - is never
+  signalled, because its PID could be recycled between the read and the signal
+  (oxide#195, Tom's 2026-10-31 ruling c096c8fc).
 - The monitor (first child) owns all I/O, including all blocking setup (the
   kinfo_proc check, path resolution, scratch and evidence creation) inside
   the custodian's setup deadline: the receipt phases, output draining,
@@ -50,8 +50,11 @@ the leader is reaped, every census round records, once per identity and up to
 a fixed bound, the exact rows it still classifies in the leader's own session
 (PID, start, ppid, pgid, uid, zombie) in the receipt's `survivors` list for the
 owner; that is observation only, no message and no signal. The census still
-decides closure, so a survivor keeps the run UNCLOSED with its scratch and
-evidence.
+decides closure, so a survivor that is still there when the deciding census runs
+keeps the run UNCLOSED with its scratch and evidence, while one that exits first
+leaves a recorded row and a closed run that honestly says so. Closing a
+survivor is deferred: it needs a boundary that holds the identity (Queue
+papercut 9ff7386d).
 
 An exception in any phase after setup, or a monitor message with a missing
 or ill-typed field, latches a fault; the bounded pinned stop, WNOHANG reap,
@@ -2089,17 +2092,29 @@ def survivor_row(row):
     return entry if entry["pid"] > 0 and entry["start"] > 0 else None
 
 
-def survivors_line(rows):
+def survivors_line(rows, closure=None):
     """One bounded summary line for the recorded survivors, or None when the run
-    recorded none. Pure: the monitor prints it, and it claims only what was
-    observed (never a signal, never a closure)."""
+    recorded none. Pure.
+
+    The recorded rows are an observation: a survivor seen after the stop may
+    exit by itself, so a LATER census can still be certainly empty and the run
+    can close. The line therefore never invents a closure verdict - it takes
+    the run's own final `closure` (`closed` / `UNCLOSED` / unknown) and states
+    only that: a closed run says the survivors were gone by the deciding
+    census, and only an UNCLOSED run says the scratch was kept. It never claims
+    a signal."""
     rows = [row for row in (rows or []) if isinstance(row, dict)]
     if not rows:
         return None
     shown = ", ".join(f"{row.get('pid')}/{row.get('start')}" for row in rows[:8])
     more = "" if len(rows) <= 8 else f" (+{len(rows) - 8} more)"
-    return (f"supervisor: {len(rows)} same-session survivor(s) not signalled (no custody):"
-            f" {shown}{more}; the run stays UNCLOSED and its scratch is kept")
+    head = (f"supervisor: {len(rows)} same-session survivor(s) not signalled (no custody):"
+            f" {shown}{more}")
+    if closure == "closed":
+        return head + "; they were gone by the deciding census, so the run closed"
+    if closure == "UNCLOSED":
+        return head + "; the run stays UNCLOSED and its scratch is kept"
+    return head + "; the deciding census fixes the outcome"
 
 
 def detach_authorization(fault, deadline_hit, now, exit_at):
@@ -3632,9 +3647,11 @@ class Monitor:
         Observation only. Tom's 2026-10-31 ruling (Queue decision c096c8fc) is
         that a same-user process which is not this run's child is not held
         unreaped across the signal, so its PID could be recycled between the
-        identity read and a signal: such an identity is never signalled, and the
-        run stays UNCLOSED. Recording its exact row is what makes the residual
-        legible to the owner without widening the signal set."""
+        identity read and a signal: such an identity is never signalled. Recording
+        its exact row is what makes the residual legible to the owner without
+        widening the signal set. A recorded row is not a closure verdict: a
+        survivor seen here may exit by itself, and the later census still decides
+        whether the run closes or stays UNCLOSED."""
         try:
             rows = [survivor_row(row) for row in (result.get("member_rows") or [])]
             with self.lock:
@@ -4112,7 +4129,7 @@ class Monitor:
                 f" (device {detach.get('device')}, exit {detach['exit']}, timed out {detach['timed_out']},"
                 f" post-state {detach['post_state']}, qualified {detach['qualified']})"
                 + (f": {detach['reason']}" if detach.get("reason") else ""))
-        survivors = survivors_line(receipt.get("survivors"))
+        survivors = survivors_line(receipt.get("survivors"), outcome.get("closure"))
         if survivors is not None:  # oxide#195: recorded, never signalled
             lines.append(survivors)
         for line in lines:  # one bounded write per line, so none truncates the rest

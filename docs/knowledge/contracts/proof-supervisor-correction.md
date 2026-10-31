@@ -35,9 +35,14 @@ path that converts an observation into a signal. Current behaviour is the
 [shared proof supervisor](workflow.md#shared-proof-supervisor) section's
 *Cooperative-session survivors* description: after the leader is reaped the
 monitor records the survivor's exact row in the receipt's bounded `survivors`
-list, signals nothing, and the run stays `UNCLOSED`. Read the table rows below
-about "survivors" with that amendment: a survivor is recorded and left to a
-boundary that can hold it, never signalled by this runner.
+list and signals nothing. A recorded row is not a verdict: a transient survivor
+may be gone by the deciding census, so the run then closes and the summary says
+so, while a survivor still present keeps the run `UNCLOSED` with its scratch.
+Read the table rows below about "survivors" with that amendment: a survivor is
+recorded and left to a boundary that can hold it, never signalled by this
+runner. This is observation-only custody hardening; closing the historical
+Cargo-group survivor is deferred to Queue papercut
+`9ff7386d-c70e-49c7-880a-2e6c676b2eb9`.
 
 ## Contract
 
