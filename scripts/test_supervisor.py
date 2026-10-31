@@ -1899,8 +1899,7 @@ class PureAdmission(unittest.TestCase):
         monitor = self.monitor(directory)
         path = self.publish(directory, {"schema": 2, "source": "oxide", "run": self.RUN,
                                         "command": "4242-0", "waited_ns": 90 * NS})
-        info = os.lstat(str(path))
-        monitor.read_admission(str(path), (info.st_dev, info.st_ino))
+        monitor.read_admission(str(path))
         os.close(monitor.ctl_w)
         sent = self.drain(monitor.cmd_r)
         self.assertEqual([m["type"] for m in sent], ["admission"])
@@ -1979,8 +1978,7 @@ class PureAdmission(unittest.TestCase):
         path = self.publish(directory, {"schema": 2, "source": "oxide", "run": self.RUN,
                                         "command": "4242-3", "reason": "queue"},
                             name=bounded.WAITING_NAME)
-        info = os.lstat(str(path))
-        monitor.read_admission(str(path), (info.st_dev, info.st_ino), "admission_waiting")
+        monitor.read_admission(str(path), None, "admission_waiting")
         os.close(monitor.ctl_w)
         sent = self.drain(monitor.cmd_r)
         self.assertEqual([m["type"] for m in sent], ["admission_waiting"])
@@ -1990,6 +1988,59 @@ class PureAdmission(unittest.TestCase):
         self.assertEqual((waiting["observed"], waiting["reason"], waiting["ignored"]), (1, "queue", 0))
         self.assertEqual(monitor.receipt["admission"]["observed"], 0)
         self.assertEqual(monitor.receipt["admission"]["reported_wait_ns"], 0)
+
+    def test_the_dedup_identity_is_the_file_actually_opened(self):
+        # Review finding: a writer publishes by atomic rename. If the file is
+        # replaced between the sampler's `lstat` and the read, dedup must bind to
+        # the opened inode, not to the sampled one, or the replacement would be
+        # reported now and again on the next poll (and could grant twice).
+        directory = self.fixture()
+        monitor = self.monitor(directory)
+        path = self.publish(directory, {"schema": 2, "source": "oxide", "run": self.RUN,
+                                        "command": "first", "waited_ns": 5 * NS})
+        sampled = os.lstat(str(path))
+        sampled_identity = (sampled.st_dev, sampled.st_ino)
+        # Replace the file atomically before the read: the sampler's stat names
+        # the old inode, the open sees the new one.
+        self.publish(directory, {"schema": 2, "source": "oxide", "run": self.RUN,
+                                 "command": "second", "waited_ns": 7 * NS},
+                     name=bounded.ADMISSION_NAME + ".replacement")
+        os.replace(str(directory / (bounded.ADMISSION_NAME + ".replacement")), str(path))
+        consumed = monitor.read_admission(str(path), sampled_identity)
+        info = os.lstat(str(path))
+        self.assertEqual(consumed, (info.st_dev, info.st_ino),
+                         "the read must report the identity it actually opened")
+        self.assertNotEqual(consumed, sampled_identity)
+        # Reporting the same opened identity again is a no-op.
+        self.assertEqual(monitor.read_admission(str(path), consumed), consumed)
+        os.close(monitor.ctl_w)
+        sent = self.drain(monitor.cmd_r)
+        self.assertEqual([m["type"] for m in sent], ["admission"])
+        self.assertEqual(sent[0]["command"], "second")
+        self.assertEqual(monitor.receipt["admission"]["observed"], 1)
+        self.assertEqual(monitor.receipt["admission"]["identity"], list(consumed))
+
+    def test_a_duplicate_completion_cannot_grant_the_same_wait_twice(self):
+        # Belt and braces for the same race: even if a completion reaches the
+        # custodian twice, one command grants its wait only once.
+        custodian = self.custodian()
+        custodian.record = lambda kind, **fields: None
+        with self.clock(custodian, 10):
+            custodian.accept(self.waiting(custodian, 10, command="dup"))
+        # 15 s of reported wait, fully backed by the 20 s elapsed time.
+        with self.clock(custodian, 20):
+            custodian.accept(self.message(custodian, 15 * NS, offset_s=20, command="dup"))
+        with self.clock(custodian, 21):
+            custodian.accept(self.message(custodian, 15 * NS, offset_s=21, command="dup"))
+        self.assertEqual(custodian.admission_granted, 15 * NS, "the second completion must not grant again")
+        self.assertEqual(custodian.admission_counted, 1)
+        self.assertEqual(custodian.admission_duplicates, 1)
+        custodian.cmd_r, custodian.cmd_w = self.pipe()
+        custodian.observe_admission(True)
+        os.close(custodian.cmd_w)
+        decision = [record["record"] for record in self.drain(custodian.cmd_r)
+                    if record["record"]["event"] == "admission_decision"][0]
+        self.assertEqual(decision["duplicates"], 1)
 
     def test_a_rejected_waiting_report_is_recorded_without_a_message(self):
         directory = self.fixture()

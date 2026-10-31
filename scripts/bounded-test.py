@@ -3688,44 +3688,58 @@ class Monitor:
         except BaseException:
             pass
 
-    def read_admission(self, path, identity=None, key="admission"):
+    def read_admission(self, path, seen=None, key="admission"):
         """One bounded read of an admission report (oxide#192).
 
         Only a regular file opened without following a link, at most
         ADMISSION_MAX_BYTES, validated against its own fixed schema: the
-        completed-wait marker or the waiting report. A valid report is sent to
-        the custodian with its own completed stamp; the extension decision is
-        the custodian's. Every other outcome is recorded here and nothing is
-        sent."""
+        completed-wait marker or the waiting report. Deduplication is bound to
+        the identity of the file actually opened (`fstat` on the open handle),
+        never to an identity sampled before the open: a writer publishes by
+        atomic rename, so a replacement between the sampler's `lstat` and this
+        open would otherwise report the new file once and then report it again on
+        the next poll, and a duplicated completion would grant the same wait
+        twice. A valid report is sent to the custodian with its own completed
+        stamp; the extension decision is the custodian's. Every other outcome is
+        recorded here and nothing is sent.
+
+        Returns the identity this call consumed, or None when nothing was read."""
         waiting = key == "admission_waiting"
         try:
             info = os.lstat(path)
             if not stat.S_ISREG(info.st_mode):
                 self.reject_admission("not a regular file", key, observed=False)
-                return
+                return None
             handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
             try:
+                opened = os.fstat(handle)
+                identity = (opened.st_dev, opened.st_ino)
+                if not stat.S_ISREG(opened.st_mode):
+                    self.reject_admission("not a regular file", key, observed=False)
+                    return None
+                if seen is not None and identity == seen:
+                    return identity  # already reported: one inode is one report
                 raw = os.read(handle, ADMISSION_MAX_BYTES + 1)
             finally:
                 os.close(handle)
         except OSError as error:
             self.reject_admission("read: " + errno_name(error), key, observed=False)
-            return
+            return None
         completed = now_ns()
         if len(raw) > ADMISSION_MAX_BYTES:
             self.reject_admission(f"larger than {ADMISSION_MAX_BYTES} bytes", key)
-            return
+            return None
         try:
             marker = json.loads(raw)
         except ValueError:
             self.reject_admission("not JSON", key)
-            return
+            return None
         run_id = self.ctx.get("run_id")
         problem = (admission_waiting_malformed(marker, run_id) if waiting
                    else admission_malformed(marker, run_id))
         if problem:
             self.reject_admission(problem, key)
-            return
+            return None
         try:
             record = self.receipt[key]
             with self.lock:
@@ -3744,8 +3758,10 @@ class Monitor:
             else:
                 self.send("admission", waited_ns=marker["waited_ns"], command=marker["command"],
                           completed=completed, marker=index)
+            return identity
         except BaseException:
             self.note_admission(error=True, key=key)
+            return None
 
     def sample_admission(self):
         """Poll both admission reports for a new identity (oxide#192).
@@ -3761,10 +3777,12 @@ class Monitor:
                     continue
                 try:
                     info = os.lstat(path)
-                    identity = (info.st_dev, info.st_ino, info.st_mode)
-                    if identity != seen[key]:
-                        seen[key] = identity
-                        self.read_admission(path, identity, key)
+                    candidate = (info.st_dev, info.st_ino)
+                    if candidate != seen[key]:
+                        # Mark what the read actually consumed, so a rename that
+                        # lands between this stat and the open is reported once.
+                        consumed = self.read_admission(path, seen[key], key)
+                        seen[key] = candidate if consumed is None else consumed
                 except FileNotFoundError:
                     seen[key] = None
                 except OSError:
@@ -4284,6 +4302,8 @@ class Monitor:
                        f" granted {admission['granted_ns'] / NS:.1f} s; {rejected_waiting} waiting and"
                        f" {rejected_grants} completed report(s) rejected"
                        + (f"; {admission['unclassified']} unpaired" if admission.get("unclassified") else "")
+                       + (f"; {admission['duplicates']} duplicate completion(s) ignored"
+                          if admission.get("duplicates") else "")
                        + "\n")
             for entry in (pairs.get("unpaired") or [])[:3]:
                 if entry["later_observation"] or rejected_waiting or rejected_grants:
@@ -4381,6 +4401,7 @@ class Custodian:
         self.admission_ordinal = 0
         self.admission_last_ordinal = 0
         self.admission_rejected_reports = 0
+        self.admission_duplicates = 0
         self.sampling_ended = False
         self.exceptions = 0
         self.injected = set()
@@ -4534,6 +4555,12 @@ class Custodian:
             self.admission_ordinal += 1
             self.admission_last_ordinal = self.admission_ordinal
             pair = self.admission_pair(message["command"])
+            if pair is not None and pair["ended"] is not None:
+                # One terminal per command grants time at most once, whatever the
+                # monitor's deduplication does: a duplicate completion can never
+                # grant the same wait twice.
+                self.admission_duplicates += 1
+                return
             if self.stopped_at is not None or self.deadline_hit:
                 self.admission_ignored += 1
                 self.admission_late_ns = at
@@ -5126,6 +5153,7 @@ class Custodian:
                       "waiting_ns": self.admission_waiting_ns,
                       "waiting_reason": self.admission_waiting_reason,
                       "admission_waiting": self.admission_pairs_summary(),
+                      "duplicates": self.admission_duplicates,
                       "unclassified": self.admission_unclassified,
                       "cap_ns": ADMISSION_CAP_NS, "limit_s": self.limit_s,
                       "absolute_ns": self.absolute}

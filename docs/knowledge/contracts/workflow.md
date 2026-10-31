@@ -2318,8 +2318,8 @@ review afterwards.
 integrated head adds the admission reports described in the supervisor rule
 below: the completed-wait marker and its bounded grant, the correlated waiting
 report, and the stop-boundary drain with late-marker classification. Together
-with oxide#191's merged 287 pure and 48 real cases the suite is now 319 pure + 53
-real = 372 cases (29 pure and 5 real of them oxide#192's: the completed wait and its
+with oxide#191's merged 287 pure and 48 real cases the suite is now 321 pure + 53
+real = 374 cases (31 pure and 5 real of them oxide#192's: the completed wait and its
 grant, the rejection control, the late grant, a wait that never ends before the
 stop, and the stale-run plus zero-duration-grant correlation), which the
 bootstrap's expected count and limitation list follow. The exported deadline,
@@ -2391,7 +2391,7 @@ the independent reviewer qualification. Until those exist at that head the bytes
 are unqualified and carry no credit for any other proof. The covering checks run
 at this head are recorded in the pull request: `effigy rust:compile`,
 `effigy rust:format`, `effigy test rust`, `effigy proof:supervisor:test`
-(319 pure cases) and `effigy docs:check`.
+(321 pure cases) and `effigy docs:check`.
 
 **Settlement observation (oxide#147, unqualified source).** The current
 `bounded-test.py` also carries observation-only settlement diagnostics, so a
@@ -2718,7 +2718,12 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   command's own slot admission grant ends (its measured interval from the first
   attempt to the grant), armed only by this supervisor's exported layout. The monitor polls the path every 0.25 s, opens only a regular file
   without following a link, reports one marker per file identity and stamps
-  the moment it read it; the custodian adds at most that reported wait, never
+  the moment it read it. Deduplication binds to the identity of the file it
+  actually opened (`fstat` on the open handle), never to an identity sampled
+  before the open, so an atomic replacement that lands between the sampler's
+  `lstat` and the read is reported once and never again on the next poll; and
+  the custodian grants one command's wait at most once, counting and ignoring a
+  duplicate completion. The custodian adds at most that reported wait, never
   more than this run's own elapsed wall clock and never more than 600 s in
   total, to `absolute`, and recomputes `stop_at` and `exit_at`. Nothing is
   ever shortened and `OXIDE_PROOF_DEADLINE_NS` is not rewritten, so a proof
@@ -2898,7 +2903,7 @@ with a recorded minimum. A fallback run, or a nested case outside the
 monitored root, fails the qualification. Its reserve readings identify the
 qualification's scratch volume and the boot volume separately. The suite
 runs in order:
-- 319 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 321 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -3173,7 +3178,7 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 372 cases (319 pure + 53 real, including oxide#191's post-census detach
+- all 374 cases (321 pure + 53 real, including oxide#191's post-census detach
   cases and oxide#192's five admission-report cases);
 - every real case directory and receipt still present after the
   candidate's cleanup.
