@@ -56,9 +56,11 @@ release deletes the slot whole through the holding area and forgets its
 record. The escaped writer is the `oxide exec` tool's own forked child: it
 leaves the product's exec group by joining the supervisor's leader process
 group (never a setsid escape), holds a file in its slot scratch, and is
-confirmed in that group before the removal; the product's stop cannot end it,
-the supervisor can census and signal it, and the proof stops it in a
-`finally`. The one product seam is the debug-only
+confirmed in that group before the removal; it redirects its inherited
+standard streams and closes their other descriptors before it waits, so the
+proof's pipe wait cannot be held by it. The product's stop cannot end it, the
+supervisor can census and signal it, and the proof stops it in a `finally`.
+The one product seam is the debug-only
 `OXIDE_TEST_BOOT_MS` override, which the product honors only under this
 supervisor's own scratch/evidence/deadline layout. The quarantines are made by
 the product's own removal path: a blocked `oxide exec` tool loses the volume
@@ -181,6 +183,18 @@ def follow_reattach(scratch, stopped, stat, open_held, close_held, mark_ready, s
         close_held(held)
 
 
+def detach_inherited(open_devnull, dup2, close, closerange):
+    # The escaped child must not keep the proof's standard-stream pipes open:
+    # the proof's communicate() waits for EOF, and the product's exit must not
+    # depend on this child. Redirect 0/1/2 and close inherited descriptors.
+    null = open_devnull()
+    for target in (0, 1, 2):
+        dup2(null, target)
+    if null > 2:
+        close(null)
+    closerange(3, 256)
+
+
 def main():
     gate = os.environ["FIXTURE_GATE"]
     scratch = os.environ["TMPDIR"]
@@ -190,6 +204,7 @@ def main():
     if os.fork() != 0:
         while True:
             time.sleep(0.5)
+    detach_inherited(lambda: os.open(os.devnull, os.O_RDWR), os.dup2, os.close, os.closerange)
     try:
         os.setpgid(0, leader)
     except OSError as error:
@@ -2014,8 +2029,9 @@ def self_check() -> int:
     reuses), the owners-on attach and mount observation every mode shares,
     the escaped exec writer's syntax, exec-group escape and
     supervisor-leader-group membership, its exercised detach/re-attach
-    readiness state machine, the release oracle's `process <pid>` form, the
-    dispatch, the product-message marker and the receipt bound."""
+    readiness state machine, its detach of the inherited standard streams
+    before it waits, the release oracle's `process <pid>` form, the dispatch,
+    the product-message marker and the receipt bound."""
     fixture = {
         "OXIDE_POOL": "/fixture/pool",
         "HOME": "/fixture/home",
@@ -2066,6 +2082,30 @@ def self_check() -> int:
     expect('"escaped-writer"' in ESCAPE_TOOL, "the escaped writer does not hold a file in the slot")
     namespace = {"__name__": "escape_tool_self_check"}
     exec(compile(ESCAPE_TOOL, "escape-tool", "exec"), namespace)
+    detach = namespace["detach_inherited"]
+    detach_calls = []
+    detach(
+        lambda: 7,
+        lambda descriptor, target: detach_calls.append(("dup", descriptor, target)),
+        lambda descriptor: detach_calls.append(("close", descriptor)),
+        lambda first, last: detach_calls.append(("range", first, last)),
+    )
+    expect(
+        detach_calls
+        == [
+            ("dup", 7, 0),
+            ("dup", 7, 1),
+            ("dup", 7, 2),
+            ("close", 7),
+            ("range", 3, 256),
+        ],
+        f"the escaped writer does not detach the inherited streams: {detach_calls}",
+    )
+    expect(
+        ESCAPE_TOOL.index("    detach_inherited(lambda: os.open(os.devnull")
+        < ESCAPE_TOOL.index("    follow_reattach(\n        scratch,"),
+        "the escaped writer waits before detaching the inherited streams",
+    )
     follow = namespace["follow_reattach"]
 
     def observed(events):
