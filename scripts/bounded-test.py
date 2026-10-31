@@ -934,16 +934,21 @@ class Census:
     - `ancestor` (a): the row's own identity is EXACTLY one recorded pair, and
       that identity is re-verified through the safe Kinfo reader after the
       snapshot. A recycled PID, a changed identity or an unreadable re-read is
-      not excluded.
+      not excluded, and a row whose PID is a recorded ancestor's PID is decided
+      by this rule alone: a changed or unverifiable identity stays unknown and
+      never falls through to the parent rule.
     - `parent` (b): the row's observation-time parent row (same snapshot) has a
-      PID above 1, its identity is EXACTLY one recorded pair, that identity is
-      re-verified through the safe Kinfo reader after the snapshot, and the row
-      is positively outside the supervised leader's session AND process group
-      (both readable and both different from the leader's). A matching parent
-      PID alone is not enough, and a recycled or missing parent row, an
-      unreadable session or group, and every PPID 1 orphan stay unknown. The
-      macOS rule that a supervised descendant can only be reparented to launchd
-      makes the sibling's parentage incompatible with supervised descent.
+      PID above 1, its identity is EXACTLY one recorded pair, and ONE sibling
+      observation re-verifies the row's own PID/start identity AND that parent
+      identity on both sides of the session/group reads, so a PID reused between
+      the snapshot and those reads cannot lend another process's session or group
+      to this row. The row must be positively outside the supervised leader's
+      session AND process group (both readable and both different from the
+      leader's). A matching parent PID alone is not enough, and a recycled or
+      missing parent row, a replaced identity, an unreadable session or group,
+      and every PPID 1 orphan stay unknown. The macOS rule that a supervised
+      descendant can only be reparented to launchd makes such parentage
+      incompatible with supervised descent.
 
     NO clock, wall, boot or uptime value takes part: a start-time ordering
     cannot prove the absence of a masked backward, back-and-forth or forward
@@ -951,10 +956,13 @@ class Census:
     earlier is never excluded. A tracked descendant keeps its existing
     classification however its start token compares.
 
-    A subclass cannot weaken these: every rule needs a positive, re-verified
-    identity plus (for `parent`) positive session and group exclusion, a
-    skipped row is neither a member nor uncertain, and each exclusion's bounded
-    evidence (`pid`, `start`, `rule`) is returned for the receipt.
+    A TRACKED identity is never excluded: it is a member this census already
+    accepted, so both rules veto it before anything else and no exclusion ever
+    removes tracked attribution. Every rule needs a positive, re-verified
+    identity plus (for `parent`) one bound observation with positive session and
+    group exclusion, a skipped row is neither a member nor uncertain, and each
+    exclusion's bounded evidence (`pid`, `start`, `rule`) is returned for the
+    receipt.
 
     The round also builds an optional, monitor-receipt-only diagnostics
     object summarizing ESRCH rows (confirm attempts/outcome and the final
@@ -982,6 +990,7 @@ class Census:
         self.sid, self.snapshot, self.getsid, self.reread, self.pause = sid, snapshot, getsid, reread, pause
         self.terminal_allowed = terminal_allowed if terminal_allowed is True else False
         self.ancestors = _ancestor_identity_set(ancestors)
+        self.ancestor_pids = frozenset(identity[0] for identity in self.ancestors)
         self.getpgid = getpgid if callable(getpgid) else os.getpgid
         self.tracked = {}
         # Observation-only per-round counters (oxide#147). They are reset at the
@@ -1076,48 +1085,74 @@ class Census:
         except BaseException:
             return False
 
-    def identity_stable(self, identity):
+    def identity_stable(self, identity, parent_pid=None):
         """Whether this exact identity is still what the safe reader names.
 
         Oxide#197 (design ruling ea5a3dc9): an excluded row's identity is
         re-verified through the same Kinfo reader after the census snapshot, so
         an ancestor that was recycled, changed or became unreadable inside the
-        census is never excluded. Pure observation: one read, no bookkeeping,
-        never raises."""
+        census is never excluded. With `parent_pid` the same read must also still
+        name that parent, which binds the observed parentage to this observation
+        rather than to the older snapshot. Pure observation: one read, no
+        bookkeeping, never raises."""
         try:
             again = self.reread(identity[0])
-            return (isinstance(again, dict) and again.get("pid") == identity[0]
-                    and again.get("start") == identity[1])
+            if not (isinstance(again, dict) and again.get("pid") == identity[0]
+                    and again.get("start") == identity[1]):
+                return False
+            return parent_pid is None or again.get("ppid") == parent_pid
         except BaseException:
             return False
 
-    def outside_leader_session_and_group(self, identity):
-        """Whether a row is positively outside the leader's session AND group.
+    def sibling_observation(self, identity, parent_identity):
+        """Whether one sibling observation proves both parentage and isolation.
 
-        Requires both reads to succeed and both values to differ from the
-        supervised leader's PID, which is its session id and its process group
-        id. An unreadable session or group is never evidence. One observation,
-        never raises."""
+        Oxide#197 (design ruling ea5a3dc9): the launcher-sibling fact is only
+        usable when the row's own PID/start identity AND its recorded parent are
+        re-verified on both sides of the session/group reads, so a PID reused
+        between the snapshot and those reads can never lend another process's
+        session or group to this row. Every read must succeed and the row must
+        be positively outside the supervised leader's session AND process group
+        (both readable, both different from the leader's PID, which is its
+        session and group id). Never raises."""
         try:
+            ppid = parent_identity[0]
+            if not self.identity_stable(parent_identity):
+                return False
+            if not self.identity_stable(identity, parent_pid=ppid):
+                return False
             session = self.getsid(identity[0])
             group = self.getpgid(identity[0])
             if session is None or group is None:
                 return False
-            return session != self.sid and group != self.sid
+            if session == self.sid or group == self.sid:
+                return False
+            if not self.identity_stable(identity, parent_pid=ppid):
+                return False
+            return self.identity_stable(parent_identity)
         except BaseException:
             return False
 
     def exclusion_rule(self, row, by_pid):
         """The structural launcher rule that excludes this row, or None.
 
-        Order is `ancestor`, then `parent`; each needs its positive identity
-        re-verified after the snapshot, and `parent` additionally needs the row
-        to be positively outside the leader's session and process group. Pure
-        classification over the injected readers: no pauses, never raises."""
+        Order is `ancestor`, then `parent`. A tracked identity is never
+        excluded: it is a member this census already accepted. A row whose PID
+        is a recorded ancestor's PID is only ever the `ancestor` rule, so a
+        changed identity stays unknown instead of falling through to its
+        parent's rule. `parent` needs a re-verified parent identity plus
+        `sibling_observation`. Pure classification over the injected readers:
+        no pauses, never raises."""
         try:
             identity = (row["pid"], row["start"])
-            if self.excludes_ancestor(identity) and self.identity_stable(identity):
-                return "ancestor"
+            if identity in self.tracked:  # a tracked member is never excluded
+                return None
+            if row["pid"] in self.ancestor_pids:
+                # A recorded ancestor PID is decided here only: the exact,
+                # re-verified identity is excluded, anything else (changed or
+                # unreadable identity) stays unknown and never falls through.
+                return "ancestor" if (identity in self.ancestors
+                                       and self.identity_stable(identity)) else None
             ppid = row.get("ppid")
             if type(ppid) is not int or ppid <= 1:  # an orphan is never excluded
                 return None
@@ -1125,9 +1160,9 @@ class Census:
             if parent is None:  # an unknown parent is never excluded
                 return None
             parent_identity = (parent["pid"], parent["start"])
-            if not (self.excludes_ancestor(parent_identity) and self.identity_stable(parent_identity)):
+            if not self.excludes_ancestor(parent_identity):
                 return None
-            if not self.outside_leader_session_and_group(identity):
+            if not self.sibling_observation(identity, parent_identity):
                 return None
             return "parent"
         except BaseException:
@@ -1179,13 +1214,13 @@ class Census:
         pending = []  # (index, row, identity, state) still being confirmed, snapshot order
         for index, row in enumerate(rows):
             identity = (row["pid"], row["start"])
-            rule = self.exclusion_rule(row, by_pid) if by_pid else None
+            # A tracked identity keeps its existing member/terminal attribution
+            # and is never excluded, so a launcher rule can never remove it.
+            rule = (self.exclusion_rule(row, by_pid)
+                    if by_pid and identity not in self.tracked else None)
             if rule is not None:
-                # This run's own launcher chain (or a row positively created
-                # before it): never a member and never an unknown row. No read,
-                # no pause. A recycled PID has a different start token and falls
-                # through to the unchanged classification.
-                self.tracked.pop(identity, None)
+                # This run's own launcher chain: never a member and never an
+                # unknown row. No pause, and its tracked set is left untouched.
                 records[index] = {"skip": True}
                 excluded_total += 1
                 rule_totals[rule] += 1

@@ -458,6 +458,7 @@ class FakeTable:
         self.rows, self.sessions, self.rereads = rows, sessions, reread or {}
         self.groups = groups or {}
         self.reads = 0
+        self.reads_by_pid = {}
 
     def snapshot(self):
         return list(self.rows)
@@ -477,6 +478,10 @@ class FakeTable:
     def reread(self, pid):
         self.reads += 1
         value = self.rereads.get(pid, "rows")
+        if isinstance(value, list):  # per-PID sequence; the last entry repeats
+            index = self.reads_by_pid.get(pid, 0)
+            self.reads_by_pid[pid] = index + 1
+            value = value[min(index, len(value) - 1)]
         if callable(value):
             value = value(self.reads)
         if isinstance(value, BaseException):
@@ -768,6 +773,56 @@ class PureAncestors(unittest.TestCase):
         result = census(unreadable_group, ancestors=[self.LAUNCHER]).round()
         self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
         self.assertEqual(result["ancestor_exclusions"]["by_rule"]["parent"], 0)
+
+    def test_a_tracked_member_with_a_recorded_ancestor_parent_is_never_excluded(self):
+        # Review finding: the parent rule must not precede, or remove, tracked
+        # attribution. A row this census already accepted as a member keeps its
+        # member status even when its parent is a recorded ancestor.
+        sibling = row(900, start=12, ppid=self.LAUNCHER[0])
+        table = FakeTable(self.launcher_rows(sibling), {700: 7, 900: 100})
+        check = census(table, ancestors=[self.LAUNCHER])
+        first = check.round()
+        self.assertEqual((first["certain"], first["members"], first["uncertain"]), (True, 1, 0))
+        self.assertIn((900, 12), check.tracked)
+        self.assertEqual(first["ancestor_exclusions"]["by_rule"]["parent"], 0)
+        # The tracked veto holds on the next round even if the row's own session
+        # becomes unreadable: a member is never reclassified by a launcher rule.
+        table.sessions = {700: 7, 900: ProcessLookupError(errno.ESRCH, "gone")}
+        second = check.round()
+        self.assertEqual((second["members"], second["uncertain"]), (1, 0))
+        self.assertIn((900, 12), check.tracked)
+        self.assertEqual(second["ancestor_exclusions"]["by_rule"]["parent"], 0)
+
+    def test_a_pid_reused_between_the_sibling_reads_is_never_excluded(self):
+        # Review finding: the session/group facts must belong to the snapshot
+        # row's own identity. A replacement identity inside the observation
+        # window (the second sibling read) is never excluded as a sibling.
+        sibling = row(900, start=12, ppid=self.LAUNCHER[0])
+        table = FakeTable(self.launcher_rows(sibling), {700: 7, 900: 7},
+                          reread={900: [sibling, row(900, start=99, ppid=700)]})
+        result = census(table, ancestors=[self.LAUNCHER]).round()
+        # The replacement identity is not excluded as a sibling, and the row's
+        # own changed identity keeps it unknown under the existing rule.
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual(result["ancestor_exclusions"]["by_rule"]["parent"], 0)
+        self.assertEqual(result["ancestor_exclusions"]["rows"],
+                         [{"pid": 700, "start": 11, "rule": "ancestor"}])
+
+    def test_a_changed_ancestor_child_identity_never_falls_through_to_its_parent(self):
+        # Review finding: a failed ancestor re-verification stays unknown. The
+        # child 600 is a recorded ancestor PID with a changed start token and a
+        # stable recorded parent (700), which must not turn it into a sibling.
+        rows = [row(700, start=11, ppid=500), row(600, start=99, ppid=700)]
+        table = FakeTable(rows, {700: 7, 600: PermissionError(1, "denied")},
+                          reread={700: row(700, start=11, ppid=500),
+                                  600: row(600, start=99, ppid=700)})
+        result = census(table, ancestors=[self.LAUNCHER, (600, 12)]).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual(result["uncertain_rows"][0]["pid"], 600)
+        self.assertEqual(result["ancestor_exclusions"]["by_rule"],
+                         {"ancestor": 1, "parent": 0}, result["ancestor_exclusions"])
+        self.assertEqual(result["ancestor_exclusions"]["rows"],
+                         [{"pid": 700, "start": 11, "rule": "ancestor"}])
 
     def test_a_sibling_spawned_mid_run_is_excluded_and_recorded(self):
         # Round 1: the launcher alone. Round 2: an unrelated sibling appears

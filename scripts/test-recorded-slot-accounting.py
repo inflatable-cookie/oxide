@@ -82,7 +82,7 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILDER = "1.97.1"
 # The qualified shared supervisor this proof's whole command runs under.
-GUARD_SHA256 = "d7bc4de3bf3e494cb7b5cefe6e185bdc08d26d1dd5f78ebfbc2fc44cdd733190"
+GUARD_SHA256 = "10f5dc8536ab6b534c637dc5842c11a01d240381854a53a8b97db1653f8e2392"
 GUARD_PATH = os.path.join(REPO, "scripts", "bounded-test.py")
 
 # The product's serialized pool facts, bound to source by `--self-test`. The

@@ -2169,7 +2169,7 @@ with no earlier run migrated.
 
 **Post-census image detach request (oxide#191, decision `ee263cea`, unqualified
 source).** The current `bounded-test.py`
-(`d7bc4de3bf3e494cb7b5cefe6e185bdc08d26d1dd5f78ebfbc2fc44cdd733190`) adds one
+(`10f5dc8536ab6b534c637dc5842c11a01d240381854a53a8b97db1653f8e2392`) adds one
 opt-in control for a proof
 whose own test image must be detached, and it is the only route by which such a
 proof may detach after a launch; the qualified shared runner is otherwise
@@ -2282,7 +2282,7 @@ custodian keeps its filesystem-free decision path and the existing
 cooperative-session limits. These bytes are unqualified until one uncounted
 `effigy proof:supervisor:qualify:diagnostic` records a clean picture and then
 ONE counted author and ONE separate independent reviewer
-`effigy proof:supervisor:qualify` pass at the same head (310 pure plus 49 real
+`effigy proof:supervisor:qualify` pass at the same head (313 pure plus 49 real
 cases, including the seventy-six pure detach cases and the eight real ones: a
 bound success, a refused identity, a failed attempt, an unrequested attachment
 whose opt-in custody keep is recorded separately, and a real stuck child the
@@ -2311,17 +2311,28 @@ nothing else:
   identity is re-verified through the safe Kinfo reader after the census
   snapshot. A row with a recorded PID but a different start token, a recycled
   identity or an unreadable re-read is not excluded and keeps its existing
-  handling.
+  handling. A row whose PID is a recorded ancestor's PID is decided by this rule
+  alone, so a changed or unverifiable identity stays unknown and never falls
+  through to its parent's rule.
 - **`parent` (the launcher sibling):** the row's observation-time parent row, in
-  the same snapshot, has a PID above 1, an identity that is exactly one recorded
-  pair, that parent identity is re-verified through the safe Kinfo reader after
-  the snapshot, and the row itself is positively outside the supervised leader's
-  session AND process group (both readable and both different from the leader's
-  PID, which is its session and group id). The macOS rule that a supervised
-  descendant can only be reparented to launchd — never to a supervisor ancestor
-  — makes such parentage incompatible with supervised descent. A matching
-  parent PID alone is not enough: a recycled parent PID, a missing parent row,
-  an unreadable session or group and every PPID 1 orphan stay unknown.
+  the same snapshot, has a PID above 1 and an identity that is exactly one
+  recorded pair, and ONE sibling observation re-verifies the row's own
+  `(PID, start)` identity AND that parent identity on both sides of the
+  session/group reads, so a PID reused between the snapshot and those reads can
+  never lend another process's session or group to this row; the row must still
+  name that parent in both re-reads. Within that observation the row must be
+  positively outside the supervised leader's session AND process group (both
+  readable and both different from the leader's PID, which is its session and
+  group id). The macOS rule that a supervised descendant can only be reparented
+  to launchd — never to a supervisor ancestor — makes such parentage
+  incompatible with supervised descent. A matching parent PID alone is not
+  enough: a recycled parent PID, a replaced identity, a missing parent row, an
+  unreadable session or group and every PPID 1 orphan stay unknown.
+
+A **tracked** identity — one this census already accepted as a member — is
+never excluded by either rule: both veto it before anything else, and no
+exclusion ever removes tracked attribution. A tracked row is therefore never
+reclassified, whatever its parent or its session/group read says.
 
 No wall, boot or uptime value participates anywhere in the census, so a row
 whose start token merely looks earlier is never excluded and a tracked
@@ -2337,11 +2348,11 @@ recorded chain in one bounded `ancestors` object with fixed keys — `state`
 every exclusion in one bounded cumulative `ancestor_exclusions` object: at most
 `EXCLUSION_MAX_ROWS` (20) distinct `pid`/`start`/`rule` rows, the total decision
 count, the omitted count (`count == rows + omitted`) and the per-rule counts. The
-current `bounded-test.py` (`d7bc4de3…`) adds this to the oxide#191 runner, so
+current `bounded-test.py` (`10f5dc85…`) adds this to the oxide#191 runner, so
 those controls are unqualified until that head's own uncounted
 `effigy proof:supervisor:qualify:diagnostic` and separate author and independent
-reviewer `effigy proof:supervisor:qualify` pass; the suite gains twenty-three
-pure structural launcher-rule cases (310 pure plus 49 real = 359, and the
+reviewer `effigy proof:supervisor:qualify` pass; the suite gains twenty-six
+pure structural launcher-rule cases (313 pure plus 49 real = 362, and the
 bootstrap's expected case total follows the suite).
 
 **Settlement observation (oxide#147, unqualified source).** The current
@@ -2569,17 +2580,20 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
     acceptance never fires and every `ESRCH` row keeps the old uncertain
     handling, while the terminal count stays the accountably known valid
     0. Apart from the two structural launcher rules above (a re-verified
-    recorded ancestor identity, and a launcher sibling whose re-verified parent
-    is one of those identities and which is positively outside the leader's
-    session and process group), no live process is excluded by parent, and a
-    replacement identity is never declared foreign or member by inference.
+    recorded ancestor identity, decided only by that rule; and a launcher
+    sibling whose parent identity and own identity are re-verified around the
+    session/group reads and which is positively outside the leader's session and
+    process group), no live process is excluded by parent, a tracked member is
+    never excluded, and a replacement identity is never declared foreign or
+    member by inference.
 
   The launcher rules are the only parent-based exclusions: the monitor records
   its own chain once in bounded setup (at most 64 levels, from its owner parent
-  through PID 1) and the census skips only a re-verified recorded identity or a
-  re-verified recorded parent identity on a row that is also positively outside
-  the leader's session and process group. The receipt carries that record as the
-  bounded `ancestors` object and the positive exclusion evidence as the bounded
+  through PID 1) and the census skips only a re-verified recorded identity, or a
+  non-tracked row whose own identity and recorded parent identity are re-verified
+  around the session/group reads and which is positively outside the leader's
+  session and process group. The receipt carries that record as the bounded
+  `ancestors` object and the positive exclusion evidence as the bounded
   `ancestor_exclusions` object, both described above.
 
   An uncertain or failed census after `stopped` latches a fault at once. A
@@ -5529,7 +5543,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
 - **Focused proof of absent checkout chains (oxide#135).** The one fixed proof
   is `effigy rust:prune-absence` (`scripts/test-prune-absence.py` under this
-  tree's shared supervisor `d7bc4de3…`, the merged oxide#151 guard plus
+  tree's shared supervisor `10f5dc85…`, the merged oxide#151 guard plus
   oxide#191's opt-in post-census detach and oxide#197's ancestor-chain
   exclusion) with
   `--root-parent /private/tmp`, the owner-accepted internal-placement exception
