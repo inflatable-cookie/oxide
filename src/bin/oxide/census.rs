@@ -1211,12 +1211,9 @@ mod tests {
             platform::with_stated_processes(vec![pid as i32], || verify(&slot, Some(&live)))
                 .expect_err("a live holder must refuse");
         assert!(error.contains("still running"), "{error}");
-        let mut child = std::process::Command::new("/bin/true")
-            .spawn()
-            .expect("a one-shot child");
-        let gone_pid = child.id();
-        child.wait().expect("the one-shot child exits");
-        let gone = holder_state(Some(&Holder { pid: gone_pid })).expect("a reaped pid is gone");
+        // A pid above the platform's range: the kernel reports it gone.
+        let gone =
+            holder_state(Some(&Holder { pid: 4_000_000 })).expect("an impossible pid is gone");
         assert!(gone.contains("is gone"), "{gone}");
         // The decision over a stated kernel identity: another account's
         // process is the other positive; a same-account process is not.
