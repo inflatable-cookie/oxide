@@ -118,15 +118,50 @@ BOOT_CASES = (
 # by joining the qualified supervisor's own leader process group
 # (`FIXTURE_LEADER_PGID`, this proof's group). It therefore stays inside the
 # supervisor's custody for its census and closure while the product's stop
-# cannot end it. It holds a file in its slot scratch until the proof stops it.
+# cannot end it. Readiness is published only after the child has observed the
+# slot scratch become absent (the detach) and then present again (the
+# re-attach), with a fresh handle on the returned tree: a pre-detach handle or
+# a readiness written before removal is never used.
 ESCAPE_TOOL = r"""#!/usr/bin/env python3
 import os, sys, time
-gate = os.environ["FIXTURE_GATE"]
-scratch = os.environ["TMPDIR"]
-leader = int(os.environ["FIXTURE_LEADER_PGID"])
-with open(os.path.join(gate, "started"), "w", encoding="utf-8") as handle:
-    handle.write(scratch + "\n")
-if os.fork() == 0:
+
+
+def follow_reattach(scratch, stopped, stat, open_held, close_held, mark_ready, sleep):
+    # Hold a file on the slot tree across a detach and a re-attach. The ready
+    # marker is written only after the path was observed absent and then
+    # present again, after a fresh handle is opened on that returned tree.
+    held = None
+    seen_absent = False
+    announced = False
+    while not stopped():
+        try:
+            stat(scratch)
+        except OSError:
+            seen_absent = True
+            if held is not None:
+                close_held(held)
+                held = None
+        else:
+            if seen_absent and not announced:
+                if held is not None:
+                    close_held(held)
+                held = open_held(os.path.join(scratch, "escaped-writer"))
+                announced = True
+                mark_ready()
+        sleep(0.05)
+    if held is not None:
+        close_held(held)
+
+
+def main():
+    gate = os.environ["FIXTURE_GATE"]
+    scratch = os.environ["TMPDIR"]
+    leader = int(os.environ["FIXTURE_LEADER_PGID"])
+    with open(os.path.join(gate, "started"), "w", encoding="utf-8") as handle:
+        handle.write(scratch + "\n")
+    if os.fork() != 0:
+        while True:
+            time.sleep(0.5)
     try:
         os.setpgid(0, leader)
     except OSError as error:
@@ -135,36 +170,30 @@ if os.fork() == 0:
         os._exit(9)
     with open(os.path.join(gate, "escaped"), "w", encoding="utf-8") as handle:
         handle.write(str(os.getpid()) + "\n")
-    held = None
-    fresh = False
-    stop = os.path.join(gate, "stop")
-    end = time.monotonic() + 240.0
-    while time.monotonic() < end and not os.path.exists(stop):
-        if not fresh:
-            if held is None:
-                try:
-                    held = open(os.path.join(scratch, "escaped-writer"), "a")
-                except OSError:
-                    pass
-            try:
-                os.stat(scratch)
-            except OSError:
-                pass
-            else:
-                # The volume is back: replace the pre-detach handle with one
-                # on the re-attached tree, then mark it ready.
-                if held is not None:
-                    held.close()
-                held = open(os.path.join(scratch, "escaped-writer"), "a")
-                fresh = True
-                with open(os.path.join(gate, "escaped-ready"), "w", encoding="utf-8") as marker:
-                    marker.write("ready\n")
-        time.sleep(0.05)
-    if held is not None:
-        held.close()
+    stop_path = os.path.join(gate, "stop")
+    deadline = time.monotonic() + 240.0
+
+    def stopped():
+        return time.monotonic() >= deadline or os.path.exists(stop_path)
+
+    def mark_ready():
+        with open(os.path.join(gate, "escaped-ready"), "w", encoding="utf-8") as marker:
+            marker.write("ready\n")
+
+    follow_reattach(
+        scratch,
+        stopped,
+        os.stat,
+        lambda path: open(path, "a"),
+        lambda handle: handle.close(),
+        mark_ready,
+        time.sleep,
+    )
     os._exit(0)
-while True:
-    time.sleep(0.5)
+
+
+if __name__ == "__main__":
+    main()
 """
 BOOT_APP = {
     "Cargo.toml": '[package]\nname = "bootapp"\nversion = "0.1.0"\nedition = "2021"\n',
@@ -852,6 +881,11 @@ class BootClosure:
                 os.getpgid(escaped_pid) == os.getpgrp(),
                 f"{case}: escaped writer pid {escaped_pid} is not in the supervisor's leader group",
             )
+        if escaped:
+            need(
+                not os.path.exists(os.path.join(env["FIXTURE_GATE"], "escaped-ready")),
+                f"{case}: readiness was published before the removal",
+            )
         self.volume.force_detach(f"{case} removal")
         code, _, stderr = self.proof.finish(child, f"{case} exec after removal", WAIT_SECONDS)
         # A surviving exec, or a removal without the product's own quarantine
@@ -1263,8 +1297,9 @@ def self_check() -> int:
     — plus the deletion oracle's slot-leaf resolution (the slot's own leaf,
     never the project-label folder a build or an adopt also creates or
     reuses), the escaped exec writer's syntax, exec-group escape and
-    supervisor-leader-group membership, the release oracle's `process <pid>`
-    form, the dispatch, the product-message marker and the receipt bound."""
+    supervisor-leader-group membership, its exercised detach/re-attach
+    readiness state machine, the release oracle's `process <pid>` form, the
+    dispatch, the product-message marker and the receipt bound."""
     fixture = {
         "OXIDE_POOL": "/fixture/pool",
         "HOME": "/fixture/home",
@@ -1295,13 +1330,56 @@ def self_check() -> int:
     # The escaped exec writer (oxide#196) must be valid Python, leave the
     # product's exec group by joining the supervisor's own leader group, and
     # never leave the supervisor's session: the qualified supervisor can only
-    # census and signal its leader group. The release oracle must match the
-    # product's `process <pid>` census message, never a `pid <pid>` form.
+    # census and signal its leader group. Its readiness state machine is
+    # exercised with stated observations: readiness and a fresh handle must
+    # follow an observed detach and re-attach, and must never appear without
+    # one. The release oracle must match the product's `process <pid>` census
+    # message, never a `pid <pid>` form.
     compile(ESCAPE_TOOL, "escape-tool", "exec")
     expect("os.setpgid(0, leader)" in ESCAPE_TOOL, "the escaped writer does not leave the exec group")
     expect("FIXTURE_LEADER_PGID" in ESCAPE_TOOL, "the escaped writer does not join the supervisor's leader group")
     expect("setsid" not in ESCAPE_TOOL, "the escaped writer must not leave the supervisor's session")
     expect('"escaped-writer"' in ESCAPE_TOOL, "the escaped writer does not hold a file in the slot")
+    namespace = {"__name__": "escape_tool_self_check"}
+    exec(compile(ESCAPE_TOOL, "escape-tool", "exec"), namespace)
+    follow = namespace["follow_reattach"]
+
+    def observed(events):
+        state = {"step": 0, "opened": [], "closed": [], "ready": []}
+
+        def stopped():
+            return state["step"] >= len(events)
+
+        def stat(_path):
+            event = events[state["step"]]
+            state["step"] += 1
+            if event == "absent":
+                raise FileNotFoundError("detached")
+            return None
+
+        def open_held(path):
+            handle = ("handle", len(state["opened"]))
+            state["opened"].append(path)
+            return handle
+
+        def close_held(handle):
+            state["closed"].append(handle)
+
+        def mark_ready():
+            state["ready"].append(state["step"])
+
+        follow("/slot", stopped, stat, open_held, close_held, mark_ready, lambda _: None)
+        return state
+
+    detached = observed(["present", "absent", "present"])
+    expect(len(detached["ready"]) == 1, "the writer did not mark ready after re-attach")
+    expect(detached["ready"][0] == 3, "readiness did not follow the returning observation")
+    expect(len(detached["opened"]) == 1, "the writer did not open a fresh handle after re-attach")
+    expect("escaped-writer" in detached["opened"][0], "the writer opened the wrong path")
+    expect(detached["closed"] == [("handle", 0)], "the fresh handle was not closed at stop")
+    not_detached = observed(["present", "present"])
+    expect(not_detached["ready"] == [], "readiness was written before an observed detach")
+    expect(not_detached["opened"] == [], "a pre-detach handle was opened")
     census_message = "process 4242 (python3) holds /slot/scratch/escaped-writer open inside /slot"
     expect(process_refusal(4242) in census_message, "the release oracle does not match the census message")
     expect(f"pid {4242}" not in census_message, "the old pid-only oracle would not match the census message")

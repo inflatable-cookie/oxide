@@ -1293,9 +1293,9 @@ pub(super) fn write_hold_intent_injected(
     write_ledger(pool, &ledger)
 }
 
-/// Test-only: record the durable rename intent of one idle slot straight into
-/// the ledger, so a test can model the interruption windows around an eviction's
-/// rename without opening (and reconciling) the pool.
+/// Test-only: record the durable rename intent of one idle **or held** slot
+/// straight into the ledger, so a test can model the interruption windows
+/// around an eviction's rename without opening (and reconciling) the pool.
 #[cfg(test)]
 pub(super) fn hold_intent_for_test(
     pool: &Path,
@@ -1310,7 +1310,7 @@ pub(super) fn hold_intent_for_test(
         .iter_mut()
         .find(|slot| slot.id == slot_id)
         .ok_or(LeaseError::UnknownAccounting)?;
-    if slot.state != SlotPersistState::Idle {
+    if !matches!(slot.state, SlotPersistState::Idle | SlotPersistState::Held) {
         return Err(LeaseError::UnknownAccounting);
     }
     let name = derived_holding_name(&store_id, slot.id, slot.incarnation, &slot.last_lease_id)
@@ -1327,6 +1327,18 @@ pub(super) fn hold_intent_for_test(
 /// expected root identity, without reconciliation, so a test can prove the
 /// rename boundary refuses a replaced root. Writes nothing durable beyond the
 /// rename; the caller inspects the pool itself.
+/// Test-only: whether one slot row still carries a hold intent, read without
+/// opening (and reconciling) the pool.
+#[cfg(test)]
+pub(super) fn hold_intent_present_injected(pool: &Path, slot_id: u64) -> bool {
+    read_ledger(pool).ok().is_some_and(|ledger| {
+        ledger
+            .slots
+            .iter()
+            .any(|slot| slot.id == slot_id && slot.hold_intent.is_some())
+    })
+}
+
 #[cfg(test)]
 pub(super) fn hold_expecting_injected(
     pool: &Path,

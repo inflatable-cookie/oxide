@@ -711,8 +711,9 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # kept; and the operator-confirmed release (oxide#196) refuses while an
 # `oxide exec` tool's forked child, which leaves the product's exec group by
 # joining the supervisor's leader process group, holds a file in its slot
-# scratch, then deletes the slot whole through the holding area once that
-# writer is stopped. The explicit internal root is the owner-accepted
+# scratch after observing the detach and then the re-attach (a fresh handle;
+# readiness never precedes removal), then deletes the slot whole through the
+# holding area once that writer is stopped. The explicit internal root is the owner-accepted
 # exception for this fixture's genuine directory-budget internal pool (a pool
 # under /Volumes refuses). 300 s, 512 MiB monitored scratch, ordinary detach.
 # No reinstall, live pool or live slot mutation. Not a benchmark or full QA.

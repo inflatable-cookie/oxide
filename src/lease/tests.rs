@@ -1,8 +1,8 @@
 use super::managed;
 use super::pool::{
-    create_injected, evict_held_slot_injected, evict_idle_slot_injected, lease_injected,
-    mark_evicting_for_test, recover_injected, release_injected, status_injected,
-    with_accounting_limits,
+    create_injected, evict_held_slot_injected, evict_idle_slot_injected, hold_expecting_injected,
+    hold_intent_for_test, hold_intent_present_injected, lease_injected, mark_evicting_for_test,
+    recover_injected, release_injected, status_injected, with_accounting_limits,
 };
 use super::{
     AccountingCoverage, AccountingGapKind, AccountingScan, AdmissionClass, LeaseError,
@@ -1205,6 +1205,88 @@ fn a_held_slot_is_evicted_whole_only_by_its_exact_lease() {
             .iter()
             .any(|entry| entry.name == holding[0] && entry.slot_id == granted.slot_id),
         "the holding row does not name the held eviction"
+    );
+}
+
+/// oxide#196 crash window A: a held eviction's durable intent exists but the
+/// rename did not happen. The next locked open clears the stale intent and the
+/// slot stays held with its tree, so a retry can finish.
+#[test]
+fn a_held_intent_without_its_rename_is_cleared_and_the_slot_stays_held() {
+    let fx = Fixture::new("held-intent-stale");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let granted = lease_injected(request(&pool, &project, &workspace, "holder-a")).expect("lease");
+    let id: u64 = granted.slot_id.parse().expect("slot id");
+    let slot_path = pool.join("payload").join("slots").join(&granted.slot_id);
+    let metadata = fs::metadata(&slot_path).expect("slot tree");
+    hold_intent_for_test(&pool, id, metadata.dev(), metadata.ino()).expect("held intent");
+    assert!(hold_intent_present_injected(&pool, id));
+    // The next locked open sees the tree still at its slot path: the intent is
+    // stale, not a pending rename.
+    let view = managed::ledger_view(&pool).expect("reconciled view");
+    assert!(
+        view.slots
+            .iter()
+            .any(|slot| slot.slot_id == granted.slot_id && slot.state == SlotOccupancy::Held),
+        "the slot did not stay held"
+    );
+    assert!(slot_path.is_dir(), "the slot tree moved without a rename");
+    assert!(
+        !hold_intent_present_injected(&pool, id),
+        "the stale intent survived the next open"
+    );
+    // And the held eviction can finish on a retry.
+    evict_held_slot_injected(&pool, &granted.slot_id, &granted.lease_id)
+        .expect("the retry evicts the held slot");
+    assert!(!slot_path.exists());
+}
+
+/// oxide#196 crash window B: the rename happened but the revised ledger did
+/// not. The next locked open adopts the held tree by the identity its durable
+/// intent recorded, writes the holding row, and drops the held row; the tree
+/// is then deleted from the holding area.
+#[test]
+fn a_held_rename_interrupted_before_its_row_write_is_adopted_by_identity() {
+    let fx = Fixture::new("held-intent-adopt");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let granted = lease_injected(request(&pool, &project, &workspace, "holder-a")).expect("lease");
+    let id: u64 = granted.slot_id.parse().expect("slot id");
+    let slot_path = pool.join("payload").join("slots").join(&granted.slot_id);
+    let metadata = fs::metadata(&slot_path).expect("slot tree");
+    let identity = (metadata.dev(), metadata.ino());
+    hold_intent_for_test(&pool, id, identity.0, identity.1).expect("held intent");
+    // Rename the tree under the recorded intent without the row write, as a
+    // crash between the rename and `persist_revised` would.
+    let name = hold_expecting_injected(&pool, id, Some(identity)).expect("interrupted rename");
+    assert!(
+        !slot_path.exists(),
+        "the interrupted rename left the tree at its path"
+    );
+    // The next locked open adopts it by identity, never by name alone.
+    let view = managed::ledger_view(&pool).expect("reconciled view");
+    assert!(
+        view.slots
+            .iter()
+            .all(|slot| slot.slot_id != granted.slot_id),
+        "the held row survived the adopted rename"
+    );
+    let row = view
+        .holding
+        .iter()
+        .find(|entry| entry.name == name)
+        .expect("the adopted holding row");
+    assert_eq!(row.slot_id, granted.slot_id);
+    let drained = managed::drain_holding(&pool, Some(&name)).expect("the holding deletion");
+    assert!(
+        drained.gone,
+        "the adopted tree was not deleted: {:?}",
+        drained.refused
     );
 }
 
