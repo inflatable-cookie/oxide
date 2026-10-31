@@ -1742,6 +1742,45 @@ class PureAdmission(unittest.TestCase):
         self.assertFalse(pairs["unpaired"][0]["later_observation"])
         self.assertNotIn("unfinished", pairs)
 
+    def test_every_launch_refusal_prints_one_bounded_reason(self):
+        # Papercut bc0d56cd: a 125 launch refusal must never be silent.
+        custodian = self.custodian()
+        custodian.monitor = 1234
+        custodian.not_launched = "monitor setup failed or slow"
+        custodian.signal_pinned = lambda pid, number, group: None
+        custodian.reap = lambda pid: 0
+        custodian.pump = lambda timeout: None
+        captured = []
+        with patched(bounded, "report", lambda text, fd=2: captured.append(text)):
+            with patched(bounded, "now_ns", lambda: custodian.start):
+                self.assertEqual(custodian.abandon_launch(), 125)
+        self.assertEqual(len(captured), 1)
+        self.assertIn("not launched", captured[0])
+        self.assertIn("monitor setup failed or slow", captured[0])
+        self.assertLessEqual(len(captured[0]), 4096)
+
+    def test_the_monitor_reports_an_unexpected_failure_instead_of_exiting_silently(self):
+        # An exception in the monitor used to exit silently, which reached the
+        # custodian as an unexplained 125.
+        captured, codes = [], []
+
+        class BrokenMonitor:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def run(self):
+                raise RuntimeError("injected monitor failure")
+
+        with patched(bounded, "Monitor", BrokenMonitor), \
+                patched(bounded, "report", lambda text, fd=2: captured.append(text)), \
+                patched(bounded.os, "_exit", lambda code: codes.append(code)):
+            bounded.monitor_main({}, None, None, None, None)
+        self.assertEqual(codes, [1])
+        self.assertEqual(len(captured), 1)
+        self.assertIn("monitor failed before completion", captured[0])
+        self.assertIn("RuntimeError", captured[0])
+        self.assertNotIn("Traceback", captured[0])
+
     def test_reading_freshness_is_not_latched_after_the_closure_decision(self):
         # Review finding: a completed, closed run was reported as exit 125 when
         # a reserve sample stalled after the decision, because the monitor stops

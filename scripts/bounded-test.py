@@ -4339,8 +4339,11 @@ def monitor_main(ctx, ctl_w, cmd_r, out_r, err_r):
     except SetupRefused as refusal:
         report(f"bounded-test.py: refused before any proof work: {refusal}\n")
         code = 2
-    except BaseException:
-        pass
+    except BaseException as error:
+        # No traceback and no source lookup: the class name only. A silent exit
+        # here reached the custodian as an unexplained 125.
+        report("bounded-test.py: monitor failed before completion: " + type_name(error) + "\n")
+        code = 1
     finally:
         os._exit(code)
 
@@ -4383,6 +4386,7 @@ class Custodian:
         self.gate_opened = False
         self.gate_at = None
         self.pre_gate_killed = self.leader_killed = False
+        self.not_launched = None
         # Admission grants (oxide#192): counted from the monitor's marker
         # observations, bounded by the run's own elapsed time and the fixed cap.
         self.admission_counted = 0
@@ -5018,7 +5022,11 @@ class Custodian:
             return self.last_resort()
 
     def abandon_launch(self):
-        """Setup slow or failed: launch nothing, stop the pinned monitor now."""
+        """Setup slow or failed: launch nothing, stop the pinned monitor now.
+
+        One bounded line names the reason before the pinned monitor is stopped, so
+        a launch refusal is never silent."""
+        report(f"bounded-test.py: not launched: {self.not_launched or 'setup did not finish'}\n")
         try:
             self.signal_pinned(self.monitor, signal.SIGKILL, group=False)
             status, end = None, min(now_ns() + NS, self.exit_at)
@@ -5164,8 +5172,11 @@ class Custodian:
 
     def last_resort(self):
         """finish raised: KILL the pinned monitor if still held, one WNOHANG
-        reap, and exit non-zero. Never raises."""
+        reap, and exit non-zero. Never raises, and one bounded line names the
+        reason."""
         try:
+            report("bounded-test.py: finish failed:"
+                   f" deadline {self.deadline_hit}; fault {self.guard.fault}\n")
             if self.monitor is not None and not self.monitor_reaped:
                 self.signal_pinned(self.monitor, signal.SIGKILL, group=False)
                 self.monitor_reaped = self.reap(self.monitor) is not None

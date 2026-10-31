@@ -2318,8 +2318,8 @@ review afterwards.
 integrated head adds the admission reports described in the supervisor rule
 below: the completed-wait marker and its bounded grant, the correlated waiting
 report, and the stop-boundary drain with late-marker classification. Together
-with oxide#191's merged 287 pure and 48 real cases the suite is now 321 pure + 53
-real = 374 cases (31 pure and 5 real of them oxide#192's: the completed wait and its
+with oxide#191's merged 287 pure and 48 real cases the suite is now 323 pure + 53
+real = 376 cases (33 pure and 5 real of them oxide#192's: the completed wait and its
 grant, the rejection control, the late grant, a wait that never ends before the
 stop, and the stale-run plus zero-duration-grant correlation), which the
 bootstrap's expected count and limitation list follow. The exported deadline,
@@ -2391,7 +2391,7 @@ the independent reviewer qualification. Until those exist at that head the bytes
 are unqualified and carry no credit for any other proof. The covering checks run
 at this head are recorded in the pull request: `effigy rust:compile`,
 `effigy rust:format`, `effigy test rust`, `effigy proof:supervisor:test`
-(321 pure cases) and `effigy docs:check`.
+(323 pure cases) and `effigy docs:check`.
 
 **Settlement observation (oxide#147, unqualified source).** The current
 `bounded-test.py` also carries observation-only settlement diagnostics, so a
@@ -2716,7 +2716,11 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   rejected as `stale run` and never paired with this one (the runner rejects the
   retired schema-1 three-key shape too). `oxide` writes it when a leased
   command's own slot admission grant ends (its measured interval from the first
-  attempt to the grant), armed only by this supervisor's exported layout. The monitor polls the path every 0.25 s, opens only a regular file
+  attempt to the grant), armed only by this supervisor's exported layout.
+  Markers are read only after the monitor is ready, by its own sampler: a
+  malformed, stale or foreign document is rejected and counted (a rejection is
+  also a control message the custodian counts as an observation) and can never
+  fault the run, refuse it or abandon its launch. The monitor polls the path every 0.25 s, opens only a regular file
   without following a link, reports one marker per file identity and stamps
   the moment it read it. Deduplication binds to the identity of the file it
   actually opened (`fstat` on the open handle), never to an identity sampled
@@ -2788,7 +2792,11 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   600 s.
 - **Exit and receipt.**
   - Exit codes: 124 at a deadline; 125 for a fault, refusal or `UNCLOSED`;
-    otherwise the command's status (128+N for signal N).
+    otherwise the command's status (128+N for signal N). Every 125 is explainable
+    from one bounded stderr line (papercut `bc0d56cd`): a launch refusal prints
+    `not launched: <reason>`, a failed finish prints its deadline and latched
+    fault, and an unexpected monitor failure prints its exception class name —
+    never a traceback and never silence.
   - The monitor publishes `receipt.json` phases by atomic replacement:
     `started: incomplete`, then `closure_established: cleanup_pending` or
     `unclosed: scratch_kept`, `cleanup_partial_or_unknown` before deleting,
@@ -2903,7 +2911,7 @@ with a recorded minimum. A fallback run, or a nested case outside the
 monitored root, fails the qualification. Its reserve readings identify the
 qualification's scratch volume and the boot volume separately. The suite
 runs in order:
-- 321 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 323 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -3178,7 +3186,7 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 374 cases (321 pure + 53 real, including oxide#191's post-census detach
+- all 376 cases (323 pure + 53 real, including oxide#191's post-census detach
   cases and oxide#192's five admission-report cases);
 - every real case directory and receipt still present after the
   candidate's cleanup.
