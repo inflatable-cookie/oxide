@@ -3752,14 +3752,23 @@ class Monitor:
                         if row is None and identity_problem is None:
                             # Positively absent: no row to name and no foreign PID to
                             # signal, so it is accounted here by reaping whatever the
-                            # kernel still holds for this child, and then reported.
+                            # kernel still holds for this child. The receipt is only
+                            # truthful when that reap actually succeeded; a failed
+                            # reap is unaccounted custody and the monitor holds.
                             absent_reaped, _status = reap_own_child(handle, window_end)
                             with self.lock:
-                                detach["reaped"] = True
-                                detach["reaped_by"] = "monitor"
+                                detach["reaped"] = bool(absent_reaped)
+                                detach["reaped_by"] = "monitor" if absent_reaped else None
                                 detach["child_absent"] = True
                                 detach["reap_timed_out"] = not absent_reaped
                                 self.receipt["detach"] = detach
+                            if not absent_reaped:
+                                self.publish("detach_child_unaccounted: monitor_held")
+                                self.summary()
+                                end = ctx["start_ns"] + int(ctx["limit_s"] * NS) - int(0.1 * NS)
+                                while not self.stop.is_set() and now_ns() < end:
+                                    time.sleep(0.02)
+                                return
                             self.publish("detach_child_absent: scratch_kept")
                             self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
                             return

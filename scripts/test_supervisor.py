@@ -5307,6 +5307,62 @@ class PureDetach(unittest.TestCase):
                        {"exit": 0, "timed_out": False, "truncated": False, "output": "not a plist"}):
             self.assertIsNone(bounded.image_attachments(backing, run=lambda *a, b=broken: b), broken)
 
+    def test_an_absent_child_whose_reap_fails_is_not_recorded_as_reaped(self):
+        # P2: the absent-child branch wrote reaped/reaped_by as a success even when
+        # the reap helper failed. Driven through the REAL `Monitor.run`.
+        sandbox = Path(tempfile.mkdtemp(prefix="absent-child.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(sandbox), True)
+        evidence = sandbox / "evidence"
+        evidence.mkdir(parents=True)
+        # A short limit keeps the (correct) hold bounded inside this test.
+        ctx = {"run_id": "absent-child", "command": ["/bin/true"], "limit_s": 2,
+               "adopted": None, "evidence_arg": str(evidence), "root_parent": str(sandbox),
+               "budget": 512 * 1024 * 1024,
+               "start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "inject": []}
+        ctl_r, ctl_w = os.pipe()
+        cmd_r, cmd_w = os.pipe()
+        out_r, out_w = os.pipe()
+        err_r, err_w = os.pipe()
+        for fd in (ctl_r, cmd_w, out_w, err_w):
+            self.addCleanup(os.close, fd)
+        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_r)
+        sent = []
+        monitor.send = lambda kind, **fields: sent.append(kind)
+
+        class Handle:
+            pid = 0
+
+            def wait(self, timeout=None):
+                return None
+
+        record = {"state": "failed", "qualified": False, "attempted": True, "exit": None,
+                  "timed_out": False, "withdrawn": None, "error": None, "post_state": "still_mounted",
+                  "reason": "fixture", "backing": None, "mount": None, "device": None,
+                  "volume_uuid": None, "timeout_s": None, "budget_ns": None, "output": "",
+                  "output_truncated": False, "reap_timed_out": False, "reaped": False,
+                  "late_gate": None, "_handle": Handle()}
+        saved = (bounded.post_census_detach, bounded.process_row, bounded.reap_own_child,
+                 bounded.cleanup_safety)
+        bounded.post_census_detach = lambda *a, **k: dict(record)
+        bounded.process_row = lambda pid: (None, None)          # positively absent
+        bounded.reap_own_child = lambda handle, window_end: (False, None)  # the reap fails
+        bounded.cleanup_safety = lambda ctx, **k: None
+        os.write(cmd_w, (json.dumps({"type": "cleanup", "outcome": {"closure": "closed",
+                                                                   "status": 0}}) + "\n").encode())
+        try:
+            monitor.run()
+        finally:
+            (bounded.post_census_detach, bounded.process_row, bounded.reap_own_child,
+             bounded.cleanup_safety) = saved
+        with open(evidence / "receipt.json") as handle:
+            persisted = json.load(handle)
+        detach = persisted["detach"]
+        self.assertEqual((detach["reaped"], detach["reaped_by"], detach["reap_timed_out"]),
+                         (False, None, True), detach)
+        self.assertEqual(persisted["phase"], "detach_child_unaccounted: monitor_held",
+                         persisted["phase"])
+        self.assertNotIn("monitor_complete", sent, sent)
+
     def test_a_detach_receipt_is_recorded_before_a_custody_keep_returns(self):
         # Ordering, driven through the REAL `Monitor.run`: a run with BOTH a detach
         # request and a custody indication whose second backing is live must record

@@ -69,7 +69,7 @@ import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILDER = "1.97.1"
-EXPECTED_RUNNER_SHA256 = "7c0a3156028a460f81d766c8e3d173ec8be22e30fe70ee4dc221a6fcfec12a2a"
+EXPECTED_RUNNER_SHA256 = "950b1de4440398db1f5cb4b2099f2c5eca6cd2e2ca60211a8766ab01880a18d2"
 MIB = 1024 * 1024
 WALL_LIMIT_S = 300
 SCRATCH_BUDGET_MIB = 512
