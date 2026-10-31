@@ -604,3 +604,33 @@ pub(crate) fn arm_holding_rename_failure() {
 pub(crate) fn take_holding_rename_failure() -> bool {
     HOLDING_RENAME_FAILURE.with(|armed| armed.replace(false))
 }
+
+thread_local! {
+    /// One injected ledger parent-directory sync failure, armed by a library
+    /// test. It fires after the ledger replacement (rename) and before the
+    /// directory sync, so the intent may be durable while the write errors.
+    static LEDGER_DIR_SYNC_FAILURE: Cell<bool> = const { Cell::new(false) };
+    /// One injected post-rename observation failure, armed by a library test.
+    /// It fires after the slot tree has moved into the holding area.
+    static POST_RENAME_OBSERVATION_FAILURE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Arm one injected ledger parent-directory sync failure.
+pub(crate) fn arm_ledger_dir_sync_failure() {
+    LEDGER_DIR_SYNC_FAILURE.with(|armed| armed.set(true));
+}
+
+/// Consume the armed ledger directory-sync failure, if any.
+pub(crate) fn take_ledger_dir_sync_failure() -> bool {
+    LEDGER_DIR_SYNC_FAILURE.with(|armed| armed.replace(false))
+}
+
+/// Arm one injected post-rename observation failure.
+pub(crate) fn arm_post_rename_observation_failure() {
+    POST_RENAME_OBSERVATION_FAILURE.with(|armed| armed.set(true));
+}
+
+/// Consume the armed post-rename observation failure, if any.
+pub(crate) fn take_post_rename_observation_failure() -> bool {
+    POST_RENAME_OBSERVATION_FAILURE.with(|armed| armed.replace(false))
+}

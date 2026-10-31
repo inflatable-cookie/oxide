@@ -2247,15 +2247,30 @@ impl Pool {
             .map_err(pre)?;
         // The durable hold intent is the commit point. Everything above is a
         // read-only pre-commit check; a failure there leaves the pool bytes and
-        // identity unchanged.
-        self.record_hold_intent(id, identity).map_err(pre)?;
+        // identity unchanged. The intent write itself replaces the ledger
+        // before it syncs the directory, so a failed write is classified by
+        // re-reading the ledger: a visible intent (or an unreadable ledger) is
+        // conservatively post-commit, never a byte-identical pre-commit.
+        if let Err(error) = self.record_hold_intent(id, identity) {
+            let durable = match read_ledger(&self.root) {
+                Ok(ledger) => ledger
+                    .slots
+                    .iter()
+                    .find(|slot| slot.id == id)
+                    .is_some_and(|slot| slot.hold_intent.is_some()),
+                Err(_) => true,
+            };
+            return Err(if durable {
+                HeldEvictionFailure::PostCommit(format!(
+                    "the ledger replacement carrying the hold intent may be durable but its directory sync failed, so the commit boundary is unknown; the tree was not moved and the next locked open resolves the recorded intent ({error})"
+                ))
+            } else {
+                HeldEvictionFailure::PreCommit(error)
+            });
+        }
         let row = match self.hold_slot_tree(id, &path, Some(identity)) {
             Ok(row) => row,
-            Err(error) => {
-                return Err(HeldEvictionFailure::PostCommit(format!(
-                    "the hold intent is durable but the tree was not moved ({error})"
-                )))
-            }
+            Err(error) => return Err(self.post_rename_failure(id, &error)),
         };
         let name = row.name.clone();
         self.created_holding.push(row.name.clone());
@@ -2267,6 +2282,44 @@ impl Pool {
             )));
         }
         Ok(std::mem::take(&mut self.created_holding))
+    }
+
+    /// Classify a held eviction's failure after its durable intent. The tree
+    /// may have been renamed into the holding area even when the later
+    /// observation failed, so the message never claims "not moved" without
+    /// checking the holding area (and its containment name).
+    fn post_rename_failure(&self, id: u64, error: &LeaseError) -> HeldEvictionFailure {
+        let Some(slot) = self.slot(id) else {
+            return HeldEvictionFailure::PostCommit(format!(
+                "the hold intent is durable and the tree's location in the holding area is unknown ({error})"
+            ));
+        };
+        let Some(name) = self.holding_name_for(id, slot.incarnation, &slot.last_lease_id) else {
+            return HeldEvictionFailure::PostCommit(format!(
+                "the hold intent is durable and the tree's location in the holding area is unknown ({error})"
+            ));
+        };
+        match holding_presence(&self.holding_root().join(&name)) {
+            Some(true) => HeldEvictionFailure::PostCommit(format!(
+                "the hold intent is durable and the tree is in the holding area as {name} but its post-rename observation failed ({error})"
+            )),
+            None => HeldEvictionFailure::PostCommit(format!(
+                "the hold intent is durable and the tree's location in the holding area is unknown; it may have been moved as {name} ({error})"
+            )),
+            Some(false) => {
+                let contained =
+                    holding_presence(&self.holding_root().join(unverified_holding_name(&name)));
+                if contained == Some(true) {
+                    HeldEvictionFailure::PostCommit(format!(
+                        "the hold intent is durable and the moved object was not the verified slot; it is contained in the holding area ({error})"
+                    ))
+                } else {
+                    HeldEvictionFailure::PostCommit(format!(
+                        "the hold intent is durable but the tree was not moved ({error})"
+                    ))
+                }
+            }
+        }
     }
 
     fn take_idle(
@@ -4763,6 +4816,14 @@ impl Pool {
         };
         if renamed != 0 {
             return Err(io_error(std::io::Error::last_os_error()));
+        }
+        // oxide#196: an injected post-rename observation failure leaves the
+        // tree in the holding area while the ledger row stays held.
+        #[cfg(test)]
+        if crate::test_fs::take_post_rename_observation_failure() {
+            return Err(io_error(std::io::Error::other(
+                "injected post-rename observation failure",
+            )));
         }
         // The moved entry must be the very object whose descriptor was
         // verified. A swap in the rename window is detected here, and the
