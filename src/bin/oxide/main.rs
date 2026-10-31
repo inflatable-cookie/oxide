@@ -3408,16 +3408,24 @@ mod tests {
         .expect("a budget clock");
         budget::arm_execution(Instant::now(), budget::Phase::PrimaryCargo);
         std::thread::sleep(Duration::from_millis(10));
-        // The deadline is already due when the drain starts. The child exits
-        // during the first bounded line-read slice, so only a harvest taken
-        // after that slice (and before any latch) can see the natural exit.
-        // Under an overloaded machine the child may not have exited by then;
-        // the product is then entitled to stop it, so the regression asserts
-        // the invariant exactly where it is observable: a natural exit status
-        // observed with a settled stream must not carry a latched deadline.
+        // The deadline is already due when the drain starts. A child still
+        // running when the first line-read slice ends is entitled to a stop, so
+        // the natural exit must be observed before the drain begins. Waiting
+        // here keeps the test deterministic under load (it was a 20 ms race).
+        // The invariant checked below is the one this ordering guarantees: a
+        // natural exit observed with a settled stream carries no latched
+        // deadline.
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "exit 0"]).stdout(Stdio::piped());
         let mut group = process::start_group(&mut command).expect("a child");
+        let exited = (0..500).any(|_| {
+            let done = group.child.try_wait().ok().flatten().is_some();
+            if !done {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            done
+        });
+        assert!(exited, "the natural exit was not observed within 5 s");
         let mut stop = process::Stop::new();
         let (status, _target, drained) =
             collect_run(&mut group, &budget_invocation(), None, &mut stop).expect("a result");

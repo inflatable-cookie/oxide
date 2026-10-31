@@ -426,12 +426,14 @@ impl std::ops::DerefMut for OwnedGroup {
 impl Drop for OwnedGroup {
     fn drop(&mut self) {
         let id = self.0.id;
-        // A group with no members is closed. Its leader is reaped by then: a
-        // zombie leader still keeps the group non-empty.
         if group_empty(id) {
+            // Nothing left to signal. Collect the leader if it has exited but
+            // was not yet reaped; this never blocks on a live child.
+            let _ = self.0.child.try_wait();
             return;
         }
         signal_group(id, libc::SIGKILL);
+        // KILL reaches the leader too, so this wait returns once it is gone.
         let _ = self.0.child.wait();
         let started = Instant::now();
         while !group_empty(id) && started.elapsed() < OWNED_CLOSE {
