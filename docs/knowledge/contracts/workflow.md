@@ -2823,9 +2823,10 @@ bounds:
   qualification's scratch, with the boot volume read and labelled separately
   (both keep the 22 GiB threshold);
 - a fixed 600 s `CLOCK_UPTIME_RAW` deadline held by a minimal outer actor
-  (oxide#191 amendment, Tom 2026-10-31: was 300 s, because the combined suite
-  needed 251-258 s against the former 250 s suite alarm, which is now 350 s,
-  the 380 s candidate limit less its 30 s margin).
+  (oxide#192 amendment, 2026-10-31; history: 300 s originally, 420 s under
+  oxide#191 when the suite needed 251-258 s against the old 250 s alarm). The
+  suite's own alarm is now 530 s, the 560 s candidate limit less its 30 s
+  margin.
   The actor forks the whole bootstrap as a pinned worker and makes only
   WNOHANG reaps, bounded sleeps and signals to that worker. All file,
   hashing and stdout work runs in the worker. At 598 s the actor KILLs the
