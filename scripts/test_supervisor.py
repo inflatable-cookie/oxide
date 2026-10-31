@@ -3433,6 +3433,8 @@ def detach_case_rows(case):
          "detach": {"state": "refused", "qualified": False, "post_state": "unknown"}},
         {"case": "test_a_failed_attempt_keeps_the_mount_and_is_unqualified", "dir": case, "exit": 125,
          "detach": {"state": "failed", "qualified": False, "post_state": "still_mounted"}},
+        {"case": "test_an_unrequested_attachment_keeps_the_owned_root", "dir": case, "exit": 125,
+         "detach": {"state": "unexpected", "qualified": False, "post_state": "attached"}},
     ]
 
 
@@ -4311,13 +4313,13 @@ class PureDetach(unittest.TestCase):
 
     def test_a_deadline_reserve_refuses_before_any_attempt(self):
         ctx, backing = self.layout()
-        ctx["limit_s"] = 1
+        ctx["limit_s"] = 1  # the custodian's wait window has already closed
         facts = self.facts()
         self.request(ctx, backing)
         record = bounded.post_census_detach(ctx, facts)
-        self.assertEqual(facts.detached, [], "a detach ran past the deadline reserve")
+        self.assertEqual(facts.detached, [], "a detach ran past the custodian's wait window")
         self.assertEqual((record["state"], record["qualified"]), ("refused", False))
-        self.assertIn("deadline", record["reason"])
+        self.assertIn("wait window", record["reason"])
 
     def test_a_failed_or_timed_out_attempt_keeps_the_mount(self):
         for attempt, state in (({"exit": 1, "timed_out": False, "error": None, "output": "busy"}, "failed"),
@@ -4364,6 +4366,153 @@ class PureDetach(unittest.TestCase):
         record = bounded.post_census_detach(ctx, facts)
         self.assertEqual((record["state"], record["post_state"], record["qualified"]),
                          ("failed", "unknown", False), record)
+
+    def test_a_null_or_non_object_request_is_refused(self):
+        for payload in (b"null", b"[]", b'"text"', b"7", b"true"):
+            ctx, _backing = self.layout()
+            with open(os.path.join(ctx["evidence"], bounded.DETACH_REQUEST_NAME), "wb") as handle:
+                handle.write(payload)
+            facts = self.facts()
+            record = bounded.post_census_detach(ctx, facts)
+            self.assertIsNotNone(record, f"{payload} was read as an absent request")
+            self.assertEqual((record["state"], record["attempted"], record["qualified"]),
+                             ("refused", False, False), record)
+            self.assertIn("not an object", record["reason"])
+            self.assertEqual(facts.detached, [], f"{payload} was detached")
+
+    def test_the_kept_output_is_bounded(self):
+        big = b"x" * (4 * bounded.DETACH_OUTPUT_MAX_BYTES)
+        tail = b""
+        for index in range(0, len(big), 1024):
+            tail = bounded._bounded_tail(tail, big[index:index + 1024])
+            self.assertLessEqual(len(tail), bounded.DETACH_OUTPUT_MAX_BYTES)
+        self.assertEqual(tail, big[-bounded.DETACH_OUTPUT_MAX_BYTES:])
+        self.assertLessEqual(len(bounded.bounded_run.__doc__), 4096)
+
+    def test_the_authorization_gate_is_the_custodians_verdict(self):
+        now, exit_at = 1000 * bounded.NS, 1060 * bounded.NS
+        allowed, reason, budget = bounded.detach_authorization(None, False, now, exit_at)
+        self.assertTrue(allowed, reason)
+        self.assertGreater(budget, 0)
+        self.assertLessEqual(budget, 60 * bounded.NS)
+        for fault, deadline, when, text in (("a fault", False, now, "fault is latched"),
+                                            (None, True, now, "deadline"),
+                                            (None, False, exit_at, "wait budget")):
+            allowed, reason, budget = bounded.detach_authorization(fault, deadline, when, exit_at)
+            self.assertFalse(allowed, (fault, deadline, when))
+            self.assertEqual(budget, 0)
+            self.assertIn(text, reason)
+
+    def test_the_detach_budget_ends_before_the_custodian_wait_ends(self):
+        ctx, _backing = self.layout()
+        start = ctx["start_ns"]
+        self.assertEqual(bounded.detach_budget(ctx, start), 300 * bounded.NS - bounded.EXIT_MARGIN_S * bounded.NS
+                         - bounded.DETACH_GATE_MARGIN_NS)
+        late = start + (300 - bounded.EXIT_MARGIN_S) * bounded.NS
+        self.assertEqual(bounded.detach_budget(ctx, late), 0)
+        # A spent budget refuses before any attempt, never past the custodian's wait.
+        ctx, backing = self.layout()
+        ctx["start_ns"] = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) - int(300 * bounded.NS)
+        facts = self.facts()
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(ctx, facts)
+        self.assertEqual(facts.detached, [], "a detach ran past the custodian's wait window")
+        self.assertEqual(record["state"], "refused")
+        self.assertIn("wait window", record["reason"])
+
+    def test_the_attempt_is_clamped_by_the_authorized_budget(self):
+        ctx, backing = self.layout()
+        self.request(ctx, backing)
+        granted = []
+        record = bounded.post_census_detach(
+            ctx, self.facts(), authorize=lambda budget: (granted.append(budget) or (True, None, 2 * bounded.NS)))
+        self.assertTrue(record["qualified"], record)
+        self.assertLessEqual(record["timeout_s"], 2.0)
+        self.assertGreater(record["timeout_s"], 0.0)
+
+    def test_a_withdrawn_authorization_detaches_nothing(self):
+        ctx, backing = self.layout()
+        facts = self.facts()
+        self.request(ctx, backing)
+        record = bounded.post_census_detach(
+            ctx, facts, authorize=lambda budget: (False, "a fault is latched (injected)", 0))
+        self.assertEqual(facts.detached, [], "a detach ran without the custodian's authorization")
+        self.assertEqual((record["state"], record["attempted"], record["qualified"]),
+                         ("refused", False, False), record)
+        self.assertIn("a fault is latched", record["reason"])
+
+    def test_the_monitor_takes_no_detach_without_a_usable_answer(self):
+        def monitor(answer, close=False):
+            monitor = bounded.Monitor.__new__(bounded.Monitor)
+            _ctl_r, _ctl_w = os.pipe()
+            cmd_r, cmd_w = os.pipe()
+            self.addCleanup(os.close, _ctl_r)
+            self.addCleanup(os.close, _ctl_w)
+            self.addCleanup(os.close, cmd_r)
+            monitor.cmd_r = cmd_r
+            monitor.sent = []
+            monitor.send = lambda kind, **fields: monitor.sent.append((kind, fields))
+            if answer is not None:
+                os.write(cmd_w, (json.dumps(answer) + "\n").encode())
+            if close:
+                os.close(cmd_w)
+            else:
+                self.addCleanup(os.close, cmd_w)
+            return monitor
+
+        monitor_ = monitor({"type": "detach_go", "allowed": True, "budget_ns": 5 * bounded.NS})
+        self.assertEqual(monitor_.authorize_detach(10 * bounded.NS), (True, None, 5 * bounded.NS))
+        self.assertEqual(monitor_.sent[0][0], "detach_ready")
+        self.assertEqual(monitor_.sent[0][1], {"budget_ns": 10 * bounded.NS})
+        for answer, expected in (({"type": "detach_go", "allowed": False, "reason": "the deadline"},
+                                  "the deadline"),
+                                 ({"type": "detach_go", "allowed": True, "budget_ns": "lots"},
+                                  "no usable budget"),
+                                 ({"type": "other"}, "in time"),
+                                 ("not an object", "in time")):
+            monitor_ = monitor(answer)
+            self.assertFalse(monitor_.authorize_detach(200_000_000)[0], (answer, expected))
+        monitor_ = monitor(None, close=True)
+        self.assertFalse(monitor_.authorize_detach(5 * bounded.NS)[0])
+
+    def test_an_unrequested_attachment_keeps_the_owned_root(self):
+        ctx, backing = self.layout()
+        rows = [(backing, "/dev/disk7", "/Volumes/OxDetach", None)]
+        record = bounded.unrequested_attachment(ctx, facts=lambda *_args: rows)
+        self.assertEqual((record["state"], record["post_state"], record["qualified"]),
+                         ("unexpected", "attached", False), record)
+        self.assertEqual(record["unrequested"], [backing])
+        self.assertIn("never requested", record["reason"])
+        outside = [("/private/tmp/other.sparseimage", "/dev/disk9", "/Volumes/OxOther", None)]
+        self.assertIsNone(bounded.unrequested_attachment(ctx, facts=lambda *_args: outside))
+        # A stale entry a forced detach left behind is not a live mount: it must
+        # never keep a root.
+        stale = [(backing, "/dev/disk7", None, None)]
+        self.assertIsNone(bounded.unrequested_attachment(ctx, facts=lambda *_args: stale))
+        unreadable = bounded.unrequested_attachment(ctx, facts=lambda *_args: None)
+        self.assertEqual(unreadable["state"], "unexpected")
+        self.assertIn("unreadable", unreadable["reason"])
+
+    def test_a_diagnostic_receipt_is_never_qualified(self):
+        rows = [{"check": "receipt-phase", "result": "pass", "problems": []},
+                {"check": "detach-paths", "result": "pass", "problems": []}]
+        receipt = qualify.diagnostic_receipt([], rows)
+        self.assertIs(receipt["qualified"], False)
+        self.assertEqual(receipt["result"], "diagnostic")
+        self.assertEqual((receipt["checks_passed"], receipt["checks_failed"]), (2, 0))
+        self.assertIn("never a counted native PASS", receipt["claims"])
+        refused = qualify.diagnostic_receipt(["boom"], [])
+        self.assertIs(refused["qualified"], False)
+        self.assertEqual(refused["problems"], ["boom"])
+
+    def test_success_requires_a_zero_exit_and_a_detached_post_state(self):
+        for attempt, mount_point in (({"exit": None, "timed_out": False, "error": None, "output": ""}, False),
+                                     ({"exit": 0, "timed_out": False, "error": "ENOENT", "output": ""}, False)):
+            ctx, backing = self.layout()
+            self.request(ctx, backing)
+            record = bounded.post_census_detach(ctx, self.facts(attempt=attempt, mount_point=mount_point))
+            self.assertFalse(record["qualified"], record)
+            self.assertNotEqual(record["state"], "detached", record)
 
     def test_the_marker_records_a_failed_detach_as_unconcluded(self):
         self.assertIn("detach", bounded.MARKER_REASONS)
@@ -6094,8 +6243,13 @@ import json, os, plistlib, subprocess, sys
 case = os.environ["CASE_DIR"]
 evidence = os.environ["OXIDE_PROOF_EVIDENCE"]
 token = os.environ["CASE_TOKEN"]
+# "request": the image lives in the evidence directory and a request is
+# published. "unrequested": the image lives in the guard's own scratch and no
+# request is published, so the fail-closed pre-cleanup scan must keep the root.
+mode = os.environ.get("CASE_DETACH_MODE", "request")
 mount = "/Volumes/OxD" + token[:8]
-image = os.path.join(evidence, "detach.sparseimage")
+image = os.path.join(evidence if mode == "request" else os.environ["OXIDE_TASK_SCRATCH_ROOT"],
+                     "detach.sparseimage")
 def run(*argv, timeout=90):
     return subprocess.run(list(argv), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, timeout=timeout)
@@ -6116,13 +6270,14 @@ if len(wholes) != 1 or mounts != [mount]:
     print("unexpected attachment " + repr((wholes, mounts)), file=sys.stderr)
     raise SystemExit(3)
 uuid = plistlib.loads(run("/usr/sbin/diskutil", "info", "-plist", mount).stdout)["VolumeUUID"]
-request = {"version": 1, "backing": os.path.realpath(image), "mount": mount, "device": wholes[0],
-           "volume_uuid": uuid, "note": "supervisor suite detach case"}
-request.update(json.loads(os.environ.get("CASE_DETACH_OVERRIDE") or "{}"))
-temporary = os.path.join(evidence, "detach-request.json.tmp")
-with open(temporary, "w") as handle:
-    json.dump(request, handle)
-os.replace(temporary, os.path.join(evidence, "detach-request.json"))
+if mode == "request":
+    request = {"version": 1, "backing": os.path.realpath(image), "mount": mount, "device": wholes[0],
+               "volume_uuid": uuid, "note": "supervisor suite detach case"}
+    request.update(json.loads(os.environ.get("CASE_DETACH_OVERRIDE") or "{}"))
+    temporary = os.path.join(evidence, "detach-request.json.tmp")
+    with open(temporary, "w") as handle:
+        json.dump(request, handle)
+    os.replace(temporary, os.path.join(evidence, "detach-request.json"))
 with open(os.path.join(case, "volume.json"), "w") as handle:
     json.dump({"mount": mount, "device": wholes[0], "uuid": uuid, "image": image}, handle)
 print("detach fixture ready: " + mount + " " + wholes[0])
@@ -6139,8 +6294,8 @@ class DetachReal(unittest.TestCase):
         self.started = now_ns()
         self.token = secrets.token_hex(4)
 
-    def guard(self, override=None, inject=()):
-        extra = {"CASE_TOKEN": self.token}
+    def guard(self, override=None, inject=(), mode="request"):
+        extra = {"CASE_TOKEN": self.token, "CASE_DETACH_MODE": mode}
         if override is not None:
             extra["CASE_DETACH_OVERRIDE"] = json.dumps(override)
         env = dict(os.environ, CASE_DIR=str(self.dir), CASE_TOKEN=self.token,
@@ -6195,6 +6350,22 @@ class DetachReal(unittest.TestCase):
         self.assertEqual(self.code, 125)
         self.assertTrue(os.path.exists(self.volume["mount"]), "a refused request still detached")
         self.assertTrue(os.path.exists(self.receipt["scratch"]), "the refused root was cleaned")
+        self.remove_fixture_mount()
+
+    def test_an_unrequested_attachment_keeps_the_owned_root(self):
+        # A proof that failed before publishing its request may still have its
+        # image attached inside the guard's own scratch. Cleaning that root would
+        # delete a backing under a live mount, so the fail-closed scan keeps it.
+        self.guard(mode="unrequested")
+        detach = self.receipt["detach"]
+        self.assertEqual((detach["state"], detach["attempted"], detach["qualified"], detach["post_state"]),
+                         ("unexpected", False, False, "attached"), detach)
+        self.assertIn("never requested", detach["reason"])
+        self.assertEqual(detach["unrequested"], [self.volume["image"]])
+        self.assertEqual(self.code, 125)
+        self.assertTrue(os.path.exists(self.receipt["scratch"]), "the root holding the image was cleaned")
+        self.assertTrue(os.path.isfile(self.volume["image"]), "the backing under the live mount was removed")
+        self.assertTrue(os.path.exists(self.volume["mount"]), "the unrequested attachment was detached")
         self.remove_fixture_mount()
 
     def test_a_failed_attempt_keeps_the_mount_and_is_unqualified(self):

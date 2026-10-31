@@ -77,11 +77,12 @@ WALL_NS = 300 * NS
 CANDIDATE_LIMIT = 280
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 266  # 223 pure + 43 real (oxide#151 added the routing, marker,
+EXPECTED_CASES = 277  # 233 pure + 44 real (oxide#151 added the routing, marker,
                       # nested-window protection, bounded-sweep, qualify-entry,
                       # shared-ancestor/private-leaf and readiness cases; oxide#191
-                      # adds fourteen pure post-census detach cases and three real
-                      # ones: success, a refused identity and a failed attempt)
+                      # adds twenty-four pure post-census detach cases and four real
+                      # ones: success, a refused identity, a failed attempt and an
+                      # unrequested attachment the pre-cleanup scan must keep)
 ACTOR_MARGIN_NS = 2 * NS  # the actor's own KILL, reap and exit
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPTS)
@@ -633,6 +634,7 @@ DETACH_CASES = (
     ("test_success_detaches_exactly_the_requested_volume", "detached", True),
     ("test_an_unbound_identity_is_refused_before_any_detach", "refused", False),
     ("test_a_failed_attempt_keeps_the_mount_and_is_unqualified", "failed", False),
+    ("test_an_unrequested_attachment_keeps_the_owned_root", "unexpected", False),
 )
 
 
@@ -752,6 +754,22 @@ def preflight(argv):
 DIAGNOSTIC_FLAG = "--diagnostic"
 
 
+def diagnostic_receipt(problems, rows, extra=None):
+    """The diagnostic mode's receipt. Pure, so the suite can prove the one
+    property that matters: an uncounted collection is NEVER `qualified`, not even
+    when every named oracle passed. `result` is never `pass` either."""
+    receipt = {"selector": "proof:supervisor:qualify:diagnostic", "result": "diagnostic",
+               "qualified": False, "claims": ("diagnostic coverage and oracle outcomes only; "
+                                              "never a counted native PASS, closure, census or custody claim"),
+               "problems": list(problems),
+               "checks": list(rows),
+               "checks_passed": sum(1 for row in rows if row.get("result") == "pass"),
+               "checks_failed": sum(1 for row in rows if row.get("result") != "pass"),
+               "limitations": LIMITATIONS}
+    receipt.update(extra or {})
+    return receipt
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == PREFLIGHT_FLAG:
@@ -771,8 +789,7 @@ def refusal(message, diagnostic, extra=None):
     print(message, file=sys.stderr)
     if not diagnostic:
         return 2
-    receipt = {"selector": "proof:supervisor:qualify:diagnostic", "result": "refused",
-               "qualified": False, "problems": [message], "limitations": LIMITATIONS}
+    receipt = diagnostic_receipt([message], [], {"result": "refused"})
     try:
         receipt["head"] = git("rev-parse", "HEAD").strip()
     except Exception:
@@ -963,11 +980,10 @@ def qualify(diagnostic=False):
         "outcomes": results.get("outcomes"),
         "limitations": LIMITATIONS,
     }
-    if diagnostic:
-        qualification["qualified"] = not problems
-        qualification["checks"] = rows
-        qualification["claims"] = ("diagnostic case coverage and oracle outcomes only; never a counted "
-                                   "native PASS, closure, census or custody claim")
+    if diagnostic:  # an uncounted collection is never `qualified`, even when clean
+        qualification.update(diagnostic_receipt(problems, rows))
+        qualification["selector"] = "proof:supervisor:qualify:diagnostic"
+        qualification["result"] = "diagnostic"
     qualification["worker_wall_ns_before_print"] = now_ns() - START
     print("qualification receipt:", json.dumps(qualification, indent=1), flush=True)
     if diagnostic:

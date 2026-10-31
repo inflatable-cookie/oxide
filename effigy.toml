@@ -298,7 +298,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # commands take Tom's answered internal-root exception explicitly
 # (`--root-parent /private/tmp`) rather than placing a pool on a selected
 # volume, where the product correctly refuses it. The supervisor is this tree's
-# `bounded-test.py` (sha256 26a850ac…, oxide#191's post-census detach bytes over
+# `bounded-test.py` (sha256 afa2b298…, oxide#191's post-census detach bytes over
 # the qualified oxide#151 guard; those added bytes are unqualified until their
 # own qualifications pass); 300 s wall and
 # 512 MiB monitored scratch are unchanged and the fit stays unmeasured until
@@ -530,7 +530,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 
 # Owned-output prune (oxide#129, oxide#152): one fixed 22-case native proof
 # under the shared supervisor (`scripts/bounded-test.py` SHA-256
-# 26a850ac38eb7c1afb7278e89921e100009700cc6a17b2f7cd5c52ba01a27e82,
+# afa2b298b869c6f9b571f814a4f44bea2b4092eda9c55c74aafd51ec2ed183fb,
 # the qualified oxide#151 guard plus oxide#191's opt-in post-census detach,
 # unqualified until its own qualifications pass): 360 s, 512 MiB monitored scratch, 30 s work
 # shutdown margin, one
@@ -641,9 +641,11 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # benchmark and not full QA.
 #
 # Since oxide#191 the candidate also carries the opt-in post-census image detach
-# (Tom decision ee263cea) and the suite's three real detach cases, so this
-# receipt is the one that proves the new success, refusal and uncertainty
-# paths alongside the unchanged guard cases. The changed runner is unqualified
+# (Tom decision ee263cea), its custodian authorization gate and the suite's four
+# real detach cases (bound success, refused identity, failed attempt, and an
+# unrequested attachment the pre-cleanup scan must keep), so this receipt is the
+# one that proves the new success, refusal and uncertainty paths alongside the
+# unchanged guard cases. The changed runner is unqualified
 # until one counted author and one separate independent reviewer run of this
 # selector pass at the same head.
 [tasks."proof:supervisor:qualify"]
@@ -1084,7 +1086,7 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 
 # Slot headroom (oxide#118, oxide#177): under the shared proof supervisor
 # (oxide#109/#114/#151 plus oxide#191's opt-in post-census detach, bounded-test.py
-# SHA-256 26a850ac38eb7c1afb7278e89921e100009700cc6a17b2f7cd5c52ba01a27e82,
+# SHA-256 afa2b298b869c6f9b571f814a4f44bea2b4092eda9c55c74aafd51ec2ed183fb,
 # unqualified until its own qualifications pass), stages
 # `oxide` offline with 1.97.1 and proves the permanent ledger/control fences,
 # legacy read without migration, the raised-ceiling fence written at the 129th

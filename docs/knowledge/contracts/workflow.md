@@ -2169,7 +2169,7 @@ with no earlier run migrated.
 
 **Post-census image detach request (oxide#191, decision `ee263cea`, unqualified
 source).** The current `bounded-test.py`
-(`26a850ac38eb7c1afb7278e89921e100009700cc6a17b2f7cd5c52ba01a27e82`) adds one
+(`afa2b298b869c6f9b571f814a4f44bea2b4092eda9c55c74aafd51ec2ed183fb`) adds one
 opt-in control for a proof
 whose own test image must be detached, and it is the only route by which such a
 proof may detach after a launch; the qualified shared runner is otherwise
@@ -2186,27 +2186,40 @@ evidence directory, a canonical `/Volumes/<one component>` mount point, one
 `/dev/diskN` node (whole disk or one mounted slice), a UUID, the same image
 attached from that backing with that node mounted at that mount holding that
 volume UUID, the mount bound to that node's device, and a caller-owned run root
-detaching nothing. It then makes at most ONE ORDINARY `hdiutil detach <mount>`
-of that exact image, with a bounded child and bounded output, inside the same
-absolute deadline (refusing rather than starting when under three seconds
-remain) and under the still-running reserve and owned-byte samplers; success is
-the mount gone *and* the device no longer attached from that backing, never a
-zero exit on its own. A refusal, failure, timeout, identity change or
+detaching nothing. It then asks the custodian — which alone holds the latched fault, the deadline
+and the closure verdict — to authorize the single attempt over the control pipe;
+the custodian answers from that state only (no filesystem call) with its verdict
+and the wait budget that remains before it would declare the monitor incomplete.
+An allowed attempt is ONE ORDINARY `hdiutil detach <mount>` of that exact image,
+clamped to that budget and to its own ceiling, with a bounded child and an output
+tail capped at 4096 bytes however much the child writes; success is every fact at
+once — exit zero, no spawn error, no timeout, the mount gone *and* its device no
+longer attached from that backing — never a zero or missing exit on its own. A
+request that is present but not an object (including JSON `null`) is a refusal,
+never an absent request. A refusal, failure, timeout, identity change or
 ambiguous/unreadable post-state is never retried, never removes a backing,
 keeps the mount, its backing and the evidence, records the attempt in the
 receipt's `detach` object, ends the run unqualified (exit 125) and leaves the
 owner marker unconcluded with the `detach` reason. Only a positive detach is
 followed by the ordinary owned-scratch cleanup; an UNCLOSED, uncertain or
-faulted run never enters that branch, and a run whose proof published no
-request is byte-for-byte unchanged with no `detach` object in its receipt. The
+faulted run never enters that branch. A run whose proof published no request is
+otherwise unchanged with no `detach` object in its receipt, with one fail-closed
+exception: before cleaning an owned root the monitor reads the attachment facts
+once and, if a *mounted* image still lives inside that root or its evidence
+directory, keeps the whole root with `state: unexpected` and exit 125 instead of
+deleting a backing under a live mount (a stale detached `hdiutil` entry is not
+custody and keeps nothing). A qualification diagnostic receipt is always
+`qualified: false`, even when every named oracle passed, and its `result` is
+never `pass`. The
 custodian keeps its filesystem-free decision path and the existing
 cooperative-session limits. These bytes are unqualified until one uncounted
 `effigy proof:supervisor:qualify:diagnostic` records a clean picture and then
 ONE counted author and ONE separate independent reviewer
-`effigy proof:supervisor:qualify` pass at the same head (223 pure plus 43 real
-cases, including the fourteen pure detach cases and the three real ones: a
-bound success, a refused identity and a failed attempt), with independent
-exact-head source review afterwards.
+`effigy proof:supervisor:qualify` pass at the same head (233 pure plus 44 real
+cases, including the twenty-four pure detach cases and the four real ones: a
+bound success, a refused identity, a failed attempt and an unrequested
+attachment that the pre-cleanup scan must keep), with independent exact-head
+source review afterwards.
 
 **Settlement observation (oxide#147, unqualified source).** The current
 `bounded-test.py` also carries observation-only settlement diagnostics, so a
@@ -5362,7 +5375,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
 - **Focused proof of absent checkout chains (oxide#135).** The one fixed proof
   is `effigy rust:prune-absence` (`scripts/test-prune-absence.py` under this
-  tree's shared supervisor `26a850ac…`, the merged oxide#151 guard plus
+  tree's shared supervisor `afa2b298…`, the merged oxide#151 guard plus
   oxide#191's opt-in post-census detach) with
   `--root-parent /private/tmp`, the owner-accepted internal-placement exception
   (decision `bd357a4c`): the missing-chain fixtures must be on the boot Data
