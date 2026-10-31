@@ -222,6 +222,22 @@ def cleanup_after_failure(proof) -> bool:
     return False
 
 
+def retain_for_census(proof, outcome) -> bool:
+    """Whether the mount and its backing stay for the guard's post-leader
+    census instead of being detached after the collection returns.
+
+    A collection that recorded ANY failure, abort, skip or unexecuted case —
+    or that left a child unreaped — is not a positive-closure state: the
+    direct leaders were reaped, which proves nothing about their Cargo
+    descendants. Only a fully clean collection detaches ordinarily.
+    """
+    if proof.unclosed:
+        return True
+    if not outcome:
+        return False
+    return any(outcome.get(key) for key in ("failed", "aborted", "skipped", "unexecuted"))
+
+
 class Proof(layout.Proof):
     """The #104 runner plus one background child for the held build. The
     child stays in the supervisor's session and in `unclosed` until reaped."""
@@ -1338,7 +1354,7 @@ class BootClosure:
         self.kept(found, {BOOT_HOOK: "unreadable"})
 
 
-def boot_closure(proof: Proof, repo: str, diagnostic: bool) -> str:
+def boot_closure(proof: Proof, repo: str, diagnostic: bool) -> tuple:
     """Run the three cases; return the one result line. The diagnostic mode
     records recoverable failures and stops on an outcome it cannot classify."""
     outcome = {
@@ -1427,7 +1443,7 @@ def boot_closure(proof: Proof, repo: str, diagnostic: bool) -> str:
         )
     layout.record("result.txt", f"{'diagnostic (not a PASS)' if diagnostic else 'passed'}\n{line}\n")
     print(line)
-    return line
+    return line, outcome
 
 
 # The nine-item proof-authoring premise checklist, traced through the actual
@@ -2396,6 +2412,122 @@ def self_check() -> int:
         "main records the failure before deciding custody",
     )
 
+    # The REAL `main` failure path, for both applicable modes: a diagnostic
+    # collection that RETURNS with a recorded failure (no exception propagates)
+    # must still keep the mount and backing for the guard's post-leader census
+    # instead of detaching, while a fully clean counted collection detaches
+    # ordinarily and an unexecuted child alone also retains.
+    class MainProof:
+        instances = []
+        extra_unclosed = ()
+
+        def __init__(self, root):
+            self.root = root
+            self.unclosed = set(MainProof.extra_unclosed)
+            self.mount = None
+            self.peak = 0
+            self.low = 1 << 40
+            self.detached = False
+            MainProof.instances.append(self)
+
+        def detach(self):
+            self.detached = True
+
+        def phase(self, label):
+            return None
+
+    cases = [case for case, _, _ in Removal.CASES]
+    failing = {
+        "version": "x", "mode": "diagnostic", "qualified": False, "cases": cases,
+        "reached": ["idle"], "completed": [], "failed": [["idle", "boom"]],
+        "skipped": [], "unexecuted": ["held", "held-delete", "quarantine"],
+        "first_fault": "idle: boom", "aborted": None, "unclosed": [],
+    }
+    clean = {
+        "version": "x", "mode": "diagnostic", "qualified": False, "cases": cases,
+        "reached": cases, "completed": cases, "failed": [], "skipped": [],
+        "unexecuted": [], "first_fault": None, "aborted": None, "unclosed": [],
+    }
+    recorded = {}
+    saved_main = {
+        "Proof": globals()["Proof"],
+        "run": globals()["run"],
+        "boot_closure": globals()["boot_closure"],
+        "argv": sys.argv,
+        "record": layout.record,
+        "work_left": layout.work_left,
+    }
+    holder = dict(os.environ)
+    main_scratch = os.path.realpath(tempfile.mkdtemp(prefix="removal-main-check."))
+    os.makedirs(os.path.join(main_scratch, "evidence"), mode=0o700)
+    try:
+        os.environ.update(
+            {
+                "OXIDE_TASK_SCRATCH_ROOT": main_scratch,
+                "OXIDE_PROOF_EVIDENCE": os.path.join(main_scratch, "evidence"),
+                "TMPDIR": main_scratch,
+                "TMP": main_scratch,
+                "TEMP": main_scratch,
+                "OXIDE_PROOF_DEADLINE_NS": str(
+                    time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) + 300 * 10**9
+                ),
+            }
+        )
+        os.environ.pop("RUSTFLAGS", None)
+        os.environ.pop("CARGO_ENCODED_RUSTFLAGS", None)
+        layout.record = lambda name, body: recorded.update({name: body})
+        layout.work_left = lambda: 300.0
+        globals()["Proof"] = MainProof
+        for argv, body, unclosed, expect_detach, label, main_mode in (
+            (["x", "--diagnostic"], failing, (), False, "main-mode diagnostic failure", True),
+            (["x", "--boot-closure", "--diagnostic"], failing, (), False,
+             "boot-closure diagnostic failure", False),
+            (["x"], clean, (), True, "counted clean collection", True),
+            (["x", "--diagnostic"], clean, (9999,), False, "unreaped child with an otherwise clean outcome", True),
+        ):
+            MainProof.instances.clear()
+            MainProof.extra_unclosed = unclosed
+            WRITERS["launched"] = False
+            note_writer_launch()
+
+            def fake_run(proof, repo, diagnostic, body=body):
+                return dict(body)
+
+            def fake_boot(proof, repo, diagnostic, body=body):
+                return ("stub line", dict(body))
+
+            globals()["run"] = fake_run
+            globals()["boot_closure"] = fake_boot
+            sys.argv = argv
+            recorded.clear()
+            code = main()
+            expect(code == 0, f"{label}: main returned {code}")
+            instance = MainProof.instances[-1]
+            expect(
+                instance.detached is expect_detach,
+                f"{label}: detach={instance.detached}, expected {expect_detach}",
+            )
+            if main_mode:
+                line = recorded.get("result.txt", "")
+                if expect_detach:
+                    expect("ordinary detach" in line,
+                           f"{label}: the recorded line does not report the ordinary detach: {line!r}")
+                else:
+                    expect("retained for the guard" in line,
+                           f"{label}: the recorded line does not report retention: {line!r}")
+    finally:
+        MainProof.extra_unclosed = ()
+        globals()["Proof"] = saved_main["Proof"]
+        globals()["run"] = saved_main["run"]
+        globals()["boot_closure"] = saved_main["boot_closure"]
+        sys.argv = saved_main["argv"]
+        layout.record = saved_main["record"]
+        layout.work_left = saved_main["work_left"]
+        WRITERS["launched"] = False
+        os.environ.clear()
+        os.environ.update(holder)
+        shutil.rmtree(main_scratch, ignore_errors=True)
+
     # Dispatch: only the documented argument lists select a mode.
     expect(mode_from_args([]) == (False, False, False), "no-argument mode")
     expect(mode_from_args(["--diagnostic"]) == (False, True, False), "main diagnostic mode")
@@ -2455,12 +2587,18 @@ def main() -> int:
     signal.setitimer(signal.ITIMER_REAL, layout.work_left())
     proof = Proof(root)
     outcome = None
+    retained = False
     try:
         if focused:
-            boot_closure(proof, repo, diagnostic)
+            _, outcome = boot_closure(proof, repo, diagnostic)
         else:
             outcome = run(proof, repo, diagnostic)
-        proof.detach()
+        retained = retain_for_census(proof, outcome)
+        if retained:
+            print("collection recorded a failure or an unreaped child: keeping the mount and "
+                  "backing for the guard's post-leader census", file=sys.stderr)
+        else:
+            proof.detach()
     except BaseException as failure:
         retained = cleanup_after_failure(proof)
         layout.record("result.txt", f"failed: {failure!r}\nunclosed children: {sorted(proof.unclosed)}\nmount: {proof.mount}\nbacking retained for the guard: {retained}\nroot: {root}\n")
@@ -2482,14 +2620,15 @@ def main() -> int:
             f"{[case for case, _ in outcome['skipped']]}, unexecuted {outcome['unexecuted']}; "
             f"{elapsed:.0f} s script time, peak owned {proof.peak // MIB} MiB at phase checks, "
             f"host free minimum {proof.low // MIB} MiB; one owned 128 MiB scratch image, "
-            f"ordinary detach"
+            f"{'mount and backing retained for the guard' if retained else 'ordinary detach'}"
         )
         layout.record("result.txt", f"diagnostic (not a PASS)\n{line}\n")
         print(line)
         return 0
     line = (
         f"removal proof held: {elapsed:.0f} s script time, peak owned {proof.peak // MIB} MiB at phase checks, "
-        f"host free minimum {proof.low // MIB} MiB; scratch closure and cleanup are the shared runner's"
+        f"host free minimum {proof.low // MIB} MiB; scratch closure and cleanup are the shared runner's; "
+        f"{'mount and backing retained for the guard' if retained else 'ordinary detach'}"
     )
     layout.record("result.txt", f"passed\n{line}\n")
     print(line)
