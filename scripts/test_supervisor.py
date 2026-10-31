@@ -5222,28 +5222,45 @@ class PureDetach(unittest.TestCase):
             bounded.bounded_run = saved
 
     def test_a_malformed_attachment_is_an_unknown_detach_post_state(self):
-        # Parser to the detach post-state: unreadable facts can never read as
-        # "detached", whatever the exit code says.
+        # Parser to the detach POST-STATE only: the pre-attempt binding is valid,
+        # so the one attempt really begins, and then the post-state read is
+        # malformed. Unreadable facts can never read as "detached", whatever the
+        # exit code says, and the backing is retained.
         ctx, backing = self.layout()
         self.request(ctx, backing)
-        document = {"images": [{"image-path": backing,
-                                "system-entities": [{"dev-entry": "/dev/disk7", "mount-point": "bad"}]}]}
-        payload = plistlib.dumps(document).decode()
+        good = {"images": [{"image-path": backing,
+                            "system-entities": [{"dev-entry": "/dev/disk7"},
+                                                {"dev-entry": "/dev/disk7s1",
+                                                 "mount-point": "/Volumes/OxDetach",
+                                                 "volume-uuid": DETACH_UUID}]}]}
+        # Genuinely malformed: a non-string mount point is not a readable fact.
+        malformed = {"images": [{"image-path": backing,
+                                 "system-entities": [{"dev-entry": "/dev/disk7s1", "mount-point": 7}]}]}
+        calls = []
 
         def fake_run(*_args, **_kwargs):
+            calls.append(len(calls))
+            payload = plistlib.dumps(good if len(calls) == 1 else malformed).decode()
             return {"exit": 0, "timed_out": False, "truncated": False, "output": payload}
 
         facts = self.facts(mount_point=lambda attempted: not attempted)
-        # Use the REAL parser for the post-state read.
+        # Use the REAL parser for both reads (binding and post-state).
         facts.attachments = lambda target, timeout=None: bounded.image_attachments(target, timeout)
+        facts.stats["/dev/disk7s1"] = types.SimpleNamespace(st_rdev=42)
         saved = bounded.bounded_run
         try:
             bounded.bounded_run = fake_run
             record = bounded.post_census_detach(ctx, facts)
         finally:
             bounded.bounded_run = saved
+        # The request bound and exactly one attempt really ran…
+        self.assertTrue(record["attempted"], record)
+        self.assertEqual(len(facts.detached), 1, facts.detached)
+        self.assertGreaterEqual(len(calls), 2, "the post-state read did not happen")
+        # …and its post-state is unknown, not detached, with the backing retained.
         self.assertEqual((record["post_state"], record["qualified"]), ("unknown", False), record)
-        self.assertNotEqual(record["state"], "detached", record)
+        self.assertEqual(record["state"], "failed", record)
+        self.assertTrue(os.path.isfile(backing), "the backing was removed")
 
     def test_the_fixture_child_imports_every_module_it_uses(self):
         # The fixture body is a fresh python child: a module it reaches through a
