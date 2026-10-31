@@ -1490,7 +1490,7 @@ mod tests {
         for (label, status, after) in [
             (
                 "unreadable status",
-                Err("code-signing read failed".to_owned()),
+                Err("code-signing read failed; the census is unknown".to_owned()),
                 Ok(Some((1_000, 501))),
             ),
             ("disappeared", Ok(status), Ok(None)),
