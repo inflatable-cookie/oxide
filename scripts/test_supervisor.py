@@ -12,7 +12,7 @@ disk is never filled.
 Every fixture process first resets and unblocks SIGALRM and arms an interval
 timer to FIXTURE_DEADLINE_NS, an absolute CLOCK_UPTIME_RAW deadline in the
 environment, so a late descendant exits at once. Ordering: case verdict
-(45 s) < fixture fallback (60 s) < qualification (300 s). A case asserts its
+(45 s) < fixture fallback (60 s) < qualification (420 s). A case asserts its
 verdict before the fallback; fallback expiry never counts as closure.
 
 Real case directories go in the outer supervisor's evidence directory
@@ -7895,7 +7895,9 @@ def write(name, size):
 
 
 def main():
-    signal.alarm(250)  # secondary bound; the supervisor's deadline is primary
+    # Secondary bound; the supervisor's deadline is primary. It is the 380 s
+    # candidate limit less its 30 s margin (oxide#191 amendment: was 250 s).
+    signal.alarm(350)
     PROTECTION.update(protect_outer_root())
     if PROTECTION.get("state") == "failed":
         # No nested case may run when the outer root could not be protected:

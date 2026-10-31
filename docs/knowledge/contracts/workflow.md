@@ -2653,7 +2653,8 @@ bounds:
   (both keep the 22 GiB threshold);
 - a fixed 420 s `CLOCK_UPTIME_RAW` deadline held by a minimal outer actor
   (oxide#191 amendment, Tom 2026-10-31: was 300 s, because the combined suite
-  needed 251-258 s against the former 250 s fixture alarm).
+  needed 251-258 s against the former 250 s suite alarm, which is now 350 s,
+  the 380 s candidate limit less its 30 s margin).
   The actor forks the whole bootstrap as a pinned worker and makes only
   WNOHANG reaps, bounded sleeps and signals to that worker. All file,
   hashing and stdout work runs in the worker. At 418 s the actor KILLs the
@@ -2960,7 +2961,7 @@ runs in order:
     SIGALRM inherited as ignored and blocked.
 
 Every fixture arms SIGALRM to `FIXTURE_DEADLINE_NS`. The order is case
-verdict 45 s < fixture fallback 60 s < qualification 300 s, and fallback
+verdict 45 s < fixture fallback 60 s < qualification 420 s, and fallback
 expiry never counts as closure. The bootstrap requires all of:
 - candidate exit 0;
 - phase `monitor_complete`;
