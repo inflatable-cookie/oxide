@@ -2361,19 +2361,27 @@ development measurement (not a qualification): a clean, closed run of
 GiB; closed, status 0, no deadline) — 76.2 % of the 380 s candidate limit,
 80.4 % of the 360 s stop point and 82.7 % of the 350 s suite alarm. The earlier
 provisional estimate of about 241 s was under-measured because oxide#191's detach
-real cases were failing early there. The measured basis therefore fits the
-raised bound with about 60 s of alarm margin and needs no further change; the
-scoped amendment caps the deadline at 420 s and the candidate limit at 380 s, so
-no larger bound is permitted here either.
+real cases were failing early there. Those figures describe that private run
+only: they are superseded by the direct diagnostic below, which ran longer inside
+the real qualification, and the brief-author correction then raised the bounds
+again.
 
 **Superseded the same day (oxide#192 amendment, Oxide Supervisor, 2026-10-31).**
 The first uncounted diagnostic at `5623edd` (direct, under Tom `d3d61247`)
 exceeded the 350 s suite alarm (candidate exit 142 = SIGALRM, 357 s wall, load
 about 9.5), so inside the real qualification the combined suite runs longer than
-the private 297 s measurement. The bounds are therefore raised to a 600 s fixed
-deadline (kill at 598 s), a 560 s candidate limit and a 530 s suite alarm;
-scratch stays 512 MiB and the margin semantics are unchanged. Earlier
-qualifications stay bound to the limits they ran under.
+the private 297 s measurement. That packet is **failed**: it is preserved as
+history with no native credit, and only its pure suite passed. The bounds are
+therefore raised to a 600 s fixed deadline (kill at 598 s), a 560 s candidate
+limit and a 530 s suite alarm; scratch stays 512 MiB and the margin semantics
+are unchanged. Earlier qualifications stay bound to the limits they ran under.
+Under Tom decision `d3d61247`, while Effigy's I2/I3 helper-process regression
+makes its session census uncertain, the owner may run the exact `effigy.toml`
+proof commands directly with the same bounds, environment, reserve and custody
+checks and a per-session executor/command/head/exit/load/log-hash envelope; that
+is no general waiver, and one clean uncounted diagnostic, one counted author
+qualification and one distinct independent reviewer qualification follow in that
+order at the final published head.
 
 **Integrated head: qualification pending separate activation.** The merged
 bytes have **no** exact-head author qualification, and this task's run did not
@@ -2826,7 +2834,8 @@ bounds:
   (oxide#192 amendment, 2026-10-31; history: 300 s originally, 420 s under
   oxide#191 when the suite needed 251-258 s against the old 250 s alarm). The
   suite's own alarm is now 530 s, the 560 s candidate limit less its 30 s
-  margin.
+  margin; the first direct diagnostic then exhausted oxide#191's 350 s alarm at
+  357 s wall (candidate exit 142 = SIGALRM, its pure suite OK).
   The actor forks the whole bootstrap as a pinned worker and makes only
   WNOHANG reaps, bounded sleeps and signals to that worker. All file,
   hashing and stdout work runs in the worker. At 598 s the actor KILLs the

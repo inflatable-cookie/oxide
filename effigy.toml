@@ -652,6 +652,17 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # refusal and uncertainty paths alongside the unchanged guard cases. The changed runner is unqualified
 # until one counted author and one separate independent reviewer run of this
 # selector pass at the same head.
+# Oxide#192 correction (2026-10-31 brief author): the first direct uncounted
+# diagnostic at 5623edd exhausted the earlier 350 s suite alarm (candidate exit
+# 142 = SIGALRM, 357 s wall); that packet is a failed diagnostic preserved with
+# no credit, its pure suite OK. The bounds below are a 600 s fixed deadline
+# (kill at 598 s), a 560 s candidate limit and a 530 s suite alarm, with the
+# 512 MiB monitored scratch and the margin/custody semantics unchanged. Under
+# Tom decision d3d61247 the owner may execute this exact command directly while
+# Effigy's I2/I3 helper-process regression makes its session census uncertain,
+# under the same bounds, environment, reserve and custody checks and a
+# per-session executor/command/head/exit/load/log-hash envelope; no general proof
+# waiver follows.
 [tasks."proof:supervisor:qualify"]
 admission = "heavy"
 run = "python3 scripts/qualify-supervisor.py"
