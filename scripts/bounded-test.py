@@ -1795,7 +1795,9 @@ def custody_problems(paths, probe, facts=None, timeout=DETACH_INFO_TIMEOUT_S, de
             # The deadline is rechecked here AND the remainder is shared with the
             # backings still to read, so neither a slow earlier read nor several
             # reads can outlive the custodian's window.
-            budget = max(0.05, min(timeout, remaining / max(1, len(paths) - index)))
+            # No floor: a floor larger than a small positive remainder would grant a
+            # read more time than the custodian's window still allows.
+            budget = min(timeout, remaining / max(1, len(paths) - index))
         rows = read(backing, budget)
         if rows is None:
             problems.append(f"{backing}: attachment facts are unreadable")

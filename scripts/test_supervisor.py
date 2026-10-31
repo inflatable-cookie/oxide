@@ -5521,6 +5521,37 @@ class PureDetach(unittest.TestCase):
         self.assertLessEqual(reads[0][1], 0.35, reads)
         self.assertIn("no custodian wait window is left", record["reason"])
 
+    def test_a_sub_50ms_remainder_is_not_rounded_up(self):
+        # No floor may exceed a smaller positive remainder. The clock is fixed so
+        # the boundary is deterministic: 30 ms shared across two backings grants at
+        # most 15 ms each, never a 50 ms floor.
+        ctx, first = self.layout()
+        second = os.path.join(ctx["scratch"], "second.sparseimage")
+        with open(second, "wb") as handle:
+            handle.write(b"second backing")
+        grants = []
+
+        def facts(backing, timeout=None):
+            grants.append(timeout)
+            return []
+
+        fixed = 1_000 * bounded.NS
+        saved_now = bounded.now_ns
+        bounded.now_ns = lambda: fixed
+        try:
+            problems = bounded.custody_problems(
+                [first, second], self.facts(), facts, timeout=bounded.DETACH_INFO_TIMEOUT_S,
+                deadline_ns=fixed + 30_000_000)
+        finally:
+            bounded.now_ns = saved_now
+        self.assertEqual(problems, [], problems)
+        self.assertEqual(len(grants), 2, grants)
+        # Each grant is bounded by the 30 ms remainder (the first is shared down to
+        # half), and none is widened to the old 50 ms floor.
+        self.assertTrue(all(value is not None and value <= 0.03 for value in grants), grants)
+        self.assertEqual(grants[0], 0.015, grants)
+        self.assertTrue(all(value < 0.05 for value in grants), grants)
+
     def test_an_exhausted_window_scans_nothing(self):
         ctx, backing = self.layout()
         self.declare_custody(ctx, backing)
