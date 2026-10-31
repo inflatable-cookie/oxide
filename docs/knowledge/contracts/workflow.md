@@ -2766,9 +2766,9 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   (a grant, a zero-duration or capped grant, a late grant) end a wait. A rejected
   or overflowed report is unclassified in the same way. Together with the grant and late
   records this makes the states distinguishable in one receipt: granted before
-  the stop, granted after it (late, no clock moved), still waiting when it fired
-  (paired, nothing granted), stale (rejected by run), and unclassified (a report
-  was lost or rejected). A missing, malformed, oversized, linked or unreadable
+  the stop, granted after it (late, no clock moved), unpaired (nothing granted,
+  unclassified because its terminal may have been overwritten or missed), stale
+  (rejected by run), and rejected or overflowed (unclassified). A missing, malformed, oversized, linked or unreadable
   marker is recorded in `receipt.admission` with a bounded rejection list and
   nothing else happens: it never latches a fault and never changes closure,
   EOF, cleanup or classification. The grant is cooperative evidence about the

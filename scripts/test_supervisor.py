@@ -7898,8 +7898,9 @@ class Real(unittest.TestCase):
         self.assertEqual(len(decisions), 1)
         self.assertEqual(decisions[0]["granted_ns"], 0, "a zero-duration grant moves no clock")
         pairs = decisions[0]["admission_waiting"]
-        self.assertEqual((pairs["commands"], pairs["ended"], pairs["unfinished_count"]), (1, 1, 0),
+        self.assertEqual((pairs["commands"], pairs["ended"], pairs["unpaired_count"]), (1, 1, 0),
                          "the zero-duration grant ends its command's wait")
+        self.assertEqual(pairs["possibly_overwritten_count"], 0)
         self.assertEqual(decisions[0]["unclassified"], 0)
 
     def test_a_malformed_admission_marker_changes_nothing(self):
