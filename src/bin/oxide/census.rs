@@ -1499,7 +1499,7 @@ mod tests {
             (
                 "unreadable identity",
                 Ok(status),
-                Err("identity read failed".to_owned()),
+                Err("identity read failed; the census is unknown".to_owned()),
             ),
         ] {
             let error = platform::platform_status_verdict(&identity, status, after)
