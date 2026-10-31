@@ -93,7 +93,8 @@ FIXTURE = runner.FIXTURE
 CANDIDATE_MARKER = b"selected for the next build: internal pool (no removable volume registered)"
 
 
-def stage_at(proof: Proof, source: str, label: str, jobs: int | None = None) -> str:
+def stage_at(proof: Proof, source: str, label: str, jobs: int | None = None,
+             retain_stage_root: bool = False) -> str:
     """Build `oxide` from `source` into its own fresh target and build
     directories under the owned scratch, never shared with another source
     tree: one shared target let Cargo reuse the base binary for the
@@ -101,7 +102,14 @@ def stage_at(proof: Proof, source: str, label: str, jobs: int | None = None) -> 
 
     `jobs` is an OPTIONAL explicit Cargo job bound applied after the
     inherited-environment sanitization (which removes `CARGO_BUILD_*`); the
-    default `None` keeps every existing selector's behaviour unchanged."""
+    default `None` keeps every existing selector's behaviour unchanged.
+
+    `retain_stage_root` is an OPT-IN retention path for a caller whose staging
+    child may leave a descendant writing: the direct Cargo leader's exit does
+    not prove its group is closed, so such a caller keeps `stage_root` inside
+    the owned root for the qualified guard's post-leader census instead of
+    deleting it here. The default `False` preserves every other selector's
+    behaviour exactly."""
     stage_root = os.path.join(proof.root, f"stage-{label}")
     os.makedirs(stage_root)
     env = dict(os.environ)
@@ -151,7 +159,12 @@ def stage_at(proof: Proof, source: str, label: str, jobs: int | None = None) -> 
     copy = os.path.join(proof.root, "bin", label)
     os.makedirs(os.path.dirname(copy), exist_ok=True)
     shutil.copy2(built, copy)
-    shutil.rmtree(stage_root)
+    if retain_stage_root:
+        # The staged tree stays for the guard's post-leader census and its
+        # retention policy; removing it here would delete that evidence first.
+        print(f"{label}: staging tree {stage_root} retained for the guard's census")
+    else:
+        shutil.rmtree(stage_root)
     return copy
 
 
