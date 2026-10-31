@@ -1502,6 +1502,7 @@ CUSTODY_MAX_BYTES = 2048
 CUSTODY_MAX_BACKINGS = 8
 DETACH_MIN_BUDGET_NS = 8 * NS  # below this the whole sequence cannot fit the custodian's window
 DRAIN_WAIT_S = 0.5  # one short bounded drain of post-decision records, inside the window
+INFO_ORPHANS = []  # attachment reads whose child was not reaped; custody is never dropped
 DETACH_POST_RESERVE_S = 5.0  # kept for the post-state read after the child
 DETACH_STATES = ("refused", "detached", "failed", "timed_out", "withdrawn", "unknown")
 DETACH_POST_STATES = ("detached", "still_mounted", "still_attached", "unknown")
@@ -1670,6 +1671,11 @@ def image_attachments(backing=None, timeout=DETACH_INFO_TIMEOUT_S, run=None):
     is unknown and a custody check keeps the root. `run` substitutes the child
     runner (the parser's own seam)."""
     attempt = (run or bounded_run)([HDIUTIL, "info", "-plist"], timeout, DETACH_INFO_MAX_BYTES)
+    if attempt.get("handle") is not None:
+        # A read whose child could not be reaped is unreadable AND its custody is
+        # kept: the caller must close or hand it over before completing.
+        INFO_ORPHANS.append(attempt["handle"])
+        return None
     if attempt["exit"] != 0 or attempt["timed_out"] or attempt["truncated"] or not attempt["output"]:
         return None
     try:
@@ -3333,12 +3339,36 @@ class Monitor:
             "output": {}, "census": None, "census_rounds": 0, "settlement": self.settlement,
         }
 
+    def close_orphan_reads(self, ctx):
+        """Attachment reads whose child was never reaped are closed here, bounded
+        by what is left of the custodian's wait window. An orphan that cannot be
+        closed is unaccounted custody: the monitor holds instead of completing."""
+        if not INFO_ORPHANS:
+            return True
+        window_end = (ctx["start_ns"] + int(ctx["limit_s"] * NS) - EXIT_MARGIN_S * NS
+                      - int(0.2 * NS))
+        while INFO_ORPHANS:
+            handle = INFO_ORPHANS.pop(0)
+            reaped, _status = close_own_child(handle, window_end)
+            if not reaped:
+                INFO_ORPHANS.insert(0, handle)
+                return False
+        return True
+
     def finish_monitor(self, ctx, phase, drain=False):
         """Complete this monitor. Only an image-protocol run drains, and only
         inside what is left of the custodian's own wait window; the drain happens
         BEFORE the final publication so the persisted receipt carries the
         post-decision records. A run with neither a request nor a custody
         indication passes drain=False and reads nothing."""
+        if not self.close_orphan_reads(ctx):
+            # Unaccounted custody: keep everything and let the custodian end the run.
+            self.publish("orphan_read_unaccounted: monitor_held")
+            self.summary()
+            end = ctx["start_ns"] + int(ctx["limit_s"] * NS) - int(0.1 * NS)
+            while not self.stop.is_set() and now_ns() < end:
+                time.sleep(0.02)
+            return
         if drain:
             remaining = (ctx["start_ns"] + int(ctx["limit_s"] * NS) - EXIT_MARGIN_S * NS
                          - now_ns()) / NS
@@ -3688,14 +3718,15 @@ class Monitor:
             detach = post_census_detach(ctx, authorize=self.authorize_detach,
                                         still_allowed=self.detach_still_allowed)
             opted_in = detach is not None
-            if detach is None:
-                # Separate from the detach protocol and strictly OPT-IN: only a
-                # proof that published an image-custody indication is checked, so a
-                # run with neither indication nor request keeps the default
-                # cleanup path exactly (no scan, no gate, no new failure mode).
-                custody = cleanup_safety(ctx)
-                opted_in = custody is not None
-                if custody is not None and custody["state"] == "kept":
+            # The custody indication is checked for EVERY cleanup run, whether or
+            # not a detach request succeeded: a proof can declare more than one
+            # backing, and a second live one must never be cleaned just because the
+            # requested image detached. Without an indication this is one lstat and
+            # no scan, so a run that published neither keeps the default path.
+            custody = cleanup_safety(ctx)
+            if custody is not None:
+                opted_in = True
+                if custody["state"] == "kept":
                     with self.lock:
                         self.receipt["cleanup"] = custody
                     self.send("cleanup_kept", reason=custody["reason"][:200])

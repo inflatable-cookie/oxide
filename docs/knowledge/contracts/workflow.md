@@ -2169,7 +2169,7 @@ with no earlier run migrated.
 
 **Post-census image detach request (oxide#191, decision `ee263cea`, unqualified
 source).** The current `bounded-test.py`
-(`0e4340d907cbeebb43ee50a9fed491299854cbc457ecf64e1d9d083a28b5a11f`) adds one
+(`d69ae16a6c27651979109aecc88cadb139a653278b21104cd478157350934028`) adds one
 opt-in control for a proof
 whose own test image must be detached, and it is the only route by which such a
 proof may detach after a launch; the qualified shared runner is otherwise
@@ -2242,8 +2242,10 @@ re-reads the real `Kinfo.one()` row (liveness field is the boolean `zombie`; the
 no `stat` key) and requires the same PID, the same start time, still this monitor as
 parent and a non-zombie before it signals; then it signals, observes it gone under that same identity and
 acknowledges (a post-timeout close is the backstop); only a declined handoff (the
-child is already gone) lets the monitor finish the reap itself. The live handle
-also survives an exception raised inside the child executor after spawn: the
+child is already gone) lets the monitor finish the reap itself. The same rule covers the attachment read: an `hdiutil info` child that cannot be reaped is kept as
+custody, closed bounded by the remaining window before completion, and an orphan that cannot be closed
+makes the monitor hold rather than claim completion. The live handle also survives an exception raised
+inside the child executor after spawn: the
 failure record carries it, so custody is never dropped on an error path. Pin, signal and observation are recorded, an unobserved child is a latched
 fault, and the root, backing and evidence stay kept either way. A request that is
 present but not an object (including JSON `null`) is a refusal, never an
@@ -2262,7 +2264,9 @@ one is mounted, attached without a mount point (its `/dev` node still exists) or
 uncertain (unreadable facts, an unreadable device state, a malformed indication,
 or a UUID that does not match the request); a stale `hdiutil` entry whose device
 node is positively gone keeps nothing, and a positively clear backing set records
-`state: ok`. A run that publishes **neither** an indication nor a request is
+`state: ok`. The custody indication is consulted for EVERY cleanup run, including after a successful detach,
+because a proof can declare more than one backing and a second live one must never be cleaned just
+because the requested image detached. A run that publishes **neither** an indication nor a request is
 never scanned and never gated, so the default cleanup path is byte-for-byte
 unchanged and gains no new failure mode. An opted-in run additionally requires
 one final custodian authorization, taken after the detach from its current
@@ -2276,8 +2280,8 @@ custodian keeps its filesystem-free decision path and the existing
 cooperative-session limits. These bytes are unqualified until one uncounted
 `effigy proof:supervisor:qualify:diagnostic` records a clean picture and then
 ONE counted author and ONE separate independent reviewer
-`effigy proof:supervisor:qualify` pass at the same head (277 pure plus 48 real
-cases, including the sixty-six pure detach cases and the eight real ones: a
+`effigy proof:supervisor:qualify` pass at the same head (280 pure plus 48 real
+cases, including the sixty-nine pure detach cases and the eight real ones: a
 bound success, a refused identity, a failed attempt, an unrequested attachment
 whose opt-in custody keep is recorded separately, and a real stuck child the
 custodian pins, signals and observes closed), with independent exact-head source
@@ -5437,7 +5441,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
 - **Focused proof of absent checkout chains (oxide#135).** The one fixed proof
   is `effigy rust:prune-absence` (`scripts/test-prune-absence.py` under this
-  tree's shared supervisor `0e4340d9…`, the merged oxide#151 guard plus
+  tree's shared supervisor `d69ae16a…`, the merged oxide#151 guard plus
   oxide#191's opt-in post-census detach) with
   `--root-parent /private/tmp`, the owner-accepted internal-placement exception
   (decision `bd357a4c`): the missing-chain fixtures must be on the boot Data

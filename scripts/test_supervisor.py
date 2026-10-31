@@ -5307,6 +5307,97 @@ class PureDetach(unittest.TestCase):
                        {"exit": 0, "timed_out": False, "truncated": False, "output": "not a plist"}):
             self.assertIsNone(bounded.image_attachments(backing, run=lambda *a, b=broken: b), broken)
 
+    def test_a_second_declared_backing_is_checked_after_a_successful_detach(self):
+        # A proof may declare more than one backing. Detaching the requested image
+        # must not skip the custody check for the other one.
+        ctx, first = self.layout()
+        second = os.path.join(ctx["scratch"], "second.sparseimage")
+        with open(second, "wb") as handle:
+            handle.write(b"second backing")
+        self.declare_custody(ctx, first, second)
+        rows = {first: [], second: [("/dev/disk9s1", "/Volumes/OxSecond", None)]}
+        record = bounded.cleanup_safety(
+            ctx, self.facts(), facts=lambda backing, timeout=None: rows[os.path.realpath(backing)])
+        self.assertEqual(record["state"], "kept", record)
+        self.assertEqual(sorted(record["unrequested"]), sorted([first, second]))
+        self.assertIn("/Volumes/OxSecond", record["reason"])
+
+    def test_an_unreaped_attachment_read_is_kept_as_a_child(self):
+        backing = "/fixture/volume.sparseimage"
+
+        class FakeChild:
+            pid = 0
+
+            def __init__(self, statuses):
+                self.statuses = list(statuses)
+
+            def wait(self, timeout=None):
+                if not self.statuses:
+                    return None
+                value = self.statuses.pop(0)
+                if isinstance(value, BaseException):
+                    raise value
+                return value
+
+        handle = FakeChild([4242])
+        bounded.INFO_ORPHANS.clear()
+        try:
+            self.assertIsNone(bounded.image_attachments(backing, run=lambda *a: {
+                "exit": 0, "timed_out": False, "truncated": False, "output": "",
+                "reaped": False, "handle": handle}))
+            self.assertEqual(bounded.INFO_ORPHANS, [handle], "an unreaped read child was dropped")
+        finally:
+            bounded.INFO_ORPHANS.clear()
+
+    def monitor_stub(self):
+        monitor = bounded.Monitor.__new__(bounded.Monitor)
+        cmd_r, cmd_w = os.pipe()
+        self.addCleanup(os.close, cmd_r)
+        self.addCleanup(os.close, cmd_w)
+        monitor.cmd_r = cmd_r
+        monitor.lock = threading.Lock()
+        monitor.receipt = {"custodian": []}
+        monitor.published = []
+        monitor.publish = lambda phase: monitor.published.append(
+            (phase, [r["event"] for r in monitor.receipt["custodian"]]))
+        monitor.summary = lambda: None
+        monitor.send = lambda *a, **k: monitor.published.append(("sent", None))
+        monitor.stop = threading.Event()
+        return monitor, cmd_w
+
+    def test_an_orphan_read_is_closed_before_completion_or_the_monitor_holds(self):
+        class FakeChild:
+            pid = 0
+
+            def __init__(self, reaped):
+                self.reaped = reaped
+
+            def wait(self, timeout=None):
+                return 7 if self.reaped else None
+
+        ctx = {"start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "limit_s": 300}
+        monitor, _cmd_w = self.monitor_stub()
+        bounded.INFO_ORPHANS.clear()
+        try:
+            bounded.INFO_ORPHANS.append(FakeChild(True))
+            monitor.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=False)
+            self.assertEqual(bounded.INFO_ORPHANS, [], "a closed orphan was kept")
+            self.assertEqual([phase for phase, _r in monitor.published][0],
+                             "monitor_complete: pending_custodian")
+            self.assertTrue(monitor.stop.is_set())
+
+            # Unreaped: the monitor must not claim completion.
+            monitor, _cmd_w = self.monitor_stub()
+            ctx_late = {"start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) - 300 * bounded.NS,
+                        "limit_s": 300}
+            bounded.INFO_ORPHANS.append(FakeChild(False))
+            monitor.finish_monitor(ctx_late, "monitor_complete: pending_custodian", drain=False)
+            self.assertEqual([phase for phase, _r in monitor.published],
+                             ["orphan_read_unaccounted: monitor_held"], monitor.published)
+            self.assertFalse(monitor.stop.is_set())
+        finally:
+            bounded.INFO_ORPHANS.clear()
+
     def test_a_malformed_attachment_keeps_the_request_free_root(self):
         # Parser to the opt-in custody check: the declared backing's mounted entity
         # loses its dev-entry, so nothing about it is provably clear.
