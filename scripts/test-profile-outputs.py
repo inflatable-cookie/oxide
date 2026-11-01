@@ -267,6 +267,12 @@ def plan_only() -> int:
     print("A /private/tmp fallback is not external scratch-pool coverage.")
     print("base-compat: pinned base 4a70b83 and candidate, internal root; 300 s / 512 MiB.")
     print("Base-compat fit is UNMEASURED; prior 128 MiB bound was superseded by ea36e265.")
+    print("Deadline: Builds 600 s (work cutoff ~565 s); base-compat 300 s (work cutoff ~265 s).")
+    print("Fit UNMEASURED: the historical Builds work estimate was 360-540 s, not a gate.")
+    print("Allocation estimate UNMEASURED: 288 MiB staging + 128 MiB image + 48 MiB fixtures")
+    print("  + 32 MiB evidence + 16 MiB margin = 512 MiB; base-compat fit needs measurement.")
+    print("CPU planning: 6 CPU / 8 GiB; stagings use 6 jobs, fixture children 2 jobs each,")
+    print("  at most two gated writers overlap; maximum 6 Cargo jobs.")
     print("Both modes: one 128 MiB sparse image, ordinary detach, guard custody.")
     print("--diagnostic is uncounted; native runs require owner activation.")
     return 0
@@ -2898,7 +2904,7 @@ def run(proof: Proof, repo: str) -> None:
             case_reached("11")
             # ----- case 11 (continued): the candidate migration runs only now -----
             code, _, stderr = oxide(proof, ["outputs", "adopt"], "11 migrate", migrated)
-            expect(code == 0, f"11: candidate migration failed: {stderr}")
+            expect(code == 0, f"11: candidate migration failed: exit {code}: {stderr[-2000:]}")
             expect_layout(migrated, {"debug": f"link:{migrated_root}", "release": f"link:{migrated_root}"})
             upgraded = perm.read_json(marker_path)
             expect(upgraded["version"] == "oxide.outputs.root/2", "11: marker not upgraded to root/2")

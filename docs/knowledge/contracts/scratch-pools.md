@@ -511,6 +511,7 @@ stand at this head:
 | --- | --- | --- | --- |
 | `rust:installed-handoff` | 600 s / 128 MiB | yes | `proof:installed-handoff:test`, `proof:installed-handoff:plan`, and `HandoffSelectorTests` |
 | `rust:profile-outputs` | 600 s / 512 MiB | yes | `--plan` |
+| `rust:profile-outputs:base-compat` (internal keep) | 300 s / 512 MiB | yes | `--plan` |
 | `rust:recorded-slot-accounting` | 300 s / 512 MiB | yes; migrated (recorded-slot-accounting; native chain held) | `proof:recorded-slot-accounting:test`, `--plan` |
 | `rust:exec-output-inference` | 300 s / 512 MiB | yes | `proof:exec-inference:test`, `--plan` |
 | `rust:auto-adopt-ineligible` | 300 s / 512 MiB | yes | `--plan` (shared #117 fixture, no distinct pure selector) |
