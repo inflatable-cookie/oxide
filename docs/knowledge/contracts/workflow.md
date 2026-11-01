@@ -79,9 +79,9 @@ is product behaviour and not only proof input. The
 [cold-slot seeding contract](cold-slot-seeding.md) owns the transaction, its
 partial-association limit and the proof plan.
 
-The default-off merge-base identity checks remain in
+The explicit seed opt-out merge-base identity checks remain in
 `tests/cold_seed_default_off.rs`, behind `#[ignore]`; the separate
-`effigy rust:seed-default-off` selector stages the qualification-held merge-base
+`effigy rust:seed-default-off` selector stages the S3-or-later merge-base
 `oxide` and exports `OXIDE_SEED_BASELINE_BINARY`. They are not part of
 `effigy test rust` and do not qualify the default-on candidate.
 

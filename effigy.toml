@@ -80,7 +80,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 run = "python3 scripts/bounded-test.py oxide test --workspace --all-targets --locked"
 default = false
 
-# Merge-base identity for the seeding qualification hold (oxide#176). The two
+# Merge-base identity with explicit seeding opt-out (oxide#176). The two
 # tests in tests/cold_seed_default_off.rs need a staged merge-base oxide, so
 # they are #[ignore] in the unit suite. This selector reuses the #104 stage_at
 # helper, exports OXIDE_SEED_BASELINE_BINARY, and runs that target with
