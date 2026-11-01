@@ -2,9 +2,8 @@
 """Owned output links at profile directories (oxide#133): the fixed native
 matrix.
 
-The qualified shared supervisor (`scripts/bounded-test.py`, SHA-256
-`961164e797c01432fa8234497627f75e56489ef6395ef66e48824cdb0e48c052`, the
-merged oxide#142 monitor qualified at main `791f552`) owns the deadline,
+The shared supervisor (`scripts/bounded-test.py`; qualification is bound to
+its own source bytes) owns the deadline,
 512 MiB monitored scratch, continuous host reserve sampling, process
 census/closure and cleanup. The
 brief's scoped amendment (root owner, 2026-10-23T16:10Z, under the temporary
@@ -60,17 +59,17 @@ file created at the real target root before adoption must still exist, be a
 real regular file and be unchanged after adoption and builds, while Cargo's own
 `CACHEDIR.TAG`/`.rustc_info.json` are asserted real only when present.
 
-CPU controls for a 6 CPU / 8 GiB planning request: the two independent
-stagings are SEQUENTIAL and each is explicitly bounded to 6 Cargo jobs; fixture
+CPU controls for a 6 CPU / 8 GiB planning request: when both are staged,
+the two independent stagings are SEQUENTIAL and each is explicitly bounded to 6 Cargo jobs; fixture
 Cargo children are bounded to 2 jobs each and at most two gated writers overlap
 (2 x 2 = 4), so the whole proof peaks at 6 concurrent Cargo jobs. No inherited
 CARGO_BUILD_JOBS is trusted: the shared staging helper sanitizes it first and
 takes an explicit optional job bound (its default stays unchanged for other
 selectors).
 
-Staging (an unmeasured estimate, not a gate): two independent configs from
-authenticated pinned source, this HEAD's candidate (~45-80 s at 6 jobs) and
-base `4a70b83` (~45-80 s at 6 jobs); each target is copied out and discarded
+Staging (an unmeasured estimate, not a gate): Builds stages this HEAD's
+candidate; base-compat stages that candidate and base `4a70b83` from
+authenticated pinned source (~45-80 s each at 6 jobs); each target is copied out and discarded
 before the next staging starts, so only one staging target exists at a time.
 The script discards each staging target after copying
 its binary into the owned `bin/` directory so both never exceed the allocation:
@@ -88,7 +87,7 @@ The combined case matrix (mode-specific coverage is listed by `--plan`):
  7 complete exec declaration, undeclared refusal and custom declaration refusal
  8 real nonempty member kept and an empty one converted by explicit adopt
  9 container-style preflight sees a real `target`
-10 legacy whole-target receipt, link and `outputs-2` key unchanged and warm under state 4
+10 legacy whole-target receipt, link and `outputs-2` key unchanged and warm under the successor fence
 11 explicit base-created migration, source-shaped root/1 fixture (no nonce in receipt/registry), shared nonce upgrade, unchanged root inode/payload
 12 P0-P4 replay, creator/parent identity races, exact pre-P4 rollback at both marker boundaries
 13 an active writer blocks migration without effects
@@ -97,7 +96,7 @@ The combined case matrix (mode-specific coverage is listed by `--plan`):
 16 whole and selected clean with the existing watchdog semantics
 17 malformed member, unknown custody, internal fallback versus external link refusals
 18 linked-versus-real placement changes yield distinct cold slots
-19 an independently staged state-3 binary refuses state 4 without effects
+19 an independently staged state-3 binary refuses the successor fence without effects
 20 root-group prune with another checkout reference KEEP, exact guarded rollback and terminal crash image oracles
 
 `--diagnostic` is the ONE opt-in diagnostic mode (decision 1e4feb57): the same
@@ -195,6 +194,8 @@ MARKER = ".oxide-output.json"
 CAPABILITIES = "__oxide-build-capabilities"
 STATE3_FENCE = "oxide.outputs/2"
 STATE4_FENCE = "oxide.outputs/3"
+MIN_CANDIDATE_CAPABILITY = 4
+OBSERVED_CAPABILITIES = {"base": None, "candidate": None}
 
 CASES = [
     "01-real-target-debug-link",
@@ -290,6 +291,16 @@ def capabilities(binary: str) -> int:
     )
     expect(result.returncode == 0, f"{binary}: capability probe exit {result.returncode}")
     return int(json.loads(result.stdout)["control_state_version"])
+
+
+def check_capability(role: str, value: int) -> None:
+    expect(type(value) is int and value >= 0, f"{role}: invalid capability {value!r}")
+    OBSERVED_CAPABILITIES[role] = value
+    if role == "base":
+        expect(value == 3, f"base capability {value}, expected 3")
+    else:
+        expect(role == "candidate", f"unknown capability role {role!r}")
+        expect(value >= MIN_CANDIDATE_CAPABILITY, f"candidate capability {value} below {MIN_CANDIDATE_CAPABILITY}")
 
 
 def fence_in(pool: str) -> str:
@@ -1565,12 +1576,17 @@ def oxide(proof: Proof, args: list, label: str, cwd: str) -> tuple:
     return proof.oxide(args, label, cwd)
 
 
-def auto_legacy(proof: Proof, checkout: str) -> None:
-    """Create the published whole-target /2 state the way a fresh checkout on
-    the permanent drive gets it: the automatic first conversion."""
-    code, _, stderr = oxide(proof, ["build"], "auto-adopt", checkout)
-    expect(code == 0, f"auto-adopt build failed: {stderr}")
-    expect(os.path.islink(os.path.join(checkout, "target")), "automatic conversion did not publish a whole-target link")
+def source_legacy(proof: Proof, checkout: str) -> None:
+    """Construct the published whole-target shape from a candidate-created root.
+
+    Automatic adoption now publishes profile members, so it cannot create the
+    legacy migration premise used by cases 12 and 13.
+    """
+    os.makedirs(os.path.join(checkout, "target"))
+    pool = proof.env["OXIDE_POOL"]
+    perm.legacy_whole_target(proof, pool, proof.mount, checkout, "legacy fixture")
+    expect(os.path.islink(os.path.join(checkout, "target")), "legacy fixture has no whole-target link")
+    expect(receipt(pool, checkout)["version"] == "oxide.outputs.transition/2", "legacy fixture receipt is not /2")
 
 
 def base_legacy(proof: Proof, base: str, pool: str, checkout: str) -> None:
@@ -1722,7 +1738,7 @@ CASE_IDS = MODE_CASES[MODE]
 # 2. perm.proof_env sets OXIDE_TEST_HOME_FROM_ENV=1.
 # 3. perm.proof_env scrubs inherited OXIDE_*, XDG_* and sets fixture controls.
 # 4. case 01 creates an empty target before explicit adopt; cases 12/13 use
-#    auto_legacy to assert the automatic whole-target conversion.
+#    source_legacy to construct the legacy whole-target migration premise.
 # 5. Case 05 invokes a fake Cargo external subcommand and asserts its recorded
 #    argv includes the subcommand token: `nextest run --help`.
 # 6. attach_owned_image uses -owners on; existing identity and detach gates apply.
@@ -1797,6 +1813,7 @@ def write_assertion_receipt(outcome: str, failure) -> str:
     record = {
         "mode": MODE,
         "case_table": mode_labels(MODE),
+        "observed_capabilities": dict(OBSERVED_CAPABILITIES),
         "version": "oxide.outputs.proof-assertions/1",
         "outcome": outcome,
         "primary_failure": None if failure is None else str(failure)[-2000:],
@@ -2189,6 +2206,7 @@ def diagnostic_record(proof, started_ms, primary, secondary) -> dict:
         "version": "oxide.outputs.proof-diagnostic/1",
         "mode": MODE,
         "case_table": mode_labels(MODE),
+        "observed_capabilities": dict(OBSERVED_CAPABILITIES),
         "collection": "diagnostic",
         "qualified": False,
         "outcome": outcome,
@@ -2668,6 +2686,7 @@ def pure_diagnostic_controls() -> None:
 
 
 def run(proof: Proof, repo: str) -> None:
+    OBSERVED_CAPABILITIES.update(base=None, candidate=None)
     os.environ.pop("CARGO_ENCODED_RUSTFLAGS", None)
     os.environ["RUSTFLAGS"] = ""
     pure_diagnostic_controls()
@@ -2697,8 +2716,8 @@ def run(proof: Proof, repo: str) -> None:
     candidate = layout.stage_at(proof, repo, "candidate", jobs=STAGE_JOBS)
     if base is not None:
         expect(perm.sha256_file(base) != perm.sha256_file(candidate), "base and candidate binaries are identical")
-        expect(capabilities(base) == 3, "base binary is not a state-3 binary")
-    expect(capabilities(candidate) == 4, "candidate binary is not a state-4 binary")
+        check_capability("base", capabilities(base))
+    check_capability("candidate", capabilities(candidate))
     print(f"candidate {perm.sha256_file(candidate)}" + (f" base {perm.sha256_file(base)}" if base else ""), flush=True)
     proof.binary = candidate
 
@@ -3060,7 +3079,7 @@ def run(proof: Proof, repo: str) -> None:
             first = make_checkout(proof, "first")
             SHARED["first"] = first
             # A real EMPTY target selects the explicit profile adopt: an absent target
-            # would let the automatic whole-target first conversion run, and building
+            # would let the automatic profile first conversion run, and building
             # first would fill target/debug so adoption would keep it real.
             os.makedirs(os.path.join(first, "target"))
             adopt(proof, first, "01 adopt")
@@ -3309,7 +3328,7 @@ def run(proof: Proof, repo: str) -> None:
             expect_layout(unknown, {"debug": f"link:{root_of(pool, unknown)}"})
             # An external subcommand has opaque output directories. A2: the positive
             # control comes FIRST and is established on a checkout that is positively
-            # unconverted (a real empty target prevents automatic whole-target
+            # unconverted (a real empty target prevents automatic profile
             # adoption), so the later absence really is the linked refusal. The
             # recording tool is installed under BOTH names a Cargo external subcommand
             # can be looked up as, and it records its exact argv.
@@ -3511,16 +3530,16 @@ def run(proof: Proof, repo: str) -> None:
 
     if DIAG.enter("10.1", fixtures=()):
         try:
-            # ----- case 10: legacy whole-target state stays unchanged under state 4 ---
+            # ----- case 10: legacy whole-target state stays unchanged under successor fence ---
             case_reached("10")
             # The pool now carries the successor fence (case 11); the base-produced /2
             # checkout must still build warm with the same slot, key, receipt and link.
-            expect(fence_in(pool) == STATE4_FENCE, f"10: the pool is not state 4: {fence_in(pool)}")
-            code, _, stderr = oxide(proof, ["build"], "10 warm under state4", legacy)
-            expect(code == 0, f"10: legacy build under state4 failed: {stderr}")
+            expect(fence_in(pool) == STATE4_FENCE, f"10: the pool lacks the successor fence: {fence_in(pool)}")
+            code, _, stderr = oxide(proof, ["build"], "10 warm under successor fence", legacy)
+            expect(code == 0, f"10: legacy build under successor fence failed: {stderr}")
             warm_slot, warm_state = perm.slot_state(stderr)
-            expect(warm_state == "warm", f"10: legacy build was not warm under state4: {summary(stderr)}")
-            expect(warm_slot == base_slot, f"10: legacy slot changed under state4 {base_slot} -> {warm_slot}")
+            expect(warm_state == "warm", f"10: legacy build was not warm under successor fence: {summary(stderr)}")
+            expect(warm_slot == base_slot, f"10: legacy slot changed under successor fence {base_slot} -> {warm_slot}")
             expect(os.path.islink(os.path.join(legacy, "target")), "10: the legacy link changed")
             expect(link_at(os.path.join(legacy, "target")) == legacy_root, "10: the legacy link text changed")
             expect(item(pool, legacy, "version") == "oxide.outputs.transition/2", "10: the legacy receipt was rewritten")
@@ -3537,7 +3556,7 @@ def run(proof: Proof, repo: str) -> None:
             # exact published /2 state.
             for boundary in ("p0", "staged", "marker", "swapped"):
                 fixture = make_checkout(proof, f"replay-{boundary}")
-                auto_legacy(proof, fixture)
+                source_legacy(proof, fixture)
                 root = root_of(pool, fixture)
                 marker_before = perm.read_bytes(os.path.join(root, MARKER))
                 if boundary == "marker":
@@ -3581,7 +3600,7 @@ def run(proof: Proof, repo: str) -> None:
                 # A source-shaped root/1 marker makes both boundaries the two sides of
                 # the marker upgrade: staged is before it, marker is after it.
                 fixture = make_checkout(proof, f"rollback-{boundary}")
-                auto_legacy(proof, fixture)
+                source_legacy(proof, fixture)
                 root = make_root_one_fixture(pool, fixture)
                 marker_before = perm.read_bytes(os.path.join(root, MARKER))
                 env = {**proof.env, "OXIDE_TEST_MIGRATION_ROLLBACK": boundary}
@@ -3615,7 +3634,7 @@ def run(proof: Proof, repo: str) -> None:
             # leaves the migration pending: no payload is deleted and no creator is
             # replaced.
             creator_fixture = make_checkout(proof, "creator-race")
-            auto_legacy(proof, creator_fixture)
+            source_legacy(proof, creator_fixture)
             creator_root = root_of(pool, creator_fixture)
             env = {**proof.env, "OXIDE_TEST_OUTPUTS_CRASH": "migration-backed-up"}
             code, _, _ = perm.oxide_env(proof, ["outputs", "adopt"], "12 backup crash", creator_fixture, env)
@@ -3639,7 +3658,7 @@ def run(proof: Proof, repo: str) -> None:
             # change: the journal stays pending with no effects until the exact pinned
             # identity returns.
             parent_race = make_checkout(proof, "parent-race")
-            auto_legacy(proof, parent_race)
+            source_legacy(proof, parent_race)
             env = {**proof.env, "OXIDE_TEST_OUTPUTS_CRASH": "migration-staged"}
             code, _, _ = perm.oxide_env(proof, ["outputs", "adopt"], "12 parent crash", parent_race, env)
             expect(code != 0, "12: the parent-race crash did not stop adopt")
@@ -3660,7 +3679,7 @@ def run(proof: Proof, repo: str) -> None:
             # A crash after the P4 commit keeps the committed real target and the
             # cleanup journal; a replay finishes cleanup and never rolls back.
             p4 = make_checkout(proof, "p4-cleanup")
-            auto_legacy(proof, p4)
+            source_legacy(proof, p4)
             env = {**proof.env, "OXIDE_TEST_OUTPUTS_CRASH": "migration-p4"}
             code, _, _ = perm.oxide_env(proof, ["outputs", "adopt"], "12 p4 crash", p4, env)
             expect(code != 0, "12: the injected P4 stop did not stop adopt")
@@ -3698,7 +3717,7 @@ def run(proof: Proof, repo: str) -> None:
 
             # A committed migration is never rolled back.
             rollback = make_checkout(proof, "committed")
-            auto_legacy(proof, rollback)
+            source_legacy(proof, rollback)
             adopt(proof, rollback, "12 committed migrate")
             env = {**proof.env, "OXIDE_TEST_MIGRATION_ROLLBACK": "1"}
             code, _, _ = perm.oxide_env(proof, ["outputs", "adopt"], "12 committed", rollback, env)
@@ -3714,7 +3733,7 @@ def run(proof: Proof, repo: str) -> None:
             # ----- case 13: an active writer blocks migration ---------------------
             case_reached("13")
             blocked = make_checkout(proof, "blocked")
-            auto_legacy(proof, blocked)
+            source_legacy(proof, blocked)
             gate = os.path.join(proof.root, "gate13")
             os.makedirs(gate)
             child = perm.start_child(proof, [proof.binary, "build"], blocked, {**proof.env, "OXIDE_PROFILE_GATE": gate})
@@ -4251,7 +4270,7 @@ def run(proof: Proof, repo: str) -> None:
 
     if DIAG.enter("19.1", fixtures=()):
         try:
-            # ----- case 19: the staged state-3 binary refuses state 4 -------------
+            # ----- case 19: the staged state-3 binary refuses the successor fence -------------
             case_reached("19")
             snapshot = {member: os.readlink(member_link(migrated, member)) for member in ("debug", "release")}
             receipt_before = perm.sha256_file(perm.receipt_path(pool, migrated))
@@ -4692,6 +4711,21 @@ def pure_mode_contract() -> None:
     global MODE, CASE_IDS
     saved = MODE, CASE_IDS
     try:
+        for value, accepted in ((3, False), (4, True), (9, True)):
+            try:
+                check_capability("candidate", value)
+            except OracleFailure:
+                expect(not accepted, f"candidate {value} rejected")
+            else:
+                expect(accepted, f"candidate {value} accepted")
+        check_capability("base", 3)
+        try:
+            check_capability("base", 4)
+        except OracleFailure:
+            pass
+        else:
+            fail("base capability must remain exactly 3")
+        OBSERVED_CAPABILITIES.update(base=None, candidate=None)
         expect(not stages_base("builds"), "Builds must not stage the base")
         expect(stages_base("base-compat"), "base-compat must stage the base")
         try:

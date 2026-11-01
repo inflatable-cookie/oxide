@@ -5602,6 +5602,8 @@ author and reviewer native remain unactivated.
   consumer adoption, live prune, host installation and release actions are
   outside this task.
 
+The Supervisor's Builds diagnostic at `8acd4be` refused before any case because the candidate capability was newer than the proof's stale equality check (10 s, monitored peak 134.6 MiB; `wpo-logs/diag-8acd4be.log`). It is historical and gives no qualification credit. The correction accepts candidate capability at least 4, retains exact base capability 3, records observed values in mode receipts, and constructs the legacy migration fixture from a candidate-created root because current automatic adoption creates profile members. Fresh owner-activated diagnostic and native chains are required.
+
 **Proof split (oxide#207).** The profile-output matrix is split into Builds-native and base-compat modes. Builds stages only the candidate and uses a private `OXIDE_SCRATCH_ROOT` under the selected supervisor root (600 s / 512 MiB); it covers cases 01–09, fixture-constructed root/1 case 11, 12–18 and 20. A `/private/tmp` fallback does not prove external scratch-pool placement. The scoped base-compat selectors use the internal root under bd357a4c for the pinned base-created cases 10 and 11 and the case 19 forward-fence refusal (300 s / 128 MiB). The earlier 288 MiB staging estimate makes fit within the new base-compat bound unmeasured, pending the separately activated diagnostic. Each mode has its own receipt and requires its own diagnostic, author and independent reviewer native at the reviewed head. The following describes the pre-split proof and its historical design, not a completed native at this head.
 
 **Proof (oxide#133).** `scripts/test-profile-outputs.py` publishes the fixed
