@@ -1765,8 +1765,10 @@ CASE_IDS = MODE_CASES[MODE]
 #    forwards `cargo nextest --help`, so the recorded argv is `nextest --help`.
 # 6. attach_owned_image uses -owners on; existing identity and detach gates apply.
 # 7. run freezes both compiler flag variables before staging and fixture setup.
-# 8. Builds uses a private scratch pool under the runner root; base-compat
-#    requires the internal root for its pinned pre-S3 base.
+# 8. Builds uses a private scratch pool under the runner root. Only the
+#    base-compat selectors use the bd357a4c internal-placement exception:
+#    the pinned pre-S3 base requires an internal pool and case 20 requires
+#    boot-Data checkout absence (decision 41307e95).
 # 9. Python tempfile.mkdtemp uses the explicit runner root; no shell mktemp.
 
 def mode_labels(mode: str) -> list:
