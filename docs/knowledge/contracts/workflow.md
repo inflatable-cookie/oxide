@@ -1746,7 +1746,11 @@ necessary.
   `effigy proof:installed-handoff:test` checks the apparatus and fixture
   environment without staging a binary; `proof:installed-handoff:plan` prints
   the case plan. The uncounted `rust:installed-handoff:diagnostic` uses the
-  same bounds and aborts on unknown writer closure. The diagnostic and each
+  same bounds, records bounded monotonic case and command timings with exits
+  and the first 2 KiB of captured output, and aborts on unknown writer closure.
+  Its historical diagnostic at `1852c2f` stopped at the work deadline after
+  seven completed cases; its receipt lacks the timing needed to apportion the
+  278 s and carries no native credit (decision 88c71155). The diagnostic and each
   native session require owner activation at the migrated head; no previous
   receipt carries over. The proof touches no live pool, installed binary or
   real install receipt, and is not a benchmark or full QA.

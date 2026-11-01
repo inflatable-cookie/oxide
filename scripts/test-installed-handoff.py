@@ -8,8 +8,8 @@ plain Cargo and the pinned 1.97.1, offline, into its own scratch target, copies
 the binary and deletes the target before the fixtures. Only private scratch
 pools are created; no installed binary, host state or network is involved. The stage is kept
 inside the scratch budget by single-threaded, single-codegen-unit, debug-free,
-symbol-stripped, size-optimised codegen: the staged tree peaks near 58 MiB,
-the fixtures near 2 MiB, and staging takes about 37 s.
+symbol-stripped, size-optimised codegen. An earlier internal-root run measured
+about 58 MiB for staging and 37 s; it is not evidence of Builds performance.
 A fallback to `/private/tmp` exercises the internal path, where the scratch
 declaration is inert; it does not provide scratch-pool coverage.
 
@@ -41,6 +41,11 @@ HIGH premise dispositions (see the case bodies and helpers below):
    Fixture.env supplies that root and an explicit 64 MiB cap to every child.
 9. main uses tempfile.mkdtemp with an explicit supervisor scratch parent; no
    shell mktemp is used.
+
+The uncounted diagnostic records bounded monotonic case and command times,
+command exits and the first 2 KiB of captured stdout and stderr. A work-deadline
+stop is recorded explicitly; unlaunched commands have no exit status. Its
+receipt remains qualified: false. No timing observation is an acceptance gate.
 
 Not a benchmark, not full QA and not real-drive or host-install qualification.
 """
@@ -88,9 +93,15 @@ SCRATCH_ROOT = ""
 TOOLCHAIN_BIN = os.path.dirname(shutil.which("rustc") or "")
 
 
+class ProofFailure(SystemExit):
+    def __init__(self, message: str):
+        super().__init__(1)
+        self.message = message
+
+
 def fail(message: str) -> None:
     print(f"installed-handoff proof failed: {message}", file=sys.stderr)
-    sys.exit(1)
+    raise ProofFailure(message)
 
 
 def expect(condition: bool, message: str) -> None:
@@ -102,9 +113,12 @@ def case(name: str) -> None:
     CASES.append(name)
     if DIAGNOSTIC is not None:
         if DIAGNOSTIC["active"] is not None:
+            end_case(DIAGNOSTIC)
             DIAGNOSTIC["completed"].append(DIAGNOSTIC["active"])
             DIAGNOSTIC["states"][DIAGNOSTIC["active"]] = "completed"
         DIAGNOSTIC["active"] = name
+        DIAGNOSTIC["case_times"][name] = {"start_ns": time.monotonic_ns(), "end_ns": None}
+        DIAGNOSTIC["last_command"] = None
         DIAGNOSTIC["reached"].append(name)
         expect(name in CASE_PLAN and DIAGNOSTIC["states"][name] == "unexecuted", "case plan drift")
         DIAGNOSTIC["states"][name] = "active"
@@ -117,6 +131,51 @@ def work_left() -> float:
     if left <= 3:
         fail("work deadline reached before the supervisor's shutdown margin")
     return left
+
+
+def end_case(outcome):
+    name = outcome["active"]
+    if name is not None and name in outcome["case_times"]:
+        outcome["case_times"][name]["end_ns"] = time.monotonic_ns()
+
+
+def bounded_output(value):
+    if value is None:
+        return None
+    data = value if isinstance(value, bytes) else str(value).encode("utf-8", "replace")
+    return data[:2048].decode("utf-8", "replace")
+
+
+def observed_run(argv, *, limit, _runner=None, _remaining=None, **kwargs):
+    """Observe the existing child call; the shared supervisor owns custody."""
+    runner = subprocess.run if _runner is None else _runner
+    remaining = work_left if _remaining is None else _remaining
+    row = None
+    if DIAGNOSTIC is not None:
+        row = {"case": DIAGNOSTIC["active"], "command": [str(x)[:512] for x in argv[:16]],
+               "start_ns": time.monotonic_ns(), "end_ns": None, "exit": None,
+               "stdout": None, "stderr": None, "stop": None}
+        DIAGNOSTIC["last_command"] = row
+        if len(DIAGNOSTIC["commands"]) < 256:
+            DIAGNOSTIC["commands"].append(row)
+        else:
+            DIAGNOSTIC["commands_omitted"] += 1
+    try:
+        left = remaining()
+        result = runner(argv, timeout=min(limit, left) if limit is not None else left, **kwargs)
+        if row is not None:
+            row.update(exit=result.returncode, stdout=bounded_output(result.stdout),
+                       stderr=bounded_output(result.stderr))
+        return result
+    except BaseException as error:
+        if row is not None:
+            row["stop"] = getattr(error, "message", type(error).__name__)[:256]
+            row["stdout"] = bounded_output(getattr(error, "stdout", None))
+            row["stderr"] = bounded_output(getattr(error, "stderr", None))
+        raise
+    finally:
+        if row is not None:
+            row["end_ns"] = time.monotonic_ns()
 
 
 def sha256(path: str) -> str:
@@ -162,9 +221,8 @@ def current_state(version: int = STATE_VERSION) -> str:
         "records": [],
     }
     # Version 5 is the recorded-accounting fence (oxide#146) and must carry it;
-    # the versions below it never do. Version 7 is the raised-ceiling fence
-    # (oxide#177) and always carries its own fence too. A version-4 document is
-    # the old-binary side this proof keeps readable.
+    # the versions below it never do. Version 7 carries the eviction-accounting
+    # fence; version 8 adds the raised-ceiling fence, and version 9 adds holding.
     if version >= RECORDED_ACCOUNTING_STATE_VERSION:
         document["recorded_accounting"] = RECORDED_ACCOUNTING_FENCE
     if version >= EVICTION_ACCOUNTING_STATE_VERSION:
@@ -228,11 +286,11 @@ def compile_stub(root: str) -> str:
            "RUSTUP_HOME": os.environ.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup"),
            "RUSTUP_TOOLCHAIN": BUILDER, "RUSTUP_AUTO_INSTALL": "0",
            "RUSTFLAGS": "-C strip=symbols"}
-    result = subprocess.run(
+    result = observed_run(
         ["rustc", "--edition", "2021", "-O", "-o", binary, source],
         env=env, capture_output=True,
         text=True,
-        timeout=min(60, work_left()),
+        limit=60,
     )
     expect(result.returncode == 0, f"stub compile failed: {result.stderr[-2000:]}")
     os.unlink(source)
@@ -299,14 +357,21 @@ def _stage_subject(root: str, capability: dict | None = None, *, isolated: bool)
         }
     )
     with open(log, "w", encoding="utf-8") as handle:
-        build = subprocess.run(
+        build = observed_run(
             ["cargo", "build", "-j", "1", "--locked", "--offline", "--bin", "oxide"],
             cwd=REPO,
             env=env,
             stdout=handle,
             stderr=subprocess.STDOUT,
-            timeout=work_left(),
+            limit=None,
         )
+    if DIAGNOSTIC is not None and DIAGNOSTIC["last_command"] is not None:
+        # Cargo's stderr is merged into this file, so identify the merged
+        # stream instead of implying that missing captured stderr was empty.
+        with open(log, "rb") as handle:
+            DIAGNOSTIC["last_command"]["stdout"] = bounded_output(handle.read(2048))
+        DIAGNOSTIC["last_command"]["stderr"] = None
+        DIAGNOSTIC["last_command"]["stderr_note"] = "merged into stdout"
     if build.returncode:
         with open(log, encoding="utf-8") as handle:
             fail(f"staging exit {build.returncode}: {handle.read()[-2000:]}")
@@ -320,11 +385,11 @@ def _stage_subject(root: str, capability: dict | None = None, *, isolated: bool)
     # The installer's hidden probe must report this build's own versions and
     # its compiled proof controls (debug staging); a future bump then fails
     # this proof loudly instead of mis-testing it.
-    probe = subprocess.run(
+    probe = observed_run(
         [subject, CAPABILITIES_PROBE],
         capture_output=True,
         text=True,
-        timeout=min(30, work_left()),
+        limit=30,
     )
     expect(probe.returncode == 0, f"capability probe exit {probe.returncode}: {probe.stderr!r}")
     # The default stays exactly this proof's own declared versions, so every
@@ -396,8 +461,8 @@ class Fixture:
                      "if [ \"$1\" = locate-project ]; then echo " + shlex.quote(manifest) + "; exit 0; fi\n"
                      "exit 1\n")
             write(cargo, setup, 0o755)
-            result = subprocess.run([SUBJECT, "check"], cwd=workspace, env=self.env(SUBJECT),
-                                    capture_output=True, text=True, timeout=min(30, work_left()))
+            result = observed_run([SUBJECT, "check"], cwd=workspace, env=self.env(SUBJECT),
+                                    capture_output=True, text=True, limit=30)
             write(cargo, original, 0o755)
             expect(result.returncode == 1 and os.path.isfile(os.path.join(self.pool, "ledger.json")),
                    f"fixture setup did not create its pool: {result.stderr[-2000:]}")
@@ -512,13 +577,12 @@ def run(fixture: Fixture, binary: str, args: list, env_extra: dict | None = None
     env = fixture.env(binary)
     if env_extra:
         env.update(env_extra)
-    limit = min(timeout, work_left())
-    return subprocess.run(
+    return observed_run(
         [binary, *args],
         env=env,
         capture_output=True,
         text=True,
-        timeout=limit,
+        limit=timeout,
     )
 
 
@@ -826,13 +890,13 @@ def check_final_release(root: str, binary: str) -> None:
     # A first command creates the current pool and fenced state; Cargo fails,
     # so nothing else happens.
     write(os.path.join(fixture.tools, "cargo"), header + "exit 1\n", 0o755)
-    scaffold = subprocess.run(
+    scaffold = observed_run(
         [binary, "check"],
         env=fixture.env(binary),
         cwd=workspace,
         capture_output=True,
         text=True,
-        timeout=min(60, work_left()),
+        limit=60,
     )
     expect(scaffold.returncode == 1, f"scaffold exit {scaffold.returncode}: {scaffold.stderr!r}")
     with open(state, encoding="utf-8") as handle:
@@ -857,13 +921,13 @@ def check_final_release(root: str, binary: str) -> None:
         header + poll + "printf '%s' " + shlex.quote(current_state(NEWER_STATE_VERSION)) + " > " + shlex.quote(state) + "\nexit 0\n",
         0o755,
     )
-    result = subprocess.run(
+    result = observed_run(
         [binary, "check"],
         env=fixture.env(binary),
         cwd=workspace,
         capture_output=True,
         text=True,
-        timeout=min(60, work_left()),
+        limit=60,
     )
     expect(result.returncode == 1, f"final release exit {result.returncode}: {result.stderr!r}")
     expect(
@@ -911,13 +975,13 @@ def check_cargo_exit_75(root: str, binary: str) -> None:
     # The first command creates the pool; the second starts from an existing
     # current-version pool. Both must return Cargo's 75 untouched.
     for label in ("creating", "existing"):
-        result = subprocess.run(
+        result = observed_run(
             [binary, "check"],
             env=fixture.env(binary),
             cwd=workspace,
             capture_output=True,
             text=True,
-            timeout=min(60, work_left()),
+            limit=60,
         )
         expect(result.returncode == 75, f"cargo 75 {label}: exit {result.returncode}: {result.stderr!r}")
         expect(NOTICE not in result.stderr and REFUSAL not in result.stderr, f"cargo 75 {label} handed off")
@@ -943,13 +1007,17 @@ def collect(groups, invoke, outcome, launched):
         try:
             invoke(body)
             if outcome["active"] is not None:
+                end_case(outcome)
                 outcome["completed"].append(outcome["active"])
                 outcome["states"][outcome["active"]] = "completed"
                 outcome["active"] = None
             outcome["groups_completed"].append(name)
         except SystemExit as error:
+            end_case(outcome)
+            message = getattr(error, "message", f"SystemExit {error.code}")
             outcome["failed"].append({"case": outcome["active"], "group": name,
-                                      "error": str(error)[:256]})
+                                      "error": str(message)[:256],
+                                      "last_command": outcome["last_command"]})
             if outcome["active"] is not None:
                 outcome["states"][outcome["active"]] = "failed"
             outcome["active"] = None
@@ -958,9 +1026,13 @@ def collect(groups, invoke, outcome, launched):
                 outcome["unexecuted_groups"] = [item[0] for item in groups[index + 1:]]
                 return
         except Exception as error:
+            end_case(outcome)
+            outcome["failed"].append({"case": outcome["active"], "group": name,
+                                      "error": type(error).__name__,
+                                      "last_command": outcome["last_command"]})
             if outcome["active"] is not None:
                 outcome["states"][outcome["active"]] = "aborted"
-            outcome["aborted"] = type(error).__name__
+            outcome["aborted"] = getattr(error, "message", type(error).__name__)[:256]
             outcome["unexecuted_groups"] = [item[0] for item in groups[index + 1:]]
             return
 
@@ -968,7 +1040,8 @@ def collect(groups, invoke, outcome, launched):
 def empty_outcome():
     return {"qualified": False, "states": {name: "unexecuted" for name in CASE_PLAN}, "reached": [], "completed": [], "failed": [],
             "active": None, "groups_completed": [], "unexecuted_groups": [],
-            "aborted": None}
+            "aborted": None, "case_times": {}, "commands": [], "commands_omitted": 0,
+            "last_command": None, "start_ns": time.monotonic_ns(), "end_ns": None}
 
 
 def diagnostic_exit(outcome):
@@ -984,6 +1057,45 @@ def diagnostic_exit(outcome):
 
 
 def self_check():
+    global DIAGNOSTIC
+    # Exercise observation without creating a child or touching a fixture.
+    previous_diagnostic = DIAGNOSTIC
+    DIAGNOSTIC = empty_outcome()
+    try:
+        DIAGNOSTIC["active"] = CASE_PLAN[0]
+        fake = lambda argv, **kwargs: subprocess.CompletedProcess(argv, 42, "o" * 3000, "e" * 3000)
+        result = observed_run(["fixture", "check"], limit=30, _runner=fake, _remaining=lambda: 10)
+        row = DIAGNOSTIC["commands"][0]
+        assert result.returncode == row["exit"] == 42
+        assert row["case"] == CASE_PLAN[0] and row["command"] == ["fixture", "check"]
+        assert row["start_ns"] <= row["end_ns"] and len(row["stderr"]) == len(row["stdout"]) == 2048
+        def stopped():
+            raise ProofFailure("work deadline")
+        try:
+            observed_run(["fixture", "status"], limit=30, _runner=fake, _remaining=stopped)
+            assert False, "deadline did not stop launch"
+        except ProofFailure:
+            pass
+        row = DIAGNOSTIC["commands"][1]
+        assert row["stop"] == "work deadline" and row["exit"] is None and row["end_ns"] >= row["start_ns"]
+        # A case failure carries its triggering command and elapsed window.
+        DIAGNOSTIC = empty_outcome()
+        old_cases = list(CASES)
+        def failing_case(_):
+            case(CASE_PLAN[0])
+            observed_run(["fixture", "status"], limit=30, _runner=fake, _remaining=stopped)
+        try:
+            collect((("fixture", None),), failing_case, DIAGNOSTIC, lambda: True)
+            failure = DIAGNOSTIC["failed"][0]
+            timing = DIAGNOSTIC["case_times"][CASE_PLAN[0]]
+            assert failure["error"] == "work deadline"
+            assert failure["last_command"]["command"] == ["fixture", "status"]
+            assert failure["last_command"]["exit"] is None
+            assert timing["start_ns"] <= timing["end_ns"]
+        finally:
+            CASES[:] = old_cases
+    finally:
+        DIAGNOSTIC = previous_diagnostic
     outcome = empty_outcome()
     calls = []
     def invoke(body):
@@ -1108,11 +1220,13 @@ def main() -> int:
         return 0
     except BaseException as error:
         if diagnostic:
-            outcome["aborted"] = type(error).__name__
+            outcome["aborted"] = getattr(error, "message", type(error).__name__)[:256]
             outcome["unexecuted_groups"] = [name for name, _ in GROUPS if name not in outcome["groups_completed"]]
         raise
     finally:
         if diagnostic:
+            end_case(outcome)
+            outcome["end_ns"] = time.monotonic_ns()
             # Bounded by the fixed group/case table and truncated error strings.
             with open(os.path.join(evidence, "installed-handoff-diagnostic.json"), "w", encoding="utf-8") as handle:
                 json.dump(outcome, handle, sort_keys=True)
