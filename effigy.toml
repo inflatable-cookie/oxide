@@ -77,19 +77,28 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 run = "python3 scripts/bounded-test.py oxide test --workspace --all-targets --locked"
 default = false
 
-# Merge-base identity for the seeding qualification hold (oxide#176). The two
+# Merge-base identity with explicit seeding opt-out (oxide#176). The two
 # tests in tests/cold_seed_default_off.rs need a staged merge-base oxide, so
 # they are #[ignore] in the unit suite. This selector reuses the #104 stage_at
 # helper, exports OXIDE_SEED_BASELINE_BINARY, and runs that target with
 # --ignored. Default baseline is git merge-base HEAD origin/main; override
 # with OXIDE_SEED_BASELINE_COMMIT. 300 s / 512 MiB owned scratch. The
-# explicit internal root is the owner-accepted exception (decision bd357a4c)
-# because the tiny-build fixture creates a genuine directory-budget pool,
-# which the product refuses on an external volume. Not a native proof and
-# not an alias for full QA.
+# fixture uses a scratch pool on the supervisor-selected volume. Baselines
+# must contain scratch-pools S3 (79e55f4). A /private/tmp fallback exercises
+# the inert internal path and is not scratch-pool coverage. Not full QA.
 [tasks."rust:seed-default-off"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-seed-default-off.py"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-seed-default-off.py"
+
+[tasks."proof:seed-default-off:test"]
+run = "python3 scripts/test-seed-default-off.py --self-check"
+
+[tasks."proof:seed-default-off:plan"]
+run = "python3 scripts/test-seed-default-off.py --plan"
+
+[tasks."rust:seed-default-off:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-seed-default-off.py --diagnostic"
 
 # Installed-binary hand-off (oxide#122): one author proof, one fixed script
 # and the whole command under the qualified shared supervisor, within the

@@ -1,9 +1,19 @@
-//! The qualification hold is invisible when the opt-in is unset.
+//! Explicit seeding opt-out preserves merge-base identity after default-on qualification.
 
 use std::ffi::{CStr, CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Output};
+
+fn evidence(label: &str, output: &Output) -> String {
+    let head = |bytes: &[u8]| String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]).into_owned();
+    format!(
+        "{label}: status={}\nstdout (first 4096 bytes):\n{}\nstderr (first 4096 bytes):\n{}",
+        output.status,
+        head(&output.stdout),
+        head(&output.stderr)
+    )
+}
 
 struct Scratch(PathBuf);
 
@@ -47,7 +57,7 @@ fn baseline_binary() -> std::ffi::OsString {
 
 #[test]
 #[ignore = "needs OXIDE_SEED_BASELINE_BINARY; run via effigy rust:seed-default-off"]
-fn status_off_matches_ignored_opt_in_and_held_adds_only_its_notice() {
+fn status_qualified_modes_match_baseline_without_side_effects() {
     let real_home = std::env::var_os("HOME").expect("invoking HOME");
     let rustup_home = std::env::var_os("RUSTUP_HOME")
         .filter(|value| !value.is_empty())
@@ -77,28 +87,60 @@ fn status_off_matches_ignored_opt_in_and_held_adds_only_its_notice() {
         command.output().expect("oxide status")
     };
     let candidate = OsStr::new(env!("CARGO_BIN_EXE_oxide"));
-    let off = run(candidate, None);
-    let ignored = run(candidate, Some("0"));
-    let held = run(candidate, Some("1"));
-    assert!(off.status.success() && ignored.status.success() && held.status.success());
-    assert_eq!(off.stdout, ignored.stdout);
-    assert_eq!(off.stderr, ignored.stderr);
-    assert_eq!(off.stderr, held.stderr);
-    let notice = b"seeding skipped: seeding not yet qualified on this Cargo; enabled after the qualification proof\n";
-    assert_eq!(
-        held.stdout.strip_prefix(notice),
-        Some(off.stdout.as_slice())
-    );
-    // The merge-base binary is the required comparison: an absent input fails
-    // here instead of letting the identity claim pass dormant.
+    let default = run(candidate, None);
+    let off = run(candidate, Some("0"));
+    let on = run(candidate, Some("1"));
     let base = run(&baseline_binary(), None);
-    assert_eq!(base.status.code(), off.status.code());
-    assert_eq!(base.stdout, off.stdout);
-    assert_eq!(base.stderr, off.stderr);
-    assert!(!pool.exists());
-    assert!(std::fs::read_dir(&home).unwrap().next().is_none());
-    assert!(std::fs::read_dir(&cargo_home).unwrap().next().is_none());
-    assert!(!home.join(".rustup").exists());
+    let details = format!(
+        "{}\n{}\n{}\n{}",
+        evidence("candidate unset", &default),
+        evidence("candidate 0", &off),
+        evidence("candidate 1", &on),
+        evidence("baseline unset", &base)
+    );
+    assert!(
+        default.status.success()
+            && off.status.success()
+            && on.status.success()
+            && base.status.success(),
+        "{details}"
+    );
+    // No recorded seed exists in this read-only fixture. Qualified status has
+    // no hold notice, and opt-out suppresses recorded seed information.
+    let old_notice = "seeding skipped: seeding not yet qualified on this Cargo; enabled after the qualification proof";
+    for output in [&default, &off, &on, &base] {
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains(old_notice),
+            "{details}"
+        );
+    }
+    assert!(
+        !String::from_utf8_lossy(&off.stdout).contains("recorded seed:"),
+        "{details}"
+    );
+    assert_eq!(default.stdout, off.stdout, "{details}");
+    assert_eq!(default.stderr, off.stderr, "{details}");
+    assert_eq!(default.stdout, on.stdout, "{details}");
+    assert_eq!(default.stderr, on.stderr, "{details}");
+    assert_eq!(base.status.code(), off.status.code(), "{details}");
+    assert_eq!(base.stdout, off.stdout, "{details}");
+    assert_eq!(base.stderr, off.stderr, "{details}");
+    assert!(!pool.exists(), "{details}");
+    assert!(
+        std::fs::read_dir(&home)
+            .unwrap_or_else(|error| panic!("home read: {error}\n{details}"))
+            .next()
+            .is_none(),
+        "{details}"
+    );
+    assert!(
+        std::fs::read_dir(&cargo_home)
+            .unwrap_or_else(|error| panic!("cargo home read: {error}\n{details}"))
+            .next()
+            .is_none(),
+        "{details}"
+    );
+    assert!(!home.join(".rustup").exists(), "{details}");
 }
 
 #[test]
@@ -111,11 +153,18 @@ fn tiny_build_matches_staged_base_when_seed_is_off() {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(real_home).join(".rustup"));
     let scratch = Scratch::new();
-    let home = scratch.0.join("home");
+    let base_home = scratch.0.join("base-home");
+    let candidate_home = scratch.0.join("candidate-home");
     let cargo_home = scratch.0.join("cargo-home");
     let pool = scratch.0.join("pool");
     let checkout = scratch.0.join("checkout");
-    std::fs::create_dir(&home).unwrap();
+    let base_paths = (&base_home, &pool, &checkout);
+    let candidate_paths = (&candidate_home, &pool, &checkout);
+    assert_ne!(base_paths.0, candidate_paths.0);
+    assert_eq!(base_paths.1, candidate_paths.1);
+    assert_eq!(base_paths.2, candidate_paths.2);
+    std::fs::create_dir(&base_home).unwrap();
+    std::fs::create_dir(&candidate_home).unwrap();
     std::fs::create_dir(&cargo_home).unwrap();
     std::fs::create_dir_all(checkout.join("src")).unwrap();
     std::fs::write(
@@ -128,7 +177,8 @@ fn tiny_build_matches_staged_base_when_seed_is_off() {
         "fn main() { println!(\"seed-off\"); }\n",
     )
     .unwrap();
-    let run = |binary: &OsStr| {
+    let run = |binary: &OsStr, paths: (&PathBuf, &PathBuf, &PathBuf), prior: Option<&Output>| {
+        let (home, pool, checkout) = paths;
         let output = Command::new(binary)
             .args(["build", "--offline"])
             .current_dir(&checkout)
@@ -139,28 +189,59 @@ fn tiny_build_matches_staged_base_when_seed_is_off() {
             .env("RUSTUP_TOOLCHAIN", "1.97.1")
             .env("OXIDE_POOL", &pool)
             .env("OXIDE_CONFIG", scratch.0.join("missing-config"))
-            .env_remove("OXIDE_COLD_SEED")
+            .env("OXIDE_COLD_SEED", "0")
             .env_remove("CARGO_TARGET_DIR")
             .env_remove("CARGO_BUILD_BUILD_DIR")
             .output()
             .expect("run tiny offline build");
+        let details = match prior {
+            Some(previous) => format!(
+                "{}\n{}",
+                evidence("baseline", previous),
+                evidence("candidate", &output)
+            ),
+            None => evidence("baseline", &output),
+        };
+        assert!(output.status.success(), "{details}");
         assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+            !String::from_utf8_lossy(&output.stderr).contains("seeding"),
+            "{details}"
         );
-        assert!(!String::from_utf8_lossy(&output.stderr).contains("seeding"));
-        let bytes = std::fs::read(checkout.join("target/debug/seed-off-fixture")).unwrap();
-        assert!(!pool.join("oxide-managed/seeds").exists());
-        assert!(!home.join(".rustup").exists());
-        (output.stdout, bytes)
+        let bytes = std::fs::read(checkout.join("target/debug/seed-off-fixture"))
+            .unwrap_or_else(|error| panic!("fixture binary read failed: {error}\n{details}"));
+        assert!(!pool.join("oxide-managed/seeds").exists(), "{details}");
+        assert!(!home.join(".rustup").exists(), "{details}");
+        (output, bytes)
     };
-    let old = run(&base);
-    std::fs::remove_dir_all(&pool).unwrap();
-    std::fs::remove_dir_all(checkout.join("target")).unwrap();
-    let new = run(OsStr::new(env!("CARGO_BIN_EXE_oxide")));
-    assert_eq!(old.0, new.0);
-    assert_eq!(old.1, new.1);
+    // Scratch host records live under HOME. A fresh second HOME permits a new
+    // binding at the same path, which the byte-identity comparison requires.
+    let old = run(&base, base_paths, None);
+    let details = evidence("baseline", &old.0);
+    assert!(
+        std::fs::read_dir(&candidate_home)
+            .unwrap_or_else(|error| panic!("candidate home read: {error}\n{details}"))
+            .next()
+            .is_none(),
+        "{details}"
+    );
+    std::fs::remove_dir_all(&pool)
+        .unwrap_or_else(|error| panic!("pool cleanup: {error}\n{details}"));
+    assert!(!pool.exists(), "{details}");
+    std::fs::remove_dir_all(checkout.join("target")).unwrap_or_else(|error| {
+        panic!("target cleanup: {error}\n{}", evidence("baseline", &old.0))
+    });
+    let new = run(
+        OsStr::new(env!("CARGO_BIN_EXE_oxide")),
+        candidate_paths,
+        Some(&old.0),
+    );
+    let details = format!(
+        "{}\n{}",
+        evidence("baseline", &old.0),
+        evidence("candidate", &new.0)
+    );
+    assert_eq!(old.0.stdout, new.0.stdout, "{details}");
+    assert_eq!(old.1, new.1, "{details}");
 }
 
 #[test]

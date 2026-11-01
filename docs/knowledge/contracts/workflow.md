@@ -79,9 +79,9 @@ is product behaviour and not only proof input. The
 [cold-slot seeding contract](cold-slot-seeding.md) owns the transaction, its
 partial-association limit and the proof plan.
 
-The default-off merge-base identity checks remain in
+The explicit seed opt-out merge-base identity checks remain in
 `tests/cold_seed_default_off.rs`, behind `#[ignore]`; the separate
-`effigy rust:seed-default-off` selector stages the qualification-held merge-base
+`effigy rust:seed-default-off` selector stages the S3-or-later merge-base
 `oxide` and exports `OXIDE_SEED_BASELINE_BINARY`. They are not part of
 `effigy test rust` and do not qualify the default-on candidate.
 
@@ -1379,8 +1379,16 @@ the backing and records and aborts as an unknown outcome instead of being
 downgraded to the case's own oracle failure. Diagnostic dependency
 handling requires a *passed* predecessor (a skipped one is not passed), and an
 unknown-outcome abort records every remaining planned case as not run, so a
-reached prefix is never reported as a complete collection. Its native author and
-reviewer sessions are separately root-activated; no counted native has passed.
+reached prefix is never reported as a complete collection. At native head `0eeb7404020e86d3b040578d731c232f229733a1`, the
+Supervisor-activated uncounted diagnostic completed 12/12 and the counted
+author and distinct independent reviewer natives each passed all 12 cases,
+closed under `/private/tmp` at the 300 s / 512 MiB bounds. The three runs
+used direct commands under decision `d3d61247`, in order, and are recorded
+with executor, command, load and log hashes in
+`/Volumes/Builds/scratch/oxide/evidence-s4-pool-temp-scratch-0eeb740-20261101T123940Z`
+(`NOTE.md`, `sessions.jsonl`, `SHA256SUMS`): 68 s diagnostic, 67 s author,
+68 s reviewer, with reviewer peak 71.6 MiB. Carry to the integrated head
+requires independent exact-diff confirmation under decision `0475a633`.
 Author natives 1 and 2 and diagnostics 1, 2 and 3 at earlier heads are spent
 failures: the first two hid the toolchain behind the fixture HOME and used
 `--locked` without a lock, and the diagnostics were refused in turn by an
@@ -2000,9 +2008,9 @@ the separate owned image stays under its existing custody rules. Inherited
 `TMPDIR` fixtures stay outside the directory-budget pool on the same device;
 values under the pool are not valid, and the product's pool-membership refusal
 is never weakened. This ruling
-requires separate exact-head review and native activations; the blocked review
-at `8d030b2` and earlier proof packets remain historical with no native credit
-for the corrected head. The shorter supervisor prefix is tracked by papercut
+has separate native evidence at `0eeb740` as described above; carrying it to
+the integrated head requires independent exact-diff confirmation. The blocked
+review at `8d030b2` and earlier proof packets stay historical. The shorter supervisor prefix is tracked by papercut
 `503e484d`. The earlier decision `bd357a4c` accepted the internal-root
 exception, and an earlier oxide#136 diagnostic observed about 58 MiB peak;
 that figure remains historical and is not a budget reduction or new evidence.
