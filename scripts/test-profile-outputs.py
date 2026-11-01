@@ -1736,6 +1736,11 @@ def mode_labels(mode: str) -> list:
             for case in MODE_CASES[mode]]
 
 
+def stages_base(mode: str) -> bool:
+    expect(mode in MODE_CASES, f"unknown profile-outputs mode {mode!r}")
+    return mode == "base-compat"
+
+
 def fixture_environment(root: str, mode: str, home: str, cargo_home: str) -> dict:
     scratch_pool = os.path.join(root, "scratch-pools")
     pool = os.path.join(scratch_pool if mode == "builds" else root, "pool")
@@ -2684,7 +2689,7 @@ def run(proof: Proof, repo: str) -> None:
     # stages are sequential and each is bounded to 6 Cargo jobs (passed
     # explicitly to the shared helper, which sanitizes CARGO_BUILD_* first).
     base = None
-    if MODE == "base-compat":
+    if stages_base(MODE):
         base_src = source_at(proof, repo, BASE, "base")
         base = layout.stage_at(proof, base_src, "base", jobs=STAGE_JOBS)
         shutil.rmtree(base_src)
@@ -4686,6 +4691,14 @@ def pure_mode_contract() -> None:
     global MODE, CASE_IDS
     saved = MODE, CASE_IDS
     try:
+        expect(not stages_base("builds"), "Builds must not stage the base")
+        expect(stages_base("base-compat"), "base-compat must stage the base")
+        try:
+            stages_base("unknown")
+        except OracleFailure:
+            pass
+        else:
+            fail("unknown staging mode was accepted")
         expect(mode_labels("base-compat") == ["10-base", "11-base", "19"], "base table changed")
         expect(mode_labels("builds") == ["01", "02", "03", "04", "05", "06", "07", "08", "09", "11-source", "12", "13", "14", "15", "16", "17", "18", "20"], "Builds table changed")
         for mode in MODE_CASES:
