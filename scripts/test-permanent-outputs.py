@@ -1093,7 +1093,9 @@ def run(proof: Proof, repo: str, base_compat: bool = False) -> None:
     set_recorded_uuid(pool, good)
     proof.phase("after the second-command transition")
 
-    # 8b. An active writer blocks the output barrier until it closes.
+    # 8b. An active writer blocks a destination transition until it closes.
+    # A leased check exercises legacy replay; explicit adopt now migrates the
+    # whole-target layout (outputs.rs:2244), covered in exec-inference case 16.
     code, _, stderr = proof.oxide(["build", "--bin", "poutputs"], "relink to external before the adopt", app)
     expect(code == 0 and link_target(link) == external_root, f"pre-adopt relink failed: {stderr}")
     gate_env = dict(env)
@@ -1105,7 +1107,7 @@ def run(proof: Proof, repo: str, base_compat: bool = False) -> None:
         expect(writer.poll() is None, "the gated build exited early")
         set_recorded_uuid(pool, wrong)
         waiting = start_child(
-            proof, [proof.binary, "outputs", "adopt"], app, env
+            proof, [proof.binary, "check"], app, env
         )
         time.sleep(2.0)
         if waiting.poll() is not None:
@@ -1247,13 +1249,13 @@ def run(proof: Proof, repo: str, base_compat: bool = False) -> None:
     crash_env = dict(env)
     crash_env["OXIDE_TEST_OUTPUTS_CRASH"] = "prepared"
     code, _, stderr = oxide_env(
-        proof, ["outputs", "adopt"], "injected stop after the prepared receipt", app, crash_env
+        proof, ["check"], "injected stop after the prepared receipt", app, crash_env
     )
     expect(code != 0 and "injected transition stop" in stderr, stderr)
     prepared = read_json(receipt_path(pool, app))
     expect(prepared["state"] == "prepared" and prepared["prepared"], prepared)
     expect(link_target(link) == local_root, "the prepared receipt changed the live link")
-    code, stdout, stderr = proof.oxide(["outputs", "adopt"], "replay a prepared receipt", app)
+    code, stdout, stderr = proof.oxide(["check"], "replay a prepared receipt", app)
     expect(code == 0 and link_target(link) == external_root, f"replay failed: {stdout}{stderr}")
     replay = read_json(receipt_path(pool, app))
     expect(replay["state"] == "committed" and replay["generation"] == prepared["prepared"]["generation"], replay)
@@ -1265,7 +1267,7 @@ def run(proof: Proof, repo: str, base_compat: bool = False) -> None:
         set_recorded_uuid(pool, good)
         crash_env["OXIDE_TEST_OUTPUTS_CRASH"] = point
         code, _, stderr = oxide_env(
-            proof, ["outputs", "adopt"], f"injected stop after {point}", app, crash_env
+            proof, ["check"], f"injected stop after {point}", app, crash_env
         )
         expect(code != 0 and "injected transition stop" in stderr, stderr)
         prepared = read_json(receipt_path(pool, app))
@@ -1278,7 +1280,7 @@ def run(proof: Proof, repo: str, base_compat: bool = False) -> None:
             # stops the replay before its rename: link, sibling and receipt kept.
             prepared_bytes = read_bytes(receipt_path(pool, app))
             set_recorded_uuid(pool, wrong)
-            code, _, stderr = proof.oxide(["outputs", "adopt"], "replay with a wrong UUID refuses", app)
+            code, _, stderr = proof.oxide(["check"], "replay with a wrong UUID refuses", app)
             expect(code != 0 and "cannot be replayed" in stderr, stderr)
             expect(link_target(link) == local_root, "the refused replay moved the live link")
             expect(os.path.islink(sibling), "the refused replay removed the sibling")
@@ -1286,7 +1288,7 @@ def run(proof: Proof, repo: str, base_compat: bool = False) -> None:
             set_recorded_uuid(pool, good)
         else:
             expect(link_target(link) == external_root, "the renamed crash did not publish the link")
-        code, stdout, stderr = proof.oxide(["outputs", "adopt"], f"replay after {point}", app)
+        code, stdout, stderr = proof.oxide(["check"], f"replay after {point}", app)
         expect(code == 0 and link_target(link) == external_root, f"{point} replay failed: {stdout}{stderr}")
         expect(
             read_json(receipt_path(pool, app))["state"] == "committed",
@@ -1296,8 +1298,8 @@ def run(proof: Proof, repo: str, base_compat: bool = False) -> None:
             not glob.glob(os.path.join(app, ".target.oxide-new-*")),
             "a prepared sibling was left behind",
         )
-    code, stdout, _ = proof.oxide(["outputs", "adopt"], "idempotent adopt", app)
-    expect(code == 0 and "already selects" in stdout, stdout)
+    code, stdout, _ = proof.oxide(["check"], "idempotent replay", app)
+    expect(code == 0, stdout)
     proof.phase("after crash replay")
 
     # 9b. A same-device symlink in place of `.oxide-outputs` is not the real
