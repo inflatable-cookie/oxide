@@ -1746,11 +1746,16 @@ necessary.
   `effigy proof:installed-handoff:test` checks the apparatus and fixture
   environment without staging a binary; `proof:installed-handoff:plan` prints
   the case plan. The uncounted `rust:installed-handoff:diagnostic` uses the
-  same bounds, records bounded monotonic case and command timings with exits
-  and the first 2 KiB of captured output, and aborts on unknown writer closure.
+  same bounds, publishes an atomic bounded progress receipt at phase, case and
+  command boundaries, records monotonic timings, observed exits and bounded
+  output, and aborts on unknown writer closure. Its retained merged Cargo
+  staging log exposes package-cache waits even if the supervisor stops it.
+  A started command without a terminal record has unknown exit.
   Its historical diagnostic at `1852c2f` stopped at the work deadline after
   seven completed cases; its receipt lacks the timing needed to apportion the
-  278 s and carries no native credit (decision 88c71155). The diagnostic and each
+  278 s and carries no native credit (decision 88c71155). The later `e64850e`
+  diagnostic hit the supervisor deadline during staging, before the old
+  in-memory receipt was published; it also has no native credit. The diagnostic and each
   native session require owner activation at the migrated head; no previous
   receipt carries over. The proof touches no live pool, installed binary or
   real install receipt, and is not a benchmark or full QA.

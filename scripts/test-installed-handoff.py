@@ -42,10 +42,14 @@ HIGH premise dispositions (see the case bodies and helpers below):
 9. main uses tempfile.mkdtemp with an explicit supervisor scratch parent; no
    shell mktemp is used.
 
-The uncounted diagnostic records bounded monotonic case and command times,
-command exits and the first 2 KiB of captured stdout and stderr. A work-deadline
-stop is recorded explicitly; unlaunched commands have no exit status. Its
-receipt remains qualified: false. No timing observation is an acceptance gate.
+The uncounted diagnostic atomically publishes a bounded progress receipt at
+phase and case boundaries and around child commands; a killed child has an
+unknown exit. It records monotonic times, command exits, bounded captured output
+and the retained merged Cargo staging log, including package-cache lock waits.
+The invoking Cargo cache remains shared: candidate cache and checkout sizes
+plus the historical staging peak do not establish a safe 128 MiB private seed.
+A work-deadline stop is explicit. The receipt remains qualified: false; timing
+observations are not acceptance gates.
 
 Not a benchmark, not full QA and not real-drive or host-install qualification.
 """
@@ -85,6 +89,8 @@ SHUTDOWN_MARGIN_S = 20
 CASE_PLAN = ('newer_state_hands_off_once', 'marker_present_refuses_even_with_newer_state', 'marker_is_inert_without_newer_state', 'non_numeric_older_and_malformed_documents_do_not_trigger', 'malformed_and_oversized_documents_keep_the_existing_refusal', 'no_pool_means_no_trigger', 'newer_registration_without_a_candidate_refuses', 'newer_state_without_receipts_or_candidate_refuses', 'a_receipt_that_does_not_cover_a_newer_registration_refuses', 'the_newest_receipt_is_the_only_candidate', 'a_replacement_before_the_last_check_refuses', 'plain_passthrough_skips_the_hand_off_check', 'usage_only_exec_skips_the_hand_off_check', 'launch_check_probe_skips_the_hand_off_check', 'the_running_binary_refuses_to_hand_off_to_itself', 'cargo_exit_75_is_propagated_and_is_not_a_trigger', 'a_final_release_error_never_replays_the_command')
 CASES = []
 DIAGNOSTIC = None
+DIAGNOSTIC_PATH = None
+DIAGNOSTIC_WRITER = None
 
 # The platform toolchain stays reachable for `rustc -vV` and `cargo -V`
 # probes; the fixture's own `cargo` and `oxide` stay first on PATH.
@@ -109,6 +115,41 @@ def expect(condition: bool, message: str) -> None:
         fail(message)
 
 
+def publish_diagnostic(outcome, writer=None):
+    """Atomically replace this run's bounded, unqualified progress receipt."""
+    if outcome is None:
+        return
+    encoded = (json.dumps(outcome, sort_keys=True, ensure_ascii=True) + "\n").encode("utf-8")
+    if len(encoded) > 2 * MIB:
+        raise RuntimeError("diagnostic receipt exceeds 2 MiB")
+    writer = writer if writer is not None else DIAGNOSTIC_WRITER
+    if writer is not None:
+        writer(encoded)
+        return
+    if DIAGNOSTIC_PATH is None:
+        return
+    directory = os.path.dirname(DIAGNOSTIC_PATH)
+    fd, temp = tempfile.mkstemp(prefix=".handoff-receipt.", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+        os.replace(temp, DIAGNOSTIC_PATH)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def phase(name):
+    if DIAGNOSTIC is not None:
+        now = time.monotonic_ns()
+        if DIAGNOSTIC["phase"] is not None:
+            DIAGNOSTIC["phases"][-1]["end_ns"] = now
+        DIAGNOSTIC["phase"] = name
+        DIAGNOSTIC["phases"].append({"name": name, "start_ns": now, "end_ns": None})
+        publish_diagnostic(DIAGNOSTIC)
+        print(f"phase {name}", flush=True)
+
+
 def case(name: str) -> None:
     CASES.append(name)
     if DIAGNOSTIC is not None:
@@ -122,7 +163,8 @@ def case(name: str) -> None:
         DIAGNOSTIC["reached"].append(name)
         expect(name in CASE_PLAN and DIAGNOSTIC["states"][name] == "unexecuted", "case plan drift")
         DIAGNOSTIC["states"][name] = "active"
-    print(f"case {name}")
+        publish_diagnostic(DIAGNOSTIC)
+    print(f"case {name}", flush=True)
 
 
 def work_left() -> float:
@@ -146,7 +188,7 @@ def bounded_output(value):
     return data[:2048].decode("utf-8", "replace")
 
 
-def observed_run(argv, *, limit, _runner=None, _remaining=None, **kwargs):
+def observed_run(argv, *, limit, _runner=None, _remaining=None, _merged_log=None, **kwargs):
     """Observe the existing child call; the shared supervisor owns custody."""
     runner = subprocess.run if _runner is None else _runner
     remaining = work_left if _remaining is None else _remaining
@@ -154,28 +196,65 @@ def observed_run(argv, *, limit, _runner=None, _remaining=None, **kwargs):
     if DIAGNOSTIC is not None:
         row = {"case": DIAGNOSTIC["active"], "command": [str(x)[:512] for x in argv[:16]],
                "start_ns": time.monotonic_ns(), "end_ns": None, "exit": None,
-               "stdout": None, "stderr": None, "stop": None}
+               "stdout": None, "stderr": None, "stop": None, "state": "preparing"}
+        if _merged_log is not None:
+            row["merged_log"] = _merged_log
+            row["package_cache_wait"] = {"state": "not yet observed", "line": None}
         DIAGNOSTIC["last_command"] = row
         if len(DIAGNOSTIC["commands"]) < 256:
             DIAGNOSTIC["commands"].append(row)
         else:
             DIAGNOSTIC["commands_omitted"] += 1
+        publish_diagnostic(DIAGNOSTIC)
     try:
+        if row is not None:
+            row["state"] = "launching"
+            publish_diagnostic(DIAGNOSTIC)
         left = remaining()
         result = runner(argv, timeout=min(limit, left) if limit is not None else left, **kwargs)
         if row is not None:
             row.update(exit=result.returncode, stdout=bounded_output(result.stdout),
-                       stderr=bounded_output(result.stderr))
+                       stderr=bounded_output(result.stderr),
+                       stderr_tail=bounded_output(result.stderr[-2048:] if result.stderr is not None else None),
+                       state="finished")
         return result
     except BaseException as error:
         if row is not None:
             row["stop"] = getattr(error, "message", type(error).__name__)[:256]
+            row["state"] = "not launched" if isinstance(error, ProofFailure) else "outcome unknown"
             row["stdout"] = bounded_output(getattr(error, "stdout", None))
             row["stderr"] = bounded_output(getattr(error, "stderr", None))
+            stderr = getattr(error, "stderr", None)
+            row["stderr_tail"] = bounded_output(stderr[-2048:] if stderr is not None else None)
         raise
     finally:
         if row is not None:
             row["end_ns"] = time.monotonic_ns()
+            if _merged_log is not None:
+                observe_staging_log(row, _merged_log)
+            publish_diagnostic(DIAGNOSTIC)
+
+
+def cache_wait_observation(prefix):
+    needle = b"Blocking waiting for file lock on package cache"
+    match = next((line for line in prefix.splitlines() if needle in line), None)
+    return {"state": "observed" if match else "not observed in bounded prefix",
+            "line": bounded_output(match), "prefix_bytes": len(prefix)}
+
+
+def observe_staging_log(row, log):
+    """Read a bounded prefix for Cargo's lock message and a bounded tail."""
+    try:
+        with open(log, "rb") as handle:
+            prefix = handle.read(65536)
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 2048))
+            row["merged_log_tail"] = bounded_output(handle.read(2048))
+        row["package_cache_wait"] = cache_wait_observation(prefix)
+        row["merged_log_bytes"] = size
+    except OSError as error:
+        row["package_cache_wait"] = {"state": "unreadable", "line": None, "error": type(error).__name__}
 
 
 def sha256(path: str) -> str:
@@ -322,7 +401,8 @@ def _stage_subject(root: str, capability: dict | None = None, *, isolated: bool)
     the binary is copied out, so the proof's own writes stay tiny.
     """
     stage = os.path.join(root, "stage")
-    log = os.path.join(root, "stage.log")
+    log = (os.path.join(os.environ["OXIDE_PROOF_EVIDENCE"], "installed-handoff-stage.log")
+           if DIAGNOSTIC is not None else os.path.join(root, "stage.log"))
     invoking_home = os.path.expanduser("~")
     rustup_home = os.environ.get("RUSTUP_HOME") or os.path.join(invoking_home, ".rustup")
     cargo_home = os.environ.get("CARGO_HOME") or os.path.join(invoking_home, ".cargo")
@@ -363,6 +443,7 @@ def _stage_subject(root: str, capability: dict | None = None, *, isolated: bool)
             env=env,
             stdout=handle,
             stderr=subprocess.STDOUT,
+            _merged_log=log if DIAGNOSTIC is not None else None,
             limit=None,
         )
     if DIAGNOSTIC is not None and DIAGNOSTIC["last_command"] is not None:
@@ -381,7 +462,8 @@ def _stage_subject(root: str, capability: dict | None = None, *, isolated: bool)
     shutil.copy2(built, subject)
     os.chmod(subject, 0o755)
     shutil.rmtree(stage)
-    os.unlink(log)
+    if DIAGNOSTIC is None:
+        os.unlink(log)
     # The installer's hidden probe must report this build's own versions and
     # its compiled proof controls (debug staging); a future bump then fails
     # this proof loudly instead of mis-testing it.
@@ -1011,7 +1093,9 @@ def collect(groups, invoke, outcome, launched):
                 outcome["completed"].append(outcome["active"])
                 outcome["states"][outcome["active"]] = "completed"
                 outcome["active"] = None
+                publish_diagnostic(outcome)
             outcome["groups_completed"].append(name)
+            publish_diagnostic(outcome)
         except SystemExit as error:
             end_case(outcome)
             message = getattr(error, "message", f"SystemExit {error.code}")
@@ -1021,9 +1105,11 @@ def collect(groups, invoke, outcome, launched):
             if outcome["active"] is not None:
                 outcome["states"][outcome["active"]] = "failed"
             outcome["active"] = None
+            publish_diagnostic(outcome)
             if launched():
                 outcome["aborted"] = "writer closure unknown after failure"
                 outcome["unexecuted_groups"] = [item[0] for item in groups[index + 1:]]
+                publish_diagnostic(outcome)
                 return
         except Exception as error:
             end_case(outcome)
@@ -1034,6 +1120,7 @@ def collect(groups, invoke, outcome, launched):
                 outcome["states"][outcome["active"]] = "aborted"
             outcome["aborted"] = getattr(error, "message", type(error).__name__)[:256]
             outcome["unexecuted_groups"] = [item[0] for item in groups[index + 1:]]
+            publish_diagnostic(outcome)
             return
 
 
@@ -1041,7 +1128,8 @@ def empty_outcome():
     return {"qualified": False, "states": {name: "unexecuted" for name in CASE_PLAN}, "reached": [], "completed": [], "failed": [],
             "active": None, "groups_completed": [], "unexecuted_groups": [],
             "aborted": None, "case_times": {}, "commands": [], "commands_omitted": 0,
-            "last_command": None, "start_ns": time.monotonic_ns(), "end_ns": None}
+            "last_command": None, "phase": None, "phases": [],
+            "start_ns": time.monotonic_ns(), "end_ns": None}
 
 
 def diagnostic_exit(outcome):
@@ -1057,11 +1145,42 @@ def diagnostic_exit(outcome):
 
 
 def self_check():
-    global DIAGNOSTIC
-    # Exercise observation without creating a child or touching a fixture.
+    global DIAGNOSTIC, DIAGNOSTIC_WRITER
+    # Exercise receipt publication and interruption without a child or fixture.
     previous_diagnostic = DIAGNOSTIC
+    previous_writer = DIAGNOSTIC_WRITER
+    snapshots = []
+    DIAGNOSTIC_WRITER = lambda encoded: snapshots.append(json.loads(encoded))
     DIAGNOSTIC = empty_outcome()
     try:
+        timeouts = []
+        def interrupted(argv, **kwargs):
+            timeouts.append(kwargs["timeout"])
+            saved = snapshots[-1]["last_command"]
+            assert saved["command"] == ["cargo", "build"]
+            assert saved["state"] == "launching" and saved["exit"] is None and saved["end_ns"] is None
+            raise KeyboardInterrupt()
+        try:
+            observed_run(["cargo", "build"], limit=60, _runner=interrupted, _remaining=lambda: 7)
+            assert False, "interruption was not propagated"
+        except KeyboardInterrupt:
+            pass
+        assert timeouts == [7]
+        saved = snapshots[-1]["last_command"]
+        assert saved["exit"] is None and saved["state"] == "outcome unknown"
+        assert saved["end_ns"] >= saved["start_ns"]
+        assert len(json.dumps(snapshots[-1]).encode("utf-8")) < 2 * MIB
+        count = len(snapshots)
+        try:
+            publish_diagnostic({"oversized": "x" * (2 * MIB)})
+            assert False, "oversized receipt accepted"
+        except RuntimeError:
+            pass
+        assert len(snapshots) == count
+        wait = cache_wait_observation(b"    Blocking waiting for file lock on package cache\n")
+        assert wait["state"] == "observed" and "package cache" in wait["line"]
+        assert cache_wait_observation(b"")["state"] == "not observed in bounded prefix"
+        DIAGNOSTIC = empty_outcome()
         DIAGNOSTIC["active"] = CASE_PLAN[0]
         fake = lambda argv, **kwargs: subprocess.CompletedProcess(argv, 42, "o" * 3000, "e" * 3000)
         result = observed_run(["fixture", "check"], limit=30, _runner=fake, _remaining=lambda: 10)
@@ -1096,6 +1215,7 @@ def self_check():
             CASES[:] = old_cases
     finally:
         DIAGNOSTIC = previous_diagnostic
+        DIAGNOSTIC_WRITER = previous_writer
     outcome = empty_outcome()
     calls = []
     def invoke(body):
@@ -1174,7 +1294,7 @@ def parse_mode(arguments):
 
 
 def main() -> int:
-    global DIAGNOSTIC, SUBJECT, SCRATCH_ROOT
+    global DIAGNOSTIC, DIAGNOSTIC_PATH, SUBJECT, SCRATCH_ROOT
     mode = parse_mode(sys.argv[1:])
     if mode == "plan":
         print("installed-handoff groups: " + ", ".join(name for name, _ in GROUPS))
@@ -1191,6 +1311,9 @@ def main() -> int:
     expect(bool(evidence) and os.path.isdir(evidence), "not running under the shared supervisor")
     if diagnostic:
         DIAGNOSTIC = outcome
+        DIAGNOSTIC_PATH = os.path.join(evidence, "installed-handoff-diagnostic.json")
+        sys.stdout.reconfigure(line_buffering=True, write_through=True)
+        publish_diagnostic(outcome)
     try:
         check_source_versions()
         scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")
@@ -1199,12 +1322,15 @@ def main() -> int:
             expect(os.environ.get(name) == scratch, f"{name} differs from the supervisor scratch")
         root = tempfile.mkdtemp(prefix="installed-handoff.", dir=scratch)
         SCRATCH_ROOT = root
+        phase("stage subject")
         binary = _stage_subject(root, isolated=True)
         SUBJECT = binary
         digest = sha256(binary)
         print(f"subject {binary} sha256 {digest}")
+        phase("compile stub")
         compile_stub(root)
         if diagnostic:
+            phase("cases")
             # Each group launches product children, so a failure after launch
             # is conservatively an unknown writer outcome.
             collect(GROUPS, lambda body: body(root, binary), outcome, lambda: True)
@@ -1227,10 +1353,9 @@ def main() -> int:
         if diagnostic:
             end_case(outcome)
             outcome["end_ns"] = time.monotonic_ns()
-            # Bounded by the fixed group/case table and truncated error strings.
-            with open(os.path.join(evidence, "installed-handoff-diagnostic.json"), "w", encoding="utf-8") as handle:
-                json.dump(outcome, handle, sort_keys=True)
-                handle.write("\n")
+            if outcome["phase"] is not None:
+                outcome["phases"][-1]["end_ns"] = outcome["end_ns"]
+            publish_diagnostic(outcome)
 
 if __name__ == "__main__":
     sys.exit(main())
