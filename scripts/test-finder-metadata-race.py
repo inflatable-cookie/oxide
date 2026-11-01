@@ -90,7 +90,12 @@ only from that drain (`src/owned_delete.rs:247`, `src/bin/oxide/prune.rs:4076`):
   debug-only low-reserve reading fires on the first check *after one recovered
   entry was unlinked*, so the per-unlink check stops the drain mid-way: exit 3,
   the `.prune-<intent>` leaf kept with its remaining metadata, the intent
-  non-terminal and `receipt_settled: false`.
+  non-terminal and `receipt_settled: false`. That hook arms only through the
+  shared debug gate `proof_evidence` (`src/bin/oxide/prune.rs`), which since
+  oxide#211 (decision `60d4914f`) accepts this fixture's declared
+  `OXIDE_SCRATCH_ROOT` when it is a canonical strict child of the supervisor's
+  run root (`declaration_allowed`); the earlier gate required `/private/tmp`,
+  which is why the `24bd3e3` diagnostic's run never armed it and has no credit.
 - `prune_completion_fault`: the product's terminal crash point fires after the
   quarantine leaf is removed and the registry terminal write lands but before
   the checkout receipt settles: exit 3 with `deleted` yet `receipt_settled:
@@ -352,10 +357,17 @@ def unknown(message: str) -> None:
 
 
 def scratch_root() -> str:
+    """The supervisor's run root, canonical.
+
+    Canonical on both sides matters: the shared debug gate the prune fault
+    fixture arms through compares this root with this proof's declared
+    `OXIDE_SCRATCH_ROOT` and requires the declaration to be a canonical strict
+    child (`declaration_allowed`, `src/bin/oxide/prune.rs`, oxide#211).
+    """
     root = os.environ.get("OXIDE_TASK_SCRATCH_ROOT")
     if not root:
         unknown("OXIDE_TASK_SCRATCH_ROOT is missing; run this through effigy")
-    root = os.path.abspath(root)
+    root = os.path.realpath(root)
     if not os.path.isdir(root):
         unknown(f"owned scratch {root} is not a directory")
     return root
@@ -1572,6 +1584,21 @@ ORACLE_PINS = (
     ),
     (
         "src/bin/oxide/prune.rs",
+        "fn declaration_allowed(scratch: &Path, given: Option<&Path>, canonical: Option<&Path>) -> bool {",
+        "the shared debug gate's declaration rule the fault case arms through",
+    ),
+    (
+        "src/bin/oxide/prune.rs",
+        "given == canonical && canonical != scratch && canonical.starts_with(scratch)",
+        "the declared-root rule: canonical, strict child of the supervisor scratch",
+    ),
+    (
+        "src/bin/oxide/prune.rs",
+        "let Some(evidence) = proof_evidence() else {",
+        "the low-reserve hook's gate on the shared evidence rule",
+    ),
+    (
+        "src/bin/oxide/prune.rs",
         'const REGISTRY_FILE: &str = "registry.json";',
         "the pool-owned registry leaf",
     ),
@@ -1672,6 +1699,15 @@ def scratch_contract_problems(base: str = "/fixture/run") -> list:
             problems.append(f"{case}: the declared scratch root {scratch!r} is not canonical")
         elif os.path.commonpath([scratch, base]) != base:
             problems.append(f"{case}: the declared scratch root {scratch!r} escapes the run root")
+        # The shared debug gate the prune fault fixture arms through requires a
+        # canonical DECLARATION that is a strict child of the canonical run root
+        # (`declaration_allowed`, src/bin/oxide/prune.rs, oxide#211).
+        if os.path.realpath(scratch) != scratch:
+            problems.append(f"{case}: the declared scratch root {scratch!r} is not canonicalised")
+        if not scratch.startswith(base + os.sep):
+            problems.append(
+                f"{case}: the declared scratch root {scratch!r} is not a strict child of {base!r}"
+            )
         if os.path.dirname(pool) != scratch or pool == scratch:
             problems.append(f"{case}: the pool {pool!r} is not strictly inside {scratch!r}")
         if env.get("OXIDE_POOL_CAP") != str(POOL_BUDGET):
