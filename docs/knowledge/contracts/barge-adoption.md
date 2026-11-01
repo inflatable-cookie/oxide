@@ -383,6 +383,16 @@ and an explicit live invocation without attributable equivalent inputs must
 report insufficient. Neither comparison invokes a delete path or changes the
 ordinary prune route.
 
+A read-only filesystem image alone is not yet an established capture seam:
+Oxide's `store::private_file` opens authority files read-write even when its
+caller only reads them, so a read-only mount can cause its actual evaluator to
+refuse before the intended comparison. Barge's public planner does not accept
+an `OxideSnapshot`, and its own testkit is crate-private. A proposed test-only
+adapter must show how both actual evaluator calls receive equivalent file,
+mount and writer observations without changing production account trust or
+silently replacing the semantics under test. Until that is demonstrated, an
+immutable-looking fixture and matching pre/post digests are insufficient.
+
 The proof must demonstrate the boundary, not just the manifest parser: include
 an unchanged controlled fixture and counterfactuals that change an input,
 drop a binding, exceed a cap, fail an observation, or introduce an uncontrolled
@@ -422,6 +432,17 @@ The sources here are Oxide's `src/bin/oxide/prune.rs` and Barge's O1 pin
 | Control fence | Known ready fence, missing fence and unknown version or owner; preserve any whole-batch refusal. |
 | Intents | Pending Oxide intent and settled intent, including intent naming a root otherwise eligible. Oxide's dry run refuses an unfinished journal before evaluation; Barge's reference reader marks a named unfinished intent current. Compare those different scopes honestly. |
 | Operator list and legacy | Listed and unlisted legacy roots, receiptless legacy, and a nonlegacy counterfactual. The list does not waive other checks and is not a Barge history waiver. |
+
+The custody readers also have distinct intermediate classifications that need
+counterfactuals before a result can be called a match. At the O1 pin,
+`PoolCustody::classify` marks an acquiring record held and a retired record
+without a lost fact unknown. Oxide's `Store::checkout_custody` counts spawning
+and running records and skips retired records without an unresolved lost writer.
+Oxide's prune eligibility then makes additional `active_holders` checks, so
+these intermediate differences alone do not establish different final plan
+outcomes. Exercise the actual full evaluators with the same attributable
+fixture facts; if a final difference is observed and cannot be explained by
+D-1 through D-3, report it as blocking rather than folding it into a match.
 
 The frozen D-1 prose predates Oxide's device reconciliation. In current
 `judge_recorded_root`, a stale recorded device alone is accepted when the
