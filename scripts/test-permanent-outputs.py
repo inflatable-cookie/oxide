@@ -587,9 +587,12 @@ def proof_env(pool: str, home: str, cargo_home: str) -> dict:
         ):
             env.pop(key, None)
     scratch = os.environ["OXIDE_TASK_SCRATCH_ROOT"]
+    private_root = os.path.dirname(pool)
+    expect(os.path.isabs(private_root) and os.path.commonpath((scratch, private_root)) == scratch
+           and private_root != scratch, "pool is not inside a private supervisor scratch directory")
     env.update(
         {
-            "OXIDE_SCRATCH_ROOT": scratch,
+            "OXIDE_SCRATCH_ROOT": private_root,
             "OXIDE_POOL": pool,
             "OXIDE_POOL_CAP": "64MiB",
             "HOME": home,
@@ -3202,9 +3205,9 @@ def exec_self_test() -> None:
     # private pool, its explicit cap or the supervisor-selected scratch root.
     from unittest.mock import patch
     with patch.dict(os.environ, {"OXIDE_TASK_SCRATCH_ROOT": "/fixture/root", "OXIDE_POOL": "/host/pool", "OXIDE_SCRATCH_ROOT": "/host"}, clear=True):
-        env = proof_env("/fixture/root/pool", "/fixture/root/home", "/fixture/root/cargo")
-    expect(env["OXIDE_SCRATCH_ROOT"] == "/fixture/root", "scratch declaration drifted")
-    expect(env["OXIDE_POOL"] == "/fixture/root/pool", "pool selection drifted")
+        env = proof_env("/fixture/root/private/pool", "/fixture/root/private/home", "/fixture/root/private/cargo")
+    expect(env["OXIDE_SCRATCH_ROOT"] == "/fixture/root/private", "scratch declaration drifted")
+    expect(env["OXIDE_POOL"] == "/fixture/root/private/pool", "pool selection drifted")
     expect(env["OXIDE_POOL_CAP"] == "64MiB", "pool cap drifted")
     expect(all(env[k] == "/fixture/root" for k in ("TMPDIR", "TMP", "TEMP")), "temporary root drifted")
 
