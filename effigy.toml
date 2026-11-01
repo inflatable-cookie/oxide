@@ -332,7 +332,8 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # ordinary detach). Stages this HEAD's debug `oxide` offline with 1.97.1 and
 # models the drive as one owned 128 MiB scratch APFS image at a unique
 # /Volumes name: effect-free plan, refusals without mutation, explicit
-# conversion to an owned link, builds/run/test/profiles through it, the
+# profile conversion, a constructed legacy whole-target fixture,
+# builds/run/test/profiles through its owned link, the
 # checkout-local fallback and redock with both roots kept, the git-tracked
 # refusal, a wrong volume UUID with no shadow write, an active writer
 # blocking the swap, crash replay after prepared/sibling/renamed, clean
