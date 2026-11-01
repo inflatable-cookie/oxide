@@ -131,6 +131,7 @@ import re
 import secrets
 import shutil
 import tempfile
+from unittest import mock
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -255,75 +256,14 @@ PARENT_IGNORE_APP = {**APP, ".gitignore": "/target/\n/.oxide-outputs/\n"}
 
 
 def plan_only() -> int:
-    print("profile-outputs proof allocation (unmeasured staging estimate)")
-    print(f"  script          {os.path.abspath(__file__)}")
-    print("  supervisor      scripts/bounded-test.py --limit 600 --scratch-budget-mib 512")
-    print(f"  deadline        600 s total (scoped brief amendment); helper work cutoff ~565 s")
-    print("                  = 30 s helper reserve + 5 s refusal margin; cleanup/detach inside it")
-    print("  fit             UNMEASURED: 360-540 s estimated work inside the ~565 s cutoff;")
-    print("                  no native, trial or setup-only run has been activated, so the")
-    print("                  estimate is not an established fit")
-    print("  cpu             planning request 6 CPU / 8 GiB: two SEQUENTIAL stagings at")
-    print("                  STAGE_JOBS=6 each, fixture children at FIXTURE_JOBS=2 with at")
-    print("                  most two gated writers (2 x 2 = 4); peak 6 Cargo jobs")
-    print("  time estimate   two sequential 6-job stagings ~45-80 s each, 25 s setup,")
-    print("                  150-240 s cases (base control, p0/parent races, unknown")
-    print("                  custody, prune oracles), plus the controls added in this phase:")
-    print("                  a seeded directory-budget fallback adopt+build for the watched clean,")
-    print("                  three extra fixture builds/adopts (mixed run, second eligible")
-    print("                  gone root, cleared-target parent-ignore), settled-background")
-    print("                  waits and additional dry runs (~60-90 s), 30 s cleanup")
-    print("                  -> 360-540 s estimated work; UNMEASURED, not a fit claim")
-    print("  history         the 420 s publication at 030836f6 is historical and unactivated")
-    print("  amendment       GRANTED scoped bound: 600 s total (root owner 2026-10-23T16:10Z),")
-    print("                  512 MiB unchanged; no disk increase, runner change or native start")
-    print("  disk            288 MiB staging peak, counted as ONE staging target at a time")
-    print("                  (each is copied out and discarded before the next starts; two")
-    print("                  live targets are NOT assumed), + 128 MiB image backing +")
-    print("                  48 MiB fixtures (three added tiny checkouts) + 32 MiB")
-    print("                  evidence + 16 MiB margin = 512 MiB")
-    print("                  real target occupancy: one tiny locked checkout per case,")
-    print("                  a few MiB each, inside the fixtures allowance")
-    print(f"  staging         candidate {os.environ.get('OXIDE_PROFILE_HEAD', 'this HEAD')} and base {BASE}")
-    print("  seed            none: both stagings are plain Cargo offline builds from authenticated pinned source")
-    print("  base order      both base-created legacy states (case 10 warm slot and case 11")
-    print("                  migration) are prepared under ONE base-compatible registration")
-    print("                  before ANY candidate command runs in that pool")
-    print("  monitoring      supervisor reserve sampling, census/closure and cleanup; this script runs no clock, timer or harness")
-    print("  image           one owned 128 MiB APFS sparse image at a unique /Volumes/<name>,")
-    print("                  attached with hdiutil -owners on for every attach/reattach,")
-    print("                  asserted by a bounded read-only mount observation and the")
-    print("                  product registration control; ordinary detach")
-    print("  reserves        normal registration 16 MiB reserve / 64 MiB cap below the")
-    print("                  128 MiB geometry, with a positive selected-removable control")
-    print("                  before external oracles and a separate deliberate 200 MiB")
-    print("                  low-reserve control (recorded reserve raised to 200 MiB,")
-    print("                  then restored byte-exactly) proving the honest local fallback")
-    print("  top level       a benign ordinary target-root file on its OWN checkout")
-    print("                  survives adopt and builds, then a clean of THAT checkout must")
-    print("                  refuse it as foreign and succeed after removal;")
-    print("                  CACHEDIR.TAG/.rustc_info.json asserted real only when present")
-    print("  ignore          the fixture uses /target (valid for whole-target links and")
-    print("                  member parents) plus a separate /target/ parent-ignore control")
-    print("                  proving a directory-only rule covers the member links: the")
-    print("                  automatic conversion publishes the profile layout and an")
-    print("                  explicit adoption over a real empty target accepts it")
-    print("  peer keep       an injected committed peer receipt plus matching registry")
-    print("                  rows (SYNTHETIC INJECTED AUTHORITY, not a bind-produced")
-    print("                  receipt) keeps that root; a second, distinct eligible gone")
-    print("                  root is a candidate in the SAME preview")
-    print("  clean           the reserve stop runs on the internal directory-budget store")
-    print("                  under the pool's own permanent registration (low-reserve")
-    print("                  fallback) with a gated delegating fake cargo; the removable")
-    print("                  watchdog is removal-only and is not claimed as a reserve stop")
-    print("  environment     one private HOME, CARGO_HOME and directory pool per session")
-    print("  diagnostic      ONE opt-in --diagnostic run records every oracle failure,")
-    print("                  skips only unmet-dependency steps, still stops on any")
-    print("                  safety failure, writes ONE distinct diagnostic receipt,")
-    print("                  and is never counted or accepted as a native PASS")
-    print("  cases")
-    for case in CASES:
-        print(f"    {case}")
+    print(f"profile-outputs mode: {MODE}")
+    print("cases: " + ", ".join(mode_labels(MODE)))
+    print("Builds: candidate only, private OXIDE_SCRATCH_ROOT and 64MiB pool cap; 600 s / 512 MiB.")
+    print("A /private/tmp fallback is not external scratch-pool coverage.")
+    print("base-compat: pinned base 4a70b83 and candidate, internal root; 300 s / 128 MiB.")
+    print("Base-compat fit is UNMEASURED; earlier staging estimate was 288 MiB.")
+    print("Both modes: one 128 MiB sparse image, ordinary detach, guard custody.")
+    print("--diagnostic is uncounted; native runs require owner activation.")
     return 0
 
 
@@ -1790,6 +1730,21 @@ CASE_IDS = MODE_CASES[MODE]
 #    requires the internal root for its pinned pre-S3 base.
 # 9. Python tempfile.mkdtemp uses the explicit runner root; no shell mktemp.
 
+def mode_labels(mode: str) -> list:
+    return [(case + "-base" if case in ("10", "11") and mode == "base-compat"
+             else case + "-source" if case == "11" else case)
+            for case in MODE_CASES[mode]]
+
+
+def fixture_environment(root: str, mode: str, home: str, cargo_home: str) -> dict:
+    scratch_pool = os.path.join(root, "scratch-pools")
+    pool = os.path.join(scratch_pool if mode == "builds" else root, "pool")
+    env = perm.proof_env(pool, home, cargo_home)
+    if mode == "builds":
+        env["OXIDE_SCRATCH_ROOT"] = scratch_pool
+    env["OXIDE_POOL_CAP"] = "64MiB"
+    return env
+
 _CASE_PROGRESS = {"reached": [], "started_ms": None}
 
 
@@ -1835,6 +1790,7 @@ def write_assertion_receipt(outcome: str, failure) -> str:
         unexecuted = [case for case in CASE_IDS if case not in reached]
     record = {
         "mode": MODE,
+        "case_table": mode_labels(MODE),
         "version": "oxide.outputs.proof-assertions/1",
         "outcome": outcome,
         "primary_failure": None if failure is None else str(failure)[-2000:],
@@ -2222,6 +2178,7 @@ def diagnostic_record(proof, started_ms, primary, secondary) -> dict:
     return {
         "version": "oxide.outputs.proof-diagnostic/1",
         "mode": MODE,
+        "case_table": mode_labels(MODE),
         "collection": "diagnostic",
         "qualified": False,
         "outcome": outcome,
@@ -2494,7 +2451,7 @@ def pure_diagnostic_controls() -> None:
             ["the run stopped after that failure: 05: the run stopped later", "a secondary error"],
         )
         expect(record["version"] == "oxide.outputs.proof-diagnostic/1", record["version"])
-        expect(record["mode"] == "diagnostic" and record["qualified"] is False, f"{record['mode']}/{record['qualified']}")
+        expect(record["collection"] == "diagnostic" and record["qualified"] is False, f"{record['mode']}/{record['qualified']}")
         expect(record["outcome"] == "failures_recorded", record["outcome"])
         expect(record["primary_failure"] == "02: first recorded fault", record["primary_failure"])
         expect(record["first_recorded_failure"]["step"] == "02.1", record["first_recorded_failure"])
@@ -2699,7 +2656,6 @@ def pure_diagnostic_controls() -> None:
 def run(proof: Proof, repo: str) -> None:
     os.environ.pop("CARGO_ENCODED_RUSTFLAGS", None)
     os.environ["RUSTFLAGS"] = ""
-    pure_diagnostic_controls()
     pure_registry_controls()
     pure_detach_record_control()
     pure_attachment_facts_control()
@@ -2734,15 +2690,12 @@ def run(proof: Proof, repo: str) -> None:
     scratch_pool = os.path.join(proof.root, "scratch-pools")
     if MODE == "builds":
         os.mkdir(scratch_pool, 0o700)
-    pool = os.path.join(scratch_pool if MODE == "builds" else proof.root, "pool")
     home = os.path.join(proof.root, "home")
     cargo_home = os.path.join(proof.root, "cargo-home")
     for directory in (home, cargo_home):
         os.makedirs(directory)
-    proof.env = perm.proof_env(pool, home, cargo_home)
-    if MODE == "builds":
-        proof.env["OXIDE_SCRATCH_ROOT"] = scratch_pool
-    proof.env["OXIDE_POOL_CAP"] = "64MiB"
+    proof.env = fixture_environment(proof.root, MODE, home, cargo_home)
+    pool = proof.env["OXIDE_POOL"]
     # Every fixture Cargo child (oxide build/test/bench/doc/check/metadata)
     # inherits this bound. At most two gated fixture writers run at once, so
     # the fixture peak is 2 x FIXTURE_JOBS = 4 jobs; staging is sequential and
@@ -4708,6 +4661,34 @@ USAGE = (
 )
 
 
+def pure_mode_contract() -> None:
+    global MODE, CASE_IDS
+    saved = MODE, CASE_IDS
+    try:
+        expect(mode_labels("base-compat") == ["10-base", "11-base", "19"], "base table changed")
+        expect(mode_labels("builds") == ["01", "02", "03", "04", "05", "06", "07", "08", "09", "11-source", "12", "13", "14", "15", "16", "17", "18", "20"], "Builds table changed")
+        for mode in MODE_CASES:
+            MODE, CASE_IDS = mode, MODE_CASES[mode]
+            for step, case, _, _, _ in CASE_STEPS:
+                expect(DIAG.enter(step) == (case in CASE_IDS), f"{mode} gate {step}")
+                if case not in CASE_IDS:
+                    try:
+                        case_reached(case)
+                    except OracleFailure:
+                        pass
+                    else:
+                        fail(f"{mode} admitted forbidden {case}")
+        # proof_env reads the run root; no filesystem or child is touched.
+        with mock.patch.dict(os.environ, {"OXIDE_TASK_SCRATCH_ROOT": "/owned", "OXIDE_SCRATCH_ROOT": "/hostile", "OXIDE_POOL": "/hostile"}):
+            env = fixture_environment("/owned/run", "builds", "/owned/home", "/owned/cargo")
+            expect(env["OXIDE_SCRATCH_ROOT"] == "/owned/run/scratch-pools", "scratch root")
+            expect(env["OXIDE_POOL"] == "/owned/run/scratch-pools/pool" and env["OXIDE_POOL_CAP"] == "64MiB", "pool contract")
+            env = fixture_environment("/owned/run", "base-compat", "/owned/home", "/owned/cargo")
+            expect("OXIDE_SCRATCH_ROOT" not in env and env["OXIDE_POOL"] == "/owned/run/pool", "base contract")
+    finally:
+        MODE, CASE_IDS = saved
+
+
 def diagnostic_main(proof: Proof, repo: str) -> int:
     """Run the whole fixed matrix once in diagnostic mode and write the ONE
     diagnostic receipt. Coverage aid only: it never claims a counted PASS,
@@ -4791,6 +4772,7 @@ def main() -> int:
     if arguments == ["--plan"]:
         return plan_only()
     if arguments == ["--self-check"]:
+        pure_mode_contract()
         pure_diagnostic_controls()
         pure_registry_controls()
         pure_detach_record_control()

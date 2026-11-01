@@ -171,6 +171,12 @@ run = "python3 scripts/test-installed-handoff.py --plan"
 [tasks."proof:profile-outputs:test"]
 run = "python3 scripts/test-profile-outputs.py --self-check"
 
+[tasks."proof:profile-outputs:plan"]
+run = "python3 scripts/test-profile-outputs.py --plan"
+
+[tasks."proof:profile-outputs:base-compat:plan"]
+run = "python3 scripts/test-profile-outputs.py --base-compat --plan"
+
 [tasks."rust:profile-outputs"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-profile-outputs.py"
