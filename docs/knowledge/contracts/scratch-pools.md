@@ -332,7 +332,6 @@ each script's own selector text and case bodies.
 | `rust:auto-adopt-ineligible` (#154) + `:diagnostic` | control pool is a directory-budget pool |
 | `rust:prune-authority` (#134) + `:diagnostic` | internal pool placement only |
 | `rust:oxide-removable-boot-closure` (#161) + `:diagnostic` | directory-budget base pool plus one owned image |
-| `rust:finder-metadata-race` (#155) + `:diagnostic` | every fixture pool is a directory-budget pool |
 | `rust:command-budgets` (#140) + `:diagnostic` | `OXIDE_POOL_BACKEND=directory-budget` fixture pools |
 
 **Migrated:** `rust:seed-default-off` and its diagnostic use the
@@ -358,6 +357,8 @@ Not in scope: proofs that never carried `bd357a4c` but assert their own
 all, in their own briefs with their own activations. `rust:front-door-accounting` uses the S4 migration: both fixture pools use the selected-volume scratch root; its diagnostic and native evidence at the migrated head remain pending.
 
 `rust:cold-slot-seeding` and its diagnostic now use the selected-volume scratch pool recipe (oxide#204); their new native evidence remains owner-activated.
+
+`rust:finder-metadata-race` and its diagnostic now use the selected-volume scratch pool recipe (oxide#213): each case declares its own `OXIDE_SCRATCH_ROOT` inside its run root with the pool strictly inside it and an explicit cap, and the pure `rust:finder-metadata-race:test` pins that contract. Their source changed, so their native evidence must be re-established at the migrated head.
 
 ## Recipe changes
 
@@ -515,7 +516,7 @@ stand at this head:
 | `rust:auto-adopt-ineligible` | 300 s / 512 MiB | yes | `--plan` (shared #117 fixture, no distinct pure selector) |
 | `rust:prune-authority` | 300 s / 512 MiB | yes | `proof:prune-authority:test` (`--self-check`) |
 | `rust:oxide-removable-boot-closure` | 300 s / 512 MiB | yes | `rust:oxide-removable-boot-closure:test` (`--self-check`) |
-| `rust:finder-metadata-race` | 420 s / 512 MiB | yes | `rust:finder-metadata-race:test`, `--plan` |
+| `rust:finder-metadata-race` | 420 s / 512 MiB | yes; migrated (#213; native chain held) | `rust:finder-metadata-race:test`, `--plan` |
 | `rust:command-budgets` | 300 s / 512 MiB | yes | `proof:command-budgets:test`, `--plan` |
 
 Every sub-slice follows the same six-step path, in this order, and each step's
