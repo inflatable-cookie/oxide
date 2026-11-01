@@ -1,12 +1,11 @@
 # Scratch build pools on an external validation volume (proposed design)
 
-**Status: S1 implemented; later slices remain proposed.** This contract records
+**Status: S2 implemented; later slices remain proposed.** This contract records
 a design for an explicit, UUID-bound `directory-budget-v1` "scratch pool" on a verified external
 volume, so validation and proof fixtures can keep their scratch on the Builds
 drive instead of declaring the internal-root exception (decision `bd357a4c`) for
 `/private/tmp`. S1 adds typed path judgement and an unreachable pure scratch
-admission decision. No scratch branch is wired, and no selector, recipe, host
-setting, real pool or native run exists. The internal-root exception stays
+admission decision. S2 wires read-only admission; creation and missing-record repair remain unavailable until S3. No selector, recipe, host setting, real pool or native run exists. The internal-root exception stays
 current truth until each slice below lands and passes its own review. Oxide#173.
 
 Owning neighbours: [workflow](workflow.md#temporary-scratch-placement) owns
@@ -118,7 +117,7 @@ The scratch branch must not inherit that as a hole:
    byte-identical output.
 4. The mount-root judgement is then replaced by the stricter `Binding`
    verification below; a path on some other mounted volume that is not under
-   `/Volumes` still refuses (`scratch-volume-unverified`).
+   `/Volumes` still refuses (`scratch-volume-unverified`). After ordinary success, a valid declaration containing the pool triggers a boot-volume check; boot-volume paths remain ordinary and other mounts refuse. Invalid declarations or paths outside the declaration leave ordinary success unchanged. After external refusal, invalid roots refuse and outside-root paths retain row 9.
 5. Only after those pass are the root, binding and record verified, and only
    then does the store open or create anything.
 
@@ -420,7 +419,10 @@ zero-walk regression (including an absent volume with and without a record), and
 one CLI case on a private internal fixture showing the declaration changes
 nothing there. Selectors: as S1. 300 s, 512 MiB.
 
+S2 temporarily refuses admitted absent pools with `scratch-creation-unavailable` and bound pools missing host records with `scratch-record-repair-unavailable`, before any effect.
+
 **S3 — creation, binding, record and open on a verified volume. ELEVATED.**
+S3 removes both temporary refusals and implements creation and leased-open record repair.
 This slice enables a `directory-budget-v1` pool on removable media, so the
 actual trigger is: its admission walk decides whole-slot deletion on a volume
 outside the boot disk. Write and verify the on-volume binding and the host

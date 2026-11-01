@@ -538,7 +538,7 @@ impl Facts {
         self.storage_root(RootKind::Cache)
     }
 
-    fn state_dir(&self) -> Result<PathBuf, String> {
+    pub(crate) fn state_dir(&self) -> Result<PathBuf, String> {
         self.storage_root(RootKind::State)
     }
 }
@@ -548,7 +548,7 @@ fn shown(value: &std::ffi::OsStr) -> String {
     bounded(&Path::new(value).display().to_string())
 }
 
-fn bounded(text: &str) -> String {
+pub(crate) fn bounded(text: &str) -> String {
     const LIMIT: usize = 240;
     let escaped: String = text
         .chars()

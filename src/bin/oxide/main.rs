@@ -29,8 +29,8 @@ mod outputs;
 mod process;
 mod prune;
 mod removable;
-#[allow(dead_code)] // S1 is deliberately unreachable until S2.
 mod scratch_admission;
+mod scratch_io;
 #[allow(dead_code)] // Integrated by the cold-seeding front door.
 mod seed_catalog;
 #[allow(dead_code)] // Integrated by the cold-seeding front door.
@@ -1979,14 +1979,19 @@ fn run_status(args: &[OsString]) -> Result<u8, String> {
         println!("seeding skipped: {reason}");
     }
     let settings = store::settings()?;
-    print_settings(&settings);
+    let scratch_status = scratch_io::evaluate(&settings, true);
+    print_settings(&settings, &scratch_status);
     println!(
         "{}",
         wrapper::status_line(wrapper::Policy::from_env(), &wrapper::inherited(&[]))
     );
     let mut budget = MeasureBudget::new();
     let mut control = None;
-    match Store::open_recorded(&settings) {
+    match scratch_status
+        .as_ref()
+        .map_err(|e| e.clone())
+        .and_then(|_| Store::open_recorded(&settings))
+    {
         Ok(None) => println!(
             "  not created; the first building oxide command creates it ({}: {})",
             Backend::DirectoryBudget.tag(),
@@ -2694,7 +2699,7 @@ fn report_stray(workspace: &Path, remaining_ms: u64) {
 
 /// Config file, path and budget with where each came from. Never prints
 /// file contents or unrelated environment values.
-fn print_settings(settings: &config::Settings) {
+fn print_settings(settings: &config::Settings, scratch: &Result<Option<String>, String>) {
     let file = &settings.file;
     println!(
         "config: {} ({}{})",
@@ -2713,11 +2718,19 @@ fn print_settings(settings: &config::Settings) {
             ignored.display()
         );
     }
-    println!(
-        "pool: {} (from {})",
-        settings.pool.display(),
-        settings.pool_source.describe()
-    );
+    match scratch {
+        Ok(Some(uuid)) => println!(
+            "pool: {} (scratch pool, volume {})",
+            settings.pool.display(),
+            uuid
+        ),
+        Err(error) => println!("pool: {} unavailable ({})", settings.pool.display(), error),
+        Ok(None) => println!(
+            "pool: {} (from {})",
+            settings.pool.display(),
+            settings.pool_source.describe()
+        ),
+    }
     println!(
         "  soft budget {} MB (from {})",
         settings.budget / 1_000_000,
