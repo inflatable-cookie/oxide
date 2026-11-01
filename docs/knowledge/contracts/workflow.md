@@ -1787,6 +1787,12 @@ necessary.
     The exit-1 status is not explained by the captured stderr.
   - **Limit.** This fixture's first-command pool creation is not normal
     daily-command latency.
+  - **Validation clarification (Tom, 2026-11-01).** The no-live-cleanup
+    restriction forbids explicit maintenance; ordinary admission eviction by
+    the required installed-Oxide covering build is accepted build residue. It
+    does not authorize a prune, clean, registry repair or restoration of an
+    evicted slot. Subsequent covering builds for this task use a private scratch
+    pool and a commit-bound disposable source snapshot.
   - **Trace scope.** The diagnostic's private fixture setup may request a
     debug-only trace to a bounded per-command evidence file, after matching
     the supervisor's running owner marker, scratch/evidence layout and private

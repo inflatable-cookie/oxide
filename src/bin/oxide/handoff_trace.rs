@@ -3,7 +3,7 @@
 #[cfg(debug_assertions)]
 mod debug {
     use std::fs::{self, File, OpenOptions};
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
@@ -53,8 +53,16 @@ mod debug {
         {
             return None;
         }
-        let marker: serde_json::Value =
-            serde_json::from_slice(&fs::read(marker_path).ok()?).ok()?;
+        let mut bytes = Vec::new();
+        File::open(marker_path)
+            .ok()?
+            .take(4097)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() > 4096 {
+            return None;
+        }
+        let marker: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
         let run = std::env::var("OXIDE_PROOF_RUN_ID").ok()?;
         if run.len() != 32
             || !run.bytes().all(|b| b.is_ascii_hexdigit())

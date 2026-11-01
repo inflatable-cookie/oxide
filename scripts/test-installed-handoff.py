@@ -247,7 +247,8 @@ def observed_run(argv, *, limit, _runner=None, _remaining=None, _merged_log=None
             row["state"] = "launching"
             publish_diagnostic(DIAGNOSTIC)
         left = remaining()
-        if row is not None and _fixture is not None and _trace and _runner is None:
+        if (row is not None and row in DIAGNOSTIC["commands"]
+                and _fixture is not None and _trace and _runner is None):
             env = kwargs.get("env", {})
             evidence = os.environ.get("OXIDE_PROOF_EVIDENCE", "")
             run_id = os.environ.get("OXIDE_PROOF_RUN_ID", "")
