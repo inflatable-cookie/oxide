@@ -2,16 +2,9 @@
 """Focused native proof for recorded per-slot accounting (oxide#146).
 
 One fixed script and the whole command of the shared proof supervisor
-(`bounded-test.py`, guard sha256 94b1aba6..., the oxide#191 bytes that add the
-opt-in post-census image detach to the qualified oxide#151 guard, plus
-oxide#197's ancestor and launcher-sibling exclusions). That pin is
-checked against the actual runner file before any effect, so a branch that
-still carries different guard bytes refuses here instead of spending a run;
-these bytes are unqualified until their own author and reviewer qualifications
-pass at the merged head. The
-approved recipe is an INTERNAL directory pool, so both heavy selectors pass
-`--root-parent /private/tmp` explicitly (Tom's internal-root exception): a
-pool inside a selected-volume root would be refused by the product itself.
+(`bounded-test.py`, qualified archive evidence-195-b29ef6c-20261101T043444Z).
+Fixture pools use OXIDE_SCRATCH_ROOT inside the supervisor's selected-volume
+run root; a /private/tmp fallback is not scratch-pool coverage.
 Bounds are unchanged: 300 s wall, 512 MiB monitored scratch, 270 s work and a
 30 s shutdown margin.
 
@@ -27,7 +20,7 @@ is absent until the product creates it. Byte pressure is driven by the
 documented `OXIDE_POOL_CAP` soft byte budget (applied at pool creation), never
 by a proof-invented variable.
 
-The internal-pool fact is the product's own serialized `config.json`
+The directory-budget fact is the product's own serialized `config.json`
 (`backend: "directory-budget-v1"`, and no `volume` entry), read through
 `recorded_backend()`; a missing, malformed, unknown or removable backend
 refuses by name. The ledger has no backend field at all, so a case may never
@@ -45,7 +38,7 @@ the release walk is asserted separately.
 | A all-recorded admission | `oxide check` (gated) | fixture crate B | slot A idle with a current record | admission (`Held`), then release |
 | B missing record | `oxide check` (gated) | fixture crate C | A and B idle, B's record dropped, `capacity_policy` 2 | admission, then release |
 | C release/reuse | `oxide check` (gated) | fixture crate A | A idle with a current record | admission (reuse), then release; stdout read after release |
-| D byte pressure | `oxide check` (gated) + held writer | pressure crate | one idle slot, one held slot, an out-of-slot stray, byte budget, internal backend recorded in `config.json` | admission, then releases |
+| D byte pressure | `oxide check` (gated) + held writer | pressure crate | one idle slot, one held slot, an out-of-slot stray, byte budget, directory backend recorded in `config.json` | admission, then releases |
 | E hard-link overcount | `oxide check` (gated) | pressure crate | two idle slots sharing one inode, budget between union and sum | admission, then release |
 | F legacy + crash | `oxide check` (gated, then killed) | third crate, then a fresh crate | every record dropped, `capacity_policy` 1 | admission, then release, then product recovery |
 | G status/audit | `oxide status`, `oxide status --measure` | fixture work dir | one idle slot with a record | no `oxide check`, so no release walk |
@@ -81,8 +74,8 @@ import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILDER = "1.97.1"
-# The qualified shared supervisor this proof's whole command runs under.
-GUARD_SHA256 = "94b1aba60a7475a31b5620039986336f13e1c88d58dd3732b5736290dc63685b"
+# Qualified archive: evidence-195-b29ef6c-20261101T043444Z.
+GUARD_SHA256 = "fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b"
 GUARD_PATH = os.path.join(REPO, "scripts", "bounded-test.py")
 
 # The product's serialized pool facts, bound to source by `--self-test`. The
@@ -408,7 +401,7 @@ def source_identity() -> str:
 def recorded_backend(config: object, where: str = "the pool config") -> str:
     """The pool's recorded backend from its serialized `config.json`.
 
-    Only a positively recorded internal directory pool passes. A missing,
+    Only a positively recorded directory-budget pool passes. A missing,
     malformed, unknown or removable backend refuses by name: the fixture never
     assumes its own placement, and it never reads a backend out of the ledger,
     which has no such field.
@@ -735,15 +728,17 @@ class Fixture:
         self.root = os.path.join(root, label)
         self.home = os.path.join(self.root, "home")
         self.cargo_home = os.path.join(self.root, "cargo")
-        self.pool = os.path.join(self.root, "pool")
+        self.scratch_root = os.path.join(root, "pools")
+        self.pool = os.path.join(self.scratch_root, label)
         self.work = os.path.join(self.root, "work")
         self.temp = os.path.join(self.root, "temp")
         self.walk_log = os.path.join(self.root, "walk.log")
         self.scope_log = os.path.join(self.root, "scope.log")
         self.budget_bytes = budget_bytes
-        for path in (self.home, self.cargo_home, self.temp, self.work):
+        for path in (self.home, self.cargo_home, self.temp, self.work, self.scratch_root):
             os.makedirs(path, exist_ok=True)
         os.chmod(self.root, 0o700)
+        os.chmod(self.scratch_root, 0o700)
 
     # -- fixture crates -------------------------------------------------
 
@@ -815,8 +810,8 @@ class Fixture:
                 "CARGO_HOME": self.cargo_home,
                 "OXIDE_TEST_HOME_FROM_ENV": "1",
                 "OXIDE_POOL": self.pool,
-                # The fixture creates its own pool, outside the published
-                # task scratch root, so it takes the explicit opt-in.
+                "OXIDE_SCRATCH_ROOT": self.scratch_root,
+                # Explicit pool creation opt-in.
                 "OXIDE_POOL_CREATE": "1",
                 # The documented soft byte budget for the next pool creation.
                 "OXIDE_POOL_CAP": str(self.budget_bytes),
@@ -1556,9 +1551,9 @@ PREMISE_CHECKLIST = {
     "3_environment_isolation": "Fixture.env() scrub of OXIDE_*/XDG_*/flag/TMP overrides",
     "4_automatic_adoption": "not applicable: no case uses permanent outputs or a target/ placement",
     "5_cargo_external_argv": "not applicable: no case invokes an external Cargo subcommand",
-    "6_owned_images": "not applicable: internal directory pool only; no image, mount or device",
+    "6_owned_images": "not applicable: directory-budget pool only; no image, mount or device",
     "7_compiler_flags": "toolchain_env() frozen RUSTFLAGS, encoded flags removed, recipe_problems()",
-    "8_temporary_storage": "internal-root selectors; Fixture.env() TMPDIR inside the owned root",
+    "8_temporary_storage": "Fixture.env() puts TMPDIR and scratch pools inside the owned root",
     "9_macos_mktemp": "not applicable: fixtures use explicit os.makedirs paths, never mktemp",
 }
 NA_PREMISES = ("4_automatic_adoption", "5_cargo_external_argv", "6_owned_images", "9_macos_mktemp")
