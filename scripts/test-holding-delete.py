@@ -20,6 +20,8 @@ from the invoking Cargo home (target and build directories stay inside the
 monitored scratch and are deleted before any fixture). Every fixture tree has
 its own private `HOME`, `CARGO_HOME`, pool and crate, so nothing touches a
 live pool, `~/.local/bin/oxide` or host settings; fixture pools use the selected scratch volume.
+A fallback to `/private/tmp` exercises the internal path where the declaration is
+inert; it is not scratch-pool coverage and must be reported as such.
 
 Cases:
 
@@ -69,7 +71,8 @@ import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILDER = "1.97.1"
-EXPECTED_RUNNER_SHA256 = "94b1aba60a7475a31b5620039986336f13e1c88d58dd3732b5736290dc63685b"
+# Qualified at #195: evidence-195-b29ef6c-20261101T043444Z.
+EXPECTED_RUNNER_SHA256 = "fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b"
 MIB = 1024 * 1024
 WALL_LIMIT_S = 300
 SCRATCH_BUDGET_MIB = 512
@@ -170,7 +173,7 @@ PREMISE_CHECKLIST = {
         "stage_subject() drops every CARGO_TARGET_/CARGO_BUILD_/CARGO_ENCODED_/SCCACHE_/"
         "OXIDE_/XDG_ key plus CARGO/RUSTC/RUSTFLAGS/RUSTDOCFLAGS/RUSTC_WRAPPER/"
         "RUSTC_WORKSPACE_WRAPPER, and fixture_env() builds the child environment from a "
-        "fixed allow-list (private HOME, CARGO_HOME, OXIDE_POOL, OXIDE_POOL_CAP, "
+        "fixed allow-list (private HOME, CARGO_HOME, OXIDE_SCRATCH_ROOT, OXIDE_POOL, OXIDE_POOL_CAP, "
         "TMPDIR/TMP/TEMP, the toolchain home, the bounded test controls) so no host "
         "pool, config or account provenance is inherited"
     ),
@@ -742,6 +745,11 @@ def self_check() -> None:
     )
     source = read_text(os.path.abspath(__file__))
     selector_source = read_text(os.path.join(REPO, "effigy.toml"))
+    expect(
+        EXPECTED_RUNNER_SHA256 == "fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b"
+        and sha256_file(os.path.join(REPO, "scripts", "bounded-test.py")) == EXPECTED_RUNNER_SHA256,
+        "the supervisor must match the #195 qualified bytes",
+    )
     for item, disposition in PREMISE_CHECKLIST.items():
         expect(bool(disposition.strip()), f"premise {item} has no disposition")
         if item in NA_PREMISES:
