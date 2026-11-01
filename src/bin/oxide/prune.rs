@@ -3409,6 +3409,23 @@ fn hook_placement_allowed(scratch: &Path, declared: Option<&Path>, control: &Pat
     }
 }
 
+/// The control-directory conditions of [`prune_fixture_fault`] as pure path
+/// facts: `given` is the path the proof named, `canonical` its resolved form.
+/// A symlinked or non-canonical control, the supervisor scratch root itself and
+/// any control outside the armed placement all refuse.
+#[cfg(debug_assertions)]
+fn hook_control_allowed(
+    given: &Path,
+    canonical: &Path,
+    scratch: &Path,
+    declared: Option<&Path>,
+) -> bool {
+    canonical == given
+        && canonical != scratch
+        && canonical.starts_with(scratch)
+        && hook_placement_allowed(scratch, declared, canonical)
+}
+
 /// Debug builds only, under [`proof_evidence`]: a low-reserve reading for
 /// one prune worker check, in exactly one of two modes (both set disarms
 /// both; malformed or zero values disarm):
@@ -3711,10 +3728,7 @@ fn prune_fixture_fault(control: &Path, variable: &str, target: &Path, marker: &s
     let Ok(canonical_control) = fs::canonicalize(control) else {
         return false;
     };
-    if canonical_control != control
-        || canonical_control == scratch
-        || !canonical_control.starts_with(&scratch)
-        || !hook_placement_allowed(&scratch, declared.as_deref(), &canonical_control)
+    if !hook_control_allowed(control, &canonical_control, &scratch, declared.as_deref())
         || !matches!(store::open_control_directory(control), Ok(Some(_)))
         || std::env::var_os(variable).as_deref() != Some(target.as_os_str())
     {
@@ -6898,6 +6912,65 @@ mod tests {
             scratch,
             Some(&declared),
             &scratch.join("scratch-pools-evil/pool/oxide-managed"),
+        ));
+
+        // The control-directory conditions: the canonical strict child passes;
+        // a symlinked or non-canonical spelling, the scratch root itself, a
+        // task-root sibling and an outside path all refuse.
+        assert!(hook_control_allowed(
+            &control,
+            &control,
+            scratch,
+            Some(&declared)
+        ));
+        let real = declared.join("pool/real");
+        let link = declared.join("pool/link");
+        assert!(
+            !hook_control_allowed(&link, &real, scratch, Some(&declared)),
+            "symlinked control"
+        );
+        assert!(
+            !hook_control_allowed(
+                &declared.join("pool/../pool/oxide-managed"),
+                &control,
+                scratch,
+                Some(&declared),
+            ),
+            "non-canonical control"
+        );
+        assert!(
+            !hook_control_allowed(scratch, scratch, scratch, Some(&declared)),
+            "scratch root itself"
+        );
+        let sibling_declared = Path::new("/Volumes/Builds/scratch/oxide/run/sibling/scratch-pools");
+        let sibling_control = sibling_declared.join("pool/oxide-managed");
+        assert!(
+            !hook_control_allowed(
+                &sibling_control,
+                &sibling_control,
+                scratch,
+                Some(sibling_declared),
+            ),
+            "task-root sibling declaration"
+        );
+        let outside = Path::new("/Volumes/Builds/other/pool/oxide-managed");
+        assert!(
+            !hook_control_allowed(outside, outside, scratch, None),
+            "outside path"
+        );
+    }
+
+    /// Release builds carry none of the prune fixture hooks: the stub never fires.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn prune_fixture_hooks_are_absent_in_release() {
+        let path =
+            Path::new("/Volumes/Builds/scratch/oxide/run/scratch/scratch-pools/pool/oxide-managed");
+        assert!(!prune_fixture_fault(
+            path,
+            "OXIDE_TEST_PRUNE_DIAGNOSTIC_DELAY",
+            path,
+            "prune-diagnostic-delay-fired",
         ));
     }
 
