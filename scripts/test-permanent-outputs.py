@@ -164,6 +164,15 @@ class Proof(layout.Proof):
         self.detach_confirmed = False
         self.detach_attempted = False
         self.fixture_ready = False
+        self.diagnostic = False
+
+    def phase(self, label):
+        try:
+            return super().phase(label)
+        except RuntimeError as fault:
+            if self.diagnostic:
+                raise ProofAbort(f"resource checkpoint {label}: {fault}") from fault
+            raise
 
     def run(self, command, *, cwd=None, env=None, timeout=120):
         child_env = env or self.env
@@ -7162,6 +7171,7 @@ def main() -> int:
     signal.signal(signal.SIGALRM, overdue)
     signal.setitimer(signal.ITIMER_REAL, work_left())
     proof = Proof(root)
+    proof.diagnostic = diagnostic
     if label in ("permanent-outputs", "auto-adopt", "detach-permanent", "ignore-safety"):
         proof.collection = Collection()
     try:
