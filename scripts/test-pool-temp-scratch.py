@@ -219,7 +219,8 @@ Proof-authoring premise checklist (workflow.md):
    records intent and one ordinary detach, and keeps uncertain custody.
 7. `toolchain_environment` freezes `RUSTFLAGS` for both environments and
    neither imports `CARGO_ENCODED_RUSTFLAGS`.
-8. `scratch_root` canonicalizes the guard's explicit /private/tmp run root;
+8. `scratch_root` canonicalizes `OXIDE_TASK_SCRATCH_ROOT` exported by the
+   guard under its explicit /private/tmp parent;
    `run_session` creates the private workspace beneath it. The fixture pool,
    staging and temp directories stay inside it; the children receive no
    `OXIDE_SCRATCH_ROOT`. The image backing and custody use guard evidence.
@@ -629,7 +630,7 @@ def plan() -> None:
   staging: plain Cargo, pinned 1.97.1, offline, 1 job, target deleted after
   fixtures: private HOME, CARGO_HOME and OXIDE_POOL with a 64 MiB cap;
             no OXIDE_SCRATCH_ROOT declaration
-  removable: one owned 128 MiB APFS scratch image at a unique /Volumes/<name>,
+  removable: one owned 128 MiB APFS scratch image with volume name oxide-temp-proof,
              ordinary detach only, never a real drive
   cases:"""
     )

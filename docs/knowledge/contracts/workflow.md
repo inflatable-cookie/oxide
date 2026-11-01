@@ -1290,7 +1290,7 @@ shared proof supervisor (`bounded-test.py --root-parent /private/tmp --limit 300
 --scratch-budget-mib 512`; an ELEVATED trigger: it deletes owned scratch, decides
 writer closure and writes to an owned removable fixture volume). It stages
 this clean HEAD's debug `oxide` offline with 1.97.1 and covers, on tiny
-fixtures with a private `HOME`, `CARGO_HOME` and directory pool. Decision af7df7d6 keeps the explicit internal root because the shortest slot scratch under the selected Builds prefix is 101 bytes, above the 91-byte socket bound. The source-derived internal layout is at most 88 bytes for the two-digit slot IDs the proof admits, a 3-byte margin; case 12 verifies the actual names and reports the run figures. No child receives `OXIDE_SCRATCH_ROOT`. Staging and
+fixtures with a private `HOME`, `CARGO_HOME` and directory pool. Decision af7df7d6 keeps the explicit internal root because this fixture's shortest admitted slot scratch (`test-1`) under the selected Builds prefix is 103 bytes, above the 91-byte socket bound. The source-derived internal layout is at most 88 bytes for the two-digit slot IDs the proof admits, a 3-byte margin; case 12 verifies the actual names and reports the run figures. No child receives `OXIDE_SCRATCH_ROOT`. Staging and
 every fixture child share one resolved absolute toolchain home — an inherited
 `RUSTUP_HOME` when it is absolute and usable, else the account default
 `$HOME/.rustup` resolved from the original HOME *before* the private fixture
