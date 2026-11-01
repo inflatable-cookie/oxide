@@ -9,9 +9,9 @@ Bounds are unchanged: 300 s wall, 512 MiB monitored scratch, 270 s work and a
 30 s shutdown margin.
 
 Everything is private: each fixture has its own `HOME`, `CARGO_HOME`,
-`OXIDE_POOL`, `TMPDIR`/`TMP`/`TEMP` and walk/scope logs beside the pool, all
-inside the one owned monitored root. Inherited `OXIDE_*`/`XDG_*` and encoded
-compiler-flag values are scrubbed; `OXIDE_TEST_HOME_FROM_ENV=1` makes the
+`OXIDE_POOL`, `TMPDIR`/`TMP`/`TEMP` and walk/scope logs, all inside the
+one owned monitored root. Inherited `OXIDE_*`/`XDG_*`/`CARGO_*`/`GIT_*`/
+`SCCACHE_*` and compiler-flag overrides are scrubbed; `OXIDE_TEST_HOME_FROM_ENV=1` makes the
 private `HOME` authoritative; the **invoking** toolchain home is resolved
 before that HOME exists and handed to staging and every fixture child with
 `RUSTUP_TOOLCHAIN=1.97.1`, `RUSTUP_AUTO_INSTALL=0` and offline Cargo; every
@@ -315,11 +315,13 @@ def staging_recipe(scratch: str, rustup_home: str | None = None) -> tuple[list[s
     env = {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith(("CARGO_TARGET_", "CARGO_BUILD_", "SCCACHE_", "OXIDE_"))
+        if not key.startswith(("CARGO_", "SCCACHE_", "OXIDE_", "XDG_", "GIT_"))
         and key not in ("CARGO", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
                         "CARGO_ENCODED_RUSTFLAGS", "RUSTFLAGS", "RUSTUP_HOME",
                         "RUSTUP_TOOLCHAIN", "RUSTUP_AUTO_INSTALL", "CARGO_NET_OFFLINE")
     }
+    # Staging needs the invoking offline registry cache; restore only this Cargo value.
+    env["CARGO_HOME"] = os.environ.get("CARGO_HOME") or os.path.join(os.environ["HOME"], ".cargo")
     env.update(toolchain_env(rustup_home if rustup_home is not None else INVOKING_RUSTUP_HOME))
     env.update(
         {
@@ -412,7 +414,7 @@ def recorded_backend(config: object, where: str = "the pool config") -> str:
     if not isinstance(backend, str) or not backend:
         abort(f"{where} records no backend")
     if backend == VOLUME_BACKEND:
-        abort(f"{where} records the removable backend {backend!r}, not an internal directory pool")
+        abort(f"{where} records the removable backend {backend!r}, not a directory-budget pool")
     if backend != BUDGET_BACKEND:
         abort(f"{where} records an unknown backend {backend!r}")
     if "volume" in config:
@@ -798,10 +800,11 @@ class Fixture:
         env = {
             key: value
             for key, value in os.environ.items()
-            if not key.startswith(("OXIDE_", "XDG_"))
+            if not key.startswith(("OXIDE_", "XDG_", "CARGO_", "GIT_", "SCCACHE_"))
             and key not in ("TMPDIR", "TMP", "TEMP", "CARGO_ENCODED_RUSTFLAGS", "RUSTFLAGS",
                             "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "RUSTUP_AUTO_INSTALL",
-                            "CARGO_NET_OFFLINE")
+                            "CARGO_NET_OFFLINE", "CARGO", "RUSTC", "RUSTC_WRAPPER",
+                            "RUSTC_WORKSPACE_WRAPPER")
         }
         env.update(toolchain_env(INVOKING_RUSTUP_HOME))
         env.update(
@@ -903,7 +906,7 @@ class Fixture:
         except ValueError as error:
             abort(f"the pool config at {path} is not JSON: {error}")
 
-    def require_internal_directory_backend(self) -> str:
+    def require_directory_backend(self) -> str:
         return recorded_backend(self.pool_config(), f"the pool config at {self.pool}")
 
     def ledger(self) -> dict:
@@ -1216,8 +1219,8 @@ def case_d_byte_pressure_evicts_only_the_idle_slot(root: str, subject: str) -> N
         f"the fixture did not get its byte budget: {fx.ledger()['cap_bytes']}",
     )
     expect(
-        fx.require_internal_directory_backend() == BUDGET_BACKEND,
-        f"the fixture is not the internal directory pool: {fx.pool_config()}",
+        fx.require_directory_backend() == BUDGET_BACKEND,
+        f"the fixture is not a directory-budget pool: {fx.pool_config()}",
     )
     idle_record = fx.recorded(idle[0])
     expect(idle_record is not None, "the idle slot has no current record to count")
@@ -1548,7 +1551,7 @@ def case_g_status_readonly_and_measure_audit(root: str, subject: str) -> None:
 PREMISE_CHECKLIST = {
     "1_private_home_and_rustup": "invoking_rustup_home()/toolchain_env()/establish_lock()",
     "2_account_home_control": "Fixture.env() sets OXIDE_TEST_HOME_FROM_ENV=1; capability probe",
-    "3_environment_isolation": "Fixture.env() scrub of OXIDE_*/XDG_*/flag/TMP overrides",
+    "3_environment_isolation": "Fixture.env()/staging_recipe() scrub OXIDE_*/XDG_*/CARGO_*/GIT_*/SCCACHE_* and flags",
     "4_automatic_adoption": "not applicable: no case uses permanent outputs or a target/ placement",
     "5_cargo_external_argv": "not applicable: no case invokes an external Cargo subcommand",
     "6_owned_images": "not applicable: directory-budget pool only; no image, mount or device",
@@ -1893,6 +1896,25 @@ def self_check() -> None:
     expect(env["OXIDE_SCRATCH_ROOT"] == fx.scratch_root and env["OXIDE_POOL"] == fx.pool,
            "fixture scratch contract drift")
     expect(env["OXIDE_POOL_CAP"] == str(GENEROUS_BUDGET), "fixture cap drift")
+    # Exercise both real environment builders against hostile inherited values.
+    hostile = {key: "hostile" for key in ("OXIDE_POOL", "XDG_CONFIG_HOME", "CARGO_TARGET_DIR",
+               "CARGO_PROFILE_DEV_DEBUG", "GIT_CONFIG_GLOBAL", "SCCACHE_DIR", "RUSTC_WRAPPER")}
+    saved_env = dict(os.environ)
+    try:
+        os.environ.update(hostile)
+        os.environ["CARGO_HOME"] = "/invoking/cargo"
+        _, stage_env = staging_recipe("/run", rustup_home="/toolchain")
+        fixture_env = fx.env()
+        expect(stage_env["CARGO_HOME"] == "/invoking/cargo", "staging lost offline cache")
+        expect(fixture_env["CARGO_HOME"] == fx.cargo_home, "fixture cargo home leaked")
+        for key in hostile:
+            expect(stage_env.get(key) != "hostile", f"staging inherited {key}")
+            expect(fixture_env.get(key) != "hostile", f"fixture inherited {key}")
+        expect(stage_env["CARGO_PROFILE_DEV_DEBUG"] == "0", "staging profile not restored")
+        expect(fixture_env["OXIDE_POOL"] == fx.pool, "fixture pool not restored")
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_env)
     # R1 — the render functions the counted run actually calls.
     rendered = render_build_rs(SLOT_FILLER_BYTES)
     expect("__SLOT_FILLER_BYTES__" not in rendered, "the filler placeholder survived")
@@ -2328,7 +2350,7 @@ def self_test() -> None:
         expect(document["collection_complete"] is False, "an aborted receipt claimed completeness")
         expect(document["case_states"] == states, "the receipt states disagree with the run")
 
-        # F1: the internal-pool fact is the pool's serialized `config.json`
+        # F1: the directory-budget fact is the pool's serialized `config.json`
         # backend, bound to product source. The ledger struct has no backend
         # field, which is exactly what used to crash case D.
         pool_source = open(os.path.join(REPO, "src", "lease", "pool.rs"), encoding="utf-8").read()
@@ -2336,7 +2358,7 @@ def self_test() -> None:
         expect(f'const CONFIG_NAME: &str = "{CONFIG_NAME}";' in mod_source,
                f"the config name {CONFIG_NAME!r} is not the product's")
         expect(f'BUDGET_BACKEND_DIRECTORY_V1: &str = "{BUDGET_BACKEND}";' in mod_source,
-               f"the internal backend tag {BUDGET_BACKEND!r} is not the product's")
+               f"the directory backend tag {BUDGET_BACKEND!r} is not the product's")
         expect(f'VOLUME_BACKEND_APFS_V1: &str = "{VOLUME_BACKEND}";' in mod_source,
                f"the removable backend tag {VOLUME_BACKEND!r} is not the product's")
         ledger_struct = pool_source.split("struct Ledger {", 1)[1].split("\n}", 1)[0]
@@ -2344,7 +2366,7 @@ def self_test() -> None:
                "the ledger now records a backend: rebind the F1 premise before trusting it again")
         expect(
             recorded_backend({"version": 5, "backend": BUDGET_BACKEND, "cap_bytes": 1}) == BUDGET_BACKEND,
-            "the real internal-pool config was not accepted",
+            "the directory-budget config was not accepted",
         )
         for rejected in (
             {"version": 5, "store_id": "x", "cap_bytes": 1, "next_slot": 1, "next_lease": 1, "slots": []},
@@ -2359,7 +2381,7 @@ def self_test() -> None:
             except CaseFailure as failure:
                 expect(failure.abort, f"a wrong backend was treated as recoverable: {rejected!r}")
             else:
-                fail(f"a pool without a recorded internal backend was accepted: {rejected!r}")
+                fail(f"a pool without a recorded directory backend was accepted: {rejected!r}")
 
         # F2: a case that dies of an unexpected exception is a failure, never a
         # pass, and the remaining cases are explicitly not run after the abort.

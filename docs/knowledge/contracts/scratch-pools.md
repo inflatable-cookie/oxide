@@ -513,7 +513,7 @@ stand at this head:
 | `rust:installed-handoff` | 120 s / 64 MiB | **none — authored in this sub-slice** | none in the script; only `scripts/test_dogfood_scripts.py` `HandoffSelectorTests` pins its root, limits and body |
 | `rust:profile-outputs` | 600 s / 512 MiB | yes | `--plan` |
 | `rust:pool-temp-scratch` | 300 s / 512 MiB | yes | `proof:pool-temp:test`, `--plan` |
-| `rust:recorded-slot-accounting` | 300 s / 512 MiB | migrated (#209; native chain held) | `proof:recorded-slot-accounting:test`, `--plan` |
+| `rust:recorded-slot-accounting` | 300 s / 512 MiB | yes; migrated (recorded-slot-accounting; native chain held) | `proof:recorded-slot-accounting:test`, `--plan` |
 | `rust:exec-output-inference` | 300 s / 512 MiB | yes | `proof:exec-inference:test`, `--plan` |
 | `rust:auto-adopt-ineligible` | 300 s / 512 MiB | yes | `--plan` (shared #117 fixture, no distinct pure selector) |
 | `rust:prune-authority` | 300 s / 512 MiB | yes | `proof:prune-authority:test` (`--self-check`) |
