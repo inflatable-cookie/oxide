@@ -903,11 +903,13 @@ mod platform {
         }
     }
 
-    /// The one production decision for a descriptor's two reads. Both-flavour
-    /// `EPERM` is a hidden path: the census cannot say what the process holds,
-    /// so it is UNKNOWN and refuses. Both-flavour `ENOENT` is a dead-handle
-    /// candidate; either read reporting the descriptor closed means it is no
-    /// longer held; anything else is re-read as a pair.
+    /// The one production decision for a descriptor's two reads. A readable
+    /// path is a positive observation whatever the other flavour says, so it
+    /// is checked for containment and never discarded in favour of a closed
+    /// read. Both-flavour `EPERM` is a hidden path: the census cannot say what
+    /// the process holds, so it is UNKNOWN and refuses. Both-flavour `ENOENT`
+    /// is a dead-handle candidate; only both reads reporting the descriptor
+    /// closed mean it is no longer held; any other mixed pair is re-read.
     pub(super) fn classify_pair(
         _pid: i32,
         _descriptor: i32,
@@ -915,7 +917,10 @@ mod platform {
         path: &Result<Option<PathBuf>, io::Error>,
     ) -> Pair {
         match (facts, path) {
-            (Ok(()), Ok(Some(path))) => Pair::Path(path.clone()),
+            // A readable path is a live observation, whatever the vnode-facts
+            // read says. Dropping it for a closed sibling read would let a
+            // handle reopened inside the slot pass as closed.
+            (_, Ok(Some(path))) => Pair::Path(path.clone()),
             (Ok(()), Ok(None)) => Pair::DeadCandidate,
             (Err(left), Err(right))
                 if left.raw_os_error() == Some(libc::EPERM)
@@ -929,8 +934,7 @@ mod platform {
             {
                 Pair::DeadCandidate
             }
-            (Err(left), _) if closed(left) => Pair::Closed,
-            (_, Err(right)) if closed(right) => Pair::Closed,
+            (Err(left), Err(right)) if closed(left) && closed(right) => Pair::Closed,
             _ => Pair::Retry,
         }
     }
@@ -1443,15 +1447,17 @@ mod tests {
             ),
             platform::Pair::Opaque
         ));
-        assert!(matches!(
-            platform::classify_pair(
-                9,
-                4,
-                &Err(Error::from_raw_os_error(libc::EPERM)),
-                &Ok(Some(PathBuf::from("/slot/file"))),
-            ),
-            platform::Pair::Retry
-        ));
+        // A readable path is checked for containment even when the other
+        // flavour is hidden; it is never a blind spot.
+        match platform::classify_pair(
+            9,
+            4,
+            &Err(Error::from_raw_os_error(libc::EPERM)),
+            &Ok(Some(PathBuf::from("/slot/file"))),
+        ) {
+            platform::Pair::Path(path) => assert_eq!(path, PathBuf::from("/slot/file")),
+            _ => panic!("a readable path was not classified as a path"),
+        }
         assert!(matches!(
             platform::classify_pair(
                 9,
@@ -1461,8 +1467,40 @@ mod tests {
             ),
             platform::Pair::DeadCandidate
         ));
+        // A closed facts read paired with a readable empty name is a mixed
+        // pair, not a closed descriptor.
         assert!(matches!(
             platform::classify_pair(9, 4, &Err(Error::from_raw_os_error(libc::EBADF)), &Ok(None),),
+            platform::Pair::Retry
+        ));
+    }
+
+    /// A mixed closed/readable observation must never be closed: a live
+    /// handle reopened inside the slot has to reach the containment check, and
+    /// an ambiguous pair has to be re-read (and refused if it does not settle).
+    #[test]
+    fn a_mixed_closed_and_readable_observation_is_never_closed() {
+        use std::io::Error;
+        match platform::classify_pair(
+            9,
+            4,
+            &Err(Error::from_raw_os_error(libc::EBADF)),
+            &Ok(Some(PathBuf::from("/slot/file"))),
+        ) {
+            platform::Pair::Path(path) => assert_eq!(path, PathBuf::from("/slot/file")),
+            _ => panic!("a readable in-slot path was discarded"),
+        }
+        assert!(matches!(
+            platform::classify_pair(9, 4, &Ok(()), &Err(Error::from_raw_os_error(libc::EBADF))),
+            platform::Pair::Retry
+        ));
+        assert!(matches!(
+            platform::classify_pair(
+                9,
+                4,
+                &Err(Error::from_raw_os_error(libc::EBADF)),
+                &Err(Error::from_raw_os_error(libc::EBADF)),
+            ),
             platform::Pair::Closed
         ));
     }
