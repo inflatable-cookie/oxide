@@ -111,15 +111,28 @@ pub(crate) fn decide(f: Facts<'_>) -> Decision {
             return refusal(Refusal::Class("scratch-declaration-default-pool"));
         }
     }
-    let record = match f.record {
-        Document::Missing => None,
+    // Status needs the record first to establish a scratch fact. An absent
+    // volume also needs it to name the missing binding. For a present leased
+    // path, defer record classification until after placement and binding.
+    let parse_record = || match &f.record {
+        Document::Missing => Ok(None),
         Document::Bytes(bytes) if bytes.len() <= 4096 => {
             match serde_json::from_slice::<Record>(bytes) {
-                Ok(r) if r.schema == "oxide.scratch-pool-record/1" && r.pool == f.pool => Some(r),
-                _ => return refusal(Refusal::Class("scratch-record-invalid")),
+                Ok(r) if r.schema == "oxide.scratch-pool-record/1" && r.pool == f.pool => {
+                    Ok(Some(r))
+                }
+                _ => Err(Refusal::Class("scratch-record-invalid")),
             }
         }
-        _ => return refusal(Refusal::Class("scratch-record-invalid")),
+        _ => Err(Refusal::Class("scratch-record-invalid")),
+    };
+    let mut record = if f.status || !f.volume_present {
+        match parse_record() {
+            Ok(record) => record,
+            Err(reason) => return refusal(reason),
+        }
+    } else {
+        None
     };
     if !f.volume_present {
         return refusal(Refusal::VolumeAbsent {
@@ -142,9 +155,9 @@ pub(crate) fn decide(f: Facts<'_>) -> Decision {
         }
     }
     let root = if f.status {
-        record.as_ref().map(|r| &r.scratch_root)
+        record.as_ref().map(|r| r.scratch_root.clone())
     } else {
-        f.declaration.as_ref()
+        f.declaration.clone()
     };
     let Some(root) = root else {
         return refusal(Refusal::Class("scratch-root-unsafe"));
@@ -152,7 +165,7 @@ pub(crate) fn decide(f: Facts<'_>) -> Decision {
     if !root.is_absolute() || !f.root_safe {
         return refusal(Refusal::Class("scratch-root-unsafe"));
     }
-    if f.pool == *root || !f.pool.starts_with(root) {
+    if f.pool == root || !f.pool.starts_with(&root) {
         return refusal(Refusal::Class("scratch-path-outside-root"));
     }
     if !f.parent_exists {
@@ -177,16 +190,22 @@ pub(crate) fn decide(f: Facts<'_>) -> Decision {
     if let Some(b) = &binding {
         if b.volume_uuid != f.volume_uuid
             || b.mount_point != f.mount_point
-            || b.scratch_root != *root
+            || b.scratch_root != root
             || b.pool != f.pool
         {
             return refusal(Refusal::Class("scratch-binding-mismatch"));
         }
     }
+    if !f.status {
+        record = match parse_record() {
+            Ok(record) => record,
+            Err(reason) => return refusal(reason),
+        };
+    }
     if let Some(r) = &record {
         if r.volume_uuid != f.volume_uuid
             || r.mount_point != f.mount_point
-            || r.scratch_root != *root
+            || r.scratch_root != root
             || binding.as_ref().is_none_or(|b| {
                 r.volume_uuid != b.volume_uuid
                     || r.mount_point != b.mount_point
@@ -418,6 +437,49 @@ mod tests {
             assert_eq!(result.message(), message);
         }
     }
+    #[test]
+    fn record_invalid_does_not_mask_present_leased_path_or_binding_faults() {
+        let mut f = facts();
+        f.record = Document::Invalid;
+        f.root_safe = false;
+        assert_eq!(decide(f), class("scratch-root-unsafe"));
+        let mut f = facts();
+        f.record = Document::Invalid;
+        f.pool = "/Volumes/Builds/else/pool".into();
+        assert_eq!(decide(f), class("scratch-path-outside-root"));
+        let mut f = facts();
+        f.record = Document::Invalid;
+        f.parent_exists = false;
+        assert_eq!(decide(f), class("scratch-parent-missing"));
+        let mut f = facts();
+        f.record = Document::Invalid;
+        f.volume_verified = false;
+        assert_eq!(decide(f), class("scratch-volume-unverified"));
+        let mut f = facts();
+        f.record = Document::Invalid;
+        f.binding = Document::Missing;
+        assert_eq!(decide(f), class("scratch-binding-missing"));
+        let mut f = facts();
+        f.record = Document::Invalid;
+        f.binding = Document::Invalid;
+        assert_eq!(decide(f), class("scratch-binding-invalid"));
+        let mut f = facts();
+        f.record = Document::Invalid;
+        f.binding = Document::Bytes(BAD_BINDING);
+        assert_eq!(decide(f), class("scratch-binding-mismatch"));
+        let mut f = facts();
+        f.record = Document::Invalid;
+        assert_eq!(decide(f), class("scratch-record-invalid"));
+        let mut f = facts();
+        f.status = true;
+        f.record = Document::Invalid;
+        f.root_safe = false;
+        assert_eq!(
+            decide(f),
+            Decision::Unavailable(Refusal::Class("scratch-record-invalid"))
+        );
+    }
+
     #[test]
     fn strict_documents_and_every_identity_field() {
         for (is_binding, document) in [(true, BINDING), (false, RECORD)] {
