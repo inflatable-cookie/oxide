@@ -765,54 +765,56 @@ def run(proof: Proof, repo: str, base_compat: bool = False, diagnostic: bool = F
         # A first conversion needs Git to ignore the exact non-directory link
         # path (oxide#125); `/.oxide-outputs/` is still left to `oxide init`.
         with open(os.path.join(fixture, ".gitignore"), "w", encoding="utf-8") as handle:
-            handle.write("/target\n")
-    expect(
-        proof.run(["git", "check-ignore", "-q", "--", ".oxide-outputs"], cwd=app).returncode != 0,
-        "the fixture already ignored .oxide-outputs before oxide init",
-    )
-    code, stdout, stderr = proof.oxide(["init"], "oxide init adds the ignore entry", app)
-    expect(
-        code == 0 and ("created" in stdout.lower() or "added" in stdout.lower()),
-        stdout + stderr,
-    )
-    ignore_text = read_bytes(os.path.join(app, ".gitignore")).decode()
-    expect(
-        "/.oxide-outputs/" in ignore_text.splitlines(),
-        f"oxide init did not add the local-output ignore entry: {ignore_text!r}",
-    )
-    code, stdout, stderr = proof.oxide(["init"], "oxide init is idempotent", app)
-    expect(code == 0 and "already present" in stdout, stdout + stderr)
-    expect(
-        read_bytes(os.path.join(app, ".gitignore")).decode().count("/.oxide-outputs/") == 1,
-        "oxide init duplicated the ignore entry",
-    )
+            handle.write("/target\n/.oxide-outputs/\n" if base_compat else "/target\n")
+    if not base_compat:
+        expect(
+            proof.run(["git", "check-ignore", "-q", "--", ".oxide-outputs"], cwd=app).returncode != 0,
+            "the fixture already ignored .oxide-outputs before oxide init",
+        )
+        code, stdout, stderr = proof.oxide(["init"], "oxide init adds the ignore entry", app)
+        expect(
+            code == 0 and ("created" in stdout.lower() or "added" in stdout.lower()),
+            stdout + stderr,
+        )
+        ignore_text = read_bytes(os.path.join(app, ".gitignore")).decode()
+        expect(
+            "/.oxide-outputs/" in ignore_text.splitlines(),
+            f"oxide init did not add the local-output ignore entry: {ignore_text!r}",
+        )
+        code, stdout, stderr = proof.oxide(["init"], "oxide init is idempotent", app)
+        expect(code == 0 and "already present" in stdout, stdout + stderr)
+        expect(
+            read_bytes(os.path.join(app, ".gitignore")).decode().count("/.oxide-outputs/") == 1,
+            "oxide init duplicated the ignore entry",
+        )
     proof.phase("after fixtures and adoption")
 
     # A first build creates the internal pool; the checkout stays ephemeral
     # and its real target directory is untouched by output policy.
     code, _, stderr = proof.oxide(["check"], "ephemeral first build", app)
     expect(code == 0, f"first build failed: {stderr}")
-    expect(os.path.isdir(os.path.join(app, "target")), "ephemeral target missing")
-    expect(
-        not os.path.lexists(os.path.join(app, "target", MARKER)),
-        "ephemeral build wrote an output marker",
-    )
-    expect(
-        not os.path.exists(os.path.join(app, ".oxide-outputs")),
-        "an ephemeral build created the local output root",
-    )
+    if not base_compat:
+        expect(os.path.isdir(os.path.join(app, "target")), "ephemeral target missing")
+        expect(
+            not os.path.lexists(os.path.join(app, "target", MARKER)),
+            "ephemeral build wrote an output marker",
+        )
+        expect(
+            not os.path.exists(os.path.join(app, ".oxide-outputs")),
+            "an ephemeral build created the local output root",
+        )
 
-    # Registration: permission for permanent output placement.
-    code, stdout, stderr = proof.oxide(["outputs", "plan"], "plan before any drive", app)
-    expect(code == 0, stderr)
-    report = json.loads(stdout)
-    expect(report["mode"] == "unregistered" and report["action"] == "refuse", report)
-    code, _, stderr = proof.oxide(["outputs", "adopt"], "adopt without permanent mode", app)
-    expect(code != 0 and "permanent drive mode" in stderr, stderr)
-    expect(
-        not os.path.exists(os.path.join(app, ".oxide-outputs")),
-        "a refused adopt created the local root",
-    )
+        # Registration: permission for permanent output placement.
+        code, stdout, stderr = proof.oxide(["outputs", "plan"], "plan before any drive", app)
+        expect(code == 0, stderr)
+        report = json.loads(stdout)
+        expect(report["mode"] == "unregistered" and report["action"] == "refuse", report)
+        code, _, stderr = proof.oxide(["outputs", "adopt"], "adopt without permanent mode", app)
+        expect(code != 0 and "permanent drive mode" in stderr, stderr)
+        expect(
+            not os.path.exists(os.path.join(app, ".oxide-outputs")),
+            "a refused adopt created the local root",
+        )
 
     mounted = attach_image(proof, os.environ["OXIDE_PROOF_EVIDENCE"], name)
     expect(mounted == mount, f"scratch volume mounted at {mounted}, not {mount}")
