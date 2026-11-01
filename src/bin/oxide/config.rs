@@ -1065,7 +1065,7 @@ pub fn refuse_unsafe_pool_path(path: &Path) -> Result<(), String> {
     judge_pool_path(path).map_err(PathRefusal::message)
 }
 
-fn judge_pool_path(path: &Path) -> Result<(), PathRefusal> {
+pub(crate) fn judge_pool_path(path: &Path) -> Result<(), PathRefusal> {
     // `..` after a missing component would resolve only once the missing
     // parents exist, past this check: refuse it outright.
     if path
@@ -1113,7 +1113,7 @@ fn judge_pool_path(path: &Path) -> Result<(), PathRefusal> {
     judge_git_work_tree(path, &canonical)
 }
 
-fn judge_git_work_tree(path: &Path, canonical: &Path) -> Result<(), PathRefusal> {
+pub(crate) fn judge_git_work_tree(path: &Path, canonical: &Path) -> Result<(), PathRefusal> {
     for ancestor in canonical.ancestors() {
         match fs::symlink_metadata(ancestor.join(".git")) {
             Ok(_) => {
@@ -2262,7 +2262,17 @@ mod tests {
         let scratch = Scratch::new("git");
         let repo = scratch.0.join("repo");
         fs::create_dir_all(repo.join(".git")).expect("repo");
-        assert!(refuse_unsafe_pool_path(&repo.join("pool")).is_err());
+        let pool = repo.join("pool");
+        let git_message = format!(
+            "the pool path {} is inside the Git work tree {}; choose a path outside any repository",
+            pool.display(),
+            fs::canonicalize(&repo).unwrap().display()
+        );
+        assert_eq!(refuse_unsafe_pool_path(&pool), Err(git_message.clone()));
+        assert_eq!(
+            judge_pool_path(&pool),
+            Err(PathRefusal::GitWorkTree(git_message))
+        );
         assert!(refuse_unsafe_pool_path(&repo.join("deep/missing/pool")).is_err());
         let alias = scratch.0.join("alias");
         std::os::unix::fs::symlink(&repo, &alias).expect("alias");

@@ -92,12 +92,14 @@ pub(crate) fn decide(f: Facts<'_>) -> Decision {
         return Decision::Ordinary;
     }
     if !f.status {
-        match f.ordinary {
+        match f.ordinary.clone() {
             Ok(()) => return Decision::Ordinary,
-            Err(PathRefusal::ExternalVolume { ref canonical, .. }) if f.declaration.is_some() => {
+            Err(ref external @ PathRefusal::ExternalVolume { ref canonical, .. })
+                if f.declaration.is_some() =>
+            {
                 // A result from any other ancestor is not authority to lift this refusal.
                 if *canonical != f.git_recheck.0 {
-                    return Decision::Refuse(Refusal::Class("scratch-git-recheck-invalid"));
+                    return Decision::Refuse(Refusal::Path(external.clone()));
                 }
                 if let Err(e) = f.git_recheck.1 {
                     return Decision::Refuse(Refusal::Path(e));
@@ -124,6 +126,20 @@ pub(crate) fn decide(f: Facts<'_>) -> Decision {
             uuid: record.as_ref().map(|r| r.volume_uuid.clone()),
             mount: record.as_ref().map(|r| r.mount_point.clone()),
         });
+    }
+    if f.status {
+        match f.ordinary {
+            Err(ref external @ PathRefusal::ExternalVolume { ref canonical, .. }) => {
+                if *canonical != f.git_recheck.0 {
+                    return refusal(Refusal::Path(external.clone()));
+                }
+                if let Err(e) = f.git_recheck.1 {
+                    return refusal(Refusal::Path(e));
+                }
+            }
+            Err(e) => return refusal(Refusal::Path(e)),
+            Ok(()) => return refusal(Refusal::Class("scratch-volume-unverified")),
+        }
     }
     let root = if f.status {
         record.as_ref().map(|r| &r.scratch_root)
@@ -266,7 +282,7 @@ mod tests {
         );
         let mut f = facts();
         f.git_recheck.0 = "/elsewhere".into();
-        assert_eq!(decide(f), class("scratch-git-recheck-invalid"));
+        assert_eq!(decide(f), Decision::Refuse(Refusal::Path(external())));
         let mut f = facts();
         f.source = Source::Default;
         assert_eq!(decide(f), class("scratch-declaration-default-pool")); // 5
@@ -392,18 +408,7 @@ mod tests {
             Path::new("missing/../pool"),
         ] {
             let message = crate::config::refuse_unsafe_pool_path(path).unwrap_err();
-            let refusal = if path.starts_with("/Volumes") {
-                external()
-            } else {
-                PathRefusal::Traversal(message.clone())
-            };
-            let refusal = match refusal {
-                PathRefusal::ExternalVolume { canonical, .. } => PathRefusal::ExternalVolume {
-                    message: message.clone(),
-                    canonical,
-                },
-                other => other,
-            };
+            let refusal = crate::config::judge_pool_path(path).unwrap_err();
             let mut f = facts();
             f.ordinary = Err(refusal);
             f.declaration = None;
@@ -412,5 +417,81 @@ mod tests {
             };
             assert_eq!(result.message(), message);
         }
+    }
+    #[test]
+    fn strict_documents_and_every_identity_field() {
+        for (is_binding, document) in [(true, BINDING), (false, RECORD)] {
+            for key in ["volume_uuid", "mount_point", "scratch_root", "pool"] {
+                let mut value: serde_json::Value = serde_json::from_slice(document).unwrap();
+                value[key] = serde_json::Value::String("different".into());
+                let bytes = serde_json::to_vec(&value).unwrap();
+                let mut f = facts();
+                if is_binding {
+                    f.binding = Document::Bytes(&bytes);
+                } else {
+                    f.record = Document::Bytes(&bytes);
+                }
+                let expected = if is_binding {
+                    "scratch-binding-mismatch"
+                } else if key == "pool" {
+                    "scratch-record-invalid"
+                } else {
+                    "scratch-record-mismatch"
+                };
+                assert_eq!(decide(f), class(expected), "{is_binding} {key}");
+            }
+            for key in ["schema", "unknown"] {
+                let mut value: serde_json::Value = serde_json::from_slice(document).unwrap();
+                value[key] = serde_json::Value::String("wrong".into());
+                let bytes = serde_json::to_vec(&value).unwrap();
+                let mut f = facts();
+                if is_binding {
+                    f.binding = Document::Bytes(&bytes);
+                } else {
+                    f.record = Document::Bytes(&bytes);
+                }
+                assert_eq!(
+                    decide(f),
+                    class(if is_binding {
+                        "scratch-binding-invalid"
+                    } else {
+                        "scratch-record-invalid"
+                    })
+                );
+            }
+            let oversized = vec![b' '; if is_binding { 16385 } else { 4097 }];
+            let mut f = facts();
+            if is_binding {
+                f.binding = Document::Bytes(&oversized);
+            } else {
+                f.record = Document::Bytes(&oversized);
+            }
+            assert_eq!(
+                decide(f),
+                class(if is_binding {
+                    "scratch-binding-invalid"
+                } else {
+                    "scratch-record-invalid"
+                })
+            );
+        }
+        // created_ms is provenance, so it does not participate in agreement.
+        assert_eq!(decide(facts()), Decision::Admit);
+    }
+
+    #[test]
+    fn internal_success_is_inert_and_status_checks_git() {
+        let mut f = facts();
+        f.ordinary = Ok(());
+        f.source = Source::Default;
+        f.root_safe = false;
+        assert_eq!(decide(f), Decision::Ordinary);
+        let mut f = facts();
+        f.status = true;
+        f.git_recheck.1 = Err(PathRefusal::GitWorkTree("git".into()));
+        assert_eq!(
+            decide(f),
+            Decision::Unavailable(Refusal::Path(PathRefusal::GitWorkTree("git".into())))
+        );
     }
 }
