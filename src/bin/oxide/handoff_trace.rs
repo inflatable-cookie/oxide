@@ -225,6 +225,67 @@ pub(crate) fn phase<T>(name: &'static str, action: impl FnOnce() -> T) -> T {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_child_has_no_trace() {
+        let Some(path) = std::env::var_os("OXIDE_HANDOFF_TRACE_FILE") else {
+            return;
+        };
+        assert_eq!(super::phase("release-test", || 42), 42);
+        assert!(std::fs::read(path).unwrap().is_empty());
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_trace_is_disabled_even_with_private_layout() {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        let root = std::env::temp_dir().join(format!("release-trace-{}", std::process::id()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let scratch = root.join("scratch");
+        let evidence = root.join("evidence");
+        let fixture = scratch.join("fixture");
+        let home = fixture.join("case/home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir(&evidence).unwrap();
+        let info = std::fs::metadata(&root).unwrap();
+        let marker = serde_json::json!({"run_id":"a".repeat(32), "root":root,
+            "owner_uid":info.uid(), "device":info.dev(), "inode":info.ino(), "version":1,
+            "outcome":"running", "closure":"none", "concluded_unix":null});
+        let marker_path = root.join(".oxide-scratch.json");
+        std::fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        std::fs::set_permissions(&marker_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let trace = evidence.join("handoff-trace.release");
+        std::fs::write(&trace, b"").unwrap();
+        std::fs::set_permissions(&trace, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "handoff_trace::tests::release_child_has_no_trace",
+            ])
+            .env("OXIDE_HANDOFF_TRACE", "1")
+            .env("OXIDE_TEST_HOME_FROM_ENV", "1")
+            .env("OXIDE_TASK_SCRATCH_ROOT", &scratch)
+            .env("OXIDE_PROOF_EVIDENCE", &evidence)
+            .env("OXIDE_SCRATCH_ROOT", &fixture)
+            .env("OXIDE_POOL", home.parent().unwrap().join("pool"))
+            .env("HOME", &home)
+            .env("OXIDE_PROOF_RUN_ID", "a".repeat(32))
+            .env("OXIDE_HANDOFF_TRACE_FILE", &trace)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
+        assert!(std::fs::read(trace).unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn phase_preserves_success_and_error() {
         assert_eq!(super::phase("test", || 42), 42);

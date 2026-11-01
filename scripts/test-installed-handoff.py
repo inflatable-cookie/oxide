@@ -211,8 +211,15 @@ def trace_layout(env, evidence, run_id):
                 or not stat.S_ISREG(marker_info.st_mode) or marker_info.st_uid != info.st_uid
                 or marker_info.st_mode & 0o077 or marker_info.st_size > 4096):
             return False
-        with open(marker_path, "rb") as handle:
-            marker = json.load(handle)
+        fd = os.open(marker_path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if (opened.st_dev, opened.st_ino) != (marker_info.st_dev, marker_info.st_ino):
+                return False
+            raw = handle.read(4097)
+        if len(raw) > 4096:
+            return False
+        marker = json.loads(raw)
         return (isinstance(run_id, str) and re.fullmatch(r"[0-9a-f]{32}", run_id) is not None
                 and marker.get("run_id") == run_id and marker.get("root") == root
                 and marker.get("owner_uid") == info.st_uid and marker.get("device") == info.st_dev
@@ -244,10 +251,6 @@ def observed_run(argv, *, limit, _runner=None, _remaining=None, _merged_log=None
             DIAGNOSTIC["commands_omitted"] += 1
         publish_diagnostic(DIAGNOSTIC)
     try:
-        if row is not None:
-            row["state"] = "launching"
-            publish_diagnostic(DIAGNOSTIC)
-        left = remaining()
         if (row is not None and row in DIAGNOSTIC["commands"]
                 and _fixture is not None and _trace and _runner is None):
             env = kwargs.get("env", {})
@@ -264,7 +267,10 @@ def observed_run(argv, *, limit, _runner=None, _remaining=None, _merged_log=None
                     row["trace"] = {"state": "allocated", "file": os.path.basename(path), "run": run_id}
                 except OSError:
                     row["trace"] = {"state": "allocation failed"}
+        if row is not None:
+            row["state"] = "launching"
             publish_diagnostic(DIAGNOSTIC)
+        left = remaining()
         result = runner(argv, timeout=min(limit, left) if limit is not None else left, **kwargs)
         if row is not None:
             row.update(exit=result.returncode, stdout=bounded_output(result.stdout),

@@ -607,7 +607,9 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
         guarded,
     ));
     let destination = outputs::destination_facts(planned.as_ref());
-    let incremental_key = prep!(incremental::key_component(&checkout, &invocation));
+    let incremental_key = prep!(handoff_trace::phase("incremental-key", || {
+        incremental::key_component(&checkout, &invocation)
+    }));
     let key = prep!(handoff_trace::phase("key", || SlotKey::resolve_in(
         &checkout,
         invocation.profile.recipe_key(),
