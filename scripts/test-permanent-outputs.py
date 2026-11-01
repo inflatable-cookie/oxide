@@ -168,7 +168,12 @@ class Proof(layout.Proof):
     def run(self, command, *, cwd=None, env=None, timeout=120):
         child_env = env or self.env
         if self.fixture_ready:
-            check_child_env(child_env)
+            stage_target = child_env.get("CARGO_TARGET_DIR", "")
+            if command[0] == "cargo" and stage_target.startswith(self.root + os.sep):
+                expect(same_device_tmp(child_env.get("TMPDIR", ""), self.root),
+                       "staging TMPDIR must be writable on the scratch device")
+            else:
+                check_child_env(child_env)
         result = super().run(command, cwd=cwd, env=env, timeout=timeout)
         if self.mount and os.path.ismount(self.mount):
             check_image_slot_paths(self.mount)
