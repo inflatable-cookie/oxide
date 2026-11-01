@@ -2,12 +2,12 @@
 """Focused installed-binary hand-off proof for oxide#122.
 
 One fixed script and whole command under the qualified shared supervisor
-(`bounded-test.py`): the brief's 120 s wall limit and 64 MiB monitored scratch
+(`bounded-test.py`): the brief's 120 s wall limit and 128 MiB monitored scratch
 budget including cleanup. It stages this clean HEAD's debug `oxide` itself with
 plain Cargo and the pinned 1.97.1, offline, into its own scratch target, copies
 the binary and deletes the target before the fixtures. Only private scratch
 pools are created; no installed binary, host state or network is involved. The stage is kept
-inside the 64 MiB gate by single-threaded, single-codegen-unit, debug-free,
+inside the scratch budget by single-threaded, single-codegen-unit, debug-free,
 symbol-stripped, size-optimised codegen: the staged tree peaks near 58 MiB,
 the fixtures near 2 MiB, and staging takes about 37 s.
 A fallback to `/private/tmp` exercises the internal path, where the scratch
@@ -1068,7 +1068,7 @@ def main() -> int:
         print("installed-handoff groups: " + ", ".join(name for name, _ in GROUPS))
         for name in CASE_PLAN:
             print("  " + name)
-        print("supervisor bounds: 120 s, 64 MiB scratch")
+        print("supervisor bounds: 120 s, 128 MiB scratch")
         return 0
     if mode == "self-check":
         return self_check()

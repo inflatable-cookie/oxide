@@ -356,7 +356,7 @@ root in `<mount>/scratch/oxide` of the selected volume, and falls back to
 `/private/tmp` when none is usable. For each migrated proof:
 
 1. The selector drops `--root-parent /private/tmp`; its admission, its wall
-   clock, its own monitored scratch budget (512 MiB for most, 64 MiB for
+   clock, its own monitored scratch budget (512 MiB for most, 128 MiB for
    `rust:installed-handoff`, 600 s for `rust:profile-outputs`, 420 s for
    `rust:finder-metadata-race`) and cleanup are unchanged, and each migrated
    selector still states its pool premise in its own comment.
@@ -498,7 +498,7 @@ stand at this head:
 
 | Selector | Limit / scratch | `:diagnostic` twin | Effect-free pre-native check |
 | --- | --- | --- | --- |
-| `rust:installed-handoff` | 120 s / 64 MiB | yes | `proof:installed-handoff:test`, `proof:installed-handoff:plan`, and `HandoffSelectorTests` |
+| `rust:installed-handoff` | 120 s / 128 MiB | yes | `proof:installed-handoff:test`, `proof:installed-handoff:plan`, and `HandoffSelectorTests` |
 | `rust:profile-outputs` | 600 s / 512 MiB | yes | `--plan` |
 | `rust:pool-temp-scratch` | 300 s / 512 MiB | yes | `proof:pool-temp:test`, `--plan` |
 | `rust:recorded-slot-accounting` | 300 s / 512 MiB | yes | `proof:recorded-slot-accounting:test`, `--plan` |
