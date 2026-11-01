@@ -884,17 +884,16 @@ run = "python3 scripts/bounded-test.py python3 scripts/test-oxide-exec.py"
 # payload and every slot, readiness walks nothing (oxide#182), held and
 # killed-holder `recover-interrupted` refuse without a walk, a waiting build
 # walks nothing and the recovered cold build walks only the slot it re-leased
-# and the one it released. `--root-parent /private/tmp` is the owner-accepted
-# internal-placement exception (decision bd357a4c): the fixture's pool is a
-# genuine internal directory-budget pool and the product refuses one on an
-# external volume. Everything the proof creates lives inside that monitored
+# and the one it released. Pools use OXIDE_SCRATCH_ROOT on the selected
+# volume; a /private/tmp fallback is not scratch-pool coverage. Everything
+# the proof creates lives inside that monitored
 # root, and the script stops 30 s before the guard deadline. 300 s and 512 MiB
 # monitored scratch including cleanup; the byte-pressure eviction case is
 # retired to `rust:recorded-slot-accounting` and `rust:holding-delete`. Not a
 # benchmark and not full QA.
 [tasks."rust:front-door-accounting"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-front-door-accounting.py"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-front-door-accounting.py"
 
 # The uncounted keep-going twin (oxide#191): the same guard, root and limits
 # with `--diagnostic` appended. It records reached/completed/failed/
@@ -904,7 +903,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # It is never a counted native PASS.
 [tasks."rust:front-door-accounting:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-front-door-accounting.py --diagnostic"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-front-door-accounting.py --diagnostic"
 
 # The pure apparatus check of the front-door script: walk and scope root
 # mapping, the exact ordered walk oracles (a whole-payload admission walk is
