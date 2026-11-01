@@ -286,7 +286,8 @@ LOCK_ARGV = ("cargo", "generate-lockfile", "--offline")
 # path must fit `MAX_SCRATCH_PATH_BYTES` under the internal guard root.
 FIXTURE_NAME = "t"
 # A fresh pool and one fixture use the first 8-hex identity folder. The proof
-# bounds its observed slot IDs to two digits (quick is the longest profile);
+# bounds observed slot IDs to two digits; among admitted quick and test
+# profiles, quick is the longer name.
 # case 12 refuses any shape outside this model rather than assuming it fits.
 INTERNAL_ROOT_PARENT = "/private/tmp"
 GUARD_RUN_PREFIX = "oxide-proof."

@@ -1996,7 +1996,10 @@ Builds prefix cannot fit even the shortest fixture slot scratch beneath the
 88-byte maximum with a positive 3-byte margin for the script's admitted slot
 names. The guard still monitors one owned root, 300 s, 512 MiB, reserve,
 custody, closure and cleanup. This selector exports no `OXIDE_SCRATCH_ROOT`;
-the separate owned image stays under its existing custody rules. This ruling
+the separate owned image stays under its existing custody rules. Inherited
+`TMPDIR` fixtures stay outside the directory-budget pool on the same device;
+values under the pool are not valid, and the product's pool-membership refusal
+is never weakened. This ruling
 requires separate exact-head review and native activations; the blocked review
 at `8d030b2` and earlier proof packets remain historical with no native credit
 for the corrected head. The shorter supervisor prefix is tracked by papercut
