@@ -1934,7 +1934,7 @@ def detach_run(proof: Proof, repo: str, diagnostic: bool = False) -> None:
         ("readopt", (), case_readopt),
         ("refusals", (), case_refusals),
     ]
-    finish_fixture_cases(proof, pool, mount, cases, diagnostic)
+    finish_fixture_cases(proof, pool, mount, cases, diagnostic, "detach-permanent")
     proof.detach()
 
 
@@ -2263,7 +2263,7 @@ def auto_run(proof: Proof, repo: str, diagnostic: bool = False) -> None:
         ("failed_build", (), case_failed_build),
         ("shared_lifecycle", (), case_shared_lifecycle),
     ]
-    finish_fixture_cases(proof, pool, mount, cases, diagnostic)
+    finish_fixture_cases(proof, pool, mount, cases, diagnostic, "auto-adopt")
     proof.detach()
 
 
@@ -2832,7 +2832,7 @@ def ignore_run(proof: Proof, repo: str, diagnostic: bool = False) -> None:
         ("replay", (), case_replay),
         ("accepted_detach", (), case_accepted_detach),
     ]
-    finish_fixture_cases(proof, pool, mount, cases, diagnostic)
+    finish_fixture_cases(proof, pool, mount, cases, diagnostic, "ignore-safety")
     proof.detach()
 
 
@@ -3212,8 +3212,21 @@ def collect_cases(
 
 
 
-def finish_fixture_cases(proof: Proof, pool: str, mount: str, cases, diagnostic: bool) -> None:
+FIXTURE_GROUPS = {
+    "detach-permanent": ("detach_sequence", "readopt", "refusals"),
+    "auto-adopt": ("controls", "corrupt_receipt", "failed_build", "shared_lifecycle"),
+    "ignore-safety": ("directory_rules", "nested", "negated", "tracked", "unknown_git", "present_target", "replay", "accepted_detach"),
+}
+
+
+def validate_fixture_groups(mode: str, cases) -> None:
+    expect(tuple(case for case, _, _ in cases) == FIXTURE_GROUPS[mode], f"{mode}: case table drifted")
+    expect(all(callable(body) for _, _, body in cases), f"{mode}: a case body is not callable")
+
+
+def finish_fixture_cases(proof: Proof, pool: str, mount: str, cases, diagnostic: bool, mode: str) -> None:
     """Collect independent fixture groups without proceeding on unknown custody."""
+    validate_fixture_groups(mode, cases)
     collection = proof.collection
     if diagnostic:
         guard_writer_custody(proof)
@@ -3437,6 +3450,22 @@ def exec_self_test() -> None:
             pass
         else:
             fail("A2 accepted a never-converted fixture")
+
+    for mode, groups in FIXTURE_GROUPS.items():
+        table = [(name, (), lambda: None) for name in groups]
+        validate_fixture_groups(mode, table)
+        try:
+            validate_fixture_groups(mode, table[:-1])
+        except RuntimeError:
+            pass
+        else:
+            fail(f"{mode}: incomplete diagnostic table accepted")
+        try:
+            validate_fixture_groups(mode, [(groups[0], (), None)] + table[1:])
+        except RuntimeError:
+            pass
+        else:
+            fail(f"{mode}: unbound diagnostic body accepted")
 
     ran: list[str] = []
 
