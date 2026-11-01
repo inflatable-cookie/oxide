@@ -52,12 +52,9 @@ minimum_effigy_version = "0.14.0"
 # command of the qualified shared supervisor. A slot tree is renamed whole into
 # the payload's private holding area under the pool lock and deleted outside it,
 # with one durable row per held tree and a non-blocking per-entry custody lock.
-# `--root-parent /private/tmp` is the owner-accepted internal-placement
-# exception (decision bd357a4c): the fixture's own OXIDE_POOL is a genuine
-# internal `directory-budget-v1` pool, which the product correctly refuses on an
-# external volume. The cases are a 20,000-entry eviction with the product's own
-# recorded lock-held figure, a refused unknown entry type that keeps its row and
-# charge, a concurrent admission while a held tree is deleted, and a killed
+# Fixture pools use OXIDE_SCRATCH_ROOT under the supervisor's selected-volume
+# scratch, with explicit caps. The cases are a 20,000-entry eviction with the
+# product's recorded lock figure, a refused entry, concurrent admission, and a killed
 # deleter whose entry the next command finishes. 300 s, 512 MiB monitored
 # scratch. `--diagnostic` is the same guard, root and limits in keep-going mode
 # with a bounded `qualified: false` receipt; it is never a counted pass.
@@ -70,11 +67,11 @@ run = "python3 scripts/test-holding-delete.py --self-check"
 
 [tasks."rust:holding-delete"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-holding-delete.py"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-holding-delete.py"
 
 [tasks."rust:holding-delete:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-holding-delete.py --diagnostic"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-holding-delete.py --diagnostic"
 
 [test.suites.rust]
 run = "python3 scripts/bounded-test.py oxide test --workspace --all-targets --locked"

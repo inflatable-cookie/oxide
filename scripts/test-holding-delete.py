@@ -19,7 +19,7 @@ The subject is this HEAD's debug `oxide`, staged with plain Cargo `--offline`
 from the invoking Cargo home (target and build directories stay inside the
 monitored scratch and are deleted before any fixture). Every fixture tree has
 its own private `HOME`, `CARGO_HOME`, pool and crate, so nothing touches a
-live pool, `~/.local/bin/oxide`, a mounted volume or host settings.
+live pool, `~/.local/bin/oxide` or host settings; fixture pools use the selected scratch volume.
 
 Cases:
 
@@ -184,8 +184,8 @@ PREMISE_CHECKLIST = {
         "run `oxide run`/`oxide test` and the staged candidate's own commands only"
     ),
     "6_owned_images": (
-        "not applicable: the fixture is an internal directory-budget pool, with no "
-        "sparse image, attach, mount or removable device anywhere in the script"
+        "not applicable: the fixture is a scratch directory-budget pool, with no "
+        "sparse image or attach in the script; the selected scratch volume may be removable"
     ),
     "7_compiler_flags": (
         "stage_subject() freezes RUSTFLAGS=-C strip=symbols with assertion-on, "
@@ -193,11 +193,10 @@ PREMISE_CHECKLIST = {
         "an inherited encoded value cannot override the staged candidate"
     ),
     "8_temporary_storage": (
-        "the selector's fixed COMMAND runs the qualified shared supervisor with "
-        "--root-parent /private/tmp (the owner-accepted internal-placement exception "
-        "bd357a4c, which the fixture's genuine internal directory-budget pool needs), "
-        "every case root comes from an explicit path under that parent, and "
-        "fixture_env() gives each fixture tree its own TMPDIR/TMP/TEMP inside it"
+        "the supervisor selects its default scratch volume; run_cases() creates a private "
+        "scratch-pools directory under OXIDE_TASK_SCRATCH_ROOT, and fixture_env() "
+        "passes it as OXIDE_SCRATCH_ROOT with explicit OXIDE_POOL_CAP. Every case "
+        "and pool is inside that directory; TMPDIR/TMP/TEMP are private per case"
     ),
     "9_macos_mktemp": (
         "the script never runs a shell `mktemp`; self_check() creates its two "
@@ -209,8 +208,6 @@ NA_PREMISES = ("4_automatic_adoption", "5_cargo_external_argv", "6_owned_images"
 COMMAND = [
     "python3",
     "scripts/bounded-test.py",
-    "--root-parent",
-    "/private/tmp",
     "--limit",
     str(WALL_LIMIT_S),
     "--scratch-budget-mib",
@@ -219,11 +216,6 @@ COMMAND = [
     "python3",
     "scripts/test-holding-delete.py",
 ]
-# The root the fixture's genuine internal directory-budget pool needs (the
-# owner-accepted internal-placement exception bd357a4c). The fixed command, the
-# plan, the receipt and `effigy.toml`'s selector all carry it, and the pure
-# self-check binds the three records together.
-ROOT_PARENT = "/private/tmp"
 USAGE = """usage: test-holding-delete.py [--plan | --self-check | --diagnostic | --help]
 
 Without an argument this runs the counted proof under the qualified shared
@@ -587,7 +579,7 @@ def plan_document() -> dict:
             "separately owner-gated activations, so this plan claims none of them",
         },
         "live_pool": False,
-        "mounted_volume": False,
+        "mounted_volume": "selected scratch volume",
         "timing": "unmeasured; this plan claims no wall-clock figure",
     }
 
@@ -1321,6 +1313,7 @@ def fixture_env(root: str, pool: str, lock_log: str, cap: str = POOL_CAP) -> dic
         "TMPDIR": root,
         "TMP": root,
         "TEMP": root,
+        "OXIDE_SCRATCH_ROOT": os.path.join(os.environ["OXIDE_TASK_SCRATCH_ROOT"], "scratch-pools"),
         "OXIDE_POOL": pool,
         "OXIDE_POOL_CAP": cap,
         "OXIDE_TEST_HOLDING_LOCK_LOG": lock_log,
@@ -2201,7 +2194,7 @@ def run_cases() -> None:
         ("killed-deleter-takeover", prove_killed_deleter_takeover),
     ]
     FACTS.update(
-        collect(cases, os.environ["OXIDE_TASK_SCRATCH_ROOT"], DIAGNOSTIC)
+        collect(cases, private_dir(os.path.join(os.environ["OXIDE_TASK_SCRATCH_ROOT"], "scratch-pools")), DIAGNOSTIC)
     )
 
 
@@ -2241,10 +2234,6 @@ def main(argv: list[str]) -> int:
         "OXIDE_TASK_SCRATCH_ROOT is not set"
     )
     scratch = os.path.abspath(scratch)
-    expect(
-        scratch.startswith("/private/tmp/") or scratch.startswith("/tmp/"),
-        f"scratch root {scratch} is not a private temporary directory",
-    )
     expect(os.path.isdir(scratch), f"scratch root {scratch} is not a directory")
     print(
         f"host: project={git('remote', 'get-url', 'origin')} commit={commit} "
@@ -2362,7 +2351,7 @@ def main(argv: list[str]) -> int:
         "The guard's own receipt, the caller's exit and the session closure "
         "remain separately authoritative.",
         "live_pool": False,
-        "mounted_volume": False,
+        "mounted_volume": "selected scratch volume",
         "result": "pass" if not DIAGNOSTIC and fault is None else "unqualified",
     }
     path = write_receipt(receipt, scratch)
