@@ -6349,3 +6349,47 @@ Approved design direction (Tom, 2026-10-20). Not implemented. It applies to buil
   Q2–Q4 held on Oxide's own repository in the partial
   [foundation qualification](#qualification-result) record; a heavy-project benefit
   reading remains a separate stage.
+
+### Foreign churn in the supervisor census (design investigation)
+
+A PID is not an identity: the census identifies an occupant by `(pid, start)`.
+A successful safe reread showing no row or a different start proves only that
+ the old identity is absent at that observation. It does not establish the
+replacement's session or prove the PID stays empty. A failed or malformed
+read establishes neither absence nor a foreign occupant. A successful getsid
+sandwiched between matching identity reads binds that session observation to
+that identity; it cannot bind an observation across PID reuse. Start-token
+ordering, a readable foreign parent, and exiting or zombie state alone do not
+establish foreignness.
+
+The current ESRCH path can drop the old tracked identity when confirmation or
+its final reread proves absence; a replacement is not classified by inference.
+The ordinary successful-getsid path retains a tracked old identity or marks an
+untracked changed identity uncertain. The next snapshot can classify a new
+occupant, but a replacement observed after the snapshot must not be silently
+omitted from a deciding empty round. A candidate correction must explicitly
+account for that interleaving; merely dropping the old identity on a changed
+reread is insufficient. Any bounded retry that cannot classify each observed
+replacement must leave the round uncertain. A later clean snapshot is a new
+observation, not proof that an earlier unknown was foreign.
+
+| Observation | Defensible result |
+| --- | --- |
+| Same identity, bound leader session | Member, retain tracking, even in another group. |
+| Same untracked identity, bound other session | Foreign under the existing ordinary rule. |
+| Tracked identity, contradictory or unreadable session | Keep attribution; no foreign inference. |
+| ESRCH, same identity or failed reread | Existing terminal rule if all its strict premises hold; otherwise tracked member or uncertain. |
+| ESRCH, safe reread absent or replaced | Old identity absent at reread; replacement remains unclassified. |
+| Successful getsid, changed identity | The session belongs to neither identity with certainty; retain tracked old attribution or mark uncertain. |
+| Reused parent, orphan, unreadable identity or session | No launcher exclusion without its exact structural proof; use ordinary conservative classification. |
+
+Counterexamples to test include replacement after an ESRCH confirmation but
+before the final decision, repeated PID reuse between each bounded reread,
+parent reuse between sibling observations, a same-session different-group
+member, and a tracked identity whose later session appears foreign. A joined
+census thread, the final and named certain-empty census messages, pipe EOF and
+identity-bound custody remain independent closure requirements; no proposed
+classification grants signal authority. Zombie terminal treatment retains its
+existing allowlist and full paired-read requirements, not a generic exiting
+shortcut. These observations are a design investigation, not an implemented or
+qualified change.
