@@ -204,7 +204,7 @@ pub(crate) fn evaluate(settings: &Settings, status: bool) -> Result<Option<Strin
         binding: binding.fact(),
         record: record.fact(),
         pool_exists: exists,
-        incomplete: exists && !pool.join("config.json").is_file(),
+        incomplete: incomplete_pool(pool, exists),
         record_write_failed_after_creation: false,
         status,
     });
@@ -215,6 +215,11 @@ pub(crate) fn evaluate(settings: &Settings, status: bool) -> Result<Option<Strin
             Err(refusal(r, pool, status))
         }
     }
+}
+
+/// Derive row 20 from the real leaf and pool configuration on every open.
+fn incomplete_pool(pool: &Path, exists: bool) -> bool {
+    exists && !pool.join("config.json").is_file()
 }
 
 /// Publish a bounded private identity document without exposing partial bytes.
@@ -444,6 +449,78 @@ mod tests {
             fs::read(pool.join("oxide-managed/scratch.json")).unwrap(),
             b"foreign"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepared_leaf_retry_refuses_incomplete_without_writes() {
+        let root = fixture();
+        let pool = root.join("pool");
+        let uuid = "fixture-volume";
+        let binding = identity_bytes(&pool, &root, &root, uuid, "oxide.scratch-pool/1").unwrap();
+        let leaf = prepared(&pool, &binding);
+        assert!(oxide_storage::lease::managed::init_scratch_pool(&leaf, &binding, 0).is_err());
+        assert!(!pool.join("config.json").exists());
+        let binding_path = pool.join("oxide-managed/scratch.json");
+        let before = fs::read(&binding_path).unwrap();
+        let pool_meta = fs::metadata(&pool).unwrap();
+        let binding_meta = fs::metadata(&binding_path).unwrap();
+        let document = read_document(&binding_path, 16384);
+        let facts = admission::Facts {
+            ordinary: Err(PathRefusal::ExternalVolume {
+                message: "external".into(),
+                canonical: root.clone(),
+            }),
+            declared_non_boot_mount: false,
+            git_recheck: (root.clone(), Ok(())),
+            declaration: Some(root.clone()),
+            source: config::Source::Environment("OXIDE_POOL"),
+            budget_source: config::Source::Environment("OXIDE_POOL_CAP"),
+            pool: pool.clone(),
+            root_safe: true,
+            parent_exists: true,
+            volume_present: true,
+            volume_verified: true,
+            volume_uuid: uuid.into(),
+            mount_point: root.clone(),
+            binding: document.fact(),
+            record: admission::Document::Missing,
+            pool_exists: fs::symlink_metadata(&pool).is_ok(),
+            incomplete: incomplete_pool(&pool, fs::symlink_metadata(&pool).is_ok()),
+            record_write_failed_after_creation: false,
+            status: false,
+        };
+        let Decision::Refuse(reason) = admission::decide(facts) else {
+            panic!("retry must refuse")
+        };
+        let message = refusal(reason, &pool, false);
+        assert!(message.contains("scratch-incomplete") && message.contains("operator cleanup"));
+        assert!(message.contains(&pool.display().to_string()));
+        assert_eq!(fs::read(&binding_path).unwrap(), before);
+        let after_pool = fs::metadata(&pool).unwrap();
+        let after_binding = fs::metadata(&binding_path).unwrap();
+        assert_eq!(
+            (pool_meta.ino(), pool_meta.mtime(), pool_meta.mtime_nsec()),
+            (
+                after_pool.ino(),
+                after_pool.mtime(),
+                after_pool.mtime_nsec()
+            )
+        );
+        assert_eq!(
+            (
+                binding_meta.ino(),
+                binding_meta.mtime(),
+                binding_meta.mtime_nsec()
+            ),
+            (
+                after_binding.ino(),
+                after_binding.mtime(),
+                after_binding.mtime_nsec()
+            )
+        );
+        assert_eq!(fs::read_dir(&pool).unwrap().count(), 1);
+        assert!(!pool.join("config.json").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
