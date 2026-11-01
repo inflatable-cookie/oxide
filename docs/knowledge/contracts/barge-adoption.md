@@ -1,9 +1,18 @@
 # Barge adoption: Oxide's output roots and the release prune
 
-**Status: proposed design, not frozen.** This contract covers stage 4 `F6` and
-the Oxide part of stage 1 `S8` in Barge. It is design only. It changes no code,
-selector, host job, install, Builds registration or real data. Until a slice
-here lands, `oxide outputs prune` stays the authority for Oxide's output roots.
+**Status (2026-11-01): design frozen; `O1` landed (oxide#219).** Tom's F6
+decisions (`8058e38a`, with Q-A to Q-H answered in `12729764` and Q-D in
+`55636dc8`) freeze this design. Oxide's library pin and offline seeding are in
+place under [D1](#d1-integration-surface-rust-library-at-a-pinned-commit) and the
+[landed O1 note](#d1-integration-surface-rust-library-at-a-pinned-commit). Later
+slices (`O2`, `O3`, `O4`, `S8-*`) are not landed. No output placement, prune,
+admission, host job, install or Builds registration has changed.
+
+The text below is the pre-freeze proposal. Its "proposed design" and "changes
+no code" statements describe the 2026-11-01 proposal only and are kept as dated
+evidence. Where a later slice lands, its own note in this file is the current
+truth. Until `O3` lands, `oxide outputs prune` stays the authority for Oxide's
+output roots.
 
 The contract decides how Oxide uses Barge, which Oxide areas Barge declares,
 how the prune switches to Barge's release gate, what happens to the 91 legacy
