@@ -1041,60 +1041,94 @@ fn check_size(bytes: u64) -> Result<u64, String> {
     }
 }
 
-/// Refuse a pool path inside a Git work tree or on a mounted external
-/// volume (`/Volumes/...`, where a removable volume is registered), after
-/// resolving symlinks in its nearest existing ancestor. Unknown refuses.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PathRefusal {
+    Traversal(String),
+    Ancestor(String),
+    ExternalVolume { message: String, canonical: PathBuf },
+    GitWorkTree(String),
+}
+
+impl PathRefusal {
+    pub(crate) fn message(self) -> String {
+        match self {
+            Self::Traversal(message)
+            | Self::Ancestor(message)
+            | Self::GitWorkTree(message)
+            | Self::ExternalVolume { message, .. } => message,
+        }
+    }
+}
+
+/// Refuse unsafe paths, preserving the ordinary admission messages and order.
 pub fn refuse_unsafe_pool_path(path: &Path) -> Result<(), String> {
+    judge_pool_path(path).map_err(PathRefusal::message)
+}
+
+pub(crate) fn judge_pool_path(path: &Path) -> Result<(), PathRefusal> {
     // `..` after a missing component would resolve only once the missing
     // parents exist, past this check: refuse it outright.
     if path
         .components()
         .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
     {
-        return Err(format!(
+        return Err(PathRefusal::Traversal(format!(
             "the pool path {} must not contain . or .. components",
             path.display()
-        ));
+        )));
     }
     let mut existing = path;
     while fs::symlink_metadata(existing).is_err() {
-        existing = existing
-            .parent()
-            .ok_or_else(|| format!("the pool path {} has no existing ancestor", path.display()))?;
+        existing = existing.parent().ok_or_else(|| {
+            PathRefusal::Ancestor(format!(
+                "the pool path {} has no existing ancestor",
+                path.display()
+            ))
+        })?;
     }
-    let canonical = fs::canonicalize(existing)
-        .map_err(|error| format!("cannot resolve the pool path {}: {error}", path.display()))?;
+    let canonical = fs::canonicalize(existing).map_err(|error| {
+        PathRefusal::Ancestor(format!(
+            "cannot resolve the pool path {}: {error}",
+            path.display()
+        ))
+    })?;
     if canonical.starts_with("/Volumes") {
-        return Err(format!(
+        return Err(PathRefusal::ExternalVolume { message: format!(
             "the pool path {} is on an external volume ({}); a removable volume is registered with `oxide pool register-removable`, not used as the internal pool",
-            path.display(),
-            canonical.display()
-        ));
+            path.display(), canonical.display()
+        ), canonical });
     }
-    if let Some(mount) = mount_point(&canonical)? {
+    if let Some(mount) = mount_point(&canonical).map_err(PathRefusal::Ancestor)? {
         if mount.starts_with("/Volumes") {
-            return Err(format!(
-                "the pool path {} is on the external volume mounted at {}",
-                path.display(),
-                mount.display()
-            ));
+            return Err(PathRefusal::ExternalVolume {
+                message: format!(
+                    "the pool path {} is on the external volume mounted at {}",
+                    path.display(),
+                    mount.display()
+                ),
+                canonical,
+            });
         }
     }
+    judge_git_work_tree(path, &canonical)
+}
+
+pub(crate) fn judge_git_work_tree(path: &Path, canonical: &Path) -> Result<(), PathRefusal> {
     for ancestor in canonical.ancestors() {
         match fs::symlink_metadata(ancestor.join(".git")) {
             Ok(_) => {
-                return Err(format!(
+                return Err(PathRefusal::GitWorkTree(format!(
                     "the pool path {} is inside the Git work tree {}; choose a path outside any repository",
                     path.display(),
                     ancestor.display()
-                ))
+                )))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                return Err(format!(
+                return Err(PathRefusal::GitWorkTree(format!(
                     "cannot check {} for a Git work tree: {error}",
                     ancestor.display()
-                ))
+                )))
             }
         }
     }
@@ -2228,7 +2262,17 @@ mod tests {
         let scratch = Scratch::new("git");
         let repo = scratch.0.join("repo");
         fs::create_dir_all(repo.join(".git")).expect("repo");
-        assert!(refuse_unsafe_pool_path(&repo.join("pool")).is_err());
+        let pool = repo.join("pool");
+        let git_message = format!(
+            "the pool path {} is inside the Git work tree {}; choose a path outside any repository",
+            pool.display(),
+            fs::canonicalize(&repo).unwrap().display()
+        );
+        assert_eq!(refuse_unsafe_pool_path(&pool), Err(git_message.clone()));
+        assert_eq!(
+            judge_pool_path(&pool),
+            Err(PathRefusal::GitWorkTree(git_message))
+        );
         assert!(refuse_unsafe_pool_path(&repo.join("deep/missing/pool")).is_err());
         let alias = scratch.0.join("alias");
         std::os::unix::fs::symlink(&repo, &alias).expect("alias");

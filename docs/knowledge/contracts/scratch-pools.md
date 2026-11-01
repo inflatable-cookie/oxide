@@ -1,11 +1,12 @@
 # Scratch build pools on an external validation volume (proposed design)
 
-**Status: proposed design, design-only.** This contract records a design for an
-explicit, UUID-bound `directory-budget-v1` "scratch pool" on a verified external
+**Status: S1 implemented; later slices remain proposed.** This contract records
+a design for an explicit, UUID-bound `directory-budget-v1` "scratch pool" on a verified external
 volume, so validation and proof fixtures can keep their scratch on the Builds
 drive instead of declaring the internal-root exception (decision `bd357a4c`) for
-`/private/tmp`. Nothing here is implemented: no code, selector, recipe, host
-setting, real pool or native run exists, and the internal-root exception stays
+`/private/tmp`. S1 adds typed path judgement and an unreachable pure scratch
+admission decision. No scratch branch is wired, and no selector, recipe, host
+setting, real pool or native run exists. The internal-root exception stays
 current truth until each slice below lands and passes its own review. Oxide#173.
 
 Owning neighbours: [workflow](workflow.md#temporary-scratch-placement) owns
@@ -219,9 +220,10 @@ provenance.
 
 ## Refusal matrix
 
-Every row refuses before any create, write, lock, walk or child. Each row names
-its refusal class and has one unit case; rows 6–8 and 11–12 deliberately share
-a class.
+Every admission row refuses before any create, write, lock, walk or child; row 18
+is the one creation-phase failure, compensated as described. Each row names its
+refusal class and has one unit case; rows 6–8 and 11–12 deliberately share a
+class.
 
 | # | Condition | Class |
 | --- | --- | --- |
