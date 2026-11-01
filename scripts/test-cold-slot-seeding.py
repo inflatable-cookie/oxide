@@ -3365,7 +3365,8 @@ def self_test() -> None:
                                            cargo_home=base, rustup=base)
         with patch.dict(globals(), {"fixture_dir": lambda parent, name: os.path.join(parent, name)}):
             fixture = Case(fake_proof, "pin")
-        fixture_env = fixture.env()
+        with patch.dict(os.environ, {"OXIDE_TASK_SCRATCH_ROOT": base}):
+            fixture_env = fixture.env()
         expect(os.path.dirname(fixture.root) == base, "case escaped scratch pool root")
         expect(fixture.pool == os.path.join(fixture.root, "pool"), "pool placement drifted")
         expect(fixture_env["OXIDE_SCRATCH_ROOT"] == base, "scratch declaration drifted")
