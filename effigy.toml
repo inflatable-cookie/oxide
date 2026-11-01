@@ -93,7 +93,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 
 # Installed-binary hand-off (oxide#122): one author proof, one fixed script
 # and the whole command under the qualified shared supervisor, within the
-# approved 120 s / 128 MiB bounds (decision 49f52581). Inside that scratch it stages this HEAD's
+# approved 300 s / 128 MiB bounds (decisions 3017bcb3 and 49f52581). Inside that scratch it stages this HEAD's
 # debug `oxide` with plain Cargo offline and 1.97.1 (-j1, one codegen unit,
 # debug-free, symbol-stripped, size-optimised), deletes the staged target,
 # then runs private HOME, receipt and scratch-pool fixtures on the selected
@@ -106,11 +106,11 @@ run = "python3 scripts/test-installed-handoff.py --self-check"
 
 [tasks."rust:installed-handoff"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 120 --scratch-budget-mib 128 -- python3 scripts/test-installed-handoff.py"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 128 -- python3 scripts/test-installed-handoff.py"
 
 [tasks."rust:installed-handoff:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 120 --scratch-budget-mib 128 -- python3 scripts/test-installed-handoff.py --diagnostic"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 128 -- python3 scripts/test-installed-handoff.py --diagnostic"
 
 [tasks."proof:installed-handoff:plan"]
 run = "python3 scripts/test-installed-handoff.py --plan"

@@ -498,7 +498,7 @@ stand at this head:
 
 | Selector | Limit / scratch | `:diagnostic` twin | Effect-free pre-native check |
 | --- | --- | --- | --- |
-| `rust:installed-handoff` | 120 s / 128 MiB | yes | `proof:installed-handoff:test`, `proof:installed-handoff:plan`, and `HandoffSelectorTests` |
+| `rust:installed-handoff` | 300 s / 128 MiB | yes | `proof:installed-handoff:test`, `proof:installed-handoff:plan`, and `HandoffSelectorTests` |
 | `rust:profile-outputs` | 600 s / 512 MiB | yes | `--plan` |
 | `rust:pool-temp-scratch` | 300 s / 512 MiB | yes | `proof:pool-temp:test`, `--plan` |
 | `rust:recorded-slot-accounting` | 300 s / 512 MiB | yes | `proof:recorded-slot-accounting:test`, `--plan` |

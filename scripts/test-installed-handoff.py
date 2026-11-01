@@ -2,7 +2,7 @@
 """Focused installed-binary hand-off proof for oxide#122.
 
 One fixed script and whole command under the qualified shared supervisor
-(`bounded-test.py`): the brief's 120 s wall limit and 128 MiB monitored scratch
+(`bounded-test.py`): the brief's 300 s wall limit and 128 MiB monitored scratch
 budget including cleanup. It stages this clean HEAD's debug `oxide` itself with
 plain Cargo and the pinned 1.97.1, offline, into its own scratch target, copies
 the binary and deletes the target before the fixtures. Only private scratch
@@ -1068,7 +1068,7 @@ def main() -> int:
         print("installed-handoff groups: " + ", ".join(name for name, _ in GROUPS))
         for name in CASE_PLAN:
             print("  " + name)
-        print("supervisor bounds: 120 s, 128 MiB scratch")
+        print("supervisor bounds: 300 s, 128 MiB scratch")
         return 0
     if mode == "self-check":
         return self_check()

@@ -1730,8 +1730,10 @@ necessary.
   exclusion.
 - **Proof.** `effigy rust:installed-handoff` (heavy) is one fixed script and
   whole command: `bounded-test.py` around `scripts/test-installed-handoff.py`
-  with a 120 s wall limit and 128 MiB monitored scratch (decision 49f52581;
-  the earlier 64 MiB diagnostic faulted at 64.4 MiB and is unqualified). The supervisor's
+  with a 300 s wall limit and 128 MiB monitored scratch (decisions 3017bcb3
+  and 49f52581). The earlier 120 s diagnostic reached its work deadline at
+  100 s and the earlier 64 MiB diagnostic faulted at 64.4 MiB; neither has
+  qualification credit. The supervisor's
   selected-volume root on Builds holds all fixtures; each product child declares
   that scratch root and an explicit pool cap. A `/private/tmp` fallback uses
   the internal path where the declaration is inert, so it is not scratch-pool
