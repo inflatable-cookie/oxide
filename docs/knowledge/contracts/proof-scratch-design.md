@@ -138,6 +138,43 @@ This table supplements, rather than completes, the consumer inventory. A full
 audit must also classify every environment gate and source pin before changing
 any consumer.
 
+### Consumer and pin audit at planning base `bd89999`
+
+The explicit runner digest checks at this base are catalogued by the
+[replacement-census contract](workflow.md#shared-proof-supervisor):
+`test-command-budgets.py`, `test-holding-delete.py`,
+`test-outputs-prune.py`, `test-recorded-slot-accounting.py` and
+`test-slot-headroom.py` name `fcfda2b0…`; `test-accounting-guards.py`
+and `test-status-fast.py` name `d89115f1…`;
+`test-accounting-vanished.py`, `test-storage-layout.py` and
+`test-max-active.py` name `8e379c93…`. These are individual source
+requirements, not permission to update the constants. Historical declarations
+in scripts, `effigy.toml`, AGENTS and workflow can describe different
+receipts; distinguish an assertion against running bytes from historical text.
+The #227 review records the then-qualified `fcfda2b0…` bytes; #197's
+controlling native chain is bound to `c1c4446` and its recorded
+text-only successors, while #192's chain is bound to `a19fb6c` and its
+specified documentation-only successor. The older #151 `bc24b238…` receipts
+remain evidence of their own bytes. None automatically qualifies the
+post-#233 runner or a new layout. The current checked-out source, the
+deployed selector command, and a historical receipt are separate facts.
+
+| Consumer class | Source and constraint to preserve |
+| --- | --- |
+| Shared Rust arming and callers | `src/supervisor.rs`, `src/proof.rs`, `src/bin/oxide/admission.rs`, `src/owned_delete_hook.rs`, `src/lease/seed/mod.rs`, `src/bin/oxide/{prune,store,seed_plan}.rs`: arming controls admission reports and proof hooks, while each hook retains its own additional scope. Tests in the shared module and admission exercise nested and sibling cases. |
+| Independent Rust gates | `config.rs`, `store.rs`, and `inventory.rs` have the independent restrictions above; do not replace them with mere receipt presence. `prune.rs`, `one_use.rs`, `lease/pool.rs`, `handoff.rs` and `adopt.rs` also use scratch containment for their own test or product controls. Their path boundaries are not blanket proof-root authority. |
+| Scratch and evidence pass-through | `offline_seed.py`, `test-storage-inventory-cli.py`, `test-oxide-cli.py`, `test-status-fast.py`, `test-holding-delete.py`, `test-pool-describe.py`, `test-oxide-wrapper-bypass.py`, `test-installed-handoff.py`, `test-scratch-pool.py`, `test-front-door-accounting.py`, `test-cold-slot-seeding.py` and `test-finder-metadata-race.py` use reported paths, create fixtures under scratch, write evidence, or pass controls into isolated children. Existing canonicality, containment, deadline and digest checks remain effective even where no component spelling is inferred. |
+| Guard-presence and temp equality | `test-drive-mode.py`, `test-everyday-cli.py`, `test-init-guidance.py`, `test-freshness-submodules.py`, `test-oxide-pool-layout.py`, `test-oxide-removable-removal.py`, `test-permanent-outputs.py`, `test-profile-outputs.py`, `test-seed-default-off.py`, `test-storage-layout.py`, `test-max-active.py`, `test-slot-headroom.py` and `test-oxide-removable-pool.py` check or propagate scratch/evidence/deadline and, where applicable, temp equality or image custody. Do not convert a presence check into an assertion of provenance. |
+| Synthetic and historical references | `test_supervisor.py`, `test_dogfood_scripts.py`, `test_build_context_comparison.py`, `test-cargo-profiles.py` and the pure seams of the named consumers contain fixture paths or old topology controls. Retain counterfactuals deliberately; change an assertion only when its meaning changes. AGENTS and workflow describe deployed and historical behaviour, not a command to rewrite old receipts. |
+| Qualified bootstrap and route ownership | `qualify-supervisor.py::topology` independently compares suite record, expected selected parent and device; `bounded-test.py` owns selected/fallback routing, receipt, sweep and marker. `rust-test-600.py` owns its two explicitly created roots and passes adopted scratch; it does not own the inherited environment parent. |
+
+The review of #227 at `a52e487` (comment `6565393813`) independently
+confirmed the #196 retained report: a recursive removal was attempted against
+an inherited per-user temporary parent and stopped on a permission error; the
+extent is unknown. That review establishes neither the exact command nor
+supervisor attribution. The source audit here does not inspect or repair the
+live parent.
+
 ### Deletion mechanism: current no-go
 
 The current `scripts/bounded-test.py::empty_directory_entries` opens
