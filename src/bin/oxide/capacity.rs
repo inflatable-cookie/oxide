@@ -103,6 +103,10 @@ fn injected_value() -> Option<String> {
 }
 
 fn answer_with(path: &Path, injected: Option<&str>) -> Answer {
+    // Release builds never read the injection; the parameter stays in the
+    // signature so one call shape serves both profiles.
+    #[cfg(not(debug_assertions))]
+    let _ = injected;
     #[cfg(debug_assertions)]
     if let Some(injected) = injected {
         if let Some(answer) = injected_answer(injected) {

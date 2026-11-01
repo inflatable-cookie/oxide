@@ -309,7 +309,7 @@ pub(super) fn derive<R: Read>(
     if !buffered.buffer().is_empty() {
         return Err(Refusal::ArchiveGrammar("member"));
     }
-    let mut inner = buffered.into_inner();
+    let inner = buffered.into_inner();
     loop {
         if Instant::now() > deadline {
             return Err(Refusal::Deadline);

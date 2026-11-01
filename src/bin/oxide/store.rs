@@ -1383,6 +1383,9 @@ fn source_identity_matches(
 pub(crate) enum SeedRun {
     Skipped(&'static str),
     Seeded(
+        /// The transaction's own receipt. The command logs the `last`
+        /// document and ignores this one; the seed-outcome regression reads it.
+        #[allow(dead_code)]
         oxide_storage::lease::managed::SeedReceipt,
         oxide_storage::lease::managed::SeedLast,
     ),

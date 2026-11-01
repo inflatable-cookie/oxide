@@ -354,6 +354,7 @@ struct VerifiedEntry {
     inode: u64,
     size: u64,
     /// 1-based position in this round's verified list, for the test seams.
+    #[cfg(test)]
     ordinal: u32,
 }
 
@@ -1274,6 +1275,7 @@ fn drain_finder_metadata(
                 device: identity.0,
                 inode: identity.1,
                 size: identity.2,
+                #[cfg(test)]
                 ordinal: u32::try_from(verified.len() + 1).unwrap_or(u32::MAX),
             }),
             Ok(None) => {

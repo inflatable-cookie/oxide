@@ -2,9 +2,13 @@
 
 use super::backing::BackingPaths;
 use super::slice::{
-    AdmissionClass, MemberPair, MemberSet, OneUseSlice, RestoreOutcome, SliceAdmission,
-    SliceReport, VictimPolicy,
+    AdmissionClass, MemberPair, OneUseSlice, RestoreOutcome, SliceAdmission, SliceReport,
+    VictimPolicy,
 };
+// Only the admission-policy tests build a `MemberSet` here; release code reaches
+// one through `LeaseRequest`.
+#[cfg(test)]
+use super::slice::MemberSet;
 use super::{
     canonical_existing_dir, current_uid, ensure_private_dir, io_error, is_finder_metadata,
     is_tolerated_metadata_file, open_verified_directory, persist_private_file, random_hex,
@@ -15,8 +19,8 @@ use super::{
     UnmeasuredSlot, ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES,
     CAPACITY_POLICY_VERSION, CONFIG_NAME, LEASE_VERSION, LEDGER_NAME,
     LEGACY_CAPACITY_POLICY_VERSION, LEGACY_MAX_SLOTS, LOCK_NAME, MAX_HOLDER_BYTES,
-    MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_REFUSAL_SLOTS, MAX_SLOTS,
-    PREVIOUS_CAPACITY_POLICY_VERSION, RAISED_CAPACITY_POLICY_VERSION, SLOTS_NAME,
+    MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS, PREVIOUS_CAPACITY_POLICY_VERSION,
+    RAISED_CAPACITY_POLICY_VERSION, SLOTS_NAME,
 };
 use super::{BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1};
 use crate::inventory::{
@@ -190,11 +194,14 @@ fn choose_folder(
 
 /// One member pair verified against this pool's ledger under the pool lock
 /// (design §6.2). The pair is kept exactly as the front door named it so set
-/// membership stays a literal comparison with the ledger row.
+/// membership stays a literal comparison with the ledger row; only the
+/// admission-policy tests read it back (release code compares the ledger row's
+/// own `id`/`incarnation`).
 #[derive(Clone, Debug)]
 struct VerifiedMember {
     id: u64,
     incarnation: u64,
+    #[cfg(test)]
     pair: MemberPair,
 }
 
@@ -492,8 +499,6 @@ pub(super) struct SeedSlotView {
 /// The pool and ledger facts call 1 and call 2 may read.
 pub(super) struct SeedPoolView {
     pub(super) store_id: String,
-    /// The recorded backend: `directory-budget-v1` or `apfs-volume-v1`.
-    pub(super) backend: String,
     pub(super) pool_root: PathBuf,
     /// The payload root. Call 1 and the sidecar writers need no payload, so
     /// their seam leaves this `None` and opens no volume; call 2 uses
@@ -606,7 +611,6 @@ fn open_seed_inner(root: &Path, with_payload: bool) -> Result<SeedPoolOpen, Leas
         _lock: lock,
         view: SeedPoolView {
             store_id: config.store_id.clone(),
-            backend: config.backend.clone(),
             pool_root: root,
             payload_root,
             slots: ledger
@@ -2071,6 +2075,7 @@ impl Pool {
         Some(VerifiedMember {
             id: slot.id,
             incarnation: slot.incarnation,
+            #[cfg(test)]
             pair: pair.clone(),
         })
     }
@@ -3189,7 +3194,8 @@ impl Pool {
     /// The capacity refusal after eviction could not bring the pool under
     /// budget. With no unmeasured slot it is the shipped [`LeaseError::Full`];
     /// otherwise a bounded capacity reason names the slots a partial walk
-    /// charged conservatively, at most [`MAX_REFUSAL_SLOTS`] IDs and a count.
+    /// charged conservatively, at most [`super::MAX_REFUSAL_SLOTS`] IDs and a
+    /// count.
     fn capacity_refusal(&self, measured: u64) -> LeaseError {
         if self.unmeasured.is_empty() {
             return LeaseError::Full;

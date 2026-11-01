@@ -87,9 +87,9 @@ pub struct WalkOutcome {
 /// seeding on any gap.
 ///
 /// This path-based entry exists for direct root-failure regressions. The
-/// seeding call walks [`walk_slot_in`], from the slot descriptor it already
-/// verified, so no path component can be redirected between the check and the
-/// walk.
+/// seeding call walks [`walk_slot_in_monitored`], from the slot descriptor it
+/// already verified, so no path component can be redirected between the check
+/// and the walk.
 #[cfg(test)]
 pub fn walk_slot(root: &Path, device: u64, limits: WalkLimits, started: Instant) -> WalkOutcome {
     match open_root(root) {
@@ -106,6 +106,7 @@ pub fn walk_slot(root: &Path, device: u64, limits: WalkLimits, started: Instant)
 
 /// Walk an already-open slot root. The descriptor is the one custody verified,
 /// so the walk cannot be redirected to another directory by a path change.
+#[cfg(test)]
 pub fn walk_slot_in(
     root: BorrowedFd<'_>,
     device: u64,

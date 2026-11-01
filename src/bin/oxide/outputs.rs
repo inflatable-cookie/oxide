@@ -87,8 +87,10 @@ const MAX_ROOTS: usize = 8;
 /// Cooperative holders named in a plan.
 const MAX_HOLDERS: usize = 16;
 /// Debug-only crash injection, naming a write-ahead point.
+#[cfg(debug_assertions)]
 const CRASH_ENVIRONMENT: &str = "OXIDE_TEST_OUTPUTS_CRASH";
 /// Debug-only rollback oracle for an uncommitted layout migration.
+#[cfg(debug_assertions)]
 const ROLLBACK_ENVIRONMENT: &str = "OXIDE_TEST_MIGRATION_ROLLBACK";
 /// Siblings of `<checkout>/target` that a layout migration owns.
 const STAGE_PREFIX: &str = ".target.oxide-new-";

@@ -1628,7 +1628,8 @@ fn bound_utf8(text: String, limit: usize) -> Rendered {
 
 /// Debug builds only, absent from release: walk observation and deterministic
 /// mutation fixtures. Production accounting is unchanged unless a debug
-/// fixture explicitly opts in through its bounded scratch environment.#[cfg(debug_assertions)]
+/// fixture explicitly opts in through its bounded scratch environment.
+#[cfg(debug_assertions)]
 pub mod walk_observer {
     use super::WalkPoint;
     use serde::Deserialize;

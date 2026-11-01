@@ -986,7 +986,8 @@ fn read_private_file_bounded(path: &Path, max: u64) -> Result<Vec<u8>, LeaseErro
 /// preserving every other field, so a locked [`pool::Pool::open`] can raise
 /// the fence before it reconciles a recorded deletion. `src/bin/oxide/store.rs`
 /// owns the same values; its constants alias these so the two writers cannot
-/// drift.
+/// drift. A document at version 6 or later carries `CONTROL_ONE_USE_FENCE`;
+/// a document at [`CONTROL_FENCE_VERSION`] takes every fence.
 pub const CONTROL_FENCE_VERSION: u32 = 9;
 pub const CONTROL_RECORDED_ACCOUNTING_FENCE: &str = "oxide.accounting/1";
 pub const CONTROL_EVICTION_ACCOUNTING_FENCE: &str = "oxide.eviction-accounting/1";
@@ -999,8 +1000,6 @@ pub const CONTROL_ONE_USE_FENCE: &str = "oxide.one-use/1";
 /// meets version 9 first and hands off to a receipt-matching successor instead
 /// of reading a state it cannot represent.
 pub const CONTROL_HOLDING_FENCE: &str = "oxide.holding/1";
-/// The control version that must carry [`CONTROL_ONE_USE_FENCE`].
-const CONTROL_ONE_USE_VERSION: u64 = 6;
 /// Raise a front-door control state to the current fence version before a
 /// locked pool open reconciles a recorded deletion (oxide#177; fence first).
 ///

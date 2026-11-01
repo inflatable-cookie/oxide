@@ -14,7 +14,10 @@ minimum_effigy_version = "0.14.0"
 "rust:compile-linux" = "oxide check --locked --offline --target x86_64-unknown-linux-gnu"
 # Release-profile compile of the binaries (oxide#187). Debug-only proof items
 # reached from unconditional code fail here, which the debug selectors miss.
-"rust:compile-release" = "oxide check --release --workspace --bins --locked"
+# `-D warnings` makes the release profile's own diagnostics fatal (oxide#223),
+# so the profile Oxide is installed from cannot accumulate actionable warnings;
+# Cargo still caps dependency lints, so this covers the workspace package only.
+"rust:compile-release" = "RUSTFLAGS='-D warnings' oxide check --release --workspace --bins --locked"
 # Duplicate packages in the normal dependency closure for every target
 # (oxide#103: exactly one sha2). Reads the lock; builds nothing.
 "rust:tree-duplicates" = "oxide tree --locked --offline -e normal -d --target all"
