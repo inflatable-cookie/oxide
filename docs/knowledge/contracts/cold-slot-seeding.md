@@ -255,7 +255,7 @@ Written against clean pushed `main` at
 `cec65daff49a2961c9b9d1dd2cad235251c02e48`. Every `file:line` anchor below is
 against that commit; re-check the anchors before trusting them after any
 rebind. The shared proof supervisor is `scripts/bounded-test.py`
-SHA-256 `d9bc5ff6dcd0913d9c1ff8e57030ce794f969e1f23c050b224a981b4c17618cd`
+SHA-256 `94b1aba60a7475a31b5620039986336f13e1c88d58dd3732b5736290dc63685b`
 (the qualified oxide#151 guard `bc24b238…` plus oxide#191's opt-in post-census
 image detach and oxide#197's ancestor and launcher-sibling exclusions, unqualified until their
 own qualifications pass; the earlier
@@ -2271,7 +2271,7 @@ Elevated merge hold are unchanged.
   The private pool is a genuine internal `directory-budget-v1` pool, so the
   recipe declares the owner-accepted internal-placement exception (decision
   `bd357a4c`) inside the same monitored owned root; the supervisor bytes are
-  the `d9bc5ff6…` pin above, with `--limit 600` (Tom's decision `1527723f`, this selector and its diagnostic twin only; any higher bound needs another operator ruling) and a 512 MiB monitored
+  the `94b1aba6…` pin above, with `--limit 600` (Tom's decision `1527723f`, this selector and its diagnostic twin only; any higher bound needs another operator ruling) and a 512 MiB monitored
   scratch budget including cleanup and the one owned image.
 - `effigy rust:cold-slot-seeding:diagnostic` appends the script's
   `--diagnostic`: the uncounted keep-going collection required before a counted

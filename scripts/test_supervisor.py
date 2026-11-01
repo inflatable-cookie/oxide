@@ -879,15 +879,14 @@ class PureAncestors(unittest.TestCase):
         result = census(in_session, ancestors=[self.LAUNCHER]).round()
         self.assertEqual((result["members"], result["uncertain"]), (1, 0))
         self.assertEqual(result["ancestor_exclusions"]["by_rule"]["parent"], 0)
-        # A leader group with a foreign session is inconsistent, so the row is
-        # ambiguous: never excluded and never a positively foreign result.
+        # A leader group with a foreign session is not a positive decision, so
+        # the row keeps main's classification: foreign, never excluded.
         in_group = FakeTable(self.launcher_rows(sibling), {700: 7, 900: 7}, groups={900: 100})
         result = census(in_group, ancestors=[self.LAUNCHER]).round()
-        self.assertEqual((result["members"], result["uncertain"]), (0, 1))
-        self.assertEqual(result["uncertain_rows"][0]["reason"], "launcher observation ambiguous")
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
         self.assertEqual(result["ancestor_exclusions"]["by_rule"]["parent"], 0)
-        # Unreadable session or group observations are ambiguous, never
-        # evidence: the dedicated case below covers both in more detail.
+        # An unreadable session keeps main's uncertain result; an unreadable
+        # group with a readable foreign session keeps main's foreign result.
         unreadable_session = FakeTable(self.launcher_rows(sibling),
                                        {700: 7, 900: ProcessLookupError(errno.ESRCH, "gone")},
                                        groups={900: 900})
@@ -897,7 +896,7 @@ class PureAncestors(unittest.TestCase):
         unreadable_group = FakeTable(self.launcher_rows(sibling), {700: 7, 900: 7},
                                      groups={900: OSError(1, "denied")})
         result = census(unreadable_group, ancestors=[self.LAUNCHER]).round()
-        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
         self.assertEqual(result["ancestor_exclusions"]["by_rule"]["parent"], 0)
 
     def test_a_tracked_member_with_a_recorded_ancestor_parent_is_never_excluded(self):
@@ -950,35 +949,67 @@ class PureAncestors(unittest.TestCase):
         self.assertEqual(result["ancestor_exclusions"]["rows"],
                          [{"pid": 700, "start": 11, "rule": "ancestor"}])
 
-    def test_a_stable_replacement_at_an_ancestor_pid_stays_uncertain_not_foreign(self):
-        # Review finding: a recorded ancestor PID that now names a *stable* other
-        # process with a readable foreign session must not become foreign, which
-        # would let an unknown launcher observation help closure.
+    def test_a_foreign_ancestor_child_with_an_undecided_observation_matches_main(self):
+        # Review c4032d7b: an UNDECIDED launcher observation excludes no row and
+        # falls through to main's ordinary getsid/reread classification. A stable
+        # replacement at a recorded ancestor PID with a readable foreign session
+        # is therefore foreign, exactly as it is without the launcher rules.
         replaced = row(700, start=99, ppid=600)
         table = FakeTable([replaced], {700: 7}, reread={700: replaced})
         result = census(table, ancestors=[self.LAUNCHER]).round()
-        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (False, 0, 1))
-        self.assertEqual(result["uncertain_rows"][0]["reason"], "launcher observation ambiguous")
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
         self.assertEqual(result["ancestor_exclusions"]["count"], 0)
-        # A positively supervised session at that PID proves a descendant (an
-        # ancestor predates the leader), so the ordinary census counts it.
+        # Counterfactual: the superseded path turned the same row uncertain, so
+        # this case fails under it and only the fall-through satisfies it.
+        def superseded_launcher_path(round_result):
+            return dict(round_result, certain=False, uncertain=round_result["uncertain"] + 1)
+        superseded = superseded_launcher_path(result)
+        self.assertNotEqual((superseded["certain"], superseded["uncertain"]),
+                            (result["certain"], result["uncertain"]),
+                            "the old ambiguous path must fail this classification")
+        # A positively supervised session at that PID is still carried as a member.
         supervised = FakeTable([row(700, start=99, ppid=600)], {700: 100},
                                reread={700: row(700, start=99, ppid=600)})
         result = census(supervised, ancestors=[self.LAUNCHER]).round()
         self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 1, 0))
 
-    def test_a_transient_failed_sibling_reverification_is_uncertain_not_foreign(self):
-        # Review finding: a transient re-verification failure with readable
-        # foreign session and group observations must stay uncertain.
+    def test_a_transient_failed_sibling_reverification_takes_main_classification(self):
+        # Review c4032d7b: a transiently failed re-verification is undecided, so
+        # it excludes nothing and the readable foreign observations classify the
+        # row exactly as main does.
         sibling = row(900, start=12, ppid=self.LAUNCHER[0])
         table = FakeTable(self.launcher_rows(sibling), {700: 7, 900: 7}, groups={900: 900},
                           reread={900: [OSError(5, "transient"), sibling, sibling, sibling]})
         result = census(table, ancestors=[self.LAUNCHER]).round()
-        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (False, 0, 1))
-        self.assertEqual(result["uncertain_rows"][0]["reason"], "launcher observation ambiguous")
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
         self.assertEqual(result["ancestor_exclusions"]["by_rule"]["parent"], 0)
 
-    def test_an_unreadable_sibling_session_or_group_is_uncertain_not_foreign(self):
+    def test_a_held_suite_zombie_classifies_exactly_as_main_does(self):
+        # Review c4032d7b: a zombie's launcher rules must never change main's
+        # classification. Here the row's parent is the recorded launcher but its
+        # group read is unreadable, so the launcher decision is undecided: the
+        # terminal-allowlist and strict outcomes must match the same table with
+        # no ancestor record at all.
+        zombie = row(900, start=12, ppid=self.LAUNCHER[0], zombie=True)
+        def table():
+            return FakeTable([row(700, start=11, ppid=600), zombie],
+                             {700: 7, 900: ProcessLookupError(errno.ESRCH, "gone")},
+                             reread={900: zombie}, groups={900: OSError(1, "denied")})
+        for terminal_allowed in (True, False):
+            with_ancestors = census(table(), ancestors=[self.LAUNCHER],
+                                    terminal_allowed=terminal_allowed).round()
+            without = census(table(), ancestors=(), terminal_allowed=terminal_allowed).round()
+            self.assertEqual((with_ancestors["certain"], with_ancestors["members"],
+                              with_ancestors["uncertain"]),
+                             (without["certain"], without["members"], without["uncertain"]),
+                             terminal_allowed)
+            self.assertEqual(with_ancestors["terminal_count_status"],
+                             without["terminal_count_status"], terminal_allowed)
+            self.assertEqual(with_ancestors["terminal_nonwriters"],
+                             without["terminal_nonwriters"], terminal_allowed)
+            self.assertEqual(with_ancestors["ancestor_exclusions"]["by_rule"]["parent"], 0)
+
+    def test_an_unreadable_sibling_session_or_group_keeps_main_classification(self):
         sibling = row(900, start=12, ppid=self.LAUNCHER[0])
         for sessions, groups in (
                 ({700: 7, 900: ProcessLookupError(errno.ESRCH, "gone")}, {900: 900}),
@@ -986,9 +1017,11 @@ class PureAncestors(unittest.TestCase):
                 ({700: 7, 900: 7}, {900: None})):
             table = FakeTable(self.launcher_rows(sibling), sessions, groups=groups)
             result = census(table, ancestors=[self.LAUNCHER]).round()
-            self.assertEqual((result["certain"], result["uncertain"]), (False, 1), (sessions, groups))
-            self.assertEqual(result["uncertain_rows"][0]["reason"],
-                             "launcher observation ambiguous")
+            # Main's result: an unreadable session is uncertain; an unreadable
+            # group with a readable foreign session is foreign.
+            expected = (False, 1) if 900 in sessions and isinstance(
+                sessions.get(900), BaseException) else (True, 0)
+            self.assertEqual((result["certain"], result["uncertain"]), expected, (sessions, groups))
             self.assertEqual(result["ancestor_exclusions"]["by_rule"]["parent"], 0)
 
     def test_an_inside_ancestor_pid_observation_is_carried_as_a_member(self):
@@ -1045,10 +1078,10 @@ class PureAncestors(unittest.TestCase):
         table = FakeTable(rows, {700: 7, 900: PermissionError(1, "denied")},
                           reread={700: row(700, start=99), 900: row(900, start=12, ppid=700)})
         result = census(table, ancestors=[self.LAUNCHER]).round()
-        # The changed identity at a recorded ancestor PID is ambiguous, and the
-        # child's unreadable session stays unknown: two unaccounted rows, no
-        # exclusion and no positively foreign result.
-        self.assertEqual((result["certain"], result["uncertain"]), (False, 2))
+        # The changed identity at a recorded ancestor PID falls through to main's
+        # classification (foreign here), and only the child's unreadable session
+        # stays unknown: no exclusion and no launcher-side classification.
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
         self.assertEqual(result["ancestor_exclusions"]["by_rule"]["parent"], 0)
         self.assertEqual(result["ancestor_exclusions"]["rows"], [], result["ancestor_exclusions"])
 

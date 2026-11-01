@@ -44,14 +44,15 @@ and which one bound observation proves is positively outside the supervised
 leader's session AND process group (macOS has no subreaper, so a supervised
 descendant can only be reparented to launchd, never to a supervisor ancestor).
 No clock, wall, boot or uptime fact is consulted: a start-time ordering cannot
-prove the absence of a masked step. A tracked identity is never excluded and
-never made ambiguous, and no exclusion removes tracked attribution. A launcher
-rule that positively observes the row in the leader's session carries it as a
-tracked member of exactly that identity, so a later contradictory read cannot
-make it foreign; anything an applicable rule cannot decide positively is
-uncertain, never a positively foreign row. A recycled PID or parent, an unknown
-parent, a PPID 1 orphan, an unreadable session or group, a changed identity and
-any other unreadable row keep their existing handling, so unknown stays unknown.
+prove the absence of a masked step. Only a POSITIVELY decided identity may be
+excluded, and a tracked identity is never excluded and never loses tracked
+attribution. A launcher rule that positively observes the row in the leader's
+session carries it as a tracked member of exactly that identity, so a later
+contradictory read cannot make it foreign. An UNDECIDED launcher observation
+excludes no row and falls through to the ordinary getsid/reread classification,
+so a recycled PID or parent, an unknown parent, a PPID 1 orphan, an unreadable
+session or group, a changed identity and any other unreadable row classify
+exactly as they do without the launcher rules.
 Every exclusion's bounded positive evidence is recorded in the receipt. The
 test-only `setup-delay` injection adds a cold setup longer than the reserve
 freshness window inside the setup deadline, the end-to-end control for
@@ -1082,8 +1083,8 @@ class Census:
       `member` reading is carried into the census as a member of exactly this
       identity (an ancestor predates the leader, so a descendant can never be one)
       and the identity is tracked; any other reading — contradictory, unreadable
-      or simply not the leader's session — is `ambiguous` — uncertain — because a
-      recorded ancestor's PID must never end up positively foreign.
+      or simply not the leader's session — is undecided, excludes nothing and
+      leaves the row to the ordinary classification.
     - `parent` (b): the row's observation-time parent row (same snapshot) has a
       PID above 1, its identity is EXACTLY one recorded pair, and ONE sibling
       observation re-verifies the row's own PID/start identity AND that parent
@@ -1096,7 +1097,8 @@ class Census:
       member of exactly this identity (tracked, so a later contradictory session
       read cannot make it foreign); anything else — a recycled or missing parent
       row, a replaced identity, a transiently failed re-verification, an
-      unreadable session or group — is `ambiguous` and stays uncertain. Every
+      unreadable session or group — is undecided, excludes nothing and keeps the
+      ordinary classification. Every
       PPID 1 orphan and unknown parent is never excluded by this rule. The macOS
       rule that a supervised descendant can only be reparented to launchd makes
       such parentage incompatible with supervised descent.
@@ -1113,12 +1115,12 @@ class Census:
     identity plus (for `parent`) one bound observation with positive session and
     group exclusion. A `member` launcher observation is carried as a tracked
     member row, so a positively observed member can never be lost to a later
-    contradictory read. An `ambiguous` launcher decision makes the row UNCERTAIN
-    with reason `launcher observation ambiguous`: it is never a member and never
-    a positively foreign row, so an unknown launcher observation can never help
-    establish closure. A skipped row is neither a member nor uncertain, and each
-    exclusion's bounded evidence (`pid`, `start`, `rule`) is returned for the
-    receipt.
+    contradictory read. An UNDECIDED launcher observation excludes nothing and
+    adds no record: the row is classified by the ordinary getsid/reread path
+    exactly as it would be without the launcher rules, so neither an unknown
+    observation nor a recycled identity is silently dropped. A skipped row is
+    neither a member nor uncertain, and each exclusion's bounded evidence
+    (`pid`, `start`, `rule`) is returned for the receipt.
 
     The round also builds an optional, monitor-receipt-only diagnostics
     object summarizing ESRCH rows (confirm attempts/outcome and the final
@@ -1302,7 +1304,8 @@ class Census:
         - `ambiguous`: anything else — a failed read, a replaced identity, a
           parent that no longer matches, an unreadable session or group, or a
           group reading of the leader while the session differs. That is never
-          evidence for exclusion, and the caller keeps it uncertain.
+          evidence for exclusion, so the caller excludes nothing and the row
+          keeps the ordinary census classification.
 
         Never raises."""
         try:
@@ -1330,17 +1333,17 @@ class Census:
     def exclusion_rule(self, row, by_pid):
         """The structural launcher decision for this row.
 
-        Returns `ancestor` or `parent` (excluded), `member` (a bound session
-        observation positively put the row in the leader's session, so the caller
-        carries it as a member of exactly this identity), `ambiguous` (a launcher
-        rule applies but cannot be positively decided, so the row must stay
-        uncertain), or None (no launcher rule applies and the ordinary census
-        classifies the row). A tracked identity is never excluded and never made
-        ambiguous by these rules: it is a member this census already accepted. A
-        row whose PID is a recorded ancestor's PID is decided by the ancestor
-        rule alone, so a changed or unverifiable identity is never excluded and
-        never falls through to its parent's rule. Pure classification over the
-        injected readers: no pauses, never raises."""
+        Only a POSITIVELY decided identity leaves this function: `ancestor` or
+        `parent` (excluded), or `member` (a bound observation positively put the
+        row in the leader's session, so the caller carries it as a member of
+        exactly this identity). Everything else returns None, which excludes no
+        row and leaves the row to the ordinary getsid/reread classification, so
+        an undecided launcher observation never changes main's classification.
+        A tracked identity is never excluded by these rules. A row whose PID is a
+        recorded ancestor's PID is decided by the ancestor rule alone: a changed
+        or unverifiable identity there is simply not excluded (fail closed
+        against exclusion) and never falls through to its parent's rule. Pure
+        classification over the injected readers: no pauses, never raises."""
         try:
             identity = (row["pid"], row["start"])
             if identity in self.tracked:  # a tracked member is never excluded
@@ -1350,12 +1353,12 @@ class Census:
                 # re-verified identity is excluded and never falls through.
                 if identity in self.ancestors and self.identity_stable(identity):
                     return "ancestor"
-                # A different identity at that PID is not an ancestor. One
-                # bound session observation decides it: a member observation is
-                # carried into the census (an ancestor predates the leader, so a
-                # descendant can never be one) and anything else is ambiguous.
-                # A recorded ancestor's PID is never positively foreign.
-                return self.member_observation(identity)
+                # A different identity at that PID is not this ancestor. One
+                # bound session observation decides only the positive case: a
+                # member observation is carried into the census (an ancestor
+                # predates the leader, so a descendant can never be one). An
+                # undecided observation excludes nothing and falls through.
+                return "member" if self.member_observation(identity) == "member" else None
             ppid = row.get("ppid")
             if type(ppid) is not int or ppid <= 1:  # an orphan is never excluded
                 return None
@@ -1370,9 +1373,9 @@ class Census:
                 return "parent"
             if observed == "inside":
                 return "member"
-            return "ambiguous"
+            return None  # undecided: excludes nothing, ordinary classification owns it
         except BaseException:
-            return "ambiguous"
+            return None  # never exclude on an unreadable or failed observation
 
     def round(self):
         self.reset_stats()
@@ -1432,15 +1435,12 @@ class Census:
                 self.tracked[identity] = row
                 records[index] = {"member": row}
                 continue
-            if rule == "ambiguous":
-                # A launcher rule applied but could not be positively decided.
-                # Fail closed: never a member, never a positively foreign row.
-                records[index] = {"uncertain": dict(
-                    row, reason="launcher observation ambiguous")}
-                continue
             if rule is not None:
-                # This run's own launcher chain: never a member and never an
-                # unknown row. No pause, and its tracked set is left untouched.
+                # A positively decided launcher identity: this run's own
+                # launcher chain, so never a member and never an unknown row. No
+                # pause, and its tracked set is left untouched. An UNDECIDED
+                # observation never reaches this branch: it excludes no row and
+                # the ordinary getsid/reread classification below owns the row.
                 records[index] = {"skip": True}
                 excluded_total += 1
                 rule_totals[rule] += 1

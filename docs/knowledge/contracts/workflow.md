@@ -2341,8 +2341,8 @@ nothing else:
   into the census as a member of exactly this identity and tracked** (an ancestor
   predates the leader, so a descendant can never be one), so a later
   contradictory read cannot turn it foreign; every other reading — including a
-  stable session that is not the leader's — is **ambiguous and uncertain**, and
-  a recorded ancestor's PID is never a positively foreign row.
+  stable session that is not the leader's — is **undecided**, excludes no row and
+  leaves the row to the ordinary getsid/reread classification.
 - **`parent` (the launcher sibling):** the row's observation-time parent row, in
   the same snapshot, has a PID above 1 and an identity that is exactly one
   recorded pair, and ONE sibling observation re-verifies the row's own
@@ -2356,22 +2356,22 @@ nothing else:
   identity and tracked**, so a later contradictory session read cannot make it a
   foreign row. Anything else — a recycled or missing parent row, a replaced
   identity, a transiently failed re-verification, an unreadable session or
-  group, or a leader group reading with a foreign session — is **ambiguous and
-  stays uncertain**, never excluded and never positively foreign. A matching
-  parent PID alone is not enough, and every PPID 1 orphan and unknown parent is
-  never excluded by this rule. The macOS rule that a supervised descendant can
+  group, or a leader group reading with a foreign session — is **undecided**: it
+  excludes nothing and the row keeps the ordinary getsid/reread classification, so
+  a held-suite zombie, a recycled identity or a foreign row classifies exactly as
+  it does without the launcher rules. A matching parent PID alone is not enough,
+  and every PPID 1 orphan and unknown parent is never excluded by this rule. The macOS rule that a supervised descendant can
   only be reparented to launchd — never to a supervisor ancestor — makes such
   parentage incompatible with supervised descent.
 
 A **tracked** identity — one this census already accepted as a member — is
-never excluded and never made ambiguous by either rule: both veto it before
-anything else, and no exclusion ever removes tracked attribution. A tracked row
-is therefore never reclassified, whatever its parent or its session/group read
-says. A `member` launcher observation is carried as a tracked member row of
-exactly the observed identity, so a positively observed member is never
-re-read into a foreign row. An ambiguous launcher decision is recorded as an
-uncertain row with reason `launcher observation ambiguous`, so an unknown
-launcher observation can never help establish closure.
+never excluded by either rule: both veto it before anything else, and no
+exclusion ever removes tracked attribution. A tracked row is therefore never
+reclassified, whatever its parent or its session/group read says. A `member`
+launcher observation is carried as a tracked member row of exactly the observed
+identity, so a positively observed member is never re-read into a foreign row.
+Only a positively decided identity may be excluded; an undecided observation
+adds no record of its own and never changes main's classification.
 
 No wall, boot or uptime value participates anywhere in the census, so a row
 whose start token merely looks earlier is never excluded and a tracked
@@ -2387,12 +2387,13 @@ recorded chain in one bounded `ancestors` object with fixed keys — `state`
 every exclusion in one bounded cumulative `ancestor_exclusions` object: at most
 `EXCLUSION_MAX_ROWS` (20) distinct `pid`/`start`/`rule` rows, the total decision
 count, the omitted count (`count == rows + omitted`) and the per-rule counts. The
-integrated `bounded-test.py` (`d9bc5ff6…`) adds this over the oxide#191 detach
+integrated `bounded-test.py`
+(`94b1aba60a7475a31b5620039986336f13e1c88d58dd3732b5736290dc63685b`) adds this over the oxide#191 detach
 control and the oxide#192 admission reports, so those controls are unqualified
 until this head's own uncounted `effigy proof:supervisor:qualify:diagnostic` and
 separate author and independent reviewer `effigy proof:supervisor:qualify` pass;
 the suite gains thirty-one pure structural launcher-rule cases and one real
-launcher-sibling case (360 pure plus 55 real = 415 at this head, and the
+launcher-sibling case (361 pure plus 55 real = 416 at this head, and the
 bootstrap's expected case total follows the suite). The end-to-end slow-setup
 launch-and-close regression for #192's sampling-based freshness clock is
 inherited here by decision `7bb1089d`: it injects a cold setup longer than the
@@ -2411,7 +2412,7 @@ grant, the rejection control, the late grant, a wait that never ends before the
 stop, and the stale-run plus zero-duration-grant correlation), which the
 bootstrap's expected count and limitation list follow; the integrated oxide#197
 head then adds its structural launcher cases and the inherited slow-setup
-regression, for 360 pure + 55 real = 415). The exported deadline,
+regression, for 361 pure + 55 real = 416). The exported deadline,
 closure, census, reserve, scratch, cleanup, custody and signal rules are
 unchanged, a run with no admission report behaves exactly as before, and the
 detach protocol's own rules are oxide#191's. The native chain ran at native head
@@ -2705,9 +2706,8 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
     descendant, a same-session stranger and any row not excluded above keep the
     classification above, an unreadable or empty record excludes nothing, and no
     wall, boot or uptime value ever takes part. A `member` launcher observation
-    is carried as a tracked member row, and an ambiguous one
-    (`launcher observation ambiguous`) makes the row uncertain: neither is ever
-    a positively foreign row.
+    is carried as a tracked member row; an undecided one excludes nothing and
+    leaves the row to the ordinary classification.
   - **Terminal nonwriter** (allowlisted kernels only): an actual `getsid`
     `ESRCH` (errno-checked, not any `ProcessLookupError`) whose snapshot
     row and FIRST existing confirmation read show the same complete
@@ -3064,7 +3064,7 @@ with a recorded minimum. A fallback run, or a nested case outside the
 monitored root, fails the qualification. Its reserve readings identify the
 qualification's scratch volume and the boot volume separately. The suite
 runs in order:
-- 360 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 361 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -3339,7 +3339,7 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 415 cases (360 pure + 55 real, including oxide#191's post-census detach
+- all 416 cases (361 pure + 55 real, including oxide#191's post-census detach
   cases, oxide#192's five admission-report cases and its sampling-freshness
   cases, and oxide#197's structural launcher-rule cases with the launcher-sibling
   and slow-setup real cases);
@@ -5837,7 +5837,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
 - **Focused proof of absent checkout chains (oxide#135).** The one fixed proof
   is `effigy rust:prune-absence` (`scripts/test-prune-absence.py` under this
-  tree's shared supervisor `d9bc5ff6…`, the merged oxide#151 guard plus
+  tree's shared supervisor `94b1aba6…`, the merged oxide#151 guard plus
   oxide#191's opt-in post-census detach and oxide#197's ancestor-chain
   exclusion) with
   `--root-parent /private/tmp`, the owner-accepted internal-placement exception
