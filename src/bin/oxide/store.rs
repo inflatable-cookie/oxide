@@ -1974,7 +1974,9 @@ impl Store {
             Found::LegacyImage => Err(legacy_refusal()),
             Found::Directory | Found::Unknown => {
                 if let Some(uuid) = crate::scratch_io::evaluate(settings, false)? {
-                    if repair { crate::scratch_io::repair(settings, &uuid)?; }
+                    if repair {
+                        crate::scratch_io::repair(settings, &uuid)?;
+                    }
                 }
                 Self::open_at(&settings.pool, settings).map(Some)
             }
@@ -12057,5 +12059,119 @@ pub(crate) mod tests {
             fixture.store.ledger().unwrap().holding.is_empty(),
             "the holding row survived its deletion"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod scratch_internal_tests {
+    use super::*;
+    use std::ffi::{CStr, CString, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::process::Command;
+
+    fn fixture() -> PathBuf {
+        let named = std::env::var_os("OXIDE_TEST_INTERNAL_ROOT")
+            .expect("OXIDE_TEST_INTERNAL_ROOT is required");
+        let root = fs::canonicalize(&named).expect("internal root");
+        assert_eq!(Path::new(&named), root);
+        let supervised =
+            fs::canonicalize(std::env::var_os("OXIDE_TASK_SCRATCH_ROOT").expect("supervised root"))
+                .expect("supervised root");
+        assert!(
+            root.starts_with(supervised),
+            "internal root must be supervised"
+        );
+        let metadata = fs::metadata(&root).unwrap();
+        assert!(
+            metadata.is_dir()
+                && metadata.uid() == unsafe { libc::getuid() }
+                && metadata.mode() & 0o077 == 0
+        );
+        let observed = oxide_storage::volume::observe_path(&root).unwrap();
+        let boot = oxide_storage::volume::observe_path(Path::new("/System/Volumes/Data")).unwrap();
+        assert_eq!(observed.fstype, "apfs");
+        assert_eq!((observed.dev, observed.uuid), (boot.dev, boot.uuid));
+        let mut name = CString::new(root.join("scratch-unit.XXXXXX").as_os_str().as_bytes())
+            .unwrap()
+            .into_bytes_with_nul();
+        assert!(!unsafe { libc::mkdtemp(name.as_mut_ptr().cast()) }.is_null());
+        PathBuf::from(OsStr::from_bytes(
+            CStr::from_bytes_until_nul(&name).unwrap().to_bytes(),
+        ))
+    }
+
+    fn isolated(test: &str, root: &Path) {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("OXIDE_S3_UNIT_CHILD", "1")
+            .env(
+                "OXIDE_TEST_INTERNAL_ROOT",
+                std::env::var_os("OXIDE_TEST_INTERNAL_ROOT").unwrap(),
+            )
+            .env("HOME", root.join("home"))
+            .env("OXIDE_TEST_HOME_FROM_ENV", "1")
+            .env("OXIDE_CONFIG", root.join("config.toml"))
+            .env("OXIDE_POOL", root.join("pool"))
+            .env("OXIDE_POOL_CAP", "64MiB")
+            .env("OXIDE_POOL_CREATE", "1")
+            .env("OXIDE_SCRATCH_ROOT", root)
+            .env("OXIDE_S3_ROOT", root)
+            .status()
+            .expect("unit child");
+        assert!(status.success(), "isolated unit child failed");
+    }
+
+    #[test]
+    fn scratch_declaration_is_inert_on_boot_volume() {
+        if std::env::var_os("OXIDE_S3_UNIT_CHILD").is_none() {
+            let root = fixture();
+            isolated(
+                "store::scratch_internal_tests::scratch_declaration_is_inert_on_boot_volume",
+                &root,
+            );
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os("OXIDE_S3_ROOT").unwrap());
+        fs::create_dir(root.join("home")).unwrap();
+        let settings = super::settings().unwrap();
+        assert!(crate::scratch_io::evaluate(&settings, false)
+            .unwrap()
+            .is_none());
+        create_pool(&settings.pool, admission_budget(&settings)).unwrap();
+        let _store = Store::open_at(&settings.pool, &settings).unwrap();
+        let config = fs::read(settings.pool.join("config.json")).unwrap();
+        assert!(!settings.pool.join("oxide-managed/scratch.json").exists());
+        assert!(!root
+            .join("home/Library/Application Support/oxide/state/scratch-pools")
+            .exists());
+        unsafe { std::env::remove_var("OXIDE_SCRATCH_ROOT") };
+        assert!(crate::scratch_io::evaluate(&settings, false)
+            .unwrap()
+            .is_none());
+        let _same_store = Store::open_at(&settings.pool, &settings).unwrap();
+        assert_eq!(config, fs::read(settings.pool.join("config.json")).unwrap());
+    }
+
+    #[test]
+    fn internal_git_refusal_is_unchanged_by_scratch_declaration() {
+        if std::env::var_os("OXIDE_S3_UNIT_CHILD").is_none() {
+            let root = fixture();
+            isolated("store::scratch_internal_tests::internal_git_refusal_is_unchanged_by_scratch_declaration", &root);
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os("OXIDE_S3_ROOT").unwrap());
+        fs::create_dir(root.join(".git")).unwrap();
+        let settings = super::settings().unwrap();
+        let with = crate::scratch_io::evaluate(&settings, false).unwrap_err();
+        unsafe { std::env::remove_var("OXIDE_SCRATCH_ROOT") };
+        let without = crate::scratch_io::evaluate(&settings, false).unwrap_err();
+        assert_eq!(with, without);
+        assert!(with.contains("Git work tree"));
+        assert!(!settings.pool.exists());
     }
 }

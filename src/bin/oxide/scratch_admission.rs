@@ -529,6 +529,34 @@ mod tests {
         assert_eq!(decide(f), Decision::Admit);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stale_volume_directory_refuses_without_creation() {
+        use std::ffi::{CStr, CString, OsStr};
+        use std::os::unix::ffi::OsStrExt;
+        let base = std::env::var_os("OXIDE_TEST_INTERNAL_ROOT").expect("internal test root");
+        let mut name = CString::new(
+            Path::new(&base)
+                .join("stale-s3.XXXXXX")
+                .as_os_str()
+                .as_bytes(),
+        )
+        .unwrap()
+        .into_bytes_with_nul();
+        assert!(!unsafe { libc::mkdtemp(name.as_mut_ptr().cast()) }.is_null());
+        let parent = PathBuf::from(OsStr::from_bytes(
+            CStr::from_bytes_until_nul(&name).unwrap().to_bytes(),
+        ));
+        let volume = parent.join("volume");
+        std::fs::create_dir(&volume).unwrap();
+        let verified = oxide_storage::volume::Binding::open_in(&parent, "volume", None).is_ok();
+        let mut f = facts();
+        f.volume_verified = verified;
+        assert_eq!(decide(f), class("scratch-volume-unverified"));
+        assert_eq!(std::fs::read_dir(&volume).unwrap().count(), 0);
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
     #[test]
     fn ordinary_messages_are_preserved() {
         // Compare actual existing path judgement with the pure branch's refusal bytes.

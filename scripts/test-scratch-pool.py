@@ -36,8 +36,9 @@ REPO = Path(__file__).resolve().parent.parent
 
 
 def plan():
-    print("S3: cases 01-15; two sequential 128 MiB owned APFS images; "
-          "at most one attached; 300 s; 512 MiB; private fixture account")
+    print("S3 native: 01-10 except 04-internal and 06-inert, plus 12-15; "
+          "two sequential 128 MiB owned APFS images; at most one attached; "
+          "300 s; 512 MiB; private fixture account; case 11 is unit-proved")
 
 
 def self_check():
@@ -47,6 +48,15 @@ def self_check():
     assert not may_detach(True, True)
     assert detached(True, []) and not detached(False, []) and not detached(True, ['/dev/disk1'])
     assert may_attach(False) and not may_attach(True)
+    import inspect
+    create_source = inspect.getsource(Images.create)
+    attach_source = inspect.getsource(Images.attach)
+    detach_source = inspect.getsource(Images.detach)
+    assert create_source.index('image-custody.json') < create_source.index('hdiutil')
+    assert 'may_attach(self.attached is not None)' in attach_source
+    assert detach_source.index('self.request.unlink()') < detach_source.index('may_detach(') < detach_source.index("'detach'")
+    assert 'detached(not os.path.ismount' in detach_source
+    assert 'attachment entities unreadable' in detach_source
     print('scratch-pool proof self-check: custody, child closure, request withdrawal, post-state and exclusive attachment OK')
     return 0
 
@@ -117,6 +127,7 @@ class Images:
         self.name = 'OxS3' + str(os.getpid())
         self.mount = Path('/Volumes') / self.name
         self.children_reaped = True
+        self.observations = []
 
     def create(self):
         atomic(self.evidence / 'image-custody.json', custody_document(str(self.a), str(self.b)))
@@ -141,12 +152,19 @@ class Images:
         self.attached = {'version': 1, 'backing': str(image), 'mount': str(self.mount),
                          'device': device, 'volume_uuid': uuid}
         atomic(self.request, self.attached)
+        self.observations.append(dict(self.attached))
         print('mounted', self.mount, device, uuid, flush=True)
         return uuid
 
     def detach(self):
         require(self.attached is not None, 'no attachment')
+        observation = run(['/usr/sbin/diskutil', 'info', '-plist', self.attached['mount']])
+        require(observation.returncode == 0, 'pre-detach identity unreadable')
+        facts = plistlib.loads(observation.stdout)
+        require(facts.get('VolumeUUID') == self.attached['volume_uuid'] and
+                facts.get('DeviceNode') == self.attached['device'], 'pre-detach identity changed')
         self.request.unlink()
+        atomic(self.evidence / f"detach-attempt-{len(self.observations)}.json", self.attached)
         require(may_detach(self.children_reaped, self.request.exists()), 'detach precondition')
         p = subprocess.run(['/usr/bin/hdiutil', 'detach', self.attached['device']],
                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -155,8 +173,14 @@ class Images:
         info = run(['/usr/bin/hdiutil', 'info', '-plist'])
         require(info.returncode == 0, 'attachment post-state unreadable')
         images = plistlib.loads(info.stdout)['images']
-        entities = [e for image in images if image.get('image-path') == self.attached['backing']
-                    for e in image.get('system-entities', [])]
+        require(isinstance(images, list), 'attachment list malformed')
+        entities = []
+        for image in images:
+            require(isinstance(image, dict) and isinstance(image.get('image-path'), str), 'attachment entry malformed')
+            if image['image-path'] == self.attached['backing']:
+                rows = image.get('system-entities')
+                require(isinstance(rows, list) and rows and all(isinstance(e, dict) and isinstance(e.get('dev-entry'), str) for e in rows), 'attachment entities unreadable')
+                entities.extend(rows)
         require(detached(not os.path.ismount(self.mount), entities), 'detach post-state unknown')
         self.attached = None
 
@@ -173,7 +197,20 @@ def fixture():
     scratch = Path(os.environ['OXIDE_TASK_SCRATCH_ROOT']).resolve(strict=True)
     evidence = Path(os.environ['OXIDE_PROOF_EVIDENCE']).resolve(strict=True)
     root = Path(tempfile.mkdtemp(prefix='s3.', dir=scratch))
-    subject = Path(helper.stage_subject(str(root), toolchain))
+    staging_env = {k: v for k, v in os.environ.items()
+                   if not k.startswith(('OXIDE_', 'XDG_', 'GIT_', 'CARGO_', 'SCCACHE_'))
+                   and k not in ('RUSTFLAGS', 'RUSTC', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER')}
+    staging_env.update(RUSTUP_HOME=toolchain, RUSTUP_TOOLCHAIN='1.97.1', RUSTUP_AUTO_INSTALL='0',
+                       CARGO_NET_OFFLINE='true', CARGO_HOME=os.environ.get('CARGO_HOME', str(Path(os.environ['HOME']) / '.cargo')),
+                       CARGO_TARGET_DIR=str(root / 'target'), CARGO_INCREMENTAL='0',
+                       CARGO_PROFILE_DEV_DEBUG='0', CARGO_PROFILE_DEV_OPT_LEVEL='s',
+                       CARGO_PROFILE_DEV_CODEGEN_UNITS='1', CARGO_PROFILE_DEV_PANIC='abort',
+                       RUSTFLAGS='-C strip=symbols')
+    built = run(['cargo', 'build', '-j', '1', '--locked', '--offline', '--bin', 'oxide'],
+                cwd=REPO, env=staging_env)
+    require(built.returncode == 0, 'staging failed: ' + built.stderr.decode(errors='replace')[-2000:])
+    subject = root / 'target/debug/oxide'
+    require(subject.is_file(), 'staged binary missing')
     home, cargo, checkout, tmp = (root / n for n in ('home', 'cargo', 'checkout', 'tmp'))
     for path in (home, cargo, checkout, tmp): path.mkdir(mode=0o700)
     (checkout / 'src').mkdir()
@@ -255,7 +292,9 @@ def proof(diagnostic):
         def case07():
             before = record.read_bytes(); images.detach()
             require(not mount.exists(), 'mount point remained after detach')
-            text = product(subject, checkout, env, 'status', ok=True)
+            walk = root / 'status-walk.log'
+            text = product(subject, checkout, changed(OXIDE_TEST_WALK_LOG=walk), 'status', ok=True)
+            require(not walk.exists() or not walk.read_bytes(), 'status walked the absent pool')
             require('unavailable' in text and uuid_a in text, 'missing absent status')
             refuse(env, uuid_a)
             require(not mount.exists() and record.read_bytes() == before, 'absent path or record changed')
@@ -278,7 +317,9 @@ def proof(diagnostic):
             finally: binding.write_bytes(original)
         def case12():
             record.unlink(); before = tree(pool)
-            text = product(subject, checkout, env, 'status', ok=True)
+            walk = root / 'status-repair-walk.log'
+            text = product(subject, checkout, changed(OXIDE_TEST_WALK_LOG=walk), 'status', ok=True)
+            require(not walk.exists() or not walk.read_bytes(), 'status walked pool')
             require('scratch pool, volume' not in text and not record.exists() and tree(pool) == before, 'status repaired record')
             check(); require(record.is_file(), 'leased open failed to repair')
             require(uuid_a in product(subject, checkout, env, 'status', ok=True), 'missing scratch label')
@@ -291,6 +332,9 @@ def proof(diagnostic):
         def case14():
             original = record.read_bytes()
             try:
+                record.chmod(0)
+                refuse(env, 'scratch-record-invalid')
+                record.chmod(0o600)
                 for content in (b'{', b' ' * 4097):
                     record.write_bytes(content); refuse(env, 'scratch-record-invalid')
                 record.unlink(); record.symlink_to(root / 'missing')
@@ -302,23 +346,35 @@ def proof(diagnostic):
             refuse(env, 'no host record'); require(not mount.exists() and not record.exists(), 'absent pool created')
         cases = (case01, case02, case03, case04, case05, case06, case07,
                  case08, case09, case10, case12, case13, case14, case15)
+        dependencies = {'02': ('01',), '03': ('02',), '07': ('03',),
+                        '08': ('07',), '09': ('08',), '10': ('09',),
+                        '12': ('10',), '13': ('12',), '14': ('13',), '15': ('14',)}
+        completed = set()
         for name, case in zip(NATIVE_CASES, cases):
-            if first:
-                outcomes.append({'case': name, 'outcome': 'skipped', 'reason': 'shared predecessor failed'})
+            missing = [n for n in dependencies.get(name, ()) if n not in completed]
+            if missing or (first and not diagnostic):
+                outcomes.append({'case': name, 'outcome': 'skipped', 'reason': 'prerequisite not completed: ' + ','.join(missing)})
                 continue
             try:
                 print('case', name, flush=True); case()
+                completed.add(name)
                 outcomes.append({'case': name, 'outcome': 'completed'})
             except Exception as exc:
-                first = f'{type(exc).__name__}: {exc}'[:1024]
-                outcomes.append({'case': name, 'outcome': 'failed', 'reason': first})
+                fault = f'{type(exc).__name__}: {exc}'[:1024]
+                first = first or fault
+                outcomes.append({'case': name, 'outcome': 'failed', 'reason': fault})
         receipt = {'qualified': False if diagnostic else first is None, 'cases': outcomes,
                    'first_fault': first, 'volume_a': uuid_a, 'volume_b': world.get('uuid_b'),
-                   'mount': str(mount)}
+                   'mount': str(mount), 'attachments': images.observations}
         atomic(evidence / ('scratch-diagnostic.json' if diagnostic else 'scratch-result.json'), receipt)
     except Exception as exc:
         first = first or f'{type(exc).__name__}: {exc}'[:1024]
         print('scratch proof aborted:', first, file=sys.stderr)
+        if diagnostic and os.environ.get('OXIDE_PROOF_EVIDENCE'):
+            remaining_cases = [n for n in NATIVE_CASES if n not in {o['case'] for o in outcomes}]
+            outcomes.extend({'case': n, 'outcome': 'skipped', 'reason': 'unknown setup or custody'} for n in remaining_cases)
+            atomic(Path(os.environ['OXIDE_PROOF_EVIDENCE']) / 'scratch-diagnostic.json',
+                   {'qualified': False, 'cases': outcomes, 'first_fault': first})
         return 1
     if diagnostic: return 1
     return int(first is not None)

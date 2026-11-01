@@ -878,7 +878,8 @@ pub mod managed {
 
     impl ScratchLeaf {
         /// Compensate only while the path still names the held leaf.
-        pub fn remove_if_owned(&self) -> Result<(), LeaseError> {
+        pub fn remove_if_owned(&self, binding: &[u8]) -> Result<(), LeaseError> {
+            verify_scratch_initializer(&self.path, &self.file, binding, false)?;
             let current = std::fs::symlink_metadata(&self.path).map_err(io_error)?;
             let held = self.file.metadata().map_err(io_error)?;
             if !current.is_dir()
@@ -928,8 +929,9 @@ pub mod managed {
         if budget_bytes == 0 {
             return Err(LeaseError::InvalidInput("budget must be positive"));
         }
+        verify_scratch_initializer(pool, &leaf.file, binding, false)?;
         let _lock = lock_pool(pool)?;
-        verify_scratch_initializer(pool, &leaf.file, binding)?;
+        verify_scratch_initializer(pool, &leaf.file, binding, true)?;
         init_budget_pool_locked(pool, budget_bytes)
     }
 
@@ -6098,7 +6100,12 @@ fn prepare_new_pool(pool: &Path) -> Result<PathBuf, LeaseError> {
 }
 
 /// Check the creator's held leaf and the complete prepared shape under the init lock.
-fn verify_scratch_initializer(pool: &Path, leaf: &File, expected: &[u8]) -> Result<(), LeaseError> {
+fn verify_scratch_initializer(
+    pool: &Path,
+    leaf: &File,
+    expected: &[u8],
+    locked: bool,
+) -> Result<(), LeaseError> {
     use std::io::Read;
     use std::os::fd::FromRawFd;
     let incomplete =
@@ -6121,10 +6128,9 @@ fn verify_scratch_initializer(pool: &Path, leaf: &File, expected: &[u8]) -> Resu
         return Err(incomplete());
     }
     let names = holding_names(current.as_fd(), 3).map_err(|_| incomplete())?;
-    if names.len() != 2
-        || !names.iter().any(|n| n.as_bytes() == b"oxide-managed")
-        || !names.iter().any(|n| n.as_bytes() == b"lock")
-    {
+    let has_managed = names.iter().any(|n| n.as_bytes() == b"oxide-managed");
+    let has_lock = names.iter().any(|n| n.as_bytes() == b"lock");
+    if !has_managed || names.len() != 1 + usize::from(has_lock) || (locked && !has_lock) {
         return Err(incomplete());
     }
     let managed = open_directory_at(current.as_fd(), c"oxide-managed").map_err(|_| incomplete())?;

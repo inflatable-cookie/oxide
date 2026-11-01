@@ -346,7 +346,7 @@ pub(crate) fn create(settings: &Settings, uuid: &str, budget: u64) -> Result<(),
     write_document(&control.join("scratch.json"), &binding, 16384, false)?;
     let record_result = record_path(&pool).and_then(|p| write_document(&p, &record, 4096, true));
     if record_result.is_err() {
-        leaf.remove_if_owned().map_err(|_| {
+        leaf.remove_if_owned(&binding).map_err(|_| {
             "scratch-record-unwritable; scratch-incomplete requires operator cleanup"
         })?;
         return Err("scratch-record-unwritable".into());

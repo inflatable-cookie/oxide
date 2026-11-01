@@ -84,7 +84,9 @@ caller uid). Init creates it empty, or tightens an empty caller-owned directory
 to `0700`. A directory whose only occupant is the CLI's leftover `lock` file
 from a failed init is still init-able. An existing pool cannot have its cap
 raised and cannot be reinitialized. Arbitrary directories are not reinterpreted
-as bounded.
+as bounded. The one scratch-only initializer accepts the invoking creator's
+exclusive leaf only after checking its held identity and exact binding bytes
+under the init lock; it does not change ordinary initialization's refusal.
 
 Pinned at init and recorded in `config.json`:
 

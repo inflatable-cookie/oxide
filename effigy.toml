@@ -1234,3 +1234,14 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 600 --
 # creates no pool and touches no image.
 [tasks."proof:cold-slot-seeding:test"]
 run = "python3 scripts/test-cold-slot-seeding.py --self-test"
+# Scratch-pool proof: default selected-volume scratch, 300 s and 512 MiB.
+[tasks."proof:scratch-pool:test"]
+run = "python3 scripts/test-scratch-pool.py --self-check"
+
+[tasks."rust:scratch-pool:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-scratch-pool.py --diagnostic"
+
+[tasks."rust:scratch-pool"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-scratch-pool.py"
