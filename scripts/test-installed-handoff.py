@@ -221,9 +221,14 @@ def compile_stub(root: str) -> str:
     source = os.path.join(root, "handoff-stub.rs")
     write(source, STUB_SOURCE, 0o644)
     binary = os.path.join(root, "handoff-stub")
+    env = {"PATH": os.environ.get("PATH", ""),
+           "HOME": os.path.join(root, "stage-home"),
+           "RUSTUP_HOME": os.environ.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup"),
+           "RUSTUP_TOOLCHAIN": BUILDER, "RUSTUP_AUTO_INSTALL": "0",
+           "RUSTFLAGS": "-C strip=symbols"}
     result = subprocess.run(
         ["rustc", "--edition", "2021", "-O", "-o", binary, source],
-        capture_output=True,
+        env=env, capture_output=True,
         text=True,
         timeout=min(60, work_left()),
     )
@@ -975,6 +980,35 @@ def self_check():
     assert calls == [1] and outcome["unexecuted_groups"] == ["two"]
     assert outcome["aborted"] and outcome["qualified"] is False
     assert len({name for name, _ in GROUPS}) == len(GROUPS)
+    # Construct only an object in memory: no directories, pool, or child.
+    global SCRATCH_ROOT
+    old_root = SCRATCH_ROOT
+    SCRATCH_ROOT = "/fixture/run"
+    fixture = Fixture.__new__(Fixture)
+    fixture.root = "/fixture/run/case"
+    fixture.home = fixture.root + "/home"
+    fixture.pool = fixture.root + "/pool"
+    fixture.cargo_home = fixture.root + "/cargo-home"
+    fixture.bin = fixture.home + "/.local/bin"
+    fixture.tools = fixture.root + "/tools"
+    fixture.record = fixture.root + "/record"
+    old_scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT")
+    os.environ["OXIDE_TASK_SCRATCH_ROOT"] = "/fixture/run"
+    try:
+        env = fixture.env("/fixture/binary")
+        assert env["OXIDE_SCRATCH_ROOT"] == "/fixture/run"
+        assert env["OXIDE_POOL"].startswith(env["OXIDE_SCRATCH_ROOT"] + "/")
+        assert env["OXIDE_POOL_CAP"] == "64MiB"
+        assert env["HOME"] == fixture.home and env["CARGO_HOME"] == fixture.cargo_home
+        assert env["OXIDE_TEST_HOME_FROM_ENV"] == "1"
+        assert env["RUSTUP_AUTO_INSTALL"] == "0" and env["RUSTUP_TOOLCHAIN"] == BUILDER
+        assert "CARGO_ENCODED_RUSTFLAGS" not in env and not any(k.startswith(("XDG_", "GIT_")) for k in env)
+    finally:
+        SCRATCH_ROOT = old_root
+        if old_scratch is None:
+            os.environ.pop("OXIDE_TASK_SCRATCH_ROOT", None)
+        else:
+            os.environ["OXIDE_TASK_SCRATCH_ROOT"] = old_scratch
     check_source_versions()
     print("installed-handoff apparatus self-check passed")
     return 0
