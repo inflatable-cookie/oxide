@@ -817,12 +817,12 @@ def self_check() -> None:
         and "--scratch-budget-mib" in COMMAND,
         "the fixed command changed",
     )
-    expect(
-        "--root-parent" in COMMAND
-        and COMMAND[COMMAND.index("--root-parent") + 1] == ROOT_PARENT,
-        "the fixed command must carry the internal-placement root its fixture pool "
-        "needs, which is what premise item 8 records",
-    )
+    expect("--root-parent" not in COMMAND, "supervisor must select its default scratch")
+    fixture_env_body = body_of("fixture_env")
+    expect('"OXIDE_SCRATCH_ROOT"' in fixture_env_body and '"OXIDE_POOL_CAP": cap' in fixture_env_body,
+           "fixture must declare scratch root and explicit cap")
+    expect('"scratch-pools"' in body_of("run_cases") and '"scratch-pools"' in fixture_env_body,
+           "cases and declaration must share the private scratch root")
 
     def selector_command(name: str) -> str:
         block = re.search(
