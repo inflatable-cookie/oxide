@@ -565,7 +565,10 @@ mod tests {
         assert_eq!(decide(facts()), Decision::Admit);
         let mut f = facts();
         f.record = Document::Missing;
-        assert_eq!(decide_for_open(f), Decision::Admit);
+        assert_eq!(
+            decide_for_open(f),
+            Decision::Refuse(Refusal::RecordRepairUnavailable)
+        );
     }
 
     #[test]
