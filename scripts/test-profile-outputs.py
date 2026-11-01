@@ -1723,7 +1723,8 @@ CASE_IDS = MODE_CASES[MODE]
 # 3. perm.proof_env scrubs inherited OXIDE_*, XDG_* and sets fixture controls.
 # 4. case 01 creates an empty target before explicit adopt; cases 12/13 use
 #    auto_legacy to assert the automatic whole-target conversion.
-# 5. This proof does not invoke a Cargo external subcommand.
+# 5. Case 05 invokes a fake Cargo external subcommand and asserts its recorded
+#    argv includes the subcommand token: `nextest run --help`.
 # 6. attach_owned_image uses -owners on; existing identity and detach gates apply.
 # 7. run freezes both compiler flag variables before staging and fixture setup.
 # 8. Builds uses a private scratch pool under the runner root; base-compat
