@@ -9,49 +9,62 @@ supervisor:
     effigy rust:finder-metadata-race:diagnostic
     effigy rust:finder-metadata-race:test
 
-whose recipes are `python3 scripts/bounded-test.py --root-parent /private/tmp
---limit 420 --scratch-budget-mib 512 -- python3
-scripts/test-finder-metadata-race.py [--diagnostic]`. Admission, the
-wall-clock limit, the host reserve, the owned scratch bound, child sessions and
-cleanup belong to the supervisor; this script starts no session, signals no
-group, and keeps no clock, reserve reading or scratch of its own. Fixture
-scratch is written only inside `OXIDE_TASK_SCRATCH_ROOT`; image backings and
-their custody records only inside `OXIDE_PROOF_EVIDENCE`.
+whose recipes are `python3 scripts/bounded-test.py --limit 420
+--scratch-budget-mib 512 -- python3 scripts/test-finder-metadata-race.py
+[--diagnostic]`. Admission, the wall-clock limit, the host reserve, the owned
+scratch bound, child sessions and cleanup belong to the supervisor; this script
+starts no session, signals no group, and keeps no clock, reserve reading or
+scratch of its own. Fixture scratch is written only inside
+`OXIDE_TASK_SCRATCH_ROOT`; image backings and their custody records only inside
+`OXIDE_PROOF_EVIDENCE`.
 
-`--root-parent /private/tmp` is the owner-accepted internal-placement exception
-(decision `bd357a4c` v4): every fixture pool here is a genuine *internal*
-directory-budget pool, which the product correctly refuses on an external
-volume. It stays inside the same monitored 512 MiB owned root.
+Every fixture pool here is a genuine `directory-budget-v1` pool, so each case
+declares one private `OXIDE_SCRATCH_ROOT` inside its own run root and keeps its
+`OXIDE_POOL` strictly inside that root with an explicit `OXIDE_POOL_CAP`
+(oxide#173 scratch pools, slice S4). On the supervisor's selected volume that
+is a scratch pool on removable media; on a `/private/tmp` fallback the
+declaration is inert and the same recipe makes an ordinary internal pool there,
+which is therefore not scratch-pool coverage and is reported as such.
 
-Stages this HEAD's and the pinned pre-change commit's debug `oxide` offline
-with the pinned 1.97.1 toolchain through plain Cargo, then drives the debug-only race injection
-(`OXIDE_TEST_FINDER_RACE`, absent from release builds, armed only under the
-supervisor's exported layout) at exactly the boundary the product documents —
-after the caller's listing, before the removal:
+Stages this HEAD's debug `oxide` offline with the pinned 1.97.1 toolchain
+through plain Cargo and covers both callers. The **lease** half runs the
+post-oxide#190 holding model: an eviction renames the whole idle slot tree into
+`<pool>/payload/.oxide-holding/<entry>` under the pool lock, records one holding
+row, and deletes the tree outside the lock (`src/lease/pool.rs:112`,
+`holding_root`), so a refused item stays recorded and charged until a later
+command finishes it. The **prune** half still drives the debug-only race
+injection (`OXIDE_TEST_FINDER_RACE`, absent from release builds, armed only
+under the supervisor's exported layout) at the boundary the product documents —
+after the caller's listing, before the removal — because that hook is reached
+only from that drain (`src/owned_delete.rs:247`, `src/bin/oxide/prune.rs:4076`):
 
 - `lease_control`: two admissions under a 1 MiB budget; the second evicts the
-  first project's idle whole slot with no race armed. The slot *leaf* is gone
-  and no deletion is pending. Fixture premise.
-- `lease_unlinked_file`: stop immediately after a nested `filler` unlink,
-  verify its journal record remains, admit an unrelated build while a
-  fixture collision blocks recovery, remove that collision, and check that
-  the next admission removes the victim.
-- `lease_old_counterfactual`: the pinned old binary creates a raced eviction;
-  its verified root is moved to its recorded private name with a fixture-owned
-  replacement at the observed name. The old binary refuses an unrelated check
-  with `unknown_accounting`. The test upgrades only the ledger fence and restores
-  the old idle size observation, then the candidate admits the same check while
-  keeping both the captured root and replacement. The two binary hashes are
-  printed; this fixture-only ledger migration is not a product migration.
-- `lease_metadata`: the same eviction raced with `.DS_Store`/`._*`. The
-  eviction completes and the evidence records the firing.
-- `lease_foreign`: raced with an ordinary file. The admission refuses, the slot
-  leaf and the new file stay, and `status` reports the recorded deletion as
-  pending reconciliation.
-- `lease_link`: raced with a metadata-named symbolic link. It refuses, the link
-  is neither followed nor removed, the deletion stays pending.
-- `lease_exhaust`: raced with tolerated metadata on *every* attempt. The fixed
-  bound is used up and the deletion stays pending; never a success.
+  first project's idle whole slot with no content planted. The slot *leaf* is
+  gone, the holding row and its tree are gone, and `status` reports no held or
+  pending deletion. Fixture premise.
+- `lease_metadata`: the same eviction with real `.DS_Store` and `._*` files
+  planted at the tree root and in a nested directory. They go with the held
+  tree and never refuse the deletion: it completes and leaves no row, no tree
+  and no held line in `status`.
+- `lease_foreign`: the same eviction with one ordinary foreign file in the
+  tree. The holding drain deletes a regular file by name
+  (`src/lease/pool.rs:5552`), so the tree and the file go together and the
+  deletion completes with nothing left charged.
+- `lease_link`: the same eviction with a `.DS_Store`-named symbolic link to an
+  owned sentinel directory *outside* the pool. The drain unlinks the link
+  itself and never follows it (`unlinkat(..., 0)` at `src/lease/pool.rs:5557`),
+  so the deletion completes and the sentinel and its content are untouched.
+- `lease_exhaust`: the same eviction with an entry the drain cannot classify (a
+  FIFO) in the tree. The drain refuses it by name
+  (`src/lease/pool.rs:5566`, "an unknown entry type"), so the tree stays under
+  `.oxide-holding` with its row and its recorded charge, the command reports
+  that it stays recorded and charged (`src/bin/oxide/main.rs:1931`) and exits
+  zero. Recorded `status` lists the recorded row, its charge and `presence not
+  probed` (`src/bin/oxide/main.rs:2454`): its lock-free snapshot never probes
+  presence (`src/lease/mod.rs`, `HoldingEntry::present`), so the fixture proves
+  the tree and its entry with its own `lstat` instead of reading a product
+  probe. The fixture then removes its own FIFO and the next command finishes the
+  held deletion, dropping both the tree and the row.
 - `prune_metadata`: one owned 128 MiB APFS image, registered as the permanent
   outputs drive, with one real private Git checkout on it (ignored `target`)
   whose first build is asserted to have adopted an owned root into a real
@@ -77,7 +90,12 @@ after the caller's listing, before the removal:
   debug-only low-reserve reading fires on the first check *after one recovered
   entry was unlinked*, so the per-unlink check stops the drain mid-way: exit 3,
   the `.prune-<intent>` leaf kept with its remaining metadata, the intent
-  non-terminal and `receipt_settled: false`.
+  non-terminal and `receipt_settled: false`. That hook arms only through the
+  shared debug gate `proof_evidence` (`src/bin/oxide/prune.rs`), which since
+  oxide#211 (decision `60d4914f`) accepts this fixture's declared
+  `OXIDE_SCRATCH_ROOT` when it is a canonical strict child of the supervisor's
+  run root (`declaration_allowed`); the earlier gate required `/private/tmp`,
+  which is why the `24bd3e3` diagnostic's run never armed it and has no credit.
 - `prune_completion_fault`: the product's terminal crash point fires after the
   quarantine leaf is removed and the registry terminal write lands but before
   the checkout receipt settles: exit 3 with `deleted` yet `receipt_settled:
@@ -85,9 +103,15 @@ after the caller's listing, before the removal:
 
 Limits, stated rather than implied: `oxide clean` is deliberately unchanged (it
 removes exactly its enumerated plan, so new content is left and counted) and has
-no case here. No run of this script has passed: its fit is UNMEASURED. The
-uncounted diagnostic and counted author native each need owner activation;
-the independent reviewer native is waived for oxide#175.
+no case here. Two pre-#190 cases are retired by Oxide Supervisor decision
+`6818efde` and are not declared, run or counted: `lease_unlinked_file`
+(oxide#190 removed the per-entry capture journal and its
+`OXIDE_TEST_CAPTURE_UNLINK_STOP` seam) and `lease_old_counterfactual` (the
+pinned pre-#190 base binary and its legacy journal replay are no longer required
+here; `rust:holding-delete` and the #190 units cover that ground). No run of
+this script has passed: its fit is UNMEASURED. The uncounted diagnostic and
+counted author native each need owner activation, and the independent reviewer
+native was waived for oxide#175 only.
 
 Diagnostic safety (`--diagnostic`): only a *recoverable oracle* failure is
 recorded and followed by the next independent case. An unknown writer, device,
@@ -98,9 +122,11 @@ retains every image backing and its custody record, and writes a bounded
 exception is unknown closure, and an unwritable receipt aborts explicitly),
 records the first fault and a per-case reason, and lists reached, completed,
 failed, skipped and unexecuted cases. Unknown journal or receipt state (an
-absent, unreadable, incomplete or malformed pool-owned registry, or an intent
-count other than exactly one for the recorded quarantine) aborts; it is never
-counted as a recoverable oracle failure. `subprocess` timeouts are unknown
+absent, unreadable, incomplete or malformed pool ledger or holding row, an
+absent or unreadable holding area, an absent, unreadable, incomplete or
+malformed pool-owned registry, or an intent count other than exactly one for
+the recorded quarantine) aborts; it is never counted as a recoverable oracle
+failure. `subprocess` timeouts are unknown
 closure, never a recoverable failure.
 
 Nine-premise checklist (docs/knowledge/contracts/workflow.md
@@ -113,15 +139,15 @@ Nine-premise checklist (docs/knowledge/contracts/workflow.md
    generated for a `--locked` call; both offline staging calls are `--locked`
    and use the lock committed in their respective source trees.
 2. account-home control: `OXIDE_TEST_HOME_FROM_ENV=1` in `case_env`.
-3. environment isolation: `case_env` drops every inherited `OXIDE_*`, `XDG_*`,
-   `CARGO_*`, `GIT_*`, `RUSTUP_*`, `RUSTC*` and `RUSTFLAGS` before setting only
-   the fixture's explicit values, then re-adds the supervisor's own
-   `OXIDE_TASK_SCRATCH_ROOT`, `OXIDE_PROOF_DEADLINE_NS`,
-   `OXIDE_PROOF_EVIDENCE` (required for the hook guard) and, per case,
-   `OXIDE_TEST_FINDER_RACE`, or the scoped `OXIDE_TEST_CAPTURE_UNLINK_STOP`
-   for the nested-file case. That case uses the existing debug-only
-   `OXIDE_TEST_BUDGET_BYTES` to admit below a larger temporary budget while
-   the captured slot is blocked.
+3. environment isolation: `fixture_environment` drops every inherited
+   `OXIDE_*`, `XDG_*`, `CARGO_*`, `GIT_*`, `RUSTUP_*`, `RUSTC*` and `RUSTFLAGS`
+   before setting only the fixture's explicit values — including this case's
+   own `OXIDE_SCRATCH_ROOT`, its pool strictly inside it and its explicit
+   `OXIDE_POOL_CAP` — then re-adds the supervisor's own
+   `OXIDE_TASK_SCRATCH_ROOT`, `OXIDE_PROOF_DEADLINE_NS` and
+   `OXIDE_PROOF_EVIDENCE` (required for the hook guard) and, per prune case,
+   its own `OXIDE_TEST_FINDER_RACE`. No lease case arms that injection: the
+   eviction path has no such seam.
 4. automatic adoption: `workspace()` makes a real private Git repository whose
    `.gitignore` covers `target`, so the first conversion is eligible; each
    prune case then asserts the adopted owned root, the checkout's member link
@@ -150,8 +176,9 @@ Nine-premise checklist (docs/knowledge/contracts/workflow.md
 7. compiler flags: `RUSTFLAGS` is frozen for staging and every fixture child and
    `CARGO_ENCODED_RUSTFLAGS` is removed everywhere.
 8. temporary storage: scratch and `TMPDIR`/`TMP`/`TEMP` come from the
-   supervisor's owned scratch; the selector declares the internal-placement
-   exception above.
+   supervisor's owned scratch; each case declares its own `OXIDE_SCRATCH_ROOT`
+   there and keeps its pool strictly inside it, so the pool, the temp root and
+   the images all stay inside the monitored owned root.
 9. macOS mktemp: no `mktemp` is used; each case makes its own directory with a
    random suffix under the owned scratch.
 """
@@ -172,12 +199,10 @@ import secrets
 import shutil
 import stat
 import subprocess
-import tarfile
 import time
 
 MIB = 1024 * 1024
 BUILDER = "1.97.1"
-BASE_COMMIT = "d5f5e4d5f3793d770a4241405dc3f33f200df7cc"
 POOL_BUDGET = 1 * MIB
 IMAGE_MIB = 128
 RESERVE = "16MiB"
@@ -189,9 +214,15 @@ SHUTDOWN_MARGIN_SECONDS = 30
 MUTED = ("OXIDE_", "XDG_", "CARGO_", "GIT_", "RUSTUP_", "RUSTC", "RUSTFLAGS")
 MANAGED_NAME = "oxide-managed"
 REGISTRY_RELATIVE = ("outputs", "registry.json")
+# The private holding area at the payload root (oxide#190): an evicted slot tree
+# is renamed whole into it and deleted outside the pool lock.
+HOLDING_NAME = ".oxide-holding"
 # The product refuses a per-command temporary directory whose path is longer
 # than its Unix-socket bound of 91 bytes.
 SOCKET_PATH_BUDGET = 91
+# One declared scratch root per case, and its pool strictly inside it (§S4).
+SCRATCH_DIRNAME = "scratch-pools"
+POOL_DIRNAME = "pool"
 # Every prune checkout lives on the removable image, so the product cannot keep
 # an inherited same-volume `TMPDIR` and instead makes an owned per-command
 # directory inside the slot. Its longest path is
@@ -261,14 +292,17 @@ CRATE = {
 # The first conversion publishes owned member links, so the checkout has to be
 # a real Git repository whose ignore rules cover them.
 GITIGNORE = "/target\n"
-CASES = (
+# The lease half runs the post-oxide#190 holding model and the prune half drives
+# the Finder-race drain; the two are separate case sets.
+LEASE_CASES = (
     "lease_control",
-    "lease_unlinked_file",
-    "lease_old_counterfactual",
     "lease_metadata",
     "lease_foreign",
     "lease_link",
     "lease_exhaust",
+)
+CASES = (
+    *LEASE_CASES,
     "prune_metadata",
     "prune_foreign",
     "prune_exhaust",
@@ -277,16 +311,21 @@ CASES = (
     "prune_drain_fault",
     "prune_completion_fault",
 )
-# The race each case arms: `repeat` recreates on every attempt, so the fixed
-# bound is exercised; `None` is the unraced premise control.
+# Cases retired by Oxide Supervisor decision 6818efde. They are declared
+# nowhere: `--self-check` refuses the proof if either name reappears in the case
+# table, the race map or a dispatch branch.
+RETIRED_CASES = ("lease_unlinked_file", "lease_old_counterfactual")
+# The race each prune case arms: `repeat` recreates on every attempt, so the
+# fixed bound is exercised; `None` is the unraced premise control. No lease
+# case arms it: oxide#190's eviction has no race seam (the debug hook is reached
+# only from the outputs-prune drain, src/owned_delete.rs:247), so the lease half
+# plants its content instead and proves the holding model's own outcomes.
 RACES = {
     "lease_control": None,
-    "lease_unlinked_file": None,
-    "lease_old_counterfactual": None,
-    "lease_metadata": "*:metadata",
-    "lease_foreign": "*:foreign",
-    "lease_link": "*:link",
-    "lease_exhaust": "*:repeat",
+    "lease_metadata": None,
+    "lease_foreign": None,
+    "lease_link": None,
+    "lease_exhaust": None,
     "prune_metadata": "*:metadata",
     "prune_foreign": "*:foreign",
     "prune_exhaust": "*:repeat",
@@ -295,7 +334,6 @@ RACES = {
     "prune_drain_fault": "*:metadata",
     "prune_completion_fault": "*:metadata",
 }
-COMPLETING = {"lease_control", "lease_metadata", "prune_metadata"}
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INVOKING_RUSTUP_HOME = os.environ.get("RUSTUP_HOME") or os.path.join(
     os.environ.get("HOME", ""), ".rustup"
@@ -319,10 +357,17 @@ def unknown(message: str) -> None:
 
 
 def scratch_root() -> str:
+    """The supervisor's run root, canonical.
+
+    Canonical on both sides matters: the shared debug gate the prune fault
+    fixture arms through compares this root with this proof's declared
+    `OXIDE_SCRATCH_ROOT` and requires the declaration to be a canonical strict
+    child (`declaration_allowed`, `src/bin/oxide/prune.rs`, oxide#211).
+    """
     root = os.environ.get("OXIDE_TASK_SCRATCH_ROOT")
     if not root:
         unknown("OXIDE_TASK_SCRATCH_ROOT is missing; run this through effigy")
-    root = os.path.abspath(root)
+    root = os.path.realpath(root)
     if not os.path.isdir(root):
         unknown(f"owned scratch {root} is not a directory")
     return root
@@ -533,67 +578,55 @@ def stage(root: str, source: str, label: str) -> str:
 
 
 
-def base_source(root: str) -> str:
-    """Extract the immutable pre-change tree into this proof's scratch."""
-    archive = os.path.join(root, "base.tar")
-    source = os.path.join(root, "base-source")
-    os.mkdir(source, 0o700)
-    with open(archive, "wb") as output:
-        try:
-            result = subprocess.run(
-                ["git", "archive", "--format=tar", BASE_COMMIT],
-                cwd=REPO, stdout=output, stderr=subprocess.PIPE, timeout=work_left(),
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            unknown(f"base source archive could not be closed: {error}")
-    if result.returncode:
-        fail(f"base source archive failed: {result.stderr[-1000:]!r}")
-    with tarfile.open(archive, "r:") as bundle:
-        for member in bundle:
-            name = member.name.rstrip("/") if member.isdir() else member.name
-            components = name.split("/")
-            if (member.name.startswith("/") or any(part in ("", ".", "..") for part in components)
-                    or not (member.isdir() or member.isfile())):
-                unknown(f"unsafe base archive entry: {member.name!r}")
-            target = os.path.join(source, *components)
-            if member.isdir():
-                os.makedirs(target, mode=0o700, exist_ok=True)
-            else:
-                os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
-                content = bundle.extractfile(member)
-                if content is None:
-                    unknown(f"unreadable base archive entry: {member.name!r}")
-                with content, open(target, "xb") as destination:
-                    shutil.copyfileobj(content, destination)
-                os.chmod(target, member.mode & 0o777)
-    os.unlink(archive)
-    return source
-
-
 def case_root(root: str, case: str) -> str:
     path = os.path.join(root, "cases", case, secrets.token_hex(4))
     os.makedirs(path, exist_ok=True)
     return path
 
 
-def case_env(root: str, case: str, race: str | None) -> tuple[dict, str]:
-    base = case_root(root, case)
-    home = os.path.join(base, "home")
-    cargo_home = os.path.join(base, "cargo-home")
-    temp = os.path.join(base, "temp")
-    for path in (home, cargo_home, temp):
-        os.makedirs(path, exist_ok=True)
-    env = scrubbed(os.environ)
+def fixture_paths(base: str) -> dict:
+    """This case's private paths, all inside its own run root. Pure.
+
+    The pool is a genuine `directory-budget-v1` pool, so it is a *scratch*
+    pool: one root the case declares, canonical (the declaration has no symlink
+    component) and with the pool strictly below it. Nothing here is outside
+    `OXIDE_TASK_SCRATCH_ROOT`, so the supervisor's census, reserve watchdog and
+    scratch budget cover every byte the fixture writes.
+    """
+    scratch = os.path.realpath(os.path.join(base, SCRATCH_DIRNAME))
+    return {
+        "home": os.path.join(base, "home"),
+        "cargo_home": os.path.join(base, "cargo-home"),
+        "temp": os.path.join(base, "temp"),
+        "scratch": scratch,
+        "pool": os.path.join(scratch, POOL_DIRNAME),
+    }
+
+
+def fixture_environment(
+    base: str, case: str, race: str | None, inherited: dict
+) -> dict:
+    """One case's complete fixture environment. Pure: it creates nothing.
+
+    Pure so the effect-free `--self-check` can assert the same contract a native
+    case runs under: the declaration, the pool strictly inside it and the
+    explicit cap, with a hostile inherited environment in place.
+    """
+    paths = fixture_paths(base)
+    env = scrubbed(inherited)
     env.update(toolchain_env())
     env.update(
         {
-            "HOME": home,
-            "CARGO_HOME": cargo_home,
-            "TMPDIR": temp,
-            "TMP": temp,
-            "TEMP": temp,
+            "HOME": paths["home"],
+            "CARGO_HOME": paths["cargo_home"],
+            "TMPDIR": paths["temp"],
+            "TMP": paths["temp"],
+            "TEMP": paths["temp"],
             "OXIDE_TEST_HOME_FROM_ENV": "1",
-            "OXIDE_POOL": os.path.join(base, "pool"),
+            # The scratch declaration, the pool strictly inside it and the
+            # explicit budget the product requires for a scratch pool.
+            "OXIDE_SCRATCH_ROOT": paths["scratch"],
+            "OXIDE_POOL": paths["pool"],
             "OXIDE_POOL_CREATE": "1",
             "OXIDE_POOL_CAP": str(POOL_BUDGET),
             "RUSTC_WRAPPER": "",
@@ -602,13 +635,21 @@ def case_env(root: str, case: str, race: str | None) -> tuple[dict, str]:
     )
     # The supervisor's own layout is what arms the debug-only injection.
     for key in ("OXIDE_TASK_SCRATCH_ROOT", "OXIDE_PROOF_DEADLINE_NS", "OXIDE_PROOF_EVIDENCE"):
-        if key in os.environ:
-            env[key] = os.environ[key]
+        if key in inherited:
+            env[key] = inherited[key]
     if race is not None:
         env["OXIDE_TEST_FINDER_RACE"] = race
     for key, value in CASE_ENV.get(case, {}).items():
         env[key] = value
-    return env, base
+    return env
+
+
+def case_env(root: str, case: str, race: str | None) -> tuple[dict, str]:
+    base = case_root(root, case)
+    paths = fixture_paths(base)
+    for path in (paths["home"], paths["cargo_home"], paths["temp"], paths["scratch"]):
+        os.makedirs(path, mode=0o700, exist_ok=True)
+    return fixture_environment(base, case, race, os.environ), base
 
 
 def workspace(env: dict, base: str, name: str, package: str = "app") -> str:
@@ -745,19 +786,114 @@ def selected_members(document: dict, root_path: str) -> list:
 
 
 
-def verified_capture_name(value: object) -> str:
-    """A journal name is a private leaf, never a path outside the fixture."""
-    prefix = ".oxide-capture-"
-    if (not isinstance(value, str) or not value.startswith(prefix)
-            or len(value) != len(prefix) + 32
-            or any(char not in "0123456789abcdef" for char in value[len(prefix):])):
-        unknown(f"invalid private capture name: {value!r}")
-    return value
+def ledger_document(env: dict) -> dict:
+    """The pool's own ledger, read after the command that wrote it exited.
+
+    An absent, unreadable or malformed document is unknown journal state, never
+    an oracle failure: nothing is concluded from what could not be read.
+    """
+    path = os.path.join(env["OXIDE_POOL"], "ledger.json")
+    state, _ = lstat_state(path)
+    if state == "absent":
+        unknown(f"the pool ledger {path} is missing; journal state is unknown")
+    if state == "error":
+        unknown(f"the pool ledger {path} cannot be inspected; journal state is unknown")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            document = json.load(handle)
+    except Exception as error:  # noqa: BLE001 - unreadable journal state
+        unknown(f"the pool ledger {path} is unreadable ({error!r})")
+    if not isinstance(document, dict):
+        unknown(f"the pool ledger {path} is not a document")
+    holding = document.get("holding")
+    if holding is not None and not isinstance(holding, list):
+        unknown(f"the pool ledger {path} has a malformed holding list")
+    return document
+
+
+def holding_rows(env: dict) -> list:
+    """The recorded pending deletions (oxide#190 `holding` rows)."""
+    rows = ledger_document(env).get("holding") or []
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("name"), str):
+            unknown(f"the ledger holds a malformed holding row: {row!r}")
+    return rows
+
+
+def holding_trees(env: dict) -> dict:
+    """The holding entries actually present, by name.
+
+    `<pool>/payload/.oxide-holding/<store>-<slot>-<incarnation>-<nonce>` is the
+    area an eviction renames a whole slot tree into (oxide#190,
+    `src/lease/pool.rs:112`), so a presence check of one entry is an `lstat`,
+    never a walk.
+    """
+    root = os.path.join(env["OXIDE_POOL"], "payload", HOLDING_NAME)
+    state, _ = lstat_state(root)
+    if state == "absent":
+        return {}
+    if state == "error":
+        unknown(f"the holding area {root} cannot be inspected; custody is unknown")
+    if not os.path.isdir(root):
+        unknown(f"the holding area {root} is not a directory")
+    return {name: os.path.join(root, name) for name in sorted(os.listdir(root))}
+
+
+def plant(case: str, victim: str, base: str):
+    """Put this case's content inside the idle slot's own tree.
+
+    Nothing is injected: oxide#190's eviction has no race seam (the debug hook is
+    reached only from the outputs-prune drain), so the lease half plants the state
+    its case is about and the oracles read the holding model's own outcomes.
+    Returns the link case's sentinel path, otherwise a short description.
+    """
+    nested = os.path.join(victim, "src", "fixture")
+    os.makedirs(nested, exist_ok=True)
+    if case == "lease_control":
+        return "no planted content (premise control)"
+    if case == "lease_metadata":
+        for directory in (victim, nested):
+            for name, data in ((".DS_Store", b"finder"), ("._lib.rs", b"appledouble")):
+                with open(os.path.join(directory, name), "wb") as handle:
+                    handle.write(data)
+        return "Finder metadata at the tree root and one nested directory"
+    if case == "lease_foreign":
+        with open(os.path.join(victim, "foreign.txt"), "w", encoding="utf-8") as handle:
+            handle.write("foreign\n")
+        return "one ordinary foreign file"
+    if case == "lease_link":
+        sentinel = os.path.join(base, "link-referent")
+        os.makedirs(sentinel, mode=0o700, exist_ok=True)
+        with open(os.path.join(sentinel, "kept.txt"), "w", encoding="utf-8") as handle:
+            handle.write("referent\n")
+        os.symlink(sentinel, os.path.join(victim, ".DS_Store"))
+        return sentinel
+    if case == "lease_exhaust":
+        os.mkfifo(os.path.join(victim, "unemptiable"), mode=0o600)
+        return "one entry the drain cannot classify (a FIFO)"
+    fail(f"{case}: no lease fixture is declared")
+
+
+def sentinel_identity(path: str) -> tuple:
+    """The link sentinel's identity and content, read without following it."""
+    state, facts = lstat_state(path)
+    if state != "present":
+        unknown(f"the link sentinel {path} is {state}; its custody is unknown")
+    if not stat.S_ISDIR(facts.st_mode) or facts.st_uid != os.getuid():
+        unknown(f"the link sentinel {path} is not our own directory")
+    with open(os.path.join(path, "kept.txt"), encoding="utf-8") as handle:
+        return facts.st_dev, facts.st_ino, handle.read()
 
 
 def lease_case(oxide: str, root: str, case: str, race: str | None) -> str:
+    """One holding-model case: evict an idle whole slot and read what happened.
+
+    The eviction renames the tree into the payload's holding area and records one
+    row; the command then joins its own deletion outside the pool lock. A tree the
+    drain can empty leaves neither a row nor a tree; one it cannot keeps both,
+    charged, until a later command finishes it.
+    """
     env, base = case_env(root, case, race)
-    mark = evidence_mark()
     first = run([oxide, "check"], cwd=workspace(env, base, "a"), env=env)
     if first.returncode:
         fail(f"{case}: the first admission failed: {first.stderr[-1500:]}")
@@ -767,225 +903,97 @@ def lease_case(oxide: str, root: str, case: str, race: str | None) -> str:
             f"{case}: the first admission left {len(before)} slot leaves, expected one: {sorted(before)}"
         )
     victim = next(iter(before))
-    second_env = dict(env)
-    if case == "lease_unlinked_file":
-        second_env["OXIDE_TEST_CAPTURE_UNLINK_STOP"] = "filler"
-    second = run([oxide, "check"], cwd=workspace(env, base, "b"), env=second_env)
-    if case == "lease_unlinked_file":
-        marker = os.path.join(evidence_dir(), "capture-unlink-stop")
-        if second.returncode == 0 or not os.path.isfile(marker):
-            fail(f"{case}: nested unlink stop did not fire: {second.stderr[-1500:]}")
-        with open(os.path.join(env["OXIDE_POOL"], "ledger.json"), encoding="utf-8") as handle:
-            ledger = json.load(handle)
-        slots = [slot for slot in ledger.get("slots", []) if slot.get("capture")]
-        entries = slots[0]["capture"].get("captures", []) if len(slots) == 1 else []
-        files = [entry for entry in entries if entry.get("original") == "filler" and entry.get("path")]
-        if len(files) != 1 or not stat.S_ISREG(files[0].get("mode", 0)):
-            fail(f"{case}: missing nested file capture in ledger")
-        private_root = os.path.join(os.path.dirname(victim), verified_capture_name(slots[0]["capture"]["root"]["private"]))
-        if not os.path.isdir(private_root) or os.path.exists(victim):
-            fail(f"{case}: private root or absent original is not as recorded")
-        root_record = slots[0]["capture"]["root"]
-        root_stat = os.lstat(private_root)
-        if (not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_uid != os.getuid()
-                or root_stat.st_mode & 0o077 or root_stat.st_dev != root_record["device"]
-                or root_stat.st_ino != root_record["inode"]):
-            fail(f"{case}: private root identity or permissions do not match")
-        parent = private_root
-        chain = []
-        for raw_name in files[0]["path"]:
-            name = verified_capture_name(raw_name)
-            matches = [entry for entry in entries if entry.get("path") == chain
-                       and entry.get("private") == name]
-            if len(matches) != 1:
-                fail(f"{case}: capture ancestry is incomplete")
-            ancestor = matches[0]
-            parent = os.path.join(parent, name)
-            facts = os.lstat(parent)
-            if (not stat.S_ISDIR(facts.st_mode) or facts.st_dev != ancestor["device"]
-                    or facts.st_ino != ancestor["inode"]):
-                fail(f"{case}: captured ancestor identity does not match")
-            chain.append(name)
-        for name in (verified_capture_name(files[0]["private"]), files[0]["original"]):
-            try:
-                os.lstat(os.path.join(parent, name))
-            except FileNotFoundError:
-                continue
-            fail(f"{case}: unlinked file name {name!r} is present")
-        # A fixture-owned collision blocks put-back while the unrelated build
-        # is admitted. Give it enough budget for the recorded blocked charge.
-        os.mkdir(victim)
-        roomy = dict(env)
-        roomy["OXIDE_TEST_BUDGET_BYTES"] = str(64 * MIB)
-        checkout = workspace(env, base, "c")
-        other = run([oxide, "check"], cwd=checkout, env=roomy)
-        if other.returncode or not os.path.isdir(private_root):
-            fail(f"{case}: unrelated admission did not keep the blocked capture: {other.stderr[-1500:]}")
-        with open(os.path.join(env["OXIDE_POOL"], "ledger.json"), encoding="utf-8") as handle:
-            after = json.load(handle)
-        pending = [row for row in after.get("slots", []) if row.get("id") == slots[0]["id"]]
-        if len(pending) != 1 or pending[0].get("state") != "evicting":
-            fail(f"{case}: the blocked slot was reused or removed")
-        recorded = pending[0].get("recorded") or {}
-        if recorded.get("unique_bytes", 0) <= 0:
-            fail(f"{case}: the blocked slot has no positive recorded charge")
-        tight = dict(env)
-        tight["OXIDE_TEST_BUDGET_BYTES"] = "1"
-        # A different package identity cannot reuse checkout c's warm slot:
-        # this request must need a new slot and encounter the capacity check.
-        refused = run(
-            [oxide, "check"], cwd=workspace(env, base, "d", "capacity-control"), env=tight
-        )
-        if refused.returncode == 0 or "unknown_accounting" in refused.stderr:
-            fail(f"{case}: exhausted budget did not refuse on capacity: {refused.stderr[-1500:]}")
-        if "pool cap cannot admit a new slot" not in refused.stderr:
-            fail(f"{case}: the capacity refusal was not reported: {refused.stderr[-1500:]}")
-        if not os.path.isdir(private_root) or not os.path.isdir(victim):
-            fail(f"{case}: budget pressure removed a blocked slot or replacement")
-        os.rmdir(victim)
-        replay = run([oxide, "check"], cwd=checkout, env=roomy)
-        if replay.returncode:
-            fail(f"{case}: subsequent replay failed: {replay.stderr[-1500:]}")
-        if os.path.exists(private_root) or victim in slot_leaves(env["OXIDE_POOL"]):
-            fail(f"{case}: victim was not removed by replay")
-        return f"{case}: admitted unrelated work while blocked; next admission completed eviction"
+    planted = plant(case, victim, base)
+    sentinel = sentinel_identity(planted) if case == "lease_link" else None
+    second_checkout = workspace(env, base, "b", "second-project")
+    second = run([oxide, "check"], cwd=second_checkout, env=env)
     after = slot_leaves(env["OXIDE_POOL"])
+    rows = holding_rows(env)
+    trees = holding_trees(env)
     status = run([oxide, "status"], cwd=base, env=env)
-    pending = "recorded deletion pending reconciliation" in status.stdout
+    if victim in after:
+        fail(f"{case}: the evicted slot leaf {victim} is still under payload/slots")
+    if "recorded deletion pending reconciliation" in status.stdout:
+        fail(f"{case}: status reports a legacy pending reconciliation: {status.stdout[-1500:]}")
 
-    if case == "lease_control" or case == "lease_metadata":
+    if case != "lease_exhaust":
         if second.returncode:
             fail(f"{case}: the eviction did not complete: {second.stderr[-1500:]}")
-        if victim in after:
-            fail(f"{case}: the evicted slot leaf {victim} is still present")
-        if pending:
-            fail(f"{case}: a deletion stayed pending after a complete eviction")
-        if race is not None:
-            require_fired(case, mark, "Metadata")
-        return f"{case}: completed, victim {victim}, slots {len(before)}->{len(after)}"
+        if rows or trees:
+            fail(
+                f"{case}: a held deletion survived a completed eviction: rows {rows}, "
+                f"trees {sorted(trees)}"
+            )
+        if "held for deletion" in status.stdout:
+            fail(f"{case}: status reports a held deletion that completed: {status.stdout[-1500:]}")
+        if case == "lease_link":
+            if sentinel_identity(planted) != sentinel:
+                fail(f"{case}: the drain followed the symbolic link into its referent")
+            return f"{case}: the link went with the held tree and its referent was not followed"
+        return f"{case}: completed; the victim went with the held tree ({planted})"
 
+    # The unemptiable entry. The eviction commits (the leaf is gone and one row
+    # is recorded), the drain refuses the entry by name and the tree stays
+    # charged, so an admission that needed that space is refused rather than
+    # deciding as if the bytes were free.
     if second.returncode == 0:
-        fail(f"{case}: an admission succeeded over a refused deletion")
-    if victim not in after:
-        fail(f"{case}: the refused slot leaf {victim} was removed anyway")
-    if not pending:
-        fail(f"{case}: the refused deletion is not reported as pending")
-    if case == "lease_foreign" and not [
-        path for path in tree_files(victim) if os.path.basename(path) == "foreign.txt"
-    ]:
-        fail(f"{case}: the foreign entry was deleted instead of kept")
-    if case == "lease_link" and not [
-        os.path.join(dirpath, name)
-        for dirpath, dirnames, names in os.walk(victim)
-        for name in dirnames + names
-        if name == ".DS_Store" and os.path.islink(os.path.join(dirpath, name))
-    ]:
-        fail(f"{case}: the metadata-named link is gone")
-    require_fired(
-        case,
-        mark,
-        {"lease_foreign": "Foreign", "lease_link": "Link", "lease_exhaust": "Metadata"}[case],
+        fail(f"{case}: an admission over budget admitted beside an undeletable held tree")
+    if "cannot lease a slot" not in second.stderr:
+        fail(f"{case}: the capacity refusal was not reported: {second.stderr[-1500:]}")
+    if "admit a new slot" not in second.stderr:
+        fail(f"{case}: the refusal does not name the capacity result: {second.stderr[-1500:]}")
+    if "kept the held slot tree" not in second.stderr:
+        fail(f"{case}: the refused drain was not reported: {second.stderr[-1500:]}")
+    if "stays recorded and charged" not in second.stderr:
+        fail(f"{case}: the refusal did not report the charged row: {second.stderr[-1500:]}")
+    if len(rows) != 1:
+        fail(f"{case}: the ledger holds {len(rows)} holding rows, expected exactly one: {rows}")
+    row = rows[0]
+    if row.get("bytes", 0) <= 0:
+        fail(f"{case}: the held tree is not charged: {row}")
+    if row["name"] not in trees:
+        fail(f"{case}: the recorded holding tree {row['name']!r} is not present: {sorted(trees)}")
+    held = trees[row["name"]]
+    if not [path for path in tree_files(held) if os.path.basename(path) == "unemptiable"]:
+        fail(f"{case}: the held tree lost its unemptiable entry")
+    # Recorded status is lock-free and never probes presence (oxide#128): the
+    # entry it reports is the recorded row, its charge and `presence not
+    # probed`. Presence is proved by this fixture's own lstat above — the
+    # recorded tree is there and still holds the unemptiable entry.
+    held_lines = [
+        line
+        for line in status.stdout.splitlines()
+        if f"slot {row.get('slot')} held for deletion" in line
+    ]
+    if len(held_lines) != 1:
+        fail(f"{case}: status does not report the held row: {status.stdout[-1500:]}")
+    if "recorded," not in held_lines[0]:
+        fail(f"{case}: the held line reports no charge: {held_lines[0]!r}")
+    if "presence not probed" not in held_lines[0]:
+        fail(
+            f"{case}: the recorded status line does not state that presence was "
+            f"not probed: {held_lines[0]!r}"
+        )
+    # The fixture removes its own item; the next command finishes the deletion.
+    os.unlink(os.path.join(held, "unemptiable"))
+    finish = run([oxide, "check"], cwd=workspace(env, base, "c", "third-project"), env=env)
+    if finish.returncode:
+        fail(f"{case}: the finishing command failed: {finish.stderr[-1500:]}")
+    if "deleted the held slot tree" not in finish.stderr:
+        fail(f"{case}: the finishing command did not report the deletion: {finish.stderr[-1500:]}")
+    remaining_rows, remaining_trees = holding_rows(env), holding_trees(env)
+    if remaining_rows or remaining_trees:
+        fail(
+            f"{case}: the held deletion was not finished: rows {remaining_rows}, "
+            f"trees {sorted(remaining_trees)}"
+        )
+    closing = run([oxide, "status"], cwd=base, env=env)
+    if "held for deletion" in closing.stdout:
+        fail(f"{case}: status still reports a held deletion: {closing.stdout[-1500:]}")
+    return (
+        f"{case}: the unemptiable entry kept the tree charged under {HOLDING_NAME}; "
+        "the next command finished it"
     )
-    return f"{case}: pending, victim {victim}, exit {second.returncode}"
-
-
-def upgraded_counterfactual_ledger(ledger: dict, slot_id: int, closed: dict) -> dict:
-    """Model only the new fence and retained idle observation, not the tree."""
-    result = json.loads(json.dumps(ledger))
-    matches = [slot for slot in result.get("slots", []) if slot.get("id") == slot_id]
-    if (result.get("capacity_policy") != 2 or len(matches) != 1
-            or matches[0].get("state") != "evicting"
-            or matches[0].get("recorded") is not None
-            or not matches[0].get("capture")
-            or closed.get("for_lease") != matches[0].get("last_lease_id")
-            or closed.get("unique_bytes", 0) <= 0):
-        fail("old counterfactual is not the expected fenced, blocked fixture")
-    result["capacity_policy"] = 3
-    matches[0]["recorded"] = closed
-    return result
-
-
-def old_counterfactual(oxide: str, old_oxide: str, root: str) -> str:
-    """Execute the immutable old binary and candidate against one blocked tree."""
-    case = "lease_old_counterfactual"
-    env, base = case_env(root, case, None)
-    first = run([old_oxide, "check"], cwd=workspace(env, base, "a"), env=env)
-    if first.returncode:
-        fail(f"{case}: old fixture setup failed: {first.stderr[-1500:]}")
-    ledger_path = os.path.join(env["OXIDE_POOL"], "ledger.json")
-    with open(ledger_path, encoding="utf-8") as handle:
-        idle = json.load(handle)
-    slots = idle.get("slots", [])
-    if len(slots) != 1 or slots[0].get("state") != "idle":
-        fail(f"{case}: expected one idle old-code slot")
-    closed, slot_id = slots[0].get("recorded"), slots[0]["id"]
-    if not isinstance(closed, dict) or closed.get("unique_bytes", 0) <= 0:
-        fail(f"{case}: old idle size observation is absent")
-    mark = evidence_mark()
-    race_env = dict(env)
-    race_env["OXIDE_TEST_FINDER_RACE"] = "*:foreign"
-    trigger = run([old_oxide, "check"], cwd=workspace(env, base, "b"), env=race_env)
-    if trigger.returncode == 0:
-        fail(f"{case}: old eviction unexpectedly succeeded")
-    require_fired(case, mark, "Foreign")
-    with open(ledger_path, encoding="utf-8") as handle:
-        failed = json.load(handle)
-    rows = [slot for slot in failed.get("slots", []) if slot.get("id") == slot_id]
-    leaves = [path for path in slot_leaves(env["OXIDE_POOL"]) if path.endswith(f"-{slot_id}")]
-    if len(rows) != 1 or not rows[0].get("capture") or len(leaves) != 1:
-        fail(f"{case}: old eviction did not leave the expected journal and slot")
-    victim = leaves[0]
-    root_record = rows[0]["capture"]["root"]
-    private_root = os.path.join(os.path.dirname(victim), verified_capture_name(root_record["private"]))
-    root_stat = os.lstat(victim)
-    if (not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_dev != root_record["device"]
-            or root_stat.st_ino != root_record["inode"] or os.path.lexists(private_root)):
-        fail(f"{case}: the recorded root cannot be safely put into a blocked fixture")
-    # The old run restored its own recorded root after the raced refusal.
-    # Model a crash with that exact root at its recorded private name and a
-    # different fixture-owned object occupying the observed name.
-    os.rename(victim, private_root)
-    os.mkdir(victim, 0o700)
-    replacement = os.lstat(victim)
-
-    def require_same_roots():
-        private = os.lstat(private_root)
-        current = os.lstat(victim)
-        if (not stat.S_ISDIR(private.st_mode) or private.st_uid != os.getuid()
-                or private.st_mode & 0o077
-                or (private.st_dev, private.st_ino) != (root_stat.st_dev, root_stat.st_ino)
-                or not stat.S_ISDIR(current.st_mode)
-                or (current.st_dev, current.st_ino) != (replacement.st_dev, replacement.st_ino)):
-            fail(f"{case}: the captured root or replacement identity changed")
-        if not any(os.path.basename(p) == "foreign.txt" for p in tree_files(private_root)):
-            fail(f"{case}: the raced foreign entry did not survive")
-
-    require_same_roots()
-    checkout = workspace(env, base, "c")
-    roomy = dict(env)
-    roomy["OXIDE_TEST_BUDGET_BYTES"] = str(64 * MIB)
-    previous = run([old_oxide, "check"], cwd=checkout, env=roomy)
-    if previous.returncode == 0 or "unknown_accounting" not in previous.stderr:
-        fail(f"{case}: actual old code did not refuse unknown_accounting: {previous.stderr[-1500:]}")
-    with open(ledger_path, encoding="utf-8") as handle:
-        blocked = json.load(handle)
-    upgraded = upgraded_counterfactual_ledger(blocked, slot_id, closed)
-    require_same_roots()
-    # The old format deliberately clears an Evicting size. Restore the exact
-    # preceding idle observation under the new version fence; no payload,
-    # captured journal, or requested command changes between the two runs.
-    temporary = os.path.join(env["OXIDE_POOL"], "counterfactual-ledger.tmp")
-    with open(temporary, "x", encoding="utf-8") as handle:
-        os.chmod(temporary, 0o600)
-        json.dump(upgraded, handle)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, ledger_path)
-    current = run([oxide, "check"], cwd=checkout, env=roomy)
-    if current.returncode:
-        fail(f"{case}: candidate refused the same admission: {current.stderr[-1500:]}")
-    require_same_roots()
-    return f"{case}: old {BASE_COMMIT} refused unknown_accounting; candidate admitted with blocked tree kept"
 
 
 class ImageCustody:
@@ -1508,11 +1516,275 @@ def settle_case(settle: Settle) -> str:
     return f"{case}: pending after replay, phase {phase}"
 
 
-def self_check() -> int:
-    """Pure check of the fixture layout budget and the shutdown cutoff: no
-    scratch, child or image."""
+# Values this proof's remaining oracles read out of product source, re-checked
+# effect-free against the current tree (the S4 pre-review current-main sweep,
+# oxide#213). Each one is the product truth behind an assertion the script makes
+# at a native head, so a moved constant or reworded line fails here instead of
+# inside a native case. Nothing here is a claim about a run.
+ORACLE_PINS = (
+    (
+        "src/bin/oxide/child_temp.rs",
+        "pub(crate) const MAX_SCRATCH_PATH_BYTES: usize = 91;",
+        "the product's per-command temporary path bound",
+    ),
+    (
+        "src/lease/mod.rs",
+        'const SLOTS_NAME: &str = "slots";',
+        "the slot leaves the lease oracles read",
+    ),
+    (
+        "src/lease/pool.rs",
+        'const HOLDING_NAME: &str = ".oxide-holding";',
+        "the payload's private holding area",
+    ),
+    (
+        "src/lease/pool.rs",
+        "libc::S_IFREG | libc::S_IFLNK => {",
+        "the drain's by-name unlink of files and links",
+    ),
+    (
+        "src/lease/pool.rs",
+        '"an unknown entry type"',
+        "the drain's refusal the exhaustion case reads",
+    ),
+    (
+        "src/bin/oxide/main.rs",
+        "kept the held slot tree",
+        "the reported refusal of a held deletion",
+    ),
+    (
+        "src/bin/oxide/main.rs",
+        "stays recorded and charged",
+        "the charged row a refusal reports",
+    ),
+    (
+        "src/bin/oxide/main.rs",
+        "deleted the held slot tree",
+        "the reported finish of a held deletion",
+    ),
+    (
+        "src/bin/oxide/main.rs",
+        '"  slot {} held for deletion: {} recorded, {}s old, {}"',
+        "the status line the exhaustion case reads",
+    ),
+    (
+        "src/bin/oxide/main.rs",
+        '"presence not probed"',
+        "the recorded status wording for an unprobed held row",
+    ),
+    (
+        "src/lease/mod.rs",
+        "(a lock-free snapshot never probes)",
+        "the recorded snapshot that never probes presence",
+    ),
+    (
+        "src/lease/mod.rs",
+        '"pool cap cannot admit a new slot"',
+        "the capacity refusal the exhaustion case reads",
+    ),
+    (
+        "src/bin/oxide/prune.rs",
+        "fn declaration_allowed(scratch: &Path, given: Option<&Path>, canonical: Option<&Path>) -> bool {",
+        "the shared debug gate's declaration rule the fault case arms through",
+    ),
+    (
+        "src/bin/oxide/prune.rs",
+        "given == canonical && canonical != scratch && canonical.starts_with(scratch)",
+        "the declared-root rule: canonical, strict child of the supervisor scratch",
+    ),
+    (
+        "src/bin/oxide/prune.rs",
+        "let Some(evidence) = proof_evidence() else {",
+        "the low-reserve hook's gate on the shared evidence rule",
+    ),
+    (
+        "src/bin/oxide/prune.rs",
+        'const REGISTRY_FILE: &str = "registry.json";',
+        "the pool-owned registry leaf",
+    ),
+    (
+        "src/bin/oxide/prune.rs",
+        'const QUARANTINE_PREFIX: &str = ".prune-";',
+        "the quarantined leaf prefix",
+    ),
+    (
+        "src/bin/oxide/prune.rs",
+        'crash_point("terminal")',
+        "the pre-completion crash point",
+    ),
+    (
+        "src/bin/oxide/prune.rs",
+        "{mode}: check {count}, {deleted} entries deleted, {recovered} recovered",
+        "the low-reserve firing line",
+    ),
+    (
+        "src/bin/oxide/prune.rs",
+        "oxide: prune preview SHA-256",
+        "the preview digest line the plan oracle reads",
+    ),
+    ("src/bin/oxide/prune.rs", '["prune", "--dry-run"]', "the preview dispatch"),
+    (
+        "src/bin/oxide/outputs.rs",
+        'pub const EXTERNAL_DIR: &str = "oxide-outputs";',
+        "the owned outputs tree on the drive",
+    ),
+    (
+        "src/bin/oxide/removable.rs",
+        'root.join("oxide-managed")',
+        "the pool control directory the registry lives in",
+    ),
+)
+SELECTOR_RECIPE = {
+    "rust:finder-metadata-race": "python3 scripts/test-finder-metadata-race.py",
+    "rust:finder-metadata-race:diagnostic": (
+        "python3 scripts/test-finder-metadata-race.py --diagnostic"
+    ),
+}
+
+
+def selector_blocks(text: str) -> dict:
+    """The task tables of an `effigy.toml`, keyed by their own header."""
+    blocks = {}
+    current = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            current = stripped
+            blocks[current] = []
+        elif current is not None:
+            blocks[current].append(line)
+    return blocks
+
+
+def scratch_contract_problems(base: str = "/fixture/run") -> list:
+    """The declared scratch pool and the selectors' recipe, with no effect.
+
+    A script left half-migrated — a pool on the boot volume, no declaration, no
+    explicit cap, or a pool outside the declared root — fails here instead of
+    spending a native run whose pool the product would refuse, and a selector
+    that still names the internal root fails with it.
+    """
     problems = []
-    # The approved 30 s shutdown margin, enforced for every running child.
+    case_base = os.path.join(base, "cases", "lease_control", "0badc0de")
+    # Hostile inherited values: the declaration, the pool, the cap, the account
+    # and the flag overrides must all come from the fixture, never the caller.
+    hostile = {
+        "OXIDE_SCRATCH_ROOT": "/fixture/host-scratch",
+        "OXIDE_POOL": "/fixture/host-pool",
+        "OXIDE_POOL_CAP": "1",
+        "OXIDE_TASK_SCRATCH_ROOT": base,
+        "OXIDE_PROOF_DEADLINE_NS": "981",
+        "OXIDE_PROOF_EVIDENCE": "/fixture/evidence",
+        "OXIDE_TEST_FINDER_RACE": "*:directory",
+        "HOME": "/fixture/host-home",
+        "CARGO_HOME": "/fixture/host-cargo",
+        "TMPDIR": "/fixture/host-temp",
+        "XDG_CONFIG_HOME": "/fixture/xdg",
+        "RUSTFLAGS": "-Ctarget-cpu=native",
+        "CARGO_ENCODED_RUSTFLAGS": "-Ctarget-cpu=native",
+        "RUSTUP_TOOLCHAIN": "nightly",
+    }
+    for case in ("lease_control", "prune_drain_fault"):
+        env = fixture_environment(
+            case_base, case, RACES[case], hostile
+        )
+        scratch = env.get("OXIDE_SCRATCH_ROOT", "")
+        pool = env.get("OXIDE_POOL", "")
+        expected = os.path.join(case_base, SCRATCH_DIRNAME)
+        if scratch != expected:
+            problems.append(
+                f"{case}: the declared scratch root is {scratch!r}, not the case's own {expected}"
+            )
+        if not os.path.isabs(scratch) or os.path.normpath(scratch) != scratch:
+            problems.append(f"{case}: the declared scratch root {scratch!r} is not canonical")
+        elif os.path.commonpath([scratch, base]) != base:
+            problems.append(f"{case}: the declared scratch root {scratch!r} escapes the run root")
+        # The shared debug gate the prune fault fixture arms through requires a
+        # canonical DECLARATION that is a strict child of the canonical run root
+        # (`declaration_allowed`, src/bin/oxide/prune.rs, oxide#211).
+        if os.path.realpath(scratch) != scratch:
+            problems.append(f"{case}: the declared scratch root {scratch!r} is not canonicalised")
+        if not scratch.startswith(base + os.sep):
+            problems.append(
+                f"{case}: the declared scratch root {scratch!r} is not a strict child of {base!r}"
+            )
+        if os.path.dirname(pool) != scratch or pool == scratch:
+            problems.append(f"{case}: the pool {pool!r} is not strictly inside {scratch!r}")
+        if env.get("OXIDE_POOL_CAP") != str(POOL_BUDGET):
+            problems.append(f"{case}: the pool cap is not the explicit fixture budget")
+        if env.get("OXIDE_POOL_CREATE") != "1":
+            problems.append(f"{case}: the pool creation opt-in is missing")
+        if env.get("OXIDE_TEST_HOME_FROM_ENV") != "1":
+            problems.append(f"{case}: the account-home control is missing")
+        for name, path in (
+            ("HOME", "home"),
+            ("CARGO_HOME", "cargo-home"),
+            ("TMPDIR", "temp"),
+        ):
+            if env.get(name) != os.path.join(case_base, path):
+                problems.append(f"{case}: {name} is not the case's private {path}")
+        if env.get("TMPDIR") != env.get("TMP") or env.get("TMPDIR") != env.get("TEMP"):
+            problems.append(f"{case}: TMPDIR/TMP/TEMP do not agree")
+        if env.get("RUSTFLAGS") != "-C strip=symbols":
+            problems.append(f"{case}: the compiler flags were not frozen")
+        if "CARGO_ENCODED_RUSTFLAGS" in env or "XDG_CONFIG_HOME" in env:
+            problems.append(f"{case}: an encoded flag or XDG override survived the scrub")
+        for key in ("OXIDE_TASK_SCRATCH_ROOT", "OXIDE_PROOF_DEADLINE_NS", "OXIDE_PROOF_EVIDENCE"):
+            if env.get(key) != hostile[key]:
+                problems.append(f"{case}: the supervisor's {key} was not re-added")
+        if case in CASE_ENV:
+            for key, value in CASE_ENV[case].items():
+                if env.get(key) != value:
+                    problems.append(f"{case}: the case's {key} was not set")
+        if RACES[case] is not None and env.get("OXIDE_TEST_FINDER_RACE") != RACES[case]:
+            problems.append(f"{case}: the race injection is not this case's own")
+    if os.path.sep in SCRATCH_DIRNAME or SCRATCH_DIRNAME in (".", ".."):
+        problems.append("the scratch directory name is not a bare leaf name")
+    if os.path.basename(POOL_DIRNAME) != POOL_DIRNAME or POOL_DIRNAME in (".", ".."):
+        problems.append("the pool directory name is not a bare leaf name")
+    path = os.path.join(REPO, "effigy.toml")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            blocks = selector_blocks(handle.read())
+    except OSError as error:
+        return problems + [f"cannot read {path}: {error}"]
+    for selector, body in SELECTOR_RECIPE.items():
+        lines = blocks.get(f'[tasks."{selector}"]')
+        if lines is None:
+            problems.append(f"{selector}: no such selector in effigy.toml")
+            continue
+        run_line = next(
+            (line for line in lines if line.strip().startswith("run =")), None
+        )
+        if run_line is None:
+            problems.append(f"{selector}: the selector has no run command")
+            continue
+        if "--root-parent" in run_line:
+            problems.append(f"{selector}: the selector still names an internal root")
+        if "--limit 420 --scratch-budget-mib 512" not in run_line:
+            problems.append(f"{selector}: the unchanged 420 s / 512 MiB bounds drifted")
+        if not run_line.strip().endswith(f"{body}\""):
+            problems.append(f"{selector}: the selector does not run this proof's body")
+        if "admission = \"heavy\"" not in "".join(lines):
+            problems.append(f"{selector}: heavy admission is missing")
+    return problems
+
+
+def self_check() -> int:
+    """Pure check of the fixture layout budget, the scratch pool contract, the
+    current-main oracles and the shutdown cutoff: no scratch, child or image."""
+    problems = []
+    # The S4 fixture contract and the current-main oracle values, effect-free.
+    problems.extend(scratch_contract_problems())
+    for relative, needle, what in ORACLE_PINS:
+        try:
+            with open(os.path.join(REPO, relative), encoding="utf-8") as handle:
+                source = handle.read()
+        except OSError as error:
+            problems.append(f"{relative}: cannot be read ({error})")
+            continue
+        if needle not in source:
+            problems.append(f"{relative}: {what} drifted (missing {needle!r})")
     # Counterfactual: the 420 s selector leaves exactly 390 s of work, and the
     # earlier 25 s margin's 395 s is refused.
     if SHUTDOWN_MARGIN_SECONDS != 30:
@@ -1550,34 +1822,55 @@ def self_check() -> int:
                 problems.append(f"{case}: current layout is {size} bytes ({path})")
                 break
         print(f"  {case:<26} worst temp path {worst} bytes of {SOCKET_PATH_BUDGET}")
-    # The old-format control changes exactly its format fence and the saved
-    # idle size: it cannot accidentally turn a different state into the case.
-    if verified_capture_name(".oxide-capture-" + "a" * 32) != ".oxide-capture-" + "a" * 32:
-        problems.append("a valid private capture leaf was refused")
-    for unsafe in ("../outside", ".oxide-capture-" + "a" * 32 + "/child", None):
-        try:
-            verified_capture_name(unsafe)
-        except Unknown:
-            pass
-        else:
-            problems.append("a private capture path escape was accepted")
-    old_fixture = {"capacity_policy": 2, "slots": [{
-        "id": 1, "state": "evicting", "last_lease_id": "lease",
-        "capture": {"root": "unchanged"},
-    }]}
-    old_copy = json.loads(json.dumps(old_fixture))
-    saved = {"for_lease": "lease", "unique_bytes": 42}
-    upgraded = upgraded_counterfactual_ledger(old_fixture, 1, saved)
-    if (old_fixture != old_copy or upgraded["capacity_policy"] != 3
-            or upgraded["slots"][0].get("capture") != old_copy["slots"][0]["capture"]
-            or upgraded["slots"][0].get("recorded") != saved):
-        problems.append("old counterfactual migration changed more than the fence and size")
+    # The retired pre-#190 cases are declared nowhere (decision 6818efde), and
+    # nothing in the proof still reaches for the capture journal or the pinned
+    # base binary: the case table, the race map and the dispatch are all checked
+    # by name, and the retired helpers no longer exist.
+    for retired in RETIRED_CASES:
+        if retired in CASES or retired in RACES:
+            problems.append(f"{retired}: a retired case is still declared")
+    if [case for case in CASES if case.startswith("lease_")] != list(LEASE_CASES):
+        problems.append("the lease half is not the declared holding-model case set")
+    for retired_name in ("BASE_COMMIT", "base_source", "verified_capture_name",
+                         "old_counterfactual", "upgraded_counterfactual_ledger"):
+        if retired_name in globals():
+            problems.append(f"a retired pre-#190 mechanism survived: {retired_name}")
+    for case in LEASE_CASES:
+        lease_env = fixture_environment(
+            "/fixture/run/cases/" + case + "/0badc0de", case, RACES[case], {}
+        )
+        if [key for key in lease_env if key.startswith("OXIDE_TEST_CAPTURE_")]:
+            problems.append(f"{case}: the retired capture-unlink seam is still armed")
+        if "OXIDE_TEST_BUDGET_BYTES" in lease_env:
+            problems.append(f"{case}: the retired budget override is still armed")
+    # No lease case arms the race injection: oxide#190's eviction has no seam,
+    # and a lease case that armed one would be claiming a firing it cannot get.
+    for case in LEASE_CASES:
+        if RACES[case] is not None:
+            problems.append(f"{case}: a lease case still arms the prune-only race injection")
+    for case in CASES:
+        if case.startswith("prune_") and RACES[case] is None:
+            problems.append(f"{case}: a prune case arms no race")
+    # The holding model the lease half asserts, as executed structure: one record
+    # per pending deletion, presence read from the payload's private area, and
+    # the two fixture states the case bodies plant.
+    probe_env = {"OXIDE_POOL": "/nonexistent/pool"}
     try:
-        upgraded_counterfactual_ledger(old_fixture, 1, {"for_lease": "wrong", "unique_bytes": 42})
-    except Recoverable:
+        ledger_document(probe_env)
+    except Unknown:
         pass
     else:
-        problems.append("old counterfactual accepted a different lease's size")
+        problems.append("an absent pool ledger was accepted as journal state")
+    if holding_trees(probe_env) != {}:
+        problems.append("an absent holding area was not read as no held entry")
+    # Every lease case must have its own fixture branch: a case dispatched into
+    # `plant` without one would fail only at a native head.
+    planted_source = inspect.getsource(plant)
+    for case in LEASE_CASES:
+        if f'"{case}"' not in planted_source:
+            problems.append(f"{case}: plant() declares no fixture branch")
+    if HOLDING_NAME != ".oxide-holding" or os.path.basename(HOLDING_NAME) != HOLDING_NAME:
+        problems.append("the holding area name drifted from the product's payload entry")
     if set(PRUNE_SLUGS) - set(CASES):
         problems.append(f"slugs declared for unknown cases: {sorted(set(PRUNE_SLUGS) - set(CASES))}")
     if {case for case in CASES if case.startswith("prune_")} != set(PRUNE_SLUGS):
@@ -1648,6 +1941,11 @@ def self_check() -> int:
         problems.append(f"the replay invocation drifted: {seen!r}")
     print("  replay dispatch: both settle handlers share one executed replay body")
     print(f"  settle dispatch: {len(CASES)} cases bind one {Settle.__name__} bundle")
+    print(
+        f"  scratch pools: one declared root per case, the pool strictly inside it, "
+        f"{len(SELECTOR_RECIPE)} selectors on the selected-volume recipe"
+    )
+    print(f"  current-main oracles: {len(ORACLE_PINS)} product values still hold")
     # An overlong volume name must be refused, not attached.
     try:
         assert_prune_path_budget("counterfactual", "oxide155-" + "x" * 40)
@@ -1658,7 +1956,8 @@ def self_check() -> int:
         for problem in problems:
             print(f"self-check: {problem}", file=sys.stderr)
         return 1
-    print("self-check: fixture layout budget holds, old layouts still refused")
+    print("self-check: fixture layout budget holds, old layouts still refused, "
+          "scratch pool contract holds")
     return 0
 
 
@@ -1734,12 +2033,13 @@ def plan() -> int:
         race = RACES[case]
         print(f"  {case:<26} race {race or 'none (control)'}")
     print(
-        f"allocation: {sum(1 for c in CASES if c.startswith('lease_'))} internal 1 MiB "
-        "directory pools on the boot Data volume (the selector's internal-placement "
-        f"exception), {len(PRUNE_SLUGS)} owned 128 MiB sparse images with custody records "
-        "in the guard's evidence directory (one attached at a time and ordinarily "
-        "detached), one private HOME/CARGO_HOME and TMPDIR per case, staged debug oxide "
-        "in owned scratch"
+        f"allocation: {sum(1 for c in CASES if c.startswith('lease_'))} 1 MiB "
+        "directory-budget scratch pools, one per case, each declared with its own "
+        "OXIDE_SCRATCH_ROOT inside the case's run root and an explicit "
+        f"OXIDE_POOL_CAP, {len(PRUNE_SLUGS)} owned 128 MiB sparse images with custody "
+        "records in the guard's evidence directory (one attached at a time and "
+        "ordinarily detached), one private HOME/CARGO_HOME and TMPDIR per case, "
+        "staged debug oxide in owned scratch"
     )
     print("prune fixture layout (product Unix-socket bound %d bytes):" % SOCKET_PATH_BUDGET)
     for case in CASES:
@@ -1832,25 +2132,21 @@ def main(argv: list) -> int:
         evidence_dir()
         work_left()
         oxide = stage(root, REPO, "candidate")
-        source = base_source(root)
-        old_oxide = stage(root, source, "base")
-        shutil.rmtree(source)
+
         def digest(path):
             value = hashlib.sha256()
             with open(path, "rb") as handle:
                 for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                     value.update(chunk)
             return value.hexdigest()
-        candidate_digest, old_digest = digest(oxide), digest(old_oxide)
-        if candidate_digest == old_digest:
-            fail("candidate and base binaries are identical")
-        print(f"base {BASE_COMMIT} sha256 {old_digest}; candidate sha256 {candidate_digest}", flush=True)
+
+        print(f"candidate sha256 {digest(oxide)}", flush=True)
     except (Unknown, Recoverable) as error:
         state["first_fault"] = f"setup: {type(error).__name__}: {error}"
         if isinstance(error, Unknown):
             state["abort"] = state["first_fault"]
         return finish(1)
-    except (OSError, tarfile.TarError, subprocess.TimeoutExpired) as error:
+    except (OSError, subprocess.TimeoutExpired) as error:
         # Setup or staging raised outside the classified paths: its closure is
         # unknown, so it is recorded as an abort, never as an oracle failure.
         state["first_fault"] = f"setup: {type(error).__name__}: {error}"
@@ -1863,9 +2159,7 @@ def main(argv: list) -> int:
         state["reached"].append(case)
         try:
             line = (
-                old_counterfactual(oxide, old_oxide, root)
-                if case == "lease_old_counterfactual"
-                else lease_case(oxide, root, case, RACES[case])
+                lease_case(oxide, root, case, RACES[case])
                 if case.startswith("lease_")
                 else prune_case(oxide, root, case, RACES[case])
             )
