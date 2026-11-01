@@ -3999,39 +3999,7 @@ impl RootSession {
     }
 
     fn verify_marker(&self, candidate: &Candidate) -> Result<(), String> {
-        let name = std::ffi::CString::new(outputs::MARKER).map_err(|error| error.to_string())?;
-        // SAFETY: the root descriptor and C string are live for the call.
-        let fd = unsafe {
-            libc::openat(
-                self.root.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(format!(
-                "the owner marker is not readable ({})",
-                std::io::Error::last_os_error()
-            ));
-        }
-        // SAFETY: `fd` is a newly owned descriptor.
-        let file = unsafe { File::from_raw_fd(fd) };
-        let mut bytes = Vec::new();
-        file.take(64 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| format!("cannot read the owner marker: {error}"))?;
-        if bytes.len() > 64 * 1024 || sha256_hex(&bytes) != candidate.marker_digest {
-            return Err("the owner marker changed before the quarantine rename".to_owned());
-        }
-        let marker: Marker = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("the owner marker is invalid ({error})"))?;
-        if !marker.is_owned_by(&candidate.checkout, &candidate.checkout_id)
-            || marker.nonce() != candidate.nonce.as_deref()
-            || marker.generation() != candidate.generation
-        {
-            return Err("the owner marker does not match the plan".to_owned());
-        }
-        Ok(())
+        verify_root_marker(&self.root, candidate)
     }
 
     /// Recheck the volume and its reserve between bounded work batches.
@@ -6071,53 +6039,170 @@ fn resume_intent(store: &Store, control: &Path, intent: &Intent) -> Result<Resum
             // present and unchanged, the journal can be rolled back exactly;
             // any other state is uncertain and stays pending. The journal's
             // device number may predate a reboot, so the reopen proves identity by
-            // the inode and the verified volume and the marker comparison below
-            // binds the reserved nonce, generation and recorded digest.
-            let candidate = Candidate {
-                checkout_id: intent.identity.checkout_id.clone(),
-                checkout: intent.identity.checkout.clone(),
-                receipt: intent.identity.receipt.clone(),
-                member: intent.identity.member.clone(),
-                root: intent.identity.root.clone(),
-                root_kind: intent.identity.root_kind,
-                volume_uuid: intent.identity.volume_uuid.clone(),
-                checkout_volume_uuid: None,
-                nonce: intent.identity.nonce.clone(),
-                generation: intent.identity.generation,
-                dev: intent.identity.dev,
-                ino: intent.identity.ino,
-                marker_digest: intent.identity.marker_digest.clone(),
-                logical_bytes: 0,
-                allocated_bytes: 0,
-                accounting_complete: false,
-                receiptless: false,
-            };
-            let session = match RootSession::open_recorded(&intent.identity) {
-                Ok(session) => session,
+            // the inode and the verified volume and the marker comparison in
+            // `replay_journaled_root` binds the reserved nonce, generation and
+            // recorded digest.
+            let candidate = journal_candidate(intent);
+            let reopened = match RootSession::open_recorded(&intent.identity) {
+                Ok(session) => Reopened::Original(OpenedRoot::Session(session)),
                 Err(original) => {
                     // A crash between the exclusive rename and its journal
                     // phase leaves the root under the intent's own random
                     // quarantine leaf. Only that exact inode, on the recorded
                     // volume, with the recorded marker, resumes deletion.
-                    let session = RootSession::open_quarantine(
+                    match RootSession::open_quarantine(
                         &intent.identity,
                         &quarantine_leaf(intent)?,
-                    )
-                    .map_err(|quarantine| {
-                        format!("the root is not at its path ({original}) or in its quarantine ({quarantine})")
-                    })?;
-                    session.verify_marker(&candidate)?;
-                    update_intent(control, &intent.id, IntentPhase::Renamed).map_err(|error| {
-                        format!("cannot record the observed quarantine rename: {error}")
-                    })?;
-                    return resume_quarantine(store, control, intent, &session);
+                    ) {
+                        Ok(session) => Reopened::Quarantine(OpenedRoot::Session(session)),
+                        Err(quarantine) => Reopened::Missing(format!(
+                            "the root is not at its path ({original}) or in its quarantine ({quarantine})"
+                        )),
+                    }
                 }
             };
-            session.verify_marker(&candidate)?;
+            replay_journaled_root(store, control, intent, &candidate, reopened)
+        }
+    }
+}
+
+/// The plan identity a journal recorded, as the replay compares it.
+fn journal_candidate(intent: &Intent) -> Candidate {
+    Candidate {
+        checkout_id: intent.identity.checkout_id.clone(),
+        checkout: intent.identity.checkout.clone(),
+        receipt: intent.identity.receipt.clone(),
+        member: intent.identity.member.clone(),
+        root: intent.identity.root.clone(),
+        root_kind: intent.identity.root_kind,
+        volume_uuid: intent.identity.volume_uuid.clone(),
+        checkout_volume_uuid: None,
+        nonce: intent.identity.nonce.clone(),
+        generation: intent.identity.generation,
+        dev: intent.identity.dev,
+        ino: intent.identity.ino,
+        marker_digest: intent.identity.marker_digest.clone(),
+        logical_bytes: 0,
+        allocated_bytes: 0,
+        accounting_complete: false,
+        receiptless: false,
+    }
+}
+
+/// Where reopening a journaled root found it, and through what its owner marker
+/// is compared.
+///
+/// The opener is the only part of a replay that needs the verified mount, which
+/// a unit test cannot create (only `/Volumes/<name>` binds). Everything after
+/// that decision is one function, [`replay_journaled_root`], so the decision and
+/// its effects are exercised together.
+enum Reopened {
+    /// The root is at its recorded path: verify the marker, then roll back.
+    Original(OpenedRoot),
+    /// The exclusive rename happened but its journal phase did not: the root is
+    /// under the intent's own quarantine leaf, so verify the marker, record the
+    /// rename and resume the deletion.
+    Quarantine(OpenedRoot),
+    /// Neither location positively holds the recorded root; the intent stays
+    /// pending.
+    Missing(String),
+}
+
+/// A reopened root whose owner marker a replay can compare.
+enum OpenedRoot {
+    /// The verified session `resume_intent` opens in production.
+    Session(RootSession),
+    /// A caller-held descriptor for the same recorded root, so a unit test drives
+    /// this same decision and its effects without a mount. It runs the identical
+    /// [`verify_root_marker`], and it never deletes: only a verified session may
+    /// resume a deletion.
+    #[cfg(test)]
+    Fixture(OwnedFd),
+}
+
+impl OpenedRoot {
+    fn verify_marker(&self, candidate: &Candidate) -> Result<(), String> {
+        match self {
+            Self::Session(session) => session.verify_marker(candidate),
+            #[cfg(test)]
+            Self::Fixture(root) => verify_root_marker(root, candidate),
+        }
+    }
+}
+
+/// Decide and perform one replay of a journal that recorded no filesystem effect.
+fn replay_journaled_root(
+    store: &Store,
+    control: &Path,
+    intent: &Intent,
+    candidate: &Candidate,
+    reopened: Reopened,
+) -> Result<Resumed, String> {
+    match reopened {
+        Reopened::Original(root) => {
+            root.verify_marker(candidate)?;
             rollback_intent(store, control, intent)?;
             Ok(Resumed::RolledBack)
         }
+        Reopened::Quarantine(root) => {
+            root.verify_marker(candidate)?;
+            match &root {
+                OpenedRoot::Session(session) => {
+                    update_intent(control, &intent.id, IntentPhase::Renamed).map_err(|error| {
+                        format!("cannot record the observed quarantine rename: {error}")
+                    })?;
+                    resume_quarantine(store, control, intent, session)
+                }
+                #[cfg(test)]
+                OpenedRoot::Fixture(_) => Err(
+                    "a replay without a verified session never resumes a deletion; the intent stays pending"
+                        .to_owned(),
+                ),
+            }
+        }
+        Reopened::Missing(reason) => Err(reason),
     }
+}
+
+/// Compare the owner marker under an opened root descriptor with the journal's
+/// recorded identity: its exact bytes, its checkout and its reserved nonce and
+/// generation. The device number is deliberately absent — identity was settled by
+/// the reopen (recorded inode on the verified volume), and a reboot may have
+/// renumbered the volume since the journal was written.
+fn verify_root_marker(root: &OwnedFd, candidate: &Candidate) -> Result<(), String> {
+    let name = std::ffi::CString::new(outputs::MARKER).map_err(|error| error.to_string())?;
+    // SAFETY: the root descriptor and C string are live for the call.
+    let fd = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "the owner marker is not readable ({})",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `fd` is a newly owned descriptor.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let mut bytes = Vec::new();
+    file.take(64 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read the owner marker: {error}"))?;
+    if bytes.len() > 64 * 1024 || sha256_hex(&bytes) != candidate.marker_digest {
+        return Err("the owner marker changed before the quarantine rename".to_owned());
+    }
+    let marker: Marker = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("the owner marker is invalid ({error})"))?;
+    if !marker.is_owned_by(&candidate.checkout, &candidate.checkout_id)
+        || marker.nonce() != candidate.nonce.as_deref()
+        || marker.generation() != candidate.generation
+    {
+        return Err("the owner marker does not match the plan".to_owned());
+    }
+    Ok(())
 }
 
 fn quarantine_leaf(intent: &Intent) -> Result<String, String> {
@@ -9052,13 +9137,21 @@ mod tests {
         fstat_fd(&fd).unwrap()
     }
 
+    /// The reason a replay refused. A replay that returned a verdict where the
+    /// test requires a refusal is itself a failure.
+    fn replay_refusal(result: Result<Resumed, String>, what: &str) -> String {
+        match result {
+            Err(reason) => reason,
+            Ok(_) => panic!("{what}"),
+        }
+    }
+
     /// A reboot or a reattach renumbers a mounted volume's `st_dev`. The
     /// unchanged root is still the recorded one — same inode, same marker, same
     /// verified volume — so its stale device is reconciled instead of making the
     /// row unknown, while a changed inode never is.
     #[test]
     fn a_renumbered_device_reconciles_an_unchanged_root() {
-        use std::os::unix::fs::MetadataExt;
         let fixture = Fixture::new();
         let mut row = row_for(&fixture.root);
         fs::create_dir_all(&row.root).unwrap();
@@ -9204,14 +9297,20 @@ mod tests {
         assert!(!same_candidates(&[&planned], &[]));
     }
 
-    /// A pending intent and a crash replay across a renumbering: the journaled
-    /// group is published with this run's observation in one write, and a replay
-    /// from an earlier session proves identity by the recorded inode and the
-    /// verified volume rather than by the stale number.
+    /// A pending intent and a crash replay across a renumbering, through the
+    /// production replay path. `resume_intent` refuses when it cannot positively
+    /// reopen the recorded root; `replay_journaled_root` — the one function it
+    /// calls once a reopen succeeds — rolls the journal back exactly, and a
+    /// swapped volume is never rolled back.
     #[test]
     fn a_pending_intent_replays_across_a_renumbered_device() {
         let fixture = Fixture::new();
         let mut root = row_for(&fixture.root);
+        root.root = fixture
+            .root
+            .join("mnt")
+            .join(outputs::EXTERNAL_DIR)
+            .join("app");
         fs::create_dir_all(&root.root).unwrap();
         write_root_marker(&root.root, &root_marker(&root));
         let observed = observe_fixture_root(&root);
@@ -9251,31 +9350,37 @@ mod tests {
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600)).unwrap();
-        // The row records the stale number a pre-reboot write left behind; the
-        // candidate carries this run's own observation.
-        let mut candidate = candidate_of(&debug);
-        candidate.dev = observed.dev;
-        candidate.ino = observed.ino;
-        candidate.marker_digest = observed.marker_digest.clone();
         let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
+        let journal = |id: &str| -> Intent {
+            // The row records the stale number a pre-reboot write left behind; the
+            // candidate carries this run's own observation.
+            let mut candidate = candidate_of(&debug);
+            candidate.dev = observed.dev;
+            candidate.ino = observed.ino;
+            candidate.marker_digest = observed.marker_digest.clone();
+            let quarantine = fixture.root.join(format!("{QUARANTINE_PREFIX}{id}"));
+            let revision = ready_registry(&control).unwrap().revision;
+            match journal_intent(
+                &store,
+                &control,
+                &candidate,
+                &"f".repeat(64),
+                id,
+                &quarantine,
+                revision,
+            ) {
+                Ok(true) => {}
+                Ok(false) => panic!("the journal did not publish"),
+                Err(stop) => panic!("the journal refused: {}", stop_text(stop)),
+            }
+            ready_registry(&control)
+                .unwrap()
+                .intent(id)
+                .cloned()
+                .unwrap()
+        };
         let id = "a".repeat(32);
-        let quarantine = fixture.root.join(format!("{QUARANTINE_PREFIX}{id}"));
-        let revision = ready_registry(&control).unwrap().revision;
-        match journal_intent(
-            &store,
-            &control,
-            &candidate,
-            &"f".repeat(64),
-            &id,
-            &quarantine,
-            revision,
-        ) {
-            Ok(true) => {}
-            Ok(false) => panic!("the journal did not publish"),
-            Err(stop) => panic!("the journal refused: {}", stop_text(stop)),
-        }
-        let journaled = ready_registry(&control).unwrap();
-        let intent = journaled.intent(&id).cloned().unwrap();
+        let intent = journal(&id);
         assert_eq!(intent.identity.dev, observed.dev);
         assert_eq!(intent.group.len(), 2);
         assert!(
@@ -9286,7 +9391,8 @@ mod tests {
             "the intent kept a stale device for its own group"
         );
         assert!(
-            journaled
+            ready_registry(&control)
+                .unwrap()
                 .rows
                 .iter()
                 .filter(|row| row.root == debug.root)
@@ -9294,24 +9400,48 @@ mod tests {
             "the registry publication did not refresh the group's device"
         );
 
-        // A later session (or a replay after the reboot) reopens the recorded
-        // root: the journal's number may be stale, so identity rests on the
-        // inode and the verified volume, and the owner marker is compared
-        // against the intent before any effect.
+        // The reboot, after the publication: the journal and every row of the
+        // group keep the number they recorded, and the volume reports a new one.
+        let live_dev = u64::try_from(fixture_stat(&root.root).st_dev).unwrap();
+        let stale_dev = live_dev + 41;
+        let mut rebooted = ready_registry(&control).unwrap();
+        for row in rebooted
+            .rows
+            .iter_mut()
+            .filter(|row| row.root == debug.root)
+        {
+            row.root_dev = Some(stale_dev);
+        }
+        for record in rebooted.intents.iter_mut() {
+            record.identity.dev = stale_dev;
+            for member in record.group.iter_mut() {
+                member.root_dev = Some(stale_dev);
+            }
+        }
+        rebooted.bump().unwrap();
+        write_registry(&control, &rebooted).unwrap();
+        let intent = ready_registry(&control)
+            .unwrap()
+            .intent(&id)
+            .cloned()
+            .unwrap();
+        assert_ne!(
+            intent.identity.dev, live_dev,
+            "the fixture did not renumber"
+        );
+
+        // The mount half of a replay: the journal's number is stale, so the reopen
+        // binds the recorded inode on the verified volume and a fresh candidate
+        // still has to report its own observed device.
         let stat = fixture_stat(&root.root);
-        let live_dev = u64::try_from(stat.st_dev).unwrap();
         assert_eq!(
             judge_root_identity(&stat, live_dev, None, observed.ino),
             Ok(live_dev)
         );
-        // A fresh candidate is different: its device came from this run, so a
-        // difference there is a changed mount or root.
         assert_eq!(
             judge_root_identity(&stat, live_dev, Some(live_dev + 1), observed.ino).unwrap_err(),
             "the root's device changed"
         );
-        // A renumbered device still never rescues a changed inode, and a
-        // descriptor off the verified volume is refused whatever it records.
         assert_eq!(
             judge_root_identity(&stat, live_dev, None, observed.ino + 1).unwrap_err(),
             "the root's inode changed"
@@ -9321,15 +9451,129 @@ mod tests {
             "the root is not on the verified volume"
         );
 
-        // The exact rollback of that journal still restores both members (its
-        // comparison is journal against registry, never against a live device).
-        rollback_intent(&store, &control, &intent).unwrap();
+        // The production replay entry point refuses when neither the recorded path
+        // nor the quarantine leaf can be positively reopened (no `/Volumes` mount
+        // exists here), and it settles nothing.
+        let refused = replay_refusal(
+            resume_intent(&store, &control, &intent),
+            "the real replay settled a journal it could not positively reopen",
+        );
+        assert!(refused.contains("not at its path"), "{refused}");
+        assert!(refused.contains("in its quarantine"), "{refused}");
+        let kept = ready_registry(&control).unwrap();
+        assert!(
+            kept.intent(&id).is_some(),
+            "a refused replay settled its journal"
+        );
+        assert!(
+            kept.rows
+                .iter()
+                .filter(|row| row.root == debug.root)
+                .all(|row| row.pruning.as_deref() == Some(id.as_str()) && !row.selected),
+            "a refused replay changed the registry"
+        );
+
+        // The decision and effects `resume_intent` runs once the reopen succeeds:
+        // the root at its recorded path carries the journal's own marker, so both
+        // members are restored and the journal is removed.
+        let replayed = replay_journaled_root(
+            &store,
+            &control,
+            &intent,
+            &journal_candidate(&intent),
+            Reopened::Original(OpenedRoot::Fixture(
+                fs::File::open(&root.root).unwrap().into(),
+            )),
+        )
+        .unwrap();
+        assert!(matches!(replayed, Resumed::RolledBack));
         let rolled = ready_registry(&control).unwrap();
+        assert!(
+            rolled.intent(&id).is_none(),
+            "the rolled-back journal remains"
+        );
         for row in rolled.rows.iter().filter(|row| row.root == debug.root) {
             assert!(row.pruning.is_none(), "{} kept a pruning mark", row.member);
-            assert_eq!(row.root_dev, Some(observed.dev));
+            // The rollback restores the journal's own recorded facts; it never
+            // invents the live device.
+            assert_eq!(row.root_dev, Some(stale_dev));
         }
-        assert!(rolled.intents.is_empty(), "the rolled-back journal remains");
+        assert!(
+            rolled
+                .rows
+                .iter()
+                .find(|row| row.member == "debug")
+                .unwrap()
+                .selected,
+            "the rollback did not restore the selected member"
+        );
+
+        // The quarantine branch is the deletion path: a replay without a verified
+        // session never resumes a deletion, even with the journal's own marker, so
+        // the intent stays pending.
+        let id = "b".repeat(32);
+        let swapped_intent = journal(&id);
+        let quarantine_refusal = replay_refusal(
+            replay_journaled_root(
+                &store,
+                &control,
+                &swapped_intent,
+                &journal_candidate(&swapped_intent),
+                Reopened::Quarantine(OpenedRoot::Fixture(
+                    fs::File::open(&root.root).unwrap().into(),
+                )),
+            ),
+            "a session-less replay resumed a deletion",
+        );
+        assert!(
+            quarantine_refusal.contains("never resumes a deletion"),
+            "{quarantine_refusal}"
+        );
+        assert!(
+            ready_registry(&control).unwrap().intent(&id).is_some(),
+            "a session-less deletion replay settled its journal"
+        );
+
+        // A swapped volume is never rolled back: the marker now at the recorded
+        // path belongs to another volume, so its preimage is not the journal's. The
+        // replay refuses and leaves the journal and every row exactly as the
+        // publication wrote them.
+        let mut swapped = root_marker(&debug);
+        swapped["volume_uuid"] = serde_json::json!("99999999-8888-7777-6666-555555555555");
+        write_root_marker(&root.root, &swapped);
+        assert_ne!(
+            observe_fixture_root(&root).marker.volume_uuid(),
+            swapped_intent.identity.volume_uuid.as_deref(),
+            "the fixture is not a swapped volume"
+        );
+        let refused = replay_refusal(
+            replay_journaled_root(
+                &store,
+                &control,
+                &swapped_intent,
+                &journal_candidate(&swapped_intent),
+                Reopened::Original(OpenedRoot::Fixture(
+                    fs::File::open(&root.root).unwrap().into(),
+                )),
+            ),
+            "a swapped volume was rolled back",
+        );
+        assert_eq!(
+            refused, "the owner marker changed before the quarantine rename",
+            "a swapped volume was reconciled"
+        );
+        let kept = ready_registry(&control).unwrap();
+        assert!(
+            kept.intent(&id).is_some(),
+            "a swapped volume settled its journal"
+        );
+        assert!(
+            kept.rows
+                .iter()
+                .filter(|row| row.root == debug.root)
+                .all(|row| row.pruning.as_deref() == Some(id.as_str()) && !row.selected),
+            "a swapped volume changed the registry"
+        );
     }
 
     /// A group with a stale recorded device is ONE owner. The selected references
