@@ -216,8 +216,8 @@ def self_check() -> None:
         old = Git(False)
         try:
             resolve_baseline(old, "/repo")
-        except SystemExit:
-            pass
+        except RuntimeError as error:
+            assert "must contain scratch-pools S3" in str(error)
         else:
             raise AssertionError("pre-S3 baseline was accepted")
         assert len(old.commands) == 2 and old.commands[-1][-2:] == [S3, "a" * 40]
