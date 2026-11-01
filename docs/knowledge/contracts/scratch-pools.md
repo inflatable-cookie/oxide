@@ -332,6 +332,12 @@ each script's own selector text and case bodies.
 | `rust:finder-metadata-race` (#155) + `:diagnostic` | every fixture pool is a directory-budget pool |
 | `rust:command-budgets` (#140) + `:diagnostic` | `OXIDE_POOL_BACKEND=directory-budget` fixture pools |
 
+**Migrated:** `rust:seed-default-off` (#205) and its diagnostic use the
+supervisor-selected scratch volume with a declared scratch pool. Its baseline
+must contain S3 (`79e55f4`); older baseline comparisons require the internal
+root and are outside this migrated proof (decision fe367c88). Its native
+qualification remains separately owner-activated.
+
 **Keep the internal root** (the premise is the boot Data volume or
 non-`/Volumes` placement, which no scratch pool replaces):
 

@@ -276,6 +276,11 @@ def main() -> int:
     try:
         commit = run(proof, repo, commit, diagnostic)
     except BaseException as failure:
+        if diagnostic:
+            receipt = os.path.join(os.environ["OXIDE_PROOF_EVIDENCE"], "diagnostic.json")
+            if not os.path.exists(receipt):
+                record("diagnostic.json", json.dumps({"qualified": False, "cases": [],
+                    "skipped": list(TESTS), "failure": str(failure)[:512]}) + "\n")
         record(
             "result.txt",
             f"failed: {failure!r}\nunclosed children: {sorted(proof.unclosed)}\nroot: {root}\n",
