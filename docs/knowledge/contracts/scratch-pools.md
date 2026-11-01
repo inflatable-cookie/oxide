@@ -327,7 +327,6 @@ each script's own selector text and case bodies.
 | --- | --- |
 | `rust:installed-handoff` (#122) | two cases create a real directory pool; needs the diagnostic apparatus authored first (S4) |
 | `rust:profile-outputs` (#133) + `:diagnostic` | 20 private directory-budget fixture pools |
-| `rust:pool-temp-scratch` (#136) + `:diagnostic` | migrated to selected-volume scratch pool plus one owned image; migrated-head native evidence pending |
 | `rust:recorded-slot-accounting` (#146) + `:diagnostic` | genuine directory-budget pool, verified from the product's own config |
 | `rust:exec-output-inference` (#160) + `:diagnostic` | control pool is a directory-budget pool |
 | `rust:auto-adopt-ineligible` (#154) + `:diagnostic` | control pool is a directory-budget pool |
@@ -336,11 +335,12 @@ each script's own selector text and case bodies.
 | `rust:finder-metadata-race` (#155) + `:diagnostic` | every fixture pool is a directory-budget pool |
 | `rust:command-budgets` (#140) + `:diagnostic` | `OXIDE_POOL_BACKEND=directory-budget` fixture pools |
 
-**Keep the internal root** (the premise is the boot Data volume or
-non-`/Volumes` placement, which no scratch pool replaces):
+**Keep the internal root** (the premise is boot Data, non-`/Volumes` placement,
+or a socket path that cannot fit under the selected-volume guard prefix):
 
 | Selector/recipe | Genuine premise |
 | --- | --- |
+| `rust:pool-temp-scratch` (#136) + `:diagnostic` | decision af7df7d6: the Builds guard prefix makes even the shortest slot scratch path 101 bytes, exceeding the 91-byte product bound; both selectors keep `/private/tmp` |
 | `rust:outputs-prune` (#129/#152) + `:diagnostic` | cases 10 and 21 prove checkout absence on the boot Data volume |
 | `rust:prune-absence` (#135) + `:diagnostic` | the missing-ancestor chain must sit on the boot Data volume |
 | the `AGENTS.md` unit-suite recipe (`OXIDE_TEST_INTERNAL_ROOT`) | three macOS fixtures take the boot Data volume and `MNT_IGNORE_OWNERSHIP` premises; `config::tests::git_work_trees_and_aliases_refuse` needs a root off `/Volumes` |
@@ -497,7 +497,7 @@ does not change. So each migration is a proof-authoring change:
   Nothing in S4 grants an activation or carries an old native receipt forward;
   the new head's receipts are the evidence.
 
-The ten sub-slices and the three keeps are listed in "Migration list". Each
+The migrating sub-slices and the keeps are listed in "Migration list". Each
 selector keeps **its own** wall clock and scratch budget; there is no uniform
 figure, and the columns below are read from the selectors and scripts as they
 stand at this head:
@@ -506,7 +506,6 @@ stand at this head:
 | --- | --- | --- | --- |
 | `rust:installed-handoff` | 120 s / 64 MiB | **none — authored in this sub-slice** | none in the script; only `scripts/test_dogfood_scripts.py` `HandoffSelectorTests` pins its root, limits and body |
 | `rust:profile-outputs` | 600 s / 512 MiB | yes | `--plan` |
-| `rust:pool-temp-scratch` | 300 s / 512 MiB | yes | `proof:pool-temp:test`, `--plan` |
 | `rust:recorded-slot-accounting` | 300 s / 512 MiB | yes | `proof:recorded-slot-accounting:test`, `--plan` |
 | `rust:exec-output-inference` | 300 s / 512 MiB | yes | `proof:exec-inference:test`, `--plan` |
 | `rust:auto-adopt-ineligible` | 300 s / 512 MiB | yes | `--plan` (shared #117 fixture, no distinct pure selector) |

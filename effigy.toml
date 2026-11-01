@@ -252,12 +252,12 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # reports the longest injected path in bytes and characters against the
 # 91-byte socket bound. No live pool, registered drive, install or consumer is
 # touched. Not a benchmark and not an alias for full QA.
-# Directory fixtures use OXIDE_SCRATCH_ROOT inside the selected-volume run
-# root; a /private/tmp fallback exercises the internal path and is not
-# scratch-pool coverage. The 300 s / 512 MiB bounds are unchanged.
+# The child-temp 91-byte socket bound requires the short internal guard root
+# (decision af7df7d6); the selected Builds prefix cannot fit. No scratch-pool
+# declaration is exported. The 300 s / 512 MiB bounds are unchanged.
 [tasks."rust:pool-temp-scratch"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-pool-temp-scratch.py"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-pool-temp-scratch.py"
 
 # Pure regression of the proof's own apparatus (fixture layout, rerun
 # completeness, observation freshness, readiness parsing, refusal targeting,
@@ -277,7 +277,7 @@ run = "python3 scripts/test-pool-temp-scratch.py --plan"
 # receipt is explicitly unqualified and is never counted native evidence.
 [tasks."rust:pool-temp-scratch:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-pool-temp-scratch.py --diagnostic"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-pool-temp-scratch.py --diagnostic"
 
 # Recorded per-slot accounting (oxide#146): admission and byte-pressure
 # eviction from closed per-slot observations, O(slots) with zero inventory

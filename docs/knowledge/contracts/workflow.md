@@ -1286,11 +1286,11 @@ successor design establishes equivalence.
 
 **Proof.** `effigy rust:pool-temp-scratch` is one fixed script,
 `scripts/test-pool-temp-scratch.py`, and the whole command of the qualified
-shared proof supervisor (`bounded-test.py --limit 300
+shared proof supervisor (`bounded-test.py --root-parent /private/tmp --limit 300
 --scratch-budget-mib 512`; an ELEVATED trigger: it deletes owned scratch, decides
 writer closure and writes to an owned removable fixture volume). It stages
 this clean HEAD's debug `oxide` offline with 1.97.1 and covers, on tiny
-fixtures with a private `HOME`, `CARGO_HOME` and directory pool under a private `OXIDE_SCRATCH_ROOT` on the selected volume. A `/private/tmp` fallback exercises the internal path and is not scratch-pool coverage. Staging and
+fixtures with a private `HOME`, `CARGO_HOME` and directory pool. Decision af7df7d6 keeps the explicit internal root because the shortest slot scratch under the selected Builds prefix is 101 bytes, above the 91-byte socket bound. The source-derived internal layout is at most 88 bytes for the two-digit slot IDs the proof admits, a 3-byte margin; case 12 verifies the actual names and reports the run figures. No child receives `OXIDE_SCRATCH_ROOT`. Staging and
 every fixture child share one resolved absolute toolchain home — an inherited
 `RUSTUP_HOME` when it is absolute and usable, else the account default
 `$HOME/.rustup` resolved from the original HOME *before* the private fixture
@@ -1989,27 +1989,20 @@ the selected-volume default and positive outer closure (oxide#147's own records
 hold the case counts, runs and events). Qualification is bound to those bytes
 and evidence; an older hash's receipts do not transfer to new bytes.
 
-**Internal-placement proofs (oxide#136, accepted narrow exception).** A proof
-whose subject is the *internal* directory pool cannot run over the
-selected-volume default: the product correctly refuses a `directory-budget`
-internal pool on an external volume, and that refusal is not bendable (no
-debug-only exception). The owner accepted this narrow exception for genuine
-internal-placement proofs (decision `bd357a4c`, 2026-10-25). Such a proof may
-declare the internal root explicitly through the qualified guard's existing
-`--root-parent` option — for oxide#136, `--root-parent /private/tmp` in both its
-counted and diagnostic selectors. The guard still creates ONE fresh owned
-monitored root under that canonical internal directory and applies the
-unchanged 300 s, 512 MiB, 22 GiB reserve, custody, retention and cleanup rules
-to everything inside it, including staging, the fixture pool, temp and the
-single owned 128 MiB image. The selected-volume default is unchanged for every
-other caller: builds, tests and ordinary proofs keep the drive placement. The
-exception authorises placement only; each such proof still needs its own
-independent exact-head source confirmation and separate execution activation.
-Its fixtures must stay outside the directory-budget pool on the same device —
-inherited `TMPDIR` values under the pool directory are not valid, and the
-product's pool-membership refusal is never weakened. The observed ~58 MiB peak
-in an oxide#136 diagnostic is a measurement, not a bound reduction or a
-guarantee for other work.
+**Internal-root keep for child-temp proof (oxide#136).** Decision af7df7d6
+retains `--root-parent /private/tmp` in both selectors: the guard's selected
+Builds prefix cannot fit even the shortest fixture slot scratch beneath the
+91-byte socket bound. The short internal fixture path has a source-derived
+88-byte maximum with a positive 3-byte margin for the script's admitted slot
+names. The guard still monitors one owned root, 300 s, 512 MiB, reserve,
+custody, closure and cleanup. This selector exports no `OXIDE_SCRATCH_ROOT`;
+the separate owned image stays under its existing custody rules. This ruling
+requires separate exact-head review and native activations; the blocked review
+at `8d030b2` and earlier proof packets remain historical with no native credit
+for the corrected head. The shorter supervisor prefix is tracked by papercut
+`503e484d`. The earlier decision `bd357a4c` accepted the internal-root
+exception, and an earlier oxide#136 diagnostic observed about 58 MiB peak;
+that figure remains historical and is not a budget reduction or new evidence.
 
 **Genuine internal-placement proofs (Tom, 2026-10-25).** Tom answered decision
 `bd357a4c-2e1d-4190-bafb-290d7c2ae244`: "Accept the internal-root exception for
