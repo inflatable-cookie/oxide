@@ -2,7 +2,7 @@
 """Focused native proof for recorded per-slot accounting (oxide#146).
 
 One fixed script and the whole command of the shared proof supervisor
-(`bounded-test.py`, guard sha256 7acca44c..., the oxide#191 bytes that add the
+(`bounded-test.py`, guard sha256 94b1aba6..., the oxide#191 bytes that add the
 opt-in post-census image detach to the qualified oxide#151 guard, plus
 oxide#197's ancestor and launcher-sibling exclusions). That pin is
 checked against the actual runner file before any effect, so a branch that
