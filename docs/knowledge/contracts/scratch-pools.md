@@ -455,7 +455,7 @@ equal to the root, a sibling-prefix path and a missing parent each refuse with
 nothing created, and an external path inside a Git work tree refuses with the
 Git message; the internal Git-message control is unit-proved by `store::scratch_internal_tests::internal_git_refusal_is_unchanged_by_scratch_declaration`; (05) no explicit budget
 refuses; (06) a declared root that is a symlink, group-writable, or a mount root
-refuses; the boot-volume inertness control is unit-proved by `store::scratch_internal_tests::scratch_declaration_is_inert_on_boot_volume`; (07) ordinary detach, with the host record case 01 wrote still present:
+refuses; the boot-volume inertness control is unit-proved by `store::scratch_internal_tests::scratch_declaration_is_inert_on_boot_volume`: two fresh pools have equal parsed configs except their distinct, validated `store_id` values, identical entry names and no scratch identity (decision 8ee50015); (07) ordinary detach, with the host record case 01 wrote still present:
 `status` reports `unavailable (scratch volume <uuid> absent)` with no walk and
 no write, a leased command refuses naming the same UUID from the record, no
 shadow directory appears and the mount point is not recreated; (08) re-attach the same image:

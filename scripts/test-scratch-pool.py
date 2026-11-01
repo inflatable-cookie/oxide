@@ -401,11 +401,21 @@ def proof(diagnostic):
         def case05(): refuse(changed(OXIDE_POOL=scratch / 'no-budget', OXIDE_POOL_CAP=None), 'scratch-budget-required')
         def case06():
             link = mount / 'root-link'; link.symlink_to(scratch)
-            refuse(changed(OXIDE_SCRATCH_ROOT=link, OXIDE_POOL=link / 'pool2'), 'scratch-root-unsafe')
+            pool2 = link / 'pool2'
+            require(not os.path.lexists(pool2), 'symlink control already exists')
+            refuse(changed(OXIDE_SCRATCH_ROOT=link, OXIDE_POOL=pool2), 'scratch-root-unsafe')
+            require(not os.path.lexists(pool2), 'symlink refusal created pool')
+            writable = scratch / 'writable'
+            require(not os.path.lexists(writable), 'writable control already exists')
             scratch.chmod(0o770)
-            try: refuse(changed(OXIDE_POOL=scratch / 'writable'), 'scratch-root-unsafe')
+            try:
+                refuse(changed(OXIDE_POOL=writable), 'scratch-root-unsafe')
+                require(not os.path.lexists(writable), 'writable refusal created pool')
             finally: scratch.chmod(0o700)
-            refuse(changed(OXIDE_SCRATCH_ROOT=mount, OXIDE_POOL=mount / 'direct'), 'scratch-root-unsafe')
+            direct = mount / 'direct'
+            require(not os.path.lexists(direct), 'mount-root control already exists')
+            refuse(changed(OXIDE_SCRATCH_ROOT=mount, OXIDE_POOL=direct), 'scratch-root-unsafe')
+            require(not os.path.lexists(direct), 'mount-root refusal created pool')
         def case07():
             before = record.read_bytes(); images.detach()
             require(not mount.exists(), 'mount point remained after detach')

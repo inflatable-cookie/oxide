@@ -12137,23 +12137,95 @@ mod scratch_internal_tests {
         }
         let root = PathBuf::from(std::env::var_os("OXIDE_S3_ROOT").unwrap());
         fs::create_dir(root.join("home")).unwrap();
-        let settings = super::settings().unwrap();
-        assert!(crate::scratch_io::evaluate(&settings, false)
-            .unwrap()
-            .is_none());
-        create_pool(&settings.pool, admission_budget(&settings)).unwrap();
-        let _store = Store::open_at(&settings.pool, &settings).unwrap();
-        let config = fs::read(settings.pool.join("config.json")).unwrap();
-        assert!(!settings.pool.join("oxide-managed/scratch.json").exists());
+        let declared = root.join("pool");
+        let control = root.join("control-pool");
+        assert!(!declared.exists() && !control.exists());
+        let first = Store::open_or_create().expect("declared internal pool");
+        assert_eq!(first.pool, declared);
+        assert!(!declared.join("oxide-managed/scratch.json").exists());
         assert!(!root
             .join("home/Library/Application Support/oxide/state/scratch-pools")
             .exists());
-        unsafe { std::env::remove_var("OXIDE_SCRATCH_ROOT") };
-        assert!(crate::scratch_io::evaluate(&settings, false)
+        // This child process is isolated from the unit runner's environment.
+        unsafe {
+            std::env::remove_var("OXIDE_SCRATCH_ROOT");
+            std::env::set_var("OXIDE_POOL", &control);
+        }
+        let second = Store::open_or_create().expect("ordinary internal pool");
+        assert_eq!(second.pool, control);
+        assert!(!control.join("oxide-managed/scratch.json").exists());
+        assert!(!root
+            .join("home/Library/Application Support/oxide/state/scratch-pools")
+            .exists());
+        let mut first_config: serde_json::Value =
+            serde_json::from_slice(&fs::read(declared.join("config.json")).unwrap()).unwrap();
+        let mut second_config: serde_json::Value =
+            serde_json::from_slice(&fs::read(control.join("config.json")).unwrap()).unwrap();
+        let left = first_config.as_object_mut().unwrap();
+        let right = second_config.as_object_mut().unwrap();
+        let expected: std::collections::BTreeSet<&str> =
+            ["version", "backend", "store_id", "cap_bytes", "image_bytes"]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            left.keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+        assert_eq!(
+            right
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+        // Only store_id is generated per initialization; a new field must be assessed above.
+        let left_id = left
+            .remove("store_id")
             .unwrap()
-            .is_none());
-        let _same_store = Store::open_at(&settings.pool, &settings).unwrap();
-        assert_eq!(config, fs::read(settings.pool.join("config.json")).unwrap());
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let right_id = right
+            .remove("store_id")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_owned();
+        for id in [&left_id, &right_id] {
+            assert!(oxide_storage::seed_source::SourceCache::new(id).is_ok());
+            assert!(
+                id.len() == 32
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            );
+        }
+        assert_ne!(left_id, right_id);
+        assert_eq!(left, right);
+        fn entries(root: &Path, path: &Path, id: &str, result: &mut Vec<String>) {
+            for entry in fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let relative = entry
+                    .path()
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace(id, "<store-id>");
+                result.push(relative);
+                if entry.file_type().unwrap().is_dir() {
+                    entries(root, &entry.path(), id, result);
+                }
+            }
+        }
+        let mut left_entries = Vec::new();
+        let mut right_entries = Vec::new();
+        entries(&declared, &declared, &left_id, &mut left_entries);
+        entries(&control, &control, &right_id, &mut right_entries);
+        left_entries.sort();
+        right_entries.sort();
+        assert_eq!(left_entries, right_entries);
     }
 
     #[test]
