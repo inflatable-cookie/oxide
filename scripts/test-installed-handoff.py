@@ -872,6 +872,11 @@ def check_cargo_exit_75(root: str, binary: str) -> None:
 
 
 def main() -> int:
+    if sys.argv[1:] == ["--plan"]:
+        print("installed-handoff: stage subject and stub; exercise handoff, refusals,")
+        print("skipped commands, same binary, Cargo exit and final release")
+        print("supervisor bounds: 120 s, 64 MiB scratch")
+        return 0
     check_source_versions()
     if sys.argv[1:] == ["--self-test"]:
         print("installed-handoff source version checks passed")
