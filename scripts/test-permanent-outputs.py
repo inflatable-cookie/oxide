@@ -990,6 +990,13 @@ def run(proof: Proof, repo: str, base_compat: bool = False, diagnostic: bool = F
         f"status did not name the unused local root: {stdout}",
     )
 
+    # A separate legacy checkout will migrate its local fallback after redock;
+    # the original checkout remains whole-target for the leased-build control.
+    migration_app = fresh_checkout(proof, root, "redock-migration", "/target\n/.oxide-outputs/\n")
+    migration_external = legacy_whole_target(proof, pool, mount, migration_app, "redock migration")
+    with open(os.path.join(migration_external, "external-sentinel"), "wb") as handle:
+        handle.write(b"migration external kept")
+
     # 5. Detaching the drive: the checkout-local fallback root.
     external_before = sorted(os.listdir(external_root))
     with open(os.path.join(external_root, "external-sentinel"), "wb") as handle:
@@ -1026,29 +1033,26 @@ def run(proof: Proof, repo: str, base_compat: bool = False, diagnostic: bool = F
     )
     with open(os.path.join(local_root, "local-sentinel"), "wb") as handle:
         handle.write(b"local kept")
+    code, _, stderr = proof.oxide(["check"], "migration checkout falls back", migration_app)
+    expect(code == 0, f"migration fallback failed: {stderr}")
+    migration_local = os.path.join(migration_app, ".oxide-outputs", "local")
+    expect(link_target(os.path.join(migration_app, "target")) == migration_local,
+           "migration checkout did not select its local root")
+    migration_marker = read_json(os.path.join(migration_local, MARKER))
+    with open(os.path.join(migration_local, "local-sentinel"), "wb") as handle:
+        handle.write(b"migration local kept")
     proof.phase("after fallback")
 
     # 6. Redocking relinks without copying or deleting either root.
     mounted = attach_image(proof, os.environ["OXIDE_PROOF_EVIDENCE"], name)
     expect(mounted == mount, f"re-attached at {mounted}, not {mount}")
     before_redock = read_json(receipt_path(pool, app))
-    report = plan(proof, app, "plan after redocking")
-    expect(report["action"] in ("relink", "noop"), report)
-    expect(
-        report["proposed_root"]["generation"]
-        == read_json(os.path.join(external_root, MARKER))["generation"],
-        report,
-    )
-    print(
-        "redock before: receipt "
-        f"gen {before_redock['generation']} {before_redock['state']}, "
-        f"external marker {read_json(os.path.join(external_root, MARKER))['generation']}, "
-        f"local marker {read_json(os.path.join(local_root, MARKER))['generation']}, "
-        f"plan {report['proposed_root']}"
-    )
+    require_migration_fixture(before_redock, app, "leased redock")
     code, _, stderr = proof.oxide(["build", "--bin", "poutputs"], "build after redocking", app)
     expect(code == 0, f"redocked build failed: {stderr}")
     expect(link_target(link) == external_root, f"redock did not relink: {os.readlink(link)}")
+    redocked_receipt = read_json(receipt_path(pool, app))
+    require_migration_fixture(redocked_receipt, app, "leased redock after build")
     expect(read_bytes(os.path.join(external_root, "external-sentinel")) == b"external kept", "root lost")
     expect(
         sorted(os.listdir(external_root)) == sorted(external_before + ["external-sentinel"]),
@@ -1061,6 +1065,31 @@ def run(proof: Proof, repo: str, base_compat: bool = False, diagnostic: bool = F
     )
     code, stdout, _ = proof.oxide(["outputs", "status"], "status with both roots", app)
     expect("local fallback root" in stdout and "present" in stdout, stdout)
+
+    # The other checkout previews and performs explicit migration of its
+    # currently selected local root; this must not change the build control.
+    before_migration = read_json(receipt_path(pool, migration_app))
+    require_migration_fixture(before_migration, migration_app, "redock migration")
+    report = plan(proof, migration_app, "plan explicit migration after redocking")
+    expect(report["action"] == "migrate" and report["layout"] == "whole-target", report)
+    expect(report["proposed_root"]["root"] == migration_local, report)
+    expect(set(report["migration_members"]) == {"debug", "release"}, report)
+    code, stdout, stderr = proof.oxide(["outputs", "adopt"], "migrate local root after redocking", migration_app)
+    expect(code == 0, stdout + stderr)
+    migration_target = os.path.join(migration_app, "target")
+    expect(os.path.isdir(migration_target) and not os.path.islink(migration_target), "migration target not real")
+    for member in ("debug", "release"):
+        expect(member_link_target(migration_app, member) == os.path.join(migration_local, member),
+               f"migration changed {member} root")
+    migrated = read_json(receipt_path(pool, migration_app))
+    expect(migrated["version"] == "oxide.outputs.transition/3" and migrated["state"] == "committed", migrated)
+    expect(sorted(item["member"] for item in migrated["links"]) == ["debug", "release"], migrated)
+    expect(all(item.get("selected", {}).get("root") == migration_local for item in migrated["links"]), migrated)
+    expect(read_json(os.path.join(migration_local, MARKER))["nonce"] == migration_marker["nonce"],
+           "migration changed local root nonce")
+    expect(read_bytes(os.path.join(migration_local, "local-sentinel")) == b"migration local kept", "migration local root lost")
+    expect(read_bytes(os.path.join(migration_external, "external-sentinel")) == b"migration external kept", "migration external root lost")
+    expect(link_target(link) == external_root, "migration changed the separate redock checkout")
     proof.phase("after redock")
 
     # 6b. The local fallback root refuses to appear where Git would track it.
@@ -2269,7 +2298,7 @@ def auto_run(proof: Proof, repo: str, diagnostic: bool = False) -> None:
                 "a stop published a member link",
             )
             code, _, stderr = proof.oxide(["build"], "replay rolls back an unpublished adoption", prepared)
-            expect(code != 0 and "run the command again" in stderr and not auto_notices(stderr), stderr)
+            expect(code != 0 and "Run the command again" in stderr and not auto_notices(stderr), stderr)
             code, _, stderr = proof.oxide(["build"], "the command after the rollback is unconverted", prepared)
             expect(code == 0 and not auto_notices(stderr), stderr)
             expect(not os.path.islink(os.path.join(prepared, "target")), "rollback left a link")
