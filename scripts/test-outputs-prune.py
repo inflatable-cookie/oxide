@@ -2903,7 +2903,8 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
         os.rename(kappa_root, kappa_root + ".real")
         os.symlink(kappa_root + ".real", kappa_root)
         _, _, preview = world.plan_file("symlink root dry run", alpha)
-        expect(kappa_root not in world.candidates(preview), "a symlink root became a candidate")
+        world.complete(preview, "symlink root dry run")
+        expect(kappa_root not in world.candidates(preview), world.report(preview))
         os.unlink(kappa_root)
         os.rename(kappa_root + ".real", kappa_root)
         world.restore(kappa, kappa_away)
@@ -3558,7 +3559,18 @@ def self_test() -> int:
             "canonical dry run",
         ):
             assert label in body, label
-        assert body.count("world.complete(preview,") >= 6, body.count("world.complete(preview,")
+        def symlink_root_guarded(source: str) -> bool:
+            return (
+                '_, _, preview = world.plan_file("symlink root dry run", alpha)\n'
+                '        world.complete(preview, "symlink root dry run")\n'
+                '        expect(kappa_root not in world.candidates(preview), world.report(preview))'
+            ) in source
+
+        assert symlink_root_guarded(body), "symlink root exclusion lacks its complete snapshot premise"
+        assert not symlink_root_guarded(body.replace(
+            '        world.complete(preview, "symlink root dry run")\n', '', 1
+        )), "removing the symlink root premise must fail the source check"
+        assert body.count("world.complete(preview,") >= 7, body.count("world.complete(preview,")
         assert body.count("world.report(preview)") >= 8, body.count("world.report(preview)")
         # The corrupt-receipt case expects the whole batch and says so.
         assert 'get("complete") is False' in body, "the corrupt-receipt case no longer pins incompleteness"
