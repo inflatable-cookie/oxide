@@ -3198,6 +3198,16 @@ def exec_self_test() -> None:
     resource-gate or receipt regression is therefore found without spending a
     native activation on it.
     """
+    # Pure environment contract: inherited host configuration cannot override the
+    # private pool, its explicit cap or the supervisor-selected scratch root.
+    from unittest.mock import patch
+    with patch.dict(os.environ, {"OXIDE_TASK_SCRATCH_ROOT": "/fixture/root", "OXIDE_POOL": "/host/pool", "OXIDE_SCRATCH_ROOT": "/host"}, clear=True):
+        env = proof_env("/fixture/root/pool", "/fixture/root/home", "/fixture/root/cargo")
+    expect(env["OXIDE_SCRATCH_ROOT"] == "/fixture/root", "scratch declaration drifted")
+    expect(env["OXIDE_POOL"] == "/fixture/root/pool", "pool selection drifted")
+    expect(env["OXIDE_POOL_CAP"] == "64MiB", "pool cap drifted")
+    expect(all(env[k] == "/fixture/root" for k in ("TMPDIR", "TMP", "TEMP")), "temporary root drifted")
+
     ran: list[str] = []
 
     def quiet(_text: str) -> None:
