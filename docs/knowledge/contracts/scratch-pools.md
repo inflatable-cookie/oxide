@@ -326,7 +326,7 @@ each script's own selector text and case bodies.
 | Selector(s) | Premise today |
 | --- | --- |
 | `rust:installed-handoff` (#122, #206) | selected-volume scratch pools; diagnostic and native evidence at the migrated head require owner activation |
-| `rust:profile-outputs` (#133) + `:diagnostic` | 20 private directory-budget fixture pools |
+| `rust:profile-outputs` (#133) + `:diagnostic` | migrated: selected-volume scratch pool; native chain pending |
 | `rust:recorded-slot-accounting` (#146) + `:diagnostic` | genuine directory-budget pool, verified from the product's own config |
 | `rust:exec-output-inference` (#160) + `:diagnostic` | control pool is a directory-budget pool |
 | `rust:auto-adopt-ineligible` (#154) + `:diagnostic` | control pool is a directory-budget pool |
@@ -347,6 +347,7 @@ or a socket path that cannot fit under the selected-volume guard prefix):
 | Selector/recipe | Genuine premise |
 | --- | --- |
 | `rust:pool-temp-scratch` (#136) + `:diagnostic` | decision af7df7d6: the Builds guard prefix makes this fixture's shortest admitted slot scratch path (`test-1`) 103 bytes, exceeding the 91-byte product bound; both selectors keep `/private/tmp` |
+| `rust:profile-outputs:base-compat` + `:diagnostic` | pinned pre-S3 base cases 10, 11 and 19 require an internal pool, and case 20 requires boot-Data checkout absence (41307e95); 300 s / 512 MiB under ea36e265, fit unmeasured |
 | `rust:outputs-prune` (#129/#152) + `:diagnostic` | cases 10 and 21 prove checkout absence on the boot Data volume |
 | `rust:prune-absence` (#135) + `:diagnostic` | the missing-ancestor chain must sit on the boot Data volume |
 | the `AGENTS.md` unit-suite recipe (`OXIDE_TEST_INTERNAL_ROOT`) | three macOS fixtures take the boot Data volume and `MNT_IGNORE_OWNERSHIP` premises; `config::tests::git_work_trees_and_aliases_refuse` needs a root off `/Volumes` |
@@ -510,6 +511,7 @@ stand at this head:
 | --- | --- | --- | --- |
 | `rust:installed-handoff` | 600 s / 128 MiB | yes | `proof:installed-handoff:test`, `proof:installed-handoff:plan`, and `HandoffSelectorTests` |
 | `rust:profile-outputs` | 600 s / 512 MiB | yes | `--plan` |
+| `rust:profile-outputs:base-compat` (internal keep) | 300 s / 512 MiB | yes | `--plan` |
 | `rust:recorded-slot-accounting` | 300 s / 512 MiB | yes; migrated (recorded-slot-accounting; native chain held) | `proof:recorded-slot-accounting:test`, `--plan` |
 | `rust:exec-output-inference` | 300 s / 512 MiB | yes | `proof:exec-inference:test`, `--plan` |
 | `rust:auto-adopt-ineligible` | 300 s / 512 MiB | yes | `--plan` (shared #117 fixture, no distinct pure selector) |

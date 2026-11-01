@@ -124,15 +124,16 @@ run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 128 -- p
 [tasks."proof:installed-handoff:plan"]
 run = "python3 scripts/test-installed-handoff.py --plan"
 
-# Owned output links at profile directories (oxide#133): one fixed 20-case
+# Owned output links at profile directories (oxide#133): a mode-split
 # script and the whole command of the qualified shared supervisor. The brief's
 # scoped amendment (root owner, 2026-10-23T16:10Z) makes this proof 600 s TOTAL
 # instead of 420; the old 420 s publication at 030836f6 stays historical and
 # unactivated. The helper work cutoff is about 565 s (30 s reserve plus a 5 s
 # refusal margin), inside which cleanup and image detach must finish. The
 # published estimate is UNMEASURED. CPU controls support a 6 CPU / 8 GiB
-# planning request: the two independent stagings are sequential and each is
-# explicitly bounded to 6 Cargo jobs, fixture Cargo children to 2 jobs with at
+# planning request: Builds stages the candidate; base-compat stages the base
+# and candidate sequentially, each bounded to 6 Cargo jobs. Fixture Cargo
+# children are bounded to 2 jobs with at
 # most two gated writers overlapping, so the proof peaks at 6 concurrent Cargo
 # jobs; the shared staging helper takes that bound explicitly and keeps its
 # default for other selectors. Its private 128 MiB image is attached with
@@ -153,29 +154,33 @@ run = "python3 scripts/test-installed-handoff.py --plan"
 # The selected-clean reserve stop uses a positively created directory-budget
 # pool; the removable watchdog is removal-only and is not claimed as a reserve
 # stop.
-# Scratch stays 512 MiB and the detach is ordinary. It
-# stages base 4a70b83 and this HEAD's candidate independently and sequentially
-# from authenticated pinned source, asserts distinct binaries and state-3 /
-# state-4 capabilities, and covers the member layout, binding, migration,
-# clean, refusals and the root-group prune. It has not run: each side's run is
-# a separately counted owner activation, and the merge hold requires the exact
-# head author and reviewer native receipts.
-# Internal-placement exception (decision bd357a4c, 2026-10-25): its private
-# fixture pools are genuine internal directory-budget pools, which the product
-# correctly refuses on an external volume, so this recipe declares the
-# qualified guard's explicit internal root (`--root-parent /private/tmp`). One
-# monitored owned root still holds staging, fixtures, temp, evidence and the
-# single owned 128 MiB image under the unchanged 600 s / 512 MiB / reserve /
-# custody / cleanup rules; ordinary builds, tests and proofs keep the
-# selected-volume default.
+# Both modes use 512 MiB and ordinary detach. Builds stages only this HEAD's
+# candidate (capability >= 4) and covers the member layout, binding, migration,
+# clean and refusals. Base-compat stages base 4a70b83 and the
+# candidate from authenticated pinned source, asserts distinct binaries and
+# exact base capability 3, and covers base cases 10, 11 and 19 plus case 20
+# root-group prune with its boot-Data checkout-absence premise.
+# Each mode requires its own owner-activated diagnostic, counted author and
+# independent reviewer native at the reviewed head.
+# Builds fixtures use a private OXIDE_SCRATCH_ROOT under the selected runner root.
+# The scoped base-compat selectors alone retain the internal root (bd357a4c).
 [tasks."proof:profile-outputs:test"]
 run = "python3 scripts/test-profile-outputs.py --self-check"
 
+[tasks."proof:profile-outputs:base-compat:test"]
+run = "python3 scripts/test-profile-outputs.py --base-compat --self-check"
+
+[tasks."proof:profile-outputs:plan"]
+run = "python3 scripts/test-profile-outputs.py --plan"
+
+[tasks."proof:profile-outputs:base-compat:plan"]
+run = "python3 scripts/test-profile-outputs.py --base-compat --plan"
+
 [tasks."rust:profile-outputs"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-profile-outputs.py"
+run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-profile-outputs.py"
 
-# The SAME fixed 20-case proof in its own opt-in diagnostic collection mode
+# The same selected mode in its own opt-in diagnostic collection mode
 # (`--diagnostic`, decision 1e4feb57): recoverable oracle failures are recorded
 # and dependent/tainted steps skipped, while the deadline, custody, unsettled
 # children and unrecordable evidence still abort. It exists so the pre-counted
@@ -183,11 +188,19 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 600 --
 # the counted one; the counted selector above stays byte-for-byte its own
 # fail-fast command. Its receipt is marked diagnostic and never claims PASS,
 # closure or counted credit, and it needs its own owner activation. It keeps
-# the same declared internal root (see the counted selector's exception note)
+# the selected-volume root
 # and the unchanged 600 s / 512 MiB bound.
 [tasks."rust:profile-outputs:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-profile-outputs.py --diagnostic"
+run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-profile-outputs.py --diagnostic"
+
+[tasks."rust:profile-outputs:base-compat"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-profile-outputs.py --base-compat"
+
+[tasks."rust:profile-outputs:base-compat:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-profile-outputs.py --base-compat --diagnostic"
 
 # Enumerated paths that disappear during accounting (oxide#113): the
 # qualified session supervisor bounds one fixed native proof covering the
@@ -431,7 +444,7 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 #
 # `--root-parent /private/tmp` is the owner-accepted internal-placement
 # exception (decision bd357a4c, Tom-approved apparatus correction 2026-10-26),
-# exactly as `rust:profile-outputs`, `rust:command-budgets`,
+# exactly as `rust:profile-outputs:base-compat`, `rust:command-budgets`,
 # `rust:pool-temp-scratch`, `rust:recorded-slot-accounting` and
 # `rust:outputs-prune` use it: this fixture's control pool is a genuine
 # internal `directory-budget` pool, which the product correctly refuses on the

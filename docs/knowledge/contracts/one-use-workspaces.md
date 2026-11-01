@@ -2499,7 +2499,7 @@ adds **no** feature, so no historical or unrelated role changes by accident.
 | --- | --- | --- |
 | `test-oxide-pool-layout.py:210-211` | current HEAD **candidate**; fixed `BASE = 850260c` | candidate only |
 | `test-permanent-outputs.py` — **seven** calls: `:589` (counted), `:1583` (`detach-permanent`), `:1837` (`auto-adopt`), `:2297` (`ignore-safety`), `:4775` (`exec-inference`), `:6238` (`auto-ineligible`), and `:778` (fixed `PRE_FEATURE = 8c9b5ae`) | six current-HEAD candidates, each its own role, **plus** the fixed historical pre-feature role; every focused mode has scratch fixtures | feature + class/roots on all six current candidates (each call, not a helper default); the pre-feature role keeps its source and flags; all seven are marked next-needed-run |
-| `test-profile-outputs.py:2695-2697` | current HEAD **candidate**; fixed `BASE = 4a70b83` | candidate only |
+| `test-profile-outputs.py` — candidate `layout.stage_at` call in `run()` | current HEAD **candidate**; fixed `BASE = 4a70b83` | candidate only |
 | `test-oxide-removable-removal.py:358,621` | current HEAD candidate (and boot-closure mode) | candidate only |
 | `test-drive-mode.py:172` | current HEAD candidate; fixture workspace, pool, `HOME`, `CARGO_HOME` and `TMPDIR` under owned scratch (`scripts/test-drive-mode.py:174-230`) | candidate only, plus class/roots for its fixtures |
 | `test-outputs-prune.py:1728` (through `test-installed-handoff.py:191`) | current HEAD candidate with an explicit capability dict | candidate only, plus class/roots; capability assertions updated |
