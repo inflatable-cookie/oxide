@@ -2,7 +2,7 @@
 """Focused native proof for child temporary files on the selected pool (oxide#136).
 
 One fixed script under the qualified shared supervisor (`bounded-test.py
---limit 300 --scratch-budget-mib 512`), and the whole command of that
+--root-parent /private/tmp --limit 300 --scratch-budget-mib 512`), and the whole command of that
 supervisor: the supervisor owns the absolute deadline, the 20 GiB reserve
 watchdog, the monitored scratch and cleanup, and closure; this script keeps no
 clock, sampler or session of its own. The brief's tier is ELEVATED (it deletes
@@ -76,7 +76,7 @@ Cases (each one is a real child, nothing is simulated):
     child's temporary files land on the image, the inherited fixture scratch
     (another device) is replaced, release removes the directory, and after an
     ordinary detach the same registration's selection falls back to the
-    internal pool, whose own scratch is used with no stale `/Volumes/<name>`
+    original directory pool, whose own scratch is used with no stale `/Volumes/<name>`
     directory created. With an inherited same-device `TMPDIR`, the fallback
     keeps it and creates nothing. The custody directory is derived from the
     supervisor's own published `OXIDE_TASK_SCRATCH_ROOT`/`OXIDE_PROOF_EVIDENCE`
@@ -135,9 +135,9 @@ replaces it.
    `TMPDIR=<root>/fx/inherited-tmp`. State: the pool is absent, the fixture is a
    same-device sibling, no owned scratch. Grammar: current identifier, `dir=`
    canonical inherited, `temp: inherited <canonical>`, the product's
-   `oxide: creating the build pool at` line, and post-conditions read from the
+   ordinary creation line, and post-conditions read from the
    created pool (`config.json` backend, payload, ledger, device, slot). A
-   successful create already passed the product's Time Machine exclusion gate.
+   successful create passed the applicable product admission gates.
 3. unusable inherited TMPDIR (case 3): `oxide check` over absent/file/relative/
    unwritable/symlink values, plus a device-gated other-device value. State:
    each bad value under `root/fx`, the device from the monitored root. Grammar:
@@ -186,10 +186,10 @@ replaces it.
     `diskutil info -plist`, `oxide pool register-removable`, `oxide check`,
     bounded `hdiutil detach`, then two more `oxide check` runs. State: the image
     and its intent/attachment records under the supervisor evidence directory,
-    device/UUID/owners-on bound before registration, the internal pool present
+    device/UUID/owners-on bound before registration, the original directory pool present
     for the fallback. Grammar: the mount point, the build's `temp: oxide` path
     under `<mount>/oxide-pool`, positive detach (not mounted, mount point not
-    recreated), the internal pool's fallback path, and the same-device inherited
+    recreated), the original directory pool's fallback path, and the same-device inherited
     directory kept with no owned directory created.
 12. socket bound (case 12): `oxide check` with no inherited TMPDIR. State: the
     pool and crate from earlier cases, a fresh identifier. Grammar: the current
@@ -201,47 +201,54 @@ the same batch as the lock fix: (a) the `--locked` oracle ran without the lock
 precondition (the native-2 failure), and (b) case 9 read `test result: ok` from
 stderr, where Cargo never writes it.
 
-Fixed proof-authoring checklist sweep (Supervisor b18d0552), each item either
-an executable-body fact or an explicit not-applicable reason. `--self-check`
-is a pure, pre-scratch regression of items 1, 2, 3, 5 and 7; it creates no
-scratch, no child process and no toolchain, and it dispatches before the
-scratch root, the toolchain decision or staging.
+Proof-authoring premise checklist (workflow.md):
+1. `resolve_toolchain_home` and `toolchain_environment` preserve the invoking
+   rustup home, pin 1.97.1, disable installation and stay offline. `World` owns
+   private HOME/CARGO_HOME; `new_fixture` establishes a manifest-consistent
+   lock before the fixture's `--locked` oracle. Staging uses the repo lock.
+2. `fixture_environment` sets `OXIDE_TEST_HOME_FROM_ENV=1` for the debug build.
+3. `fixture_environment` is built fresh; `World` adds only fixture controls.
+   `staging_environment` scrubs ambient OXIDE_, XDG_, GIT_, CARGO_, SCCACHE_
+   and compiler overrides, then restores only the invoking Cargo cache and the
+   explicit offline settings. `--self-check` exercises hostile controls.
+4. `make_fixture` asserts no target, and this proof registers no permanent
+   mode; the first build cannot start from an adopted checkout.
+5. `CARGO_BUILD_ARGV`, `CARGO_ORACLE_ARGV` and `LOCK_ARGV` include their Cargo
+   subcommands; there is no fake external Cargo subcommand in this proof.
+6. `removable_flow` uses `-owners on`, verifies device, UUID and ownership,
+   records intent and one ordinary detach, and keeps uncertain custody.
+7. `toolchain_environment` freezes `RUSTFLAGS` for both environments and
+   neither imports `CARGO_ENCODED_RUSTFLAGS`.
+8. `scratch_root` canonicalizes `OXIDE_TASK_SCRATCH_ROOT` exported by the
+   guard under its explicit /private/tmp parent;
+   `run_session` creates the private workspace beneath it. The fixture pool,
+   staging and temp directories stay inside it; the children receive no
+   `OXIDE_SCRATCH_ROOT`. The image backing and custody use guard evidence.
+   This selector keeps the internal root under decision af7df7d6: the Builds
+   prefix cannot satisfy the product's 91-byte socket path bound.
+9. No `mktemp` is called. `private_dir` creates named directories under the
+   supervisor's fresh owned run root.
 
-1. Toolchain provenance: `resolve_toolchain_home` honours an absolute, usable
-   inherited `RUSTUP_HOME`, else resolves the account default `<HOME>/.rustup`
-   from the *original* HOME before any private fixture HOME exists, and
-   `toolchain_environment` publishes that absolute path to staging and every
-   fixture child with `RUSTUP_TOOLCHAIN=1.97.1` and `RUSTUP_AUTO_INSTALL=0`.
-   A missing, relative or absent toolchain home refuses before scratch or
-   staging instead of hiding behind a fake HOME. (The first authorised author
-   native failed exactly here: the fixture HOME hid the installed 1.97.1.)
-2. Private account home: every fixture child carries the debug build's
-   `OXIDE_TEST_HOME_FROM_ENV=1`, so the private fixture HOME is the account home
-   and the real account's config, pool record and status are untouched.
-3. No imported ambient controls: the fixture environment is built fresh (it can
-   carry only `OXIDE_TEST_HOME_FROM_ENV` plus the proof's own explicit pool
-   controls), and the staging environment scrubs `OXIDE_*`, `XDG_*` and
-   `CARGO_ENCODED_RUSTFLAGS`; the self-check rejects a hostile parent that
-   would import any of them.
-4. Auto-adopt premise: `make_fixture` asserts the fresh checkout has no
-   `target/`, and the internal pool has no permanent registration, so the first
-   build cannot mistake a converted root for fresh work.
-5. External Cargo argv: the only external Cargo invocations are the recorded
-   `CARGO_BUILD_ARGV` (staging) and `CARGO_ORACLE_ARGV` (premise oracle), both
-   with the subcommand name in argv, which the self-check asserts.
-6. Owned removable image: case 11 attaches it with `-owners on`, parses the
-   mount point from the plist and confirms `GlobalPermissionsEnabled` through
-   `diskutil` before registration (the mount-root rule).
-7. Frozen build flags: `FROZEN_RUSTFLAGS` is shared by staging and every
-   fixture child, and an inherited `CARGO_ENCODED_RUSTFLAGS` (which outranks
-   RUSTFLAGS in Cargo) is scrubbed, so the recipe cannot drift.
-8. TMPDIR/scratch selection on the selected volume: not applicable inside this
-   proof, which *is* the oxide#136 source under test; its fixture TMPDIR is the
-   proof's own private scratch, and no oxide#145 default or unqualified temp
-   root is borrowed.
-9. `mktemp` without a template ignores TMPDIR: not applicable, this proof calls
-   no `mktemp`; every scratch directory is an explicit `private_dir(...)` under
-   `OXIDE_TASK_SCRATCH_ROOT` inside the qualified guard.
+Current-main oracle sweep (15ce0e3415f6c01a3aad7e9125336dc498e2efd3):
+`--version` checks only the oxide identity, not a product version equality;
+0.1.0 is the generated fixture's own package and lock, not a product pin.
+The staged binary's SHA256 is measured at runtime; no runner or source digest
+is pinned. `src/bin/oxide/scratch_io.rs` `create` prints the scratch creation
+notice; `store.rs` `create_pool` prints the ordinary fallback notice. Both
+initializers use the directory-budget-v1 backend (`src/lease/pool.rs` and
+`src/lease/mod.rs`). `child_temp.rs` supplies the temp summaries, real-directory,
+marker and Unix-socket refusal wording and the 91-byte bound. `main.rs`
+`slot_line` and `store.rs` `SlotSize::describe` supply the measured status
+format; the proof parses the fixture's own slot and allocated figure. The
+image-selection and fallback are derived from `removable.rs` `select`, and
+its image UUID/device come from this run, not historical identity constants.
+The builder 1.97.1 is the explicit proof toolchain, not a product version.
+The short non-/Volumes guard root is required for socket-path fit (decision
+af7df7d6); the other-device probe reads metadata only and the image case uses
+a separately owned mount. Source positions at this main: `scratch_io.rs:355`,
+`store.rs:5357,5382`, `lease/mod.rs:37,40`, `lease/pool.rs:923,2525,2546`,
+`child_temp.rs:59,114,118,222,242,263`, `main.rs:2592`, `store.rs:792`,
+`identity.rs:350`, `removable.rs:878`, and `bounded-test.py:148,4014`.
 
 `--plan` prints the allocation and cases and touches nothing. No live pool,
 registered drive, install receipt, host setting or consumer is touched; the
@@ -277,20 +284,16 @@ CARGO_ORACLE_ARGV = ("cargo", "check", "--offline", "--locked")
 LOCK_ARGV = ("cargo", "generate-lockfile", "--offline")
 # The fixture's checkout/package label. It becomes part of the product's slot
 # folder, so it is deliberately one character: the injected product scratch
-# path must still fit `MAX_SCRATCH_PATH_BYTES` under either root this proof
-# uses.
+# path must fit `MAX_SCRATCH_PATH_BYTES` under the internal guard root.
 FIXTURE_NAME = "t"
-# The product's slot folder for this fixture is `<label>-<8 hex>`, so the
-# folder component is the label plus nine characters, not the label alone.
-PRODUCT_FOLDER_CHARS = len(FIXTURE_NAME) + 1 + 8
-# Fixed parts of the longest injected product scratch path this proof builds:
-#   <mount>/oxide-proof.<8>/scratch/pt/p/payload/slots/<folder>/quick-1/scratch
-# `/oxide-proof.` plus mkdtemp's eight random characters, then the proof's own
-# leaves (`/scratch`, `/pt`, `/p`), the product's (`/payload`, `/slots`,
-# `/quick-1`, `/scratch`) and one `/` before the folder label.
-GUARD_LEAF_CHARS = len("/oxide-proof.") + 8
-PROOF_LEAVES_CHARS = len("/scratch") + len("/pt") + len("/p")
-PRODUCT_LEAVES_CHARS = len("/payload") + len("/slots") + len("/quick-1") + len("/scratch")
+# A fresh pool and one fixture use the first 8-hex identity folder. The proof
+# bounds observed slot IDs to two digits; among admitted quick and test
+# profiles, quick is the longer name.
+# case 12 refuses any shape outside this model rather than assuming it fits.
+INTERNAL_ROOT_PARENT = "/private/tmp"
+GUARD_RUN_PREFIX = "oxide-proof."
+GUARD_RANDOM_CHARS = 8
+MAX_SLOT_ID = 99
 
 
 def is_inside(path: str, root: str) -> bool:
@@ -316,7 +319,7 @@ def pool_path(root: str) -> str:
     An empty pre-created directory is classed by the product as an unknown
     existing pool (`Found::Unknown`), so creation is skipped and opening
     `config.json` fails. Only the product may create the pool, on its own
-    creation path, with its own Time Machine exclusion and format checks.
+    creation path, with its applicable admission and format checks.
     """
     return os.path.join(root, "p")
 
@@ -338,6 +341,9 @@ def layout_pre_creates_pool(root: str, paths=None) -> bool:
     return any(
         os.path.normpath(path) == pool or is_inside(path, pool) for path in paths
     )
+
+
+ORDINARY_CREATION_NOTICE = "oxide: creating the build pool at"
 
 
 OBSERVATION_MARKER = "OXIDE-TEMP nonce="
@@ -591,20 +597,22 @@ def custody_layout(
     }
 
 
-def longest_injected_path(mount_chars: int, folder_chars: int) -> int:
-    """The longest product scratch path this proof's layout can construct.
+def max_slot_scratch_path(pool: str) -> str:
+    """The longest admitted fixture slot path: eight hex and a two-digit ID."""
+    return os.path.join(pool, "payload", "slots", FIXTURE_NAME + "-" + "f" * 8,
+                        f"quick-{MAX_SLOT_ID}", "scratch")
 
-    `folder_chars` is the product's real folder component (`<label>-<8 hex>`),
-    not the bare label; the earlier helper under-modelled that width.
-    """
-    return (
-        mount_chars
-        + GUARD_LEAF_CHARS
-        + PROOF_LEAVES_CHARS
-        + PRODUCT_LEAVES_CHARS
-        + 1
-        + folder_chars
-    )
+
+def guard_fixture_pool(parent: str) -> str:
+    """The qualified guard's explicit-parent layout, including its run root."""
+    return os.path.join(parent, GUARD_RUN_PREFIX + "x" * GUARD_RANDOM_CHARS,
+                        "scratch", "pt", "p")
+
+
+def matches_fixture_slot_path(path: str, pool: str) -> bool:
+    relative = os.path.relpath(path, pool)
+    return bool(re.fullmatch(r"payload/slots/t-[0-9a-f]{8}/(?:quick|test)-[1-9][0-9]?/scratch", relative))
+
 # macOS `sun_path`, including the NUL, less `/` and an eleven-byte socket name.
 SOCKET_PATH_BOUND = 91
 MIB = 1024 * 1024
@@ -617,14 +625,18 @@ STARTED = time.perf_counter()
 def plan() -> None:
     print(
         """pool-temp-scratch proof, planned allocation (unmeasured):
-  supervisor: bounded-test.py --limit 300 --scratch-budget-mib 512
+  supervisor: bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512
   work stops before the supervisor's 30 s shutdown margin
   staging: plain Cargo, pinned 1.97.1, offline, 1 job, target deleted after
-  fixtures: one private HOME, CARGO_HOME, OXIDE_POOL and tiny std-only crates
-  removable: one owned 128 MiB APFS scratch image at a unique /Volumes/<name>,
+  fixtures: private HOME, CARGO_HOME and OXIDE_POOL with a 64 MiB cap;
+            no OXIDE_SCRATCH_ROOT declaration
+  removable: one owned 128 MiB APFS scratch image with volume name oxide-temp-proof,
              ordinary detach only, never a real drive
   cases:"""
     )
+    maximum = max_slot_scratch_path(guard_fixture_pool(INTERNAL_ROOT_PARENT))
+    print(f"  derived internal maximum: {len(maximum.encode())} bytes, "
+          f"{len(maximum)} characters; margin {SOCKET_PATH_BOUND - len(maximum.encode())} bytes")
     for index, name in enumerate(CASE_NAMES, start=1):
         print(f"    {index}. {name}")
     print(
@@ -645,7 +657,7 @@ CASE_NAMES = [
     "crash with a surviving group keeps it; the leftover never survives closure",
     "test, exec and run children observe the chosen directory",
     "foreign, linked and over-bound positions refuse",
-    "removable image and absent-volume internal fallback",
+    "removable image and absent-volume directory-pool fallback",
     "longest injected path against the socket bound",
 ]
 
@@ -1071,14 +1083,14 @@ def toolchain_environment(toolchain_home: str) -> dict:
     }
 
 
-def staging_environment(environ, toolchain_home: str) -> dict:
+def staging_environment(environ, toolchain_home: str, scratch: str) -> dict:
     """The staging child's environment: the caller's own, minus Cargo/target
     and wrapper overrides, plus the shared toolchain facts."""
     env = {
         key: value
         for key, value in environ.items()
         if not key.startswith(
-            ("CARGO_TARGET_", "CARGO_BUILD_", "SCCACHE_", "OXIDE_", "XDG_")
+            ("CARGO_", "SCCACHE_", "OXIDE_", "XDG_", "GIT_", "RUSTC_")
         )
         and key
         not in (
@@ -1092,6 +1104,10 @@ def staging_environment(environ, toolchain_home: str) -> dict:
     env.update(toolchain_environment(toolchain_home))
     env.update(
         {
+            "CARGO_HOME": environ.get("CARGO_HOME") or os.path.join(environ.get("HOME") or os.path.expanduser("~"), ".cargo"),
+            "TMPDIR": scratch,
+            "TMP": scratch,
+            "TEMP": scratch,
             "RUSTC_WRAPPER": "",
             "RUSTC_WORKSPACE_WRAPPER": "",
         }
@@ -1124,7 +1140,7 @@ def stage_subject(root: str, toolchain_home: str) -> str:
     """
     stage = os.path.join(root, "stage")
     log = os.path.join(root, "stage.log")
-    env = staging_environment(os.environ, toolchain_home)
+    env = staging_environment(os.environ, toolchain_home, root)
     env.update(
         {
             "CARGO_TARGET_DIR": os.path.join(stage, "target"),
@@ -1736,11 +1752,9 @@ def inherited_kept(world: World, crate: str) -> None:
         open(keep, encoding="utf-8").read() == "retained",
         "the inherited directory's content changed",
     )
-    # Creation happened on the product's own path; that path's Time Machine
-    # exclusion gate and format checks had to pass for this command to exit 0,
-    # so no separate `tmutil` probe is needed (or permitted) here.
+    # The explicit internal-root route must take ordinary pool creation.
     expect(
-        "oxide: creating the build pool at" in result.stderr,
+        ORDINARY_CREATION_NOTICE in result.stderr,
         f"the first leased command did not create the pool: {result.stderr[-1500:]}",
     )
     expect(os.path.isdir(world.pool), "the first leased command did not create the pool")
@@ -2591,7 +2605,7 @@ def removable(
     """
     case(CASE_NAMES[10])
     if sys.platform != "darwin":
-        say("not macOS: no removable fixture, the internal pool stands")
+        say("not macOS: no removable fixture, the original directory pool stands")
         return
     removable_flow(
         world,
@@ -2845,7 +2859,7 @@ def removable_flow(
             effects.canonical(observed).startswith(
                 effects.canonical(os.path.join(world.pool, "payload")) + os.sep
             ),
-            f"the fallback did not use the internal pool's scratch: {observed}",
+            f"the fallback did not use the original directory pool's scratch: {observed}",
         )
         say(
             "post-detach selection: "
@@ -2922,9 +2936,19 @@ def path_bound(world: World, crate: str) -> None:
         f"an accepted path is {len(longest.encode())} bytes, over the "
         f"{SOCKET_PATH_BOUND}-byte bound",
     )
-    # A guard against a silently longer derivation: the observation must be
-    # the documented `<slot>/scratch` shape.
     expect(leaf == "scratch", f"the injected path does not end in scratch: {observed}")
+    root = os.path.dirname(os.path.dirname(os.path.dirname(world.pool)))
+    expect(os.path.dirname(root) == INTERNAL_ROOT_PARENT
+           and re.fullmatch(r"oxide-proof\.[a-z0-9_]{8}", os.path.basename(root)) is not None
+           and world.pool == os.path.join(root, "scratch", "pt", "p"),
+           f"the guard fixture layout changed: {world.pool}")
+    maximum = max_slot_scratch_path(world.pool)
+    maximum_bytes = len(maximum.encode())
+    margin = SOCKET_PATH_BOUND - maximum_bytes
+    say(f"derived maximum: {maximum_bytes} bytes, {len(maximum)} characters; margin {margin} bytes")
+    expect(margin > 0, f"the derived maximum has no positive socket margin: {maximum_bytes}")
+    expect(all(matches_fixture_slot_path(path, world.pool) and len(path.encode()) <= maximum_bytes
+               for path in accepted), "an accepted slot path exceeds or differs from the bounded fixture layout")
 
 
 def self_check() -> int:
@@ -2960,6 +2984,7 @@ def self_check() -> int:
     staging = staging_environment(
         {"PATH": "/usr/bin", "HOME": "/home/tom", "CARGO_HOME": "/home/tom/.cargo"},
         resolved,
+        "/scratch/fixture",
     )
     fixture = fixture_environment(
         {"PATH": "/usr/bin", "HOME": "/home/tom"},
@@ -3010,11 +3035,14 @@ def self_check() -> int:
         "OXIDE_TEST_WALK_LOG": "/tmp/walk",
         "XDG_CONFIG_HOME": "/home/tom/.config",
         "XDG_CACHE_HOME": "/home/tom/.cache",
+        "GIT_CONFIG_GLOBAL": "/host/git",
+        "CARGO_PROFILE_DEV_DEBUG": "2",
+        "TMPDIR": "/host/tmp",
     }
     scrubbed_fixture = fixture_environment(
         hostile, "/home/tom/.rustup", "/scratch/fixture/home", "/scratch/fixture/cargo-home"
     )
-    scrubbed_staging = staging_environment(hostile, "/home/tom/.rustup")
+    scrubbed_staging = staging_environment(hostile, "/home/tom/.rustup", "/scratch/fixture")
     for label, env in (("fixture", scrubbed_fixture), ("staging", scrubbed_staging)):
         property_true(
             f"{label} env imports no ambient OXIDE_/XDG_ control",
@@ -3031,6 +3059,12 @@ def self_check() -> int:
             f"{label} env freezes RUSTFLAGS",
             env["RUSTFLAGS"] == FROZEN_RUSTFLAGS == "-C strip=symbols",
         )
+    property_true(
+        "staging keeps only explicit Cargo controls and owned temp",
+        "GIT_CONFIG_GLOBAL" not in scrubbed_staging
+        and "CARGO_PROFILE_DEV_DEBUG" not in scrubbed_staging
+        and all(scrubbed_staging[key] == "/scratch/fixture" for key in ("TMPDIR", "TMP", "TEMP")),
+    )
     property_true(
         "explicit fixture controls are the only OXIDE_* the fixture env carries",
         {key for key in scrubbed_fixture if key.startswith("OXIDE_")}
@@ -3334,40 +3368,25 @@ def self_check() -> int:
         and not is_inside("/x/pt/p2", "/x/pt/p"),
     )
 
-    # 3i. Source fit for the two roots this proof actually uses, with the
-    #     product's real folder width (`t-<8 hex>`, ten characters). The
-    #     selected-volume root is the ordinary #145 default; the internal root
-    #     is this proof's declared `--root-parent /private/tmp` recipe. No
-    #     claim is made for arbitrary mounts: a mount two characters longer
-    #     than the observed selected-volume one would exceed the bound, which
-    #     is why both figures are asserted exactly.
-    selected_mount = len("/Volumes/Builds")
-    internal_mount = len("/private/tmp")
-    property_true(
-        "the selected-volume layout measures 90 bytes",
-        longest_injected_path(selected_mount, PRODUCT_FOLDER_CHARS) == 90,
-    )
-    property_true(
-        "the internal-root layout measures 87 bytes",
-        longest_injected_path(internal_mount, PRODUCT_FOLDER_CHARS) == 87,
-    )
-    property_true(
-        "both layouts fit the 91-byte bound",
-        longest_injected_path(selected_mount, PRODUCT_FOLDER_CHARS) <= 91
-        and longest_injected_path(internal_mount, PRODUCT_FOLDER_CHARS) <= 91,
-    )
-    property_true(
-        "a mount two characters longer would exceed the bound",
-        longest_injected_path(selected_mount + 2, PRODUCT_FOLDER_CHARS) > 91,
-    )
-    property_true(
-        "the earlier long labels would not have fitted",
-        longest_injected_path(
-            selected_mount, len("tempcheck") + 1 + 8
-        )
-        + (len("/pool-temp") - len("/pt") + len("/pool") - len("/p"))
-        > 91,
-    )
+    # Reconstruct the real guard parent, eight-character run root and the
+    # widest fixture names admitted by case 12. A selected Builds parent has
+    # an additional /scratch/oxide and must never be accepted as fitting.
+    internal_pool = guard_fixture_pool(INTERNAL_ROOT_PARENT)
+    selected_pool = guard_fixture_pool("/Volumes/Builds/scratch/oxide")
+    internal_max = len(max_slot_scratch_path(internal_pool).encode())
+    selected_max = len(max_slot_scratch_path(selected_pool).encode())
+    property_true("internal maximum has positive socket-path margin",
+                  internal_max < SOCKET_PATH_BOUND)
+    property_true("internal layout includes the guard run and scratch names",
+                  internal_pool == "/private/tmp/oxide-proof.xxxxxxxx/scratch/pt/p")
+    property_true("selected-volume layout exceeds the socket bound",
+                  selected_max > SOCKET_PATH_BOUND)
+    property_true("selected prefix includes the supervisor owned subtree",
+                  selected_max - internal_max == len("/Volumes/Builds/scratch/oxide") - len(INTERNAL_ROOT_PARENT))
+    property_true("actual two-digit fixture shape fits the model",
+                  matches_fixture_slot_path(max_slot_scratch_path(internal_pool), internal_pool))
+    property_true("three-digit slot is outside the declared model",
+                  not matches_fixture_slot_path(max_slot_scratch_path(internal_pool).replace("quick-99", "quick-100"), internal_pool))
 
     # 4. Missing or unusable provenance refuses instead of hiding the toolchain
     #    behind a fake HOME, and it refuses for every shape.
@@ -3440,6 +3459,9 @@ def self_check() -> int:
         layout_pre_creates_pool("/x/pt", constructor_paths("/x/pt") + ["/x/pt/p/fx"]),
     )
     property_true("the pool path is the product's own directory", probe.pool == "/x/pt/p")
+    property_true("fixture has no scratch declaration and sets its cap",
+                  "OXIDE_SCRATCH_ROOT" not in probe.base
+                  and probe.base.get("OXIDE_POOL_CAP") == "64MiB")
     property_true(
         "the fixture directory is never inside the pool",
         not is_inside("/x/pt/fx", probe.pool),
@@ -3852,6 +3874,8 @@ def self_check() -> int:
         """
 
         observe = World.observe
+        launch = World.launch
+        env = World.env
 
         def __init__(
             self, mount="/Volumes/oxide-temp-proof", observed=None,
@@ -3861,6 +3885,11 @@ def self_check() -> int:
             self.pool = os.path.join(root, "p")
             self.mount = mount
             self.runs = []
+            self.run_envs = []
+            self.base = dict(probe.base)
+            self.base["OXIDE_POOL"] = self.pool
+            self.nonce_seed = "n"
+            self.nonces = 0
             self.accepted = []
             self.stale_nonce = stale_nonce
             self.pending = list(
@@ -3877,17 +3906,9 @@ def self_check() -> int:
         def fixture(self, name):
             return os.path.join(self.root, "fx", name)
 
-        def env(self, **overrides):
-            env = {"OXIDE_PROOF_NONCE": "n"}
-            for key, value in overrides.items():
-                if value is None:
-                    env.pop(key, None)
-                else:
-                    env[key] = value
-            return env
-
         def run(self, args, *, cwd, env, check=True):
             self.runs.append(tuple(args))
+            self.run_envs.append(dict(env))
             nonce = "n-stale" if self.stale_nonce else env.get("OXIDE_PROOF_NONCE")
             # Only a check consumes the next observation; the registration call
             # before it carries no observation of its own.
@@ -3928,6 +3949,14 @@ def self_check() -> int:
 
     image_path = os.path.join(custody_dir, "dragontail.sparseimage")
     caught, effects, _world = run_flow()
+    property_true(
+        "case 11 registration, image build and fallbacks receive no scratch declaration",
+        len(_world.run_envs) == 4
+        and _world.runs[0][:2] == ("pool", "register-removable")
+        and all(args == ("check",) for args in _world.runs[1:])
+        and all("OXIDE_SCRATCH_ROOT" not in env and env["OXIDE_POOL"] == _world.pool
+                for env in _world.run_envs),
+    )
     property_true(
         "the owned image success flow completes with one planned ordinary detach",
         caught is None and effects.detach_calls == 1 and not effects.mounted,
@@ -4212,7 +4241,7 @@ def self_check() -> int:
 
     slot = (
         "/private/tmp/oxide-proof.abcd1234/scratch/pt/p/payload/slots/"
-        "t-1abcdef/quick-1/scratch"
+        "t-1abcdef0/quick-1/scratch"
     )
     caught, world = run_path_bound(slot)
     property_true(
@@ -4224,7 +4253,7 @@ def self_check() -> int:
     )
     long_leaf = (
         "/private/tmp/oxide-proof.abcd1234/scratch/pt/p/payload/slots/"
-        "t-1abcdef/quick-1/" + "s" * 30 + "/scratch"
+        "t-1abcdef0/quick-1/" + "s" * 30 + "/scratch"
     )
     caught, _world = run_path_bound(long_leaf)
     property_true(

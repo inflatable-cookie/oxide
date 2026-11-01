@@ -325,9 +325,8 @@ each script's own selector text and case bodies.
 
 | Selector(s) | Premise today |
 | --- | --- |
-| `rust:installed-handoff` (#122) | two cases create a real directory pool; needs the diagnostic apparatus authored first (S4) |
+| `rust:installed-handoff` (#122, #206) | selected-volume scratch pools; diagnostic and native evidence at the migrated head require owner activation |
 | `rust:profile-outputs` (#133) + `:diagnostic` | 20 private directory-budget fixture pools |
-| `rust:pool-temp-scratch` (#136) + `:diagnostic` | directory-budget pool plus one owned image; no boot-Data premise |
 | `rust:recorded-slot-accounting` (#146) + `:diagnostic` | genuine directory-budget pool, verified from the product's own config |
 | `rust:exec-output-inference` (#160) + `:diagnostic` | control pool is a directory-budget pool |
 | `rust:auto-adopt-ineligible` (#154) + `:diagnostic` | control pool is a directory-budget pool |
@@ -342,11 +341,12 @@ must contain S3 (`79e55f4`); older baseline comparisons require the internal
 root and are outside this migrated proof (decision fe367c88). Its native
 qualification remains separately owner-activated.
 
-**Keep the internal root** (the premise is the boot Data volume or
-non-`/Volumes` placement, which no scratch pool replaces):
+**Keep the internal root** (the premise is boot Data, non-`/Volumes` placement,
+or a socket path that cannot fit under the selected-volume guard prefix):
 
 | Selector/recipe | Genuine premise |
 | --- | --- |
+| `rust:pool-temp-scratch` (#136) + `:diagnostic` | decision af7df7d6: the Builds guard prefix makes this fixture's shortest admitted slot scratch path (`test-1`) 103 bytes, exceeding the 91-byte product bound; both selectors keep `/private/tmp` |
 | `rust:outputs-prune` (#129/#152) + `:diagnostic` | cases 10 and 21 prove checkout absence on the boot Data volume |
 | `rust:prune-absence` (#135) + `:diagnostic` | the missing-ancestor chain must sit on the boot Data volume |
 | the `AGENTS.md` unit-suite recipe (`OXIDE_TEST_INTERNAL_ROOT`) | three macOS fixtures take the boot Data volume and `MNT_IGNORE_OWNERSHIP` premises; `config::tests::git_work_trees_and_aliases_refuse` needs a root off `/Volumes` |
@@ -366,7 +366,7 @@ root in `<mount>/scratch/oxide` of the selected volume, and falls back to
 `/private/tmp` when none is usable. For each migrated proof:
 
 1. The selector drops `--root-parent /private/tmp`; its admission, its wall
-   clock, its own monitored scratch budget (512 MiB for most, 64 MiB for
+   clock, its own monitored scratch budget (512 MiB for most, 128 MiB for
    `rust:installed-handoff`, 600 s for `rust:profile-outputs`, 420 s for
    `rust:finder-metadata-race`) and cleanup are unchanged, and each migrated
    selector still states its pool premise in its own comment.
@@ -492,9 +492,7 @@ does not change. So each migration is a proof-authoring change:
   `OXIDE_`/`XDG_`/`CARGO_*`/`GIT_` scrub, the declaration and cap, `mktemp`-only
   fixture roots, the image custody where one exists);
 - the required **uncounted keep-going diagnostic** before any counted native,
-  as an uncounted collection that never becomes a PASS. Nine of the ten already
-  have a `:diagnostic` twin; `rust:installed-handoff` has **none**, so its
-  sub-slice must author it first (below);
+  as an uncounted collection that never becomes a PASS. Each migrated selector has a `:diagnostic` twin; `rust:installed-handoff` authored one as part of its migration;
 - the **counted author native at the migrated head**, then one distinct
   **independent reviewer native at that exact head**, because every migrated
   child now writes a pool on removable media (the ELEVATED trigger), in
@@ -503,16 +501,15 @@ does not change. So each migration is a proof-authoring change:
   Nothing in S4 grants an activation or carries an old native receipt forward;
   the new head's receipts are the evidence.
 
-The ten sub-slices and the three keeps are listed in "Migration list". Each
+The migrating sub-slices and the keeps are listed in "Migration list". Each
 selector keeps **its own** wall clock and scratch budget; there is no uniform
 figure, and the columns below are read from the selectors and scripts as they
 stand at this head:
 
 | Selector | Limit / scratch | `:diagnostic` twin | Effect-free pre-native check |
 | --- | --- | --- | --- |
-| `rust:installed-handoff` | 120 s / 64 MiB | **none — authored in this sub-slice** | none in the script; only `scripts/test_dogfood_scripts.py` `HandoffSelectorTests` pins its root, limits and body |
+| `rust:installed-handoff` | 600 s / 128 MiB | yes | `proof:installed-handoff:test`, `proof:installed-handoff:plan`, and `HandoffSelectorTests` |
 | `rust:profile-outputs` | 600 s / 512 MiB | yes | `--plan` |
-| `rust:pool-temp-scratch` | 300 s / 512 MiB | yes | `proof:pool-temp:test`, `--plan` |
 | `rust:recorded-slot-accounting` | 300 s / 512 MiB | yes; migrated (recorded-slot-accounting; native chain held) | `proof:recorded-slot-accounting:test`, `--plan` |
 | `rust:exec-output-inference` | 300 s / 512 MiB | yes | `proof:exec-inference:test`, `--plan` |
 | `rust:auto-adopt-ineligible` | 300 s / 512 MiB | yes | `--plan` (shared #117 fixture, no distinct pure selector) |
@@ -533,17 +530,7 @@ Nothing is carried over between steps: a failing or missing step stops that
 sub-slice, and the design stays valid because every not-yet-migrated proof keeps
 `bd357a4c`.
 
-`rust:installed-handoff` is the one sub-slice that must author apparatus before
-it can migrate: the script has no `--diagnostic`, no `--self-check` and no
-`--plan`. Its bounded path is (a) add a `--diagnostic` keep-going collection
-with a bounded `qualified: false` receipt beside the guard's, (b) add a
-`--self-check` that pins the diagnostic dispatch and the fixture environment
-with no child, pool, Cargo or install, (c) add the two selectors
-`rust:installed-handoff:diagnostic` and `proof:installed-handoff:test` at the
-same guard, 120 s and 64 MiB, and update `HandoffSelectorTests`, then (d) the
-six steps above. If the owner declines that apparatus work, installed-handoff
-stays on `--root-parent /private/tmp` under `bd357a4c`: the migration list is a
-candidate list, and a smaller migration is a legitimate outcome.
+`rust:installed-handoff` has a diagnostic, a pure self-check, a plan and a selector pin. Its fixture pools use the selected-volume scratch root and an explicit cap. The diagnostic and both native sessions need their own owner activation at the migrated head; prior evidence is not carried forward.
 
 Cost, stated rather than hidden: nine existing diagnostics plus one authored
 one, and twenty natives (author and reviewer), each at its own budget,

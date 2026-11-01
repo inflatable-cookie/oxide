@@ -1286,11 +1286,11 @@ successor design establishes equivalence.
 
 **Proof.** `effigy rust:pool-temp-scratch` is one fixed script,
 `scripts/test-pool-temp-scratch.py`, and the whole command of the qualified
-shared proof supervisor (`bounded-test.py --limit 300
+shared proof supervisor (`bounded-test.py --root-parent /private/tmp --limit 300
 --scratch-budget-mib 512`; an ELEVATED trigger: it deletes owned scratch, decides
 writer closure and writes to an owned removable fixture volume). It stages
 this clean HEAD's debug `oxide` offline with 1.97.1 and covers, on tiny
-fixtures with a private `HOME`, `CARGO_HOME` and directory pool. Staging and
+fixtures with a private `HOME`, `CARGO_HOME` and directory pool. Decision af7df7d6 keeps the explicit internal root because this fixture's shortest admitted slot scratch (`test-1`) under the selected Builds prefix is 103 bytes, above the 91-byte socket bound. The source-derived internal layout is at most 88 bytes for the two-digit slot IDs the proof admits, a 3-byte margin; case 12 verifies the actual names and reports the run figures. No child receives `OXIDE_SCRATCH_ROOT`. Staging and
 every fixture child share one resolved absolute toolchain home — an inherited
 `RUSTUP_HOME` when it is absolute and usable, else the account default
 `$HOME/.rustup` resolved from the original HOME *before* the private fixture
@@ -1342,7 +1342,7 @@ group closes; a foreign entry, a link and an over-bound
 derived path each refusing the command without spawning, deleting or
 following anything; and one owned 128 MiB scratch APFS image used as the
 removable pool, where a build's temporary files land on the image, then an
-ordinary detach selects the internal pool's scratch with no stale
+ordinary detach selects the original directory pool's scratch with no stale
 `/Volumes/<name>` directory written. It reports the longest injected path in
 bytes and characters against the bound. It never touches a live pool or the
 registered drive, and it is not a benchmark or an alias for full QA.
@@ -1352,7 +1352,7 @@ the account homes, the crate, its own scratch and the sibling fixture
 directory, and never the pool directory. The first production `oxide` command
 that needs the pool creates it, and the proof then verifies the created
 `config.json` backend, payload, ledger, device and the inherited-directory
-observation, so the product's own exclusion gate is the oracle rather than a
+observation, so the product's own applicable admission gates are the oracle rather than a
 separate probe. Every fixture launch mints a fresh observation identifier that
 the build script declares to Cargo and echoes, and every consumed observation
 is refused unless it carries the current identifier, so a replayed warning from
@@ -1379,8 +1379,16 @@ the backing and records and aborts as an unknown outcome instead of being
 downgraded to the case's own oracle failure. Diagnostic dependency
 handling requires a *passed* predecessor (a skipped one is not passed), and an
 unknown-outcome abort records every remaining planned case as not run, so a
-reached prefix is never reported as a complete collection. Its native author and
-reviewer sessions are separately root-activated; no counted native has passed.
+reached prefix is never reported as a complete collection. At native head `0eeb7404020e86d3b040578d731c232f229733a1`, the
+Supervisor-activated uncounted diagnostic completed 12/12 and the counted
+author and distinct independent reviewer natives each passed all 12 cases,
+closed under `/private/tmp` at the 300 s / 512 MiB bounds. The three runs
+used direct commands under decision `d3d61247`, in order, and are recorded
+with executor, command, load and log hashes in
+`/Volumes/Builds/scratch/oxide/evidence-s4-pool-temp-scratch-0eeb740-20261101T123940Z`
+(`NOTE.md`, `sessions.jsonl`, `SHA256SUMS`): 68 s diagnostic, 67 s author,
+68 s reviewer, with reviewer peak 71.6 MiB. Carry to the integrated head
+requires independent exact-diff confirmation under decision `0475a633`.
 Author natives 1 and 2 and diagnostics 1, 2 and 3 at earlier heads are spent
 failures: the first two hid the toolchain behind the fixture HOME and used
 `--locked` without a lock, and the diagnostics were refused in turn by an
@@ -1390,7 +1398,7 @@ cases 1-10 and aborted at the removable case, whose containment check compared
 the custody directory against the workspace and its parent instead of the
 supervisor's published owned root; that topology and its custody decision are
 corrected here, and the run stays a spent failure. The pure self-check
-(`effigy proof:pool-temp:test`, 149 properties) covers the constructor layout,
+(`effigy proof:pool-temp:test`, 153 properties) covers the constructor layout,
 rerun completeness, observation freshness, readiness parsing, refusal
 targeting, accounting deltas, the published-root containment refusals, the
 removable flow's custody decisions (including a missing or swapped device
@@ -1730,34 +1738,42 @@ necessary.
   exclusion.
 - **Proof.** `effigy rust:installed-handoff` (heavy) is one fixed script and
   whole command: `bounded-test.py` around `scripts/test-installed-handoff.py`
-  with a 120 s wall limit and 64 MiB monitored scratch. Its selector names an
-  explicit `--root-parent /private/tmp` because two of its cases create a real
-  internal directory pool; the selected-volume default would be refused by the
-  product, exactly as for the other genuine internal-placement proofs, and this
-  is the same owner-accepted exception rather than a global default change.
-  Inside that scratch
-  the script stages this HEAD's debug `oxide` with plain Cargo offline and the
-  pinned 1.97.1, then deletes the staged target before the fixtures, so it
-  creates no Oxide pool and touches no live pool, installed binary, install
-  receipt or host state. The stage fits the 64 MiB gate by building with one
-  job, one codegen unit, no debug info, stripped symbols and size-optimised
-  codegen: the staged tree peaks near 58 MiB, the fixtures near 2 MiB, and
-  staging takes about 37 s. Over private HOME, receipt and directory-pool
-  fixtures with a compiled stub candidate, it covers newer state
-  and registration versions; malformed, older and non-`u32` documents that must
-  not trigger; one hand-off with exact argv and environment plus the marker;
-  marker refusal and inertness; foreign, path, hash, size, capability,
-  ownership, `PATH`, same-inode and replacement refusals; skipped commands; and
-  a final-release error after effects that never executes anything. What it
-  exercises is a binary staged from this HEAD carrying control state version 8
-  with a compiled recording stub candidate that reports the newer version 9; it
-  is not a real installed version-4 binary handing off to version 5, and it
-  claims no host install. `effigy proof:installed-handoff:test` checks the
-  fixture control-state and ledger versions against product constants without
-  staging a binary. That real forward-fence hand-off stays behind the
-  separate QA-compatibility-window and receipt-matching install gate. It never
-  touches the real `~/.local/bin/oxide`, a real install receipt or a live pool,
-  and is not a benchmark or an alias for full QA.
+  with a 600 s wall limit and 128 MiB monitored scratch (decisions 5bf3c438
+  and 49f52581). The earlier 120 s diagnostic reached its work deadline at
+  100 s and the earlier 64 MiB diagnostic faulted at 64.4 MiB; neither has
+  qualification credit. The supervisor's
+  selected-volume root on Builds holds all fixtures; each product child declares
+  that scratch root and an explicit pool cap. A `/private/tmp` fallback uses
+  the internal path where the declaration is inert, so it is not scratch-pool
+  coverage. The script stages this HEAD's
+  debug `oxide` offline with 1.97.1, then exercises private HOME, receipt and
+  scratch-pool fixtures with a recording candidate. It covers newer state and
+  registration versions, refusals, skipped commands, and a final-release error
+  after effects. The current candidate reports a version newer than the staged
+  subject's control version 9; this is not a real installed-version transition.
+  `effigy proof:installed-handoff:test` checks the apparatus and fixture
+  environment without staging a binary; `proof:installed-handoff:plan` prints
+  the case plan. The uncounted `rust:installed-handoff:diagnostic` uses the
+  same bounds, publishes an atomic bounded progress receipt at phase, case and
+  command boundaries, records monotonic timings, observed exits and bounded
+  output, and aborts on unknown writer closure. Its retained merged Cargo
+  staging log exposes package-cache waits even if the supervisor stops it.
+  A started command without a terminal record has unknown exit.
+  Its historical diagnostic at `1852c2f` stopped at the work deadline after
+  seven completed cases; its receipt lacks the timing needed to apportion the
+  278 s and carries no native credit (decision 88c71155). The later `e64850e`
+  diagnostic hit the supervisor deadline during staging, before the old
+  in-memory receipt was published; it also has no native credit. The `490e935`
+  diagnostic stopped at 282 s after eight reached cases; its recorded staging
+  took 55 s and individual fixture setup checks took 11.5–13 s, with no native
+  credit (decision 5bf3c438). Their stderr reports 0.1–0.4 s in the build
+  summary and `seeding skipped: lock unavailable`; that message names the
+  fixture's unavailable Cargo.lock, not a measured lock wait. The receipt has
+  no per-product-step timing and does not establish which step accounts for
+  the remaining interval. The diagnostic and each
+  native session require owner activation at the migrated head; no previous
+  receipt carries over. The proof touches no live pool, installed binary or
+  real install receipt, and is not a benchmark or full QA.
 
 ### Version identity (oxide#130)
 
@@ -1989,27 +2005,23 @@ the selected-volume default and positive outer closure (oxide#147's own records
 hold the case counts, runs and events). Qualification is bound to those bytes
 and evidence; an older hash's receipts do not transfer to new bytes.
 
-**Internal-placement proofs (oxide#136, accepted narrow exception).** A proof
-whose subject is the *internal* directory pool cannot run over the
-selected-volume default: the product correctly refuses a `directory-budget`
-internal pool on an external volume, and that refusal is not bendable (no
-debug-only exception). The owner accepted this narrow exception for genuine
-internal-placement proofs (decision `bd357a4c`, 2026-10-25). Such a proof may
-declare the internal root explicitly through the qualified guard's existing
-`--root-parent` option — for oxide#136, `--root-parent /private/tmp` in both its
-counted and diagnostic selectors. The guard still creates ONE fresh owned
-monitored root under that canonical internal directory and applies the
-unchanged 300 s, 512 MiB, 22 GiB reserve, custody, retention and cleanup rules
-to everything inside it, including staging, the fixture pool, temp and the
-single owned 128 MiB image. The selected-volume default is unchanged for every
-other caller: builds, tests and ordinary proofs keep the drive placement. The
-exception authorises placement only; each such proof still needs its own
-independent exact-head source confirmation and separate execution activation.
-Its fixtures must stay outside the directory-budget pool on the same device —
-inherited `TMPDIR` values under the pool directory are not valid, and the
-product's pool-membership refusal is never weakened. The observed ~58 MiB peak
-in an oxide#136 diagnostic is a measurement, not a bound reduction or a
-guarantee for other work.
+**Internal-root keep for child-temp proof (oxide#136).** Decision af7df7d6
+retains `--root-parent /private/tmp` in both selectors: the guard's selected
+Builds prefix cannot fit even the shortest fixture slot scratch beneath the
+91-byte socket bound. The short internal fixture path has a source-derived
+88-byte maximum with a positive 3-byte margin for the script's admitted slot
+names. The guard still monitors one owned root, 300 s, 512 MiB, reserve,
+custody, closure and cleanup. This selector exports no `OXIDE_SCRATCH_ROOT`;
+the separate owned image stays under its existing custody rules. Inherited
+`TMPDIR` fixtures stay outside the directory-budget pool on the same device;
+values under the pool are not valid, and the product's pool-membership refusal
+is never weakened. This ruling
+has separate native evidence at `0eeb740` as described above; carrying it to
+the integrated head requires independent exact-diff confirmation. The blocked
+review at `8d030b2` and earlier proof packets stay historical. The shorter supervisor prefix is tracked by papercut
+`503e484d`. The earlier decision `bd357a4c` accepted the internal-root
+exception, and an earlier oxide#136 diagnostic observed about 58 MiB peak;
+that figure remains historical and is not a budget reduction or new evidence.
 
 **Genuine internal-placement proofs (Tom, 2026-10-25).** Tom answered decision
 `bd357a4c-2e1d-4190-bafb-290d7c2ae244`: "Accept the internal-root exception for
