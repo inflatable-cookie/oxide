@@ -144,6 +144,11 @@ struct Row {
     recipe: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     nonce: Option<String>,
+    /// The root's own immutable creation generation, read from its owner
+    /// marker when the row is written (oxide#218). Rows written before
+    /// oxide#152 recorded the receipt's committed selection generation
+    /// instead; `judge_recorded_root` reconciles exactly that superseded shape
+    /// from the recorded marker digest, and never a changed marker.
     generation: u64,
     /// The root's device and inode when the selection was committed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -563,7 +568,7 @@ fn seed_registry(control: &Path, registry: &mut Registry) -> Result<(), String> 
                 if registry.rows.len() >= MAX_ROWS {
                     return Err("the receipt seed reached the registry row limit".to_owned());
                 }
-                let identity = row_identity(selected)?;
+                let identity = root_identity(selected)?;
                 registry.rows.push(Row {
                     checkout_id: stub.checkout_id.clone(),
                     checkout: stub.checkout.clone(),
@@ -575,10 +580,10 @@ fn seed_registry(control: &Path, registry: &mut Registry) -> Result<(), String> 
                     volume_uuid: selected.volume_uuid().map(str::to_owned),
                     recipe: outputs::RECIPE_PUBLIC.to_owned(),
                     nonce: selected.nonce().map(str::to_owned),
-                    generation: selected.generation(),
-                    root_dev: identity.0,
-                    root_ino: identity.1,
-                    marker_digest: identity.2,
+                    generation: identity.generation(selected),
+                    root_dev: identity.dev,
+                    root_ino: identity.ino,
+                    marker_digest: identity.digest,
                     selected: is_selected,
                     pending: !is_selected,
                     pruning: None,
@@ -1025,14 +1030,20 @@ fn note_placement(
                 row.pending = false;
                 if keep_selected {
                     // The committed root now exists: refresh the identity the
-                    // prune proof matches (a pending row had none yet).
-                    let identity = row_identity(selected)?;
-                    row.root_dev = identity.0;
-                    row.root_ino = identity.1;
-                    row.marker_digest = identity.2;
-                    row.nonce = selected.nonce().map(str::to_owned);
-                    row.generation = selected.generation();
-                    row.volume_uuid = selected.volume_uuid().map(str::to_owned);
+                    // prune proof matches (a pending row had none yet). The row
+                    // records the root's OWN immutable creation generation, not
+                    // the selection's commit generation (oxide#218), and a
+                    // placement that no longer describes the live marker leaves
+                    // the recorded history exactly as it is.
+                    let identity = root_identity(selected)?;
+                    if identity.describes(selected) {
+                        row.generation = identity.generation(selected);
+                        row.root_dev = identity.dev;
+                        row.root_ino = identity.ino;
+                        row.marker_digest = identity.digest;
+                        row.nonce = selected.nonce().map(str::to_owned);
+                        row.volume_uuid = selected.volume_uuid().map(str::to_owned);
+                    }
                 }
             } else if row.selected || row.pending {
                 row.selected = false;
@@ -1063,7 +1074,7 @@ fn note_placement(
     }
     if let Some(selected) = selected {
         if keep_selected && !matched_selected {
-            let identity = row_identity(selected)?;
+            let identity = root_identity(selected)?;
             if registry.rows.len() >= MAX_ROWS {
                 mark_incomplete(registry, "the registry row limit was reached")?;
             } else {
@@ -1078,10 +1089,10 @@ fn note_placement(
                     volume_uuid: selected.volume_uuid().map(str::to_owned),
                     recipe: outputs::RECIPE_PUBLIC.to_owned(),
                     nonce: selected.nonce().map(str::to_owned),
-                    generation: selected.generation(),
-                    root_dev: identity.0,
-                    root_ino: identity.1,
-                    marker_digest: identity.2,
+                    generation: identity.generation(selected),
+                    root_dev: identity.dev,
+                    root_ino: identity.ino,
+                    marker_digest: identity.digest,
                     selected: keep_selected,
                     pending: false,
                     pruning: None,
@@ -1098,7 +1109,7 @@ fn note_placement(
             if registry.rows.len() >= MAX_ROWS {
                 mark_incomplete(registry, "the registry row limit was reached")?;
             } else {
-                let identity = row_identity(proposed)?;
+                let identity = root_identity(proposed)?;
                 registry.rows.push(Row {
                     checkout_id: checkout_id.to_owned(),
                     checkout: checkout.to_path_buf(),
@@ -1110,10 +1121,10 @@ fn note_placement(
                     volume_uuid: proposed.volume_uuid().map(str::to_owned),
                     recipe: outputs::RECIPE_PUBLIC.to_owned(),
                     nonce: proposed.nonce().map(str::to_owned),
-                    generation: proposed.generation(),
-                    root_dev: identity.0,
-                    root_ino: identity.1,
-                    marker_digest: identity.2,
+                    generation: identity.generation(proposed),
+                    root_dev: identity.dev,
+                    root_ino: identity.ino,
+                    marker_digest: identity.digest,
                     selected: false,
                     pending: true,
                     pruning: None,
@@ -1422,16 +1433,74 @@ fn mark_incomplete(registry: &mut Registry, reason: &str) -> Result<(), String> 
     Ok(())
 }
 
-fn row_identity(selected: &Selected) -> Result<(Option<u64>, Option<u64>, Option<String>), String> {
+/// One selected root's identity as a registry row records it.
+struct RecordedRoot {
+    dev: Option<u64>,
+    ino: Option<u64>,
+    digest: Option<String>,
+    /// The root's own marker facts — its nonce and immutable creation
+    /// generation — when the marker is readable right now.
+    marker: Option<(Option<String>, u64)>,
+}
+
+impl RecordedRoot {
+    /// The generation a row records: the root's OWN immutable creation
+    /// generation (oxide#218), never the selection's commit generation, which
+    /// advances with every transition while the marker keeps the generation it
+    /// was created at. A root with no readable marker (a future or an absent
+    /// one) falls back to the selection's generation exactly as before.
+    fn generation(&self, selected: &Selected) -> u64 {
+        self.marker
+            .as_ref()
+            .map_or_else(|| selected.generation(), |(_, generation)| *generation)
+    }
+
+    /// Whether the root's own marker records exactly this placement's nonce and
+    /// creation generation, so these facts describe the live root. A readable
+    /// marker that records another nonce or generation is a SUPERSEDED
+    /// placement — a version-1 receipt whose root/2 marker was upgraded under
+    /// it during a migration — and that placement never overwrites the row's
+    /// recorded history with a mixed identity. An unreadable or absent marker
+    /// has no fact to contradict the placement and is recorded as before; the
+    /// prune observation refuses an invalid marker on its own.
+    fn describes(&self, selected: &Selected) -> bool {
+        match &self.marker {
+            Some((nonce, generation)) => {
+                nonce.as_deref() == selected.nonce() && *generation == selected.generation()
+            }
+            None => true,
+        }
+    }
+}
+
+fn root_identity(selected: &Selected) -> Result<RecordedRoot, String> {
     let Ok(metadata) = fs::symlink_metadata(selected.root()) else {
-        return Ok((None, None, None));
+        return Ok(RecordedRoot {
+            dev: None,
+            ino: None,
+            digest: None,
+            marker: None,
+        });
     };
     use std::os::unix::fs::MetadataExt;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Ok((None, None, None));
+        return Ok(RecordedRoot {
+            dev: None,
+            ino: None,
+            digest: None,
+            marker: None,
+        });
     }
     let digest = outputs::marker_digest(selected.root()).ok();
-    Ok((Some(metadata.dev()), Some(metadata.ino()), digest))
+    let marker = outputs::read_marker_for_prune(selected.root())
+        .ok()
+        .map(|marker| (marker.nonce().map(str::to_owned), marker.generation()));
+    Ok(RecordedRoot {
+        dev: Some(metadata.dev()),
+        ino: Some(metadata.ino()),
+        digest,
+        marker,
+    })
 }
 
 /// The checkout's volume UUID for a new marker (shared root/2 field).
@@ -2234,38 +2303,17 @@ fn evaluate(
     let mut evaluated = Vec::new();
     // Eligibility and candidate construction are per (checkout, root): every
     // member of one root under the same checkout is ONE owner, so one
-    // representative (the first sorted member) is evaluated and the full group
-    // is verified again at intent publication. A group carrying a pending or
-    // otherwise unsettled reference is kept, never offered as a candidate.
-    let mut rows: Vec<Row> = registry
-        .rows
-        .iter()
-        .filter(|row| row.live() || row.pruned_ms.is_none())
-        .cloned()
-        .collect();
-    rows.sort_by(|left, right| {
-        (
-            left.checkout_id.as_str(),
-            left.root.as_path(),
-            left.member.as_str(),
-        )
-            .cmp(&(
-                right.checkout_id.as_str(),
-                right.root.as_path(),
-                right.member.as_str(),
-            ))
-    });
-    let mut grouped: Vec<Row> = Vec::new();
-    let mut group_keys: Vec<(String, PathBuf)> = Vec::new();
-    for row in rows {
-        let key = (row.checkout_id.clone(), row.root.clone());
-        if group_keys.iter().any(|known| known == &key) {
-            continue;
-        }
-        group_keys.push(key);
-        grouped.push(row);
-    }
-    let rows = grouped;
+    // representative is evaluated and the full group is verified again at
+    // intent publication. A group carrying a pending or otherwise unsettled
+    // reference is kept, never offered as a candidate.
+    let rows = representatives(
+        registry
+            .rows
+            .iter()
+            .filter(|row| row.live() || row.pruned_ms.is_none())
+            .cloned()
+            .collect(),
+    );
     if rows.len() > SNAPSHOT_MAX_RECEIPTS {
         // A cap is not permission to consider part of the registry.
         return Ok(Evaluation {
@@ -3724,6 +3772,26 @@ struct ObservedIdentity {
     legacy: bool,
 }
 
+/// Whether a recorded generation that is NEWER than the owner marker's own
+/// creation generation is the documented pre-oxide#152 superseded selection
+/// generation (oxide#218). The attribution is never the number itself: it needs
+/// `digest_pinned`, the positive fact that the recorded marker digest is the
+/// LIVE marker's exact bytes. Then the document — including its own nonce,
+/// volume and creation generation — is the recorded one, so the row's
+/// generation can only be the receipt's commit generation that the old writer
+/// copied, never a claim about a re-created root. A recorded generation older
+/// than the marker's is never reconciled: nothing writes one.
+///
+/// Shared by the observation and the pre-effect marker verification so those
+/// two rules can never drift.
+fn superseded_selection_generation(
+    recorded: u64,
+    marker_generation: u64,
+    digest_pinned: bool,
+) -> bool {
+    digest_pinned && recorded > marker_generation
+}
+
 /// Compare one live observation with the recorded row, returning the device this
 /// run should bind.
 ///
@@ -3734,6 +3802,19 @@ struct ObservedIdentity {
 /// generation, the nonce, the marker's own volume UUID and the recorded marker
 /// digest — so a stale number is replaced by the live one while a reused inode on
 /// another volume, a re-created root or an edited marker is never reconciled.
+///
+/// The recorded generation has one documented superseded shape (oxide#218).
+/// Before oxide#152 a transition recorded the receipt's COMMITTED selection
+/// generation in the row, which advances with every transition, while the owner
+/// marker keeps the generation the root was created at (it is rewritten only by
+/// the version-1 to version-2 upgrade, which preserves it). Such a row is
+/// reconciled only when the recorded marker digest pins the EXACT live marker
+/// bytes: the document — including its own nonce, volume and creation
+/// generation — is then the recorded one, so the field is a superseded
+/// selection observation, never a claim about a re-created root. A recorded
+/// generation OLDER than the marker's is never reconciled (nothing writes one),
+/// and a row without a recorded digest has no pin at all, so it must agree
+/// exactly.
 fn judge_recorded_root(row: &Row, observed: &ObservedIdentity) -> Result<u64, String> {
     if row.root_ino != Some(observed.ino) {
         return Err("the recorded root's inode changed".to_owned());
@@ -3744,10 +3825,17 @@ fn judge_recorded_root(row: &Row, observed: &ObservedIdentity) -> Result<u64, St
     if row.root_dev.is_none() {
         return Err("the recorded root has no device".to_owned());
     }
+    let superseded = superseded_selection_generation(
+        row.generation,
+        observed.marker.generation(),
+        row.marker_digest
+            .as_deref()
+            .is_some_and(|recorded| recorded == observed.marker_digest),
+    );
     if observed.marker.kind() != row.root_kind
-        || observed.marker.generation() != row.generation
         || observed.marker.volume_uuid() != row.volume_uuid.as_deref()
         || observed.marker.nonce() != row.nonce.as_deref()
+        || (observed.marker.generation() != row.generation && !superseded)
     {
         return Err("the owner marker does not match the recorded root identity".to_owned());
     }
@@ -5352,6 +5440,44 @@ fn group_rows<'a>(registry: &'a Registry, checkout_id: &str, root: &Path) -> Vec
     rows
 }
 
+/// One evaluated representative per (checkout, root) group, in a stable order.
+///
+/// The representative is the group's first LIVE reference in member order: a
+/// row that is selected, pending, reserved or already owned by an intent. An
+/// inactive history row is never the representative while the group still has
+/// one, because a history reference keeps its own recorded facts (an old legacy
+/// `target` row's superseded nonce or generation, oxide#218) and is not the
+/// checkout's current authority — comparing it with the live marker would keep
+/// the whole batch for a contradiction the group does not have. A group with no
+/// live reference keeps the first member, exactly as before.
+fn representatives(mut rows: Vec<Row>) -> Vec<Row> {
+    rows.sort_by(|left, right| {
+        (
+            left.checkout_id.as_str(),
+            left.root.as_path(),
+            !left.live(),
+            left.member.as_str(),
+        )
+            .cmp(&(
+                right.checkout_id.as_str(),
+                right.root.as_path(),
+                !right.live(),
+                right.member.as_str(),
+            ))
+    });
+    let mut grouped: Vec<Row> = Vec::new();
+    let mut group_keys: Vec<(String, PathBuf)> = Vec::new();
+    for row in rows {
+        let key = (row.checkout_id.clone(), row.root.clone());
+        if group_keys.iter().any(|known| known == &key) {
+            continue;
+        }
+        group_keys.push(key);
+        grouped.push(row);
+    }
+    grouped
+}
+
 /// The verified group of one candidate root: all references share the root's
 /// immutable identity, none is pending or already owned by another
 /// transaction. Anything else refuses.
@@ -6260,9 +6386,15 @@ fn verify_root_marker(root: &OwnedFd, candidate: &Candidate) -> Result<(), Strin
     }
     let marker: Marker = serde_json::from_slice(&bytes)
         .map_err(|error| format!("the owner marker is invalid ({error})"))?;
+    // The digest comparison above already proved these are the recorded marker
+    // bytes, so the same superseded-generation attribution the observation made
+    // applies here: a pre-oxide#152 row's commit generation never blocks the
+    // effect its own preview named.
+    let superseded =
+        superseded_selection_generation(candidate.generation, marker.generation(), true);
     if !marker.is_owned_by(&candidate.checkout, &candidate.checkout_id)
         || marker.nonce() != candidate.nonce.as_deref()
-        || marker.generation() != candidate.generation
+        || (marker.generation() != candidate.generation && !superseded)
     {
         return Err("the owner marker does not match the plan".to_owned());
     }
@@ -8315,8 +8447,12 @@ mod tests {
             nonce: None,
             generation: 1,
         };
-        let (dev, ino, digest) = row_identity(&selected).unwrap();
-        assert!(dev.is_some() && ino.is_some() && digest.is_none());
+        let identity = root_identity(&selected).unwrap();
+        assert!(identity.dev.is_some() && identity.ino.is_some() && identity.digest.is_none());
+        assert!(
+            identity.marker.is_none(),
+            "a markerless root records no marker"
+        );
         selected = Selected {
             kind: RootKind::Local,
             root: root.clone(),
@@ -8324,8 +8460,56 @@ mod tests {
             nonce: Some("a".repeat(32)),
             generation: 1,
         };
-        let (_, _, digest) = row_identity(&selected).unwrap();
-        assert!(digest.is_none());
+        let identity = root_identity(&selected).unwrap();
+        assert!(identity.digest.is_none());
+        // A root without a readable marker has no fact that contradicts the
+        // placement, so the row records the selection's generation as before.
+        assert!(identity.describes(&selected));
+        assert_eq!(identity.generation(&selected), 1);
+    }
+
+    /// oxide#218: the row records the root marker's OWN immutable creation
+    /// generation, never the placement's commit generation, and a placement that
+    /// no longer describes the live marker (the version-1 receipt a migration
+    /// upgraded the marker under) does not rewrite the row.
+    #[test]
+    fn a_recorded_row_takes_its_generation_and_agreement_from_the_marker() {
+        let fixture = Fixture::new();
+        let root = fixture.root.join("root");
+        fs::create_dir_all(&root).unwrap();
+        let mut row = row_for(&fixture.root);
+        row.nonce = Some("d".repeat(32));
+        write_root_marker(&root, &root_marker(&row));
+        let selected = Selected {
+            kind: RootKind::External,
+            root: root.clone(),
+            volume_uuid: row.volume_uuid.clone(),
+            nonce: Some("d".repeat(32)),
+            generation: 1,
+        };
+        let recorded = root_identity(&selected).unwrap();
+        assert_eq!(
+            recorded.marker.as_ref(),
+            Some(&(Some("d".repeat(32)), 1u64)),
+            "the row's identity must read the marker's own nonce and generation"
+        );
+        // The marker was created at generation 1 while a placement's committed
+        // generation is 2: the row records 1, and that placement does not
+        // describe the live marker (the migration's superseded whole-target
+        // reference, which must never rewrite the row).
+        let newer = Selected {
+            generation: 2,
+            ..selected.clone()
+        };
+        assert_eq!(recorded.generation(&newer), 1);
+        assert!(!recorded.describes(&newer));
+        // The same root's matching placement describes it.
+        assert!(recorded.describes(&selected));
+        assert_eq!(recorded.generation(&selected), 1);
+        // A different nonce is a different root creation, never a match.
+        let mut other = selected.clone();
+        other.nonce = Some("e".repeat(32));
+        assert!(!recorded.describes(&other));
     }
 
     #[test]
@@ -9475,6 +9659,202 @@ mod tests {
             judge_recorded_root(&unrecorded, &observe_fixture_root(&row)).unwrap_err(),
             "the recorded root has no device"
         );
+    }
+
+    /// oxide#218: before oxide#152 a transition recorded the receipt's
+    /// COMMITTED selection generation in the row, which advances with every
+    /// transition, while the owner marker keeps the generation the root was
+    /// created at. That superseded shape is reconciled only from the EXACT
+    /// recorded marker digest: a row without one, a marker that changed, a
+    /// nonce that disagrees, and a recorded generation older than the marker's
+    /// all stay unknown.
+    #[test]
+    fn a_pre_152_selection_generation_reconciles_only_from_the_recorded_marker() {
+        let fixture = Fixture::new();
+        let mut row = row_for(&fixture.root);
+        fs::create_dir_all(&row.root).unwrap();
+        write_root_marker(&row.root, &root_marker(&row));
+        let observed = observe_fixture_root(&row);
+        row.root_ino = Some(observed.ino);
+        row.marker_digest = Some(observed.marker_digest.clone());
+        assert_eq!(judge_recorded_root(&row, &observed), Ok(observed.dev));
+
+        // The marker was created at generation 1 and the row records a LATER
+        // committed generation (the live praxis-5f7d5240 and effigy-47de65c1
+        // shapes: 2 and 3).
+        let mut superseded = row.clone();
+        superseded.generation = 2;
+        assert_eq!(
+            judge_recorded_root(&superseded, &observed),
+            Ok(observed.dev)
+        );
+        let mut later = row.clone();
+        later.generation = 3;
+        assert_eq!(judge_recorded_root(&later, &observed), Ok(observed.dev));
+
+        // The recorded digest is the pin. Without one the row carries no
+        // evidence that the marker document is the recorded one.
+        let mut unpinned = superseded.clone();
+        unpinned.marker_digest = None;
+        assert_eq!(
+            judge_recorded_root(&unpinned, &observed).unwrap_err(),
+            "the owner marker does not match the recorded root identity"
+        );
+        // Another nonce is another root creation, whatever the generation says.
+        let mut other_nonce = root_marker(&row);
+        other_nonce["nonce"] = serde_json::json!("e".repeat(32));
+        write_root_marker(&row.root, &other_nonce);
+        assert_eq!(
+            judge_recorded_root(&superseded, &observe_fixture_root(&row)).unwrap_err(),
+            "the owner marker does not match the recorded root identity"
+        );
+        // An edited marker document is a changed marker: its digest no longer
+        // pins the recorded one, so nothing is reconciled.
+        write_root_marker(&row.root, &root_marker(&row));
+        let recorded = observe_fixture_root(&row);
+        let mut edited = root_marker(&row);
+        edited["created_ms"] = serde_json::json!(2u64);
+        write_root_marker(&row.root, &edited);
+        assert_eq!(
+            judge_recorded_root(&superseded, &observe_fixture_root(&row)).unwrap_err(),
+            "the owner marker does not match the recorded root identity"
+        );
+        // A recorded generation OLDER than the marker's is never a superseded
+        // selection: nothing writes one, so the marker still keeps the root.
+        let mut ahead = row.clone();
+        ahead.generation = 1;
+        let mut newer_marker = root_marker(&row);
+        newer_marker["generation"] = serde_json::json!(2u64);
+        write_root_marker(&row.root, &newer_marker);
+        assert_eq!(
+            judge_recorded_root(&ahead, &observe_fixture_root(&row)).unwrap_err(),
+            "the owner marker does not match the recorded root identity"
+        );
+        // A superseded generation is never a way past a failed inode check.
+        write_root_marker(&row.root, &root_marker(&row));
+        let mut moved_inode = superseded.clone();
+        moved_inode.root_ino = Some(observed.ino + 1);
+        assert_eq!(
+            judge_recorded_root(&moved_inode, &recorded).unwrap_err(),
+            "the recorded root's inode changed"
+        );
+    }
+
+    /// oxide#218: the pre-effect marker verification applies the SAME superseded
+    /// -generation rule as the observation, so a preview that named a pre-#152
+    /// candidate can perform exactly the effect it named. A changed marker,
+    /// another nonce and a generation older than the marker's still refuse.
+    #[test]
+    fn the_pre_effect_marker_check_accepts_only_the_superseded_generation() {
+        let fixture = Fixture::new();
+        let mut row = row_for(&fixture.root);
+        fs::create_dir_all(&row.root).unwrap();
+        write_root_marker(&row.root, &root_marker(&row));
+        let observed = observe_fixture_root(&row);
+        row.root_dev = Some(observed.dev);
+        row.root_ino = Some(observed.ino);
+        row.marker_digest = Some(observed.marker_digest.clone());
+        let root: OwnedFd = fs::File::open(&row.root).unwrap().into();
+        let mut candidate = candidate_of(&row);
+        candidate.dev = observed.dev;
+        candidate.ino = observed.ino;
+        candidate.marker_digest = observed.marker_digest.clone();
+        assert_eq!(candidate.generation, 1);
+        assert_eq!(verify_root_marker(&root, &candidate), Ok(()));
+
+        // The pre-#152 row's commit generation 2 beside the marker's creation
+        // generation 1, with the exact recorded bytes: accepted, because the
+        // observation already attributed this candidate.
+        let mut superseded = candidate.clone();
+        superseded.generation = 2;
+        assert_eq!(verify_root_marker(&root, &superseded), Ok(()));
+
+        // A changed marker document is never accepted.
+        let mut edited = root_marker(&row);
+        edited["created_ms"] = serde_json::json!(2u64);
+        write_root_marker(&row.root, &edited);
+        assert_eq!(
+            verify_root_marker(&root, &superseded).unwrap_err(),
+            "the owner marker changed before the quarantine rename"
+        );
+        write_root_marker(&row.root, &root_marker(&row));
+        // Another nonce is another root creation.
+        let mut other_nonce = superseded.clone();
+        other_nonce.nonce = Some("e".repeat(32));
+        assert_eq!(
+            verify_root_marker(&root, &other_nonce).unwrap_err(),
+            "the owner marker does not match the plan"
+        );
+        // A candidate generation OLDER than the marker's is never reconciled.
+        let mut newer_marker = root_marker(&row);
+        newer_marker["generation"] = serde_json::json!(2u64);
+        write_root_marker(&row.root, &newer_marker);
+        let mut ahead = candidate.clone();
+        ahead.marker_digest = outputs::marker_digest(&row.root).unwrap();
+        assert_eq!(
+            verify_root_marker(&root, &ahead).unwrap_err(),
+            "the owner marker does not match the plan"
+        );
+        // The marker's own creation generation matches.
+        let mut matching = ahead.clone();
+        matching.generation = 2;
+        assert_eq!(verify_root_marker(&root, &matching), Ok(()));
+    }
+
+    /// oxide#218: an inactive history reference is never a group's
+    /// representative while the group still has a live one, so a superseded
+    /// legacy `target` row (an old nonce or generation) cannot make the whole
+    /// snapshot incomplete for a group whose current references are fine.
+    #[test]
+    fn a_group_representative_is_its_first_live_reference() {
+        let fixture = Fixture::new();
+        let history = |member: &str| {
+            let mut row = row_for(&fixture.root);
+            row.member = member.to_owned();
+            row.selected = false;
+            row.pending = false;
+            row.nonce = None;
+            row
+        };
+        let live = |member: &str| {
+            let mut row = row_for(&fixture.root);
+            row.member = member.to_owned();
+            row
+        };
+        // `target` sorts before `zulu/release`, and the history row is not the
+        // representative.
+        let rows = representatives(vec![history("target"), live("zulu/release")]);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.member.as_str())
+                .collect::<Vec<_>>(),
+            ["zulu/release"]
+        );
+        // Two live references keep the first member in sorted order, and one
+        // group is still exactly one representative.
+        let rows = representatives(vec![live("release"), live("debug"), history("target")]);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.member.as_str())
+                .collect::<Vec<_>>(),
+            ["debug"]
+        );
+        // A group with no live reference keeps its first member: a released
+        // root has only its recorded history.
+        let rows = representatives(vec![history("target"), history("alpha")]);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.member.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha"]
+        );
+        // Different roots and different checkouts stay separate groups.
+        let mut other_root = live("debug");
+        other_root.root = fixture.root.join("elsewhere");
+        let mut other_checkout = live("debug");
+        other_checkout.checkout_id = "b".repeat(64);
+        let rows = representatives(vec![live("debug"), other_root, other_checkout]);
+        assert_eq!(rows.len(), 3);
     }
 
     /// The real-run plan gate: a plan made before a reboot still binds the same
