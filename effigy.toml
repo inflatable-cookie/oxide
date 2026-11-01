@@ -1204,7 +1204,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 
 # Cold-slot seeding (oxide#137 §16, oxide#169 slice 4): one fixed 24-case
 # script and the whole command of the qualified shared supervisor, with
-# default selected-volume scratch and explicitly capped scratch pools. 600 s (Tom 1527723f), 512 MiB monitored scratch, one owned
+# default selected-volume scratch and explicitly capped scratch pools. 900 s (Tom 09c6cd03), 512 MiB monitored scratch, one owned
 # 128 MiB APFS image attached with `hdiutil -owners on`, ordinary detach. It stages
 # this HEAD's debug `oxide` and seeds one private offline CARGO_HOME from a
 # union lock with the shared bounded seeder (scripts/offline_seed.py), then
@@ -1213,7 +1213,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # independently activated reviewer native are separately owner-activated.
 [tasks."rust:cold-slot-seeding"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py"
+run = "python3 scripts/bounded-test.py --limit 900 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py"
 
 # Uncounted keep-going collection for oxide#169, run through the same
 # qualified guard, root, bounds and custody. Its receipt is distinctly
@@ -1223,7 +1223,7 @@ run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- p
 # outcome aborts and retains the image.
 [tasks."rust:cold-slot-seeding:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py --diagnostic"
+run = "python3 scripts/bounded-test.py --limit 900 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py --diagnostic"
 
 # The pure apparatus of the cold-slot seeding proof: the case table, the
 # keep-going/fail-fast collection semantics, the receipt builder, the lock

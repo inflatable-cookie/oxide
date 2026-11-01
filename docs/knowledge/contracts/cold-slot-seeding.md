@@ -59,11 +59,11 @@ without masking the original exception. No product defect was involved.
 A donor path that is absent (evicted or its slot directory vanished) before the
 first recipient write is `DonorPayloadMissing` and skips cold; an existing
 foreign-owned, linked, wrong-type or wrong-device donor path remains an
-`UnsafePath` refusal. The selector bound is **600 s** for
-`rust:cold-slot-seeding` and `:diagnostic` only (Tom decision `1527723f`,
-superseding the 480 s bound from `e3540b1c`), with
+`UnsafePath` refusal. The selector bound is **900 s** for
+`rust:cold-slot-seeding` and `:diagnostic` only (Tom decision `09c6cd03`,
+superseding the 600 s bound from `1527723f`), with
 the 30 s script margin, 512 MiB monitored scratch, heavy admission, host
-reserve, custody and ordinary detach unchanged; any bound above 600 s needs
+reserve, custody and ordinary detach unchanged; any bound above 900 s needs
 another operator ruling. Revision 15 supersedes the build-script,
 proc-macro and Git offers of revisions 11–14 for v1; their text is retained
 as history. The default-on flip remains isolated behind this task's merge
@@ -2254,12 +2254,12 @@ does not establish scratch-pool coverage.
 
 ### 16.3 Runner, bounds, clocks and activation
 
-Tom decision `1527723f` raises only these two selectors to 600 s. The 480 s
+Tom decision `09c6cd03` raises only these two selectors from 600 s to 900 s. The diagnostic at `98d665b` completed 23/24 cases with zero failures and case 24 aborted near 600 s; it remains historical with no qualification credit. The 480 s
 uncounted diagnostic at `86208d1` remains historical with no counted credit:
 case 21 failed its dep-info source assertion, case 22 aborted at the work
 cutoff, and cases 23–24 were unexecuted. That run established neither complete
 fit nor a product PASS. Case 21 now compares canonical source paths; a fresh
-exact-head review precedes a separately owner-activated 600 s diagnostic and,
+exact-head review precedes a separately owner-activated 900 s diagnostic and,
 only after a clean complete diagnostic, the separately activated author and
 independent reviewer natives. The 512 MiB budget, 30 s margin, safeguards and
 Elevated merge hold are unchanged.
@@ -2267,10 +2267,10 @@ Elevated merge hold are unchanged.
 - Selector (created by oxide#169):
   `effigy rust:cold-slot-seeding` = one fixed script and the whole command of
   the qualified shared supervisor,
-  `python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py`.
+  `python3 scripts/bounded-test.py --limit 900 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py`.
   The supervisor selects its default scratch volume; fixture pools use an
-  explicitly capped scratch root inside the monitored run root. The 600 s
-  limit (Tom's decision `1527723f`, this selector and its diagnostic twin only;
+  explicitly capped scratch root inside the monitored run root. The 900 s
+  limit (Tom's decision `09c6cd03`, this selector and its diagnostic twin only;
   any higher bound needs another operator ruling) and 512 MiB monitored scratch
   budget include cleanup and the one owned image. The migrated recipe needs
   its own owner-activated native chain; earlier evidence remains historical.
@@ -2282,7 +2282,7 @@ Elevated merge hold are unchanged.
   accounting, deadline or receipt outcomes).
 - The cold script derives its own work clock from the supervisor deadline with
   the 30 s shutdown margin (the imported finder helper's 300 s constant is
-  overridden only in this selectors' process), so the 600 s bound applies to
+  overridden only in this selectors' process), so the 900 s bound applies to
   both the guard and the script.
 - `effigy proof:cold-slot-seeding:test` runs only the script's pure
   `--self-check`/`--self-test` with synthetic seams: no child, pool, image or
@@ -2344,7 +2344,7 @@ Coexisting: staging (60-85), Cargo home (50-70), image backing (≤ 128), tiny
 fixtures (≤ 8) — about **120-290 MiB**. Ordinary detach, backing removed only
 after a completed detach.
 
-Time, per required case, against the 600 s wall clock (estimates; the basis
+Time, per required case, against the 900 s wall clock (estimates; the basis
 names the measured analogue or the work performed):
 
 | Case | Estimate | Basis |
@@ -2365,7 +2365,7 @@ names the measured analogue or the work performed):
 | cleanup, receipts and the phase table inside the guard | 5-10 s | bounded writes and one detach |
 
 Revision 15 raised only these selectors from 300 s to **480 s**; decision
-`1527723f` now sets 600 s. The following 271 s arithmetic and 275 s stop
+`1527723f` set 600 s; `09c6cd03` now sets 900 s. The following 271 s arithmetic and 275 s stop
 proposal are historical, superseded by that approved bound and the fresh
 exact-head diagnostic requirement. The upper estimates sum to **271 s of the earlier 300 s bound** (the lower estimates to
 about 135 s), leaving 29 s at the top of the range. That is the arithmetic of a
@@ -2450,7 +2450,7 @@ comparison as the proof.
    `bb151a59`'s ambiguous-name visibility for both the summary and `oxide
    status`, without adding a walk or reconciliation?
 14. Do the phased §16.4 figures (Phase B peak about 290-445 MiB of 512 MiB, and
-   upper time estimates summing to 271 s of the earlier 300 s (v1 is now 600 s) with the required SQLite
+   upper time estimates summing to 271 s of the earlier 300 s (v1 is now 900 s) with the required SQLite
    and offered-run cases retained) leave enough room for an unmeasured fit
    whose diagnostic is still mandatory, or should the conflict go to the
    Supervisor before freeze?

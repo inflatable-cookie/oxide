@@ -57,14 +57,14 @@ The qualification apparatus is one fixed 24-case script,
 `scripts/test-cold-slot-seeding.py`:
 `effigy rust:cold-slot-seeding` and `:diagnostic` run it under the qualified
 shared supervisor with explicitly capped scratch pools on the selected volume
-(a `/private/tmp` fallback is not scratch-pool coverage), **600 s** (Tom's decision `1527723f`, this selector and its
+(a `/private/tmp` fallback is not scratch-pool coverage), **900 s** (Tom's decision `09c6cd03`, this selector and its
 diagnostic twin only), 512 MiB monitored scratch and one owned 128 MiB image;
 `effigy proof:cold-slot-seeding:test` runs only its pure apparatus. Case 21
 compares canonical dep-info and workspace source paths, with relative paths
 resolved from the workspace and an owned-alias pure regression. The earlier
 480 s diagnostic at `86208d1` failed case 21, aborted case 22 at its work
 cutoff and left cases 23–24 unexecuted; it remains historical with no counted
-credit or complete fit. The new 600 s bound retains the 30 s margin and all
+credit or complete fit. The diagnostic at `98d665b` completed 23/24 cases with zero failures and case 24 aborted near 600 s; it is historical with no qualification credit. The 900 s bound retains the 30 s margin and all
 other safeguards. A fresh exact-head source review must precede the next
 separately owner-activated diagnostic. The
 uncounted diagnostic, one counted author native and one separately activated
