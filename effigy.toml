@@ -77,6 +77,26 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 run = "python3 scripts/bounded-test.py oxide test --workspace --all-targets --locked"
 default = false
 
+# The covering Rust unit suite at 600 s with the AGENTS dual-root recipe
+# (oxide#224). Same suite as `test rust`, under the same qualified shared
+# supervisor, but with its fixed 600 s / 512 MiB bounds and the two roots that
+# suite alone needs: a monitored internal root (`OXIDE_TASK_SCRATCH_ROOT` and
+# `OXIDE_TEST_INTERNAL_ROOT` on the boot volume) and ordinary test temp on the
+# selected volume (`TMPDIR`/`TMP`/`TEMP` under
+# `<mount>/scratch/oxide-validation`). The wrapper creates exactly those two
+# per-run roots, refuses inherited/shared/home/mount roots, and removes them
+# only after a closed run; any other outcome keeps them and prints their paths.
+# Not full QA. `proof:rust-test-600:test` runs only the wrapper's pure
+# self-check (refusals, environment, command, cleanup) with no suite or scratch.
+[tasks."rust:test-600"]
+run = "python3 scripts/rust-test-600.py"
+
+[tasks."proof:rust-test-600:test"]
+run = "python3 scripts/rust-test-600.py --self-check"
+
+[tasks."proof:rust-test-600:plan"]
+run = "python3 scripts/rust-test-600.py --plan"
+
 # Merge-base identity with explicit seeding opt-out (oxide#176). The two
 # tests in tests/cold_seed_default_off.rs need a staged merge-base oxide, so
 # they are #[ignore] in the unit suite. This selector reuses the #104 stage_at

@@ -3905,26 +3905,28 @@ fn a_blocked_journaled_deletion_refuses_a_second_explicit_eviction() {
     assert!(super::pool::capture_record_injected(&pool, first_id).is_some());
 }
 
-/// oxide#177's accounting-cost gate as one fixed measurement: one whole round
-/// trip of the real recorded representation — the bounded ledger read, the
-/// ranked ordering admission uses, and the actual atomic ledger write that
-/// reads its result back — at the legacy 128-slot ceiling and at the raised
-/// 256-slot ceiling. Both figures are printed and each whole round trip must
-/// stay under one generous fixed test ceiling.
+/// oxide#177's accounting-cost gate, corrected by oxide#224 so a loaded volume
+/// cannot fail a correct change. One whole round trip of the real recorded
+/// representation — the bounded ledger read, the ranked ordering admission
+/// uses, and the actual atomic ledger write that reads its result back — at the
+/// legacy 128-slot ceiling and at the raised 256-slot ceiling.
 ///
-/// The round trip includes the atomic replacement's durable `fsync` of a
-/// ledger that now reaches the journaled worst-valid size, which is host I/O
-/// and dominates the figure on a loaded machine (195.7 ms was observed for the
-/// 256-slot round trip there), so the ceiling is 1000 ms: a fixed sanity bound
-/// on the requested write round trip, not on the representation work alone. It
-/// still catches a whole-payload walk or a per-slot quadratic regression,
-/// which is what the gate is for. This is not a benchmark or a claim about a
-/// large live pool.
+/// The round trip includes the atomic replacement's durable `fsync`, which is
+/// host I/O and dominates the figure on a loaded drive (195.7 ms was observed
+/// for the 256-slot round trip there, and a loaded run once measured the
+/// 128-slot one at 1.04 s). So the absolute elapsed figures are reported as
+/// observations and nothing asserts on them. The regression oracle is instead
+/// the deterministic representation work the same round trip must do: exactly
+/// one atomic replacement, exactly two whole-ledger reads (the snapshot and the
+/// write's own read-back), the exact bytes those touch, one slot row per read
+/// or write, linear serialized growth, and the durable file bytes and inode
+/// that the replacement published. A whole-ledger re-read per slot, a repeated
+/// representation pass or an in-place write fails that oracle on any host.
+/// Formerly `a_256_slot_ledger_round_trip_stays_under_the_fixed_cost_ceiling`.
 #[test]
-fn a_256_slot_ledger_round_trip_stays_under_the_fixed_cost_ceiling() {
-    use std::time::{Duration, Instant};
+fn a_256_slot_ledger_round_trip_has_bounded_recorded_work() {
+    use std::time::Instant;
 
-    const CEILING: Duration = Duration::from_millis(1_000);
     let fx = Fixture::new("ledger-cost");
     let pool = fx.dir("pool");
     create_injected(&pool, 64 * 1024 * 1024).expect("init");
@@ -3980,21 +3982,18 @@ fn a_256_slot_ledger_round_trip_stays_under_the_fixed_cost_ceiling() {
             "slots": rows,
         })
     };
-    let mut measured = Vec::new();
+    let ledger_path = pool.join("ledger.json");
+    let mut sizes = Vec::new();
     for slots in [super::LEGACY_MAX_SLOTS, super::MAX_SLOTS] {
         let input = serde_json::to_vec(&documented(slots)).expect("ledger");
         // Warm the code paths once (this write is not measured).
         super::pool::write_ledger_bytes_injected(&pool, &input).expect("warm write");
-        // Whole round trips for this size: read the recorded ledger, rank it
-        // exactly as admission does, then perform the actual atomic ledger
-        // write and read its result back. The gate is the whole round trip, not
-        // its parts; the best of three keeps one scheduler stall from turning a
-        // generous fixed ceiling into a flaky assertion.
-        let mut best = Duration::MAX;
-        for _ in 0..3 {
-            let started = Instant::now();
-            // The passive snapshot reads and validates the ledger (including
-            // the journal) without reconciling the recorded deletion.
+        let before = fs::metadata(&ledger_path).expect("ledger metadata");
+        // One round trip: the passive snapshot reads and validates the ledger
+        // (including the journal) without reconciling the recorded deletion,
+        // then the ranked ordering admission uses, then the actual atomic
+        // ledger write and its read-back.
+        let round_trip = || {
             let view = super::pool::snapshot_injected(&pool).expect("recorded read");
             assert_eq!(view.slots.len(), slots);
             assert_eq!(view.evicting_slot_ids.len(), 1);
@@ -4005,17 +4004,82 @@ fn a_256_slot_ledger_round_trip_stays_under_the_fixed_cost_ceiling() {
                 .collect();
             order.sort();
             assert_eq!(order.first(), Some(&(1, 1)));
-            super::pool::write_ledger_bytes_injected(&pool, &input).expect("valid write");
-            best = best.min(started.elapsed());
-        }
-        println!(
-            "{slots}-slot ledger round trip, best of 3 (read, rank, atomic write and read-back): {} us",
-            best.as_micros()
+            assert_eq!(order.last(), Some(&(slots as u64, slots as u64)));
+            super::pool::write_ledger_bytes_injected(&pool, &input).expect("valid write")
+        };
+        super::pool::ledger_work::reset();
+        let stored = round_trip();
+        let work = super::pool::ledger_work::observed();
+        // Deterministic bounded representation work. A per-slot re-read of the
+        // whole ledger, a repeated serialization pass or a per-slot quadratic
+        // regression cannot satisfy these counts on any host, and none of them
+        // depends on how busy the volume is.
+        assert_eq!(
+            work.writes, 1,
+            "the {slots}-slot round trip did not make exactly one atomic write: {work:?}"
         );
-        assert!(best < CEILING, "{slots}-slot round trip took {best:?}");
-        measured.push((slots, best));
+        assert_eq!(
+            work.reads, 2,
+            "the {slots}-slot round trip did not read the ledger exactly twice: {work:?}"
+        );
+        assert_eq!(
+            work.write_bytes,
+            stored.len() as u64,
+            "the {slots}-slot round trip wrote a different representation: {work:?}"
+        );
+        assert_eq!(
+            work.read_bytes,
+            2 * work.write_bytes,
+            "the {slots}-slot round trip read bytes beyond its two ledger reads: {work:?}"
+        );
+        assert_eq!(
+            work.rows,
+            3 * slots as u64,
+            "the {slots}-slot round trip handled a slot row more than once per read or write: {work:?}"
+        );
+        assert!(
+            work.write_bytes <= MAX_LEDGER_BYTES,
+            "the {slots}-slot ledger exceeds the bounded representation: {work:?}"
+        );
+        // Durable correctness, not just an in-memory figure: the file on disk
+        // is exactly the read-back bytes and the atomic replacement published a
+        // new inode.
+        let after = fs::metadata(&ledger_path).expect("ledger metadata after");
+        assert_ne!(
+            before.ino(),
+            after.ino(),
+            "the {slots}-slot write did not replace the ledger atomically"
+        );
+        assert_eq!(
+            fs::read(&ledger_path).expect("ledger bytes"),
+            stored,
+            "the {slots}-slot ledger on disk is not the read-back representation"
+        );
+        let reread: serde_json::Value = serde_json::from_slice(&stored).expect("json");
+        assert_eq!(reread["slots"].as_array().expect("rows").len(), slots);
+        assert_eq!(reread["slots"][0]["state"], "evicting");
+        sizes.push(stored.len() as u64);
+        // Absolute elapsed time, reported honestly and never asserted: the
+        // durable `fsync` makes this a host-I/O observation, not a gate.
+        let mut samples = Vec::new();
+        for _ in 0..3 {
+            let started = Instant::now();
+            let _ = round_trip();
+            samples.push(started.elapsed());
+        }
+        let best = samples.iter().min().copied().unwrap_or_default();
+        println!(
+            "{slots}-slot ledger round trip (read, rank, atomic write and read-back): {:?} observed; {} bytes, {} reads, {} write, {} rows — observation only, no wall-clock gate",
+            best, work.write_bytes, work.reads, work.writes, work.rows
+        );
     }
-    assert_eq!(measured.len(), 2);
+    // The representation grows with one row per slot, so the doubled ceiling
+    // must not multiply the bytes more than that plus a fixed slack.
+    assert_eq!(sizes.len(), 2);
+    assert!(
+        sizes[1] <= 2 * sizes[0] + 4_096,
+        "the raised-ceiling ledger grew beyond one row per slot: {sizes:?}"
+    );
 }
 
 #[test]
@@ -7718,6 +7782,63 @@ fn an_unrecorded_private_capture_in_a_held_tree_is_quarantined() {
     );
 }
 
+/// Restores one fixture directory's original mode on every exit path, including
+/// an unwind after the tree moved whole into the holding area (oxide#224).
+///
+/// The guard touches only the directory it was created for: its recorded path
+/// and, because a rename preserves the unreadable mode, the same relative path
+/// below any entry of the payload's holding area. It never changes a sibling
+/// object's mode and never follows a link.
+struct OwnerModeGuard {
+    recorded: PathBuf,
+    relative: PathBuf,
+    holding: PathBuf,
+    mode: u32,
+}
+
+impl OwnerModeGuard {
+    /// Capture `recorded`'s current mode before a fixture makes it unreadable.
+    fn new(recorded: PathBuf, relative: &str, holding: PathBuf) -> Self {
+        let mode = fs::symlink_metadata(&recorded)
+            .expect("fixture directory metadata")
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            mode & 0o700,
+            0o700,
+            "capture the fixture mode before making it unreadable"
+        );
+        Self {
+            recorded,
+            relative: PathBuf::from(relative),
+            holding,
+            mode,
+        }
+    }
+}
+
+impl Drop for OwnerModeGuard {
+    fn drop(&mut self) {
+        restore_owner_mode(&self.recorded, self.mode);
+        let Ok(entries) = fs::read_dir(&self.holding) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            restore_owner_mode(&entry.path().join(&self.relative), self.mode);
+        }
+    }
+}
+
+/// Restore a directory the fixture made owner-unreadable, and nothing else.
+fn restore_owner_mode(path: &Path, mode: u32) {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.is_dir() && metadata.mode() & 0o7777 != mode {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+    }
+}
+
 /// A legacy pending deletion is migrated with an O(1) root verification, not a
 /// recursive preflight under the pool lock: a tree whose inventory would have
 /// stopped the old completeness walk no longer blocks every admission. The tree
@@ -7728,10 +7849,13 @@ fn a_legacy_pending_tree_migrates_without_a_locked_walk() {
     let fixture = Fixture::new("legacy-no-walk");
     let (pool, slot_id, slot_path) = idle_slot_for_eviction(&fixture, "legacy-no-walk");
     // The old preflight listed every directory recursively, so this unreadable
-    // nested directory would have blocked the whole pool.
+    // nested directory would have blocked the whole pool. The guard restores
+    // its original mode on every exit path, including a panic before the tree
+    // moved and one after it (oxide#224).
     let locked = slot_path.join("build/locked");
     fs::create_dir(&locked).expect("locked directory");
     fs::write(locked.join("data"), b"x").expect("data");
+    let _mode = OwnerModeGuard::new(locked.clone(), "build/locked", holding_area(&pool));
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("unreadable");
     mark_evicting_for_test(&pool, slot_id).expect("a legacy pending deletion");
     let verified = {
@@ -7773,6 +7897,59 @@ fn a_legacy_pending_tree_migrates_without_a_locked_walk() {
         "the tree is deleted once it is enterable: {pass:?}"
     );
     assert!(holding_rows(&pool).is_empty());
+}
+
+/// The unreadable fixture above restores its original mode on an unwind, both
+/// before and after the whole tree moved into the holding area, and leaves a
+/// sibling directory's mode alone (oxide#224).
+#[test]
+fn the_unreadable_eviction_fixture_restores_its_mode_across_an_unwind() {
+    let fixture = Fixture::new("legacy-mode-guard");
+    let pool = fixture.dir("pool");
+    create_injected(&pool, 8 * 1024 * 1024).expect("init");
+    // Both layouts the fixture can be in when a panic unwinds: the slot root
+    // still in place, and the same tree already renamed into holding.
+    let before = pool.join("payload/slots/7/build/locked");
+    let after = holding_area(&pool).join("held/build/locked");
+    for path in [&before, &after] {
+        fs::create_dir_all(path).expect("locked directory");
+        fs::write(path.join("data"), b"x").expect("data");
+    }
+    let original = fs::symlink_metadata(&before).expect("mode").mode() & 0o7777;
+    // A sibling object at its own mode must survive the guard untouched.
+    let sibling = pool.join("payload/slots/7/build/unrelated");
+    fs::create_dir(&sibling).expect("sibling");
+    fs::set_permissions(&sibling, fs::Permissions::from_mode(0o500)).expect("sibling mode");
+    let guard = OwnerModeGuard::new(before.clone(), "build/locked", holding_area(&pool));
+    for path in [&before, &after] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000)).expect("unreadable");
+    }
+    let unwound = std::panic::catch_unwind(|| {
+        let _mode = guard;
+        assert!(
+            fs::read_dir(&after).is_err(),
+            "the moved tree is not unreadable"
+        );
+        panic!("the fixture body unwinds with the tree unreadable");
+    });
+    assert!(unwound.is_err(), "the fixture body did not unwind");
+    for path in [&before, &after] {
+        assert_eq!(
+            fs::symlink_metadata(path)
+                .expect("restored directory")
+                .mode()
+                & 0o7777,
+            original,
+            "{} kept an unreadable mode",
+            path.display()
+        );
+    }
+    assert_eq!(
+        fs::symlink_metadata(&sibling).expect("sibling").mode() & 0o7777,
+        0o500,
+        "the guard modified an unrelated directory"
+    );
+    fs::set_permissions(&sibling, fs::Permissions::from_mode(0o700)).expect("sibling cleanup");
 }
 
 #[test]
