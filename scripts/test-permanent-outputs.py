@@ -1699,9 +1699,13 @@ def run(proof: Proof, repo: str, base_compat: bool = False, diagnostic: bool = F
     )
     expect(code == 0, stderr)
     crafted = json.loads(committed_bytes.decode())
+    expect(crafted["version"] == "oxide.outputs.transition/2", crafted)
+    expect(len(crafted["links"]) == 1 and crafted["links"][0]["member"] == "target", crafted)
     crafted["state"] = "prepared"
     generation = crafted["generation"] + 1
-    crafted["prepared"] = {
+    # Version 2 records preparation on its target placement, not at the top
+    # level (outputs.rs Receipt deserializer). Preserve its selected root.
+    crafted["links"][0]["prepared"] = {
         "generation": generation,
         "to": {
             "kind": "local",
