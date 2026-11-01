@@ -5385,6 +5385,11 @@ author and reviewer native remain unactivated.
   foreign link refuses. Every first link also checks the actual Git
   ignore/tracked state of `target/<member>`; a winning parent `target/` ignore
   is allowed, unknown answers refuse.
+  For a receiptless, nonempty real target, `oxide outputs plan` reports the
+  explicit profile adoption member by member: nonempty real directories stay
+  local, missing or empty members convert, and a foreign member refuses by
+  name. A later refusal can follow an earlier member's conversion; the plan
+  itself writes nothing and never promises an atomic adoption.
 - **Classification and declarations.** `check`, `build`, `run`, `test`,
   `clippy`, `rustc` and `fix` with `quick`/`debug` map to `debug`, `--release`
   to `release`. Plain `bench` maps to `release` (Cargo's release-based bench

@@ -1748,6 +1748,9 @@ struct MemberPlanView {
     state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     root: Option<PathBuf>,
+    /// First-adoption prediction: keep, convert, or refuse this member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adoption: Option<&'static str>,
 }
 
 fn plan_report(context: &Context) -> Result<PlanReport, String> {
@@ -1818,6 +1821,7 @@ fn plan_report(context: &Context) -> Result<PlanReport, String> {
                         member: placement.member().to_owned(),
                         state: state.code(),
                         root: state.link_root().map(Path::to_path_buf),
+                        adoption: None,
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?,
@@ -1857,10 +1861,40 @@ fn plan_report(context: &Context) -> Result<PlanReport, String> {
                 }
             }
             TargetState::RealNonEmpty => {
-                report.reason = Some(
-                    "the existing target directory has content; Oxide never moves, adopts or deletes it. Move it aside yourself if you accept losing its warm build, then re-run `oxide outputs adopt`"
-                        .to_owned(),
-                );
+                report.layout = "profile";
+                report.action = "create-owned-link";
+                for member in ["debug", "release"] {
+                    let link = link_path(&context.workspace, member);
+                    let state = link_state(&link, &context.workspace, &context.checkout_id)?;
+                    let adoption = match &state {
+                        TargetState::RealNonEmpty => "keep",
+                        TargetState::Foreign => "refuse",
+                        TargetState::Missing
+                        | TargetState::RealEmpty
+                        | TargetState::OwnedLink(_)
+                        | TargetState::Dangling(_) => "convert",
+                    };
+                    if adoption == "refuse" && report.reason.is_none() {
+                        report.action = "refuse";
+                        report.reason = Some(format!(
+                            "{} is {}; it is never followed or replaced; earlier members may already be converted",
+                            link.display(), state.label()
+                        ));
+                    }
+                    report.members.push(MemberPlanView {
+                        member: member.to_owned(),
+                        state: state.code(),
+                        root: state.link_root().map(Path::to_path_buf),
+                        adoption: Some(adoption),
+                    });
+                }
+                if report.reason.is_none() {
+                    if let Err(reason) = &usable {
+                        report.reason = Some(format!(
+                            "the volume is not usable ({reason}); converted members would select the checkout-local fallback root"
+                        ));
+                    }
+                }
             }
             TargetState::Foreign => {
                 report.reason = Some(
@@ -12193,6 +12227,91 @@ mod tests {
 
     fn registry_document(store: &Store) -> PathBuf {
         store.control().join("outputs").join("registry.json")
+    }
+
+    #[test]
+    fn first_profile_plan_agrees_with_adopt_for_member_classes() {
+        for class in [
+            "nonempty",
+            "empty",
+            "missing",
+            "foreign-file",
+            "foreign-symlink",
+        ] {
+            let fixture = Fixture::new();
+            let (store, context) = fresh_pool(&fixture);
+            let target = context.link();
+            fs::create_dir(&target).unwrap();
+            fs::write(target.join("keep.txt"), b"warm").unwrap();
+            let debug = target.join("debug");
+            match class {
+                "nonempty" => {
+                    fs::create_dir(&debug).unwrap();
+                    fs::write(debug.join("keep"), b"member").unwrap();
+                }
+                "empty" => fs::create_dir(&debug).unwrap(),
+                "foreign-file" => fs::write(&debug, b"foreign").unwrap(),
+                "foreign-symlink" => {
+                    let outside = fixture.root.join("foreign");
+                    fs::create_dir(&outside).unwrap();
+                    symlink(outside, &debug).unwrap();
+                }
+                "missing" => {}
+                _ => unreachable!(),
+            }
+            let report = plan_report(&context).unwrap();
+            assert_eq!(report.layout, "profile", "{class}");
+            assert!(!report.data_move);
+            let member = report.members.iter().find(|m| m.member == "debug").unwrap();
+            let foreign = class.starts_with("foreign");
+            let expected = if foreign {
+                "refuse"
+            } else if class == "nonempty" {
+                "keep"
+            } else {
+                "convert"
+            };
+            assert_eq!(member.adoption, Some(expected), "{class}");
+            assert_eq!(report.action == "refuse", foreign, "{class}");
+            if foreign {
+                assert!(report.reason.as_ref().unwrap().contains("debug"));
+            }
+            assert!(
+                !registry_document(&store).exists(),
+                "plan wrote registry: {class}"
+            );
+            assert!(
+                !receipt_path(store.control(), &context.checkout_id).exists(),
+                "plan wrote receipt: {class}"
+            );
+            assert_eq!(fs::read(target.join("keep.txt")).unwrap(), b"warm");
+
+            let result = adopt_at(&context, || Ok(Some(store.handle_for_tests())));
+            assert_eq!(result.is_err(), foreign, "{class}: {result:?}");
+            if class == "nonempty" {
+                assert_eq!(fs::read(debug.join("keep")).unwrap(), b"member");
+                assert!(!fs::symlink_metadata(&debug)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
+            } else if !foreign {
+                assert!(
+                    fs::symlink_metadata(&debug)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink(),
+                    "{class}"
+                );
+            } else if class == "foreign-file" {
+                assert_eq!(fs::read(&debug).unwrap(), b"foreign");
+            } else {
+                assert!(fs::symlink_metadata(&debug)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
+            }
+            assert_eq!(fs::read(target.join("keep.txt")).unwrap(), b"warm");
+        }
     }
 
     /// A committed whole-target receipt for this fixture's checkout.

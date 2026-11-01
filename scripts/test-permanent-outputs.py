@@ -838,19 +838,23 @@ def run(proof: Proof, repo: str, base_compat: bool = False, diagnostic: bool = F
 
     if not base_compat:
         require_case("permanent-outputs", "ordinary-controls")
-        # 1. A nonempty real target refuses, with no mutation.
+        # 1. Explicit profile adoption preserves existing target content.
         keep_target = os.path.join(keep, "target")
         os.makedirs(keep_target, exist_ok=True)
         with open(os.path.join(keep_target, "keep.txt"), "wb") as handle:
             handle.write(b"warm build")
         report = plan(proof, keep, "plan with a nonempty target")
-        expect(report["current_target"] == "real-nonempty" and report["action"] == "refuse", report)
-        expect("never moves" in report["reason"], report)
+        expect(report["current_target"] == "real-nonempty" and report["action"] == "create-owned-link", report)
+        expect(report["layout"] == "profile" and not report["data_move"], report)
+        expect({m["member"]: m["adoption"] for m in report["members"]} ==
+               {"debug": "convert", "release": "convert"}, report)
         code, _, stderr = proof.oxide(["outputs", "adopt"], "adopt a nonempty target", keep)
-        expect(code != 0 and "never moves" in stderr, stderr)
+        expect(code == 0, stderr)
         expect(read_bytes(os.path.join(keep_target, "keep.txt")) == b"warm build", "target mutated")
         expect(os.path.isdir(keep_target), "the real target directory was replaced")
-        expect(not os.path.exists(os.path.join(keep, ".oxide-outputs")), "refused adopt wrote a root")
+        expect(not os.path.islink(os.path.join(keep_target, "keep.txt")), "adopt replaced keep.txt")
+        for member in ("debug", "release"):
+            expect(os.path.islink(os.path.join(keep_target, member)), f"{member} was not converted")
 
         # 2. A foreign symlink refuses, with no mutation.
         outside = os.path.join(root, "outside")
@@ -861,7 +865,7 @@ def run(proof: Proof, repo: str, base_compat: bool = False, diagnostic: bool = F
         report = plan(proof, foreign, "plan with a foreign symlink")
         expect(report["current_target"] == "foreign" and report["action"] == "refuse", report)
         code, _, stderr = proof.oxide(["outputs", "adopt"], "adopt a foreign symlink", foreign)
-        expect(code != 0 and "never moves" in stderr, stderr)
+        expect(code != 0 and "never replaces it" in stderr, stderr)
         expect(os.readlink(os.path.join(foreign, "target")) == outside, "foreign link was replaced")
         expect(read_bytes(os.path.join(outside, "sentinel")) == b"foreign", "foreign target mutated")
         # 2b. Without a receipt, permanent mode never hands Cargo the foreign link:
@@ -2239,12 +2243,19 @@ def auto_run(proof: Proof, repo: str, diagnostic: bool = False) -> None:
             with open(os.path.join(crashed, "target", "debug"), "wb") as handle:
                 handle.write(b"creator")
             code, _, stderr = proof.oxide(["build"], "replay refuses a creator at the member link", crashed)
-            expect(code != 0 and "cannot be replayed" in stderr, stderr)
+            expect(code != 0 and os.path.join(crashed, "target", "debug") in stderr
+                   and "never follows or replaces it" in stderr, stderr)
             expect(
                 read_bytes(os.path.join(crashed, "target", "debug")) == b"creator",
                 "the creator was replaced",
             )
             expect(os.path.islink(sibling), "the prepared sibling was removed")
+            os.remove(os.path.join(crashed, "target", "debug"))
+            code, _, stderr = proof.oxide(["outputs", "adopt"], "replay after removing the creator", crashed)
+            expect(code == 0, stderr)
+            expect(os.path.islink(os.path.join(crashed, "target", "debug")), "replay did not publish debug")
+            expect(not os.path.lexists(sibling), "replay left the prepared sibling")
+            expect(read_json(receipt_file(pool, crashed))["state"] == "committed", "replay did not commit")
 
             # A stop before any link is published: the next command's replay rolls the
             # preparation back to detached and refuses once (its slot was keyed for the
