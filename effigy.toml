@@ -301,26 +301,20 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # walks when every record is current. HELD for owner activation: this
 # declaration activates nothing and no native has run.
 #
-# The proof needs a GENUINE internal directory pool, so both new heavy
-# commands take Tom's answered internal-root exception explicitly
-# (`--root-parent /private/tmp`) rather than placing a pool on a selected
-# volume, where the product correctly refuses it. The supervisor is this tree's
-# `bounded-test.py` (sha256 94b1aba6…, oxide#191's post-census detach and
-# oxide#197's ancestor and launcher-sibling exclusions over
-# the qualified oxide#151 guard; those added bytes are unqualified until their
-# own qualifications pass); 300 s wall and
-# 512 MiB monitored scratch are unchanged and the fit stays unmeasured until
-# a separately activated diagnostic. Staging reuses the oxide#140 recipe (4
-# Cargo jobs, 16 codegen units, assertions on, no debug info, no incremental,
-# symbol-stripped); fixtures stay sequential at one Cargo job. No guard,
-# census, allowlist, clock or cleanup authority changes here.
+# Fixture directory-budget pools use OXIDE_SCRATCH_ROOT inside the selected
+# volume's monitored run root. A /private/tmp fallback is not scratch coverage.
+# Qualified supervisor archive: evidence-195-b29ef6c-20261101T043444Z.
+# Bounds remain 300 s and 512 MiB; native fit awaits owner activation.
 [tasks."rust:recorded-slot-accounting"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-recorded-slot-accounting.py"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-recorded-slot-accounting.py"
 
 # Pure apparatus regression: the staging recipe and its negative mutations,
 # the case/dependency map, and the diagnostic dispatch, taint, abort and
 # receipt rules. No scratch, child process, toolchain, image or pool.
+[tasks."proof:recorded-slot-accounting:plan"]
+run = "python3 scripts/test-recorded-slot-accounting.py --plan"
+
 [tasks."proof:recorded-slot-accounting:test"]
 run = "python3 scripts/test-recorded-slot-accounting.py --self-check && python3 scripts/test-recorded-slot-accounting.py --self-test"
 
@@ -333,7 +327,7 @@ run = "python3 scripts/test-recorded-slot-accounting.py --self-check && python3 
 # task.
 [tasks."rust:recorded-slot-accounting:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-recorded-slot-accounting.py --diagnostic"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-recorded-slot-accounting.py --diagnostic"
 
 # Final outputs on the permanent drive (oxide#117), under the qualified
 # shared supervisor (oxide#109; 300 s absolute, 512 MiB monitored scratch,
