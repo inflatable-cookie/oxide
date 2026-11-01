@@ -2402,6 +2402,48 @@ the gate, a child execution and a closed outcome, and asserts from the receipt
 that the first completed reserve reading arrived after the superseded
 custodian-start window, so the case would fault under that basis; the separate
 no-reading and setup-deadline controls stay in `PureFreshnessClock`.
+**Qualification chain for the integrated #197 head (recorded).** The supervisor
+archive `/Volumes/Builds/scratch/oxide/evidence-197-c1c4446-20261101T010045Z`
+(`NOTE.md` sha256 `8871c21a…`, `SHA256SUMS` over every log, `sessions.jsonl`
+sha256 `c84701ac…`) records the owner-activated chain at native head
+`c1c4446…`, all at supervisor `94b1aba6…` (suite `ed560949…`, bootstrap
+`88a073e2…`) with 54 recorded case rows each:
+
+- uncounted diagnostic, contaminated: `diag-c1c4446.log` (`b934ba04…`), 9/11
+  with two timing-only Real failures while an unauthorized overlapping
+  `effigy rust:test` (Barge T5 reviewer `ba3e7b93`) ran at load 34; the census
+  cases were clean. Preserved with no credit.
+- uncounted diagnostic, clean: `diag2-c1c4446.log` (`8109a8cb…`), 11/11
+  checks, 0 problems, exit 0, evidence `oxide-supervisor-qualify.d2vd5nma`.
+- counted author qualification: `author-c1c4446.log` (`14dd71a9…`),
+  `result: pass`, 0 problems, candidate exit 0, evidence
+  `oxide-supervisor-qualify.sy0gp881`, executor "Oxide Supervisor e96f186a,
+  direct" from a new session leader.
+- counted independent reviewer qualification: `reviewer-c1c4446.log`
+  (`1d116b75…`), `result: pass`, 0 problems, candidate exit 0, evidence
+  `oxide-supervisor-qualify.zez7b17y`, executor "independent reviewer subagent
+  of Oxide Supervisor e96f186a" in its own worktree `w197-reviewer-c1c4446`.
+- installed-Effigy runs: `effigy-diag-c1c4446.log` (`2ab57d93…`) is an
+  uncounted 8/11 whose three uncertain outer rows were exiting processes of an
+  unrelated Effigy test tree (foreign churn, not Effigy launch ancestry), with
+  two consequent DetachReal errors and exit 125 — preserved, no credit;
+  `effigy-diag2-c1c4446.log` (`7012d78c…`) is a clean uncounted 11/11 with 0
+  problems, exit 0, evidence `oxide-supervisor-qualify._enpfxdr`.
+
+The counted qualifications therefore ran DIRECTLY (new session leaders, the
+named executors above), and the installed-Effigy evidence in this archive is the
+uncounted diagnostic pair rather than a counted qualification pair: the
+merge-hold wording that asks for both qualifications "once through the installed
+Effigy" is **not** evidenced here and remains with the owner. The final head
+`cc579f6…` is that native head plus two text corrections only — `AGENTS.md`'s
+suite counts (361 pure + 55 real = 416, thirty-two launcher cases) and the
+`scripts/test-recorded-slot-accounting.py` docstring guard hash `94b1aba6` —
+proven text-only by `git diff --stat c1c4446..cc579f6` (2 files, 2 insertions,
+2 deletions) and an AST comparison with docstrings stripped that is identical,
+so these receipts carry to it without repeating the chain (brief v6 text-only
+ruling, parallel to #192's v8). No historical packet is rewritten and no native
+credit transfers between tasks.
+
 **Admission reports on the integrated source (oxide#192, qualified at the native head).** The
 integrated head adds the admission reports described in the supervisor rule
 below: the completed-wait marker and its bounded grant, the correlated waiting
