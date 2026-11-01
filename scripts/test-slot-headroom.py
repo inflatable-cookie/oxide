@@ -20,6 +20,16 @@ ceiling that must write `capacity_policy: 4`. The worst-valid 256-slot ledger
 and 512-record control-state serialization/round-trip and oversized-field
 refusals are unit tests in `effigy test rust`, not native fixtures.
 
+Premise checklist: (1) base_env preserves invoking rustup, pins the toolchain,
+uses private HOME/CARGO_HOME and disables installation; stage uses the repo lock.
+(2) base_env sets OXIDE_TEST_HOME_FROM_ENV. (3) base_env scrubs inherited
+OXIDE/XDG and build overrides; staging scrubs its Oxide environment. (4) No
+case requires an unconverted permanent checkout. (5) No external Cargo
+subcommand fixture. (6) No images. (7) stage and base_env clear encoded flags
+and freeze RUSTFLAGS. (8) Pools and TMPDIR stay inside the selected run root;
+a /private/tmp fallback exercises the internal path, not scratch-pool coverage.
+(9) No mktemp fixture; all paths derive from the supervisor's private root.
+
 Modes. The default run is the counted proof and fails fast. `--diagnostic` is
 the uncounted keep-going collection: a recoverable phase failure is recorded
 and only its declared dependents are skipped, while an unknown outcome, an
@@ -58,6 +68,7 @@ labelled_slot = fm.labelled_slot
 
 REPO = os.path.dirname(HERE)
 ROOT = os.path.realpath(os.environ.get("OXIDE_TASK_SCRATCH_ROOT", ""))
+SCRATCH_POOL_ROOT = os.path.join(ROOT, "scratch-pools")
 EVIDENCE = os.path.realpath(os.environ.get("OXIDE_PROOF_EVIDENCE", ""))
 SHUTDOWN_MARGIN_S = 30
 RUNNER_SHA256 = "94b1aba60a7475a31b5620039986336f13e1c88d58dd3732b5736290dc63685b"
@@ -155,6 +166,7 @@ def write_evidence(name: str, contents: str) -> None:
 
 
 def base_env(proof: Proof, pool: str, **extra: str) -> dict:
+    expect(os.path.realpath(pool).startswith(SCRATCH_POOL_ROOT + os.sep), "pool outside scratch pool root")
     env = dict(os.environ)
     # A private HOME must not hide the installed toolchain: keep the real
     # RUSTUP_HOME and the project's exact channel.
@@ -171,6 +183,7 @@ def base_env(proof: Proof, pool: str, **extra: str) -> dict:
     env.update(
         {
             "OXIDE_POOL": pool,
+            "OXIDE_SCRATCH_ROOT": SCRATCH_POOL_ROOT,
             "OXIDE_POOL_CAP": "64MiB",
             "OXIDE_MAX_ACTIVE": "16",
             "HOME": os.path.join(ROOT, "home"),
@@ -1155,6 +1168,9 @@ def main() -> None:
         dirty = subprocess.check_output(["git", "status", "--porcelain"], cwd=REPO, text=True).strip()
         expect(not dirty, f"source checkout is dirty: {dirty}")
 
+        os.mkdir(SCRATCH_POOL_ROOT, 0o700)
+        expect(os.path.realpath(SCRATCH_POOL_ROOT) == SCRATCH_POOL_ROOT and
+               os.stat(SCRATCH_POOL_ROOT).st_dev == os.stat(ROOT).st_dev, "unsafe scratch pool root")
         os.makedirs(os.path.join(ROOT, "home"), mode=0o700, exist_ok=True)
         os.makedirs(os.path.join(ROOT, "cargo-home"), mode=0o700, exist_ok=True)
         os.makedirs(os.path.join(ROOT, "markers"), mode=0o700, exist_ok=True)
@@ -1168,15 +1184,15 @@ def main() -> None:
         print(f"staged oxide sha256 {binary_sha256}", flush=True)
         proof.phase("after staging")
 
-        fences_pool = os.path.join(ROOT, "pool-fences")
+        fences_pool = os.path.join(SCRATCH_POOL_ROOT, "pool-fences")
         fences_env = base_env(proof, fences_pool)
         fences_app = write_tree(os.path.join(ROOT, "checkouts", "fences"), FIXTURE)
-        raised_pool = os.path.join(ROOT, "pool-raised")
-        project_pool = os.path.join(ROOT, "pool-project")
+        raised_pool = os.path.join(SCRATCH_POOL_ROOT, "pool-raised")
+        project_pool = os.path.join(SCRATCH_POOL_ROOT, "pool-project")
         project_env = base_env(proof, project_pool)
-        reuse_pool = os.path.join(ROOT, "pool-reuse")
+        reuse_pool = os.path.join(SCRATCH_POOL_ROOT, "pool-reuse")
         reuse_env = base_env(proof, reuse_pool)
-        byte_pool = os.path.join(ROOT, "pool-byte")
+        byte_pool = os.path.join(SCRATCH_POOL_ROOT, "pool-byte")
         phases = [
             ("fences", [], lambda: prove_fences_and_exhaustion(proof, fences_app, fences_pool, fences_env)),
             (

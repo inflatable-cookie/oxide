@@ -1129,7 +1129,7 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # 512 MiB monitored scratch.
 [tasks."rust:slot-headroom"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-slot-headroom.py"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-slot-headroom.py"
 
 # Opt-in uncounted collection for oxide#177: the same fixed script, guard and
 # limits with `--diagnostic`. It records reached/completed/failed/skipped
@@ -1139,7 +1139,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # proof child. It is never a counted native PASS, closure or activation.
 [tasks."rust:slot-headroom:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-slot-headroom.py --diagnostic"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-slot-headroom.py --diagnostic"
 
 # Pure apparatus check of the diagnostic collection, through the script's
 # existing `--self-check` mode only: it stages nothing, starts no child,
