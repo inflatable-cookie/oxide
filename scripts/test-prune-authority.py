@@ -155,6 +155,24 @@ def scratch_layout(task_root: str) -> tuple[str, str]:
     return scratch, os.path.join(scratch, "pool")
 
 
+def declare_scratch(env: dict, mode: str, task_root: str) -> dict:
+    """Return a copy of a fixture env with this mode's scratch declaration applied.
+
+    Pure. Builds declares OXIDE_SCRATCH_ROOT and the pool inside it; internal
+    declares none. Any inherited OXIDE_SCRATCH_ROOT is dropped first, so a host
+    value can never leak into either mode."""
+    if mode not in MODE_CASES:
+        raise RuntimeError(f"unknown mode {mode!r}")
+    env = dict(env)
+    env.pop("OXIDE_SCRATCH_ROOT", None)
+    env["OXIDE_POOL_CAP"] = "64MiB"
+    if mode == "builds":
+        scratch, pool = scratch_layout(task_root)
+        env["OXIDE_SCRATCH_ROOT"] = scratch
+        env["OXIDE_POOL"] = pool
+    return env
+
+
 def place_pool(world, pool: str) -> None:
     """Move a World's pool, and every path derived from it, under the scratch root."""
     world.pool = pool
@@ -367,11 +385,11 @@ def prepare(proof, custody, mode):
         scratch, pool = scratch_layout(adapter.root)
         os.mkdir(scratch, 0o700)
         place_pool(world, pool)
-    adapter.env = permanent.proof_env(world.pool, str(home), str(cargo_home))
-    adapter.env.pop("OXIDE_SCRATCH_ROOT", None)
+    adapter.env = declare_scratch(permanent.proof_env(world.pool, str(home), str(cargo_home)),
+                                  mode, adapter.root)
+    require(adapter.env.get("OXIDE_POOL") == world.pool, "fixture pool is not the placed pool")
     if mode == "builds":
-        adapter.env["OXIDE_SCRATCH_ROOT"] = scratch
-    adapter.env["OXIDE_POOL_CAP"] = "64MiB"
+        require(adapter.env.get("OXIDE_SCRATCH_ROOT") == scratch, "builds fixture scratch declaration drifted")
     adapter.env["CARGO_BUILD_JOBS"] = "2"
     adapter.env.pop("CARGO_ENCODED_RUSTFLAGS", None)
     adapter.env["RUSTFLAGS"] = ""
@@ -633,6 +651,34 @@ def self_check() -> int:
     world = SimpleNamespace(pool="/old", control="", outputs="", registry="")
     place_pool(world, pool)
     require(world.registry == pool + "/oxide-managed/outputs/registry.json", "placed registry path")
+
+    # The fixture environment contract. Builds declares OXIDE_SCRATCH_ROOT and the
+    # pool inside it, whatever the host or base env carried; internal declares none.
+    import inspect
+    hostile = {"OXIDE_SCRATCH_ROOT": "/hostile/scratch", "OXIDE_POOL": "/hostile/pool",
+               "OXIDE_POOL_CAP": "1MiB", "PATH": "/usr/bin"}
+    built = declare_scratch(hostile, "builds", "/fake/run")
+    require(built["OXIDE_SCRATCH_ROOT"] == "/fake/run/scratch-pools", f"builds scratch: {built}")
+    require(built["OXIDE_POOL"] == "/fake/run/scratch-pools/pool", f"builds pool: {built}")
+    require(built["OXIDE_POOL"].startswith(built["OXIDE_SCRATCH_ROOT"] + os.sep), "builds pool escaped the scratch root")
+    require(built["OXIDE_POOL_CAP"] == "64MiB" and built["PATH"] == "/usr/bin", "builds cap or base env drifted")
+    require(hostile["OXIDE_SCRATCH_ROOT"] == "/hostile/scratch", "declare_scratch mutated its input")
+    internal = declare_scratch(hostile, "internal", "/fake/run")
+    require("OXIDE_SCRATCH_ROOT" not in internal, "internal mode declared a scratch root")
+    require(internal["OXIDE_POOL"] == "/hostile/pool", "internal mode rewrote the pool it was given")
+    require(internal["OXIDE_POOL_CAP"] == "64MiB", "internal cap drifted")
+    try:
+        declare_scratch(hostile, "nope", "/fake/run")
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("an unknown mode was accepted by declare_scratch")
+    # prepare() must route the real fixture env through declare_scratch, so the
+    # pure contract above is the one the run uses (not a parallel copy).
+    prepare_source = inspect.getsource(prepare)
+    require("declare_scratch(permanent.proof_env(" in prepare_source,
+            "prepare() does not apply the scratch declaration")
+    require("scratch_layout(" in inspect.getsource(declare_scratch), "declare_scratch does not use scratch_layout")
 
     # The unknown-external oracle: kept for the planted reason, never a candidate.
     good = {"coverage": {"complete": True}, "candidates": [{"root": "/r1"}],
