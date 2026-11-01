@@ -1063,7 +1063,7 @@ CENSUS_PHASE_NS = 2 * NS
 CENSUS_WORK_ROWS = 20
 
 
-class CensusWorkStopped(Exception):
+class CensusWorkStopped(BaseException):
     """A round cannot establish certainty under its fixed bounds."""
 
 
@@ -1418,6 +1418,35 @@ class Census:
         except BaseException:
             return False
 
+    def read_session(self, pid):
+        work = getattr(self, "_work", None)
+        return work.call(self.getsid, pid) if work is not None else self.getsid(pid)
+
+    def read_group(self, pid):
+        work = getattr(self, "_work", None)
+        return work.call(self.getpgid, pid) if work is not None else self.getpgid(pid)
+
+    def observe_identity(self, identity):
+        work = getattr(self, "_work", None)
+        if work is None:
+            return self.reread(identity[0])
+        row = work.call(self.reread, identity[0])
+        if row is not None:
+            observed = work.identity(row)
+            if observed is None or observed[0] != identity[0]:
+                work.stop("invalid")
+        else:
+            observed = None
+        if observed != identity:
+            # A safe observation resolves this exact old identity only.
+            self.tracked.pop(identity, None)
+            self._round_records[identity] = {"skip": True}
+            if identity in work.entries:
+                work.resolve(identity, "gone")
+            if row is not None:
+                work.replacement(row)
+        return row
+
     def identity_stable(self, identity, parent_pid=None):
         """Whether this exact identity is still what the safe reader names.
 
@@ -1429,11 +1458,13 @@ class Census:
         rather than to the older snapshot. Pure observation: one read, no
         bookkeeping, never raises."""
         try:
-            again = self.reread(identity[0])
+            again = self.observe_identity(identity)
             if not (isinstance(again, dict) and again.get("pid") == identity[0]
                     and again.get("start") == identity[1]):
                 return False
             return parent_pid is None or again.get("ppid") == parent_pid
+        except CensusWorkStopped:
+            raise
         except BaseException:
             return False
 
@@ -1451,12 +1482,14 @@ class Census:
         try:
             if not self.identity_stable(identity):
                 return "ambiguous"
-            session = self.getsid(identity[0])
+            session = self.read_session(identity[0])
             if session is None:
                 return "ambiguous"
             if not self.identity_stable(identity):
                 return "ambiguous"
             return "member" if session == self.sid else "ambiguous"
+        except CensusWorkStopped:
+            raise
         except BaseException:
             return "ambiguous"
 
@@ -1489,8 +1522,8 @@ class Census:
                 return "ambiguous"
             if not self.identity_stable(identity, parent_pid=ppid):
                 return "ambiguous"
-            session = self.getsid(identity[0])
-            group = self.getpgid(identity[0])
+            session = self.read_session(identity[0])
+            group = self.read_group(identity[0])
             if session is None or group is None:
                 return "ambiguous"
             if not self.identity_stable(identity, parent_pid=ppid):
@@ -1502,6 +1535,8 @@ class Census:
             if group == self.sid:  # inconsistent with the readable session
                 return "ambiguous"
             return "outside"
+        except CensusWorkStopped:
+            raise
         except BaseException:
             return "ambiguous"
 
@@ -1549,294 +1584,270 @@ class Census:
             if observed == "inside":
                 return "member"
             return None  # undecided: excludes nothing, ordinary classification owns it
+        except CensusWorkStopped:
+            raise
         except BaseException:
             return None  # never exclude on an unreadable or failed observation
 
     def round(self):
+        """Classify every identity observed during one bounded census round."""
         self.reset_stats()
-        begun = now_ns()
-        try:
-            rows = self.snapshot()
-        except Exception as error:
-            try:
-                self.stats["snapshot_ns"] = now_ns() - begun
-                self.stats["snapshot_error"] = True
-            except BaseException:
-                pass
-            return {"certain": False, "members": len(self.tracked), "uncertain": 1,
-                    "error": f"snapshot: {error}", "member_rows": [], "uncertain_rows": [],
-                    "terminal_count_status": "invalid", "terminal_nonwriters": None}
-        try:
-            self.stats["snapshot_ns"] = now_ns() - begun  # observation only
-            self.stats["rows"] = len(rows)
-            self.stats["zombie_rows"] = sum(1 for row in rows if row.get("zombie") is True)
-        except BaseException:
-            pass
-        present = {(row["pid"], row["start"]) for row in rows}
-        for identity in list(self.tracked):
-            if identity not in present:
-                del self.tracked[identity]
-        # Launcher rules (oxide#197, design ruling ea5a3dc9). The parent rule
-        # needs the observation-time parent row, so the parent is resolved from
-        # this same snapshot. No clock fact is read: an ancestor record that was
-        # not recorded excludes nothing.
-        by_pid = {}
-        if self.ancestors:
-            for row in rows:
-                by_pid.setdefault(row["pid"], row)
+        work = CensusWork()
+        self._work = work
+        self._round_records = records = {}
+        begun = work.deadline - CENSUS_PHASE_NS
+        pending, finals = {}, {}
         exclusions, excluded_total = [], 0
         rule_totals = {"ancestor": 0, "parent": 0}
-        members, uncertain = [], []
-        diag_attempted, diag_saturated = 0, False
-        terminal_count, terminal_witnesses, terminal_tainted = 0, [], False
-        # One outcome record per snapshot row. Confirmation reads are
-        # interleaved across identities, so every published list (members,
-        # uncertain, diagnostics, terminal witnesses) is assembled from these
-        # records in SNAPSHOT order at the end of the round, never in the
-        # order in which a pass happened to resolve an identity.
-        records = [None] * len(rows)
-        pending = []  # (index, row, identity, state) still being confirmed, snapshot order
-        for index, row in enumerate(rows):
-            identity = (row["pid"], row["start"])
-            # A tracked identity keeps its existing member/terminal attribution
-            # and is never excluded, so a launcher rule can never remove it.
-            rule = (self.exclusion_rule(row, by_pid)
-                    if by_pid and identity not in self.tracked else None)
-            if rule == "member":
-                # A bound session observation positively found this identity in
-                # the leader's session: carry it as a member and track it, so a
-                # later contradictory session read cannot turn it into a foreign
-                # row or let it vanish from the census.
-                self.tracked[identity] = row
-                records[index] = {"member": row}
-                continue
-            if rule is not None:
-                # A positively decided launcher identity: this run's own
-                # launcher chain, so never a member and never an unknown row. No
-                # pause, and its tracked set is left untouched. An UNDECIDED
-                # observation never reaches this branch: it excludes no row and
-                # the ordinary getsid/reread classification below owns the row.
-                records[index] = {"skip": True}
-                excluded_total += 1
-                rule_totals[rule] += 1
-                if len(exclusions) < EXCLUSION_MAX_ROWS:
-                    exclusions.append({"pid": identity[0], "start": identity[1], "rule": rule})
-                continue
-            failure, getsid_error = None, None
+        diag_attempted = 0
+        terminal_tainted = False
+
+        def finish(identity, record, disposition):
+            records[identity] = record
+            work.resolve(identity, disposition)
+
+        def confirm(identity, row, state):
+            state["tries"] += 1
+            self.stats["confirm_reads"] += 1
             try:
-                session = self.getsid(row["pid"])
-            except ProcessLookupError as error:
-                try:
-                    actual_esrch = _ERRNO.__get__(error) == errno.ESRCH
-                except BaseException:
-                    actual_esrch = False
-                if actual_esrch:
-                    session, failure, getsid_error = None, "gone", error
-                else:
-                    session, failure = None, f"getsid: {error}"
-            except OSError as error:
-                session, failure = None, f"getsid: {error}"
-            if failure == "gone":
-                if diag_attempted >= U64MAX:
-                    diag_saturated = True
-                else:
-                    diag_attempted += 1
-                state = {"tries": 0, "outcome": None, "error": None, "first_row": "unset",
-                         "first_error": None, "clean": True, "gone": False, "getsid_error": getsid_error}
-                # The FIRST confirmation read for this identity runs here,
-                # immediately after its own getsid and before the next row's,
-                # so the snapshot/first-read pairing terminal eligibility
-                # depends on keeps its existing timing adjacency.
-                if self.confirmation_attempt(row, state):
-                    pending.append((index, row, identity, state))
-                    continue
-                if state["gone"]:
-                    self.tracked.pop(identity, None)
-                    records[index] = {"diag": _diag_attempt(row, state["tries"], state["outcome"], "not_read")}
-                    continue
-                # A failed first read resolves the confirmation exactly as the
-                # serial loop did: the identity keeps the existing final read.
-                records[index] = {"esrch": True, "row": row, "identity": identity, "state": state}
-                continue
-            try:
-                again = self.reread(row["pid"])
+                again = self.observe_identity(identity)
+            except CensusWorkStopped:
+                raise
             except Exception as error:
-                again, failure = None, f"reread: {error}" if failure in (None, "gone") else failure
-            stable = again is not None and again["start"] == row["start"]
-            if failure == "gone":
-                failure = "getsid ESRCH, absence not confirmed"
-            if failure is None and stable and session == self.sid:
-                self.tracked[identity] = row
-                records[index] = {"member": row}
-            elif identity in self.tracked:
-                records[index] = {"member": row}
-            elif failure is None and stable:
-                records[index] = {"skip": True}  # positively foreign
+                if state["tries"] == 1:
+                    state["first_error"] = error
+                state.update(outcome="read_failed", error=error, clean=False)
+                return False
+            if state["tries"] == 1:
+                state["first_row"] = again
+            if again is None or work.identity(again) != identity:
+                state.update(outcome="absent" if again is None else "replaced", gone=True)
+                return False
+            if not _same_complete_zombie(row, again):
+                state["clean"] = False
+            return True
+
+        def resolved_confirm(identity, row, state):
+            if state["gone"]:
+                finish(identity, {"diag": _diag_attempt(row, state["tries"], state["outcome"], "not_read")}, "gone")
             else:
-                records[index] = {"uncertain": dict(row, reason=failure or "identity changed across getsid")}
-        # Further confirmation passes: each is ONE shared CONFIRM_PAUSE and
-        # then ONE reread of every still-pending identity in snapshot order.
-        # One pause therefore serves every identity in the pass, while any two
-        # successive confirmation reads for one identity stay at least one
-        # full CONFIRM_PAUSE apart. Per-identity tries, all_clean, first-read
-        # pairing, absent/replaced priority and read-failure termination are
-        # unchanged, and a match never short-circuits.
-        further = 0
-        while pending and further < CONFIRM_TRIES - 1:
-            further += 1
-            self.pause(CONFIRM_PAUSE)
-            try:
-                self.stats["pause_calls"] += 1  # observation only: this round's shared pauses
-            except BaseException:
-                pass
-            survivors = []
-            for index, row, identity, state in pending:
-                if self.confirmation_attempt(row, state):
-                    survivors.append((index, row, identity, state))
-                elif state["gone"]:
-                    self.tracked.pop(identity, None)
-                    records[index] = {"diag": _diag_attempt(row, state["tries"], state["outcome"], "not_read")}
+                finals[identity] = (row, state)
+
+        def drain_queue():
+            nonlocal excluded_total, diag_attempted
+            while True:
+                item = work.next()
+                if item is None:
+                    return
+                identity, row = item
+                if work.entries[identity][1] != "pending":
+                    continue
+                # A reopened identity supersedes its prior disposition.
+                records.pop(identity, None)
+                rule = self.exclusion_rule(row, by_pid) if by_pid and identity not in self.tracked else None
+                work.check()
+                if work.entries[identity][1] != "pending":
+                    continue
+                if rule == "member":
+                    self.tracked[identity] = row
+                    finish(identity, {"member": row}, "member")
+                    continue
+                if rule is not None:
+                    finish(identity, {"skip": True}, "foreign")
+                    excluded_total += 1
+                    rule_totals[rule] += 1
+                    if len(exclusions) < EXCLUSION_MAX_ROWS:
+                        exclusions.append({"pid": identity[0], "start": identity[1], "rule": rule})
+                    continue
+                try:
+                    before = self.observe_identity(identity)
+                except CensusWorkStopped:
+                    raise
+                except Exception as error:
+                    finish(identity, {"uncertain": dict(row, reason=f"reread: {error}")}, "uncertain")
+                    continue
+                if before is None or work.identity(before) != identity:
+                    continue
+                failure, getsid_error = None, None
+                try:
+                    session = self.read_session(identity[0])
+                except ProcessLookupError as error:
+                    session = None
+                    if _ERRNO.__get__(error) == errno.ESRCH:
+                        failure, getsid_error = "gone", error
+                    else:
+                        failure = f"getsid: {error}"
+                except OSError as error:
+                    session, failure = None, f"getsid: {error}"
+                if failure == "gone":
+                    diag_attempted += 1
+                    state = {"tries": 0, "outcome": None, "error": None, "first_row": "unset",
+                             "first_error": None, "clean": True, "gone": False, "getsid_error": getsid_error}
+                    # The confirmation immediately follows this identity's getsid.
+                    if confirm(identity, before, state):
+                        pending[identity] = (before, state)
+                    else:
+                        resolved_confirm(identity, before, state)
+                    continue
+                try:
+                    after = self.observe_identity(identity)
+                except CensusWorkStopped:
+                    raise
+                except Exception as error:
+                    after = None
+                    failure = failure or f"reread: {error}"
+                if after is not None and work.identity(after) != identity:
+                    continue
+                if after is None and failure is None:
+                    continue  # positively absent; observe_identity already resolved it
+                if failure is None and session == self.sid:
+                    self.tracked[identity] = after
+                    finish(identity, {"member": after}, "member")
+                elif identity in self.tracked:
+                    finish(identity, {"member": row}, "member")
+                elif failure is None:
+                    finish(identity, {"skip": True}, "foreign")
                 else:
-                    records[index] = {"esrch": True, "row": row, "identity": identity, "state": state}
-            pending = survivors
-        for index, row, identity, state in pending:  # 20 reads done, absence never shown
-            state["outcome"] = "matching_exhausted"
-            records[index] = {"esrch": True, "row": row, "identity": identity, "state": state}
-        # The existing final KERN_PROC_PID read and classification, once per
-        # surviving ESRCH identity, in snapshot order: 20 confirmation reads
-        # plus this distinct final read for a persistent row, while a Gone
-        # during confirmation skips it and a read failure keeps the old
-        # final-absence rule. No pause is added before it.
-        for record in records:
-            if not record or not record.get("esrch"):
-                continue
-            row, identity, state = record["row"], record["identity"], record["state"]
-            tries, confirm_outcome = state["tries"], state["outcome"]
+                    finish(identity, {"uncertain": dict(row, reason=failure)}, "uncertain")
+
+        def final_read(identity, row, state):
+            nonlocal terminal_tainted
             failure = "getsid ESRCH, absence not confirmed"
             try:
-                again = self.reread(row["pid"])
+                again = self.observe_identity(identity)
+            except CensusWorkStopped:
+                raise
             except Exception as error:
-                # The serial algorithm also reached its ordinary tail here, so
-                # a tracked identity keeps its retained attribution as a member
-                # and only an untracked one becomes uncertain. Marking every
-                # failed final read uncertain would change that result.
-                again = None
-                failure = f"reread: {error}"
-                record["diag"] = _diag_attempt(row, tries, confirm_outcome, "read_failed", error=error)
-                try:
-                    if self.terminal_allowed is True and row.get("zombie") is True:
-                        terminal_tainted = True
-                except BaseException:
-                    pass
+                record = {"diag": _diag_attempt(row, state["tries"], state["outcome"], "read_failed", error=error)}
+                if self.terminal_allowed and row.get("zombie") is True:
+                    terminal_tainted = True
+                retained = self.retains_member_attribution(identity)
+                if retained:
+                    record["member"] = row
+                else:
+                    record["uncertain"] = dict(row, reason=f"reread: {error}")
+                finish(identity, record, "member" if retained else "uncertain")
+                return
+            if again is None or work.identity(again) != identity:
+                finish(identity, {"diag": _diag_attempt(row, state["tries"], state["outcome"],
+                                                        "absent" if again is None else "replaced")}, "gone")
+                return
+            record = {"diag": _diag_attempt(row, state["tries"], state["outcome"], "same_identity",
+                                            error=state["getsid_error"])}
+            terminal = (state["outcome"] == "matching_exhausted" and state["clean"]
+                        and self.terminal_eligible(row, state["first_row"], state["first_error"])
+                        and _same_complete_zombie(row, again))
+            if terminal:
+                record["terminal"] = _terminal_witness_row(row, identity in self.tracked)
+                finish(identity, record, "terminal")
+            else:
+                if self.terminal_allowed and row.get("zombie") is True:
+                    terminal_tainted = True
                 if self.retains_member_attribution(identity):
-                    record["member"] = row  # retained attribution, exactly as the serial tail
+                    record["member"] = row
+                    finish(identity, record, "member")
                 else:
                     record["uncertain"] = dict(row, reason=failure)
-                continue
-            if again is None:
-                self.tracked.pop(identity, None)
-                record["diag"] = _diag_attempt(row, tries, confirm_outcome, "absent")
-                continue
-            if again["start"] != row["start"]:
-                self.tracked.pop(identity, None)
-                record["diag"] = _diag_attempt(row, tries, confirm_outcome, "replaced")
-                continue
-            record["diag"] = _diag_attempt(row, tries, confirm_outcome, "same_identity",
-                                           error=state["getsid_error"])
-            try:
-                terminal = (confirm_outcome == "matching_exhausted" and state["clean"]
-                            and self.terminal_eligible(row, state["first_row"], state["first_error"])
-                            and _same_complete_zombie(row, again))
-            except BaseException:
-                terminal = False
-            if not terminal:
-                # An actual-ESRCH row with a SZOMB snapshot that is neither
-                # Gone nor terminal-accepted stays unaccounted and taints the
-                # terminal count, but only when terminal acceptance is
-                # possible at all. In strict mode the count is accountably
-                # zero; rows that were never terminal candidates (no SZOMB
-                # snapshot) leave an accountable count alone.
-                try:
-                    if self.terminal_allowed is True and row.get("zombie") is True:
-                        terminal_tainted = True
-                except BaseException:
-                    pass
-            if terminal:
-                try:
-                    witness = _terminal_witness_row(row, identity in self.tracked)
-                except BaseException:
-                    witness = None
-                if witness is not None:
-                    terminal_witnesses.append(witness)
-                terminal_count += 1
-                record["skip"] = True  # kept tracked attribution; neither member nor uncertain
-                continue
-            if self.retains_member_attribution(identity):
-                record["member"] = row  # tracked attribution kept
-            else:
-                record["uncertain"] = dict(row, reason=failure)
-        diag_rows = []
-        for record in records:  # SNAPSHOT order, including more than 20 rows
-            if not record:
-                continue
-            if record.get("member") is not None:
-                members.append(record["member"])
-            elif record.get("uncertain") is not None:
-                uncertain.append(record["uncertain"])
-            if record.get("diag") is not None:
-                diag_rows.append(record["diag"])
+                    finish(identity, record, "uncertain")
+
         try:
-            self.stats["scan_ns"] = now_ns() - begun - self.stats["snapshot_ns"]  # observation only
+            try:
+                rows = work.call(self.snapshot)
+            except CensusWorkStopped:
+                raise
+            except Exception:
+                self.stats["snapshot_error"] = True
+                work.stop("invalid")
+            work.seed(rows)  # validate before removing any tracked identity
+            self.stats["snapshot_ns"] = now_ns() - begun
+            self.stats["rows"] = len(rows)
+            self.stats["zombie_rows"] = sum(1 for row in rows if row.get("zombie") is True)
+            present = set(work.entries)
+            for identity in list(self.tracked):
+                if identity not in present:
+                    del self.tracked[identity]
+            by_pid = {row["pid"]: row for row in rows} if self.ancestors else {}
+            drain_queue()
+            passes = 0
+            while pending or finals:
+                while pending and passes < CONFIRM_TRIES - 1:
+                    passes += 1
+                    work.pause(self.pause, CONFIRM_PAUSE)
+                    self.stats["pause_calls"] += 1
+                    current, pending = pending, {}
+                    for identity, (row, state) in current.items():
+                        if work.entries[identity][1] != "pending":
+                            continue
+                        if confirm(identity, row, state):
+                            pending[identity] = (row, state)
+                        else:
+                            resolved_confirm(identity, row, state)
+                    drain_queue()
+                for identity, (row, state) in pending.items():
+                    if work.entries[identity][1] != "pending":
+                        continue
+                    if state["tries"] == CONFIRM_TRIES:
+                        state["outcome"] = "matching_exhausted"
+                        finals[identity] = (row, state)
+                    else:
+                        finish(identity, {"uncertain": dict(row, reason="confirmation schedule exhausted")}, "uncertain")
+                        if self.terminal_allowed and row.get("zombie") is True:
+                            terminal_tainted = True
+                pending.clear()
+                if finals:
+                    current, finals = finals, {}
+                    for identity, (row, state) in current.items():
+                        if work.entries[identity][1] == "pending":
+                            final_read(identity, row, state)
+                    drain_queue()
+            work.check()
+            if any(entry[1] == "pending" for entry in work.entries.values()):
+                work.stop("interrupted")
+            ordered = [records[i] for i in work.entries if i in records]
+            members = [r["member"] for r in ordered if "member" in r]
+            uncertain = [r["uncertain"] for r in ordered if "uncertain" in r]
+            witnesses = [r["terminal"] for r in ordered if r.get("terminal") is not None]
+            terminal_count = sum(entry[1] == "terminal" for entry in work.entries.values())
+            status, value = _terminal_fields(terminal_count, terminal_tainted, False)
+            if status != "valid" and not uncertain:
+                uncertain.append({"reason": "terminal count not countable"})
+            result = {"certain": not uncertain, "members": len(members), "uncertain": len(uncertain),
+                      "member_rows": members[:20], "uncertain_rows": uncertain[:20],
+                      "terminal_count_status": status, "terminal_nonwriters": value}
+            if self.ancestors:
+                result["ancestor_exclusions"] = {"rows": exclusions, "count": excluded_total,
+                    "omitted": max(0, excluded_total - len(exclusions)), "by_rule": rule_totals}
+            diagnostics = _diag_object(diag_attempted, [r["diag"] for r in ordered if "diag" in r], False) if diag_attempted else None
+            if diagnostics is not None:
+                result["diagnostics"] = diagnostics
+            if witnesses:
+                compact_len = len(json.dumps(diagnostics, ensure_ascii=True, separators=(',', ':')).encode()) if diagnostics else 0
+                result["terminal_witnesses"] = _fit_witnesses(witnesses, len(diagnostics.get("rows", [])) if diagnostics else 0, compact_len)
+            self.stats["scan_ns"] = now_ns() - begun - self.stats["snapshot_ns"]
             self.stats["esrch_rows"] = diag_attempted
             self.stats["terminal"] = terminal_count
-        except BaseException:
+            result["replacement_work"] = work.summary()
+            work.check()
+            return result
+        except CensusWorkStopped:
             pass
-        try:
-            status, value = _terminal_fields(terminal_count, terminal_tainted, False)
         except BaseException:
-            status, value = "invalid", None
-        if status not in TERMINAL_STATUS_VALUES:
-            status, value = "invalid", None
-        if status in ("invalid", "overflow") and not uncertain:
-            # An unaccountable terminal count must block closure through
-            # the unchanged IPC fields, even if no row was uncertain.
-            uncertain.append({"reason": "terminal count not countable"})
-        result = {"certain": not uncertain, "members": len(members), "uncertain": len(uncertain),
-                "member_rows": members[:20], "uncertain_rows": uncertain[:20]}
-        if self.ancestors:
-            # Receipt-only, bounded positive evidence for the launcher rules: the
-            # rows kept here are the first EXCLUSION_MAX_ROWS of this round, and
-            # the counts cover every exclusion decision. Observation only: it
-            # never changes a classification, count, read, pause or budget.
-            result["ancestor_exclusions"] = {
-                "rows": exclusions, "count": excluded_total,
-                "omitted": max(0, excluded_total - len(exclusions)),
-                "by_rule": rule_totals}
-        result["terminal_count_status"] = status
-        result["terminal_nonwriters"] = value if (
-            status == "valid" and type(value) is int and 0 <= value <= U64MAX) else None
-        diag_compact_len, diag_kept = 0, 0
-        if diag_attempted:
-            try:
-                diagnostics = _diag_object(diag_attempted, diag_rows, diag_saturated)
-            except BaseException:
-                diagnostics = None
-            if diagnostics is not None:
-                try:
-                    check = json.dumps(diagnostics, ensure_ascii=True, separators=(',', ':')).encode("utf-8")
-                    if len(check) <= DIAG_MAX_BYTES and len(diagnostics.get("rows", [])) <= DIAG_MAX_ROWS:
-                        result["diagnostics"] = diagnostics
-                        diag_compact_len, diag_kept = len(check), len(diagnostics.get("rows", []))
-                except BaseException:
-                    pass
-        if terminal_witnesses:
-            try:
-                fitted = _fit_witnesses(terminal_witnesses, diag_kept, diag_compact_len)
-            except BaseException:
-                fitted = []
-            if fitted:
-                result["terminal_witnesses"] = fitted
-        return result
+            if work.status == "complete":
+                work.status = "interrupted"
+        finally:
+            self._work = None
+        # A failed or interrupted round never uses a partial snapshot as absence.
+        try:
+            summary = work.summary()
+        except BaseException:
+            summary = {"snapshot": work.snapshot_count, "replacement": work.replacement_count,
+                       "reads": work.reads, "pending": sum(e[1] == "pending" for e in work.entries.values()),
+                       "status": work.status if work.status != "complete" else "invalid",
+                       "rows": [], "omitted": len(work.entries)}
+        return {"certain": False, "members": len(self.tracked), "uncertain": 1,
+                "member_rows": list(self.tracked.values())[:20], "uncertain_rows": [],
+                "terminal_count_status": "invalid", "terminal_nonwriters": None,
+                "replacement_work": summary}
 
 
 # Guard and precedence (custodian side, pure) -------------------------------------

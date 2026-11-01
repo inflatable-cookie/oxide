@@ -715,6 +715,46 @@ class PureCensus(unittest.TestCase):
             work.call(late)
         self.assertEqual((work.status, work.reads), ("deadline", 2))
 
+    def test_each_replacement_entry_classifies_the_new_identity(self):
+        for path in ("first", "shared", "final", "ordinary"):
+            with self.subTest(path=path):
+                old, new = row(501, start=1), row(501, start=2)
+                if path == "first":
+                    reads = [old, new, new, new]
+                elif path == "shared":
+                    reads = [old, old, new, new, new]
+                elif path == "final":
+                    reads = [old] * 21 + [new, new, new]
+                else:
+                    reads = [old, new, new, new]
+                sessions = [7, 100] if path == "ordinary" else [ProcessLookupError(3, "gone"), 100]
+                table = FakeTable([old], {501: sessions}, reread={501: reads})
+                check = census(table)
+                result = check.round()
+                self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 1, 0))
+                self.assertIn((501, 2), check.tracked)
+                self.assertEqual(result["replacement_work"]["replacement"], 1)
+
+    def test_churn_hits_identity_cap_without_certain_empty(self):
+        table = FakeTable([row(502, start=1)], {502: 7},
+                          reread={502: lambda reads: row(502, start=reads + 1)})
+        result = census(table).round()
+        self.assertFalse(result["certain"])
+        self.assertGreaterEqual(result["uncertain"], 1)
+        self.assertEqual(result["replacement_work"]["status"], "identity_cap")
+        self.assertEqual(result["replacement_work"]["replacement"], 128)
+        self.assertGreater(result["replacement_work"]["omitted"], 0)
+        self.assertEqual(result["terminal_count_status"], "invalid")
+
+    def test_duplicate_snapshot_does_not_discard_tracking(self):
+        table = FakeTable([row(503), row(503, start=9)], {503: 7})
+        check = census(table)
+        check.tracked[(999, 7)] = row(999, start=7)
+        result = check.round()
+        self.assertEqual(result["replacement_work"]["status"], "invalid")
+        self.assertFalse(result["certain"])
+        self.assertIn((999, 7), check.tracked)
+
     def test_member_and_foreign(self):
         table = FakeTable([row(101), row(200)], {101: 100, 200: 7})
         result = census(table).round()
@@ -1304,7 +1344,7 @@ class PureCensusFinalAbsence(unittest.TestCase):
         # drops it and incorrectly reports a certain empty deciding census.
         table = FakeTable([row(110, start=5)],
                           {110: [ProcessLookupError(3, "gone"), 100]},
-                          reread={110: lambda reads: row(110, start=5) if reads <= 20 else row(110, start=9)})
+                          reread={110: lambda reads: row(110, start=5) if reads <= 21 else row(110, start=9)})
         check = census(table)
         result = check.round()
         self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 1, 0))
