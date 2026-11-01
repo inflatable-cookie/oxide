@@ -324,14 +324,60 @@ The protocol needs an authenticated per-run channel established before Cargo
  keep the lease and proof resources, never imply success. A cooperative stop
  cannot repair the historical orphan or guarantee closure after its owner dies.
 
-A preliminary source discriminator, not yet a custody conclusion: in Apple's
-[XNU `forkproc` at `f6217f891ac0`](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_fork.c),
-PID allocation checks the process, process-group and session hashes while
-holding the process-list lock. This source observation (examined 2026-11-01)
-does not establish when an exited child leaves its group, when a zombie leaves
-the process hash, or whether a particular deployed macOS version has these
-semantics. Those lifetime paths and supported public API guarantees still need
-independent analysis before a group-signal fixture can be authorized.
+### Held-child source discriminator
+
+The following is source analysis, not an approved signal protocol or native
+proof. POSIX.1-2017 [definitions](https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap03.html)
+(§§3.295–3.301; [readable mirror](https://mirror.doc.mel.vin/posix/basedefs/V1_chap03.html))
+include a zombie in the definition of a process and define a group's lifetime
+as ending when its last process leaves, including at the end of that process's
+lifetime. Thus, *if* the child was actually placed in the group and cannot
+leave it, and its parent exclusively retains it unreaped, an exited child is
+not by itself the end of that group lifetime. This conclusion depends on the
+membership and exclusive-reaping premises; a recorded PID or a later
+`killpg(..., 0)` observation does not establish either.
+
+Apple's archived [setsid](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/setsid.2.html)
+manual describes creation of a session and a group whose ID equals the
+caller's PID; its [setpgid](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/setpgid.2.html)
+manual says a session leader cannot change groups that way. A group leader
+that is not a session leader needs a separate cooperative membership premise:
+the original group can outlive its leader's departure, and a group or session
+escape also makes a held leader insufficient to contain descendants. The
+[signal API](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/killpg.2.html)
+addresses a group, not a held descriptor or a guarantee that every descendant
+is inside it. These archived descriptions and the POSIX inference must still
+be independently reviewed for the particular fixture and supported macOS.
+
+Apple's [sigaction](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/sigaction.2.html)
+manual specifies that `SA_NOCLDWAIT` prevents zombie creation. An explicit
+`SIG_IGN` disposition is also not a custody premise. A fixture must arrange
+and retain a non-auto-reaping disposition, forbid any concurrent wait of the
+child, and treat owner death, a successful reap or uncertainty in either
+condition as the end of signal authority. Apple's [waitpid](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/waitpid.2.html)
+manual describes child selection and reparenting after parent termination;
+a successful wait is not an observation that can be undone. An unresponsive
+owner cannot delegate this custody merely by publishing its PID.
+
+In Apple's XNU source at [`f6217f891ac0`](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_fork.c),
+examined 2026-11-01, `forkproc` checks the process, group and session hashes
+when allocating a PID under the process-list lock. In the same revision,
+[`kern_exit.c`](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_exit.c)
+places an exiting process on the zombie list, and `reap_child_locked` removes
+it from its group and process hash under that lock; its `P_NOCLDWAIT` path
+permits kernel reaping. This explains that revision's relevant mechanism,
+not a version-independent public guarantee or evidence of the host kernel's
+exact source. No native observation or qualification follows from it.
+
+The fixture still needs an independently reviewed, executable ownership
+argument: establish group creation before signalling; show how its owned child
+is prevented from changing group while live; serialize all wait paths and
+signal disposition; handle actual reaping and owner failure without a signal;
+and distinguish a final group/session census from descendant containment.
+The resource bound, negative controls and every executable premise-checklist
+item remain to be specified and reviewed. This analysis does not authorize a
+speculative group signal, change the existing supervisor, or resolve the
+Cargo-survivor papercut.
 
 Before implementation, independently review the ownership and deadline
  contract and obtain any necessary operator ruling. First discriminate whether
