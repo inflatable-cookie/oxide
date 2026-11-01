@@ -1177,10 +1177,17 @@ accepted ledger serialization — the legacy one-journal `Evicting` state,
 worst-valid byte bound, which since oxide#190 is only input an older writer
 left (this writer starts no journal) — escaped round-trip and oversized-field refusals are
 unit tests in `effigy test rust`, as is a
-fixed 1000 ms ceiling on a whole 128-slot and 256-slot recorded-ledger round
-trip with a journal (bounded read via the passive snapshot, ranked ordering,
-the actual atomic write and its read-back; the ceiling is generous for the
-included `fsync`, which is host I/O), reporting both measured figures. `effigy rust:slot-headroom:diagnostic` is the same fixed guard and
+128-slot and 256-slot recorded-ledger round trip with a journal (bounded read
+via the passive snapshot, ranked ordering, the actual atomic write and its
+read-back). Oxide#224 changed that unit gate's scope: the round trip's absolute
+elapsed time is reported as an observation, not asserted, because the included
+`fsync` is host I/O and a loaded volume once measured the 128-slot figure at
+1.04 s against a correct build, while the acceptance oracle is now deterministic
+representation work — exactly one atomic write, exactly two whole-ledger reads,
+the exact bytes and slot rows those touch, linear serialized growth, and the
+published durable file bytes and inode. A whole-ledger re-read per slot, a
+repeated representation pass or an in-place write fails that oracle on any host,
+and no same-run ratio or wall-clock figure is compared. `effigy rust:slot-headroom:diagnostic` is the same fixed guard and
 limits with `--diagnostic`: an uncounted keep-going collection that records
 reached/completed/failed/skipped phases and the latched first fault in a
 bounded `qualified: false` receipt, continues only into phases whose declared

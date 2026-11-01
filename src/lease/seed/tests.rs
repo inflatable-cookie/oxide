@@ -1622,6 +1622,53 @@ fn seed_refuses_after_the_clone_when_the_work_deadline_expires() {
         .exists());
 }
 
+/// The clock seam a correctness fixture may opt into (oxide#224) is scoped to
+/// the calling thread and restores the host clock when its guard drops, so a
+/// fixture proving catalog pinning cannot leak a frozen reading into another
+/// test or into the deadline regressions.
+#[test]
+fn the_seed_clock_seam_is_thread_scoped_and_restores_the_host_clock() {
+    let before = now();
+    {
+        let _frozen = test_clock::freeze();
+        let first = now();
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(now(), first, "the frozen reading advanced");
+        let other = std::thread::spawn(now).join().expect("clock thread");
+        assert!(
+            other > first,
+            "the frozen reading leaked into another thread"
+        );
+        assert_eq!(now(), first, "the frozen reading changed after a peer read");
+    }
+    std::thread::sleep(Duration::from_millis(2));
+    assert!(
+        now() > before,
+        "the guard did not restore the host clock reading"
+    );
+}
+
+/// The same fixture the deadline regression uses, with the seam armed: a real
+/// 25 ms delay against a 1 ms production budget still completes, because the
+/// elapsed-time bound is not what this fixture proves. The real-clock sibling
+/// above keeps the refusal (oxide#224).
+#[test]
+fn a_frozen_seed_clock_keeps_a_completion_off_the_wall_clock_deadline() {
+    reset_hooks();
+    let _frozen = test_clock::freeze();
+    let rig = Rig::new("deadline-frozen");
+    let donor = make_donor(&rig, "a");
+    let (_grant, recipient) = lease_recipient(&rig, "a");
+    let mut request = donor.request(&recipient);
+    request.work_budget_ms = Some(1);
+    VERIFY_DELAY_MS.with(|cell| cell.set(Some(25)));
+    let outcome = seed(&rig.pool, &request).expect("seed");
+    assert!(
+        matches!(outcome, SeedOutcome::Seeded(_)),
+        "the frozen clock still met the wall-clock bound: {outcome:?}"
+    );
+}
+
 #[test]
 fn seed_refuses_a_nonempty_recipient_build() {
     reset_hooks();

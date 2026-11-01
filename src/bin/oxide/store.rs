@@ -8184,6 +8184,14 @@ pub(crate) mod tests {
     #[test]
     fn seed_front_door_pins_a_catalog_and_records_the_completed_generation() {
         use oxide_storage::lease::managed::{read_seed_last, SeedCatalog, SeedSourceKind};
+        // This fixture proves catalog pinning and the recorded completion, not
+        // the library's five-second cooperative work deadline: on a shared host
+        // a few tiny clones can exceed it and fail an otherwise correct run
+        // (oxide#224). Freeze only this thread's seed clock, so the deadline
+        // regressions in the library keep the real clock and its production
+        // bound.
+        #[cfg(debug_assertions)]
+        let _clock = oxide_storage::lease::seed::test_clock::freeze();
         let (root, mut store, donor_key) = seed_fixture();
         let donor = lease(&store, &donor_key, None).expect("donor lease");
         let source_root = root.join("source");

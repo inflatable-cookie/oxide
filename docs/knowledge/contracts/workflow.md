@@ -1641,15 +1641,26 @@ or global Cargo configuration is involved.
   detach and deletion are a separate Tom-approved planner step after fresh
   positive idleness.
 - **Selectors.** `rust:compile`, `rust:compile-release` (oxide#187),
-  `rust:compile-linux`, `rust:format` and `test rust` call `oxide`. With the default `quick` profile, check and test
+  `rust:compile-linux`, `rust:format`, `test rust` and `rust:test-600` call
+  `oxide`. With the default `quick` profile, check and test
   use line tables rather than `dev`'s full debug info. Focused proof, profile
   and install selectors call Cargo, because they test or build Oxide itself.
+  `rust:test-600` (oxide#224) is the same covering suite at its measured
+  600 s / 512 MiB bounds. `scripts/rust-test-600.py` creates exactly the two
+  per-run roots the suite needs — an internal root on the boot volume exported
+  as `OXIDE_TASK_SCRATCH_ROOT` and `OXIDE_TEST_INTERNAL_ROOT`, and ordinary
+  test temp under the selected volume's `<mount>/scratch/oxide-validation` —
+  and runs the unchanged shared supervisor once. It refuses inherited control
+  roots and any home, mount-root or group/other-writable ancestor, and removes
+  only its own two run roots, only after a closed run; any other outcome keeps
+  them with their evidence and prints their paths. Its pure self-check and plan
+  are effect-free, and a covering run uses this or `test rust`, not both.
 - **Escapes.** There are no `:cargo` sibling selectors (removed oxide#153
   with Tom's explicit approval; the prior sibling rule is superseded). The
   outage escape is Effigy's machine-wide per-program `oxide` fallback
   (see [Switching an existing project](#switching-an-existing-project)):
   `force = true` while `oxide` is broken, or `cargo` by hand.
-- **Test supervisor.** `test rust` and `rust:pool-scale`
+- **Test supervisor.** `test rust`, `rust:test-600` and `rust:pool-scale`
   run under the [shared proof supervisor](#shared-proof-supervisor).
 - **Fixtures.** `effigy dogfood:scripts:test` proves the installer's refusals
   (linked or foreign directories, an existing destination, a destination

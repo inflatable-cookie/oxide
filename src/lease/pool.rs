@@ -6290,7 +6290,70 @@ fn write_config(pool: &Path, config: &PoolConfig) -> Result<(), LeaseError> {
 
 fn write_ledger(pool: &Path, ledger: &Ledger) -> Result<(), LeaseError> {
     let bytes = serde_json::to_vec(ledger).map_err(|error| LeaseError::Io(error.to_string()))?;
-    persist_private_file(&pool.join(LEDGER_NAME), &bytes)
+    persist_private_file(&pool.join(LEDGER_NAME), &bytes)?;
+    #[cfg(test)]
+    ledger_work::write(bytes.len() as u64, ledger.slots.len() as u64);
+    Ok(())
+}
+
+/// Test-only, deterministic observation of the ledger representation work one
+/// call performs (oxide#224): whole-ledger reads, bytes read, atomic writes,
+/// bytes written and slot rows handled. It exists only in this crate's test
+/// build, is thread-local, changes no behaviour and is never consulted by
+/// production code. The ledger round-trip fixture uses it as a load-independent
+/// regression oracle over bounded representation work.
+#[cfg(test)]
+pub(crate) mod ledger_work {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct Work {
+        pub(crate) reads: u64,
+        pub(crate) read_bytes: u64,
+        pub(crate) writes: u64,
+        pub(crate) write_bytes: u64,
+        pub(crate) rows: u64,
+    }
+
+    thread_local! {
+        static WORK: Cell<Work> = const {
+            Cell::new(Work {
+                reads: 0,
+                read_bytes: 0,
+                writes: 0,
+                write_bytes: 0,
+                rows: 0,
+            })
+        };
+    }
+
+    pub(crate) fn reset() {
+        WORK.with(|work| work.set(Work::default()));
+    }
+
+    pub(crate) fn read(bytes: u64, rows: u64) {
+        WORK.with(|work| {
+            let mut current = work.get();
+            current.reads += 1;
+            current.read_bytes += bytes;
+            current.rows += rows;
+            work.set(current);
+        });
+    }
+
+    pub(crate) fn write(bytes: u64, rows: u64) {
+        WORK.with(|work| {
+            let mut current = work.get();
+            current.writes += 1;
+            current.write_bytes += bytes;
+            current.rows += rows;
+            work.set(current);
+        });
+    }
+
+    pub(crate) fn observed() -> Work {
+        WORK.with(Cell::get)
+    }
 }
 
 /// Read-side shape checks: identities, the recorded slot path and the
@@ -6454,6 +6517,8 @@ fn read_ledger(pool: &Path) -> Result<Ledger, LeaseError> {
     let ledger: Ledger =
         serde_json::from_slice(&bytes).map_err(|_| LeaseError::UnknownAccounting)?;
     validate_ledger_read(&ledger)?;
+    #[cfg(test)]
+    ledger_work::read(bytes.len() as u64, ledger.slots.len() as u64);
     Ok(ledger)
 }
 

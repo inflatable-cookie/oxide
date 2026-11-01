@@ -911,7 +911,7 @@ pub fn seed_monitored(
     };
     // The five-second cooperative work bound starts with donor revalidation,
     // and every read and clone step below checks it.
-    let deadline = Instant::now() + budget;
+    let deadline = now() + budget;
     if proof_breach("verify") {
         return Err(monitor_stop());
     }
@@ -941,7 +941,7 @@ pub fn seed_monitored(
         if monitor() {
             return Err(monitor_stop());
         }
-        if Instant::now() > deadline {
+        if now() > deadline {
             return Ok(skip(SeedSkipReason::WorkDeadline));
         }
         let file = &planned.file;
@@ -1012,7 +1012,7 @@ pub fn seed_monitored(
         }
         sources.push(opened_file.fd);
     }
-    if Instant::now() > deadline {
+    if now() > deadline {
         return Ok(skip(SeedSkipReason::WorkDeadline));
     }
     // §6.5's point of no return is the first **recipient write**: creating the
@@ -1045,7 +1045,7 @@ pub fn seed_monitored(
             return Err(monitor_stop());
         }
         let file = &planned.file;
-        if Instant::now() > deadline {
+        if now() > deadline {
             return if wrote_any {
                 Err(work_deadline_after_clone())
             } else {
@@ -1145,7 +1145,7 @@ pub fn seed_monitored(
             index,
             path: &recipient_path,
         });
-        if Instant::now() > deadline {
+        if now() > deadline {
             return Err(work_deadline_after_clone());
         }
     }
@@ -1165,13 +1165,8 @@ pub fn seed_monitored(
     let limits = walk_limits();
     // The walk's own cooperative deadline starts here; the seed's 5 s work
     // budget above is a separate bound and is not charged to the walk.
-    let walked = walk::walk_slot_in_monitored(
-        recipient_fd.as_fd(),
-        payload_device,
-        limits,
-        Instant::now(),
-        monitor,
-    );
+    let walked =
+        walk::walk_slot_in_monitored(recipient_fd.as_fd(), payload_device, limits, now(), monitor);
     if walked.gap == Some(SeedWalkGap::MonitorStop) || monitor() {
         return Err(monitor_stop());
     }
@@ -1349,7 +1344,7 @@ fn proof_adjust_plan(
         let out = format!("{profile}/build/{name}/out");
         let mut pending = vec![(out.clone(), root.join(&out))];
         while let Some((relative, directory)) = pending.pop() {
-            if extras.len() > SEED_MAX_PLAN_FILES || Instant::now() > deadline || monitor() {
+            if extras.len() > SEED_MAX_PLAN_FILES || now() > deadline || monitor() {
                 return Ok(());
             }
             let Ok(items) = fs::read_dir(&directory) else {
@@ -1613,6 +1608,59 @@ fn affinity_dir(pool_root: &Path, record_id: u64) -> PathBuf {
         .join(MANAGED_NAME)
         .join("affinity")
         .join(record_id.to_string())
+}
+
+/// The seed's cooperative clock reading. Production reads the host's monotonic
+/// clock; a debug-only seam can freeze this thread's reading so a correctness
+/// fixture is never decided by host scheduling (oxide#224). Release builds have
+/// no seam and no behaviour change.
+fn now() -> Instant {
+    #[cfg(debug_assertions)]
+    {
+        if let Some(frozen) = test_clock::frozen() {
+            return frozen;
+        }
+    }
+    Instant::now()
+}
+
+/// Debug builds only, absent from release: a thread-scoped clock reading for
+/// fixtures that prove catalog pinning and completion rather than a work
+/// deadline (oxide#224). It is thread-local, so a fixture that freezes its own
+/// thread cannot change another test's clock, and every regression that
+/// exercises the five-second bound keeps the real clock.
+#[cfg(debug_assertions)]
+pub mod test_clock {
+    use std::cell::RefCell;
+    use std::time::Instant;
+
+    thread_local! {
+        static FROZEN: RefCell<Option<Instant>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn frozen() -> Option<Instant> {
+        FROZEN.with(|cell| *cell.borrow())
+    }
+
+    /// Freeze this thread's seed clock at its current reading until the guard
+    /// drops. The guard restores the previous reading, so a nested freeze is
+    /// scoped rather than leaked.
+    pub fn freeze() -> Freeze {
+        let previous = FROZEN.with(|cell| cell.replace(Some(Instant::now())));
+        Freeze { previous }
+    }
+
+    /// Restores the reading that was in force before [`freeze`].
+    pub struct Freeze {
+        previous: Option<Instant>,
+    }
+
+    impl Drop for Freeze {
+        fn drop(&mut self) {
+            let previous = self.previous.take();
+            FROZEN.with(|cell| *cell.borrow_mut() = previous);
+        }
+    }
 }
 
 /// The cooperative work bound: 5 s at most, however a caller asks for more.
@@ -2358,7 +2406,7 @@ fn hash_fd(
         if monitor() {
             return Err(StreamError::Monitor);
         }
-        if Instant::now() > deadline {
+        if now() > deadline {
             return Err(StreamError::Deadline);
         }
         let read = file
@@ -2391,7 +2439,7 @@ fn read_bounded(
         if monitor() {
             return Err(StreamError::Monitor);
         }
-        if Instant::now() > deadline {
+        if now() > deadline {
             return Err(StreamError::Deadline);
         }
         let read = file
