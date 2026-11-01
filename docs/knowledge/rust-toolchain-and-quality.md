@@ -43,6 +43,15 @@ The installed package route supplies the authoring rules; these repository
 files activate the route and define its local profile.
 
 Repository validation selectors are listed in [`AGENTS.md`](../../AGENTS.md).
+The release profile carries no diagnostic allowance: `effigy
+rust:compile-release` compiles the binaries with `RUSTFLAGS='-D warnings'`, so
+an unused import, an unneeded `mut` or an item only a debug build reaches fails
+the check instead of becoming noise in the profile Oxide is installed from
+(oxide#223). Cargo still caps dependency lints, so that gate covers this
+workspace package only. An item kept for a debug or test caller is gated with
+the same `cfg` that caller compiles under (`#[cfg(debug_assertions)]` for proof
+hooks and controls, `#[cfg(test)]` for test seams), never with a broad `allow`,
+so no gate can hide an item from the build that uses it.
 The opt-in `oxide-light`/`oxide-full-debug` development profiles, their
 selectors and the no-go disposition of their unqualified comparison
 observations are owned by the

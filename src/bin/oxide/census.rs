@@ -38,7 +38,11 @@
 //! `lsof` is never used: it is external, unbounded and its silence is not a
 //! kernel guarantee.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+// The census's test fixtures name paths with `PathBuf`; production code here
+// takes borrowed paths only.
+#[cfg(test)]
+use std::path::PathBuf;
 
 /// A recorded holder pid that the release must find positively gone (or,
 /// when the kernel's own table says the pid now names another account's

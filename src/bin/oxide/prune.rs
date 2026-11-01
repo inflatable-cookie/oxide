@@ -76,6 +76,7 @@ const OBSERVATION_ENTRIES: u64 = 50_000;
 const OBSERVATION_MS: u64 = 5_000;
 /// Debug-only fault injection for the native proof: name a prune phase to stop
 /// before its effect.
+#[cfg(debug_assertions)]
 const CRASH_ENVIRONMENT: &str = "OXIDE_TEST_PRUNE_CRASH";
 
 const USAGE: &str = "\
@@ -5056,6 +5057,10 @@ const MAX_DIRECTORY_NAMES: usize = 200_000;
 /// it act on the partial list it had collected. A directory whose enumeration
 /// cannot be proven is never read as an empty one.
 fn next_listed_name(stream: *mut libc::DIR, listed: u64) -> Result<Option<String>, Stop> {
+    // Only the test seam consults the ordinal; the parameter stays so the
+    // caller has one shape.
+    #[cfg(not(test))]
+    let _ = listed;
     #[cfg(test)]
     if let Some(error) = test_enumeration_fault::fire(listed) {
         return Err(Stop::Pending(format!(
