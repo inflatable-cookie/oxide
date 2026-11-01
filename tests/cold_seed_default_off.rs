@@ -162,3 +162,32 @@ fn tiny_build_matches_staged_base_when_seed_is_off() {
     assert_eq!(old.0, new.0);
     assert_eq!(old.1, new.1);
 }
+
+#[test]
+fn scratch_declaration_is_inert_for_internal_status() {
+    let scratch = Scratch::new();
+    let home = scratch.0.join("home");
+    let cargo_home = scratch.0.join("cargo-home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(&cargo_home).unwrap();
+    let run = |declared: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oxide"));
+        cmd.arg("status")
+            .env("HOME", &home)
+            .env("CARGO_HOME", &cargo_home)
+            .env("OXIDE_TEST_HOME_FROM_ENV", "1")
+            .env("OXIDE_POOL", scratch.0.join("pool"))
+            .env("OXIDE_CONFIG", scratch.0.join("missing-config"))
+            .env_remove("OXIDE_SCRATCH_ROOT");
+        if declared {
+            cmd.env("OXIDE_SCRATCH_ROOT", "");
+        }
+        cmd.output().expect("oxide status")
+    };
+    let ordinary = run(false);
+    let declared = run(true);
+    assert!(ordinary.status.success() && declared.status.success());
+    assert_eq!(ordinary.stdout, declared.stdout);
+    assert_eq!(ordinary.stderr, declared.stderr);
+    assert!(!scratch.0.join("pool").exists());
+}

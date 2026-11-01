@@ -1,4 +1,4 @@
-//! Pure scratch-pool admission. No caller is wired until S2.
+//! Pure scratch-pool admission.
 use crate::config::{PathRefusal, Source};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -24,18 +24,19 @@ struct Binding {
 
 #[derive(Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
-struct Record {
-    schema: String,
-    pool: PathBuf,
-    volume_uuid: String,
-    mount_point: PathBuf,
-    scratch_root: PathBuf,
-    created_ms: u64,
+pub(crate) struct Record {
+    pub schema: String,
+    pub pool: PathBuf,
+    pub volume_uuid: String,
+    pub mount_point: PathBuf,
+    pub scratch_root: PathBuf,
+    pub created_ms: u64,
 }
 
 #[derive(Debug)]
 pub(crate) struct Facts<'a> {
     pub ordinary: Result<(), PathRefusal>,
+    pub declared_non_boot_mount: bool,
     /// The canonical ancestor and result of its Git recheck, supplied together.
     pub git_recheck: (PathBuf, Result<(), PathRefusal>),
     pub declaration: Option<PathBuf>,
@@ -61,6 +62,8 @@ pub(crate) struct Facts<'a> {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum Refusal {
+    CreationUnavailable,
+    RecordRepairUnavailable,
     Path(PathRefusal),
     Class(&'static str),
     VolumeAbsent {
@@ -93,6 +96,9 @@ pub(crate) fn decide(f: Facts<'_>) -> Decision {
     }
     if !f.status {
         match f.ordinary.clone() {
+            Ok(()) if f.declared_non_boot_mount => {
+                return refusal(Refusal::Class("scratch-volume-unverified"))
+            }
             Ok(()) => return Decision::Ordinary,
             Err(ref external @ PathRefusal::ExternalVolume { ref canonical, .. })
                 if f.declaration.is_some() =>
@@ -228,6 +234,22 @@ pub(crate) fn decide(f: Facts<'_>) -> Decision {
     Decision::Admit
 }
 
+/// Apply the temporary S2 boundaries to a pure admission result.
+pub(crate) fn decide_for_open(f: Facts<'_>) -> Decision {
+    let pool_exists = f.pool_exists;
+    let record_missing = matches!(f.record, Document::Missing);
+    let status = f.status;
+    match decide(f) {
+        Decision::Admit if !status && !pool_exists => {
+            Decision::Refuse(Refusal::CreationUnavailable)
+        }
+        Decision::Admit if !status && record_missing => {
+            Decision::Refuse(Refusal::RecordRepairUnavailable)
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +269,7 @@ mod tests {
     fn facts() -> Facts<'static> {
         Facts {
             ordinary: Err(external()),
+            declared_non_boot_mount: false,
             git_recheck: ("/Volumes/Builds/root".into(), Ok(())),
             declaration: Some("/Volumes/Builds/root".into()),
             source: Source::Environment("OXIDE_POOL"),
@@ -268,6 +291,40 @@ mod tests {
     }
     fn class(name: &'static str) -> Decision {
         Decision::Refuse(Refusal::Class(name))
+    }
+    #[test]
+    fn temporary_s2_refusals_gate_open() {
+        let mut f = facts();
+        f.pool_exists = false;
+        f.binding = Document::Missing;
+        f.record = Document::Missing;
+        assert_eq!(
+            decide_for_open(f),
+            Decision::Refuse(Refusal::CreationUnavailable)
+        );
+        let mut f = facts();
+        f.record = Document::Missing;
+        assert_eq!(
+            decide_for_open(f),
+            Decision::Refuse(Refusal::RecordRepairUnavailable)
+        );
+        assert_eq!(decide_for_open(facts()), Decision::Admit);
+        let mut f = facts();
+        f.declaration = None;
+        assert_eq!(
+            decide_for_open(f),
+            Decision::Refuse(Refusal::Path(external()))
+        );
+    }
+    #[test]
+    fn post_ordinary_mount_is_explicit() {
+        let mut f = facts();
+        f.ordinary = Ok(());
+        assert_eq!(decide(f), Decision::Ordinary);
+        let mut f = facts();
+        f.ordinary = Ok(());
+        f.declared_non_boot_mount = true;
+        assert_eq!(decide(f), class("scratch-volume-unverified"));
     }
     #[test]
     fn refusal_matrix() {

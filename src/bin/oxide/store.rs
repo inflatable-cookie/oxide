@@ -1834,7 +1834,7 @@ impl Store {
         let settings = settings()?;
         let path = settings.pool.clone();
         let source = settings.pool_source;
-        config::refuse_unsafe_pool_path(&path)?;
+        crate::scratch_io::evaluate(&settings, false)?;
         // A pasted `oxide status` annotation is not part of a path, so it
         // refuses for every pool state: an absent path and an existing
         // ordinary directory both get the hint instead of the generic open
@@ -1944,11 +1944,14 @@ impl Store {
     /// Open an existing internal pool using settings already resolved for
     /// this command.
     pub fn open_existing_with(settings: &Settings) -> Result<Option<Self>, String> {
+        if std::env::var_os("OXIDE_SCRATCH_ROOT").is_some() {
+            crate::scratch_io::evaluate(settings, false)?;
+        }
         match config::inspect(&settings.pool) {
             Found::Absent => Ok(None),
             Found::LegacyImage => Err(legacy_refusal()),
             Found::Directory | Found::Unknown => {
-                config::refuse_unsafe_pool_path(&settings.pool)?;
+                crate::scratch_io::evaluate(settings, false)?;
                 Self::open_at(&settings.pool, settings).map(Some)
             }
         }
@@ -1958,7 +1961,7 @@ impl Store {
     /// opening its ledger or reconciling any pool state.
     pub fn existing_control() -> Result<Option<PathBuf>, String> {
         let settings = settings()?;
-        config::refuse_unsafe_pool_path(&settings.pool)?;
+        crate::scratch_io::evaluate(&settings, false)?;
         match config::inspect(&settings.pool) {
             Found::Absent => Ok(None),
             Found::LegacyImage => Err(legacy_refusal()),
@@ -1980,11 +1983,14 @@ impl Store {
     /// lock, reconciliation or any write (oxide#128). Refuses a retired,
     /// foreign or unsafe pool exactly as [`Store::open_existing_with`] does.
     pub fn open_recorded(settings: &Settings) -> Result<Option<Self>, String> {
+        let scratch = crate::scratch_io::evaluate(settings, true)?;
         match config::inspect(&settings.pool) {
             Found::Absent => Ok(None),
             Found::LegacyImage => Err(legacy_refusal()),
             Found::Directory | Found::Unknown => {
-                config::refuse_unsafe_pool_path(&settings.pool)?;
+                if scratch.is_none() {
+                    config::refuse_unsafe_pool_path(&settings.pool)?;
+                }
                 Self::open_recorded_at(&settings.pool, settings).map(Some)
             }
         }
