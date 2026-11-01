@@ -5963,10 +5963,13 @@ The stable, read-only interface other tools use to find the registered Builds dr
   (`prune.rs:3276-3287`). Both modes' fit is unmeasured and both need their own
   owner activation; neither has run at the migrated head.
   The armed debug prune test hooks (`OXIDE_TEST_PRUNE_*`) fire only under the
-  supervisor and only on the internal volume or under the proof's declared
-  `OXIDE_SCRATCH_ROOT` pool inside its supervisor scratch (`hook_placement_allowed`,
-  `src/bin/oxide/prune.rs`). The EACCES and low-reserve injections keep the
-  internal-only rule. Release builds carry none of them.
+  supervisor and only through one shared gate, `proof_evidence`
+  (`src/bin/oxide/prune.rs`). That gate arms on the internal volume, or under a
+  declared `OXIDE_SCRATCH_ROOT` that is a canonical strict child of the
+  supervisor scratch (`declaration_allowed`). Control-directory hooks also
+  require their control inside the declaration (`hook_control_allowed`). The
+  EACCES, low-reserve and control hooks all route through that gate (decisions
+  `40380716` and `60d4914f`). Release builds carry none of them.
   Effigy heavy admission unavailable (f6b3b50 retired host-run client;
   Queue #381 pending); not host-admitted. Any later activation needs fresh
   owner scheduler headroom, independent source-fit and separate activation.

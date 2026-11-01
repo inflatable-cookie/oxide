@@ -3374,17 +3374,38 @@ fn supervisor_evidence() -> Option<PathBuf> {
     oxide_storage::proof::evidence()
 }
 
-/// The evidence directory for the injections that stay on the internal volume
-/// (the EACCES and low-reserve fixtures): supervised, with canonical scratch
-/// below /private/tmp.
+/// The one placement rule of the shared debug fixture gate, `proof_evidence`.
+/// Every `OXIDE_TEST_PRUNE_*` hook routed through it arms on the internal volume
+/// (scratch below /private/tmp), or under a declared scratch pool that is a
+/// canonical strict child of the supervisor scratch. `given` is the declaration
+/// as the proof spelled it and `canonical` its resolved form, so a symlinked or
+/// non-canonical declaration refuses.
+#[cfg(debug_assertions)]
+fn declaration_allowed(scratch: &Path, given: Option<&Path>, canonical: Option<&Path>) -> bool {
+    if scratch.starts_with("/private/tmp") {
+        return true;
+    }
+    match (given, canonical) {
+        (Some(given), Some(canonical)) => {
+            given == canonical && canonical != scratch && canonical.starts_with(scratch)
+        }
+        _ => false,
+    }
+}
+
+/// The evidence directory of an armed debug proof fixture, through the one
+/// shared gate: supervised evidence plus the declaration rule above. Hooks that
+/// need a control directory apply their own control checks on top
+/// (`hook_control_allowed`). Used by the EACCES, low-reserve and control hooks.
 #[cfg(debug_assertions)]
 fn proof_evidence() -> Option<PathBuf> {
     let evidence = supervisor_evidence()?;
     let scratch = fs::canonicalize(std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")?).ok()?;
-    if !scratch.starts_with("/private/tmp") {
-        return None;
-    }
-    Some(evidence)
+    let given = std::env::var_os("OXIDE_SCRATCH_ROOT").map(PathBuf::from);
+    let canonical = given
+        .as_deref()
+        .and_then(|path| fs::canonicalize(path).ok());
+    declaration_allowed(&scratch, given.as_deref(), canonical.as_deref()).then_some(evidence)
 }
 
 /// Where an armed prune fixture may place its control directory (oxide#211, S4,
@@ -3715,7 +3736,7 @@ fn account_candidates(evaluated: &mut [Evaluated], control: &Path) {
 
 #[cfg(debug_assertions)]
 fn prune_fixture_fault(control: &Path, variable: &str, target: &Path, marker: &str) -> bool {
-    let Some(evidence) = supervisor_evidence() else {
+    let Some(evidence) = proof_evidence() else {
         return false;
     };
     let Some(scratch) =
@@ -6958,6 +6979,60 @@ mod tests {
             !hook_control_allowed(outside, outside, scratch, None),
             "outside path"
         );
+
+        // The shared gate (`proof_evidence`), routed by the EACCES, low-reserve and
+        // control hooks alike: the declaration must be a canonical strict child of
+        // the scratch. `injected_low_reserve` has no control path, so its accepted
+        // and refused cases are decided here by the declaration alone.
+        let lookalike = Path::new("/Volumes/Builds/scratch/oxide/run/scratch-evil/scratch-pools");
+        assert!(
+            declaration_allowed(scratch, Some(&declared), Some(&declared)),
+            "low-reserve: declared strict child"
+        );
+        assert!(
+            declaration_allowed(Path::new("/private/tmp/run/scratch"), None, None),
+            "internal, no declaration"
+        );
+        assert!(
+            !declaration_allowed(scratch, None, None),
+            "low-reserve: no declaration on the selected volume"
+        );
+        assert!(
+            !declaration_allowed(scratch, Some(scratch), Some(scratch)),
+            "low-reserve: declaration is the scratch root"
+        );
+        assert!(
+            !declaration_allowed(scratch, Some(sibling_declared), Some(sibling_declared)),
+            "low-reserve: task-root sibling"
+        );
+        assert!(
+            !declaration_allowed(scratch, Some(&link), Some(&real)),
+            "low-reserve: symlinked declaration"
+        );
+        assert!(
+            !declaration_allowed(
+                scratch,
+                Some(&scratch.join("scratch-pools/../scratch-pools")),
+                Some(&declared),
+            ),
+            "low-reserve: non-canonical declaration"
+        );
+        assert!(
+            !declaration_allowed(scratch, Some(outside), Some(outside)),
+            "low-reserve: outside declaration"
+        );
+        assert!(
+            !declaration_allowed(scratch, Some(&lookalike), Some(&lookalike)),
+            "low-reserve: prefix lookalike"
+        );
+    }
+
+    /// Release builds carry no low-reserve fixture: the stub never reads a reserve.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn prune_low_reserve_hook_is_absent_in_release() {
+        assert!(!injected_low_reserve(0, 0));
+        assert!(!injected_low_reserve(u64::MAX, u64::MAX));
     }
 
     /// Release builds carry none of the prune fixture hooks: the stub never fires.
