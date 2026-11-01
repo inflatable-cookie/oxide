@@ -2074,11 +2074,11 @@ cases 2 and 3 remains the end-to-end counterpart.
 On tiny private fixtures with private `HOME`, `CARGO_HOME`, `OXIDE_POOL`,
 `OXIDE_TEST_HOME_FROM_ENV=1`, the invoking rustup home preserved, and a
 private vendored/offline Cargo home seeded by the shared bounded seeder. The
-four canonical temporary variables follow the repository recipe: the
-supervisor's `OXIDE_TASK_SCRATCH_ROOT` and `OXIDE_TEST_INTERNAL_ROOT` point at
-one fresh internal root for the genuine internal pool, and `TMPDIR`, `TMP` and
-`TEMP` point at a separate fresh directory so ordinary test temp still follows
-the selected-volume rule.
+supervisor supplies `OXIDE_TASK_SCRATCH_ROOT` on its selected volume and
+sets `TMPDIR`, `TMP` and `TEMP` to that scratch. The script creates a private
+`OXIDE_SCRATCH_ROOT` inside it; each explicitly capped fixture pool is strictly
+inside that root. A `/private/tmp` fallback exercises the internal path and
+does not establish scratch-pool coverage.
 
 1. **SQLite negative package control (retained).** A private workspace whose
    dependency is `libsqlite3-sys` with the `bundled` feature (the SQLite
@@ -2267,12 +2267,13 @@ Elevated merge hold are unchanged.
 - Selector (created by oxide#169):
   `effigy rust:cold-slot-seeding` = one fixed script and the whole command of
   the qualified shared supervisor,
-  `python3 scripts/bounded-test.py --root-parent /private/tmp --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py`.
-  The private pool is a genuine internal `directory-budget-v1` pool, so the
-  recipe declares the owner-accepted internal-placement exception (decision
-  `bd357a4c`) inside the same monitored owned root; the supervisor bytes are
-  the `94b1aba6…` pin above, with `--limit 600` (Tom's decision `1527723f`, this selector and its diagnostic twin only; any higher bound needs another operator ruling) and a 512 MiB monitored
-  scratch budget including cleanup and the one owned image.
+  `python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py`.
+  The supervisor selects its default scratch volume; fixture pools use an
+  explicitly capped scratch root inside the monitored run root. The 600 s
+  limit (Tom's decision `1527723f`, this selector and its diagnostic twin only;
+  any higher bound needs another operator ruling) and 512 MiB monitored scratch
+  budget include cleanup and the one owned image. The migrated recipe needs
+  its own owner-activated native chain; earlier evidence remains historical.
 - `effigy rust:cold-slot-seeding:diagnostic` appends the script's
   `--diagnostic`: the uncounted keep-going collection required before a counted
   run (records reached/completed/failed/dependent-skipped/unexecuted cases and
@@ -2323,7 +2324,7 @@ deleted between phases.
 1.97.1, 4 jobs, stripped) with the new archive-reader dependencies: 60-85 MiB
 (the #122 recipe measured 58.3 MiB before them).
 
-**Phase B — SQLite donor and recipient on the proof's private internal pool.**
+**Phase B — SQLite donor and recipient on the proof's private scratch pool.**
 Coexisting for the whole phase: staging (60-85), the seeded private
 `CARGO_HOME` with `.crate` archives **and** extracted sources at once
 (50-70; SQLite is about 10 MiB compressed and about 30 MiB extracted, plus
@@ -2336,7 +2337,7 @@ script. The 480 MiB stop threshold leaves 35 MiB of headroom under the
 case.
 
 **Phase C — removable image.** The script first deletes **its own** private
-internal pool directory (fixture cleanup of a tree it created, not product
+scratch pool directory (fixture cleanup of a tree it created, not product
 eviction; recorded with its measured bytes and the post-delete peak), then
 attaches one owned 128 MiB sparse image and runs the tiny `cfg-if` seed case.
 Coexisting: staging (60-85), Cargo home (50-70), image backing (≤ 128), tiny
@@ -2356,7 +2357,7 @@ names the measured analogue or the work performed):
 | 9, 10 held donor and differing context | 2-5 s each, 5-10 s | a gated writer and one Cargo call |
 | 11, 12, 14, 18, 19, 20 crash, caps, unsupported layout, seeded-recipient, reserve, partial trust | 1-4 s each, 10-24 s | fixture copies, mostly no Cargo |
 | 15 no donor writes | 2-4 s | one seed plus digests |
-| 16 removable image: delete internal pool, attach, seed, detach | 10-18 s | owned sparse image attach/detach plus a tiny build |
+| 16 removable image: delete fixture pool, attach, seed, detach | 10-18 s | owned sparse image attach/detach plus a tiny build |
 | 17 registry tamper controls, 21 artifact collisions | 2-4 s each, 10-20 s | archive/tree/plan mutations, no or one tiny Cargo call |
 | 22 competing acquire between selection and the pin (skip, cold build) | 3-6 s | a debug pause plus one competing `oxide` command and a tiny cold build |
 | 23 ambiguous-name visibility | 2-4 s | one tiny build plus summary/status rendering |
