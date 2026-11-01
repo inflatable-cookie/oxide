@@ -6246,7 +6246,7 @@ printed only the candidate set, and a whole-batch refusal is indistinguishable t
 from a per-root decision. The proof therefore now makes the premise explicit —
 `World.complete` requires a COMPLETE preview for the canonical dry run,
 non-reserving control, eligibility, live detached, released vanished, registered
-image, and case-12 symlink-root and reserve previews. Those assertions use
+image, and case-12 reserve and the pre- and post-symlink controls. Those assertions use
 `preview_report`'s bounded root→reason map; the corrupt-receipt case requires the
 whole batch. Other candidate and keep assertions do not all enforce completeness or
 report the map, so the proof does not claim that coverage throughout. This correction
@@ -6263,7 +6263,14 @@ whole batch; cases 11–22 were skipped and no counted native was spent. The cas
 now separately checks whole-batch refusal and nonmutation for a foreign root and
 a forged checkout digest, then tests the eligible boot-Data root alongside the
 per-root image-checkout keep with a complete preview. This is fixture correction,
-not product evidence; a fresh diagnostic remains required. No live prune, dry run,
+not product evidence. The `4c028a2` diagnostic completed cases 01–11 but failed
+case 12: the intentional symlink replacement of a recorded root made authority
+incomplete, as the no-follow observation requires. The alpha and beta lines in
+its bounded report carry that shared batch reason; they do not identify which
+root caused it. Case 12 now requires a complete eligible kappa before and after
+the replacement, and a whole-batch refusal without mutation while the symlink
+exists. Cases 13–22 were skipped; the packet is uncounted, and a fresh diagnostic
+remains required. No live prune, dry run,
 `resolve-intent`, mode, consumer or pool mutation is authorized by this implementation.
 
 ## Adaptive sccache location (proposed)

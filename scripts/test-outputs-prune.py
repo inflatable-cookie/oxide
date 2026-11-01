@@ -796,6 +796,18 @@ def preview_report(preview: dict) -> str:
     )
 
 
+def symlink_root_refusal(preview: dict, root: str) -> bool:
+    """A changed recorded root makes this snapshot incomplete, not a per-root keep."""
+    reasons = [row.get("reason", "") for row in preview.get("kept", []) if row.get("root") == root]
+    return (
+        (preview.get("coverage") or {}).get("complete") is False
+        and not preview.get("candidates")
+        and len(reasons) == 1
+        and "the recorded root is not a real directory" in reasons[0]
+        and "the whole batch is kept" in reasons[0]
+    )
+
+
 def control_state_version(document: dict) -> "int | None":
     """The numeric version a control document implies from its OWN fences.
 
@@ -2922,13 +2934,31 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
         kappa_slot, _ = permanent.slot_state(stderr)
         kappa_pool = "removable pool:" if "removable" in permanent.summary(stderr) else "internal pool:"
         kappa_away = world.vanish(kappa)
+        _, _, preview = world.plan_file("before symlink root dry run", alpha)
+        world.complete(preview, "before symlink root dry run")
+        expect(kappa_root in world.candidates(preview), world.report(preview))
+        sentinel = os.path.join(kappa_root, "symlink-root-sentinel")
+        with open(sentinel, "wb") as handle:
+            handle.write(b"untouched")
+        original = os.stat(kappa_root)
+        marker_before = permanent.read_bytes(os.path.join(kappa_root, ".oxide-output.json"))
+        control_before = tree_bytes(world.control)
         os.rename(kappa_root, kappa_root + ".real")
         os.symlink(kappa_root + ".real", kappa_root)
-        _, _, preview = world.plan_file("symlink root dry run", alpha)
-        world.complete(preview, "symlink root dry run")
-        expect(kappa_root not in world.candidates(preview), world.report(preview))
+        plan, sha, preview = world.plan_file("symlink root dry run", alpha)
+        expect(symlink_root_refusal(preview, kappa_root), world.report(preview))
+        code, _, stderr = world.real_run("symlink root refusal", alpha, plan, sha)
+        expect(code == 2, f"symlink root refusal exited {code}: {stderr}")
+        expect(os.path.islink(kappa_root), "the root symlink changed")
+        expect(os.stat(kappa_root + ".real").st_ino == original.st_ino, "the real root changed")
+        expect(permanent.read_bytes(os.path.join(kappa_root + ".real", "symlink-root-sentinel")) == b"untouched", "the symlink target was touched")
+        expect(permanent.read_bytes(os.path.join(kappa_root + ".real", ".oxide-output.json")) == marker_before, "the marker changed")
+        expect(tree_bytes(world.control) == control_before and not world.intents() and not world.quarantines(), "the symlink refusal changed control or journaled")
         os.unlink(kappa_root)
         os.rename(kappa_root + ".real", kappa_root)
+        _, _, preview = world.plan_file("restored root dry run", alpha)
+        world.complete(preview, "restored root dry run")
+        expect(kappa_root in world.candidates(preview), world.report(preview))
         world.restore(kappa, kappa_away)
         # Reserve: a low reserve at the check before the rename refuses with the
         # root unchanged (exit 2); a low reserve between delete batches of a
@@ -3581,17 +3611,21 @@ def self_test() -> int:
             "canonical dry run",
         ):
             assert label in body, label
-        def symlink_root_guarded(source: str) -> bool:
-            return (
-                '_, _, preview = world.plan_file("symlink root dry run", alpha)\n'
-                '        world.complete(preview, "symlink root dry run")\n'
-                '        expect(kappa_root not in world.candidates(preview), world.report(preview))'
-            ) in source
-
-        assert symlink_root_guarded(body), "symlink root exclusion lacks its complete snapshot premise"
-        assert not symlink_root_guarded(body.replace(
-            '        world.complete(preview, "symlink root dry run")\n', '', 1
-        )), "removing the symlink root premise must fail the source check"
+        symlink_preview = {
+            "coverage": {"complete": False}, "candidates": [],
+            "kept": [{"root": "/root", "reason": "the recorded root is not a real directory; the whole batch is kept"}],
+        }
+        assert symlink_root_refusal(symlink_preview, "/root")
+        assert not symlink_root_refusal({**symlink_preview, "coverage": {"complete": True}}, "/root")
+        assert not symlink_root_refusal({**symlink_preview, "candidates": [{"root": "/root"}]}, "/root")
+        assert not symlink_root_refusal({**symlink_preview, "kept": [{"root": "/root", "reason": "whole batch is kept"}]}, "/root")
+        for fragment in (
+            'world.complete(preview, "before symlink root dry run")',
+            'expect(symlink_root_refusal(preview, kappa_root), world.report(preview))',
+            'world.real_run("symlink root refusal", alpha, plan, sha)',
+            'world.complete(preview, "restored root dry run")',
+        ):
+            assert fragment in body, fragment
         reserve_guard = (
             'plan, sha, preview = world.plan_file("reserve dry run", alpha)\n'
             '        world.complete(preview, "reserve dry run")\n'
