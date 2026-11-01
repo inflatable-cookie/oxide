@@ -3360,6 +3360,18 @@ def self_test() -> None:
     self_check()
     base = tempfile.mkdtemp(prefix="cold-seed-selftest.", dir=tempfile.gettempdir())
     try:
+        # Pin the actual Case constructor and child environment without a pool.
+        fake_proof = types.SimpleNamespace(scratch_pool_root=base, home=base,
+                                           cargo_home=base, rustup=base)
+        with patch.dict(globals(), {"fixture_dir": lambda parent, name: os.path.join(parent, name)}):
+            fixture = Case(fake_proof, "pin")
+        fixture_env = fixture.env()
+        expect(os.path.dirname(fixture.root) == base, "case escaped scratch pool root")
+        expect(fixture.pool == os.path.join(fixture.root, "pool"), "pool placement drifted")
+        expect(fixture_env["OXIDE_SCRATCH_ROOT"] == base, "scratch declaration drifted")
+        expect(fixture_env["OXIDE_POOL"] == fixture.pool, "pool selection drifted")
+        expect(fixture_env["OXIDE_POOL_CAP"] == "256MiB", "explicit cap drifted")
+
         # The diagnostic collection's taint/skip/abort precedence.
         table = [
             ("a", (), lambda: None),
