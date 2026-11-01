@@ -1,7 +1,7 @@
 //! Pure scratch-pool admission.
 use crate::config::{PathRefusal, Source};
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 
 /// Documents have already been read with their file type, owner and size checked.
 #[derive(Debug)]
@@ -115,6 +115,14 @@ pub(crate) fn decide(f: Facts<'_>) -> Decision {
         }
         if f.source == Source::Default {
             return refusal(Refusal::Class("scratch-declaration-default-pool"));
+        }
+        if f.declaration.as_ref().is_none_or(|root| {
+            !root.is_absolute()
+                || root
+                    .components()
+                    .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+        }) {
+            return refusal(Refusal::Class("scratch-root-unsafe"));
         }
     }
     // Status needs the record first to establish a scratch fact. An absent
@@ -317,6 +325,78 @@ mod tests {
         );
     }
     #[test]
+    fn injected_bound_pool_and_temporary_refusals_leave_fixture_untouched() {
+        use std::ffi::{CStr, CString, OsStr};
+        use std::os::unix::ffi::OsStrExt;
+        let base = std::env::var_os("OXIDE_TEST_INTERNAL_ROOT")
+            .map(PathBuf::from)
+            .expect("internal fixture root");
+        let template = base.join("scratch-admit.XXXXXX");
+        let mut name = CString::new(template.as_os_str().as_bytes())
+            .unwrap()
+            .into_bytes_with_nul();
+        assert!(!unsafe { libc::mkdtemp(name.as_mut_ptr().cast()) }.is_null());
+        let root = PathBuf::from(OsStr::from_bytes(
+            CStr::from_bytes_until_nul(&name).unwrap().to_bytes(),
+        ));
+        let pool = root.join("pool");
+        let make_facts = |exists, binding, record| Facts {
+            ordinary: Err(PathRefusal::ExternalVolume {
+                message: "external".into(),
+                canonical: root.clone(),
+            }),
+            declared_non_boot_mount: false,
+            git_recheck: (root.clone(), Ok(())),
+            declaration: Some(root.clone()),
+            source: Source::Environment("OXIDE_POOL"),
+            budget_source: Source::File,
+            pool: pool.clone(),
+            root_safe: true,
+            parent_exists: true,
+            volume_present: true,
+            volume_verified: true,
+            volume_uuid: "uuid".into(),
+            mount_point: base.clone(),
+            binding,
+            record,
+            pool_exists: exists,
+            incomplete: false,
+            record_write_failed_after_creation: false,
+            status: false,
+        };
+        assert_eq!(
+            decide_for_open(make_facts(false, Document::Missing, Document::Missing)),
+            Decision::Refuse(Refusal::CreationUnavailable)
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        std::fs::create_dir(&pool).unwrap();
+        let payload = serde_json::json!({"schema":"oxide.scratch-pool/1", "volume_uuid":"uuid", "mount_point":base, "scratch_root":root, "pool":pool, "created_ms":1});
+        let binding = serde_json::to_vec(&payload).unwrap();
+        std::fs::write(pool.join("binding"), &binding).unwrap();
+        let before = std::fs::read(pool.join("binding")).unwrap();
+        assert_eq!(
+            decide_for_open(make_facts(
+                true,
+                Document::Bytes(&binding),
+                Document::Missing
+            )),
+            Decision::Refuse(Refusal::RecordRepairUnavailable)
+        );
+        assert_eq!(std::fs::read_dir(&pool).unwrap().count(), 1);
+        assert_eq!(std::fs::read(pool.join("binding")).unwrap(), before);
+        let record = serde_json::to_vec(&serde_json::json!({"schema":"oxide.scratch-pool-record/1", "volume_uuid":"uuid", "mount_point":base, "scratch_root":root, "pool":pool, "created_ms":1})).unwrap();
+        assert_eq!(
+            decide_for_open(make_facts(
+                true,
+                Document::Bytes(&binding),
+                Document::Bytes(&record)
+            )),
+            Decision::Admit
+        );
+        assert_eq!(std::fs::read_dir(&pool).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn post_ordinary_mount_is_explicit() {
         let mut f = facts();
         f.ordinary = Ok(());
@@ -332,40 +412,49 @@ mod tests {
         let mut f = facts();
         f.ordinary = Err(PathRefusal::Traversal("traversal".into()));
         assert_eq!(
-            decide(f),
+            decide_for_open(f),
             Decision::Refuse(Refusal::Path(PathRefusal::Traversal("traversal".into())))
         );
         let mut f = facts();
         f.ordinary = Err(PathRefusal::Ancestor("ancestor".into()));
         assert_eq!(
-            decide(f),
+            decide_for_open(f),
             Decision::Refuse(Refusal::Path(PathRefusal::Ancestor("ancestor".into())))
         );
         let mut f = facts();
         f.ordinary = Err(PathRefusal::GitWorkTree("git".into()));
         assert_eq!(
-            decide(f),
+            decide_for_open(f),
             Decision::Refuse(Refusal::Path(PathRefusal::GitWorkTree("git".into())))
         );
         let mut f = facts();
         f.declaration = None;
-        assert_eq!(decide(f), Decision::Refuse(Refusal::Path(external())));
+        assert_eq!(
+            decide_for_open(f),
+            Decision::Refuse(Refusal::Path(external()))
+        );
         let mut f = facts();
         f.git_recheck.1 = Err(PathRefusal::GitWorkTree("git".into()));
         assert_eq!(
-            decide(f),
+            decide_for_open(f),
             Decision::Refuse(Refusal::Path(PathRefusal::GitWorkTree("git".into())))
         );
         let mut f = facts();
         f.git_recheck.0 = "/elsewhere".into();
-        assert_eq!(decide(f), Decision::Refuse(Refusal::Path(external())));
+        assert_eq!(
+            decide_for_open(f),
+            Decision::Refuse(Refusal::Path(external()))
+        );
         let mut f = facts();
         f.source = Source::Default;
-        assert_eq!(decide(f), class("scratch-declaration-default-pool")); // 5
+        assert_eq!(
+            decide_for_open(f),
+            class("scratch-declaration-default-pool")
+        ); // 5
         for _ in 6..=8 {
             let mut f = facts();
             f.root_safe = false;
-            assert_eq!(decide(f), class("scratch-root-unsafe"));
+            assert_eq!(decide_for_open(f), class("scratch-root-unsafe"));
         }
         for pool in [
             "/Volumes/Builds/root",
@@ -375,19 +464,19 @@ mod tests {
             let mut f = facts();
             f.pool = pool.into();
             f.record = Document::Missing;
-            assert_eq!(decide(f), class("scratch-path-outside-root"));
+            assert_eq!(decide_for_open(f), class("scratch-path-outside-root"));
         } // 9
         let mut f = facts();
         f.parent_exists = false;
-        assert_eq!(decide(f), class("scratch-parent-missing")); // 10
+        assert_eq!(decide_for_open(f), class("scratch-parent-missing")); // 10
         for _ in 11..=12 {
             let mut f = facts();
             f.volume_verified = false;
-            assert_eq!(decide(f), class("scratch-volume-unverified"));
+            assert_eq!(decide_for_open(f), class("scratch-volume-unverified"));
         }
         let mut f = facts();
         f.binding = Document::Missing;
-        assert_eq!(decide(f), class("scratch-binding-missing")); // 13
+        assert_eq!(decide_for_open(f), class("scratch-binding-missing")); // 13
         for document in [
             Document::Invalid,
             Document::Bytes(b"{}"),
@@ -395,11 +484,11 @@ mod tests {
         ] {
             let mut f = facts();
             f.binding = document;
-            assert_eq!(decide(f), class("scratch-binding-invalid"));
+            assert_eq!(decide_for_open(f), class("scratch-binding-invalid"));
         } // 14
         let mut f = facts();
         f.binding = Document::Bytes(BAD_BINDING);
-        assert_eq!(decide(f), class("scratch-binding-mismatch")); // 15
+        assert_eq!(decide_for_open(f), class("scratch-binding-mismatch")); // 15
         for document in [
             Document::Invalid,
             Document::Bytes(b"{}"),
@@ -407,21 +496,21 @@ mod tests {
         ] {
             let mut f = facts();
             f.record = document;
-            assert_eq!(decide(f), class("scratch-record-invalid"));
+            assert_eq!(decide_for_open(f), class("scratch-record-invalid"));
         } // 16
         let mut f = facts();
         f.record = Document::Bytes(BAD_RECORD);
-        assert_eq!(decide(f), class("scratch-record-mismatch")); // 17
+        assert_eq!(decide_for_open(f), class("scratch-record-mismatch")); // 17
         let mut f = facts();
         f.record_write_failed_after_creation = true;
         assert_eq!(
-            decide(f),
+            decide_for_open(f),
             Decision::RefuseAndRemoveOwnLeaf(Refusal::Class("scratch-record-unwritable"))
         ); // 18
         let mut f = facts();
         f.volume_present = false;
         assert_eq!(
-            decide(f),
+            decide_for_open(f),
             Decision::Refuse(Refusal::VolumeAbsent {
                 uuid: Some("uuid".into()),
                 mount: Some("/Volumes/Builds".into())
@@ -431,7 +520,7 @@ mod tests {
         f.volume_present = false;
         f.record = Document::Missing;
         assert_eq!(
-            decide(f),
+            decide_for_open(f),
             Decision::Refuse(Refusal::VolumeAbsent {
                 uuid: None,
                 mount: None
@@ -439,21 +528,24 @@ mod tests {
         ); // 19
         let mut f = facts();
         f.incomplete = true;
-        assert_eq!(decide(f), class("scratch-incomplete")); // 20
+        assert_eq!(decide_for_open(f), class("scratch-incomplete")); // 20
         let mut f = facts();
         f.budget_source = Source::Default;
-        assert_eq!(decide(f), class("scratch-budget-required")); // 21
+        assert_eq!(decide_for_open(f), class("scratch-budget-required")); // 21
         let mut f = facts();
         f.declaration = Some("relative".into());
-        assert_eq!(decide(f), class("scratch-root-unsafe")); // 22
+        assert_eq!(decide_for_open(f), class("scratch-root-unsafe")); // 22
         let mut f = facts();
         f.declaration = None;
-        assert_eq!(decide(f), Decision::Refuse(Refusal::Path(external()))); // 23
+        assert_eq!(
+            decide_for_open(f),
+            Decision::Refuse(Refusal::Path(external()))
+        ); // 23
         let mut f = facts();
         f.status = true;
         f.volume_present = false;
         assert_eq!(
-            decide(f),
+            decide_for_open(f),
             Decision::Unavailable(Refusal::VolumeAbsent {
                 uuid: Some("uuid".into()),
                 mount: Some("/Volumes/Builds".into())
@@ -463,17 +555,17 @@ mod tests {
         f.status = true;
         f.binding = Document::Invalid;
         assert_eq!(
-            decide(f),
+            decide_for_open(f),
             Decision::Unavailable(Refusal::Class("scratch-binding-invalid"))
         );
         let mut f = facts();
         f.status = true;
         f.record = Document::Missing;
-        assert_eq!(decide(f), Decision::Ordinary); // 24
+        assert_eq!(decide_for_open(f), Decision::Ordinary); // 24
         assert_eq!(decide(facts()), Decision::Admit);
         let mut f = facts();
         f.record = Document::Missing;
-        assert_eq!(decide(f), Decision::Admit);
+        assert_eq!(decide_for_open(f), Decision::Admit);
     }
 
     #[test]

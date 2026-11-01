@@ -1,6 +1,6 @@
 # Scratch build pools on an external validation volume (proposed design)
 
-**Status: S1 implemented; S2 implementation is incomplete and later slices remain proposed.** This contract records
+**Status: S2 implemented; later slices remain proposed.** This contract records
 a design for an explicit, UUID-bound `directory-budget-v1` "scratch pool" on a verified external
 volume, so validation and proof fixtures can keep their scratch on the Builds
 drive instead of declaring the internal-root exception (decision `bd357a4c`) for

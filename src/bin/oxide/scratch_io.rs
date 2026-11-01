@@ -90,20 +90,22 @@ fn safe_root(root: &Path, mount: &Path) -> bool {
         && fs::canonicalize(root).is_ok_and(|p| p == root)
         && fs::metadata(mount).is_ok_and(|m| m.dev() == meta.dev())
 }
-fn refusal(reason: Refusal, pool: &Path) -> String {
+fn refusal(reason: Refusal, pool: &Path, status: bool) -> String {
     match reason {
         Refusal::CreationUnavailable => CREATION.into(),
         Refusal::RecordRepairUnavailable => REPAIR.into(),
         Refusal::Path(e) => e.message(),
         Refusal::Class(c) => c.to_owned(),
-        Refusal::VolumeAbsent { uuid: Some(uuid), mount: Some(mount) } => format!("the scratch pool at {} is bound to volume {} at {}; that volume is absent", pool.display(), uuid, mount.display()),
-        Refusal::VolumeAbsent { .. } => format!("the scratch pool's volume is absent and no host record matches {}; nothing was created", pool.display()),
+        Refusal::VolumeAbsent { uuid: Some(uuid), .. } if status => format!("scratch volume {} absent", config::bounded(&uuid)),
+        Refusal::VolumeAbsent { uuid: Some(uuid), mount: Some(mount) } => format!("the scratch pool at {} is bound to volume {} at {}; that volume is absent", config::bounded(&pool.display().to_string()), config::bounded(&uuid), config::bounded(&mount.display().to_string())),
+        Refusal::VolumeAbsent { .. } => format!("the scratch pool's volume is absent and no host record matches {}; nothing was created", config::bounded(&pool.display().to_string())),
     }
 }
 /// A verified scratch UUID, or no scratch fact. Performs no writes or pool walk.
 pub(crate) fn evaluate(settings: &Settings, status: bool) -> Result<Option<String>, String> {
-    let pool = &settings.pool;
-    let ordinary = config::judge_pool_path(pool);
+    let ordinary = config::judge_pool_path(&settings.pool);
+    let normalized: PathBuf = settings.pool.components().collect();
+    let pool = &normalized;
     let declaration = if status {
         None
     } else {
@@ -207,9 +209,9 @@ pub(crate) fn evaluate(settings: &Settings, status: bool) -> Result<Option<Strin
     });
     match decision {
         Decision::Ordinary => config::refuse_unsafe_pool_path(pool).map(|()| None),
-        Decision::Admit => Ok(parsed.map(|r| r.volume_uuid)),
+        Decision::Admit => Ok(parsed.map(|r| config::bounded(&r.volume_uuid))),
         Decision::Refuse(r) | Decision::Unavailable(r) | Decision::RefuseAndRemoveOwnLeaf(r) => {
-            Err(refusal(r, pool))
+            Err(refusal(r, pool, status))
         }
     }
 }
