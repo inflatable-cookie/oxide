@@ -317,6 +317,8 @@ never a raw path dump, bounded and escaped as today.
 
 `rust:holding-delete` and its diagnostic now use a scratch pool under the supervisor-selected volume (oxide#202); their native evidence must be established at the migrated head.
 
+`rust:oxide-removable-boot-closure` and its diagnostic now use a scratch pool under the supervisor-selected volume (oxide#212, S4). The same script serves `rust:oxide-removable-removal` and its diagnostic, so those migrate with it; none of the four passes an internal root. Their native evidence must be re-established at the migrated head, and the earlier `2a409d5`/`a04d587` receipts stay bound to the bytes they ran under.
+
 `bd357a4c` is only about `--root-parent /private/tmp`. Pool premise is read from
 each script's own selector text and case bodies.
 
@@ -331,7 +333,6 @@ each script's own selector text and case bodies.
 | `rust:exec-output-inference` (#160) + `:diagnostic` | control pool is a directory-budget pool |
 | `rust:auto-adopt-ineligible` (#154) + `:diagnostic` | control pool is a directory-budget pool |
 | `rust:prune-authority` (#134) + `:diagnostic` | internal pool placement only |
-| `rust:oxide-removable-boot-closure` (#161) + `:diagnostic` | directory-budget base pool plus one owned image |
 | `rust:finder-metadata-race` (#155) + `:diagnostic` | every fixture pool is a directory-budget pool |
 | `rust:command-budgets` (#140) + `:diagnostic` | `OXIDE_POOL_BACKEND=directory-budget` fixture pools |
 
