@@ -98,12 +98,19 @@ own machine-checked matrix: `--self-test` fails if it drifts from
 CASE_PLAN/CASE_NAMES, and the dependency column is exactly what a
 `--diagnostic` run uses to decide which cases may still run.
 
-  01 init: adopt publishes the current control format (state version 9 with
-     the `oxide.outputs/3` owned-outputs fence, the v9-required
-     `oxide.accounting/1` and `oxide.eviction-accounting/1` fences, the
-     `oxide.slots/256` raised-ceiling fence and the `oxide.holding/1`
-     whole-tree holding fence, plus a ready transaction in both controls) and
-     the current registry document is exactly
+  01 init: adopt publishes the current control format in BOTH paired
+     controls, each at the version its OWN fences imply (`Store::save`: a
+     document names the highest fence it carries, never a binary-wide
+     maximum). The internal pool admitted the bootstrap build, so it is fully
+     fenced: version 9 with `oxide.outputs/3`, `oxide.accounting/1`,
+     `oxide.eviction-accounting/1`, `oxide.slots/256` and `oxide.holding/1`.
+     The paired removable pool was created by registration and only received
+     the owned-outputs fence from this adopt (no leased command has admitted
+     into it yet), so it stays at the recorded-accounting version 5 and
+     carries no later fence. `control_state_version(document)` derives each
+     from the document, so one number can never be asserted for both. Both
+     controls must also carry a ready transaction, and the current registry
+     document is exactly
      `oxide.outputs.registry/2` with schema 2 and `complete: true` — the pair
      this head writes, checked against the frozen `prune.rs` literals by the
      pure selector; a legacy 1/1 document is readable by the product but is
@@ -423,6 +430,21 @@ RECORDED_ACCOUNTING_FENCE = "oxide.accounting/1"
 EVICTION_ACCOUNTING_FENCE = "oxide.eviction-accounting/1"
 SLOT_CEILING_FENCE = "oxide.slots/256"
 HOLDING_FENCE = "oxide.holding/1"
+ONE_USE_FENCE = "oxide.one-use/1"
+# The numeric versions a control document can carry, one per fence
+# (`src/lease/control.rs`). A document's version names the HIGHEST fence it
+# actually carries (`Store::save`, `src/bin/oxide/store.rs`), not this binary's
+# maximum: a pool that has never admitted a build is not forced to the current
+# one. CONTROL_STATE_VERSION is therefore only the fully fenced maximum, and
+# case 01 scopes it to the control that has actually admitted a build.
+HOLDING_STATE_VERSION = CONTROL_STATE_VERSION
+SLOT_CEILING_STATE_VERSION = 8
+EVICTION_ACCOUNTING_STATE_VERSION = 7
+ONE_USE_STATE_VERSION = 6
+RECORDED_ACCOUNTING_STATE_VERSION = 5
+PREVIOUS_STATE_VERSION = 4
+OLDER_STATE_VERSION = 3
+LEGACY_FIELDS_STATE_VERSION = 2
 # The registry document this head WRITES (prune.rs REGISTRY_VERSION /
 # REGISTRY_SCHEMA): initialization creates 2/2 and a profile receipt promotes a
 # legacy 1/1 document to 2/2, so 2/2 is the current-write format case 01 must
@@ -436,6 +458,9 @@ CANDIDATE_CAPABILITY = {
     "test_controls": True,
 }
 HANDOFF_NOTICE = "handing off to the installed binary"
+# The released predecessor of the owned-outputs fence; a document carrying it is
+# version 3 (`Store::save`), never this head's write.
+LEGACY_OWNED_OUTPUTS_FENCE = "oxide.outputs/2"
 # A build script that holds Cargo running until its gate releases it
 # (bounded at 60 s), so a writer is positively Running, not pre-launch.
 GATED_BUILD = r"""
@@ -457,8 +482,10 @@ def plan() -> int:
     print("oxide#129 owned-output prune proof plan")
     print(f"supervisor bounded-test.py sha256 {SUPERVISOR}")
     print(
-        f"control format: state version {CONTROL_STATE_VERSION}, {OWNED_OUTPUTS_FENCE}, "
-        f"{SLOT_CEILING_FENCE}, {HOLDING_FENCE}"
+        f"control format: fully fenced {CONTROL_STATE_VERSION} ({OWNED_OUTPUTS_FENCE}, "
+        f"{RECORDED_ACCOUNTING_FENCE}, {EVICTION_ACCOUNTING_FENCE}, {SLOT_CEILING_FENCE}, "
+        f"{HOLDING_FENCE}); a pool that has not admitted a build keeps "
+        f"{RECORDED_ACCOUNTING_STATE_VERSION}"
     )
     print(f"wall limit {LIMIT_SECONDS} s; monitored owned scratch {SCRATCH_MIB} MiB")
     print("static allocation:")
@@ -746,6 +773,46 @@ class _Skippable:
 
 def case(case_id: str) -> _Case:
     return _Case(case_id)
+
+
+def control_state_version(document: dict) -> "int | None":
+    """The numeric version a control document implies from its OWN fences.
+
+    The product's `State` writer does not stamp a binary-wide maximum: it writes
+    the version of the highest fence the document carries (`Store::save`,
+    `src/bin/oxide/store.rs` — holding, then slot ceiling, then eviction
+    accounting, then one-use, then recorded accounting, then the owned-outputs
+    fence, then the initialization record). So an internal pool that has admitted
+    a build is fully fenced at the current maximum while a paired removable pool
+    that only received the owned-outputs fence from an initialization stays at
+    the recorded-accounting version. Deriving the expected version from the
+    document is what keeps this proof honest in both cases; `None` means a
+    present fence value is not the one this head writes, which is a failure, not
+    a version.
+    """
+
+    for name, expected, version in (
+        ("holding", HOLDING_FENCE, HOLDING_STATE_VERSION),
+        ("slot_ceiling", SLOT_CEILING_FENCE, SLOT_CEILING_STATE_VERSION),
+        (
+            "eviction_accounting",
+            EVICTION_ACCOUNTING_FENCE,
+            EVICTION_ACCOUNTING_STATE_VERSION,
+        ),
+        ("one_use_workspaces", ONE_USE_FENCE, ONE_USE_STATE_VERSION),
+        ("recorded_accounting", RECORDED_ACCOUNTING_FENCE, RECORDED_ACCOUNTING_STATE_VERSION),
+    ):
+        value = document.get(name)
+        if value is None:
+            continue
+        if value != expected:
+            return None
+        return version
+    if document.get("outputs_init") is not None or document.get("owned_outputs") == LEGACY_OWNED_OUTPUTS_FENCE:
+        return OLDER_STATE_VERSION
+    if document.get("owned_outputs") == OWNED_OUTPUTS_FENCE:
+        return PREVIOUS_STATE_VERSION
+    return LEGACY_FIELDS_STATE_VERSION
 
 
 def registry_is_current(registry: dict) -> bool:
@@ -2213,25 +2280,62 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
         # registry or row is written by hand.
         world.version_one = world.version_one_fixture()
         world.adopt(alpha)
-        for control in (world.control, os.path.join(world.control, "removable", "oxide-managed")):
+        # Both paired controls are current writes, but their NUMERIC version
+        # differs and must: a document names the highest fence it carries
+        # (`Store::save`), not this binary's maximum.
+        #   - the internal pool admitted the bootstrap build above, so the
+        #     admission gate forward-fenced it: the fully fenced maximum with
+        #     every fence;
+        #   - the paired removable pool was created by registration and only
+        #     received the owned-outputs fence from this adopt, because no
+        #     leased command has admitted into it yet: the recorded-accounting
+        #     version, with the fences it has and no others.
+        # Pinning one number for both controls asserted a fact the product never
+        # promises and the 4d5e47b counted run failed on it (state version 5 at
+        # the removable control).
+        for control, admitted in (
+            (world.control, True),
+            (os.path.join(world.control, "removable", "oxide-managed"), False),
+        ):
             state_file = os.path.join(control, "state.json")
             expect(os.path.isfile(state_file), f"paired control state {state_file} is missing")
             state = permanent.read_json(state_file)
-            # The current control format at this head (src/lease/mod.rs
-            # CONTROL_FENCE_VERSION and the fence literals, src/lease/control.rs
-            # STATE_VERSION and OWNED_OUTPUTS_FENCE): a bump fails this proof
-            # loudly instead of letting it check a stale format. Version 9
-            # requires the owned-outputs fence and all four later fences.
-            expect(state["version"] == CONTROL_STATE_VERSION, f"{control}: state version {state['version']}")
-            for name, expected in (
-                ("owned_outputs", OWNED_OUTPUTS_FENCE),
-                ("recorded_accounting", RECORDED_ACCOUNTING_FENCE),
-                ("eviction_accounting", EVICTION_ACCOUNTING_FENCE),
-                ("slot_ceiling", SLOT_CEILING_FENCE),
-                ("holding", HOLDING_FENCE),
-            ):
-                expect(state.get(name) == expected, f"{control}: {name} {state.get(name)!r} is not {expected!r}")
+            expect(
+                state.get("version") == control_state_version(state),
+                f"{control}: state version {state.get('version')} does not follow its own fences {state}",
+            )
+            expect(
+                state.get("owned_outputs") == OWNED_OUTPUTS_FENCE,
+                f"{control}: {state.get('owned_outputs')!r} is not {OWNED_OUTPUTS_FENCE!r}",
+            )
             expect("ready" in json.dumps(state.get("outputs_init")), f"{control}: {state.get('outputs_init')}")
+            if admitted:
+                expect(
+                    state.get("version") == CONTROL_STATE_VERSION,
+                    f"{control}: an admitted pool is {state.get('version')}, not {CONTROL_STATE_VERSION}",
+                )
+                for name, expected in (
+                    ("recorded_accounting", RECORDED_ACCOUNTING_FENCE),
+                    ("eviction_accounting", EVICTION_ACCOUNTING_FENCE),
+                    ("slot_ceiling", SLOT_CEILING_FENCE),
+                    ("holding", HOLDING_FENCE),
+                ):
+                    expect(
+                        state.get(name) == expected,
+                        f"{control}: {name} {state.get(name)!r} is not {expected!r}",
+                    )
+            else:
+                expect(
+                    state.get("version") == RECORDED_ACCOUNTING_STATE_VERSION,
+                    f"{control}: a pool that has not admitted a build is {state.get('version')}, "
+                    f"not the recorded-accounting version {RECORDED_ACCOUNTING_STATE_VERSION}",
+                )
+                expect(
+                    state.get("recorded_accounting") == RECORDED_ACCOUNTING_FENCE,
+                    f"{control}: {state.get('recorded_accounting')!r}",
+                )
+                for name in ("eviction_accounting", "slot_ceiling", "holding"):
+                    expect(name not in state, f"{control}: {name} is set before this pool admitted a build")
         registry = world.registry_doc()
         expect(registry_is_current(registry), registry)
         # Older-binary fence control: the exact d246d400 artifact's copy reports
@@ -3187,18 +3291,46 @@ def self_test() -> int:
             assert f"pub const {name}: u32 = super::CONTROL_FENCE_VERSION;" in control, (
                 "src/lease/control.rs no longer derives " + name + " from the control fence"
             )
-        assert "pub const SLOT_CEILING_STATE_VERSION: u32 = 8;" in control, (
-            "the raised-ceiling state version moved; case 01's ceiling fence premise changed"
-        )
+        # The per-fence numeric versions a control document can carry, and the
+        # order `Store::save` derives its version from the fences present.
+        for name, version in (
+            ("SLOT_CEILING_STATE_VERSION", SLOT_CEILING_STATE_VERSION),
+            ("EVICTION_ACCOUNTING_STATE_VERSION", EVICTION_ACCOUNTING_STATE_VERSION),
+            ("ONE_USE_STATE_VERSION", ONE_USE_STATE_VERSION),
+            ("RECORDED_ACCOUNTING_STATE_VERSION", RECORDED_ACCOUNTING_STATE_VERSION),
+            ("PREVIOUS_STATE_VERSION", PREVIOUS_STATE_VERSION),
+            ("OLDER_STATE_VERSION", OLDER_STATE_VERSION),
+            ("LEGACY_FIELDS_STATE_VERSION", LEGACY_FIELDS_STATE_VERSION),
+        ):
+            found = re.search(r"^pub const " + name + r": u32 = (\d+);$", control, re.MULTILINE)
+            assert found is not None, f"src/lease/control.rs no longer declares {name}"
+            assert int(found.group(1)) == version, (found.group(1), version)
+        store = read(os.path.join("src", "bin", "oxide", "store.rs"))
+        for line in (
+            "let recorded = fenced.recorded_accounting.is_some();",
+            "let slot_ceiling = fenced.slot_ceiling.is_some();",
+            "let holding = fenced.holding.is_some();",
+            "fenced.version = if holding {",
+            "} else if slot_ceiling {",
+            "} else if fenced.eviction_accounting.is_some() {",
+            "} else if recorded {",
+            "} else if successor {",
+            "} else if previous {",
+        ):
+            assert line in store, f"the version ladder in store.rs changed: {line}"
         # The owned-outputs fence is a literal in control.rs; the four later
         # fences live in mod.rs under the shared `CONTROL_` prefix.
         assert f'pub const OWNED_OUTPUTS_FENCE: &str = "{OWNED_OUTPUTS_FENCE}";' in control, (
             "src/lease/control.rs no longer declares this owned-outputs fence"
         )
+        assert (
+            f'pub const LEGACY_OWNED_OUTPUTS_FENCE: &str = "{LEGACY_OWNED_OUTPUTS_FENCE}";' in control
+        ), "src/lease/control.rs no longer declares this predecessor owned-outputs fence"
         for name, value in (
             ("CONTROL_RECORDED_ACCOUNTING_FENCE", RECORDED_ACCOUNTING_FENCE),
             ("CONTROL_EVICTION_ACCOUNTING_FENCE", EVICTION_ACCOUNTING_FENCE),
             ("CONTROL_SLOT_CEILING_FENCE", SLOT_CEILING_FENCE),
+            ("CONTROL_ONE_USE_FENCE", ONE_USE_FENCE),
             ("CONTROL_HOLDING_FENCE", HOLDING_FENCE),
         ):
             found = re.search(r"^pub const " + name + r': &str = "([^"]+)";$', lease, re.MULTILINE)
@@ -3226,8 +3358,9 @@ def self_test() -> int:
             registration.group(1),
             CANDIDATE_CAPABILITY["registration_version"],
         )
-        # Case 01 asserts every fence, so a new required fence cannot be pinned
-        # here and left unchecked there.
+        # Case 01 scopes the fully fenced maximum to the control that admitted a
+        # build and derives the other control's version from its own fences, so a
+        # single binary-wide number can never be asserted for both again.
         case_one = inspect.getsource(run)
         for name in (
             "OWNED_OUTPUTS_FENCE",
@@ -3237,6 +3370,58 @@ def self_test() -> int:
             "HOLDING_FENCE",
         ):
             assert name in case_one, f"case 01 no longer checks {name}"
+        assert "control_state_version(state)" in case_one, "case 01 stopped deriving the version"
+        assert "(world.control, True)," in case_one, case_one
+        assert 'os.path.join(world.control, "removable", "oxide-managed"), False' in case_one, case_one
+        assert 'state.get("version") == CONTROL_STATE_VERSION' in case_one, case_one
+        assert 'state.get("version") == RECORDED_ACCOUNTING_STATE_VERSION' in case_one, case_one
+
+        # The derived oracle itself, on synthetic documents: each rung of the
+        # product's ladder, the two owned-outputs fallbacks, a bare document and
+        # an unknown fence value, which is a failure rather than a version.
+        assert control_state_version({"holding": HOLDING_FENCE}) == HOLDING_STATE_VERSION
+        assert control_state_version({"slot_ceiling": SLOT_CEILING_FENCE}) == 8
+        assert control_state_version({"eviction_accounting": EVICTION_ACCOUNTING_FENCE}) == 7
+        assert control_state_version({"one_use_workspaces": ONE_USE_FENCE}) == 6
+        assert control_state_version({"recorded_accounting": RECORDED_ACCOUNTING_FENCE}) == 5
+        assert control_state_version({"owned_outputs": OWNED_OUTPUTS_FENCE}) == 4
+        assert control_state_version({"outputs_init": {"state": "ready"}}) == 3
+        assert control_state_version({"owned_outputs": LEGACY_OWNED_OUTPUTS_FENCE}) == 3
+        assert control_state_version({}) == 2
+        assert control_state_version({"holding": "oxide.holding/2"}) is None
+        assert control_state_version({"recorded_accounting": "oxide.accounting/2"}) is None
+        # The two documents case 01 actually reads, shape for shape: the
+        # internal pool the bootstrap build forward-fenced, and the paired
+        # removable pool that only received the owned-outputs fence.
+        assert (
+            control_state_version(
+                {
+                    "version": CONTROL_STATE_VERSION,
+                    "owned_outputs": OWNED_OUTPUTS_FENCE,
+                    "recorded_accounting": RECORDED_ACCOUNTING_FENCE,
+                    "eviction_accounting": EVICTION_ACCOUNTING_FENCE,
+                    "slot_ceiling": SLOT_CEILING_FENCE,
+                    "holding": HOLDING_FENCE,
+                    "outputs_init": {"state": "ready"},
+                }
+            )
+            == CONTROL_STATE_VERSION
+        )
+        assert (
+            control_state_version(
+                {
+                    "version": RECORDED_ACCOUNTING_STATE_VERSION,
+                    "owned_outputs": OWNED_OUTPUTS_FENCE,
+                    "recorded_accounting": RECORDED_ACCOUNTING_FENCE,
+                    "outputs_init": {"state": "ready"},
+                }
+            )
+            == RECORDED_ACCOUNTING_STATE_VERSION
+        )
+        # The maximum and the recorded-accounting rung are distinct, so the
+        # scoping in case 01 is not a no-op.
+        assert CONTROL_STATE_VERSION != RECORDED_ACCOUNTING_STATE_VERSION
+        assert HOLDING_STATE_VERSION == CONTROL_STATE_VERSION
 
     check("control format pins", control_format_pins)
 
@@ -3271,6 +3456,12 @@ def self_test() -> int:
             SLOT_CEILING_FENCE,
             HOLDING_FENCE,
         ) == ("oxide.accounting/1", "oxide.eviction-accounting/1", "oxide.slots/256", "oxide.holding/1")
+        assert (
+            HOLDING_STATE_VERSION,
+            SLOT_CEILING_STATE_VERSION,
+            EVICTION_ACCOUNTING_STATE_VERSION,
+            RECORDED_ACCOUNTING_STATE_VERSION,
+        ) == (9, 8, 7, 5)
         assert CANDIDATE_CAPABILITY == {
             "control_state_version": CONTROL_STATE_VERSION,
             "registration_version": 2,
