@@ -33,6 +33,7 @@ import io
 import json
 import os
 import plistlib
+import re
 import secrets
 import shutil
 import signal
@@ -109,6 +110,50 @@ SETTLE_REFUSALS = (CENSUS_FAULT, EOF_FAULT)
 FD_SOCKET_NAME = "fdsock"
 FD_ACK_TIMEOUT_S = 10
 NONCE_TIMEOUT_S = 10
+
+# A Cargo-shaped group inside the leader's own cooperative session (oxide#195).
+# Oxide starts Cargo with `process_group(0)`: Cargo leads a new process group in
+# the leader's session, so the pinned leader-group KILL never reaches it. The
+# cargo fixture below leads such a group and starts a "test binary" in that same
+# group; both ignore SIGTERM, so only the supervisor's proved per-identity
+# session stop can close them. The leader keeps the session alive to its
+# deadline, which is the oxide#182 shape.
+CARGO_TEST_BINARY = fixture("signal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(3600)\n")
+CARGO_SHAPED = fixture(
+    "import os, subprocess, sys, time\n"
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    f"test = subprocess.Popen([sys.executable, '-c', {CARGO_TEST_BINARY!r}])\n"
+    "open(os.environ['CASE_DIR'] + '/test.pid', 'w').write(str(test.pid))\n"
+    "open(os.environ['CASE_DIR'] + '/cargo.ready', 'w').write(str(os.getpid()))\n"
+    "time.sleep(3600)\n")
+CARGO_LEADER = fixture(
+    "import os, subprocess, sys, time\n"
+    f"cargo = subprocess.Popen([sys.executable, '-c', {CARGO_SHAPED!r}],"
+    " preexec_fn=lambda: os.setpgid(0, 0))\n"
+    "open(os.environ['CASE_DIR'] + '/cargo.pid', 'w').write(str(cargo.pid))\n"
+    "deadline = time.monotonic() + 20\n"
+    "while not os.path.exists(os.environ['CASE_DIR'] + '/cargo.ready') and time.monotonic() < deadline:\n"
+    "    time.sleep(0.02)\n"
+    "time.sleep(3600)\n")
+
+# A transient same-session member: it leads its own group in the leader's session
+# (the Cargo shape), outlives the leader's deadline KILL, and then exits on its own
+# a few seconds later. The census must record its exact row and the run must close
+# truthfully, never claiming UNCLOSED for a survivor that was gone in time.
+TRANSIENT_MEMBER = fixture(
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "parent = os.getppid()\n"
+    "until = time.monotonic() + 25\n"
+    "while os.getppid() == parent and time.monotonic() < until:\n"
+    "    time.sleep(0.02)\n"
+    "time.sleep(3.0)\n"
+    "raise SystemExit(0)\n")
+TRANSIENT_LEADER = fixture(
+    "import subprocess, sys\n"
+    f"member = subprocess.Popen([sys.executable, '-c', {TRANSIENT_MEMBER!r}],"
+    " preexec_fn=lambda: os.setpgid(0, 0))\n"
+    "open(os.environ['CASE_DIR'] + '/member.pid', 'w').write(str(member.pid))\n"
+    "time.sleep(3600)\n")
 
 # An escaped writer: it leaves the nested session with setsid, keeps the nested
 # leader's stdout/stderr write descriptors open (the pipe therefore never
@@ -248,6 +293,10 @@ def escaped_writer_problems(facts):
     for target in facts.get("signal_targets") or []:
         if target in (child, suite):
             problems.append(f"a signal targeted the escaped writer or the suite: {target}")
+    for target in facts.get("session_targets") or []:
+        # oxide#195 (ruling c096c8fc): no non-held session identity is ever
+        # signalled, so no such record may exist at all.
+        problems.append(f"a non-held session signal record exists: {target}")
     for pin in facts.get("signal_pins") or []:
         if pin not in ("leader", "monitor"):
             problems.append(f"a signal targeted an unexpected pin: {pin}")
@@ -2894,6 +2943,906 @@ def seam_fixture(base, referent):
             "tail": tail, "link": os.path.join(anchor, tail)}
 
 
+class PureSurvivors(unittest.TestCase):
+    """Oxide#195 under Tom's 2026-10-31 ruling (Queue decision c096c8fc): a
+    same-user process that is not held unreaped by the runner is never
+    signalled, because its PID could be recycled between the identity read and
+    the signal. The monitor records the survivor's exact identity in the
+    receipt and the census still decides UNCLOSED; no announcement and no
+    non-held signal exists on this path."""
+
+    def monitor(self, survivors=None):
+        ctl_r, ctl_w = os.pipe()
+        cmd_r, cmd_w = os.pipe()
+        out_r, out_w = os.pipe()
+        err_r, err_w = os.pipe()
+        for fd in (ctl_r, cmd_r, out_r, err_r, ctl_w, cmd_w, out_w, err_w):
+            self.addCleanup(os.close, fd)
+        monitor = bounded.Monitor({"run_id": "r", "inject": [],
+                                   "terminal_mode": {"mode": "strict"}},
+                                  ctl_w, cmd_r, out_r, err_r)
+        monitor.leader = [4242, 77]
+        monitor.receipt = {"survivors": [] if survivors is None else survivors}
+        os.set_blocking(ctl_r, False)
+        return monitor, ctl_r
+
+    def sent(self, ctl_r):
+        blob = b""
+        while True:
+            try:
+                chunk = os.read(ctl_r, 1 << 20)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            blob += chunk
+        return blob
+
+    def members(self, *rows):
+        return {"certain": False, "members": len(rows), "uncertain": 0,
+                "member_rows": list(rows)}
+
+    def test_a_survivor_row_carries_only_a_bounded_identity(self):
+        live = row(900, start=5, uid=501)
+        self.assertEqual(bounded.survivor_row(live),
+                         {"pid": 900, "start": 5, "ppid": 1, "pgid": 900, "uid": 501,
+                          "zombie": False})
+        self.assertEqual(set(bounded.survivor_row(live)), set(bounded.SURVIVOR_KEYS))
+        # Extra or textual fields are dropped, never copied into the receipt.
+        self.assertEqual(set(bounded.survivor_row(dict(live, command="/bin/x", note="text"))),
+                         set(bounded.SURVIVOR_KEYS))
+        for broken in (None, "row", {}, {"pid": 900}, dict(live, pid=0),
+                       dict(live, start=0), dict(live, pid=-1), dict(live, start="5"),
+                       dict(live, pid=True), dict(live, zombie="no"), dict(live, zombie=1),
+                       dict(live, uid=None), dict(live, pgid="1")):
+            with self.subTest(broken=broken):
+                self.assertIsNone(bounded.survivor_row(broken))
+
+    def test_the_monitor_records_each_identity_once_within_the_bound(self):
+        monitor, _ctl_r = self.monitor()
+        monitor.record_survivors(self.members(row(900, start=5), row(900, start=5),
+                                              {"pid": 901}, "not-a-row", None))
+        self.assertEqual(monitor.receipt["survivors"],
+                         [{"pid": 900, "start": 5, "ppid": 1, "pgid": 900, "uid": 501,
+                           "zombie": False}])
+        monitor.record_survivors(self.members(row(900, start=5)))  # same identity: no duplicate
+        self.assertEqual(len(monitor.receipt["survivors"]), 1)
+        # The first observation of one identity wins; a new identity is a new row.
+        monitor.record_survivors(self.members(row(900, start=5, zombie=True), row(901, start=6)))
+        self.assertEqual([(item["pid"], item["start"], item["zombie"])
+                          for item in monitor.receipt["survivors"]],
+                         [(900, 5, False), (901, 6, False)])
+        monitor, _ctl_r = self.monitor()
+        rows = [row(1000 + index, start=index + 1) for index in range(bounded.SURVIVOR_MAX + 6)]
+        monitor.record_survivors(self.members(*rows))
+        self.assertEqual(len(monitor.receipt["survivors"]), bounded.SURVIVOR_MAX)
+        self.assertEqual([item["pid"] for item in monitor.receipt["survivors"]],
+                         [1000 + index for index in range(bounded.SURVIVOR_MAX)])
+
+    def test_recording_a_survivor_sends_and_signals_nothing(self):
+        monitor, ctl_r = self.monitor()
+        calls = []
+
+        def refuse(*args):
+            calls.append(args)
+            raise AssertionError("the survivor path must never signal")
+
+        with patched(os, "kill", refuse), patched(os, "killpg", refuse):
+            monitor.record_survivors(self.members(row(900, start=5), row(901, start=6)))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.sent(ctl_r), b"", "the survivor path must never send a message")
+        self.assertEqual(len(monitor.receipt["survivors"]), 2)
+        # No closure claim either: the census/receipt decision is untouched.
+        self.assertNotIn("census", monitor.receipt)
+
+    def test_no_supervisor_path_signals_an_unheld_process(self):
+        # The structural regression for the ruling: every kill/killpg call site
+        # in the supervisor must be one of the custody-bound functions, so a
+        # checked-then-signalled non-child PID cannot be reintroduced.
+        source = Path(bounded.__file__).read_text()
+        tree = ast.parse(source)
+        def callee(node):
+            if isinstance(node, ast.Attribute):
+                return {f"{getattr(node.value, 'id', '?')}.{node.attr}"}
+            if isinstance(node, ast.IfExp):  # `(os.killpg if group else os.kill)(...)`
+                return callee(node.body) | callee(node.orelse)
+            return set()
+
+        sites = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                for inner in ast.walk(node):
+                    if not isinstance(inner, ast.Call):
+                        continue
+                    for name in callee(inner.func) & {"os.kill", "os.killpg"}:
+                        sites.setdefault(node.name, set()).add(name)
+        self.assertEqual(sites, {
+            # a direct child this process still holds unreaped (pid cannot be reused)
+            "close_own_child": {"os.kill"},
+            # the pinned leader/monitor, checked with held_unreaped before the call
+            "signal_pinned": {"os.kill", "os.killpg"},
+            # the pinned detach child, identity- and parentage-checked
+            "signal_detach_child": {"os.kill"},
+            # a signal to its own PID inside the fork child (injections)
+            "launch_leader": {"os.kill"},
+            # a liveness probe of the pinned group, never a signal
+            "stop_leader": {"os.killpg"},
+        }, sites)
+        self.assertNotIn("session_stop", bounded.FIELDS)
+        for forbidden in ("session_signal", "session_member_refused", "session_stop_attempt"):
+            self.assertNotIn(forbidden, source)
+
+    def test_the_summary_line_states_the_residual_without_claiming_a_signal(self):
+        self.assertIsNone(bounded.survivors_line([]))
+        self.assertIsNone(bounded.survivors_line(None))
+        self.assertIsNone(bounded.survivors_line([], "closed"))
+        one = bounded.survivors_line([{"pid": 900, "start": 5}], "UNCLOSED")
+        self.assertIn("1 same-session survivor(s) not signalled", one)
+        self.assertIn("900/5", one)
+        self.assertIn("UNCLOSED", one)
+        self.assertIn("scratch is kept", one)
+        self.assertNotIn("limit", one)
+        many = bounded.survivors_line([{"pid": 900 + index, "start": 5}
+                                       for index in range(10)], "UNCLOSED")
+        self.assertIn("900/5", many)
+        self.assertIn("+2 more", many)
+        self.assertEqual(many.count("/5"), 8)
+
+    def test_a_transient_survivor_then_a_certain_empty_census_reports_closed(self):
+        # Exact-head review: a survivor observed after the stop may exit by
+        # itself, so a later certain-empty census closes the run. The line must
+        # never claim UNCLOSED or a kept scratch for a closed run, and the
+        # summary must take the run's own final closure rather than the rows.
+        transient = bounded.survivors_line([{"pid": 900, "start": 5}], "closed")
+        self.assertIn("900/5", transient)
+        self.assertIn("gone by the deciding census", transient)
+        self.assertIn("the run closed", transient)
+        self.assertNotIn("UNCLOSED", transient)
+        self.assertNotIn("kept", transient)
+        unknown = bounded.survivors_line([{"pid": 900, "start": 5}])
+        self.assertIn("the deciding census fixes the outcome", unknown)
+        self.assertNotIn("UNCLOSED", unknown)
+        self.assertNotIn("closed;", unknown)
+        # The summary composes the line from the receipt's own outcome, so the
+        # transient case closes truthfully end to end.
+        source = " ".join(inspect.getsource(bounded.Monitor.summary).split())
+        self.assertIn('survivors_line(receipt.get("survivors"), outcome.get("closure"),'
+                      ' join.get("joined"))', source)
+        self.assertNotIn('survivors_line(receipt.get("survivors"), "UNCLOSED")', source)
+        # And the persistent-survivor regression still holds: the same rows with
+        # an UNCLOSED outcome keep the honest residual.
+        persistent = bounded.survivors_line([{"pid": 900, "start": 5}], "UNCLOSED")
+        self.assertIn("the run stays UNCLOSED and its scratch is kept", persistent)
+        self.assertNotIn("the run closed", persistent)
+
+    def test_a_transient_survivor_records_a_row_and_does_not_decide_closure(self):
+        # The monitor records the row and makes no closure claim of its own: the
+        # receipt decision stays with the census, so a later empty round can win.
+        monitor, _ctl_r = self.monitor()
+        monitor.record_survivors(self.members(row(900, start=5)))
+        self.assertEqual([item["pid"] for item in monitor.receipt["survivors"]], [900])
+        self.assertNotIn("outcome", monitor.receipt)
+        self.assertNotIn("census", monitor.receipt)
+        # A second, certainly empty round adds nothing and closes nothing here.
+        monitor.record_survivors({"certain": True, "members": 0, "uncertain": 0, "member_rows": []})
+        self.assertEqual(len(monitor.receipt["survivors"]), 1)
+
+    @contextlib.contextmanager
+    def settled_census(self):
+        """A certain-empty census stand-in, for scripted decisions."""
+
+        class SettledCensus:
+            def __init__(self, sid, terminal_allowed=False, ancestors=()):
+                self.stats = {}
+
+            def round(self):
+                return {"certain": True, "members": 0, "uncertain": 0, "member_rows": [],
+                        "uncertain_rows": [], "terminal_count_status": "valid",
+                        "terminal_nonwriters": 0}
+
+        saved = bounded.Census
+        bounded.Census = SettledCensus
+        try:
+            yield
+        finally:
+            bounded.Census = saved
+
+    def publishable_monitor(self):
+        monitor, ctl_r = self.monitor()
+        evidence = Path(tempfile.mkdtemp(prefix="survivors.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(evidence), True)
+        monitor.ctx = {"run_id": "r", "evidence": str(evidence)}
+        monitor.receipt.update({"phase": None, "custodian": [], "census": None, "census_rounds": 0})
+        return monitor, evidence, ctl_r
+
+    def test_a_recorded_survivor_reaches_the_published_receipt(self):
+        # Review finding: a row that never reaches the receipt on disk is not
+        # evidence. Recording plus publication must leave the row in the file.
+        monitor, evidence, _ctl_r = self.publishable_monitor()
+        monitor.record_survivors(self.members(row(900, start=5)))
+        monitor.publish("unclosed: scratch_kept")
+        published = json.loads((evidence / "receipt.json").read_text())
+        self.assertEqual([(item["pid"], item["start"], item["zombie"])
+                          for item in published["survivors"]], [(900, 5, False)])
+        self.assertEqual(published["phase"], "unclosed: scratch_kept")
+
+    def test_the_round_records_its_survivors_before_it_reports_them(self):
+        # The custodian can decide on the census message and the monitor can
+        # publish immediately after it, so the row must already be recorded when
+        # the message is sent. Driving the real loop pins the ordering.
+        monitor, _evidence, _ctl_r = self.publishable_monitor()
+        monitor.census_stop = OneShotStop()
+        seen = []
+
+        class SurvivorCensus(FakeCensus):
+            def round(self):
+                return {"certain": False, "members": 1, "uncertain": 0,
+                        "member_rows": [row(900, start=5)], "uncertain_rows": [],
+                        "terminal_count_status": "valid", "terminal_nonwriters": 0}
+
+        original_send = monitor.send
+
+        def send(message_type, **fields):
+            if message_type == "census":
+                seen.append(len(monitor.receipt["survivors"]))
+            return original_send(message_type, **fields)
+
+        monitor.send = send
+        saved = bounded.Census
+        bounded.Census = SurvivorCensus
+        try:
+            monitor.census_loop(7)
+        finally:
+            bounded.Census = saved
+        self.assertEqual(seen, [1], "the census message was sent before the survivor was recorded")
+        self.assertEqual([item["pid"] for item in monitor.receipt["survivors"]], [900])
+
+    def test_the_census_thread_is_joined_before_the_final_publication(self):
+        # A late append after publication would silently drop evidence: a prompt
+        # join must land the row first and record that the list is complete.
+        monitor, evidence, _ctl_r = self.publishable_monitor()
+        monitor.census_stop = OneShotStop()
+
+        def late_round():
+            time.sleep(0.05)
+            monitor.record_survivors(self.members(row(900, start=5)))
+
+        monitor.census_thread = threading.Thread(target=late_round)
+        monitor.census_thread.start()
+        record = monitor.join_census(5)
+        self.assertEqual(record["joined"], True)
+        self.assertNotIn("frozen", record)
+        self.assertEqual(record["rows"], 1)
+        monitor.publish("unclosed: scratch_kept")
+        published = json.loads((evidence / "receipt.json").read_text())
+        self.assertEqual([item["pid"] for item in published["survivors"]], [900])
+        self.assertEqual(published["census_join"]["joined"], True)
+        # Idempotent and never blocking: an absent thread and a spent bound are
+        # both non-verdicts, never exceptions.
+        self.assertTrue(monitor.join_census(5)["joined"])
+        self.assertTrue(bounded.Monitor.join_census(self.monitor()[0], 0)["joined"])
+        self.assertTrue(bounded.Monitor.join_census(self.monitor()[0], -5)["joined"])
+
+    def test_an_expired_join_freezes_the_published_list_and_says_so(self):
+        # Reviewer finding: a bounded join may expire. The published receipt must
+        # then be an honest, explicitly incomplete prefix: no row may land after
+        # the publication, the receipt records `joined: false`/`frozen: true`, and
+        # the summary says later rows may be missing instead of implying a
+        # complete record. This is the discriminating timeout-path regression.
+        monitor, evidence, _ctl_r = self.publishable_monitor()
+        monitor.census_stop = OneShotStop()
+        monitor.record_survivors(self.members(row(900, start=5)))  # prefix before the stall
+        release = threading.Event()
+        appended = []
+
+        def stalled_round():
+            release.wait(5)
+            monitor.record_survivors(self.members(row(901, start=6)))
+            appended.append(True)
+
+        monitor.census_thread = threading.Thread(target=stalled_round)
+        monitor.census_thread.start()
+        record = monitor.join_census(0.05)
+        self.assertEqual(record["joined"], False)
+        self.assertIs(record["frozen"], True)
+        self.assertEqual(record["rows"], 1)
+        self.assertIs(monitor.census_frozen, True)
+        try:
+            monitor.publish("unclosed: scratch_kept")
+            published = json.loads((evidence / "receipt.json").read_text())
+            self.assertEqual([item["pid"] for item in published["survivors"]], [900])
+            self.assertEqual(published["census_join"]["joined"], False)
+            self.assertIs(published["census_join"]["frozen"], True)
+            line = bounded.survivors_line(published["survivors"], "UNCLOSED",
+                                          published["census_join"].get("joined"))
+            self.assertIn("may be missing", line)
+            self.assertIn("the run stays UNCLOSED and its scratch is kept", line)
+            self.assertNotIn("the run closed", line)
+            # The stalled round finishes late: its row must never appear behind
+            # the published receipt, and the receipt stays the frozen prefix.
+            release.set()
+            monitor.census_thread.join(5)
+            self.assertFalse(monitor.census_thread.is_alive())
+            self.assertEqual(appended, [True])
+            self.assertEqual([item["pid"] for item in monitor.receipt["survivors"]], [900])
+            on_disk = json.loads((evidence / "receipt.json").read_text())
+            self.assertEqual([item["pid"] for item in on_disk["survivors"]], [900])
+            # A later join call never rewrites the published record, even though
+            # the thread has now finished: the frozen prefix stays the record.
+            again = monitor.join_census(5)
+            self.assertIs(again["joined"], False)
+            self.assertIs(again["frozen"], True)
+            self.assertEqual(monitor.receipt["census_join"]["rows"], 1)
+            # A completed join adds no caveat, and a completed closed run still
+            # reports the truth without one.
+            self.assertNotIn("may be missing",
+                             bounded.survivors_line([{"pid": 900, "start": 5}], "closed", True))
+            false_closed = bounded.survivors_line([{"pid": 900, "start": 5}], "closed", False)
+            self.assertNotIn("so the run closed", false_closed)
+            self.assertIn("the run is not closed", false_closed)
+            self.assertIn("may be missing",
+                          bounded.survivors_line([{"pid": 900, "start": 5}], "UNCLOSED", False))
+        finally:
+            release.set()
+
+    def test_the_join_record_is_published_and_never_decides_closure(self):
+        # The join record is evidence about the record, not a verdict: a monitor
+        # that produced it makes no closure claim of its own.
+        monitor, evidence, _ctl_r = self.publishable_monitor()
+        monitor.census_thread = None
+        record = monitor.join_census(1)
+        self.assertEqual(record, {"joined": True, "started": False, "bound_s": 1.0,
+                                  "waited_ns": record["waited_ns"], "rows": 0,
+                                  "deciding": None, "final": None})
+        monitor.publish("started: incomplete")
+        published = json.loads((evidence / "receipt.json").read_text())
+        self.assertEqual(published["census_join"]["joined"], True)
+        self.assertNotIn("outcome", published)
+        self.assertNotIn("frozen", published["census_join"])
+
+    def custodian_stub(self):
+        custodian = bounded.Custodian(["true"])
+        custodian.run_id = "r"
+        read_end, custodian.cmd_w = os.pipe()
+        self.addCleanup(os.close, read_end)
+        self.addCleanup(os.close, custodian.cmd_w)
+        os.set_blocking(read_end, False)
+        custodian.guard = bounded.Guard(0)
+        custodian.leader = 4242
+        custodian.leader_start = 77
+        return custodian, read_end
+
+    def test_an_expired_join_turns_a_cleanup_decision_into_an_honest_non_closure(self):
+        # Supervisor invariant: an incomplete join NEVER yields certain closure.
+        # The run keeps its root, the persisted verdict becomes UNCLOSED with the
+        # reason, and the custodian latches the same reason so it cannot exit as a
+        # pass. This fails on the pre-fix source, where the join answer was
+        # ignored and the closed outcome stood.
+        monitor, evidence, ctl_r = self.publishable_monitor()
+        monitor.receipt["outcome"] = {"closure": "closed", "status": 0, "fault": None,
+                                      "deadline": False, "launched": True}
+        self.assertIn('if decision == "cleanup" and not settled:',
+                      " ".join(inspect.getsource(bounded.Monitor.run).split()))
+        join = {"joined": False, "frozen": True, "rows": 1, "bound_s": 0.05, "waited_ns": 1}
+        reason = monitor.refuse_incomplete_closure(join)
+        self.assertIs(monitor.receipt["census_join"]["refused"], True)
+        # The refusal is final: a later join (or a second refusal pass) cannot make
+        # the record look complete again.
+        self.assertIs(monitor.join_census(5)["joined"], False)
+        outcome = monitor.receipt["outcome"]
+        self.assertEqual(outcome["closure"], "UNCLOSED")
+        self.assertEqual(outcome["fault"], "closure not established: " + reason)
+        self.assertIs(outcome["deadline"], False)
+        monitor.publish("census_join_incomplete: scratch_kept")
+        published = json.loads((evidence / "receipt.json").read_text())
+        self.assertEqual(published["outcome"]["closure"], "UNCLOSED")
+        self.assertEqual(published["phase"], "census_join_incomplete: scratch_kept")
+        # The message is well formed and the custodian turns it into a latched
+        # fault: closure is refused and the exit is not a pass.
+        blob = os.read(ctl_r, 1 << 16).decode()
+        lines = [line for line in blob.splitlines() if '"census_join_incomplete"' in line]
+        self.assertEqual(len(lines), 1, blob)
+        message = json.loads(lines[0])
+        self.assertIsNone(bounded.malformed(message))
+        custodian, _cmd = self.custodian_stub()
+        custodian.monitor_seq = 0
+        custodian.accept(message)
+        self.assertIn("closure not established", custodian.guard.fault or "")
+        self.assertTrue(custodian.census_uncertain)
+        self.assertFalse(custodian.closure(True))
+        self.assertEqual(bounded.exit_code(False, custodian.guard.fault, True, 0), 125)
+        self.assertEqual(bounded.exit_code(True, custodian.guard.fault, True, 0), 124)
+        # A completed join takes none of this path: the closed outcome stands and
+        # no message is sent.
+        clean, clean_evidence, clean_ctl = self.publishable_monitor()
+        clean.receipt["outcome"] = {"closure": "closed", "status": 0, "fault": None,
+                                    "deadline": False, "launched": True}
+        clean.census_thread = None
+        self.assertIs(clean.join_census(1)["joined"], True)
+        clean.publish("closure_established: cleanup_pending")
+        kept = json.loads((clean_evidence / "receipt.json").read_text())
+        self.assertEqual(kept["outcome"]["closure"], "closed")
+        self.assertNotIn("refused", kept["census_join"])
+        with self.assertRaises(BlockingIOError):  # nothing was sent: no message
+            os.read(clean_ctl, 1 << 16)
+
+    def test_a_late_census_round_cannot_be_omitted_or_pass_through_run(self):
+        # Reviewer finding: exercise the whole run path, including finalisation.
+        # A cleanup decision arrives while the census thread is still inside a
+        # round that will later observe a member. The bounded join expires, the
+        # decision is refused, the late row can never reach the published receipt,
+        # the owned scratch is kept, and nothing may pass.
+        sandbox = Path(tempfile.mkdtemp(prefix="late-census.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(sandbox), True)
+        evidence = sandbox / "evidence"
+        ctx = {"run_id": "late-census", "command": ["/bin/true"], "limit_s": 300,
+               "adopted": None, "evidence_arg": str(evidence), "root_parent": str(sandbox),
+               "budget": 512 * 1024 * 1024,
+               "start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "inject": []}
+        ctl_r, ctl_w = os.pipe()
+        cmd_r, cmd_w = os.pipe()
+        for fd in (ctl_r, cmd_w):
+            self.addCleanup(os.close, fd)
+        # The monitor's drain threads get immediate EOF (its own read fds).
+        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, os.open(os.devnull, os.O_RDONLY),
+                                  os.open(os.devnull, os.O_RDONLY))
+        sent, lines = [], []
+        release = threading.Event()
+
+        def send(message_type, **fields):
+            sent.append((message_type, dict(fields)))
+
+        class LateCensus:
+            def __init__(self, sid, terminal_allowed=False, ancestors=()):
+                self.stats = {}
+
+            def round(self):
+                release.wait(15)  # still inside a round when the join expires
+                return {"certain": False, "members": 1, "uncertain": 0,
+                        "member_rows": [row(900, start=5)], "uncertain_rows": [],
+                        "terminal_count_status": "valid", "terminal_nonwriters": 0}
+
+        monitor.send = send
+        try:
+            with patched(bounded, "report", lines.append), patched(bounded, "Census", LateCensus):
+                for number, command in enumerate((
+                        {"type": "leader", "pid": os.getpid()},
+                        {"type": "stopped", "sent": 0},
+                        {"type": "cleanup", "outcome": {"closure": "closed", "status": 0,
+                                                        "fault": None, "deadline": False,
+                                                        "launched": True}}), start=1):
+                    os.write(cmd_w, (json.dumps(dict(command, run="late-census", seq=number))
+                                     + "\n").encode())
+                monitor.run()
+        finally:
+            release.set()
+            if monitor.census_thread is not None:
+                monitor.census_thread.join(15)
+        persisted = json.loads((evidence / "receipt.json").read_text())
+        # No pass: the refused decision is UNCLOSED, with the reason on the record.
+        self.assertEqual(persisted["phase"], "monitor_complete: pending_custodian")
+        self.assertEqual(persisted["outcome"]["closure"], "UNCLOSED")
+        self.assertIn("census thread did not finish before publication",
+                      persisted["outcome"]["fault"])
+        join = persisted["census_join"]
+        self.assertIs(join["joined"], False)
+        self.assertIs(join["frozen"], True)
+        self.assertIs(join["refused"], True)
+        self.assertIs(join["started"], True)
+        # The late round observed a member, but it cannot land behind the receipt.
+        self.assertEqual(persisted["survivors"], [])
+        scratch = Path(ctx["scratch"])
+        self.assertTrue(scratch.is_dir(), "the refused run removed its owned scratch")
+        self.assertEqual(sorted(path.name for path in scratch.iterdir()), [])
+        # The summary names the incomplete census and never claims closure, even
+        # with an empty survivor prefix.
+        self.assertTrue(any("no same-session survivor row was recorded" in line for line in lines),
+                        lines)
+        self.assertFalse(any("so the run closed" in line for line in lines), lines)
+        self.assertFalse(any("closure_established" in line for line in lines), lines)
+        # No cleanup was attempted: no cleanup phase was ever published.
+        self.assertNotIn("cleanup: owned scratch not fully removed", " ".join(lines))
+        kinds = [kind for kind, _fields in sent]
+        self.assertIn("census_join_incomplete", kinds)
+        self.assertIn("monitor_complete", kinds)
+        # The custodian turns that message into a latched fault: not a pass.
+        custodian, _cmd = self.custodian_stub()
+        custodian.run_id = "late-census"
+        custodian.monitor_seq = 0
+        custodian.leader = monitor.leader[0]
+        custodian.leader_start = monitor.leader[1]
+        message = dict(next(fields for kind, fields in sent if kind == "census_join_incomplete"),
+                       type="census_join_incomplete", run="late-census", seq=1,
+                       at=bounded.now_ns(), leader=monitor.leader)
+        self.assertIsNone(bounded.malformed(message))
+        custodian.accept(message)
+        self.assertIn("closure not established", custodian.guard.fault or "")
+        self.assertEqual(bounded.exit_code(False, custodian.guard.fault, True, 0), 125)
+
+    def test_a_round_that_returns_during_the_join_binds_the_deciding_census(self):
+        # Reviewer finding: a stalled round may return between the stop and the
+        # final publication. It must never be mistaken for the deciding census,
+        # and a final round that reports a member must refuse closure while its
+        # row is kept as evidence. Releasing the round during the join (not after
+        # run() returns) is the interleaving this exercises.
+        sandbox = Path(tempfile.mkdtemp(prefix="mid-join.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(sandbox), True)
+        evidence = sandbox / "evidence"
+        ctx = {"run_id": "mid-join", "command": ["/bin/true"], "limit_s": 300,
+               "adopted": None, "evidence_arg": str(evidence), "root_parent": str(sandbox),
+               "budget": 512 * 1024 * 1024,
+               "start_ns": time.clock_gettime_ns(time.CLOCK_UPUPTIME_RAW)
+               if False else time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "inject": []}
+        ctl_r, ctl_w = os.pipe()
+        cmd_r, cmd_w = os.pipe()
+        for fd in (ctl_r, cmd_w):
+            self.addCleanup(os.close, fd)
+        # The monitor's drain threads get immediate EOF (its own read fds).
+        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, os.open(os.devnull, os.O_RDONLY),
+                                  os.open(os.devnull, os.O_RDONLY))
+        sent, lines, written = [], [], []
+        release = threading.Event()
+
+        class InterleavedCensus:
+            def __init__(self, sid, terminal_allowed=False, ancestors=()):
+                self.stats = {}
+                self.rounds = 0
+
+            def round(self):
+                self.rounds += 1
+                if self.rounds == 1:
+                    return {"certain": True, "members": 0, "uncertain": 0, "member_rows": [],
+                            "uncertain_rows": [], "terminal_count_status": "valid",
+                            "terminal_nonwriters": 0}
+                release.wait(15)  # still inside the round when the stop is bound
+                return {"certain": False, "members": 1, "uncertain": 0,
+                        "member_rows": [row(900, start=5)], "uncertain_rows": [],
+                        "terminal_count_status": "valid", "terminal_nonwriters": 0}
+
+        real_send = monitor.send
+        census_seqs = []
+
+        def decide(seq):
+            os.write(cmd_w, (json.dumps({
+                "type": "cleanup", "run": "mid-join",
+                "census": {"seq": seq, "after": 2, "certain": True, "members": 0,
+                           "uncertain": 0},
+                "outcome": {"closure": "closed", "status": 0, "fault": None,
+                            "deadline": False, "launched": True}}) + "\n").encode())
+
+        def send(message_type, **fields):
+            if monitor.stop.is_set():  # the run is over: never write to a closing pipe
+                return monitor.seq
+            seq = real_send(message_type, **fields)
+            sent.append((message_type, dict(fields)))
+            if message_type == "census" and not written:
+                # The decision lands after the next round has started, so that
+                # round is still in flight when the deciding census is bound.
+                written.append(True)
+                census_seqs.append(seq)
+                threading.Timer(0.35, lambda: decide(seq)).start()
+            return seq
+
+        def releaser():
+            # Release only once the deciding census is bound: that is inside the
+            # bounded join, before the final publication.
+            until = time.monotonic() + 15
+            while not monitor.census_bound and time.monotonic() < until:
+                time.sleep(0.005)
+            release.set()
+
+        monitor.send = send
+        helper = threading.Thread(target=releaser)
+        try:
+            with patched(bounded, "report", lines.append), \
+                    patched(bounded, "Census", InterleavedCensus):
+                for number, command in enumerate((
+                        {"type": "leader", "pid": os.getpid()},
+                        {"type": "stopped", "sent": 0}), start=1):
+                    os.write(cmd_w, (json.dumps(dict(command, run="mid-join", seq=number))
+                                     + "\n").encode())
+                helper.start()
+                monitor.run()
+        finally:
+            release.set()
+            helper.join(15)
+            if monitor.census_thread is not None:
+                monitor.census_thread.join(15)
+        persisted = json.loads((evidence / "receipt.json").read_text())
+        # The deciding census is the certainly empty round, and it never changes.
+        self.assertEqual(persisted["deciding_census"],
+                         {"certain": True, "members": 0, "uncertain": 0})
+        self.assertEqual(persisted["census_rounds"], 1)
+        self.assertEqual(persisted["census_rounds_at_stop"], 1)
+        self.assertEqual(persisted["census"], {"certain": True, "members": 0, "uncertain": 0,
+                                               "member_rows": [], "uncertain_rows": [],
+                                               "terminal_count_status": "valid",
+                                               "terminal_nonwriters": 0})
+        # The late round is a post-decision observation, clearly labelled.
+        self.assertEqual(persisted["census_after_stop"],
+                         {"rounds": 1, "last": {"certain": False, "members": 1,
+                                                "uncertain": 0}})
+        join = persisted["census_join"]
+        self.assertIs(join["joined"], True)
+        self.assertIs(join["started"], True)
+        self.assertEqual(join["deciding"], {"certain": True, "members": 0, "uncertain": 0})
+        self.assertEqual(join["final"], {"certain": False, "members": 1, "uncertain": 0})
+        # The deciding census is the message the decision named, resolved against
+        # the monitor's own record of what it sent.
+        self.assertEqual(persisted["deciding_census_seq"], census_seqs[0])
+        self.assertEqual(persisted["deciding_census"],
+                         {"certain": True, "members": 0, "uncertain": 0})
+        self.assertEqual(persisted["custodian_census"]["seq"], census_seqs[0])
+        # Closure is refused on the FINAL census, not the stale deciding one, and
+        # the late row is kept as evidence instead of being dropped.
+        self.assertEqual(persisted["outcome"]["closure"], "UNCLOSED")
+        self.assertIn("final census round was not certainly empty",
+                      persisted["outcome"]["fault"])
+        self.assertEqual([item["pid"] for item in persisted["survivors"]], [900])
+        self.assertTrue(Path(ctx["scratch"]).is_dir(), "the refused run removed its scratch")
+        self.assertFalse(any("so the run closed" in line for line in lines), lines)
+        self.assertTrue(any("the run stays UNCLOSED and its scratch is kept" in line
+                            for line in lines), lines)
+        kinds = [kind for kind, _fields in sent]
+        self.assertIn("census_join_incomplete", kinds)
+        custodian, _cmd = self.custodian_stub()
+        custodian.run_id = "mid-join"
+        custodian.monitor_seq = 0
+        custodian.leader = monitor.leader[0]
+        custodian.leader_start = monitor.leader[1]
+        message = dict(next(fields for kind, fields in sent if kind == "census_join_incomplete"),
+                       type="census_join_incomplete", run="mid-join", seq=1,
+                       at=bounded.now_ns(), leader=monitor.leader)
+        self.assertIsNone(bounded.malformed(message))
+        custodian.accept(message)
+        self.assertIn("closure not established", custodian.guard.fault or "")
+        self.assertEqual(bounded.exit_code(False, custodian.guard.fault, True, 0), 125)
+
+    def test_the_deciding_census_is_the_message_the_decision_named(self):
+        # Reviewer finding: the labelled deciding census must be the census
+        # MESSAGE the custodian's decision named, not merely the last round the
+        # monitor happened to complete. Here a member round completes (and is
+        # sent) BEFORE the decision arrives, while the decision names the earlier
+        # certainly empty message: the receipt must bind the deciding census to
+        # that message, keep the member round visible as the census at the stop,
+        # and refuse closure on the final round.
+        sandbox = Path(tempfile.mkdtemp(prefix="named-census.", dir=str(SCRATCH))).resolve()
+        self.addCleanup(shutil.rmtree, str(sandbox), True)
+        evidence = sandbox / "evidence"
+        ctx = {"run_id": "named-census", "command": ["/bin/true"], "limit_s": 300,
+               "adopted": None, "evidence_arg": str(evidence), "root_parent": str(sandbox),
+               "budget": 512 * 1024 * 1024,
+               "start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "inject": []}
+        ctl_r, ctl_w = os.pipe()
+        cmd_r, cmd_w = os.pipe()
+        for fd in (ctl_r, cmd_w):
+            self.addCleanup(os.close, fd)
+        # The monitor's drain threads get immediate EOF (its own read fds).
+        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, os.open(os.devnull, os.O_RDONLY),
+                                  os.open(os.devnull, os.O_RDONLY))
+        sent, lines, census_seqs = [], [], []
+        empty = {"certain": True, "members": 0, "uncertain": 0, "member_rows": [],
+                 "uncertain_rows": [], "terminal_count_status": "valid",
+                 "terminal_nonwriters": 0}
+        member = {"certain": False, "members": 1, "uncertain": 0,
+                  "member_rows": [row(900, start=5)], "uncertain_rows": [],
+                  "terminal_count_status": "valid", "terminal_nonwriters": 0}
+        state = {"rounds": 0}
+
+        class NamedCensus:
+            def __init__(self, sid, terminal_allowed=False, ancestors=()):
+                self.stats = {}
+
+            def round(self):
+                state["rounds"] += 1
+                if state["rounds"] == 1:
+                    return dict(empty)
+                if state["rounds"] == 2:
+                    return dict(member)  # completes and is sent before the decision
+                # Round 3: the decision is written now, naming round 1's message,
+                # so the bind happens while this round is in flight.
+                os.write(cmd_w, (json.dumps({
+                    "type": "cleanup", "run": "named-census",
+                    "census": {"seq": census_seqs[0], "after": 2, "certain": True,
+                               "members": 0, "uncertain": 0},
+                    "outcome": {"closure": "closed", "status": 0, "fault": None,
+                                "deadline": False, "launched": True}}) + "\n").encode())
+                # Stay in flight until the deciding census is bound, so this round
+                # is unambiguously post-decision.
+                until = time.monotonic() + 15
+                while not monitor.census_bound and time.monotonic() < until:
+                    time.sleep(0.005)
+                return dict(member)
+
+        real_send = monitor.send
+
+        def send(message_type, **fields):
+            if monitor.stop.is_set():
+                return monitor.seq
+            seq = real_send(message_type, **fields)
+            sent.append((message_type, dict(fields)))
+            if message_type == "census":
+                census_seqs.append(seq)
+            return seq
+
+        monitor.send = send
+        try:
+            with patched(bounded, "report", lines.append), patched(bounded, "Census", NamedCensus):
+                for number, command in enumerate((
+                        {"type": "leader", "pid": os.getpid()},
+                        {"type": "stopped", "sent": 0}), start=1):
+                    os.write(cmd_w, (json.dumps(dict(command, run="named-census", seq=number))
+                                     + "\n").encode())
+                monitor.run()
+        finally:
+            release = getattr(monitor, "census_thread", None)
+            if release is not None:
+                release.join(15)
+        persisted = json.loads((evidence / "receipt.json").read_text())
+        # The decision named message 1, which is certainly empty: that is the
+        # deciding census, and it is bound by the monitor's own message record.
+        self.assertEqual(persisted["custodian_census"]["seq"], census_seqs[0])
+        self.assertEqual(persisted["deciding_census_seq"], census_seqs[0])
+        self.assertEqual(persisted["deciding_census"],
+                         {"certain": True, "members": 0, "uncertain": 0})
+        # The last round completed before the bind is the member round - clearly
+        # distinguished from the deciding census rather than relabelled as it.
+        self.assertEqual(persisted["census_rounds"], 2)
+        self.assertEqual(persisted["census"]["members"], 1)
+        self.assertNotEqual(persisted["deciding_census"], {"certain": False, "members": 1,
+                                                           "uncertain": 0})
+        # Round 3 (final) reports a member: closure is refused, on the record.
+        self.assertEqual(persisted["census_after_stop"]["rounds"], 1)
+        self.assertEqual(persisted["outcome"]["closure"], "UNCLOSED")
+        self.assertIn("final census round was not certainly empty", persisted["outcome"]["fault"])
+        self.assertEqual(persisted["census_join"]["deciding"],
+                         {"certain": True, "members": 0, "uncertain": 0})
+        self.assertTrue(Path(ctx["scratch"]).is_dir())
+        self.assertFalse(any("so the run closed" in line for line in lines), lines)
+
+    def test_a_decision_naming_no_sent_census_message_cannot_close(self):
+        # The other side of the binding: a decision that names nothing, or a
+        # message this monitor never sent, refuses closure even when the census
+        # thread finished and the final round is certainly empty.
+        for named in (None, {"seq": 999999, "after": 2, "certain": True, "members": 0,
+                             "uncertain": 0}, {"seq": True, "certain": True, "members": 0,
+                                              "uncertain": 0}, "not-an-object"):
+            with self.subTest(named=named):
+                sandbox = Path(tempfile.mkdtemp(prefix="unnamed-census.",
+                                                dir=str(SCRATCH))).resolve()
+                self.addCleanup(shutil.rmtree, str(sandbox), True)
+                evidence = sandbox / "evidence"
+                ctx = {"run_id": "unnamed-census", "command": ["/bin/true"], "limit_s": 300,
+                       "adopted": None, "evidence_arg": str(evidence),
+                       "root_parent": str(sandbox), "budget": 512 * 1024 * 1024,
+                       "start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "inject": []}
+                ctl_r, ctl_w = os.pipe()
+                cmd_r, cmd_w = os.pipe()
+                for fd in (ctl_r, cmd_w):
+                    self.addCleanup(os.close, fd)
+                monitor = bounded.Monitor(ctx, ctl_w, cmd_r,
+                                          os.open(os.devnull, os.O_RDONLY),
+                                          os.open(os.devnull, os.O_RDONLY))
+                sent = []
+                real_send = monitor.send
+
+                def send(message_type, **fields):
+                    if monitor.stop.is_set():
+                        return monitor.seq
+                    seq = real_send(message_type, **fields)
+                    sent.append(message_type)
+                    if message_type == "census" and not state.get("decided"):
+                        state["decided"] = True
+                        os.write(cmd_w, (json.dumps({
+                            "type": "cleanup", "census": named,
+                            "outcome": {"closure": "closed", "status": 0, "fault": None,
+                                        "deadline": False, "launched": True}}) + "\n").encode())
+                    return seq
+
+                state = {}
+                monitor.send = send
+                try:
+                    with self.settled_census():
+                        for number, command in enumerate(({"type": "leader", "pid": os.getpid()},
+                                                          {"type": "stopped", "sent": 0}), start=1):
+                            os.write(cmd_w, (json.dumps(dict(command, run="unnamed-census",
+                                                             seq=number)) + "\n").encode())
+                        monitor.run()
+                finally:
+                    if monitor.census_thread is not None:
+                        monitor.census_thread.join(15)
+                persisted = json.loads((evidence / "receipt.json").read_text())
+                self.assertEqual(persisted["outcome"]["closure"], "UNCLOSED", named)
+                self.assertIn("census message", persisted["outcome"]["fault"], named)
+                self.assertIsNone(persisted["deciding_census"], named)
+                self.assertTrue(Path(ctx["scratch"]).is_dir())
+
+    def test_every_publication_path_joins_the_census_first(self):
+        # Structural guard for the reviewer's "all publication paths" point: the
+        # join must precede the first publication in the run and in finalisation.
+        run = inspect.getsource(bounded.Monitor.run).split("\n", 1)[1]
+        joined = run.find("join_census(")
+        decision = run.find('if decision == "cleanup"')
+        self.assertGreaterEqual(joined, 0)
+        self.assertGreaterEqual(decision, 0)
+        self.assertLess(joined, decision, "run can publish a decision before it joins the census")
+        finish = inspect.getsource(bounded.Monitor.finish_monitor).split("\n", 1)[1]
+        self.assertGreaterEqual(finish.find("join_census("), 0)
+        self.assertLess(finish.find("join_census("), finish.find("publish("),
+                        "finalisation publishes before it joins the census")
+        self.assertTrue(hasattr(bounded.Monitor, "refuse_incomplete_closure"))
+        self.assertIn('if decision == "cleanup" and not settled:',
+                      " ".join(inspect.getsource(bounded.Monitor.run).split()))
+
+    def test_an_empty_frozen_prefix_is_reported_and_never_closed(self):
+        empty = bounded.survivors_line([], "UNCLOSED", False)
+        self.assertIn("no same-session survivor row was recorded", empty)
+        self.assertIn("cannot show the run closed", empty)
+        self.assertIsNone(bounded.survivors_line([], "UNCLOSED", True))
+        self.assertIsNone(bounded.survivors_line([], None))
+        # A contradictory pair (closed with an incomplete join) is never reported
+        # as a closed run, with or without rows.
+        for rows in ([], [{"pid": 900, "start": 5}]):
+            line = bounded.survivors_line(rows, "closed", False)
+            self.assertNotIn("so the run closed", line)
+            self.assertTrue("the run is not closed" in line or "cannot show the run closed" in line,
+                            line)
+
+    def test_the_qualification_oracle_requires_the_survivor_record_and_no_signal(self):
+        rows = survivor_case_rows("/x")
+        self.assertEqual(self.survivor_oracle(rows), [], rows)
+        self.assertTrue(any("recorded no case outcome" in p
+                            for p in self.survivor_oracle([])))
+        closed = [dict(rows[0], outcome={"closure": "closed", "deadline": True})]
+        self.assertTrue(any("claimed closure" in p for p in self.survivor_oracle(closed)))
+        early = [dict(rows[0], outcome={"closure": "UNCLOSED", "deadline": False})]
+        self.assertTrue(any("did not reach the deadline" in p for p in self.survivor_oracle(early)))
+        dropped = [dict(rows[0], survivors=[])]
+        self.assertTrue(any("survivor row(s)" in p for p in self.survivor_oracle(dropped)))
+        anonymous = [dict(rows[0], survivors=[{"pid": 0, "start": 0}])]
+        self.assertTrue(any("without an identity" in p for p in self.survivor_oracle(anonymous)))
+        signalled = [dict(rows[0], signal_targets=[4100])]
+        self.assertTrue(any("signalled a non-held survivor" in p
+                            for p in self.survivor_oracle(signalled)))
+        no_census = [dict(rows[0], census=0)]
+        self.assertTrue(any("no census member" in p for p in self.survivor_oracle(no_census)))
+
+    def test_the_signal_custody_oracle_rejects_any_non_held_signal(self):
+        receipt = {"phase": "monitor_complete: pending_custodian", "custodian": [
+            {"event": "signal", "target": 9, "pin": "leader", "held_unreaped": True},
+            {"event": "detach_child_signal", "pid": 4100, "start": 77}],
+            "outcome": {"closure": "closed", "status": 0, "fault": None, "deadline": False}}
+        self.assertEqual(self.custody_oracle(receipt), [])
+        for mutation in ({"pin": "session-member"}, {"held_unreaped": False}):
+            with self.subTest(mutation=mutation):
+                broken = dict(receipt)
+                broken["custodian"] = [dict(receipt["custodian"][0], **mutation)]
+                self.assertTrue(any("without custody" in p for p in self.custody_oracle(broken)))
+        extra = dict(receipt)
+        extra["custodian"] = receipt["custodian"] + [
+            {"event": "session_signal", "target": 4100, "start": 77, "killpg": False,
+             "held_unreaped": False, "pin": "session-member", "signal": "SIGKILL"}]
+        self.assertTrue(any("non-held session signal" in p for p in self.custody_oracle(extra)))
+        anonymous = dict(receipt)
+        anonymous["custodian"] = [{"event": "detach_child_signal", "pid": 0, "start": 0}]
+        self.assertTrue(any("held identity" in p for p in self.custody_oracle(anonymous)))
+
+    def custody_oracle(self, receipt):
+        results = {"outcomes": [["zero", "pass"]], "cases": [{"case": "zero", "dir": "/x"}]}
+        plan = dict(qualify.check_plan(receipt, results, {"source": "selected-volume"},
+                                       None, KernelFactsForOracle(), None))
+        return plan["signal-custody"]()
+
+    def survivor_oracle(self, rows):
+        receipt = {"phase": "monitor_complete: pending_custodian", "custodian": [],
+                   "outcome": {"closure": "UNCLOSED", "status": -15, "fault": CENSUS_FAULT,
+                               "deadline": True}}
+        results = {"outcomes": [["zero", "pass"]], "cases": [{"case": "zero", "dir": "/x"}] + rows}
+        plan = dict(qualify.check_plan(receipt, results, {"source": "selected-volume"},
+                                       None, KernelFactsForOracle(), None))
+        return plan["survivor-paths"]()
+
+
 class TraversalSeam:
     """Test-only seams over `os.open`, `os.stat` and `os.close`, restored in
     `finally`. The monitor has no test hook of its own: these wrap the real
@@ -3349,9 +4298,16 @@ class PureDefaultScratch(unittest.TestCase):
         self.assertIn("validation_parent", text, "the recipe does not use the validation parent")
         self.assertNotIn("prepare_scratch_parent", text,
                          "the recipe would create the supervisor's marked subtree")
-        self.assertNotIn("/Volumes/Builds", text, "the recipe hardcodes a mount path")
-        self.assertIn('mkdir -p "$scratch_base"', text)
-        self.assertIn('mktemp -d "$scratch_base/run.XXXXXX"', text)
+        # The mount path rule is about the RECIPE, so it is checked on the recipe's
+        # own shell block: the file elsewhere records historical evidence paths
+        # (an archived packet under a drive) that no recipe may reuse.
+        blocks = re.findall(r"```sh\n(.*?)```", text, re.S)
+        self.assertTrue(blocks, "the unit recipe has no shell block")
+        recipe = next(block for block in blocks if "validation_parent" in block)
+        self.assertIn("validation_parent", recipe)
+        self.assertNotIn("/Volumes/Builds", recipe, "the recipe hardcodes a mount path")
+        self.assertIn('mkdir -p "$scratch_base"', recipe)
+        self.assertIn('mktemp -d "$scratch_base/run.XXXXXX"', recipe)
 
     # The owned leaf
 
@@ -4829,6 +5785,25 @@ def detach_case_rows(case):
     ]
 
 
+def survivor_case_rows(case):
+    """The real cooperative-session survivor case row a qualification receipt
+    must carry, in the shape the suite publishes it (oxide#195): a Cargo-shaped
+    same-session group that reached the deadline, is recorded in the receipt's
+    bounded `survivors` list and is never signalled, with the run honestly
+    UNCLOSED."""
+    return [
+        {"case": "test_cargo_shaped_group_survivor_is_recorded_and_never_signalled",
+         "dir": case, "exit": 124, "census": 2,
+         "outcome": {"closure": "UNCLOSED", "status": -15, "fault": CENSUS_FAULT,
+                     "deadline": True},
+         "survivors": [{"pid": 4100, "start": 77, "ppid": 1, "pgid": 4100, "uid": 501,
+                        "zombie": False},
+                       {"pid": 4101, "start": 78, "ppid": 4100, "pgid": 4100, "uid": 501,
+                        "zombie": False}],
+         "session_signals": []},
+    ]
+
+
 class KernelFactsForOracle:
     """The detach-path oracle needs no kernel facts; this makes that explicit."""
 
@@ -4973,7 +5948,8 @@ class PureQualificationTopology(unittest.TestCase):
         self.assertEqual(qualify.nested_cases({"cases": [{"case": "zero", "dir": case}]}, record), [])
         receipt = self.receipt(parent, root, evidence, scratch, registration, case)
         results = {"outcomes": [["zero", "pass"]],
-                   "cases": [{"case": "zero", "dir": case}] + detach_case_rows(case)}
+                   "cases": ([{"case": "zero", "dir": case}] + detach_case_rows(case)
+                             + survivor_case_rows(case))}
         problems = qualify.check(receipt, results, expected, record, facts)
         self.assertEqual([p for p in problems if "cases:" not in p], [], problems)
 
@@ -5122,11 +6098,11 @@ class PureQualificationTopology(unittest.TestCase):
                "inject": []}
         ctl_r, ctl_w = os.pipe()
         cmd_r, cmd_w = os.pipe()
-        out_r, out_w = os.pipe()
-        err_r, err_w = os.pipe()
-        for fd in (ctl_r, cmd_w, out_w, err_w):
+        for fd in (ctl_r, cmd_w):
             self.addCleanup(os.close, fd)
-        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_r)
+        # The monitor's drain threads get immediate EOF (its own read fds).
+        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, os.open(os.devnull, os.O_RDONLY),
+                                  os.open(os.devnull, os.O_RDONLY))
         messages = []
 
         def send(message_type, **fields):
@@ -5284,7 +6260,8 @@ class PureQualificationTopology(unittest.TestCase):
         receipt = self.receipt(parent, root, evidence, scratch, registration, case)
         receipt["scratch_default"].update(mount=mount, volume_uuid=DRIVE_UUID)
         results = {"outcomes": [["zero", "pass"]],
-                   "cases": [{"case": "zero", "dir": case}] + detach_case_rows(case)}
+                   "cases": ([{"case": "zero", "dir": case}] + detach_case_rows(case)
+                             + survivor_case_rows(case))}
         problems = qualify.check(receipt, results, expected, record, facts, base)
         self.assertEqual([p for p in problems if "cases:" not in p], [], problems)
         # oxide#191: the receipt must exercise the detach success, refusal and
@@ -6762,6 +7739,51 @@ class PureDetach(unittest.TestCase):
                        {"exit": 0, "timed_out": False, "truncated": False, "output": "not a plist"}):
             self.assertIsNone(bounded.image_attachments(backing, run=lambda *a, b=broken: b), broken)
 
+    @contextlib.contextmanager
+    def settled_census(self):
+        """A certain-empty census stand-in for a scripted decision."""
+
+        class SettledCensus:
+            def __init__(self, sid, terminal_allowed=False, ancestors=()):
+                self.stats = {}
+
+            def round(self):
+                return {"certain": True, "members": 0, "uncertain": 0, "member_rows": [],
+                        "uncertain_rows": [], "terminal_count_status": "valid",
+                        "terminal_nonwriters": 0}
+
+        saved = bounded.Census
+        bounded.Census = SettledCensus
+        try:
+            yield
+        finally:
+            bounded.Census = saved
+
+    def start_census_then(self, monitor, cmd_w, run_id, decision, sent):
+        """Write a leader/stopped pair and `decision` once the first census round is
+        reported. The decision names that census message, as a real custodian does,
+        so the scripted run is as coherent as a real one (oxide#195)."""
+        written = []
+        real = monitor.send
+
+        def send(message_type, **fields):
+            if monitor.stop.is_set():  # the run is over: never write to a closing pipe
+                return monitor.seq
+            seq = real(message_type, **fields)
+            sent.append(message_type)
+            if message_type == "census" and not written:
+                written.append(True)
+                payload = dict(decision)
+                payload["census"] = {"seq": seq, "after": 2, "certain": True,
+                                     "members": 0, "uncertain": 0}
+                os.write(cmd_w, (json.dumps(payload) + "\n").encode())
+            return seq
+
+        for number, command in enumerate(({"type": "leader", "pid": os.getpid()},
+                                          {"type": "stopped", "sent": 0}), start=1):
+            os.write(cmd_w, (json.dumps(dict(command, run=run_id, seq=number)) + "\n").encode())
+        return send
+
     def test_an_absent_child_whose_reap_fails_is_not_recorded_as_reaped(self):
         # P2: the absent-child branch wrote reaped/reaped_by as a success even when
         # the reap helper failed. Driven through the REAL `Monitor.run`.
@@ -6776,13 +7798,15 @@ class PureDetach(unittest.TestCase):
                "start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "inject": []}
         ctl_r, ctl_w = os.pipe()
         cmd_r, cmd_w = os.pipe()
-        out_r, out_w = os.pipe()
-        err_r, err_w = os.pipe()
-        for fd in (ctl_r, cmd_w, out_w, err_w):
+        for fd in (ctl_r, cmd_w):
             self.addCleanup(os.close, fd)
-        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_r)
+        # The monitor's drain threads get immediate EOF (its own read fds).
+        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, os.open(os.devnull, os.O_RDONLY),
+                                  os.open(os.devnull, os.O_RDONLY))
         sent = []
-        monitor.send = lambda message_type, **fields: sent.append(message_type)
+        monitor.send = self.start_census_then(
+            monitor, cmd_w, "absent-child",
+            {"type": "cleanup", "outcome": {"closure": "closed", "status": 0}}, sent)
 
         class Handle:
             pid = 0
@@ -6802,10 +7826,9 @@ class PureDetach(unittest.TestCase):
         bounded.process_row = lambda pid: (None, None)          # positively absent
         bounded.reap_own_child = lambda handle, window_end: (False, None)  # the reap fails
         bounded.cleanup_safety = lambda ctx, **k: None
-        os.write(cmd_w, (json.dumps({"type": "cleanup", "outcome": {"closure": "closed",
-                                                                   "status": 0}}) + "\n").encode())
         try:
-            monitor.run()
+            with self.settled_census():
+                monitor.run()
         finally:
             (bounded.post_census_detach, bounded.process_row, bounded.reap_own_child,
              bounded.cleanup_safety) = saved
@@ -6877,25 +7900,28 @@ class PureDetach(unittest.TestCase):
                "start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "inject": []}
         ctl_r, ctl_w = os.pipe()
         cmd_r, cmd_w = os.pipe()
-        out_r, out_w = os.pipe()
-        err_r, err_w = os.pipe()
-        for fd in (ctl_r, cmd_w, out_w, err_w):
+        for fd in (ctl_r, cmd_w):
             self.addCleanup(os.close, fd)
-        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_r)
+        # The monitor's drain threads get immediate EOF (its own read fds).
+        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, os.open(os.devnull, os.O_RDONLY),
+                                  os.open(os.devnull, os.O_RDONLY))
         sent = []
 
+        base = self.start_census_then(
+            monitor, cmd_w, "both-paths",
+            {"type": "cleanup", "outcome": {"closure": "closed", "status": 0}}, sent)
+
         def send(message_type, **fields):
-            sent.append(message_type)
             if message_type == "detach_ready":
                 # Answer every authorization request, as the custodian would.
                 os.write(cmd_w, (json.dumps({"type": "detach_go", "allowed": True,
                                              "budget_ns": 30 * bounded.NS}) + "\n").encode())
+            base(message_type, **fields)
 
         monitor.send = send
-        os.write(cmd_w, (json.dumps({"type": "cleanup", "outcome": {"closure": "closed",
-                                                                   "status": 0}}) + "\n").encode())
         try:
-            monitor.run()
+            with self.settled_census():
+                monitor.run()
         finally:
             bounded.bounded_run = saved_run
             bounded.DefaultProbe.mount_point = saved_mount
@@ -8464,6 +9490,11 @@ class Real(unittest.TestCase):
                       "wall_s": round((self.verdict_ns - self.started) / NS, 3),
                       "signals": [[s["signal"], s["pin"], s["killpg"], s["held_unreaped"], s["result"]]
                                   for s in signals],
+                      "signal_targets": [s["target"] for s in signals],
+                      "survivors": self.receipt.get("survivors"),
+                      "session_signals": [[record.get("target"), record.get("start")]
+                                          for record in self.receipt["custodian"]
+                                          if str(record.get("event", "")).startswith("session_")],
                       "held_streams": sorted(getattr(receiver, "held_names", []))})
         for entry in signals:  # custody at every signal
             self.assertTrue(entry["held_unreaped"], entry)
@@ -8833,6 +9864,79 @@ class Real(unittest.TestCase):
         self.assertGreaterEqual(self.receipt["census"]["members"], 1)
         self.assert_kept_outside_outer_cleanup()
 
+    def test_cargo_shaped_group_survivor_is_recorded_and_never_signalled(self):
+        # oxide#195 regression, the oxide#182 shape under Tom's 2026-10-31 ruling
+        # (c096c8fc): a Cargo-shaped process group leads its own group in the
+        # leader's cooperative session and the leader reaches the deadline. The
+        # pinned leader-group KILL cannot reach it, and the supervisor must NOT
+        # signal it either - it is not this run's child, so it is not held
+        # unreaped and a checked-then-signalled PID could be recycled. The run is
+        # honestly UNCLOSED, the survivor's exact identity is recorded, and the
+        # process is still alive at the verdict.
+        self.assertEqual(self.guardian(CARGO_LEADER), 124)
+        outcome = self.outcome()
+        self.assertEqual(outcome["closure"], "UNCLOSED")
+        self.assertTrue(outcome["deadline"])
+        self.assertIn(CENSUS_FAULT, outcome["fault"])
+        census = self.receipt["census"]
+        self.assertGreaterEqual(census["members"], 2, census)
+        cargo = int((self.dir / "cargo.pid").read_text())
+        test = int((self.dir / "test.pid").read_text())
+        # No signal may name either survivor, and no non-held session signal exists.
+        signalled = {record["target"] for record in self.receipt["custodian"]
+                     if record["event"] == "signal"}
+        self.assertNotIn(cargo, signalled)
+        self.assertNotIn(test, signalled)
+        self.assertEqual([record for record in self.receipt["custodian"]
+                          if str(record.get("event", "")).startswith("session_")], [])
+        # The exact identity is recorded for the owner, and it is still running.
+        recorded = {(row["pid"], row["start"]) for row in self.receipt["survivors"]}
+        member_pids = {row.get("pid") for row in (census.get("member_rows") or [])}
+        for pid in (cargo, test):
+            row = bounded.Kinfo.one(pid)
+            self.assertIsNotNone(row, f"survivor {pid} left the process table")
+            self.assertIs(row.get("zombie"), False, f"survivor {pid} is not live")
+            self.assertIn((pid, row["start"]), recorded,
+                          "the survivor's exact identity was not recorded")
+            self.assertIn(pid, member_pids, "the survivor was not the census's own member row")
+        self.assert_kept_outside_outer_cleanup()
+
+    def test_a_transient_member_records_a_row_and_the_run_closes(self):
+        # Reviewer finding: the transient case must be behavioural. A member that
+        # leads its own group in the leader's session outlives the deadline KILL
+        # and then exits by itself, so the census records its exact row and a
+        # later certainly-empty round closes the run. The summary must say the
+        # run closed, never that it stays UNCLOSED or kept a scratch, and no
+        # non-held identity may be signalled.
+        self.assertEqual(self.guardian(TRANSIENT_LEADER), 124)
+        outcome = self.outcome()
+        self.assertEqual(outcome["closure"], "closed")
+        self.assertIsNone(outcome["fault"])
+        self.assertTrue(outcome["deadline"])
+        census = self.receipt["census"]
+        self.assertEqual((census["certain"], census["members"], census["uncertain"]),
+                         (True, 0, 0), census)
+        member = int((self.dir / "member.pid").read_text())
+        recorded = [(item["pid"], item["start"], item["zombie"])
+                    for item in self.receipt["survivors"]]
+        self.assertTrue(recorded, "the transient member was never recorded")
+        self.assertIn(member, [pid for pid, _start, _zombie in recorded])
+        for pid, start, zombie in recorded:
+            self.assertGreater(start, 0)
+            self.assertIs(zombie, False)
+        signalled = {record["target"] for record in self.receipt["custodian"]
+                     if record["event"] == "signal"}
+        self.assertNotIn(member, signalled)
+        self.assertIsNone(bounded.Kinfo.one(member), "the transient member was still live")
+        log = (self.dir / "guardian.log").read_text()
+        survivor_line = [line for line in log.splitlines()
+                         if "same-session survivor(s) not signalled" in line]
+        self.assertEqual(len(survivor_line), 1, log)
+        self.assertIn("gone by the deciding census, so the run closed", survivor_line[0])
+        self.assertNotIn("UNCLOSED", survivor_line[0])
+        self.assertNotIn("scratch is kept", survivor_line[0])
+        self.assertFalse((self.dir / "oxide-proof.").exists())
+
     def test_escaped_pipe_holder_unclosed(self):
         # The escaped writer leaves the nested session, keeps the leader's
         # stdout/stderr write descriptors open, and proves it is still alive
@@ -8853,6 +9957,8 @@ class Real(unittest.TestCase):
                  "deadline": self.outcome().get("deadline"), "ready": True,
                  "nonce_ok": reply == token, "child_pid": child_pid, "suite_pid": os.getpid(),
                  "signal_targets": [r["target"] for r in signals], "signal_pins": [r["pin"] for r in signals],
+                 "session_targets": [r.get("target") for r in self.receipt["custodian"]
+                                     if str(r.get("event", "")).startswith("session_")],
                  "retained": (self.dir / "evidence" / "receipt.json").exists()}
         CASES[-1]["nonce_ok"] = facts["nonce_ok"]
         self.assertEqual(escaped_writer_problems(facts), [], facts)
@@ -9630,6 +10736,7 @@ def main():
                                            PureTraversal, PureDefaultScratch, PureScratchPreparation,
                                            PureMarker, PureSweep, PureExistingParent,
                                            PureProtectionAndLifecycle, QualifyEntry,
+                                           PureSurvivors,
                                            PureQualificationTopology, PureClosureDecision,
                                            PureSettlement, PureInterleavedConfirmation, PureDetach))
     ok = runner.run(pure).wasSuccessful()

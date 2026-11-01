@@ -2460,6 +2460,33 @@ therefore carry to the final head without repeating the chain (brief v6 and v7
 text-only rulings, parallel to #192's v8). No historical packet is rewritten and
 no native credit transfers between tasks.
 
+**Cooperative-session survivors (oxide#195, brief v3, unqualified at this
+integrated head).** The integrated `bounded-test.py`
+(`fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b`),
+`test_supervisor.py`
+(`c95d46aa0e590285c3c412294ffb215c0d45b19ba804f2243f0d2ebd62158d7b`) and
+`qualify-supervisor.py`
+(`c4b7a6a7983dfe4e097c3949e35f603aed8aefdee95ad41722986130cf01922c`) add the
+oxide#195 custody hardening over the oxide#197 ancestor rules and the oxide#192
+admission reports, so all three controls remain unqualified until this head's own
+uncounted `effigy proof:supervisor:qualify:diagnostic` and separate author and
+independent reviewer `effigy proof:supervisor:qualify` pass. It removes every path
+that signals a merely observed non-child PID (the earlier checked-then-signalled
+design is deleted, not narrowed), records the same-session survivors a census
+round still sees in the receipt's bounded `survivors` list, and binds the deciding
+census to the census message the custodian's own decision named. Closure now also
+requires a finished census thread, a certainly empty final round and a certainly
+empty named message; an expired join freezes the survivor list at its published
+prefix, records `census_join.joined: false`/`frozen`/`refused`, refuses the
+cleanup decision, has the custodian latch the reason, and keeps the root, backing
+and evidence. Nothing in that path signals anything. The suite gains twenty-one
+pure cases and one real recorded-and-never-signalled Cargo-shaped survivor case
+in place of the former separate-group survivor case (382 pure plus 57 real = 439
+at this head, and the bootstrap's expected case total follows the suite; the
+historical #197 record above keeps its own 416). The keeper of the historical
+survivor is Queue papercut `9ff7386d`; this head keeps that process's identity on
+record and claims no closure of it.
+
 **Admission reports on the integrated source (oxide#192, qualified at the native head).** The
 integrated head adds the admission reports described in the supervisor rule
 below: the completed-wait marker and its bounded grant, the correlated waiting
@@ -2722,16 +2749,41 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   - SIGCHLD is set to default before any fork, so no pin is auto-reaped.
   - The child resets inherited signal dispositions and the signal mask
     before `exec`. An exec failure exits 127.
-- **Signals.** Only the pinned leader's group (TERM, then KILL after at most
-  5 s) and, at the end, the pinned monitor are ever signalled. Each signal
-  is recorded with its target, pin and `held_unreaped` custody at that
-  moment. On macOS a group whose only member is the unreaped leader answers
-  `EPERM`, which is recorded and not a fault. Groups other than the
-  leader's are never signalled.
+- **Signals.** Only an identity the runner holds unreaped across the signal is
+  ever signalled: the pinned leader's group (TERM, then KILL after at most 5 s),
+  the pinned monitor, and a direct child still held unreaped (the detach
+  handoff; the #197 launcher-rule exclusions add no signal). Each signal is
+  recorded with its target, pin and `held_unreaped` custody at that moment. On
+  macOS a group whose only member is the unreaped leader answers `EPERM`, which
+  is recorded and not a fault. No other group and no observed non-child PID is
+  ever signalled (oxide#195, Tom's 2026-10-31 ruling `c096c8fc`).
+- **Cooperative-session survivors (oxide#195).** The leader's group is not the
+  whole session: Oxide starts Cargo as the leader of its own process group in the
+  same session, so a leader-group KILL leaves Cargo's group running. Oxide#182's
+  archived packet ended `UNCLOSED` with exactly one such survivor (a unit-test
+  binary in Cargo's group). Such a process is not this run's child, so it is not
+  held unreaped and its PID could be recycled between an identity read and a
+  signal: it is **never** signalled, and the supervisor has no path that converts
+  an observation into a signal. After the leader is reaped, each census round
+  records, once per identity and up to sixteen rows, the exact member rows it
+  still classifies in the leader's session (`pid`, `start`, `ppid`, `pgid`,
+  `uid`, `zombie`) in the receipt's `survivors` list, and the summary line states
+  how many were not signalled. Each row is recorded before the round that reports
+  it is sent, and the census thread is joined (bounded, never past the deadline)
+  before the receipt is published, so the evidence a verdict rests on is the
+  evidence on disk. Closing such a survivor needs a boundary that holds the
+  identity (Queue papercut `9ff7386d`); this change does not close the historical
+  survivor and does not claim to.
 - **Closure.** The leader is reaped first. Only after that does the custodian
   send `stopped`, so the final census never sees the leader. Closure is
   established when all of the following hold:
   - no fault is latched;
+  - the census thread finished inside its bounded join, the last completed round
+    is certainly empty, and the census MESSAGE the custodian's decision named is
+    itself certainly empty (`census_settled`; the custodian echoes that message's
+    sequence and facts, and the monitor resolves it against its own record of the
+    messages it sent, so a late round or a decision without its own census
+    evidence refuses closure);
   - a census started after `stopped` is certain, with zero members and zero
     uncertain rows, within 10 s (bounded by `exit_at`);
   - both output pipes have reached EOF.

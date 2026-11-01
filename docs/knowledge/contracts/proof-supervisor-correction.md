@@ -24,6 +24,26 @@ design keeps that baseline's guards:
 All earlier findings, deviations and failed evidence stand as recorded.
 Nothing here qualifies anything.
 
+**Amended by oxide#195 (2026-11-01).** This reviewed text is the historical
+design, and its "only pinned children are ever signalled" contract was
+re-opened by oxide#182's packet, which ended `UNCLOSED` with a live
+Cargo-shaped group inside the leader's own cooperative session. Tom's
+2026-10-31 signal-custody ruling (Queue decision `c096c8fc`) settled it: a
+same-user process that is not the runner's child is not held unreaped, so a
+merely observed non-child PID is never signalled, and the supervisor has no
+path that converts an observation into a signal. Current behaviour is the
+[shared proof supervisor](workflow.md#shared-proof-supervisor) section's
+*Cooperative-session survivors* description: after the leader is reaped the
+monitor records the survivor's exact row in the receipt's bounded `survivors`
+list and signals nothing. A recorded row is not a verdict: a transient survivor
+may be gone by the deciding census, so the run then closes and the summary says
+so, while a survivor still present keeps the run `UNCLOSED` with its scratch.
+Read the table rows below about "survivors" with that amendment: a survivor is
+recorded and left to a boundary that can hold it, never signalled by this
+runner. This is observation-only custody hardening; closing the historical
+Cargo-group survivor is deferred to Queue papercut
+`9ff7386d-c70e-49c7-880a-2e6c676b2eb9`.
+
 ## Contract
 
 Pinned-leader cooperative closure (Tom, "Yes, (2)", Queue decision

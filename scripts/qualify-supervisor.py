@@ -77,7 +77,7 @@ WALL_NS = 600 * NS  # oxide#192 amendment (2026-10-31): was 420 s (#191), 300 s 
 CANDIDATE_LIMIT = 560  # oxide#192 amendment: was 380 s (#191), 280 s before
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 416  # 361 pure + 55 real. oxide#151 added the routing, marker,
+EXPECTED_CASES = 439  # 382 pure + 57 real. oxide#151 added the routing, marker,
                       # nested-window protection, bounded-sweep, qualify-entry,
                       # shared-ancestor/private-leaf and readiness cases; oxide#191
                       # adds seventy-six pure post-census detach cases and eight real
@@ -106,6 +106,9 @@ EXPECTED_CASES = 416  # 361 pure + 55 real. oxide#151 added the routing, marker,
                       # launcher sibling, and the inherited end-to-end slow-setup
                       # launch-and-close regression for #192's sampling-based
                       # freshness clock)
+                      # oxide#195 replaces the separate-group survivor case
+                      # with one recorded-and-never-signalled Cargo survivor case
+                      # and adds its pure custody/publication/join cases.
 ACTOR_MARGIN_NS = 2 * NS  # the actor's own KILL, reap and exit
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPTS)
@@ -116,7 +119,8 @@ SOURCES = {
 }
 LIMITATIONS = [
     "Cooperative session scope: a process that calls setsid is seen only if tracked as a member earlier or while it holds an output pipe; arbitrary same-user writers are outside the promise.",
-    "Only the pinned leader's group and the pinned monitor are ever signalled; survivors in other groups end the run UNCLOSED with scratch kept, never signalled.",
+    "Only identities the runner positively holds unreaped across the signal are ever signalled: the pinned leader's group, the pinned monitor and a held direct child. A same-user process that is not this run's child is not held, so its PID could be recycled between the identity read and a signal and it is NEVER signalled (Tom's 2026-10-31 ruling c096c8fc); the exact row is recorded in the receipt's bounded `survivors` list and the run stays UNCLOSED with its scratch. Closing such a survivor needs a boundary that holds it, which is outside this runner.",
+    "Census evidence binding (oxide#195): the custodian echoes the sequence and facts of the last post-reap census message it processed, and the receipt's `deciding_census`/`deciding_census_seq` are resolved by the monitor against its own record of the census messages it sent. Closure requires the census thread to have finished inside its bounded join, the last completed round to be certainly empty AND that named message to be certainly empty, so a late round or a decision without its own census evidence keeps the run UNCLOSED. An expired join freezes the survivor list at its published prefix and is recorded (`census_join.joined: false`, `frozen`, `refused`).",
     "The census treats every unvalidated process on the host as uncertain, including zombies of unrelated parents, so such a process present after the stop yields a false UNCLOSED (fails closed).",
     "Host free space is a sampled abort threshold (0.25 s, 22 GiB = 20 GiB reserve + 2 GiB margin) read on the filesystem actually holding the scratch, so on the selected drive it is that volume's free space, not the internal disk's; no instantaneous guarantee. Owned bytes are walked every 2 s against a monitored budget, not a hard ceiling.",
     "The default scratch parent is the owned subtree <mount>/scratch/oxide, read passively from OXIDE_POOL, the user config file's [pool] path or the built-in pool, and the pool's removable registration, with one kernel volume-UUID read; that is not the product's verified build-time selection (no diskutil container/role check), the config reader understands only a simple [pool] path entry, and anything unreadable or unsupported falls back to /private/tmp with a warning. The bootstrap refuses to qualify on a fallback.",
@@ -356,6 +360,9 @@ ORDINARY_KEYS = {"case", "exit", "phase", "dir", "retained_unclosed", "outcome",
                  "signals", "stale_latency_ns", "held_streams", "nonce_ok",
                  "detach",  # oxide#191: the post-census detach outcome that case recorded
                  "cleanup",  # oxide#191: the fail-closed pre-cleanup keep, when it fired
+                 "signal_targets",  # oxide#195: every PID the case's guard signalled
+                 "survivors",  # oxide#195: the same-session identities it recorded, never signalled
+                 "session_signals",  # oxide#195: the witness that no non-held session record exists
                  "kept"}  # the suite's retained-resource path for a focused case
 
 
@@ -664,6 +671,7 @@ DETACH_CASES = (
 
 CLEANUP_CASE = "test_an_unrequested_attachment_keeps_the_owned_root"
 STUCK_CASE = "test_a_stuck_detach_child_is_closed_by_the_custodian"
+SURVIVOR_CASES = ("test_cargo_shaped_group_survivor_is_recorded_and_never_signalled",)
 
 
 def check_plan(receipt, results, expected, record=None, facts=None, base=None):
@@ -701,10 +709,55 @@ def check_plan(receipt, results, expected, record=None, facts=None, base=None):
         return []
 
     def signal_custody():
+        """Oxide#195 ruling c096c8fc: only an identity the runner holds unreaped is
+        ever signalled, so every signal record must be a held leader/monitor or a
+        held detach child, and no non-held session signal may appear at all."""
         problems = []
         for entry in receipt["custodian"]:
-            if entry["event"] == "signal" and not (entry["held_unreaped"] and entry["pin"] in ("leader", "monitor")):
+            event = entry.get("event")
+            if event == "signal" and not (entry["held_unreaped"] and entry["pin"] in ("leader", "monitor")):
                 problems.append(f"signal without custody: {entry}")
+            elif event == "detach_child_signal" and not (
+                    entry.get("pid", 0) > 1 and entry.get("start", 0) > 0):
+                problems.append(f"detach signal without a held identity: {entry}")
+            elif isinstance(event, str) and event.startswith("session_"):
+                problems.append(f"a non-held session signal appears in the receipt: {entry}")
+        return problems
+
+    def survivor_paths():
+        """Oxide#195 under Tom's ruling: the cooperative-session survivor must be
+        recorded, never signalled, and must leave the run honestly UNCLOSED."""
+        problems = []
+        recorded = {}
+        for case in results.get("cases", []):
+            if case.get("case") in SURVIVOR_CASES and case["case"] not in recorded:
+                recorded[case["case"]] = case
+        case = recorded.get(SURVIVOR_CASES[0])
+        if case is None:
+            problems.append(f"{SURVIVOR_CASES[0]} recorded no case outcome")
+            return problems
+        outcome = case.get("outcome") or {}
+        if outcome.get("closure") != "UNCLOSED":
+            problems.append(f"{SURVIVOR_CASES[0]} claimed closure: {outcome}")
+        if outcome.get("deadline") is not True:
+            problems.append(f"{SURVIVOR_CASES[0]} did not reach the deadline: {outcome}")
+        if not case.get("census"):
+            problems.append(f"{SURVIVOR_CASES[0]} kept no census member to prove the residual")
+        survivors = case.get("survivors") or []
+        if len(survivors) < 2:
+            problems.append(f"{SURVIVOR_CASES[0]} recorded {len(survivors)} survivor row(s), not the group")
+        for row_entry in survivors:
+            if not (isinstance(row_entry, dict) and row_entry.get("pid", 0) > 1
+                    and row_entry.get("start", 0) > 0):
+                problems.append(f"{SURVIVOR_CASES[0]} recorded a survivor row without an identity:"
+                                f" {row_entry}")
+        signalled = set(case.get("signal_targets") or [])
+        for row_entry in survivors:
+            if row_entry.get("pid") in signalled:
+                problems.append(f"{SURVIVOR_CASES[0]} signalled a non-held survivor: {row_entry.get('pid')}")
+        if case.get("session_signals"):
+            problems.append(f"{SURVIVOR_CASES[0]} carries a non-held session signal:"
+                            f" {case.get('session_signals')}")
         return problems
 
     def detach_paths():
@@ -760,6 +813,7 @@ def check_plan(receipt, results, expected, record=None, facts=None, base=None):
         ("nested-cases", lambda: nested_cases(results, record, facts)),
         ("owned-bytes", owned_bytes),
         ("signal-custody", signal_custody),
+        ("survivor-paths", survivor_paths),
         ("detach-paths", detach_paths),
         ("cases", cases),
     ]
