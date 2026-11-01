@@ -276,3 +276,68 @@ the pinned child at that moment.
 
 If any of this can't be met within the approved scope, the brief stops and
 names the missing mechanism.
+
+## Cargo-group survivor custody investigation
+
+The retained oxide#182 receipt records a deadline stop of the pinned leader
+ group, followed by a certain census with one member in a different group and
+ an `UNCLOSED` outcome. It is historical observation, not authority to act on
+ that PID. Oxide starts Cargo in its own group and its lease recovery retains a
+ slot while that group is present or its state is unknown. The supervisor's
+ leader pin does not pin Cargo's group. The existing direct-child detach
+ handoff works only because the monitor retains its own unreaped child until
+ custody is settled; it cannot adopt an already orphaned descendant.
+
+**No-go for retrospective signalling:** no supported identity-holding signal
+ primitive for an observed non-child has been established by this investigation.
+ PID plus start time, parent, session or group checks are observations separated
+ from `kill` by a reuse race. A kqueue process event is notification, not a
+ signal handle: XNU's [process filter](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_event.c)
+ attaches a knote and releases its process reference; the attachment can be
+ detached on exit. It does not establish signal custody. A Mach task port or
+ private audit-token signalling interface has not been established as a
+ supported, available, identity-bound signal primitive for these processes;
+ neither is an implementation premise. Tracing/reparenting an arbitrary
+ observed process is likewise not an authorized custody transfer. Retain the
+ observation-only policy and keep roots and evidence on unknown closure.
+
+A prospective cooperative alternative is for Oxide to remain the direct
+ parent of the Cargo group leader, hold that child unreaped across any group
+ signal, and perform bounded cancellation and closure itself before releasing
+ its lease. A supervisor stop protocol would request that action while Oxide
+ is alive, reserving time before the supervisor's own pinned-group escalation.
+ This is a candidate, not an approved contract: a dead or unresponsive Oxide,
+ a child already reaped, an escaped group, an unreadable response, or a spent
+ deadline gives no authority to signal the observed group and leaves closure
+ unknown. Group custody is distinct from the supervisor leader's group. The
+ holder must prevent auto-reap and concurrent wait, retain the child through
+ the signal, positively reap it afterwards, and separately prove group and
+ session closure; holding a leader does not contain descendants that change
+ group or session. No claim covers arbitrary same-user processes.
+
+The protocol needs an authenticated per-run channel established before Cargo
+ starts, explicit ownership and bounded acknowledgements, and a single absolute
+ remaining window shared by request, TERM grace, KILL, reap and final census.
+ Cancellation or supervisor fault cannot create a new allowance. A lost reply,
+ stale request, concurrent exit/reap, PID or group reuse, launch failure,
+ unresponsive parent, group escape, and late or contradictory census must all
+ keep the lease and proof resources, never imply success. A cooperative stop
+ cannot repair the historical orphan or guarantee closure after its owner dies.
+
+Before implementation, independently review the ownership and deadline
+ contract and obtain any necessary operator ruling. First discriminate whether
+ the supported macOS child and group lifetime semantics actually support a held
+ Cargo leader throughout the proposed stop, including zombie, concurrent wait,
+ auto-reap and group reuse cases; source inspection and bounded isolated fixture
+ tests must establish this rather than infer it from a PID check. Then separately
+ design and test the channel and product cancellation, and finally integrate
+ the shared supervisor. Tests must force each race above, owner death, partial
+ messages, deadline exhaustion, survivor and escaped-group controls, and verify
+ no signal to an observational non-child and no cleanup on uncertainty.
+ Each implementation slice needs a scoped brief, HIGH proof premise checklist,
+ a keep-going diagnostic and exact-head author and distinct reviewer native
+ qualification under the shared runner's fixed time and scratch bounds. Writer
+ closure makes this Elevated. The brief must identify every shared-supervisor
+ consumer and explicitly rebind only the affected proofs after qualification;
+ prior receipts remain bound to their original bytes. No native execution or
+ behavior change is implied by this investigation.
