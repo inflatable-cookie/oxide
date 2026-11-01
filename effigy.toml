@@ -160,14 +160,8 @@ run = "python3 scripts/test-installed-handoff.py --plan"
 # clean, refusals and the root-group prune. It has not run: each side's run is
 # a separately counted owner activation, and the merge hold requires the exact
 # head author and reviewer native receipts.
-# Internal-placement exception (decision bd357a4c, 2026-10-25): its private
-# fixture pools are genuine internal directory-budget pools, which the product
-# correctly refuses on an external volume, so this recipe declares the
-# qualified guard's explicit internal root (`--root-parent /private/tmp`). One
-# monitored owned root still holds staging, fixtures, temp, evidence and the
-# single owned 128 MiB image under the unchanged 600 s / 512 MiB / reserve /
-# custody / cleanup rules; ordinary builds, tests and proofs keep the
-# selected-volume default.
+# Builds fixtures use a private OXIDE_SCRATCH_ROOT under the selected runner root.
+# The scoped base-compat selectors alone retain the internal root (bd357a4c).
 [tasks."proof:profile-outputs:test"]
 run = "python3 scripts/test-profile-outputs.py --self-check"
 
@@ -189,7 +183,7 @@ run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- p
 # the counted one; the counted selector above stays byte-for-byte its own
 # fail-fast command. Its receipt is marked diagnostic and never claims PASS,
 # closure or counted credit, and it needs its own owner activation. It keeps
-# the same declared internal root (see the counted selector's exception note)
+# the selected-volume root
 # and the unchanged 600 s / 512 MiB bound.
 [tasks."rust:profile-outputs:diagnostic"]
 admission = "heavy"
@@ -1210,7 +1204,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # cases and aborts on an unknown child, custody uncertainty, a prerequisite
 # failure or an exhausted deadline. Its receipt is distinctly qualified=false
 # and is never a counted PASS; this declaration activates nothing. It keeps
-# the same declared internal root (see the counted selector's exception note)
+# the selected-volume root
 # and the unchanged 300 s / 512 MiB bound.
 [tasks."rust:command-budgets:diagnostic"]
 admission = "heavy"

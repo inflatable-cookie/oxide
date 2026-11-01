@@ -2466,7 +2466,7 @@ def pure_diagnostic_controls() -> None:
             "passed" not in body
             and body.get("outcome") != "pass"
             and body.get("qualified") is False
-            and body.get("mode") == "diagnostic",
+            and body.get("collection") == "diagnostic",
             "the diagnostic receipt claims a PASS",
         )
         expect(body["primary_failure"] == "02: first recorded fault", body["primary_failure"])
@@ -4832,7 +4832,7 @@ def main() -> int:
     detach_owned_volume(proof, "success")
     # On success a missing or failed assertion receipt FAILS the proof.
     receipt = write_assertion_receipt("pass", None)
-    print(f"profile-outputs proof: 20 cases held; assertion receipt {receipt}", flush=True)
+    print(f"profile-outputs {MODE}: {len(CASE_IDS)} cases held; assertion receipt {receipt}", flush=True)
     return 0
 
 
