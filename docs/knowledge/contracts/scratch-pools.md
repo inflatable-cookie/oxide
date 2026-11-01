@@ -330,7 +330,6 @@ each script's own selector text and case bodies.
 | `rust:recorded-slot-accounting` (#146) + `:diagnostic` | genuine directory-budget pool, verified from the product's own config |
 | `rust:exec-output-inference` (#160) + `:diagnostic` | control pool is a directory-budget pool |
 | `rust:auto-adopt-ineligible` (#154) + `:diagnostic` | control pool is a directory-budget pool |
-| `rust:prune-authority` (#134) + `:diagnostic` | internal pool placement only |
 | `rust:oxide-removable-boot-closure` (#161) + `:diagnostic` | directory-budget base pool plus one owned image |
 | `rust:finder-metadata-race` (#155) + `:diagnostic` | every fixture pool is a directory-budget pool |
 | `rust:command-budgets` (#140) + `:diagnostic` | `OXIDE_POOL_BACKEND=directory-budget` fixture pools |
@@ -348,6 +347,7 @@ or a socket path that cannot fit under the selected-volume guard prefix):
 | --- | --- |
 | `rust:pool-temp-scratch` (#136) + `:diagnostic` | decision af7df7d6: the Builds guard prefix makes this fixture's shortest admitted slot scratch path (`test-1`) 103 bytes, exceeding the 91-byte product bound; both selectors keep `/private/tmp` |
 | `rust:outputs-prune` (#129/#152) + `:diagnostic` | cases 10 and 21 prove checkout absence on the boot Data volume |
+| `rust:prune-authority:internal` (#134) + `:diagnostic` | decision 7aedd5af: ONLY the receiptless legacy-positive case; its legacy checkout's nearest existing ancestor must be on the boot Data volume (`src/bin/oxide/prune.rs:3276-3287`). The Builds mode `rust:prune-authority` migrated (oxide#211) |
 | `rust:prune-absence` (#135) + `:diagnostic` | the missing-ancestor chain must sit on the boot Data volume |
 | the `AGENTS.md` unit-suite recipe (`OXIDE_TEST_INTERNAL_ROOT`) | three macOS fixtures take the boot Data volume and `MNT_IGNORE_OWNERSHIP` premises; `config::tests::git_work_trees_and_aliases_refuse` needs a root off `/Volumes` |
 
@@ -358,6 +358,8 @@ Not in scope: proofs that never carried `bd357a4c` but assert their own
 all, in their own briefs with their own activations. `rust:front-door-accounting` uses the S4 migration: both fixture pools use the selected-volume scratch root; its diagnostic and native evidence at the migrated head remain pending.
 
 `rust:cold-slot-seeding` and its diagnostic now use the selected-volume scratch pool recipe (oxide#204); their new native evidence remains owner-activated.
+
+`rust:prune-authority` and its diagnostic now use a scratch pool under the supervisor-selected volume (oxide#211, S4): `OXIDE_SCRATCH_ROOT` is a private `scratch-pools` directory inside the run root, and no `--root-parent` is passed. Its accounting, authority-refusal, revalidation, Unknown-external and grouped cases carry no boot-Data premise; migrated native evidence is pending at the migrated head. The receiptless legacy-positive case stays on the internal root as `rust:prune-authority:internal` and its diagnostic (decision `7aedd5af`), so the legacy oracle keeps its boot-Data ancestor.
 
 ## Recipe changes
 
