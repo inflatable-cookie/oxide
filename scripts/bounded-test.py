@@ -32,6 +32,32 @@ UNCLOSED and scratch is kept. The command gets OXIDE_PROOF_EVIDENCE, the
 evidence directory, which cleanup never removes. Groups other than the
 pinned leader's are never signalled.
 
+Supervisor ancestors (oxide#197, design ruling ea5a3dc9): in its bounded setup,
+before the leader exists, the monitor walks its own ppid chain up to
+ANCESTOR_MAX_LEVELS levels and records each level's positive identity (PID plus
+the same start token the census uses) in the receipt. The post-leader census
+then excludes, and nothing else: (a) a row whose own identity is exactly one of
+those recorded pairs, re-verified through the safe Kinfo reader after the
+snapshot; (b) a launcher sibling whose observation-time parent row has a PID
+above 1 and, re-verified the same way, exactly one of those recorded identities,
+and which one bound observation proves is positively outside the supervised
+leader's session AND process group (macOS has no subreaper, so a supervised
+descendant can only be reparented to launchd, never to a supervisor ancestor).
+No clock, wall, boot or uptime fact is consulted: a start-time ordering cannot
+prove the absence of a masked step. Only a POSITIVELY decided identity may be
+excluded, and a tracked identity is never excluded and never loses tracked
+attribution. A launcher rule that positively observes the row in the leader's
+session carries it as a tracked member of exactly that identity, so a later
+contradictory read cannot make it foreign. An UNDECIDED launcher observation
+excludes no row and falls through to the ordinary getsid/reread classification,
+so a recycled PID or parent, an unknown parent, a PPID 1 orphan, an unreadable
+session or group, a changed identity and any other unreadable row classify
+exactly as they do without the launcher rules.
+Every exclusion's bounded positive evidence is recorded in the receipt. The
+test-only `setup-delay` injection adds a cold setup longer than the reserve
+freshness window inside the setup deadline, the end-to-end control for
+oxide#192's sampling-based freshness clock.
+
 An exception in any phase after setup, or a monitor message with a missing
 or ill-typed field, latches a fault; the bounded pinned stop, WNOHANG reap,
 census and keep still run, each phase under its own guard. An uncaught
@@ -142,6 +168,11 @@ LIMIT_S = 300
 STOP_RESERVE_S = 20
 EXIT_MARGIN_S = 2
 SETUP_S = 10
+# oxide#197 (inherited from #192 decision 7bb1089d): the injected cold-setup
+# delay is longer than the reserve freshness window and well inside SETUP_S, so
+# it discriminates the sampling-based freshness clock from the superseded
+# custodian-start basis.
+SETUP_DELAY_S = 1.5
 TERM_GRACE_S = 5
 CENSUS_GRACE_S = 10
 THRESHOLD = 22 * GIB  # 20 GiB reserve + 2 GiB margin
@@ -152,6 +183,11 @@ PERSIST = 8 * MIB
 FORWARD = 32 * MIB
 CENSUS_INTERVAL = 0.2
 CONFIRM_TRIES, CONFIRM_PAUSE = 20, 0.05  # gone confirmation within one round, at most 1 s
+# Oxide#197: the supervisor's own ancestor chain is recorded once, before the
+# leader exists, as positive (PID, start) identities, at most this many levels.
+ANCESTOR_MAX_LEVELS = 64
+# Bounded positive exclusion evidence kept in the receipt (rows, not decisions).
+EXCLUSION_MAX_ROWS = 20
 DIAG_MAX_BYTES = 16384  # compact UTF-8 JSON ceiling for the optional receipt census diagnostics
 DIAG_MAX_ROWS = 20  # at most 20 diagnostic summary rows; the rest count as omitted
 # Observation-only settlement diagnostics (oxide#147). Fixed schema, one record
@@ -228,7 +264,7 @@ SWEEP_TIME_BUDGET_NS = 1 * NS  # of the 10 s setup budget, checked between files
 SWEEP_ENTRY_BUDGET = 4096  # examined entries plus recursive steps, across all roots
 SWEEP_ROWS = 20  # bounded result rows in the receipt; the rest count as omitted
 INJECTIONS = {
-    "setup-stall", "no-detector", "ack-eof", "ack-wrong", "cancel-before-ack", "monitor-die",
+    "setup-stall", "setup-delay", "no-detector", "ack-eof", "ack-wrong", "cancel-before-ack", "monitor-die",
     "monitor-stall", "cleanup-interrupt", "custodian-timeout-after-monitor", "census-uncertain",
     "census-uncertain-first", "reserve-low-after", "cancel-after-ack", "cancel-at-gate",
     "pump-exception", "kqueue-exception", "malformed-message", "stop-exception",
@@ -535,6 +571,57 @@ class Kinfo:
         row = cls.one(os.getpid())
         if row is None or (row["ppid"], row["pgid"], row["uid"]) != (os.getppid(), os.getpgid(0), os.getuid()):
             raise ValueError("layout does not match this process")
+
+
+def ancestor_identities(snapshot=Kinfo.all, parent=os.getppid, max_levels=ANCESTOR_MAX_LEVELS):
+    """This supervisor's own ancestor chain, as positive (PID, start) identities.
+
+    Oxide#197: walks the ppid chain from our own parent through PID 1 and
+    records, for each level, the identity the snapshot actually names (PID plus
+    the same start token the census uses), bounded to `max_levels` levels. The
+    census excludes exactly these identities, and only while a row's own
+    (PID, start) still matches, so a recycled PID is never excluded.
+
+    Records nothing it did not read: a snapshot failure is `unreadable`, and
+    the walk stops at the first level the snapshot does not name (never a
+    guessed parent). The returned object has fixed keys: `state`
+    (`recorded`/`partial`/`unreadable`), `count`, the bounded `identities`
+    rows (PID, start and 1-based level) and `stop` (an enumerated reason or
+    None). `partial` means an unexpected error ended the walk after some
+    positives were recorded."""
+    try:
+        by_pid = {row["pid"]: row for row in snapshot()}
+    except Exception:
+        return {"state": "unreadable", "count": 0, "identities": [], "stop": None}
+    identities, seen, stop = [], set(), None
+    try:
+        pid = parent()
+        while True:
+            if len(identities) >= max_levels:
+                stop = "depth-bound"
+                break
+            row = by_pid.get(pid)
+            if row is None:
+                stop = "not-in-snapshot"
+                break
+            identity = (row["pid"], row["start"])
+            if type(identity[0]) is not int or type(identity[1]) is not int or identity[0] <= 0:
+                stop = "malformed-row"
+                break
+            if identity in seen:
+                stop = "cycle"
+                break
+            seen.add(identity)
+            identities.append({"pid": identity[0], "start": identity[1],
+                               "level": len(identities) + 1})
+            if pid == 1:
+                stop = "pid-1"
+                break
+            pid = row["ppid"]
+    except BaseException:
+        return {"state": "partial", "count": len(identities), "identities": identities,
+                "stop": "read-error"}
+    return {"state": "recorded", "count": len(identities), "identities": identities, "stop": stop}
 
 
 def _diag_u64(value):
@@ -897,6 +984,30 @@ def _fit_witnesses(witnesses, diag_kept_count, diag_compact_len):
         return []
 
 
+def _ancestor_identity_set(identities):
+    """The exact (PID, start) identities a census may skip (oxide#197).
+
+    Accepts the recorded rows (mappings with `pid`/`start`) or plain pairs, and
+    keeps only exact non-bool positive-PID integer pairs. Anything else is
+    dropped rather than coerced, so a malformed record excludes nothing.
+    Never raises."""
+    kept = set()
+    try:
+        for entry in identities or ():
+            try:
+                if isinstance(entry, dict):
+                    pid, start = entry.get("pid"), entry.get("start")
+                else:
+                    pid, start = entry
+                if type(pid) is int and type(start) is int and pid > 0:
+                    kept.add((pid, start))
+            except BaseException:
+                continue
+    except BaseException:
+        return frozenset()
+    return frozenset(kept)
+
+
 class Census:
     """Classifies every process against session `sid` (the leader's PID).
 
@@ -954,8 +1065,62 @@ class Census:
 
     Everything else (other getsid errors, identity change, failed or
     missing metadata, unconfirmed zombies, a failed snapshot) is uncertain
-    and blocks closure, first-seen rows included. Start time is never used
-    to exclude a process.
+    and blocks closure, first-seen rows included. Start time is not a proxy
+    for liveness or ordering: it is only the second half of a whole
+    (PID, start) identity, and no wall, boot or uptime comparison ever excludes
+    a row.
+
+    Supervisor ancestors (oxide#197, design ruling ea5a3dc9): the supervisor
+    records its own ppid chain, up to ANCESTOR_MAX_LEVELS levels, before the
+    leader exists, as positive (PID, start) identities. Two structural launcher
+    rules follow, and nothing else is relaxed:
+
+    - `ancestor` (a): the row's own identity is EXACTLY one recorded pair, and
+      that identity is re-verified through the safe Kinfo reader after the
+      snapshot. A row whose PID is a recorded ancestor's PID is decided by this
+      rule alone and never falls through to the parent rule. A different
+      identity at that PID is decided by ONE bound session observation: a
+      `member` reading is carried into the census as a member of exactly this
+      identity (an ancestor predates the leader, so a descendant can never be one)
+      and the identity is tracked; any other reading — contradictory, unreadable
+      or simply not the leader's session — is undecided, excludes nothing and
+      leaves the row to the ordinary classification.
+    - `parent` (b): the row's observation-time parent row (same snapshot) has a
+      PID above 1, its identity is EXACTLY one recorded pair, and ONE sibling
+      observation re-verifies the row's own PID/start identity AND that parent
+      identity on both sides of the session/group reads, so a PID reused between
+      the snapshot and those reads cannot lend another process's session or group
+      to this row. Only a positively `outside` observation excludes: the row must
+      be readable in both the session and the process group and both must differ
+      from the leader's PID. A matching parent PID alone is not enough. A row
+      positively `inside` the leader's session is carried into the census as a
+      member of exactly this identity (tracked, so a later contradictory session
+      read cannot make it foreign); anything else — a recycled or missing parent
+      row, a replaced identity, a transiently failed re-verification, an
+      unreadable session or group — is undecided, excludes nothing and keeps the
+      ordinary classification. Every
+      PPID 1 orphan and unknown parent is never excluded by this rule. The macOS
+      rule that a supervised descendant can only be reparented to launchd makes
+      such parentage incompatible with supervised descent.
+
+    NO clock, wall, boot or uptime value takes part: a start-time ordering
+    cannot prove the absence of a masked backward, back-and-forth or forward
+    wall step, so it is not evidence and a row whose start token merely looks
+    earlier is never excluded. A tracked descendant keeps its existing
+    classification however its start token compares.
+
+    A TRACKED identity is never excluded: it is a member this census already
+    accepted, so both rules veto it before anything else and no exclusion ever
+    removes tracked attribution. Every rule needs a positive, re-verified
+    identity plus (for `parent`) one bound observation with positive session and
+    group exclusion. A `member` launcher observation is carried as a tracked
+    member row, so a positively observed member can never be lost to a later
+    contradictory read. An UNDECIDED launcher observation excludes nothing and
+    adds no record: the row is classified by the ordinary getsid/reread path
+    exactly as it would be without the launcher rules, so neither an unknown
+    observation nor a recycled identity is silently dropped. A skipped row is
+    neither a member nor uncertain, and each exclusion's bounded evidence
+    (`pid`, `start`, `rule`) is returned for the receipt.
 
     The round also builds an optional, monitor-receipt-only diagnostics
     object summarizing ESRCH rows (confirm attempts/outcome and the final
@@ -979,9 +1144,12 @@ class Census:
     and they never change classification."""
 
     def __init__(self, sid, snapshot=Kinfo.all, getsid=os.getsid, reread=Kinfo.one, pause=time.sleep,
-                 terminal_allowed=False):
+                 terminal_allowed=False, ancestors=(), getpgid=os.getpgid):
         self.sid, self.snapshot, self.getsid, self.reread, self.pause = sid, snapshot, getsid, reread, pause
         self.terminal_allowed = terminal_allowed if terminal_allowed is True else False
+        self.ancestors = _ancestor_identity_set(ancestors)
+        self.ancestor_pids = frozenset(identity[0] for identity in self.ancestors)
+        self.getpgid = getpgid if callable(getpgid) else os.getpgid
         self.tracked = {}
         # Observation-only per-round counters (oxide#147). They are reset at the
         # start of every round, are never added to the round's returned object
@@ -1063,6 +1231,152 @@ class Census:
         except BaseException:
             return False
 
+    def excludes_ancestor(self, identity):
+        """Whether this identity is one recorded supervisor ancestor.
+
+        Oxide#197: positive identity only, so the exact (PID, start) pair
+        recorded at startup. Never a PID alone, never a recycled PID and never
+        an identity that was not read. Pure predicate: no reads or writes,
+        never raises."""
+        try:
+            return identity in self.ancestors
+        except BaseException:
+            return False
+
+    def identity_stable(self, identity, parent_pid=None):
+        """Whether this exact identity is still what the safe reader names.
+
+        Oxide#197 (design ruling ea5a3dc9): an excluded row's identity is
+        re-verified through the same Kinfo reader after the census snapshot, so
+        an ancestor that was recycled, changed or became unreadable inside the
+        census is never excluded. With `parent_pid` the same read must also still
+        name that parent, which binds the observed parentage to this observation
+        rather than to the older snapshot. Pure observation: one read, no
+        bookkeeping, never raises."""
+        try:
+            again = self.reread(identity[0])
+            if not (isinstance(again, dict) and again.get("pid") == identity[0]
+                    and again.get("start") == identity[1]):
+                return False
+            return parent_pid is None or again.get("ppid") == parent_pid
+        except BaseException:
+            return False
+
+    def member_observation(self, identity):
+        """One bound session observation: `member` or `ambiguous`.
+
+        Oxide#197 (design ruling ea5a3dc9): when a launcher rule has to read a
+        session, the row's own identity is re-verified through the safe reader on
+        BOTH sides of that read, so a positively observed member can never be
+        lost to a contradictory later read. `member` means the identity held on
+        both sides and the row is in the leader's session. Anything else — a
+        failed read, a replaced identity, an unreadable session or a stable
+        session that is not the leader's — is `ambiguous`, because a recorded
+        ancestor's PID must never end up positively foreign. Never raises."""
+        try:
+            if not self.identity_stable(identity):
+                return "ambiguous"
+            session = self.getsid(identity[0])
+            if session is None:
+                return "ambiguous"
+            if not self.identity_stable(identity):
+                return "ambiguous"
+            return "member" if session == self.sid else "ambiguous"
+        except BaseException:
+            return "ambiguous"
+
+    def sibling_observation(self, identity, parent_identity):
+        """One sibling observation: `outside`, `inside` or `ambiguous`.
+
+        Oxide#197 (design ruling ea5a3dc9): the launcher-sibling fact is only
+        usable when the row's own PID/start identity AND its recorded parent are
+        re-verified on both sides of the session/group reads, so a PID reused
+        between the snapshot and those reads can never lend another process's
+        session or group to this row.
+
+        - `outside`: every read succeeded, both identities held, the row still
+          names that parent, and the session AND group are readable and both
+          differ from the leader's PID (its session and group id).
+        - `inside`: every read succeeded, both identities held, and the row is
+          in the leader's session. That observation is carried into the census
+          as a member of exactly this identity, so it is tracked and a later
+          contradictory session read cannot turn it into a foreign row.
+        - `ambiguous`: anything else — a failed read, a replaced identity, a
+          parent that no longer matches, an unreadable session or group, or a
+          group reading of the leader while the session differs. That is never
+          evidence for exclusion, so the caller excludes nothing and the row
+          keeps the ordinary census classification.
+
+        Never raises."""
+        try:
+            ppid = parent_identity[0]
+            if not self.identity_stable(parent_identity):
+                return "ambiguous"
+            if not self.identity_stable(identity, parent_pid=ppid):
+                return "ambiguous"
+            session = self.getsid(identity[0])
+            group = self.getpgid(identity[0])
+            if session is None or group is None:
+                return "ambiguous"
+            if not self.identity_stable(identity, parent_pid=ppid):
+                return "ambiguous"
+            if not self.identity_stable(parent_identity):
+                return "ambiguous"
+            if session == self.sid:
+                return "inside"
+            if group == self.sid:  # inconsistent with the readable session
+                return "ambiguous"
+            return "outside"
+        except BaseException:
+            return "ambiguous"
+
+    def exclusion_rule(self, row, by_pid):
+        """The structural launcher decision for this row.
+
+        Only a POSITIVELY decided identity leaves this function: `ancestor` or
+        `parent` (excluded), or `member` (a bound observation positively put the
+        row in the leader's session, so the caller carries it as a member of
+        exactly this identity). Everything else returns None, which excludes no
+        row and leaves the row to the ordinary getsid/reread classification, so
+        an undecided launcher observation never changes main's classification.
+        A tracked identity is never excluded by these rules. A row whose PID is a
+        recorded ancestor's PID is decided by the ancestor rule alone: a changed
+        or unverifiable identity there is simply not excluded (fail closed
+        against exclusion) and never falls through to its parent's rule. Pure
+        classification over the injected readers: no pauses, never raises."""
+        try:
+            identity = (row["pid"], row["start"])
+            if identity in self.tracked:  # a tracked member is never excluded
+                return None
+            if row["pid"] in self.ancestor_pids:
+                # A recorded ancestor PID is decided here only: the exact,
+                # re-verified identity is excluded and never falls through.
+                if identity in self.ancestors and self.identity_stable(identity):
+                    return "ancestor"
+                # A different identity at that PID is not this ancestor. One
+                # bound session observation decides only the positive case: a
+                # member observation is carried into the census (an ancestor
+                # predates the leader, so a descendant can never be one). An
+                # undecided observation excludes nothing and falls through.
+                return "member" if self.member_observation(identity) == "member" else None
+            ppid = row.get("ppid")
+            if type(ppid) is not int or ppid <= 1:  # an orphan is never excluded
+                return None
+            parent = (by_pid or {}).get(ppid)
+            if parent is None:  # an unknown parent is never excluded
+                return None
+            parent_identity = (parent["pid"], parent["start"])
+            if not self.excludes_ancestor(parent_identity):
+                return None
+            observed = self.sibling_observation(identity, parent_identity)
+            if observed == "outside":
+                return "parent"
+            if observed == "inside":
+                return "member"
+            return None  # undecided: excludes nothing, ordinary classification owns it
+        except BaseException:
+            return None  # never exclude on an unreadable or failed observation
+
     def round(self):
         self.reset_stats()
         begun = now_ns()
@@ -1087,6 +1401,16 @@ class Census:
         for identity in list(self.tracked):
             if identity not in present:
                 del self.tracked[identity]
+        # Launcher rules (oxide#197, design ruling ea5a3dc9). The parent rule
+        # needs the observation-time parent row, so the parent is resolved from
+        # this same snapshot. No clock fact is read: an ancestor record that was
+        # not recorded excludes nothing.
+        by_pid = {}
+        if self.ancestors:
+            for row in rows:
+                by_pid.setdefault(row["pid"], row)
+        exclusions, excluded_total = [], 0
+        rule_totals = {"ancestor": 0, "parent": 0}
         members, uncertain = [], []
         diag_attempted, diag_saturated = 0, False
         terminal_count, terminal_witnesses, terminal_tainted = 0, [], False
@@ -1099,6 +1423,30 @@ class Census:
         pending = []  # (index, row, identity, state) still being confirmed, snapshot order
         for index, row in enumerate(rows):
             identity = (row["pid"], row["start"])
+            # A tracked identity keeps its existing member/terminal attribution
+            # and is never excluded, so a launcher rule can never remove it.
+            rule = (self.exclusion_rule(row, by_pid)
+                    if by_pid and identity not in self.tracked else None)
+            if rule == "member":
+                # A bound session observation positively found this identity in
+                # the leader's session: carry it as a member and track it, so a
+                # later contradictory session read cannot turn it into a foreign
+                # row or let it vanish from the census.
+                self.tracked[identity] = row
+                records[index] = {"member": row}
+                continue
+            if rule is not None:
+                # A positively decided launcher identity: this run's own
+                # launcher chain, so never a member and never an unknown row. No
+                # pause, and its tracked set is left untouched. An UNDECIDED
+                # observation never reaches this branch: it excludes no row and
+                # the ordinary getsid/reread classification below owns the row.
+                records[index] = {"skip": True}
+                excluded_total += 1
+                rule_totals[rule] += 1
+                if len(exclusions) < EXCLUSION_MAX_ROWS:
+                    exclusions.append({"pid": identity[0], "start": identity[1], "rule": rule})
+                continue
             failure, getsid_error = None, None
             try:
                 session = self.getsid(row["pid"])
@@ -1280,6 +1628,15 @@ class Census:
             uncertain.append({"reason": "terminal count not countable"})
         result = {"certain": not uncertain, "members": len(members), "uncertain": len(uncertain),
                 "member_rows": members[:20], "uncertain_rows": uncertain[:20]}
+        if self.ancestors:
+            # Receipt-only, bounded positive evidence for the launcher rules: the
+            # rows kept here are the first EXCLUSION_MAX_ROWS of this round, and
+            # the counts cover every exclusion decision. Observation only: it
+            # never changes a classification, count, read, pause or budget.
+            result["ancestor_exclusions"] = {
+                "rows": exclusions, "count": excluded_total,
+                "omitted": max(0, excluded_total - len(exclusions)),
+                "by_rule": rule_totals}
         result["terminal_count_status"] = status
         result["terminal_nonwriters"] = value if (
             status == "valid" and type(value) is int and 0 <= value <= U64MAX) else None
@@ -1308,6 +1665,56 @@ class Census:
 
 
 # Guard and precedence (custodian side, pure) -------------------------------------
+
+
+def exclusion_record():
+    """The receipt's cumulative, bounded launcher-exclusion evidence (oxide#197)."""
+    return {"rows": [], "count": 0, "omitted": 0,
+            "by_rule": {"ancestor": 0, "parent": 0}, "rounds": 0}
+
+
+def merge_exclusions(receipt, report):
+    """Add one round's launcher-exclusion evidence to the receipt's record.
+
+    Observation only: never raises and never changes a classification, count,
+    fault, closure, EOF or cleanup. The receipt keeps at most
+    EXCLUSION_MAX_ROWS distinct positive identity rows; every decision still
+    moves `count`, `by_rule` and `omitted`."""
+    try:
+        if not isinstance(receipt, dict) or not isinstance(report, dict):
+            return
+        record = receipt.get("ancestor_exclusions")
+        if not isinstance(record, dict):
+            record = exclusion_record()
+            receipt["ancestor_exclusions"] = record
+        record["rounds"] += 1
+        reported = report.get("count")
+        count = reported if type(reported) is int and reported >= 0 else 0
+        record["count"] += count
+        kept = 0
+        rows = report.get("rows")
+        if isinstance(rows, list):
+            for entry in rows:
+                if not isinstance(entry, dict):
+                    continue
+                pid, start, rule = entry.get("pid"), entry.get("start"), entry.get("rule")
+                if not (type(pid) is int and type(start) is int
+                        and rule in ("ancestor", "parent")):
+                    continue
+                if len(record["rows"]) < EXCLUSION_MAX_ROWS and not any(
+                        row.get("pid") == pid and row.get("start") == start
+                        for row in record["rows"]):
+                    record["rows"].append({"pid": pid, "start": start, "rule": rule})
+        # Invariant: every decision is either a kept distinct row or omitted.
+        record["omitted"] = max(0, record["count"] - len(record["rows"]))
+        by_rule = report.get("by_rule")
+        if isinstance(by_rule, dict):
+            for rule in ("ancestor", "parent"):
+                value = by_rule.get(rule)
+                if type(value) is int and value >= 0:
+                    record["by_rule"][rule] += value
+    except BaseException:
+        pass
 
 
 class Guard:
@@ -3360,6 +3767,9 @@ class Monitor:
         self.inject = set(ctx["inject"])
         self.pipes = [(out_r, "stdout", 1), (err_r, "stderr", 2)]
         self.receipt = None
+        # Oxide#197: the recorded ancestor chain, filled by setup before the
+        # leader exists. Nothing is excluded until it is recorded.
+        self.ancestors = {"state": "unreadable", "count": 0, "identities": [], "stop": None}
         # Observation-only settlement diagnostics; the receipt carries this
         # same object, so publishing includes it without extra work.
         self.settlement = settlement_record()
@@ -3472,6 +3882,11 @@ class Monitor:
             Kinfo.check()
         except Exception as error:
             raise SetupRefused(f"missing kinfo_proc ({type_name(error)})")
+        # Oxide#197: record this run's own ancestor chain before anything is
+        # launched, so the post-leader census can exclude exactly those
+        # positive identities and nothing else.
+        self.ancestors = ancestor_identities()
+        ctx["ancestors"] = self.ancestors
         if ctx["adopted"]:
             scratch = os.path.realpath(ctx["adopted"])
             if not os.path.isdir(scratch):
@@ -3516,6 +3931,8 @@ class Monitor:
             "root": ctx["root"], "scratch": ctx["scratch"], "evidence": ctx["evidence"],
             "scratch_owned": ctx["owned"], "start_ns": ctx["start_ns"], "abort_threshold": THRESHOLD,
             "terminal_mode": dict(terminal_mode),
+            "ancestors": dict(self.ancestors, identities=list(self.ancestors["identities"])),
+            "ancestor_exclusions": exclusion_record(),
             "scratch_default": dict(ctx["selection"]),
             "scratch_sweep": marker.get("sweep"),
             "scratch_marker": {key: marker.get(key) for key in ("path", "state", "run_id", "reason")},
@@ -3841,8 +4258,10 @@ class Monitor:
                 self.note(thread_start_latency_ns=max(0, started - received))
         except BaseException:
             pass
+        record = self.ctx.get("ancestors") or {}
         census = Census(self.leader[0], terminal_allowed=(
-            self.ctx.get("terminal_mode", {}).get("mode") == "allowlisted"))
+            self.ctx.get("terminal_mode", {}).get("mode") == "allowlisted"),
+            ancestors=record.get("identities") or ())
         self.note(census_built_ns=now_ns())
         while not self.census_stop.is_set():
             begin = now_ns()
@@ -3869,6 +4288,7 @@ class Monitor:
                 acquired = now_ns()
                 self.receipt["census"] = result
                 self.receipt["census_rounds"] += 1
+                merge_exclusions(self.receipt, result.get("ancestor_exclusions"))
             released = now_ns()
             self.note(entry, phase="locked", lock_acquired_ns=acquired, lock_released_ns=released,
                       certain=result["certain"], members=result["members"],
@@ -3992,6 +4412,10 @@ class Monitor:
         self.send("setup", root=ctx["root"], scratch=ctx["scratch"], evidence=ctx["evidence"], owned=ctx["owned"])
         if "setup-stall" in self.inject:
             time.sleep(SETUP_S + 5)
+        if "setup-delay" in self.inject:
+            # A cold setup slower than the reserve freshness window, still inside
+            # the setup deadline: no reading exists yet, and that is not a fault.
+            time.sleep(SETUP_DELAY_S)
         for target in (self.sample_reserve, self.sample_owned, self.sample_admission):
             threading.Thread(target=target, daemon=True).start()
         for fd, name, sink in self.pipes:

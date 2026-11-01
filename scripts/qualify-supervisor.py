@@ -77,7 +77,7 @@ WALL_NS = 600 * NS  # oxide#192 amendment (2026-10-31): was 420 s (#191), 300 s 
 CANDIDATE_LIMIT = 560  # oxide#192 amendment: was 380 s (#191), 280 s before
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 382  # 329 pure + 53 real. oxide#151 added the routing, marker,
+EXPECTED_CASES = 416  # 361 pure + 55 real. oxide#151 added the routing, marker,
                       # nested-window protection, bounded-sweep, qualify-entry,
                       # shared-ancestor/private-leaf and readiness cases; oxide#191
                       # adds seventy-six pure post-census detach cases and eight real
@@ -92,7 +92,20 @@ EXPECTED_CASES = 382  # 329 pure + 53 real. oxide#151 added the routing, marker,
                       # correlation), together with the overwrite/rejection
                       # classification, launch-refusal reasons, the
                       # sampling-based freshness clock and shutdown-freshness
-                      # regressions.
+                      # regressions. oxide#197 adds 32 pure structural launcher-rule
+                      # cases (re-verified ancestor exclusion with no parent
+                      # fall-through, a bound sibling observation with
+                      # identity/parentage re-verification around the session/group
+                      # reads, the tracked-member veto, a distinct ambiguous outcome
+                      # for a changed ancestor identity or an unreadable sibling
+                      # session/group (never foreign), a carried member observation
+                      # so a positively seen member is never re-read into a foreign
+                      # row, the masked/back-and-forth/forward wall-step refusals,
+                      # recycled/unknown/PPID-1 refusals, evidence bounds and the
+                      # mid-run sibling regression) and two real cases (the
+                      # launcher sibling, and the inherited end-to-end slow-setup
+                      # launch-and-close regression for #192's sampling-based
+                      # freshness clock)
 ACTOR_MARGIN_NS = 2 * NS  # the actor's own KILL, reap and exit
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPTS)

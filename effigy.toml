@@ -298,7 +298,8 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # commands take Tom's answered internal-root exception explicitly
 # (`--root-parent /private/tmp`) rather than placing a pool on a selected
 # volume, where the product correctly refuses it. The supervisor is this tree's
-# `bounded-test.py` (sha256 0848974d…, oxide#191's post-census detach bytes over
+# `bounded-test.py` (sha256 94b1aba6…, oxide#191's post-census detach and
+# oxide#197's ancestor and launcher-sibling exclusions over
 # the qualified oxide#151 guard; those added bytes are unqualified until their
 # own qualifications pass); 300 s wall and
 # 512 MiB monitored scratch are unchanged and the fit stays unmeasured until
@@ -530,9 +531,10 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 
 # Owned-output prune (oxide#129, oxide#152): one fixed 22-case native proof
 # under the shared supervisor (`scripts/bounded-test.py` SHA-256
-# 0848974d79d84617070bd611da9503b48a0127e68c2965cebcd36e8d5fc13414,
-# the qualified oxide#151 guard plus oxide#191's opt-in post-census detach,
-# unqualified until its own qualifications pass): 360 s, 512 MiB monitored scratch, 30 s work
+# 94b1aba60a7475a31b5620039986336f13e1c88d58dd3732b5736290dc63685b,
+# the qualified oxide#151 guard plus oxide#191's opt-in post-census detach and
+# oxide#197's ancestor and launcher-sibling exclusions,
+# unqualified until their own qualifications pass): 360 s, 512 MiB monitored scratch, 30 s work
 # shutdown margin, one
 # owned 128 MiB scratch image, ordinary detach. Fence and initialization, root
 # nonces, shared and cancelled reservations, snapshot, overflow, eligibility,
@@ -1101,9 +1103,10 @@ admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-freshness-submodules.py"
 
 # Slot headroom (oxide#118, oxide#177): under the shared proof supervisor
-# (oxide#109/#114/#151 plus oxide#191's opt-in post-census detach, bounded-test.py
-# SHA-256 0848974d79d84617070bd611da9503b48a0127e68c2965cebcd36e8d5fc13414,
-# unqualified until its own qualifications pass), stages
+# (oxide#109/#114/#151 plus oxide#191's opt-in post-census detach and oxide#197's
+# ancestor and launcher-sibling exclusions, bounded-test.py
+# SHA-256 94b1aba60a7475a31b5620039986336f13e1c88d58dd3732b5736290dc63685b,
+# unqualified until their own qualifications pass), stages
 # `oxide` offline with 1.97.1 and proves the permanent ledger/control fences,
 # legacy read without migration, the raised-ceiling fence written at the 129th
 # slot, rank exhaustion, a 256-slot pool whose 257th and 258th admissions
