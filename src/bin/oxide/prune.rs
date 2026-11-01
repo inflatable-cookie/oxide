@@ -3366,47 +3366,21 @@ fn injected_eacces(_directory: &Path) -> bool {
     false
 }
 
-/// The evidence directory of an armed debug proof fixture, under the shared
-/// proof supervisor (a deadline, canonical owned scratch, evidence nested in
-/// it or its `evidence/` sibling). The caller decides placement.
-#[cfg(debug_assertions)]
-fn supervisor_evidence() -> Option<PathBuf> {
-    oxide_storage::proof::evidence()
-}
-
-/// The evidence directory for the injections that stay on the internal volume
-/// (the EACCES and low-reserve fixtures): supervised, with canonical scratch
-/// below /private/tmp.
+/// The evidence directory of an armed debug proof fixture: only under the
+/// shared proof supervisor (a deadline, canonical scratch below
+/// /private/tmp, evidence nested in it or its `evidence/` sibling).
 #[cfg(debug_assertions)]
 fn proof_evidence() -> Option<PathBuf> {
-    let evidence = supervisor_evidence()?;
+    // The shared guard (`oxide_storage::proof`) requires the supervisor's
+    // deadline, canonical owned scratch and nested-or-sibling evidence; the
+    // prune hooks additionally stay on the internal volume, which is where
+    // their own proofs run.
+    let evidence = oxide_storage::proof::evidence()?;
     let scratch = fs::canonicalize(std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")?).ok()?;
     if !scratch.starts_with("/private/tmp") {
         return None;
     }
     Some(evidence)
-}
-
-/// Where an armed prune fixture may place its control directory (oxide#211, S4,
-/// decision 7aedd5af). Internal: the supervisor scratch is below /private/tmp.
-/// Selected volume: the control directory must sit under the proof's DECLARED
-/// scratch pool root (`OXIDE_SCRATCH_ROOT`), which is a strict child of the
-/// supervisor scratch. The declaration itself was verified by the product at
-/// admission; this only names where a test hook may fire.
-#[cfg(debug_assertions)]
-fn hook_placement_allowed(scratch: &Path, declared: Option<&Path>, control: &Path) -> bool {
-    if scratch.starts_with("/private/tmp") {
-        return true;
-    }
-    match declared {
-        Some(declared) => {
-            declared != scratch
-                && declared.starts_with(scratch)
-                && control != declared
-                && control.starts_with(declared)
-        }
-        None => false,
-    }
 }
 
 /// Debug builds only, under [`proof_evidence`]: a low-reserve reading for
@@ -3698,7 +3672,7 @@ fn account_candidates(evaluated: &mut [Evaluated], control: &Path) {
 
 #[cfg(debug_assertions)]
 fn prune_fixture_fault(control: &Path, variable: &str, target: &Path, marker: &str) -> bool {
-    let Some(evidence) = supervisor_evidence() else {
+    let Some(evidence) = proof_evidence() else {
         return false;
     };
     let Some(scratch) =
@@ -3706,15 +3680,12 @@ fn prune_fixture_fault(control: &Path, variable: &str, target: &Path, marker: &s
     else {
         return false;
     };
-    let declared =
-        std::env::var_os("OXIDE_SCRATCH_ROOT").and_then(|path| fs::canonicalize(path).ok());
     let Ok(canonical_control) = fs::canonicalize(control) else {
         return false;
     };
     if canonical_control != control
         || canonical_control == scratch
         || !canonical_control.starts_with(&scratch)
-        || !hook_placement_allowed(&scratch, declared.as_deref(), &canonical_control)
         || !matches!(store::open_control_directory(control), Ok(Some(_)))
         || std::env::var_os(variable).as_deref() != Some(target.as_os_str())
     {
@@ -6864,42 +6835,6 @@ pub(crate) fn test_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// oxide#211 (decision 7aedd5af): a prune test hook arms on the internal
-    /// volume, or under a DECLARED scratch pool inside the supervisor scratch.
-    /// Every other placement stays inert, including a declaration equal to the
-    /// scratch root, a control outside the declared pool and a prefix lookalike.
-    #[cfg(debug_assertions)]
-    #[test]
-    fn prune_hook_placement_is_internal_or_a_declared_scratch_pool() {
-        let scratch = Path::new("/Volumes/Builds/scratch/oxide/run/scratch");
-        let declared = scratch.join("scratch-pools");
-        let control = declared.join("pool/oxide-managed");
-        assert!(hook_placement_allowed(scratch, Some(&declared), &control));
-        assert!(hook_placement_allowed(
-            Path::new("/private/tmp/run/scratch"),
-            None,
-            Path::new("/private/tmp/run/scratch/pool/oxide-managed"),
-        ));
-        assert!(!hook_placement_allowed(scratch, None, &control));
-        assert!(!hook_placement_allowed(scratch, Some(scratch), &control));
-        assert!(!hook_placement_allowed(
-            scratch,
-            Some(Path::new("/Volumes/Builds/other/scratch-pools")),
-            &control,
-        ));
-        assert!(!hook_placement_allowed(
-            scratch,
-            Some(&declared),
-            &scratch.join("checkouts/pool/oxide-managed"),
-        ));
-        assert!(!hook_placement_allowed(scratch, Some(&declared), &declared));
-        assert!(!hook_placement_allowed(
-            scratch,
-            Some(&declared),
-            &scratch.join("scratch-pools-evil/pool/oxide-managed"),
-        ));
-    }
 
     /// oxide#155: a Finder-metadata race that did not remove the quarantine is
     /// a pending intent for every caller, never a completed deletion. The

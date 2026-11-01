@@ -5962,11 +5962,6 @@ The stable, read-only interface other tools use to find the registered Builds dr
   legacy checkout's nearest existing ancestor must be on the boot Data volume
   (`prune.rs:3276-3287`). Both modes' fit is unmeasured and both need their own
   owner activation; neither has run at the migrated head.
-  The armed debug prune test hooks (`OXIDE_TEST_PRUNE_*`) fire only under the
-  supervisor and only on the internal volume or under the proof's declared
-  `OXIDE_SCRATCH_ROOT` pool inside its supervisor scratch (`hook_placement_allowed`,
-  `src/bin/oxide/prune.rs`). The EACCES and low-reserve injections keep the
-  internal-only rule. Release builds carry none of them.
   Effigy heavy admission unavailable (f6b3b50 retired host-run client;
   Queue #381 pending); not host-admitted. Any later activation needs fresh
   owner scheduler headroom, independent source-fit and separate activation.
