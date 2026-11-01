@@ -1714,7 +1714,7 @@ Every case applies the nine-item
 with an executable location or a concrete not-applicable reason: the script
 records all nine in `PREMISE_CHECKLIST` (private HOME and rustup, account-home
 control, environment isolation, no adopting conversion, no external Cargo
-subcommand, no image, frozen compiler flags, the internal-root temporary
+subcommand, no image, frozen compiler flags, selected-volume temporary
 storage, no `mktemp`), `--self-check` asserts the map is complete, and the
 diagnostic receipt carries it. The uncounted `--diagnostic` gate below runs
 before the first counted native. The
@@ -1774,10 +1774,9 @@ keeps on and the fixture checks through the built-in capability probe before
 any case asserts a count, and a release build must refuse control presence at
 any value.
 
-**Recipe binding.** The proof needs a genuine internal `directory-budget-v1`
-pool, so both heavy commands pass `--root-parent /private/tmp` explicitly
-(Tom's answered internal-root exception); a pool under a selected volume would
-be refused by the product itself. Staging is one function with the real argv
+**Recipe binding.** Fixture directory-budget pools use an explicit cap and
+`OXIDE_SCRATCH_ROOT` within the supervisor's selected-volume run root.
+Staging is one function with the real argv
 and environment, and `--self-check` mutates it (one job, one codegen unit,
 profile drift, a leaked encoded-flags value, a build directory outside the
 stage) so the pure check fails if the recipe regresses. Fixtures keep one Cargo
