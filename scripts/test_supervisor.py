@@ -1256,6 +1256,17 @@ class PureCensusFinalAbsence(unittest.TestCase):
         self.assertNotIn((110, 9), check.tracked)
         self.assertEqual(result["diagnostics"]["rows"][0]["final"], "replaced")
 
+    def test_final_replacement_is_classified_in_same_round(self):
+        # The replacement has a bound leader session; the old implementation
+        # drops it and incorrectly reports a certain empty deciding census.
+        table = FakeTable([row(110, start=5)],
+                          {110: [ProcessLookupError(3, "gone"), 100]},
+                          reread={110: lambda reads: row(110, start=5) if reads <= 20 else row(110, start=9)})
+        check = census(table)
+        result = check.round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 1, 0))
+        self.assertIn((110, 9), check.tracked)
+
     def test_final_none_tracked_drops_only_old(self):
         table = FakeTable([row(111, start=5)], {111: 100})
         check = census(table)
