@@ -96,8 +96,8 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # approved 120 s / 64 MiB bounds. Inside that scratch it stages this HEAD's
 # debug `oxide` with plain Cargo offline and 1.97.1 (-j1, one codegen unit,
 # debug-free, symbol-stripped, size-optimised), deletes the staged target,
-# then runs private HOME, receipt and directory-pool fixtures. It creates no
-# Oxide pool and touches no live pool, ~/.local/bin/oxide, install receipt or
+# then runs private HOME, receipt and scratch-pool fixtures on the selected
+# volume. It touches no live pool, ~/.local/bin/oxide, install receipt or
 # host state. Measured peak: 58.3 MiB of the 64 MiB gate, staging ~37 s. Not
 # a benchmark, a real-install qualification or an alias for full QA.
 [tasks."proof:installed-handoff:test"]

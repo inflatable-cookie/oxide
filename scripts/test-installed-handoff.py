@@ -5,14 +5,14 @@ One fixed script and whole command under the qualified shared supervisor
 (`bounded-test.py`): the brief's 120 s wall limit and 64 MiB monitored scratch
 budget including cleanup. It stages this clean HEAD's debug `oxide` itself with
 plain Cargo and the pinned 1.97.1, offline, into its own scratch target, copies
-the binary and deletes the target before the fixtures. No Oxide pool, no
-installed binary, no host state and no network are involved. The stage is kept
+the binary and deletes the target before the fixtures. Only private scratch
+pools are created; no installed binary, host state or network is involved. The stage is kept
 inside the 64 MiB gate by single-threaded, single-codegen-unit, debug-free,
 symbol-stripped, size-optimised codegen: the staged tree peaks near 58 MiB,
 the fixtures near 2 MiB, and staging takes about 37 s.
 
 Every fixture has a private HOME with receipts and a candidate stub, a private
-`OXIDE_POOL` directory pool with planted control files, a private CARGO_HOME,
+`OXIDE_POOL` scratch pool with planted control files, a private CARGO_HOME,
 and a PATH whose only `oxide` is the fixture candidate. Cases cover: newer
 state and registration versions; malformed, older and non-numeric documents
 that must not trigger; a valid candidate that is executed exactly once with

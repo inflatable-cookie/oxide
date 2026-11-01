@@ -323,7 +323,7 @@ each script's own selector text and case bodies.
 
 | Selector(s) | Premise today |
 | --- | --- |
-| `rust:installed-handoff` (#122) | two cases create a real directory pool; needs the diagnostic apparatus authored first (S4) |
+| `rust:installed-handoff` (#122, #206) | selected-volume scratch pools; diagnostic and native evidence at the migrated head require owner activation |
 | `rust:profile-outputs` (#133) + `:diagnostic` | 20 private directory-budget fixture pools |
 | `rust:pool-temp-scratch` (#136) + `:diagnostic` | directory-budget pool plus one owned image; no boot-Data premise |
 | `rust:recorded-slot-accounting` (#146) + `:diagnostic` | genuine directory-budget pool, verified from the product's own config |
@@ -482,9 +482,7 @@ does not change. So each migration is a proof-authoring change:
   `OXIDE_`/`XDG_`/`CARGO_*`/`GIT_` scrub, the declaration and cap, `mktemp`-only
   fixture roots, the image custody where one exists);
 - the required **uncounted keep-going diagnostic** before any counted native,
-  as an uncounted collection that never becomes a PASS. Nine of the ten already
-  have a `:diagnostic` twin; `rust:installed-handoff` has **none**, so its
-  sub-slice must author it first (below);
+  as an uncounted collection that never becomes a PASS. Each migrated selector has a `:diagnostic` twin; `rust:installed-handoff` authored one as part of its migration;
 - the **counted author native at the migrated head**, then one distinct
   **independent reviewer native at that exact head**, because every migrated
   child now writes a pool on removable media (the ELEVATED trigger), in
@@ -500,7 +498,7 @@ stand at this head:
 
 | Selector | Limit / scratch | `:diagnostic` twin | Effect-free pre-native check |
 | --- | --- | --- | --- |
-| `rust:installed-handoff` | 120 s / 64 MiB | **none — authored in this sub-slice** | none in the script; only `scripts/test_dogfood_scripts.py` `HandoffSelectorTests` pins its root, limits and body |
+| `rust:installed-handoff` | 120 s / 64 MiB | yes | `proof:installed-handoff:test`, `proof:installed-handoff:plan`, and `HandoffSelectorTests` |
 | `rust:profile-outputs` | 600 s / 512 MiB | yes | `--plan` |
 | `rust:pool-temp-scratch` | 300 s / 512 MiB | yes | `proof:pool-temp:test`, `--plan` |
 | `rust:recorded-slot-accounting` | 300 s / 512 MiB | yes | `proof:recorded-slot-accounting:test`, `--plan` |
@@ -523,17 +521,7 @@ Nothing is carried over between steps: a failing or missing step stops that
 sub-slice, and the design stays valid because every not-yet-migrated proof keeps
 `bd357a4c`.
 
-`rust:installed-handoff` is the one sub-slice that must author apparatus before
-it can migrate: the script has no `--diagnostic`, no `--self-check` and no
-`--plan`. Its bounded path is (a) add a `--diagnostic` keep-going collection
-with a bounded `qualified: false` receipt beside the guard's, (b) add a
-`--self-check` that pins the diagnostic dispatch and the fixture environment
-with no child, pool, Cargo or install, (c) add the two selectors
-`rust:installed-handoff:diagnostic` and `proof:installed-handoff:test` at the
-same guard, 120 s and 64 MiB, and update `HandoffSelectorTests`, then (d) the
-six steps above. If the owner declines that apparatus work, installed-handoff
-stays on `--root-parent /private/tmp` under `bd357a4c`: the migration list is a
-candidate list, and a smaller migration is a legitimate outcome.
+`rust:installed-handoff` has a diagnostic, a pure self-check, a plan and a selector pin. Its fixture pools use the selected-volume scratch root and an explicit cap. The diagnostic and both native sessions need their own owner activation at the migrated head; prior evidence is not carried forward.
 
 Cost, stated rather than hidden: nine existing diagnostics plus one authored
 one, and twenty natives (author and reviewer), each at its own budget,
