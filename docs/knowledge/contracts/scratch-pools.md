@@ -440,7 +440,9 @@ one fixed script and the whole command of the qualified shared supervisor
 (`bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3
 scripts/test-scratch-pool.py`), 300 s, 512 MiB, two owned 128 MiB APFS images in total, at most one attached at a time,
 attached with `hdiutil -owners on` and ordinarily detached, private `HOME`,
-`CARGO_HOME` and config. **ELEVATED also requires one distinct independent
+`CARGO_HOME` and config. The tiny image cannot meet the unchanged 20 GiB pool
+reserve, so this debug fixture supplies scoped pool and watchdog readings; the
+shared supervisor independently enforces the real host reserve and scratch budget. **ELEVATED also requires one distinct independent
 reviewer native `effigy rust:scratch-pool` at the exact head**, in addition to
 the reviewer's exact-head source review of the author's evidence; the author's
 native and the reviewer's are separate owner activations.
@@ -461,7 +463,7 @@ same UUID, warm reuse; (09) a *different* image at the same mount name refuses
 by UUID; (10) a copied pool (binding edited to another UUID, then the original
 bytes restored) refuses and the pool is untouched; (11) a stale mount directory is unit-proved through `scratch_admission::tests::stale_volume_directory_refuses_without_creation`, since an unprivileged user cannot create a stale `/Volumes` entry; (12) the host record removed while the volume is present: `status` writes
 nothing and reports exactly as today (no scratch fact), and a leased open
-repairs the record once, after which `status` shows the UUID label; (13) the
+repairs the record on a guarded recovery open and on a leased open, after which `status` shows the UUID label; (13) the
 host record edited to another UUID refuses as a mismatch with both records and
 the pool bytes unchanged; (14) an
 unreadable, malformed, symlinked or oversized host record refuses as invalid;

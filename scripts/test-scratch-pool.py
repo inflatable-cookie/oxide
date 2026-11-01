@@ -2,19 +2,19 @@
 """S3 external scratch-pool proof, supervised by bounded-test.py.
 
 Premise checklist (workflow.md):
-1. toolchain provenance is resolved before private HOME; pinned offline staging;
-   fixture lock is written before --locked calls (setup).
-2. OXIDE_TEST_HOME_FROM_ENV=1 on every product child (setup).
-3. fixture environment is built from a small allowlist; OXIDE/XDG/GIT/CARGO
-   inheritance is not copied (setup).
-4. automatic adoption is not an oracle; fixture outputs remain in private root.
-5. no Cargo external subcommand is invoked.
-6. both owned images attach with -owners on; custody and detach are in Images.
-7. staging and fixture children use the same declared RUSTFLAGS; encoded flags
-   are removed (setup).
-8. all temporary files are in the qualified supervisor's scratch; images are
-   in its evidence; the selector does not override default routing.
-9. tempfile.mkdtemp uses an explicit dir under the published scratch.
+1. fixture(): resolve toolchain before private HOME; pinned offline staging;
+   write fixture lock before --locked calls.
+2. fixture(): OXIDE_TEST_HOME_FROM_ENV=1 on every product child.
+3. fixture(): allowlisted fixture environment, scrub staging OXIDE/XDG/GIT/CARGO.
+4. fixture(): automatic adoption is not an oracle; checkout is private.
+5. product(): no Cargo external subcommand is invoked.
+6. Images.create/attach/detach: both images use owners-on and bounded custody.
+7. fixture(): same declared RUSTFLAGS for staging and fixture; encoded flags scrubbed.
+8. fixture(): scratch and TMPDIR are inside supervisor scratch; Images uses evidence.
+   The 128 MiB image cannot satisfy the 20 GiB product threshold: fixture() supplies
+   debug-only pool and watchdog readings above 22 GiB. The independent shared
+   supervisor still enforces its real host reserve and monitored scratch budget.
+9. fixture(): tempfile.mkdtemp uses an explicit supervisor scratch parent.
 
 Cases are ordered and share state. Diagnostic records each outcome and skips
 all dependent cases after a fault; unknown image custody always aborts. The
@@ -48,17 +48,68 @@ def self_check():
     assert not may_detach(True, True)
     assert detached(True, []) and not detached(False, []) and not detached(True, ['/dev/disk1'])
     assert may_attach(False) and not may_attach(True)
+    children = Children()
+    assert children.closed()
+    children.launched += 1
+    assert not children.closed()
+    children.reaped += 1
+    assert children.closed()
+    children.unknown = True
+    assert not children.closed()
+    def fault(exc):
+        def raise_it(): raise exc
+        return raise_it
+    ran = []
+    cases = [('01', fault(OracleFailure('oracle'))), ('04', lambda: ran.append('independent'))]
+    rows, _, aborted = drive_cases(cases, True)
+    assert ran == ['independent'] and not aborted and rows[1]['outcome'] == 'completed'
+    ran.clear()
+    for error in (UnknownOutcome('child'), TimeoutError('deadline'), OSError('custody')):
+        rows, _, aborted = drive_cases([('01', fault(error)), ('04', lambda: ran.append('unsafe'))], True)
+        assert aborted and not ran and rows[1]['outcome'] == 'skipped'
     import inspect
-    create_source = inspect.getsource(Images.create)
-    attach_source = inspect.getsource(Images.attach)
-    detach_source = inspect.getsource(Images.detach)
+    create_source = inspect.getsource(Images._create)
+    attach_source = inspect.getsource(Images._attach)
+    detach_source = inspect.getsource(Images._detach)
     assert create_source.index('image-custody.json') < create_source.index('hdiutil')
     assert 'may_attach(self.attached is not None)' in attach_source
     assert detach_source.index('self.request.unlink()') < detach_source.index('may_detach(') < detach_source.index("'detach'")
     assert 'detached(not os.path.ismount' in detach_source
     assert 'attachment entities unreadable' in detach_source
+    fixture_source = inspect.getsource(fixture)
+    assert 'OXIDE_TEST_POOL_FREE_BYTES' in fixture_source
+    assert 'OXIDE_TEST_WATCHDOG_READINGS' in fixture_source
+    assert '32 * 1024 ** 3' in fixture_source
+    assert 'may_detach(CHILDREN.closed()' in detach_source
     print('scratch-pool proof self-check: custody, child closure, request withdrawal, post-state and exclusive attachment OK')
     return 0
+
+
+def drive_cases(cases, diagnostic):
+    dependencies = {'02': ('01',), '03': ('02',), '07': ('03',),
+                    '08': ('07',), '09': ('08',), '10': ('09',),
+                    '12': ('10',), '13': ('12',), '14': ('13',), '15': ('14',)}
+    completed, outcomes, first, aborted = set(), [], None, False
+    for name, case in cases:
+        missing = [n for n in dependencies.get(name, ()) if n not in completed]
+        if aborted or missing or (first and not diagnostic):
+            reason = 'unknown outcome' if aborted else 'prerequisite not completed: ' + ','.join(missing)
+            outcomes.append({'case': name, 'outcome': 'skipped', 'reason': reason})
+            continue
+        try:
+            print('case', name, flush=True); case()
+            completed.add(name)
+            outcomes.append({'case': name, 'outcome': 'completed'})
+        except OracleFailure as exc:
+            fault = f'{type(exc).__name__}: {exc}'[:1024]
+            first = first or fault
+            outcomes.append({'case': name, 'outcome': 'failed', 'reason': fault})
+        except Exception as exc:
+            fault = f'{type(exc).__name__}: {exc}'[:1024]
+            first = first or fault
+            outcomes.append({'case': name, 'outcome': 'failed', 'reason': fault})
+            aborted = True
+    return outcomes, first, aborted
 
 
 def custody_document(a, b):
@@ -86,21 +137,66 @@ def atomic(path, value):
     os.replace(tmp, path)
 
 
+class OracleFailure(Exception):
+    pass
+
+
+class UnknownOutcome(Exception):
+    pass
+
+
 def require(condition, message):
     if not condition:
-        raise RuntimeError(message)
+        raise OracleFailure(message)
 
 
 def remaining():
     left = (int(os.environ['OXIDE_PROOF_DEADLINE_NS']) - time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)) / 1e9 - 20
-    require(left > 1, 'work window exhausted')
+    if left <= 1: raise UnknownOutcome('work window exhausted')
     return left
 
 
+class Children:
+    def __init__(self):
+        self.launched = 0
+        self.reaped = 0
+        self.unknown = False
+
+    def closed(self):
+        return not self.unknown and self.launched == self.reaped
+
+    def run(self, argv, timeout=None, **kwargs):
+        try:
+            child = subprocess.Popen([str(x) for x in argv], stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
+        except OSError as exc:
+            self.unknown = True
+            raise UnknownOutcome(f'child spawn: {exc}') from exc
+        self.launched += 1
+        try:
+            stdout, stderr = child.communicate(timeout=remaining() if timeout is None else timeout)
+        except Exception as exc:
+            self.unknown = True
+            # This is our own direct child, not a process-name or group kill.
+            try:
+                child.kill()
+                child.communicate(timeout=min(1, max(0.01, remaining())))
+                if child.returncode is not None: self.reaped += 1
+            except Exception:
+                pass
+            raise UnknownOutcome(f'child completion unknown: {type(exc).__name__}') from exc
+        if child.returncode is None:
+            self.unknown = True
+            raise UnknownOutcome('child completion has no reaped status')
+        self.reaped += 1
+        return subprocess.CompletedProcess(child.args, child.returncode, stdout, stderr)
+
+
+CHILDREN = Children()
+
+
 def run(argv, **kwargs):
-    return subprocess.run([str(x) for x in argv], stdin=subprocess.DEVNULL,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          timeout=remaining(), **kwargs)
+    return CHILDREN.run(argv, **kwargs)
 
 
 def tree(path):
@@ -126,10 +222,15 @@ class Images:
         self.request = evidence / 'detach-request.json'
         self.name = 'OxS3' + str(os.getpid())
         self.mount = Path('/Volumes') / self.name
-        self.children_reaped = True
         self.observations = []
 
     def create(self):
+        try:
+            return self._create()
+        except Exception as exc:
+            raise UnknownOutcome(f'image create/custody: {exc}') from exc
+
+    def _create(self):
         atomic(self.evidence / 'image-custody.json', custody_document(str(self.a), str(self.b)))
         for image in (self.a, self.b):
             p = run(['/usr/bin/hdiutil', 'create', '-size', '128m', '-fs', 'APFS',
@@ -137,6 +238,12 @@ class Images:
             require(p.returncode == 0, 'image creation failed')
 
     def attach(self, image):
+        try:
+            return self._attach(image)
+        except Exception as exc:
+            raise UnknownOutcome(f'image attach/custody: {exc}') from exc
+
+    def _attach(self, image):
         require(may_attach(self.attached is not None), 'another image is attached')
         p = run(['/usr/bin/hdiutil', 'attach', '-owners', 'on', '-nobrowse', '-plist', image])
         require(p.returncode == 0, 'attach failed; custody retained')
@@ -157,6 +264,12 @@ class Images:
         return uuid
 
     def detach(self):
+        try:
+            return self._detach()
+        except Exception as exc:
+            raise UnknownOutcome(f'image detach/custody: {exc}') from exc
+
+    def _detach(self):
         require(self.attached is not None, 'no attachment')
         observation = run(['/usr/sbin/diskutil', 'info', '-plist', self.attached['mount']])
         require(observation.returncode == 0, 'pre-detach identity unreadable')
@@ -165,10 +278,8 @@ class Images:
                 facts.get('DeviceNode') == self.attached['device'], 'pre-detach identity changed')
         self.request.unlink()
         atomic(self.evidence / f"detach-attempt-{len(self.observations)}.json", self.attached)
-        require(may_detach(self.children_reaped, self.request.exists()), 'detach precondition')
-        p = subprocess.run(['/usr/bin/hdiutil', 'detach', self.attached['device']],
-                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           timeout=min(30, remaining()))
+        require(may_detach(CHILDREN.closed(), self.request.exists()), 'detach precondition')
+        p = run(['/usr/bin/hdiutil', 'detach', self.attached['device']], timeout=min(30, remaining()))
         require(p.returncode == 0, 'detach failed; both backings retained')
         info = run(['/usr/bin/hdiutil', 'info', '-plist'])
         require(info.returncode == 0, 'attachment post-state unreadable')
@@ -217,11 +328,15 @@ def fixture():
     (checkout / 'Cargo.toml').write_text('[package]\nname="scratch-proof"\nversion="0.1.0"\nedition="2021"\n')
     (checkout / 'Cargo.lock').write_text('# This file is automatically @generated by Cargo.\nversion = 4\n\n[[package]]\nname = "scratch-proof"\nversion = "0.1.0"\n')
     (checkout / 'src/lib.rs').write_text('pub fn proof() -> u8 { 1 }\n')
+    readings = root / 'watchdog-readings'
+    readings.write_text(str(32 * 1024 ** 3))
     env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(home),
            'CARGO_HOME': str(cargo), 'RUSTUP_HOME': toolchain, 'RUSTUP_TOOLCHAIN': '1.97.1',
            'RUSTUP_AUTO_INSTALL': '0', 'CARGO_NET_OFFLINE': 'true',
            'RUSTFLAGS': '-C strip=symbols', 'OXIDE_TEST_HOME_FROM_ENV': '1',
            'OXIDE_POOL_CREATE': '1', 'OXIDE_POOL_CAP': '64MiB',
+           'OXIDE_TEST_POOL_FREE_BYTES': str(32 * 1024 ** 3),
+           'OXIDE_TEST_WATCHDOG_READINGS': str(readings),
            'TMPDIR': str(tmp), 'TMP': str(tmp), 'TEMP': str(tmp),
            'OXIDE_CONFIG': str(root / 'config.toml')}
     return root, evidence, subject, checkout, env
@@ -321,6 +436,9 @@ def proof(diagnostic):
             text = product(subject, checkout, changed(OXIDE_TEST_WALK_LOG=walk), 'status', ok=True)
             require(not walk.exists() or not walk.read_bytes(), 'status walked pool')
             require('scratch pool, volume' not in text and not record.exists() and tree(pool) == before, 'status repaired record')
+            product(subject, checkout, env, 'pool', 'recover-interrupted', '999999', ok=False)
+            require(record.is_file(), 'recovery open failed to repair')
+            record.unlink()
             check(); require(record.is_file(), 'leased open failed to repair')
             require(uuid_a in product(subject, checkout, env, 'status', ok=True), 'missing scratch label')
         def case13():
@@ -346,25 +464,9 @@ def proof(diagnostic):
             refuse(env, 'no host record'); require(not mount.exists() and not record.exists(), 'absent pool created')
         cases = (case01, case02, case03, case04, case05, case06, case07,
                  case08, case09, case10, case12, case13, case14, case15)
-        dependencies = {'02': ('01',), '03': ('02',), '07': ('03',),
-                        '08': ('07',), '09': ('08',), '10': ('09',),
-                        '12': ('10',), '13': ('12',), '14': ('13',), '15': ('14',)}
-        completed = set()
-        for name, case in zip(NATIVE_CASES, cases):
-            missing = [n for n in dependencies.get(name, ()) if n not in completed]
-            if missing or (first and not diagnostic):
-                outcomes.append({'case': name, 'outcome': 'skipped', 'reason': 'prerequisite not completed: ' + ','.join(missing)})
-                continue
-            try:
-                print('case', name, flush=True); case()
-                completed.add(name)
-                outcomes.append({'case': name, 'outcome': 'completed'})
-            except Exception as exc:
-                fault = f'{type(exc).__name__}: {exc}'[:1024]
-                first = first or fault
-                outcomes.append({'case': name, 'outcome': 'failed', 'reason': fault})
+        outcomes, first, aborted = drive_cases(zip(NATIVE_CASES, cases), diagnostic)
         receipt = {'qualified': False if diagnostic else first is None, 'cases': outcomes,
-                   'first_fault': first, 'volume_a': uuid_a, 'volume_b': world.get('uuid_b'),
+                   'first_fault': first, 'aborted': aborted, 'volume_a': uuid_a, 'volume_b': world.get('uuid_b'),
                    'mount': str(mount), 'attachments': images.observations}
         atomic(evidence / ('scratch-diagnostic.json' if diagnostic else 'scratch-result.json'), receipt)
     except Exception as exc:

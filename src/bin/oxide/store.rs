@@ -1960,9 +1960,15 @@ impl Store {
         Self::open_existing_mode(settings, false)
     }
 
-    /// A clean operation opens a pool for a guarded, mutating command.
+    /// A guarded mutating operation repairs an absent scratch record.
     pub fn open_existing_for_clean(settings: &Settings) -> Result<Option<Self>, String> {
         Self::open_existing_mode(settings, true)
+    }
+
+    /// Recovery is a guarded mutating open and must repair scratch identity first.
+    pub fn open_existing_for_recovery() -> Result<Option<Self>, String> {
+        let settings = settings()?;
+        Self::open_existing_mode(&settings, true)
     }
 
     fn open_existing_mode(settings: &Settings, repair: bool) -> Result<Option<Self>, String> {

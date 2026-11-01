@@ -344,13 +344,7 @@ pub(crate) fn create(settings: &Settings, uuid: &str, budget: u64) -> Result<(),
         .create(&control)
         .map_err(|e| e.to_string())?;
     write_document(&control.join("scratch.json"), &binding, 16384, false)?;
-    let record_result = record_path(&pool).and_then(|p| write_document(&p, &record, 4096, true));
-    if record_result.is_err() {
-        leaf.remove_if_owned(&binding).map_err(|_| {
-            "scratch-record-unwritable; scratch-incomplete requires operator cleanup"
-        })?;
-        return Err("scratch-record-unwritable".into());
-    }
+    publish_record_or_compensate(&leaf, &binding, record_path(&pool), &record)?;
     volume.verify().map_err(|_| "scratch-binding-mismatch")?;
     eprintln!(
         "oxide: creating a scratch build pool on volume {}; not for ordinary project builds",
@@ -359,4 +353,112 @@ pub(crate) fn create(settings: &Settings, uuid: &str, budget: u64) -> Result<(),
     oxide_storage::lease::managed::init_scratch_pool(&leaf, &binding, budget)
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// If host publication fails, remove only the leaf still owned by this invocation.
+fn publish_record_or_compensate(
+    leaf: &oxide_storage::lease::managed::ScratchLeaf,
+    binding: &[u8],
+    path: Result<PathBuf, String>,
+    record: &[u8],
+) -> Result<(), String> {
+    let result = path.and_then(|p| write_document(&p, record, 4096, true));
+    if result.is_ok() {
+        return Ok(());
+    }
+    leaf.remove_if_owned(binding)
+        .map_err(|_| "scratch-record-unwritable; scratch-incomplete requires operator cleanup")?;
+    Err("scratch-record-unwritable".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::{CStr, CString, OsStr};
+    use std::os::unix::fs::symlink;
+
+    fn fixture() -> PathBuf {
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT").expect("supervised scratch root");
+        let mut name = CString::new(
+            Path::new(&base)
+                .join("scratch-io.XXXXXX")
+                .as_os_str()
+                .as_bytes(),
+        )
+        .unwrap()
+        .into_bytes_with_nul();
+        assert!(!unsafe { libc::mkdtemp(name.as_mut_ptr().cast()) }.is_null());
+        PathBuf::from(OsStr::from_bytes(
+            CStr::from_bytes_until_nul(&name).unwrap().to_bytes(),
+        ))
+    }
+
+    fn prepared(path: &Path, binding: &[u8]) -> oxide_storage::lease::managed::ScratchLeaf {
+        let leaf = oxide_storage::lease::managed::create_scratch_leaf(path).unwrap();
+        fs::create_dir(path.join("oxide-managed")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            path.join("oxide-managed"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        write_document(
+            &path.join("oxide-managed/scratch.json"),
+            binding,
+            16384,
+            false,
+        )
+        .unwrap();
+        leaf
+    }
+
+    #[test]
+    fn record_write_failure_compensates_only_the_owned_leaf() {
+        let root = fixture();
+        let pool = root.join("pool");
+        let binding = b"binding";
+        let leaf = prepared(&pool, binding);
+        let blocked = root.join("not-a-directory");
+        fs::write(&blocked, b"keep").unwrap();
+        let error =
+            publish_record_or_compensate(&leaf, binding, Ok(blocked.join("record")), b"record")
+                .unwrap_err();
+        assert_eq!(error, "scratch-record-unwritable");
+        assert!(!pool.exists());
+        assert_eq!(fs::read(&blocked).unwrap(), b"keep");
+        let pool = root.join("swapped");
+        let leaf = prepared(&pool, binding);
+        fs::rename(&pool, root.join("original")).unwrap();
+        fs::create_dir(&pool).unwrap();
+        let error = publish_record_or_compensate(&leaf, binding, Err("injected".into()), b"record")
+            .unwrap_err();
+        assert!(error.contains("scratch-incomplete"));
+        assert!(pool.is_dir() && root.join("original/oxide-managed/scratch.json").is_file());
+        let pool = root.join("changed-binding");
+        let leaf = prepared(&pool, binding);
+        fs::write(pool.join("oxide-managed/scratch.json"), b"foreign").unwrap();
+        let error = publish_record_or_compensate(&leaf, binding, Err("injected".into()), b"record")
+            .unwrap_err();
+        assert!(error.contains("scratch-incomplete"));
+        assert_eq!(
+            fs::read(pool.join("oxide-managed/scratch.json")).unwrap(),
+            b"foreign"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_document_publication_is_bounded_and_does_not_replace_record() {
+        let root = fixture();
+        let path = root.join("state/record.json");
+        write_document(&path, b"first", 4096, true).unwrap();
+        assert!(write_document(&path, b"second", 4096, true).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        assert!(write_document(&root.join("oversized"), &vec![0; 4097], 4096, true).is_err());
+        let link = root.join("link");
+        symlink(&path, &link).unwrap();
+        assert!(matches!(read_document(&link, 4096), ReadDocument::Invalid));
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        fs::remove_dir_all(root).unwrap();
+    }
 }
