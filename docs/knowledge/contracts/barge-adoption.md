@@ -341,6 +341,57 @@ read, or a stable-looking pair of sequential plans, is not proof of identical
 inputs. This constraint does not authorize redirecting production account trust
 or enabling Barge's synthetic-account feature in the production dependency.
 
+#### Fixture capture and comparison seam (design)
+
+A synthetic comparison uses one fresh, privately owned fixture tree and one
+observation window. Its capture is a versioned, bounded manifest, serialized in
+one deterministic order and SHA-256 bound. It names the exact Oxide source and
+Barge dependency revisions, the window's start and end, the fixture volume and
+root mapping, the declaration and volume registry, both Oxide pools and their
+control fences and ledgers, the output registry, each receipt and marker, and
+each absence and custody observation. File entries bind the exact bytes and
+object identity or an explicit missing/unreadable result; observations carry
+which actor made them and their outcome. Enumeration, byte, row and time caps
+are part of the manifest. A cap, read failure, missing mandatory fact, ambiguous
+root mapping or unclassified actor makes the capture insufficient rather than
+an empty value.
+
+Neither evaluator may be replaced by an independently rewritten release rule.
+The Oxide side calls its actual prune evaluator; the Barge side calls the
+feature-off pinned `barge::release::plan`. Its test-only account and platform
+adapters may point only at the fixture, and must not be compiled into the
+production dependency. Setup completes before the capture window, and no
+fixture producer or case helper may mutate authority while the two evaluations
+run. Check the fixture tree before and after, including the names, types,
+contents and symlink targets, and bind the observations that are not file bytes
+separately. A matching pair of tree hashes alone cannot rule out an intervening
+change, a mount change, or a writer appearing and disappearing. The fixture
+must positively establish exclusive control over each relevant input and
+adapter observation throughout the window; anything not so established makes
+the comparison insufficient. Barge reads some files directly inside `plan`, so
+an outer manifest does not by itself prove which bytes that planner consumed.
+
+Compare the union of roots under an explicit one-to-one identity mapping, not
+just the intersection or a capped preview. Preserve each evaluator's actual
+outcome, completeness, reason and coverage. Missing or duplicate rows, a
+refusal before enumeration, differing bindings, a truncated report or a
+non-equivalent observation is insufficient. A known D-1, D-2 or D-3 label may
+only be assigned when the captured facts and the two actual results establish
+that precise case; an unexplained difference remains blocking. This fixture
+seam establishes no live snapshot: production account trust stays unchanged,
+and an explicit live invocation without attributable equivalent inputs must
+report insufficient. Neither comparison invokes a delete path or changes the
+ordinary prune route.
+
+The proof must demonstrate the boundary, not just the manifest parser: include
+an unchanged controlled fixture and counterfactuals that change an input,
+drop a binding, exceed a cap, fail an observation, or introduce an uncontrolled
+writer. These counterfactuals must produce insufficient rather than parity.
+The proof's nine premise dispositions must point to the actual case and helper
+bodies, and its diagnostic remains one separately activated Queue proof at the
+reviewed head under the amended task authority. No fixture result qualifies a
+live Builds comparison or the later O3 cutover.
+
 **Synthetic comparison boundary (Tom, 2026-11-01).** Use exclusively owned
 fixtures with attributable equivalent inputs for O2. Live comparisons without
 an adequate capture seam remain insufficient. O3 remains blocked until O2's
