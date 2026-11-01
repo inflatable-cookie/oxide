@@ -2278,6 +2278,41 @@ def tree_snapshot(root: str) -> dict:
     return snapshot
 
 
+def owned_tree_snapshot(root: str) -> dict:
+    """Capture the root and every entry, including link text, without following links.
+
+    Scandir and reads raise on failure; a missing or unreadable subtree cannot
+    be mistaken for an empty one. Access times are excluded because reads change them.
+    """
+    snapshot = {}
+
+    def visit(path: str, relative: str) -> None:
+        facts = os.lstat(path)
+        entry = (facts.st_mode, facts.st_uid, facts.st_gid, facts.st_dev,
+                 facts.st_ino, facts.st_size, facts.st_mtime_ns)
+        if stat.S_ISDIR(facts.st_mode):
+            snapshot[relative] = entry
+            with os.scandir(path) as entries:
+                names = sorted(entry.name for entry in entries)
+            for name in names:
+                visit(os.path.join(path, name), os.path.join(relative, name))
+        elif stat.S_ISREG(facts.st_mode):
+            snapshot[relative] = entry + (hashlib.sha256(permanent.read_bytes(path)).hexdigest(),)
+        elif stat.S_ISLNK(facts.st_mode):
+            snapshot[relative] = entry + (os.readlink(path),)
+        else:
+            raise RuntimeError(f"unexpected entry in fixture tree: {path}")
+
+    if not stat.S_ISDIR(os.lstat(root).st_mode):
+        raise RuntimeError(f"fixture root is not a real directory: {root}")
+    visit(root, ".")
+    return snapshot
+
+
+def symlink_root_unchanged(before: dict, after: dict, link_target: str, expected_target: str) -> bool:
+    return before == after and link_target == expected_target
+
+
 def marker(root: str) -> dict:
     return permanent.read_json(os.path.join(root, ".oxide-output.json"))
 
@@ -2944,12 +2979,17 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
         marker_before = permanent.read_bytes(os.path.join(kappa_root, ".oxide-output.json"))
         control_before = tree_bytes(world.control)
         os.rename(kappa_root, kappa_root + ".real")
-        os.symlink(kappa_root + ".real", kappa_root)
+        expected_target = kappa_root + ".real"
+        os.symlink(expected_target, kappa_root)
+        root_before = owned_tree_snapshot(expected_target)
         plan, sha, preview = world.plan_file("symlink root dry run", alpha)
         expect(symlink_root_refusal(preview, kappa_root), world.report(preview))
         code, _, stderr = world.real_run("symlink root refusal", alpha, plan, sha)
         expect(code == 2, f"symlink root refusal exited {code}: {stderr}")
         expect(os.path.islink(kappa_root), "the root symlink changed")
+        expect(symlink_root_unchanged(root_before, owned_tree_snapshot(expected_target),
+                                      os.readlink(kappa_root), expected_target),
+               "the root tree or symlink destination changed")
         expect(os.stat(kappa_root + ".real").st_ino == original.st_ino, "the real root changed")
         expect(permanent.read_bytes(os.path.join(kappa_root + ".real", "symlink-root-sentinel")) == b"untouched", "the symlink target was touched")
         expect(permanent.read_bytes(os.path.join(kappa_root + ".real", ".oxide-output.json")) == marker_before, "the marker changed")
@@ -3611,6 +3651,14 @@ def self_test() -> int:
             "canonical dry run",
         ):
             assert label in body, label
+        # The nonmutation comparator rejects both lost content and retargeting.
+        fixture_tree = {".": (1,), "./file": (2, "digest"), "./empty": (3,)}
+        assert symlink_root_unchanged(fixture_tree, dict(fixture_tree), "/real", "/real")
+        assert not symlink_root_unchanged(fixture_tree, {".": (1,), "./empty": (3,)}, "/real", "/real")
+        assert not symlink_root_unchanged(fixture_tree, dict(fixture_tree), "/other", "/real")
+        snapshot_source = inspect.getsource(owned_tree_snapshot)
+        for required in ("os.lstat", "os.scandir", "os.readlink", "hashlib.sha256", 'visit(root, ".")'):
+            assert required in snapshot_source, required
         symlink_preview = {
             "coverage": {"complete": False}, "candidates": [],
             "kept": [{"root": "/root", "reason": "the recorded root is not a real directory; the whole batch is kept"}],
@@ -3623,6 +3671,9 @@ def self_test() -> int:
             'world.complete(preview, "before symlink root dry run")',
             'expect(symlink_root_refusal(preview, kappa_root), world.report(preview))',
             'world.real_run("symlink root refusal", alpha, plan, sha)',
+            'root_before = owned_tree_snapshot(expected_target)',
+            'expect(symlink_root_unchanged(root_before, owned_tree_snapshot(expected_target),',
+            'os.readlink(kappa_root), expected_target)',
             'world.complete(preview, "restored root dry run")',
         ):
             assert fragment in body, fragment

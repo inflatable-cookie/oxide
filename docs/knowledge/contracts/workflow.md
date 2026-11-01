@@ -6268,8 +6268,11 @@ case 12: the intentional symlink replacement of a recorded root made authority
 incomplete, as the no-follow observation requires. The alpha and beta lines in
 its bounded report carry that shared batch reason; they do not identify which
 root caused it. Case 12 now requires a complete eligible kappa before and after
-the replacement, and a whole-batch refusal without mutation while the symlink
-exists. Cases 13–22 were skipped; the packet is uncounted, and a fresh diagnostic
+the replacement, and a whole-batch refusal while the symlink exists. The refusal
+checks the exact link text and a no-follow snapshot of the real root and every
+entry (metadata, file digests and link targets), plus control bytes and journal
+state; the pure self-test rejects deleted-content and retargeting counterfactuals.
+Cases 13–22 were skipped; the packet is uncounted, and a fresh diagnostic
 remains required. No live prune, dry run,
 `resolve-intent`, mode, consumer or pool mutation is authorized by this implementation.
 
