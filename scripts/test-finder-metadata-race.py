@@ -59,9 +59,12 @@ only from that drain (`src/owned_delete.rs:247`, `src/bin/oxide/prune.rs:4076`):
   (`src/lease/pool.rs:5566`, "an unknown entry type"), so the tree stays under
   `.oxide-holding` with its row and its recorded charge, the command reports
   that it stays recorded and charged (`src/bin/oxide/main.rs:1931`) and exits
-  zero, and `status` lists it as held for deletion with the tree still present
-  (`src/bin/oxide/main.rs:2444`). The fixture then removes its own FIFO and the
-  next command finishes the held deletion, dropping both the tree and the row.
+  zero. Recorded `status` lists the recorded row, its charge and `presence not
+  probed` (`src/bin/oxide/main.rs:2454`): its lock-free snapshot never probes
+  presence (`src/lease/mod.rs`, `HoldingEntry::present`), so the fixture proves
+  the tree and its entry with its own `lstat` instead of reading a product
+  probe. The fixture then removes its own FIFO and the next command finishes the
+  held deletion, dropping both the tree and the row.
 - `prune_metadata`: one owned 128 MiB APFS image, registered as the permanent
   outputs drive, with one real private Git checkout on it (ignored `target`)
   whose first build is asserted to have adopted an owned root into a real
@@ -941,13 +944,24 @@ def lease_case(oxide: str, root: str, case: str, race: str | None) -> str:
     held = trees[row["name"]]
     if not [path for path in tree_files(held) if os.path.basename(path) == "unemptiable"]:
         fail(f"{case}: the held tree lost its unemptiable entry")
+    # Recorded status is lock-free and never probes presence (oxide#128): the
+    # entry it reports is the recorded row, its charge and `presence not
+    # probed`. Presence is proved by this fixture's own lstat above — the
+    # recorded tree is there and still holds the unemptiable entry.
     held_lines = [
         line
         for line in status.stdout.splitlines()
         if f"slot {row.get('slot')} held for deletion" in line
     ]
-    if len(held_lines) != 1 or "tree still present" not in held_lines[0]:
-        fail(f"{case}: status does not report the held tree: {status.stdout[-1500:]}")
+    if len(held_lines) != 1:
+        fail(f"{case}: status does not report the held row: {status.stdout[-1500:]}")
+    if "recorded," not in held_lines[0]:
+        fail(f"{case}: the held line reports no charge: {held_lines[0]!r}")
+    if "presence not probed" not in held_lines[0]:
+        fail(
+            f"{case}: the recorded status line does not state that presence was "
+            f"not probed: {held_lines[0]!r}"
+        )
     # The fixture removes its own item; the next command finishes the deletion.
     os.unlink(os.path.join(held, "unemptiable"))
     finish = run([oxide, "check"], cwd=workspace(env, base, "c", "third-project"), env=env)
@@ -1543,8 +1557,13 @@ ORACLE_PINS = (
     ),
     (
         "src/bin/oxide/main.rs",
-        '"tree still present, deletion pending outside the pool lock"',
-        "the held tree's recorded presence",
+        '"presence not probed"',
+        "the recorded status wording for an unprobed held row",
+    ),
+    (
+        "src/lease/mod.rs",
+        "(a lock-free snapshot never probes)",
+        "the recorded snapshot that never probes presence",
     ),
     (
         "src/lease/mod.rs",
