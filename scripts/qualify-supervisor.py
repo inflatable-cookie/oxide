@@ -5,17 +5,17 @@ The supervisor (`scripts/bounded-test.py`) is the candidate under test, not
 an already-qualified guard, and this bootstrap does not supply the
 qualification it evaluates. Its own bounds: Effigy heavy admission (before
 this script starts), a clean checkout, a reserve reading before and after,
-one fixed 420 s deadline on CLOCK_UPTIME_RAW, and fixtures with finite
+one fixed 600 s deadline on CLOCK_UPTIME_RAW, and fixtures with finite
 self-exit fallbacks.
 
 The deadline is enforced by `bounded`, a minimal outer actor: the process
 forks the whole bootstrap as a worker child and holds it unreaped, making
 only WNOHANG reaps, bounded sleeps and a KILL of that pinned child. All
 filesystem, hashing and stdout work happens in the worker, so a blocked
-stdout reader or slow read cannot extend the 420 s: at the deadline the
+stdout reader or slow read cannot extend the 600 s: at the deadline the
 worker is KILLed and the exit is 124 with whatever output was written.
 
-The worker runs the candidate with a 380 s limit and a 512 MiB monitored
+The worker runs the candidate with a 560 s limit and a 512 MiB monitored
 budget around `scripts/test_supervisor.py` and **no** `--root-parent` and no
 `--evidence`, so the candidate's default scratch routing is what runs: one
 owned root under `<mount>/scratch/oxide` on the volume the machine's
@@ -50,13 +50,9 @@ topology agreeing on one owned root whose scratch and evidence are its
 members, every nested case directory inside that root with its receipt still
 present after cleanup, a reserve sampled on the scratch's own device, reserve
 sampling from before the gate with no gap over 1 s, the fixture writers
-counted, custody at every signal (only the pinned leader group, the pinned
-monitor and a held direct child are ever signalled), the survivor case
-(oxide#195: a Cargo-shaped same-session group recorded in the receipt and
-never signalled, with the run honestly UNCLOSED), the post-census detach
-paths, and every expected case passing. Reserve readings identify the
-qualification's scratch volume; the boot volume is read and labelled
-separately.
+counted, custody at every signal, and every expected case passing. Reserve
+readings identify the qualification's scratch volume; the boot volume is read
+and labelled separately.
 On overrun it TERMs, then KILLs, only its own unreaped candidate child.
 Nothing is ever deleted: nested UNCLOSED cases leave live fixture processes
 whose only bound is their fallback, which is not closure, so the whole
@@ -77,11 +73,11 @@ import time
 import traceback
 
 NS = 1_000_000_000
-WALL_NS = 420 * NS  # oxide#191 amendment (Tom 2026-10-31): was 300 s
-CANDIDATE_LIMIT = 380  # oxide#191 amendment: was 280 s
+WALL_NS = 600 * NS  # oxide#192 amendment (2026-10-31): was 420 s (#191), 300 s before
+CANDIDATE_LIMIT = 560  # oxide#192 amendment: was 380 s (#191), 280 s before
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 357  # 308 pure + 49 real (oxide#151 added the routing, marker,
+EXPECTED_CASES = 438  # 382 pure + 56 real. oxide#151 added the routing, marker,
                       # nested-window protection, bounded-sweep, qualify-entry,
                       # shared-ancestor/private-leaf and readiness cases; oxide#191
                       # adds seventy-six pure post-census detach cases and eight real
@@ -89,14 +85,30 @@ EXPECTED_CASES = 357  # 308 pure + 49 real (oxide#151 added the routing, marker,
                       # unrequested attachment whose opt-in custody keep is recorded
                       # separately, a stuck child the custodian closes itself, and the
                       # two unreadable-identity paths — closed by the monitor or
-                      # handed off by parentage. Oxide#195 adds twenty-one pure
-                      # survivor cases and replaces one real separate-group
-                      # survivor case with two: a Cargo-shaped same-session group
-                      # that reaches the deadline, is recorded, is never
-                      # signalled and stays UNCLOSED, and a transient member whose
-                      # recorded row is gone by the deciding census so the run
-                      # closes truthfully)
-SURVIVOR_CASES = ("test_cargo_shaped_group_survivor_is_recorded_and_never_signalled",)
+                      # handed off by parentage. oxide#192 adds 39 pure and 5 real
+                      # admission-report cases (the completed wait and its grant, the
+                      # rejection control, the late grant, a wait with no observed
+                      # terminal, and the stale-run plus zero-duration-grant
+                      # correlation), together with the overwrite/rejection
+                      # classification, launch-refusal reasons, the
+                      # sampling-based freshness clock and shutdown-freshness
+                      # regressions. oxide#197 adds 32 pure structural launcher-rule
+                      # cases (re-verified ancestor exclusion with no parent
+                      # fall-through, a bound sibling observation with
+                      # identity/parentage re-verification around the session/group
+                      # reads, the tracked-member veto, a distinct ambiguous outcome
+                      # for a changed ancestor identity or an unreadable sibling
+                      # session/group (never foreign), a carried member observation
+                      # so a positively seen member is never re-read into a foreign
+                      # row, the masked/back-and-forth/forward wall-step refusals,
+                      # recycled/unknown/PPID-1 refusals, evidence bounds and the
+                      # mid-run sibling regression) and two real cases (the
+                      # launcher sibling, and the inherited end-to-end slow-setup
+                      # launch-and-close regression for #192's sampling-based
+                      # freshness clock)
+                      # oxide#195 replaces the separate-group survivor case
+                      # with one recorded-and-never-signalled Cargo survivor case
+                      # and adds its pure custody/publication/join cases.
 ACTOR_MARGIN_NS = 2 * NS  # the actor's own KILL, reap and exit
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPTS)
@@ -106,8 +118,9 @@ SOURCES = {
     "bootstrap": os.path.abspath(__file__),
 }
 LIMITATIONS = [
-    "Cooperative session scope: a process that calls setsid is seen only if tracked as a member earlier or while it holds an output pipe, is never signalled, and arbitrary same-user writers are outside the promise.",
+    "Cooperative session scope: a process that calls setsid is seen only if tracked as a member earlier or while it holds an output pipe; arbitrary same-user writers are outside the promise.",
     "Only identities the runner positively holds unreaped across the signal are ever signalled: the pinned leader's group, the pinned monitor and a held direct child. A same-user process that is not this run's child is not held, so its PID could be recycled between the identity read and a signal and it is NEVER signalled (Tom's 2026-10-31 ruling c096c8fc); the exact row is recorded in the receipt's bounded `survivors` list and the run stays UNCLOSED with its scratch. Closing such a survivor needs a boundary that holds it, which is outside this runner.",
+    "Census evidence binding (oxide#195): the custodian echoes the sequence and facts of the last post-reap census message it processed, and the receipt's `deciding_census`/`deciding_census_seq` are resolved by the monitor against its own record of the census messages it sent. Closure requires the census thread to have finished inside its bounded join, the last completed round to be certainly empty AND that named message to be certainly empty, so a late round or a decision without its own census evidence keeps the run UNCLOSED. An expired join freezes the survivor list at its published prefix and is recorded (`census_join.joined: false`, `frozen`, `refused`).",
     "The census treats every unvalidated process on the host as uncertain, including zombies of unrelated parents, so such a process present after the stop yields a false UNCLOSED (fails closed).",
     "Host free space is a sampled abort threshold (0.25 s, 22 GiB = 20 GiB reserve + 2 GiB margin) read on the filesystem actually holding the scratch, so on the selected drive it is that volume's free space, not the internal disk's; no instantaneous guarantee. Owned bytes are walked every 2 s against a monitored budget, not a hard ceiling.",
     "The default scratch parent is the owned subtree <mount>/scratch/oxide, read passively from OXIDE_POOL, the user config file's [pool] path or the built-in pool, and the pool's removable registration, with one kernel volume-UUID read; that is not the product's verified build-time selection (no diskutil container/role check), the config reader understands only a simple [pool] path entry, and anything unreadable or unsupported falls back to /private/tmp with a warning. The bootstrap refuses to qualify on a fallback.",
@@ -115,11 +128,12 @@ LIMITATIONS = [
     "Owner markers and bounded self-expiry: each run root in the owned parent carries one private\n    .oxide-scratch.json written before any child or run resource. The fixed startup sweep\n    (1 s and 4096 steps, checked between filesystem steps) removes only real owner-marked roots\n    whose marker records a positive conclusion of all their owned resources strictly older than\n    seven days; unmarked, foreign, corrupt, future-dated, unconcluded, nested-UNCLOSED or\n    otherwise non-expirable roots are never touched, and an exhausted budget leaves the rest for\n    a later run. There is no background reaper, and a partial deletion keeps the marker and the\n    root. The marker is not a liveness probe.",
     "The candidate root that holds a retained nested UNCLOSED fixture stays unconcluded\n    (nested-unclosed) even when the outer session closed and the suite passed; a failed\n    qualification keeps the bootstrap base unconcluded. Neither can expire while that holds.",
     "Deadlines are enforced by a single-threaded custodian on CLOCK_UPTIME_RAW with bounded calls; no hard real-time scheduling claim.",
+    "Admission reports (oxide#192): a completed admission marker (admission.json) can move the candidate's deadline by at most the wait it reports, never more than the run's own elapsed wall clock and never more than a fixed 600 s total; schema 2 documents name the run and one bounded command token. A waiting report (admission-waiting.json) grants nothing and is paired only with its own command's completed marker: a foreign run is rejected as stale, a zero-duration, capped or late grant ends its command's wait, and every rejected or unpaired report is unclassified - a later admission report or a rejected read may have overwritten the fixed-name completion before a poll, and a completion can be missed between the last poll and the sampler's stop, so no wait is ever described as a proven unfinished one. A marker the child could not publish before the stop is simply absent, and the supervisor never waits past its deadline for one. This case suite's own outer 600 s actor is not extended by it.",
     "The candidate's settlement diagnostics (receipt `settlement` and the custodian's decision-time `settlement` record) are bounded observations, not acceptance gates: they never decide classification, closure, EOF, the deadline or cleanup, and a lost or truncated observation only means missing evidence. The receipt object keeps accumulating after the decision, so only the custodian's record is the decision-time view.",
     "macOS only (kqueue NOTE_EXIT, sysctl kinfo_proc at self-checked offsets); Linux is not qualified.",
-    "Effigy admission waits happen before this script starts and are not inside its 420 s.",
+    "Effigy admission waits happen before this script starts and are not inside its 600 s.",
     "Nested candidate sessions are outside the outer session; their UNCLOSED cases are settled by no guardian. Their case directories, receipts and kept UNCLOSED scratch live in the outer candidate's own evidence directory inside its selected-volume owned root, so the outer monitored walk and 512 MiB budget cover them and cleanup never removes them; their fixture processes end only at the finite fallback, which is not closure.",
-    "The outer actor KILLs only its pinned worker at the deadline; a candidate still running then is bounded by its own 380 s limit, not by the actor.",
+    "The outer actor KILLs only its pinned worker at the deadline; a candidate still running then is bounded by its own 560 s limit, not by the actor.",
     "Synthetic fixtures model Cargo's setpgid groups; no real Cargo build or live application ran.",
     "Owned bytes are a non-atomic best-effort walk: an entry past the platform path limit is reached one descriptor-relative component at a time from its nearest nameable directory, and any error other than a vanished entry is a measurement fault, never a smaller total.",
 ]
@@ -344,11 +358,11 @@ CONTROL_CASES = {
 }
 ORDINARY_KEYS = {"case", "exit", "phase", "dir", "retained_unclosed", "outcome", "census", "wall_s",
                  "signals", "stale_latency_ns", "held_streams", "nonce_ok",
-                 "survivors",  # oxide#195: the same-session identities the case recorded, never signalled
-                 "signal_targets",  # oxide#195: every PID the case's guard signalled
-                 "session_signals",  # oxide#195: the witness that no non-held session record exists
                  "detach",  # oxide#191: the post-census detach outcome that case recorded
                  "cleanup",  # oxide#191: the fail-closed pre-cleanup keep, when it fired
+                 "signal_targets",  # oxide#195: every PID the case's guard signalled
+                 "survivors",  # oxide#195: the same-session identities it recorded, never signalled
+                 "session_signals",  # oxide#195: the witness that no non-held session record exists
                  "kept"}  # the suite's retained-resource path for a focused case
 
 
@@ -657,6 +671,7 @@ DETACH_CASES = (
 
 CLEANUP_CASE = "test_an_unrequested_attachment_keeps_the_owned_root"
 STUCK_CASE = "test_a_stuck_detach_child_is_closed_by_the_custodian"
+SURVIVOR_CASES = ("test_cargo_shaped_group_survivor_is_recorded_and_never_signalled",)
 
 
 def check_plan(receipt, results, expected, record=None, facts=None, base=None):
@@ -711,10 +726,7 @@ def check_plan(receipt, results, expected, record=None, facts=None, base=None):
 
     def survivor_paths():
         """Oxide#195 under Tom's ruling: the cooperative-session survivor must be
-        recorded, never signalled, and must leave the run honestly UNCLOSED. The
-        suite's own nested Cargo-shaped run is the evidence, and a row that
-        claims closure, drops the survivor record or carries any signal to a
-        non-held identity fails."""
+        recorded, never signalled, and must leave the run honestly UNCLOSED."""
         problems = []
         recorded = {}
         for case in results.get("cases", []):
@@ -734,16 +746,18 @@ def check_plan(receipt, results, expected, record=None, facts=None, base=None):
         survivors = case.get("survivors") or []
         if len(survivors) < 2:
             problems.append(f"{SURVIVOR_CASES[0]} recorded {len(survivors)} survivor row(s), not the group")
-        for row in survivors:
-            if not (isinstance(row, dict) and row.get("pid", 0) > 1 and row.get("start", 0) > 0):
-                problems.append(f"{SURVIVOR_CASES[0]} recorded a survivor row without an identity: {row}")
+        for row_entry in survivors:
+            if not (isinstance(row_entry, dict) and row_entry.get("pid", 0) > 1
+                    and row_entry.get("start", 0) > 0):
+                problems.append(f"{SURVIVOR_CASES[0]} recorded a survivor row without an identity:"
+                                f" {row_entry}")
         signalled = set(case.get("signal_targets") or [])
-        for row in survivors:
-            if row.get("pid") in signalled:
-                problems.append(f"{SURVIVOR_CASES[0]} signalled a non-held survivor: {row.get('pid')}")
+        for row_entry in survivors:
+            if row_entry.get("pid") in signalled:
+                problems.append(f"{SURVIVOR_CASES[0]} signalled a non-held survivor: {row_entry.get('pid')}")
         if case.get("session_signals"):
-            problems.append(f"{SURVIVOR_CASES[0]} carries a non-held session signal: "
-                            f"{case.get('session_signals')}")
+            problems.append(f"{SURVIVOR_CASES[0]} carries a non-held session signal:"
+                            f" {case.get('session_signals')}")
         return problems
 
     def detach_paths():
@@ -889,7 +903,7 @@ def qualify(diagnostic=False):
     for number in (signal.SIGINT, signal.SIGTERM):
         signal.signal(number, lambda n, _f: forward.append(n))
     print("proof:supervisor:qualify: the supervisor is the candidate under test; this bootstrap (Effigy heavy"
-          " admission, reserve readings, fixed 420 s deadline, finite fixture fallbacks) does not qualify it",
+          " admission, reserve readings, fixed 600 s deadline, finite fixture fallbacks) does not qualify it",
           flush=True)
     if sys.platform != "darwin":
         return refusal("refused: macOS only", diagnostic)
@@ -1064,8 +1078,18 @@ def qualify(diagnostic=False):
         "outcomes": results.get("outcomes"),
         "limitations": LIMITATIONS,
     }
+    outcomes = results.get("outcomes") or []
+    failed_cases = [{"case": case, "verdict": verdict} for case, verdict in outcomes if verdict != "pass"]
+    collection = {
+        "reached": len(outcomes), "expected": EXPECTED_CASES,
+        "completed": len(outcomes) - len(failed_cases), "failed": failed_cases,
+        "unexecuted": max(0, EXPECTED_CASES - len(outcomes)),
+        "first_fault": failed_cases[0] if failed_cases else None,
+        "note": "uncounted keep-going collection; never a PASS and never qualification evidence",
+    }
     if diagnostic:  # an uncounted collection is never `qualified`, even when clean
-        qualification.update(diagnostic_receipt(problems, rows))
+        qualification.update(diagnostic_receipt(problems, rows, {"collection": collection}))
+        qualification["mode"] = "diagnostic"
         qualification["selector"] = "proof:supervisor:qualify:diagnostic"
         qualification["result"] = "diagnostic"
     qualification["worker_wall_ns_before_print"] = now_ns() - START

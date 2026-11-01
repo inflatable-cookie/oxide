@@ -9,13 +9,9 @@ Implements docs/knowledge/contracts/proof-supervisor-correction.md (revision
 - The custodian (this process) is single-threaded. It owns the absolute
   deadline, both pins (the monitor and the proof leader, held unreaped) and
   every signal. After setup it makes only bounded calls: fork, kevent and
-  select with a zero or remaining-budget timeout, waitpid WNOHANG, one
-  process-table read per custody decision, kill or killpg on a child it holds
-  unreaped, and non-blocking pipe I/O. It never touches files or stdio after
-  setup and never signals a number it does not hold unreaped: a merely
-  observed same-user process - a same-session survivor included - is never
-  signalled, because its PID could be recycled between the read and the signal
-  (oxide#195, Tom's 2026-10-31 ruling c096c8fc).
+  select with a zero or remaining-budget timeout, waitpid WNOHANG, kill or
+  killpg on a pinned child, and non-blocking pipe I/O. It never touches files
+  or stdio after setup and never signals a number it does not hold unreaped.
 - The monitor (first child) owns all I/O, including all blocking setup (the
   kinfo_proc check, path resolution, scratch and evidence creation) inside
   the custodian's setup deadline: the receipt phases, output draining,
@@ -33,35 +29,64 @@ census started after the leader was reaped that is certain with no members
 and no uncertain rows, and EOF on both output pipes. An uncertain census
 after the stop latches a fault that no later census clears. Anything else is
 UNCLOSED and scratch is kept. The command gets OXIDE_PROOF_EVIDENCE, the
-evidence directory, which cleanup never removes.
+evidence directory, which cleanup never removes. Groups other than the
+pinned leader's are never signalled.
 
 Cooperative-session survivors (oxide#195, Tom's 2026-10-31 signal-custody
 ruling, Queue decision c096c8fc): the leader's group is not the whole session.
-Oxide starts Cargo as the leader of its own process group in the same
-session, so a leader-group KILL leaves that group running (oxide#182's
-archived packet ended UNCLOSED with exactly one such survivor, a unit-test
-binary in Cargo's group). The supervisor does NOT signal it. A same-user
-process that is not this run's child is never held unreaped, so its PID could
-be recycled between any identity read and a signal; a merely observed non-child
-PID is never enough. Only an identity the runner positively holds across the
-signal may be signalled: the pinned leader group (its leader is held
-unreaped), the pinned monitor, and a direct child still held unreaped. After
-the leader is reaped, every census round records, once per identity and up to
-a fixed bound, the exact rows it still classifies in the leader's own session
-(PID, start, ppid, pgid, uid, zombie) in the receipt's `survivors` list for the
-owner; that is observation only, no message and no signal. Each row is recorded
-before the round that reports it is sent, and the census thread is joined
-(bounded, never past the deadline) before the receipt is published, so the
-evidence a verdict rests on is the evidence on disk. If that join expires the
-list is frozen at its published prefix and the receipt and summary say so
-(`census_join.joined: false`), never claiming a complete record; a `cleanup`
-decision in that state is refused outright, so an incomplete join never yields
-certain closure and the run is kept `UNCLOSED`. The census still
-decides closure, so a survivor that is still there when the deciding census runs
-keeps the run UNCLOSED with its scratch and evidence, while one that exits first
-leaves a recorded row and a closed run that honestly says so. Closing a
-survivor is deferred: it needs a boundary that holds the identity (Queue
-papercut 9ff7386d).
+Oxide starts Cargo as the leader of its own process group in the same session,
+so a leader-group KILL leaves that group running (oxide#182's archived packet
+ended UNCLOSED with exactly one such survivor, a unit-test binary in Cargo's
+group). The supervisor does NOT signal it. A same-user process that is not this
+run's child is never held unreaped, so its PID could be recycled between any
+identity read and a signal; a merely observed non-child PID is never enough.
+Only an identity the runner positively holds across the signal may be
+signalled: the pinned leader group (its leader is held unreaped), the pinned
+monitor, and a direct child still held unreaped. After the leader is reaped,
+every census round records, once per identity and up to a fixed bound, the exact
+rows it still classifies in the leader's own session (PID, start, ppid, pgid,
+uid, zombie) in the receipt's `survivors` list for the owner; that is
+observation only, no message and no signal. Each row is recorded before the
+round that reports it is sent, and the census thread is joined (bounded, never
+past the deadline) before the receipt is published, so the evidence a verdict
+rests on is the evidence on disk. The custodian echoes the sequence number and
+facts of the last post-reap census message it processed, the monitor binds
+`deciding_census`/`deciding_census_seq` to that message from its own record of
+what it sent, and closure requires the thread to have finished, the last
+completed round to be certainly empty AND that named message to be certainly
+empty. A frozen list is published as an explicitly incomplete prefix
+(`census_join.joined: false`) and an expired join never yields certain closure:
+a `cleanup` decision in that state is refused, the persisted verdict becomes
+UNCLOSED with the reason, the custodian latches it, and the root, backing and
+evidence are kept. Closing such a survivor needs a boundary that holds the
+identity (Queue papercut 9ff7386d); this change does not close the historical
+survivor and does not claim to.
+
+Supervisor ancestors (oxide#197, design ruling ea5a3dc9): in its bounded setup,
+before the leader exists, the monitor walks its own ppid chain up to
+ANCESTOR_MAX_LEVELS levels and records each level's positive identity (PID plus
+the same start token the census uses) in the receipt. The post-leader census
+then excludes, and nothing else: (a) a row whose own identity is exactly one of
+those recorded pairs, re-verified through the safe Kinfo reader after the
+snapshot; (b) a launcher sibling whose observation-time parent row has a PID
+above 1 and, re-verified the same way, exactly one of those recorded identities,
+and which one bound observation proves is positively outside the supervised
+leader's session AND process group (macOS has no subreaper, so a supervised
+descendant can only be reparented to launchd, never to a supervisor ancestor).
+No clock, wall, boot or uptime fact is consulted: a start-time ordering cannot
+prove the absence of a masked step. Only a POSITIVELY decided identity may be
+excluded, and a tracked identity is never excluded and never loses tracked
+attribution. A launcher rule that positively observes the row in the leader's
+session carries it as a tracked member of exactly that identity, so a later
+contradictory read cannot make it foreign. An UNDECIDED launcher observation
+excludes no row and falls through to the ordinary getsid/reread classification,
+so a recycled PID or parent, an unknown parent, a PPID 1 orphan, an unreadable
+session or group, a changed identity and any other unreadable row classify
+exactly as they do without the launcher rules.
+Every exclusion's bounded positive evidence is recorded in the receipt. The
+test-only `setup-delay` injection adds a cold setup longer than the reserve
+freshness window inside the setup deadline, the end-to-end control for
+oxide#192's sampling-based freshness clock.
 
 An exception in any phase after setup, or a monitor message with a missing
 or ill-typed field, latches a fault; the bounded pinned stop, WNOHANG reap,
@@ -73,13 +98,39 @@ fault (including SIGINT or SIGTERM to the custodian), refusal or UNCLOSED;
 otherwise the command's status (128+N for signal N). The receipt has no success phase: success is phase `monitor_complete`
 plus custodian exit 0, recorded by the caller.
 
+Admission reports (oxide#192). A supervised child that waited for admission may
+publish one bounded marker, `admission.json`, in the evidence directory, and one
+`admission-waiting.json` when it starts waiting. Schema 2 documents name this
+run (`OXIDE_PROOF_RUN_ID`) and one bounded command token, so a stale file from an
+earlier run is rejected instead of paired with this one, and each waiting report
+is paired only with its own command's completed marker. The monitor reads only a
+regular file without following a link, at most 512 bytes with an exact key set,
+and reports each once per file identity. The custodian grants at most the
+completed wait, never more than the run's own elapsed wall clock and never more
+than a fixed 600 s total, to its deadline; a waiting report grants nothing, and
+only an observed terminal report for that same command ends its wait (a
+zero-duration grant, a capped grant or a late grant all end it). Every unpaired
+wait is **unclassified**, including one that was the run's last admission-file
+observation: the fixed-name completion may have been overwritten by a later
+report or by a rejected read before a poll, or missed entirely between the last
+poll and the sampler's stop, so missing terminal evidence is never reported as a
+finished or unfinished conclusion. Nothing is shortened, the exported
+OXIDE_PROOF_DEADLINE_NS is not rewritten and classification is unchanged: a
+rejected or missing report removes nothing but the grant, and the receipt
+reports the wait, the pairing and the grant separately. One bounded drain reads
+what has already arrived before the deadline is declared, so
+a marker published just before the stop can still grant; a marker that reaches
+the custodian after the stop decision or a deadline is recorded as late with its
+reason and moves nothing, so a run that stopped as admission completed is
+classified honestly rather than as an unexplained timeout. The grant is
+cooperative evidence about a child's own admission, not a claim about any other
+writer.
+
 Scope: the cooperative session. A process that calls setsid leaves it and is
 seen only while tracked or holding an output pipe; arbitrary same-user
-writers are outside the promise. A same-session survivor that is not held by
-the runner is recorded, never signalled, and ends the run UNCLOSED; closing
-it needs a boundary that holds it (oxide#195's reported design conflict).
-Host free space is a sampled abort threshold; the owned-byte budget is
-monitored, not a hard ceiling. macOS only.
+writers are outside the promise. Host free space is a sampled abort
+threshold; the owned-byte budget is monitored, not a hard ceiling. macOS
+only.
 
 Post-census image detach (oxide#191, decision ee263cea): a proof whose own
 test image must be detached publishes ONE bounded atomic `detach-request.json`
@@ -147,6 +198,11 @@ LIMIT_S = 300
 STOP_RESERVE_S = 20
 EXIT_MARGIN_S = 2
 SETUP_S = 10
+# oxide#197 (inherited from #192 decision 7bb1089d): the injected cold-setup
+# delay is longer than the reserve freshness window and well inside SETUP_S, so
+# it discriminates the sampling-based freshness clock from the superseded
+# custodian-start basis.
+SETUP_DELAY_S = 1.5
 TERM_GRACE_S = 5
 CENSUS_GRACE_S = 10
 THRESHOLD = 22 * GIB  # 20 GiB reserve + 2 GiB margin
@@ -157,17 +213,23 @@ PERSIST = 8 * MIB
 FORWARD = 32 * MIB
 CENSUS_INTERVAL = 0.2
 CONFIRM_TRIES, CONFIRM_PAUSE = 20, 0.05  # gone confirmation within one round, at most 1 s
-# Cooperative-session survivors (oxide#195, Tom's 2026-10-31 ruling c096c8fc):
-# after the leader is reaped, the monitor records the members a census round
-# still classifies in the leader's own session, once per identity and up to this
-# many rows. Nothing is announced and nothing is signalled: a same-user
-# non-child PID is not held unreaped, so it is never signalled and the run stays
-# UNCLOSED. The bound keeps a forking tree's evidence finite.
+# Cooperative-session survivors (oxide#195, ruling c096c8fc): after the leader is
+# reaped the monitor records the members a census round still classifies in the
+# leader's own session, once per identity and up to this many rows. Nothing is
+# announced and nothing is signalled: a same-user non-child PID is not held
+# unreaped, so it is never signalled and the run stays UNCLOSED.
 SURVIVOR_MAX = 16
 SURVIVOR_KEYS = ("pid", "start", "ppid", "pgid", "uid", "zombie")
-CENSUS_MESSAGE_KEEP = 64  # census messages whose facts stay addressable by sequence
+# Census messages whose facts stay addressable by sequence, so a decision can be
+# bound to the exact message it rested on.
+CENSUS_MESSAGE_KEEP = 64
 CENSUS_JOIN_S = 3.0  # bounded wait for the census thread before the receipt is published;
 # one round's own worst case is a full snapshot plus 19 shared confirmation pauses (about 1.4 s)
+# Oxide#197: the supervisor's own ancestor chain is recorded once, before the
+# leader exists, as positive (PID, start) identities, at most this many levels.
+ANCESTOR_MAX_LEVELS = 64
+# Bounded positive exclusion evidence kept in the receipt (rows, not decisions).
+EXCLUSION_MAX_ROWS = 20
 DIAG_MAX_BYTES = 16384  # compact UTF-8 JSON ceiling for the optional receipt census diagnostics
 DIAG_MAX_ROWS = 20  # at most 20 diagnostic summary rows; the rest count as omitted
 # Observation-only settlement diagnostics (oxide#147). Fixed schema, one record
@@ -244,7 +306,7 @@ SWEEP_TIME_BUDGET_NS = 1 * NS  # of the 10 s setup budget, checked between files
 SWEEP_ENTRY_BUDGET = 4096  # examined entries plus recursive steps, across all roots
 SWEEP_ROWS = 20  # bounded result rows in the receipt; the rest count as omitted
 INJECTIONS = {
-    "setup-stall", "no-detector", "ack-eof", "ack-wrong", "cancel-before-ack", "monitor-die",
+    "setup-stall", "setup-delay", "no-detector", "ack-eof", "ack-wrong", "cancel-before-ack", "monitor-die",
     "monitor-stall", "cleanup-interrupt", "custodian-timeout-after-monitor", "census-uncertain",
     "census-uncertain-first", "reserve-low-after", "cancel-after-ack", "cancel-at-gate",
     "pump-exception", "kqueue-exception", "malformed-message", "stop-exception",
@@ -257,11 +319,35 @@ INJECTIONS = {
 RESERVE_DELAY_S, SCRATCH_DELAY_S = 0.5, 4.0  # injected publication delays before a sampler stall
 INJECT_AFTER_GATE_NS = 1_500_000_000  # post-gate injections wait for the fixture to start
 EXCEPTION_RECORDS = 8
+# Admission marker (oxide#192): a supervised child that waited for admission
+# publishes one bounded marker in the evidence directory. The custodian grants
+# at most the reported wait, never more than the run's own elapsed wall clock
+# and never more than ADMISSION_CAP_NS in total, so the work clock is not
+# consumed by a queue wait while the run stays hard-bounded. A marker is
+# cooperative evidence only: nothing about a rejected one faults the run.
+ADMISSION_NAME = "admission.json"
+# A waiting report (oxide#192): the child has started an admission wait and no
+# grant has ended it. It never moves a deadline; it exists so a wait that never
+# ends before the stop is reported and classified instead of leaving no trace.
+WAITING_NAME = "admission-waiting.json"
+ADMISSION_SCHEMA = 2
+ADMISSION_MAX_BYTES = 512
+ADMISSION_POLL_S = 0.25
+ADMISSION_CAP_NS = 600 * NS
+ADMISSION_RECORDS = 32  # per-report custodian records kept; the rest only move the counters
+ADMISSION_REJECTIONS = 8  # bounded rejection reasons kept in the receipt
+ADMISSION_COMMANDS = 64  # bounded pairing table: one entry per supervised command token
+ADMISSION_UNPAIRED = 8  # bounded unpaired list carried by the decision record
+ADMISSION_KEYS = frozenset({"schema", "source", "run", "command", "waited_ns"})
+WAITING_KEYS = frozenset({"schema", "source", "run", "command", "reason"})
 FIELDS = {  # required fields per monitor message type; bool is never accepted as int
     "reading": {"kind": str},
     "ready": {}, "monitor_complete": {}, "cleanup_failed": {},
     "output_eof": {"stream": str},
     "census": {"after": int, "members": int, "uncertain": int, "certain": bool},
+    "admission": {"waited_ns": int, "command": str, "completed": int, "marker": int},
+    "admission_waiting": {"reason": str, "command": str, "completed": int, "marker": int},
+    "admission_rejected": {"kind": str, "completed": int, "reason": str},
     "setup": {"root": str, "scratch": str, "evidence": str, "owned": bool},
     "detach": {"attempted": bool, "qualified": bool, "post_state": str},
     "detach_ready": {"budget_ns": int},
@@ -297,6 +383,84 @@ def settlement_record():
         "rounds_started": 0, "rounds_completed": 0, "omitted": 0,
         "phase": "none", "rounds": [],
     }
+
+
+def token_ok(value):
+    """A bounded, printable, non-empty token: the only text a report may carry."""
+    return isinstance(value, str) and 0 < len(value) <= 32 and value.isprintable()
+
+
+def admission_common_malformed(marker, keys, run_id):
+    """Why a report's shared fields are not usable, or None.
+
+    Fixed schema, exact keys, bounded types: schema 2, one printable source
+    token, this run's own identity and one printable command token. A report
+    from another run is stale and is never paired with this one."""
+    if not isinstance(marker, dict):
+        return "not an object"
+    if set(marker) != keys:
+        return "unexpected keys"
+    if not typed(marker["schema"], int) or marker["schema"] != ADMISSION_SCHEMA:
+        return "unsupported schema"
+    if not token_ok(marker["source"]):
+        return "ill-typed source"
+    if marker["run"] != run_id:
+        return "stale run"
+    if not token_ok(marker["command"]):
+        return "ill-typed command"
+    return None
+
+
+def admission_malformed(marker, run_id):
+    """Why a completed-wait marker is not usable, or None.
+
+    The shared fields, then a non-negative reported wait inside u64. A marker
+    is cooperative evidence for the custodian's bounded grant; anything else is
+    reported in the receipt and never latches a fault."""
+    problem = admission_common_malformed(marker, ADMISSION_KEYS, run_id)
+    if problem:
+        return problem
+    waited = marker["waited_ns"]
+    if not typed(waited, int) or not 0 <= waited <= U64MAX:
+        return "ill-typed waited_ns"
+    return None
+
+
+def admission_waiting_malformed(marker, run_id):
+    """Why a waiting report is not usable, or None. The shared fields, then its
+    own reason token instead of a wait. A waiting report never grants time:
+    anything wrong with it is reported in the receipt and never latches a
+    fault."""
+    problem = admission_common_malformed(marker, WAITING_KEYS, run_id)
+    if problem:
+        return problem
+    if not token_ok(marker["reason"]):
+        return "ill-typed reason"
+    return None
+
+
+def admission_record():
+    """The monitor's admission-marker observations (oxide#192).
+
+    Fixed shape: every stamp is an int CLOCK_UPTIME_RAW value or `None` when
+    no marker was observed, every count is a non-bool int, and the rejection
+    reasons are a bounded list. This is the observation side of the grant;
+    the custodian's own decision record carries what it actually granted."""
+    return {"schema": 1, "marker": ADMISSION_NAME, "observed": 0, "reported_wait_ns": 0,
+            "first_ns": None, "last_ns": None, "identity": None, "ignored": 0,
+            "rejections": [], "errors": 0}
+
+
+def admission_waiting_record():
+    """The monitor's waiting-report observations (oxide#192).
+
+    Fixed shape, same bounds: a stamp is an int CLOCK_UPTIME_RAW value or
+    `None`, counts are non-bool ints, the first reported reason is kept as an
+    opaque token and rejections are a bounded list. A waiting report grants
+    nothing; the custodian records its own decision-side facts separately."""
+    return {"schema": 1, "marker": WAITING_NAME, "observed": 0, "first_ns": None,
+            "last_ns": None, "reason": None, "identity": None, "ignored": 0,
+            "rejections": [], "errors": 0}
 
 
 def report(text, fd=2):
@@ -453,6 +617,57 @@ class Kinfo:
         row = cls.one(os.getpid())
         if row is None or (row["ppid"], row["pgid"], row["uid"]) != (os.getppid(), os.getpgid(0), os.getuid()):
             raise ValueError("layout does not match this process")
+
+
+def ancestor_identities(snapshot=Kinfo.all, parent=os.getppid, max_levels=ANCESTOR_MAX_LEVELS):
+    """This supervisor's own ancestor chain, as positive (PID, start) identities.
+
+    Oxide#197: walks the ppid chain from our own parent through PID 1 and
+    records, for each level, the identity the snapshot actually names (PID plus
+    the same start token the census uses), bounded to `max_levels` levels. The
+    census excludes exactly these identities, and only while a row's own
+    (PID, start) still matches, so a recycled PID is never excluded.
+
+    Records nothing it did not read: a snapshot failure is `unreadable`, and
+    the walk stops at the first level the snapshot does not name (never a
+    guessed parent). The returned object has fixed keys: `state`
+    (`recorded`/`partial`/`unreadable`), `count`, the bounded `identities`
+    rows (PID, start and 1-based level) and `stop` (an enumerated reason or
+    None). `partial` means an unexpected error ended the walk after some
+    positives were recorded."""
+    try:
+        by_pid = {row["pid"]: row for row in snapshot()}
+    except Exception:
+        return {"state": "unreadable", "count": 0, "identities": [], "stop": None}
+    identities, seen, stop = [], set(), None
+    try:
+        pid = parent()
+        while True:
+            if len(identities) >= max_levels:
+                stop = "depth-bound"
+                break
+            row = by_pid.get(pid)
+            if row is None:
+                stop = "not-in-snapshot"
+                break
+            identity = (row["pid"], row["start"])
+            if type(identity[0]) is not int or type(identity[1]) is not int or identity[0] <= 0:
+                stop = "malformed-row"
+                break
+            if identity in seen:
+                stop = "cycle"
+                break
+            seen.add(identity)
+            identities.append({"pid": identity[0], "start": identity[1],
+                               "level": len(identities) + 1})
+            if pid == 1:
+                stop = "pid-1"
+                break
+            pid = row["ppid"]
+    except BaseException:
+        return {"state": "partial", "count": len(identities), "identities": identities,
+                "stop": "read-error"}
+    return {"state": "recorded", "count": len(identities), "identities": identities, "stop": stop}
 
 
 def _diag_u64(value):
@@ -815,6 +1030,30 @@ def _fit_witnesses(witnesses, diag_kept_count, diag_compact_len):
         return []
 
 
+def _ancestor_identity_set(identities):
+    """The exact (PID, start) identities a census may skip (oxide#197).
+
+    Accepts the recorded rows (mappings with `pid`/`start`) or plain pairs, and
+    keeps only exact non-bool positive-PID integer pairs. Anything else is
+    dropped rather than coerced, so a malformed record excludes nothing.
+    Never raises."""
+    kept = set()
+    try:
+        for entry in identities or ():
+            try:
+                if isinstance(entry, dict):
+                    pid, start = entry.get("pid"), entry.get("start")
+                else:
+                    pid, start = entry
+                if type(pid) is int and type(start) is int and pid > 0:
+                    kept.add((pid, start))
+            except BaseException:
+                continue
+    except BaseException:
+        return frozenset()
+    return frozenset(kept)
+
+
 class Census:
     """Classifies every process against session `sid` (the leader's PID).
 
@@ -872,8 +1111,62 @@ class Census:
 
     Everything else (other getsid errors, identity change, failed or
     missing metadata, unconfirmed zombies, a failed snapshot) is uncertain
-    and blocks closure, first-seen rows included. Start time is never used
-    to exclude a process.
+    and blocks closure, first-seen rows included. Start time is not a proxy
+    for liveness or ordering: it is only the second half of a whole
+    (PID, start) identity, and no wall, boot or uptime comparison ever excludes
+    a row.
+
+    Supervisor ancestors (oxide#197, design ruling ea5a3dc9): the supervisor
+    records its own ppid chain, up to ANCESTOR_MAX_LEVELS levels, before the
+    leader exists, as positive (PID, start) identities. Two structural launcher
+    rules follow, and nothing else is relaxed:
+
+    - `ancestor` (a): the row's own identity is EXACTLY one recorded pair, and
+      that identity is re-verified through the safe Kinfo reader after the
+      snapshot. A row whose PID is a recorded ancestor's PID is decided by this
+      rule alone and never falls through to the parent rule. A different
+      identity at that PID is decided by ONE bound session observation: a
+      `member` reading is carried into the census as a member of exactly this
+      identity (an ancestor predates the leader, so a descendant can never be one)
+      and the identity is tracked; any other reading — contradictory, unreadable
+      or simply not the leader's session — is undecided, excludes nothing and
+      leaves the row to the ordinary classification.
+    - `parent` (b): the row's observation-time parent row (same snapshot) has a
+      PID above 1, its identity is EXACTLY one recorded pair, and ONE sibling
+      observation re-verifies the row's own PID/start identity AND that parent
+      identity on both sides of the session/group reads, so a PID reused between
+      the snapshot and those reads cannot lend another process's session or group
+      to this row. Only a positively `outside` observation excludes: the row must
+      be readable in both the session and the process group and both must differ
+      from the leader's PID. A matching parent PID alone is not enough. A row
+      positively `inside` the leader's session is carried into the census as a
+      member of exactly this identity (tracked, so a later contradictory session
+      read cannot make it foreign); anything else — a recycled or missing parent
+      row, a replaced identity, a transiently failed re-verification, an
+      unreadable session or group — is undecided, excludes nothing and keeps the
+      ordinary classification. Every
+      PPID 1 orphan and unknown parent is never excluded by this rule. The macOS
+      rule that a supervised descendant can only be reparented to launchd makes
+      such parentage incompatible with supervised descent.
+
+    NO clock, wall, boot or uptime value takes part: a start-time ordering
+    cannot prove the absence of a masked backward, back-and-forth or forward
+    wall step, so it is not evidence and a row whose start token merely looks
+    earlier is never excluded. A tracked descendant keeps its existing
+    classification however its start token compares.
+
+    A TRACKED identity is never excluded: it is a member this census already
+    accepted, so both rules veto it before anything else and no exclusion ever
+    removes tracked attribution. Every rule needs a positive, re-verified
+    identity plus (for `parent`) one bound observation with positive session and
+    group exclusion. A `member` launcher observation is carried as a tracked
+    member row, so a positively observed member can never be lost to a later
+    contradictory read. An UNDECIDED launcher observation excludes nothing and
+    adds no record: the row is classified by the ordinary getsid/reread path
+    exactly as it would be without the launcher rules, so neither an unknown
+    observation nor a recycled identity is silently dropped. A skipped row is
+    neither a member nor uncertain, and each exclusion's bounded evidence
+    (`pid`, `start`, `rule`) is returned for the receipt.
 
     The round also builds an optional, monitor-receipt-only diagnostics
     object summarizing ESRCH rows (confirm attempts/outcome and the final
@@ -897,9 +1190,12 @@ class Census:
     and they never change classification."""
 
     def __init__(self, sid, snapshot=Kinfo.all, getsid=os.getsid, reread=Kinfo.one, pause=time.sleep,
-                 terminal_allowed=False):
+                 terminal_allowed=False, ancestors=(), getpgid=os.getpgid):
         self.sid, self.snapshot, self.getsid, self.reread, self.pause = sid, snapshot, getsid, reread, pause
         self.terminal_allowed = terminal_allowed if terminal_allowed is True else False
+        self.ancestors = _ancestor_identity_set(ancestors)
+        self.ancestor_pids = frozenset(identity[0] for identity in self.ancestors)
+        self.getpgid = getpgid if callable(getpgid) else os.getpgid
         self.tracked = {}
         # Observation-only per-round counters (oxide#147). They are reset at the
         # start of every round, are never added to the round's returned object
@@ -981,6 +1277,152 @@ class Census:
         except BaseException:
             return False
 
+    def excludes_ancestor(self, identity):
+        """Whether this identity is one recorded supervisor ancestor.
+
+        Oxide#197: positive identity only, so the exact (PID, start) pair
+        recorded at startup. Never a PID alone, never a recycled PID and never
+        an identity that was not read. Pure predicate: no reads or writes,
+        never raises."""
+        try:
+            return identity in self.ancestors
+        except BaseException:
+            return False
+
+    def identity_stable(self, identity, parent_pid=None):
+        """Whether this exact identity is still what the safe reader names.
+
+        Oxide#197 (design ruling ea5a3dc9): an excluded row's identity is
+        re-verified through the same Kinfo reader after the census snapshot, so
+        an ancestor that was recycled, changed or became unreadable inside the
+        census is never excluded. With `parent_pid` the same read must also still
+        name that parent, which binds the observed parentage to this observation
+        rather than to the older snapshot. Pure observation: one read, no
+        bookkeeping, never raises."""
+        try:
+            again = self.reread(identity[0])
+            if not (isinstance(again, dict) and again.get("pid") == identity[0]
+                    and again.get("start") == identity[1]):
+                return False
+            return parent_pid is None or again.get("ppid") == parent_pid
+        except BaseException:
+            return False
+
+    def member_observation(self, identity):
+        """One bound session observation: `member` or `ambiguous`.
+
+        Oxide#197 (design ruling ea5a3dc9): when a launcher rule has to read a
+        session, the row's own identity is re-verified through the safe reader on
+        BOTH sides of that read, so a positively observed member can never be
+        lost to a contradictory later read. `member` means the identity held on
+        both sides and the row is in the leader's session. Anything else — a
+        failed read, a replaced identity, an unreadable session or a stable
+        session that is not the leader's — is `ambiguous`, because a recorded
+        ancestor's PID must never end up positively foreign. Never raises."""
+        try:
+            if not self.identity_stable(identity):
+                return "ambiguous"
+            session = self.getsid(identity[0])
+            if session is None:
+                return "ambiguous"
+            if not self.identity_stable(identity):
+                return "ambiguous"
+            return "member" if session == self.sid else "ambiguous"
+        except BaseException:
+            return "ambiguous"
+
+    def sibling_observation(self, identity, parent_identity):
+        """One sibling observation: `outside`, `inside` or `ambiguous`.
+
+        Oxide#197 (design ruling ea5a3dc9): the launcher-sibling fact is only
+        usable when the row's own PID/start identity AND its recorded parent are
+        re-verified on both sides of the session/group reads, so a PID reused
+        between the snapshot and those reads can never lend another process's
+        session or group to this row.
+
+        - `outside`: every read succeeded, both identities held, the row still
+          names that parent, and the session AND group are readable and both
+          differ from the leader's PID (its session and group id).
+        - `inside`: every read succeeded, both identities held, and the row is
+          in the leader's session. That observation is carried into the census
+          as a member of exactly this identity, so it is tracked and a later
+          contradictory session read cannot turn it into a foreign row.
+        - `ambiguous`: anything else — a failed read, a replaced identity, a
+          parent that no longer matches, an unreadable session or group, or a
+          group reading of the leader while the session differs. That is never
+          evidence for exclusion, so the caller excludes nothing and the row
+          keeps the ordinary census classification.
+
+        Never raises."""
+        try:
+            ppid = parent_identity[0]
+            if not self.identity_stable(parent_identity):
+                return "ambiguous"
+            if not self.identity_stable(identity, parent_pid=ppid):
+                return "ambiguous"
+            session = self.getsid(identity[0])
+            group = self.getpgid(identity[0])
+            if session is None or group is None:
+                return "ambiguous"
+            if not self.identity_stable(identity, parent_pid=ppid):
+                return "ambiguous"
+            if not self.identity_stable(parent_identity):
+                return "ambiguous"
+            if session == self.sid:
+                return "inside"
+            if group == self.sid:  # inconsistent with the readable session
+                return "ambiguous"
+            return "outside"
+        except BaseException:
+            return "ambiguous"
+
+    def exclusion_rule(self, row, by_pid):
+        """The structural launcher decision for this row.
+
+        Only a POSITIVELY decided identity leaves this function: `ancestor` or
+        `parent` (excluded), or `member` (a bound observation positively put the
+        row in the leader's session, so the caller carries it as a member of
+        exactly this identity). Everything else returns None, which excludes no
+        row and leaves the row to the ordinary getsid/reread classification, so
+        an undecided launcher observation never changes main's classification.
+        A tracked identity is never excluded by these rules. A row whose PID is a
+        recorded ancestor's PID is decided by the ancestor rule alone: a changed
+        or unverifiable identity there is simply not excluded (fail closed
+        against exclusion) and never falls through to its parent's rule. Pure
+        classification over the injected readers: no pauses, never raises."""
+        try:
+            identity = (row["pid"], row["start"])
+            if identity in self.tracked:  # a tracked member is never excluded
+                return None
+            if row["pid"] in self.ancestor_pids:
+                # A recorded ancestor PID is decided here only: the exact,
+                # re-verified identity is excluded and never falls through.
+                if identity in self.ancestors and self.identity_stable(identity):
+                    return "ancestor"
+                # A different identity at that PID is not this ancestor. One
+                # bound session observation decides only the positive case: a
+                # member observation is carried into the census (an ancestor
+                # predates the leader, so a descendant can never be one). An
+                # undecided observation excludes nothing and falls through.
+                return "member" if self.member_observation(identity) == "member" else None
+            ppid = row.get("ppid")
+            if type(ppid) is not int or ppid <= 1:  # an orphan is never excluded
+                return None
+            parent = (by_pid or {}).get(ppid)
+            if parent is None:  # an unknown parent is never excluded
+                return None
+            parent_identity = (parent["pid"], parent["start"])
+            if not self.excludes_ancestor(parent_identity):
+                return None
+            observed = self.sibling_observation(identity, parent_identity)
+            if observed == "outside":
+                return "parent"
+            if observed == "inside":
+                return "member"
+            return None  # undecided: excludes nothing, ordinary classification owns it
+        except BaseException:
+            return None  # never exclude on an unreadable or failed observation
+
     def round(self):
         self.reset_stats()
         begun = now_ns()
@@ -1005,6 +1447,16 @@ class Census:
         for identity in list(self.tracked):
             if identity not in present:
                 del self.tracked[identity]
+        # Launcher rules (oxide#197, design ruling ea5a3dc9). The parent rule
+        # needs the observation-time parent row, so the parent is resolved from
+        # this same snapshot. No clock fact is read: an ancestor record that was
+        # not recorded excludes nothing.
+        by_pid = {}
+        if self.ancestors:
+            for row in rows:
+                by_pid.setdefault(row["pid"], row)
+        exclusions, excluded_total = [], 0
+        rule_totals = {"ancestor": 0, "parent": 0}
         members, uncertain = [], []
         diag_attempted, diag_saturated = 0, False
         terminal_count, terminal_witnesses, terminal_tainted = 0, [], False
@@ -1017,6 +1469,30 @@ class Census:
         pending = []  # (index, row, identity, state) still being confirmed, snapshot order
         for index, row in enumerate(rows):
             identity = (row["pid"], row["start"])
+            # A tracked identity keeps its existing member/terminal attribution
+            # and is never excluded, so a launcher rule can never remove it.
+            rule = (self.exclusion_rule(row, by_pid)
+                    if by_pid and identity not in self.tracked else None)
+            if rule == "member":
+                # A bound session observation positively found this identity in
+                # the leader's session: carry it as a member and track it, so a
+                # later contradictory session read cannot turn it into a foreign
+                # row or let it vanish from the census.
+                self.tracked[identity] = row
+                records[index] = {"member": row}
+                continue
+            if rule is not None:
+                # A positively decided launcher identity: this run's own
+                # launcher chain, so never a member and never an unknown row. No
+                # pause, and its tracked set is left untouched. An UNDECIDED
+                # observation never reaches this branch: it excludes no row and
+                # the ordinary getsid/reread classification below owns the row.
+                records[index] = {"skip": True}
+                excluded_total += 1
+                rule_totals[rule] += 1
+                if len(exclusions) < EXCLUSION_MAX_ROWS:
+                    exclusions.append({"pid": identity[0], "start": identity[1], "rule": rule})
+                continue
             failure, getsid_error = None, None
             try:
                 session = self.getsid(row["pid"])
@@ -1198,6 +1674,15 @@ class Census:
             uncertain.append({"reason": "terminal count not countable"})
         result = {"certain": not uncertain, "members": len(members), "uncertain": len(uncertain),
                 "member_rows": members[:20], "uncertain_rows": uncertain[:20]}
+        if self.ancestors:
+            # Receipt-only, bounded positive evidence for the launcher rules: the
+            # rows kept here are the first EXCLUSION_MAX_ROWS of this round, and
+            # the counts cover every exclusion decision. Observation only: it
+            # never changes a classification, count, read, pause or budget.
+            result["ancestor_exclusions"] = {
+                "rows": exclusions, "count": excluded_total,
+                "omitted": max(0, excluded_total - len(exclusions)),
+                "by_rule": rule_totals}
         result["terminal_count_status"] = status
         result["terminal_nonwriters"] = value if (
             status == "valid" and type(value) is int and 0 <= value <= U64MAX) else None
@@ -1228,12 +1713,182 @@ class Census:
 # Guard and precedence (custodian side, pure) -------------------------------------
 
 
+def exclusion_record():
+    """The receipt's cumulative, bounded launcher-exclusion evidence (oxide#197)."""
+    return {"rows": [], "count": 0, "omitted": 0,
+            "by_rule": {"ancestor": 0, "parent": 0}, "rounds": 0}
+
+
+def merge_exclusions(receipt, report):
+    """Add one round's launcher-exclusion evidence to the receipt's record.
+
+    Observation only: never raises and never changes a classification, count,
+    fault, closure, EOF or cleanup. The receipt keeps at most
+    EXCLUSION_MAX_ROWS distinct positive identity rows; every decision still
+    moves `count`, `by_rule` and `omitted`."""
+    try:
+        if not isinstance(receipt, dict) or not isinstance(report, dict):
+            return
+        record = receipt.get("ancestor_exclusions")
+        if not isinstance(record, dict):
+            record = exclusion_record()
+            receipt["ancestor_exclusions"] = record
+        record["rounds"] += 1
+        reported = report.get("count")
+        count = reported if type(reported) is int and reported >= 0 else 0
+        record["count"] += count
+        kept = 0
+        rows = report.get("rows")
+        if isinstance(rows, list):
+            for entry in rows:
+                if not isinstance(entry, dict):
+                    continue
+                pid, start, rule = entry.get("pid"), entry.get("start"), entry.get("rule")
+                if not (type(pid) is int and type(start) is int
+                        and rule in ("ancestor", "parent")):
+                    continue
+                if len(record["rows"]) < EXCLUSION_MAX_ROWS and not any(
+                        row.get("pid") == pid and row.get("start") == start
+                        for row in record["rows"]):
+                    record["rows"].append({"pid": pid, "start": start, "rule": rule})
+        # Invariant: every decision is either a kept distinct row or omitted.
+        record["omitted"] = max(0, record["count"] - len(record["rows"]))
+        by_rule = report.get("by_rule")
+        if isinstance(by_rule, dict):
+            for rule in ("ancestor", "parent"):
+                value = by_rule.get(rule)
+                if type(value) is int and value >= 0:
+                    record["by_rule"][rule] += value
+    except BaseException:
+        pass
+
+
+def survivor_row(row):
+    """One bounded receipt row for a cooperative-session member (oxide#195), or
+    None when the row carries no usable identity.
+
+    `SURVIVOR_KEYS` only: an identity token and the facts that made the process a
+    member, never text, never a path and never a conclusion. A row is recorded so
+    the owner can see exactly which process outlived the stop; it is never
+    evidence that anything was signalled."""
+    if not isinstance(row, dict):
+        return None
+    entry = {}
+    for key in SURVIVOR_KEYS:
+        value = row.get(key)
+        if key == "zombie":
+            if not isinstance(value, bool):
+                return None
+            entry[key] = value
+            continue
+        if not typed(value, int) or value < 0:
+            return None
+        entry[key] = value
+    return entry if entry["pid"] > 0 and entry["start"] > 0 else None
+
+
+def census_summary(result):
+    """The three facts of one census round or census message, or None. Used to bind
+    the deciding census and the final round beside a frozen survivor prefix
+    (oxide#195). Only the fixed keys are copied, so a message or a round answers
+    the same way."""
+    if not isinstance(result, dict):
+        return None
+    entry = {}
+    for key in ("certain", "members", "uncertain"):
+        value = result.get(key)
+        if key == "certain":
+            if not isinstance(value, bool):
+                return None
+        elif not typed(value, int) or value < 0:
+            return None
+        entry[key] = value
+    return entry
+
+
+def census_settled(join, final, deciding):
+    """Whether closure may rest on the census evidence (oxide#195), pure.
+
+    True only when all three hold: the census thread finished inside its bounded
+    join; the last completed round is certainly empty; and the census MESSAGE the
+    custodian's decision named is a certainly empty message this monitor really
+    sent. Anything else refuses closure with its own reason, so neither a stalled
+    round nor a decision without its own census evidence can leave a later member
+    row beside an empty list and a closed verdict."""
+    if not isinstance(join, dict) or join.get("joined") is not True:
+        return False, "the census thread did not finish before publication"
+    if not isinstance(final, dict):
+        return False, "no certainly empty census round completed before publication"
+    if final.get("members") or final.get("uncertain"):
+        return False, (f"the final census round was not certainly empty"
+                       f" ({final.get('members')} member(s), {final.get('uncertain')} uncertain)")
+    if final.get("certain") is not True:
+        return False, "no certainly empty census round completed before publication"
+    if not isinstance(deciding, dict):
+        return False, "the decision names no census message this monitor sent"
+    if deciding.get("members") or deciding.get("uncertain") or deciding.get("certain") is not True:
+        return False, ("the census message the decision rested on was not certainly empty"
+                       f" ({deciding.get('members')} member(s), {deciding.get('uncertain')} uncertain)")
+    return True, None
+
+
+def survivors_line(rows, closure=None, joined=None):
+    """One bounded summary line for the recorded survivors, or None when the run
+    recorded none. Pure.
+
+    The recorded rows are an observation: a survivor seen after the stop may
+    exit by itself, so a LATER census can still be certainly empty and the run
+    can close. The line therefore never invents a closure verdict - it takes
+    the run's own final `closure` (`closed` / `UNCLOSED` / unknown) and states
+    only that: a closed run says the survivors were gone by the deciding
+    census, and only an UNCLOSED run says the scratch was kept. `joined is False`
+    adds that the census thread outlived its bounded join, so the list is a
+    frozen prefix and later rows may be missing; it never claims completeness it
+    does not have, and it never claims a signal."""
+    rows = [row for row in (rows or []) if isinstance(row, dict)]
+    if not rows:
+        if joined is not False:
+            return None
+        # An incomplete join is reported even when the prefix is empty: the
+        # operator must never have to infer a missing census from silence.
+        return ("supervisor: no same-session survivor row was recorded; the census thread had"
+                " not finished at publication, so this record cannot show the run closed")
+    shown = ", ".join(f"{row.get('pid')}/{row.get('start')}" for row in rows[:8])
+    more = "" if len(rows) <= 8 else f" (+{len(rows) - 8} more)"
+    head = (f"supervisor: {len(rows)} same-session survivor(s) not signalled (no custody):"
+            f" {shown}{more}")
+    if closure == "closed":
+        line = head + "; they were gone by the deciding census, so the run closed"
+    elif closure == "UNCLOSED":
+        line = head + "; the run stays UNCLOSED and its scratch is kept"
+    else:
+        line = head + "; the deciding census fixes the outcome"
+    if joined is False:
+        # The census thread outlived its bounded join, so the published list is a
+        # frozen prefix: say so rather than implying a complete record. Such a
+        # record can never be a closed run - closure is refused when the join is
+        # incomplete - so a contradictory pair must not be reported as closed.
+        if closure == "closed":
+            line = head + "; the census thread had not finished at publication, so the run is not closed"
+        else:
+            line += ("; the census thread had not finished at publication, so later rows may be"
+                     " missing")
+    return line
+
+
 class Guard:
-    """Newest completed readings and the latched first fault."""
+    """Newest completed readings and the latched first fault.
+
+    Freshness measures the steady-state sampling window, so a kind with no
+    reading yet is stale only from `sampling_ns`, the moment sampling actually
+    began. Before that the bounded setup phase owns its own window
+    (`Custodian.setup_at`) and a cold setup sweep longer than the 1 s reserve
+    window is not a fault (decision 50acd33b, papercut 90e93f06)."""
 
     def __init__(self, start_ns, threshold=THRESHOLD, budget=SCRATCH_BUDGET):
         self.start_ns, self.threshold, self.budget = start_ns, threshold, budget
         self.reserve_at = self.scratch_at = None
+        self.sampling_ns = None
         self.fault = None
 
     def latch(self, fault):
@@ -1265,8 +1920,15 @@ class Guard:
     def check(self, now):
         for kind, at, stale in (("reserve", self.reserve_at, RESERVE_STALE_NS),
                                 ("scratch", self.scratch_at, SCRATCH_STALE_NS)):
-            if now - (self.start_ns if at is None else at) > stale:
-                self.latch(f"{kind} readings stale: none in {stale / NS:g} s")
+            if at is None:
+                # No reading of this kind has completed: before sampling began the
+                # setup deadline owns the window, and after it began the sampling
+                # window is measured from that start, never from custodian start.
+                if self.sampling_ns is None or now - self.sampling_ns <= stale:
+                    continue
+            elif now - at <= stale:
+                continue
+            self.latch(f"{kind} readings stale: none in {stale / NS:g} s")
         return self.fault
 
 
@@ -2080,119 +2742,6 @@ def detach_child_identity(row, pid, start, monitor_pid):
     `zombie` (there is no `stat` key)."""
     return bool(row is not None and row.get("pid") == pid and row.get("start") == start
                 and row.get("ppid") == monitor_pid and row.get("zombie") is False)
-
-
-def survivor_row(row):
-    """One bounded receipt row for a cooperative-session member (oxide#195), or
-    None when the row carries no usable identity.
-
-    `SURVIVOR_KEYS` only: an identity token and the facts that made the process a
-    member, never text, never a path and never a conclusion. A row is recorded so
-    the owner can see exactly which process outlived the stop; it is never
-    evidence that anything was signalled."""
-    if not isinstance(row, dict):
-        return None
-    entry = {}
-    for key in SURVIVOR_KEYS:
-        value = row.get(key)
-        if key == "zombie":
-            if not isinstance(value, bool):
-                return None
-            entry[key] = value
-            continue
-        if not typed(value, int) or value < 0:
-            return None
-        entry[key] = value
-    return entry if entry["pid"] > 0 and entry["start"] > 0 else None
-
-
-def census_summary(result):
-    """The three facts of one census round or census message, or None. Used to bind
-    the deciding census and the final round beside a frozen survivor prefix
-    (oxide#195). Only the fixed keys are copied, so a message or a round answers
-    the same way."""
-    if not isinstance(result, dict):
-        return None
-    entry = {}
-    for key in ("certain", "members", "uncertain"):
-        value = result.get(key)
-        if key == "certain":
-            if not isinstance(value, bool):
-                return None
-        elif not typed(value, int) or value < 0:
-            return None
-        entry[key] = value
-    return entry
-
-
-def census_settled(join, final, deciding):
-    """Whether closure may rest on the census evidence (oxide#195), pure.
-
-    True only when all three hold: the census thread finished inside its bounded
-    join; the last completed round is certainly empty; and the census MESSAGE the
-    custodian's decision named is a certainly empty message this monitor really
-    sent. Anything else refuses closure with its own reason, so neither a stalled
-    round nor a decision without its own census evidence can leave a later member
-    row beside an empty list and a closed verdict."""
-    if not isinstance(join, dict) or join.get("joined") is not True:
-        return False, "the census thread did not finish before publication"
-    if not isinstance(final, dict):
-        return False, "no certainly empty census round completed before publication"
-    if final.get("members") or final.get("uncertain"):
-        return False, (f"the final census round was not certainly empty"
-                       f" ({final.get('members')} member(s), {final.get('uncertain')} uncertain)")
-    if final.get("certain") is not True:
-        return False, "no certainly empty census round completed before publication"
-    if not isinstance(deciding, dict):
-        return False, "the decision names no census message this monitor sent"
-    if deciding.get("members") or deciding.get("uncertain") or deciding.get("certain") is not True:
-        return False, ("the census message the decision rested on was not certainly empty"
-                       f" ({deciding.get('members')} member(s), {deciding.get('uncertain')} uncertain)")
-    return True, None
-
-
-def survivors_line(rows, closure=None, joined=None):
-    """One bounded summary line for the recorded survivors, or None when the run
-    recorded none. Pure.
-
-    The recorded rows are an observation: a survivor seen after the stop may
-    exit by itself, so a LATER census can still be certainly empty and the run
-    can close. The line therefore never invents a closure verdict - it takes
-    the run's own final `closure` (`closed` / `UNCLOSED` / unknown) and states
-    only that: a closed run says the survivors were gone by the deciding
-    census, and only an UNCLOSED run says the scratch was kept. `joined is False`
-    adds that the census thread outlived its bounded join, so the list is a
-    frozen prefix and later rows may be missing; it never claims completeness it
-    does not have, and it never claims a signal."""
-    rows = [row for row in (rows or []) if isinstance(row, dict)]
-    if not rows:
-        if joined is not False:
-            return None
-        # An incomplete join is reported even when the prefix is empty: the
-        # operator must never have to infer a missing census from silence.
-        return ("supervisor: no same-session survivor row was recorded; the census thread had"
-                " not finished at publication, so this record cannot show the run closed")
-    shown = ", ".join(f"{row.get('pid')}/{row.get('start')}" for row in rows[:8])
-    more = "" if len(rows) <= 8 else f" (+{len(rows) - 8} more)"
-    head = (f"supervisor: {len(rows)} same-session survivor(s) not signalled (no custody):"
-            f" {shown}{more}")
-    if closure == "closed":
-        line = head + "; they were gone by the deciding census, so the run closed"
-    elif closure == "UNCLOSED":
-        line = head + "; the run stays UNCLOSED and its scratch is kept"
-    else:
-        line = head + "; the deciding census fixes the outcome"
-    if joined is False:
-        # The census thread outlived its bounded join, so the published list is a
-        # frozen prefix: say so rather than implying a complete record. Such a
-        # record can never be a closed run - closure is refused when the join is
-        # incomplete - so a contradictory pair must not be reported as closed.
-        if closure == "closed":
-            line = head + "; the census thread had not finished at publication, so the run is not closed"
-        else:
-            line += ("; the census thread had not finished at publication, so later rows may be"
-                     " missing")
-    return line
 
 
 def detach_authorization(fault, deadline_hit, now, exit_at):
@@ -3377,6 +3926,9 @@ class Monitor:
         self.inject = set(ctx["inject"])
         self.pipes = [(out_r, "stdout", 1), (err_r, "stderr", 2)]
         self.receipt = None
+        # Oxide#197: the recorded ancestor chain, filled by setup before the
+        # leader exists. Nothing is excluded until it is recorded.
+        self.ancestors = {"state": "unreadable", "count": 0, "identities": [], "stop": None}
         # Observation-only settlement diagnostics; the receipt carries this
         # same object, so publishing includes it without extra work.
         self.settlement = settlement_record()
@@ -3388,14 +3940,12 @@ class Monitor:
         # honest prefix, no row may land after the receipt is published, and the
         # receipt records `census_join.frozen`.
         self.census_frozen = False
-        # `receipt['census']` is the DECIDING census: the last round completed
-        # before the stop request, bound at the stop. Rounds that complete after
-        # that bind go to `receipt['census_after_stop']`, so a stalled round can
-        # never be mistaken for the census the verdict rests on.
+        # `receipt['census']` is the LAST round completed before the stop; the
+        # DECIDING census is the message the custodian's decision named, bound from
+        # this monitor's own message record. Rounds finishing after the bind are
+        # post-decision observations under `receipt['census_after_stop']`.
         self.census_bound = False
         self.census_last = None
-        # Every census message this monitor sent, by its own sequence number, so a
-        # decision can be bound to the exact message it rested on.
         self.census_messages = {}
 
     def note(self, entry=_SETTLE_TOP, **fields):
@@ -3506,6 +4056,11 @@ class Monitor:
             Kinfo.check()
         except Exception as error:
             raise SetupRefused(f"missing kinfo_proc ({type_name(error)})")
+        # Oxide#197: record this run's own ancestor chain before anything is
+        # launched, so the post-leader census can exclude exactly those
+        # positive identities and nothing else.
+        self.ancestors = ancestor_identities()
+        ctx["ancestors"] = self.ancestors
         if ctx["adopted"]:
             scratch = os.path.realpath(ctx["adopted"])
             if not os.path.isdir(scratch):
@@ -3531,7 +4086,9 @@ class Monitor:
             raise SetupRefused(f"reserve path {reserve_path}: {type_name(error)}")
         selection["device"] = selection["device"] if selection["device"] is not None else reserve_device
         ctx.update(root=root, scratch=scratch, evidence=os.path.realpath(evidence), owned=owned,
-                   reserve_path=reserve_path, reserve_device=reserve_device, selection=selection)
+                   reserve_path=reserve_path, reserve_device=reserve_device, selection=selection,
+                   admission_path=os.path.join(os.path.realpath(evidence), ADMISSION_NAME),
+                   waiting_path=os.path.join(os.path.realpath(evidence), WAITING_NAME))
         try:
             terminal_mode = _decide_terminal_mode()
         except BaseException:
@@ -3548,6 +4105,8 @@ class Monitor:
             "root": ctx["root"], "scratch": ctx["scratch"], "evidence": ctx["evidence"],
             "scratch_owned": ctx["owned"], "start_ns": ctx["start_ns"], "abort_threshold": THRESHOLD,
             "terminal_mode": dict(terminal_mode),
+            "ancestors": dict(self.ancestors, identities=list(self.ancestors["identities"])),
+            "ancestor_exclusions": exclusion_record(),
             "scratch_default": dict(ctx["selection"]),
             "scratch_sweep": marker.get("sweep"),
             "scratch_marker": {key: marker.get(key) for key in ("path", "state", "run_id", "reason")},
@@ -3557,6 +4116,7 @@ class Monitor:
             "owned_bytes": {"samples": 0, "maximum": None, "budget": ctx["budget"], "last_ns": None},
             "output": {}, "census": None, "census_rounds": 0, "settlement": self.settlement,
             "survivors": [],
+            "admission": admission_record(), "admission_waiting": admission_waiting_record(),
         }
 
     def close_orphan_reads(self, ctx):
@@ -3717,6 +4277,139 @@ class Monitor:
             except OSError as error:
                 self.send("reading", kind="scratch", complete=False, error=str(error))
             self.stop.wait(SCRATCH_INTERVAL)
+
+    def note_admission(self, error=False, key="admission"):
+        """One bounded, never-latched admission-observation failure."""
+        try:
+            record = self.receipt[key]
+            with self.lock:
+                if error:
+                    record["errors"] += 1
+        except BaseException:
+            pass
+
+    def reject_admission(self, reason, key="admission", observed=True):
+        """Record why one report was ignored, and tell the custodian.
+
+        Cooperative evidence only: a rejected report never faults the run. A
+        readable document that failed validation is still an observation of the
+        fixed-name completion file, so the custodian must count it: it can have
+        replaced a completion before the next poll. `observed=False` covers the
+        paths that never read a document (a vanished path, a non-regular file, an
+        open error), which are not observations of a write. At most one rejection
+        is reported per poll and file, so the control-message rate stays bounded
+        by the sampler."""
+        try:
+            record = self.receipt[key]
+            with self.lock:
+                record["ignored"] += 1
+                if len(record["rejections"]) < ADMISSION_REJECTIONS:
+                    record["rejections"].append(reason)
+            if observed:
+                self.send("admission_rejected", kind=key, completed=now_ns(), reason=reason[:64])
+        except BaseException:
+            pass
+
+    def read_admission(self, path, seen=None, key="admission"):
+        """One bounded read of an admission report (oxide#192).
+
+        Only a regular file opened without following a link, at most
+        ADMISSION_MAX_BYTES, validated against its own fixed schema: the
+        completed-wait marker or the waiting report. Deduplication is bound to
+        the identity of the file actually opened (`fstat` on the open handle),
+        never to an identity sampled before the open: a writer publishes by
+        atomic rename, so a replacement between the sampler's `lstat` and this
+        open would otherwise report the new file once and then report it again on
+        the next poll, and a duplicated completion would grant the same wait
+        twice. A valid report is sent to the custodian with its own completed
+        stamp; the extension decision is the custodian's. Every other outcome is
+        recorded here and nothing is sent.
+
+        Returns the identity this call consumed, or None when nothing was read."""
+        waiting = key == "admission_waiting"
+        try:
+            info = os.lstat(path)
+            if not stat.S_ISREG(info.st_mode):
+                self.reject_admission("not a regular file", key, observed=False)
+                return None
+            handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                opened = os.fstat(handle)
+                identity = (opened.st_dev, opened.st_ino)
+                if not stat.S_ISREG(opened.st_mode):
+                    self.reject_admission("not a regular file", key, observed=False)
+                    return None
+                if seen is not None and identity == seen:
+                    return identity  # already reported: one inode is one report
+                raw = os.read(handle, ADMISSION_MAX_BYTES + 1)
+            finally:
+                os.close(handle)
+        except OSError as error:
+            self.reject_admission("read: " + errno_name(error), key, observed=False)
+            return None
+        completed = now_ns()
+        if len(raw) > ADMISSION_MAX_BYTES:
+            self.reject_admission(f"larger than {ADMISSION_MAX_BYTES} bytes", key)
+            return None
+        try:
+            marker = json.loads(raw)
+        except ValueError:
+            self.reject_admission("not JSON", key)
+            return None
+        run_id = self.ctx.get("run_id")
+        problem = (admission_waiting_malformed(marker, run_id) if waiting
+                   else admission_malformed(marker, run_id))
+        if problem:
+            self.reject_admission(problem, key)
+            return None
+        try:
+            record = self.receipt[key]
+            with self.lock:
+                record["observed"] += 1
+                record["first_ns"] = completed if record["first_ns"] is None else record["first_ns"]
+                record["last_ns"] = completed
+                record["identity"] = None if identity is None else [int(identity[0]), int(identity[1])]
+                if waiting:
+                    record["reason"] = marker["reason"] if record["reason"] is None else record["reason"]
+                else:
+                    record["reported_wait_ns"] = min(U64MAX, record["reported_wait_ns"] + marker["waited_ns"])
+                index = record["observed"]
+            if waiting:
+                self.send("admission_waiting", reason=marker["reason"], command=marker["command"],
+                          completed=completed, marker=index)
+            else:
+                self.send("admission", waited_ns=marker["waited_ns"], command=marker["command"],
+                          completed=completed, marker=index)
+            return identity
+        except BaseException:
+            self.note_admission(error=True, key=key)
+            return None
+
+    def sample_admission(self):
+        """Poll both admission reports for a new identity (oxide#192).
+
+        A writer publishes a fresh file by rename, so one identity is one
+        report. Absence is not an event, and no failure here is latched."""
+        paths = (("admission", self.ctx.get("admission_path")),
+                 ("admission_waiting", self.ctx.get("waiting_path")))
+        seen = {"admission": None, "admission_waiting": None}
+        while not self.stop.is_set():
+            for key, path in paths:
+                if not path:
+                    continue
+                try:
+                    info = os.lstat(path)
+                    candidate = (info.st_dev, info.st_ino)
+                    if candidate != seen[key]:
+                        # Mark what the read actually consumed, so a rename that
+                        # lands between this stat and the open is reported once.
+                        consumed = self.read_admission(path, seen[key], key)
+                        seen[key] = candidate if consumed is None else consumed
+                except FileNotFoundError:
+                    seen[key] = None
+                except OSError:
+                    self.note_admission(error=True, key=key)
+            self.stop.wait(ADMISSION_POLL_S)
 
     def drain(self, fd, name, sink):
         counts = self.receipt["output"].setdefault(
@@ -3880,8 +4573,10 @@ class Monitor:
                 self.note(thread_start_latency_ns=max(0, started - received))
         except BaseException:
             pass
+        record = self.ctx.get("ancestors") or {}
         census = Census(self.leader[0], terminal_allowed=(
-            self.ctx.get("terminal_mode", {}).get("mode") == "allowlisted"))
+            self.ctx.get("terminal_mode", {}).get("mode") == "allowlisted"),
+            ancestors=record.get("identities") or ())
         self.note(census_built_ns=now_ns())
         while not self.census_stop.is_set():
             begin = now_ns()
@@ -3918,6 +4613,7 @@ class Monitor:
                 else:
                     self.receipt["census"] = result
                     self.receipt["census_rounds"] += 1
+                merge_exclusions(self.receipt, result.get("ancestor_exclusions"))
             released = now_ns()
             self.note(entry, phase="locked", lock_acquired_ns=acquired, lock_released_ns=released,
                       certain=result["certain"], members=result["members"],
@@ -3927,7 +4623,7 @@ class Monitor:
                 # Record BEFORE reporting the round: the custodian may decide on this
                 # message and the monitor may publish its receipt straight after it,
                 # so a row appended after the send could be missing from the evidence
-                # that justified the verdict (oxide#195 review).
+                # that justified the verdict (oxide#195).
                 self.record_survivors(result)
             self.send("census", after=after, members=result["members"], uncertain=result["uncertain"],
                       certain=result["certain"])
@@ -4047,7 +4743,11 @@ class Monitor:
         self.send("setup", root=ctx["root"], scratch=ctx["scratch"], evidence=ctx["evidence"], owned=ctx["owned"])
         if "setup-stall" in self.inject:
             time.sleep(SETUP_S + 5)
-        for target in (self.sample_reserve, self.sample_owned):
+        if "setup-delay" in self.inject:
+            # A cold setup slower than the reserve freshness window, still inside
+            # the setup deadline: no reading exists yet, and that is not a fault.
+            time.sleep(SETUP_DELAY_S)
+        for target in (self.sample_reserve, self.sample_owned, self.sample_admission):
             threading.Thread(target=target, daemon=True).start()
         for fd, name, sink in self.pipes:
             threading.Thread(target=self.drain, args=(fd, name, sink), daemon=True).start()
@@ -4095,8 +4795,8 @@ class Monitor:
         settled, unsettled_reason = census_settled(
             join, getattr(self, "census_last", None), self.receipt.get("deciding_census"))
         if decision == "cleanup" and not settled:
-            # The census evidence cannot be shown final and certainly empty, so
-            # certain closure is not available: keep everything and say why.
+            # The census evidence cannot be shown final and certainly empty from the
+            # message the decision named, so certain closure is not available.
             decision = "keep"
             self.refuse_incomplete_closure(join, unsettled_reason)
             self.publish("census_join_incomplete: scratch_kept")
@@ -4370,6 +5070,54 @@ class Monitor:
             lines.append(survivors)
         for line in lines:  # one bounded write per line, so none truncates the rest
             report(line + "\n")
+        admission = next((record for record in reversed(receipt["custodian"])
+                          if isinstance(record, dict) and record.get("event") == "admission_decision"), None)
+        if admission is not None:
+            effective = (admission["absolute_ns"] - receipt["start_ns"]) / NS
+            report(f"supervisor: admission wait reported {admission['reported_wait_ns'] / NS:.1f} s in"
+                   f" {admission['counted']} marker(s), granted {admission['granted_ns'] / NS:.1f} s of the"
+                   f" {ADMISSION_CAP_NS / NS:.0f} s cap (limit {admission['limit_s']:.0f} s, deadline"
+                   f" {effective:.1f} s after start); {admission['ignored']} late;"
+                   f" observed {receipt['admission']['observed']}, rejected {receipt['admission']['ignored']}\n")
+            if admission["ignored"]:
+                reason = admission.get("late_reason") or "unknown"
+                report(f"supervisor: an admission marker reached the custodian after the stop decision"
+                       f" ({reason}), so its wait is reported and not granted; the deadline classification"
+                       " stands and no clock was moved\n")
+            pairs = admission.get("admission_waiting") or {}
+            rejected_waiting = receipt["admission_waiting"]["ignored"]
+            rejected_grants = receipt["admission"]["ignored"]
+            if pairs.get("commands") or rejected_waiting:
+                report(f"supervisor: admission waits reported by {pairs.get('commands', 0)} command(s):"
+                       f" {pairs.get('ended', 0)} ended, {pairs.get('unpaired_count', 0)} unpaired"
+                       f" ({pairs.get('possibly_overwritten_count', 0)} with a later admission report);"
+                       f" granted {admission['granted_ns'] / NS:.1f} s; {rejected_waiting} waiting and"
+                       f" {rejected_grants} completed report(s) rejected"
+                       + (f"; {admission['unclassified']} unclassified report(s)"
+                          if admission.get("unclassified") else "")
+                       + (f"; {admission['duplicates']} duplicate completion(s) ignored"
+                          if admission.get("duplicates") else "")
+                       + "\n")
+            for entry in (pairs.get("unpaired") or [])[:3]:
+                if entry["later_observation"] or rejected_waiting or rejected_grants:
+                    report(f"supervisor: command {entry['command']} reported waiting ({entry['reason']}) at"
+                           f" {(entry['waiting_ns'] - receipt['start_ns']) / NS:.1f} s; a later admission"
+                           " report or a rejected read may have overwritten its completion before the"
+                           " supervisor polled it, so that wait is unclassified, not a proven unfinished"
+                           " wait\n")
+                else:
+                    report(f"supervisor: command {entry['command']} reported waiting ({entry['reason']}) at"
+                           f" {(entry['waiting_ns'] - receipt['start_ns']) / NS:.1f} s; no admission-file"
+                           " observation followed it, but the fixed-name completion may have been missed"
+                           " between polls, so its terminal evidence is missing and the wait is"
+                           " unclassified, not a proven unfinished wait\n")
+            if pairs.get("unpaired_count"):
+                report("supervisor: the deadline classification stands for the unpaired command(s); no"
+                       " clock was moved for them\n")
+            if rejected_waiting:
+                report(f"supervisor: {rejected_waiting} waiting report(s) were rejected"
+                       f" ({', '.join(receipt['admission_waiting']['rejections'][:3])}); those waits are"
+                       " unclassified\n")
 
 
 class SetupRefused(Exception):
@@ -4384,8 +5132,11 @@ def monitor_main(ctx, ctl_w, cmd_r, out_r, err_r):
     except SetupRefused as refusal:
         report(f"bounded-test.py: refused before any proof work: {refusal}\n")
         code = 2
-    except BaseException:
-        pass
+    except BaseException as error:
+        # No traceback and no source lookup: the class name only. A silent exit
+        # here reached the custodian as an unexplained 125.
+        report("bounded-test.py: monitor failed before completion: " + type_name(error) + "\n")
+        code = 1
     finally:
         os._exit(code)
 
@@ -4431,6 +5182,27 @@ class Custodian:
         self.gate_opened = False
         self.gate_at = None
         self.pre_gate_killed = self.leader_killed = False
+        self.not_launched = None
+        # Admission grants (oxide#192): counted from the monitor's marker
+        # observations, bounded by the run's own elapsed time and the fixed cap.
+        self.admission_counted = 0
+        self.admission_ignored = 0
+        self.admission_reported = 0
+        self.admission_granted = 0
+        self.admission_records = 0
+        self.admission_clamped = self.admission_capped = False
+        self.admission_late_ns = None
+        self.admission_late_reason = None
+        self.admission_waiting_reports = 0
+        self.admission_waiting_ns = None
+        self.admission_waiting_reason = None
+        self.admission_pairs = {}
+        self.admission_unclassified = 0
+        self.admission_ordinal = 0
+        self.admission_last_ordinal = 0
+        self.admission_rejected_reports = 0
+        self.admission_duplicates = 0
+        self.sampling_ended = False
         self.exceptions = 0
         self.injected = set()
         self.paths = None  # from the monitor's setup message
@@ -4526,7 +5298,23 @@ class Custodian:
             self.guard.latch(f"cancelled by signal {self.cancelled}")
         if self.monitor_exited and not self.monitor_complete:
             self.guard.latch("monitor died")
-        self.guard.check(now_ns())
+        self.check_readings()
+
+    def check_readings(self):
+        """Enforce reading freshness only while the run still has a decision to
+        make (oxide#192).
+
+        The monitor stops its samplers when it publishes `monitor_complete`, so
+        from that point a missing reading is the designed shutdown, not a stalled
+        monitor: latching staleness there would turn a completed, closed and
+        cleaned run into exit 125 without changing any closure fact. Threshold
+        faults from readings that do arrive and every closure rule are unchanged,
+        and the whole settle phase still enforces freshness."""
+        try:
+            if not self.sampling_ended:
+                self.guard.check(now_ns())
+        except BaseException as error:
+            self.exception(error)
 
     def read_messages(self):
         while True:
@@ -4550,6 +5338,130 @@ class Custodian:
         if len(self.ctl_buffer) > MAX_LINE:
             self.guard.latch("protocol: control line overflow")
             self.ctl_buffer = b""
+
+    def admit(self, message, at):
+        """Grant bounded time for one reported admission wait (oxide#192).
+
+        A child's marker is cooperative evidence: the custodian adds at most
+        `waited_ns`, never more than this run's own elapsed wall clock and
+        never beyond ADMISSION_CAP_NS in total, to `absolute`. Nothing is
+        shortened, no exported deadline is rewritten and no classification
+        changes: the grant is reported separately in the receipt. A marker that
+        reaches the custodian after the stop decision, or after a deadline was
+        declared, cannot move anything; it is recorded as late with its reason
+        so the run is classified honestly rather than as an unexplained
+        timeout. A command the bounded pairing table cannot retain, and a second
+        terminal for a command that already has one, grant nothing at all."""
+        try:
+            self.admission_ordinal += 1
+            self.admission_last_ordinal = self.admission_ordinal
+            pair = self.admission_pair(message["command"])
+            if pair is None:
+                # The bounded table cannot retain this command, so a first terminal
+                # and a duplicate are indistinguishable. Grant nothing: a missed
+                # extension only makes the run stricter, while a double grant would
+                # move the deadline twice for one wait. The report stays counted as
+                # unclassified.
+                return
+            if pair["ended"] is not None:
+                # One terminal per command grants time at most once, whatever the
+                # monitor's deduplication does: a duplicate completion can never
+                # grant the same wait twice.
+                self.admission_duplicates += 1
+                return
+            if self.stopped_at is not None or self.deadline_hit:
+                self.admission_ignored += 1
+                self.admission_late_ns = at
+                self.admission_late_reason = "stopped" if self.stopped_at is not None else "deadline"
+                # The wait ended after the stop: still a completed wait for this
+                # command, so it is never reported as unfinished.
+                if pair is not None and pair["ended"] is None:
+                    pair.update(ended=self.admission_late_reason, ended_ns=at,
+                                waited_ns=message["waited_ns"])
+                if self.admission_records < ADMISSION_RECORDS:
+                    self.admission_records += 1
+                    self.record("admission_late", command=message["command"],
+                                waited_ns=message["waited_ns"], at=at,
+                                reason=self.admission_late_reason, deadline_hit=self.deadline_hit,
+                                stopped=self.stopped_at is not None)
+                return
+            # A completed wait ends this command's wait even when it grants no
+            # time: a zero-duration grant or a cap-refused grant is an ending,
+            # not an unfinished wait.
+            if pair is not None and pair["ended"] is None:
+                pair.update(ended="grant", ended_ns=at, waited_ns=message["waited_ns"])
+            waited = message["waited_ns"]
+            elapsed = max(0, at - self.start)
+            clamped = waited > elapsed
+            if clamped:
+                waited = elapsed
+            room = max(0, ADMISSION_CAP_NS - self.admission_granted)
+            grant = min(waited, room)
+            self.admission_counted += 1
+            self.admission_reported = min(U64MAX, self.admission_reported + message["waited_ns"])
+            self.admission_clamped = self.admission_clamped or clamped
+            if grant <= 0:
+                self.admission_capped = True
+                return
+            self.admission_granted += grant
+            self.admission_capped = self.admission_granted >= ADMISSION_CAP_NS
+            self.absolute = self.start + int(self.limit_s * NS) + self.admission_granted
+            self.stop_at = self.absolute - STOP_RESERVE_S * NS
+            self.exit_at = self.absolute - EXIT_MARGIN_S * NS
+            if self.admission_records < ADMISSION_RECORDS:
+                self.admission_records += 1
+                self.record("admission", command=message["command"], waited_ns=message["waited_ns"],
+                            grant_ns=grant, clamped=clamped, granted_ns=self.admission_granted,
+                            absolute_ns=self.absolute)
+        except BaseException as error:
+            self.exception(error)
+
+    def admission_pair(self, command):
+        """One command token's paired record, or None when the table is full.
+
+        A bounded table (ADMISSION_COMMANDS) pairs each supervised command's
+        waiting report with its own completion, so a stale file, a zero-duration
+        or late grant and a lost report are never reported as a proven
+        unfinished wait. Overflow is counted and treated as unclassified, never
+        as evidence, and a terminal for an overflowed command grants no time
+        because the custodian cannot distinguish it from a duplicate."""
+        entry = self.admission_pairs.get(command)
+        if entry is not None:
+            return entry
+        if len(self.admission_pairs) >= ADMISSION_COMMANDS:
+            self.admission_unclassified += 1
+            return None
+        entry = {"command": command, "waiting_ns": None, "reason": None,
+                 "waiting_ordinal": None, "ended": None, "ended_ns": None, "waited_ns": None}
+        self.admission_pairs[command] = entry
+        return entry
+
+    def note_waiting(self, message, at):
+        """Record that a child reported a wait that has not ended (oxide#192).
+
+        Report only: a waiting report never moves `absolute`, `stop_at` or
+        `exit_at`, before or after a stop decision. It exists so a wait that was
+        still outstanding when the run stopped is reported and left unclassified
+        instead of being lost inside an unexplained timeout; only an observed
+        terminal report ends a wait."""
+        try:
+            self.admission_ordinal += 1
+            self.admission_last_ordinal = self.admission_ordinal
+            self.admission_waiting_reports += 1
+            self.admission_waiting_ns = at
+            if self.admission_waiting_reason is None:
+                self.admission_waiting_reason = message["reason"]
+            pair = self.admission_pair(message["command"])
+            if pair is not None and pair["waiting_ns"] is None:
+                pair["waiting_ns"], pair["reason"] = at, message["reason"]
+                pair["waiting_ordinal"] = self.admission_ordinal
+            if self.admission_records < ADMISSION_RECORDS:
+                self.admission_records += 1
+                self.record("admission_waiting", command=message["command"], reason=message["reason"],
+                            at=at, after_stop=self.stopped_at is not None or self.deadline_hit,
+                            granted_ns=self.admission_granted)
+        except BaseException as error:
+            self.exception(error)
 
     def accept(self, message):
         problem = malformed(message)
@@ -4590,9 +5502,35 @@ class Custodian:
                 self.guard.latch("protocol: ready before setup")
             elif self.guard.reserve_at is None or self.guard.scratch_at is None:
                 self.guard.latch("protocol: ready before completed readings")
+            else:
+                # Freshness begins here: the samplers are live and have published.
+                self.guard.sampling_ns = now_ns()
             self.ready = True
         elif kind == "output_eof":
             self.eof.add(message["stream"])
+        elif kind == "admission":
+            at = now_ns()
+            if message["at"] > at:
+                self.guard.latch("admission message stamped in the future")
+            else:
+                self.admit(message, at)
+        elif kind == "admission_waiting":
+            at = now_ns()
+            if message["at"] > at:
+                self.guard.latch("admission message stamped in the future")
+            else:
+                self.note_waiting(message, at)
+        elif kind == "admission_rejected":
+            at = now_ns()
+            if message["at"] > at:
+                self.guard.latch("admission message stamped in the future")
+            else:
+                # An observation of the fixed-name file, not evidence about any
+                # command: it advances the ordinal so a wait before it can never
+                # be called provably unfinished.
+                self.admission_ordinal += 1
+                self.admission_last_ordinal = self.admission_ordinal
+                self.admission_rejected_reports += 1
         elif kind == "census":
             if self.reaped_seq is not None and message["after"] >= self.reaped_seq:
                 # Post-reap: this is the evidence a decision would rest on. Keep
@@ -4721,12 +5659,17 @@ class Custodian:
         # in its `setup` message. The leader opens /dev/null itself.
         self.env = dict(os.environ)
         self.env["OXIDE_PROOF_DEADLINE_NS"] = str(self.absolute)
+        self.env["OXIDE_PROOF_RUN_ID"] = self.run_id
         self.ctx = {
             "run_id": self.run_id, "command": self.command, "limit_s": self.limit_s,
             "adopted": os.environ.get("OXIDE_TASK_SCRATCH_ROOT") or None, "evidence_arg": self.evidence_arg,
             "root_parent": self.root_parent, "budget": self.budget, "start_ns": self.start,
             "inject": sorted(self.inject),
         }
+
+    def setup_expired(self, now):
+        """Setup is bounded by its own deadline, never by reading freshness."""
+        return now >= self.setup_at
 
     def launch_monitor(self):
         self.ctl_r, ctl_w = os.pipe()
@@ -4749,7 +5692,7 @@ class Custodian:
             select.kevent(pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_ONESHOT, select.KQ_NOTE_EXIT),
         ], 0, 0)
         while not self.ready and self.guard.fault is None and not self.monitor_exited and not self.cancelled:
-            if now_ns() >= self.setup_at:
+            if self.setup_expired(now_ns()):
                 break
             self.pump(self.setup_at - now_ns())
         if self.ready and self.guard.fault is None and not self.cancelled:
@@ -4793,7 +5736,7 @@ class Custodian:
         if "cancel-before-ack" in self.inject:
             self.cancelled = signal.SIGTERM
         ack = b""
-        while not self.cancelled and self.guard.fault is None and now_ns() < self.setup_at:
+        while not self.cancelled and self.guard.fault is None and not self.setup_expired(now_ns()):
             ready, _, _ = select.select([ack_r], [], [], max(0, min(self.setup_at - now_ns(), 50_000_000)) / NS)
             if ready:
                 try:
@@ -4904,7 +5847,11 @@ class Custodian:
             return self.last_resort()
 
     def abandon_launch(self):
-        """Setup slow or failed: launch nothing, stop the pinned monitor now."""
+        """Setup slow or failed: launch nothing, stop the pinned monitor now.
+
+        One bounded line names the reason before the pinned monitor is stopped, so
+        a launch refusal is never silent."""
+        report(f"bounded-test.py: not launched: {self.not_launched or 'setup did not finish'}\n")
         try:
             self.signal_pinned(self.monitor, signal.SIGKILL, group=False)
             status, end = None, min(now_ns() + NS, self.exit_at)
@@ -4920,8 +5867,16 @@ class Custodian:
     def watch(self):
         while not (self.leader_exited or self.cancelled or self.guard.fault):
             if now_ns() >= self.stop_at:
-                self.deadline_hit = True
-                break
+                # One bounded drain before the deadline is declared, so a marker
+                # that was already published and is waiting in the control pipe
+                # can still grant and move the stop (oxide#192). Only a grant
+                # that moves the stop past now continues the loop; a marker with
+                # no room cannot spin it.
+                self.pump(0)
+                if now_ns() >= self.stop_at:
+                    self.deadline_hit = True
+                    break
+                continue
             self.pump(self.stop_at - now_ns())
 
     def stop(self, launched):
@@ -4986,11 +5941,67 @@ class Custodian:
             elif len(self.eof) != 2:
                 self.guard.latch("closure not established: output EOF witness missing")
         self.observe_settlement(launched, census_end)
+        self.observe_admission(launched)
+
+    def admission_pairs_summary(self):
+        """The bounded per-command pairing view for the decision record.
+
+        Only commands whose waiting report was accepted are counted. A command
+        is finished when its own completed report arrived at all (`grant`, even
+        with a zero or clamped grant) or arrived after the stop (`late`). An
+        unpaired wait is **never** called a proven unfinished wait: the completion
+        file has one fixed name, so any later admission-file observation -
+        another command's grant, another command's waiting report, or a rejected
+        read - may have replaced a completion before the next 0.25 s poll, and a
+        completion published between the last poll and the sampler's stop can be
+        missed entirely. `later_observation` states whether such a later
+        observation exists in this run (the summary also treats any rejected
+        report as one). Both lists are bounded; the counts are the full ones."""
+        waiting = [entry for entry in self.admission_pairs.values() if entry["waiting_ns"] is not None]
+        ended = [entry for entry in waiting if entry["ended"] is not None]
+        unpaired = [entry for entry in waiting if entry["ended"] is None]
+        rows = [{"command": entry["command"], "reason": entry["reason"],
+                 "waiting_ns": entry["waiting_ns"],
+                 "later_observation": entry["waiting_ordinal"] != self.admission_last_ordinal}
+                for entry in unpaired]
+        overwritten = [row for row in rows if row["later_observation"]]
+        return {"commands": len(waiting), "ended": len(ended),
+                "unpaired_count": len(rows),
+                "unpaired": rows[:ADMISSION_UNPAIRED],
+                "possibly_overwritten_count": len(overwritten),
+                "rejected_reports": self.admission_rejected_reports}
+
+    def observe_admission(self, launched):
+        """Best-effort decision-time record of the admission grants
+        (oxide#192). A failed write is dropped and never latched, so this can
+        never fail a run, replace the first fault or change the deadline."""
+        try:
+            self.seq += 1
+            record = {"at": now_ns(), "event": "admission_decision", "launched": launched,
+                      "counted": self.admission_counted, "ignored": self.admission_ignored,
+                      "reported_wait_ns": self.admission_reported, "granted_ns": self.admission_granted,
+                      "clamped": self.admission_clamped, "capped": self.admission_capped,
+                      "late_ns": self.admission_late_ns, "late_reason": self.admission_late_reason,
+                      "waiting_reports": self.admission_waiting_reports,
+                      "waiting_ns": self.admission_waiting_ns,
+                      "waiting_reason": self.admission_waiting_reason,
+                      "admission_waiting": self.admission_pairs_summary(),
+                      "duplicates": self.admission_duplicates,
+                      "unclassified": self.admission_unclassified,
+                      "cap_ns": ADMISSION_CAP_NS, "limit_s": self.limit_s,
+                      "absolute_ns": self.absolute}
+            os.write(self.cmd_w, (json.dumps({"run": self.run_id, "seq": self.seq, "type": "record",
+                                              "record": record}) + "\n").encode())
+        except BaseException:
+            pass
 
     def last_resort(self):
         """finish raised: KILL the pinned monitor if still held, one WNOHANG
-        reap, and exit non-zero. Never raises."""
+        reap, and exit non-zero. Never raises, and one bounded line names the
+        reason."""
         try:
+            report("bounded-test.py: finish failed:"
+                   f" deadline {self.deadline_hit}; fault {self.guard.fault}\n")
             if self.monitor is not None and not self.monitor_reaped:
                 self.signal_pinned(self.monitor, signal.SIGKILL, group=False)
                 self.monitor_reaped = self.reap(self.monitor) is not None
@@ -5064,6 +6075,9 @@ class Custodian:
                    "fault": self.guard.fault, "deadline": self.deadline_hit, "launched": launched}
         self.tell("cleanup" if self.closed else "keep", outcome=outcome,
                   census=self.census_decision)
+        # The monitor stops sampling once it publishes `monitor_complete`; its
+        # shutdown is not a freshness window (see check_readings).
+        self.sampling_ended = True
         if "custodian-timeout-after-monitor" in self.inject:
             self.exit_at = now_ns()  # injected: the custodian runs out right after deciding
         while not self.monitor_complete and not self.monitor_exited and now_ns() < self.exit_at:

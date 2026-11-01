@@ -1,13 +1,15 @@
 use super::managed;
 use super::pool::{
-    create_injected, evict_idle_slot_injected, lease_injected, mark_evicting_for_test,
-    recover_injected, release_injected, status_injected, with_accounting_limits,
+    create_injected, evict_held_slot_injected, evict_idle_slot_injected, hold_expecting_injected,
+    hold_intent_for_test, hold_intent_present_injected, holding_name_for_slot_injected,
+    lease_injected, mark_evicting_for_test, recover_injected, release_injected,
+    slot_state_injected, status_injected, with_accounting_limits,
 };
 use super::{
-    AccountingCoverage, AccountingGapKind, AccountingScan, AdmissionClass, LeaseError,
-    LeaseRequest, Profile, SlotLayout, SlotOccupancy, VictimPolicy, BUDGET_BACKEND_DIRECTORY_V1,
-    MANAGED_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_LEDGER_BYTES, MAX_REFUSAL_SLOTS,
-    RAISED_CAPACITY_POLICY_VERSION,
+    AccountingCoverage, AccountingGapKind, AccountingScan, AdmissionClass, HeldEvictionFailure,
+    LeaseError, LeaseRequest, Profile, SlotLayout, SlotOccupancy, VictimPolicy,
+    BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES,
+    MAX_LEDGER_BYTES, MAX_REFUSAL_SLOTS, RAISED_CAPACITY_POLICY_VERSION,
 };
 use std::fs::{self, File};
 use std::io::Write;
@@ -1153,6 +1155,668 @@ fn managed_eviction_retires_only_idle_slots_and_tolerates_managed_control() {
         status_injected(&pool),
         Err(LeaseError::UnsafePath(_))
     ));
+}
+
+/// oxide#196: the operator-confirmed release retires a **held** slot by its
+/// exact lease in one transaction. A wrong lease refuses with the row still
+/// held and the tree in place; the matching lease moves the tree whole into
+/// the holding area, drops the held row and leaves no idle intermediate.
+#[test]
+fn a_held_slot_is_evicted_whole_only_by_its_exact_lease() {
+    let fx = Fixture::new("held-evict");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let granted = lease_injected(request(&pool, &project, &workspace, "holder-a")).expect("lease");
+    let slot_path = pool.join("payload").join("slots").join(&granted.slot_id);
+    // A wrong lease refuses with the held row, the ledger bytes, the control
+    // state and the tree identity unchanged: a pre-commit refusal writes
+    // nothing.
+    let wrong = "0".repeat(32);
+    let ledger_before = fs::read(pool.join("ledger.json")).expect("ledger bytes");
+    let control_before = fs::read(pool.join(MANAGED_NAME).join("state.json")).ok();
+    let tree_before = fs::metadata(&slot_path).expect("slot tree");
+    assert!(matches!(
+        evict_held_slot_injected(&pool, &granted.slot_id, &wrong),
+        Err(HeldEvictionFailure::PreCommit(LeaseError::Busy))
+    ));
+    assert_eq!(
+        fs::read(pool.join("ledger.json")).expect("ledger bytes"),
+        ledger_before,
+        "a pre-commit refusal wrote the ledger"
+    );
+    assert_eq!(
+        fs::read(pool.join(MANAGED_NAME).join("state.json")).ok(),
+        control_before,
+        "a pre-commit refusal wrote the control state"
+    );
+    let tree_after = fs::metadata(&slot_path).expect("slot tree");
+    assert_eq!(
+        (tree_after.dev(), tree_after.ino()),
+        (tree_before.dev(), tree_before.ino()),
+        "a pre-commit refusal replaced the slot tree"
+    );
+    assert!(slot_path.is_dir(), "a refused held eviction moved the tree");
+    let view = managed::ledger_view(&pool).expect("ledger");
+    assert_eq!(
+        view.slots
+            .iter()
+            .find(|slot| slot.slot_id == granted.slot_id)
+            .map(|slot| slot.state),
+        Some(SlotOccupancy::Held),
+        "a refused held eviction released the row"
+    );
+    // The exact lease moves the tree whole; no idle row is left behind.
+    let holding =
+        evict_held_slot_injected(&pool, &granted.slot_id, &granted.lease_id).expect("evict held");
+    assert_eq!(holding.len(), 1);
+    assert!(
+        !slot_path.exists(),
+        "the held tree stayed in the slots area"
+    );
+    let view = managed::ledger_view(&pool).expect("ledger");
+    assert!(
+        view.slots
+            .iter()
+            .all(|slot| slot.slot_id != granted.slot_id),
+        "the held row survived its eviction"
+    );
+    assert!(
+        view.holding
+            .iter()
+            .any(|entry| entry.name == holding[0] && entry.slot_id == granted.slot_id),
+        "the holding row does not name the held eviction"
+    );
+}
+
+/// oxide#196: a source swapped between the pre-rename verification and the
+/// rename moves a foreign object. The command must not call it the slot tree:
+/// it reports the containment, the verified tree as not moved and the object
+/// as not this slot's, leaves the slot held and the object never adopted or
+/// deleted as the slot's.
+#[test]
+fn a_swapped_source_is_contained_and_never_reported_as_the_slot_tree() {
+    let fx = Fixture::new("held-swap-contained");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let granted = lease_injected(request(&pool, &project, &workspace, "holder-a")).expect("lease");
+    let id: u64 = granted.slot_id.parse().expect("slot id");
+    let slot_path = pool.join("payload").join("slots").join(&granted.slot_id);
+    let aside = fx.dir("aside").join("verified-tree");
+    let name = holding_name_for_slot_injected(&pool, id).expect("holding name");
+    let moved = slot_path.clone();
+    let parked = aside.clone();
+    let guard = crate::test_fs::before_holding_rename(move || {
+        fs::rename(&moved, &parked).expect("park the verified tree");
+        fs::create_dir(&moved).expect("foreign tree");
+        fs::write(moved.join("foreign"), b"foreign object").expect("foreign marker");
+    });
+    let failure = evict_held_slot_injected(&pool, &granted.slot_id, &granted.lease_id)
+        .expect_err("a swapped source is not the verified tree");
+    drop(guard);
+    match failure {
+        HeldEvictionFailure::PostCommit(reason) => {
+            assert!(reason.contains("different object"), "{reason}");
+            assert!(reason.contains("contained as"), "{reason}");
+            assert!(reason.contains("not this slot's"), "{reason}");
+            assert!(
+                reason.contains("verified slot tree was not moved"),
+                "{reason}"
+            );
+            assert!(
+                !reason.contains("the tree was moved into the holding area"),
+                "{reason}"
+            );
+        }
+        HeldEvictionFailure::PreCommit(error) => {
+            panic!("a swapped source was classified pre-commit: {error}")
+        }
+    }
+    let contained = pool
+        .join("payload")
+        .join(".oxide-holding")
+        .join(format!(".unverified-{name}"));
+    assert!(contained.is_dir(), "the foreign object was not contained");
+    assert_eq!(
+        fs::read(contained.join("foreign")).expect("foreign marker"),
+        b"foreign object"
+    );
+    assert!(!pool
+        .join("payload")
+        .join(".oxide-holding")
+        .join(&name)
+        .exists());
+    assert!(!slot_path.exists());
+    assert!(
+        aside.is_dir(),
+        "the verified tree was not parked by the fixture"
+    );
+    assert_eq!(
+        slot_state_injected(&pool, &granted.slot_id).as_deref(),
+        Some("held")
+    );
+    assert!(hold_intent_present_injected(&pool, id));
+    let view = status_injected(&pool).expect("the next locked open reconciles");
+    assert!(
+        view.slots
+            .iter()
+            .any(|slot| slot.slot_id == granted.slot_id && slot.state == SlotOccupancy::Held),
+        "the slot did not stay held"
+    );
+    assert!(
+        view.holding.is_empty(),
+        "the foreign object was adopted as a slot tree"
+    );
+    assert!(
+        contained.is_dir(),
+        "the foreign object was deleted as a slot tree"
+    );
+    assert!(aside.is_dir(), "the verified tree was touched");
+}
+
+/// oxide#196: when the containment rename itself fails, the foreign object
+/// remains at the derived holding name and the command reports that truth,
+/// never the slot tree's location, and never adopts or deletes it as the
+/// slot's.
+#[test]
+fn a_failed_containment_rename_leaves_the_foreign_object_at_the_derived_name() {
+    let fx = Fixture::new("held-swap-uncontained");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let granted = lease_injected(request(&pool, &project, &workspace, "holder-a")).expect("lease");
+    let id: u64 = granted.slot_id.parse().expect("slot id");
+    let slot_path = pool.join("payload").join("slots").join(&granted.slot_id);
+    let aside = fx.dir("aside").join("verified-tree");
+    let name = holding_name_for_slot_injected(&pool, id).expect("holding name");
+    let moved = slot_path.clone();
+    let parked = aside.clone();
+    let guard = crate::test_fs::before_holding_rename(move || {
+        fs::rename(&moved, &parked).expect("park the verified tree");
+        fs::create_dir(&moved).expect("foreign tree");
+        fs::write(moved.join("foreign"), b"foreign object").expect("foreign marker");
+    });
+    crate::test_fs::arm_containment_rename_failure();
+    let failure = evict_held_slot_injected(&pool, &granted.slot_id, &granted.lease_id)
+        .expect_err("a swapped source is not the verified tree");
+    drop(guard);
+    match failure {
+        HeldEvictionFailure::PostCommit(reason) => {
+            assert!(reason.contains("containment rename failed"), "{reason}");
+            assert!(reason.contains("remains at"), "{reason}");
+            assert!(reason.contains("not this slot's"), "{reason}");
+            assert!(
+                reason.contains("verified slot tree was not moved"),
+                "{reason}"
+            );
+            assert!(
+                !reason.contains("the tree was moved into the holding area"),
+                "{reason}"
+            );
+        }
+        HeldEvictionFailure::PreCommit(error) => {
+            panic!("a failed containment was classified pre-commit: {error}")
+        }
+    }
+    let derived = pool.join("payload").join(".oxide-holding").join(&name);
+    assert!(derived.is_dir(), "the foreign object left the holding area");
+    assert_eq!(
+        fs::read(derived.join("foreign")).expect("foreign marker"),
+        b"foreign object"
+    );
+    assert!(
+        !derived
+            .parent()
+            .expect("holding area")
+            .join(format!(".unverified-{name}"))
+            .exists(),
+        "a failed containment left a contained name"
+    );
+    assert!(!slot_path.exists());
+    assert!(aside.is_dir());
+    assert_eq!(
+        slot_state_injected(&pool, &granted.slot_id).as_deref(),
+        Some("held")
+    );
+    assert!(hold_intent_present_injected(&pool, id));
+    let view = status_injected(&pool).expect("the next locked open reconciles");
+    assert!(
+        view.slots
+            .iter()
+            .any(|slot| slot.slot_id == granted.slot_id && slot.state == SlotOccupancy::Held),
+        "the slot did not stay held"
+    );
+    assert!(view.holding.is_empty(), "the foreign object was adopted");
+    assert!(
+        derived.is_dir(),
+        "the foreign object was deleted as a slot tree"
+    );
+}
+
+/// oxide#196: the containment rename is an atomic no-replace operation. A
+/// pre-existing entry under the containment name is preserved byte for byte;
+/// the swapped object remains at the derived name and is reported truthfully,
+/// never replacing the existing entry and never adopted or deleted as a slot
+/// tree.
+#[test]
+fn a_pre_existing_containment_name_is_preserved() {
+    let fx = Fixture::new("held-containment-collision");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let granted = lease_injected(request(&pool, &project, &workspace, "holder-a")).expect("lease");
+    let id: u64 = granted.slot_id.parse().expect("slot id");
+    let slot_path = pool.join("payload").join("slots").join(&granted.slot_id);
+    let aside = fx.dir("aside").join("verified-tree");
+    let name = holding_name_for_slot_injected(&pool, id).expect("holding name");
+    let holding = pool.join("payload").join(".oxide-holding");
+    fs::create_dir_all(&holding).expect("holding area");
+    fs::set_permissions(&holding, fs::Permissions::from_mode(0o700)).expect("private holding");
+    let contained = holding.join(format!(".unverified-{name}"));
+    fs::create_dir(&contained).expect("pre-existing containment entry");
+    fs::write(contained.join("marker"), b"pre-existing containment").expect("marker");
+    let moved = slot_path.clone();
+    let parked = aside.clone();
+    let guard = crate::test_fs::before_holding_rename(move || {
+        fs::rename(&moved, &parked).expect("park the verified tree");
+        fs::create_dir(&moved).expect("foreign tree");
+        fs::write(moved.join("foreign"), b"foreign object").expect("foreign marker");
+    });
+    let failure = evict_held_slot_injected(&pool, &granted.slot_id, &granted.lease_id)
+        .expect_err("a swapped source is not the verified tree");
+    drop(guard);
+    match failure {
+        HeldEvictionFailure::PostCommit(reason) => {
+            assert!(reason.contains("containment rename failed"), "{reason}");
+            assert!(
+                reason.contains("without replacing any existing entry"),
+                "{reason}"
+            );
+            assert!(reason.contains("remains at"), "{reason}");
+            assert!(reason.contains("not this slot's"), "{reason}");
+        }
+        HeldEvictionFailure::PreCommit(error) => {
+            panic!("a containment collision was classified pre-commit: {error}")
+        }
+    }
+    assert!(
+        contained.is_dir(),
+        "the pre-existing containment entry was replaced"
+    );
+    assert_eq!(
+        fs::read(contained.join("marker")).expect("marker"),
+        b"pre-existing containment",
+        "the pre-existing containment entry was modified"
+    );
+    let derived = holding.join(&name);
+    assert!(derived.is_dir(), "the foreign object left the derived name");
+    assert_eq!(
+        fs::read(derived.join("foreign")).expect("foreign marker"),
+        b"foreign object"
+    );
+    assert!(!slot_path.exists());
+    assert!(aside.is_dir());
+    assert_eq!(
+        slot_state_injected(&pool, &granted.slot_id).as_deref(),
+        Some("held")
+    );
+    assert!(hold_intent_present_injected(&pool, id));
+    let view = status_injected(&pool).expect("the next locked open reconciles");
+    assert!(
+        view.slots
+            .iter()
+            .any(|slot| slot.slot_id == granted.slot_id && slot.state == SlotOccupancy::Held),
+        "the slot did not stay held"
+    );
+    assert!(view.holding.is_empty(), "a foreign object was adopted");
+    assert!(contained.is_dir());
+    assert!(derived.is_dir());
+    assert_eq!(
+        fs::read(contained.join("marker")).expect("marker"),
+        b"pre-existing containment",
+        "the next open modified the pre-existing containment entry"
+    );
+}
+
+/// oxide#196: a pre-existing entry under the derived holding name is a
+/// pre-rename collision. The failure must say the tree was not moved and must
+/// not attribute the existing entry to this slot by name; the next open clears
+/// the stale intent without adopting it, and a retry succeeds once the entry
+/// is removed.
+#[test]
+fn a_pre_existing_holding_entry_is_not_attributed_to_the_slot() {
+    let fx = Fixture::new("held-name-collision");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let granted = lease_injected(request(&pool, &project, &workspace, "holder-a")).expect("lease");
+    let id: u64 = granted.slot_id.parse().expect("slot id");
+    let slot_path = pool.join("payload").join("slots").join(&granted.slot_id);
+    let name = holding_name_for_slot_injected(&pool, id).expect("holding name");
+    let holding = pool.join("payload").join(".oxide-holding");
+    fs::create_dir_all(&holding).expect("holding area");
+    fs::set_permissions(&holding, fs::Permissions::from_mode(0o700)).expect("private holding");
+    let foreign = holding.join(&name);
+    fs::create_dir(&foreign).expect("pre-existing entry");
+    fs::write(foreign.join("marker"), b"another command's tree").expect("marker");
+    let failure = evict_held_slot_injected(&pool, &granted.slot_id, &granted.lease_id)
+        .expect_err("a pre-existing derived name refuses the rename");
+    match failure {
+        HeldEvictionFailure::PostCommit(reason) => {
+            assert!(reason.contains("tree was not moved"), "{reason}");
+            assert!(!reason.contains("moved into the holding area"), "{reason}");
+            assert!(reason.contains("not this slot's"), "{reason}");
+        }
+        HeldEvictionFailure::PreCommit(error) => {
+            panic!("a pre-existing holding entry was classified pre-commit: {error}")
+        }
+    }
+    assert!(slot_path.is_dir(), "the collision moved the slot tree");
+    assert_eq!(
+        fs::read(foreign.join("marker")).expect("marker"),
+        b"another command's tree",
+        "the pre-existing entry was touched"
+    );
+    assert_eq!(
+        slot_state_injected(&pool, &granted.slot_id).as_deref(),
+        Some("held")
+    );
+    assert!(hold_intent_present_injected(&pool, id));
+    // The next open clears the stale intent and never adopts the foreign entry.
+    let view = status_injected(&pool).expect("the next locked open reconciles");
+    assert!(
+        view.slots
+            .iter()
+            .any(|slot| slot.slot_id == granted.slot_id && slot.state == SlotOccupancy::Held),
+        "the slot did not stay held"
+    );
+    assert!(!hold_intent_present_injected(&pool, id));
+    assert!(
+        view.holding.is_empty(),
+        "the pre-existing entry was adopted as this slot's"
+    );
+    assert_eq!(
+        fs::read(foreign.join("marker")).expect("marker"),
+        b"another command's tree",
+        "the pre-existing entry was touched by the next open"
+    );
+    fs::remove_dir_all(&foreign).expect("remove the foreign entry");
+    let rows = evict_held_slot_injected(&pool, &granted.slot_id, &granted.lease_id)
+        .expect("the retry evicts once the name is free");
+    assert_eq!(rows, vec![name.clone()]);
+    assert!(!slot_path.exists());
+    assert!(
+        foreign.is_dir(),
+        "the retried tree is not in the holding area"
+    );
+    let drained = managed::drain_holding(&pool, Some(&name)).expect("the holding deletion");
+    assert!(
+        drained.gone,
+        "the retried tree was not deleted: {:?}",
+        drained.refused
+    );
+    assert!(!foreign.exists());
+}
+
+/// oxide#196: a failed ledger write **after** the ledger replacement but
+/// before its parent-directory sync has already replaced the ledger, so it is
+/// classified post-commit (the intent may be durable), never as a
+/// byte-identical pre-commit. The tree was not moved; the next locked open
+/// clears the stale intent and the retry evicts.
+#[test]
+fn a_failed_intent_directory_sync_is_postcommit_and_recovers() {
+    let fx = Fixture::new("held-intent-sync");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let granted = lease_injected(request(&pool, &project, &workspace, "holder-a")).expect("lease");
+    let id: u64 = granted.slot_id.parse().expect("slot id");
+    let slot_path = pool.join("payload").join("slots").join(&granted.slot_id);
+    let ledger_before = fs::read(pool.join("ledger.json")).expect("ledger bytes");
+    crate::test_fs::arm_ledger_dir_sync_failure();
+    let failure = evict_held_slot_injected(&pool, &granted.slot_id, &granted.lease_id)
+        .expect_err("the injected directory sync failure");
+    match failure {
+        HeldEvictionFailure::PostCommit(reason) => {
+            assert!(reason.contains("directory sync"), "{reason}");
+            assert!(
+                reason.contains("may be durable") || reason.contains("commit boundary is unknown"),
+                "{reason}"
+            );
+        }
+        HeldEvictionFailure::PreCommit(error) => {
+            panic!("a replaced ledger was classified pre-commit: {error}")
+        }
+    }
+    // The replacement is visible: the intent is durable, the row is held and
+    // the tree is still at its path (the rename never ran).
+    assert_eq!(
+        slot_state_injected(&pool, &granted.slot_id).as_deref(),
+        Some("held")
+    );
+    assert!(hold_intent_present_injected(&pool, id));
+    assert!(slot_path.is_dir(), "the failed intent write moved the tree");
+    assert_ne!(
+        fs::read(pool.join("ledger.json")).expect("ledger bytes"),
+        ledger_before,
+        "the replaced ledger is byte-identical to the old one"
+    );
+    let view = status_injected(&pool).expect("the next locked open reconciles");
+    assert!(
+        view.slots
+            .iter()
+            .any(|slot| slot.slot_id == granted.slot_id && slot.state == SlotOccupancy::Held),
+        "the slot is not charged as held"
+    );
+    assert!(
+        !hold_intent_present_injected(&pool, id),
+        "the stale intent survived the next open"
+    );
+    let holding = evict_held_slot_injected(&pool, &granted.slot_id, &granted.lease_id)
+        .expect("the retry evicts the held slot");
+    assert_eq!(holding.len(), 1);
+    assert!(!slot_path.exists());
+}
+
+/// oxide#196: an injected post-rename observation failure reports the tree as
+/// (possibly) in the holding area, never as "not moved", and the next locked
+/// open adopts it by the intent's recorded identity.
+#[test]
+fn a_post_rename_observation_failure_reports_the_holding_area_and_recovers() {
+    let fx = Fixture::new("held-post-rename");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let granted = lease_injected(request(&pool, &project, &workspace, "holder-a")).expect("lease");
+    let id: u64 = granted.slot_id.parse().expect("slot id");
+    let slot_path = pool.join("payload").join("slots").join(&granted.slot_id);
+    let name = holding_name_for_slot_injected(&pool, id).expect("holding name");
+    crate::test_fs::arm_post_rename_observation_failure();
+    let failure = evict_held_slot_injected(&pool, &granted.slot_id, &granted.lease_id)
+        .expect_err("the injected post-rename observation failure");
+    match failure {
+        HeldEvictionFailure::PostCommit(reason) => {
+            assert!(reason.contains("holding area"), "{reason}");
+            assert!(reason.contains(&name), "{reason}");
+            assert!(
+                reason.contains("not verified as this slot's tree"),
+                "{reason}"
+            );
+            assert!(!reason.contains("tree was not moved"), "{reason}");
+        }
+        HeldEvictionFailure::PreCommit(error) => {
+            panic!("a post-rename failure was classified pre-commit: {error}")
+        }
+    }
+    let holding_path = pool.join("payload").join(".oxide-holding").join(&name);
+    assert!(
+        holding_path.is_dir(),
+        "the moved tree is not in the holding area"
+    );
+    assert!(!slot_path.exists(), "the tree is still at its slot path");
+    assert_eq!(
+        slot_state_injected(&pool, &granted.slot_id).as_deref(),
+        Some("held")
+    );
+    assert!(hold_intent_present_injected(&pool, id));
+    let view = status_injected(&pool).expect("the next locked open adopts");
+    assert!(
+        view.slots
+            .iter()
+            .all(|slot| slot.slot_id != granted.slot_id),
+        "the held row survived the adopted rename"
+    );
+    assert!(
+        view.holding
+            .iter()
+            .any(|entry| entry.name == name && entry.slot_id == granted.slot_id),
+        "the holding row does not name the adopted tree"
+    );
+    let drained = managed::drain_holding(&pool, Some(&name)).expect("the holding deletion");
+    assert!(
+        drained.gone,
+        "the adopted tree was not deleted: {:?}",
+        drained.refused
+    );
+}
+
+/// oxide#196: an injected rename failure after the durable hold intent is
+/// reported as post-commit, never as a pre-commit refusal. The slot stays
+/// held and charged, the intent is durable, the tree stays at its path, and
+/// the next locked open clears the stale intent so a retry evicts it whole.
+#[test]
+fn a_post_intent_rename_failure_is_committed_and_recovers() {
+    let fx = Fixture::new("held-rename-failure");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let granted = lease_injected(request(&pool, &project, &workspace, "holder-a")).expect("lease");
+    let id: u64 = granted.slot_id.parse().expect("slot id");
+    let slot_path = pool.join("payload").join("slots").join(&granted.slot_id);
+    crate::test_fs::arm_holding_rename_failure();
+    let failure = evict_held_slot_injected(&pool, &granted.slot_id, &granted.lease_id)
+        .expect_err("the injected rename failure");
+    match failure {
+        HeldEvictionFailure::PostCommit(reason) => {
+            assert!(reason.contains("hold intent"), "{reason}");
+            assert!(reason.contains("tree was not moved"), "{reason}");
+        }
+        other => panic!("a post-intent failure was classified as {other:?}"),
+    }
+    // Conservatively charged and never idle: the held row, its durable intent
+    // and its tree are all still recorded.
+    assert_eq!(
+        slot_state_injected(&pool, &granted.slot_id).as_deref(),
+        Some("held")
+    );
+    assert!(hold_intent_present_injected(&pool, id));
+    assert!(slot_path.is_dir(), "the failed rename removed the tree");
+    let view = status_injected(&pool).expect("the next locked open reconciles");
+    assert!(
+        view.slots
+            .iter()
+            .any(|slot| slot.slot_id == granted.slot_id && slot.state == SlotOccupancy::Held),
+        "the committed slot is not charged as held"
+    );
+    assert!(
+        !hold_intent_present_injected(&pool, id),
+        "the stale intent survived the next open"
+    );
+    let holding = evict_held_slot_injected(&pool, &granted.slot_id, &granted.lease_id)
+        .expect("the retry evicts the held slot");
+    assert_eq!(holding.len(), 1);
+    assert!(!slot_path.exists());
+}
+
+/// oxide#196 crash window A: a held eviction's durable intent exists but the
+/// rename did not happen. The next locked open clears the stale intent and the
+/// slot stays held with its tree, so a retry can finish.
+#[test]
+fn a_held_intent_without_its_rename_is_cleared_and_the_slot_stays_held() {
+    let fx = Fixture::new("held-intent-stale");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let granted = lease_injected(request(&pool, &project, &workspace, "holder-a")).expect("lease");
+    let id: u64 = granted.slot_id.parse().expect("slot id");
+    let slot_path = pool.join("payload").join("slots").join(&granted.slot_id);
+    let metadata = fs::metadata(&slot_path).expect("slot tree");
+    hold_intent_for_test(&pool, id, metadata.dev(), metadata.ino()).expect("held intent");
+    assert!(hold_intent_present_injected(&pool, id));
+    // The next locked open sees the tree still at its slot path: the intent is
+    // stale, not a pending rename.
+    let view = managed::ledger_view(&pool).expect("reconciled view");
+    assert!(
+        view.slots
+            .iter()
+            .any(|slot| slot.slot_id == granted.slot_id && slot.state == SlotOccupancy::Held),
+        "the slot did not stay held"
+    );
+    assert!(slot_path.is_dir(), "the slot tree moved without a rename");
+    assert!(
+        !hold_intent_present_injected(&pool, id),
+        "the stale intent survived the next open"
+    );
+    // And the held eviction can finish on a retry.
+    evict_held_slot_injected(&pool, &granted.slot_id, &granted.lease_id)
+        .expect("the retry evicts the held slot");
+    assert!(!slot_path.exists());
+}
+
+/// oxide#196 crash window B: the rename happened but the revised ledger did
+/// not. The next locked open adopts the held tree by the identity its durable
+/// intent recorded, writes the holding row, and drops the held row; the tree
+/// is then deleted from the holding area.
+#[test]
+fn a_held_rename_interrupted_before_its_row_write_is_adopted_by_identity() {
+    let fx = Fixture::new("held-intent-adopt");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let granted = lease_injected(request(&pool, &project, &workspace, "holder-a")).expect("lease");
+    let id: u64 = granted.slot_id.parse().expect("slot id");
+    let slot_path = pool.join("payload").join("slots").join(&granted.slot_id);
+    let metadata = fs::metadata(&slot_path).expect("slot tree");
+    let identity = (metadata.dev(), metadata.ino());
+    hold_intent_for_test(&pool, id, identity.0, identity.1).expect("held intent");
+    // Rename the tree under the recorded intent without the row write, as a
+    // crash between the rename and `persist_revised` would.
+    let name = hold_expecting_injected(&pool, id, Some(identity)).expect("interrupted rename");
+    assert!(
+        !slot_path.exists(),
+        "the interrupted rename left the tree at its path"
+    );
+    // The next locked open adopts it by identity, never by name alone.
+    let view = managed::ledger_view(&pool).expect("reconciled view");
+    assert!(
+        view.slots
+            .iter()
+            .all(|slot| slot.slot_id != granted.slot_id),
+        "the held row survived the adopted rename"
+    );
+    let row = view
+        .holding
+        .iter()
+        .find(|entry| entry.name == name)
+        .expect("the adopted holding row");
+    assert_eq!(row.slot_id, granted.slot_id);
+    let drained = managed::drain_holding(&pool, Some(&name)).expect("the holding deletion");
+    assert!(
+        drained.gone,
+        "the adopted tree was not deleted: {:?}",
+        drained.refused
+    );
 }
 
 #[test]

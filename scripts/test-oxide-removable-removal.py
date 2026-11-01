@@ -42,13 +42,25 @@ closure. Not a benchmark and not real-drive qualification.
 process, so a quarantined lost slot whose holder started before the current
 boot session is positively closed. It stages the same candidate, attaches
 the same owned image through the same owners-on attach and mount
-observation, and runs three independent cases over private checkouts:
+observation, and runs four independent cases over private checkouts:
 a quarantined `exec` slot whose override boot time follows its holder start
 is reported closed by `status`, an explicit `outputs adopt` of a whole-target
 fixture then migrates, and the next admission deletes the slot whole with
 `oxide: deleted slot <n> lost before this boot (...)`; a quarantined slot
 whose override boot time precedes its holder start stays kept with its
-bytes; and an unreadable override stays kept. The one seam is the debug-only
+bytes; an unreadable override stays kept; and an operator-confirmed
+`oxide pool release-quarantined <slot> --confirm-writers-stopped`
+(oxide#196) refuses while an escaped process keeps a file open inside the
+slot, then -- once that process is stopped -- a dry run is clean and the
+release deletes the slot whole through the holding area and forgets its
+record. The escaped writer is the `oxide exec` tool's own forked child: it
+leaves the product's exec group by joining the supervisor's leader process
+group (never a setsid escape), holds a file in its slot scratch, and is
+confirmed in that group before the removal; it redirects its inherited
+standard streams and closes their other descriptors before it waits, so the
+proof's pipe wait cannot be held by it. The product's stop cannot end it, the
+supervisor can census and signal it, and the proof stops it in a `finally`.
+The one product seam is the debug-only
 `OXIDE_TEST_BOOT_MS` override, which the product honors only under this
 supervisor's own scratch/evidence/deadline layout. The quarantines are made by
 the product's own removal path: a blocked `oxide exec` tool loses the volume
@@ -129,7 +141,103 @@ BOOT_CASES = (
     ("before-boot", "a quarantined holder from an earlier boot session is deleted whole and its checkout adopts"),
     ("after-boot", "a holder from this boot session stays quarantined"),
     ("unreadable-boot", "an unreadable boot time stays quarantined"),
+    ("release-quarantined", "an operator-confirmed release refuses while an escaped writer holds the slot, then deletes it whole once that writer is stopped"),
 )
+# The escaped exec writer (oxide#196): the `oxide exec` tool forks a child
+# that leaves the product's exec group — the removal stop signals that group —
+# by joining the qualified supervisor's own leader process group
+# (`FIXTURE_LEADER_PGID`, this proof's group). It therefore stays inside the
+# supervisor's custody for its census and closure while the product's stop
+# cannot end it. Readiness is published only after the child has observed the
+# slot scratch become absent (the detach) and then present again (the
+# re-attach), with a fresh handle on the returned tree: a pre-detach handle or
+# a readiness written before removal is never used.
+ESCAPE_TOOL = r"""#!/usr/bin/env python3
+import os, sys, time
+
+
+def follow_reattach(scratch, stopped, stat, open_held, close_held, mark_ready, sleep):
+    # Hold a file on the slot tree across a detach and a re-attach. The ready
+    # marker is written only after the path was observed absent and then
+    # present again, after a fresh handle is opened on that returned tree.
+    held = None
+    seen_absent = False
+    announced = False
+    while not stopped():
+        try:
+            stat(scratch)
+        except OSError:
+            seen_absent = True
+            if held is not None:
+                close_held(held)
+                held = None
+        else:
+            if seen_absent and not announced:
+                if held is not None:
+                    close_held(held)
+                held = open_held(os.path.join(scratch, "escaped-writer"))
+                announced = True
+                mark_ready()
+        sleep(0.05)
+    if held is not None:
+        close_held(held)
+
+
+def detach_inherited(open_devnull, dup2, close, closerange):
+    # The escaped child must not keep the proof's standard-stream pipes open:
+    # the proof's communicate() waits for EOF, and the product's exit must not
+    # depend on this child. Redirect 0/1/2 and close inherited descriptors.
+    null = open_devnull()
+    for target in (0, 1, 2):
+        dup2(null, target)
+    if null > 2:
+        close(null)
+    closerange(3, 256)
+
+
+def main():
+    gate = os.environ["FIXTURE_GATE"]
+    scratch = os.environ["TMPDIR"]
+    leader = int(os.environ["FIXTURE_LEADER_PGID"])
+    with open(os.path.join(gate, "started"), "w", encoding="utf-8") as handle:
+        handle.write(scratch + "\n")
+    if os.fork() != 0:
+        while True:
+            time.sleep(0.5)
+    detach_inherited(lambda: os.open(os.devnull, os.O_RDWR), os.dup2, os.close, os.closerange)
+    try:
+        os.setpgid(0, leader)
+    except OSError as error:
+        with open(os.path.join(gate, "escaped-error"), "w", encoding="utf-8") as handle:
+            handle.write(str(error))
+        os._exit(9)
+    with open(os.path.join(gate, "escaped"), "w", encoding="utf-8") as handle:
+        handle.write(str(os.getpid()) + "\n")
+    stop_path = os.path.join(gate, "stop")
+    deadline = time.monotonic() + 240.0
+
+    def stopped():
+        return time.monotonic() >= deadline or os.path.exists(stop_path)
+
+    def mark_ready():
+        with open(os.path.join(gate, "escaped-ready"), "w", encoding="utf-8") as marker:
+            marker.write("ready\n")
+
+    follow_reattach(
+        scratch,
+        stopped,
+        os.stat,
+        lambda path: open(path, "a"),
+        lambda handle: handle.close(),
+        mark_ready,
+        time.sleep,
+    )
+    os._exit(0)
+
+
+if __name__ == "__main__":
+    main()
+"""
 BOOT_APP = {
     "Cargo.toml": '[package]\nname = "bootapp"\nversion = "0.1.0"\nedition = "2021"\n',
     "src/main.rs": 'fn main() {\n    println!("bootapp ok");\n}\n',
@@ -1139,11 +1247,29 @@ def deletion_oracle_leaf(slots: str, slot: str, folder: str) -> str:
     return leaf
 
 
-def write_tool(path: str) -> str:
+def write_script(path: str, text: str) -> str:
     with open(path, "w", encoding="utf-8") as handle:
-        handle.write(HOLD_TOOL)
+        handle.write(text)
     os.chmod(path, 0o755)
     return os.path.realpath(path)
+
+
+def process_refusal(pid: int) -> str:
+    """The census message names a writer as `process <pid> ...`; the old
+    `pid <pid>` form never matches it."""
+    return f"process {pid}"
+
+
+def process_alive(pid: int) -> bool:
+    """Whether a pid this proof started is still running; a permission error
+    is not proof it is gone."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def git_fixture(proof: Proof, path: str, files: dict) -> str:
@@ -1182,9 +1308,10 @@ def diagnostic_receipt(outcome: dict, prefix: str = DIAGNOSTIC_RECEIPT) -> str:
 
 
 class BootClosure:
-    """The focused session: one candidate, one owned image, three independent
-    cases. Every quarantine is made by the product's own removal stop; no
-    state file is edited."""
+    """The focused session: one candidate, one owned image, four independent
+    cases (three boot-session cases and the operator-confirmed release). Every
+    quarantine is made by the product's own removal stop; no state file is
+    edited."""
 
     def __init__(self, proof: Proof, repo: str, source: str):
         self.proof = proof
@@ -1213,7 +1340,10 @@ class BootClosure:
         self.env = private_environment(proof.root)
         proof.env = self.env
         self.pool = self.env["OXIDE_POOL"]
-        self.tool = write_tool(os.path.join(proof.root, "hold-tool"))
+        self.tool = write_script(os.path.join(proof.root, "hold-tool"), HOLD_TOOL)
+        # The operator-confirmed release case (oxide#196) starts this escaped
+        # exec writer; without it the case cannot run.
+        self.escape_tool = write_script(os.path.join(proof.root, "escape-tool"), ESCAPE_TOOL)
         self.victims = {}
         for case, _ in BOOT_CASES:
             victim = git_fixture(proof, os.path.join(proof.root, f"victim-{case}"), BOOT_APP)
@@ -1273,15 +1403,96 @@ class BootClosure:
         need(code == 0, f"{label}: status exit {code}: {stderr[-800:]}")
         return stdout
 
-    def quarantine(self, case: str) -> dict:
+    def ledger(self) -> dict:
+        path = os.path.join(self.pool, "oxide-managed", "removable", "ledger.json")
+        need(os.path.isfile(path), f"no removable pool ledger at {path}; custody unknown")
+        return read_json(path)
+
+    def custody_digest(self) -> str:
+        """A bounded digest of the removable pool's state and ledger, so a
+        refusal can be shown to change nothing."""
+        digest = hashlib.sha256()
+        for path in (
+            os.path.join(self.pool, REMOVABLE_STATE),
+            os.path.join(self.pool, "oxide-managed", "removable", "ledger.json"),
+        ):
+            need(os.path.isfile(path), f"no custody document at {path}")
+            with open(path, "rb") as handle:
+                digest.update(handle.read())
+        return digest.hexdigest()
+
+    def stop_escaped(self, gate: str, pid: int) -> None:
+        """Stop the escaped exec writer and wait for it to be gone; a writer
+        this proof cannot positively end leaves custody unknown."""
+        try:
+            with open(os.path.join(gate, "stop"), "w", encoding="utf-8") as handle:
+                handle.write("stop\n")
+        except OSError as error:
+            raise UnknownOutcome(f"cannot write the escaped writer's stop file: {error}")
+        end = time.monotonic() + 10.0
+        while time.monotonic() < end:
+            if not process_alive(pid):
+                return
+            time.sleep(0.05)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        end = time.monotonic() + 5.0
+        while time.monotonic() < end:
+            if not process_alive(pid):
+                return
+            time.sleep(0.05)
+        raise UnknownOutcome(f"the escaped writer pid {pid} did not stop; custody unknown")
+
+    def quarantine(self, case: str, escaped: bool = False) -> dict:
         """Hold a removable slot with `oxide exec`, force the volume away, and
-        return the product's own quarantined record facts."""
+        return the product's own quarantined record facts. With `escaped`, the
+        exec tool forks a child that leaves the product's exec group by joining
+        this proof's (supervisor leader) process group, holding a file in its
+        slot scratch until the case stops it."""
         env = self.child_env({"FIXTURE_GATE": os.path.join(self.proof.root, "gate", case)})
+        if escaped:
+            env["FIXTURE_LEADER_PGID"] = str(os.getpgrp())
         os.makedirs(env["FIXTURE_GATE"], mode=0o700)
         victim = self.victims[case]
         before = set(os.listdir(self.slots))
-        child = self.proof.start(["exec", "--", self.tool], victim, env)
+        tool = self.escape_tool if escaped else self.tool
+        child = self.proof.start(["exec", "--", tool], victim, env)
         wait_for(os.path.join(env["FIXTURE_GATE"], "started"), f"{case} exec")
+        escaped_pid = None
+        if escaped:
+            with open(os.path.join(env["FIXTURE_GATE"], "started"), encoding="utf-8") as handle:
+                scratch = handle.read().strip()
+            need(
+                scratch.startswith(self.slots + os.sep),
+                f"{case}: the exec tool's TMPDIR {scratch!r} is not inside the slot tree",
+            )
+            deadline = time.monotonic() + WAIT_SECONDS
+            marker = os.path.join(env["FIXTURE_GATE"], "escaped")
+            while not os.path.isfile(marker):
+                error_path = os.path.join(env["FIXTURE_GATE"], "escaped-error")
+                if os.path.isfile(error_path):
+                    with open(error_path, encoding="utf-8") as handle:
+                        raise UnknownOutcome(
+                            f"{case}: the escaped child could not join the supervisor's leader group: {handle.read()[:300]}"
+                        )
+                need(
+                    time.monotonic() < deadline,
+                    f"{case}: the escaped exec child did not publish its pid",
+                )
+                time.sleep(0.01)
+            with open(marker, encoding="utf-8") as handle:
+                escaped_pid = int(handle.read().strip())
+            need(
+                os.getpgid(escaped_pid) == os.getpgrp(),
+                f"{case}: escaped writer pid {escaped_pid} is not in the supervisor's leader group",
+            )
+        if escaped:
+            need(
+                not os.path.exists(os.path.join(env["FIXTURE_GATE"], "escaped-ready")),
+                f"{case}: readiness was published before the removal",
+            )
         self.volume.force_detach(f"{case} removal")
         code, _, stderr = self.proof.finish(child, f"{case} exec after removal", WAIT_SECONDS)
         # A surviving exec, or a removal without the product's own quarantine
@@ -1319,14 +1530,26 @@ class BootClosure:
             f"{case}: quarantined slot {slot} leaf {directory} in project folder {folder}, "
             f"holder started {started} ms, state record {record.get('id')}"
         )
-        return {
+        found = {
             "case": case,
             "slot": slot,
             "folder": folder,
             "directory": directory,
             "started": started,
             "victim": victim,
+            "gate": env["FIXTURE_GATE"],
         }
+        if escaped:
+            wait_for(
+                os.path.join(env["FIXTURE_GATE"], "escaped-ready"),
+                f"{case} escaped writer after re-attach",
+            )
+            need(
+                escaped_pid is not None and process_alive(escaped_pid),
+                f"{case}: the escaped exec writer did not survive the removal",
+            )
+            found["escaped"] = escaped_pid
+        return found
 
     def kept(self, found: dict, extra: dict) -> None:
         """The slot stays held with its bytes: no deletion, its project folder
@@ -1460,6 +1683,128 @@ class BootClosure:
         # A present but unusable override is an unknown boot time, never the
         # real one and never closure.
         self.kept(found, {BOOT_HOOK: "unreadable"})
+
+    def release_quarantined(self) -> None:
+        """The operator-confirmed release (oxide#196): the exec tool's escaped
+        child, outside the product's exec group but inside the supervisor's
+        leader group, keeps a file open inside the quarantined slot, so every
+        release refuses and nothing changes; once the writer is stopped, a dry
+        run is clean and the release deletes the slot whole through the holding
+        area."""
+        found = self.quarantine("release-quarantined", escaped=True)
+        case = found["case"]
+        slot, folder, directory, victim = found["slot"], found["folder"], found["directory"], found["victim"]
+        gate, escaped = found["gate"], found["escaped"]
+        try:
+            before = self.custody_digest()
+            # The escaped child is the exec tool's own fork, outside the
+            # product's exec group but inside the supervisor's leader group,
+            # and holds a file in the slot scratch.
+            need(os.path.isdir(directory), f"{case}: the quarantined slot leaf is already gone")
+            need(process_alive(escaped), f"{case}: the escaped writer is not running")
+            # Without the operator's flag: refused before any pool read.
+            code, _, stderr = self.proof.oxide(
+                ["pool", "release-quarantined", slot],
+                "release without the flag",
+                victim,
+                self.child_env({}),
+            )
+            oracle(
+                code != 0 and "--confirm-writers-stopped" in stderr and "would check" in stderr,
+                f"{case}: the unflagged release was not refused with its checks: {code} {stderr[-1200:]}",
+            )
+            # With the flag the census refuses, naming the escaped process.
+            code, _, stderr = self.proof.oxide(
+                ["pool", "release-quarantined", slot, "--confirm-writers-stopped"],
+                "release with an escaped writer",
+                victim,
+                self.child_env({}),
+            )
+            oracle(
+                code != 0 and process_refusal(escaped) in stderr and "inside" in stderr,
+                f"{case}: the census did not refuse the escaped writer {escaped}: {code} {stderr[-1600:]}",
+            )
+            oracle("nothing was released" in stderr, f"{case}: the refusal did not say nothing changed")
+            # A dry run makes the same check and changes nothing.
+            code, _, stderr = self.proof.oxide(
+                ["pool", "release-quarantined", slot, "--dry-run", "--confirm-writers-stopped"],
+                "dry run with an escaped writer",
+                victim,
+                self.child_env({}),
+            )
+            oracle(
+                code != 0 and process_refusal(escaped) in stderr,
+                f"{case}: the dry run did not refuse the escaped writer: {code} {stderr[-1200:]}",
+            )
+            oracle(
+                self.custody_digest() == before and os.path.isdir(directory),
+                f"{case}: a refusal changed the pool or the slot tree",
+            )
+            # Stop the escaped writer: no process holds a file in the slot.
+            self.stop_escaped(gate, escaped)
+            code, stdout, stderr = self.proof.oxide(
+                ["pool", "release-quarantined", slot, "--dry-run", "--confirm-writers-stopped"],
+                "clean dry run",
+                victim,
+                self.child_env({}),
+            )
+            oracle(code == 0, f"{case}: the clean dry run failed: {code} {stderr[-1200:]}")
+            oracle(
+                f"would release quarantined slot {slot}" in stdout
+                and "census:" in stdout
+                and "operator confirmed writers stopped" in stdout,
+                f"{case}: the dry-run line is incomplete: {stdout[-1200:]}",
+            )
+            oracle(
+                self.custody_digest() == before and os.path.isdir(directory),
+                f"{case}: the dry run changed the pool or the slot tree",
+            )
+            # The release deletes the slot whole through the holding area.
+            code, stdout, stderr = self.proof.oxide(
+                ["pool", "release-quarantined", slot, "--confirm-writers-stopped"],
+                "operator-confirmed release",
+                victim,
+                self.child_env({}),
+            )
+            oracle(code == 0, f"{case}: the release failed: {code} {stderr[-1600:]}")
+            oracle(
+                f"released quarantined slot {slot}" in stdout
+                and "census:" in stdout
+                and "operator confirmed writers stopped" in stdout,
+                f"{case}: the release line is incomplete: {stdout[-1200:]}",
+            )
+            oracle(
+                f"deleted slot {slot} quarantined:" in stderr,
+                f"{case}: no deletion line names the quarantined slot: {stderr[-1600:]}",
+            )
+            oracle(
+                "deleted the held slot tree" in stderr,
+                f"{case}: the holding-area pass did not delete the tree: {stderr[-1600:]}",
+            )
+            oracle(
+                not os.path.lexists(directory),
+                f"{case}: slot leaf {directory} still exists after the release",
+            )
+            oracle(os.path.isdir(folder), f"{case}: the project folder {folder} was removed")
+            records = [
+                record
+                for record in self.state().get("records", [])
+                if str((record.get("lost") or {}).get("slot_id")) == slot
+            ]
+            oracle(not records, f"{case}: the released slot's record is still in state: {records[:1]}")
+            ledger = self.ledger()
+            oracle(
+                all(str(row.get("slot_id")) != slot for row in ledger.get("slots", [])),
+                f"{case}: the released slot is still in the ledger",
+            )
+            oracle(
+                ledger.get("holding", []) == [],
+                f"{case}: the released tree is still charged in the holding area: {ledger.get('holding', [])[:2]}",
+            )
+            stdout = self.status("release status", victim, {})
+            oracle(f"slot {slot} " not in stdout, f"{case}: status still lists the released slot")
+        finally:
+            self.stop_escaped(gate, escaped)
 
 
 def boot_closure(proof: Proof, repo: str, diagnostic: bool) -> tuple:
@@ -1682,7 +2027,11 @@ def self_check() -> int:
     — plus the deletion oracle's slot-leaf resolution (the slot's own leaf,
     never the project-label folder a build or an adopt also creates or
     reuses), the owners-on attach and mount observation every mode shares,
-    the dispatch, the product-message marker and the receipt bound."""
+    the escaped exec writer's syntax, exec-group escape and
+    supervisor-leader-group membership, its exercised detach/re-attach
+    readiness state machine, its detach of the inherited standard streams
+    before it waits, the release oracle's `process <pid>` form, the dispatch,
+    the product-message marker and the receipt bound."""
     fixture = {
         "OXIDE_POOL": "/fixture/pool",
         "HOME": "/fixture/home",
@@ -1710,6 +2059,94 @@ def self_check() -> int:
                 return 0, quarantine, ""
             return 0, "", "oxide: fixture build summary"
 
+    # The escaped exec writer (oxide#196) must be valid Python, leave the
+    # product's exec group by joining the supervisor's own leader group, and
+    # never leave the supervisor's session: the qualified supervisor can only
+    # census and signal its leader group. Its readiness state machine is
+    # exercised with stated observations: readiness and a fresh handle must
+    # follow an observed detach and re-attach, and must never appear without
+    # one. The release oracle must match the product's `process <pid>` census
+    # message, never a `pid <pid>` form.
+    compile(ESCAPE_TOOL, "escape-tool", "exec")
+    # The release case starts this tool from the constructor's own attribute.
+    # A missing initialization passes every string pin but makes the case
+    # unrunnable, so the actual initializer source is pinned here.
+    init_source = inspect.getsource(BootClosure.__init__)
+    expect(
+        "self.escape_tool = write_script(" in init_source and "ESCAPE_TOOL" in init_source,
+        "BootClosure does not initialize the escaped writer tool",
+    )
+    expect("os.setpgid(0, leader)" in ESCAPE_TOOL, "the escaped writer does not leave the exec group")
+    expect("FIXTURE_LEADER_PGID" in ESCAPE_TOOL, "the escaped writer does not join the supervisor's leader group")
+    expect("setsid" not in ESCAPE_TOOL, "the escaped writer must not leave the supervisor's session")
+    expect('"escaped-writer"' in ESCAPE_TOOL, "the escaped writer does not hold a file in the slot")
+    namespace = {"__name__": "escape_tool_self_check"}
+    exec(compile(ESCAPE_TOOL, "escape-tool", "exec"), namespace)
+    detach = namespace["detach_inherited"]
+    detach_calls = []
+    detach(
+        lambda: 7,
+        lambda descriptor, target: detach_calls.append(("dup", descriptor, target)),
+        lambda descriptor: detach_calls.append(("close", descriptor)),
+        lambda first, last: detach_calls.append(("range", first, last)),
+    )
+    expect(
+        detach_calls
+        == [
+            ("dup", 7, 0),
+            ("dup", 7, 1),
+            ("dup", 7, 2),
+            ("close", 7),
+            ("range", 3, 256),
+        ],
+        f"the escaped writer does not detach the inherited streams: {detach_calls}",
+    )
+    expect(
+        ESCAPE_TOOL.index("    detach_inherited(lambda: os.open(os.devnull")
+        < ESCAPE_TOOL.index("    follow_reattach(\n        scratch,"),
+        "the escaped writer waits before detaching the inherited streams",
+    )
+    follow = namespace["follow_reattach"]
+
+    def observed(events):
+        state = {"step": 0, "opened": [], "closed": [], "ready": []}
+
+        def stopped():
+            return state["step"] >= len(events)
+
+        def stat(_path):
+            event = events[state["step"]]
+            state["step"] += 1
+            if event == "absent":
+                raise FileNotFoundError("detached")
+            return None
+
+        def open_held(path):
+            handle = ("handle", len(state["opened"]))
+            state["opened"].append(path)
+            return handle
+
+        def close_held(handle):
+            state["closed"].append(handle)
+
+        def mark_ready():
+            state["ready"].append(state["step"])
+
+        follow("/slot", stopped, stat, open_held, close_held, mark_ready, lambda _: None)
+        return state
+
+    detached = observed(["present", "absent", "present"])
+    expect(len(detached["ready"]) == 1, "the writer did not mark ready after re-attach")
+    expect(detached["ready"][0] == 3, "readiness did not follow the returning observation")
+    expect(len(detached["opened"]) == 1, "the writer did not open a fresh handle after re-attach")
+    expect("escaped-writer" in detached["opened"][0], "the writer opened the wrong path")
+    expect(detached["closed"] == [("handle", 0)], "the fresh handle was not closed at stop")
+    not_detached = observed(["present", "present"])
+    expect(not_detached["ready"] == [], "readiness was written before an observed detach")
+    expect(not_detached["opened"] == [], "a pre-detach handle was opened")
+    census_message = "process 4242 (python3) holds /slot/scratch/escaped-writer open inside /slot"
+    expect(process_refusal(4242) in census_message, "the release oracle does not match the census message")
+    expect(f"pid {4242}" not in census_message, "the old pid-only oracle would not match the census message")
     root = tempfile.mkdtemp(prefix="boot-closure-self-check.")
     try:
         case = BootClosure.__new__(BootClosure)

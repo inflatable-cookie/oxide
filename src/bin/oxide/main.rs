@@ -6,10 +6,12 @@
 //! directory. A checkout may take another checkout's idle compatible slot
 //! only through the freshness gate. Plain `cargo` behavior is untouched.
 
+mod admission;
 mod adopt;
 mod budget;
 mod capacity;
 mod cargo_home;
+mod census;
 mod child_temp;
 mod clean;
 mod cli;

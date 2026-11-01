@@ -650,6 +650,31 @@ Cargo.
    stays with that reason. Cargo, execution and freshness-gate work are not
    measured as waits. A changed reason is printed, up to eight reason lines
    per command followed by one suppression notice.
+
+   **Supervised admission marker** (oxide#192). When the shared proof
+   supervisor armed this process — `OXIDE_PROOF_DEADLINE_NS` parses as an
+   absolute `CLOCK_UPTIME_RAW` value and the canonical `OXIDE_PROOF_EVIDENCE`
+   is nested in, or the `scratch`/`evidence` sibling of, the canonical
+   `OXIDE_TASK_SCRATCH_ROOT` — a granted lease publishes one bounded marker,
+   `admission.json`, carrying this command's own measured admission interval
+   (`{"schema":2,"source":"oxide","run":R,"command":C,"waited_ns":N}`, at most
+   512 bytes, written to a private temporary file and renamed). `R` is the
+   supervisor's exported run identity and `C` one bounded token for this
+   admission attempt, so a report can be paired with its own command and a file
+   left by an earlier run is recognisable. It exists so the supervisor can
+   report queue time separately instead of spending its work window on it
+   ([shared proof supervisor](#shared-proof-supervisor)). When the command
+   first observes that it has to wait it also publishes one
+   `admission-waiting.json`
+   (`{"schema":2,"source":"oxide","run":R,"command":C,"reason":"<token>"}`,
+   the same bounds, the reason being its own wait label such as `queue` or
+   `host limit`), so a wait that never ends before the supervisor stops is still
+   reported; that report grants nothing. Both writes are best effort and
+   observation only: an unarmed run writes nothing, a failed write changes
+   nothing, Oxide never reads either report back, and no slot, ledger, output or
+   exit-code state depends on them. They are compiled in every profile, because
+   an installed `oxide` runs the reported case too; they are the proof-facing
+   side effects that are not debug-only hooks.
    **Second-slot rule** (Tom, 2026-10-20, oxide#107): when this checkout's
    slot for the same key is busy (a live command such as a long `oxide exec
    -- tauri dev`, or an interrupted one whose group may still run), a further
@@ -2168,9 +2193,9 @@ no product, task or native evidence for any proof that uses them, and the
 with no earlier run migrated.
 
 **Post-census image detach request (oxide#191, decision `ee263cea`, unqualified
-source).** The current `bounded-test.py`
-(`0848974d79d84617070bd611da9503b48a0127e68c2965cebcd36e8d5fc13414`) adds one
-opt-in control for a proof
+source).** The oxide#191 runner bytes
+(`0848974d79d84617070bd611da9503b48a0127e68c2965cebcd36e8d5fc13414`, as merged on
+main) add one opt-in control for a proof
 whose own test image must be detached, and it is the only route by which such a
 proof may detach after a launch; the qualified shared runner is otherwise
 unchanged. A proof publishes ONE bounded atomic request (`detach-request.json`,
@@ -2283,121 +2308,281 @@ cooperative-session limits. These bytes are unqualified until one uncounted
 `effigy proof:supervisor:qualify:diagnostic` records a clean picture and then
 ONE counted author and ONE separate independent reviewer
 `effigy proof:supervisor:qualify` pass at the same head (287 pure plus 48 real
-cases at that head, including the seventy-six pure detach cases and the eight
-real ones: a bound success, a refused identity, a failed attempt, an
-unrequested attachment whose opt-in custody keep is recorded separately, and a
-real stuck child the custodian pins, signals and observes closed), with
-independent exact-head source review afterwards.
+cases at that head, including the seventy-six pure detach cases and the eight real ones: a
+bound success, a refused identity, a failed attempt, an unrequested attachment
+whose opt-in custody keep is recorded separately, and a real stuck child the
+custodian pins, signals and observes closed), with independent exact-head source
+review afterwards.
 
-**Cooperative-session survivors (oxide#195, queue approval Tom decision
-`9b5a2cfa`; signal-custody ruling `c096c8fc`; unqualified source).** The stop
-reaches the leader's own cooperative session only through identities the runner
-holds. Oxide starts Cargo as the leader of its own process group
-(`process_group(0)`) inside the leader's session, so the pinned leader-group
-KILL cannot reach it: oxide#182's archived packet
-(`/Volumes/Builds/scratch/oxide/evidence-182-20261029T134114Z`) ended
-`UNCLOSED` after its 300 s deadline with exactly one surviving session member,
-PID 15391 (ppid 1, pgid 80401), a unit-test binary in Cargo's group. That
-packet is historical evidence; it is not reclassified, re-signalled or deleted
-here. Tom's 2026-10-31 ruling rejected the first correction (identity re-read,
-then `SIGKILL` by PID): a same-user process that is not this run's child is not
-held unreaped, so its PID could be recycled between the read and the signal. A
-merely observed non-child PID is therefore **never** signalled, and that path
-does not exist in the source. Only an identity the runner positively holds
-across the signal may be signalled: the pinned leader group (its leader is held
-unreaped), the pinned monitor, and a direct child still held unreaped. After the
-leader is reaped, every census round records, once per identity and up to
-sixteen rows, the exact rows it still classifies in the leader's own session
-(`PID`, `start`, `ppid`, `pgid`, `uid`, `zombie`) in the receipt's `survivors`
-list, and the summary line states how many same-session survivors were not
-signalled. Each row is recorded before the round that reports it is sent and the
-census thread is joined (bounded, never past the deadline) before the receipt is
-published, so the evidence a verdict rests on is the evidence on disk. That is
-observation only: no message, no signal, no closure claim. An expired join is
-handled conservatively and truthfully. The custodian echoes the sequence number
-and facts of the last post-reap census message it processed in its
-`cleanup`/`keep` command, and at the stop request the monitor **binds the
-deciding census to that message**: it resolves the sequence against its own
-record of the census messages it sent (recorded under the same lock, before the
-write, so a message exists before a decision can name it) and publishes
-`deciding_census` plus `deciding_census_seq` from that resolution.
-`receipt.census` and `census_rounds` remain the rounds that completed before the
-bind and never change afterwards, and any round that finishes later is a
-post-decision observation under `receipt.census_after_stop` (`rounds` plus the
-last round's facts). A decision that names no message, or one this monitor never
-sent, binds nothing. Closure then requires **all three**: the census thread
-finished inside its bounded join, the last completed round is certainly empty,
-and the named census message is itself certainly empty (`census_settled`); a
-stalled round that returns with a member, or a decision without its own census
-evidence, refuses closure with its own reason while any member row is kept as
-evidence. On an expired join the
-survivor list is frozen at its published prefix (no row may land after
-publication), `census_join` records
-`joined: false`, `frozen: true`, `started` and `refused`, the summary says later
-rows may be missing — and an empty frozen prefix is still reported, never
-silently omitted — and **an incomplete join never yields certain closure** — a
-`cleanup` decision
-in that state is refused, the persisted verdict becomes `UNCLOSED` with
-`closure not established: the census thread did not finish before publication`,
-the custodian latches the same reason, and the root, backing and evidence are
-kept.
-A recorded row is observation, never a verdict: a survivor seen after the stop
-may exit by itself, so a LATER certain-empty census can still close the run, and
-the summary line states the run's own final closure — a closed run says the
-survivors were gone by the deciding census, and only an `UNCLOSED` run says the
-scratch was kept. A survivor that is still there when the deciding census runs
-keeps the run `UNCLOSED` with its scratch and evidence, and the recorded
-identity is what the owner needs to act on it. This change is **observation-only
-custody hardening**: it does not close the historical Cargo-group survivor and
-does not claim to. Identity-held closure is deferred to Queue papercut
-`9ff7386d-c70e-49c7-880a-2e6c676b2eb9`, because closing such a survivor needs a
-boundary that holds the identity (the product keeping its command tree inside
-the pinned leader group, or a pin-able holder owning that group). This head's
-suite replaces the former separate-group survivor case with one real
-Cargo-shaped case (a `setpgid` group leader in the leader's session and its own
-child in that group, both survivable past the deadline, both recorded and never
-signalled, both still live at the `UNCLOSED` verdict), and adds the pure rules
-that keep it that way, including an AST guard that every kill call site in the
-supervisor is a custody-bound one; pure regressions that a recorded row reaches
-the published receipt, that a round records its rows before it reports them and
-that the census thread is joined before publication, that an expired join freezes
-the published list, records `joined: false`/`frozen: true` and says later rows may
-be missing, that an empty frozen prefix is still reported, that every publication
-path joins the census first (a structural guard over `run` and finalisation), and
-that an expired join refuses closure (persisted `UNCLOSED`, a latched reason, no
-pass exit) including under a full run whose census thread is still inside a round
-that later observes a member (that late row can never reach the published receipt
-and the owned scratch is kept); and a *mid-join* interleaving where that round
-returns between the bound deciding census and the final publication, which must
-refuse closure on the final round's member, keep the row as evidence and leave the
-deciding census unchanged beside `census_after_stop`; a completed-but-unsent
-ordering where the decision names an earlier certainly empty message while a
-member round completed before the bind, so the deciding census is that named
-message (never the later round) and closure is refused on the final round; a
-decision that names no message or a message this monitor never sent, which
-cannot close; and a transient-survivor
-regression (both pure and real: a recorded row followed by a certain-empty
-census closes the run and never reports `UNCLOSED`/kept). At this head the three
-sources are
-`bounded-test.py`
-`5457436bd1899bb5c93187425dbf7e24bd727cecfc2f0c708c48acd9285afc19`,
+**Ancestor and launcher-sibling exclusions (oxide#197, brief v2, unqualified
+source).** Run under Effigy, the supervisor's own ancestor chain — the Effigy
+runner, then the payload leader and sentinel, then this supervisor — is
+reported by `kinfo_proc` as stable and not zombie while `getsid` fails with
+`ESRCH`, so every nested case under the installed Effigy could end `UNCLOSED`
+with `census uncertain: N unvalidated rows` while the same bytes passed when run
+directly. A direct-run diagnostic then saw one unvalidated row from a
+short-lived unrelated Node CLI call that shared the launcher shell's session.
+Brief v2's start-time ordering rule was then withdrawn by design ruling
+`ea5a3dc9`: a wall/boot/uptime comparison cannot prove the absence of a masked
+backward, back-and-forth or forward wall step, so no clock fact may exclude a
+row. Only two structural facts remain. In its bounded setup, before the leader
+exists, the monitor walks its own `ppid` chain from its owner parent through PID
+1, bounded to `ANCESTOR_MAX_LEVELS` (64) levels, and records each level's
+positive identity: the exact `(PID, start)` pair the snapshot names, the same
+start token the census already uses. The post-leader census then skips and
+nothing else:
+
+- **`ancestor`:** the row's own identity is exactly one recorded pair AND that
+  identity is re-verified through the safe Kinfo reader after the census
+  snapshot. A row whose PID is a recorded ancestor's PID is decided by this rule
+  alone and never falls through to its parent's rule. A different identity at
+  that PID is decided by ONE bound session observation: if the identity held on
+  both sides of that read and the row is in the leader's session it is **carried
+  into the census as a member of exactly this identity and tracked** (an ancestor
+  predates the leader, so a descendant can never be one), so a later
+  contradictory read cannot turn it foreign; every other reading — including a
+  stable session that is not the leader's — is **undecided**, excludes no row and
+  leaves the row to the ordinary getsid/reread classification.
+- **`parent` (the launcher sibling):** the row's observation-time parent row, in
+  the same snapshot, has a PID above 1 and an identity that is exactly one
+  recorded pair, and ONE sibling observation re-verifies the row's own
+  `(PID, start)` identity AND that parent identity on both sides of the
+  session/group reads, so a PID reused between the snapshot and those reads can
+  never lend another process's session or group to this row; the row must still
+  name that parent in both re-reads. Only a positively **outside** observation
+  excludes: the session and the group must both be readable and both different
+  from the leader's PID (its session and group id). A row positively **inside**
+  the leader's session is **carried into the census as a member of exactly this
+  identity and tracked**, so a later contradictory session read cannot make it a
+  foreign row. Anything else — a recycled or missing parent row, a replaced
+  identity, a transiently failed re-verification, an unreadable session or
+  group, or a leader group reading with a foreign session — is **undecided**: it
+  excludes nothing and the row keeps the ordinary getsid/reread classification, so
+  a held-suite zombie, a recycled identity or a foreign row classifies exactly as
+  it does without the launcher rules. A matching parent PID alone is not enough,
+  and every PPID 1 orphan and unknown parent is never excluded by this rule. The macOS rule that a supervised descendant can
+  only be reparented to launchd — never to a supervisor ancestor — makes such
+  parentage incompatible with supervised descent.
+
+A **tracked** identity — one this census already accepted as a member — is
+never excluded by either rule: both veto it before anything else, and no
+exclusion ever removes tracked attribution. A tracked row is therefore never
+reclassified, whatever its parent or its session/group read says. A `member`
+launcher observation is carried as a tracked member row of exactly the observed
+identity, so a positively observed member is never re-read into a foreign row.
+Only a positively decided identity may be excluded; an undecided observation
+adds no record of its own and never changes main's classification.
+
+No wall, boot or uptime value participates anywhere in the census, so a row
+whose start token merely looks earlier is never excluded and a tracked
+descendant keeps its existing classification however its token compares.
+Descendants, same-session strangers, first-seen unreadable rows and every
+identity that was never read are classified exactly as before, an unreadable or
+empty ancestor record excludes nothing, and the walk stops at the first level
+the snapshot does not name instead of guessing a parent. The receipt records the
+recorded chain in one bounded `ancestors` object with fixed keys — `state`
+(`recorded`/`partial`/`unreadable`), `count`, the `identities` rows (PID, start,
+1-based level) and `stop` (`pid-1`, `depth-bound`, `not-in-snapshot`,
+`malformed-row`, `cycle`, `read-error` or null) — and the positive evidence for
+every exclusion in one bounded cumulative `ancestor_exclusions` object: at most
+`EXCLUSION_MAX_ROWS` (20) distinct `pid`/`start`/`rule` rows, the total decision
+count, the omitted count (`count == rows + omitted`) and the per-rule counts. The
+integrated `bounded-test.py`
+(`94b1aba60a7475a31b5620039986336f13e1c88d58dd3732b5736290dc63685b`) adds this over the oxide#191 detach
+control and the oxide#192 admission reports, so those controls are unqualified
+until this head's own uncounted `effigy proof:supervisor:qualify:diagnostic` and
+separate author and independent reviewer `effigy proof:supervisor:qualify` pass;
+the suite gains thirty-one pure structural launcher-rule cases and one real
+launcher-sibling case (361 pure plus 55 real = 416 at this head, and the
+bootstrap's expected case total follows the suite). The end-to-end slow-setup
+launch-and-close regression for #192's sampling-based freshness clock is
+inherited here by decision `7bb1089d`: it injects a cold setup longer than the
+1 s reserve window but inside the 10 s setup deadline, requires a launch through
+the gate, a child execution and a closed outcome, and asserts from the receipt
+that the first completed reserve reading arrived after the superseded
+custodian-start window, so the case would fault under that basis; the separate
+no-reading and setup-deadline controls stay in `PureFreshnessClock`.
+**Qualification chain for the integrated #197 head (recorded, decision
+`b688eac2`).** The controlling chain is the Validation section's: one uncounted
+DIRECT `proof:supervisor:qualify:diagnostic`, one counted DIRECT author
+qualification, one counted DIRECT independent reviewer qualification at the exact
+source head, and ONE uncounted diagnostic through the installed Effigy with 11/11
+checks and zero problems. The merge-hold phrase that also asked for both counted
+qualifications "once through the installed Effigy" was an overstatement and is
+superseded; no counted installed-Effigy qualification is required.
+
+The supervisor archive
+`/Volumes/Builds/scratch/oxide/evidence-197-c1c4446-20261101T010045Z` binds all
+of it. `SHA256SUMS` covers `NOTE.md` (`8871c21a…`), `REVIEWER-PROVENANCE.md`
+(`d5c68065…`), every run log, `run197.sh` and `sessions.jsonl` (`c84701ac…`).
+The native head is `c1c4446…`, every receipt names supervisor `94b1aba6…`, suite
+`ed560949…` and bootstrap `88a073e2…`, and each run recorded 54 case rows:
+
+- uncounted DIRECT diagnostic, contaminated: `diag-c1c4446.log` (`b934ba04…`),
+  9/11 with two timing-only Real failures while an unauthorized overlapping
+  `effigy rust:test` (Barge T5 reviewer `ba3e7b93`) ran at load 34; the census
+  cases were clean. Preserved with no credit.
+- uncounted DIRECT diagnostic, clean: `diag2-c1c4446.log` (`8109a8cb…`), 11/11
+  checks and 0 problems, `result: diagnostic`, **exit 1** (a diagnostic selector
+  always exits non-zero even on a clean 11/11), evidence
+  `oxide-supervisor-qualify.d2vd5nma`.
+- counted DIRECT author qualification: `author-c1c4446.log` (`14dd71a9…`),
+  `result: pass`, 0 problems, exit 0, candidate exit 0, evidence
+  `oxide-supervisor-qualify.sy0gp881`, executor "Oxide Supervisor e96f186a,
+  direct" from a new session leader.
+- counted DIRECT independent reviewer qualification: `reviewer-c1c4446.log`
+  (`1d116b75…`), `result: pass`, 0 problems, exit 0, candidate exit 0, evidence
+  `oxide-supervisor-qualify.zez7b17y`. Its distinct executor is recorded in
+  `REVIEWER-PROVENANCE.md`, which `SHA256SUMS` binds: a fresh general-purpose
+  subagent (harness id `a9fd3220c7593d6c9`, its own worktree
+  `w197-reviewer-c1c4446`, its own process session and conversation, spawned by
+  the Supervisor session `e96f186a` under authority `fb3cef4d`) — separate
+  context, not a different model — and it wrote its own `sessions.jsonl` line
+  ("independent reviewer subagent of Oxide Supervisor e96f186a"). That is the
+  provenance to verify; the earlier PR table's attribution to `e96f186a` alone
+  was imprecise.
+- uncounted installed-Effigy diagnostic, clean: `effigy-diag2-c1c4446.log`
+  (`7012d78c…`), 11/11 checks and 0 problems, `result: diagnostic`, **exit 1**
+  by that same rule, evidence `oxide-supervisor-qualify._enpfxdr`. The earlier
+  `effigy-diag-c1c4446.log` (`2ab57d93…`) is an uncounted 8/11 whose three
+  uncertain outer rows were exiting processes of an unrelated Effigy test tree
+  (foreign churn, not Effigy launch ancestry), with two consequent DetachReal
+  errors and exit 125 — preserved, no credit.
+
+The controlling native head is `c1c4446…`; every later commit on this branch
+is text-only against it (`cc579f6` and `fd9c74d` are those text-only heads:
+`AGENTS.md` suite counts — 361 pure + 55 real = 416, thirty-two launcher cases —,
+the `scripts/test-recorded-slot-accounting.py` docstring guard hash `94b1aba6`,
+and this record), so the final head is the branch head and the reviewer verifies
+it by the diff stat against `c1c4446` plus an AST comparison with docstrings
+stripped that is identical, with `GUARD_SHA256` still `94b1aba6…`. The receipts
+therefore carry to the final head without repeating the chain (brief v6 and v7
+text-only rulings, parallel to #192's v8). No historical packet is rewritten and
+no native credit transfers between tasks.
+
+**Cooperative-session survivors (oxide#195, brief v3, unqualified at this
+integrated head).** The integrated `bounded-test.py`
+(`fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b`),
 `test_supervisor.py`
-`38b5513ed8e12e61cf0f8ec4c562922a42c8352b8e1cc900ca8a588b141c301a` and
+(`c95d46aa0e590285c3c412294ffb215c0d45b19ba804f2243f0d2ebd62158d7b`) and
 `qualify-supervisor.py`
-`e514e8cf379ed3044468712af61c178615ce985ee3ed85e1703d169bb42b6f51`. The
-head's suite is 308 pure plus 49 real cases and is **unqualified** until one
-uncounted keep-going
-`effigy proof:supervisor:qualify:diagnostic` and then ONE counted author and
-ONE separate independent reviewer `effigy proof:supervisor:qualify` pass at the
-exact head after independent exact-head source review; the `#191`, `#151` and
-`#147` receipts stay bound to their own bytes. **Activation bounds are the
-current main #191 values and are unchanged by this change:** a 420 s fixed outer
-deadline, a 380 s candidate limit and a 350 s suite alarm, with 512 MiB
-monitored scratch and the existing reserve/custody checks. The 300 s bound named
-in earlier documents — including the historical #182 packet — stays historical
-and labels those runs only. If another runner-bound task merges first, its
-values are integrated through a separately reviewed source update, never
-silently.
+(`30763aabbee0f09fe02bb04b7a85be584430de5ef8df827cbf9105c9a0cf80f6`) add the
+oxide#195 custody hardening over the oxide#197 ancestor rules and the oxide#192
+admission reports, so all three controls remain unqualified until this head's own
+uncounted `effigy proof:supervisor:qualify:diagnostic` and separate author and
+independent reviewer `effigy proof:supervisor:qualify` pass. It removes every path
+that signals a merely observed non-child PID (the earlier checked-then-signalled
+design is deleted, not narrowed), records the same-session survivors a census
+round still sees in the receipt's bounded `survivors` list, and binds the deciding
+census to the census message the custodian's own decision named. Closure now also
+requires a finished census thread, a certainly empty final round and a certainly
+empty named message; an expired join freezes the survivor list at its published
+prefix, records `census_join.joined: false`/`frozen`/`refused`, refuses the
+cleanup decision, has the custodian latch the reason, and keeps the root, backing
+and evidence. Nothing in that path signals anything. The suite gains twenty-one
+pure cases and one real recorded-and-never-signalled Cargo-shaped survivor case
+in place of the former separate-group survivor case (382 pure plus 56 real = 438
+at this head, and the bootstrap's expected case total follows the suite; the
+historical #197 record above keeps its own 416). The keeper of the historical
+survivor is Queue papercut `9ff7386d`; this head keeps that process's identity on
+record and claims no closure of it.
+
+**Admission reports on the integrated source (oxide#192, qualified at the native head).** The
+integrated head adds the admission reports described in the supervisor rule
+below: the completed-wait marker and its bounded grant, the correlated waiting
+report, and the stop-boundary drain with late-marker classification. Together
+with oxide#191's merged 287 pure and 48 real cases the suite was 329 pure + 53
+real = 382 cases at that native head (39 pure and 5 real of them oxide#192's: the completed wait and its
+grant, the rejection control, the late grant, a wait that never ends before the
+stop, and the stale-run plus zero-duration-grant correlation), which the
+bootstrap's expected count and limitation list follow; the integrated oxide#197
+head then adds its structural launcher cases and the inherited slow-setup
+regression, for 361 pure + 55 real = 416). The exported deadline,
+closure, census, reserve, scratch, cleanup, custody and signal rules are
+unchanged, a run with no admission report behaves exactly as before, and the
+detach protocol's own rules are oxide#191's. The native chain ran at native head
+`a19fb6c`: the owner-activated uncounted diagnostic passed 11/11 checks with zero
+problems, and the counted author qualification and the distinct independent
+reviewer qualification both passed, recorded in
+`/Volumes/Builds/scratch/oxide/evidence-192-a19fb6c-final-20261031T232038Z`
+(SHA256SUMS; the reviewer's own receipt is
+`oxide-supervisor-qualify.i729jh46`). The final head `71b7963` differs from that
+native head only in `AGENTS.md` and `workflow.md` Markdown; the independent
+review confirmed by `git diff a19fb6c..71b7963` that it changes no executable
+statement, non-docstring constant, test, fixture or proof-script behaviour, so
+those receipts bind to the final head under the brief-author source-immutable
+rule (decisions `7bb1089d` and `36ab646d`). The remaining end-to-end slow-setup
+launch-and-closure regression is assigned to oxide#197, not dropped. Earlier
+receipts stay historical, the `bc24b238…` (#151) bytes remain the qualified ones
+for their own runs, and no earlier evidence is migrated.
+
+**Historical receipts (superseded source).** At `93bb6db` the author side ran
+`effigy proof:supervisor:test` (227 pure), an uncounted diagnostic (270 reached
+of 270 expected, 270 completed, none failed or unexecuted, evidence kept at
+`/Volumes/Builds/scratch/oxide/oxide-supervisor-qualify._xqoizwl`) and then the
+counted `effigy proof:supervisor:qualify` (`result: pass`, no problems, 270/270
+cases, candidate `closed` status 0, no fault, no deadline, positive outer
+closure, 198.2 s, the 24 expected retained nested `UNCLOSED` case directories and
+the base kept at
+`/Volumes/Builds/scratch/oxide/oxide-supervisor-qualify.4sjmprvx`; scripts
+`supervisor` `a0d7fa83…`, `suite` `59916bd6…`, `bootstrap` `9ae2b84d…`). A
+reviewer qualification also passed at that source's documentation head
+`68faa7b`, reported by the review rather than by this file. Those receipts, and
+oxide#191's own receipts on its reviewed bytes, bind the source they ran under
+and are **history** only: the correlated waiting report (schema 2 with the run
+and command tokens) changed `bounded-test.py`, `test_supervisor.py` and
+`qualify-supervisor.py` again before integration, and a first diagnostic at
+`96f0767` recorded a fixture `NameError` as one failed case and continued
+(corrected, preserved as history).
+
+**Measured combined-suite basis (oxide#192, 2026-10-31).** After merging
+oxide#191's reviewed runner (which already raised the qualification's fixed
+deadline to 420 s and its candidate limit to 380 s, and the suite's own alarm to
+350 s), the combined 314 pure + 53 real suite was measured once, privately, as a
+development measurement (not a qualification): a clean, closed run of
+`bounded-test.py --root-parent <owned mktemp> --limit 380 --scratch-budget-mib 512
+-- python3 scripts/test_supervisor.py` finished the 53 real cases in **289.6 s**
+(guard wall 297 s; owned-byte peak 95.9 MiB of 512 MiB; reserve minimum 2207.7
+GiB; closed, status 0, no deadline) — 76.2 % of the 380 s candidate limit,
+80.4 % of the 360 s stop point and 82.7 % of the 350 s suite alarm. The earlier
+provisional estimate of about 241 s was under-measured because oxide#191's detach
+real cases were failing early there. Those figures describe that private run
+only: they are superseded by the direct diagnostic below, which ran longer inside
+the real qualification, and the brief-author correction then raised the bounds
+again.
+
+**Superseded the same day (oxide#192 amendment, Oxide Supervisor, 2026-10-31).**
+The first uncounted diagnostic at `5623edd` (direct, under Tom `d3d61247`)
+exceeded the 350 s suite alarm (candidate exit 142 = SIGALRM, 357 s wall, load
+about 9.5), so inside the real qualification the combined suite runs longer than
+the private 297 s measurement. That packet is **failed**: it is preserved as
+history with no native credit, and only its pure suite passed. The bounds are
+therefore raised to a 600 s fixed deadline (kill at 598 s), a 560 s candidate
+limit and a 530 s suite alarm; scratch stays 512 MiB and the margin semantics
+are unchanged. Earlier qualifications stay bound to the limits they ran under.
+Under Tom decision `d3d61247`, while Effigy's I2/I3 helper-process regression
+makes its session census uncertain, the owner may run the exact `effigy.toml`
+proof commands directly with the same bounds, environment, reserve and custody
+checks and a per-session executor/command/head/exit/load/log-hash envelope; that
+is no general waiver, and one clean uncounted diagnostic, one counted author
+qualification and one distinct independent reviewer qualification follow in that
+order at the final published head.
+
+**Integrated head: qualified, pending the final-head verdict.** The oxide#192
+bytes are qualified at native head `a19fb6c` by the owner-activated uncounted
+diagnostic (11/11 checks, zero problems) and by the counted author and distinct
+independent reviewer qualifications (receipts in
+`evidence-192-a19fb6c-final-20261031T232038Z`). The final head `71b7963` changes
+only `AGENTS.md` and `workflow.md` Markdown, and the independent review confirmed
+with `git diff a19fb6c..71b7963` that it carries no executable statement,
+non-docstring constant, test, fixture or proof-script behaviour change, so those
+receipts bind to it under the brief-author source-immutable rule. The reviewer's
+slow-setup regression finding is resolved by decision `7bb1089d` (the
+end-to-end case is assigned to oxide#197, not dropped). What remains is an
+independent final-head verdict before hold release; the covering checks at this
+that head were `effigy proof:supervisor:test` (329 pure cases) and
+`effigy docs:check`, with the earlier `effigy rust:compile`,
+`effigy rust:format` and `effigy test rust` runs unchanged-input history.
 
 **Settlement observation (oxide#147, unqualified source).** The current
 `bounded-test.py` also carries observation-only settlement diagnostics, so a
@@ -2515,10 +2700,11 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   - It may read `OXIDE_PROOF_DEADLINE_NS`, the absolute `CLOCK_UPTIME_RAW`
     deadline, and write evidence to keep under `OXIDE_PROOF_EVIDENCE`, the
     evidence directory: counted in owned bytes, never removed by cleanup.
-  - It must leave no process outside the leader's cooperative session when it
-    exits. A survivor in that session is recorded but never signalled, and it
-    ends the run `UNCLOSED` (oxide#195); a process that leaves the session with
-    `setsid` is never signalled either.
+  - It may publish one bounded `admission.json` marker in
+    `OXIDE_PROOF_EVIDENCE` when its own admission wait ends (below); the
+    supervisor reports that wait and grants bounded time for it.
+  - It must leave no process outside its leader's group when it exits: such
+    a process is never signalled and ends the run `UNCLOSED`.
   - It adds no supervision or accounting of its own.
 - **Processes.**
   - The single-threaded custodian owns the absolute deadline, the two pins
@@ -2566,29 +2752,38 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
 - **Signals.** Only an identity the runner holds unreaped across the signal is
   ever signalled: the pinned leader's group (TERM, then KILL after at most 5 s),
   the pinned monitor, and a direct child still held unreaped (the detach
-  handoff). Each signal is recorded with its target, pin and `held_unreaped`
-  custody at that moment. On macOS a group whose only member is the unreaped
-  leader answers `EPERM`, which is recorded and not a fault. No other group and
-  no observed non-child PID is ever signalled (oxide#195, Tom's 2026-10-31
-  ruling `c096c8fc`).
+  handoff; the #197 launcher-rule exclusions add no signal). Each signal is
+  recorded with its target, pin and `held_unreaped` custody at that moment. On
+  macOS a group whose only member is the unreaped leader answers `EPERM`, which
+  is recorded and not a fault. No other group and no observed non-child PID is
+  ever signalled (oxide#195, Tom's 2026-10-31 ruling `c096c8fc`).
 - **Cooperative-session survivors (oxide#195).** The leader's group is not the
-  whole session: Oxide starts Cargo as the leader of its own process group in
-  the same session, so a leader-group KILL leaves Cargo's group running.
-  Oxide#182's archived packet ended `UNCLOSED` with exactly one such survivor (a
-  unit-test binary in Cargo's group). Such a process is not this run's child, so
-  it is not held unreaped and its PID could be recycled between an identity read
-  and a signal: it is **never** signalled, and the supervisor has no path that
-  converts an observation into a signal. After the leader is reaped, each census
-  round records, once per identity and up to sixteen rows, the exact member rows
-  it still classifies in the leader's session (`pid`, `start`, `ppid`, `pgid`,
+  whole session: Oxide starts Cargo as the leader of its own process group in the
+  same session, so a leader-group KILL leaves Cargo's group running. Oxide#182's
+  archived packet ended `UNCLOSED` with exactly one such survivor (a unit-test
+  binary in Cargo's group). Such a process is not this run's child, so it is not
+  held unreaped and its PID could be recycled between an identity read and a
+  signal: it is **never** signalled, and the supervisor has no path that converts
+  an observation into a signal. After the leader is reaped, each census round
+  records, once per identity and up to sixteen rows, the exact member rows it
+  still classifies in the leader's session (`pid`, `start`, `ppid`, `pgid`,
   `uid`, `zombie`) in the receipt's `survivors` list, and the summary line states
-  how many were not signalled. Closure is unchanged, so a survivor leaves the
-  run `UNCLOSED` with its scratch and evidence kept; disposing of the recorded
-  process needs a boundary that holds it, which this runner does not have.
+  how many were not signalled. Each row is recorded before the round that reports
+  it is sent, and the census thread is joined (bounded, never past the deadline)
+  before the receipt is published, so the evidence a verdict rests on is the
+  evidence on disk. Closing such a survivor needs a boundary that holds the
+  identity (Queue papercut `9ff7386d`); this change does not close the historical
+  survivor and does not claim to.
 - **Closure.** The leader is reaped first. Only after that does the custodian
   send `stopped`, so the final census never sees the leader. Closure is
   established when all of the following hold:
   - no fault is latched;
+  - the census thread finished inside its bounded join, the last completed round
+    is certainly empty, and the census MESSAGE the custodian's decision named is
+    itself certainly empty (`census_settled`; the custodian echoes that message's
+    sequence and facts, and the monitor resolves it against its own record of the
+    messages it sent, so a late round or a decision without its own census
+    evidence refuses closure);
   - a census started after `stopped` is certain, with zero members and zero
     uncertain rows, within 10 s (bounded by `exit_at`);
   - both output pipes have reached EOF.
@@ -2608,6 +2803,21 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
     foreign or member by inference.
   - **Uncertain:** everything else, including first-seen unreadable rows,
     failed re-reads and unconfirmed zombies.
+  - **Launcher (oxide#197):** a row a positive structural launcher rule
+    excludes, in this order: its own `(PID, start)` identity is exactly one the
+    monitor recorded for its own `ppid` chain in setup and is re-verified
+    through the safe reader after the snapshot (`ancestor`); or its
+    observation-time parent row has a PID above 1, exactly one of those recorded
+    identities, re-verified the same way, and the row is positively outside the
+    leader's session AND process group (`parent`, the launcher sibling). Each is
+    neither a member nor uncertain. Only those positive facts qualify: a
+    recycled PID or parent PID with a different start token, a changed identity,
+    a missing parent row, an unreadable session or group, a PPID 1 orphan, a
+    descendant, a same-session stranger and any row not excluded above keep the
+    classification above, an unreadable or empty record excludes nothing, and no
+    wall, boot or uptime value ever takes part. A `member` launcher observation
+    is carried as a tracked member row; an undecided one excludes nothing and
+    leaves the row to the ordinary classification.
   - **Terminal nonwriter** (allowlisted kernels only): an actual `getsid`
     `ESRCH` (errno-checked, not any `ProcessLookupError`) whose snapshot
     row and FIRST existing confirmation read show the same complete
@@ -2628,14 +2838,32 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
     non-`ESRCH` `errno`) can never qualify. In strict mode terminal
     acceptance never fires and every `ESRCH` row keeps the old uncertain
     handling, while the terminal count stays the accountably known valid
-    0. No live process is excluded by parent, and a replacement identity
-    is never declared foreign or member by inference.
+    0. Apart from the two structural launcher rules above (a re-verified
+    recorded ancestor identity, decided only by that rule; and a launcher
+    sibling whose parent identity and own identity are re-verified around the
+    session/group reads and which is positively outside the leader's session and
+    process group), no live process is excluded by parent, a tracked member is
+    never excluded, and a replacement identity is never declared foreign or
+    member by inference.
+
+  The launcher rules are the only parent-based exclusions: the monitor records
+  its own chain once in bounded setup (at most 64 levels, from its owner parent
+  through PID 1) and the census skips only a re-verified recorded identity, or a
+  non-tracked row whose own identity and recorded parent identity are re-verified
+  around the session/group reads and which is positively outside the leader's
+  session and process group. The receipt carries that record as the bounded
+  `ancestors` object and the positive exclusion evidence as the bounded
+  `ancestor_exclusions` object, both described above.
 
   An uncertain or failed census after `stopped` latches a fault at once. A
   later certain empty census never clears it or authorizes cleanup.
 
-  Start time is only an identity token, never an exclusion. Owned scratch
-  is removed only after established closure.
+  Start time is an identity token, never a liveness or ordering signal: the
+  only exclusions it takes part in are the whole `(PID, start)` identity of a
+  recorded ancestor or of a recorded parent of a launcher sibling. No wall,
+  boot or uptime comparison excludes anything, because a masked backward,
+  back-and-forth or forward wall step cannot be ruled out. Owned scratch is
+  removed only after established closure.
 
   Kernel allowlist: once in monitor setup, three fixed-buffer `sysctlbyname`
   reads (`kern.uuid` 64 B, `kern.osversion` 64 B, `kern.version` 1024 B)
@@ -2710,15 +2938,128 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   - Clock: a reading stamped later than the custodian's own clock reading
     when it arrives. Both sides use the same system-wide clock, so such a
     reading is never fresh.
+
+  Freshness measures the steady-state sampling window, and it begins when
+  sampling actually begins — the monitor's `ready`, after its first completed
+  readings — never at custodian start (decision `50acd33b`, papercut `90e93f06`).
+  A cold setup, whose bounded startup sweep of a shared parent can take longer
+  than 1 s, is owned by its own 10 s setup deadline and can never trip the 1 s
+  reserve window; the steady-state windows (1 s reserve, 10 s owned bytes) and
+  the setup deadline are unchanged. It also ends with the decision: once the
+  custodian has sent its `cleanup`/`keep` decision, the monitor's samplers stop as
+  it publishes `monitor_complete`, so the monitor's shutdown is not a freshness
+  window (oxide#192; a stalled sample during shutdown cannot turn a completed,
+  closed and cleaned run into exit 125). Threshold faults from readings that do
+  arrive, every closure rule and the whole settle phase are unchanged, and a
+  stale reading while the run is executing still latches.
 - **Clock and deadlines.** One clock everywhere: `CLOCK_UPTIME_RAW` integer
   nanoseconds. The supervisor refuses before any proof work if that clock,
   kqueue, macOS or the self-checked `kinfo_proc` layout is missing.
   - `stop_at` is the limit minus 20 s.
   - `exit_at` is the limit minus 2 s.
   - Every wait is a kevent or select timeout within the remaining budget.
+  - An admission marker can add at most its own reported wait, this run's own
+    elapsed wall clock and 600 s in total to the deadline, never shortening
+    it (below).
+- **Admission marker (oxide#192).** A supervised child that waited for
+  admission may publish one bounded marker, `admission.json`, in the evidence
+  directory: exactly the keys `schema`, `source`, `run`, `command` and
+  `waited_ns`, schema 2, where `source` and `command` are printable tokens of at
+  most 32 characters, `run` is this supervisor's own exported
+  `OXIDE_PROOF_RUN_ID` and `waited_ns` a non-negative wait inside `u64`, at most
+  512 bytes, published by rename. A document whose `run` is not this run is
+  rejected as `stale run` and never paired with this one (the runner rejects the
+  retired schema-1 three-key shape too). `oxide` writes it when a leased
+  command's own slot admission grant ends (its measured interval from the first
+  attempt to the grant), armed only by this supervisor's exported layout.
+  Admission sampling starts together with the reserve and owned-byte samplers,
+  before the monitor's `ready`: a pre-existing, malformed, stale or foreign
+  document is rejected and counted there (a rejection is also a control message
+  the custodian counts as an observation) and grants nothing, because only a
+  document carrying this run's identity can be paired and the child receives
+  that identity only after the gate opens. No marker path can fault the run,
+  refuse it or abandon its launch. The monitor polls the path every 0.25 s, opens only a regular file
+  without following a link, reports one marker per file identity and stamps
+  the moment it read it. Deduplication binds to the identity of the file it
+  actually opened (`fstat` on the open handle), never to an identity sampled
+  before the open, so an atomic replacement that lands between the sampler's
+  `lstat` and the read is reported once and never again on the next poll; and
+  the custodian grants one command's wait at most once, counting and ignoring a
+  duplicate completion. The custodian adds at most that reported wait, never
+  more than this run's own elapsed wall clock and never more than 600 s in
+  total, to `absolute`, and recomputes `stop_at` and `exit_at`. Nothing is
+  ever shortened and `OXIDE_PROOF_DEADLINE_NS` is not rewritten, so a proof
+  script that bounds its own work from it keeps its unextended cutoff and gets
+  no benefit from a grant.
+
+  **The stop boundary.** When the watch loop reaches its stop it makes one
+  bounded drain of the control pipe before it declares the deadline, so a
+  marker that was already published and is waiting to be read can still grant
+  and move the stop; the loop continues only when the grant moves the stop past
+  the current time, so a marker that grants nothing cannot spin it. A marker
+  that reaches the custodian after the stop decision or after a deadline was
+  declared cannot move anything: it is recorded as `admission_late` with its
+  reason (`deadline` or `stopped`), its observed stamp and its reported wait,
+  and the deadline classification stands. The summary says so in its own line.
+  A run that stopped as admission completed is therefore reported as a deadline
+  with a late admission, never as an unexplained timeout, and no clock is
+  moved after the decision. A marker the child could not publish before the
+  stop is simply absent: the supervisor never waits past its deadline for one,
+  and the product cancels its waiting lease on a signal rather than reporting a
+  grant it did not get.
+
+  **A wait that never ends, correlated per command.** Both schema-2 documents
+  name the run and one bounded command token. The monitor rejects any document
+  whose `run` is not this run (reason `stale run`) and keeps the rejection in
+  the report's own bounded list, so a file left by an earlier run is never
+  paired with this one. `admission-waiting.json` has exactly the keys
+  `schema`, `source`, `run`, `command` and `reason` (two printable tokens of at
+  most 32 characters), at most 512 bytes, and is published by the child when a
+  wait starts; it never moves `absolute`, `stop_at` or `exit_at`. The custodian
+  keeps a bounded pairing table (64 commands) and pairs a command's waiting
+  report only with that command's own completed report. Its wait **ended** when
+  its own completion arrived, at any duration: a zero-duration grant, a grant
+  clamped by the cap and a late grant all end it. An unpaired wait is **never**
+  described as a proven unfinished wait: missing terminal evidence is unknown.
+  The completion file has one fixed name, so a later admission-file observation —
+  another command's grant or waiting report, or a **rejected read** — may have
+  replaced a completion before the next 0.25 s poll, and a completion published
+  between the last poll and the sampler's stop can be missed entirely. The
+  decision record therefore carries only `unpaired` rows with a
+  `later_observation` fact, and the summary says either that a later admission
+  report or a rejected read may have overwritten the completion, or that no
+  admission-file observation followed the wait while its terminal evidence is
+  still missing; both are unclassified, and only the observed terminal reports
+  (a grant, a zero-duration or capped grant, a late grant) end a wait. A rejected
+  or overflowed report is unclassified in the same way. A terminal for a command
+  the bounded pairing table cannot retain (more than 64 commands) grants
+  **nothing**: without a record the custodian cannot tell a first terminal from a
+  duplicate, and a missed extension only makes the run stricter. A duplicate
+  terminal for a retained command is likewise counted and ignored, so one command
+  can never move the deadline twice for the same wait. Together with the grant and late
+  records this makes the states distinguishable in one receipt: granted before
+  the stop, granted after it (late, no clock moved), unpaired (nothing granted,
+  unclassified because its terminal may have been overwritten or missed), stale
+  (rejected by run), and rejected or overflowed (unclassified). A missing, malformed, oversized, linked or unreadable
+  marker is recorded in `receipt.admission` with a bounded rejection list and
+  nothing else happens: it never latches a fault and never changes closure,
+  EOF, cleanup or classification. The grant is cooperative evidence about the
+  child's own admission, not a claim about any other writer. `receipt.admission`
+  records the observations and the reported waits; each accepted grant and each
+  late marker is also a `receipt.custodian` event (at most 32 kept), and one
+  best-effort `admission_decision` record carries the decision-time totals, the
+  late reason and stamp, the cap and the effective deadline. The summary prints
+  the reported wait, the grant and the effective deadline separately, so a
+  queue wait is reported honestly rather than consumed from the work window.
+  The cap bounds the run: markers can never move the deadline by more than
+  600 s.
 - **Exit and receipt.**
   - Exit codes: 124 at a deadline; 125 for a fault, refusal or `UNCLOSED`;
-    otherwise the command's status (128+N for signal N).
+    otherwise the command's status (128+N for signal N). Every 125 is explainable
+    from one bounded stderr line (papercut `bc0d56cd`): a launch refusal prints
+    `not launched: <reason>`, a failed finish prints its deadline and latched
+    fault, and an unexpected monitor failure prints its exception class name —
+    never a traceback and never silence.
   - The monitor publishes `receipt.json` phases by atomic replacement:
     `started: incomplete`, then `closure_established: cleanup_pending` or
     `unclosed: scratch_kept`, `cleanup_partial_or_unknown` before deleting,
@@ -2779,16 +3120,18 @@ bounds:
 - reserve readings before and after, on the volume that actually holds the
   qualification's scratch, with the boot volume read and labelled separately
   (both keep the 22 GiB threshold);
-- a fixed 420 s `CLOCK_UPTIME_RAW` deadline held by a minimal outer actor
-  (oxide#191 amendment, Tom 2026-10-31: was 300 s, because the combined suite
-  needed 251-258 s against the former 250 s suite alarm, which is now 350 s,
-  the 380 s candidate limit less its 30 s margin).
+- a fixed 600 s `CLOCK_UPTIME_RAW` deadline held by a minimal outer actor
+  (oxide#192 amendment, 2026-10-31; history: 300 s originally, 420 s under
+  oxide#191 when the suite needed 251-258 s against the old 250 s alarm). The
+  suite's own alarm is now 530 s, the 560 s candidate limit less its 30 s
+  margin; the first direct diagnostic then exhausted oxide#191's 350 s alarm at
+  357 s wall (candidate exit 142 = SIGALRM, its pure suite OK).
   The actor forks the whole bootstrap as a pinned worker and makes only
   WNOHANG reaps, bounded sleeps and signals to that worker. All file,
-  hashing and stdout work runs in the worker. At 418 s the actor KILLs the
+  hashing and stdout work runs in the worker. At 598 s the actor KILLs the
   worker and exits 124, so blocked output or a slow read cannot extend the
   deadline. A candidate still running then is bounded only by its own
-  380 s limit (was 280 s);
+  560 s limit (380 s under oxide#191, 280 s before);
 - on candidate overrun, TERM then KILL of its own unreaped candidate child
   only, from its own reap loop, so no signal can follow the reap.
 
@@ -2806,7 +3149,7 @@ unconcluded with an honest reason even when the outer session closed and the
 suite passed, so it can never expire; only a fully concluded base or candidate
 root older than seven days is eligible for a later run's bounded sweep.
 
-It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
+It runs `bounded-test.py --limit 560 --scratch-budget-mib 512` around
 `scripts/test_supervisor.py` with **no** `--root-parent` **and no
 `--evidence`**: the candidate's own default scratch routing runs, and its
 evidence directory is its own `<root>/evidence`, so the suite's nested
@@ -2831,7 +3174,7 @@ with a recorded minimum. A fallback run, or a nested case outside the
 monitored root, fails the qualification. Its reserve readings identify the
 qualification's scratch volume and the boot volume separately. The suite
 runs in order:
-- 209 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 361 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -3044,9 +3387,7 @@ runs in order:
   the suite takes custody, acknowledges and holds them; the held-stream cases
   must latch exactly the missing-EOF refusal after a certainly empty census,
   and the paired control that releases both closes with status 0 and no fault;
-- real cases with tiny Python fixtures and injected faults (39 at the oxide#151
-  head; the current head has 48, the oxide#191 detach cases and the oxide#195
-  survivor case below):
+- 39 real cases with tiny Python fixtures and injected faults:
   - exit 0, owned cleanup, nonzero, exec 127, output saturation;
   - a case directory that already holds the owned long-path fixture: the
     first scratch reading counts it, closure holds and the command runs (before
@@ -3056,13 +3397,8 @@ runs in order:
     in `finally`; a live owned child with an explicitly injected session
     error blocking with terminal `invalid`/null;
   - a group cascading to `closed` at the deadline;
-  - oxide#195: a Cargo-shaped group (a `setpgid` group leader in the leader's
-    own cooperative session and its own child in that group) that reaches the
-    deadline: both members are recorded in the receipt's bounded `survivors`
-    list with their exact identities, neither is signalled, and both are still
-    live (non-zombie, census-owned) at the `UNCLOSED` verdict, whose case
-    directory and receipt stay outside the outer cleanup (this replaces the
-    former separate-group survivor case);
+  - a separate-group survivor `UNCLOSED`, never signalled and still alive at
+    the verdict, its case directory and receipt outside the outer cleanup;
   - an escaped pipe holder, kept the same way;
   - a latched fault with an empty census (kept, not cleaned);
   - SIGTERM and SIGINT to the custodian;
@@ -3096,7 +3432,10 @@ runs in order:
     SIGALRM inherited as ignored and blocked.
 
 Every fixture arms SIGALRM to `FIXTURE_DEADLINE_NS`. The order is case
-verdict 45 s < fixture fallback 60 s < qualification 420 s, and fallback
+verdict 45 s (the detach class's own outer window is 75 s, because its nested
+guard's stop is at 40 s and its exit at 58 s; a timeout there retains the mount,
+backing and evidence and infers no detach outcome) < fixture fallback 60 s <
+qualification 600 s, and fallback
 expiry never counts as closure. The bootstrap requires all of:
 - candidate exit 0;
 - phase `monitor_complete`;
@@ -3110,7 +3449,10 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 249 cases;
+- all 416 cases (361 pure + 55 real, including oxide#191's post-census detach
+  cases, oxide#192's five admission-report cases and its sampling-freshness
+  cases, and oxide#197's structural launcher-rule cases with the launcher-sibling
+  and slow-setup real cases);
 - every real case directory and receipt still present after the
   candidate's cleanup.
 
@@ -3118,8 +3460,32 @@ It prints a receipt binding the commit, SHA-256 of all three sources, the
 platform, each case's exit, phase, outcome and signal custody, the suite's
 recorded layout, the prepared parent, both bounded sweep summaries, both
 marker states, the scratch-volume and boot-volume reserve readings, the kept
-base and `UNCLOSED` case directories, and the limitations. Admission waits fall outside its 300 s. `effigy
-proof:supervisor:test` runs the pure cases alone.
+base and `UNCLOSED` case directories, and the limitations. Admission waits
+fall outside its 600 s: that is the amended actor cap (oxide#192 raised it to
+600 s from #191's 420 s, itself from 300 s) with the 560 s candidate limit and the
+530 s suite alarm, and a candidate marker can only move the candidate's deadline (by at most
+600 s) inside it.
+`effigy proof:supervisor:test` runs the pure cases alone.
+
+**Uncounted keep-going diagnostic.** `effigy proof:supervisor:qualify:diagnostic`
+(heavy) runs the same bootstrap (`qualify-supervisor.py --diagnostic`), guard,
+fixed 600 s absolute deadline (oxide#192 amendment; 420 s under #191, 300 s
+before), the 560 s candidate limit, the 530 s suite alarm, selected-volume routing and the unchanged
+512 MiB monitored scratch with its 30 s shutdown margin, and is required before
+the counted author qualification at a changed head. It runs each named qualification oracle on its own — receipt phase,
+candidate outcome, reserve sampling, default scratch, sweep, protected root,
+nested cases, owned bytes, signal custody, the detach cases and the case total —
+so one failing check never hides the rest, records a bounded
+`qualified: false` receipt with its per-check rows (`checks_passed`,
+`checks_failed`, `claims`) and the case-level `collection` object (reached,
+completed, failed and unexecuted against the bootstrap's own count, with the
+first fault), and always exits non-zero. A precondition refusal in this mode
+also prints one bounded `qualified: false` receipt before exiting. The receipt
+is never a counted PASS, never a qualification and never evidence for another
+proof, and a skipped or unexecuted check is never a pass. Earlier history is
+preserved: the `96f0767` collection recorded a fixture `NameError` as one failed
+case and kept going (corrected, not excused), and the `93bb6db` diagnostic and
+counted receipts stay bound to their own bytes.
 
 `test rust`, the profile proofs, `rust:pool-scale`,
 `rust:oxide-exec` and `rust:front-door-accounting` keep their invocation and
@@ -4199,8 +4565,11 @@ oxide#102.
   reused. An incomplete payload walk shows allocation as `at least`.
 - **Explicit slot release.** `oxide pool recover-interrupted <slot>`
   replaces the retired CLI's `recover` for an interrupted slot automatic
-  [crash recovery](#crash-recovery) keeps held. Source- and unit-reviewed;
-  no native proof drives it.
+  [crash recovery](#crash-recovery) keeps held. A slot quarantined in the
+  current boot session refuses that command and is released separately with
+  `oxide pool release-quarantined <slot> --confirm-writers-stopped`
+  (oxide#196, [surprise removal](#implemented-part-2-surprise-removal-oxide098)).
+  Source- and unit-reviewed; no native proof drives `recover-interrupted`.
 - **Proof.** `effigy rust:oxide-budget-default` runs the
   [removable proof](#removable-build-volume)'s guarded session with these
   cases first, over a scratch `HOME` (toolchains from the real
@@ -4492,15 +4861,16 @@ Sources: `fstatfs(2)` / `sys/mount.h`; `getattrlist(2)` / `sys/attr.h` (`ATTR_VO
 - **A build whose volume vanishes fails; Oxide stops its own group.** Cargo's and rustc's later writes into the slot fail (the mount point is gone and `/Volumes` is not writable by the user). A program whose executable lived on the volume may not fail: in the author's first native run a build script running from the slot spun at full CPU after a forced detach and never exited, so Cargo and Oxide waited indefinitely. While a removable command runs, Oxide therefore checks about once a second that the mount root still opens as the device it started on (the reserve watchdog's loop, with no space trigger). When it does not, Oxide sends TERM to its own Cargo (or exec tool) group, KILL after 2 s, and waits up to 10 s more for the group to be empty. The command ends with the build's failure (at least 1); nothing is replayed. If the group is not observed empty in time, the slot is quarantined and the command exits 1.
 - **Lost-volume record.** Releasing the slot flushes the volume first (part 1). When that flush fails and the mount root no longer opens as a mount root, the slot is recorded lost: the record is retired with a `lost` entry (slot ID, time, closure), the lease stays held, and the slot is never reused. The command prints `oxide: removable volume gone; slot <n> is …` and, after its summary, that the next command uses the internal pool. A flush failure with the volume still present stays the part-1 retirement, never deleted.
 - **Positive writer closure decides deletion.** The holding command has seen its own process group empty before releasing. Closure is still not positive, and the slot is quarantined, when the record belongs to another `oxide` process, the command was `oxide exec` (a tool may start processes outside its group), `OXIDE_ALLOW_RUSTC_WRAPPER=1` let Cargo run an inherited rustc wrapper (a wrapper server may outlive the build), or `RUSTC_WORKSPACE_WRAPPER` / `CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER` was set. A workspace wrapper set only in a Cargo config file is not read here; a process that left Cargo's group (for example through `setsid`) is outside this check, as in crash recovery. Such an escaped daemon can still be writing when the lost slot is deleted; group closure is the cooperative boundary, not proof that every external helper has stopped. Device disappearance, elapsed time and PID absence are never taken as closure. **A restart is one more positive-closure fact (oxide#161):** every process ends, so a quarantined record whose holder started before the current boot session is closed. The boot session's start is read through an OS-layer function (`sysctl kern.boottime` on macOS; unknown, never inferred, off macOS) and compared with the record's holder start. An unreadable or zero boot time, a missing or zero holder start, or a start inside a fixed 60 s safety margin stays unknown, so the slot stays quarantined. The margin covers the early-boot clock set and millisecond truncation, and the kernel's boot time follows later clock adjustments with the clock, so a holder of the current session never falls behind it. This fact decides lost-slot handling only, and a record from the current boot keeps exactly its previous behaviour.
-- **Re-attach.** The next leased command that selects the removable pool, under its admission lock and before admission: each lost slot whose closure was positive — the holding command saw its own group empty, or the holder predates this boot session — whose record lock is free and whose recorded group (for a current-session holder) is still empty is released and deleted whole through the volume-bound library, with the existing failure handling. It reports once: `oxide: deleted slot <n> held when the removable volume was lost (…)`, or for the restart fact `oxide: deleted slot <n> lost before this boot (holder started <s> s before boot; a restart ends every process)`. A group number recorded in an earlier boot session is not checked, because it may belong to an unrelated process now. A reused group or a live holder leaves it for a later command. A failed lost-slot deletion returns an error before admission. Its persisted retired record remains until whole-slot eviction succeeds: crash recovery skips that record, reuse excludes it, and the next admission retries its deletion before taking a lease. This prevents the temporary idle ledger state between recovery and eviction from becoming reusable through the Oxide command front door. A quarantined slot from the current boot session stays held with its bytes counted: never reused, recovered or deleted; `recover-interrupted` refuses it. Once a later boot session has begun it is closed and deleted as above. Idle slots, flushed at release, stay warm across the removal.
+- **Re-attach.** The next leased command that selects the removable pool, under its admission lock and before admission: each lost slot whose closure was positive — the holding command saw its own group empty, or the holder predates this boot session — whose record lock is free and whose recorded group (for a current-session holder) is still empty is released and deleted whole through the volume-bound library, with the existing failure handling. It reports once: `oxide: deleted slot <n> held when the removable volume was lost (…)`, or for the restart fact `oxide: deleted slot <n> lost before this boot (holder started <s> s before boot; a restart ends every process)`. A group number recorded in an earlier boot session is not checked, because it may belong to an unrelated process now. A reused group or a live holder leaves it for a later command. A failed lost-slot deletion returns an error before admission. Its persisted retired record remains until whole-slot eviction succeeds: crash recovery skips that record, reuse excludes it, and the next admission retries its deletion before taking a lease. This prevents the temporary idle ledger state between recovery and eviction from becoming reusable through the Oxide command front door. A quarantined slot from the current boot session stays held with its bytes counted: never reused, recovered or deleted; `recover-interrupted` refuses it, and it is released explicitly with `oxide pool release-quarantined <slot> --confirm-writers-stopped` once its writers are stopped (below). Once a later boot session has begun it is closed and deleted as above. Idle slots, flushed at release, stay warm across the removal.
+- **Explicit quarantined release (oxide#196).** `oxide pool release-quarantined <slot> [--dry-run] --confirm-writers-stopped` acts only on a slot whose record is retired, held and quarantined in the current boot session, in the selected removable pool. Anything else refuses and names its state: a live command's slot, a retired record that is not a lost slot, a lost slot whose writers are positively closed, a record a later boot session has closed (both deleted by the next selecting command), a ledger entry that is not held, a record that is not provably this slot's lease, and an absent tree (the volume is not attached, so there is nothing to check or delete). `recover-interrupted` keeps its own scope. The operator's flag is required: without it the command refuses before reading any pool and prints the checks it would make. Before any effect it makes one positive, bounded same-user descriptor census of the slot tree: no process of this account may hold a file open inside the tree, no process's working directory may be inside it, and the recorded holder pid must be positively gone (or name another account's process, which the recorded holder cannot be); a same-account live pid is unidentifiable from the record's userspace wall-clock start and refuses. The census follows the writer-custody rules: a descriptor listing the kernel answers `EPERM` for is re-observed by kernel identity with a short bounded backoff and settles only on a positive fact (a later listing, a gone pid, a changed start identity or a changed effective uid); a vnode descriptor whose path and vnode facts are both hidden (`EPERM`) is a counted and reported OS blind spot only when the process's own `csops(CS_OPS_STATUS)` reports `CS_PLATFORM_BINARY` and its kernel start identity is positively the same before and after that status read (Tom decision e528a712, the same rule Barge uses); every other hidden descriptor, and a hidden working directory, is UNKNOWN and refuses, and every readable descriptor of a blind-spot process is still checked (an in-slot one refuses); both-flavour `ENOENT` is a reported dead handle (a revoked vnode cannot do I/O) settled only by a second observation; a descriptor the platform reports closed is never a hold; and a process of another account is outside the cooperative check because the slot tree is this account's own `0700` directory. An unreadable process or descriptor, a reached process, descriptor, per-process descriptor or wall-clock bound, and a live or unidentifiable recorded holder are UNKNOWN and refuse. `--dry-run` prints the census verdict and changes nothing. The effect moves the **held** ledger row and its tree into the [holding area](local-lease.md#whole-tree-holding-deletion-oxide190) in one library transaction: one identity-verified rename under the pool lock plus one durable row write, then deletion outside it by the claiming command, so the space stays charged until the tree is gone. There is no release-to-idle step; a failed eviction leaves the slot held and its record quarantined (a recorded hold intent is resumed by the next open), so an error never changes custody to idle. It logs one line with the slot, its recorded bytes (or `size unknown`), the census summary and the operator flag, then the usual `oxide: deleted slot …` line. The command-level refusals — selection, census and a stale preflight token — change nothing: the record selection and census run read-only before the effect store is opened, and the effect takes the admission lock without fencing, re-reads the record under it, and only a matching token reaches the commit; the admission fence is written after it. The durable hold intent (the derived holding name and the verified root identity) is the commit point. Every refusal and every I/O failure before that intent — an invalid or changed slot, the census, a stale token, a refused held-row/tree validation, a pending reconciliation, a capacity/rank check — leaves the pool bytes and identity unchanged; the admission fence is written only after the commit, never before it. Writing the intent itself replaces the ledger before it syncs the parent directory, so a failure during that write is classified by re-reading the ledger: a visible intent, or an unreadable ledger, is conservatively post-commit (the intent may be durable) with the tree still at its path; only a write that left the old ledger in place is a byte-identical pre-commit refusal. The held eviction itself is a two-durable-step library transaction: the intent is durable before the rename, and the slot row moves to the holding row in one durable write after it. A post-commit I/O failure is not a no-change refusal: before the rename the slot stays held with its tree at its path (the next locked open clears the stale intent); between the rename and the row write the tree sits in the holding area under the recorded intent while the row stays held (the next locked open adopts it by that identity and writes the holding row); a rename whose identity could not be observed is reported as unverified, never as this slot's tree; a swapped source is contained under `.unverified-<name>` with an atomic no-replace rename (`RENAME_EXCL`) when it succeeds, or reported as left at the derived name when it fails, with a pre-existing containment entry preserved byte for byte, the object never reported as the slot tree, adopted or deleted as one and the verified tree never claimed moved; a pre-existing derived or containment name found before the rename is a pre-rename failure reported as "not moved" with the entry never attributed to this slot by name; the record stays quarantined until a retry or recovery concludes it. The command then exits nonzero with a truthful committed-but-unfinished state name; the slot is never idle, adopted or deleted outside the holding protocol, and its bytes stay conservatively charged. Whether post-commit failures fall under the no-change refusal gate is settled for this brief by `precommit_refusals_and_postcommit_recovery`: pre-commit is byte-identical, post-commit is crash-safe partial state. Injected intent-directory-sync, post-intent rename, post-rename observation, swapped-source containment, failed-containment, pre-existing containment-name and derived-name-collision failures exercise the class, the charge, the truthful failure state, the never-adopt/never-delete ownership rule and the recovery.
 - **Fallback.** While the volume is absent, selection falls back to the internal pool exactly as in part 1; a lost slot is not an active command, so it does not count toward the host-wide build limit. Interrupted `run` and `test` commands are not replayed; the next `run` or `test` builds through the internal slot and executes the checkout's `target` output.
 - **Final outputs.** `CARGO_TARGET_DIR` stays `<checkout>/target` whatever pool holds the intermediates, so binaries built while docked remain at the checkout after the drive is removed. No opt-in to follow the pool exists; selecting another pool never moves or deletes outputs.
-- **Status.** With the volume present, a lost slot reads `retired and held, never reused (lost with the removable volume; deleted whole when the volume returns)` or `(quarantined: …)`; a quarantined record whose holder predates the current boot session reads `(lost with the removable volume and …; its holder predates this boot session, so it is deleted whole when the volume returns)`. With the volume absent, the removable block lists each lost slot from the internal control state, read-only, with the same boot-session wording.
+- **Status.** With the volume present, a lost slot reads `retired and held, never reused (lost with the removable volume; deleted whole when the volume returns)` or `(quarantined: lost with the removable volume and …; kept with its bytes, never reused or deleted; release with `oxide pool release-quarantined <slot>` once its writers are stopped)`; a quarantined record whose holder predates the current boot session reads `(lost with the removable volume and …; its holder predates this boot session, so it is deleted whole when the volume returns)`. With the volume absent, the removable block lists each lost slot from the internal control state, read-only, with the same boot-session wording.
 - **State.** The lost entry adds an optional `lost` field to the record and a `lost` flag to the flush log in the removable pool's internal `state.json`. An `oxide` binary built before part 2 refuses that state (unknown field) rather than reusing a lost slot.
 
 **Proof.** `effigy rust:oxide-removable-removal` (heavy) runs `scripts/test-oxide-removable-removal.py` as the whole command of the qualified shared proof supervisor (`bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512`, oxide#109): writes and evidence stay under its scratch and evidence directories, work stops 30 s before its deadline and the supervisor decides closure and cleanup. The explicit internal root is the owner-accepted internal-placement exception (decision `bd357a4c`, the same one the boot-closure mode needs): the proof's directory-budget pool is genuinely internal and the product refuses an internal pool on an external volume, so the selected-volume default could only reach that refusal. The script reuses the #104 script's child runner and staging. It stages this clean HEAD's `oxide` offline with 1.97.1 under an empty `RUSTC_WRAPPER`, then, with a private `HOME`, `CARGO_HOME` and budget-only internal pool, attaches and registers one owned 128 MiB scratch APFS image at a unique `/Volumes/<name>`. Every attach and re-attach uses `hdiutil -owners on`, and a bounded read-only `/sbin/mount` observation asserts that the mounted root carries no `noowners` flag (MNT_IGNORE_OWNERSHIP), because the product refuses an ignore-ownership mount root at registration; the pure self-check pins that one option list (with the observation refusing both an ignore-ownership mount and a listing without this image) and that `Volume.attach` uses it, so the main mode and the boot-closure mode cannot diverge (oxide#191). The mounted payload is counted through the image's backing file in the scratch. Surprise removal is `hdiutil detach -force` of that image's own whole-disk device, positively bound just before (image path owns device and mount, mount is the recorded volume UUID), in three predeclared cases: an idle flushed slot survives removal and re-attach warm with an internal fallback build in between; a build whose build script blocks in its slot (its executable on the volume) is ended by the removal stop and fails, a late file write and directory creation into its slot path (by the build script when it gets that far, and by the unprivileged proof script) fail, the slot is recorded lost, `status` lists it with the volume absent, internal fallback `build`, `run` and `test` use checkout-local outputs, and after re-attach the next build deletes the lost slot whole and keeps the idle one; the same with `OXIDE_ALLOW_RUSTC_WRAPPER=1` is quarantined, kept with its bytes after re-attach and not deleted. After each removal `/Volumes` is root-owned without group or other write, the mount point is gone (or root-owned and not writable), and an unprivileged create under it is refused without creating anything. A checkout binary built while docked runs after removal. The forced detach never targets anything but the recorded scratch image. This script no longer detaches after a launch: every attach publishes one post-census detach request (oxide#191, decision `ee263cea`, [protocol](#shared-proof-supervisor)) naming that image's backing, mount, device and volume UUID, and the qualified guard performs at most one ordinary detach of exactly that image after its own post-leader census, keeping the mount, backing and evidence whenever it cannot establish closure; an in-script detach happens only before any child launch and withdraws the request first. Result lines report that request, never a detach this script did not perform. An exact-head review found the earlier success-path detach ran before the guard's census, so custody moved into the guard's post-census step. Not a benchmark or real-drive qualification: a real USB/Thunderbolt disconnect and a long-lived wrapper server are not exercised. **Run history, preserved.** The 2026-10-30 QA baseline at `1d6312d` found this selector red with `registration failed`: the product correctly refused its image with `the mounted root is not provably closed to this user: … MNT_IGNORE_OWNERSHIP`, because the script attached without `-owners on` while the newer proofs already did. That is a stale proof premise, not a product regression; oxide#191 adds the owners-on attach, the mount observation and the self-check pin. Both modes stage through the shared `layout.stage_at` helper's narrowly scoped `retain_stage_root=True` opt-in, which keeps the staged Cargo tree inside the guard's owned root for its post-leader census while the helper's default still removes it for every other selector; and a failure after any child launch, a diagnostic collection that RETURNS with any recorded failure, abort, skip or unexecuted case, and any unreaped child all keep the mount and its backing for the guard's post-leader census rather than detaching them; only a child-free failure and a fully clean collection detach ordinarily. The recorded result line follows that top-level decision in both modes (the focused mode returns a `{custody}` placeholder that `main` fills after `retain_for_census`), so a retained mount is never reported as a detach. The pure self-check drives the real helper route for both retention modes and the main-path custody matrix for both modes. With owners honored the script then reached a second stale premise — the product correctly refusing its internal directory-budget pool on the external selected volume — so the selector now passes `--root-parent /private/tmp`, the owner-accepted internal-placement exception `bd357a4c` the boot-closure mode already needed. A counted author native then passed at `2a409d5`: 29 s script time, monitored owned peak 99.7 MiB of 512 MiB, host free minimum 2196.0 GiB, the idle slot warm across removal, the held build stopped with exit 143 and its lost slot deleted whole after re-attach, and the wrapper-allowed slot quarantined and kept. That pass stays historical at that script. The exact-head review then required the uncounted keep-going diagnostic the repository policy demands before a counted native: the main mode is now a fixed `idle` → `held` → `held-delete` → `quarantine` case map with `--diagnostic` (`effigy rust:oxide-removable-removal:diagnostic`), an effect-free `--plan` (`effigy proof:removable-removal:plan`), and the nine premise dispositions the pure self-check binds to the actual fixture environment (private HOME and invoking rustup home, `OXIDE_TEST_HOME_FROM_ENV=1`, the isolation scrub, the frozen `RUSTFLAGS` with no encoded value and a refusal of an inherited `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS` before staging, the owner-scoped scratch, and `TMPDIR`/`TMP`/`TEMP` on it). Its first diagnostic exposed two fixture defects rather than product findings, both now fixed and pinned: a forced detach can leave a stale *detached* hdiutil entry, so custody is defined as a *mounted* entry of this image (a real second mount still refuses), and a case that failed before its `finish` left its child in the guard's census, which the guard honestly reported as `UNCLOSED`; each case now reaps its own child positively. After that repair the diagnostic completed 4/4 cases at `558469a` (37 s script time, guarded owned peak 85.4 MiB of 512 MiB, closed, no deadline) and the counted author native passed at the same head (28 s script time, guarded owned peak 85.4 MiB of 512 MiB, host free minimum 2195.8 GiB, closed/status 0/no deadline). A second exact-head review then found two source defects, fixed without running either selector. A timed-out or otherwise unclassifiable child, writer, mount, device or custody outcome aborts the collection and is recorded as `aborted` with the remaining cases `unexecuted`; only an `oracle(...)` product expectation is recoverable, and the receipt keeps fault, abort and unexecuted truthfully. Staging now runs inside `staging_environment_scrubbed`, which removes every inherited `OXIDE_`/`XDG_`/`CARGO_`/`SCCACHE_`/`RUSTC*` key and restores only the invoking `CARGO_HOME` (set explicitly), and the fixture environment drops all `CARGO_*`/`SCCACHE_*`; the pure self-check pins both, including the staging scrub's restoration on the failure path. The `558469a`/`a0804fa` receipts stay historical at those heads. The first diagnostic at `9459ebe` then failed in setup before any case (`KeyError: 'OXIDE_PROOF_DEADLINE_NS'`): that scrub deleted the guard's own control variables, which the shared `layout.stage_at` → `work_left()` path reads to bound each staged child. That packet is historical with no credit. A narrow correction keeps exactly `GUARD_CONTROLS` (`OXIDE_PROOF_DEADLINE_NS`, `OXIDE_PROOF_EVIDENCE`) visible through the scrub while removing every fixture-facing `OXIDE_*` value, and a setup exception now records the real fault as `aborted` with all four cases `unexecuted` (a marker-style `OracleFailure` still records `failed: [[setup, …]]`) rather than an empty, fault-less receipt; the pure self-check exercises the guard-control visibility through `layout.work_left()` and both setup-abort receipt shapes. A further correction binds the run to its source before any effect: `resolve_source` requires both git calls to exit 0, a nonempty exact 40-hex commit identity and a clean tracked worktree — a nonzero exit with empty stdout is never a clean worktree — and a lookup that dies, times out or is interrupted, a nonzero exit, a non-exact identity and a dirty tracked worktree all abort inside the receipt-writing path with the fault, the abort and every planned case `unexecuted`, never reaching staging, image creation or attachment; both modes are gated the same way and the constructors refuse an unvalidated source. The pure self-check covers every source-gate branch plus the clean identity that reaches setup with exactly that source. The corrected head needs a fresh diagnostic and counted native under separate owner activation, and the earlier `UNCLOSED` packet's attached image (`/dev/disk4`, `/Volumes/OxRm05494fb1`) and its backing remain retained, untouched evidence.
 
-**Boot-session closure proof (oxide#161).** `effigy rust:oxide-removable-boot-closure` (heavy) is the same script's focused `--boot-closure` mode under the qualified shared proof supervisor (`bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512`); the explicit internal root is the owner-accepted internal-placement exception because the fixture's directory-budget internal pool is genuinely internal, and it stays inside the same monitored 512 MiB root. It stages this HEAD's debug `oxide` offline with 1.97.1 (the one allowed seam is the debug-only `OXIDE_TEST_BOOT_MS` override, honored only under the supervisor's own canonical scratch/evidence/deadline layout and absent from release builds), registers one owned 128 MiB scratch APFS image at a unique `/Volumes/<name>` in permanent mode (the same owners-on attach and mount observation as the main mode, oxide#191) with a private `HOME` and `CARGO_HOME`, and makes every quarantine with the product's own removal path (`oxide exec` on a blocking tool, `hdiutil detach -force` of the image's positively bound device: the removal stop ends the tool and the release flush fails with the mount gone, so the lost record names the exec holder and is quarantined); no state file is edited and no other debug seam is used. Three independent cases run over separate checkouts: a quarantined `exec` slot whose override boot time follows its holder start is reported closed by `status`, an explicit `outputs adopt` of a whole-target fixture then migrates, and the next admission deletes the slot whole with the boot-session line and no record left (the oracle names the slot's own leaf, never the project-label folder, and checks the leaf gone with the folder still present); a slot whose override boot time precedes its holder start stays kept with its directory, record and status line; an unreadable override stays kept. Custody is the same post-census detach request as the main mode (oxide#191): the guard detaches only that recorded scratch image, only after its own census, and keeps the mount and backing otherwise. `effigy rust:oxide-removable-boot-closure:diagnostic` is the same guard, root and limits with `--diagnostic` appended: the uncounted collection mode records reached, completed and failed cases, continues into the independent cases, stops on any child, volume, device or custody outcome it cannot classify, and writes one bounded `qualified: false` receipt beside the guard's; it is never a counted native PASS. `effigy rust:oxide-removable-boot-closure:test` runs only the script's pure `--self-check` (no child, pool, image or device): it pins the full fixture environment every boot-closure child receives, `status` included, against a child handed only the override; the deletion oracle's slot-leaf resolution — the slot's own `<profile>-<id>` leaf, resolved by the recorded id, inside its project folder and never that folder, with a counterfactual in which a resolver returning `slots/<folder>` is refused; the bounded, unqualified diagnostic receipt and its `json` document; the one owners-on attach option list every mode shares, with the `/sbin/mount` observation refusing an ignore-ownership mount and a listing without this image and `Volume.attach` pinned to it (oxide#191); the argument dispatch; and the product's own deletion line the candidate marker quotes. The first exact-head review found the missing `json` import and reported a partial `status` environment; both apparatus defects are fixed and pinned there before any native activation. The second found the before-boot deletion oracle naming the project-label directory `slots/<folder>` rather than the slot leaf — the deleting admission creates a fresh slot of the same project in that folder, so the folder could neither prove nor disprove whole-slot deletion. That oracle now resolves the leaf before the build from the recorded id alone, requires the leaf (not the folder) to be present before the deletion, and, after the admission, requires the leaf gone, the project folder still present and the state record removed. No native run of either selector has happened yet, so its fit is unmeasured. Not a benchmark, real-drive qualification or an alias for full QA.
+**Boot-session closure proof (oxide#161).** `effigy rust:oxide-removable-boot-closure` (heavy) is the same script's focused `--boot-closure` mode under the qualified shared proof supervisor (`bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512`); the explicit internal root is the owner-accepted internal-placement exception because the fixture's directory-budget internal pool is genuinely internal, and it stays inside the same monitored 512 MiB root. It stages this HEAD's debug `oxide` offline with 1.97.1 (the one allowed seam is the debug-only `OXIDE_TEST_BOOT_MS` override, honored only under the supervisor's own canonical scratch/evidence/deadline layout and absent from release builds), registers one owned 128 MiB scratch APFS image at a unique `/Volumes/<name>` in permanent mode (the same owners-on attach and mount observation as the main mode, oxide#191) with a private `HOME` and `CARGO_HOME`, and makes every quarantine with the product's own removal path (`oxide exec` on a blocking tool, `hdiutil detach -force` of the image's positively bound device: the removal stop ends the tool and the release flush fails with the mount gone, so the lost record names the exec holder and is quarantined); no state file is edited and no other debug seam is used. Four independent cases run over separate checkouts: a quarantined `exec` slot whose override boot time follows its holder start is reported closed by `status`, an explicit `outputs adopt` of a whole-target fixture then migrates, and the next admission deletes the slot whole with the boot-session line and no record left (the oracle names the slot's own leaf, never the project-label folder, and checks the leaf gone with the folder still present); a slot whose override boot time precedes its holder start stays kept with its directory, record and status line; an unreadable override stays kept; and the operator-confirmed release (oxide#196) uses an `oxide exec` tool that forks a child which leaves the product's exec group — the removal stop signals that group — by joining the supervisor's own leader process group (`FIXTURE_LEADER_PGID`) and holding a file in its slot scratch; the product's stop cannot end it, the supervisor can census and signal it, and the proof confirms the child's group before the removal. The child publishes readiness only after it observes the scratch path absent (the detach) and then present again (the re-attach), opening a fresh handle on the returned tree; a pre-detach handle or a readiness written before removal is never accepted. It redirects its inherited standard streams to `/dev/null` and closes the other inherited descriptors before it waits, so the proof's pipe wait cannot be held open by it. With that escaped exec writer alive the release refuses without the flag, refuses with the flag (naming the process) and refuses a dry run, all with the state and ledger bytes unchanged; once the proof stops the writer, a dry run reports the clean census and changes nothing, and the release succeeds, prints its slot/bytes/census/flag line and the usual deletion line, deletes the slot leaf through the holding area with the project folder and no record left, and leaves `status` without the slot. The writer is stopped in a `finally` and bounded by its stop file. Custody is the same post-census detach request as the main mode (oxide#191): the guard detaches only that recorded scratch image, only after its own census, and keeps the mount and backing otherwise. `effigy rust:oxide-removable-boot-closure:diagnostic` is the same guard, root and limits with `--diagnostic` appended: the uncounted collection mode records reached, completed and failed cases, continues into the independent cases, stops on any child, volume, device or custody outcome it cannot classify, and writes one bounded `qualified: false` receipt beside the guard's; it is never a counted native PASS. `effigy rust:oxide-removable-boot-closure:test` runs only the script's pure `--self-check` (no child, pool, image or device): it pins the full fixture environment every boot-closure child receives, `status` included, against a child handed only the override; the deletion oracle's slot-leaf resolution — the slot's own `<profile>-<id>` leaf, resolved by the recorded id, inside its project folder and never that folder, with a counterfactual in which a resolver returning `slots/<folder>` is refused; the bounded, unqualified diagnostic receipt and its `json` document; the one owners-on attach option list every mode shares, with the `/sbin/mount` observation refusing an ignore-ownership mount and a listing without this image and `Volume.attach` pinned to it (oxide#191); the escaped exec writer's syntax, exec-group escape and supervisor-leader-group membership, its exercised detach/re-attach readiness state machine, the release oracle's `process <pid>` form, the argument dispatch; and the product's own deletion line the candidate marker quotes. The first exact-head review found the missing `json` import and reported a partial `status` environment; both apparatus defects are fixed and pinned there before any native activation. The second found the before-boot deletion oracle naming the project-label directory `slots/<folder>` rather than the slot leaf — the deleting admission creates a fresh slot of the same project in that folder, so the folder could neither prove nor disprove whole-slot deletion. That oracle now resolves the leaf before the build from the recorded id alone, requires the leaf (not the folder) to be present before the deletion, and, after the admission, requires the leaf gone, the project folder still present and the state record removed. An owner-activated `rust:oxide-removable-boot-closure` diagnostic at `8f7573b` reached 3/4 and failed: the escaped-writer case exited 143 and quarantined its slot, but the release-quarantined case refused because macOS hid `UserEventAgent` descriptor 6. The counted author and independent reviewer natives were not run at that head, and that packet is historical with no proof credit. At the published `a04d587` head, under Tom's direct-execution exception `d3d61247` (admission decision `7b4b55d3`), the clean boot-closure diagnostic completed 4/4 with zero failures and the counted author native passed; a separate fresh subagent in its own worktree ran the counted independent reviewer native and it passed, with all sessions closed by a qualified post-census detach. Archive `/Volumes/Builds/scratch/oxide/evidence-196-a04d587-20261101T014402Z` (NOTE.md, sessions.jsonl, SHA256SUMS) records the exception, executors and evidence; the earlier failed `8f7573b` packet remains historical with no proof credit, and the merge hold stays until the final review passes. Not a benchmark, real-drive qualification or an alias for full QA.
 
 Author evidence (2026-10-22, two submissions, both spent), both under the oxide#109 guard (`bounded-test.py` SHA-256 `8e379c93…`); the selector now runs the merged oxide#114 guard (`d89115f1…`). The independent reviewer ran the proof once at final head `78b21f8` under that guard: supervisor closed with exit 0, all three removal cases passed, script time 74 s, owned peak 66.0 MiB of 512 MiB and sampled host free minimum 668.1 GiB. The held build stopped with exit 143, its slot was deleted after re-attach, the idle slot stayed warm, the quarantined slot was retained, and checkout-local fallback `run` and `test` passed. All four exact-head review gates passed. This is reviewer evidence at the final head; the author runs below retain their original heads and guard hashes. The branch was then merged with main (#114, #115) and the covering checks rerun at that head. The first, at `ef45b07` (before the removal stop), failed: the held build did not exit within 60 s after the forced detach because its build script, running from the removed volume, spun at full CPU; the supervisor reported `UNCLOSED` and kept the scratch, and SIGTERM to that build script then ended it and its Cargo. The second, at `7b45a2a`, passed in 57 s of script time (supervisor `closed`, owned bytes peak 65.4 MiB of 512 MiB, host free minimum 667.9 GiB). The removal stop sent TERM 24 ms after it sampled the missing volume, the held and quarantined builds exited 143 (Cargo ended by TERM), the lost slot's directory was still on the image after re-attach and was deleted, the quarantined slot's directory was kept, and the idle slot was reused warm. A forced detach of a disk image flushed more than a yanked cable may; neither persistence result is a claim about real drives.
 
@@ -5581,8 +5951,9 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
 - **Focused proof of absent checkout chains (oxide#135).** The one fixed proof
   is `effigy rust:prune-absence` (`scripts/test-prune-absence.py` under this
-  tree's shared supervisor `0848974d…`, the merged oxide#151 guard plus
-  oxide#191's opt-in post-census detach) with
+  tree's shared supervisor `94b1aba6…`, the merged oxide#151 guard plus
+  oxide#191's opt-in post-census detach and oxide#197's ancestor-chain
+  exclusion) with
   `--root-parent /private/tmp`, the owner-accepted internal-placement exception
   (decision `bd357a4c`): the missing-chain fixtures must be on the boot Data
   volume, and the fixture's directory-budget pool is a genuine internal pool.

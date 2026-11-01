@@ -12,7 +12,9 @@ disk is never filled.
 Every fixture process first resets and unblocks SIGALRM and arms an interval
 timer to FIXTURE_DEADLINE_NS, an absolute CLOCK_UPTIME_RAW deadline in the
 environment, so a late descendant exits at once. Ordering: case verdict
-(45 s) < fixture fallback (60 s) < qualification (420 s). A case asserts its
+(45 s; the detach class uses its own 75 s outer window, because its nested guard
+has a 40 s stop and a 58 s exit) < fixture fallback (60 s) < qualification
+(600 s). A case asserts its
 verdict before the fallback; fallback expiry never counts as closure.
 
 Real case directories go in the outer supervisor's evidence directory
@@ -31,11 +33,13 @@ import io
 import json
 import os
 import plistlib
+import re
 import secrets
 import shutil
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -291,8 +295,7 @@ def escaped_writer_problems(facts):
             problems.append(f"a signal targeted the escaped writer or the suite: {target}")
     for target in facts.get("session_targets") or []:
         # oxide#195 (ruling c096c8fc): no non-held session identity is ever
-        # signalled, so no such record may exist at all - least of all for the
-        # escaped writer or the suite.
+        # signalled, so no such record may exist at all.
         problems.append(f"a non-held session signal record exists: {target}")
     for pin in facts.get("signal_pins") or []:
         if pin not in ("leader", "monitor"):
@@ -377,7 +380,11 @@ class _ReleasedReceiver:
 
 class PureGuard(unittest.TestCase):
     def guard(self):
-        return bounded.Guard(start_ns=1000 * NS)
+        # Steady-state cases: sampling began with the run, so the freshness window
+        # is measured from the first reading exactly as before this correction.
+        guard = bounded.Guard(start_ns=1000 * NS)
+        guard.sampling_ns = 1000 * NS
+        return guard
 
     def test_low_reading_latches_and_never_clears(self):
         guard = self.guard()
@@ -456,6 +463,120 @@ class PureGuard(unittest.TestCase):
         self.assertIn("over the", guard.fault)
 
 
+class PureFreshnessClock(unittest.TestCase):
+    """Decision 50acd33b: freshness measures the steady-state sampling window
+    from when sampling actually began; setup is bounded by its own deadline."""
+
+    START = 1000 * NS
+
+    def test_a_bounded_setup_longer_than_one_second_does_not_latch(self):
+        # (a) A cold setup (the bounded startup sweep can take >1 s) inside its own
+        # deadline launches and closes: no reading exists yet, and nothing is stale.
+        guard = bounded.Guard(self.START)
+        self.assertIsNone(guard.check(self.START + 2 * bounded.NS),
+                          "a bounded setup must not be a freshness fault")
+        # Sampling begins (the monitor's ready) with its first completed readings.
+        guard.sampling_ns = self.START + 2 * bounded.NS
+        guard.reading({"kind": "reserve", "value": 500 * bounded.GIB,
+                       "at": self.START + 2 * bounded.NS, "completed": self.START + 2 * bounded.NS})
+        guard.reading({"kind": "scratch", "value": 0, "complete": True,
+                       "at": self.START + 2 * bounded.NS, "completed": self.START + 2 * bounded.NS})
+        self.assertIsNone(guard.check(self.START + 2 * bounded.NS + bounded.NS // 2))
+        self.assertIsNone(guard.fault)
+
+    def test_the_custodian_start_counterfactual_would_have_refused_that_setup(self):
+        # (b) The old rule measured an absent reading from custodian start_ns; it
+        # would call this healthy 2 s setup stale, so the two rules are
+        # discriminating rather than both permissive.
+        def old_rule(guard, now):
+            for at, stale in ((guard.reserve_at, bounded.RESERVE_STALE_NS),
+                              (guard.scratch_at, bounded.SCRATCH_STALE_NS)):
+                if now - (guard.start_ns if at is None else at) > stale:
+                    return True
+            return False
+
+        guard = bounded.Guard(self.START)
+        now = self.START + 2 * bounded.NS
+        self.assertTrue(old_rule(guard, now), "the superseded start-based rule must fail this case")
+        self.assertIsNone(guard.check(now), "the corrected sampling-based rule must not")
+
+    def test_no_sample_within_one_second_after_sampling_began_still_latches(self):
+        # (c) Once sampling began, an absent reserve reading is stale after 1 s.
+        guard = bounded.Guard(self.START)
+        guard.sampling_ns = self.START + 2 * bounded.NS
+        self.assertIsNone(guard.check(self.START + 2 * bounded.NS + bounded.NS))
+        self.assertIn("reserve readings stale",
+                      guard.check(self.START + 2 * bounded.NS + bounded.NS + 1))
+        # The owned-byte window is unchanged at 10 s; keep the reserve reading
+        # fresh so only the scratch rule is under test.
+        guard = bounded.Guard(self.START)
+        guard.sampling_ns = self.START
+        guard.reading({"kind": "reserve", "value": 500 * bounded.GIB,
+                       "at": self.START + 10_900_000_000, "completed": self.START + 10_900_000_000})
+        self.assertIsNone(guard.check(self.START + 10 * bounded.NS))
+        self.assertIn("scratch readings stale", guard.check(self.START + 11 * bounded.NS))
+
+    def test_a_setup_stall_beyond_its_deadline_still_launches_nothing(self):
+        # (d) The setup deadline is unchanged and independent of freshness: past it
+        # the launch is abandoned with one bounded reason, whatever the readings.
+        custodian = bounded.Custodian(["true"], limit_s=300)
+        custodian.start = self.START
+        custodian.absolute = self.START + 300 * bounded.NS
+        custodian.stop_at = custodian.absolute - bounded.STOP_RESERVE_S * bounded.NS
+        custodian.exit_at = custodian.absolute - bounded.EXIT_MARGIN_S * bounded.NS
+        custodian.setup_at = min(self.START + bounded.SETUP_S * bounded.NS, custodian.stop_at)
+        self.assertFalse(custodian.setup_expired(self.START + bounded.SETUP_S * bounded.NS - 1))
+        self.assertTrue(custodian.setup_expired(self.START + bounded.SETUP_S * bounded.NS))
+        # Freshness state cannot move the setup deadline.
+        before = custodian.setup_at
+        custodian.guard = bounded.Guard(self.START)
+        custodian.guard.sampling_ns = self.START
+        self.assertEqual(custodian.setup_at, before)
+        custodian.monitor = 1234
+        custodian.not_launched = "monitor setup failed or slow"
+        custodian.signal_pinned = lambda pid, number, group: None
+        custodian.reap = lambda pid: 0
+        custodian.pump = lambda timeout: None
+        captured = []
+        with patched(bounded, "report", lambda text, fd=2: captured.append(text)):
+            with patched(bounded, "now_ns", lambda: self.START + 11 * bounded.NS):
+                self.assertEqual(custodian.abandon_launch(), 125)
+        self.assertEqual(len(captured), 1)
+        self.assertIn("not launched", captured[0])
+
+    def test_ready_starts_the_freshness_clock_at_the_custodian(self):
+        # Wiring: only a valid `ready` starts sampling, and a refused one does not.
+        custodian = bounded.Custodian(["true"], limit_s=300)
+        custodian.start = self.START
+        custodian.guard = bounded.Guard(self.START)
+        read_end, custodian.cmd_w = os.pipe()
+        self.addCleanup(os.close, read_end)
+        self.addCleanup(os.close, custodian.cmd_w)
+        custodian.run_id = "r"
+        custodian.leader = 4242
+        ready = {"run": "r", "seq": custodian.monitor_seq + 1, "leader": None, "type": "ready",
+                 "at": self.START + 2 * bounded.NS}
+        custodian.accept(ready)
+        self.assertIn("ready before setup", custodian.guard.fault or "")
+        self.assertIsNone(custodian.guard.sampling_ns, "a refused ready must not start the clock")
+        custodian.guard.fault = None
+        custodian.paths = {"owned": False}
+        custodian.accept({"run": "r", "seq": custodian.monitor_seq + 1, "leader": None, "type": "ready",
+                          "at": self.START + 2 * bounded.NS})
+        self.assertIn("ready before completed readings", custodian.guard.fault or "")
+        self.assertIsNone(custodian.guard.sampling_ns)
+        custodian.guard.fault = None
+        custodian.guard.reading({"kind": "reserve", "value": 500 * bounded.GIB,
+                                 "at": self.START + 2 * bounded.NS, "completed": self.START + 2 * bounded.NS})
+        custodian.guard.reading({"kind": "scratch", "value": 0, "complete": True,
+                                 "at": self.START + 2 * bounded.NS, "completed": self.START + 2 * bounded.NS})
+        with patched(bounded, "now_ns", lambda: self.START + 2 * bounded.NS):
+            custodian.accept({"run": "r", "seq": custodian.monitor_seq + 1, "leader": None,
+                              "type": "ready", "at": self.START + 2 * bounded.NS})
+        self.assertTrue(custodian.ready)
+        self.assertEqual(custodian.guard.sampling_ns, self.START + 2 * bounded.NS)
+
+
 class PurePrecedence(unittest.TestCase):
     def test_order(self):
         code = bounded.exit_code
@@ -502,15 +623,28 @@ def _fake_libc(entries, errors=None):
 
 
 class FakeTable:
-    def __init__(self, rows, sessions, reread=None):
+    def __init__(self, rows, sessions, reread=None, groups=None):
         self.rows, self.sessions, self.rereads = rows, sessions, reread or {}
+        self.groups = groups or {}
         self.reads = 0
+        self.reads_by_pid = {}
+        self.session_reads = {}
 
     def snapshot(self):
         return list(self.rows)
 
     def getsid(self, pid):
         value = self.sessions[pid]
+        if isinstance(value, list):  # per-PID sequence; the last entry repeats
+            index = self.session_reads.get(pid, 0)
+            self.session_reads[pid] = index + 1
+            value = value[min(index, len(value) - 1)]
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    def getpgid(self, pid):
+        value = self.groups.get(pid, pid)
         if isinstance(value, BaseException):
             raise value
         return value
@@ -518,6 +652,10 @@ class FakeTable:
     def reread(self, pid):
         self.reads += 1
         value = self.rereads.get(pid, "rows")
+        if isinstance(value, list):  # per-PID sequence; the last entry repeats
+            index = self.reads_by_pid.get(pid, 0)
+            self.reads_by_pid[pid] = index + 1
+            value = value[min(index, len(value) - 1)]
         if callable(value):
             value = value(self.reads)
         if isinstance(value, BaseException):
@@ -527,9 +665,10 @@ class FakeTable:
         return next((r for r in self.rows if r["pid"] == pid), None)
 
 
-def census(table, sid=100, terminal_allowed=False):
+def census(table, sid=100, terminal_allowed=False, ancestors=()):
     return bounded.Census(sid, snapshot=table.snapshot, getsid=table.getsid, reread=table.reread,
-                          pause=lambda _seconds: None, terminal_allowed=terminal_allowed)
+                          pause=lambda _seconds: None, terminal_allowed=terminal_allowed,
+                          ancestors=ancestors, getpgid=table.getpgid)
 
 
 class PureCensus(unittest.TestCase):
@@ -600,6 +739,492 @@ class PureCensus(unittest.TestCase):
 
         result = bounded.Census(100, snapshot=broken).round()
         self.assertFalse(result["certain"])
+
+
+class PureAncestors(unittest.TestCase):
+    """Oxide#197 (design ruling ea5a3dc9): only structural launcher facts may
+    exclude a post-leader census row, and nothing else is relaxed."""
+
+    LAUNCHER = (700, 11)  # a recorded ancestor (this suite, under the outer guard)
+
+    @staticmethod
+    def chain(levels):
+        """Snapshot rows for a real ppid chain of (pid, start, ppid) levels."""
+        return [row(pid, start=start, ppid=ppid) for pid, start, ppid in levels]
+
+    def launcher_rows(self, *extra):
+        """A snapshot with the recorded launcher and any additional rows."""
+        return [row(self.LAUNCHER[0], start=self.LAUNCHER[1], ppid=600)] + list(extra)
+
+    def test_every_ancestor_to_pid_1_is_recorded(self):
+        rows = self.chain([(700, 11, 600), (600, 12, 500), (500, 13, 1), (1, 14, 0)])
+        record = bounded.ancestor_identities(snapshot=lambda: rows, parent=lambda: 700)
+        self.assertEqual((record["state"], record["stop"]), ("recorded", "pid-1"))
+        self.assertEqual(record["count"], 4)
+        self.assertEqual([(i["pid"], i["start"], i["level"]) for i in record["identities"]],
+                         [(700, 11, 1), (600, 12, 2), (500, 13, 3), (1, 14, 4)])
+
+    def test_an_ancestor_is_reverified_before_it_is_excluded(self):
+        # The identity is re-read through the safe reader after the snapshot,
+        # so exclusion needs that read to still name the same identity.
+        table = FakeTable([row(700, start=11)], {700: ProcessLookupError(errno.ESRCH, "gone")})
+        check = census(table, ancestors=[self.LAUNCHER])
+        result = check.round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
+        self.assertEqual(table.reads, 1, "the ancestor identity was not re-verified exactly once")
+        self.assertNotIn((700, 11), check.tracked)
+        self.assertEqual(result["ancestor_exclusions"]["by_rule"]["ancestor"], 1)
+
+    def test_an_ancestor_is_not_a_member_even_in_the_leader_session(self):
+        table = FakeTable([row(700, start=11)], {700: 100})
+        result = census(table, ancestors=[self.LAUNCHER]).round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
+
+    def test_an_ancestor_identity_changing_mid_census_is_uncertain(self):
+        # The snapshot names the recorded identity, but the re-verification read
+        # shows a different process: nothing may be excluded.
+        table = FakeTable([row(700, start=11)], {700: PermissionError(1, "denied")},
+                          reread={700: row(700, start=12)})
+        result = census(table, ancestors=[self.LAUNCHER]).round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (False, 0, 1))
+        self.assertEqual(result["ancestor_exclusions"]["count"], 0)
+        # The same rule applies to the parent identity of a launcher sibling.
+        sibling = row(900, start=12, ppid=700)
+        parent_changed = FakeTable(self.launcher_rows(sibling), {700: 7, 900: PermissionError(1, "denied")},
+                                   reread={700: row(700, start=12), 900: sibling})
+        result = census(parent_changed, ancestors=[self.LAUNCHER]).round()
+        # Both the changed launcher row and its child are unaccounted here.
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 2))
+        self.assertEqual(result["ancestor_exclusions"]["by_rule"]["parent"], 0)
+
+    def test_a_recycled_pid_with_a_different_start_is_not_excluded(self):
+        table = FakeTable([row(700, start=99)], {700: ProcessLookupError(errno.ESRCH, "gone")},
+                          reread={700: row(700, start=99)})
+        result = census(table, ancestors=[self.LAUNCHER]).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual(result["uncertain_rows"][0]["pid"], 700)
+        member = FakeTable([row(700, start=99)], {700: 100})
+        self.assertEqual(census(member, ancestors=[self.LAUNCHER]).round()["members"], 1)
+
+    def test_a_non_ancestor_unreadable_row_stays_unknown(self):
+        table = FakeTable([row(700, start=11), row(701, start=5)],
+                          {700: ProcessLookupError(errno.ESRCH, "gone"),
+                           701: PermissionError(1, "denied")})
+        result = census(table, ancestors=[self.LAUNCHER]).round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (False, 0, 1))
+        self.assertEqual(result["uncertain_rows"][0]["pid"], 701)
+
+    def test_an_unreadable_chain_excludes_nothing(self):
+        def broken():
+            raise OSError(12, "injected")
+        record = bounded.ancestor_identities(snapshot=broken, parent=lambda: 700)
+        self.assertEqual((record["state"], record["count"], record["identities"]),
+                         ("unreadable", 0, []))
+        table = FakeTable([row(700, start=11)], {700: ProcessLookupError(errno.ESRCH, "gone")},
+                          reread={700: row(700, start=11)})
+        result = census(table, ancestors=record["identities"]).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+
+    def test_the_depth_bound_holds(self):
+        rows = self.chain([(pid, pid, pid - 1) for pid in range(1000, 800, -1)])
+        record = bounded.ancestor_identities(snapshot=lambda: rows, parent=lambda: 1000)
+        self.assertEqual(bounded.ANCESTOR_MAX_LEVELS, 64)
+        self.assertEqual((record["count"], record["stop"]), (64, "depth-bound"))
+        self.assertEqual(len(record["identities"]), 64)
+        self.assertEqual((record["identities"][-1]["pid"], record["identities"][-1]["level"]),
+                         (1000 - 63, 64))
+        small = bounded.ancestor_identities(snapshot=lambda: rows, parent=lambda: 1000, max_levels=3)
+        self.assertEqual((small["count"], small["stop"]), (3, "depth-bound"))
+
+    def test_the_walk_never_guesses_a_missing_level(self):
+        rows = self.chain([(700, 11, 600)])  # 600 is not in the snapshot
+        record = bounded.ancestor_identities(snapshot=lambda: rows, parent=lambda: 700)
+        self.assertEqual((record["count"], record["stop"]), (1, "not-in-snapshot"))
+        self.assertEqual(record["identities"], [{"pid": 700, "start": 11, "level": 1}])
+
+    def test_a_malformed_record_excludes_nothing(self):
+        table = FakeTable([row(700, start=11)], {700: 100})
+        for bad in ([(700,)], [(700, "11")], [(True, 11)], [(0, 11)], [("700", 11)], [None], "700"):
+            result = census(table, ancestors=bad).round()
+            self.assertEqual(result["members"], 1, bad)
+            self.assertEqual(result["uncertain"], 0, bad)
+
+    # No wall, boot or uptime fact may exclude a row (ruling ea5a3dc9).
+
+    def test_there_is_no_clock_based_exclusion_surface(self):
+        self.assertFalse(hasattr(bounded, "boot_clock_evidence"))
+        self.assertFalse(hasattr(bounded, "CLOCK_AGREEMENT_US"))
+        parameters = inspect.signature(bounded.Census.__init__).parameters
+        self.assertNotIn("start_token", parameters)
+        self.assertNotIn("boot_evidence", parameters)
+        self.assertNotIn("clock", parameters)
+
+    def early_row_table(self):
+        """A row whose start token is far earlier than any supervisor start."""
+        return FakeTable([row(800, start=1, ppid=600), row(903, start=2, ppid=800)],
+                         {800: 7, 903: PermissionError(1, "denied")})
+
+    def assert_no_clock_exclusion(self):
+        table = self.early_row_table()
+        result = census(table, ancestors=[self.LAUNCHER]).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual(result["ancestor_exclusions"]["count"], 0)
+        self.assertEqual(result["ancestor_exclusions"]["rows"], [])
+
+    def test_a_masked_backward_wall_step_never_excludes_a_row(self):
+        # A backward step that leaves the wall and monotonic readings looking
+        # consistent would have hidden an earlier-looking creation. No such fact
+        # exists in the census any more, so contradictory wall facts cannot
+        # change the classification.
+        saved = (time.time_ns, time.clock_gettime_ns)
+        self.addCleanup(lambda: (setattr(time, "time_ns", saved[0]),
+                                 setattr(time, "clock_gettime_ns", saved[1])))
+        time.time_ns = lambda: 60 * 10 ** 9            # wall clock stepped far back
+        time.clock_gettime_ns = lambda _clock: 400 * 10 ** 9   # "uptime" far ahead
+        self.assert_no_clock_exclusion()
+
+    def test_a_back_and_forth_wall_step_never_excludes_a_row(self):
+        saved = (time.time_ns, time.clock_gettime_ns)
+        self.addCleanup(lambda: (setattr(time, "time_ns", saved[0]),
+                                 setattr(time, "clock_gettime_ns", saved[1])))
+        values = iter([10 ** 18, 10 ** 9, 10 ** 18, 10 ** 9])
+        time.time_ns = lambda: next(values, 10 ** 18)
+        time.clock_gettime_ns = lambda _clock: 0
+        for _ in range(2):
+            self.assert_no_clock_exclusion()
+
+    def test_a_forward_wall_step_never_excludes_a_row(self):
+        saved = (time.time_ns, time.clock_gettime_ns)
+        self.addCleanup(lambda: (setattr(time, "time_ns", saved[0]),
+                                 setattr(time, "clock_gettime_ns", saved[1])))
+        time.time_ns = lambda: 2 * 10 ** 18            # wall clock jumped forward
+        time.clock_gettime_ns = lambda _clock: 1
+        self.assert_no_clock_exclusion()
+
+    def test_a_tracked_descendant_with_an_earlier_start_token_stays_counted(self):
+        # A member whose start token looks earlier than the supervisor's own is
+        # still a member, in the same round and across rounds.
+        member = row(500, start=1, ppid=400)
+        table = FakeTable([member], {500: 100})
+        check = census(table, ancestors=[self.LAUNCHER])
+        first = check.round()
+        self.assertEqual((first["certain"], first["members"], first["uncertain"]), (True, 1, 0))
+        second = check.round()
+        self.assertEqual((second["certain"], second["members"], second["uncertain"]), (True, 1, 0))
+        self.assertEqual(second["ancestor_exclusions"]["count"], 0, second["ancestor_exclusions"])
+
+    # The launcher-sibling rule needs a positive parent and positive isolation.
+
+    def test_a_launcher_sibling_is_excluded_only_when_outside_the_session_and_group(self):
+        sibling = row(900, start=12, ppid=self.LAUNCHER[0])
+        outside = FakeTable(self.launcher_rows(sibling), {700: 7, 900: 7}, groups={900: 900})
+        result = census(outside, ancestors=[self.LAUNCHER]).round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
+        self.assertEqual(result["ancestor_exclusions"]["rows"],
+                         [{"pid": 700, "start": 11, "rule": "ancestor"},
+                          {"pid": 900, "start": 12, "rule": "parent"}], result["ancestor_exclusions"])
+        # In the leader's session it is a member, never excluded.
+        in_session = FakeTable(self.launcher_rows(sibling), {700: 7, 900: 100})
+        result = census(in_session, ancestors=[self.LAUNCHER]).round()
+        self.assertEqual((result["members"], result["uncertain"]), (1, 0))
+        self.assertEqual(result["ancestor_exclusions"]["by_rule"]["parent"], 0)
+        # A leader group with a foreign session is not a positive decision, so
+        # the row keeps main's classification: foreign, never excluded.
+        in_group = FakeTable(self.launcher_rows(sibling), {700: 7, 900: 7}, groups={900: 100})
+        result = census(in_group, ancestors=[self.LAUNCHER]).round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
+        self.assertEqual(result["ancestor_exclusions"]["by_rule"]["parent"], 0)
+        # An unreadable session keeps main's uncertain result; an unreadable
+        # group with a readable foreign session keeps main's foreign result.
+        unreadable_session = FakeTable(self.launcher_rows(sibling),
+                                       {700: 7, 900: ProcessLookupError(errno.ESRCH, "gone")},
+                                       groups={900: 900})
+        result = census(unreadable_session, ancestors=[self.LAUNCHER]).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual(result["ancestor_exclusions"]["by_rule"]["parent"], 0)
+        unreadable_group = FakeTable(self.launcher_rows(sibling), {700: 7, 900: 7},
+                                     groups={900: OSError(1, "denied")})
+        result = census(unreadable_group, ancestors=[self.LAUNCHER]).round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
+        self.assertEqual(result["ancestor_exclusions"]["by_rule"]["parent"], 0)
+
+    def test_a_tracked_member_with_a_recorded_ancestor_parent_is_never_excluded(self):
+        # Review finding: the parent rule must not precede, or remove, tracked
+        # attribution. A row this census already accepted as a member keeps its
+        # member status even when its parent is a recorded ancestor.
+        sibling = row(900, start=12, ppid=self.LAUNCHER[0])
+        table = FakeTable(self.launcher_rows(sibling), {700: 7, 900: 100})
+        check = census(table, ancestors=[self.LAUNCHER])
+        first = check.round()
+        self.assertEqual((first["certain"], first["members"], first["uncertain"]), (True, 1, 0))
+        self.assertIn((900, 12), check.tracked)
+        self.assertEqual(first["ancestor_exclusions"]["by_rule"]["parent"], 0)
+        # The tracked veto holds on the next round even if the row's own session
+        # becomes unreadable: a member is never reclassified by a launcher rule.
+        table.sessions = {700: 7, 900: ProcessLookupError(errno.ESRCH, "gone")}
+        second = check.round()
+        self.assertEqual((second["members"], second["uncertain"]), (1, 0))
+        self.assertIn((900, 12), check.tracked)
+        self.assertEqual(second["ancestor_exclusions"]["by_rule"]["parent"], 0)
+
+    def test_a_pid_reused_between_the_sibling_reads_is_never_excluded(self):
+        # Review finding: the session/group facts must belong to the snapshot
+        # row's own identity. A replacement identity inside the observation
+        # window (the second sibling read) is never excluded as a sibling.
+        sibling = row(900, start=12, ppid=self.LAUNCHER[0])
+        table = FakeTable(self.launcher_rows(sibling), {700: 7, 900: 7},
+                          reread={900: [sibling, row(900, start=99, ppid=700)]})
+        result = census(table, ancestors=[self.LAUNCHER]).round()
+        # The replacement identity is not excluded as a sibling, and the row's
+        # own changed identity keeps it unknown under the existing rule.
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual(result["ancestor_exclusions"]["by_rule"]["parent"], 0)
+        self.assertEqual(result["ancestor_exclusions"]["rows"],
+                         [{"pid": 700, "start": 11, "rule": "ancestor"}])
+
+    def test_a_changed_ancestor_child_identity_never_falls_through_to_its_parent(self):
+        # Review finding: a failed ancestor re-verification stays unknown. The
+        # child 600 is a recorded ancestor PID with a changed start token and a
+        # stable recorded parent (700), which must not turn it into a sibling.
+        rows = [row(700, start=11, ppid=500), row(600, start=99, ppid=700)]
+        table = FakeTable(rows, {700: 7, 600: PermissionError(1, "denied")},
+                          reread={700: row(700, start=11, ppid=500),
+                                  600: row(600, start=99, ppid=700)})
+        result = census(table, ancestors=[self.LAUNCHER, (600, 12)]).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual(result["uncertain_rows"][0]["pid"], 600)
+        self.assertEqual(result["ancestor_exclusions"]["by_rule"],
+                         {"ancestor": 1, "parent": 0}, result["ancestor_exclusions"])
+        self.assertEqual(result["ancestor_exclusions"]["rows"],
+                         [{"pid": 700, "start": 11, "rule": "ancestor"}])
+
+    def test_a_foreign_ancestor_child_with_an_undecided_observation_matches_main(self):
+        # Review c4032d7b: an UNDECIDED launcher observation excludes no row and
+        # falls through to main's ordinary getsid/reread classification. A stable
+        # replacement at a recorded ancestor PID with a readable foreign session
+        # is therefore foreign, exactly as it is without the launcher rules.
+        replaced = row(700, start=99, ppid=600)
+        table = FakeTable([replaced], {700: 7}, reread={700: replaced})
+        result = census(table, ancestors=[self.LAUNCHER]).round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
+        self.assertEqual(result["ancestor_exclusions"]["count"], 0)
+        # Counterfactual: the superseded path turned the same row uncertain, so
+        # this case fails under it and only the fall-through satisfies it.
+        def superseded_launcher_path(round_result):
+            return dict(round_result, certain=False, uncertain=round_result["uncertain"] + 1)
+        superseded = superseded_launcher_path(result)
+        self.assertNotEqual((superseded["certain"], superseded["uncertain"]),
+                            (result["certain"], result["uncertain"]),
+                            "the old ambiguous path must fail this classification")
+        # A positively supervised session at that PID is still carried as a member.
+        supervised = FakeTable([row(700, start=99, ppid=600)], {700: 100},
+                               reread={700: row(700, start=99, ppid=600)})
+        result = census(supervised, ancestors=[self.LAUNCHER]).round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 1, 0))
+
+    def test_a_transient_failed_sibling_reverification_takes_main_classification(self):
+        # Review c4032d7b: a transiently failed re-verification is undecided, so
+        # it excludes nothing and the readable foreign observations classify the
+        # row exactly as main does.
+        sibling = row(900, start=12, ppid=self.LAUNCHER[0])
+        table = FakeTable(self.launcher_rows(sibling), {700: 7, 900: 7}, groups={900: 900},
+                          reread={900: [OSError(5, "transient"), sibling, sibling, sibling]})
+        result = census(table, ancestors=[self.LAUNCHER]).round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
+        self.assertEqual(result["ancestor_exclusions"]["by_rule"]["parent"], 0)
+
+    def test_a_held_suite_zombie_classifies_exactly_as_main_does(self):
+        # Review c4032d7b: a zombie's launcher rules must never change main's
+        # classification. Here the row's parent is the recorded launcher but its
+        # group read is unreadable, so the launcher decision is undecided: the
+        # terminal-allowlist and strict outcomes must match the same table with
+        # no ancestor record at all.
+        zombie = row(900, start=12, ppid=self.LAUNCHER[0], zombie=True)
+        def table():
+            return FakeTable([row(700, start=11, ppid=600), zombie],
+                             {700: 7, 900: ProcessLookupError(errno.ESRCH, "gone")},
+                             reread={900: zombie}, groups={900: OSError(1, "denied")})
+        for terminal_allowed in (True, False):
+            with_ancestors = census(table(), ancestors=[self.LAUNCHER],
+                                    terminal_allowed=terminal_allowed).round()
+            without = census(table(), ancestors=(), terminal_allowed=terminal_allowed).round()
+            self.assertEqual((with_ancestors["certain"], with_ancestors["members"],
+                              with_ancestors["uncertain"]),
+                             (without["certain"], without["members"], without["uncertain"]),
+                             terminal_allowed)
+            self.assertEqual(with_ancestors["terminal_count_status"],
+                             without["terminal_count_status"], terminal_allowed)
+            self.assertEqual(with_ancestors["terminal_nonwriters"],
+                             without["terminal_nonwriters"], terminal_allowed)
+            self.assertEqual(with_ancestors["ancestor_exclusions"]["by_rule"]["parent"], 0)
+
+    def test_an_unreadable_sibling_session_or_group_keeps_main_classification(self):
+        sibling = row(900, start=12, ppid=self.LAUNCHER[0])
+        for sessions, groups in (
+                ({700: 7, 900: ProcessLookupError(errno.ESRCH, "gone")}, {900: 900}),
+                ({700: 7, 900: 7}, {900: OSError(1, "denied")}),
+                ({700: 7, 900: 7}, {900: None})):
+            table = FakeTable(self.launcher_rows(sibling), sessions, groups=groups)
+            result = census(table, ancestors=[self.LAUNCHER]).round()
+            # Main's result: an unreadable session is uncertain; an unreadable
+            # group with a readable foreign session is foreign.
+            expected = (False, 1) if 900 in sessions and isinstance(
+                sessions.get(900), BaseException) else (True, 0)
+            self.assertEqual((result["certain"], result["uncertain"]), expected, (sessions, groups))
+            self.assertEqual(result["ancestor_exclusions"]["by_rule"]["parent"], 0)
+
+    def test_an_inside_ancestor_pid_observation_is_carried_as_a_member(self):
+        # Review finding: a positively observed leader-session member identity
+        # must not be discarded before classification, or a repeated session read
+        # could report it foreign and skip it. The first session read is the
+        # bound observation (the leader's session); every later read is foreign.
+        replaced = row(700, start=99, ppid=600)
+        table = FakeTable([replaced], {700: [100, 7, 7]}, reread={700: replaced})
+        check = census(table, ancestors=[self.LAUNCHER])
+        result = check.round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 1, 0))
+        self.assertIn((700, 99), check.tracked)
+        # Carried evidence stays a member on the next round, whatever it now reads.
+        table.sessions = {700: 7}
+        follow = check.round()
+        self.assertEqual((follow["members"], follow["uncertain"]), (1, 0))
+
+    def test_an_inside_sibling_observation_is_carried_as_a_member(self):
+        # The same rule for the launcher-sibling branch: a positive in-session
+        # observation is carried as a member instead of being re-read.
+        sibling = row(900, start=12, ppid=self.LAUNCHER[0])
+        table = FakeTable(self.launcher_rows(sibling), {700: 7, 900: [100, 7, 7]})
+        check = census(table, ancestors=[self.LAUNCHER])
+        result = check.round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 1, 0))
+        self.assertIn((900, 12), check.tracked)
+        self.assertEqual(result["ancestor_exclusions"]["by_rule"]["parent"], 0)
+        table.sessions = {700: 7, 900: 7}
+        follow = check.round()
+        self.assertEqual((follow["members"], follow["uncertain"]), (1, 0))
+
+    def test_a_sibling_spawned_mid_run_is_excluded_and_recorded(self):
+        # Round 1: the launcher alone. Round 2: an unrelated sibling appears
+        # mid-run. The same census must stay certain and record the evidence.
+        launcher, sibling = row(700, start=11, ppid=600), row(904, start=40, ppid=700)
+        table = FakeTable([launcher], {700: 7})
+        check = census(table, ancestors=[self.LAUNCHER])
+        first = check.round()
+        self.assertEqual((first["certain"], first["ancestor_exclusions"]["count"]), (True, 1))
+        table.rows = [launcher, sibling]
+        table.sessions = {700: 7, 904: 7}
+        table.groups = {904: 904}
+        second = check.round()
+        self.assertEqual((second["certain"], second["uncertain"]), (True, 0))
+        self.assertEqual(second["ancestor_exclusions"]["rows"],
+                         [{"pid": 700, "start": 11, "rule": "ancestor"},
+                          {"pid": 904, "start": 40, "rule": "parent"}])
+
+    def test_a_reused_parent_pid_is_not_a_parent_exclusion(self):
+        # The parent PID is a recorded launcher PID, but its current start token
+        # is different, so the parent is a different process.
+        rows = [row(700, start=99, ppid=600), row(900, start=12, ppid=700)]
+        table = FakeTable(rows, {700: 7, 900: PermissionError(1, "denied")},
+                          reread={700: row(700, start=99), 900: row(900, start=12, ppid=700)})
+        result = census(table, ancestors=[self.LAUNCHER]).round()
+        # The changed identity at a recorded ancestor PID falls through to main's
+        # classification (foreign here), and only the child's unreadable session
+        # stays unknown: no exclusion and no launcher-side classification.
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual(result["ancestor_exclusions"]["by_rule"]["parent"], 0)
+        self.assertEqual(result["ancestor_exclusions"]["rows"], [], result["ancestor_exclusions"])
+
+    def test_an_unknown_parent_is_never_excluded(self):
+        stranger = row(901, start=10, ppid=999)
+        table = FakeTable([stranger], {901: PermissionError(1, "denied")})
+        result = census(table, ancestors=[self.LAUNCHER]).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual(result["ancestor_exclusions"]["count"], 0)
+
+    def test_a_ppid_1_orphan_is_never_excluded(self):
+        orphan = row(902, start=10, ppid=1)
+        table = FakeTable([orphan], {902: PermissionError(1, "denied")})
+        result = census(table, ancestors=[self.LAUNCHER, (1, 14)]).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual(result["ancestor_exclusions"]["count"], 0)
+
+    def test_the_bounded_evidence_keeps_a_capped_number_of_rows(self):
+        # 30 excludable siblings: every decision is counted, rows are capped.
+        siblings = [row(900 + n, start=20 + n, ppid=700) for n in range(30)]
+        sessions = {700: 7}
+        sessions.update({900 + n: 7 for n in range(30)})
+        table = FakeTable([row(700, start=11, ppid=600)] + siblings, sessions)
+        result = census(table, ancestors=[self.LAUNCHER]).round()
+        evidence = result["ancestor_exclusions"]
+        self.assertEqual(evidence["count"], 31)  # the launcher row plus 30 siblings
+        self.assertEqual(len(evidence["rows"]), bounded.EXCLUSION_MAX_ROWS)
+        self.assertEqual(evidence["omitted"], 11, evidence)
+        self.assertEqual(evidence["rows"][0], {"pid": 700, "start": 11, "rule": "ancestor"})
+        self.assertEqual(evidence["by_rule"], {"ancestor": 1, "parent": 30})
+
+    def test_the_receipt_evidence_merges_without_raising(self):
+        receipt = {}
+        report = {"rows": [{"pid": 900 + n, "start": n, "rule": "parent"} for n in range(25)],
+                  "count": 25, "by_rule": {"ancestor": 0, "parent": 25}}
+        bounded.merge_exclusions(receipt, report)
+        record = receipt["ancestor_exclusions"]
+        self.assertEqual((record["count"], len(record["rows"]), record["omitted"]),
+                         (25, bounded.EXCLUSION_MAX_ROWS, 5))
+        self.assertEqual(record["by_rule"]["parent"], 25)
+        self.assertEqual(set(record), {"rows", "count", "omitted", "by_rule", "rounds"})
+        # A repeat of the same identities adds to the counts but not the rows.
+        bounded.merge_exclusions(receipt, report)
+        self.assertEqual((record["count"], len(record["rows"])), (50, bounded.EXCLUSION_MAX_ROWS))
+        self.assertEqual(record["omitted"], 30, record)  # count == rows + omitted
+        # A malformed or absent report changes nothing and never raises.
+        for bad in (None, {}, {"rows": "x", "count": "1", "by_rule": [], "clock": 7}, 5):
+            bounded.merge_exclusions(receipt, bad)
+        self.assertEqual((record["count"], record["omitted"]), (50, 30))
+        bounded.merge_exclusions(None, report)
+        bounded.merge_exclusions({}, {"rows": [None, {"pid": True, "start": 1, "rule": "parent"},
+                                               {"pid": 1, "start": 1, "rule": "other"}], "count": 3})
+
+    def test_the_monitor_hands_the_recorded_chain_to_the_census(self):
+        seen = []
+
+        class Recording(bounded.Census):
+            def __init__(self, sid, terminal_allowed=False, ancestors=(), getpgid=None):
+                seen.append((sid, tuple(ancestors)))
+
+            def round(self):
+                return {"certain": True, "members": 0, "uncertain": 0, "member_rows": [],
+                        "uncertain_rows": [], "terminal_count_status": "valid",
+                        "terminal_nonwriters": 0,
+                        "ancestor_exclusions": {
+                            "rows": [{"pid": 900, "start": 5, "rule": "parent"}],
+                            "count": 1, "by_rule": {"ancestor": 0, "parent": 1}}}
+
+        identities = [{"pid": 700, "start": 11, "level": 1}, {"pid": 1, "start": 14, "level": 2}]
+        ctx = {"run_id": "r", "inject": [], "terminal_mode": {"mode": "strict"},
+               "ancestors": {"state": "recorded", "count": 2, "stop": "pid-1",
+                             "identities": identities}}
+        ctl_r, ctl_w = os.pipe()
+        cmd_r, cmd_w = os.pipe()
+        out_r, out_w = os.pipe()
+        err_r, err_w = os.pipe()
+        for fd in (ctl_r, cmd_r, out_r, err_r, ctl_w, cmd_w, out_w, err_w):
+            self.addCleanup(os.close, fd)
+        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_r)
+        monitor.receipt = {"census": None, "census_rounds": 0, "settlement": monitor.settlement}
+        monitor.leader = [4242, 77]
+        monitor.census_stop = OneShotStop()
+        saved = bounded.Census
+        bounded.Census = Recording
+        try:
+            monitor.census_loop(after=7)
+        finally:
+            bounded.Census = saved
+        self.assertEqual(seen, [(4242, tuple(identities))])
+        # The round's bounded positive evidence is merged into the receipt.
+        merged = monitor.receipt["ancestor_exclusions"]
+        self.assertEqual((merged["count"], merged["rounds"]), (1, 1), merged)
+        self.assertEqual(merged["rows"], [{"pid": 900, "start": 5, "rule": "parent"}], merged)
+        self.assertEqual(merged["by_rule"]["parent"], 1, merged)
 
 
 class PureCensusFinalAbsence(unittest.TestCase):
@@ -1252,6 +1877,8 @@ class PureProtocol(unittest.TestCase):
             {"type": "census", "after": True, "members": 0, "uncertain": 0, "certain": True},
             {"type": "output_eof", "stream": "bogus"},
             {"type": "output_eof"},
+            {"type": "admission_waiting"},
+            {"type": "admission_waiting", "waited": 1},
             {"type": "reading", "kind": "reserve", "value": "big"},
             {"type": "reading", "kind": "scratch", "value": 1},
             {"type": "reading", "kind": "other", "value": 1},
@@ -1430,6 +2057,761 @@ class PureProtocol(unittest.TestCase):
         custodian.signal_pinned(5555, signal.SIGKILL, group=True)
         self.assertEqual([r["result"] for r in records], ["refused: not a pinned child"] * 2)
         self.assertEqual([r["held_unreaped"] for r in records], [False, False])
+
+
+# Admission grants (oxide#192) ---------------------------------------------------
+
+
+class PureAdmission(unittest.TestCase):
+    """The bounded admission-report protocol: a completed wait grants bounded
+    time, a waiting report never does, and each command's wait is paired only
+    with that command's own completion (oxide#192)."""
+
+    RUN = "r"
+
+    def pipe(self):
+        read_end, write_end = os.pipe()
+        os.set_blocking(read_end, False)
+        self.addCleanup(os.close, read_end)
+        return read_end, write_end
+
+    def drain(self, read_end):
+        lines, buffer = [], b""
+        while True:
+            try:
+                chunk = os.read(read_end, 65536)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            buffer += chunk
+        for line in buffer.splitlines():
+            lines.append(json.loads(line))
+        return lines
+
+    def custodian(self, limit=300, start=1000 * NS):
+        custodian = bounded.Custodian(["true"], limit_s=limit)
+        custodian.run_id = self.RUN
+        custodian.guard = bounded.Guard(start)
+        custodian.cmd_r, custodian.cmd_w = self.pipe()
+        custodian.leader = 4242
+        custodian.start = start
+        custodian.absolute = start + int(limit * NS)
+        custodian.stop_at = custodian.absolute - bounded.STOP_RESERVE_S * NS
+        custodian.exit_at = custodian.absolute - bounded.EXIT_MARGIN_S * NS
+        return custodian
+
+    def message(self, custodian, waited_ns, offset_s=1, command="c1", kind="admission"):
+        # The send stamp is the patched clock's, so the future-stamp rule is
+        # exercised separately from the grant arithmetic.
+        at = custodian.start + int(offset_s * NS)
+        return {"run": self.RUN, "seq": custodian.monitor_seq + 1, "leader": None, "type": kind,
+                "at": at, "command": command,
+                "waited_ns": waited_ns if kind == "admission" else 0,
+                "reason": "queue" if kind == "admission_waiting" else None,
+                "completed": at, "marker": 1}
+
+    def clock(self, custodian, offset_s):
+        """Drive the custodian's own CLOCK_UPTIME_RAW seam at a fixed offset."""
+        return patched(bounded, "now_ns", lambda: custodian.start + int(offset_s * NS))
+
+    def waiting(self, custodian, offset_s, command="c1"):
+        message = self.message(custodian, 0, offset_s, command, "admission_waiting")
+        message.pop("waited_ns")
+        return message
+
+    def pairs(self, custodian):
+        return custodian.admission_pairs_summary()
+
+    # Grants -----------------------------------------------------------------
+
+    def test_a_reported_wait_moves_every_deadline_by_exactly_that_wait(self):
+        custodian = self.custodian()
+        with self.clock(custodian, 150):
+            custodian.accept(self.message(custodian, 120 * NS, offset_s=150))
+        self.assertIsNone(custodian.guard.fault)
+        self.assertEqual(custodian.admission_granted, 120 * NS)
+        self.assertEqual(custodian.absolute, custodian.start + 420 * NS)
+        self.assertEqual(custodian.stop_at, custodian.start + 400 * NS)
+        self.assertEqual(custodian.exit_at, custodian.start + 418 * NS)
+        self.assertFalse(custodian.deadline_hit)
+        os.close(custodian.cmd_w)
+        records = self.drain(custodian.cmd_r)
+        grants = [r["record"] for r in records if r["record"]["event"] == "admission"]
+        self.assertEqual([(g["command"], g["waited_ns"], g["grant_ns"], g["clamped"]) for g in grants],
+                         [("c1", 120 * NS, 120 * NS, False)])
+
+    def test_a_wait_never_exceeds_this_runs_own_elapsed_time(self):
+        custodian = self.custodian()
+        with self.clock(custodian, 50):
+            custodian.accept(self.message(custodian, 10_000 * NS, offset_s=50))
+        self.assertEqual(custodian.admission_granted, 50 * NS)
+        self.assertTrue(custodian.admission_clamped)
+        self.assertEqual(custodian.absolute, custodian.start + 350 * NS)
+
+    def test_the_total_grant_never_passes_the_fixed_cap(self):
+        custodian = self.custodian()
+        custodian.record = lambda kind, **fields: None  # one grant record is already proved
+        elapsed = 0
+        for _ in range(10):  # every report is fully backed by elapsed time
+            elapsed += 200
+            with self.clock(custodian, elapsed):
+                custodian.accept(self.message(custodian, 200 * NS, offset_s=elapsed, command=f"c{elapsed}"))
+        self.assertEqual(custodian.admission_granted, bounded.ADMISSION_CAP_NS)
+        self.assertTrue(custodian.admission_capped)
+        self.assertEqual(custodian.absolute, custodian.start + 300 * NS + bounded.ADMISSION_CAP_NS)
+        with self.clock(custodian, elapsed + 1):
+            custodian.accept(self.message(custodian, 1 * NS, offset_s=elapsed + 1, command="last"))
+        self.assertEqual(custodian.admission_granted, bounded.ADMISSION_CAP_NS)
+        self.assertEqual(custodian.admission_counted, 11)
+        self.assertEqual(custodian.exit_at, custodian.absolute - bounded.EXIT_MARGIN_S * NS)
+
+    def test_nothing_is_ever_shortened(self):
+        custodian = self.custodian()
+        before = (custodian.absolute, custodian.stop_at, custodian.exit_at)
+        with self.clock(custodian, 10):
+            custodian.accept(self.message(custodian, 0, offset_s=10))
+        self.assertEqual((custodian.absolute, custodian.stop_at, custodian.exit_at), before)
+        self.assertEqual(custodian.admission_granted, 0)
+
+    def test_a_grant_after_the_stop_decision_changes_nothing(self):
+        custodian = self.custodian()
+        custodian.stopped_at = custodian.start + 2 * NS
+        before = (custodian.absolute, custodian.stop_at, custodian.exit_at)
+        with self.clock(custodian, 3):
+            custodian.accept(self.message(custodian, 60 * NS, offset_s=3))
+        self.assertEqual((custodian.absolute, custodian.stop_at, custodian.exit_at), before)
+        self.assertEqual(custodian.admission_granted, 0)
+        self.assertEqual(custodian.admission_ignored, 1)
+        self.assertEqual(custodian.admission_counted, 0)
+        self.assertEqual(custodian.admission_late_reason, "stopped")
+        self.assertEqual(custodian.admission_late_ns, custodian.start + 3 * NS)
+
+    def test_a_grant_after_a_deadline_hit_changes_nothing(self):
+        custodian = self.custodian()
+        custodian.deadline_hit = True
+        before = custodian.absolute
+        with self.clock(custodian, 3):
+            custodian.accept(self.message(custodian, 60 * NS, offset_s=3))
+        self.assertEqual(custodian.absolute, before)
+        self.assertEqual(custodian.admission_granted, 0)
+        self.assertEqual(custodian.admission_ignored, 1)
+        self.assertEqual(custodian.admission_late_reason, "deadline")
+
+    def test_a_late_grant_is_recorded_with_its_reason_and_decision_facts(self):
+        custodian = self.custodian()
+        custodian.deadline_hit = True
+        recorded = []
+        custodian.record = lambda kind, **fields: recorded.append(fields)
+        with self.clock(custodian, 300):
+            custodian.accept(self.message(custodian, 126_900_000_000, offset_s=300))
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual((recorded[0]["reason"], recorded[0]["deadline_hit"], recorded[0]["stopped"]),
+                         ("deadline", True, False))
+        self.assertEqual(recorded[0]["waited_ns"], 126_900_000_000)
+        self.assertEqual(recorded[0]["at"], custodian.start + 300 * NS)
+        custodian.cmd_r, custodian.cmd_w = self.pipe()
+        custodian.observe_admission(True)
+        os.close(custodian.cmd_w)
+        decision = [record["record"] for record in self.drain(custodian.cmd_r)
+                    if record["record"]["event"] == "admission_decision"][0]
+        self.assertEqual(decision["ignored"], 1)
+        self.assertEqual(decision["late_reason"], "deadline")
+        self.assertEqual(decision["late_ns"], custodian.start + 300 * NS)
+        self.assertEqual(decision["granted_ns"], 0)
+        self.assertEqual(decision["counted"], 0)
+        self.assertEqual(decision["absolute_ns"], custodian.start + 300 * NS)
+
+    def test_a_future_stamped_grant_latches_and_grants_nothing(self):
+        custodian = self.custodian()
+        future = now_ns() + 60 * NS
+        custodian.accept(self.message(custodian, 60 * NS, offset_s=1) | {"at": future})
+        self.assertIn("future", custodian.guard.fault or "")
+        self.assertEqual(custodian.admission_granted, 0)
+
+    def test_grant_records_are_capped_and_never_fault(self):
+        custodian = self.custodian()
+        recorded = []
+        custodian.record = lambda kind, **fields: recorded.append(fields)
+        elapsed = 0
+        for _ in range(bounded.ADMISSION_RECORDS + 5):
+            elapsed += 1
+            with self.clock(custodian, elapsed):
+                custodian.accept(self.message(custodian, NS, offset_s=elapsed, command=f"c{elapsed}"))
+        self.assertIsNone(custodian.guard.fault)
+        self.assertEqual(len(recorded), bounded.ADMISSION_RECORDS)
+        self.assertEqual(custodian.admission_granted, (bounded.ADMISSION_RECORDS + 5) * NS)
+
+    def test_the_decision_record_is_best_effort_and_never_latches(self):
+        custodian = self.custodian()
+        with self.clock(custodian, 90):
+            custodian.accept(self.message(custodian, 60 * NS, offset_s=90))
+        custodian.cmd_w = -1  # a failed write is dropped, never a fault
+        custodian.observe_admission(True)
+        self.assertIsNone(custodian.guard.fault)
+        custodian = self.custodian()
+        custodian.cmd_w = None
+        custodian.observe_admission(False)  # nothing to write to, nothing raised
+        self.assertIsNone(custodian.guard.fault)
+
+    # The stop boundary ------------------------------------------------------
+
+    def test_a_marker_pending_at_the_stop_is_drained_before_the_deadline(self):
+        custodian = self.custodian(limit=300)
+        state = {"t": custodian.stop_at}
+        pending = [self.message(custodian, 60 * NS, offset_s=280)]
+        calls = []
+
+        def pump(timeout):
+            calls.append(timeout)
+            state["t"] += 1
+            if pending:
+                custodian.accept(pending.pop())
+            elif len(calls) == 2:  # no marker left: run out the (moved) stop
+                state["t"] = custodian.stop_at
+
+        custodian.pump = pump
+        with patched(bounded, "now_ns", lambda: state["t"]):
+            custodian.watch()
+        self.assertIn(0, calls, "the stop instant did not drain the control pipe")
+        self.assertTrue(custodian.deadline_hit)
+        self.assertEqual(custodian.admission_granted, 60 * NS)
+        self.assertEqual(custodian.admission_ignored, 0)
+        self.assertEqual(custodian.stop_at, custodian.start + 340 * NS)
+
+    def test_a_grant_that_cannot_move_the_stop_cannot_spin_the_watch_loop(self):
+        custodian = self.custodian(limit=300)
+        state = {"t": custodian.stop_at}
+        pending = [self.message(custodian, 0, offset_s=280)]
+        calls = []
+
+        def pump(timeout):
+            calls.append(timeout)
+            state["t"] += 1
+            if pending:
+                custodian.accept(pending.pop())
+
+        custodian.pump = pump
+        with patched(bounded, "now_ns", lambda: state["t"]):
+            custodian.watch()
+        self.assertEqual(calls, [0])
+        self.assertTrue(custodian.deadline_hit)
+        self.assertEqual(custodian.admission_granted, 0)
+
+    # Waiting reports and per-command pairing --------------------------------
+
+    def test_a_waiting_report_never_moves_a_deadline_and_is_recorded(self):
+        custodian = self.custodian()
+        recorded = []
+        custodian.record = lambda kind, **fields: recorded.append(fields)
+        before = (custodian.absolute, custodian.stop_at, custodian.exit_at)
+        with self.clock(custodian, 5):
+            custodian.accept(self.waiting(custodian, 5))
+        self.assertEqual((custodian.absolute, custodian.stop_at, custodian.exit_at), before)
+        self.assertEqual((custodian.admission_waiting_reports, custodian.admission_waiting_reason),
+                         (1, "queue"))
+        self.assertEqual(custodian.admission_waiting_ns, custodian.start + 5 * NS)
+        self.assertEqual(recorded[0]["after_stop"], False)
+        self.assertEqual(recorded[0]["command"], "c1")
+        custodian.stopped_at = custodian.start + 6 * NS
+        with self.clock(custodian, 7):
+            custodian.accept(self.waiting(custodian, 7, command="c2"))
+        self.assertEqual((custodian.absolute, custodian.stop_at, custodian.exit_at), before)
+        self.assertEqual(custodian.admission_waiting_reports, 2)
+        self.assertEqual(custodian.admission_waiting_reason, "queue", "the first reason is kept")
+        self.assertEqual(recorded[1]["after_stop"], True)
+        self.assertEqual(custodian.admission_granted, 0)
+        self.assertEqual(custodian.admission_counted, 0)
+
+    def test_each_command_pairs_its_own_waiting_and_completion(self):
+        # Review finding: only a command's own terminal report ends its wait, and
+        # an unpaired wait is never called finished or unfinished. A zero-duration
+        # or late grant ends the wait; a waiting report for one command never pairs
+        # with the completion of another.
+        custodian = self.custodian()
+        custodian.record = lambda kind, **fields: None
+        with self.clock(custodian, 10):
+            custodian.accept(self.waiting(custodian, 10, command="ended"))
+        with self.clock(custodian, 20):
+            custodian.accept(self.message(custodian, 25 * NS, offset_s=20, command="ended"))
+        with self.clock(custodian, 30):
+            custodian.accept(self.waiting(custodian, 30, command="zero"))
+        with self.clock(custodian, 40):
+            custodian.accept(self.message(custodian, 0, offset_s=40, command="zero"))
+        with self.clock(custodian, 50):
+            custodian.accept(self.waiting(custodian, 50, command="lateonly"))
+        custodian.deadline_hit = True
+        with self.clock(custodian, 51):
+            custodian.accept(self.message(custodian, 5 * NS, offset_s=51, command="lateonly"))
+        # Nothing later was observed, but a completion can still have been missed
+        # between the last poll and the sampler's stop, so the wait stays unpaired
+        # and unclassified rather than proven unfinished.
+        with self.clock(custodian, 60):
+            custodian.accept(self.waiting(custodian, 60, command="lost"))
+        pairs = self.pairs(custodian)
+        self.assertEqual(pairs["commands"], 4)
+        self.assertEqual(pairs["ended"], 3)
+        self.assertEqual(pairs["unpaired_count"], 1)
+        self.assertEqual([entry["command"] for entry in pairs["unpaired"]], ["lost"])
+        self.assertFalse(pairs["unpaired"][0]["later_observation"])
+        self.assertEqual(pairs["possibly_overwritten_count"], 0)
+        self.assertEqual(pairs["unpaired"][0]["reason"], "queue")
+        self.assertEqual(pairs["unpaired"][0]["waiting_ns"], custodian.start + 60 * NS)
+
+    def test_a_completion_overwritten_before_a_poll_is_not_a_proven_unfinished_wait(self):
+        # Review finding: the completion file has one fixed name, so two
+        # completions inside one 0.25 s poll leave only the later inode visible.
+        # An unpaired wait is therefore an unknown (possibly overwritten, rejected
+        # or missed), never a proven unfinished wait - including one that was the
+        # run's last observation.
+        custodian = self.custodian()
+        custodian.record = lambda kind, **fields: None
+        with self.clock(custodian, 10):
+            custodian.accept(self.waiting(custodian, 10, command="first"))
+        # The later command's completion replaces the fixed-name file before a
+        # poll: only this grant is observed.
+        with self.clock(custodian, 20):
+            custodian.accept(self.message(custodian, 8 * NS, offset_s=20, command="second"))
+        pairs = self.pairs(custodian)
+        self.assertEqual(pairs["commands"], 1)
+        self.assertEqual(pairs["ended"], 0)
+        self.assertEqual(pairs["unpaired_count"], 1)
+        self.assertEqual(pairs["possibly_overwritten_count"], 1)
+        self.assertTrue(pairs["unpaired"][0]["later_observation"])
+        self.assertEqual(pairs["unpaired"][0]["command"], "first")
+        self.assertEqual(pairs["unpaired"][0]["waiting_ns"], custodian.start + 10 * NS)
+
+    def test_a_rejected_read_after_a_wait_is_also_a_later_observation(self):
+        # A rejected read still observed the fixed-name file: it may have
+        # replaced the completion, so the earlier wait stays unclassified even
+        # though no later report was accepted.
+        custodian = self.custodian()
+        custodian.record = lambda kind, **fields: None
+        with self.clock(custodian, 10):
+            custodian.accept(self.waiting(custodian, 10, command="first"))
+        with self.clock(custodian, 11):
+            custodian.accept({"run": self.RUN, "seq": custodian.monitor_seq + 1, "leader": None,
+                              "type": "admission_rejected", "at": custodian.start + 11 * NS,
+                              "kind": "admission", "completed": custodian.start + 11 * NS,
+                              "reason": "unexpected keys"})
+        pairs = self.pairs(custodian)
+        self.assertEqual((pairs["unpaired_count"], pairs["possibly_overwritten_count"]), (1, 1))
+        self.assertTrue(pairs["unpaired"][0]["later_observation"])
+        self.assertEqual(pairs["rejected_reports"], 1)
+        self.assertIsNone(custodian.guard.fault, "a rejected report is cooperative evidence, never a fault")
+
+    def test_an_entirely_missed_completion_is_unclassified_not_unfinished(self):
+        # No later observation exists, but a completion written between the last
+        # poll and the sampler's stop can be missed entirely. Missing terminal
+        # evidence is unknown: nothing here may be called a proven unfinished
+        # wait, and the decision record says so.
+        custodian = self.custodian()
+        custodian.record = lambda kind, **fields: None
+        with self.clock(custodian, 10):
+            custodian.accept(self.waiting(custodian, 10, command="only"))
+        pairs = self.pairs(custodian)
+        self.assertEqual(pairs["unpaired_count"], 1)
+        self.assertFalse(pairs["unpaired"][0]["later_observation"])
+        self.assertNotIn("unfinished", pairs)
+
+    def test_every_launch_refusal_prints_one_bounded_reason(self):
+        # Papercut bc0d56cd: a 125 launch refusal must never be silent.
+        custodian = self.custodian()
+        custodian.monitor = 1234
+        custodian.not_launched = "monitor setup failed or slow"
+        custodian.signal_pinned = lambda pid, number, group: None
+        custodian.reap = lambda pid: 0
+        custodian.pump = lambda timeout: None
+        captured = []
+        with patched(bounded, "report", lambda text, fd=2: captured.append(text)):
+            with patched(bounded, "now_ns", lambda: custodian.start):
+                self.assertEqual(custodian.abandon_launch(), 125)
+        self.assertEqual(len(captured), 1)
+        self.assertIn("not launched", captured[0])
+        self.assertIn("monitor setup failed or slow", captured[0])
+        self.assertLessEqual(len(captured[0]), 4096)
+
+    def test_the_monitor_reports_an_unexpected_failure_instead_of_exiting_silently(self):
+        # An exception in the monitor used to exit silently, which reached the
+        # custodian as an unexplained 125.
+        captured, codes = [], []
+
+        class BrokenMonitor:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def run(self):
+                raise RuntimeError("injected monitor failure")
+
+        with patched(bounded, "Monitor", BrokenMonitor), \
+                patched(bounded, "report", lambda text, fd=2: captured.append(text)), \
+                patched(bounded.os, "_exit", lambda code: codes.append(code)):
+            bounded.monitor_main({}, None, None, None, None)
+        self.assertEqual(codes, [1])
+        self.assertEqual(len(captured), 1)
+        self.assertIn("monitor failed before completion", captured[0])
+        self.assertIn("RuntimeError", captured[0])
+        self.assertNotIn("Traceback", captured[0])
+
+    def test_reading_freshness_is_not_latched_after_the_closure_decision(self):
+        # Review finding: a completed, closed run was reported as exit 125 when
+        # a reserve sample stalled after the decision, because the monitor stops
+        # sampling as it publishes `monitor_complete`. The shutdown is not a
+        # freshness window; a stale reading before the decision still latches.
+        custodian = self.custodian()
+        custodian.guard = bounded.Guard(custodian.start)
+        custodian.guard.reading({"kind": "reserve", "value": 500 * bounded.GIB,
+                                 "at": custodian.start, "completed": custodian.start})
+        custodian.guard.reading({"kind": "scratch", "value": 0, "complete": True,
+                                 "at": custodian.start, "completed": custodian.start})
+        stale = custodian.start + 5 * bounded.NS
+        with patched(bounded, "now_ns", lambda: stale):
+            custodian.sampling_ended = False
+            custodian.check_readings()
+        self.assertIn("stale", custodian.guard.fault or "", "a stale reading before the decision must latch")
+        custodian.guard.fault = None
+        with patched(bounded, "now_ns", lambda: stale):
+            custodian.sampling_ended = True
+            custodian.check_readings()
+        self.assertIsNone(custodian.guard.fault, "the shutdown must not latch freshness")
+
+    def test_finish_ends_sampling_before_waiting_for_the_monitor(self):
+        custodian = self.custodian()
+        custodian.record = lambda kind, **fields: None
+        custodian.tell = lambda kind, **fields: None
+        custodian.pump = lambda timeout: None
+        custodian.reap = lambda pid: 0
+        custodian.signal_pinned = lambda pid, number, group: None  # never signal a live host PID
+        custodian.monitor = 1234
+        custodian.monitor_complete = True
+        custodian.leader_status = 0
+        custodian.census_ok = True
+        custodian.eof = {"stdout", "stderr"}
+        custodian.guard = bounded.Guard(custodian.start)
+        custodian.guard.reading({"kind": "reserve", "value": 500 * bounded.GIB,
+                                 "at": custodian.start, "completed": custodian.start})
+        with patched(bounded, "now_ns", lambda: custodian.start):
+            self.assertEqual(custodian.finish(True), 0)
+        self.assertTrue(custodian.sampling_ended)
+        self.assertIsNone(custodian.guard.fault)
+
+    def test_a_completion_without_a_waiting_report_is_never_unfinished(self):
+        custodian = self.custodian()
+        custodian.record = lambda kind, **fields: None
+        with self.clock(custodian, 10):
+            custodian.accept(self.message(custodian, 8 * NS, offset_s=10, command="only-grant"))
+        self.assertEqual(self.pairs(custodian)["commands"], 0, "only waiting reports are counted")
+        self.assertEqual(self.pairs(custodian)["unpaired_count"], 0)
+
+    def test_the_pairing_table_is_bounded_and_overflow_is_unclassified(self):
+        custodian = self.custodian()
+        custodian.record = lambda kind, **fields: None
+        for index in range(bounded.ADMISSION_COMMANDS + 3):
+            with self.clock(custodian, index):
+                custodian.accept(self.waiting(custodian, index, command=f"c{index}"))
+        self.assertEqual(custodian.admission_unclassified, 3)
+        self.assertEqual(len(custodian.admission_pairs), bounded.ADMISSION_COMMANDS)
+        pairs = self.pairs(custodian)
+        # An overflow report still advances the ordinal, so the last *stored*
+        # waiting report is not provably last: every unpaired wait here is a
+        # possible overwrite, an unknown, and none is a proven unfinished wait.
+        self.assertEqual(pairs["unpaired_count"], bounded.ADMISSION_COMMANDS)
+        self.assertEqual(pairs["possibly_overwritten_count"], bounded.ADMISSION_COMMANDS)
+        self.assertEqual(len(pairs["unpaired"]), bounded.ADMISSION_UNPAIRED)
+        self.assertTrue(all(entry["later_observation"] for entry in pairs["unpaired"]))
+
+    def test_the_decision_record_carries_the_waiting_and_pairing_facts(self):
+        custodian = self.custodian()
+        custodian.record = lambda kind, **fields: None
+        with self.clock(custodian, 9):
+            custodian.accept(self.waiting(custodian, 9, command="c9"))
+        custodian.cmd_r, custodian.cmd_w = self.pipe()
+        custodian.observe_admission(True)
+        os.close(custodian.cmd_w)
+        decision = [record["record"] for record in self.drain(custodian.cmd_r)
+                    if record["record"]["event"] == "admission_decision"][0]
+        self.assertEqual((decision["waiting_reports"], decision["waiting_reason"]), (1, "queue"))
+        self.assertEqual(decision["waiting_ns"], custodian.start + 9 * NS)
+        self.assertEqual(decision["admission_waiting"]["commands"], 1)
+        self.assertEqual(decision["admission_waiting"]["ended"], 0)
+        self.assertEqual(decision["admission_waiting"]["unpaired_count"], 1)
+        self.assertFalse(decision["admission_waiting"]["unpaired"][0]["later_observation"])
+        self.assertEqual(decision["unclassified"], 0)
+        self.assertEqual(decision["granted_ns"], 0)
+        self.assertEqual(decision["absolute_ns"], custodian.start + 300 * NS)
+
+    # Documents --------------------------------------------------------------
+
+    def test_malformed_marker_matrix(self):
+        valid = {"schema": 2, "source": "oxide", "run": self.RUN, "command": "4242-0", "waited_ns": 5}
+        self.assertIsNone(bounded.admission_malformed(valid, self.RUN))
+        self.assertIsNone(bounded.admission_malformed(dict(valid, waited_ns=bounded.U64MAX), self.RUN))
+        cases = [
+            ([], "not an object"), ("marker", "not an object"), (1, "not an object"),
+            ({}, "unexpected keys"),
+            ({key: valid[key] for key in ("schema", "source", "run", "command")}, "unexpected keys"),
+            (dict(valid, extra=1), "unexpected keys"),
+            (dict(valid, schema=1), "unsupported schema"), (dict(valid, schema=3), "unsupported schema"),
+            (dict(valid, schema="2"), "unsupported schema"), (dict(valid, schema=True), "unsupported schema"),
+            (dict(valid, source=""), "ill-typed source"), (dict(valid, source="x" * 33), "ill-typed source"),
+            (dict(valid, run="other"), "stale run"), (dict(valid, run=None), "stale run"),
+            (dict(valid, command=""), "ill-typed command"), (dict(valid, command="x" * 33), "ill-typed command"),
+            (dict(valid, command=1), "ill-typed command"),
+            (dict(valid, waited_ns=-1), "ill-typed waited_ns"), (dict(valid, waited_ns=True), "ill-typed waited_ns"),
+            (dict(valid, waited_ns=1.5), "ill-typed waited_ns"), (dict(valid, waited_ns=bounded.U64MAX + 1),
+                                                                  "ill-typed waited_ns"),
+        ]
+        for marker, expected in cases:
+            self.assertEqual(bounded.admission_malformed(marker, self.RUN), expected, marker)
+
+    def test_waiting_report_validation_matrix(self):
+        valid = {"schema": 2, "source": "oxide", "run": self.RUN, "command": "4242-0", "reason": "queue"}
+        self.assertIsNone(bounded.admission_waiting_malformed(valid, self.RUN))
+        self.assertIsNone(bounded.admission_waiting_malformed(dict(valid, reason="host limit"), self.RUN))
+        cases = [
+            ([], "not an object"), ({}, "unexpected keys"),
+            ({key: valid[key] for key in ("schema", "source", "run", "command")}, "unexpected keys"),
+            (dict(valid, waited_ns=1), "unexpected keys"),
+            (dict(valid, schema=1), "unsupported schema"), (dict(valid, schema="2"), "unsupported schema"),
+            (dict(valid, source=""), "ill-typed source"),
+            (dict(valid, run="other"), "stale run"),
+            (dict(valid, command=""), "ill-typed command"), (dict(valid, command=1), "ill-typed command"),
+            (dict(valid, reason=""), "ill-typed reason"), (dict(valid, reason="x" * 33), "ill-typed reason"),
+            (dict(valid, reason=1), "ill-typed reason"),
+        ]
+        for marker, expected in cases:
+            self.assertEqual(bounded.admission_waiting_malformed(marker, self.RUN), expected, marker)
+
+    # The monitor's readers --------------------------------------------------
+
+    def monitor(self, directory):
+        monitor = bounded.Monitor({"inject": set(), "run_id": self.RUN, "evidence": str(directory),
+                                   "admission_path": os.path.join(str(directory), bounded.ADMISSION_NAME),
+                                   "waiting_path": os.path.join(str(directory), bounded.WAITING_NAME)},
+                                  None, None, None, None)
+        monitor.cmd_r, monitor.ctl_w = self.pipe()
+        monitor.receipt = {"admission": bounded.admission_record(),
+                           "admission_waiting": bounded.admission_waiting_record()}
+        return monitor
+
+    def fixture(self):
+        directory = Path(tempfile.mkdtemp(prefix="admission.", dir=str(SCRATCH)))
+        self.addCleanup(shutil.rmtree, str(directory), True)
+        return directory
+
+    def publish(self, directory, payload, name=None):
+        path = directory / (name or bounded.ADMISSION_NAME)
+        with open(path, "wb") as handle:
+            handle.write(payload if isinstance(payload, bytes) else json.dumps(payload).encode())
+        return path
+
+    def test_a_valid_marker_is_reported_once_with_its_own_completion_stamp(self):
+        directory = self.fixture()
+        monitor = self.monitor(directory)
+        path = self.publish(directory, {"schema": 2, "source": "oxide", "run": self.RUN,
+                                        "command": "4242-0", "waited_ns": 90 * NS})
+        monitor.read_admission(str(path))
+        os.close(monitor.ctl_w)
+        sent = self.drain(monitor.cmd_r)
+        self.assertEqual([m["type"] for m in sent], ["admission"])
+        self.assertEqual((sent[0]["waited_ns"], sent[0]["command"]), (90 * NS, "4242-0"))
+        self.assertIsNone(bounded.malformed(sent[0]))
+        self.assertEqual(monitor.receipt["admission"]["observed"], 1)
+        self.assertEqual(monitor.receipt["admission"]["reported_wait_ns"], 90 * NS)
+        self.assertLessEqual(monitor.receipt["admission"]["first_ns"], monitor.receipt["admission"]["last_ns"])
+
+    def test_a_stale_run_marker_is_rejected_without_a_message(self):
+        # Review finding: a marker left by an earlier run must never be paired
+        # with this one, whatever it claims.
+        directory = self.fixture()
+        monitor = self.monitor(directory)
+        stale = self.publish(directory, {"schema": 2, "source": "oxide", "run": "another-run",
+                                         "command": "4242-0", "waited_ns": 90 * NS})
+        monitor.read_admission(str(stale))
+        stale_waiting = self.publish(directory, {"schema": 2, "source": "oxide", "run": "another-run",
+                                                 "command": "4242-0", "reason": "queue"},
+                                     name=bounded.WAITING_NAME)
+        monitor.read_admission(str(stale_waiting), None, "admission_waiting")
+        sent = self.drain(monitor.cmd_r)
+        self.assertEqual([m["type"] for m in sent], ["admission_rejected", "admission_rejected"])
+        self.assertEqual(monitor.receipt["admission"]["ignored"], 1)
+        self.assertIn("stale run", monitor.receipt["admission"]["rejections"])
+        self.assertEqual(monitor.receipt["admission_waiting"]["ignored"], 1)
+        self.assertIn("stale run", monitor.receipt["admission_waiting"]["rejections"])
+        self.assertEqual(monitor.receipt["admission_waiting"]["observed"], 0)
+
+    def test_an_ignored_marker_is_recorded_and_never_sent(self):
+        directory = self.fixture()
+        monitor = self.monitor(directory)
+        oversized = self.publish(directory, b"{" + b" " * bounded.ADMISSION_MAX_BYTES)
+        monitor.read_admission(str(oversized))
+        malformed = self.publish(directory, b"not json")
+        monitor.read_admission(str(malformed))
+        wrong = self.publish(directory, {"schema": 1, "source": "oxide", "run": self.RUN,
+                                         "command": "4242-0", "waited_ns": 1})
+        monitor.read_admission(str(wrong))
+        link = directory / "link"
+        os.symlink(str(malformed), str(link))
+        monitor.read_admission(str(link))
+        # Every readable-but-invalid document is reported as a rejection (an
+        # observation of the fixed-name file), never as an accepted marker; the
+        # symlink and other non-document paths are recorded only.
+        sent = self.drain(monitor.cmd_r)
+        self.assertEqual([m["type"] for m in sent], ["admission_rejected"] * 3)
+        record = monitor.receipt["admission"]
+        self.assertEqual(record["observed"], 0)
+        self.assertEqual(record["ignored"], 4)
+        self.assertEqual(len(record["rejections"]), 4)
+        self.assertEqual(record["reported_wait_ns"], 0)
+
+    def test_the_rejection_list_is_bounded(self):
+        directory = self.fixture()
+        monitor = self.monitor(directory)
+        bad = self.publish(directory, b"not json")
+        for _ in range(bounded.ADMISSION_REJECTIONS + 3):
+            monitor.read_admission(str(bad))
+        record = monitor.receipt["admission"]
+        self.assertEqual(record["ignored"], bounded.ADMISSION_REJECTIONS + 3)
+        self.assertEqual(len(record["rejections"]), bounded.ADMISSION_REJECTIONS)
+        sent = self.drain(monitor.cmd_r)
+        self.assertEqual([m["type"] for m in sent], ["admission_rejected"] * (bounded.ADMISSION_REJECTIONS + 3))
+
+    def test_an_absent_marker_is_not_an_event(self):
+        directory = self.fixture()
+        monitor = self.monitor(directory)
+        monitor.read_admission(str(directory / bounded.ADMISSION_NAME))
+        record = monitor.receipt["admission"]
+        self.assertEqual((record["observed"], record["ignored"], record["errors"]), (0, 1, 0))
+
+    def test_the_waiting_reader_reports_its_own_message_and_record(self):
+        directory = self.fixture()
+        monitor = self.monitor(directory)
+        path = self.publish(directory, {"schema": 2, "source": "oxide", "run": self.RUN,
+                                        "command": "4242-3", "reason": "queue"},
+                            name=bounded.WAITING_NAME)
+        monitor.read_admission(str(path), None, "admission_waiting")
+        os.close(monitor.ctl_w)
+        sent = self.drain(monitor.cmd_r)
+        self.assertEqual([m["type"] for m in sent], ["admission_waiting"])
+        self.assertEqual((sent[0]["reason"], sent[0]["command"]), ("queue", "4242-3"))
+        self.assertIsNone(bounded.malformed(sent[0]))
+        waiting = monitor.receipt["admission_waiting"]
+        self.assertEqual((waiting["observed"], waiting["reason"], waiting["ignored"]), (1, "queue", 0))
+        self.assertEqual(monitor.receipt["admission"]["observed"], 0)
+        self.assertEqual(monitor.receipt["admission"]["reported_wait_ns"], 0)
+
+    def test_the_dedup_identity_is_the_file_actually_opened(self):
+        # Review finding: a writer publishes by atomic rename. If the file is
+        # replaced between the sampler's `lstat` and the read, dedup must bind to
+        # the opened inode, not to the sampled one, or the replacement would be
+        # reported now and again on the next poll (and could grant twice).
+        directory = self.fixture()
+        monitor = self.monitor(directory)
+        path = self.publish(directory, {"schema": 2, "source": "oxide", "run": self.RUN,
+                                        "command": "first", "waited_ns": 5 * NS})
+        sampled = os.lstat(str(path))
+        sampled_identity = (sampled.st_dev, sampled.st_ino)
+        # Replace the file atomically before the read: the sampler's stat names
+        # the old inode, the open sees the new one.
+        self.publish(directory, {"schema": 2, "source": "oxide", "run": self.RUN,
+                                 "command": "second", "waited_ns": 7 * NS},
+                     name=bounded.ADMISSION_NAME + ".replacement")
+        os.replace(str(directory / (bounded.ADMISSION_NAME + ".replacement")), str(path))
+        consumed = monitor.read_admission(str(path), sampled_identity)
+        info = os.lstat(str(path))
+        self.assertEqual(consumed, (info.st_dev, info.st_ino),
+                         "the read must report the identity it actually opened")
+        self.assertNotEqual(consumed, sampled_identity)
+        # Reporting the same opened identity again is a no-op.
+        self.assertEqual(monitor.read_admission(str(path), consumed), consumed)
+        os.close(monitor.ctl_w)
+        sent = self.drain(monitor.cmd_r)
+        self.assertEqual([m["type"] for m in sent], ["admission"])
+        self.assertEqual(sent[0]["command"], "second")
+        self.assertEqual(monitor.receipt["admission"]["observed"], 1)
+        self.assertEqual(monitor.receipt["admission"]["identity"], list(consumed))
+
+    def test_a_duplicate_completion_cannot_grant_the_same_wait_twice(self):
+        # Belt and braces for the same race: even if a completion reaches the
+        # custodian twice, one command grants its wait only once.
+        custodian = self.custodian()
+        custodian.record = lambda kind, **fields: None
+        with self.clock(custodian, 10):
+            custodian.accept(self.waiting(custodian, 10, command="dup"))
+        # 15 s of reported wait, fully backed by the 20 s elapsed time.
+        with self.clock(custodian, 20):
+            custodian.accept(self.message(custodian, 15 * NS, offset_s=20, command="dup"))
+        with self.clock(custodian, 21):
+            custodian.accept(self.message(custodian, 15 * NS, offset_s=21, command="dup"))
+        # A duplicate that arrives after a deadline is still a duplicate: it is
+        # neither granted nor recorded as a late grant.
+        custodian.deadline_hit = True
+        with self.clock(custodian, 22):
+            custodian.accept(self.message(custodian, 15 * NS, offset_s=22, command="dup"))
+        self.assertEqual(custodian.admission_ignored, 0, "a duplicate is not a late grant")
+        custodian.deadline_hit = False
+        self.assertEqual(custodian.admission_granted, 15 * NS, "the second completion must not grant again")
+        self.assertEqual(custodian.admission_counted, 1)
+        self.assertEqual(custodian.admission_duplicates, 2, "both duplicates are counted, neither granted")
+        custodian.cmd_r, custodian.cmd_w = self.pipe()
+        custodian.observe_admission(True)
+        os.close(custodian.cmd_w)
+        decision = [record["record"] for record in self.drain(custodian.cmd_r)
+                    if record["record"]["event"] == "admission_decision"][0]
+        self.assertEqual(decision["duplicates"], 2)
+
+    def test_an_overflowed_completion_never_grants(self):
+        # Review finding: at table capacity admission_pair returns None, so the
+        # custodian cannot tell a first terminal from a duplicate. An overflowed
+        # command therefore grants nothing at all (a missed extension is safe, a
+        # double grant is not), and the reports stay counted as unclassified.
+        custodian = self.custodian()
+        custodian.record = lambda kind, **fields: None
+        for index in range(bounded.ADMISSION_COMMANDS):
+            with self.clock(custodian, index):
+                custodian.accept(self.waiting(custodian, index, command=f"c{index}"))
+        before = custodian.absolute
+        for offset in (100, 101):
+            with self.clock(custodian, offset):
+                custodian.accept(self.message(custodian, 15 * NS, offset_s=offset, command="overflow"))
+        self.assertEqual(custodian.absolute, before, "an overflowed completion must not move the deadline")
+        self.assertEqual(custodian.admission_granted, 0)
+        self.assertEqual(custodian.admission_counted, 0)
+        self.assertEqual(custodian.admission_duplicates, 0)
+        self.assertGreaterEqual(custodian.admission_unclassified, 2)
+
+    def test_a_rejected_waiting_report_is_recorded_without_a_message(self):
+        directory = self.fixture()
+        monitor = self.monitor(directory)
+        bad = self.publish(directory, {"schema": 2, "source": "oxide", "run": self.RUN,
+                                       "command": "4242-3", "reason": "queue", "waited_ns": 4},
+                           name=bounded.WAITING_NAME)
+        monitor.read_admission(str(bad), None, "admission_waiting")
+        link = directory / "waiting-link"
+        os.symlink(str(bad), str(link))
+        monitor.read_admission(str(link), None, "admission_waiting")
+        # The invalid document is reported as a rejection; the symlink is only
+        # recorded.
+        sent = self.drain(monitor.cmd_r)
+        self.assertEqual([m["type"] for m in sent], ["admission_rejected"])
+        waiting = monitor.receipt["admission_waiting"]
+        self.assertEqual((waiting["observed"], waiting["ignored"]), (0, 2))
+        self.assertEqual(waiting["reason"], None)
+        self.assertEqual(monitor.receipt["admission"]["ignored"], 0, "a waiting rejection is its own record")
+
+    def test_the_receipt_objects_are_bounded_and_typed(self):
+        record = bounded.admission_record()
+        self.assertEqual(set(record), {"schema", "marker", "observed", "reported_wait_ns", "first_ns",
+                                       "last_ns", "identity", "ignored", "rejections", "errors"})
+        self.assertEqual(record["marker"], bounded.ADMISSION_NAME)
+        waiting = bounded.admission_waiting_record()
+        self.assertEqual(set(waiting), {"schema", "marker", "observed", "first_ns", "last_ns", "reason",
+                                        "identity", "ignored", "rejections", "errors"})
+        self.assertEqual(waiting["marker"], bounded.WAITING_NAME)
+        for entry in (record, waiting):
+            entry["rejections"] = ["reason"] * bounded.ADMISSION_REJECTIONS
+            self.assertLess(len(json.dumps(entry)), 1024)
+        self.assertLess(bounded.ADMISSION_MAX_BYTES, 4096)
 
 
 # Owned-byte traversal (oxide#142) ----------------------------------------------
@@ -1750,7 +3132,7 @@ class PureSurvivors(unittest.TestCase):
         """A certain-empty census stand-in, for scripted decisions."""
 
         class SettledCensus:
-            def __init__(self, sid, terminal_allowed=False):
+            def __init__(self, sid, terminal_allowed=False, ancestors=()):
                 self.stats = {}
 
             def round(self):
@@ -1999,11 +3381,11 @@ class PureSurvivors(unittest.TestCase):
                "start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "inject": []}
         ctl_r, ctl_w = os.pipe()
         cmd_r, cmd_w = os.pipe()
-        out_r, out_w = os.pipe()
-        err_r, err_w = os.pipe()
-        for fd in (ctl_r, cmd_w, out_w, err_w):
+        for fd in (ctl_r, cmd_w):
             self.addCleanup(os.close, fd)
-        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_r)
+        # The monitor's drain threads get immediate EOF (its own read fds).
+        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, os.open(os.devnull, os.O_RDONLY),
+                                  os.open(os.devnull, os.O_RDONLY))
         sent, lines = [], []
         release = threading.Event()
 
@@ -2011,7 +3393,7 @@ class PureSurvivors(unittest.TestCase):
             sent.append((message_type, dict(fields)))
 
         class LateCensus:
-            def __init__(self, sid, terminal_allowed=False):
+            def __init__(self, sid, terminal_allowed=False, ancestors=()):
                 self.stats = {}
 
             def round(self):
@@ -2093,16 +3475,16 @@ class PureSurvivors(unittest.TestCase):
                if False else time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "inject": []}
         ctl_r, ctl_w = os.pipe()
         cmd_r, cmd_w = os.pipe()
-        out_r, out_w = os.pipe()
-        err_r, err_w = os.pipe()
-        for fd in (ctl_r, cmd_w, out_w, err_w):
+        for fd in (ctl_r, cmd_w):
             self.addCleanup(os.close, fd)
-        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_r)
+        # The monitor's drain threads get immediate EOF (its own read fds).
+        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, os.open(os.devnull, os.O_RDONLY),
+                                  os.open(os.devnull, os.O_RDONLY))
         sent, lines, written = [], [], []
         release = threading.Event()
 
         class InterleavedCensus:
-            def __init__(self, sid, terminal_allowed=False):
+            def __init__(self, sid, terminal_allowed=False, ancestors=()):
                 self.stats = {}
                 self.rounds = 0
 
@@ -2233,11 +3615,11 @@ class PureSurvivors(unittest.TestCase):
                "start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "inject": []}
         ctl_r, ctl_w = os.pipe()
         cmd_r, cmd_w = os.pipe()
-        out_r, out_w = os.pipe()
-        err_r, err_w = os.pipe()
-        for fd in (ctl_r, cmd_w, out_w, err_w):
+        for fd in (ctl_r, cmd_w):
             self.addCleanup(os.close, fd)
-        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_r)
+        # The monitor's drain threads get immediate EOF (its own read fds).
+        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, os.open(os.devnull, os.O_RDONLY),
+                                  os.open(os.devnull, os.O_RDONLY))
         sent, lines, census_seqs = [], [], []
         empty = {"certain": True, "members": 0, "uncertain": 0, "member_rows": [],
                  "uncertain_rows": [], "terminal_count_status": "valid",
@@ -2248,7 +3630,7 @@ class PureSurvivors(unittest.TestCase):
         state = {"rounds": 0}
 
         class NamedCensus:
-            def __init__(self, sid, terminal_allowed=False):
+            def __init__(self, sid, terminal_allowed=False, ancestors=()):
                 self.stats = {}
 
             def round(self):
@@ -2336,11 +3718,11 @@ class PureSurvivors(unittest.TestCase):
                        "start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "inject": []}
                 ctl_r, ctl_w = os.pipe()
                 cmd_r, cmd_w = os.pipe()
-                out_r, out_w = os.pipe()
-                err_r, err_w = os.pipe()
-                for fd in (ctl_r, cmd_w, out_w, err_w):
+                for fd in (ctl_r, cmd_w):
                     self.addCleanup(os.close, fd)
-                monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_w)
+                monitor = bounded.Monitor(ctx, ctl_w, cmd_r,
+                                          os.open(os.devnull, os.O_RDONLY),
+                                          os.open(os.devnull, os.O_RDONLY))
                 sent = []
                 real_send = monitor.send
 
@@ -2916,9 +4298,16 @@ class PureDefaultScratch(unittest.TestCase):
         self.assertIn("validation_parent", text, "the recipe does not use the validation parent")
         self.assertNotIn("prepare_scratch_parent", text,
                          "the recipe would create the supervisor's marked subtree")
-        self.assertNotIn("/Volumes/Builds", text, "the recipe hardcodes a mount path")
-        self.assertIn('mkdir -p "$scratch_base"', text)
-        self.assertIn('mktemp -d "$scratch_base/run.XXXXXX"', text)
+        # The mount path rule is about the RECIPE, so it is checked on the recipe's
+        # own shell block: the file elsewhere records historical evidence paths
+        # (an archived packet under a drive) that no recipe may reuse.
+        blocks = re.findall(r"```sh\n(.*?)```", text, re.S)
+        self.assertTrue(blocks, "the unit recipe has no shell block")
+        recipe = next(block for block in blocks if "validation_parent" in block)
+        self.assertIn("validation_parent", recipe)
+        self.assertNotIn("/Volumes/Builds", recipe, "the recipe hardcodes a mount path")
+        self.assertIn('mkdir -p "$scratch_base"', recipe)
+        self.assertIn('mktemp -d "$scratch_base/run.XXXXXX"', recipe)
 
     # The owned leaf
 
@@ -4559,8 +5948,8 @@ class PureQualificationTopology(unittest.TestCase):
         self.assertEqual(qualify.nested_cases({"cases": [{"case": "zero", "dir": case}]}, record), [])
         receipt = self.receipt(parent, root, evidence, scratch, registration, case)
         results = {"outcomes": [["zero", "pass"]],
-                   "cases": [{"case": "zero", "dir": case}]
-                            + detach_case_rows(case) + survivor_case_rows(case)}
+                   "cases": ([{"case": "zero", "dir": case}] + detach_case_rows(case)
+                             + survivor_case_rows(case))}
         problems = qualify.check(receipt, results, expected, record, facts)
         self.assertEqual([p for p in problems if "cases:" not in p], [], problems)
 
@@ -4709,11 +6098,11 @@ class PureQualificationTopology(unittest.TestCase):
                "inject": []}
         ctl_r, ctl_w = os.pipe()
         cmd_r, cmd_w = os.pipe()
-        out_r, out_w = os.pipe()
-        err_r, err_w = os.pipe()
-        for fd in (ctl_r, cmd_w, out_w, err_w):
+        for fd in (ctl_r, cmd_w):
             self.addCleanup(os.close, fd)
-        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_r)
+        # The monitor's drain threads get immediate EOF (its own read fds).
+        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, os.open(os.devnull, os.O_RDONLY),
+                                  os.open(os.devnull, os.O_RDONLY))
         messages = []
 
         def send(message_type, **fields):
@@ -4730,6 +6119,28 @@ class PureQualificationTopology(unittest.TestCase):
         self.assertEqual(persisted["outcome"]["closure"], "UNCLOSED")
         self.assertIn("monitor_complete", messages, messages)
         self.assertTrue(monitor.stop.is_set())
+        # Oxide#197: the real setup recorded this run's own ancestor chain in the
+        # receipt, as positive identities, bounded, starting at our own parent.
+        ancestors = persisted["ancestors"]
+        self.assertEqual(set(ancestors), {"state", "count", "identities", "stop"}, ancestors)
+        self.assertIn(ancestors["state"], ("recorded", "partial"), ancestors)
+        self.assertEqual(ancestors["count"], len(ancestors["identities"]), ancestors)
+        self.assertTrue(0 < ancestors["count"] <= bounded.ANCESTOR_MAX_LEVELS, ancestors)
+        self.assertEqual([i["level"] for i in ancestors["identities"]],
+                         list(range(1, ancestors["count"] + 1)), ancestors)
+        first = ancestors["identities"][0]
+        self.assertEqual(first["pid"], os.getppid(), ancestors)
+        parent = bounded.Kinfo.one(first["pid"])
+        self.assertIsNotNone(parent, ancestors)
+        self.assertEqual(parent["start"], first["start"], ancestors)
+        # No wall, boot or uptime fact is recorded for exclusion (ruling
+        # ea5a3dc9): the chain and the bounded structural evidence only.
+        self.assertNotIn("self", ancestors)
+        evidence = persisted["ancestor_exclusions"]
+        self.assertEqual(set(evidence), {"rows", "count", "omitted", "by_rule", "rounds"})
+        self.assertEqual(evidence["count"], evidence["omitted"] + len(evidence["rows"]), evidence)
+        self.assertEqual(len(evidence["rows"]), 0, evidence)
+        self.assertEqual(set(evidence["by_rule"]), {"ancestor", "parent"})
 
     def test_the_drain_happens_before_the_final_publication(self):
         monitor, cmd_w = self.monitor_stub()
@@ -4849,8 +6260,8 @@ class PureQualificationTopology(unittest.TestCase):
         receipt = self.receipt(parent, root, evidence, scratch, registration, case)
         receipt["scratch_default"].update(mount=mount, volume_uuid=DRIVE_UUID)
         results = {"outcomes": [["zero", "pass"]],
-                   "cases": [{"case": "zero", "dir": case}]
-                            + detach_case_rows(case) + survivor_case_rows(case)}
+                   "cases": ([{"case": "zero", "dir": case}] + detach_case_rows(case)
+                             + survivor_case_rows(case))}
         problems = qualify.check(receipt, results, expected, record, facts, base)
         self.assertEqual([p for p in problems if "cases:" not in p], [], problems)
         # oxide#191: the receipt must exercise the detach success, refusal and
@@ -5235,8 +6646,9 @@ class FakeCensus:
 
     rounds = 0
 
-    def __init__(self, sid, terminal_allowed=False):
+    def __init__(self, sid, terminal_allowed=False, ancestors=(), getpgid=None):
         self.sid, self.terminal_allowed = sid, terminal_allowed
+        self.ancestors = tuple(ancestors)
         self.stats = {"rows": 3, "esrch_rows": 1, "zombie_rows": 1, "confirm_reads": 2,
                       "pause_calls": 1, "terminal": 0, "snapshot_ns": 5, "scan_ns": 7,
                       "snapshot_error": False}
@@ -5610,7 +7022,7 @@ class PureDetach(unittest.TestCase):
             self.addCleanup(os.close, cmd_r)
             monitor.cmd_r = cmd_r
             monitor.sent = []
-            monitor.send = lambda kind, **fields: monitor.sent.append((kind, fields))
+            monitor.send = lambda message_type, **fields: monitor.sent.append((message_type, fields))
             if answer is not None:
                 os.write(cmd_w, (json.dumps(answer) + "\n").encode())
             if close:
@@ -6329,12 +7741,10 @@ class PureDetach(unittest.TestCase):
 
     @contextlib.contextmanager
     def settled_census(self):
-        """A coherent certain-empty census for a run whose decision is scripted:
-        closure now requires a finished thread and a certainly empty final round,
-        so these tests give the monitor the census a real custodian would have."""
+        """A certain-empty census stand-in for a scripted decision."""
 
         class SettledCensus:
-            def __init__(self, sid, terminal_allowed=False):
+            def __init__(self, sid, terminal_allowed=False, ancestors=()):
                 self.stats = {}
 
             def round(self):
@@ -6352,16 +7762,16 @@ class PureDetach(unittest.TestCase):
     def start_census_then(self, monitor, cmd_w, run_id, decision, sent):
         """Write a leader/stopped pair and `decision` once the first census round is
         reported. The decision names that census message, as a real custodian does,
-        so the scripted run is as coherent as a real one."""
+        so the scripted run is as coherent as a real one (oxide#195)."""
         written = []
         real = monitor.send
 
-        def send(kind, **fields):
+        def send(message_type, **fields):
             if monitor.stop.is_set():  # the run is over: never write to a closing pipe
                 return monitor.seq
-            seq = real(kind, **fields)
-            sent.append(kind)
-            if kind == "census" and not written:
+            seq = real(message_type, **fields)
+            sent.append(message_type)
+            if message_type == "census" and not written:
                 written.append(True)
                 payload = dict(decision)
                 payload["census"] = {"seq": seq, "after": 2, "certain": True,
@@ -6388,11 +7798,11 @@ class PureDetach(unittest.TestCase):
                "start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "inject": []}
         ctl_r, ctl_w = os.pipe()
         cmd_r, cmd_w = os.pipe()
-        out_r, out_w = os.pipe()
-        err_r, err_w = os.pipe()
-        for fd in (ctl_r, cmd_w, out_w, err_w):
+        for fd in (ctl_r, cmd_w):
             self.addCleanup(os.close, fd)
-        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_r)
+        # The monitor's drain threads get immediate EOF (its own read fds).
+        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, os.open(os.devnull, os.O_RDONLY),
+                                  os.open(os.devnull, os.O_RDONLY))
         sent = []
         monitor.send = self.start_census_then(
             monitor, cmd_w, "absent-child",
@@ -6490,23 +7900,23 @@ class PureDetach(unittest.TestCase):
                "start_ns": time.clock_gettime_ns(time.CLOCK_UPTIME_RAW), "inject": []}
         ctl_r, ctl_w = os.pipe()
         cmd_r, cmd_w = os.pipe()
-        out_r, out_w = os.pipe()
-        err_r, err_w = os.pipe()
-        for fd in (ctl_r, cmd_w, out_w, err_w):
+        for fd in (ctl_r, cmd_w):
             self.addCleanup(os.close, fd)
-        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, out_r, err_r)
+        # The monitor's drain threads get immediate EOF (its own read fds).
+        monitor = bounded.Monitor(ctx, ctl_w, cmd_r, os.open(os.devnull, os.O_RDONLY),
+                                  os.open(os.devnull, os.O_RDONLY))
         sent = []
 
         base = self.start_census_then(
             monitor, cmd_w, "both-paths",
             {"type": "cleanup", "outcome": {"closure": "closed", "status": 0}}, sent)
 
-        def send(kind, **fields):
-            if kind == "detach_ready":
+        def send(message_type, **fields):
+            if message_type == "detach_ready":
                 # Answer every authorization request, as the custodian would.
                 os.write(cmd_w, (json.dumps({"type": "detach_go", "allowed": True,
                                              "budget_ns": 30 * bounded.NS}) + "\n").encode())
-            base(kind, **fields)
+            base(message_type, **fields)
 
         monitor.send = send
         try:
@@ -8082,9 +9492,9 @@ class Real(unittest.TestCase):
                                   for s in signals],
                       "signal_targets": [s["target"] for s in signals],
                       "survivors": self.receipt.get("survivors"),
-                      "session_signals": [[r.get("target"), r.get("start")]
-                                          for r in self.receipt["custodian"]
-                                          if str(r.get("event", "")).startswith("session_")],
+                      "session_signals": [[record.get("target"), record.get("start")]
+                                          for record in self.receipt["custodian"]
+                                          if str(record.get("event", "")).startswith("session_")],
                       "held_streams": sorted(getattr(receiver, "held_names", []))})
         for entry in signals:  # custody at every signal
             self.assertTrue(entry["held_unreaped"], entry)
@@ -8114,6 +9524,291 @@ class Real(unittest.TestCase):
         self.assertEqual(self.guardian(fixture("open(os.environ['CASE_DIR'] + '/ran', 'w')\n")), 0)
         self.assertEqual(self.outcome()["closure"], "closed")
         self.assertEqual(self.receipt["phase"], "monitor_complete: pending_custodian")
+
+    def test_an_unrelated_launcher_sibling_does_not_block_closure(self):
+        # Oxide#197 (design ruling ea5a3dc9). This suite is the nested
+        # supervisor's launcher, so it is one of the ancestors that supervisor
+        # records. An unrelated sibling of the nested run, spawned mid-run and
+        # still alive during the post-leader census, is positively outside the
+        # nested leader's session and process group, so the launcher-sibling
+        # rule must exclude it and the nested run must still close. The sibling
+        # exits on a release file written after the nested run ends, so it is
+        # live (and readable) for every census round.
+        sibling = []
+        release = self.dir / "sibling.release"
+        code = ("import os, time\n"
+                "open(os.environ['CASE_DIR'] + '/sibling', 'w').write('1')\n"
+                "while not os.path.exists(os.environ['CASE_DIR'] + '/sibling.release'):\n"
+                "    time.sleep(0.02)\n")
+
+        def spawn_mid_run():
+            receipt = self.dir / "evidence" / "receipt.json"
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                try:
+                    phase = json.loads(receipt.read_text()).get("phase") or ""
+                except Exception:
+                    phase = ""
+                if phase.startswith("started"):
+                    break
+                time.sleep(0.02)
+            sibling.append(subprocess.Popen(
+                [sys.executable, "-c", code],
+                env=dict(os.environ, CASE_DIR=str(self.dir)),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+
+        thread = threading.Thread(target=spawn_mid_run, daemon=True)
+        thread.start()
+        try:
+            code_status = self.guardian(fixture("open(os.environ['CASE_DIR'] + '/ran', 'w')\n"))
+        finally:
+            thread.join(15)
+            release.write_text("release")
+            for child in sibling:
+                try:
+                    child.wait(10)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(5)
+        self.assertFalse(thread.is_alive(), "the sibling was never spawned")
+        self.assertTrue((self.dir / "sibling").exists(), "the sibling never ran")
+        self.assertEqual(code_status, 0)
+        self.assertEqual(self.outcome()["closure"], "closed")
+        self.assertTrue((self.dir / "ran").exists())
+        # The exclusion is positive, bounded evidence in the receipt.
+        evidence = self.receipt["ancestor_exclusions"]
+        self.assertGreaterEqual(evidence["by_rule"]["parent"], 1, evidence)
+        self.assertEqual(evidence["count"], evidence["omitted"] + len(evidence["rows"]), evidence)
+    @staticmethod
+    def report_source(kind, command, waited_ns=None, reason=None):
+        """Fixture source that builds one schema-2 report at run time.
+
+        The document must be built inside the fixture, never here: the nested
+        guardian a real case runs under exports ITS OWN run identity, and this
+        suite process only sees the outer supervisor's. A document built here
+        would name the wrong run and the nested guardian would reject it as
+        `stale run`."""
+        extra = (f"'reason': {reason or 'queue'!r}" if kind == "waiting"
+                 else f"'waited_ns': {int(waited_ns)}")
+        return ("{'schema': 2, 'source': 'fixture', "
+                f"'run': os.environ['OXIDE_PROOF_RUN_ID'], 'command': {command!r}, {extra}}}")
+
+    def test_admission_marker_extends_the_work_window(self):
+        # oxide#192: a reported slot-queue wait moves the supervisor's deadline
+        # by that wait, so execution keeps its own window instead of being
+        # killed inside it. Without the grant the leader is stopped at
+        # limit - 20 s, well before it finishes.
+        document = self.report_source("grant", "fixture-1", waited_ns=10 * 1000000000)
+        code = fixture(
+            "import json\n"
+            "path = os.path.join(os.environ['OXIDE_PROOF_EVIDENCE'], " + repr(bounded.ADMISSION_NAME) + ")\n"
+            "time.sleep(10)\n"
+            "with open(path + '.tmp', 'w') as handle:\n"
+            "    json.dump(" + document + ", handle)\n"
+            "os.replace(path + '.tmp', path)\n"
+            "time.sleep(12)\n"
+            "open(os.environ['CASE_DIR'] + '/ran', 'w')\n")
+        self.assertEqual(self.guardian(code, limit=36), 0)
+        self.assertEqual(self.outcome()["closure"], "closed")
+        self.assertIsNone(self.outcome()["fault"])
+        self.assertFalse(self.outcome()["deadline"])
+        self.assertTrue((self.dir / "ran").exists(), "the command did not keep its work window")
+        self.assertEqual(self.receipt["admission"]["observed"], 1)
+        self.assertEqual(self.receipt["admission"]["ignored"], 0)
+        self.assertIsNotNone(self.receipt["admission"]["first_ns"])
+        decisions = [r for r in self.receipt["custodian"] if r["event"] == "admission_decision"]
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["counted"], 1)
+        self.assertGreaterEqual(decisions[0]["granted_ns"], 9 * NS)
+        self.assertLessEqual(decisions[0]["granted_ns"], 11 * NS)
+        self.assertFalse(decisions[0]["capped"])
+        self.assertEqual(decisions[0]["admission_waiting"]["commands"], 0)
+
+    def test_a_late_admission_marker_is_classified_not_ignored(self):
+        # Review finding: slot admission can reach the supervisor after its stop
+        # decision. The wait is reported, nothing is granted, and the deadline
+        # classification stands instead of becoming an unexplained timeout.
+        # The fixture ignores TERM, writes its marker after the stop instant and
+        # stays in the group long enough for the sampler to read it while the
+        # custodian is still in its bounded stop.
+        waiting = self.report_source("waiting", "fixture-late")
+        grant = self.report_source("grant", "fixture-late", waited_ns=13 * 1000000000)
+        code = fixture(
+            "import json\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "evidence = os.environ['OXIDE_PROOF_EVIDENCE']\n"
+            "path = os.path.join(evidence, " + repr(bounded.ADMISSION_NAME) + ")\n"
+            "waiting = os.path.join(evidence, " + repr(bounded.WAITING_NAME) + ")\n"
+            "time.sleep(5)\n"
+            "with open(waiting + '.tmp', 'w') as handle:\n"
+            "    json.dump(" + waiting + ", handle)\n"
+            "os.replace(waiting + '.tmp', waiting)\n"
+            "time.sleep(8)\n"
+            "with open(path + '.tmp', 'w') as handle:\n"
+            "    json.dump(" + grant + ", handle)\n"
+            "os.replace(path + '.tmp', path)\n"
+            "open(os.environ['CASE_DIR'] + '/ran', 'w')\n"
+            "time.sleep(1.5)\n")
+        self.assertEqual(self.guardian(code, limit=32), 124)
+        self.assertTrue(self.outcome()["deadline"], "a late marker must not look like an ordinary exit")
+        self.assertEqual(self.outcome()["closure"], "closed")
+        self.assertIsNone(self.outcome()["fault"])
+        self.assertTrue((self.dir / "ran").exists(), "the fixture never reached its late write")
+        self.assertEqual(self.receipt["admission"]["observed"], 1)
+        late = [record for record in self.receipt["custodian"] if record["event"] == "admission_late"]
+        self.assertEqual(len(late), 1)
+        self.assertEqual(late[0]["reason"], "deadline")
+        self.assertEqual(late[0]["waited_ns"], 13 * NS)
+        self.assertGreaterEqual(late[0]["at"], self.receipt["start_ns"] + 12 * NS)
+        decisions = [r for r in self.receipt["custodian"] if r["event"] == "admission_decision"]
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["counted"], 0)
+        self.assertEqual(decisions[0]["ignored"], 1)
+        self.assertEqual(decisions[0]["granted_ns"], 0)
+        self.assertEqual(decisions[0]["late_reason"], "deadline")
+        self.assertEqual(decisions[0]["absolute_ns"], self.receipt["start_ns"] + 32 * NS)
+        pairs = decisions[0]["admission_waiting"]
+        self.assertEqual((pairs["commands"], pairs["ended"], pairs["unpaired_count"]), (1, 1, 0),
+                         "a late grant ends its own command's wait, never leaving it unpaired")
+        self.assertEqual(self.receipt["admission_waiting"]["observed"], 1)
+        self.assertEqual(self.receipt["admission_waiting"]["reason"], "queue")
+
+    def test_a_wait_that_never_ends_is_reported_and_classified(self):
+        # Review finding: a wait ending at the supervisor stop could leave no
+        # admission marker and no separately classified queue wait. A waiting
+        # report is published when the wait starts, so the run is classified as
+        # a deadline with a reported, never-granted queue wait.
+        document = self.report_source("waiting", "fixture-1")
+        code = fixture(
+            "import json\n"
+            "path = os.path.join(os.environ['OXIDE_PROOF_EVIDENCE'], "
+            + repr(bounded.WAITING_NAME) + ")\n"
+            "with open(path + '.tmp', 'w') as handle:\n"
+            "    json.dump(" + document + ", handle)\n"
+            "os.replace(path + '.tmp', path)\n"
+            "time.sleep(30)\n")
+        self.assertEqual(self.guardian(code, limit=32), 124)
+        self.assertTrue(self.outcome()["deadline"])
+        self.assertEqual(self.outcome()["closure"], "closed")
+        self.assertIsNone(self.outcome()["fault"])
+        self.assertEqual(self.receipt["admission"]["observed"], 0, "no completed wait was reported")
+        waiting = self.receipt["admission_waiting"]
+        self.assertEqual((waiting["observed"], waiting["reason"], waiting["ignored"]), (1, "queue", 0))
+        reports = [record for record in self.receipt["custodian"] if record["event"] == "admission_waiting"]
+        self.assertEqual(len(reports), 1)
+        self.assertEqual((reports[0]["reason"], reports[0]["after_stop"]), ("queue", False))
+        decisions = [r for r in self.receipt["custodian"] if r["event"] == "admission_decision"]
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual((decisions[0]["waiting_reports"], decisions[0]["waiting_reason"]), (1, "queue"))
+        self.assertEqual(decisions[0]["granted_ns"], 0)
+        self.assertEqual(decisions[0]["absolute_ns"], self.receipt["start_ns"] + 32 * NS)
+        pairs = decisions[0]["admission_waiting"]
+        self.assertEqual((pairs["commands"], pairs["ended"], pairs["unpaired_count"]), (1, 0, 1))
+        self.assertEqual(pairs["unpaired"][0]["command"], "fixture-1")
+        self.assertEqual(pairs["unpaired"][0]["reason"], "queue")
+        self.assertFalse(pairs["unpaired"][0]["later_observation"])
+
+    def test_a_stale_wait_and_a_zero_duration_grant_are_not_proven_unfinished(self):
+        # Review finding: a stale marker left by an earlier run, and a wait whose
+        # own completion arrived with a zero duration, must not be reported as a
+        # proven unfinished wait. The stale file is rejected by run identity and
+        # the zero-duration grant ends its command's wait.
+        evidence = self.dir / "evidence"
+        evidence.mkdir()
+        (evidence / bounded.WAITING_NAME).write_text(json.dumps(
+            {"schema": 2, "source": "fixture", "run": "stale-run", "command": "fixture-stale",
+             "reason": "queue"}))
+        waiting = self.report_source("waiting", "fixture-1")
+        grant = self.report_source("grant", "fixture-1", waited_ns=0)
+        code = fixture(
+            "import json\n"
+            "evidence = os.environ['OXIDE_PROOF_EVIDENCE']\n"
+            "waiting = os.path.join(evidence, " + repr(bounded.WAITING_NAME) + ")\n"
+            "grant = os.path.join(evidence, " + repr(bounded.ADMISSION_NAME) + ")\n"
+            "time.sleep(1)\n"
+            "with open(waiting + '.tmp', 'w') as handle:\n"
+            "    json.dump(" + waiting + ", handle)\n"
+            "os.replace(waiting + '.tmp', waiting)\n"
+            "with open(grant + '.tmp', 'w') as handle:\n"
+            "    json.dump(" + grant + ", handle)\n"
+            "os.replace(grant + '.tmp', grant)\n"
+            "open(os.environ['CASE_DIR'] + '/ran', 'w')\n"
+            "time.sleep(30)\n")
+        self.assertEqual(self.guardian(code, limit=31), 124)
+        self.assertTrue(self.outcome()["deadline"])
+        self.assertEqual(self.outcome()["closure"], "closed")
+        self.assertIsNone(self.outcome()["fault"])
+        self.assertTrue((self.dir / "ran").exists())
+        self.assertGreaterEqual(self.receipt["admission_waiting"]["ignored"], 1,
+                                "the stale waiting file was not rejected")
+        self.assertIn("stale run", self.receipt["admission_waiting"]["rejections"])
+        decisions = [r for r in self.receipt["custodian"] if r["event"] == "admission_decision"]
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["granted_ns"], 0, "a zero-duration grant moves no clock")
+        pairs = decisions[0]["admission_waiting"]
+        self.assertEqual((pairs["commands"], pairs["ended"], pairs["unpaired_count"]), (1, 1, 0),
+                         "the zero-duration grant ends its command's wait")
+        self.assertEqual(pairs["possibly_overwritten_count"], 0)
+        self.assertEqual(decisions[0]["unclassified"], 0)
+
+    def test_a_malformed_admission_marker_changes_nothing(self):
+        # Cooperative evidence only: a rejected marker is recorded and the run
+        # keeps its unextended deadline.
+        code = fixture(
+            "import json\n"
+            "path = os.path.join(os.environ['OXIDE_PROOF_EVIDENCE'], " + repr(bounded.ADMISSION_NAME) + ")\n"
+            "with open(path, 'w') as handle:\n"
+            "    json.dump({'schema': 2, 'source': 'fixture', 'waited_ns': 10 * 1000000000}, handle)\n"
+            "time.sleep(1)\n"
+            "open(os.environ['CASE_DIR'] + '/ran', 'w')\n")
+        # The limit must leave the fixture a real execution window: 32 s put the
+        # stop only 12 s in, so a loaded host could end the run before the
+        # fixture finished and the failure would say nothing about the marker.
+        code = self.guardian(code, limit=45)
+        # Read the marker's no-effect invariant from the receipt first: a guard
+        # shutdown fault must never be confused with an admission effect, and an
+        # admission effect must never hide behind a closed exit.
+        self.assertEqual(self.outcome()["closure"], "closed")
+        self.assertIsNone(self.outcome()["fault"])
+        self.assertFalse(self.outcome()["deadline"])
+        self.assertTrue((self.dir / "ran").exists())
+        self.assertEqual(self.receipt["admission"]["observed"], 0)
+        self.assertGreaterEqual(self.receipt["admission"]["ignored"], 1)
+        self.assertIn("unexpected keys", self.receipt["admission"]["rejections"])
+        decisions = [r for r in self.receipt["custodian"] if r["event"] == "admission_decision"]
+        self.assertEqual(decisions[0]["counted"], 0)
+        self.assertEqual(decisions[0]["granted_ns"], 0)
+        self.assertEqual(code, 0, "the malformed marker had no effect (closed, no fault, no grant),"
+                                  " so a non-zero guard exit is a guard-side fault, not this case's")
+
+    def test_a_slow_setup_inside_its_deadline_launches_and_closes(self):
+        # Oxide#197 (inherited from #192, decision 7bb1089d): the end-to-end
+        # regression for the sampling-based freshness clock. The injected cold
+        # setup takes longer than the 1 s reserve window but stays inside the 10 s
+        # setup deadline, so no reading exists when the superseded custodian-start
+        # basis would have declared the reserve stale. The corrected clock starts
+        # when sampling starts, so the run must launch through the gate, execute
+        # its child and close. The separate controls live in PureFreshnessClock:
+        # no reading within 1 s AFTER sampling began still latches, and a setup
+        # stall beyond its deadline launches nothing.
+        code = fixture("open(os.environ['CASE_DIR'] + '/ran', 'w').write('1')\n")
+        self.assertEqual(self.guardian(code, inject=["setup-delay"], limit=45), 0)
+        self.assertEqual(self.outcome()["closure"], "closed")
+        self.assertIsNone(self.outcome()["fault"])
+        self.assertFalse(self.outcome()["deadline"])
+        self.assertTrue((self.dir / "ran").exists(), "the child never launched")
+        reserve = self.receipt["reserve"]
+        first_gap = reserve["first_ns"] - self.receipt["start_ns"]
+        # The fixture really is discriminating: the first completed reserve reading
+        # arrived after the superseded rule's 1 s window measured from custodian
+        # start, which is exactly when the old basis latched a stale reserve fault,
+        # while the corrected basis measures from when sampling began.
+        self.assertGreater(first_gap, bounded.RESERVE_STALE_NS,
+                           "the injected setup did not exceed the superseded window")
+        self.assertLess(first_gap, bounded.SETUP_S * bounded.NS,
+                        "the injected setup left its own deadline")
+        self.assertGreaterEqual(first_gap, int(bounded.SETUP_DELAY_S * 0.9 * bounded.NS))
+        self.assertTrue(reserve["samples"] >= 1, reserve)
 
     def test_owned_scratch_cleanup(self):
         self.assertEqual(self.guardian(fixture("open(os.environ['TMPDIR'] + '/w', 'wb').write(bytes(65536))\n"),
@@ -8158,6 +9853,16 @@ class Real(unittest.TestCase):
         self.assertEqual(self.guardian(code), 124)
         self.assertEqual(self.outcome()["closure"], "closed")
         self.assertFalse(alive(self.child()))
+
+    def test_separate_group_survivor_unclosed_never_signalled(self):
+        code = fixture("import os\n" + spawn_line(TERM_IGNORING))
+        self.assertEqual(self.guardian(code), 125)
+        self.assertEqual(self.outcome()["closure"], "UNCLOSED")
+        self.assertTrue(alive(self.child()), "survivor must still be alive at the verdict")
+        targets = {r["target"] for r in self.receipt["custodian"] if r["event"] == "signal"}
+        self.assertNotIn(self.child(), targets)
+        self.assertGreaterEqual(self.receipt["census"]["members"], 1)
+        self.assert_kept_outside_outer_cleanup()
 
     def test_cargo_shaped_group_survivor_is_recorded_and_never_signalled(self):
         # oxide#195 regression, the oxide#182 shape under Tom's 2026-10-31 ruling
@@ -8767,6 +10472,14 @@ print("detach fixture ready: " + mount + " " + device + " wholes " + repr(wholes
 """)
 
 
+# The nested detach guard runs `--limit 60`: its own stop is at 40 s and its
+# exit at 58 s. This class's outer window must cover both plus a bounded settle:
+# killing it at the Real class's 45 s verdict would decide nothing and would
+# leave its mount and custody unknown. A timeout therefore retains the resources
+# and fails as unknown, never as a detach outcome.
+DETACH_CASE_VERDICT_S = 75
+
+
 class DetachReal(unittest.TestCase):
     """The three real post-census detach cases. Each one owns its image, keeps
     its evidence, and removes its own fixture mount after the nested guard has
@@ -8788,18 +10501,32 @@ class DetachReal(unittest.TestCase):
         # root owns no image to detach: this case needs the owned `--root-parent`.
         env.pop("OXIDE_TASK_SCRATCH_ROOT", None)
         env.update(extra)
-        args = [sys.executable, str(SUPERVISOR), "--limit", "40", "--root-parent", str(self.dir),
+        args = [sys.executable, str(SUPERVISOR), "--limit", "60", "--root-parent", str(self.dir),
                 "--evidence", str(self.dir / "evidence"), "--", sys.executable, "-c", DETACH_CASE]
         with open(self.dir / "guardian.log", "wb") as log:
             guardian = subprocess.Popen(args, env=env, stdout=subprocess.DEVNULL, stderr=log)
             try:
-                self.code = guardian.wait(timeout=VERDICT_S - (now_ns() - self.started) / NS)
+                self.code = guardian.wait(timeout=DETACH_CASE_VERDICT_S - (now_ns() - self.started) / NS)
+            except subprocess.TimeoutExpired:
+                if guardian.poll() is None:
+                    guardian.kill()
+                    guardian.wait(5)
+                self.fail("the nested detach guard did not settle inside its outer window"
+                          f" ({DETACH_CASE_VERDICT_S} s); its mount, backing and evidence are retained"
+                          " and no detach outcome is inferred from a forced kill")
             finally:
                 if guardian.poll() is None:
                     guardian.kill()
                     guardian.wait(5)
         self.receipt = json.loads((self.dir / "evidence" / "receipt.json").read_text())
-        self.volume = json.loads((self.dir / "volume.json").read_text())
+        volume_path = self.dir / "volume.json"
+        if not volume_path.exists():
+            # The fixture publishes its own attachment facts; without them no
+            # detach oracle can be evaluated, and saying so is truthful (a
+            # missing volume identity is not a detach outcome).
+            self.fail(f"the detach fixture never published its attachment facts (guard exit {self.code},"
+                      f" outcome {self.receipt.get('outcome')}); no detach oracle can be evaluated")
+        self.volume = json.loads(volume_path.read_text())
         CASES.append({"case": self._testMethodName, "exit": self.code, "phase": self.receipt["phase"],
                       "dir": str(self.dir), "detach": self.receipt.get("detach"),
                       # The request-free keep is recorded under `cleanup`, which the
@@ -8986,9 +10713,9 @@ def write(name, size):
 
 
 def main():
-    # Secondary bound; the supervisor's deadline is primary. It is the 380 s
-    # candidate limit less its 30 s margin (oxide#191 amendment: was 250 s).
-    signal.alarm(350)
+    # Secondary bound; the supervisor's deadline is primary. It is the 560 s
+    # candidate limit less its 30 s margin (oxide#192 amendment: was 350 s; 250 s before #191).
+    signal.alarm(530)
     PROTECTION.update(protect_outer_root())
     if PROTECTION.get("state") == "failed":
         # No nested case may run when the outer root could not be protected:
@@ -9001,12 +10728,15 @@ def main():
     loader = unittest.defaultTestLoader
     runner = unittest.TextTestRunner(verbosity=2, resultclass=Results)
     pure = unittest.TestSuite(loader.loadTestsFromTestCase(case)
-                              for case in (PureGuard, PurePrecedence, PureCensus, PureCensusFinalAbsence,
+                              for case in (PureGuard, PureFreshnessClock, PurePrecedence, PureCensus,
+                                           PureAncestors,
+                                           PureCensusFinalAbsence,
                                            PureDiagnostics, PureAllowlist, PureTerminalCounts, PureProtocol,
-                                           PureSurvivors,
+                                           PureAdmission,
                                            PureTraversal, PureDefaultScratch, PureScratchPreparation,
                                            PureMarker, PureSweep, PureExistingParent,
                                            PureProtectionAndLifecycle, QualifyEntry,
+                                           PureSurvivors,
                                            PureQualificationTopology, PureClosureDecision,
                                            PureSettlement, PureInterleavedConfirmation, PureDetach))
     ok = runner.run(pure).wasSuccessful()

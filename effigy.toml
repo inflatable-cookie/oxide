@@ -298,7 +298,8 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # commands take Tom's answered internal-root exception explicitly
 # (`--root-parent /private/tmp`) rather than placing a pool on a selected
 # volume, where the product correctly refuses it. The supervisor is this tree's
-# `bounded-test.py` (sha256 0848974d…, oxide#191's post-census detach bytes over
+# `bounded-test.py` (sha256 94b1aba6…, oxide#191's post-census detach and
+# oxide#197's ancestor and launcher-sibling exclusions over
 # the qualified oxide#151 guard; those added bytes are unqualified until their
 # own qualifications pass); 300 s wall and
 # 512 MiB monitored scratch are unchanged and the fit stays unmeasured until
@@ -530,9 +531,10 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 
 # Owned-output prune (oxide#129, oxide#152): one fixed 22-case native proof
 # under the shared supervisor (`scripts/bounded-test.py` SHA-256
-# 0848974d79d84617070bd611da9503b48a0127e68c2965cebcd36e8d5fc13414,
-# the qualified oxide#151 guard plus oxide#191's opt-in post-census detach,
-# unqualified until its own qualifications pass): 360 s, 512 MiB monitored scratch, 30 s work
+# 94b1aba60a7475a31b5620039986336f13e1c88d58dd3732b5736290dc63685b,
+# the qualified oxide#151 guard plus oxide#191's opt-in post-census detach and
+# oxide#197's ancestor and launcher-sibling exclusions,
+# unqualified until their own qualifications pass): 360 s, 512 MiB monitored scratch, 30 s work
 # shutdown margin, one
 # owned 128 MiB scratch image, ordinary detach. Fence and initialization, root
 # nonces, shared and cancelled reservations, snapshot, overflow, eligibility,
@@ -626,7 +628,7 @@ admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-drive-mode.py"
 
 # Shared session supervisor qualification (oxide#109): a short bootstrap
-# (healthy reserve readings, fixed 420 s wall limit held by a minimal outer
+# (healthy reserve readings, fixed 600 s wall limit held by a minimal outer
 # actor) runs the candidate `bounded-test.py` around its synthetic suite:
 # pure fault injection first, then tiny real Python children and fixture
 # writers in owned scratch. The candidate runs with no --root-parent and no
@@ -652,16 +654,28 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # refusal and uncertainty paths alongside the unchanged guard cases. The changed runner is unqualified
 # until one counted author and one separate independent reviewer run of this
 # selector pass at the same head.
+# Oxide#192 correction (2026-10-31 brief author): the first direct uncounted
+# diagnostic at 5623edd exhausted the earlier 350 s suite alarm (candidate exit
+# 142 = SIGALRM, 357 s wall); that packet is a failed diagnostic preserved with
+# no credit, its pure suite OK. The bounds below are a 600 s fixed deadline
+# (kill at 598 s), a 560 s candidate limit and a 530 s suite alarm, with the
+# 512 MiB monitored scratch and the margin/custody semantics unchanged. Under
+# Tom decision d3d61247 the owner may execute this exact command directly while
+# Effigy's I2/I3 helper-process regression makes its session census uncertain,
+# under the same bounds, environment, reserve and custody checks and a
+# per-session executor/command/head/exit/load/log-hash envelope; no general proof
+# waiver follows.
 [tasks."proof:supervisor:qualify"]
 admission = "heavy"
 run = "python3 scripts/qualify-supervisor.py"
 
 # The uncounted keep-going diagnostic of that same qualification path
-# (oxide#191): the same bootstrap, heavy admission, 420 s absolute deadline and
+# (oxide#191): the same bootstrap, heavy admission, 600 s absolute deadline and
 # 512 MiB monitored scratch, with `--diagnostic` on both the bootstrap and the
 # changed pass check. It runs each named qualification oracle on its own, so one
 # failing check never hides the rest, records a bounded `qualified: false`
-# receipt and always exits non-zero: it is never a counted PASS, and it is
+# receipt with its per-check rows (including oxide#192's admission-report checks and its
+# case-level collection) and always exits non-zero: it is never a counted PASS, and it is
 # required before the counted author qualification at a changed head.
 [tasks."proof:supervisor:qualify:diagnostic"]
 admission = "heavy"
@@ -761,17 +775,22 @@ run = "python3 scripts/test-oxide-removable-removal.py --self-check"
 # started before the current boot session is positively closed. Stages this
 # HEAD's debug `oxide` offline with 1.97.1 and, over one owned 128 MiB scratch
 # APFS image at a unique /Volumes/<name> (`-owners on`) with a private HOME
-# and CARGO_HOME, proves three independent cases: a quarantined `exec` slot
+# and CARGO_HOME, proves four independent cases: a quarantined `exec` slot
 # (the product's own removal path: the removal stop ends the blocked tool and
 # its release flush fails with the mount gone) whose debug-only override
 # boot time follows its holder start is reported closed by `status`, an
 # explicit adopt of a whole-target fixture then migrates, and the next
 # admission deletes the slot whole; a slot whose override boot time precedes
 # its holder start stays kept with its bytes; an unreadable override stays
-# kept. The explicit internal root is the owner-accepted exception for this
-# fixture's genuine directory-budget internal pool (a pool under /Volumes
-# refuses). 300 s, 512 MiB monitored scratch, ordinary detach. No reinstall,
-# live pool or live slot mutation. Not a benchmark or full QA.
+# kept; and the operator-confirmed release (oxide#196) refuses while an
+# `oxide exec` tool's forked child, which leaves the product's exec group by
+# joining the supervisor's leader process group, holds a file in its slot
+# scratch after observing the detach and then the re-attach (a fresh handle;
+# readiness never precedes removal), then deletes the slot whole through the
+# holding area once that writer is stopped. The explicit internal root is the owner-accepted
+# exception for this fixture's genuine directory-budget internal pool (a pool
+# under /Volumes refuses). 300 s, 512 MiB monitored scratch, ordinary detach.
+# No reinstall, live pool or live slot mutation. Not a benchmark or full QA.
 [tasks."rust:oxide-removable-boot-closure"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-oxide-removable-removal.py --boot-closure"
@@ -1089,9 +1108,10 @@ admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-freshness-submodules.py"
 
 # Slot headroom (oxide#118, oxide#177): under the shared proof supervisor
-# (oxide#109/#114/#151 plus oxide#191's opt-in post-census detach, bounded-test.py
-# SHA-256 0848974d79d84617070bd611da9503b48a0127e68c2965cebcd36e8d5fc13414,
-# unqualified until its own qualifications pass), stages
+# (oxide#109/#114/#151 plus oxide#191's opt-in post-census detach and oxide#197's
+# ancestor and launcher-sibling exclusions, bounded-test.py
+# SHA-256 94b1aba60a7475a31b5620039986336f13e1c88d58dd3732b5736290dc63685b,
+# unqualified until their own qualifications pass), stages
 # `oxide` offline with 1.97.1 and proves the permanent ledger/control fences,
 # legacy read without migration, the raised-ceiling fence written at the 129th
 # slot, rank exhaustion, a 256-slot pool whose 257th and 258th admissions
