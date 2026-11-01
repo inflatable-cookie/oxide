@@ -47,6 +47,7 @@ import sys
 sys.dont_write_bytecode = True
 
 import importlib.util
+import hashlib
 import json
 import os
 import secrets
@@ -71,7 +72,8 @@ ROOT = os.path.realpath(os.environ.get("OXIDE_TASK_SCRATCH_ROOT", ""))
 SCRATCH_POOL_ROOT = os.path.join(ROOT, "scratch-pools")
 EVIDENCE = os.path.realpath(os.environ.get("OXIDE_PROOF_EVIDENCE", ""))
 SHUTDOWN_MARGIN_S = 30
-RUNNER_SHA256 = "94b1aba60a7475a31b5620039986336f13e1c88d58dd3732b5736290dc63685b"
+# Qualified at b29ef6c: evidence-195-b29ef6c-20261101T043444Z.
+RUNNER_SHA256 = "fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b"
 CANDIDATE = "OxSh" + secrets.token_hex(4)
 RESULTS = []
 CHILDREN = []
@@ -1059,6 +1061,9 @@ def reset_collection() -> None:
 
 
 def self_check() -> None:
+    with open(os.path.join(REPO, "scripts", "bounded-test.py"), "rb") as handle:
+        runner_hash = hashlib.sha256(handle.read()).hexdigest()
+    expect(runner_hash == RUNNER_SHA256, f"qualified runner hash mismatch: {runner_hash}")
     """Pure apparatus check of the diagnostic collection: no child, scratch,
     pool or evidence write."""
     global PHASE_NAMES, PHASE_FAILURES, PHASE_SKIPS
@@ -1172,7 +1177,6 @@ def main() -> None:
     try:
         work_left()
         with open(os.path.join(REPO, "scripts", "bounded-test.py"), "rb") as handle:
-            import hashlib
             runner_hash = hashlib.sha256(handle.read()).hexdigest()
         expect(runner_hash == RUNNER_SHA256, f"qualified runner hash mismatch: {runner_hash}")
         source = subprocess.check_output(["git", "rev-parse", "HEAD^{commit}"], cwd=REPO, text=True).strip()
