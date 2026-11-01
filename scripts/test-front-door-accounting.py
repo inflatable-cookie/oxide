@@ -600,7 +600,7 @@ class Proof:
     def __init__(self, parent: str, oxide: str, env: dict):
         self.parent = parent
         self.oxide = oxide
-        self.pool = os.path.join(env["OXIDE_SCRATCH_ROOT"], os.path.relpath(parent, os.path.dirname(env["OXIDE_SCRATCH_ROOT"])), "pool")
+        self.pool = os.path.normpath(os.path.join(env["OXIDE_SCRATCH_ROOT"], os.path.relpath(parent, os.path.dirname(env["OXIDE_SCRATCH_ROOT"])), "pool"))
         self.env = {**env, "OXIDE_POOL": self.pool, "OXIDE_POOL_CREATE": "1"}
         self.logs = 0
         self.dirs = {}
@@ -1372,7 +1372,7 @@ def self_check() -> int:
             expect_true(env["OXIDE_POOL_CAP"] == str(SCRATCH_LIMIT_BYTES), "pool cap is not explicit")
             main_pool = Proof(fixture_root, "oxide", env).pool
             other_pool = Proof(os.path.join(fixture_root, "hardlink"), "oxide", env).pool
-            expect_true(main_pool == os.path.join(env["OXIDE_SCRATCH_ROOT"], ".", "pool"), "main pool escaped scratch root")
+            expect_true(main_pool == os.path.join(env["OXIDE_SCRATCH_ROOT"], "pool"), "main pool escaped scratch root")
             expect_true(other_pool == os.path.join(env["OXIDE_SCRATCH_ROOT"], "hardlink", "pool"), "hardlink pool escaped scratch root")
             expect_true(env["OXIDE_TEST_HOME_FROM_ENV"] == "1", "account-home control was not set")
             expect_true(env["HOME"] == os.path.join(fixture_root, "home"), "HOME is not private")
@@ -1661,7 +1661,7 @@ def self_check() -> int:
                     os.makedirs(parent, mode=0o700)
                 else:
                     os.makedirs(parent, mode=0o700)
-                case = Proof(parent, "/fixture/oxide", {})
+                case = Proof(parent, "/fixture/oxide", {"OXIDE_SCRATCH_ROOT": os.path.join(parent, "scratch-pools")})
                 walks = os.path.join(parent, "walks")
                 expect_true(os.path.isdir(walks), f"{label}: no walks directory at {walks}")
                 expect_true(stat.S_IMODE(os.stat(walks).st_mode) == 0o700,
