@@ -6437,9 +6437,9 @@ pub fn refuse_unknown_layout(
 }
 
 /// The real executable for a Cargo-reported program path, when that program's
-/// member is an owned link into `root`: `target/<member>/<rest>` maps to
-/// `root/<member>/<rest>`. A real (unlinked) member keeps Cargo's own path, so
-/// a mixed checkout never runs another member's artifact.
+/// member or legacy whole target is an owned link into `root`:
+/// `target/<member>/<rest>` maps to `root/<member>/<rest>`. A real
+/// (unlinked) member keeps Cargo's own path.
 pub fn program_target(checkout: &Path, root: &Path, program: &Path) -> Option<PathBuf> {
     let relative = program.strip_prefix(&checkout.join("target")).ok()?;
     let mut components = relative
@@ -6459,6 +6459,21 @@ pub fn program_target(checkout: &Path, root: &Path, program: &Path) -> Option<Pa
         format!("{first}/{second}")
     };
     crate::layout::Member::parse(&member).ok()?;
+    // The caller supplies the root bound under the held lease. A legacy
+    // target link must still name that exact root and carry this checkout's
+    // owner marker; an unverified link keeps the existing Cargo-path fallback.
+    if fs::read_link(checkout.join("target")).ok().as_deref() == Some(root) {
+        let checkout_id = identity::digest(&checkout.to_string_lossy());
+        owned_root(checkout, &checkout_id, root).ok()?;
+        if !relative
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+        {
+            return None;
+        }
+        let mapped = root.join(relative);
+        return mapped.is_file().then_some(mapped);
+    }
     let target = fs::read_link(link_path(checkout, &member)).ok()?;
     if target != member_destination(root, &member) {
         return None;
@@ -13055,6 +13070,38 @@ mod tests {
         let relative = PathBuf::from("../../.oxide-outputs/local/aarch64-apple-darwin/debug");
         symlink(&relative, &triple_link).unwrap();
         check_untouched("relative link", &triple_link, &relative);
+    }
+
+    #[test]
+    fn whole_target_run_maps_only_the_verified_bound_root() {
+        let (fixture, receipt) = legacy_checkout();
+        let root = receipt.selected().unwrap().root().to_path_buf();
+        let target = fixture.checkout.join("target");
+        let program = target.join("debug/app");
+        let mapped = root.join("debug/app");
+        fs::create_dir_all(mapped.parent().unwrap()).unwrap();
+        fs::write(&mapped, b"program").unwrap();
+        assert_eq!(
+            program_target(&fixture.checkout, &root, &program),
+            Some(mapped)
+        );
+
+        let foreign = fixture.root.join("foreign");
+        fs::create_dir_all(foreign.join("debug")).unwrap();
+        fs::write(foreign.join("debug/app"), b"foreign").unwrap();
+        assert_eq!(program_target(&fixture.checkout, &foreign, &program), None);
+        let marker = root.join(MARKER);
+        let marker_bytes = fs::read(&marker).unwrap();
+        fs::write(&marker, b"unverified").unwrap();
+        assert_eq!(program_target(&fixture.checkout, &root, &program), None);
+        fs::write(&marker, marker_bytes).unwrap();
+        fs::remove_file(&target).unwrap();
+        symlink(&foreign, &target).unwrap();
+        assert_eq!(program_target(&fixture.checkout, &root, &program), None);
+        fs::remove_file(&target).unwrap();
+        fs::create_dir_all(target.join("debug")).unwrap();
+        fs::write(&program, b"real").unwrap();
+        assert_eq!(program_target(&fixture.checkout, &root, &program), None);
     }
 
     #[test]

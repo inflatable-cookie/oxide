@@ -1440,9 +1440,10 @@ def run(proof: Proof, repo: str, base_compat: bool = False, diagnostic: bool = F
         wait_for(os.path.join(run_gate, "leader-exited"), "run leader exit")
         exe = read_bytes(os.path.join(run_gate, "exe")).decode()
         expect(
-            os.path.realpath(exe).startswith(external_root + os.sep) and not exe.startswith(link),
-            f"the run did not execute from the bound real root: {exe}",
+            os.path.realpath(exe).startswith(external_root + os.sep),
+            f"the run executable resolved outside the bound real root: {exe}",
         )
+        expect(not exe.startswith(link + os.sep), f"the run used the checkout target link: {exe}")
         time.sleep(0.5)
         expect(runner.poll() is None, "oxide run returned while its program's child still runs")
         held = plan(proof, app, "plan while a run child lives")
