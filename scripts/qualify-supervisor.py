@@ -77,7 +77,7 @@ WALL_NS = 600 * NS  # oxide#192 amendment (2026-10-31): was 420 s (#191), 300 s 
 CANDIDATE_LIMIT = 560  # oxide#192 amendment: was 380 s (#191), 280 s before
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 438  # 382 pure + 56 real. oxide#151 added the routing, marker,
+EXPECTED_CASES = 439  # 382 pure + 57 real. oxide#151 added the routing, marker,
                       # nested-window protection, bounded-sweep, qualify-entry,
                       # shared-ancestor/private-leaf and readiness cases; oxide#191
                       # adds seventy-six pure post-census detach cases and eight real

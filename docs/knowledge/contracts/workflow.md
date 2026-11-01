@@ -2466,7 +2466,7 @@ integrated head).** The integrated `bounded-test.py`
 `test_supervisor.py`
 (`c95d46aa0e590285c3c412294ffb215c0d45b19ba804f2243f0d2ebd62158d7b`) and
 `qualify-supervisor.py`
-(`30763aabbee0f09fe02bb04b7a85be584430de5ef8df827cbf9105c9a0cf80f6`) add the
+(`c4b7a6a7983dfe4e097c3949e35f603aed8aefdee95ad41722986130cf01922c`) add the
 oxide#195 custody hardening over the oxide#197 ancestor rules and the oxide#192
 admission reports, so all three controls remain unqualified until this head's own
 uncounted `effigy proof:supervisor:qualify:diagnostic` and separate author and
@@ -2481,7 +2481,7 @@ prefix, records `census_join.joined: false`/`frozen`/`refused`, refuses the
 cleanup decision, has the custodian latch the reason, and keeps the root, backing
 and evidence. Nothing in that path signals anything. The suite gains twenty-one
 pure cases and one real recorded-and-never-signalled Cargo-shaped survivor case
-in place of the former separate-group survivor case (382 pure plus 56 real = 438
+in place of the former separate-group survivor case (382 pure plus 57 real = 439
 at this head, and the bootstrap's expected case total follows the suite; the
 historical #197 record above keeps its own 416). The keeper of the historical
 survivor is Queue papercut `9ff7386d`; this head keeps that process's identity on
