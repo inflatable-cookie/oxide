@@ -4082,6 +4082,50 @@ fn a_256_slot_ledger_round_trip_has_bounded_recorded_work() {
     );
 }
 
+/// The ledger work oracle the round-trip fixture asserts on is discriminating,
+/// not a constant: a second whole-ledger read inside one window changes the
+/// counts and doubles the read bytes, so a per-slot re-read regression cannot
+/// hide behind a passing round trip (oxide#224).
+#[test]
+fn the_ledger_work_oracle_counts_each_extra_whole_ledger_read() {
+    let fixture = Fixture::new("ledger-work-counterfactual");
+    let pool = fixture.dir("pool");
+    create_injected(&pool, 8 * 1024 * 1024).expect("init");
+    let _held = lease_once(&fixture, &pool, "ledger-work");
+    super::pool::ledger_work::reset();
+    let first = super::pool::snapshot_injected(&pool).expect("first read");
+    let one = super::pool::ledger_work::observed();
+    assert_eq!(
+        first.slots.len(),
+        1,
+        "the fixture slot is not in the ledger"
+    );
+    assert_eq!(
+        (one.reads, one.writes),
+        (1, 0),
+        "one read was not one read: {one:?}"
+    );
+    assert_eq!(one.rows, 1, "the read did not count its slot row: {one:?}");
+    let _second = super::pool::snapshot_injected(&pool).expect("second read");
+    let two = super::pool::ledger_work::observed();
+    assert_eq!(
+        (two.reads, two.writes),
+        (2, 0),
+        "an extra whole-ledger read was not counted: {two:?}"
+    );
+    assert_eq!(
+        two.read_bytes,
+        2 * one.read_bytes,
+        "the extra read did not add its ledger bytes: {two:?}"
+    );
+    assert_eq!(
+        two.rows,
+        2 * one.rows,
+        "the extra read did not count its row: {two:?}"
+    );
+    assert_ne!(one, two, "the oracle cannot distinguish one read from two");
+}
+
 #[test]
 fn project_replacement_requires_complete_accounting_before_deletion() {
     let fx = Fixture::new("replace-accounting");
