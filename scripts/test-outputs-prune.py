@@ -775,6 +775,27 @@ def case(case_id: str) -> _Case:
     return _Case(case_id)
 
 
+def preview_report(preview: dict) -> str:
+    """One bounded line naming why every evaluated root was kept.
+
+    Every assertion about an individual keep or a candidate set carries this
+    map, because a preview the product refused as a WHOLE (an incomplete
+    snapshot) keeps every root for one shared reason and sets no candidate at
+    all: without the map that is indistinguishable from a per-root refusal, and
+    a failure prints only an empty candidate set.
+    """
+    coverage = preview.get("coverage") or {}
+    kept = [
+        f"{(row.get('root') or row.get('checkout_id') or '?')}: {row.get('reason')}"
+        for row in preview.get("kept") or []
+    ]
+    return (
+        f"coverage complete={coverage.get('complete')} "
+        f"candidates={coverage.get('candidate_roots')} kept={coverage.get('kept_roots')}; "
+        + " | ".join(kept[:12])
+    )
+
+
 def control_state_version(document: dict) -> "int | None":
     """The numeric version a control document implies from its OWN fences.
 
@@ -2037,6 +2058,24 @@ class World:
                 return kept["reason"]
         return ""
 
+    def report(self, preview: dict) -> str:
+        """[`preview_report`] for one preview."""
+        return preview_report(preview)
+
+    def complete(self, preview: dict, label: str) -> None:
+        """Require a COMPLETE snapshot before reasoning about individual keeps.
+
+        A per-root keep is only evidence when the snapshot that produced it was
+        complete; the product keeps the whole batch for one shared reason when
+        required authority is missing. Making that an explicit premise keeps a
+        broken fixture (or a genuinely incomplete registry) from masquerading as
+        a correct per-root decision, and names the shared reason when it does.
+        """
+        expect(
+            (preview.get("coverage") or {}).get("complete") is True,
+            f"{label}: the whole batch was kept instead of a per-root decision: {preview_report(preview)}",
+        )
+
     def intents(self) -> list:
         return self.registry_doc().get("intents", [])
 
@@ -2568,11 +2607,12 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
                 code, _, stderr = control.finish(world, refused, "local-fallback starter")
                 expect(code != 0, f"the refused local-fallback starter exited {code}: {stderr}")
             _, _, preview = world.plan_file("non-reserving control dry run", alpha)
+            world.complete(preview, "non-reserving control dry run")
             reason = world.kept(preview, beta_root)
-            expect(reason, f"the non-reserving control root is neither kept nor explained: {reason}")
+            expect(reason, f"the non-reserving control root is neither kept nor explained: {world.report(preview)}")
             expect(
                 beta_root not in world.candidates(preview),
-                "the non-reserving control root became a candidate",
+                f"the non-reserving control root became a candidate: {world.report(preview)}",
             )
         finally:
             permanent.set_recorded_uuid(world.pool, recorded)
@@ -2637,6 +2677,7 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
         expect("outputs/registry.json" in before and len(volume_before) > 0, "the byte oracle saw nothing")
         path, sha, preview = world.plan_file("dry run", alpha)
         expect(preview["version"] == "oxide.outputs.prune-preview/1", preview["version"])
+        world.complete(preview, "canonical dry run")
         expect(tree_bytes(world.control) == before, "a dry run changed control bytes")
         expect(tree_bytes(os.path.join(mount, "oxide-outputs")) == volume_before, "a dry run changed volume bytes")
 
@@ -2651,27 +2692,55 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
             handle.write(b"{corrupt")
         code, stdout, _ = world.dry_run("dry run with a corrupt receipt", alpha)
         preview = json.loads(stdout)
-        expect(code == 0 and not preview["candidates"], f"candidates despite a corrupt receipt: {preview['candidates']}")
-        expect("whole batch" in world.kept(preview, delta_root), world.kept(preview, delta_root))
+        expect(
+            code == 0 and not preview["candidates"],
+            f"candidates despite a corrupt receipt: {preview['candidates']}",
+        )
+        expect(
+            (preview.get("coverage") or {}).get("complete") is False,
+            f"a corrupt receipt left a complete snapshot: {world.report(preview)}",
+        )
+        expect(
+            "whole batch" in world.kept(preview, delta_root),
+            f"the corrupt receipt did not refuse the batch: {world.report(preview)}",
+        )
         with open(gamma_receipt, "wb") as handle:
             handle.write(saved_receipt)
 
     # ---- eligibility --------------------------------------------------------
     with case("08") as scope, scope.run():
         _, _, preview = world.plan_file("eligibility dry run", alpha)
-        expect(world.candidates(preview) == {delta_root}, f"candidates {world.candidates(preview)}")
-        expect("present" in world.kept(preview, world.selected(alpha)["root"]), "alpha not kept as present")
+        world.complete(preview, "eligibility dry run")
+        expect(
+            world.candidates(preview) == {delta_root},
+            f"candidates {world.candidates(preview)}: {world.report(preview)}",
+        )
+        expect(
+            "present" in world.kept(preview, world.selected(alpha)["root"]),
+            f"alpha not kept as present: {world.report(preview)}",
+        )
         epsilon = world.checkout("epsilon")
         epsilon_root = world.adopt(epsilon)["links"][0]["selected"]["root"]
         code, _, stderr = world.oxide(["outputs", "detach"], "detach epsilon", epsilon)
         expect(code == 0, stderr)
         _, _, preview = world.plan_file("live detached dry run", alpha)
-        expect(epsilon_root not in world.candidates(preview), "a live detached root became a candidate")
-        expect("present" in world.kept(preview, epsilon_root), world.kept(preview, epsilon_root))
+        world.complete(preview, "live detached dry run")
+        expect(
+            epsilon_root not in world.candidates(preview),
+            f"a live detached root became a candidate: {world.report(preview)}",
+        )
+        expect(
+            "present" in world.kept(preview, epsilon_root),
+            f"the live detached root is not kept as present: {world.report(preview)}",
+        )
         # The same released root becomes eligible once its checkout is gone.
         epsilon_away = world.vanish(epsilon)
         _, _, preview = world.plan_file("released vanished dry run", alpha)
-        expect(epsilon_root in world.candidates(preview), f"a released vanished root was kept: {world.kept(preview, epsilon_root)}")
+        world.complete(preview, "released vanished dry run")
+        expect(
+            epsilon_root in world.candidates(preview),
+            f"a released vanished root was kept: {world.report(preview)}",
+        )
         world.restore(epsilon, epsilon_away)
 
         # A registered checkout on the attached image: absence is proved through
@@ -2680,7 +2749,11 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
         omega_root = world.adopt(omega)["links"][0]["selected"]["root"]
         omega_away = world.vanish(omega)
         _, _, preview = world.plan_file("registered image checkout dry run", alpha)
-        expect(omega_root in world.candidates(preview), f"a registered /Volumes checkout was kept: {world.kept(preview, omega_root)}")
+        world.complete(preview, "registered image checkout dry run")
+        expect(
+            omega_root in world.candidates(preview),
+            f"a registered /Volumes checkout was kept: {world.report(preview)}",
+        )
         world.restore(omega, omega_away)
 
     with case("09") as scope, scope.run():
@@ -3208,8 +3281,9 @@ def self_test() -> int:
     (counted fail-fast, keep-going, taint skips, abort precedence) and the
     bounded unqualified receipt are driven with synthetic bodies.
     """
-    global permanent, DIAG
+    global permanent, DIAG, expect, fail
     restore = permanent
+    saved_expect, saved_fail = expect, fail
     fake = type(
         "FakePermanent",
         (),
@@ -3220,9 +3294,14 @@ def self_test() -> int:
                 if condition
                 else (_ for _ in ()).throw(RuntimeError(message))
             ),
+            "fail": staticmethod(lambda message: (_ for _ in ()).throw(RuntimeError(message))),
         },
     )
     permanent = fake
+    # The case bodies and `World` helpers use the module-level `expect`/`fail`
+    # that a real run binds to the permanent fixture; the pure checks drive the
+    # same code, so bind the fake's pair for the duration.
+    expect, fail = fake.expect, fake.fail
     failures = 0
 
     def check(label: str, body) -> None:
@@ -3461,6 +3540,58 @@ def self_test() -> int:
         assert HOLDING_STATE_VERSION == CONTROL_STATE_VERSION
 
     check("control format pins", control_format_pins)
+
+    def keep_diagnostics() -> None:
+        # Every individual-keep or candidate-set assertion carries the bounded
+        # reason map, and every such premise asserts a COMPLETE snapshot, so a
+        # whole-batch refusal can never again print as an empty candidate set.
+        # The 6798e5b diagnostic failed exactly that way: case 08 reported
+        # "candidates set()" with no way to tell a per-root keep from the one
+        # shared whole-batch reason.
+        body = inspect.getsource(run)
+        for label in (
+            "eligibility dry run",
+            "live detached dry run",
+            "released vanished dry run",
+            "registered image checkout dry run",
+            "non-reserving control dry run",
+            "canonical dry run",
+        ):
+            assert label in body, label
+        assert body.count("world.complete(preview,") >= 6, body.count("world.complete(preview,")
+        assert body.count("world.report(preview)") >= 8, body.count("world.report(preview)")
+        # The corrupt-receipt case expects the whole batch and says so.
+        assert 'get("complete") is False' in body, "the corrupt-receipt case no longer pins incompleteness"
+
+        # The report itself is bounded and names the coverage and the reasons.
+        report = preview_report(
+            {
+                "coverage": {"complete": False, "candidate_roots": 0, "kept_roots": 2},
+                "kept": [
+                    {"root": "/r1", "reason": "the checkout is present"},
+                    {"root": "/r2", "reason": "the registry snapshot is incomplete (x); the whole batch is kept"},
+                ],
+            }
+        )
+        assert "complete=False" in report and "/r1: the checkout is present" in report, report
+        assert "whole batch" in report and len(report) < 4000, (len(report), report)
+        assert World.kept(None, {"kept": [{"root": "/r1", "reason": "kept"}]}, "/r1") == "kept"
+
+        # The completeness premise accepts a complete snapshot and refuses an
+        # incomplete one with the shared reason.
+        World.complete(None, {"coverage": {"complete": True}}, "complete control")
+        for incomplete in (
+            {"coverage": {"complete": False}, "kept": []},
+            {},
+        ):
+            try:
+                World.complete(None, incomplete, "incomplete control")
+            except RuntimeError as error:
+                assert "whole batch" in str(error), error
+            else:
+                raise AssertionError("an incomplete preview satisfied the completeness premise")
+
+    check("keep and completeness diagnostics", keep_diagnostics)
 
     def documented_matrix() -> None:
         # The owning docstring must describe exactly the bodies this run
@@ -4525,6 +4656,7 @@ def self_test() -> int:
     check("counted mode writes no diagnostic receipt", counted_never_writes)
 
     permanent = restore
+    expect, fail = saved_expect, saved_fail
     DIAG = Diagnostics(enabled=False)
     if failures:
         print(f"test-outputs-prune self-test: {failures} check(s) failed", file=sys.stderr)

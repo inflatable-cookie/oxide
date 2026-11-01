@@ -6184,7 +6184,31 @@ at `/private/tmp/oxide-proof.c54y64f5/evidence/outputs-prune-diagnostic.20261101
 (SHA-256 `156b0a30…`, 22/22 recorded, case 01 failed, the rest skipped) and the counted
 run's supervisor receipt
 `/private/tmp/oxide-proof.sv1cd9mi/evidence/receipt.json` (SHA-256 `51cb5549…`, run
-`b2c078b2…`, closed, status 1, no deadline). No live prune, dry run,
+`b2c078b2…`, closed, status 1, no deadline). **Classification of the `6798e5b` case-08 failure (oxide#216).** At that head one uncounted
+diagnostic (`/private/tmp/oxide-proof.0qnj0n2i`, receipt SHA-256 `55c10fdb…`, source
+`6798e5b`) completed cases 01–07 and failed case 08 with an empty candidate set, and the
+counted author run at the same head (`/private/tmp/oxide-proof.16zijqo1`, supervisor
+receipt SHA-256 `e99b216c…`, stdout SHA-256 `3f26dcdf…`) failed identically; both are
+spent with no native credit. Classification from source: the stale-device
+reconciliation cannot produce this. Every prune-side change it makes *removes* a
+refusal (observation device equality, selected-group device equality, candidate
+and plan device equality, journal replay device equality) or refreshes recorded
+state; none adds a `snapshot_error`, and the one new refusal (a row with no recorded
+device) is per-row. So the empty set is either a snapshot-level refusal of this
+fixture state (the whole batch keeps every root for one shared reason) or a per-root
+keep of the one eligible root — and this head is the first ever to execute case 08,
+because every earlier head failed at case 01, so that case's premise was never
+proven. The retained receipts cannot decide between the two: the failing assertion
+printed only the candidate set, and a whole-batch refusal is indistinguishable there
+from a per-root decision. The proof therefore now makes the premise explicit —
+`World.complete` requires a COMPLETE preview before any individual-keep or
+candidate-set assertion (canonical dry run, non-reserving control, eligibility, live
+detached, released vanished, registered image), the corrupt-receipt case requires the
+whole batch so the two directions are pinned, and every such assertion carries
+`preview_report`'s bounded root→reason map, which also reaches the diagnostic
+receipt's case detail. That correction is diagnostic and premise-tightening only: no
+product behaviour is changed, and the next exact-head diagnostic names the shared
+reason (if any) instead of an empty set. No live prune, dry run,
 `resolve-intent`, mode, consumer or pool mutation is authorized by this implementation.
 
 ## Adaptive sccache location (proposed)
