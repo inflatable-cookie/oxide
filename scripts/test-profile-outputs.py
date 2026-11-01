@@ -194,6 +194,9 @@ MARKER = ".oxide-output.json"
 CAPABILITIES = "__oxide-build-capabilities"
 STATE3_FENCE = "oxide.outputs/2"
 STATE4_FENCE = "oxide.outputs/3"
+VOLUME_PREFIX = "P"
+VOLUME_TOKEN_BYTES = 2
+CHECKOUT_DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz"
 MIN_CANDIDATE_CAPABILITY = 4
 OBSERVED_CAPABILITIES = {"base": None, "candidate": None}
 
@@ -261,8 +264,8 @@ def plan_only() -> int:
     print("cases: " + ", ".join(mode_labels(MODE)))
     print("Builds: candidate only, private OXIDE_SCRATCH_ROOT and 64MiB pool cap; 600 s / 512 MiB.")
     print("A /private/tmp fallback is not external scratch-pool coverage.")
-    print("base-compat: pinned base 4a70b83 and candidate, internal root; 300 s / 128 MiB.")
-    print("Base-compat fit is UNMEASURED; earlier staging estimate was 288 MiB.")
+    print("base-compat: pinned base 4a70b83 and candidate, internal root; 300 s / 512 MiB.")
+    print("Base-compat fit is UNMEASURED; prior 128 MiB bound was superseded by ea36e265.")
     print("Both modes: one 128 MiB sparse image, ordinary detach, guard custody.")
     print("--diagnostic is uncounted; native runs require owner activation.")
     return 0
@@ -420,7 +423,16 @@ def wait_started(gate: str, label: str) -> None:
 
 
 def make_checkout(proof: Proof, name: str, files: dict | None = None) -> str:
-    workspace = os.path.join(proof.root, "checkouts", name)
+    # Unique two-character checkout labels prevent project-folder collisions:
+    # each private checkout has one stable identity and no configured origin.
+    labels = getattr(proof, "_checkout_labels", {})
+    expect(name not in labels, f"fixture checkout {name!r} was requested twice")
+    index = len(labels)
+    expect(index < len(CHECKOUT_DIGITS) ** 2, "fixture checkout labels exhausted")
+    label = CHECKOUT_DIGITS[index // len(CHECKOUT_DIGITS)] + CHECKOUT_DIGITS[index % len(CHECKOUT_DIGITS)]
+    labels[name] = label
+    proof._checkout_labels = labels
+    workspace = os.path.join(proof.root, "checkouts", label)
     os.makedirs(workspace)
     perm.write_tree(workspace, files or APP)
     result = proof.run(
@@ -655,13 +667,15 @@ def attach_owned_image(
     positively observe the mount state. Every attach and reattach in this
     proof goes through here. A distinct `image_name` gives an isolated owned
     volume for a control that must not share another registration's payload."""
+    name = getattr(proof, "_profile_volume_name", None)
+    if name is None:
+        name = VOLUME_PREFIX + secrets.token_hex(VOLUME_TOKEN_BYTES)
+        expect(not os.path.lexists(f"/Volumes/{name}"), f"volume mount already exists: {name}")
+        proof._profile_volume_name = name
     mount = perm.attach_image(
-        proof,
-        owned_image_dir(),
-        "ProfileOutputs-" + secrets.token_hex(3),
-        owners=True,
-        image_name=image_name,
+        proof, owned_image_dir(), name, owners=True, image_name=image_name,
     )
+    expect(mount == f"/Volumes/{name}", f"unexpected owned image mount: {mount}")
     owners_honored(proof, mount, label)
     refresh_attachment_details(proof)
     write_attachment_facts("attachment-facts.json", known_attachment_facts(proof, label, "attached"))
@@ -2941,7 +2955,7 @@ def run(proof: Proof, repo: str) -> None:
                     f"the selected root {selected_root} is not under {proof.mount}/oxide-outputs",
                 )
                 code, _, stderr = oxide(proof, ["build"], "selected-removable build", selected)
-                expect(code == 0, f"selected-removable build failed: {stderr}")
+                expect(code == 0, f"selected-removable build failed: exit {code}: {stderr[-2000:]}")
                 expect(
                     "fallback" not in summary(stderr),
                     f"the registered removable pool was not selected: {summary(stderr)}",
@@ -2968,17 +2982,17 @@ def run(proof: Proof, repo: str) -> None:
                 low = make_checkout(proof, "low-reserve")
                 os.makedirs(os.path.join(low, "target"))
                 code, _, stderr = oxide(proof, ["outputs", "adopt"], "low-reserve adopt", low)
-                expect(code == 0, f"low-reserve adopt failed: {stderr}")
+                expect(code == 0, f"low-reserve adopt failed: exit {code}: {stderr[-2000:]}")
                 low_root = root_of(pool, low)
                 expect(
                     low_root.startswith(low + os.sep + ".oxide-outputs" + os.sep),
                     f"the low-reserve control selected {low_root} instead of the checkout-local fallback",
                 )
                 code, _, stderr = oxide(proof, ["build"], "low-reserve build", low)
-                expect(code == 0, f"low-reserve build failed: {stderr}")
+                expect(code == 0, f"low-reserve build failed: exit {code}: {stderr[-2000:]}")
                 expect(
                     "not above the" in stderr and "reserve" in stderr,
-                    f"the low-reserve control did not report its fallback honestly: {stderr}",
+                    f"the low-reserve control did not report its fallback honestly: exit {code}: {stderr[-2000:]}",
                 )
                 # Restore the exact recorded registration bytes this fixture changed.
                 with open(registration_file, "wb") as handle:
@@ -4707,6 +4721,22 @@ USAGE = (
 )
 
 
+def pure_scratch_path_contract() -> None:
+    # Product layout: slots/<unique 2-byte label>-<8 hex>/<profile>-<u64>/scratch.
+    # Unique checkout labels and the fresh private pool prevent prefix collisions,
+    # so the first eight-digit identity prefix is used; the fallback legacy ID
+    # path is shorter. The longest allowed profile is release, and the decimal
+    # u64 maximum bounds every generated slot ID. No filesystem is touched.
+    mount = "/Volumes/" + VOLUME_PREFIX + "f" * (VOLUME_TOKEN_BYTES * 2)
+    folder = CHECKOUT_DIGITS[-1] * 2 + "-" + "f" * 8
+    leaf = "release-" + str(2**64 - 1)
+    path = os.path.join(mount, "oxide-pool", "slots", folder, leaf, "scratch")
+    size = len(os.fsencode(path))
+    expect(size == 80, f"unexpected worst-case scratch path {size}: {path}")
+    expect(size <= 80, f"scratch path exceeds 80 bytes: {path}")
+    expect(len(os.fsencode(path + "x")) > 80, "longer-path counterfactual accepted")
+
+
 def pure_mode_contract() -> None:
     global MODE, CASE_IDS
     saved = MODE, CASE_IDS
@@ -4864,6 +4894,7 @@ def main() -> int:
     if arguments == ["--plan"]:
         return plan_only()
     if arguments == ["--self-check"]:
+        pure_scratch_path_contract()
         pure_mode_contract()
         pure_diagnostic_controls()
         pure_registry_controls()
