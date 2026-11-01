@@ -92,7 +92,11 @@ default = false
 # not an alias for full QA.
 [tasks."rust:seed-default-off"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-seed-default-off.py"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-seed-default-off.py"
+
+[tasks."rust:seed-default-off:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-seed-default-off.py --diagnostic"
 
 # Installed-binary hand-off (oxide#122): one author proof, one fixed script
 # and the whole command under the qualified shared supervisor, within the

@@ -17,6 +17,8 @@ import sys
 sys.dont_write_bytecode = True
 
 import importlib.util
+import json
+import subprocess
 import os
 import re
 import signal
@@ -33,7 +35,19 @@ Proof = layout.Proof
 expect, fail, MIB = layout.expect, layout.fail, layout.MIB
 stage_at, sha256 = layout.stage_at, layout.sha256
 
+# Premise dispositions: (1) rustup is captured before fixture HOME replacement;
+# the Rust cases create private HOME/CARGO_HOME and the checked-in lock is used.
+# (2) Fixture children honour private HOME via OXIDE_TEST_HOME_FROM_ENV.
+# (3) Host OXIDE, XDG, Cargo build, Git and compiler controls are scrubbed.
+# (4) The identity cases do not assert an unconverted checkout.
+# (5) No Cargo external subcommand is used.
+# (6) No image is attached or detached.
+# (7) Both stage and fixture use empty encoded and ordinary rust flags.
+# (8) TMPDIR and fixture pools are under the supervisor's selected-volume root.
+# (9) Python mkdtemp and the Rust mkdtemp both name their owned parent explicitly.
 BUILDER = "1.97.1"
+S3 = "79e55f4"
+POOL_CAP = "128MiB"
 SHUTDOWN_MARGIN_S = 30
 TESTS = (
     "status_off_matches_ignored_opt_in_and_held_adds_only_its_notice",
@@ -73,7 +87,7 @@ def given_commit() -> str:
     return env_commit or arg_commit
 
 
-def resolve_baseline(proof: Proof, repo: str) -> str:
+def resolve_baseline(proof, repo: str) -> str:
     given = given_commit()
     if given:
         parsed = proof.run(
@@ -88,6 +102,8 @@ def resolve_baseline(proof: Proof, repo: str) -> str:
         expect(parsed.returncode == 0, f"default merge-base with origin/main failed: {parsed.stderr!r}")
         commit = parsed.stdout.decode().strip()
     expect(len(commit) == 40 and set(commit) <= set("0123456789abcdef"), f"baseline commit is not a SHA: {commit!r}")
+    ancestry = proof.run(["git", "merge-base", "--is-ancestor", S3, commit], cwd=repo, timeout=30)
+    expect(ancestry.returncode == 0, f"baseline {commit} must contain scratch-pools S3 ({S3})")
     return commit
 
 
@@ -117,6 +133,9 @@ def cargo_test_env(root: str, baseline: str) -> dict:
     env.update(
         {
             "OXIDE_SEED_BASELINE_BINARY": baseline,
+            "OXIDE_SCRATCH_ROOT": os.environ["OXIDE_TASK_SCRATCH_ROOT"],
+            "OXIDE_POOL_CAP": POOL_CAP,
+            "OXIDE_TEST_HOME_FROM_ENV": "1",
             "OXIDE_TEST_INTERNAL_ROOT": internal,
             "RUSTUP_HOME": rustup,
             "RUSTUP_TOOLCHAIN": BUILDER,
@@ -145,8 +164,7 @@ def expect_both_passed(stdout: str, stderr: str) -> None:
     expect("test result: ok." in combined, f"cargo test did not report ok:\n{combined[-4000:]}")
 
 
-def run(proof: Proof, repo: str) -> str:
-    commit = resolve_baseline(proof, repo)
+def run(proof: Proof, repo: str, commit: str, diagnostic: bool) -> str:
     print(f"seed-default-off baseline {commit} builder {BUILDER}")
     proof.phase("start")
     base_src = os.path.join(proof.root, "base-src")
@@ -158,26 +176,27 @@ def run(proof: Proof, repo: str) -> str:
     print(f"staged baseline sha256 {sha256(baseline)}")
     proof.phase("after staging")
     env = cargo_test_env(proof.root, baseline)
-    result = proof.run(
-        [
-            "cargo",
-            "test",
-            "--locked",
-            "--offline",
-            "--test",
-            "cold_seed_default_off",
-            "--",
-            "--ignored",
-            "--nocapture",
-        ],
-        cwd=repo,
-        env=env,
-        timeout=work_left(),
-    )
-    stdout, stderr = result.stdout.decode(errors="replace"), result.stderr.decode(errors="replace")
-    print(f"----- cargo test --ignored: exit {result.returncode} -----\n{stdout}{stderr}", flush=True)
-    expect(result.returncode == 0, f"cargo test --ignored exit {result.returncode}")
-    expect_both_passed(stdout, stderr)
+    outcomes = []
+    # Each ignored test has its own scratch fixture. In diagnostic mode a
+    # completed failing case does not prevent the other independent case.
+    for name in TESTS if diagnostic else (None,):
+        command = ["cargo", "test", "--locked", "--offline", "--test", "cold_seed_default_off", "--"]
+        if name:
+            command.append(name)
+        command += ["--ignored", "--nocapture"]
+        result = proof.run(command, cwd=repo, env=env, timeout=work_left())
+        stdout, stderr = result.stdout.decode(errors="replace"), result.stderr.decode(errors="replace")
+        print(f"----- cargo test {name or 'all'}: exit {result.returncode} -----\n{stdout}{stderr}", flush=True)
+        passed = result.returncode == 0 and all(
+            re.search(rf"^test {re.escape(test)} \.\.\. ok$", stdout + stderr, re.M)
+            for test in ((name,) if name else TESTS)
+        ) and "test result: ok." in stdout + stderr
+        outcomes.append({"case": name or "all", "passed": bool(passed), "exit": result.returncode})
+        if not diagnostic:
+            expect(passed, "ignored identity tests failed")
+    if diagnostic:
+        record("diagnostic.json", json.dumps({"qualified": False, "cases": outcomes}) + "\n")
+        fail("diagnostic is uncounted; see diagnostic.json")
     proof.phase("after tests")
     return commit
 
@@ -193,14 +212,30 @@ def main() -> int:
         os.path.isdir(os.environ.get("OXIDE_PROOF_EVIDENCE", "")) and "OXIDE_PROOF_DEADLINE_NS" in os.environ,
         "not under the shared proof supervisor",
     )
-    root = tempfile.mkdtemp(prefix="seed-default-off.", dir=scratch)
+    diagnostic = sys.argv[1:2] == ["--diagnostic"]
+    if diagnostic:
+        del sys.argv[1]
     repo = os.path.dirname(HERE)
+    # Resolve and reject incompatible baselines before creating a fixture root
+    # or launching any build. Git reads only repository metadata.
+    class GitReader:
+        def run(self, command, *, cwd, timeout):
+            return subprocess.run(command, cwd=cwd, timeout=timeout, capture_output=True)
+    commit = resolve_baseline(GitReader(), repo)
+    rustup = os.environ.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup")
+    for name in list(os.environ):
+        if name.startswith(("OXIDE_", "XDG_", "CARGO_", "SCCACHE_", "GIT_")) and name not in (
+            "OXIDE_TASK_SCRATCH_ROOT", "OXIDE_PROOF_EVIDENCE", "OXIDE_PROOF_DEADLINE_NS",
+        ):
+            os.environ.pop(name)
+    os.environ.update({"RUSTUP_HOME": rustup, "RUSTFLAGS": "", "CARGO_ENCODED_RUSTFLAGS": ""})
+    root = tempfile.mkdtemp(prefix="seed-default-off.", dir=scratch)
     signal.signal(signal.SIGTERM, terminated)
     signal.signal(signal.SIGALRM, overdue)
     signal.setitimer(signal.ITIMER_REAL, work_left())
     proof = Proof(root)
     try:
-        commit = run(proof, repo)
+        commit = run(proof, repo, commit, diagnostic)
     except BaseException as failure:
         record(
             "result.txt",
