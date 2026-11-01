@@ -615,6 +615,21 @@ def attach_image(
     return mounts[0]
 
 
+# HIGH checklist across all modes: (1) proof_env captures rustup before private
+# HOME, pins the toolchain and disables installs; fixture crates are std-only,
+# staging is the locked call. (2) proof_env enables OXIDE_TEST_HOME_FROM_ENV.
+# (3) It scrubs inherited Oxide/XDG/Git/build controls before setting fixtures.
+# (4) Auto-adoption controls establish the target/receipt premise explicitly.
+# (5) exec-inference's external tool checks Cargo's subcommand argv; other
+# modes have no external Cargo subcommand. (6) Owned-image attachment and
+# identity/custody stay with attach_image and Proof.detach; exec/auto-ineligible
+# request owners and verify the mount; product registration is a second check.
+# (7) main freezes RUSTFLAGS before staging and proof_env inherits those flags.
+# (8) proof_env puts TMPDIR under supervisor scratch and check_child_env checks
+# writability and pool device for every fixture child; image_slot_model and
+# check_image_slot_paths bind the image limit, /private/tmp is a fallback only.
+# The separate base-compat keep mode uses the internal root under de52775e.
+# (9) main's mkdtemp has an explicit parent; fixture tool paths live inside it.
 def proof_env(pool: str, home: str, cargo_home: str) -> dict:
     """The host-isolated environment every fixture command runs under."""
     env = dict(os.environ)
@@ -2837,6 +2852,7 @@ def plan_exec_inference() -> None:
     print("        attached with hdiutil -owners on, ordinary detach")
     print("root: supervisor-selected scratch; private OXIDE_SCRATCH_ROOT and explicit 64 MiB pool cap")
     print("        fallback to /private/tmp exercises the internal path, not scratch-pool coverage")
+    print("        directory-pool children require same-device writable TMPDIR; image slot scratch is at most 80 bytes")
     print("        image-backed removable pool is registered as the operating pool afterwards")
     print("fixture work, sequential, one Cargo child at a time: 4 Cargo jobs for the single")
     print("        staging and 1 per fixture child; planning demand 4 CPU / 6 GiB")
@@ -6951,7 +6967,7 @@ def main() -> int:
         arguments.remove("--diagnostic")
         expect(
             tuple(arguments) in (("exec-inference",), ("auto-ineligible",), ("base-compat",)),
-            "--diagnostic belongs to the exec-inference or auto-ineligible mode",
+            "--diagnostic belongs to exec-inference, auto-ineligible or base-compat",
         )
     modes = {
         (): (run, "permanent-outputs"),
