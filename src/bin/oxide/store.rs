@@ -1850,8 +1850,11 @@ impl Store {
                 )?;
                 if let Some(uuid) = &scratch {
                     let parent = path.parent().ok_or("the pool path has no parent")?;
-                    let available = free_bytes_for_creation(parent).ok_or("cannot sample host free space for pool creation")?;
-                    if available < HOST_RESERVE_BYTES { return Err("refusing to create the pool: host free space is below the 20 GiB reserve".into()); }
+                    let available = free_bytes_for_creation(parent)
+                        .ok_or("cannot sample host free space for pool creation")?;
+                    if available < HOST_RESERVE_BYTES {
+                        return Err("refusing to create the pool: host free space is below the 20 GiB reserve".into());
+                    }
                     crate::scratch_io::create(&settings, uuid, admission_budget(&settings))?;
                 } else {
                     create_pool(&path, admission_budget(&settings))?;
@@ -1860,7 +1863,9 @@ impl Store {
             Found::LegacyImage => return Err(legacy_refusal()),
             Found::Directory | Found::Unknown => {}
         }
-        if let Some(uuid) = &scratch { crate::scratch_io::repair(&settings, uuid)?; }
+        if let Some(uuid) = &scratch {
+            crate::scratch_io::repair(&settings, uuid)?;
+        }
         let store = match Self::open_at(&path, &settings) {
             Ok(store) => store,
             // An explicit path that exists but holds no recognizable Oxide
@@ -1952,6 +1957,15 @@ impl Store {
     /// Open an existing internal pool using settings already resolved for
     /// this command.
     pub fn open_existing_with(settings: &Settings) -> Result<Option<Self>, String> {
+        Self::open_existing_mode(settings, false)
+    }
+
+    /// A clean operation opens a pool for a guarded, mutating command.
+    pub fn open_existing_for_clean(settings: &Settings) -> Result<Option<Self>, String> {
+        Self::open_existing_mode(settings, true)
+    }
+
+    fn open_existing_mode(settings: &Settings, repair: bool) -> Result<Option<Self>, String> {
         if std::env::var_os("OXIDE_SCRATCH_ROOT").is_some() {
             crate::scratch_io::evaluate(settings, false)?;
         }
@@ -1960,7 +1974,7 @@ impl Store {
             Found::LegacyImage => Err(legacy_refusal()),
             Found::Directory | Found::Unknown => {
                 if let Some(uuid) = crate::scratch_io::evaluate(settings, false)? {
-                    crate::scratch_io::repair(settings, &uuid)?;
+                    if repair { crate::scratch_io::repair(settings, &uuid)?; }
                 }
                 Self::open_at(&settings.pool, settings).map(Some)
             }

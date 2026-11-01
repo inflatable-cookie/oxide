@@ -7774,3 +7774,53 @@ fn a_legacy_pending_tree_migrates_without_a_locked_walk() {
     );
     assert!(holding_rows(&pool).is_empty());
 }
+
+#[test]
+fn scratch_initializer_accepts_only_this_invocations_prepared_leaf() {
+    let fixture = Fixture::new("scratch-initializer");
+    let binding = b"the exact binding bytes";
+    let prepare = |name: &str| {
+        let path = fixture.path().join(name);
+        let leaf = managed::create_scratch_leaf(&path).unwrap();
+        let control = path.join(MANAGED_NAME);
+        fs::create_dir(&control).unwrap();
+        fs::write(control.join("scratch.json"), binding).unwrap();
+        (path, leaf)
+    };
+    let (path, leaf) = prepare("valid");
+    managed::init_scratch_pool(&leaf, binding, 1024).unwrap();
+    assert!(path.join("config.json").is_file());
+
+    let (path, leaf) = prepare("extra");
+    fs::write(path.join("extra"), b"x").unwrap();
+    assert!(managed::init_scratch_pool(&leaf, binding, 1024).is_err());
+    assert!(!path.join("config.json").exists());
+
+    let (path, leaf) = prepare("bytes");
+    fs::write(path.join(MANAGED_NAME).join("scratch.json"), b"changed").unwrap();
+    assert!(managed::init_scratch_pool(&leaf, binding, 1024).is_err());
+
+    let (path, leaf) = prepare("file-link");
+    let file = path.join(MANAGED_NAME).join("scratch.json");
+    fs::remove_file(&file).unwrap();
+    symlink("../other", &file).unwrap();
+    assert!(managed::init_scratch_pool(&leaf, binding, 1024).is_err());
+
+    let (path, leaf) = prepare("dir-link");
+    fs::rename(path.join(MANAGED_NAME), path.join("other")).unwrap();
+    symlink("other", path.join(MANAGED_NAME)).unwrap();
+    assert!(managed::init_scratch_pool(&leaf, binding, 1024).is_err());
+
+    let (path, leaf) = prepare("swapped");
+    fs::rename(&path, fixture.path().join("original")).unwrap();
+    fs::create_dir(&path).unwrap();
+    assert!(managed::init_scratch_pool(&leaf, binding, 1024).is_err());
+    assert!(!path.join("config.json").exists());
+
+    let (path, _prior_leaf) = prepare("prior");
+    assert!(managed::create_scratch_leaf(&path).is_err());
+    let error = managed::init_budget_pool(&path, 1024)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("init requires an empty pool directory"));
+}
