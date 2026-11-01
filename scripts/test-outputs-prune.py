@@ -781,14 +781,18 @@ def control_state_version(document: dict) -> "int | None":
     The product's `State` writer does not stamp a binary-wide maximum: it writes
     the version of the highest fence the document carries (`Store::save`,
     `src/bin/oxide/store.rs` — holding, then slot ceiling, then eviction
-    accounting, then one-use, then recorded accounting, then the owned-outputs
-    fence, then the initialization record). So an internal pool that has admitted
-    a build is fully fenced at the current maximum while a paired removable pool
-    that only received the owned-outputs fence from an initialization stays at
-    the recorded-accounting version. Deriving the expected version from the
-    document is what keeps this proof honest in both cases; `None` means a
-    present fence value is not the one this head writes, which is a failure, not
-    a version.
+    accounting, then one-use, then recorded accounting, then the SUCCESSOR
+    `oxide.outputs/3` fence, and only then the previous shape, which is an
+    initialization record or the released `oxide.outputs/2` fence, and finally a
+    bare document). Order matters in both places: the successor fence is checked
+    BEFORE the initialization record in the product, so a document that carries
+    both and no later fence is version 4, never 3. So an internal pool that has
+    admitted a build is fully fenced at the current maximum, while a paired
+    removable pool that only received the owned-outputs fence from an
+    initialization stays at the recorded-accounting version. Deriving the
+    expected version from the document is what keeps this proof honest in both
+    cases; `None` means a present fence value is not the one this head writes,
+    which is a failure, not a version.
     """
 
     for name, expected, version in (
@@ -808,10 +812,14 @@ def control_state_version(document: dict) -> "int | None":
         if value != expected:
             return None
         return version
-    if document.get("outputs_init") is not None or document.get("owned_outputs") == LEGACY_OWNED_OUTPUTS_FENCE:
-        return OLDER_STATE_VERSION
+    # The product tests `successor` before `previous`: a document carrying the
+    # current owned-outputs fence is version 4 even when it also carries an
+    # initialization record, and only a document WITHOUT that fence falls to the
+    # version-3 shape (an initialization record or the released `/2` fence).
     if document.get("owned_outputs") == OWNED_OUTPUTS_FENCE:
         return PREVIOUS_STATE_VERSION
+    if document.get("outputs_init") is not None or document.get("owned_outputs") == LEGACY_OWNED_OUTPUTS_FENCE:
+        return OLDER_STATE_VERSION
     return LEGACY_FIELDS_STATE_VERSION
 
 
@@ -3310,6 +3318,7 @@ def self_test() -> int:
             "let recorded = fenced.recorded_accounting.is_some();",
             "let slot_ceiling = fenced.slot_ceiling.is_some();",
             "let holding = fenced.holding.is_some();",
+            "let successor = fenced.owned_outputs.as_deref() == Some(OWNED_OUTPUTS_FENCE);",
             "fenced.version = if holding {",
             "} else if slot_ceiling {",
             "} else if fenced.eviction_accounting.is_some() {",
@@ -3318,6 +3327,14 @@ def self_test() -> int:
             "} else if previous {",
         ):
             assert line in store, f"the version ladder in store.rs changed: {line}"
+        # ORDER, not only presence: `successor` (the owned-outputs fence, version
+        # 4) is decided before `previous` (an initialization record or the
+        # released `/2` fence, version 3). The oracle above mirrors that order,
+        # and this comparison is what fails if the product ever swaps them.
+        ladder = store.index("fenced.version = if holding {")
+        assert store.index("} else if successor {", ladder) < store.index(
+            "} else if previous {", ladder
+        ), "Store::save now decides the previous shape before the successor fence"
         # The owned-outputs fence is a literal in control.rs; the four later
         # fences live in mod.rs under the shared `CONTROL_` prefix.
         assert f'pub const OWNED_OUTPUTS_FENCE: &str = "{OWNED_OUTPUTS_FENCE}";' in control, (
@@ -3387,6 +3404,26 @@ def self_test() -> int:
         assert control_state_version({"owned_outputs": OWNED_OUTPUTS_FENCE}) == 4
         assert control_state_version({"outputs_init": {"state": "ready"}}) == 3
         assert control_state_version({"owned_outputs": LEGACY_OWNED_OUTPUTS_FENCE}) == 3
+        # The counterexample the product's own order requires: a valid
+        # initialized control carrying the CURRENT owned-outputs fence and no
+        # later fence is version 4. `Store::save` tests `successor` before
+        # `previous`, so the initialization record must not shadow it back to 3.
+        assert (
+            control_state_version(
+                {"owned_outputs": OWNED_OUTPUTS_FENCE, "outputs_init": {"state": "ready"}}
+            )
+            == PREVIOUS_STATE_VERSION
+        )
+        assert (
+            control_state_version(
+                {
+                    "owned_outputs": OWNED_OUTPUTS_FENCE,
+                    "outputs_init": {"state": "ready"},
+                    "recorded_accounting": RECORDED_ACCOUNTING_FENCE,
+                }
+            )
+            == RECORDED_ACCOUNTING_STATE_VERSION
+        )
         assert control_state_version({}) == 2
         assert control_state_version({"holding": "oxide.holding/2"}) is None
         assert control_state_version({"recorded_accounting": "oxide.accounting/2"}) is None
