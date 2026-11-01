@@ -1834,7 +1834,7 @@ impl Store {
         let settings = settings()?;
         let path = settings.pool.clone();
         let source = settings.pool_source;
-        crate::scratch_io::evaluate(&settings, false)?;
+        let scratch = crate::scratch_io::evaluate(&settings, false)?;
         // A pasted `oxide status` annotation is not part of a path, so it
         // refuses for every pool state: an absent path and an existing
         // ordinary directory both get the hint instead of the generic open
@@ -1848,11 +1848,19 @@ impl Store {
                     std::env::var_os("OXIDE_POOL_CREATE").as_deref(),
                     std::env::var_os("OXIDE_TASK_SCRATCH_ROOT").as_deref(),
                 )?;
-                create_pool(&path, admission_budget(&settings))?;
+                if let Some(uuid) = &scratch {
+                    let parent = path.parent().ok_or("the pool path has no parent")?;
+                    let available = free_bytes_for_creation(parent).ok_or("cannot sample host free space for pool creation")?;
+                    if available < HOST_RESERVE_BYTES { return Err("refusing to create the pool: host free space is below the 20 GiB reserve".into()); }
+                    crate::scratch_io::create(&settings, uuid, admission_budget(&settings))?;
+                } else {
+                    create_pool(&path, admission_budget(&settings))?;
+                }
             }
             Found::LegacyImage => return Err(legacy_refusal()),
             Found::Directory | Found::Unknown => {}
         }
+        if let Some(uuid) = &scratch { crate::scratch_io::repair(&settings, uuid)?; }
         let store = match Self::open_at(&path, &settings) {
             Ok(store) => store,
             // An explicit path that exists but holds no recognizable Oxide
@@ -1951,7 +1959,9 @@ impl Store {
             Found::Absent => Ok(None),
             Found::LegacyImage => Err(legacy_refusal()),
             Found::Directory | Found::Unknown => {
-                crate::scratch_io::evaluate(settings, false)?;
+                if let Some(uuid) = crate::scratch_io::evaluate(settings, false)? {
+                    crate::scratch_io::repair(settings, &uuid)?;
+                }
                 Self::open_at(&settings.pool, settings).map(Some)
             }
         }

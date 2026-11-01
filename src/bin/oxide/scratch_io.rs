@@ -4,7 +4,7 @@ use crate::scratch_admission::{self as admission, Decision, Document, Record, Re
 use oxide_storage::volume::Binding;
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -190,7 +190,7 @@ pub(crate) fn evaluate(settings: &Settings, status: bool) -> Result<Option<Strin
         _ => nearest(pool).map(|(_, p)| p).unwrap_or_default(),
     };
     let git = config::judge_git_work_tree(pool, &ancestor);
-    let decision = admission::decide_for_open(admission::Facts {
+    let decision = admission::decide(admission::Facts {
         ordinary,
         declared_non_boot_mount,
         git_recheck: (ancestor, git),
@@ -203,7 +203,7 @@ pub(crate) fn evaluate(settings: &Settings, status: bool) -> Result<Option<Strin
         parent_exists: pool.parent().is_some_and(|p| p.is_dir()),
         volume_present: present,
         volume_verified: verified.is_some(),
-        volume_uuid: uuid,
+        volume_uuid: uuid.clone(),
         mount_point: mount,
         binding: binding.fact(),
         record: record.fact(),
@@ -214,9 +214,78 @@ pub(crate) fn evaluate(settings: &Settings, status: bool) -> Result<Option<Strin
     });
     match decision {
         Decision::Ordinary => config::refuse_unsafe_pool_path(pool).map(|()| None),
-        Decision::Admit => Ok(parsed.map(|r| config::bounded(&r.volume_uuid))),
+        Decision::Admit => Ok(Some(config::bounded(&uuid))),
         Decision::Refuse(r) | Decision::Unavailable(r) | Decision::RefuseAndRemoveOwnLeaf(r) => {
             Err(refusal(r, pool, status))
         }
     }
+}
+
+/// Publish a bounded private identity document without exposing partial bytes.
+fn write_document(path: &Path, bytes: &[u8], limit: usize) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    if bytes.len() > limit { return Err("identity document exceeds its bound".into()); }
+    let parent = path.parent().ok_or("identity path has no parent")?;
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(parent).map_err(|e| e.to_string())?;
+    let meta = fs::symlink_metadata(parent).map_err(|e| e.to_string())?;
+    if !meta.is_dir() || meta.file_type().is_symlink() || meta.uid() != unsafe { libc::getuid() } || meta.permissions().mode() & 0o077 != 0 {
+        return Err("identity directory is not private".into());
+    }
+    for n in 0..100u32 {
+        let tmp = parent.join(format!(".scratch-{}-{n}.tmp", std::process::id()));
+        let mut file = match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.to_string()),
+        };
+        let result = file.write_all(bytes).and_then(|()| file.sync_all()).and_then(|()| fs::rename(&tmp, path));
+        if result.is_err() { let _ = fs::remove_file(&tmp); }
+        return result.map_err(|e| e.to_string());
+    }
+    Err("cannot allocate identity temporary file".into())
+}
+
+fn identity_bytes(pool: &Path, root: &Path, mount: &Path, uuid: &str, schema: &str) -> Result<Vec<u8>, String> {
+    let created_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?.as_millis().try_into().map_err(|_| "clock overflow")?;
+    let created_ms: u64 = created_ms;
+    serde_json::to_vec(&serde_json::json!({"schema": schema, "pool": pool, "scratch_root": root,
+        "mount_point": mount, "volume_uuid": uuid, "created_ms": created_ms})).map_err(|e| e.to_string())
+}
+
+/// Repair a missing host record only for an admitted leased open.
+pub(crate) fn repair(settings: &Settings, uuid: &str) -> Result<(), String> {
+    let pool: PathBuf = settings.pool.components().collect();
+    let path = record_path(&pool)?;
+    if !matches!(read_document(&path, 4096), ReadDocument::Missing) { return Ok(()); }
+    let root = std::env::var_os("OXIDE_SCRATCH_ROOT").ok_or("scratch-root-unsafe")?;
+    let mount = mount_for(&pool).ok_or("scratch-volume-unverified")?;
+    let volume = Binding::open(&mount, Some(uuid)).map_err(|_| "scratch-binding-mismatch")?;
+    volume.verify().map_err(|_| "scratch-binding-mismatch")?;
+    let bytes = identity_bytes(&pool, Path::new(&root), &mount, uuid, "oxide.scratch-pool-record/1")?;
+    write_document(&path, &bytes, 4096).map_err(|_| "scratch-record-unwritable".into())
+}
+
+/// Create this invocation's bound leaf before the pool library initializes it.
+pub(crate) fn create(settings: &Settings, uuid: &str, budget: u64) -> Result<(), String> {
+    let pool: PathBuf = settings.pool.components().collect();
+    let root = std::env::var_os("OXIDE_SCRATCH_ROOT").ok_or("scratch-root-unsafe")?;
+    let mount = mount_for(&pool).ok_or("scratch-volume-unverified")?;
+    let volume = Binding::open(&mount, Some(uuid)).map_err(|_| "scratch-binding-mismatch")?;
+    volume.verify().map_err(|_| "scratch-binding-mismatch")?;
+    let binding = identity_bytes(&pool, Path::new(&root), &mount, uuid, "oxide.scratch-pool/1")?;
+    let record = identity_bytes(&pool, Path::new(&root), &mount, uuid, "oxide.scratch-pool-record/1")?;
+    let leaf = oxide_storage::lease::managed::create_scratch_leaf(&pool).map_err(|e| e.to_string())?;
+    let control = pool.join("oxide-managed");
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new().mode(0o700).create(&control).map_err(|e| e.to_string())?;
+    write_document(&control.join("scratch.json"), &binding, 16384)?;
+    if write_document(&record_path(&pool)?, &record, 4096).is_err() {
+        leaf.remove_if_owned().map_err(|_| "scratch-record-unwritable; scratch-incomplete requires operator cleanup")?;
+        return Err("scratch-record-unwritable".into());
+    }
+    volume.verify().map_err(|_| "scratch-binding-mismatch")?;
+    eprintln!("oxide: creating a scratch build pool on volume {}; not for ordinary project builds", config::bounded(uuid));
+    oxide_storage::lease::managed::init_scratch_pool(&leaf, &binding, budget).map_err(|e| e.to_string())?;
+    Ok(())
 }
