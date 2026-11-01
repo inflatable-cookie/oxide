@@ -77,7 +77,8 @@ WALL_NS = 600 * NS  # oxide#192 amendment (2026-10-31): was 420 s (#191), 300 s 
 CANDIDATE_LIMIT = 560  # oxide#192 amendment: was 380 s (#191), 280 s before
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 439  # 382 pure + 57 real. oxide#151 added the routing, marker,
+EXPECTED_CASES = 461  # 402 pure + 59 real; derived from the suite loader at oxide#233.
+                      # Earlier 382 pure + 57 real remain historical. oxide#151 added the routing, marker,
                       # nested-window protection, bounded-sweep, qualify-entry,
                       # shared-ancestor/private-leaf and readiness cases; oxide#191
                       # adds seventy-six pure post-census detach cases and eight real
@@ -799,9 +800,26 @@ def check_plan(receipt, results, expected, record=None, facts=None, base=None):
     def cases():
         outcomes = results.get("outcomes", [])
         failed = [case for case, verdict in outcomes if verdict != "pass"]
+        problems = []
         if failed or len(outcomes) != EXPECTED_CASES:
-            return [f"cases: {len(outcomes)} of {EXPECTED_CASES} recorded, failed {failed}"]
-        return []
+            problems.append(f"cases: {len(outcomes)} of {EXPECTED_CASES} recorded, failed {failed}")
+        for name, mode, state in (
+                ("test_synthetic_replacement_member_reaches_real_receipt", "census-replacement-member", "member"),
+                ("test_synthetic_replacement_foreign_reaches_real_receipt", "census-replacement-foreign", "foreign")):
+            rows = [case for case in results.get("cases", []) if case.get("case") == name]
+            matches = [verdict for case, verdict in outcomes if case.endswith("." + name)]
+            if len(rows) != 1 or matches != ["pass"]:
+                problems.append(f"cases: {name} lacks one passed fixture and outcome")
+                continue
+            fixture = rows[0].get("replacement_fixture") or {}
+            work = fixture.get("work") or {}
+            identity = {"pid": 2_147_483_647, "start": 2, "state": state}
+            if (fixture.get("source"), fixture.get("mode"), work.get("status"), work.get("replacement"),
+                    work.get("pending")) != ("synthetic", mode, "complete", 1, 0) or identity not in work.get("rows", []):
+                problems.append(f"cases: {name} has missing or inconsistent synthetic replacement evidence")
+            if 2_147_483_647 in (rows[0].get("signal_targets") or []):
+                problems.append(f"cases: {name} signalled the synthetic identity")
+        return problems
 
     return [
         ("receipt-phase", receipt_phase),

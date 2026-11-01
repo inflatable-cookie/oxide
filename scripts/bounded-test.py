@@ -308,7 +308,7 @@ SWEEP_ROWS = 20  # bounded result rows in the receipt; the rest count as omitted
 INJECTIONS = {
     "setup-stall", "setup-delay", "no-detector", "ack-eof", "ack-wrong", "cancel-before-ack", "monitor-die",
     "monitor-stall", "cleanup-interrupt", "custodian-timeout-after-monitor", "census-uncertain",
-    "census-uncertain-first", "reserve-low-after", "cancel-after-ack", "cancel-at-gate",
+    "census-uncertain-first", "census-replacement-member", "census-replacement-foreign", "reserve-low-after", "cancel-after-ack", "cancel-at-gate",
     "pump-exception", "kqueue-exception", "malformed-message", "stop-exception",
     "reserve-delay-stall", "scratch-delay-stall",
     "detach-fail", "detach-timeout", "detach-ambiguous", "detach-withdraw",
@@ -344,7 +344,7 @@ FIELDS = {  # required fields per monitor message type; bool is never accepted a
     "reading": {"kind": str},
     "ready": {}, "monitor_complete": {}, "cleanup_failed": {},
     "output_eof": {"stream": str},
-    "census": {"after": int, "members": int, "uncertain": int, "certain": bool},
+    "census": {"after": int, "members": int, "uncertain": int, "certain": bool, "replacement_work": dict},
     "admission": {"waited_ns": int, "command": str, "completed": int, "marker": int},
     "admission_waiting": {"reason": str, "command": str, "completed": int, "marker": int},
     "admission_rejected": {"kind": str, "completed": int, "reason": str},
@@ -536,6 +536,12 @@ def malformed(message):
             required["complete"] = bool
         elif message.get("kind") != "reserve":
             return "unknown reading kind"
+    if kind == "census":
+        work = message.get("replacement_work")
+        if not valid_replacement_work(work):
+            return "invalid replacement work"
+        if work["status"] != "complete" and (message.get("certain") is not False or not message.get("uncertain")):
+            return "inconsistent replacement work"
     if kind == "output_eof" and message.get("stream") not in ("stdout", "stderr"):
         return "unknown stream"
     for name, kind_ in required.items():
@@ -1175,7 +1181,9 @@ class CensusWork:
                   "status": self.status, "rows": rows, "omitted": len(self.entries) - len(rows)}
         # Fail closed on unencodable output rather than publishing incomplete evidence.
         try:
-            json.dumps(result, ensure_ascii=True, separators=(',', ':')).encode("utf-8")
+            encoded = json.dumps(result, ensure_ascii=True, separators=(',', ':')).encode("utf-8")
+            if len(encoded) > 4096:
+                self.stop("invalid")
         except Exception:
             self.stop("invalid")
         if self.status == "complete":
@@ -1183,67 +1191,58 @@ class CensusWork:
         return result
 
 
+def valid_replacement_work(value):
+    """Validate bounded round evidence before it can accompany a decision."""
+    try:
+        if not isinstance(value, dict) or set(value) != {"snapshot", "replacement", "reads", "pending", "status", "rows", "omitted"}:
+            return False
+        snapshot, replacement, reads, pending, omitted = (value[k] for k in ("snapshot", "replacement", "reads", "pending", "omitted"))
+        if any(type(n) is not int or n < 0 for n in (snapshot, replacement, reads, pending, omitted)):
+            return False
+        if snapshot > CENSUS_SNAPSHOT_CAP or replacement > CENSUS_REPLACEMENT_CAP or reads > CENSUS_READ_CAP:
+            return False
+        total = snapshot + replacement
+        rows = value["rows"]
+        if not isinstance(rows, list) or len(rows) > CENSUS_WORK_ROWS or len(rows) + omitted != total or pending > total:
+            return False
+        if value["status"] not in ("complete", "identity_cap", "read_cap", "deadline", "invalid", "interrupted"):
+            return False
+        if value["status"] == "complete" and pending:
+            return False
+        identities = []
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != {"pid", "start", "state"}:
+                return False
+            identity = CensusWork.identity(row)
+            if identity is None or row["state"] not in ("pending", "gone", "member", "foreign", "terminal", "uncertain"):
+                return False
+            identities.append(identity)
+        return len(set(identities)) == len(identities)
+    except BaseException:
+        return False
+
+
 class Census:
     """Classifies every process against session `sid` (the leader's PID).
 
-    Member: getsid reads `sid` with the PID and start token unchanged across
-    the call (KERN_PROC_PID re-read). A member stays tracked by (PID, start)
-    until a snapshot lacks that identity, whatever its later session, UID or
-    parent. Positively foreign: a validated other session, never a member.
-    Gone: getsid ESRCH and a later successful KERN_PROC_PID read lacks the
-    identity; a zombie still present is re-read within the round, at most
-    CONFIRM_TRIES times. When that confirmation does not establish absence,
-    the round's existing final KERN_PROC_PID read for the same PID is still
-    checked under the same rule: a successful read showing None or a
-    different start token establishes Gone and drops only the old tracked
-    (PID, start) identity. A replacement identity is never declared foreign
-    or member by inference. A failed read confirms nothing.
+    A round validates its entire snapshot before changing tracking, then owns a
+    bounded identity ledger and FIFO. Every newly observed replacement is
+    classified in this round, with session reads bound to matching identities
+    on both sides. Previously resolved identities may reopen. A tracked member
+    remains attributed until a successful observation proves that exact identity
+    absent. Foreign classification never applies to a tracked identity.
 
-    Confirmation scheduling (oxide#147 correction): the FIRST confirmation
-    read for an actual-ESRCH row runs immediately after that row's own getsid
-    and before the next row's, so the snapshot/first-read pairing terminal
-    eligibility depends on stays adjacent in time. Every identity still
-    pending then takes part in shared confirmation passes: each pass is ONE
-    `CONFIRM_PAUSE` followed by ONE reread of each pending identity in
-    snapshot order, for at most CONFIRM_TRIES - 1 passes. An identity
-    therefore still gets exactly its existing 1..CONFIRM_TRIES confirmation
-    reads with at least one full pause between successive reads, but a single
-    pause serves every identity in the pass, so the round's own wait no longer
-    grows with the number of zombie rows. Per-identity tries, first-read
-    pairing, contradiction tracking, absent/replaced priority, read-failure
-    termination and the separate final read are all unchanged, a match never
-    short-circuits, and members, uncertain rows, diagnostics and terminal
-    witnesses are still assembled in snapshot order from per-row records
-    rather than in resolution order.
+    Actual ESRCH retains an immediately adjacent first confirmation, followed by
+    at most nineteen shared pauses and a separate final read. Late arrivals use
+    only the remaining schedule and stay uncertain when it cannot finish. The
+    terminal rule still needs the original snapshot, initial row, every paired
+    confirmation and final row to establish the same allowlisted zombie; any
+    intervening contradictory identity observation taints that witness.
 
-    Terminal (allowlisted kernels only): an actual getsid ESRCH (errno-
-    checked, not any ProcessLookupError) whose snapshot row and FIRST
-    existing confirmation read show the same complete SZOMB identity
-    (exact non-bool bounded ints, positive PID, exact SZOMB state in
-    both) is accepted as a terminal nonwriter without claiming
-    disappearance, provided every actually performed read in the round
-    (all confirmation reads plus the existing final read, same 20+final
-    bounds, no early short-circuit) shows the same complete SZOMB
-    identity with no failure. Terminal is neither Gone (which keeps
-    priority) nor Foreign nor a blocking member; tracked attribution is
-    kept and eligibility is recomputed every round with no exemption
-    cache. A nonqualifying first read is never salvaged by later reads;
-    any failed, missing, malformed, identity/state or non-zombie
-    observation in the round disqualifies terminal and taints the round's
-    terminal count as unaccountable. Rows that were never terminal
-    candidates (no SZOMB snapshot, non-ESRCH failures) leave an
-    accountable count alone. A successful getsid keeps the old
-    member/foreign/tracked paths and other session errors can never
-    qualify. In strict mode terminal acceptance never fires and every
-    ESRCH row keeps the old uncertain handling, while the terminal count
-    stays the accountably known valid 0.
-
-    Everything else (other getsid errors, identity change, failed or
-    missing metadata, unconfirmed zombies, a failed snapshot) is uncertain
-    and blocks closure, first-seen rows included. Start time is not a proxy
-    for liveness or ordering: it is only the second half of a whole
-    (PID, start) identity, and no wall, boot or uptime comparison ever excludes
-    a row.
+    Snapshot, identity, session, group and parent reads share a 131072-call
+    budget, and readers, pauses and publication share one 2 s phase deadline.
+    Exhaustion, invalid input and interrupted work invalidate certainty and the
+    terminal count. Diagnostic rows are bounded independently of the ledger.
 
     Supervisor ancestors (oxide#197, design ruling ea5a3dc9): the supervisor
     records its own ppid chain, up to ANCESTOR_MAX_LEVELS levels, before the
@@ -1297,13 +1296,9 @@ class Census:
     neither a member nor uncertain, and each exclusion's bounded evidence
     (`pid`, `start`, `rule`) is returned for the receipt.
 
-    The round also builds an optional, monitor-receipt-only diagnostics
-    object summarizing ESRCH rows (confirm attempts/outcome and the final
-    read result with an enumerated error category). It never leaves this
-    round's return value: the census IPC message keeps only
-    after/members/uncertain/certain, and the diagnostics never change
-    classification, membership, authoritative counts, first fault, closure
-    or cleanup, nor consume extra reads, time or retry budget.
+    The round returns bounded ESRCH diagnostics and a replacement-work summary;
+    the monitor carries the work summary in both its receipt and census message.
+    Neither diagnostic omission nor receipt clipping discharges an identity.
 
     Every round also carries mandatory receipt-only terminal fields:
     `terminal_count_status` (valid/invalid/overflow) and
@@ -1361,7 +1356,7 @@ class Census:
             pass
         first = state["first_row"] == "unset"
         try:
-            again = self.reread(row["pid"])
+            again = self.observe_identity((row["pid"], row["start"]))
         except Exception as error:
             if first:
                 state["first_error"] = error
@@ -1420,24 +1415,39 @@ class Census:
 
     def read_session(self, pid):
         work = getattr(self, "_work", None)
-        return work.call(self.getsid, pid) if work is not None else self.getsid(pid)
+        value = work.call(self.getsid, pid) if work is not None else self.getsid(pid)
+        if work is not None and (type(value) is not int or not 0 < value <= U64MAX):
+            raise OSError(errno.EIO, "unreadable session")
+        return value
 
     def read_group(self, pid):
         work = getattr(self, "_work", None)
-        return work.call(self.getpgid, pid) if work is not None else self.getpgid(pid)
+        value = work.call(self.getpgid, pid) if work is not None else self.getpgid(pid)
+        if work is not None and value is not None and (type(value) is not int or not 0 < value <= U64MAX):
+            raise OSError(errno.EIO, "unreadable group")
+        return value
 
     def observe_identity(self, identity):
         work = getattr(self, "_work", None)
         if work is None:
             return self.reread(identity[0])
-        row = work.call(self.reread, identity[0])
+        try:
+            row = work.call(self.reread, identity[0])
+        except CensusWorkStopped:
+            raise
+        except BaseException:
+            self._round_taint.add(identity)
+            raise
         if row is not None:
             observed = work.identity(row)
             if observed is None or observed[0] != identity[0]:
                 work.stop("invalid")
+            if observed in work.entries and not _same_complete_zombie(work.entries[observed][0], row):
+                self._round_taint.add(observed)
         else:
             observed = None
         if observed != identity:
+            self._round_taint.add(identity)
             # A safe observation resolves this exact old identity only.
             self.tracked.pop(identity, None)
             self._round_records[identity] = {"skip": True}
@@ -1593,8 +1603,10 @@ class Census:
         """Classify every identity observed during one bounded census round."""
         self.reset_stats()
         work = CensusWork()
+        self.round_deadline = work.deadline
         self._work = work
         self._round_records = records = {}
+        self._round_taint = set()
         begun = work.deadline - CENSUS_PHASE_NS
         pending, finals = {}, {}
         exclusions, excluded_total = [], 0
@@ -1607,25 +1619,7 @@ class Census:
             work.resolve(identity, disposition)
 
         def confirm(identity, row, state):
-            state["tries"] += 1
-            self.stats["confirm_reads"] += 1
-            try:
-                again = self.observe_identity(identity)
-            except CensusWorkStopped:
-                raise
-            except Exception as error:
-                if state["tries"] == 1:
-                    state["first_error"] = error
-                state.update(outcome="read_failed", error=error, clean=False)
-                return False
-            if state["tries"] == 1:
-                state["first_row"] = again
-            if again is None or work.identity(again) != identity:
-                state.update(outcome="absent" if again is None else "replaced", gone=True)
-                return False
-            if not _same_complete_zombie(row, again):
-                state["clean"] = False
-            return True
+            return self.confirmation_attempt(row, state)
 
         def resolved_confirm(identity, row, state):
             if state["gone"]:
@@ -1634,7 +1628,7 @@ class Census:
                 finals[identity] = (row, state)
 
         def drain_queue():
-            nonlocal excluded_total, diag_attempted
+            nonlocal excluded_total, diag_attempted, terminal_tainted
             while True:
                 item = work.next()
                 if item is None:
@@ -1664,6 +1658,8 @@ class Census:
                 except CensusWorkStopped:
                     raise
                 except Exception as error:
+                    if self.terminal_allowed and row.get("zombie") is True:
+                        terminal_tainted = True
                     finish(identity, {"uncertain": dict(row, reason=f"reread: {error}")}, "uncertain")
                     continue
                 if before is None or work.identity(before) != identity:
@@ -1682,12 +1678,13 @@ class Census:
                 if failure == "gone":
                     diag_attempted += 1
                     state = {"tries": 0, "outcome": None, "error": None, "first_row": "unset",
-                             "first_error": None, "clean": True, "gone": False, "getsid_error": getsid_error}
+                             "first_error": None, "clean": _same_complete_zombie(row, before),
+                             "gone": False, "getsid_error": getsid_error}
                     # The confirmation immediately follows this identity's getsid.
-                    if confirm(identity, before, state):
-                        pending[identity] = (before, state)
+                    if confirm(identity, row, state):
+                        pending[identity] = (row, state)
                     else:
-                        resolved_confirm(identity, before, state)
+                        resolved_confirm(identity, row, state)
                     continue
                 try:
                     after = self.observe_identity(identity)
@@ -1735,6 +1732,7 @@ class Census:
             record = {"diag": _diag_attempt(row, state["tries"], state["outcome"], "same_identity",
                                             error=state["getsid_error"])}
             terminal = (state["outcome"] == "matching_exhausted" and state["clean"]
+                        and identity not in self._round_taint
                         and self.terminal_eligible(row, state["first_row"], state["first_error"])
                         and _same_complete_zombie(row, again))
             if terminal:
@@ -1943,6 +1941,11 @@ def census_summary(result):
         elif not typed(value, int) or value < 0:
             return None
         entry[key] = value
+    work = result.get("replacement_work")
+    if not valid_replacement_work(work):
+        return None
+    if work["status"] != "complete" and (entry["certain"] or entry["uncertain"] < 1):
+        return None
     return entry
 
 
@@ -1957,15 +1960,15 @@ def census_settled(join, final, deciding):
     row beside an empty list and a closed verdict."""
     if not isinstance(join, dict) or join.get("joined") is not True:
         return False, "the census thread did not finish before publication"
-    if not isinstance(final, dict):
-        return False, "no certainly empty census round completed before publication"
+    if not isinstance(final, dict) or census_summary(final) is None:
+        return False, "no valid final census round completed before publication"
     if final.get("members") or final.get("uncertain"):
         return False, (f"the final census round was not certainly empty"
                        f" ({final.get('members')} member(s), {final.get('uncertain')} uncertain)")
     if final.get("certain") is not True:
         return False, "no certainly empty census round completed before publication"
-    if not isinstance(deciding, dict):
-        return False, "the decision names no census message this monitor sent"
+    if not isinstance(deciding, dict) or census_summary(deciding) is None:
+        return False, "the decision names no valid census message this monitor sent"
     if deciding.get("members") or deciding.get("uncertain") or deciding.get("certain") is not True:
         return False, ("the census message the decision rested on was not certainly empty"
                        f" ({deciding.get('members')} member(s), {deciding.get('uncertain')} uncertain)")
@@ -4351,6 +4354,9 @@ class Monitor:
             if message_type == "census":
                 summary = census_summary(fields)
                 if summary is not None:
+                    work = fields["replacement_work"]
+                    summary["replacement_work"] = dict(work, rows=[dict(row) for row in work["rows"]])
+                    summary["after"] = fields.get("after")
                     self.census_messages[seq] = summary
                     if len(self.census_messages) > CENSUS_MESSAGE_KEEP:
                         for stale in sorted(self.census_messages)[:-CENSUS_MESSAGE_KEEP]:
@@ -4678,6 +4684,12 @@ class Monitor:
             if not typed(seq, int) or seq < 1:
                 seq = None
             bound = self.census_messages.get(seq) if seq is not None else None
+            echo = census_summary(named)
+            if echo is not None:
+                echo["replacement_work"] = named["replacement_work"]
+                echo["after"] = named.get("after")
+            if echo != bound:
+                bound = None
             self.receipt["deciding_census"] = dict(bound) if isinstance(bound, dict) else None
             self.receipt["deciding_census_seq"] = seq if isinstance(bound, dict) else None
 
@@ -4714,15 +4726,56 @@ class Monitor:
         except BaseException:
             pass
         record = self.ctx.get("ancestors") or {}
+        fixture_mode = next((mode for mode in ("census-replacement-member", "census-replacement-foreign")
+                             if mode in self.inject), None)
+        readers = {}
+        if fixture_mode:
+            # Test-only synthetic rows supplement, never replace, the real snapshot.
+            # They are not kernel facts and carry no signalling authority.
+            fake_pid = 2_147_483_647
+            state = {"round": 0, "reads": 0}
+            def fixture_row(start):
+                return {"pid": fake_pid, "start": start, "ppid": 1, "pgid": fake_pid,
+                        "uid": os.getuid(), "zombie": False}
+            def snapshot():
+                rows = Kinfo.all()
+                if any(row.get("pid") == fake_pid for row in rows):
+                    raise ValueError("synthetic census PID collides with kernel row")
+                state["round"] += 1
+                return [fixture_row(1)] + rows if state["round"] == 1 else rows
+            def reread(pid):
+                if pid != fake_pid:
+                    return Kinfo.one(pid)
+                state["reads"] += 1
+                return fixture_row(1 if state["reads"] == 1 else 2)
+            def getsid(pid):
+                if pid != fake_pid:
+                    return os.getsid(pid)
+                if state["reads"] == 1:
+                    raise ProcessLookupError(errno.ESRCH, "synthetic replacement")
+                return self.leader[0] if fixture_mode == "census-replacement-member" else 1
+            readers = {"snapshot": snapshot, "reread": reread, "getsid": getsid}
         census = Census(self.leader[0], terminal_allowed=(
             self.ctx.get("terminal_mode", {}).get("mode") == "allowlisted"),
-            ancestors=record.get("identities") or ())
+            ancestors=record.get("identities") or (), **readers)
         self.note(census_built_ns=now_ns())
         while not self.census_stop.is_set():
             begin = now_ns()
             entry = self.note_round(begin)
             self.note(phase="round-start")
             result = census.round()
+            phase_deadline = getattr(census, "round_deadline", None)
+            def expire_round():
+                if type(phase_deadline) is int and now_ns() < phase_deadline:
+                    return False
+                result["certain"] = False
+                result["uncertain"] = max(1, result.get("uncertain", 0))
+                result["terminal_count_status"], result["terminal_nonwriters"] = "invalid", None
+                work = result.get("replacement_work")
+                if valid_replacement_work(work) and work["status"] == "complete":
+                    result["replacement_work"] = dict(work, status="deadline")
+                return True
+            expire_round()
             scanned = now_ns()
             try:  # observation only: the round's measured phases and read counts
                 stats = census.stats
@@ -4736,25 +4789,39 @@ class Monitor:
             if "census-uncertain" in self.inject or (
                     "census-uncertain-first" in self.inject and not self.receipt["census_rounds"]):
                 result = dict(result, certain=False, uncertain=max(1, result["uncertain"]))
+            expire_round()
             waiting = now_ns()
             self.note(entry, phase="lock-wait", lock_wait_ns=waiting)
             self.note(phase="lock-wait")
             with self.lock:
                 acquired = now_ns()
+                expire_round()
                 self.census_last = result
+                if fixture_mode and "replacement_fixture" not in self.receipt:
+                    self.receipt["replacement_fixture"] = {
+                        "source": "synthetic", "mode": fixture_mode,
+                        "certain": result.get("certain"), "members": result.get("members"),
+                        "uncertain": result.get("uncertain"), "work": result.get("replacement_work")}
                 if self.census_bound:
                     post = self.receipt.get("census_after_stop")
                     if not isinstance(post, dict):
                         post = {"rounds": 0, "last": None}
                     post["rounds"] = int(post.get("rounds") or 0) + 1
                     post["last"] = {key: result.get(key) for key in
-                                    ("certain", "members", "uncertain")}
+                                    ("certain", "members", "uncertain", "replacement_work")}
                     self.receipt["census_after_stop"] = post
                 else:
                     self.receipt["census"] = result
                     self.receipt["census_rounds"] += 1
                 merge_exclusions(self.receipt, result.get("ancestor_exclusions"))
             released = now_ns()
+            if expire_round():
+                with self.lock:
+                    if self.census_bound:
+                        post = self.receipt.get("census_after_stop") or {"rounds": 0}
+                        post["last"] = {key: result.get(key) for key in
+                                        ("certain", "members", "uncertain", "replacement_work")}
+                        self.receipt["census_after_stop"] = post
             self.note(entry, phase="locked", lock_acquired_ns=acquired, lock_released_ns=released,
                       certain=result["certain"], members=result["members"],
                       uncertain=result["uncertain"])
@@ -4765,8 +4832,28 @@ class Monitor:
                 # so a row appended after the send could be missing from the evidence
                 # that justified the verdict (oxide#195).
                 self.record_survivors(result)
+            already_expired = expire_round()
+            if already_expired:
+                with self.lock:
+                    if self.census_bound:
+                        post = self.receipt.get("census_after_stop") or {"rounds": 0}
+                        post["last"] = {key: result.get(key) for key in
+                                        ("certain", "members", "uncertain", "replacement_work")}
+                        self.receipt["census_after_stop"] = post
             self.send("census", after=after, members=result["members"], uncertain=result["uncertain"],
-                      certain=result["certain"])
+                      certain=result["certain"], replacement_work=result.get("replacement_work"))
+            # A late write cannot be withdrawn. The final round is made uncertain
+            # before the joined thread exits and a second message latches the fault.
+            if expire_round() and not already_expired:
+                with self.lock:
+                    self.census_last = result
+                    if self.census_bound:
+                        post = self.receipt.get("census_after_stop") or {"rounds": 0}
+                        post["last"] = {key: result.get(key) for key in
+                                        ("certain", "members", "uncertain", "replacement_work")}
+                        self.receipt["census_after_stop"] = post
+                self.send("census", after=after, members=result["members"], uncertain=result["uncertain"],
+                          certain=False, replacement_work=result.get("replacement_work"))
             # `sent_ns` also covers the send's own lock acquisition and pipe write.
             sent = now_ns()
             self.note(entry, sent_ns=sent)
@@ -5678,7 +5765,8 @@ class Custodian:
                 self.census_decision = {"seq": message["seq"], "after": message["after"],
                                         "certain": message["certain"],
                                         "members": message["members"],
-                                        "uncertain": message["uncertain"]}
+                                        "uncertain": message["uncertain"],
+                                        "replacement_work": message["replacement_work"]}
             try:  # observation only, before the unchanged eligibility rule
                 self.census_messages += 1
                 if self.reaped_seq is not None and message["after"] >= self.reaped_seq:

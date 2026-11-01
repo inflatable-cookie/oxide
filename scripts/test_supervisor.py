@@ -665,8 +665,24 @@ class FakeTable:
         return next((r for r in self.rows if r["pid"] == pid), None)
 
 
-def census(table, sid=100, terminal_allowed=False, ancestors=()):
-    return bounded.Census(sid, snapshot=table.snapshot, getsid=table.getsid, reread=table.reread,
+def fixture_work():
+    return {"snapshot": 0, "replacement": 0, "reads": 1, "pending": 0,
+            "status": "complete", "rows": [], "omitted": 0}
+
+
+def census(table, sid=100, terminal_allowed=False, ancestors=(), prime=False):
+    # Legacy confirmation scripts begin immediately after getsid; model the
+    # new preceding identity read separately without consuming the script.
+    primed = set()
+    def snapshot():
+        primed.clear()
+        return table.snapshot()
+    def reread(pid):
+        if prime and pid not in primed:
+            primed.add(pid)
+            return next((r for r in table.rows if r["pid"] == pid), None)
+        return table.reread(pid)
+    return bounded.Census(sid, snapshot=snapshot, getsid=table.getsid, reread=reread,
                           pause=lambda _seconds: None, terminal_allowed=terminal_allowed,
                           ancestors=ancestors, getpgid=table.getpgid)
 
@@ -755,15 +771,102 @@ class PureCensus(unittest.TestCase):
         self.assertFalse(result["certain"])
         self.assertIn((999, 7), check.tracked)
 
+    def test_reappearing_resolved_identity_is_reopened(self):
+        a, b = row(504, start=1), row(504, start=2)
+        table = FakeTable([a], {504: [7, 7, 100]}, reread={504: [a, b, b, a, a, a]})
+        check = census(table)
+        result = check.round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 1, 0))
+        self.assertIn((504, 1), check.tracked)
+        self.assertEqual(result["replacement_work"]["reads"], 10)
+        self.assertEqual(result["replacement_work"]["replacement"], 1)
+        self.assertIn({"pid": 504, "start": 1, "state": "member"}, result["replacement_work"]["rows"])
+
+    def test_snapshot_limit_and_malformed_rows_preserve_tracking(self):
+        for rows in ([row(i + 1) for i in range(4097)], [row(1), dict(row(2), start=True)]):
+            with self.subTest(size=len(rows)):
+                table = FakeTable(rows, {})
+                check = census(table)
+                check.tracked[(9999, 7)] = row(9999, start=7)
+                result = check.round()
+                self.assertFalse(result["certain"])
+                self.assertIn(result["replacement_work"]["status"], ("identity_cap", "invalid"))
+                self.assertIn((9999, 7), check.tracked)
+                self.assertEqual(result["terminal_count_status"], "invalid")
+
+    def test_read_cap_preserves_unresolved_member(self):
+        table = FakeTable([row(505, start=7)] + [row(600 + i) for i in range(24)], {505: 7})
+        check = census(table)
+        check.tracked[(505, 7)] = row(505, start=7)
+        with patched(bounded, "CENSUS_READ_CAP", 2):
+            result = check.round()
+        self.assertEqual(result["replacement_work"]["status"], "read_cap")
+        self.assertFalse(result["certain"])
+        self.assertIn((505, 7), check.tracked)
+        self.assertEqual(result["replacement_work"]["reads"], 2)
+        self.assertEqual(result["replacement_work"]["omitted"], 5)
+
+    def test_late_identity_reader_invalidates_round_and_retains_tracking(self):
+        ticks = [0]
+        real_work = bounded.CensusWork
+        def work():
+            return real_work(clock=lambda: ticks[0])
+        table = FakeTable([row(506, start=7)] + [row(700 + i) for i in range(24)], {506: 7},
+                          reread={506: lambda _n: (ticks.__setitem__(0, 2 * NS), row(506, start=7))[1]})
+        check = census(table)
+        check.tracked[(506, 7)] = row(506, start=7)
+        with patched(bounded, "CensusWork", work):
+            result = check.round()
+        self.assertFalse(result["certain"])
+        self.assertEqual(result["replacement_work"]["status"], "deadline")
+        self.assertEqual(result["terminal_count_status"], "invalid")
+        self.assertEqual(result["replacement_work"]["omitted"], 5)
+        self.assertIn((506, 7), check.tracked)
+
+    def test_late_pause_invalidates_round(self):
+        ticks = [0]
+        real_work = bounded.CensusWork
+        table = FakeTable([row(508, start=7)], {508: ProcessLookupError(3, "gone")})
+        check = census(table)
+        check.pause = lambda _seconds: ticks.__setitem__(0, 2 * NS)
+        with patched(bounded, "CensusWork", lambda: real_work(clock=lambda: ticks[0])):
+            result = check.round()
+        self.assertFalse(result["certain"])
+        self.assertEqual(result["replacement_work"]["status"], "deadline")
+        self.assertEqual(result["terminal_count_status"], "invalid")
+
+    def test_parent_revalidation_contradiction_taints_pending_terminal(self):
+        zombie, live = row(700, start=11, zombie=True), row(700, start=11)
+        sibling = row(701, start=12, ppid=700)
+        table = FakeTable([zombie, sibling], {700: ProcessLookupError(3, "gone"), 701: 7},
+                          reread={700: [zombie, zombie, live, zombie], 701: sibling})
+        check = census(table, terminal_allowed=True, ancestors=[(700, 11)])
+        check.tracked[(700, 11)] = zombie
+        result = check.round()
+        self.assertFalse(result["certain"])
+        self.assertEqual(result["terminal_count_status"], "invalid")
+        self.assertIsNone(result["terminal_nonwriters"])
+        self.assertIn((700, 11), check.tracked)
+
+    def test_terminal_witness_requires_snapshot_and_initial_read(self):
+        zombie, live = row(507, start=7, zombie=True), row(507, start=7)
+        table = FakeTable([zombie], {507: ProcessLookupError(3, "gone")},
+                          reread={507: [live] + [zombie] * 21})
+        result = census(table, terminal_allowed=True).round()
+        self.assertFalse(result["certain"])
+        self.assertEqual(result["terminal_count_status"], "invalid")
+        self.assertNotIn("terminal_witnesses", result)
+
     def test_member_and_foreign(self):
         table = FakeTable([row(101), row(200)], {101: 100, 200: 7})
         result = census(table).round()
         self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 1, 0))
 
-    def test_identity_change_across_getsid_is_uncertain(self):
+    def test_changed_identity_is_classified_independently(self):
         table = FakeTable([row(101, start=1)], {101: 7}, reread={101: row(101, start=2)})
         result = census(table).round()
-        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual((result["certain"], result["uncertain"]), (True, 0))
+        self.assertIn({"pid": 101, "start": 2, "state": "foreign"}, result["replacement_work"]["rows"])
 
     def test_first_seen_unreadable_is_uncertain_not_foreign(self):
         table = FakeTable([row(300)], {300: PermissionError(1, "denied")})
@@ -876,8 +979,9 @@ class PureAncestors(unittest.TestCase):
         parent_changed = FakeTable(self.launcher_rows(sibling), {700: 7, 900: PermissionError(1, "denied")},
                                    reread={700: row(700, start=12), 900: sibling})
         result = census(parent_changed, ancestors=[self.LAUNCHER]).round()
-        # Both the changed launcher row and its child are unaccounted here.
-        self.assertEqual((result["certain"], result["uncertain"]), (False, 2))
+        # The replacement launcher is bound foreign; the child remains unknown.
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertIn({"pid": 700, "start": 12, "state": "foreign"}, result["replacement_work"]["rows"])
         self.assertEqual(result["ancestor_exclusions"]["by_rule"]["parent"], 0)
 
     def test_a_recycled_pid_with_a_different_start_is_not_excluded(self):
@@ -1055,12 +1159,12 @@ class PureAncestors(unittest.TestCase):
         # row's own identity. A replacement identity inside the observation
         # window (the second sibling read) is never excluded as a sibling.
         sibling = row(900, start=12, ppid=self.LAUNCHER[0])
-        table = FakeTable(self.launcher_rows(sibling), {700: 7, 900: 7},
+        table = FakeTable(self.launcher_rows(sibling), {700: 7, 900: 100},
                           reread={900: [sibling, row(900, start=99, ppid=700)]})
         result = census(table, ancestors=[self.LAUNCHER]).round()
-        # The replacement identity is not excluded as a sibling, and the row's
-        # own changed identity keeps it unknown under the existing rule.
-        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        # A fresh bound session finds the replacement itself as a member.
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 1, 0))
+        self.assertIn({"pid": 900, "start": 99, "state": "member"}, result["replacement_work"]["rows"])
         self.assertEqual(result["ancestor_exclusions"]["by_rule"]["parent"], 0)
         self.assertEqual(result["ancestor_exclusions"]["rows"],
                          [{"pid": 700, "start": 11, "rule": "ancestor"}])
@@ -1275,9 +1379,10 @@ class PureAncestors(unittest.TestCase):
                 seen.append((sid, tuple(ancestors)))
 
             def round(self):
+                self.round_deadline = bounded.now_ns() + 2 * NS
                 return {"certain": True, "members": 0, "uncertain": 0, "member_rows": [],
                         "uncertain_rows": [], "terminal_count_status": "valid",
-                        "terminal_nonwriters": 0,
+                        "terminal_nonwriters": 0, "replacement_work": fixture_work(),
                         "ancestor_exclusions": {
                             "rows": [{"pid": 900, "start": 5, "rule": "parent"}],
                             "count": 1, "by_rule": {"ancestor": 0, "parent": 1}}}
@@ -1317,7 +1422,7 @@ class PureCensusFinalAbsence(unittest.TestCase):
         base = row(109, start=5)
         table = FakeTable([base], {109: ProcessLookupError(3, "gone")},
                            reread={109: lambda reads: row(109, start=5) if reads <= 20 else None})
-        check = census(table)
+        check = census(table, prime=True)
         result = check.round()
         self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
         self.assertEqual(table.reads, 21)
@@ -1331,10 +1436,10 @@ class PureCensusFinalAbsence(unittest.TestCase):
     def test_final_replacement_after_matching_exhaustion_untracked(self):
         table = FakeTable([row(110, start=5)], {110: ProcessLookupError(3, "gone")},
                            reread={110: lambda reads: row(110, start=5) if reads <= 20 else row(110, start=9)})
-        check = census(table)
+        check = census(table, prime=True)
         result = check.round()
-        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
-        self.assertEqual(table.reads, 21)
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (False, 0, 1))
+        self.assertGreater(table.reads, 21)
         self.assertNotIn((110, 5), check.tracked)
         self.assertNotIn((110, 9), check.tracked)
         self.assertEqual(result["diagnostics"]["rows"][0]["final"], "replaced")
@@ -1352,7 +1457,7 @@ class PureCensusFinalAbsence(unittest.TestCase):
 
     def test_final_none_tracked_drops_only_old(self):
         table = FakeTable([row(111, start=5)], {111: 100})
-        check = census(table)
+        check = census(table, prime=True)
         self.assertEqual(check.round()["members"], 1)
         table.sessions = {111: ProcessLookupError(3, "gone")}
         table.reads = 0
@@ -1363,16 +1468,18 @@ class PureCensusFinalAbsence(unittest.TestCase):
 
     def test_final_replacement_tracked_not_foreign_by_inference(self):
         table = FakeTable([row(112, start=5)], {112: 100})
-        check = census(table)
+        check = census(table, prime=True)
         check.round()
         table.sessions = {112: ProcessLookupError(3, "gone")}
         table.reads = 0
         table.rereads = {112: lambda reads: row(112, start=5) if reads <= 20 else row(112, start=9)}
         result = check.round()
-        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (False, 0, 1))
         self.assertNotIn((112, 5), check.tracked)
         self.assertNotIn((112, 9), check.tracked)
-        # The replacement identity is a new row next round, foreign by validation, not by inference.
+        # The late replacement cannot complete confirmation in this round.
+        self.assertEqual(result["replacement_work"]["replacement"], 1)
+        # A later round may bind it foreign independently.
         table.rows = [row(112, start=9)]
         table.sessions = {112: 7}
         table.rereads = {}
@@ -1382,7 +1489,7 @@ class PureCensusFinalAbsence(unittest.TestCase):
 
     def test_persistent_matching_untracked_still_uncertain(self):
         table = FakeTable([row(113, start=5)], {113: ProcessLookupError(3, "gone")})
-        check = census(table)
+        check = census(table, prime=True)
         result = check.round()
         self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
         self.assertEqual(table.reads, 21)
@@ -1390,7 +1497,7 @@ class PureCensusFinalAbsence(unittest.TestCase):
 
     def test_persistent_matching_tracked_stays_member(self):
         table = FakeTable([row(114, start=5)], {114: 100})
-        check = census(table)
+        check = census(table, prime=True)
         check.round()
         table.sessions = {114: ProcessLookupError(3, "gone")}
         table.reads = 0
@@ -1401,7 +1508,7 @@ class PureCensusFinalAbsence(unittest.TestCase):
         def failing(_reads):
             raise PermissionError(13, "denied")
         table = FakeTable([row(115, start=5)], {115: ProcessLookupError(3, "gone")}, reread={115: failing})
-        result = census(table).round()
+        result = census(table, prime=True).round()
         self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
         self.assertEqual(result["diagnostics"]["rows"][0]["final"], "read_failed")
 
@@ -1411,7 +1518,7 @@ class PureCensusFinalAbsence(unittest.TestCase):
                 raise PermissionError(13, "denied")
             return None
         table = FakeTable([row(116, start=5)], {116: ProcessLookupError(3, "gone")}, reread={116: flaky})
-        check = census(table)
+        check = census(table, prime=True)
         result = check.round()
         self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
         self.assertEqual(table.reads, 2)
@@ -1422,19 +1529,19 @@ class PureCensusFinalAbsence(unittest.TestCase):
         def failing(_reads):
             raise PermissionError(13, "denied")
         table = FakeTable([row(117, start=5)], {117: ProcessLookupError(3, "gone")}, reread={117: failing})
-        result = census(table).round()
+        result = census(table, prime=True).round()
         self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
         self.assertEqual(table.reads, 2)
 
     def test_non_esrch_still_blocks(self):
         table = FakeTable([row(118, start=5)], {118: PermissionError(1, "denied")})
-        result = census(table).round()
+        result = census(table, prime=True).round()
         self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
         self.assertNotIn("diagnostics", result)
 
     def test_tracked_changes_still_member_until_positive_absence(self):
         table = FakeTable([row(119, start=5, ppid=101)], {119: 100})
-        check = census(table)
+        check = census(table, prime=True)
         self.assertEqual(check.round()["members"], 1)
         table.rows = [row(119, start=5, ppid=1, uid=0)]
         table.sessions = {119: 119}
@@ -1525,7 +1632,7 @@ class PureDiagnostics(unittest.TestCase):
     def test_invalid_numerics_omitted(self):
         table = FakeTable([row(105, start=-5)], {105: ProcessLookupError(3, "gone")},
                            reread={105: None})
-        result = census(table).round()
+        result = census(table, prime=True).round()
         self.assertEqual((result["certain"], result["members"]), (True, 0))
         entry = result["diagnostics"]["rows"][0]
         self.assertNotIn("start", entry)
@@ -1666,7 +1773,7 @@ class PureTerminalCounts(unittest.TestCase):
 
     def test_strict_clean_round_valid_zero(self):
         table = FakeTable([row(101), row(200)], {101: 100, 200: 7})
-        result = census(table).round()
+        result = census(table, prime=True).round()
         self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 1, 0))
         self.assertEqual(result["terminal_count_status"], "valid")
         self.assertEqual(result["terminal_nonwriters"], 0)
@@ -1676,7 +1783,7 @@ class PureTerminalCounts(unittest.TestCase):
     def test_gone_never_counts_even_allowlisted(self):
         for allowed in (False, True):
             table = FakeTable([row(103)], {103: ProcessLookupError(3, "gone")}, reread={103: None})
-            result = census(table, terminal_allowed=allowed).round()
+            result = census(table, terminal_allowed=allowed, prime=True).round()
             self.assertEqual((result["certain"], result["uncertain"]), (True, 0))
             self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
                              ("valid", 0))
@@ -1685,7 +1792,7 @@ class PureTerminalCounts(unittest.TestCase):
 
     def test_terminal_zombie_allowlisted(self):
         table = FakeTable([zombie_row(140, 5)], {140: ProcessLookupError(3, "gone")})
-        check = census(table, terminal_allowed=True)
+        check = census(table, terminal_allowed=True, prime=True)
         result = check.round()
         self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
         self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
@@ -1700,7 +1807,7 @@ class PureTerminalCounts(unittest.TestCase):
         # Strict mode can never accept terminal, so the count is
         # accountably known 0 even though the zombie row still blocks.
         table = FakeTable([zombie_row(141, 5)], {141: ProcessLookupError(3, "gone")})
-        result = census(table).round()
+        result = census(table, prime=True).round()
         self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
         self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
                          ("valid", 0))
@@ -1711,7 +1818,7 @@ class PureTerminalCounts(unittest.TestCase):
         # is unrelated to terminal accounting, so the accountable count
         # stays valid 0 while the round still blocks.
         table = FakeTable([row(142, start=5)], {142: ProcessLookupError(3, "gone")})
-        result = census(table, terminal_allowed=True).round()
+        result = census(table, terminal_allowed=True, prime=True).round()
         self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
         self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
                          ("valid", 0))
@@ -1724,7 +1831,7 @@ class PureTerminalCounts(unittest.TestCase):
             return zombie_row(143, 5)
         table = FakeTable([zombie_row(143, 5)], {143: ProcessLookupError(3, "gone")},
                            reread={143: flaky})
-        result = census(table, terminal_allowed=True).round()
+        result = census(table, terminal_allowed=True, prime=True).round()
         self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
         self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
                          ("invalid", None))
@@ -1733,14 +1840,14 @@ class PureTerminalCounts(unittest.TestCase):
         table = FakeTable([zombie_row(144, 5)], {144: ProcessLookupError(3, "gone")},
                            reread={144: lambda reads: zombie_row(144, 5) if reads <= 20
                            else (_ for _ in ()).throw(PermissionError(13, "denied"))})
-        result = census(table, terminal_allowed=True).round()
+        result = census(table, terminal_allowed=True, prime=True).round()
         self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
         self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
                          ("invalid", None))
 
     def test_tracked_member_terminal_recomputed(self):
         table = FakeTable([row(145, start=5)], {145: 100})
-        check = census(table, terminal_allowed=True)
+        check = census(table, terminal_allowed=True, prime=True)
         self.assertEqual(check.round()["members"], 1)
         table.rows = [zombie_row(145, 5)]
         table.sessions = {145: ProcessLookupError(3, "gone")}
@@ -1760,7 +1867,7 @@ class PureTerminalCounts(unittest.TestCase):
         # A non-ESRCH failure can never qualify as terminal, but it is
         # unrelated to terminal accounting: valid 0 with blocking uncertainty.
         table = FakeTable([zombie_row(146, 5)], {146: PermissionError(1, "denied")})
-        result = census(table, terminal_allowed=True).round()
+        result = census(table, terminal_allowed=True, prime=True).round()
         self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
         self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
                          ("valid", 0))
@@ -1776,7 +1883,7 @@ class PureTerminalCounts(unittest.TestCase):
             return zombie_row(148, 5)
         table = FakeTable([zombie_row(148, 5)], {148: ProcessLookupError(3, "gone")},
                            reread={148: flaky})
-        result = census(table, terminal_allowed=True).round()
+        result = census(table, terminal_allowed=True, prime=True).round()
         self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
         self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
                          ("invalid", None))
@@ -1791,7 +1898,7 @@ class PureTerminalCounts(unittest.TestCase):
             return zombie_row(149, 5)
         table = FakeTable([zombie_row(149, 5)], {149: ProcessLookupError(3, "gone")},
                            reread={149: mixed})
-        result = census(table, terminal_allowed=True).round()
+        result = census(table, terminal_allowed=True, prime=True).round()
         self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
         self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
                          ("invalid", None))
@@ -1800,7 +1907,7 @@ class PureTerminalCounts(unittest.TestCase):
         table = FakeTable([zombie_row(150, 5)], {150: ProcessLookupError(3, "gone")},
                            reread={150: lambda reads: zombie_row(150, 5) if reads <= 20
                            else row(150, start=5)})
-        result = census(table, terminal_allowed=True).round()
+        result = census(table, terminal_allowed=True, prime=True).round()
         self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
         self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
                          ("invalid", None))
@@ -1815,7 +1922,7 @@ class PureTerminalCounts(unittest.TestCase):
                 raise OSError(errno.EPERM, "injected failure")
             return zombie_row(151, 5)
         table = FakeTable([row(151, start=5)], {151: 100})
-        check = census(table, terminal_allowed=True)
+        check = census(table, terminal_allowed=True, prime=True)
         self.assertEqual(check.round()["members"], 1)
         table.rows = [zombie_row(151, 5)]
         table.sessions = {151: ProcessLookupError(3, "gone")}
@@ -1832,7 +1939,7 @@ class PureTerminalCounts(unittest.TestCase):
         # Only an actual errno-ESRCH failure takes the Gone branch; any
         # other ProcessLookupError errno stays on the non-ESRCH path.
         table = FakeTable([zombie_row(152, 5)], {152: ProcessLookupError(1, "denied")})
-        result = census(table, terminal_allowed=True).round()
+        result = census(table, terminal_allowed=True, prime=True).round()
         self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
         self.assertIn("getsid", result["uncertain_rows"][0]["reason"])
         self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
@@ -1842,10 +1949,10 @@ class PureTerminalCounts(unittest.TestCase):
         table = FakeTable([zombie_row(147, 5)], {147: ProcessLookupError(3, "gone")},
                            reread={147: lambda reads: zombie_row(147, 5) if reads == 1
                            else zombie_row(147, 9)})
-        result = census(table, terminal_allowed=True).round()
-        self.assertEqual((result["certain"], result["uncertain"]), (True, 0))
+        result = census(table, terminal_allowed=True, prime=True).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
         self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
-                         ("valid", 0))
+                         ("invalid", None))
         self.assertNotIn("terminal_witnesses", result)
 
     def test_combined_budget_truncation_keeps_count(self):
@@ -1853,7 +1960,7 @@ class PureTerminalCounts(unittest.TestCase):
         rows = [zombie_row(pid, pid) for pid in pids]
         sessions = {pid: ProcessLookupError(3, "gone") for pid in pids}
         table = FakeTable(rows, sessions)
-        result = census(table, terminal_allowed=True).round()
+        result = census(table, terminal_allowed=True, prime=True).round()
         self.assertEqual((result["certain"], result["uncertain"]), (True, 0))
         self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
                          ("valid", 15))
@@ -1870,7 +1977,7 @@ class PureTerminalCounts(unittest.TestCase):
             return zombie_row(132, 5)
         table = FakeTable([zombie_row(132, start=5)], {132: ProcessLookupError(3, "gone")},
                            reread={132: flaky})
-        result = census(table, terminal_allowed=True).round()
+        result = census(table, terminal_allowed=True, prime=True).round()
         self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
         self.assertGreaterEqual(result["uncertain"], 1)
         self.assertEqual(result["terminal_count_status"], "invalid")
@@ -1896,7 +2003,7 @@ class PureTerminalCounts(unittest.TestCase):
         self.assertEqual(bounded._terminal_fields(-1, False, False), ("invalid", None))
 
     def test_ipc_schema_unchanged(self):
-        self.assertEqual(set(bounded.FIELDS["census"]), {"after", "members", "uncertain", "certain"})
+        self.assertEqual(set(bounded.FIELDS["census"]), {"after", "members", "uncertain", "certain", "replacement_work"})
         self.assertNotIn("terminal_count_status", bounded.FIELDS["census"])
         self.assertNotIn("terminal_nonwriters", bounded.FIELDS["census"])
 
@@ -1913,6 +2020,8 @@ class PureProtocol(unittest.TestCase):
         return custodian
 
     def message(self, custodian, kind, leader=None, **fields):
+        if kind == "census":
+            fields.setdefault("replacement_work", fixture_work())
         return {"run": "r", "seq": custodian.monitor_seq + 1, "leader": leader, "type": kind, "at": 1, **fields}
 
     def test_wrong_run_and_sequence_gap(self):
@@ -3076,6 +3185,17 @@ class PureSurvivors(unittest.TestCase):
         return {"certain": False, "members": len(rows), "uncertain": 0,
                 "member_rows": list(rows)}
 
+    def test_mismatched_deciding_message_is_not_bound(self):
+        monitor, _ = self.monitor()
+        monitor.receipt.update({"census_rounds": 1, "custodian_census": {
+            "seq": 4, "after": 2, "certain": True, "members": 0,
+            "uncertain": 0, "replacement_work": fixture_work()}})
+        monitor.census_messages = {4: {"after": 2, "certain": True, "members": 1,
+                                      "uncertain": 0, "replacement_work": fixture_work()}}
+        monitor.bind_deciding_census()
+        self.assertIsNone(monitor.receipt["deciding_census"])
+        self.assertIsNone(monitor.receipt["deciding_census_seq"])
+
     def test_a_survivor_row_carries_only_a_bounded_identity(self):
         live = row(900, start=5, uid=501)
         self.assertEqual(bounded.survivor_row(live),
@@ -3230,9 +3350,10 @@ class PureSurvivors(unittest.TestCase):
                 self.stats = {}
 
             def round(self):
+                self.round_deadline = bounded.now_ns() + 2 * NS
                 return {"certain": True, "members": 0, "uncertain": 0, "member_rows": [],
                         "uncertain_rows": [], "terminal_count_status": "valid",
-                        "terminal_nonwriters": 0}
+                        "terminal_nonwriters": 0, "replacement_work": fixture_work()}
 
         saved = bounded.Census
         bounded.Census = SettledCensus
@@ -3270,9 +3391,10 @@ class PureSurvivors(unittest.TestCase):
 
         class SurvivorCensus(FakeCensus):
             def round(self):
+                self.round_deadline = bounded.now_ns() + 2 * NS
                 return {"certain": False, "members": 1, "uncertain": 0,
                         "member_rows": [row(900, start=5)], "uncertain_rows": [],
-                        "terminal_count_status": "valid", "terminal_nonwriters": 0}
+                        "terminal_count_status": "valid", "terminal_nonwriters": 0, "replacement_work": fixture_work()}
 
         original_send = monitor.send
 
@@ -3491,10 +3613,11 @@ class PureSurvivors(unittest.TestCase):
                 self.stats = {}
 
             def round(self):
+                self.round_deadline = bounded.now_ns() + 2 * NS
                 release.wait(15)  # still inside a round when the join expires
                 return {"certain": False, "members": 1, "uncertain": 0,
                         "member_rows": [row(900, start=5)], "uncertain_rows": [],
-                        "terminal_count_status": "valid", "terminal_nonwriters": 0}
+                        "terminal_count_status": "valid", "terminal_nonwriters": 0, "replacement_work": fixture_work()}
 
         monitor.send = send
         try:
@@ -3583,15 +3706,16 @@ class PureSurvivors(unittest.TestCase):
                 self.rounds = 0
 
             def round(self):
+                self.round_deadline = bounded.now_ns() + 2 * NS
                 self.rounds += 1
                 if self.rounds == 1:
                     return {"certain": True, "members": 0, "uncertain": 0, "member_rows": [],
                             "uncertain_rows": [], "terminal_count_status": "valid",
-                            "terminal_nonwriters": 0}
+                            "terminal_nonwriters": 0, "replacement_work": fixture_work()}
                 release.wait(15)  # still inside the round when the stop is bound
                 return {"certain": False, "members": 1, "uncertain": 0,
                         "member_rows": [row(900, start=5)], "uncertain_rows": [],
-                        "terminal_count_status": "valid", "terminal_nonwriters": 0}
+                        "terminal_count_status": "valid", "terminal_nonwriters": 0, "replacement_work": fixture_work()}
 
         real_send = monitor.send
         census_seqs = []
@@ -3600,7 +3724,7 @@ class PureSurvivors(unittest.TestCase):
             os.write(cmd_w, (json.dumps({
                 "type": "cleanup", "run": "mid-join",
                 "census": {"seq": seq, "after": 2, "certain": True, "members": 0,
-                           "uncertain": 0},
+                           "uncertain": 0, "replacement_work": fixture_work()},
                 "outcome": {"closure": "closed", "status": 0, "fault": None,
                             "deadline": False, "launched": True}}) + "\n").encode())
 
@@ -3645,17 +3769,19 @@ class PureSurvivors(unittest.TestCase):
         persisted = json.loads((evidence / "receipt.json").read_text())
         # The deciding census is the certainly empty round, and it never changes.
         self.assertEqual(persisted["deciding_census"],
-                         {"certain": True, "members": 0, "uncertain": 0})
+                         {"certain": True, "members": 0, "uncertain": 0, "after": 2,
+                          "replacement_work": fixture_work()})
         self.assertEqual(persisted["census_rounds"], 1)
         self.assertEqual(persisted["census_rounds_at_stop"], 1)
         self.assertEqual(persisted["census"], {"certain": True, "members": 0, "uncertain": 0,
                                                "member_rows": [], "uncertain_rows": [],
                                                "terminal_count_status": "valid",
-                                               "terminal_nonwriters": 0})
+                                               "terminal_nonwriters": 0,
+                                               "replacement_work": fixture_work()})
         # The late round is a post-decision observation, clearly labelled.
         self.assertEqual(persisted["census_after_stop"],
                          {"rounds": 1, "last": {"certain": False, "members": 1,
-                                                "uncertain": 0}})
+                                                "uncertain": 0, "replacement_work": fixture_work()}})
         join = persisted["census_join"]
         self.assertIs(join["joined"], True)
         self.assertIs(join["started"], True)
@@ -3665,7 +3791,8 @@ class PureSurvivors(unittest.TestCase):
         # the monitor's own record of what it sent.
         self.assertEqual(persisted["deciding_census_seq"], census_seqs[0])
         self.assertEqual(persisted["deciding_census"],
-                         {"certain": True, "members": 0, "uncertain": 0})
+                         {"certain": True, "members": 0, "uncertain": 0, "after": 2,
+                          "replacement_work": fixture_work()})
         self.assertEqual(persisted["custodian_census"]["seq"], census_seqs[0])
         # Closure is refused on the FINAL census, not the stale deciding one, and
         # the late row is kept as evidence instead of being dropped.
@@ -3721,6 +3848,8 @@ class PureSurvivors(unittest.TestCase):
         member = {"certain": False, "members": 1, "uncertain": 0,
                   "member_rows": [row(900, start=5)], "uncertain_rows": [],
                   "terminal_count_status": "valid", "terminal_nonwriters": 0}
+        empty["replacement_work"] = fixture_work()
+        member["replacement_work"] = fixture_work()
         state = {"rounds": 0}
 
         class NamedCensus:
@@ -3728,6 +3857,7 @@ class PureSurvivors(unittest.TestCase):
                 self.stats = {}
 
             def round(self):
+                self.round_deadline = bounded.now_ns() + 2 * NS
                 state["rounds"] += 1
                 if state["rounds"] == 1:
                     return dict(empty)
@@ -3738,7 +3868,7 @@ class PureSurvivors(unittest.TestCase):
                 os.write(cmd_w, (json.dumps({
                     "type": "cleanup", "run": "named-census",
                     "census": {"seq": census_seqs[0], "after": 2, "certain": True,
-                               "members": 0, "uncertain": 0},
+                               "members": 0, "uncertain": 0, "replacement_work": fixture_work()},
                     "outcome": {"closure": "closed", "status": 0, "fault": None,
                                 "deadline": False, "launched": True}}) + "\n").encode())
                 # Stay in flight until the deciding census is bound, so this round
@@ -3778,7 +3908,8 @@ class PureSurvivors(unittest.TestCase):
         self.assertEqual(persisted["custodian_census"]["seq"], census_seqs[0])
         self.assertEqual(persisted["deciding_census_seq"], census_seqs[0])
         self.assertEqual(persisted["deciding_census"],
-                         {"certain": True, "members": 0, "uncertain": 0})
+                         {"certain": True, "members": 0, "uncertain": 0, "after": 2,
+                          "replacement_work": fixture_work()})
         # The last round completed before the bind is the member round - clearly
         # distinguished from the deciding census rather than relabelled as it.
         self.assertEqual(persisted["census_rounds"], 2)
@@ -6033,6 +6164,28 @@ class PureQualificationTopology(unittest.TestCase):
               "not on the monitored root's device",
               TopologyFacts({parent: DRIVE_DEVICE, root: DRIVE_DEVICE, kept: 1}, documents={}, boot=1))
 
+    def test_qualification_requires_both_labelled_replacement_receipts(self):
+        cases, outcomes = [], []
+        for suffix, mode, state in (("member", "census-replacement-member", "member"),
+                                    ("foreign", "census-replacement-foreign", "foreign")):
+            name = f"test_synthetic_replacement_{suffix}_reaches_real_receipt"
+            work = dict(fixture_work(), snapshot=1, replacement=1,
+                        rows=[{"pid": 1, "start": 1, "state": "gone"},
+                              {"pid": 2_147_483_647, "start": 2, "state": state}])
+            cases.append({"case": name, "signal_targets": [], "replacement_fixture":
+                          {"source": "synthetic", "mode": mode, "work": work}})
+            outcomes.append(["__main__.Real." + name, "pass"])
+        results = {"outcomes": outcomes, "cases": cases}
+        plan = dict(qualify.check_plan({}, results, {}, None, None, None))
+        with patched(qualify, "EXPECTED_CASES", 2):
+            self.assertEqual(plan["cases"](), [])
+            broken = dict(results, cases=cases[:1])
+            bad = dict(qualify.check_plan({}, broken, {}, None, None, None))["cases"]()
+            self.assertTrue(any("lacks one passed fixture" in issue for issue in bad))
+            signalled = dict(cases[0], signal_targets=[2_147_483_647])
+            bad = dict(qualify.check_plan({}, dict(results, cases=[signalled, cases[1]]), {}, None, None, None))["cases"]()
+            self.assertTrue(any("signalled" in issue for issue in bad))
+
     def test_nested_cases_and_evidence_stay_inside_the_monitored_root(self):
         sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
         expected = {"source": "selected-volume", "root_parent": parent}
@@ -6503,6 +6656,8 @@ class PureClosureDecision(unittest.TestCase):
         return custodian
 
     def message(self, custodian, kind, **fields):
+        if kind == "census":
+            fields.setdefault("replacement_work", fixture_work())
         return {"run": custodian.run_id, "seq": custodian.monitor_seq + 1, "leader": [4242, 77],
                 "type": kind, "at": 1, **fields}
 
@@ -6748,9 +6903,10 @@ class FakeCensus:
                       "snapshot_error": False}
 
     def round(self):
+        self.round_deadline = bounded.now_ns() + 2 * NS
         FakeCensus.rounds += 1
         return {"certain": True, "members": 0, "uncertain": 0, "member_rows": [],
-                "uncertain_rows": [], "terminal_count_status": "valid", "terminal_nonwriters": 0}
+                "uncertain_rows": [], "terminal_count_status": "valid", "terminal_nonwriters": 0, "replacement_work": fixture_work()}
 
 
 class OneShotStop:
@@ -7842,9 +7998,10 @@ class PureDetach(unittest.TestCase):
                 self.stats = {}
 
             def round(self):
+                self.round_deadline = bounded.now_ns() + 2 * NS
                 return {"certain": True, "members": 0, "uncertain": 0, "member_rows": [],
                         "uncertain_rows": [], "terminal_count_status": "valid",
-                        "terminal_nonwriters": 0}
+                        "terminal_nonwriters": 0, "replacement_work": fixture_work()}
 
         saved = bounded.Census
         bounded.Census = SettledCensus
@@ -7869,7 +8026,7 @@ class PureDetach(unittest.TestCase):
                 written.append(True)
                 payload = dict(decision)
                 payload["census"] = {"seq": seq, "after": 2, "certain": True,
-                                     "members": 0, "uncertain": 0}
+                                     "members": 0, "uncertain": 0, "replacement_work": fixture_work()}
                 os.write(cmd_w, (json.dumps(payload) + "\n").encode())
             return seq
 
@@ -8482,10 +8639,47 @@ class PureSettlement(unittest.TestCase):
         return out
 
     def message(self, custodian, kind, **fields):
+        if kind == "census":
+            fields.setdefault("replacement_work", fixture_work())
         return {"run": custodian.run_id, "seq": custodian.monitor_seq + 1, "leader": [4242, 77],
                 "type": kind, "at": 1, **fields}
 
     # The real census thread and receipt path.
+
+    def test_synthetic_replacement_uses_real_census_and_message_path(self):
+        for mode, expected in (("census-replacement-member", "member"),
+                               ("census-replacement-foreign", "foreign")):
+            with self.subTest(mode=mode):
+                monitor, ctl_r = self.monitor()
+                monitor.inject = {mode}
+                with patched(bounded.Kinfo, "all", lambda: []), patched(bounded.Kinfo, "one", lambda _pid: None):
+                    monitor.census_loop(after=7)
+                evidence = monitor.receipt["replacement_fixture"]
+                self.assertEqual((evidence["source"], evidence["mode"]), ("synthetic", mode))
+                self.assertIn({"pid": 2_147_483_647, "start": 2, "state": expected}, evidence["work"]["rows"])
+                message = json.loads(os.read(ctl_r, 1 << 16).decode())
+                self.assertEqual(message["replacement_work"], evidence["work"])
+                self.assertIsNone(bounded.malformed(message))
+
+    def test_a_late_census_message_invalidates_final_round(self):
+        monitor, ctl_r = self.monitor()
+        ticks = [bounded.now_ns()]
+        original = monitor.send
+        def late_send(kind, **fields):
+            seq = original(kind, **fields)
+            if kind == "census" and fields["certain"]:
+                ticks[0] += 3 * NS
+            return seq
+        monitor.send = late_send
+        with patched(bounded, "Census", FakeCensus), patched(bounded, "now_ns", lambda: ticks[0]):
+            monitor.census_loop(after=7)
+        messages = [json.loads(line) for line in os.read(ctl_r, 1 << 16).decode().splitlines()]
+        self.assertEqual([m["certain"] for m in messages], [True, False])
+        self.assertEqual(messages[-1]["replacement_work"]["status"], "deadline")
+        self.assertFalse(monitor.census_last["certain"])
+        self.assertEqual(monitor.census_last["terminal_count_status"], "invalid")
+        self.assertFalse(bounded.census_settled({"joined": True}, monitor.census_last,
+                                                monitor.census_messages[messages[0]["seq"]])[0])
 
     def test_census_loop_records_the_real_round_and_keeps_the_message(self):
         monitor, ctl_r = self.monitor()
@@ -8508,7 +8702,7 @@ class PureSettlement(unittest.TestCase):
         self.assertEqual(len(blob), 1)
         message = json.loads(blob[0])
         self.assertEqual(set(message), {"run", "leader", "seq", "at", "type", "after", "members",
-                                        "uncertain", "certain"})
+                                        "uncertain", "certain", "replacement_work"})
         self.assertEqual((message["after"], message["certain"]), (7, True))
 
     def test_missing_completion_is_distinguishable_from_an_empty_census(self):
@@ -9108,8 +9302,17 @@ class ScriptedTable:
         self.log.append(("pause", None, seconds))
 
     def census(self, terminal_allowed=False):
-        return bounded.Census(100, snapshot=self.snapshot, getsid=self.getsid,
-                              reread=self.reread, pause=self.pause,
+        primed = set()
+        def snapshot():
+            primed.clear()
+            return self.snapshot()
+        def reread(pid):
+            if pid not in primed:
+                primed.add(pid)
+                return next((r for r in self.rows if r["pid"] == pid), None)
+            return self.reread(pid)
+        return bounded.Census(100, snapshot=snapshot, getsid=self.getsid,
+                              reread=reread, pause=self.pause,
                               terminal_allowed=terminal_allowed)
 
     def reference(self, terminal_allowed=False):
@@ -9187,6 +9390,12 @@ FINAL_FAILS = [dead_row(970)] * 20 + [EPERM]        # 20 confirmations, then rea
 FINAL_FAILS_NONZOMBIE = [row(971, start=7)] * 20 + [EPERM]
 
 
+def without_replacement_work(result):
+    """Compare the historical fields to the serial oracle; the new work
+    summary is independently checked by the replacement-work regressions."""
+    return {key: value for key, value in result.items() if key != "replacement_work"}
+
+
 class PureInterleavedConfirmation(unittest.TestCase):
     """Oxide#147 correction: shared confirmation passes must return exactly the
     round data the serial algorithm at 8849f99 returned, while every identity
@@ -9200,7 +9409,7 @@ class PureInterleavedConfirmation(unittest.TestCase):
         reference_table = scenario(esrch=script, **kwargs)
         produced = produced_table.census(allowed)
         result = produced.round()
-        self.assertEqual(result, reference_table.reference(allowed).round(),
+        self.assertEqual(without_replacement_work(result), reference_table.reference(allowed).round(),
                          "corrected round data must equal the serial reference")
         return produced_table, produced, result
 
@@ -9221,7 +9430,7 @@ class PureInterleavedConfirmation(unittest.TestCase):
                         # pass; the corrected round pays one pause per pass.
                         serial = scenario(esrch=script, members=[800], foreign=[810],
                                           unclear=[820]).reference(allowed)
-                        self.assertEqual(serial.round(), result)
+                        self.assertEqual(serial.round(), without_replacement_work(result))
                         self.assertEqual(serial.stats["pause_calls"], 19 * count)
                         self.assertEqual(serial.stats["confirm_reads"], produced.stats["confirm_reads"])
                     self.assertEqual(table.first_read_follows_getsid(), [])
@@ -9230,7 +9439,7 @@ class PureInterleavedConfirmation(unittest.TestCase):
         for allowed in (False, True):
             with self.subTest(allowlisted=allowed):
                 table, produced, _result = self.compare(
-                    [(921, [None]), (922, [row(922, start=99)])], allowed)
+                    [(921, [None]), (922, [None])], allowed)
                 self.assertEqual(produced.stats["pause_calls"], 0)
                 self.assertEqual((len(table.rereads(921)), len(table.rereads(922))), (1, 1),
                                  "a Gone identity is never read again and gets no final read")
@@ -9239,7 +9448,7 @@ class PureInterleavedConfirmation(unittest.TestCase):
         for allowed in (False, True):
             with self.subTest(allowlisted=allowed):
                 table, produced, result = self.compare(
-                    [(900, PERSISTENT), (901, GONE_AT_3), (902, REPLACED_AT_7),
+                    [(900, PERSISTENT), (901, GONE_AT_3), (902, [dead_row(902)] * 6 + [None]),
                      (903, FAIL_AT_5), (904, CONTRADICTION), (905, NONZOMBIE)],
                     allowed, members=[800], foreign=[810], unclear=[820])
                 self.assertEqual({pid: len(table.rereads(pid)) for pid in (900, 901, 902, 903, 904, 905)},
@@ -9258,6 +9467,14 @@ class PureInterleavedConfirmation(unittest.TestCase):
                                         f"pid {pid} confirmation reads {index - 1}->{index} must be a pause apart")
                 self.assertEqual(table.first_read_follows_getsid(), [])
 
+    def test_shared_pass_replacement_does_not_inherit_old_disposition(self):
+        table = scenario(esrch=[(902, REPLACED_AT_7)])
+        result = table.census().round()
+        self.assertFalse(result["certain"])
+        self.assertEqual(result["uncertain"], 1)
+        self.assertEqual(result["replacement_work"]["replacement"], 1)
+        self.assertIn({"pid": 902, "start": 8, "state": "uncertain"}, result["replacement_work"]["rows"])
+
     def test_tracked_attribution_is_unchanged(self):
         for allowed, expected_members in ((False, 1), (True, 0)):
             with self.subTest(allowlisted=allowed):
@@ -9267,7 +9484,7 @@ class PureInterleavedConfirmation(unittest.TestCase):
                 result = produced.round()
                 reference = scenario(esrch=[(950, [dead_row(950)])]).reference(allowed)
                 reference.tracked[(950, 7)] = dead_row(950)
-                self.assertEqual(result, reference.round())
+                self.assertEqual(without_replacement_work(result), reference.round())
                 self.assertEqual(result["members"], expected_members,
                                  "strict keeps the tracked identity as a member; terminal keeps it tracked")
                 self.assertEqual(result["terminal_nonwriters"], 1 if allowed else 0)
@@ -9341,7 +9558,7 @@ class PureInterleavedConfirmation(unittest.TestCase):
                     reference.tracked[(pid, 7)] = (dead_row(pid) if pid == 970
                                                    else row(pid, start=7))
                     expected = reference.round()
-                    self.assertEqual(result, expected,
+                    self.assertEqual(without_replacement_work(result), expected,
                                      "a tracked final-read failure must keep the serial result")
                     self.assertEqual([entry["pid"] for entry in result["member_rows"]], [pid])
                     self.assertEqual(len(table.rereads(pid)), 21)
@@ -9362,7 +9579,7 @@ class PureInterleavedConfirmation(unittest.TestCase):
 
         # Untracked, the same failure is uncertain, exactly as before.
         table = scenario(esrch=[(970, FINAL_FAILS)])
-        self.assertEqual(table.census(True).round(),
+        self.assertEqual(without_replacement_work(table.census(True).round()),
                          scenario(esrch=[(970, FINAL_FAILS)]).reference(True).round())
         self.assertEqual(len(table.rereads(970)), 21)
 
@@ -9413,7 +9630,7 @@ class PureInterleavedConfirmation(unittest.TestCase):
         table = scenario(esrch=[(900, PERSISTENT)])
         produced = table.census(allowed)
         result = produced.round()
-        return {"result": result,
+        return {"result": without_replacement_work(result),
                 "reference": scenario(esrch=[(900, PERSISTENT)]).reference(allowed).round(),
                 "reads": len(table.rereads(900)),
                 "pauses": produced.stats["pause_calls"],
@@ -9440,7 +9657,7 @@ class PureInterleavedConfirmation(unittest.TestCase):
         # A no-op batch that never reads must not look like a confirmation.
         with patched(bounded.Census, "confirmation_attempt", lambda self, row_, state: True):
             observed = self.live_run()
-        self.assertEqual(observed["reads"], 1, "a no-op batch must be detected")
+        self.assertEqual(observed["reads"], 0, "a no-op batch must be detected")
 
         # A dropped final read leaves 20 instead of 21 rereads and changes the
         # Gone classification, so it must be detected.
@@ -9618,6 +9835,28 @@ class Real(unittest.TestCase):
         self.assertEqual(self.guardian(fixture("open(os.environ['CASE_DIR'] + '/ran', 'w')\n")), 0)
         self.assertEqual(self.outcome()["closure"], "closed")
         self.assertEqual(self.receipt["phase"], "monitor_complete: pending_custodian")
+
+    def replacement_fixture(self, mode, expected_state):
+        # The seam supplies a labelled synthetic A -> B observation alongside
+        # the actual kernel snapshot; all real rows still use the normal readers.
+        self.assertEqual(self.guardian(fixture("pass\n"), inject=[mode]), 0)
+        self.assertEqual(self.outcome()["closure"], "closed")
+        observed = self.receipt.get("replacement_fixture")
+        self.assertEqual((observed["source"], observed["mode"]), ("synthetic", mode))
+        self.assertTrue(observed["certain"])
+        self.assertEqual(observed["uncertain"], 0)
+        work = observed["work"]
+        self.assertEqual((work["status"], work["replacement"], work["pending"]), ("complete", 1, 0))
+        self.assertIn({"pid": 2_147_483_647, "start": 2, "state": expected_state}, work["rows"])
+        signalled = [r["target"] for r in self.receipt["custodian"] if r["event"] == "signal"]
+        self.assertNotIn(2_147_483_647, signalled)
+        CASES[-1]["replacement_fixture"] = observed
+
+    def test_synthetic_replacement_member_reaches_real_receipt(self):
+        self.replacement_fixture("census-replacement-member", "member")
+
+    def test_synthetic_replacement_foreign_reaches_real_receipt(self):
+        self.replacement_fixture("census-replacement-foreign", "foreign")
 
     def test_an_unrelated_launcher_sibling_does_not_block_closure(self):
         # Oxide#197 (design ruling ea5a3dc9). This suite is the nested

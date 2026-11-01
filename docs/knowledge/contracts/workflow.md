@@ -6390,7 +6390,7 @@ Approved design direction (Tom, 2026-10-20). Not implemented. It applies to buil
   [foundation qualification](#qualification-result) record; a heavy-project benefit
   reading remains a separate stage.
 
-### Foreign churn in the supervisor census (design investigation)
+### Foreign churn in the supervisor census
 
 A PID is not an identity: the census identifies an occupant by `(pid, start)`.
 A successful safe reread showing no row or a different start proves only that
@@ -6431,8 +6431,8 @@ census thread, the final and named certain-empty census messages, pipe EOF and
 identity-bound custody remain independent closure requirements; no proposed
 classification grants signal authority. Zombie terminal treatment retains its
 existing allowlist and full paired-read requirements, not a generic exiting
-shortcut. These observations are a design investigation, not an implemented or
-qualified change.
+shortcut. These observations record the original design investigation; the later oxide#233
+candidate below remains unqualified.
 
 **Recommendation: no-go on either papercut shortcut.** A foreign parent's
 session does not bind its child's session: a child may enter the supervised
@@ -6475,8 +6475,42 @@ absence. This remains a design subject to independent exact-head review.
 `78364942c8dec9253d557cfc63a7775fe9284848`, runner SHA-256
 `fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b`,
 suite SHA-256 `c95d46aa0e590285c3c412294ffb215c0d45b19ba804f2243f0d2ebd62158d7b`,
-and this section before this amendment. It is a design, not implemented or
-qualified behavior. The following fixes the open choices in the candidate above.
+and this section before this amendment. It records the frozen design; the
+subsequent oxide#233 candidate is not yet qualified. The following fixes the open choices in the candidate above.
+
+**Candidate implementation (oxide#233).** The branch implements same-round
+replacement accounting using the ledger, shared read budget and fixed phase
+clock described below. The receipt and census message carry bounded
+`replacement_work` evidence, while the uncapped ledger determines obligations;
+a late publication refuses certainty. The original snapshot/confirmation/final
+zombie witnesses and the exact named and final census, EOF, joined-thread and
+fault gates remain independent. The qualification suite currently contains
+402 pure cases and 59 real cases by its loader: the two new real cases label
+synthetic replacement observations alongside the actual kernel snapshot. They
+are not kernel PID reuse, and no signal authority follows. The 382 pure / 57
+real #197 claims remain historical at their own bytes.
+
+The proof-authoring premise sweep for the new cases follows their executable
+route: `Real.replacement_fixture` calls `Real.guardian` with `fixture("pass")`;
+that fixture is Python-only and makes no Oxide, Cargo or rustup call. Therefore
+private HOME/rustup and lock generation, Oxide account-home override, inherited
+Oxide configuration and automatic adoption, Cargo external argv, and compiler
+flags are not applicable to these case bodies. They create no image, so the
+owned-image attachment premise is not applicable. `Real.setUp`, `nested_root`
+and `Real.guardian` place their `tempfile.mkdtemp` case directory and nested
+supervisor evidence inside the qualification-owned root; no shell `mktemp` is
+called. Existing suite cases and the enclosing bootstrap retain their own
+premises, bounds and custody rules. This source sweep is not a native diagnostic.
+
+These candidate bytes are **unqualified**. Main's `fcfda2b0…` runner remains
+the deployed qualified route; no prior receipt migrates. After independent
+exact-published-head source review, the Queue-held chain requires one separately
+activated uncounted diagnostic, then separately activated counted author and
+distinct reviewer native sessions, followed by exact-head rejudgment and scoped
+consumer readiness. The 600 s outer / 560 s candidate / 530 s suite bounds,
+512 MiB monitored scratch and host custody remain unchanged. The persistent
+same-identity non-zombie ESRCH (`37529b20`) and recycled-identity report
+(`631e4462`) gain no retrospective closure or signal authority.
 
 The project planner froze this bounded design on 2026-11-01 after independent
 exact-head review `6565343955` of `ecd2129b771b74e7a29ff6f38687cad88e9418ca`.
