@@ -1773,6 +1773,7 @@ necessary.
     pool's first command, and a build summary of 0.1–1.2 s. The 22 `status`
     processes took at most 17 ms; the newer-state hand-off check, which returns
     before pool open, took 18 ms.
+  - **Recovered packet.** `/Volumes/Builds/scratch/oxide/evidence-225-recovered-490e935-20261101T225233Z` contains `SHA256SUMS` and `recovery-provenance.json` binding the copied session and log to `490e935`. This is a newly hashed copy, not a historical manifest or native pass. The original `oxide-proof.u7ktgeuh/evidence` recorded 19 exit-1 checks at 11.272969375–13.084510875 s, summaries of 0.1–1.2 s, 22 status calls at most 16.900167 ms, one exit-42 handoff at 18.4845 ms, and one check without a terminal record at the deadline. Its exit remains unknown; the failed diagnostic has no native credit.
   - **Attribution boundary.** The summary's clock starts at `started` in
     `run_invocation`, after pool open, workspace location, removable selection and
     key resolution, and stops at the print. The gap of about 11.2–12.5 s
