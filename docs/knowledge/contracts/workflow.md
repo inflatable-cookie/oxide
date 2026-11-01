@@ -6349,3 +6349,150 @@ Approved design direction (Tom, 2026-10-20). Not implemented. It applies to buil
   Q2–Q4 held on Oxide's own repository in the partial
   [foundation qualification](#qualification-result) record; a heavy-project benefit
   reading remains a separate stage.
+
+### Foreign churn in the supervisor census (design investigation)
+
+A PID is not an identity: the census identifies an occupant by `(pid, start)`.
+A successful safe reread showing no row or a different start proves only that
+the old identity is absent at that observation. It does not establish the
+replacement's session or prove the PID stays empty. A failed or malformed
+read establishes neither absence nor a foreign occupant. A successful getsid
+sandwiched between matching identity reads binds that session observation to
+that identity; it cannot bind an observation across PID reuse. Start-token
+ordering, a readable foreign parent, and exiting or zombie state alone do not
+establish foreignness.
+
+The current ESRCH path can drop the old tracked identity when confirmation or
+its final reread proves absence; a replacement is not classified by inference.
+The ordinary successful-getsid path retains a tracked old identity or marks an
+untracked changed identity uncertain. The next snapshot can classify a new
+occupant, but a replacement observed after the snapshot must not be silently
+omitted from a deciding empty round. A candidate correction must explicitly
+account for that interleaving; merely dropping the old identity on a changed
+reread is insufficient. Any bounded retry that cannot classify each observed
+replacement must leave the round uncertain. A later clean snapshot is a new
+observation, not proof that an earlier unknown was foreign.
+
+| Observation | Defensible result |
+| --- | --- |
+| Same identity, bound leader session | Member, retain tracking, even in another group. |
+| Same untracked identity, bound other session | Foreign under the existing ordinary rule. |
+| Tracked identity, contradictory or unreadable session | Keep attribution; no foreign inference. |
+| ESRCH, same identity or failed reread | Existing terminal rule if all its strict premises hold; otherwise tracked member or uncertain. |
+| ESRCH, safe reread absent or replaced | Old identity absent at reread; replacement remains unclassified. |
+| Successful getsid, changed identity | The session belongs to neither identity with certainty; retain tracked old attribution or mark uncertain. |
+| Reused parent, orphan, unreadable identity or session | No launcher exclusion without its exact structural proof; use ordinary conservative classification. |
+
+Counterexamples to test include replacement after an ESRCH confirmation but
+before the final decision, repeated PID reuse between each bounded reread,
+parent reuse between sibling observations, a same-session different-group
+member, and a tracked identity whose later session appears foreign. A joined
+census thread, the final and named certain-empty census messages, pipe EOF and
+identity-bound custody remain independent closure requirements; no proposed
+classification grants signal authority. Zombie terminal treatment retains its
+existing allowlist and full paired-read requirements, not a generic exiting
+shortcut. These observations are a design investigation, not an implemented or
+qualified change.
+
+**Recommendation: no-go on either papercut shortcut.** A foreign parent's
+session does not bind its child's session: a child may enter the supervised
+session, and a parent PID can be recycled. Neither an exiting flag nor an
+unpaired zombie observation proves a nonwriter. The existing allowlisted
+terminal rule is narrower and remains unchanged. Waiting for a quiet host is
+not a correctness fix. Nor does dropping a changed identity and assuming a
+subsequent round will run work: the custodian may decide on this round, and a
+post-stop uncertain message latches the fault. In particular the current
+ESRCH replacement branch records Gone and can report a certain empty round;
+`test_final_replacement_tracked_not_foreign_by_inference` tests a later round
+but does not require it before that first round can decide. This is a design
+concern requiring independent review, not a claim that the historical packets
+contained a supervised replacement.
+
+The smallest candidate worth evaluating is a **bounded replacement worklist**
+within the same census round, for both ESRCH confirmation/final replacement
+and successful getsid identity-change paths. Remove only the positively absent
+old `(pid, start)` from tracking; immediately carry every observed replacement
+as an unclassified identity, including one from the final read. Apply ordinary
+identity-bound session classification to that replacement, with the existing
+ancestor/launcher rules only when their original structural premises can be
+proved from appropriate fresh observations. A positive member is tracked by
+its own identity even if a subsequent read contradicts it. A bound foreign
+session can exclude only an untracked replacement. A fresh observed absence
+can resolve that identity, not future occupants. Each further replacement
+enters the same worklist; cap total identities and reads per round, never
+recursively or without a fixed ceiling. Exhaustion, malformed data, failure or
+an unclassifiable occupant leaves the round uncertain, not empty. Preserve
+already tracked identities until their exact absence is established. The
+implementation brief must settle the concrete limits and the safe interaction
+with shared confirmation passes, receipt caps and census deadline. If that
+cannot be achieved without weakening the existing final/named census or
+fault-latching contract, retain the current conservative behavior and stop.
+The #214/#212 persistent same-identity ESRCH case remains unresolved by this
+candidate; no bounded reread can turn the same non-zombie row into proven
+absence. This is a proposal for review, not a frozen contract.
+
+| Interleaving / counterexample | Required disposition |
+| --- | --- |
+| Snapshot A; getsid; reread B at same PID | A absent at reread; getsid may belong to A or B. Classify B independently before an empty decision; never transfer A's session or tracking to B. |
+| A tracked; B appears during confirmation or final reread | Drop only A once replacement is safely read; account for B in that round, tracking B if bound to the leader session. |
+| B changes to C while B is classified | Account for C in turn; if bounded work is exhausted, uncertainty blocks closure. |
+| Same untracked A, foreign session bound to A | Foreign under the ordinary rule, even if its parent is unknown; a foreign parent alone proves nothing. |
+| Same tracked A, foreign session, orphan, changed parent or different group | A remains tracked; same session with a different group is still a member. |
+| Parent PID reused, parent read fails, or sibling session/group read changes | No structural exclusion; ordinary classification applies, and an unreadable child stays uncertain. |
+| ESRCH, unchanged non-zombie A or an exiting flag | No disappearance or terminal proof; tracked A remains a member, otherwise uncertain. |
+| Allowlisted complete zombie, all paired reads unchanged | Existing terminal nonwriter rule only; retained attribution survives and eligibility is recalculated each round. Failed, changed or non-zombie reads disqualify it. |
+| Interrupted worklist, failed snapshot or malformed reread | Unknown, never foreign or absent; retain attribution and block certainty. |
+| Certain empty named message but later final census sees member or unknown, or join expires | Refuse cleanup; named and final messages must both be certain and empty and join must finish. Missing either pipe EOF also vetoes closure. |
+
+The receipt evidence for command-budgets at `122493b` and removable-removal at
+`73ff05b` is respectively
+`/Volumes/Builds/scratch/oxide/oxide-proof.qv4pc4xe/evidence/receipt.json`
+(SHA-256 `8ed940705529e0afcba79585fae184768d2088039fdfaec8730a386d994a84d7`)
+and `/Volumes/Builds/scratch/oxide/oxide-proof.a746ilr6/evidence/receipt.json`
+(SHA-256 `1d25ad0db500b7a0cd9956dd85b47ab93d77c1af672c0dd0b5880828eabd6bbf`).
+Both record status 0 and UNCLOSED with two uncertain rows, PIDs 23420 and
+23421, `zombie: false`, 20 matching confirmations and a same-identity final
+read. The removable script's own result says passed and requested detach; it
+does not prove supervisor closure or detach. Queue's papercut attributes the
+rows to foreign Effigy test activity, but the receipts alone do not bind their
+sessions. The separate #192 recycled-PID report identifies a changed token;
+it does not establish which identity owned the getsid observation. All these
+packets and their original conclusions remain historical.
+
+**Future validation and rollout.** A separately approved HIGH complexity
+implementation brief must apply the proof-authoring premise checklist and
+specify time and scratch bounds, including fixed per-round worklist/read caps.
+Pure regressions must drive the real classifier through the table above,
+including replacement at the first, shared-pass and final reads; A→B→C cap
+exhaustion; tracked A and B; session/read failures; ancestor and parent PID
+reuse; zombie rule contradictions; named/final census divergence, join expiry
+and missing EOF. Include a counterfactual proving the old certain-empty
+replacement case fails the new oracle. Real qualification must use small owned
+fixtures and test-only controlled seams to exercise replacement attribution and
+closure end to end, alongside actual same-session different-group survivor,
+foreign churn, EOF veto, join and no-signal controls; do not depend on forcing
+kernel PID reuse or a quiet host. Distinguish simulated interleavings from real
+kernel observations in receipts. Run the pure selector and covering checks once,
+then an owner-activated uncounted keep-going diagnostic, counted author and
+distinct independent reviewer native qualifications at the exact published
+head, under the then-approved 600 s outer / 560 s candidate / 530 s suite and
+512 MiB bounds, reserve watchdog and custody rules. Any changed bounds require
+an explicit brief amendment, not a reset. This changes writer-closure decisions,
+so future implementation is Elevated; retain the independent reviewer native.
+No native is authorized by this design.
+
+The candidate runner remains unqualified until that chain and exact-head review
+pass. Inventory direct consumers in `effigy.toml` and all hash checks at the
+implementation head; update each applicable pin only under its own approved
+scope, with new consumer evidence where required. At this source head explicit
+`fcfda2b0…` checks occur in `test-command-budgets.py`,
+`test-holding-delete.py`, `test-outputs-prune.py`,
+`test-recorded-slot-accounting.py` and `test-slot-headroom.py`. Older explicit
+checks are `d89115f1…` in `test-accounting-guards.py` and
+`test-status-fast.py`, and `8e379c93…` in `test-accounting-vanished.py`,
+`test-storage-layout.py` and `test-max-active.py`; other scripts and
+`effigy.toml` contain historical digest declarations, so reconcile those
+separately rather than blindly replacing strings. Consumer-specific limits,
+read-only sibling boundaries and adoption holds remain in force. Old receipts
+stay bound to their actual runner bytes and limits; repinning source does not
+migrate proof credit or authorize reruns, installation or consumer adoption.
