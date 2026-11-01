@@ -1350,6 +1350,8 @@ def self_check() -> int:
             os.environ.update(
                 {
                     "OXIDE_POOL": "/fixture/host-pool",
+                    "OXIDE_SCRATCH_ROOT": "/fixture/host-scratch",
+                    "OXIDE_POOL_CAP": "1",
                     "OXIDE_CONFIG": "/fixture/host-config",
                     "OXIDE_TEST_HOME_FROM_ENV": "0",
                     "XDG_CONFIG_HOME": "/fixture/xdg",
@@ -1366,6 +1368,12 @@ def self_check() -> int:
             )
             fixture_root = os.path.join(root, "fixture")
             env = fixture_environment(fixture_root)
+            expect_true(env["OXIDE_SCRATCH_ROOT"] == os.path.join(fixture_root, "scratch-pools"), "scratch root is not private")
+            expect_true(env["OXIDE_POOL_CAP"] == str(SCRATCH_LIMIT_BYTES), "pool cap is not explicit")
+            main_pool = Proof(fixture_root, "oxide", env).pool
+            other_pool = Proof(os.path.join(fixture_root, "hardlink"), "oxide", env).pool
+            expect_true(main_pool == os.path.join(env["OXIDE_SCRATCH_ROOT"], ".", "pool"), "main pool escaped scratch root")
+            expect_true(other_pool == os.path.join(env["OXIDE_SCRATCH_ROOT"], "hardlink", "pool"), "hardlink pool escaped scratch root")
             expect_true(env["OXIDE_TEST_HOME_FROM_ENV"] == "1", "account-home control was not set")
             expect_true(env["HOME"] == os.path.join(fixture_root, "home"), "HOME is not private")
             expect_true(env["CARGO_HOME"] == os.path.join(fixture_root, "cargo-home"),
