@@ -191,11 +191,11 @@ run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- p
 
 [tasks."rust:profile-outputs:base-compat"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 128 -- python3 scripts/test-profile-outputs.py --base-compat"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-profile-outputs.py --base-compat"
 
 [tasks."rust:profile-outputs:base-compat:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 128 -- python3 scripts/test-profile-outputs.py --base-compat --diagnostic"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-profile-outputs.py --base-compat --diagnostic"
 
 # Enumerated paths that disappear during accounting (oxide#113): the
 # qualified session supervisor bounds one fixed native proof covering the
