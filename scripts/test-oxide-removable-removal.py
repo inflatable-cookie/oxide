@@ -2189,9 +2189,18 @@ def self_check() -> int:
     supervisor-leader-group membership, its exercised detach/re-attach
     readiness state machine, its detach of the inherited standard streams
     before it waits, the release oracle's `process <pid>` form, the dispatch,
-    the product-message marker and the receipt bound."""
+    the product-message marker and the receipt bound.
+
+    It also pins the scratch-pool environment contract (scratch-pools S4,
+    oxide#212), so a script left half-migrated off the internal root fails
+    here instead of running: the canonical private `OXIDE_SCRATCH_ROOT` inside
+    the monitored guard root, `OXIDE_POOL` strictly inside it with an explicit
+    cap, both modes taking it from the same `private_environment`, the four
+    selectors passing no `--root-parent`, and every product line the oracles
+    match still present in the source file that carries it."""
     fixture = {
-        "OXIDE_POOL": "/fixture/pool",
+        "OXIDE_SCRATCH_ROOT": "/fixture/scratch-pools",
+        "OXIDE_POOL": "/fixture/scratch-pools/pool",
         "HOME": "/fixture/home",
         "CARGO_HOME": "/fixture/cargo-home",
         "OXIDE_TEST_HOME_FROM_ENV": "1",
@@ -3013,12 +3022,17 @@ def self_check() -> int:
     for item, disposition in PREMISE_CHECKLIST:
         expect(disposition.strip() != "", f"premise {item} has no disposition")
     holder = dict(os.environ)
-    fixture_root = os.path.join(root, "fixture-env")
+    # The fixture root sits inside the guard root it hands to
+    # `private_environment`, exactly as `proof.root` does in a real run, so the
+    # contained-declaration assertion below is about the real relationship.
+    fixture_root = os.path.join(root, "scratch", "fixture-env")
     os.makedirs(os.path.join(root, "scratch"), mode=0o700, exist_ok=True)
     os.environ.update(
         {
             "TMPDIR": os.path.join(root, "scratch"),
             "OXIDE_POOL": "/fixture/host-pool",
+            "OXIDE_POOL_CAP": "9MiB",
+            "OXIDE_SCRATCH_ROOT": "/fixture/host-scratch-pools",
             "OXIDE_CONFIG": "/fixture/host-config",
             "OXIDE_TEST_HOME_FROM_ENV": "0",
             "XDG_CONFIG_HOME": "/fixture/xdg",
@@ -3036,18 +3050,54 @@ def self_check() -> int:
     )
     try:
         env = private_environment(fixture_root)
+        # The run root is canonicalized once, so every fixture path and the
+        # scratch pool are canonical even when the guard root is reached
+        # through a symlinked component (the self-check's own /var fixture
+        # exercises exactly that).
+        canonical_root = os.path.realpath(fixture_root)
+        guard_root = os.path.realpath(os.environ["TMPDIR"])
         expect(env["OXIDE_TEST_HOME_FROM_ENV"] == "1", "account-home control was not set")
-        expect(env["HOME"] == os.path.join(fixture_root, "home"), "HOME is not private")
-        expect(env["CARGO_HOME"] == os.path.join(fixture_root, "cargo-home"), "CARGO_HOME is not private")
+        expect(env["HOME"] == os.path.join(canonical_root, "home"), "HOME is not private")
+        expect(env["CARGO_HOME"] == os.path.join(canonical_root, "cargo-home"), "CARGO_HOME is not private")
         expect(env["RUSTUP_TOOLCHAIN"] == runner.BUILDER, "the toolchain is not pinned")
         expect(env["RUSTUP_AUTO_INSTALL"] == "0", "auto-install is not disabled")
         expect(env["RUSTFLAGS"] == FROZEN_RUSTFLAGS, f"flags not frozen: {env['RUSTFLAGS']!r}")
         expect("CARGO_ENCODED_RUSTFLAGS" not in env, "encoded flags were inherited")
         for name in ("TMPDIR", "TMP", "TEMP"):
-            expect(env[name] == os.environ["TMPDIR"], f"{name} is not the guard's scratch")
-        expect(env["OXIDE_POOL"] == os.path.join(fixture_root, "pool"),
-               "the host pool path reached the fixture")
-        expect(env["OXIDE_POOL_CAP"] == "64MiB", "the fixture cap is not its own")
+            expect(env[name] == guard_root, f"{name} is not the guard's scratch")
+        # The scratch-pool contract: one private canonical root inside the
+        # monitored guard root, the pool strictly inside that root with an
+        # existing parent, and an explicit cap. No inherited declaration or
+        # budget may survive.
+        scratch_pool = os.path.join(canonical_root, SCRATCH_POOL_ROOT)
+        expect(
+            env["OXIDE_SCRATCH_ROOT"] == scratch_pool,
+            f"the fixture scratch root is {env['OXIDE_SCRATCH_ROOT']!r}, not its own {scratch_pool!r}",
+        )
+        expect(
+            env["OXIDE_SCRATCH_ROOT"].startswith(guard_root + os.sep),
+            f"the scratch root {env['OXIDE_SCRATCH_ROOT']!r} escapes the monitored guard root {guard_root!r}",
+        )
+        expect(
+            os.path.realpath(env["OXIDE_SCRATCH_ROOT"]) == env["OXIDE_SCRATCH_ROOT"],
+            "the fixture scratch root is not canonical",
+        )
+        expect(
+            os.path.isdir(env["OXIDE_SCRATCH_ROOT"])
+            and stat.S_IMODE(os.stat(env["OXIDE_SCRATCH_ROOT"]).st_mode) == 0o700,
+            f"the fixture scratch root is not one private 0700 directory: "
+            f"{os.stat(env['OXIDE_SCRATCH_ROOT']).st_mode:o}",
+        )
+        expect(
+            env["OXIDE_POOL"].startswith(env["OXIDE_SCRATCH_ROOT"] + os.sep)
+            and env["OXIDE_POOL"] != env["OXIDE_SCRATCH_ROOT"],
+            f"the fixture pool {env['OXIDE_POOL']!r} is not strictly inside the scratch root",
+        )
+        expect(
+            os.path.isdir(os.path.dirname(env["OXIDE_POOL"])),
+            "the fixture pool's parent does not exist under the scratch root",
+        )
+        expect(env["OXIDE_POOL_CAP"] == SCRATCH_POOL_CAP, "the fixture cap is not its own")
         expect(env["CARGO_BUILD_RUSTC_WRAPPER"] == "", "an inherited wrapper reached the fixture")
         for name in (
             "OXIDE_CONFIG",
@@ -3130,6 +3180,52 @@ def self_check() -> int:
     finally:
         os.environ.clear()
         os.environ.update(holder)
+
+    # Both modes take their fixture environment from the same helper, so no
+    # mode can keep an undeclared pool, and the four selectors pass no explicit
+    # internal root: the guard's selected-volume default supplies the monitored
+    # root that the declaration must live inside, and the bounds are unchanged.
+    for label, constructor in (("Removal", Removal.__init__), ("BootClosure", BootClosure.__init__)):
+        expect(
+            "private_environment(proof.root)" in inspect.getsource(constructor),
+            f"{label} does not take its fixture environment from private_environment",
+        )
+    with open(os.path.join(os.path.dirname(HERE), "effigy.toml"), encoding="utf-8") as handle:
+        manifest = handle.read()
+
+    def selector_run(name: str) -> str:
+        marker = f'[tasks."{name}"]\n'
+        expect(manifest.count(marker) == 1, f"selector {name} is not declared exactly once")
+        for row in manifest.split(marker, 1)[1].splitlines()[1:]:
+            if row.startswith("run = "):
+                return row
+            expect(not row.startswith("["), f"selector {name} has no run line")
+        fail(f"selector {name} has no run line")
+
+    for task in (
+        "rust:oxide-removable-removal",
+        "rust:oxide-removable-removal:diagnostic",
+        "rust:oxide-removable-boot-closure",
+        "rust:oxide-removable-boot-closure:diagnostic",
+    ):
+        task_run = selector_run(task)
+        expect("scripts/test-oxide-removable-removal.py" in task_run, f"{task} does not run this proof")
+        expect("bounded-test.py" in task_run, f"{task} is not the whole command of the qualified guard")
+        expect("--root-parent" not in task_run, f"{task} still passes an explicit internal root")
+        expect(
+            "--limit 300" in task_run and "--scratch-budget-mib 512" in task_run,
+            f"{task} changed its wall clock or scratch budget: {task_run}",
+        )
+
+    # The S4 pre-review oracle sweep is a real effect-free gate: every product
+    # line this proof matches is asserted against the source file that carries
+    # it, so a reworded product message fails here instead of in a native round.
+    needles = [(relative, needle) for _, relative, needle in PRODUCT_ORACLES]
+    expect(len(set(needles)) == len(needles), "the product oracle table repeats an entry")
+    expect(
+        check_product_oracles() == len(PRODUCT_ORACLES),
+        "the product oracle sweep did not check every pinned line",
+    )
     # The shared staging helper's narrowly scoped retention opt-in, exercised
     # through the REAL `layout.stage_at` route with a fake staged build (no
     # Cargo): the default removes the staged tree exactly as before, and the
@@ -3365,7 +3461,9 @@ def self_check() -> int:
         "boot-closure self-check ok: status/build child environments, deletion "
         "oracle slot leaf, diagnostic receipt (json, bounded, unqualified), "
         "owners-on attach and mount observation, staging and fixture environment "
-        "scrub, timeout/abort driver semantics, dispatch, marker"
+        "scrub, scratch-pool declaration and selector environment contract, "
+        f"product oracle sweep ({len(PRODUCT_ORACLES)} lines), "
+        "timeout/abort driver semantics, dispatch, marker"
     )
     return 0
 
