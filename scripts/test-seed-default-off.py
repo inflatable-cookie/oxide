@@ -201,7 +201,46 @@ def run(proof: Proof, repo: str, commit: str, diagnostic: bool) -> str:
     return commit
 
 
+def self_check() -> None:
+    from unittest.mock import patch
+    class Git:
+        def __init__(self, accepted):
+            self.accepted = accepted
+            self.commands = []
+        def run(self, command, *, cwd, timeout):
+            self.commands.append(command)
+            if "--is-ancestor" in command:
+                return subprocess.CompletedProcess(command, 0 if self.accepted else 1, b"", b"")
+            return subprocess.CompletedProcess(command, 0, b"a" * 40 + b"\n", b"")
+    with patch.object(sys, "argv", ["proof", "baseline"]), patch.dict(os.environ, {}, clear=True):
+        old = Git(False)
+        try:
+            resolve_baseline(old, "/repo")
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("pre-S3 baseline was accepted")
+        assert len(old.commands) == 2 and old.commands[-1][-2:] == [S3, "a" * 40]
+        current = Git(True)
+        assert resolve_baseline(current, "/repo") == "a" * 40
+    with patch.dict(os.environ, {"OXIDE_TASK_SCRATCH_ROOT": "/Volumes/Builds/owned"}, clear=True), \
+         patch.object(os, "makedirs") as mkdir:
+        env = cargo_test_env("/Volumes/Builds/owned/case", "/baseline")
+        assert env["OXIDE_SCRATCH_ROOT"] == "/Volumes/Builds/owned"
+        assert env["OXIDE_POOL_CAP"] == POOL_CAP and env["OXIDE_TEST_HOME_FROM_ENV"] == "1"
+        assert env["OXIDE_TEST_INTERNAL_ROOT"].startswith(env["OXIDE_SCRATCH_ROOT"] + "/")
+        mkdir.assert_called_once()
+    print("seed-default-off effect-free contract checks passed")
+
+
 def main() -> int:
+    if sys.argv[1:] == ["--plan"]:
+        print("seed-default-off: S3 ancestry gate; selected-volume scratch pool; 300 s / 512 MiB; "
+              "diagnostic: two independent ignored cases, uncounted")
+        return 0
+    if sys.argv[1:] == ["--self-check"]:
+        self_check()
+        return 0
     if sys.platform != "darwin":
         fail("the seed-default-off selector requires macOS")
     scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")

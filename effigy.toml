@@ -86,13 +86,17 @@ default = false
 # helper, exports OXIDE_SEED_BASELINE_BINARY, and runs that target with
 # --ignored. Default baseline is git merge-base HEAD origin/main; override
 # with OXIDE_SEED_BASELINE_COMMIT. 300 s / 512 MiB owned scratch. The
-# explicit internal root is the owner-accepted exception (decision bd357a4c)
-# because the tiny-build fixture creates a genuine directory-budget pool,
-# which the product refuses on an external volume. Not a native proof and
-# not an alias for full QA.
+# fixture uses a scratch pool on the supervisor-selected volume. Baselines
+# must contain scratch-pools S3 (79e55f4). Not an alias for full QA.
 [tasks."rust:seed-default-off"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-seed-default-off.py"
+
+[tasks."proof:seed-default-off:test"]
+run = "python3 scripts/test-seed-default-off.py --self-check"
+
+[tasks."proof:seed-default-off:plan"]
+run = "python3 scripts/test-seed-default-off.py --plan"
 
 [tasks."rust:seed-default-off:diagnostic"]
 admission = "heavy"
