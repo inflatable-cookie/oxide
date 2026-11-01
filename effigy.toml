@@ -439,7 +439,7 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 #
 # `--root-parent /private/tmp` is the owner-accepted internal-placement
 # exception (decision bd357a4c, Tom-approved apparatus correction 2026-10-26),
-# exactly as `rust:profile-outputs`, `rust:command-budgets`,
+# exactly as `rust:profile-outputs:base-compat`, `rust:command-budgets`,
 # `rust:pool-temp-scratch`, `rust:recorded-slot-accounting` and
 # `rust:outputs-prune` use it: this fixture's control pool is a genuine
 # internal `directory-budget` pool, which the product correctly refuses on the
@@ -1204,7 +1204,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # cases and aborts on an unknown child, custody uncertainty, a prerequisite
 # failure or an exhausted deadline. Its receipt is distinctly qualified=false
 # and is never a counted PASS; this declaration activates nothing. It keeps
-# the selected-volume root
+# the same declared internal root (see the counted selector's exception note)
 # and the unchanged 300 s / 512 MiB bound.
 [tasks."rust:command-budgets:diagnostic"]
 admission = "heavy"
