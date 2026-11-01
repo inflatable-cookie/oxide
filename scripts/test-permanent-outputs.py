@@ -589,6 +589,7 @@ def proof_env(pool: str, home: str, cargo_home: str) -> dict:
     scratch = os.environ["OXIDE_TASK_SCRATCH_ROOT"]
     env.update(
         {
+            "OXIDE_SCRATCH_ROOT": scratch,
             "OXIDE_POOL": pool,
             "OXIDE_POOL_CAP": "64MiB",
             "HOME": home,
