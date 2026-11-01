@@ -6207,7 +6207,14 @@ image, and case-12 symlink-root and reserve previews. Those assertions use
 `preview_report`'s bounded root→reason map; the corrupt-receipt case requires the
 whole batch. Other candidate and keep assertions do not all enforce completeness or
 report the map, so the proof does not claim that coverage throughout. This correction
-is diagnostic and premise-tightening only: no product behaviour is changed. No live prune, dry run,
+is diagnostic and premise-tightening only: no product behaviour is changed. The owner-activated `6d572ba` diagnostic closed its guard but failed case 04: its
+control preview kept the whole batch for duplicate or contradictory group references;
+cases 05–22 were skipped and no counted native was spent. Registry publication had a
+separate duplicate-row path: a missing pending reference could append an already
+matched selected member. It now adds only the missing pending reference; the focused
+regression checks a shared selected group with one stale device. The exact cause of
+the recorded case-04 packet remains subject to a fresh diagnostic, not assumed proven
+by the regression. No live prune, dry run,
 `resolve-intent`, mode, consumer or pool mutation is authorized by this implementation.
 
 ## Adaptive sccache location (proposed)

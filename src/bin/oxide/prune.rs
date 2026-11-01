@@ -1062,7 +1062,7 @@ fn note_placement(
         }
     }
     if let Some(selected) = selected {
-        if (keep_selected && !matched_selected) || (proposed.is_some() && !matched_pending) {
+        if keep_selected && !matched_selected {
             let identity = row_identity(selected)?;
             if registry.rows.len() >= MAX_ROWS {
                 mark_incomplete(registry, "the registry row limit was reached")?;
@@ -9573,6 +9573,71 @@ mod tests {
                 .filter(|row| row.root == debug.root)
                 .all(|row| row.pruning.as_deref() == Some(id.as_str()) && !row.selected),
             "a swapped volume changed the registry"
+        );
+    }
+
+    /// Preparing a new root must not append the already selected member again.
+    /// A sibling can still carry a previous session's device observation.
+    #[test]
+    fn prepared_placement_does_not_duplicate_a_shared_root_with_stale_device() {
+        let fixture = Fixture::new();
+        let mut debug = row_for(&fixture.root);
+        debug.member = "debug".to_owned();
+        fs::create_dir(&debug.root).unwrap();
+        fs::write(debug.root.join(".oxide-output.json"), b"fixture marker").unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(&debug.root).unwrap();
+        debug.root_dev = Some(metadata.dev());
+        debug.root_ino = Some(metadata.ino());
+        debug.marker_digest = Some(outputs::marker_digest(&debug.root).unwrap());
+        let mut release = debug.clone();
+        release.member = "release".to_owned();
+        release.root_dev = Some(metadata.dev().wrapping_add(1));
+        let control = ready_control(&fixture, vec![debug.clone(), release.clone()], Vec::new());
+        let mut document = snapshot_receipt(
+            &debug,
+            "oxide.outputs.transition/3",
+            "prepared",
+            Some(&debug.root),
+        );
+        document["links"][0]["selected"]["nonce"] = serde_json::json!(debug.nonce);
+        document["links"][0]["prepared"] = serde_json::json!({
+            "generation": 2,
+            "to": {"kind": "external", "root": fixture.root.join("future"),
+                   "volume_uuid": debug.volume_uuid, "nonce": "d".repeat(32), "generation": 2},
+            "link": debug.checkout.join("target/debug")
+        });
+        publish_snapshot_receipt(&control, &debug, &document);
+        let receipt =
+            outputs::read_receipt_for_prune(&control, &debug.checkout, &debug.checkout_id)
+                .unwrap()
+                .unwrap();
+        let mut registry = ready_registry(&control).unwrap();
+        note_placement(
+            &mut registry,
+            &receipt,
+            &receipt.links()[0],
+            &debug.receipt,
+            None,
+        )
+        .unwrap();
+        let members = group_rows(&registry, &debug.checkout_id, &debug.root);
+        assert_eq!(members.len(), 2, "preparing duplicated the selected member");
+        assert_eq!(members[0].member, "debug");
+        assert_eq!(members[1].member, "release");
+        assert_eq!(members[1].root_dev, release.root_dev);
+        let mut candidate = candidate_of(&debug);
+        candidate.dev = metadata.dev();
+        candidate.ino = metadata.ino();
+        candidate.marker_digest = debug.marker_digest.clone().unwrap();
+        assert_eq!(verified_group(&registry, &candidate).unwrap().len(), 2);
+        assert_eq!(
+            registry
+                .rows
+                .iter()
+                .filter(|row| row.root == fixture.root.join("future") && row.pending)
+                .count(),
+            1
         );
     }
 
