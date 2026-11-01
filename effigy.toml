@@ -298,7 +298,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # commands take Tom's answered internal-root exception explicitly
 # (`--root-parent /private/tmp`) rather than placing a pool on a selected
 # volume, where the product correctly refuses it. The supervisor is this tree's
-# `bounded-test.py` (sha256 8fc1f114…, oxide#191's post-census detach and
+# `bounded-test.py` (sha256 d9bc5ff6…, oxide#191's post-census detach and
 # oxide#197's ancestor and launcher-sibling exclusions over
 # the qualified oxide#151 guard; those added bytes are unqualified until their
 # own qualifications pass); 300 s wall and
@@ -531,7 +531,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 
 # Owned-output prune (oxide#129, oxide#152): one fixed 22-case native proof
 # under the shared supervisor (`scripts/bounded-test.py` SHA-256
-# 8fc1f114edb9d439259225b04c05a65b880a53fc5ee3628ef6e148e3ce9bb992,
+# d9bc5ff6dcd0913d9c1ff8e57030ce794f969e1f23c050b224a981b4c17618cd,
 # the qualified oxide#151 guard plus oxide#191's opt-in post-census detach and
 # oxide#197's ancestor and launcher-sibling exclusions,
 # unqualified until their own qualifications pass): 360 s, 512 MiB monitored scratch, 30 s work
@@ -628,7 +628,7 @@ admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-drive-mode.py"
 
 # Shared session supervisor qualification (oxide#109): a short bootstrap
-# (healthy reserve readings, fixed 420 s wall limit held by a minimal outer
+# (healthy reserve readings, fixed 600 s wall limit held by a minimal outer
 # actor) runs the candidate `bounded-test.py` around its synthetic suite:
 # pure fault injection first, then tiny real Python children and fixture
 # writers in owned scratch. The candidate runs with no --root-parent and no
@@ -654,16 +654,28 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # refusal and uncertainty paths alongside the unchanged guard cases. The changed runner is unqualified
 # until one counted author and one separate independent reviewer run of this
 # selector pass at the same head.
+# Oxide#192 correction (2026-10-31 brief author): the first direct uncounted
+# diagnostic at 5623edd exhausted the earlier 350 s suite alarm (candidate exit
+# 142 = SIGALRM, 357 s wall); that packet is a failed diagnostic preserved with
+# no credit, its pure suite OK. The bounds below are a 600 s fixed deadline
+# (kill at 598 s), a 560 s candidate limit and a 530 s suite alarm, with the
+# 512 MiB monitored scratch and the margin/custody semantics unchanged. Under
+# Tom decision d3d61247 the owner may execute this exact command directly while
+# Effigy's I2/I3 helper-process regression makes its session census uncertain,
+# under the same bounds, environment, reserve and custody checks and a
+# per-session executor/command/head/exit/load/log-hash envelope; no general proof
+# waiver follows.
 [tasks."proof:supervisor:qualify"]
 admission = "heavy"
 run = "python3 scripts/qualify-supervisor.py"
 
 # The uncounted keep-going diagnostic of that same qualification path
-# (oxide#191): the same bootstrap, heavy admission, 420 s absolute deadline and
+# (oxide#191): the same bootstrap, heavy admission, 600 s absolute deadline and
 # 512 MiB monitored scratch, with `--diagnostic` on both the bootstrap and the
 # changed pass check. It runs each named qualification oracle on its own, so one
 # failing check never hides the rest, records a bounded `qualified: false`
-# receipt and always exits non-zero: it is never a counted PASS, and it is
+# receipt with its per-check rows (including oxide#192's admission-report checks and its
+# case-level collection) and always exits non-zero: it is never a counted PASS, and it is
 # required before the counted author qualification at a changed head.
 [tasks."proof:supervisor:qualify:diagnostic"]
 admission = "heavy"
@@ -1093,7 +1105,7 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # Slot headroom (oxide#118, oxide#177): under the shared proof supervisor
 # (oxide#109/#114/#151 plus oxide#191's opt-in post-census detach and oxide#197's
 # ancestor and launcher-sibling exclusions, bounded-test.py
-# SHA-256 8fc1f114edb9d439259225b04c05a65b880a53fc5ee3628ef6e148e3ce9bb992,
+# SHA-256 d9bc5ff6dcd0913d9c1ff8e57030ce794f969e1f23c050b224a981b4c17618cd,
 # unqualified until their own qualifications pass), stages
 # `oxide` offline with 1.97.1 and proves the permanent ledger/control fences,
 # legacy read without migration, the raised-ceiling fence written at the 129th

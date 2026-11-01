@@ -2089,6 +2089,9 @@ impl Store {
         waits: &mut WaitAccounting,
     ) -> Result<Acquired, String> {
         let max_active = self.max_active;
+        let admission_started = Instant::now();
+        let admission_command = crate::admission::command_token();
+        let mut reported_waiting = false;
         let ticket = self.register_ticket()?;
         loop {
             if crate::budget::admission_expired() {
@@ -2117,9 +2120,23 @@ impl Store {
                         self.release(lease, origin)?;
                         return Ok(Acquired::AdmissionExpired);
                     }
+                    // Report this command's own admission wait to a supervising
+                    // proof, best effort: unarmed or unwritable means the wait is
+                    // simply not reported (oxide#192).
+                    crate::admission::report_wait(&admission_command, admission_started.elapsed());
                     return Ok(Acquired::Lease(lease));
                 }
                 Ok(Err(wait)) => {
+                    // One bounded report at the start of the wait, so a wait that
+                    // never ends before a supervising proof stops is still
+                    // classified; it grants nothing (oxide#192).
+                    if !reported_waiting {
+                        reported_waiting = true;
+                        crate::admission::report_waiting(
+                            &admission_command,
+                            wait.category().label(),
+                        );
+                    }
                     waits.observe(&wait, max_active, Instant::now());
                     std::thread::sleep(WAIT_POLL);
                 }
