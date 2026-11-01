@@ -250,7 +250,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILDER = "1.97.1"
 
 
-def stage_subject(root: str, capability: dict | None = None) -> str:
+def stage_subject(root: str, capability: dict | None = None, *, isolated: bool = False) -> str:
     """Stage this HEAD's `oxide` with plain Cargo, offline, in owned scratch.
 
     No Oxide pool is created or touched, and the staged target is deleted once
@@ -262,25 +262,20 @@ def stage_subject(root: str, capability: dict | None = None) -> str:
     rustup_home = os.environ.get("RUSTUP_HOME") or os.path.join(invoking_home, ".rustup")
     cargo_home = os.environ.get("CARGO_HOME") or os.path.join(invoking_home, ".cargo")
     private_home = os.path.join(root, "stage-home")
-    os.makedirs(private_home, mode=0o700, exist_ok=True)
+    if isolated:
+        os.makedirs(private_home, mode=0o700, exist_ok=True)
     env = {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith(("OXIDE_", "XDG_", "CARGO_", "GIT_", "SCCACHE_"))
-        and key
-        not in (
-            "CARGO",
-            "CARGO_ENCODED_RUSTFLAGS",
-            "RUSTC",
-            "RUSTC_WRAPPER",
-            "RUSTC_WORKSPACE_WRAPPER",
-        )
+        if not key.startswith(("CARGO_TARGET_", "CARGO_BUILD_", "SCCACHE_"))
+        and not (isolated and key.startswith(("OXIDE_", "XDG_", "CARGO_", "GIT_")))
+        and key not in ("CARGO", "CARGO_ENCODED_RUSTFLAGS", "RUSTC",
+                        "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER")
     }
+    if isolated:
+        env.update({"HOME": private_home, "CARGO_HOME": cargo_home, "RUSTUP_HOME": rustup_home})
     env.update(
         {
-            "HOME": private_home,
-            "CARGO_HOME": cargo_home,
-            "RUSTUP_HOME": rustup_home,
             "RUSTUP_TOOLCHAIN": BUILDER,
             "RUSTUP_AUTO_INSTALL": "0",
             "RUSTC_WRAPPER": "",
@@ -984,6 +979,9 @@ def self_check():
     collect((("one", 1), ("two", 2)), invoke, outcome, lambda: True)
     assert calls == [1] and outcome["unexecuted_groups"] == ["two"]
     assert outcome["aborted"] and outcome["qualified"] is False
+    assert parse_mode([]) == "native" and parse_mode(["--diagnostic"]) == "diagnostic"
+    assert parse_mode(["--self-check"]) == "self-check" and parse_mode(["--plan"]) == "plan"
+    assert parse_mode(["--diagnostic", "--plan"]) is None
     assert len({name for name, _ in GROUPS}) == len(GROUPS)
     assert len(set(CASE_PLAN)) == len(CASE_PLAN) == 17
     # Construct only an object in memory: no directories, pool, or child.
@@ -1020,18 +1018,25 @@ def self_check():
     return 0
 
 
+def parse_mode(arguments):
+    modes = {(): "native", ("--plan",): "plan", ("--diagnostic",): "diagnostic",
+             ("--self-check",): "self-check", ("--self-test",): "self-check"}
+    return modes.get(tuple(arguments))
+
+
 def main() -> int:
     global DIAGNOSTIC, SUBJECT, SCRATCH_ROOT
-    if sys.argv[1:] == ["--plan"]:
+    mode = parse_mode(sys.argv[1:])
+    if mode == "plan":
         print("installed-handoff groups: " + ", ".join(name for name, _ in GROUPS))
         for name in CASE_PLAN:
             print("  " + name)
         print("supervisor bounds: 120 s, 64 MiB scratch")
         return 0
-    if sys.argv[1:] in (["--self-check"], ["--self-test"]):
+    if mode == "self-check":
         return self_check()
-    diagnostic = sys.argv[1:] == ["--diagnostic"]
-    expect(diagnostic or not sys.argv[1:], "unknown arguments")
+    expect(mode is not None, "unknown arguments")
+    diagnostic = mode == "diagnostic"
     outcome = empty_outcome()
     evidence = os.environ.get("OXIDE_PROOF_EVIDENCE", "")
     expect(bool(evidence) and os.path.isdir(evidence), "not running under the shared supervisor")
@@ -1045,7 +1050,7 @@ def main() -> int:
             expect(os.environ.get(name) == scratch, f"{name} differs from the supervisor scratch")
         root = tempfile.mkdtemp(prefix="installed-handoff.", dir=scratch)
         SCRATCH_ROOT = root
-        binary = stage_subject(root)
+        binary = stage_subject(root, isolated=True)
         SUBJECT = binary
         digest = sha256(binary)
         print(f"subject {binary} sha256 {digest}")
