@@ -5966,6 +5966,24 @@ The stable, read-only interface other tools use to find the registered Builds dr
   The corrected proof verifies a common canonical real cache root before and
   after strict seeding into its private Cargo home; its pure counterfactual
   is `effigy proof:prune-authority:test`. No counted native has run.
+  S4 (oxide#211, decision `7aedd5af`) splits the proof. `rust:prune-authority`
+  and its diagnostic (Builds mode) place the directory pool under
+  `OXIDE_SCRATCH_ROOT` on the selected volume, with no `--root-parent`. They
+  cover accounting, refusals, revalidation, a receiptless legacy root on the
+  external volume (classified Unknown and kept, `prune.rs:3210-3216`) and a
+  recorded-UUID group. `rust:prune-authority:internal` and its diagnostic keep
+  only the receiptless legacy-positive case on `/private/tmp`, because its
+  legacy checkout's nearest existing ancestor must be on the boot Data volume
+  (`prune.rs:3276-3287`). Both modes' fit is unmeasured and both need their own
+  owner activation; neither has run at the migrated head.
+  The armed debug prune test hooks (`OXIDE_TEST_PRUNE_*`) fire only under the
+  supervisor and only through one shared gate, `proof_evidence`
+  (`src/bin/oxide/prune.rs`). That gate arms on the internal volume, or under a
+  declared `OXIDE_SCRATCH_ROOT` that is a canonical strict child of the
+  supervisor scratch (`declaration_allowed`). Control-directory hooks also
+  require their control inside the declaration (`hook_control_allowed`). The
+  EACCES, low-reserve and control hooks all route through that gate (decisions
+  `40380716` and `60d4914f`). Release builds carry none of them.
   Effigy heavy admission unavailable (f6b3b50 retired host-run client;
   Queue #381 pending); not host-admitted. Any later activation needs fresh
   owner scheduler headroom, independent source-fit and separate activation.

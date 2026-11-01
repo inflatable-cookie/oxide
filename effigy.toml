@@ -560,21 +560,40 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # internal pool the product correctly refuses on an external volume. The
 # supervisor monitors that same root. Each side's run is a separately counted
 # owner activation; `--plan` alone touches nothing.
-# oxide#134 focused authority/accounting proof: one fixed script under the
-# qualified shared supervisor. Genuine internal pool placement uses the
-# owner-accepted /private/tmp exception; 300 s and 512 MiB including cleanup.
-# Each native start requires independent source fit and explicit activation.
+# oxide#134 focused authority/accounting proof, S4 migration (oxide#211): one
+# fixed script under the qualified shared supervisor. The Builds mode places its
+# directory pool in a scratch-pools directory under the supervisor's selected
+# volume (OXIDE_SCRATCH_ROOT); no --root-parent. 300 s and 512 MiB including
+# cleanup. Each native start requires independent source fit and explicit
+# activation.
 [tasks."rust:prune-authority"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-prune-authority.py"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-prune-authority.py"
 
 # Uncounted keep-going diagnostic; it never grants native PASS credit.
 [tasks."rust:prune-authority:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-prune-authority.py --diagnostic"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-prune-authority.py --diagnostic"
+
+# Keep-internal mode (decision 7aedd5af): ONLY the receiptless legacy-positive
+# case. Its legacy checkout's nearest existing ancestor must sit on the boot Data
+# volume (src/bin/oxide/prune.rs:3276-3287), so the owner-accepted /private/tmp
+# root (bd357a4c) stays for this mode alone. 300 s and 512 MiB including cleanup.
+[tasks."rust:prune-authority:internal"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-prune-authority.py --internal"
+
+# Uncounted keep-going diagnostic for the internal mode; never a native PASS.
+[tasks."rust:prune-authority:internal:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-prune-authority.py --internal --diagnostic"
 
 [tasks."proof:prune-authority:test"]
 run = "python3 scripts/test-prune-authority.py --self-check"
+
+# Effect-free: prints both modes' case tables, placements and premise dispositions.
+[tasks."proof:prune-authority:plan"]
+run = "python3 scripts/test-prune-authority.py --plan"
 
 # oxide#135 focused checked-out-absence proof: one fixed script under the
 # qualified shared supervisor. A checkout path outside /Volumes may be proved
