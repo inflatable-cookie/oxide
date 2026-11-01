@@ -920,6 +920,15 @@ def run(proof: Proof, repo: str, base_compat: bool = False, diagnostic: bool = F
     expect(receipt["version"] == "oxide.outputs.transition/3" and receipt["state"] == "committed", receipt)
     expect(not os.path.exists(os.path.join(app, ".oxide-outputs")), "adopt created a local root")
     external_root = convert_profile_to_legacy(pool, mount, app, "legacy transition fixture")
+    if not base_compat:
+        # The synthetic downgrade erased the profile receipt but retained its
+        # empty, product-created release directory. A genuine legacy root has
+        # no recorded profile member there; do not plant that unrecorded entry
+        # in the later whole-target clean control. Never remove content or links.
+        release = os.path.join(external_root, "release")
+        expect(os.path.isdir(release) and not os.path.islink(release), "legacy fixture release is not a real directory")
+        expect(os.listdir(release) == [], "legacy fixture release is not empty")
+        os.rmdir(release)
     link = os.path.join(app, "target")
     proof.phase("after first conversion")
 
