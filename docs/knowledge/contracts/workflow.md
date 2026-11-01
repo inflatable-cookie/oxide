@@ -833,11 +833,11 @@ oxide run --execution-budget 120s
   build.
 - **Proof apparatus.** `scripts/test-command-budgets.py` is the fixed proof
   and the whole command of the qualified shared supervisor under heavy
-  admission (`bounded-test.py --root-parent /private/tmp --limit 300
-  --scratch-budget-mib 512`). Its fixtures' private `OXIDE_POOL_BACKEND=directory-budget`
-  pools are genuine internal pools, so the recipe declares the owner-accepted
-  internal root (decision `bd357a4c`) inside the same monitored owned root;
-  ordinary builds, tests and proofs keep the selected-volume default. It is
+  admission (`bounded-test.py --limit 300 --scratch-budget-mib 512`). Its
+  fixtures' pools are scratch pools (scratch-pools.md S4): the script declares
+  one private `scratch-pools` directory under the selected-volume scratch root
+  as `OXIDE_SCRATCH_ROOT` with an explicit `OXIDE_POOL_CAP`, and a
+  `/private/tmp` fallback refuses before any effect. It is
   held for owner activation: the declaration activates nothing. `--plan` is
   effect-free and prints the cases, phases, disk and child-lifetime
   allocation; an unrecognized argument refuses before any subprocess;
