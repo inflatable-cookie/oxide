@@ -6,15 +6,16 @@ The shared supervisor (`scripts/bounded-test.py`; qualification is bound to
 its own source bytes) owns the deadline,
 512 MiB monitored scratch, continuous host reserve sampling, process
 census/closure and cleanup. The
-brief's scoped amendment (root owner, 2026-10-23T16:10Z, under the temporary
-Supervisor delegation) makes this selector/script/plan 600 s TOTAL instead of
-420; the old 420 publication at 030836f6 stays historical and unactivated. The
-helper's work cutoff is about 565 s (its 30 s reserve plus a 5 s refusal
-margin), inside which cleanup and image detach must finish. The published
-360-540 s work estimate is UNMEASURED, not an established fit:
+Builds mode has a 600 s total limit (the 2026-10-23 amendment raised it
+from the historical, unactivated 420 s publication at 030836f6) and a work
+cutoff around 565 s. Base-compat mode has a 300 s total limit and a work
+cutoff around 265 s; both retain a 512 MiB monitored scratch budget. The
+published Builds 360-540 s work estimate is UNMEASURED, not an established fit:
 
     python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 \\
         -- python3 scripts/test-profile-outputs.py
+    python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 \\
+        --scratch-budget-mib 512 -- python3 scripts/test-profile-outputs.py --base-compat
 
 This script is a whole fixed script with no supervision, clock, signal or
 scratch of its own. Every write stays inside the supervisor-owned scratch
