@@ -317,6 +317,12 @@ never a raw path dump, bounded and escaped as today.
 
 `rust:holding-delete` and its diagnostic now use a scratch pool under the supervisor-selected volume (oxide#202); their native evidence must be established at the migrated head.
 
+`rust:permanent-outputs`, `rust:auto-adopt-outputs`, `rust:outputs-detach-permanent`, `rust:outputs-ignore-safety`, `rust:exec-output-inference` and `rust:auto-adopt-ineligible` use declared scratch pools under the supervisor-selected root (oxide#210); their native evidence remains separately owner-activated. A /private/tmp fallback does not prove scratch-pool placement.
+
+All seven permanent-outputs modes, including base-compat, attach and re-attach their owned image with `hdiutil -owners on`; the shared helper observes `/sbin/mount` read-only and refuses a `noowners` mount before registration or further fixture work. At `6c07980`, five uncounted diagnostics failed registration on `MNT_IGNORE_OWNERSHIP`; exec-inference and auto-adopt-ineligible completed, but none of those seven diagnostics carries credit across the shared-helper correction. Their logs remain under `/Volumes/Builds/scratch/oxide/wpmo-logs/diag-*-6c07980.log`; the fresh seven diagnostic, author and reviewer native chains remain Supervisor-owned.
+
+The subsequent seven uncounted diagnostics at `5506402` completed for exec-inference, auto-adopt-ineligible and base-compat; permanent-outputs, auto-adopt, detach-permanent and ignore-safety failed. The preserved logs under `/Volumes/Builds/scratch/oxide-work/pmo2-diag-*.out` and their evidence directories remain historical. The proof now uses checkout output status and a committed receipt, separates the post-re-adoption and detached-absent controls, and checks actual Git member paths and current refusal wording. The permanent-outputs diagnostic exposed a separate product issue: receiptless explicit adoption of a nonempty target can reach a member transition without first initializing the output registry. The product correction merged at `af4b154` (oxide#217); this fixture does not pre-initialize the registry to hide the original failure. All seven diagnostics require fresh Supervisor activation at the integrated head, and earlier receipts remain historical.
+
 `rust:oxide-removable-boot-closure` and its diagnostic now use a scratch pool under the supervisor-selected volume (oxide#212, S4). The same script serves `rust:oxide-removable-removal` and its diagnostic, so those migrate with it; none of the four passes an internal root. Their native evidence must be re-established at the migrated head, and the earlier `2a409d5`/`a04d587` receipts stay bound to the bytes they ran under.
 
 `bd357a4c` is only about `--root-parent /private/tmp`. Pool premise is read from
@@ -330,9 +336,8 @@ each script's own selector text and case bodies.
 | `rust:installed-handoff` (#122, #206) | selected-volume scratch pools; diagnostic and native evidence at the migrated head require owner activation |
 | `rust:profile-outputs` (#133) + `:diagnostic` | migrated: selected-volume scratch pool; native chain passed at `3530885` (oxide#199: clean diagnostic, counted author and distinct reviewer, 17/17; archive `evidence-s4-profile-outputs-3530885-*`) |
 | `rust:recorded-slot-accounting` (#146) + `:diagnostic` | genuine directory-budget pool, verified from the product's own config |
-| `rust:exec-output-inference` (#160) + `:diagnostic` | control pool is a directory-budget pool |
-| `rust:auto-adopt-ineligible` (#154) + `:diagnostic` | control pool is a directory-budget pool |
-| `rust:oxide-removable-boot-closure` (#161) + `:diagnostic` | directory-budget base pool plus one owned image |
+| `rust:oxide-removable-boot-closure` (#161) + `:diagnostic` | migrated: selected-volume scratch pool plus one owned image; native evidence pending at the migrated head |
+| `rust:prune-authority` (#134) + `:diagnostic` | migrated: selected-volume scratch pool; the boot-Data-only case is isolated in the internal selectors below |
 | `rust:finder-metadata-race` (#155) + `:diagnostic` | every fixture pool is a directory-budget pool |
 | `rust:command-budgets` (#140) + `:diagnostic` | migrated at S4: fixture pools are scratch pools under one `OXIDE_SCRATCH_ROOT` on the selected volume; native evidence pending at the migrated head |
 
@@ -347,6 +352,7 @@ or a socket path that cannot fit under the selected-volume guard prefix):
 
 | Selector/recipe | Genuine premise |
 | --- | --- |
+| `rust:permanent-outputs:base-compat` + `:diagnostic` | decision de52775e: the pinned pre-S3 base binary cannot open an external pool |
 | `rust:pool-temp-scratch` (#136) + `:diagnostic` | decision af7df7d6: the Builds guard prefix makes this fixture's shortest admitted slot scratch path (`test-1`) 103 bytes, exceeding the 91-byte product bound; both selectors keep `/private/tmp` |
 | `rust:profile-outputs:base-compat` + `:diagnostic` | pinned pre-S3 base cases 10, 11 and 19 require an internal pool, and case 20 requires boot-Data checkout absence (41307e95); 300 s / 512 MiB under ea36e265; native chain passed at `3530885` (oxide#199, 4/4; the archive NOTE cites de52775e, the pre-S3 base keep, for the internal root) |
 | `rust:outputs-prune` (#129/#152) + `:diagnostic` | cases 10 and 21 prove checkout absence on the boot Data volume |

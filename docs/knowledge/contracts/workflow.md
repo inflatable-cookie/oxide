@@ -4924,6 +4924,10 @@ A lease records which pool it uses. Each pool stays warm on its own.
 
 ### Final outputs on the permanent drive (oxide#117)
 
+The oxide#210 shared image helper requests owners-on on every attach and re-attach and checks `/sbin/mount` read-only for `noowners` before a registering mode continues. At `6c07980`, five uncounted mode diagnostics refused registration on ignored ownership; two completed. Those receipts remain historical and none transfers to the corrected shared script.
+
+The oxide#210 proof correction (decision b0eba56a) exercises explicit `outputs adopt` on a committed whole-target checkout as a migration to profile members, including an active writer and the `migration-p0`, `migration-staged`, `migration-marker`, `migration-backed-up`, `migration-swapped` and `migration-p4` stops and replay. The older `prepared`, `linked` and `renamed` member-transition hooks remain reachable through explicit first adoption of never-converted profile checkouts (`outputs.rs` `adopt_profile_from` calls `transition_at`); the proof names those hook families separately. The fresh proof and its Supervisor-owned native sessions remain pending at the changed head; no old evidence transfers.
+
 Implemented for permanent drive mode; ephemeral drive mode is unchanged.
 This owns final-output placement only: not compiler fingerprints,
 intermediate slot limits, sccache, scheduling or admission. Device
@@ -5381,6 +5385,13 @@ author and reviewer native remain unactivated.
   foreign link refuses. Every first link also checks the actual Git
   ignore/tracked state of `target/<member>`; a winning parent `target/` ignore
   is allowed, unknown answers refuse.
+  For a receiptless, nonempty real target, `oxide outputs plan` reports the
+  explicit profile adoption member by member: nonempty real directories stay
+  local, missing or empty members convert, and a foreign member refuses by
+  name. A later refusal can follow an earlier member's conversion; the plan
+  itself writes nothing and never promises an atomic adoption. If both host
+  members are nonempty and real, adoption creates no link and refuses because
+  it commits no root; the plan reports that outcome.
 - **Classification and declarations.** `check`, `build`, `run`, `test`,
   `clippy`, `rustc` and `fix` with `quick`/`debug` map to `debug`, `--release`
   to `release`. Plain `bench` maps to `release` (Cargo's release-based bench

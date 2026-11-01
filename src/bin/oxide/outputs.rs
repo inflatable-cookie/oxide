@@ -1748,6 +1748,9 @@ struct MemberPlanView {
     state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     root: Option<PathBuf>,
+    /// First-adoption prediction: keep, convert, or refuse this member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adoption: Option<&'static str>,
 }
 
 fn plan_report(context: &Context) -> Result<PlanReport, String> {
@@ -1818,6 +1821,7 @@ fn plan_report(context: &Context) -> Result<PlanReport, String> {
                         member: placement.member().to_owned(),
                         state: state.code(),
                         root: state.link_root().map(Path::to_path_buf),
+                        adoption: None,
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?,
@@ -1857,10 +1861,47 @@ fn plan_report(context: &Context) -> Result<PlanReport, String> {
                 }
             }
             TargetState::RealNonEmpty => {
-                report.reason = Some(
-                    "the existing target directory has content; Oxide never moves, adopts or deletes it. Move it aside yourself if you accept losing its warm build, then re-run `oxide outputs adopt`"
-                        .to_owned(),
-                );
+                report.layout = "profile";
+                report.action = "create-owned-link";
+                for member in ["debug", "release"] {
+                    let link = link_path(&context.workspace, member);
+                    let state = link_state(&link, &context.workspace, &context.checkout_id)?;
+                    let adoption = match &state {
+                        TargetState::RealNonEmpty => "keep",
+                        TargetState::Foreign => "refuse",
+                        TargetState::Missing
+                        | TargetState::RealEmpty
+                        | TargetState::OwnedLink(_)
+                        | TargetState::Dangling(_) => "convert",
+                    };
+                    if adoption == "refuse" && report.reason.is_none() {
+                        report.action = "refuse";
+                        report.reason = Some(format!(
+                            "{} is {}; it is never followed or replaced; earlier members may already be converted",
+                            link.display(), state.label()
+                        ));
+                    }
+                    report.members.push(MemberPlanView {
+                        member: member.to_owned(),
+                        state: state.code(),
+                        root: state.link_root().map(Path::to_path_buf),
+                        adoption: Some(adoption),
+                    });
+                }
+                if report.reason.is_none() {
+                    if report
+                        .members
+                        .iter()
+                        .all(|member| member.adoption == Some("keep"))
+                    {
+                        report.action = "refuse";
+                        report.reason = Some("both profile members are nonempty real directories; adoption keeps them local, creates no owned link and commits no root".to_owned());
+                    } else if let Err(reason) = &usable {
+                        report.reason = Some(format!(
+                            "the volume is not usable ({reason}); converted members would select the checkout-local fallback root"
+                        ));
+                    }
+                }
             }
             TargetState::Foreign => {
                 report.reason = Some(
@@ -6396,9 +6437,9 @@ pub fn refuse_unknown_layout(
 }
 
 /// The real executable for a Cargo-reported program path, when that program's
-/// member is an owned link into `root`: `target/<member>/<rest>` maps to
-/// `root/<member>/<rest>`. A real (unlinked) member keeps Cargo's own path, so
-/// a mixed checkout never runs another member's artifact.
+/// member or legacy whole target is an owned link into `root`:
+/// `target/<member>/<rest>` maps to `root/<member>/<rest>`. A real
+/// (unlinked) member keeps Cargo's own path.
 pub fn program_target(checkout: &Path, root: &Path, program: &Path) -> Option<PathBuf> {
     let relative = program.strip_prefix(&checkout.join("target")).ok()?;
     let mut components = relative
@@ -6418,6 +6459,21 @@ pub fn program_target(checkout: &Path, root: &Path, program: &Path) -> Option<Pa
         format!("{first}/{second}")
     };
     crate::layout::Member::parse(&member).ok()?;
+    // The caller supplies the root bound under the held lease. A legacy
+    // target link must still name that exact root and carry this checkout's
+    // owner marker; an unverified link keeps the existing Cargo-path fallback.
+    if fs::read_link(checkout.join("target")).ok().as_deref() == Some(root) {
+        let checkout_id = identity::digest(&checkout.to_string_lossy());
+        owned_root(checkout, &checkout_id, root).ok()?;
+        if !relative
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+        {
+            return None;
+        }
+        let mapped = root.join(relative);
+        return mapped.is_file().then_some(mapped);
+    }
     let target = fs::read_link(link_path(checkout, &member)).ok()?;
     if target != member_destination(root, &member) {
         return None;
@@ -9736,6 +9792,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn explicit_adopt_of_committed_whole_target_never_hits_member_transition_hooks() {
+        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
+        for hook in ["prepared", "linked", "renamed"] {
+            let (fixture, legacy) = legacy_checkout();
+            register(&fixture, DriveMode::Permanent);
+            let context = fixture.context();
+            let root = legacy.selected().unwrap().root().to_path_buf();
+            let nonce = read_marker(&root).unwrap().nonce().unwrap().to_owned();
+            let store = Store::for_tests(&fixture.root.join("pool"));
+            std::env::set_var(CRASH_ENVIRONMENT, hook);
+            let result = adopt_at(&context, || Ok(Some(store)));
+            std::env::remove_var(CRASH_ENVIRONMENT);
+            assert_eq!(result, Ok(0), "legacy hook {hook} interrupted migration");
+            let receipt = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt.layout(), LayoutKind::Profile, "{hook}");
+            assert_eq!(receipt.state, ReceiptState::Committed, "{hook}");
+            assert_eq!(read_marker(&root).unwrap().nonce(), Some(nonce.as_str()));
+        }
+    }
+
     /// oxide#182: `oxide outputs plan` on a committed whole-target checkout
     /// that `adopt` would migrate reports that migration — the action, the
     /// members `adopt` classifies, and the root/1→root/2 marker upgrade with
@@ -12172,6 +12251,121 @@ mod tests {
         store.control().join("outputs").join("registry.json")
     }
 
+    #[test]
+    fn first_profile_plan_agrees_with_adopt_for_member_classes() {
+        for class in [
+            "nonempty",
+            "empty",
+            "missing",
+            "foreign-file",
+            "foreign-symlink",
+            "all-keep",
+        ] {
+            let fixture = Fixture::new();
+            let (store, context) = fresh_pool(&fixture);
+            let target = context.link();
+            fs::create_dir(&target).unwrap();
+            fs::write(target.join("keep.txt"), b"warm").unwrap();
+            let debug = target.join("debug");
+            match class {
+                "nonempty" | "all-keep" => {
+                    fs::create_dir(&debug).unwrap();
+                    fs::write(debug.join("keep"), b"member").unwrap();
+                    if class == "all-keep" {
+                        let release = target.join("release");
+                        fs::create_dir(&release).unwrap();
+                        fs::write(release.join("keep"), b"release").unwrap();
+                    }
+                }
+                "empty" => fs::create_dir(&debug).unwrap(),
+                "foreign-file" => fs::write(&debug, b"foreign").unwrap(),
+                "foreign-symlink" => {
+                    let outside = fixture.root.join("foreign");
+                    fs::create_dir(&outside).unwrap();
+                    symlink(outside, &debug).unwrap();
+                }
+                "missing" => {}
+                _ => unreachable!(),
+            }
+            let report = plan_report(&context).unwrap();
+            assert_eq!(report.layout, "profile", "{class}");
+            assert!(!report.data_move);
+            let member = report.members.iter().find(|m| m.member == "debug").unwrap();
+            let foreign = class.starts_with("foreign");
+            let expected = if foreign {
+                "refuse"
+            } else if class == "nonempty" || class == "all-keep" {
+                "keep"
+            } else {
+                "convert"
+            };
+            assert_eq!(member.adoption, Some(expected), "{class}");
+            assert_eq!(
+                report.action == "refuse",
+                foreign || class == "all-keep",
+                "{class}"
+            );
+            if class == "all-keep" {
+                assert_eq!(report.action, "refuse");
+                assert!(report.members.iter().all(|m| m.adoption == Some("keep")));
+            }
+            if foreign {
+                assert!(report.reason.as_ref().unwrap().contains("debug"));
+            }
+            assert!(
+                !registry_document(&store).exists(),
+                "plan wrote registry: {class}"
+            );
+            assert!(
+                !receipt_path(store.control(), &context.checkout_id).exists(),
+                "plan wrote receipt: {class}"
+            );
+            assert_eq!(fs::read(target.join("keep.txt")).unwrap(), b"warm");
+
+            let result = adopt_at(&context, || Ok(Some(store.handle_for_tests())));
+            assert_eq!(
+                result.is_err(),
+                foreign || class == "all-keep",
+                "{class}: {result:?}"
+            );
+            if class == "all-keep" {
+                assert!(result.unwrap_err().contains("adoption committed no root"));
+            }
+            if class == "nonempty" || class == "all-keep" {
+                assert_eq!(fs::read(debug.join("keep")).unwrap(), b"member");
+                assert!(!fs::symlink_metadata(&debug)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
+            } else if !foreign {
+                assert!(
+                    fs::symlink_metadata(&debug)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink(),
+                    "{class}"
+                );
+            } else if class == "foreign-file" {
+                assert_eq!(fs::read(&debug).unwrap(), b"foreign");
+            } else {
+                assert!(fs::symlink_metadata(&debug)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
+            }
+            if class == "all-keep" {
+                let release = target.join("release");
+                assert_eq!(fs::read(release.join("keep")).unwrap(), b"release");
+                assert!(!fs::symlink_metadata(release)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
+                assert!(!receipt_path(store.control(), &context.checkout_id).exists());
+            }
+            assert_eq!(fs::read(target.join("keep.txt")).unwrap(), b"warm");
+        }
+    }
+
     /// A committed whole-target receipt for this fixture's checkout.
     fn committed_receipt(fixture: &Fixture) -> Receipt {
         let mut receipt = fixture.receipt();
@@ -12876,6 +13070,38 @@ mod tests {
         let relative = PathBuf::from("../../.oxide-outputs/local/aarch64-apple-darwin/debug");
         symlink(&relative, &triple_link).unwrap();
         check_untouched("relative link", &triple_link, &relative);
+    }
+
+    #[test]
+    fn whole_target_run_maps_only_the_verified_bound_root() {
+        let (fixture, receipt) = legacy_checkout();
+        let root = receipt.selected().unwrap().root().to_path_buf();
+        let target = fixture.checkout.join("target");
+        let program = target.join("debug/app");
+        let mapped = root.join("debug/app");
+        fs::create_dir_all(mapped.parent().unwrap()).unwrap();
+        fs::write(&mapped, b"program").unwrap();
+        assert_eq!(
+            program_target(&fixture.checkout, &root, &program),
+            Some(mapped)
+        );
+
+        let foreign = fixture.root.join("foreign");
+        fs::create_dir_all(foreign.join("debug")).unwrap();
+        fs::write(foreign.join("debug/app"), b"foreign").unwrap();
+        assert_eq!(program_target(&fixture.checkout, &foreign, &program), None);
+        let marker = root.join(MARKER);
+        let marker_bytes = fs::read(&marker).unwrap();
+        fs::write(&marker, b"unverified").unwrap();
+        assert_eq!(program_target(&fixture.checkout, &root, &program), None);
+        fs::write(&marker, marker_bytes).unwrap();
+        fs::remove_file(&target).unwrap();
+        symlink(&foreign, &target).unwrap();
+        assert_eq!(program_target(&fixture.checkout, &root, &program), None);
+        fs::remove_file(&target).unwrap();
+        fs::create_dir_all(target.join("debug")).unwrap();
+        fs::write(&program, b"real").unwrap();
+        assert_eq!(program_target(&fixture.checkout, &root, &program), None);
     }
 
     #[test]
