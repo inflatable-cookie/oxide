@@ -20,6 +20,7 @@ Oxide aims to make Rust development easy and light: predictable storage, less bu
 - [`oxide exec` output-member inference (proposed design)](knowledge/contracts/exec-output-inference.md)
 - [Cold-slot seeding from matching dependency units (proposed design, unimplemented)](knowledge/contracts/cold-slot-seeding.md)
 - [Scratch build pools on an external validation volume](knowledge/contracts/scratch-pools.md)
+- [Barge adoption (proposed design, unfrozen)](knowledge/contracts/barge-adoption.md)
 - [One-use workspaces beside normal slots (proposed design, unimplemented)](knowledge/contracts/one-use-workspaces.md)
 - [Open decisions](knowledge/questions.md)
 - [Knowledge map](knowledge/README.md)

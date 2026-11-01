@@ -28,6 +28,8 @@
 
 [Scratch pools](contracts/scratch-pools.md) owns the implemented S1–S3 contract and proposed migration slices for an explicit, UUID-bound `directory-budget-v1` pool on a verified external validation volume: the environment-only `OXIDE_SCRATCH_ROOT` opt-in and its scope, the declared scratch root and placement rules, the pool-local binding document and its absent-volume refusal, the refusal matrix, why the built-in default pool and every ordinary refusal are unchanged, the migration list that lets ten proofs drop the owner-accepted internal-root exception (`bd357a4c`) while `rust:outputs-prune`, `rust:prune-absence` and the unit-suite recipe keep it for their boot Data volume premises, and the finite implementation slices with their validation tiers. It grants no implementation, native, host or pool authority.
 
+[Barge adoption](contracts/barge-adoption.md) is the proposed design (unfrozen) for Oxide's output roots moving to Barge: the library pin, the outputs area, the release prune, the 91 legacy roots, the space guard and the rollout gates. It changes no current behaviour.
+
 [Qualification findings](qualification-readiness.md) preserves the Cargo freshness, compiler path, cross-path, containment and capacity findings the workflow builds on. They grant no execution authority.
 
 The [idle exec sessions and run-slot custody design](contracts/idle-exec-sessions.md) is a proposal, not current truth: it owns the before-work interception analysis, the slot-versus-permit split, the `run` custody alternatives and the open operator dispositions. It grants no implementation or native authority and changes no behaviour.
