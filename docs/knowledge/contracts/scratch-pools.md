@@ -345,7 +345,7 @@ Not in scope: proofs that never carried `bd357a4c` but assert their own
 `/private/tmp` scratch (`rust:oxide-exec`, `rust:pool-scale`,
 `rust:accounting-vanished`, `rust:accounting-guards`, `rust:status-fast`,
 `rust:oxide-finder-metadata`, `rust:oxide-pool-layout`). They migrate, if at
-all, in their own briefs with their own activations. `rust:front-door-accounting` migrated in oxide#201: both fixture pools use the selected-volume scratch root; its diagnostic and native evidence at the migrated head remain pending.
+all, in their own briefs with their own activations. `rust:front-door-accounting` uses the S4 migration: both fixture pools use the selected-volume scratch root; its diagnostic and native evidence at the migrated head remain pending.
 
 ## Recipe changes (design, not applied)
 

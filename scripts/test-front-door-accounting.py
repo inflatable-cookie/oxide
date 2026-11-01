@@ -161,7 +161,7 @@ PREMISE_CHECKLIST = (
         "conversion; every checkout keeps its target local",
     ),
     ("Cargo external argv", "not applicable: no external Cargo subcommand runs in this proof"),
-    ("owned images", "applicable: no image or mount; pools use the selected removable volume under the guard"),
+    ("owned images", "not applicable: no owned image or mount; pools use the selected volume under the guard"),
     (
         "compiler flags",
         "applicable: RUSTFLAGS is the fixed FROZEN_RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS is removed for "
