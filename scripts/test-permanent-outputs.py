@@ -3400,6 +3400,24 @@ def exec_self_test() -> None:
     expect(env["OXIDE_SCRATCH_ROOT"] == "/fixture/root/private", "scratch declaration drifted")
     expect(env["OXIDE_POOL"] == "/fixture/root/private/pool", "pool selection drifted")
     expect(env["OXIDE_POOL_CAP"] == "64MiB", "pool cap drifted")
+    with patch("os.path.isdir", return_value=True), patch("os.access", return_value=True), \
+         patch("os.stat", side_effect=lambda path: type("Stat", (), {"st_dev": 1 if path == "/fixture/root" else 2})()):
+        try:
+            check_child_env(env)
+        except RuntimeError:
+            pass
+        else:
+            fail("a fixture child on another device was accepted")
+    with patch("same_device_tmp", return_value=True):
+        check_child_env(env)
+        incomplete = dict(env)
+        incomplete.pop("OXIDE_SCRATCH_ROOT")
+        try:
+            check_child_env(incomplete)
+        except RuntimeError:
+            pass
+        else:
+            fail("a fixture child without a scratch declaration was accepted")
     expect(all(env[k] == "/fixture/root" for k in ("TMPDIR", "TMP", "TEMP")), "temporary root drifted")
 
     with patch("os.path.isdir", return_value=True), patch("os.access", return_value=True), \
