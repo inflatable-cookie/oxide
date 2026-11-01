@@ -77,7 +77,7 @@ its binary into the owned `bin/` directory so both never exceed the allocation:
 288 MiB staging peak + 128 MiB image backing + 48 MiB fixtures + 32 MiB
 evidence + 16 MiB margin = 512 MiB monitored.
 
-The 20 cases (see `--plan`):
+The combined case matrix (mode-specific coverage is listed by `--plan`):
 
  1 real target with a debug member link; Cargo top-level files stay real
  2 a member mutation waits unchanged for a gated Running writer
@@ -101,7 +101,7 @@ The 20 cases (see `--plan`):
 20 root-group prune with another checkout reference KEEP, exact guarded rollback and terminal crash image oracles
 
 `--diagnostic` is the ONE opt-in diagnostic mode (decision 1e4feb57): the same
-fixed 20 cases in one session, where an oracle failure is recorded and the run
+selected mode’s cases in one session, where an oracle failure is recorded and the run
 continues to the next case whose prerequisites still hold, and a step whose
 dependency failed or whose shared fixture is no longer usable is skipped with
 its reason. It never steps over a safety failure — the runner's deadline,
@@ -1745,13 +1745,14 @@ def fixture_environment(root: str, mode: str, home: str, cargo_home: str) -> dic
     env["OXIDE_POOL_CAP"] = "64MiB"
     return env
 
-_CASE_PROGRESS = {"reached": [], "started_ms": None}
+_CASE_PROGRESS = {"reached": [], "current": None, "started_ms": None}
 
 
 def case_reached(case_id: str) -> None:
     """Record that one fixed case block has started, in execution order."""
     reached = _CASE_PROGRESS["reached"]
     expect(case_id in CASE_IDS, f"case {case_id} is forbidden in {MODE}")
+    _CASE_PROGRESS["current"] = case_id
     if case_id not in reached:
         reached.append(case_id)
     if _CASE_PROGRESS["started_ms"] is None:
@@ -1783,10 +1784,9 @@ def write_assertion_receipt(outcome: str, failure) -> str:
         )
         completed, failed_in, unexecuted = reached, None, []
     else:
-        # Conservative on failure: the last reached case is reported as
-        # started-but-unconfirmed, never as completed.
-        completed = reached[:-1]
-        failed_in = reached[-1] if reached else None
+        # Interleaved steps cannot establish whole-case completion on failure.
+        completed = []  # interleaved case steps do not establish whole-case completion
+        failed_in = _CASE_PROGRESS["current"]
         unexecuted = [case for case in CASE_IDS if case not in reached]
     record = {
         "mode": MODE,
@@ -1814,6 +1814,7 @@ def write_assertion_receipt(outcome: str, failure) -> str:
             "reached": reached,
             "completed": completed,
             "failed_in": failed_in,
+            "unconfirmed": [case for case in reached if case not in completed and case != failed_in],
             "unexecuted": unexecuted,
         },
         "claims": "this script's own case progress and source hashes only; no closure, census, gate or native PASS claim",
@@ -1990,7 +1991,9 @@ CASE_STEPS = [
     # registration, so all of them require that pool and registration; only the
     # premises a step really does not read are omitted. A failure taints the
     # pool for every step that used it, conservatively.
+    ("10.0", "10", (), SHARED_EVERY_STEP, ("pool",)),
     ("11.1", "11", (), SHARED_EVERY_STEP, ("pool",)),
+    ("10.2", "10", ("10.0", "11.1"), SHARED_EVERY_STEP, ("pool",)),
     ("11.2", "11", ("11.1",), SHARED_EVERY_STEP, ("registration", "pool")),
     ("01.1", "01", (), SHARED_EVERY_STEP, ("first", "pool")),
     ("02.1", "02", ("01.1",), SHARED_EVERY_STEP + ("first",), ("first", "custody", "pool")),
@@ -2001,7 +2004,7 @@ CASE_STEPS = [
     ("07.1", "07", ("01.1",), SHARED_EVERY_STEP + ("first",), ("first", "pool")),
     ("08.1", "08", ("01.1",), SHARED_EVERY_STEP + ("first",), ("first", "pool")),
     ("09.1", "09", ("01.1",), SHARED_EVERY_STEP + ("first",), ("first", "pool")),
-    ("10.1", "10", (), SHARED_EVERY_STEP, ("pool",)),
+    ("10.1", "10", ("10.2", "11.2"), SHARED_EVERY_STEP, ("pool",)),
     ("12.1", "12", ("01.1",), SHARED_EVERY_STEP + ("first",), ("pool", "first")),
     ("13.1", "13", ("01.1",), SHARED_EVERY_STEP + ("first",), ("pool", "first", "custody")),
     ("14.1", "14", ("01.1",), SHARED_EVERY_STEP + ("first",), ("volume", "registration", "first", "pool")),
@@ -2063,7 +2066,8 @@ class Diagnostic:
         if not self.mode:
             return True
         reasons = []
-        for need in CASE_STEP_DEPS[step]:
+        dependencies = CASE_STEP_DEPS[step] + (("10.2",) if MODE == "base-compat" and step == "11.2" else ())
+        for need in dependencies:
             if need in self.done:
                 continue
             failed = next((item for item in self.failures if item["step"] == need), None)
@@ -2274,6 +2278,9 @@ def write_diagnostic_receipt(record: dict) -> str:
 def pure_diagnostic_controls() -> None:
     """Pure/mock controls for the diagnostic state machine. No child, image,
     pool or product fixture is touched; nothing is written."""
+    global MODE, CASE_IDS
+    saved_mode = MODE, CASE_IDS
+    MODE, CASE_IDS = "builds", MODE_CASES["builds"]
     saved = (
         DIAG.mode,
         list(DIAG.done),
@@ -2651,11 +2658,13 @@ def pure_diagnostic_controls() -> None:
         DIAG.tainted, DIAG.aborted = tainted, aborted
         PREMISE_GUARDS.clear()
         PREMISE_GUARDS.update(guards)
+        MODE, CASE_IDS = saved_mode
 
 
 def run(proof: Proof, repo: str) -> None:
     os.environ.pop("CARGO_ENCODED_RUSTFLAGS", None)
     os.environ["RUSTFLAGS"] = ""
+    pure_diagnostic_controls()
     pure_registry_controls()
     pure_detach_record_control()
     pure_attachment_facts_control()
@@ -2733,25 +2742,30 @@ def run(proof: Proof, repo: str) -> None:
     # key prepared under the base-compatible registration before ANY candidate
     # command runs in this pool. The candidate must later reuse that exact
     # slot, receipt and link unchanged.
-    if MODE == "base-compat":
-        legacy = make_checkout(proof, "legacy")
-        result = proof.run([base, "outputs", "adopt"], cwd=legacy, env=proof.env, timeout=120)
-        expect(result.returncode == 0, f"10: base whole-target adopt failed: {result.stderr.decode(errors='replace')}")
-        legacy_root = root_of(pool, legacy)
-        expect(
-            legacy_root.startswith(os.path.join(proof.mount, "oxide-outputs") + os.sep),
-            f"10: the base legacy root {legacy_root} is not on the registered volume",
-        )
-        expect(os.path.islink(os.path.join(legacy, "target")), "10: base did not publish a whole-target link")
-        expect(item(pool, legacy, "version") == "oxide.outputs.transition/2", "10: base receipt is not /2")
-        result = proof.run([base, "build"], cwd=legacy, env=proof.env, timeout=180)
-        expect(result.returncode == 0, f"10: base build failed: {result.stderr.decode(errors='replace')[-2000:]}")
-        base_slot, _ = perm.slot_state(result.stderr.decode(errors="replace"))
-        # A7: keep the EXACT base receipt bytes and link facts, so the candidate's
-        # no-mutation claim is a byte comparison rather than a version/member spot
-        # check.
-        base_receipt_bytes = perm.read_bytes(perm.receipt_path(pool, legacy))
-        base_link_text = link_at(os.path.join(legacy, "target"))
+    if DIAG.enter("10.0", fixtures=()):
+        try:
+            case_reached("10")
+            legacy = make_checkout(proof, "legacy")
+            result = proof.run([base, "outputs", "adopt"], cwd=legacy, env=proof.env, timeout=120)
+            expect(result.returncode == 0, f"10: base whole-target adopt failed: {result.stderr.decode(errors='replace')}")
+            legacy_root = root_of(pool, legacy)
+            expect(
+                legacy_root.startswith(os.path.join(proof.mount, "oxide-outputs") + os.sep),
+                f"10: the base legacy root {legacy_root} is not on the registered volume",
+            )
+            expect(os.path.islink(os.path.join(legacy, "target")), "10: base did not publish a whole-target link")
+            expect(item(pool, legacy, "version") == "oxide.outputs.transition/2", "10: base receipt is not /2")
+            result = proof.run([base, "build"], cwd=legacy, env=proof.env, timeout=180)
+            expect(result.returncode == 0, f"10: base build failed: {result.stderr.decode(errors='replace')[-2000:]}")
+            base_slot, _ = perm.slot_state(result.stderr.decode(errors="replace"))
+            # A7: keep the EXACT base receipt bytes and link facts, so the candidate's
+            # no-mutation claim is a byte comparison rather than a version/member spot
+            # check.
+            base_receipt_bytes = perm.read_bytes(perm.receipt_path(pool, legacy))
+            base_link_text = link_at(os.path.join(legacy, "target"))
+            DIAG.finished("10.0")
+        except BaseException as error:
+            DIAG.failed_step(proof, "10.0", error)
     if DIAG.enter("11.1", fixtures=()):
         try:
             # ----- case 11: explicit migration of a base-created checkout ---------
@@ -2803,38 +2817,45 @@ def run(proof: Proof, repo: str) -> None:
                     with open(os.path.join(evidence, f"case11-{name}-pre.json"), "wb") as handle:
                         handle.write(perm.read_bytes(path))
 
-            if MODE == "base-compat":
-                # Case 10 (candidate half): only after BOTH base-created legacy states
-                # (this warm-slot checkout and case 11's migration checkout) exist does the
-                # first candidate command run in this pool.
-                code, _, stderr = oxide(proof, ["build"], "10 candidate warm on base slot", legacy)
-                expect(code == 0, f"10: candidate build on the base legacy slot failed: {stderr}")
-                candidate_slot, candidate_state = perm.slot_state(stderr)
-                expect(candidate_state == "warm", f"10: candidate did not reuse the base key: {summary(stderr)}")
-                expect(candidate_slot == base_slot, f"10: candidate changed the base slot {base_slot} -> {candidate_slot}")
-                expect(os.path.islink(os.path.join(legacy, "target")), "10: the base legacy link changed")
-                expect(link_at(os.path.join(legacy, "target")) == legacy_root, "10: the base legacy link text changed")
-                expect(item(pool, legacy, "version") == "oxide.outputs.transition/2", "10: the base receipt was rewritten")
-                base_links = item(pool, legacy, "links")
-                expect(base_links[0]["member"] == "target", "10: the base placement changed")
-                expect(
-                    perm.read_bytes(perm.receipt_path(pool, legacy)) == base_receipt_bytes,
-                    "10: the candidate rewrote the base receipt bytes",
-                )
-                expect(
-                    link_at(os.path.join(legacy, "target")) == base_link_text,
-                    "10: the candidate changed the base link text",
-                )
-                expect(
-                    "uses the whole-target layout" in stderr and "oxide outputs adopt" in stderr,
-                    f"10: the candidate did not print the one adopt notice: {stderr}",
-                )
             DIAG.finished("11.1")
         except BaseException as error:
             DIAG.failed_step(proof, "11.1", error)
 
+    if DIAG.enter("10.2", fixtures=()):
+        try:
+            case_reached("10")
+            # Case 10 (candidate half): only after BOTH base-created legacy states
+            # (this warm-slot checkout and case 11's migration checkout) exist does the
+            # first candidate command run in this pool.
+            code, _, stderr = oxide(proof, ["build"], "10 candidate warm on base slot", legacy)
+            expect(code == 0, f"10: candidate build on the base legacy slot failed: {stderr}")
+            candidate_slot, candidate_state = perm.slot_state(stderr)
+            expect(candidate_state == "warm", f"10: candidate did not reuse the base key: {summary(stderr)}")
+            expect(candidate_slot == base_slot, f"10: candidate changed the base slot {base_slot} -> {candidate_slot}")
+            expect(os.path.islink(os.path.join(legacy, "target")), "10: the base legacy link changed")
+            expect(link_at(os.path.join(legacy, "target")) == legacy_root, "10: the base legacy link text changed")
+            expect(item(pool, legacy, "version") == "oxide.outputs.transition/2", "10: the base receipt was rewritten")
+            base_links = item(pool, legacy, "links")
+            expect(base_links[0]["member"] == "target", "10: the base placement changed")
+            expect(
+                perm.read_bytes(perm.receipt_path(pool, legacy)) == base_receipt_bytes,
+                "10: the candidate rewrote the base receipt bytes",
+            )
+            expect(
+                link_at(os.path.join(legacy, "target")) == base_link_text,
+                "10: the candidate changed the base link text",
+            )
+            expect(
+                "uses the whole-target layout" in stderr and "oxide outputs adopt" in stderr,
+                f"10: the candidate did not print the one adopt notice: {stderr}",
+            )
+            DIAG.finished("10.2")
+        except BaseException as error:
+            DIAG.failed_step(proof, "10.2", error)
+
     if DIAG.enter("11.2", fixtures=()):
         try:
+            case_reached("11")
             # ----- case 11 (continued): the candidate migration runs only now -----
             code, _, stderr = oxide(proof, ["outputs", "adopt"], "11 migrate", migrated)
             expect(code == 0, f"11: candidate migration failed: {stderr}")
@@ -4647,12 +4668,12 @@ def run(proof: Proof, repo: str) -> None:
             DIAG.failed_step(proof, "20.1", error)
 
 USAGE = (
-    "usage: test-profile-outputs.py [--plan|--self-check|--diagnostic]\n"
+    "usage: test-profile-outputs.py [--base-compat] [--plan|--self-check|--diagnostic]\n"
     "--plan prints the fixed allocation and cases; --self-check runs the pure\n"
     "predicates only (registry, detach record, attachment facts, slot state,\n"
     "reserve-stop report, diagnostic state machine). --plan has no filesystem\n"
     "effects; --self-check only uses its own temporary directory and never the\n"
-    "runner's evidence root. --diagnostic runs the same fixed 20 cases in ONE\n"
+    "runner's evidence root. --diagnostic runs the selected mode cases in ONE\n"
     "session, records every oracle failure instead of stopping at the first,\n"
     "skips only steps whose prerequisites are unmet, still stops on any safety\n"
     "failure (deadline, custody, unsettled child, unrecordable evidence), and\n"
@@ -4678,6 +4699,28 @@ def pure_mode_contract() -> None:
                         pass
                     else:
                         fail(f"{mode} admitted forbidden {case}")
+        # Failures in each case-10 phase belong to 10 and cannot claim completion.
+        MODE, CASE_IDS = "base-compat", MODE_CASES["base-compat"]
+        for step in ("10.0", "10.2", "10.1"):
+            DIAG.reset()
+            DIAG.mode = True
+            DIAG.failed_step(None, step, OracleFailure("case 10 injected"))
+            record = diagnostic_record(None, None, "case 10 injected", [])
+            expect(record["cases"]["failed"] == ["10"], f"{step} misattributed")
+            expect("10" not in record["cases"]["completed"], f"{step} claimed completion")
+        DIAG.reset()
+        DIAG.mode = True
+        expect(not DIAG.enter("10.2") and not DIAG.enter("11.2"), "missing base prerequisites admitted")
+        DIAG.reset()
+        # Verify the native entry calls the diagnostic control before setup.
+        with mock.patch.dict(os.environ, {}), mock.patch(__name__ + ".pure_diagnostic_controls") as control, mock.patch(__name__ + ".pure_registry_controls", side_effect=RuntimeError("stop after control")):
+            try:
+                run(None, "")
+            except RuntimeError as error:
+                expect(str(error) == "stop after control", "unexpected run path")
+            else:
+                fail("native control probe did not stop")
+            expect(control.call_count == 1, "native diagnostic control missing")
         # proof_env reads the run root; no filesystem or child is touched.
         with mock.patch.dict(os.environ, {"OXIDE_TASK_SCRATCH_ROOT": "/owned", "OXIDE_SCRATCH_ROOT": "/hostile", "OXIDE_POOL": "/hostile"}):
             env = fixture_environment("/owned/run", "builds", "/owned/home", "/owned/cargo")
@@ -4686,6 +4729,7 @@ def pure_mode_contract() -> None:
             env = fixture_environment("/owned/run", "base-compat", "/owned/home", "/owned/cargo")
             expect("OXIDE_SCRATCH_ROOT" not in env and env["OXIDE_POOL"] == "/owned/run/pool", "base contract")
     finally:
+        DIAG.reset()
         MODE, CASE_IDS = saved
 
 
