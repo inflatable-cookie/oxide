@@ -1699,7 +1699,7 @@ def receipt_state(pool: str, checkout: str) -> str:
         return json.load(handle)["state"]
 
 
-def detach_run(proof: Proof, repo: str) -> None:
+def detach_run(proof: Proof, repo: str, diagnostic: bool = False) -> None:
     """Focused per-checkout detach proof under permanent mode (oxide#124): the
     #121 fixture and staging, one owned 128 MiB scratch image, ordinary detach.
     Only the fixture commands' stderr, exit codes, link, receipt, plan and
@@ -1764,165 +1764,177 @@ def detach_run(proof: Proof, repo: str) -> None:
     expect(os.path.isfile(os.path.join(link, "debug", "poutputs")), "binary not reachable through the link")
     proof.phase("after adoption")
 
-    # 2. Detach waits for an active build in the checkout, then restores the
-    #    real directory once that build has closed. The root keeps the build.
-    gate = os.path.join(root, "gate")
-    gate_env = dict(proof.env, OXIDE_OUTPUT_GATE=gate)
-    reset_gate(gate)
-    writer = start_child(proof, [proof.binary, "check"], app, gate_env)
-    waiting = None
-    try:
-        wait_for(os.path.join(gate, "started"), "gated build script")
-        expect(writer.poll() is None, "the gated build exited early")
-        waiting = start_child(proof, [proof.binary, "outputs", "detach"], app, proof.env)
-        time.sleep(2.0)
-        if waiting.poll() is not None:
-            early_out, early_err = waiting.communicate(timeout=5)
-            proof.unclosed.discard(waiting.pid)
-            fail(
-                "outputs detach did not wait for the active build in the checkout: "
-                f"exit {waiting.returncode}\n{early_out.decode(errors='replace')}"
-                f"{early_err.decode(errors='replace')}"
-            )
-        expect(
-            member_link_target(app, "debug") == adopted_debug,
-            "the owned member link moved while a build was running",
-        )
-        with open(os.path.join(gate, "release"), "wb") as handle:
-            handle.write(b"release")
-        writer_code, _, writer_stderr = finish_child(proof, writer, "gated build")
-        expect(writer_code == 0, f"the gated build failed: {writer_stderr}")
-        expect(os.path.isdir(adopted), "the build wrote nothing to the root")
-        before = tree_digest(adopted)
-        detach_code, detach_stdout, detach_stderr = finish_child(proof, waiting, "detach after the build")
+    def case_detach_sequence() -> None:
+        # 2. Detach waits for an active build in the checkout, then restores the
+        #    real directory once that build has closed. The root keeps the build.
+        gate = os.path.join(root, "gate")
+        gate_env = dict(proof.env, OXIDE_OUTPUT_GATE=gate)
+        reset_gate(gate)
+        writer = start_child(proof, [proof.binary, "check"], app, gate_env)
         waiting = None
-        expect(detach_code == 0, f"detach after the build failed: {detach_stdout}{detach_stderr}")
-    finally:
-        os.makedirs(gate, exist_ok=True)
-        with open(os.path.join(gate, "release"), "wb") as handle:
-            handle.write(b"release")
-        if writer.poll() is None:
-            writer.kill()
-        if waiting is not None and waiting.poll() is None:
-            waiting.kill()
-    proof.phase("after the gated detach")
+        try:
+            wait_for(os.path.join(gate, "started"), "gated build script")
+            expect(writer.poll() is None, "the gated build exited early")
+            waiting = start_child(proof, [proof.binary, "outputs", "detach"], app, proof.env)
+            time.sleep(2.0)
+            if waiting.poll() is not None:
+                early_out, early_err = waiting.communicate(timeout=5)
+                proof.unclosed.discard(waiting.pid)
+                fail(
+                    "outputs detach did not wait for the active build in the checkout: "
+                    f"exit {waiting.returncode}\n{early_out.decode(errors='replace')}"
+                    f"{early_err.decode(errors='replace')}"
+                )
+            expect(
+                member_link_target(app, "debug") == adopted_debug,
+                "the owned member link moved while a build was running",
+            )
+            with open(os.path.join(gate, "release"), "wb") as handle:
+                handle.write(b"release")
+            writer_code, _, writer_stderr = finish_child(proof, writer, "gated build")
+            expect(writer_code == 0, f"the gated build failed: {writer_stderr}")
+            expect(os.path.isdir(adopted), "the build wrote nothing to the root")
+            before = tree_digest(adopted)
+            detach_code, detach_stdout, detach_stderr = finish_child(proof, waiting, "detach after the build")
+            waiting = None
+            expect(detach_code == 0, f"detach after the build failed: {detach_stdout}{detach_stderr}")
+        finally:
+            os.makedirs(gate, exist_ok=True)
+            with open(os.path.join(gate, "release"), "wb") as handle:
+                handle.write(b"release")
+            if writer.poll() is None:
+                writer.kill()
+            if waiting is not None and waiting.poll() is None:
+                waiting.kill()
+        proof.phase("after the gated detach")
 
-    # 3. The detach restored a real empty directory, kept every root byte and
-    #    recorded a detached receipt. Plan and status agree.
-    expect("real empty directory again" in detach_stdout, detach_stdout)
-    expect(os.path.isdir(link) and not os.path.islink(link), "detach did not restore a real directory")
-    # The profile layout's detach restores one real EMPTY directory per owned
-    # member and keeps the real target directory (oxide#133/#144).
-    for member in ("debug", "release"):
-        path = os.path.join(link, member)
+        # 3. The detach restored a real empty directory, kept every root byte and
+        #    recorded a detached receipt. Plan and status agree.
+        expect("real empty directory again" in detach_stdout, detach_stdout)
+        expect(os.path.isdir(link) and not os.path.islink(link), "detach did not restore a real directory")
+        # The profile layout's detach restores one real EMPTY directory per owned
+        # member and keeps the real target directory (oxide#133/#144).
+        for member in ("debug", "release"):
+            path = os.path.join(link, member)
+            expect(
+                os.path.isdir(path) and not os.path.islink(path),
+                f"detach did not restore a real {member} directory",
+            )
+            expect(os.listdir(path) == [], f"the detached {member} is not empty")
+        expect(tree_digest(adopted) == before, "detach changed the owned root")
+        expect(receipt_state(pool, app) == "detached", "the receipt is not detached")
+        code, stdout, stderr = proof.oxide(["outputs", "status"], "status after detach", app)
+        expect(code == 0 and "detached" in stdout and "permanent" in stdout, stdout + stderr)
+        report = plan(proof, app, "plan after detach")
+        expect(report["mode"] == "permanent" and report["state"] == "detached", report)
+        # The real target now holds the (empty) member directories, so the target
+        # itself classifies as populated even though every member is empty.
+        expect(report["current_target"] == "real-nonempty", report)
+        expect(report["layout"] == "profile", report)
+        expect("selected" not in report and "current_root" not in report, report)
+        expect("detached" in (report.get("reason") or ""), report)
+        code, stdout, stderr = proof.oxide(["outputs", "detach"], "a second detach changes nothing", app)
+        expect(code == 0 and "already detached" in stdout, stdout + stderr)
+        proof.phase("after the detach")
+
+        # 4. The next leased builds use the real target: no relink, no notice, and
+        #    the detached root is never written.
+        code, _, stderr = proof.oxide(["build"], "the next build uses the real target", app)
+        expect(code == 0 and not auto_notices(stderr), stderr)
+        expect(os.path.isdir(link) and not os.path.islink(link), "a build relinked the target")
+        expect(os.path.isfile(os.path.join(link, "debug", "poutputs")), "no binary in the real target")
+        expect(tree_digest(adopted) == before, "a build wrote into the detached root")
+        code, _, stderr = proof.oxide(["build"], "a repeated build stays real, no notice", app)
+        expect(code == 0 and not auto_notices(stderr) and not os.path.islink(link), stderr)
+        report = plan(proof, app, "plan after real-target builds")
+        expect(report["state"] == "detached" and report["current_target"] == "real-nonempty", report)
+        proof.phase("after the real-target builds")
+
+        # 5. Controls. Explicit adopt never converts a NONEMPTY real member (the
+        #    profile contract keeps it local) and writes nothing into the root; a
+        #    missing target beside a detached receipt is never adopted.
+        before = tree_digest(adopted)
+        code, stdout, stderr = proof.oxide(["outputs", "adopt"], "adopt keeps the nonempty real members", app)
+        expect(code == 0, f"adopt refused the nonempty members: {stdout}{stderr}")
+        expect("stay real directories" in stderr, stderr)
         expect(
-            os.path.isdir(path) and not os.path.islink(path),
-            f"detach did not restore a real {member} directory",
+            os.path.isfile(os.path.join(link, "debug", "poutputs")),
+            "adopt moved or converted the real member",
         )
-        expect(os.listdir(path) == [], f"the detached {member} is not empty")
-    expect(tree_digest(adopted) == before, "detach changed the owned root")
-    expect(receipt_state(pool, app) == "detached", "the receipt is not detached")
-    code, stdout, stderr = proof.oxide(["outputs", "status"], "status after detach", app)
-    expect(code == 0 and "detached" in stdout and "permanent" in stdout, stdout + stderr)
-    report = plan(proof, app, "plan after detach")
-    expect(report["mode"] == "permanent" and report["state"] == "detached", report)
-    # The real target now holds the (empty) member directories, so the target
-    # itself classifies as populated even though every member is empty.
-    expect(report["current_target"] == "real-nonempty", report)
-    expect(report["layout"] == "profile", report)
-    expect("selected" not in report and "current_root" not in report, report)
-    expect("detached" in (report.get("reason") or ""), report)
-    code, stdout, stderr = proof.oxide(["outputs", "detach"], "a second detach changes nothing", app)
-    expect(code == 0 and "already detached" in stdout, stdout + stderr)
-    proof.phase("after the detach")
-
-    # 4. The next leased builds use the real target: no relink, no notice, and
-    #    the detached root is never written.
-    code, _, stderr = proof.oxide(["build"], "the next build uses the real target", app)
-    expect(code == 0 and not auto_notices(stderr), stderr)
-    expect(os.path.isdir(link) and not os.path.islink(link), "a build relinked the target")
-    expect(os.path.isfile(os.path.join(link, "debug", "poutputs")), "no binary in the real target")
-    expect(tree_digest(adopted) == before, "a build wrote into the detached root")
-    code, _, stderr = proof.oxide(["build"], "a repeated build stays real, no notice", app)
-    expect(code == 0 and not auto_notices(stderr) and not os.path.islink(link), stderr)
-    report = plan(proof, app, "plan after real-target builds")
-    expect(report["state"] == "detached" and report["current_target"] == "real-nonempty", report)
-    proof.phase("after the real-target builds")
-
-    # 5. Controls. Explicit adopt never converts a NONEMPTY real member (the
-    #    profile contract keeps it local) and writes nothing into the root; a
-    #    missing target beside a detached receipt is never adopted.
-    before = tree_digest(adopted)
-    code, stdout, stderr = proof.oxide(["outputs", "adopt"], "adopt keeps the nonempty real members", app)
-    expect(code == 0, f"adopt refused the nonempty members: {stdout}{stderr}")
-    expect("stay real directories" in stderr, stderr)
-    expect(
-        os.path.isfile(os.path.join(link, "debug", "poutputs")),
-        "adopt moved or converted the real member",
-    )
-    expect(
-        os.path.isdir(os.path.join(link, "debug"))
-        and not os.path.islink(os.path.join(link, "debug")),
-        "adopt linked a nonempty real member",
-    )
-    expect(tree_digest(adopted) == before, "adopt wrote into the root")
-    shutil.rmtree(link)
-    code, _, stderr = proof.oxide(["build"], "a detached receipt with an absent target is never adopted", app)
-    expect(code == 0 and not auto_notices(stderr), stderr)
-    expect(os.path.isdir(link) and not os.path.islink(link), "a detached checkout was adopted")
-    expect(receipt_state(pool, app) == "detached", "the receipt left detached state")
-    proof.phase("after the absent-target control")
-
-    # 6. Explicit adopt re-converts an empty detached target, to the same root
-    #    the checkout already had, through the existing preconditions.
-    again = fresh_checkout(proof, root, "detach-readopt")
-    code, _, stderr = proof.oxide(["build"], "re-adopt fixture adopts on its first build", again)
-    expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
-    first = os.path.dirname(member_link_target(again, "debug"))
-    code, _, stderr = proof.oxide(["outputs", "detach"], "detach the re-adopt fixture", again)
-    expect(code == 0, stderr)
-    for member in ("debug", "release"):
         expect(
-            os.listdir(os.path.join(again, "target", member)) == [],
-            f"the re-adopt {member} is not empty",
+            os.path.isdir(os.path.join(link, "debug"))
+            and not os.path.islink(os.path.join(link, "debug")),
+            "adopt linked a nonempty real member",
         )
-    code, stdout, stderr = proof.oxide(["outputs", "adopt"], "explicit adopt converts the empty members", again)
-    expect(code == 0 and "now selects the owned external root" in stdout, stdout + stderr)
-    expect(
-        os.path.dirname(member_link_target(again, "debug")) == first,
-        "re-adopt chose another root",
-    )
-    expect(receipt_state(pool, again) == "committed", "re-adopt did not commit")
-    first_debug = member_link_target(again, "debug")
-    code, _, stderr = proof.oxide(["build"], "the re-adopted checkout builds through its links", again)
-    expect(code == 0 and not auto_notices(stderr), stderr)
-    expect(member_link_target(again, "debug") == first_debug, "a build relinked the re-adopted member")
-    proof.phase("after explicit re-adoption")
+        expect(tree_digest(adopted) == before, "adopt wrote into the root")
+        shutil.rmtree(link)
+        code, _, stderr = proof.oxide(["build"], "a detached receipt with an absent target is never adopted", app)
+        expect(code == 0 and not auto_notices(stderr), stderr)
+        expect(os.path.isdir(link) and not os.path.islink(link), "a detached checkout was adopted")
+        expect(receipt_state(pool, app) == "detached", "the receipt left detached state")
+        proof.phase("after the absent-target control")
 
-    # 7. Errors stay errors: a foreign link refuses the detach with no change
-    #    and the receipt stays committed; a checkout never converted has no
-    #    receipt to detach.
-    foreign = fresh_checkout(proof, root, "detach-foreign")
-    code, _, stderr = proof.oxide(["build"], "foreign fixture adopts on its first build", foreign)
-    expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
-    outside = os.path.join(root, "outside-detach")
-    os.makedirs(outside)
-    with open(os.path.join(outside, "sentinel"), "wb") as handle:
-        handle.write(b"foreign")
-    os.remove(os.path.join(foreign, "target", "debug"))
-    os.symlink(outside, os.path.join(foreign, "target", "debug"))
-    code, stdout, stderr = proof.oxide(["outputs", "detach"], "detach refuses a foreign link", foreign)
-    expect(code != 0 and "left untouched" in stderr, stdout + stderr)
-    expect(os.readlink(os.path.join(foreign, "target", "debug")) == outside, "the foreign link was replaced")
-    expect(read_bytes(os.path.join(outside, "sentinel")) == b"foreign", "the foreign referent changed")
-    expect(receipt_state(pool, foreign) == "committed", "a refused detach changed the receipt")
 
-    never = fresh_checkout(proof, root, "detach-never-converted")
-    code, stdout, stderr = proof.oxide(["outputs", "detach"], "detach without a receipt refuses", never)
-    expect(code != 0 and "nothing to detach" in stderr, stdout + stderr)
-    expect(not os.path.lexists(os.path.join(never, "target")), "a refused detach created a target")
-    proof.phase("after the error controls")
+    def case_readopt() -> None:
+        # 6. Explicit adopt re-converts an empty detached target, to the same root
+        #    the checkout already had, through the existing preconditions.
+        again = fresh_checkout(proof, root, "detach-readopt")
+        code, _, stderr = proof.oxide(["build"], "re-adopt fixture adopts on its first build", again)
+        expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
+        first = os.path.dirname(member_link_target(again, "debug"))
+        code, _, stderr = proof.oxide(["outputs", "detach"], "detach the re-adopt fixture", again)
+        expect(code == 0, stderr)
+        for member in ("debug", "release"):
+            expect(
+                os.listdir(os.path.join(again, "target", member)) == [],
+                f"the re-adopt {member} is not empty",
+            )
+        code, stdout, stderr = proof.oxide(["outputs", "adopt"], "explicit adopt converts the empty members", again)
+        expect(code == 0 and "now selects the owned external root" in stdout, stdout + stderr)
+        expect(
+            os.path.dirname(member_link_target(again, "debug")) == first,
+            "re-adopt chose another root",
+        )
+        expect(receipt_state(pool, again) == "committed", "re-adopt did not commit")
+        first_debug = member_link_target(again, "debug")
+        code, _, stderr = proof.oxide(["build"], "the re-adopted checkout builds through its links", again)
+        expect(code == 0 and not auto_notices(stderr), stderr)
+        expect(member_link_target(again, "debug") == first_debug, "a build relinked the re-adopted member")
+        proof.phase("after explicit re-adoption")
 
+
+    def case_refusals() -> None:
+        # 7. Errors stay errors: a foreign link refuses the detach with no change
+        #    and the receipt stays committed; a checkout never converted has no
+        #    receipt to detach.
+        foreign = fresh_checkout(proof, root, "detach-foreign")
+        code, _, stderr = proof.oxide(["build"], "foreign fixture adopts on its first build", foreign)
+        expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
+        outside = os.path.join(root, "outside-detach")
+        os.makedirs(outside)
+        with open(os.path.join(outside, "sentinel"), "wb") as handle:
+            handle.write(b"foreign")
+        os.remove(os.path.join(foreign, "target", "debug"))
+        os.symlink(outside, os.path.join(foreign, "target", "debug"))
+        code, stdout, stderr = proof.oxide(["outputs", "detach"], "detach refuses a foreign link", foreign)
+        expect(code != 0 and "left untouched" in stderr, stdout + stderr)
+        expect(os.readlink(os.path.join(foreign, "target", "debug")) == outside, "the foreign link was replaced")
+        expect(read_bytes(os.path.join(outside, "sentinel")) == b"foreign", "the foreign referent changed")
+        expect(receipt_state(pool, foreign) == "committed", "a refused detach changed the receipt")
+
+        never = fresh_checkout(proof, root, "detach-never-converted")
+        code, stdout, stderr = proof.oxide(["outputs", "detach"], "detach without a receipt refuses", never)
+        expect(code != 0 and "nothing to detach" in stderr, stdout + stderr)
+        expect(not os.path.lexists(os.path.join(never, "target")), "a refused detach created a target")
+        proof.phase("after the error controls")
+
+
+    cases = [
+        ("detach_sequence", (), case_detach_sequence),
+        ("readopt", (), case_readopt),
+        ("refusals", (), case_refusals),
+    ]
+    finish_fixture_cases(proof, pool, mount, cases, diagnostic)
     proof.detach()
 
 
@@ -1957,7 +1969,7 @@ def set_mode(proof: Proof, mode: str, cwd: str) -> None:
     expect(code == 0, stderr)
 
 
-def auto_run(proof: Proof, repo: str) -> None:
+def auto_run(proof: Proof, repo: str, diagnostic: bool = False) -> None:
     """Focused auto-adopt proof (oxide#121): one fixture, one volume, the
     #117 scenario's staging and helpers. Only the fixture commands' stderr,
     exit codes and link, root, receipt and source bytes are checked."""
@@ -2059,181 +2071,199 @@ def auto_run(proof: Proof, repo: str) -> None:
         "two checkouts share a root",
     )
 
-    # 2. Controls: every present target is kept, and no notice is printed.
-    keep = fresh_checkout(proof, root, "real-target")
-    os.makedirs(os.path.join(keep, "target"))
-    with open(os.path.join(keep, "target", "keep.txt"), "wb") as handle:
-        handle.write(b"warm build")
-    code, _, stderr = proof.oxide(["build"], "a non-empty real target is never adopted", keep)
-    expect(not auto_notices(stderr), stderr)
-    expect(
-        os.path.isdir(os.path.join(keep, "target"))
-        and not os.path.islink(os.path.join(keep, "target")),
-        "the real target was replaced",
-    )
-    expect(read_bytes(os.path.join(keep, "target", "keep.txt")) == b"warm build", "target mutated")
-    expect(not os.path.exists(receipt_file(pool, keep)), "a control wrote a receipt")
+    def case_controls() -> None:
+        # 2. Controls: every present target is kept, and no notice is printed.
+        keep = fresh_checkout(proof, root, "real-target")
+        os.makedirs(os.path.join(keep, "target"))
+        with open(os.path.join(keep, "target", "keep.txt"), "wb") as handle:
+            handle.write(b"warm build")
+        code, _, stderr = proof.oxide(["build"], "a non-empty real target is never adopted", keep)
+        expect(not auto_notices(stderr), stderr)
+        expect(
+            os.path.isdir(os.path.join(keep, "target"))
+            and not os.path.islink(os.path.join(keep, "target")),
+            "the real target was replaced",
+        )
+        expect(read_bytes(os.path.join(keep, "target", "keep.txt")) == b"warm build", "target mutated")
+        expect(not os.path.exists(receipt_file(pool, keep)), "a control wrote a receipt")
 
-    empty = fresh_checkout(proof, root, "empty-target")
-    os.makedirs(os.path.join(empty, "target"))
-    code, _, stderr = proof.oxide(["build"], "an empty real target is never adopted", empty)
-    expect(not auto_notices(stderr) and not os.path.islink(os.path.join(empty, "target")), stderr)
-    expect(not os.path.exists(receipt_file(pool, empty)), "an empty target got a receipt")
+        empty = fresh_checkout(proof, root, "empty-target")
+        os.makedirs(os.path.join(empty, "target"))
+        code, _, stderr = proof.oxide(["build"], "an empty real target is never adopted", empty)
+        expect(not auto_notices(stderr) and not os.path.islink(os.path.join(empty, "target")), stderr)
+        expect(not os.path.exists(receipt_file(pool, empty)), "an empty target got a receipt")
 
-    outside = os.path.join(root, "outside")
-    os.makedirs(outside)
-    with open(os.path.join(outside, "sentinel"), "wb") as handle:
-        handle.write(b"foreign")
-    foreign = fresh_checkout(proof, root, "foreign-link")
-    os.symlink(outside, os.path.join(foreign, "target"))
-    code, _, stderr = proof.oxide(["build"], "a foreign link is refused, not adopted", foreign)
-    expect(code != 0 and not auto_notices(stderr), stderr)
-    expect(os.readlink(os.path.join(foreign, "target")) == outside, "foreign link was replaced")
-    expect(read_bytes(os.path.join(outside, "sentinel")) == b"foreign", "foreign referent mutated")
+        outside = os.path.join(root, "outside")
+        os.makedirs(outside)
+        with open(os.path.join(outside, "sentinel"), "wb") as handle:
+            handle.write(b"foreign")
+        foreign = fresh_checkout(proof, root, "foreign-link")
+        os.symlink(outside, os.path.join(foreign, "target"))
+        code, _, stderr = proof.oxide(["build"], "a foreign link is refused, not adopted", foreign)
+        expect(code != 0 and not auto_notices(stderr), stderr)
+        expect(os.readlink(os.path.join(foreign, "target")) == outside, "foreign link was replaced")
+        expect(read_bytes(os.path.join(outside, "sentinel")) == b"foreign", "foreign referent mutated")
 
-    absent = os.path.join(root, "absent-root")
-    dangling = fresh_checkout(proof, root, "dangling-link")
-    os.symlink(absent, os.path.join(dangling, "target"))
-    code, _, stderr = proof.oxide(["build"], "a dangling link is refused, not adopted", dangling)
-    expect(code != 0 and not auto_notices(stderr), stderr)
-    expect(os.readlink(os.path.join(dangling, "target")) == absent, "dangling link was replaced")
-    expect(not os.path.lexists(absent), "the dangling link's root was created")
+        absent = os.path.join(root, "absent-root")
+        dangling = fresh_checkout(proof, root, "dangling-link")
+        os.symlink(absent, os.path.join(dangling, "target"))
+        code, _, stderr = proof.oxide(["build"], "a dangling link is refused, not adopted", dangling)
+        expect(code != 0 and not auto_notices(stderr), stderr)
+        expect(os.readlink(os.path.join(dangling, "target")) == absent, "dangling link was replaced")
+        expect(not os.path.lexists(absent), "the dangling link's root was created")
 
-    filed = fresh_checkout(proof, root, "file-target")
-    with open(os.path.join(filed, "target"), "wb") as handle:
-        handle.write(b"not a directory")
-    code, _, stderr = proof.oxide(["build"], "a file at target is never adopted", filed)
-    expect(not auto_notices(stderr), stderr)
-    expect(read_bytes(os.path.join(filed, "target")) == b"not a directory", "file target mutated")
-    proof.phase("after controls")
+        filed = fresh_checkout(proof, root, "file-target")
+        with open(os.path.join(filed, "target"), "wb") as handle:
+            handle.write(b"not a directory")
+        code, _, stderr = proof.oxide(["build"], "a file at target is never adopted", filed)
+        expect(not auto_notices(stderr), stderr)
+        expect(read_bytes(os.path.join(filed, "target")) == b"not a directory", "file target mutated")
+        proof.phase("after controls")
 
-    # 3. A corrupt receipt is an error, never an absent receipt: the command
-    #    refuses before any slot is taken, and the missing target stays missing.
-    bad = fresh_checkout(proof, root, "bad-receipt")
-    os.makedirs(os.path.dirname(receipt_file(pool, bad)), exist_ok=True)
-    corrupt = receipt_file(pool, bad)
-    with open(corrupt, "wb") as handle:
-        handle.write(b"{not a receipt")
-    # Owner-only, so the product reaches its parse refusal, not the mode check.
-    os.chmod(corrupt, 0o600)
-    code, _, stderr = proof.oxide(["build"], "a corrupt receipt refuses, never adopts", bad)
-    expect(code != 0 and "is invalid" in stderr and not auto_notices(stderr), stderr)
-    expect(not os.path.lexists(os.path.join(bad, "target")), "a corrupt receipt let a target appear")
-    os.remove(receipt_file(pool, bad))
 
-    # 4. A detached checkout with its target missing is excluded: the receipt
-    #    of any state refuses automatic adoption.
-    det = fresh_checkout(proof, root, "detached")
-    code, _, stderr = proof.oxide(["build"], "detached checkout starts adopted", det)
-    expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
-    set_mode(proof, "ephemeral", det)
-    code, _, stderr = proof.oxide(["outputs", "detach"], "detach the checkout", det)
-    expect(code == 0, stderr)
-    shutil.rmtree(os.path.join(det, "target"))
-    set_mode(proof, "permanent", det)
-    code, _, stderr = proof.oxide(["build"], "missing target with a detached receipt is excluded", det)
-    expect(code == 0 and not auto_notices(stderr), stderr)
-    expect(
-        os.path.isdir(os.path.join(det, "target")) and not os.path.islink(os.path.join(det, "target")),
-        "a detached checkout was adopted",
-    )
-    with open(receipt_file(pool, det), "rb") as handle:
-        expect(json.load(handle)["state"] == "detached", "the receipt left detached state")
-    proof.phase("after detached exclusion")
+    def case_corrupt_receipt() -> None:
+        # 3. A corrupt receipt is an error, never an absent receipt: the command
+        #    refuses before any slot is taken, and the missing target stays missing.
+        bad = fresh_checkout(proof, root, "bad-receipt")
+        os.makedirs(os.path.dirname(receipt_file(pool, bad)), exist_ok=True)
+        corrupt = receipt_file(pool, bad)
+        with open(corrupt, "wb") as handle:
+            handle.write(b"{not a receipt")
+        # Owner-only, so the product reaches its parse refusal, not the mode check.
+        os.chmod(corrupt, 0o600)
+        code, _, stderr = proof.oxide(["build"], "a corrupt receipt refuses, never adopts", bad)
+        expect(code != 0 and "is invalid" in stderr and not auto_notices(stderr), stderr)
+        expect(not os.path.lexists(os.path.join(bad, "target")), "a corrupt receipt let a target appear")
+        os.remove(receipt_file(pool, bad))
 
-    # 5. Ephemeral registration: no adoption, a real target, then permanent.
-    set_mode(proof, "ephemeral", fresh)
-    eph = fresh_checkout(proof, root, "ephemeral-drive")
-    code, _, stderr = proof.oxide(["build"], "ephemeral registration never adopts", eph)
-    expect(code == 0 and not auto_notices(stderr), stderr)
-    expect(not os.path.islink(os.path.join(eph, "target")), "ephemeral build linked its target")
-    set_mode(proof, "permanent", fresh)
 
-    # 6. Absent drive: no adoption, the internal real target. The drive is
-    #    then re-attached at the same mount point.
-    force_detach(proof, image, mount, uuid)
-    gone = fresh_checkout(proof, root, "absent-drive")
-    code, _, stderr = proof.oxide(["build"], "an absent drive never adopts", gone)
-    expect(code == 0 and not auto_notices(stderr), stderr)
-    expect(not os.path.islink(os.path.join(gone, "target")), "absent drive linked its target")
-    expect(not os.path.exists(receipt_file(pool, gone)), "absent drive wrote a receipt")
-    mounted = attach_image(proof, os.environ["OXIDE_PROOF_EVIDENCE"], name)
-    expect(mounted == mount, f"re-attached at {mounted}, not {mount}")
-    proof.phase("after absent drive")
+    def case_shared_lifecycle() -> None:
+        try:
+            # 4. A detached checkout with its target missing is excluded: the receipt
+            #    of any state refuses automatic adoption.
+            det = fresh_checkout(proof, root, "detached")
+            code, _, stderr = proof.oxide(["build"], "detached checkout starts adopted", det)
+            expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
+            set_mode(proof, "ephemeral", det)
+            code, _, stderr = proof.oxide(["outputs", "detach"], "detach the checkout", det)
+            expect(code == 0, stderr)
+            shutil.rmtree(os.path.join(det, "target"))
+            set_mode(proof, "permanent", det)
+            code, _, stderr = proof.oxide(["build"], "missing target with a detached receipt is excluded", det)
+            expect(code == 0 and not auto_notices(stderr), stderr)
+            expect(
+                os.path.isdir(os.path.join(det, "target")) and not os.path.islink(os.path.join(det, "target")),
+                "a detached checkout was adopted",
+            )
+            with open(receipt_file(pool, det), "rb") as handle:
+                expect(json.load(handle)["state"] == "detached", "the receipt left detached state")
+            proof.phase("after detached exclusion")
 
-    # 7. Internal fallback (recorded volume UUID mismatch): no adoption.
-    set_recorded_uuid(pool, wrong)
-    mismatch = fresh_checkout(proof, root, "uuid-mismatch")
-    code, _, stderr = proof.oxide(["build"], "a fallback to the internal pool never adopts", mismatch)
-    expect(code == 0 and not auto_notices(stderr), stderr)
-    expect(not os.path.islink(os.path.join(mismatch, "target")), "fallback linked its target")
-    set_recorded_uuid(pool, uuid)
-    proof.phase("after fallback control")
+            # 5. Ephemeral registration: no adoption, a real target, then permanent.
+            set_mode(proof, "ephemeral", fresh)
+            eph = fresh_checkout(proof, root, "ephemeral-drive")
+            code, _, stderr = proof.oxide(["build"], "ephemeral registration never adopts", eph)
+            expect(code == 0 and not auto_notices(stderr), stderr)
+            expect(not os.path.islink(os.path.join(eph, "target")), "ephemeral build linked its target")
+            set_mode(proof, "permanent", fresh)
 
-    # 8. Crash replay. A stop after the sibling link leaves a prepared receipt;
-    #    a creator that appears at the target afterwards is never replaced.
-    crashed = fresh_checkout(proof, root, "crash-linked")
-    crash_env = dict(proof.env, OXIDE_TEST_OUTPUTS_CRASH="linked")
-    code, _, stderr = oxide_env(proof, ["build"], "crash after the sibling link", crashed, crash_env)
-    expect(code != 0 and "injected transition stop at linked" in stderr, stderr)
-    expect(not auto_notices(stderr), "a crashed adoption printed its notice")
-    # The first conversion's FIRST member transition is what crashes, so the
-    # sibling link belongs to `target/debug` and the real `target` directory
-    # already exists (oxide#160, S4b).
-    expect(
-        os.path.isdir(os.path.join(crashed, "target")),
-        "the crash did not leave the profile target directory",
-    )
-    sibling = os.path.join(crashed, "target", ".debug.oxide-new-1")
-    expect(os.path.islink(sibling), "the crash left no sibling link")
-    with open(os.path.join(crashed, "target", "debug"), "wb") as handle:
-        handle.write(b"creator")
-    code, _, stderr = proof.oxide(["build"], "replay refuses a creator at the member link", crashed)
-    expect(code != 0 and "cannot be replayed" in stderr, stderr)
-    expect(
-        read_bytes(os.path.join(crashed, "target", "debug")) == b"creator",
-        "the creator was replaced",
-    )
-    expect(os.path.islink(sibling), "the prepared sibling was removed")
+            # 6. Absent drive: no adoption, the internal real target. The drive is
+            #    then re-attached at the same mount point.
+            force_detach(proof, image, mount, uuid)
+            gone = fresh_checkout(proof, root, "absent-drive")
+            code, _, stderr = proof.oxide(["build"], "an absent drive never adopts", gone)
+            expect(code == 0 and not auto_notices(stderr), stderr)
+            expect(not os.path.islink(os.path.join(gone, "target")), "absent drive linked its target")
+            expect(not os.path.exists(receipt_file(pool, gone)), "absent drive wrote a receipt")
+            mounted = attach_image(proof, os.environ["OXIDE_PROOF_EVIDENCE"], name)
+            expect(mounted == mount, f"re-attached at {mounted}, not {mount}")
+            proof.phase("after absent drive")
 
-    # A stop before any link is published: the next command's replay rolls the
-    # preparation back to detached and refuses once (its slot was keyed for the
-    # root). The command after it builds as an unconverted checkout.
-    prepared = fresh_checkout(proof, root, "crash-prepared")
-    crash_env = dict(proof.env, OXIDE_TEST_OUTPUTS_CRASH="prepared")
-    code, _, stderr = oxide_env(proof, ["build"], "crash before publication", prepared, crash_env)
-    expect(code != 0 and "injected transition stop at prepared" in stderr, stderr)
-    expect(
-        not os.path.lexists(os.path.join(prepared, "target", "debug")),
-        "a stop published a member link",
-    )
-    code, _, stderr = proof.oxide(["build"], "replay rolls back an unpublished adoption", prepared)
-    expect(code != 0 and "run the command again" in stderr and not auto_notices(stderr), stderr)
-    code, _, stderr = proof.oxide(["build"], "the command after the rollback is unconverted", prepared)
-    expect(code == 0 and not auto_notices(stderr), stderr)
-    expect(not os.path.islink(os.path.join(prepared, "target")), "rollback left a link")
-    with open(receipt_file(pool, prepared), "rb") as handle:
-        expect(json.load(handle)["state"] == "detached", "rollback did not detach")
-    proof.phase("after crash replay")
+            # 7. Internal fallback (recorded volume UUID mismatch): no adoption.
+            set_recorded_uuid(pool, wrong)
+            mismatch = fresh_checkout(proof, root, "uuid-mismatch")
+            code, _, stderr = proof.oxide(["build"], "a fallback to the internal pool never adopts", mismatch)
+            expect(code == 0 and not auto_notices(stderr), stderr)
+            expect(not os.path.islink(os.path.join(mismatch, "target")), "fallback linked its target")
+            set_recorded_uuid(pool, uuid)
+            proof.phase("after fallback control")
 
-    # 9. Committed adoption survives a failed build: one notice, the link and
-    #    receipt stay, and a repaired source builds through them.
-    failing = fresh_checkout(proof, root, "build-fails")
-    with open(os.path.join(failing, "src", "main.rs"), "w", encoding="utf-8") as handle:
-        handle.write('fn main() { let value: u32 = "not a number"; }\n')
-    code, _, stderr = proof.oxide(["build"], "adoption survives a failed build", failing)
-    expect(code != 0 and len(auto_notices(stderr)) == 1, stderr)
-    expect(
-        os.path.isdir(os.path.join(failing, "target"))
-        and os.path.islink(os.path.join(failing, "target", "debug")),
-        "the committed member links were lost",
-    )
-    with open(os.path.join(failing, "src", "main.rs"), "w", encoding="utf-8") as handle:
-        handle.write(APP["src/main.rs"])
-    code, _, stderr = proof.oxide(["build"], "the repaired source builds through the link", failing)
-    expect(code == 0 and not auto_notices(stderr), stderr)
-    proof.phase("after failed build")
+            # 8. Crash replay. A stop after the sibling link leaves a prepared receipt;
+            #    a creator that appears at the target afterwards is never replaced.
+            crashed = fresh_checkout(proof, root, "crash-linked")
+            crash_env = dict(proof.env, OXIDE_TEST_OUTPUTS_CRASH="linked")
+            code, _, stderr = oxide_env(proof, ["build"], "crash after the sibling link", crashed, crash_env)
+            expect(code != 0 and "injected transition stop at linked" in stderr, stderr)
+            expect(not auto_notices(stderr), "a crashed adoption printed its notice")
+            # The first conversion's FIRST member transition is what crashes, so the
+            # sibling link belongs to `target/debug` and the real `target` directory
+            # already exists (oxide#160, S4b).
+            expect(
+                os.path.isdir(os.path.join(crashed, "target")),
+                "the crash did not leave the profile target directory",
+            )
+            sibling = os.path.join(crashed, "target", ".debug.oxide-new-1")
+            expect(os.path.islink(sibling), "the crash left no sibling link")
+            with open(os.path.join(crashed, "target", "debug"), "wb") as handle:
+                handle.write(b"creator")
+            code, _, stderr = proof.oxide(["build"], "replay refuses a creator at the member link", crashed)
+            expect(code != 0 and "cannot be replayed" in stderr, stderr)
+            expect(
+                read_bytes(os.path.join(crashed, "target", "debug")) == b"creator",
+                "the creator was replaced",
+            )
+            expect(os.path.islink(sibling), "the prepared sibling was removed")
 
+            # A stop before any link is published: the next command's replay rolls the
+            # preparation back to detached and refuses once (its slot was keyed for the
+            # root). The command after it builds as an unconverted checkout.
+            prepared = fresh_checkout(proof, root, "crash-prepared")
+            crash_env = dict(proof.env, OXIDE_TEST_OUTPUTS_CRASH="prepared")
+            code, _, stderr = oxide_env(proof, ["build"], "crash before publication", prepared, crash_env)
+            expect(code != 0 and "injected transition stop at prepared" in stderr, stderr)
+            expect(
+                not os.path.lexists(os.path.join(prepared, "target", "debug")),
+                "a stop published a member link",
+            )
+            code, _, stderr = proof.oxide(["build"], "replay rolls back an unpublished adoption", prepared)
+            expect(code != 0 and "run the command again" in stderr and not auto_notices(stderr), stderr)
+            code, _, stderr = proof.oxide(["build"], "the command after the rollback is unconverted", prepared)
+            expect(code == 0 and not auto_notices(stderr), stderr)
+            expect(not os.path.islink(os.path.join(prepared, "target")), "rollback left a link")
+            with open(receipt_file(pool, prepared), "rb") as handle:
+                expect(json.load(handle)["state"] == "detached", "rollback did not detach")
+            proof.phase("after crash replay")
+
+        except Exception as fault:
+            raise ProofAbort(f"shared fixture state uncertain: {fault}") from fault
+
+    def case_failed_build() -> None:
+        # 9. Committed adoption survives a failed build: one notice, the link and
+        #    receipt stay, and a repaired source builds through them.
+        failing = fresh_checkout(proof, root, "build-fails")
+        with open(os.path.join(failing, "src", "main.rs"), "w", encoding="utf-8") as handle:
+            handle.write('fn main() { let value: u32 = "not a number"; }\n')
+        code, _, stderr = proof.oxide(["build"], "adoption survives a failed build", failing)
+        expect(code != 0 and len(auto_notices(stderr)) == 1, stderr)
+        expect(
+            os.path.isdir(os.path.join(failing, "target"))
+            and os.path.islink(os.path.join(failing, "target", "debug")),
+            "the committed member links were lost",
+        )
+        with open(os.path.join(failing, "src", "main.rs"), "w", encoding="utf-8") as handle:
+            handle.write(APP["src/main.rs"])
+        code, _, stderr = proof.oxide(["build"], "the repaired source builds through the link", failing)
+        expect(code == 0 and not auto_notices(stderr), stderr)
+        proof.phase("after failed build")
+
+
+    cases = [
+        ("controls", (), case_controls),
+        ("corrupt_receipt", (), case_corrupt_receipt),
+        ("failed_build", (), case_failed_build),
+        ("shared_lifecycle", (), case_shared_lifecycle),
+    ]
+    finish_fixture_cases(proof, pool, mount, cases, diagnostic)
     proof.detach()
 
 
@@ -2408,7 +2438,7 @@ def private_path(root: str) -> str:
     return directory
 
 
-def ignore_run(proof: Proof, repo: str) -> None:
+def ignore_run(proof: Proof, repo: str, diagnostic: bool = False) -> None:
     """Focused ignore-safety proof (oxide#125, updated for oxide#160/S4b): a
     first conversion publishes owned `<checkout>/target/<member>` links only
     when Git ignores the exact repository-relative path of the link it is about
@@ -2467,312 +2497,342 @@ def ignore_run(proof: Proof, repo: str) -> None:
     expect(code == 0 and "registered removable pool" in stdout, stderr)
     proof.phase("after drive registration")
 
-    # 1. A directory-only rule genuinely covers a profile MEMBER path: the
-    #    published link is `target/<member>` inside a real target directory, so
-    #    `/target/`, `target/` and `**/target/` are accepted (oxide#160, S4b).
-    #    The single non-directory-path rule is accepted the same way.
-    for index, rule in enumerate(("/target/", "target/", "**/target/", "/target", "target")):
-        _, checkout = ignore_fixture(proof, root, f"rule-{index}", rule + "\n/.oxide-outputs/\n")
-        code, _, stderr = proof.oxide(
-            ["outputs", "adopt"], f"explicit adopt with {rule!r}", checkout
+    def case_directory_rules() -> None:
+        # 1. A directory-only rule genuinely covers a profile MEMBER path: the
+        #    published link is `target/<member>` inside a real target directory, so
+        #    `/target/`, `target/` and `**/target/` are accepted (oxide#160, S4b).
+        #    The single non-directory-path rule is accepted the same way.
+        for index, rule in enumerate(("/target/", "target/", "**/target/", "/target", "target")):
+            _, checkout = ignore_fixture(proof, root, f"rule-{index}", rule + "\n/.oxide-outputs/\n")
+            code, _, stderr = proof.oxide(
+                ["outputs", "adopt"], f"explicit adopt with {rule!r}", checkout
+            )
+            expect(code == 0, f"{rule!r}: an explicit adopt refused the rule: {stderr}")
+            expect_published(proof, pool, mount, checkout, f"explicit adopt with {rule!r}")
+        for index, rule in enumerate(("/target/", "target")):
+            _, checkout = ignore_fixture(proof, root, f"auto-{index}", rule + "\n/.oxide-outputs/\n")
+            code, _, stderr = proof.oxide(["build"], f"automatic adoption with {rule!r}", checkout)
+            expect(code == 0 and len(auto_notices(stderr)) == 1, f"{rule!r}: {stderr}")
+            expect_published(proof, pool, mount, checkout, f"automatic adoption with {rule!r}")
+        #    A real empty target takes the same accepted path.
+        _, empty = ignore_fixture(
+            proof, root, "empty-accepted", "/target/\n/.oxide-outputs/\n", empty=True
         )
-        expect(code == 0, f"{rule!r}: an explicit adopt refused the rule: {stderr}")
-        expect_published(proof, pool, mount, checkout, f"explicit adopt with {rule!r}")
-    for index, rule in enumerate(("/target/", "target")):
-        _, checkout = ignore_fixture(proof, root, f"auto-{index}", rule + "\n/.oxide-outputs/\n")
-        code, _, stderr = proof.oxide(["build"], f"automatic adoption with {rule!r}", checkout)
-        expect(code == 0 and len(auto_notices(stderr)) == 1, f"{rule!r}: {stderr}")
-        expect_published(proof, pool, mount, checkout, f"automatic adoption with {rule!r}")
-    #    A real empty target takes the same accepted path.
-    _, empty = ignore_fixture(
-        proof, root, "empty-accepted", "/target/\n/.oxide-outputs/\n", empty=True
-    )
-    code, _, stderr = proof.oxide(["outputs", "adopt"], "explicit adopt of an empty target", empty)
-    expect(code == 0, f"an empty target was refused: {stderr}")
-    expect_published(proof, pool, mount, empty, "explicit adopt of an empty target")
-    proof.phase("after the directory-rule matrix")
+        code, _, stderr = proof.oxide(["outputs", "adopt"], "explicit adopt of an empty target", empty)
+        expect(code == 0, f"an empty target was refused: {stderr}")
+        expect_published(proof, pool, mount, empty, "explicit adopt of an empty target")
+        proof.phase("after the directory-rule matrix")
 
-    # 2. A nested workspace names its exact repository-relative path, and a
-    #    directory-only nested rule covers the nested member too.
-    _, nested = ignore_fixture(
-        proof,
-        root,
-        "nested-empty",
-        "/rust/target/\n.oxide-outputs/\n",
-        relative="rust",
-        empty=True,
-    )
-    code, _, stderr = proof.oxide(["outputs", "adopt"], "nested /rust/target/", nested)
-    expect(code == 0, f"the nested directory rule was refused: {stderr}")
-    expect_published(proof, pool, mount, nested, "the nested directory rule")
-    _, nested_missing = ignore_fixture(
-        proof, root, "nested-unignored", ".oxide-outputs/\n", relative="rust"
-    )
-    refused_untouched(
-        proof,
-        pool,
-        mount,
-        nested_missing,
-        "a nested checkout with no target rule",
-        ["outputs", "adopt"],
-        ("does not ignore",),
-    )
-    expect(
-        not os.path.lexists(os.path.join(nested_missing, "target")),
-        "a refused nested conversion created a target",
-    )
 
-    # 3. Negated and unignored paths refuse; nothing links.
-    _, negated = ignore_fixture(
-        proof, root, "negated", "/target/\n!/target/debug\n/.oxide-outputs/\n"
-    )
-    stderr = refused_untouched(
-        proof,
-        pool,
-        mount,
-        negated,
-        "a rule that re-includes the debug member",
-        ["outputs", "adopt"],
-        ("re-includes",),
-    )
-    expect("target/debug" in stderr, stderr)
-    _, unignored = ignore_fixture(proof, root, "unignored", "/.oxide-outputs/\n")
-    refused_untouched(
-        proof,
-        pool,
-        mount,
-        unignored,
-        "an unignored target",
-        ["outputs", "adopt"],
-        ("does not ignore",),
-    )
-
-    # 4. A tracked path refuses even when the working tree has no target.
-    _, tracked = ignore_fixture(proof, root, "tracked", "/target\n/.oxide-outputs/\n")
-    os.makedirs(os.path.join(tracked, "target"))
-    with open(os.path.join(tracked, "target", "debug"), "wb") as handle:
-        handle.write(b"tracked")
-    added = proof.run(["git", "add", "-f", "target/debug"], cwd=tracked, timeout=30)
-    expect(added.returncode == 0, f"git add failed: {added.stderr!r}")
-    os.remove(os.path.join(tracked, "target", "debug"))
-    stderr = refused_untouched(
-        proof,
-        pool,
-        mount,
-        tracked,
-        "a tracked member path",
-        ["outputs", "adopt"],
-        ("already tracks",),
-        empty=True,
-    )
-    expect("target/debug" in stderr, stderr)
-
-    # 5. Unknown Git is never permission: no repository, no Git binary, a
-    #    timeout, a command error and a malformed answer all refuse.
-    _, no_repo = ignore_fixture(proof, root, "no-repository", "/target\n", git=False)
-    refused_untouched(
-        proof,
-        pool,
-        mount,
-        no_repo,
-        "no Git repository",
-        ["outputs", "adopt"],
-        ("could not confirm",),
-    )
-    no_git_env = dict(proof.env, PATH=private_path(root))
-    # A leased *build* in this class is ineligibility, not a refusal
-    # (oxide#154), so this control asks the explicit conversion over a real
-    # empty target adopt never creates: the member's missing prerequisite
-    # refuses before any receipt, root or link, and the target, receipt and
-    # drive roots are unchanged.
-    _, no_git = ignore_fixture(
-        proof, root, "no-git", "/target\n/.oxide-outputs/\n", empty=True
-    )
-    refused_untouched(
-        proof,
-        pool,
-        mount,
-        no_git,
-        "no Git binary on PATH",
-        ["outputs", "adopt"],
-        ("could not confirm", "cannot run git"),
-        env=no_git_env,
-        empty=True,
-    )
-    _, slow = ignore_fixture(proof, root, "slow-git", "/target\n/.oxide-outputs/\n")
-    slow_dir = fake_git(root, "timeout", "#!/bin/sh\nexec sleep 30\n")
-    refused_untouched(
-        proof,
-        pool,
-        mount,
-        slow,
-        "a Git that does not answer in time",
-        ["outputs", "adopt"],
-        ("did not finish in time",),
-        env=dict(proof.env, PATH=slow_dir + ":" + proof.env["PATH"]),
-    )
-    real_git = shutil.which("git")
-    expect(real_git is not None, "git is not on the host PATH")
-    _, invalid = ignore_fixture(proof, root, "invalid-git", "/target\n/.oxide-outputs/\n")
-    invalid_dir = fake_git(
-        root,
-        "invalid",
-        "#!/bin/sh\ncase \"$*\" in\n  *check-ignore*) printf 'not-a-rule'; exit 0 ;;\nesac\n"
-        f'exec "{real_git}" "$@"\n',
-    )
-    refused_untouched(
-        proof,
-        pool,
-        mount,
-        invalid,
-        "a malformed Git ignore answer",
-        ["outputs", "adopt"],
-        ("not one complete record",),
-        env=dict(proof.env, PATH=invalid_dir + ":" + proof.env["PATH"]),
-    )
-    _, failing = ignore_fixture(proof, root, "failing-git", "/target\n/.oxide-outputs/\n")
-    failing_dir = fake_git(
-        root,
-        "error",
-        "#!/bin/sh\ncase \"$*\" in\n  *check-ignore*) exit 128 ;;\nesac\n"
-        f'exec "{real_git}" "$@"\n',
-    )
-    refused_untouched(
-        proof,
-        pool,
-        mount,
-        failing,
-        "a failing Git ignore call",
-        ["outputs", "adopt"],
-        ("did not answer",),
-        env=dict(proof.env, PATH=failing_dir + ":" + proof.env["PATH"]),
-    )
-    proof.phase("after the unknown-Git controls")
-
-    # 6. Present but unadoptable targets keep their content and are not
-    #    covered by this guard.
-    _, nonempty = ignore_fixture(proof, root, "nonempty", "/target\n/.oxide-outputs/\n")
-    os.makedirs(os.path.join(nonempty, "target"))
-    with open(os.path.join(nonempty, "target", "keep.txt"), "wb") as handle:
-        handle.write(b"warm build")
-    code, _, stderr = proof.oxide(["outputs", "adopt"], "a nonempty target keeps its file", nonempty)
-    expect(code == 0, f"adopt refused a nonempty target: {stderr}")
-    expect(
-        read_bytes(os.path.join(nonempty, "target", "keep.txt")) == b"warm build",
-        "the top-level target file was moved",
-    )
-    expect(os.path.isdir(os.path.join(nonempty, "target")), "the real target was replaced")
-    expect_published(proof, pool, mount, nonempty, "a nonempty target's members")
-
-    outside = os.path.join(root, "outside")
-    os.makedirs(outside)
-    with open(os.path.join(outside, "sentinel"), "wb") as handle:
-        handle.write(b"foreign")
-    _, foreign = ignore_fixture(proof, root, "foreign", "/target\n/.oxide-outputs/\n")
-    os.symlink(outside, os.path.join(foreign, "target"))
-    code, _, stderr = proof.oxide(["outputs", "adopt"], "a foreign link is kept", foreign)
-    expect(code != 0 and "never moves" in stderr, stderr)
-    expect(os.readlink(os.path.join(foreign, "target")) == outside, "the foreign link was replaced")
-    expect(read_bytes(os.path.join(outside, "sentinel")) == b"foreign", "the referent mutated")
-
-    absent = os.path.join(root, "absent-root")
-    _, dangling = ignore_fixture(proof, root, "dangling", "/target\n/.oxide-outputs/\n")
-    os.symlink(absent, os.path.join(dangling, "target"))
-    code, _, stderr = proof.oxide(["outputs", "adopt"], "a dangling link is kept", dangling)
-    expect(code != 0 and "never moves" in stderr, stderr)
-    expect(os.readlink(os.path.join(dangling, "target")) == absent, "the dangling link was replaced")
-    expect(not os.path.lexists(absent), "the dangling link's root was created")
-    proof.phase("after present-target controls")
-
-    # 7. Prepared first-conversion replay rechecks the prerequisite: a rule
-    #    removed after the crash refuses to replay and keeps the prepared
-    #    receipt; restoring the rule replays and commits.
-    _, replay = ignore_fixture(proof, root, "replay", "/target\n/.oxide-outputs/\n")
-    crash_env = dict(proof.env, OXIDE_TEST_OUTPUTS_CRASH="prepared")
-    code, _, stderr = oxide_env(proof, ["outputs", "adopt"], "crash after the prepared receipt", replay, crash_env)
-    expect(code != 0 and "injected transition stop at prepared" in stderr, stderr)
-    link = os.path.join(replay, "target", "debug")
-    expect(not os.path.lexists(link), "the crash published a member link")
-    prepared = read_json(receipt_file(pool, replay))
-    expect(prepared["state"] == "prepared", prepared)
-    expect(prepared["layout"] == "profile", prepared)
-    before_roots = roots_on(mount)
-    with open(os.path.join(replay, ".gitignore"), "w", encoding="utf-8") as handle:
-        handle.write("/.oxide-outputs/\n")
-    code, _, stderr = proof.oxide(["outputs", "adopt"], "replay refuses an unignored target", replay)
-    expect(code != 0 and "does not ignore" in stderr, stderr)
-    expect(not os.path.lexists(link), "the refused replay published a link")
-    expect(
-        read_json(receipt_file(pool, replay))["state"] == "prepared",
-        "the refused replay rewrote the prepared receipt",
-    )
-    expect(roots_on(mount) == before_roots, "the refused replay created a root")
-    with open(os.path.join(replay, ".gitignore"), "w", encoding="utf-8") as handle:
-        handle.write("/target\n/.oxide-outputs/\n")
-    code, stdout, stderr = proof.oxide(["outputs", "adopt"], "replay after restoring the rule", replay)
-    expect(code == 0 and "now selects" in stdout, stdout + stderr)
-    replay_root = expect_published(proof, pool, mount, replay, "the replayed first conversion")
-    expect(os.path.isdir(replay_root), "the replayed root is missing")
-    proof.phase("after the replay case")
-
-    # 8. Accepted publications: an automatic first conversion, an explicit one
-    #    and a nested workspace all hide the link from Git.
-    _, automatic = ignore_fixture(proof, root, "auto-accepted", "/target\n/.oxide-outputs/\n")
-    code, _, stderr = proof.oxide(["build"], "automatic adoption publishes an ignored link", automatic)
-    expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
-    expect_published(proof, pool, mount, automatic, "the automatic first conversion")
-    expect(
-        os.path.isfile(os.path.join(automatic, "target", "debug", "poutputs")),
-        "the automatic conversion built nothing through the link",
-    )
-
-    _, explicit = ignore_fixture(proof, root, "explicit-accepted", "target\n/.oxide-outputs/\n")
-    code, stdout, stderr = proof.oxide(["outputs", "adopt"], "explicit adoption with `target`", explicit)
-    expect(code == 0 and "now selects" in stdout, stdout + stderr)
-    explicit_root = expect_published(proof, pool, mount, explicit, "the explicit first conversion")
-
-    nested_repo, nested_ok = ignore_fixture(
-        proof, root, "nested-accepted", "/rust/target\n.oxide-outputs/\n", relative="rust"
-    )
-    code, stdout, stderr = proof.oxide(["outputs", "adopt"], "nested /rust/target", nested_ok)
-    expect(code == 0 and "now selects" in stdout, stdout + stderr)
-    expect_published(proof, pool, mount, nested_ok, "the nested first conversion")
-    # The nested check is non-vacuous: a wholly untracked workspace collapses to
-    # `rust/` in plain `git status`, but with every untracked file listed and
-    # exact NUL-delimited paths, removing the rule exposes `rust/target`.
-    nested_ignore = os.path.join(nested_repo, ".gitignore")
-    nested_saved = read_bytes(nested_ignore)
-    with open(nested_ignore, "wb") as handle:
-        handle.write(b"")
-    try:
-        expected = repo_relative_target(proof, nested_ok)
-        exposed = git_status_names_target(proof, nested_ok)
+    def case_nested() -> None:
+        # 2. A nested workspace names its exact repository-relative path, and a
+        #    directory-only nested rule covers the nested member too.
+        _, nested = ignore_fixture(
+            proof,
+            root,
+            "nested-empty",
+            "/rust/target/\n.oxide-outputs/\n",
+            relative="rust",
+            empty=True,
+        )
+        code, _, stderr = proof.oxide(["outputs", "adopt"], "nested /rust/target/", nested)
+        expect(code == 0, f"the nested directory rule was refused: {stderr}")
+        expect_published(proof, pool, mount, nested, "the nested directory rule")
+        _, nested_missing = ignore_fixture(
+            proof, root, "nested-unignored", ".oxide-outputs/\n", relative="rust"
+        )
+        refused_untouched(
+            proof,
+            pool,
+            mount,
+            nested_missing,
+            "a nested checkout with no target rule",
+            ["outputs", "adopt"],
+            ("does not ignore",),
+        )
         expect(
-            any(entry[3:] == expected for entry in exposed),
-            f"the nested detector missed an exposed target: {exposed}",
+            not os.path.lexists(os.path.join(nested_missing, "target")),
+            "a refused nested conversion created a target",
         )
-    finally:
-        with open(nested_ignore, "wb") as handle:
-            handle.write(nested_saved)
-    expect_published(proof, pool, mount, nested_ok, "the nested first conversion restored")
-    proof.phase("after accepted publications")
 
-    # 9. Detach still works for an existing owned link.
-    set_mode(proof, "ephemeral", explicit)
-    code, stdout, stderr = proof.oxide(["outputs", "detach"], "detach an owned ignored link", explicit)
-    expect(code == 0 and "real empty directory again" in stdout, stdout + stderr)
-    detached = os.path.join(explicit, "target")
-    expect(os.path.isdir(detached) and not os.path.islink(detached), "detach left a link")
-    for member in ("debug", "release"):
-        path = os.path.join(detached, member)
-        expect(
-            os.path.isdir(path) and not os.path.islink(path),
-            f"detach did not restore a real {member} directory",
+
+    def case_negated() -> None:
+        # 3. Negated and unignored paths refuse; nothing links.
+        _, negated = ignore_fixture(
+            proof, root, "negated", "/target/\n!/target/debug\n/.oxide-outputs/\n"
         )
-        expect(os.listdir(path) == [], f"the detached {member} is not empty")
-    expect(os.path.isdir(explicit_root), "detach deleted the output root")
-    set_mode(proof, "permanent", explicit)
-    proof.phase("after detach")
+        stderr = refused_untouched(
+            proof,
+            pool,
+            mount,
+            negated,
+            "a rule that re-includes the debug member",
+            ["outputs", "adopt"],
+            ("re-includes",),
+        )
+        expect("target/debug" in stderr, stderr)
+        _, unignored = ignore_fixture(proof, root, "unignored", "/.oxide-outputs/\n")
+        refused_untouched(
+            proof,
+            pool,
+            mount,
+            unignored,
+            "an unignored target",
+            ["outputs", "adopt"],
+            ("does not ignore",),
+        )
+
+
+    def case_tracked() -> None:
+        # 4. A tracked path refuses even when the working tree has no target.
+        _, tracked = ignore_fixture(proof, root, "tracked", "/target\n/.oxide-outputs/\n")
+        os.makedirs(os.path.join(tracked, "target"))
+        with open(os.path.join(tracked, "target", "debug"), "wb") as handle:
+            handle.write(b"tracked")
+        added = proof.run(["git", "add", "-f", "target/debug"], cwd=tracked, timeout=30)
+        expect(added.returncode == 0, f"git add failed: {added.stderr!r}")
+        os.remove(os.path.join(tracked, "target", "debug"))
+        stderr = refused_untouched(
+            proof,
+            pool,
+            mount,
+            tracked,
+            "a tracked member path",
+            ["outputs", "adopt"],
+            ("already tracks",),
+            empty=True,
+        )
+        expect("target/debug" in stderr, stderr)
+
+
+    def case_unknown_git() -> None:
+        # 5. Unknown Git is never permission: no repository, no Git binary, a
+        #    timeout, a command error and a malformed answer all refuse.
+        _, no_repo = ignore_fixture(proof, root, "no-repository", "/target\n", git=False)
+        refused_untouched(
+            proof,
+            pool,
+            mount,
+            no_repo,
+            "no Git repository",
+            ["outputs", "adopt"],
+            ("could not confirm",),
+        )
+        no_git_env = dict(proof.env, PATH=private_path(root))
+        # A leased *build* in this class is ineligibility, not a refusal
+        # (oxide#154), so this control asks the explicit conversion over a real
+        # empty target adopt never creates: the member's missing prerequisite
+        # refuses before any receipt, root or link, and the target, receipt and
+        # drive roots are unchanged.
+        _, no_git = ignore_fixture(
+            proof, root, "no-git", "/target\n/.oxide-outputs/\n", empty=True
+        )
+        refused_untouched(
+            proof,
+            pool,
+            mount,
+            no_git,
+            "no Git binary on PATH",
+            ["outputs", "adopt"],
+            ("could not confirm", "cannot run git"),
+            env=no_git_env,
+            empty=True,
+        )
+        _, slow = ignore_fixture(proof, root, "slow-git", "/target\n/.oxide-outputs/\n")
+        slow_dir = fake_git(root, "timeout", "#!/bin/sh\nexec sleep 30\n")
+        refused_untouched(
+            proof,
+            pool,
+            mount,
+            slow,
+            "a Git that does not answer in time",
+            ["outputs", "adopt"],
+            ("did not finish in time",),
+            env=dict(proof.env, PATH=slow_dir + ":" + proof.env["PATH"]),
+        )
+        real_git = shutil.which("git")
+        expect(real_git is not None, "git is not on the host PATH")
+        _, invalid = ignore_fixture(proof, root, "invalid-git", "/target\n/.oxide-outputs/\n")
+        invalid_dir = fake_git(
+            root,
+            "invalid",
+            "#!/bin/sh\ncase \"$*\" in\n  *check-ignore*) printf 'not-a-rule'; exit 0 ;;\nesac\n"
+            f'exec "{real_git}" "$@"\n',
+        )
+        refused_untouched(
+            proof,
+            pool,
+            mount,
+            invalid,
+            "a malformed Git ignore answer",
+            ["outputs", "adopt"],
+            ("not one complete record",),
+            env=dict(proof.env, PATH=invalid_dir + ":" + proof.env["PATH"]),
+        )
+        _, failing = ignore_fixture(proof, root, "failing-git", "/target\n/.oxide-outputs/\n")
+        failing_dir = fake_git(
+            root,
+            "error",
+            "#!/bin/sh\ncase \"$*\" in\n  *check-ignore*) exit 128 ;;\nesac\n"
+            f'exec "{real_git}" "$@"\n',
+        )
+        refused_untouched(
+            proof,
+            pool,
+            mount,
+            failing,
+            "a failing Git ignore call",
+            ["outputs", "adopt"],
+            ("did not answer",),
+            env=dict(proof.env, PATH=failing_dir + ":" + proof.env["PATH"]),
+        )
+        proof.phase("after the unknown-Git controls")
+
+
+    def case_present_target() -> None:
+        # 6. Present but unadoptable targets keep their content and are not
+        #    covered by this guard.
+        _, nonempty = ignore_fixture(proof, root, "nonempty", "/target\n/.oxide-outputs/\n")
+        os.makedirs(os.path.join(nonempty, "target"))
+        with open(os.path.join(nonempty, "target", "keep.txt"), "wb") as handle:
+            handle.write(b"warm build")
+        code, _, stderr = proof.oxide(["outputs", "adopt"], "a nonempty target keeps its file", nonempty)
+        expect(code == 0, f"adopt refused a nonempty target: {stderr}")
+        expect(
+            read_bytes(os.path.join(nonempty, "target", "keep.txt")) == b"warm build",
+            "the top-level target file was moved",
+        )
+        expect(os.path.isdir(os.path.join(nonempty, "target")), "the real target was replaced")
+        expect_published(proof, pool, mount, nonempty, "a nonempty target's members")
+
+        outside = os.path.join(root, "outside")
+        os.makedirs(outside)
+        with open(os.path.join(outside, "sentinel"), "wb") as handle:
+            handle.write(b"foreign")
+        _, foreign = ignore_fixture(proof, root, "foreign", "/target\n/.oxide-outputs/\n")
+        os.symlink(outside, os.path.join(foreign, "target"))
+        code, _, stderr = proof.oxide(["outputs", "adopt"], "a foreign link is kept", foreign)
+        expect(code != 0 and "never moves" in stderr, stderr)
+        expect(os.readlink(os.path.join(foreign, "target")) == outside, "the foreign link was replaced")
+        expect(read_bytes(os.path.join(outside, "sentinel")) == b"foreign", "the referent mutated")
+
+        absent = os.path.join(root, "absent-root")
+        _, dangling = ignore_fixture(proof, root, "dangling", "/target\n/.oxide-outputs/\n")
+        os.symlink(absent, os.path.join(dangling, "target"))
+        code, _, stderr = proof.oxide(["outputs", "adopt"], "a dangling link is kept", dangling)
+        expect(code != 0 and "never moves" in stderr, stderr)
+        expect(os.readlink(os.path.join(dangling, "target")) == absent, "the dangling link was replaced")
+        expect(not os.path.lexists(absent), "the dangling link's root was created")
+        proof.phase("after present-target controls")
+
+
+    def case_replay() -> None:
+        # 7. Prepared first-conversion replay rechecks the prerequisite: a rule
+        #    removed after the crash refuses to replay and keeps the prepared
+        #    receipt; restoring the rule replays and commits.
+        _, replay = ignore_fixture(proof, root, "replay", "/target\n/.oxide-outputs/\n")
+        crash_env = dict(proof.env, OXIDE_TEST_OUTPUTS_CRASH="prepared")
+        code, _, stderr = oxide_env(proof, ["outputs", "adopt"], "crash after the prepared receipt", replay, crash_env)
+        expect(code != 0 and "injected transition stop at prepared" in stderr, stderr)
+        link = os.path.join(replay, "target", "debug")
+        expect(not os.path.lexists(link), "the crash published a member link")
+        prepared = read_json(receipt_file(pool, replay))
+        expect(prepared["state"] == "prepared", prepared)
+        expect(prepared["layout"] == "profile", prepared)
+        before_roots = roots_on(mount)
+        with open(os.path.join(replay, ".gitignore"), "w", encoding="utf-8") as handle:
+            handle.write("/.oxide-outputs/\n")
+        code, _, stderr = proof.oxide(["outputs", "adopt"], "replay refuses an unignored target", replay)
+        expect(code != 0 and "does not ignore" in stderr, stderr)
+        expect(not os.path.lexists(link), "the refused replay published a link")
+        expect(
+            read_json(receipt_file(pool, replay))["state"] == "prepared",
+            "the refused replay rewrote the prepared receipt",
+        )
+        expect(roots_on(mount) == before_roots, "the refused replay created a root")
+        with open(os.path.join(replay, ".gitignore"), "w", encoding="utf-8") as handle:
+            handle.write("/target\n/.oxide-outputs/\n")
+        code, stdout, stderr = proof.oxide(["outputs", "adopt"], "replay after restoring the rule", replay)
+        expect(code == 0 and "now selects" in stdout, stdout + stderr)
+        replay_root = expect_published(proof, pool, mount, replay, "the replayed first conversion")
+        expect(os.path.isdir(replay_root), "the replayed root is missing")
+        proof.phase("after the replay case")
+
+
+    def case_accepted_detach() -> None:
+        try:
+            # 8. Accepted publications: an automatic first conversion, an explicit one
+            #    and a nested workspace all hide the link from Git.
+            _, automatic = ignore_fixture(proof, root, "auto-accepted", "/target\n/.oxide-outputs/\n")
+            code, _, stderr = proof.oxide(["build"], "automatic adoption publishes an ignored link", automatic)
+            expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
+            expect_published(proof, pool, mount, automatic, "the automatic first conversion")
+            expect(
+                os.path.isfile(os.path.join(automatic, "target", "debug", "poutputs")),
+                "the automatic conversion built nothing through the link",
+            )
+
+            _, explicit = ignore_fixture(proof, root, "explicit-accepted", "target\n/.oxide-outputs/\n")
+            code, stdout, stderr = proof.oxide(["outputs", "adopt"], "explicit adoption with `target`", explicit)
+            expect(code == 0 and "now selects" in stdout, stdout + stderr)
+            explicit_root = expect_published(proof, pool, mount, explicit, "the explicit first conversion")
+
+            nested_repo, nested_ok = ignore_fixture(
+                proof, root, "nested-accepted", "/rust/target\n.oxide-outputs/\n", relative="rust"
+            )
+            code, stdout, stderr = proof.oxide(["outputs", "adopt"], "nested /rust/target", nested_ok)
+            expect(code == 0 and "now selects" in stdout, stdout + stderr)
+            expect_published(proof, pool, mount, nested_ok, "the nested first conversion")
+            # The nested check is non-vacuous: a wholly untracked workspace collapses to
+            # `rust/` in plain `git status`, but with every untracked file listed and
+            # exact NUL-delimited paths, removing the rule exposes `rust/target`.
+            nested_ignore = os.path.join(nested_repo, ".gitignore")
+            nested_saved = read_bytes(nested_ignore)
+            with open(nested_ignore, "wb") as handle:
+                handle.write(b"")
+            try:
+                expected = repo_relative_target(proof, nested_ok)
+                exposed = git_status_names_target(proof, nested_ok)
+                expect(
+                    any(entry[3:] == expected for entry in exposed),
+                    f"the nested detector missed an exposed target: {exposed}",
+                )
+            finally:
+                with open(nested_ignore, "wb") as handle:
+                    handle.write(nested_saved)
+            expect_published(proof, pool, mount, nested_ok, "the nested first conversion restored")
+            proof.phase("after accepted publications")
+
+            # 9. Detach still works for an existing owned link.
+            set_mode(proof, "ephemeral", explicit)
+            code, stdout, stderr = proof.oxide(["outputs", "detach"], "detach an owned ignored link", explicit)
+            expect(code == 0 and "real empty directory again" in stdout, stdout + stderr)
+            detached = os.path.join(explicit, "target")
+            expect(os.path.isdir(detached) and not os.path.islink(detached), "detach left a link")
+            for member in ("debug", "release"):
+                path = os.path.join(detached, member)
+                expect(
+                    os.path.isdir(path) and not os.path.islink(path),
+                    f"detach did not restore a real {member} directory",
+                )
+                expect(os.listdir(path) == [], f"the detached {member} is not empty")
+            expect(os.path.isdir(explicit_root), "detach deleted the output root")
+            set_mode(proof, "permanent", explicit)
+            proof.phase("after detach")
+        except Exception as fault:
+            raise ProofAbort(f"shared fixture state uncertain: {fault}") from fault
+
+    cases = [
+        ("directory_rules", (), case_directory_rules),
+        ("nested", (), case_nested),
+        ("negated", (), case_negated),
+        ("tracked", (), case_tracked),
+        ("unknown_git", (), case_unknown_git),
+        ("present_target", (), case_present_target),
+        ("replay", (), case_replay),
+        ("accepted_detach", (), case_accepted_detach),
+    ]
+    finish_fixture_cases(proof, pool, mount, cases, diagnostic)
     proof.detach()
 
 
@@ -3149,6 +3209,26 @@ def collect_cases(
         elif result["result"] == "aborted":
             record.aborted = f"{case}: {result['fault']}"
     return record
+
+
+
+def finish_fixture_cases(proof: Proof, pool: str, mount: str, cases, diagnostic: bool) -> None:
+    """Collect independent fixture groups without proceeding on unknown custody."""
+    collection = proof.collection
+    if diagnostic:
+        guard_writer_custody(proof)
+
+    def after_case(case: str) -> None:
+        if proof.unclosed or not proof.mount or not os.path.ismount(proof.mount):
+            raise ProofAbort(f"{case}: image or writer custody is not closed")
+        if not os.path.isfile(registration_path(pool)):
+            raise ProofAbort(f"{case}: removable registration is absent")
+        phase(proof, f"after {case}")
+
+    collect_cases(cases, diagnostic=diagnostic, work_left=guard_work_left,
+                  after_case=after_case, record=collection)
+    if diagnostic and (collection.failures or collection.aborted):
+        fail("fixture diagnostic did not complete cleanly")
 
 
 def exec_case_rows(outcomes: dict[str, dict]) -> list[dict]:
@@ -6994,15 +7074,15 @@ def main() -> int:
     if diagnostic:
         arguments.remove("--diagnostic")
         expect(
-            tuple(arguments) in ((), ("exec-inference",), ("auto-ineligible",), ("base-compat",)),
+            tuple(arguments) in ((), ("exec-inference",), ("auto-ineligible",), ("base-compat",), ("auto-adopt",), ("detach-permanent",), ("ignore-safety",)),
             "--diagnostic belongs to permanent-outputs, exec-inference, auto-ineligible or base-compat",
         )
     modes = {
         (): (lambda proof, repo: run(proof, repo, diagnostic=diagnostic), "permanent-outputs"),
         ("base-compat",): (lambda proof, repo: run(proof, repo, True), "base-compat"),
-        ("auto-adopt",): (auto_run, "auto-adopt"),
-        ("detach-permanent",): (detach_run, "detach-permanent"),
-        ("ignore-safety",): (ignore_run, "ignore-safety"),
+        ("auto-adopt",): (lambda proof, repo: auto_run(proof, repo, diagnostic), "auto-adopt"),
+        ("detach-permanent",): (lambda proof, repo: detach_run(proof, repo, diagnostic), "detach-permanent"),
+        ("ignore-safety",): (lambda proof, repo: ignore_run(proof, repo, diagnostic), "ignore-safety"),
         ("exec-inference",): (
             lambda proof, repo: exec_run(proof, repo, diagnostic),
             "exec-inference",
@@ -7021,13 +7101,13 @@ def main() -> int:
     signal.signal(signal.SIGALRM, overdue)
     signal.setitimer(signal.ITIMER_REAL, work_left())
     proof = Proof(root)
-    if label == "permanent-outputs":
+    if label in ("permanent-outputs", "auto-adopt", "detach-permanent", "ignore-safety"):
         proof.collection = Collection()
     try:
         scenario(proof, repo)
     except BaseException as failure:
-        if label == "permanent-outputs":
-            record("permanent-outputs-cases.json", json.dumps({"mode": label, "kind": "diagnostic" if diagnostic else "counted", "qualified": False, "cases": getattr(proof.collection, "outcomes", {}), "failures": proof.collection.failures, "aborted": proof.collection.aborted, "failure": repr(failure)[:600]}))
+        if label in ("permanent-outputs", "auto-adopt", "detach-permanent", "ignore-safety"):
+            record(label + "-cases.json", json.dumps({"mode": label, "kind": "diagnostic" if diagnostic else "counted", "qualified": False, "cases": getattr(proof.collection, "outcomes", {}), "failures": proof.collection.failures, "aborted": proof.collection.aborted, "failure": repr(failure)[:600]}))
         if label == "base-compat":
             record("base-compat-receipt.json", json.dumps({"mode": "base-compat", "kind": "diagnostic" if diagnostic else "counted", "cases": ([{"case": "historical-base", "outcome": "failed"}] if getattr(proof, "base_case_started", False) else []), "qualified": False, "failure": repr(failure)[:600]}))
         cleanup = cleanup_after_failure(proof, getattr(proof, "collection", None))
@@ -7048,8 +7128,8 @@ def main() -> int:
         raise
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
-    if label == "permanent-outputs":
-        record("permanent-outputs-cases.json", json.dumps({"mode": label, "kind": "diagnostic" if diagnostic else "counted", "qualified": False, "cases": proof.collection.outcomes, "failures": proof.collection.failures, "aborted": proof.collection.aborted}))
+    if label in ("permanent-outputs", "auto-adopt", "detach-permanent", "ignore-safety"):
+        record(label + "-cases.json", json.dumps({"mode": label, "kind": "diagnostic" if diagnostic else "counted", "qualified": False, "cases": proof.collection.outcomes, "failures": proof.collection.failures, "aborted": proof.collection.aborted}))
     if label == "base-compat":
         record("base-compat-receipt.json", json.dumps({"mode": "base-compat", "kind": "diagnostic" if diagnostic else "counted", "cases": [{"case": "historical-base", "outcome": "completed"}], "qualified": False}))
     expect(proof.detach_confirmed, f"ordinary detach unconfirmed; retained {proof.image}")
