@@ -341,6 +341,39 @@ read, or a stable-looking pair of sequential plans, is not proof of identical
 inputs. This constraint does not authorize redirecting production account trust
 or enabling Barge's synthetic-account feature in the production dependency.
 
+### D8 comparison cases and source boundaries
+
+These are required comparisons, not parity evidence. Each case needs the same
+bounded facts on both sides and must retain each evaluator's own result and
+reason. A refusal is not equivalent to an eligible root. An unreadable or
+unbound observation makes the comparison insufficient, even if both sides keep.
+The sources here are Oxide's `src/bin/oxide/prune.rs` and Barge's O1 pin
+`4af9360bd09629e970c143080ca159de8eef2562`, especially
+`crates/barge/src/{release,reference,pool_custody}.rs`.
+
+| Input or rule | Required positive and counterfactual cases |
+| --- | --- |
+| Registry | Complete and valid; incomplete, missing, malformed, oversized or contradictory. The batch must not be presented as complete when authority is unknown. |
+| Current references | Separately exercise selected, pending, reservation, cancelling and pruning, plus an inactive row; test shared roots across checkouts and members. |
+| Overflow | Sticky incompleteness and cancelled overflow, including an unfinished cancellation. Do not equate an unexamined overflow with no reference. |
+| Receipts | Both supported predecessor and current formats, committed selection, history, preparation and reservation; missing, malformed and contradictory receipts. Preserve any format-specific keep. |
+| Markers | Both `/1` and `/2`, absent, malformed and replaced markers. Barge's `read_oxide_marker` reports `/1` unknown; that is not evidence that it parsed `/1` as `/2`. |
+| Root identity | Match and individually change nonce, generation, kind, marker digest and inode. Oxide checks committed receipt and recorded marker identity; Barge's reference reader uses root paths for reference attribution and does not compare the row nonce to Barge's nonce. A difference needs an actual per-root observation, not an assumed match. |
+| Checkout absence | Present, positively absent, missing ancestor, unreadable or replaced ancestor, and the listed legacy boot-Data exception. Preserve volume binding and distinguish unknown from absence. |
+| Volume | Same UUID, remount, duplicate UUID and absent volume; independently change root device and inode. A volume refusal is not an empty matching root set. |
+| Writer custody | Closed, held and unknown in each pool, including a writer in the other pool and unattributed custody. The existing writer-snapshot refusal packet `c9bf3953` is a coverage limit, not a parity result. |
+| Control fence | Known ready fence, missing fence and unknown version or owner; preserve any whole-batch refusal. |
+| Intents | Pending Oxide intent and settled intent, including intent naming a root otherwise eligible. Oxide's dry run refuses an unfinished journal before evaluation; Barge's reference reader marks a named unfinished intent current. Compare those different scopes honestly. |
+| Operator list and legacy | Listed and unlisted legacy roots, receiptless legacy, and a nonlegacy counterfactual. The list does not waive other checks and is not a Barge history waiver. |
+
+The frozen D-1 prose predates Oxide's device reconciliation. In current
+`judge_recorded_root`, a stale recorded device alone is accepted when the
+verified volume, inode and marker identity still match; a device change during
+this run remains subject to the current binding. Therefore a device-only fixture
+must test the actual circumstances and must not be forced to disagree. D-2's
+batch-versus-root scope and D-3's legacy partition likewise need demonstrated
+results. Any other disagreement remains unexplained and blocks O3.
+
 ## Failure and race matrix
 
 "Keeps" means the root, its marker, its registry row and any pending intent are
