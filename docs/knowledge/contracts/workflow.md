@@ -6257,7 +6257,13 @@ separate duplicate-row path: a missing pending reference could append an already
 matched selected member. It now adds only the missing pending reference; the focused
 regression checks a shared selected group with one stale device. The exact cause of
 the recorded case-04 packet remains subject to a fresh diagnostic, not assumed proven
-by the regression. No live prune, dry run,
+by the regression. The `e76407d` diagnostic closed its guard but failed case 10:
+a listed foreign root lacked an owner marker, so incomplete authority kept the
+whole batch; cases 11–22 were skipped and no counted native was spent. The case
+now separately checks whole-batch refusal and nonmutation for a foreign root and
+a forged checkout digest, then tests the eligible boot-Data root alongside the
+per-root image-checkout keep with a complete preview. This is fixture correction,
+not product evidence; a fresh diagnostic remains required. No live prune, dry run,
 `resolve-intent`, mode, consumer or pool mutation is authorized by this implementation.
 
 ## Adaptive sccache location (proposed)

@@ -182,8 +182,8 @@ CASE_PLAN/CASE_NAMES, and the dependency column is exactly what a
   10 receiptless legacy roots: the one whose checkout is on the boot Data
      volume (device + APFS UUID proof) gets its exclusive pruning receipt and
      is deleted (receipt `pruned`/`deleted`); the one whose checkout is on the
-     attached scratch image, a foreign directory and a marker whose checkout
-     identity is not its path digest are kept, bytes unchanged.
+     attached scratch image is kept. Separate foreign-marker and forged-digest
+     controls refuse the whole batch before deletion, with bytes unchanged.
   11 active writer: a build script holds Cargo Running in a vanished checkout;
      its root is kept with a writer reason.
   12 containment and reserve: a root replaced by a symlink is kept; a symlink
@@ -2823,18 +2823,40 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
         with open(os.path.join(forged_root, ".oxide-output.json"), "w", encoding="utf-8") as handle:
             json.dump(forged_marker, handle)
         kept_before = {root: tree_bytes(root) for root in (foreign_root, forged_root, image_root)}
+        # Delta is present for all three previews, so it cannot be pruned by
+        # a control. Each invalid listed authority must refuse the WHOLE batch,
+        # including the otherwise eligible legacy root, without any effect.
+        world.restore(delta, delta_away)
+        for label, bad_root, reason in (
+            ("foreign", foreign_root, "no readable owner marker"),
+            ("forged", forged_root, "digest"),
+        ):
+            bad_list = os.path.join(proof.root, f"list-{label}.json")
+            with open(bad_list, "w", encoding="utf-8") as handle:
+                json.dump([legacy_root, bad_root], handle)
+            before = {root: tree_bytes(root) for root in (legacy_root, bad_root)}
+            authority_before = tree_bytes(world.control)
+            plan, sha, preview = world.plan_file(f"{label} refusal dry run", alpha, bad_list)
+            expect((preview.get("coverage") or {}).get("complete") is False, world.report(preview))
+            expect(not world.candidates(preview), world.report(preview))
+            expect(reason in world.kept(preview, legacy_root), world.report(preview))
+            code, _, stderr = world.real_run(f"{label} refusal real run", alpha, plan, sha, bad_list)
+            expect(code == 2, f"{label} refusal exited {code}: {stderr}")
+            expect(tree_bytes(world.control) == authority_before, f"{label} refusal changed control")
+            for root, digest in before.items():
+                expect(os.path.isdir(root) and tree_bytes(root) == digest, f"{label} refusal changed {root}")
+            expect(not os.path.exists(permanent.receipt_file(world.pool, legacy_checkout)),
+                   f"{label} refusal created a legacy receipt")
+            expect(not world.intents() and not world.quarantines(), f"{label} refusal journaled")
+
         listed = os.path.join(proof.root, "list-legacy.json")
         with open(listed, "w", encoding="utf-8") as handle:
-            json.dump([legacy_root, image_root, foreign_root, forged_root], handle)
-        # Delta (an ordinary eligible root) is present for this run so only the
-        # listed legacy roots are candidates; it vanishes again afterwards.
-        world.restore(delta, delta_away)
+            json.dump([legacy_root, image_root], handle)
         plan, sha, preview = world.plan_file("legacy dry run", alpha, listed)
-        expect(legacy_root in world.candidates(preview), f"legacy root not a candidate: {world.kept(preview, legacy_root)}")
-        expect(image_root not in world.candidates(preview), "a legacy root of an image checkout became a candidate")
-        expect("volume" in world.kept(preview, image_root), world.kept(preview, image_root))
-        expect(foreign_root not in world.candidates(preview), "a foreign directory became a candidate")
-        expect("digest" in world.kept(preview, forged_root), world.kept(preview, forged_root))
+        world.complete(preview, "legacy dry run")
+        expect(legacy_root in world.candidates(preview), world.report(preview))
+        expect(image_root not in world.candidates(preview), world.report(preview))
+        expect("volume" in world.kept(preview, image_root), world.report(preview))
         code, stdout, stderr = world.real_run("legacy real run", alpha, plan, sha, listed)
         expect(code == 0, f"legacy real run exited {code}: {stderr}")
         expect(not os.path.lexists(legacy_root), "the legacy root remains")
@@ -3583,6 +3605,17 @@ def self_test() -> int:
         assert body.count("world.report(preview)") >= 8, body.count("world.report(preview)")
         # The corrupt-receipt case expects the whole batch and says so.
         assert 'get("complete") is False' in body, "the corrupt-receipt case no longer pins incompleteness"
+        # Case 10 must test each bad listed authority before its isolated positive.
+        for fragment in (
+            '("foreign", foreign_root, "no readable owner marker")',
+            '("forged", forged_root, "digest")',
+            'json.dump([legacy_root, bad_root], handle)',
+            'json.dump([legacy_root, image_root], handle)',
+            'world.complete(preview, "legacy dry run")',
+            'expect(code == 2, f"{label} refusal exited {code}: {stderr}")',
+        ):
+            assert fragment in body, fragment
+
 
         # The report itself is bounded and names the coverage and the reasons.
         report = preview_report(
