@@ -83,9 +83,9 @@ The combined case matrix (mode-specific coverage is listed by `--plan`):
  2 a member mutation waits unchanged for a gated Running writer
  3 test / bench / bench --profile debug / doc actual member mapping
  4 a host --target member (`<triple>/debug`)
- 5 unknown-target linked refusal versus an unlinked checkout that still runs
- 6 opaque custom-profile linked refusal and the unchanged modelled custom refusal
- 7 complete exec declaration, undeclared refusal and custom declaration refusal
+ 5 unknown-target linked refusal and receipt-derived external tool placement
+ 6 opaque custom-profile tool passthrough and modelled custom refusal
+ 7 receipt-derived exec, explicit declarations and custom declaration refusal
  8 real nonempty member kept and an empty one converted by explicit adopt
  9 container-style preflight sees a real `target`
 10 legacy whole-target receipt, link and `outputs-2` key unchanged and warm under the successor fence
@@ -208,7 +208,7 @@ CASES = [
     "03-test-bench-doc-mapping",
     "04-host-target-member",
     "05-unknown-target",
-    "06-custom-profile-refusal",
+    "06-custom-profile-passthrough",
     "07-exec-declarations",
     "08-real-nonempty-kept",
     "09-container-preflight",
@@ -3351,13 +3351,19 @@ def run(proof: Proof, repo: str) -> None:
             # An external subcommand has opaque output directories. A2: the positive
             # control comes FIRST and is established on a checkout that is positively
             # unconverted (a real empty target prevents automatic profile
-            # adoption), so the later absence really is the linked refusal. The
+            # adoption), before the linked receipt-derived control. The
             # recording tool is installed under BOTH names a Cargo external subcommand
             # can be looked up as, and it records its exact argv.
             fake_bin = os.path.join(proof.root, "fake-bin")
             os.makedirs(fake_bin, exist_ok=True)
             external_marker = os.path.join(proof.root, "external-tool-ran")
-            fake_body = "#!/bin/sh\nprintf '%s' \"$*\" > \"$OXIDE_FAKE_EXTERNAL_MARKER\"\nexit 0\n"
+            fake_body = (
+                "#!/bin/sh\nprintf '%s' \"$*\" > \"$OXIDE_FAKE_EXTERNAL_MARKER\"\n"
+                "if [ \"${OXIDE_FAKE_EXTERNAL_WRITE:-0}\" = 1 ]; then\n"
+                "  mkdir -p target/debug target/release\n"
+                "  printf debug > target/debug/external-proof\n"
+                "  printf release > target/release/external-proof\nfi\nexit 0\n"
+            )
             for name in ("nextest", "cargo-nextest"):
                 fake = os.path.join(fake_bin, name)
                 with open(fake, "w", encoding="utf-8") as handle:
@@ -3383,58 +3389,38 @@ def run(proof: Proof, repo: str) -> None:
                 "05: the unconverted external control wrote an output receipt",
             )
             os.remove(external_marker)
-            # Now the linked checkout: the same installed tool must not run at all.
-            code, _, stderr = perm.oxide_env(proof, ["nextest", "run"], "05 linked external", unknown, fake_env)
-            expect(code != 0 and "not a command whose profile outputs Oxide models" in stderr, f"05: linked external command was not refused: {stderr}")
-            expect(not os.path.exists(external_marker), "05: the external tool ran in a linked checkout")
+            # Current external commands derive the placed pair from the receipt.
+            linked_receipt = perm.read_bytes(perm.receipt_path(pool, unknown))
+            linked_root = root_of(pool, unknown)
+            linked_env = {**fake_env, "OXIDE_FAKE_EXTERNAL_WRITE": "1"}
+            code, _, stderr = perm.oxide_env(proof, ["nextest", "run"], "05 linked external", unknown, linked_env)
+            expect(code == 0, f"05: linked external command failed: exit {code}: {stderr[-2000:]}")
+            expect(os.path.isfile(external_marker), "05: linked external tool did not run")
+            for member in ("debug", "release"):
+                output = os.path.join(linked_root, member, "external-proof")
+                expect(os.path.islink(member_link(unknown, member)), f"05: {member} link missing")
+                expect(perm.read_bytes(output) == member.encode(), f"05: {member} output did not reach owned root")
+            expect(perm.read_bytes(perm.receipt_path(pool, unknown)) == linked_receipt, "05: external tool changed receipt")
             DIAG.finished("05.1")
         except BaseException as error:
             DIAG.failed_step(proof, "05.1", error)
 
     if DIAG.enter("06.1", fixtures=(first_usable,)):
         try:
-            # ----- case 06: opaque custom-profile refusal -------------------------
+            # ----- case 06: opaque custom-profile passthrough --------------------
             case_reached("06")
             code, _, stderr = oxide(proof, ["build", "--profile", "custom"], "06 modelled custom", first)
             expect(code != 0 and "not an Oxide profile" in stderr, f"06: modelled custom profile was not refused: {stderr}")
-            # Case 05's unlinked run wrote the marker; clear it first so this absence
-            # check is about case 06's refusal, not leftover state.
             if os.path.exists(external_marker):
                 os.remove(external_marker)
-            authority_before = {
-                "receipt": perm.sha256_file(perm.receipt_path(pool, first)),
-                "links": {member: os.readlink(member_link(first, member)) for member in ("debug", "release")},
-                "root_entries": sorted(os.listdir(root)),
-            }
+            receipt_before = perm.read_bytes(perm.receipt_path(pool, first))
+            links_before = {member: os.readlink(member_link(first, member)) for member in ("debug", "release")}
             code, _, stderr = perm.oxide_env(proof, ["nextest", "--profile", "custom"], "06 opaque custom", first, fake_env)
-            # A11: main.rs treats an opaque command as unmodelled and calls
-            # outputs::refuse_unknown_layout, whose Err maps to exit 1. Require that
-            # exact status and the two source-defined semantic parts (the unmodelled
-            # reason naming the command, and the declare-or-detach remedy), never an
-            # arbitrary nonzero.
-            expect(code == 1, f"06: an opaque tool's custom profile exited {code}, not 1: {stderr}")
-            expect(
-                "`nextest` is not a command whose profile outputs Oxide models" in stderr,
-                f"06: the unmodelled-command reason changed: {stderr}",
-            )
-            expect(
-                "will not guess where this command writes" in stderr
-                and "delete its outputs with `oxide exec --output <member>`" not in stderr,
-                f"06: the refusal remedy changed: {stderr}",
-            )
-            expect(
-                "declare its outputs with `oxide exec --output <member>`" in stderr
-                and "oxide outputs detach" in stderr,
-                f"06: the declare-or-detach remedy is missing: {stderr}",
-            )
-            expect(not os.path.exists(external_marker), "06: the opaque tool ran in a linked checkout")
-            expect(
-                perm.sha256_file(perm.receipt_path(pool, first)) == authority_before["receipt"]
-                and {member: os.readlink(member_link(first, member)) for member in ("debug", "release")}
-                == authority_before["links"]
-                and sorted(os.listdir(root)) == authority_before["root_entries"],
-                "06: the opaque refusal changed the checkout authority",
-            )
+            expect(code == 0, f"06: opaque tool failed: exit {code}: {stderr[-2000:]}")
+            expect(os.path.isfile(external_marker), "06: opaque tool did not run")
+            expect(perm.read_bytes(external_marker) == b"nextest --profile custom", "06: opaque argv changed")
+            expect(perm.read_bytes(perm.receipt_path(pool, first)) == receipt_before, "06: opaque tool changed receipt")
+            expect({member: os.readlink(member_link(first, member)) for member in ("debug", "release")} == links_before, "06: opaque tool changed links")
             DIAG.finished("06.1")
         except BaseException as error:
             DIAG.failed_step(proof, "06.1", error)
@@ -3449,8 +3435,9 @@ def run(proof: Proof, repo: str) -> None:
                 handle.write("#!/bin/sh\nprintf '%s' \"$*\" > \"$OXIDE_EXEC_ARGV\"\nexit 0\n")
             os.chmod(script, 0o755)
             exec_env = {**proof.env, "OXIDE_EXEC_ARGV": exec_argv}
-            code, _, stderr = oxide(proof, ["exec", "--", script], "07 undeclared exec", first)
-            expect(code != 0 and "declare" in stderr, f"07: undeclared exec was not refused: {stderr}")
+            code, _, stderr = perm.oxide_env(proof, ["exec", "--", script, "derived"], "07 derived exec", first, exec_env)
+            expect(code == 0, f"07: receipt-derived exec failed: {stderr}")
+            expect(os.path.isfile(exec_argv) and perm.read_bytes(exec_argv) == b"derived", "07: derived exec did not run")
             code, _, stderr = perm.oxide_env(
                 proof,
                 ["exec", "--output", "debug", "--", script, "alpha", "beta"],
@@ -4138,6 +4125,12 @@ def run(proof: Proof, repo: str) -> None:
                 and perm.read_bytes(os.path.join(referent, "keep")) == b"referent",
                 "17: the refused command followed or replaced the foreign link",
             )
+            if os.path.exists(external_marker):
+                os.remove(external_marker)
+            code, _, stderr = perm.oxide_env(proof, ["nextest", "run"], "17 foreign external", malformed, fake_env)
+            expect(code != 0 and foreign in stderr, f"17: external command did not refuse the foreign member: exit {code}: {stderr[-2000:]}")
+            expect(not os.path.exists(external_marker), "17: foreign external command ran the tool")
+            expect(perm.read_bytes(receipt_file(pool, malformed)) == before_receipt and os.readlink(foreign) == referent, "17: external refusal changed authority")
             code, _, stderr = oxide(proof, ["build"], "17 debug still usable", malformed)
             expect(code == 0, f"17: the unaffected debug member stopped building: {stderr}")
             os.remove(foreign)
@@ -4763,6 +4756,11 @@ def pure_mode_contract() -> None:
         else:
             fail("base capability must remain exactly 3")
         OBSERVED_CAPABILITIES.update(base=None, candidate=None)
+        import inspect
+        source = inspect.getsource(run)
+        for required in ("OXIDE_FAKE_EXTERNAL_WRITE", "target/debug/external-proof", "target/release/external-proof", "linked_receipt", "17 foreign external", "07 derived exec"):
+            expect(required in source, f"external inference fixture missing {required}")
+        expect("linked external command was not refused" not in source, "stale linked external refusal remains")
         expect(HELP_EXTERNAL_ARGV == b"nextest --help", "external help argv changed")
         expect(HELP_EXTERNAL_ARGV != b"nextest run --help", "stale help argv accepted")
         expect(not stages_base("builds"), "Builds must not stage the base")
