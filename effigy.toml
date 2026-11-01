@@ -1191,29 +1191,27 @@ run = [
 # writes a uniquely named bounded helper receipt beside the guard's own; that
 # receipt never claims guard closure. Fit is unmeasured; HELD for owner
 # activation — this declaration activates nothing.
-# Internal-placement exception (decision bd357a4c, 2026-10-25): every fixture
-# labels its own pool as `OXIDE_POOL_BACKEND=directory-budget`, a genuine
-# internal directory-budget pool that the product correctly refuses on an
-# external volume, so this recipe declares the qualified guard's explicit
-# internal root (`--root-parent /private/tmp`). One monitored owned root still
-# holds staging, fixtures, temp and evidence under the unchanged 300 s /
-# 512 MiB / reserve / custody / cleanup rules; ordinary builds, tests and
-# proofs keep the selected-volume default.
+# Scratch placement (scratch-pools.md S4): the script declares one private
+# `scratch-pools` directory beneath the supervisor's selected-volume scratch
+# root as OXIDE_SCRATCH_ROOT and places every fixture pool there as a
+# directory-budget scratch pool with an explicit cap. The selector takes the
+# guard's default selected-volume scratch; a /private/tmp fallback refuses
+# before any effect, so it is never reported as scratch-pool coverage. The
+# 300 s / 512 MiB bounds, reserve, custody and cleanup are unchanged.
 [tasks."rust:command-budgets"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-command-budgets.py"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-command-budgets.py"
 
 # Uncounted keep-going collection for oxide#140, run through the same qualified
 # guard, bounds and custody: the fixed script's --diagnostic mode records
 # recoverable oracle failures, continues only into dependency-independent
 # cases and aborts on an unknown child, custody uncertainty, a prerequisite
 # failure or an exhausted deadline. Its receipt is distinctly qualified=false
-# and is never a counted PASS; this declaration activates nothing. It keeps
-# the same declared internal root (see the counted selector's exception note)
-# and the unchanged 300 s / 512 MiB bound.
+# and is never a counted PASS; this declaration activates nothing. It uses the
+# same selected-volume scratch-pool placement as the counted selector.
 [tasks."rust:command-budgets:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-command-budgets.py --diagnostic"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-command-budgets.py --diagnostic"
 
 # Cold-slot seeding (oxide#137 §16, oxide#169 slice 4): one fixed 24-case
 # script and the whole command of the qualified shared supervisor, with
