@@ -219,9 +219,7 @@ provenance.
 
 ## Refusal matrix
 
-Every row refuses before any create, write, lock, walk or child. Each row names
-its refusal class and has one unit case; rows 6–8 and 11–12 deliberately share
-a class.
+Every admission row refuses before any create, write, lock, walk or child; row 18 is the one creation-phase failure, compensated as described. Each row names its refusal class and has one unit case; rows 6–8 and 11–12 deliberately share a class.
 
 | # | Condition | Class |
 | --- | --- | --- |
