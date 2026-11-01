@@ -9792,6 +9792,94 @@ mod tests {
         );
     }
 
+    /// oxide#218: a registry row records the root's OWN immutable creation
+    /// generation, never the receipt's commit generation, and a migration's
+    /// intermediate receipt writes never rewrite a whole-target row with the
+    /// root/2 marker that replaced its legacy one.
+    ///
+    /// Counterfactual (the shape three live roots carry today): the pre-#152
+    /// writer copied `selected.generation()` into the row, and the migration
+    /// refreshed the row's device, inode and digest from the successor marker
+    /// while the placement still carried no nonce — a row pinning the root/2
+    /// bytes with an EMPTY nonce, which the prune identity proof would have to
+    /// call unknown forever.
+    #[test]
+    fn a_layout_migration_keeps_a_history_row_and_records_the_creation_generation() {
+        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
+        let (fixture, legacy) = legacy_checkout();
+        let context = fixture.context();
+        let store = pool_store(&fixture.root.join("pool"));
+        let control = store.owner_control().to_path_buf();
+        let id = context_id(&fixture);
+        let root = legacy.selected().unwrap().root().to_path_buf();
+        make_root_one_marker(&fixture, &legacy);
+        let legacy_digest = marker_digest(&root).unwrap();
+        write_receipt_document_at(
+            &fixture,
+            &control,
+            &version_one_receipt(&fixture, "committed", Some(&root)),
+        );
+        let upgraded = read_receipt_for_adopt(&control, &fixture.checkout, &id)
+            .unwrap()
+            .expect("the committed version-1 receipt was not read for adopt");
+        // The pre-migration registry state: one whole-target reference with no
+        // nonce, pinned to the root/1 marker's exact bytes.
+        crate::prune::note_receipt(&control, &upgraded).unwrap();
+        let rows = registry_rows(&control);
+        let before = rows
+            .iter()
+            .find(|row| row["member"] == "target")
+            .expect("the whole-target row was not recorded");
+        assert_eq!(before["marker_digest"], legacy_digest);
+
+        let (migrated, selected, converted) = migrate_layout(&context, &control, upgraded).unwrap();
+        assert!(converted);
+        assert_eq!(migrated.generation, legacy.generation + 1);
+        let successor_digest = marker_digest(&root).unwrap();
+        assert_ne!(
+            successor_digest, legacy_digest,
+            "the marker did not upgrade"
+        );
+        let rows = registry_rows(&control);
+        let history = rows
+            .iter()
+            .find(|row| row["member"] == "target")
+            .expect("the whole-target row disappeared");
+        assert_eq!(history["selected"], false);
+        assert!(
+            history.get("nonce").is_none(),
+            "a history row was given the successor marker's nonce: {history}"
+        );
+        assert_eq!(
+            history["marker_digest"], legacy_digest,
+            "the migration rewrote the history row with the successor marker"
+        );
+        // The profile references record the root's own creation generation,
+        // which the marker never rewrites, not the receipt's newer commit
+        // generation.
+        for member in ["debug", "release"] {
+            let row = rows
+                .iter()
+                .find(|row| row["member"] == member)
+                .unwrap_or_else(|| panic!("no registry row for {member}"));
+            assert_eq!(row["selected"], true, "{member}");
+            assert_eq!(row["nonce"], selected.nonce().unwrap(), "{member}");
+            assert_eq!(row["marker_digest"], successor_digest, "{member}");
+            assert_eq!(
+                row["generation"], 1,
+                "{member} recorded the commit generation, not the root's creation generation"
+            );
+        }
+    }
+
+    /// The pool-owned registry as rows, for the migration identity assertions.
+    fn registry_rows(control: &Path) -> Vec<serde_json::Value> {
+        let path = control.join("outputs").join("registry.json");
+        let document: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        document["rows"].as_array().cloned().unwrap()
+    }
+
     #[test]
     fn explicit_adopt_of_committed_whole_target_never_hits_member_transition_hooks() {
         let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
