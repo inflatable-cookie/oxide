@@ -313,6 +313,8 @@ never a raw path dump, bounded and escaped as today.
 
 ## Migration list
 
+`rust:slot-headroom` and its diagnostic now use a private scratch pool under the selected supervisor root (Queue task `4ee40830-e9f5-428a-bf15-01f3b059be7d`); their native evidence must be re-established at the migrated head.
+
 `rust:holding-delete` and its diagnostic now use a scratch pool under the supervisor-selected volume (oxide#202); their native evidence must be established at the migrated head.
 
 `bd357a4c` is only about `--root-parent /private/tmp`. Pool premise is read from

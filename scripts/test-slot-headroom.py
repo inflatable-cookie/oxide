@@ -20,6 +20,16 @@ ceiling that must write `capacity_policy: 4`. The worst-valid 256-slot ledger
 and 512-record control-state serialization/round-trip and oversized-field
 refusals are unit tests in `effigy test rust`, not native fixtures.
 
+Premise checklist: (1) base_env preserves invoking rustup, pins the toolchain,
+uses private HOME/CARGO_HOME and disables installation; stage uses the repo lock.
+(2) base_env sets OXIDE_TEST_HOME_FROM_ENV. (3) base_env scrubs inherited
+OXIDE/XDG and build overrides; staging scrubs its Oxide environment. (4) No
+case requires an unconverted permanent checkout. (5) No external Cargo
+subcommand fixture. (6) No images. (7) stage and base_env clear encoded flags
+and freeze RUSTFLAGS. (8) Pools and TMPDIR stay inside the selected run root;
+a /private/tmp fallback exercises the internal path, not scratch-pool coverage.
+(9) No mktemp fixture; all paths derive from the supervisor's private root.
+
 Modes. The default run is the counted proof and fails fast. `--diagnostic` is
 the uncounted keep-going collection: a recoverable phase failure is recorded
 and only its declared dependents are skipped, while an unknown outcome, an
@@ -37,6 +47,7 @@ import sys
 sys.dont_write_bytecode = True
 
 import importlib.util
+import hashlib
 import json
 import os
 import secrets
@@ -58,9 +69,11 @@ labelled_slot = fm.labelled_slot
 
 REPO = os.path.dirname(HERE)
 ROOT = os.path.realpath(os.environ.get("OXIDE_TASK_SCRATCH_ROOT", ""))
+SCRATCH_POOL_ROOT = os.path.join(ROOT, "scratch-pools")
 EVIDENCE = os.path.realpath(os.environ.get("OXIDE_PROOF_EVIDENCE", ""))
 SHUTDOWN_MARGIN_S = 30
-RUNNER_SHA256 = "94b1aba60a7475a31b5620039986336f13e1c88d58dd3732b5736290dc63685b"
+# Qualified at b29ef6c: evidence-195-b29ef6c-20261101T043444Z.
+RUNNER_SHA256 = "fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b"
 CANDIDATE = "OxSh" + secrets.token_hex(4)
 RESULTS = []
 CHILDREN = []
@@ -155,6 +168,7 @@ def write_evidence(name: str, contents: str) -> None:
 
 
 def base_env(proof: Proof, pool: str, **extra: str) -> dict:
+    expect(os.path.realpath(pool).startswith(SCRATCH_POOL_ROOT + os.sep), "pool outside scratch pool root")
     env = dict(os.environ)
     # A private HOME must not hide the installed toolchain: keep the real
     # RUSTUP_HOME and the project's exact channel.
@@ -171,6 +185,7 @@ def base_env(proof: Proof, pool: str, **extra: str) -> dict:
     env.update(
         {
             "OXIDE_POOL": pool,
+            "OXIDE_SCRATCH_ROOT": SCRATCH_POOL_ROOT,
             "OXIDE_POOL_CAP": "64MiB",
             "OXIDE_MAX_ACTIVE": "16",
             "HOME": os.path.join(ROOT, "home"),
@@ -407,10 +422,11 @@ def prove_fences_and_exhaustion(proof: Proof, app: str, pool: str, env: dict) ->
     expect(slot["rank"] == 2 and slot["state"] == "idle", f"release did not stamp the idle rank: {slot}")
     state_path = os.path.join(pool, "oxide-managed", "state.json")
     state = read_json(state_path)
-    expect(state["version"] == 8, f"the first mutation did not install the version-8 control fences: {state}")
+    expect(state["version"] == 9, f"the first mutation did not install the version-9 control fences: {state}")
     expect(state.get("slot_ceiling") == "oxide.slots/256", f"the raised-ceiling fence is missing: {state}")
     expect(state.get("eviction_accounting") == "oxide.eviction-accounting/1", f"the eviction-accounting fence is missing: {state}")
-    RESULTS.append({"case": "fences-installed", "ledger_policy": 3, "state_version": 8})
+    expect(state.get("holding") == "oxide.holding/1", f"the holding fence is missing: {state}")
+    RESULTS.append({"case": "fences-installed", "ledger_policy": 3, "state_version": 9})
 
     # A legacy representation (no fence, rank 0) still reads for status and
     # is not migrated by the observer.
@@ -431,7 +447,7 @@ def prove_fences_and_exhaustion(proof: Proof, app: str, pool: str, env: dict) ->
     # A genuinely legacy document carries none of the forward fences; keeping
     # the recorded-accounting or raised-ceiling fence would test a shape no
     # legacy binary wrote.
-    for fence in ("recorded_accounting", "one_use_workspaces", "eviction_accounting", "slot_ceiling"):
+    for fence in ("recorded_accounting", "one_use_workspaces", "eviction_accounting", "slot_ceiling", "holding"):
         legacy_state.pop(fence, None)
     legacy_state["version"] = 1
     write_json(state_path, legacy_state)
@@ -443,14 +459,15 @@ def prove_fences_and_exhaustion(proof: Proof, app: str, pool: str, env: dict) ->
     run(proof, ["exec", "--", sys.executable, "-c", "pass"], "legacy-first-write", app, env)
     fenced = read_json(ledger_path)
     fenced_state = read_json(state_path)
-    expect(fenced.get("capacity_policy") == 3 and fenced_state["version"] == 8,
-           "the first revised mutation did not install the version-8 control fences")
+    expect(fenced.get("capacity_policy") == 3 and fenced_state["version"] == 9,
+           "the first revised mutation did not install the version-9 control fences")
     # Fence first: even this one-slot pool gains the raised-ceiling and
     # eviction-accounting fences before its first ledger write.
     expect(fenced_state.get("slot_ceiling") == "oxide.slots/256",
            f"the first revised mutation did not fence the raised ceiling: {fenced_state}")
     expect(fenced_state.get("eviction_accounting") == "oxide.eviction-accounting/1",
            f"the first revised mutation did not fence eviction accounting: {fenced_state}")
+    expect(fenced_state.get("holding") == "oxide.holding/1", f"the holding fence is missing: {fenced_state}")
     RESULTS.append({"case": "legacy-read-no-migration", "fenced_on_mutation": True, "raised_fence": True})
 
     # Counter exhaustion refuses before any transition.
@@ -535,7 +552,8 @@ def prove_raised_fence(proof: Proof, pool: str, env: dict, workdir: str) -> None
     )
     state = read_json(os.path.join(pool, "oxide-managed", "state.json"))
     expect(
-        state["version"] == 8 and state.get("slot_ceiling") == "oxide.slots/256",
+        state["version"] == 9 and state.get("slot_ceiling") == "oxide.slots/256"
+        and state.get("holding") == "oxide.holding/1",
         f"the 129th slot did not make the raised-ceiling control fence durable: {state}",
     )
     RESULTS.append({
@@ -603,7 +621,8 @@ def prove_pool_ceiling(proof: Proof, app: str, pool: str, env: dict) -> None:
     # models the same consistent pair instead of a state no writer produces.
     state_path = os.path.join(pool, "oxide-managed", "state.json")
     state = read_json(state_path)
-    state["version"] = 8
+    state["version"] = 9
+    state["holding"] = "oxide.holding/1"
     state["slot_ceiling"] = "oxide.slots/256"
     state["eviction_accounting"] = "oxide.eviction-accounting/1"
     write_json(state_path, state)
@@ -670,7 +689,8 @@ def prove_pool_ceiling(proof: Proof, app: str, pool: str, env: dict) -> None:
     expect(after.get("capacity_policy") == 4, "the 257th slot did not raise the ledger fence")
     state = read_json(state_path)
     expect(
-        state["version"] == 8 and state.get("slot_ceiling") == "oxide.slots/256",
+        state["version"] == 9 and state.get("slot_ceiling") == "oxide.slots/256"
+        and state.get("holding") == "oxide.holding/1",
         f"an ordinary release dropped the raised-ceiling control fence: {state}",
     )
     RESULTS.append({
@@ -771,12 +791,14 @@ def prove_project_cap(proof: Proof, pool: str, env: dict, workdir: str) -> None:
         proof, ["exec", "--", sys.executable, "-c", "pass"], "project-cap-unknown", app, env, code=1
     )
     expect(
-        "unknown_accounting" in refused and "depth_limit" in refused,
+        f"unmeasured slot(s) {victim_record['id']}" in refused
+        and "are kept and never evicted on a partial walk" in refused,
         f"the project replacement refused without naming its accounting gap: {refused}",
     )
     expect(os.path.isdir(victim), "the victim was deleted before complete accounting")
     expect(
-        len(read_json(os.path.join(pool, "ledger.json"))["slots"]) == PROJECT_SLOT_CAP,
+        {record["id"] for record in read_json(ledger_path)["slots"]}
+        == {record["id"] for record in unrecorded["slots"]},
         "an incomplete-accounting refusal changed the project membership",
     )
     RESULTS.append({"case": "project-cap-unknown-refuses-before-deletion", "victim": victim_record["id"]})
@@ -1046,8 +1068,10 @@ def reset_collection() -> None:
 
 
 def self_check() -> None:
-    """Pure apparatus check of the diagnostic collection: no child, scratch,
-    pool or evidence write."""
+    """Pure apparatus check: no child, scratch, pool or evidence write."""
+    with open(os.path.join(REPO, "scripts", "bounded-test.py"), "rb") as handle:
+        runner_hash = hashlib.sha256(handle.read()).hexdigest()
+    expect(runner_hash == RUNNER_SHA256, f"qualified runner hash mismatch: {runner_hash}")
     global PHASE_NAMES, PHASE_FAILURES, PHASE_SKIPS
 
     def ok() -> None:
@@ -1124,6 +1148,18 @@ def self_check() -> None:
         == os.path.join(self_slots, "fences-abc", "quick-257"),
         "the labelled own-slot walk root is wrong",
     )
+    # Exercise the child environment builder without creating a pool.
+    fixture_pool = os.path.join(SCRATCH_POOL_ROOT, "pool-self-check")
+    env = base_env(None, fixture_pool)
+    expect(env["OXIDE_SCRATCH_ROOT"] == os.path.join(ROOT, "scratch-pools"), "scratch root contract")
+    expect(env["OXIDE_POOL"] == fixture_pool and env["OXIDE_POOL_CAP"] == "64MiB", "pool contract")
+    expect(env["TMPDIR"] == ROOT, "temporary storage contract")
+    try:
+        base_env(None, os.path.join(ROOT, "outside-pool"))
+    except Exception:
+        pass
+    else:
+        fail("pool outside scratch root was accepted")
     print("slot-headroom self-check PASS: diagnostic collection, taint, abort, receipt bounds and own-slot walk paths", flush=True)
 
 
@@ -1147,7 +1183,6 @@ def main() -> None:
     try:
         work_left()
         with open(os.path.join(REPO, "scripts", "bounded-test.py"), "rb") as handle:
-            import hashlib
             runner_hash = hashlib.sha256(handle.read()).hexdigest()
         expect(runner_hash == RUNNER_SHA256, f"qualified runner hash mismatch: {runner_hash}")
         source = subprocess.check_output(["git", "rev-parse", "HEAD^{commit}"], cwd=REPO, text=True).strip()
@@ -1155,6 +1190,9 @@ def main() -> None:
         dirty = subprocess.check_output(["git", "status", "--porcelain"], cwd=REPO, text=True).strip()
         expect(not dirty, f"source checkout is dirty: {dirty}")
 
+        os.mkdir(SCRATCH_POOL_ROOT, 0o700)
+        expect(os.path.realpath(SCRATCH_POOL_ROOT) == SCRATCH_POOL_ROOT and
+               os.stat(SCRATCH_POOL_ROOT).st_dev == os.stat(ROOT).st_dev, "unsafe scratch pool root")
         os.makedirs(os.path.join(ROOT, "home"), mode=0o700, exist_ok=True)
         os.makedirs(os.path.join(ROOT, "cargo-home"), mode=0o700, exist_ok=True)
         os.makedirs(os.path.join(ROOT, "markers"), mode=0o700, exist_ok=True)
@@ -1168,15 +1206,15 @@ def main() -> None:
         print(f"staged oxide sha256 {binary_sha256}", flush=True)
         proof.phase("after staging")
 
-        fences_pool = os.path.join(ROOT, "pool-fences")
+        fences_pool = os.path.join(SCRATCH_POOL_ROOT, "pool-fences")
         fences_env = base_env(proof, fences_pool)
         fences_app = write_tree(os.path.join(ROOT, "checkouts", "fences"), FIXTURE)
-        raised_pool = os.path.join(ROOT, "pool-raised")
-        project_pool = os.path.join(ROOT, "pool-project")
+        raised_pool = os.path.join(SCRATCH_POOL_ROOT, "pool-raised")
+        project_pool = os.path.join(SCRATCH_POOL_ROOT, "pool-project")
         project_env = base_env(proof, project_pool)
-        reuse_pool = os.path.join(ROOT, "pool-reuse")
+        reuse_pool = os.path.join(SCRATCH_POOL_ROOT, "pool-reuse")
         reuse_env = base_env(proof, reuse_pool)
-        byte_pool = os.path.join(ROOT, "pool-byte")
+        byte_pool = os.path.join(SCRATCH_POOL_ROOT, "pool-byte")
         phases = [
             ("fences", [], lambda: prove_fences_and_exhaustion(proof, fences_app, fences_pool, fences_env)),
             (

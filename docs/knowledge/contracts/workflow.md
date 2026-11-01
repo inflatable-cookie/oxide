@@ -4713,10 +4713,9 @@ Rules:
   both. The reserve and
   margin have no override.
 - **Slot headroom proof (oxide#118, oxide#177).** `effigy rust:slot-headroom`
-  under the qualified shared proof supervisor (with `--root-parent /private/tmp`,
-  the owner-accepted internal-placement exception bd357a4c, because its
-  fixtures create a genuine internal directory-budget pool that the product
-  correctly refuses on an external volume) stages `oxide` offline with 1.97.1
+  under the shared proof supervisor, with fixture pools under a private
+  `OXIDE_SCRATCH_ROOT` inside the selected volume's monitored run root, stages
+  `oxide` offline with 1.97.1
   and proves the permanent ledger/control fences, a legacy read
   without migration, rank exhaustion before any transition, a 256-slot pool
   whose 257th and 258th admissions replace the rank-LRU idle whole slot
@@ -4728,10 +4727,10 @@ Rules:
   inventory, the evicted slot is never walked, a release walks only its own
   slot, and default `status` at 256 walks nothing; it also crosses the legacy
   128-slot ceiling natively and requires `capacity_policy: 4` plus the
-  version-8 `oxide.slots/256` control fence, which the admission gate writes
+  version-9 control fence carrying `oxide.slots/256` and `oxide.holding/1`, which the admission gate writes
   as the command's first durable effect and a locked `Pool::open` raises
   itself before reconciliation, before any journal start or ledger write, so
-  an older binary meets version 8 and hands off or refuses before reading the
+  an older binary meets version 9 and hands off or refuses before reading the
   ledger.
   Worst-valid ledger/control serialization — including the reachable
   one-journal `Evicting` state — round-trip and oversized-field refusals are
@@ -4740,8 +4739,9 @@ Rules:
   `qualified: false` receipt, aborting on an unknown outcome or unclosed
   proof child), and `effigy proof:slot-headroom:test` is its pure
   `--self-check`. The thirteen-grant freshness bound is a bounded-loop
-  inspection, not a separately induced native case. It passed 50/50 cases at
-  `4b0a485` (#177).
+  inspection, not a separately induced native case. The earlier internal-root
+  recipe passed 50/50 cases at `4b0a485` (#177); that evidence does not carry
+  forward to the migrated recipe.
 - **Proof.** Current: `effigy rust:oxide-budget-default`
   ([above](#budget-only-default-pool-and-user-configuration)). Historical,
   before the CLI's retirement: `effigy rust:oxide-cli` added a macOS case on two scratch

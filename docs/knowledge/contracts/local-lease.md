@@ -1158,10 +1158,8 @@ one cold fallback, with sharing off after the first refusal and the existing
 discard/unshare before reacquisition.
 
 **Proof and evidence.** `effigy rust:slot-headroom` under the qualified shared
-supervisor (with `--root-parent /private/tmp`, the owner-accepted
-internal-placement exception bd357a4c, because its fixtures create a genuine
-internal directory-budget pool that the product correctly refuses on an
-external volume) covers the fences, no-migration reads, rank exhaustion, a 256-slot
+supervisor, with fixture pools under a private `OXIDE_SCRATCH_ROOT` inside
+the selected volume's monitored run root, covers the fences, no-migration reads, rank exhaustion, a 256-slot
 pool's 257th and 258th replacements, the twelve-slot project cap with a specific
 held-slot wait and one LRU idle replacement, compatible reuse, no eviction
 below both ceilings, byte-pressure LRU with a held slot excluded, and a
@@ -1190,8 +1188,9 @@ dependencies completed, and aborts on an unknown outcome or an unclosed proof
 child. `effigy proof:slot-headroom:test` runs only its pure `--self-check`
 (no child, scratch, pool or evidence write). Not covered natively: the thirteen-grant freshness bound is a
 bounded-loop inspection, and no large live inventory or physical
-multi-million-entry performance is claimed. A counted author native passed
-50/50 cases at `4b0a485` (#177).
+multi-million-entry performance is claimed. The earlier internal-root recipe
+passed a counted author native of 50/50 cases at `4b0a485` (#177); that
+evidence does not carry forward to the migrated recipe.
 
 ### Recorded per-slot accounting (oxide#146: implemented, native held)
 
