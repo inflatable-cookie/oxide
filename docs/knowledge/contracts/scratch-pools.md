@@ -352,7 +352,9 @@ a genuine `directory-budget-v1` pool) with every fixture inside
 `OXIDE_TASK_SCRATCH_ROOT`, so it now meets this document's premise rule but is
 not part of the ten sub-slices listed below.
 
-## Recipe changes (design, not applied)
+`rust:cold-slot-seeding` and its diagnostic now use the selected-volume scratch pool recipe (oxide#204); their new native evidence remains owner-activated.
+
+## Recipe changes
 
 The supervisor needs no change: with no caller root it already puts its owned
 root in `<mount>/scratch/oxide` of the selected volume, and falls back to

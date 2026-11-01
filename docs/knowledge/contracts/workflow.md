@@ -56,8 +56,8 @@ refusal, removal and quarantine rules.
 The qualification apparatus is one fixed 24-case script,
 `scripts/test-cold-slot-seeding.py`:
 `effigy rust:cold-slot-seeding` and `:diagnostic` run it under the qualified
-shared supervisor with the internal-placement exception
-(`bd357a4c`), **600 s** (Tom's decision `1527723f`, this selector and its
+shared supervisor with explicitly capped scratch pools on the selected volume
+(a `/private/tmp` fallback is not scratch-pool coverage), **600 s** (Tom's decision `1527723f`, this selector and its
 diagnostic twin only), 512 MiB monitored scratch and one owned 128 MiB image;
 `effigy proof:cold-slot-seeding:test` runs only its pure apparatus. Case 21
 compares canonical dep-info and workspace source paths, with relative paths
