@@ -9,19 +9,22 @@ supervisor:
     effigy rust:finder-metadata-race:diagnostic
     effigy rust:finder-metadata-race:test
 
-whose recipes are `python3 scripts/bounded-test.py --root-parent /private/tmp
---limit 420 --scratch-budget-mib 512 -- python3
-scripts/test-finder-metadata-race.py [--diagnostic]`. Admission, the
-wall-clock limit, the host reserve, the owned scratch bound, child sessions and
-cleanup belong to the supervisor; this script starts no session, signals no
-group, and keeps no clock, reserve reading or scratch of its own. Fixture
-scratch is written only inside `OXIDE_TASK_SCRATCH_ROOT`; image backings and
-their custody records only inside `OXIDE_PROOF_EVIDENCE`.
+whose recipes are `python3 scripts/bounded-test.py --limit 420
+--scratch-budget-mib 512 -- python3 scripts/test-finder-metadata-race.py
+[--diagnostic]`. Admission, the wall-clock limit, the host reserve, the owned
+scratch bound, child sessions and cleanup belong to the supervisor; this script
+starts no session, signals no group, and keeps no clock, reserve reading or
+scratch of its own. Fixture scratch is written only inside
+`OXIDE_TASK_SCRATCH_ROOT`; image backings and their custody records only inside
+`OXIDE_PROOF_EVIDENCE`.
 
-`--root-parent /private/tmp` is the owner-accepted internal-placement exception
-(decision `bd357a4c` v4): every fixture pool here is a genuine *internal*
-directory-budget pool, which the product correctly refuses on an external
-volume. It stays inside the same monitored 512 MiB owned root.
+Every fixture pool here is a genuine `directory-budget-v1` pool, so each case
+declares one private `OXIDE_SCRATCH_ROOT` inside its own run root and keeps its
+`OXIDE_POOL` strictly inside that root with an explicit `OXIDE_POOL_CAP`
+(oxide#173 scratch pools, slice S4). On the supervisor's selected volume that
+is a scratch pool on removable media; on a `/private/tmp` fallback the
+declaration is inert and the same recipe makes an ordinary internal pool there,
+which is therefore not scratch-pool coverage and is reported as such.
 
 Stages this HEAD's and the pinned pre-change commit's debug `oxide` offline
 with the pinned 1.97.1 toolchain through plain Cargo, then drives the debug-only race injection
@@ -113,9 +116,11 @@ Nine-premise checklist (docs/knowledge/contracts/workflow.md
    generated for a `--locked` call; both offline staging calls are `--locked`
    and use the lock committed in their respective source trees.
 2. account-home control: `OXIDE_TEST_HOME_FROM_ENV=1` in `case_env`.
-3. environment isolation: `case_env` drops every inherited `OXIDE_*`, `XDG_*`,
-   `CARGO_*`, `GIT_*`, `RUSTUP_*`, `RUSTC*` and `RUSTFLAGS` before setting only
-   the fixture's explicit values, then re-adds the supervisor's own
+3. environment isolation: `fixture_environment` drops every inherited
+   `OXIDE_*`, `XDG_*`, `CARGO_*`, `GIT_*`, `RUSTUP_*`, `RUSTC*` and `RUSTFLAGS`
+   before setting only the fixture's explicit values — including this case's
+   own `OXIDE_SCRATCH_ROOT`, its pool strictly inside it and its explicit
+   `OXIDE_POOL_CAP` — then re-adds the supervisor's own
    `OXIDE_TASK_SCRATCH_ROOT`, `OXIDE_PROOF_DEADLINE_NS`,
    `OXIDE_PROOF_EVIDENCE` (required for the hook guard) and, per case,
    `OXIDE_TEST_FINDER_RACE`, or the scoped `OXIDE_TEST_CAPTURE_UNLINK_STOP`
@@ -150,8 +155,9 @@ Nine-premise checklist (docs/knowledge/contracts/workflow.md
 7. compiler flags: `RUSTFLAGS` is frozen for staging and every fixture child and
    `CARGO_ENCODED_RUSTFLAGS` is removed everywhere.
 8. temporary storage: scratch and `TMPDIR`/`TMP`/`TEMP` come from the
-   supervisor's owned scratch; the selector declares the internal-placement
-   exception above.
+   supervisor's owned scratch; each case declares its own `OXIDE_SCRATCH_ROOT`
+   there and keeps its pool strictly inside it, so the pool, the temp root and
+   the images all stay inside the monitored owned root.
 9. macOS mktemp: no `mktemp` is used; each case makes its own directory with a
    random suffix under the owned scratch.
 """
@@ -192,6 +198,9 @@ REGISTRY_RELATIVE = ("outputs", "registry.json")
 # The product refuses a per-command temporary directory whose path is longer
 # than its Unix-socket bound of 91 bytes.
 SOCKET_PATH_BUDGET = 91
+# One declared scratch root per case, and its pool strictly inside it (§S4).
+SCRATCH_DIRNAME = "scratch-pools"
+POOL_DIRNAME = "pool"
 # Every prune checkout lives on the removable image, so the product cannot keep
 # an inherited same-volume `TMPDIR` and instead makes an owned per-command
 # directory inside the slot. Its longest path is
@@ -576,24 +585,49 @@ def case_root(root: str, case: str) -> str:
     return path
 
 
-def case_env(root: str, case: str, race: str | None) -> tuple[dict, str]:
-    base = case_root(root, case)
-    home = os.path.join(base, "home")
-    cargo_home = os.path.join(base, "cargo-home")
-    temp = os.path.join(base, "temp")
-    for path in (home, cargo_home, temp):
-        os.makedirs(path, exist_ok=True)
-    env = scrubbed(os.environ)
+def fixture_paths(base: str) -> dict:
+    """This case's private paths, all inside its own run root. Pure.
+
+    The pool is a genuine `directory-budget-v1` pool, so it is a *scratch*
+    pool: one root the case declares, canonical (the declaration has no symlink
+    component) and with the pool strictly below it. Nothing here is outside
+    `OXIDE_TASK_SCRATCH_ROOT`, so the supervisor's census, reserve watchdog and
+    scratch budget cover every byte the fixture writes.
+    """
+    scratch = os.path.realpath(os.path.join(base, SCRATCH_DIRNAME))
+    return {
+        "home": os.path.join(base, "home"),
+        "cargo_home": os.path.join(base, "cargo-home"),
+        "temp": os.path.join(base, "temp"),
+        "scratch": scratch,
+        "pool": os.path.join(scratch, POOL_DIRNAME),
+    }
+
+
+def fixture_environment(
+    base: str, case: str, race: str | None, inherited: dict
+) -> dict:
+    """One case's complete fixture environment. Pure: it creates nothing.
+
+    Pure so the effect-free `--self-check` can assert the same contract a native
+    case runs under: the declaration, the pool strictly inside it and the
+    explicit cap, with a hostile inherited environment in place.
+    """
+    paths = fixture_paths(base)
+    env = scrubbed(inherited)
     env.update(toolchain_env())
     env.update(
         {
-            "HOME": home,
-            "CARGO_HOME": cargo_home,
-            "TMPDIR": temp,
-            "TMP": temp,
-            "TEMP": temp,
+            "HOME": paths["home"],
+            "CARGO_HOME": paths["cargo_home"],
+            "TMPDIR": paths["temp"],
+            "TMP": paths["temp"],
+            "TEMP": paths["temp"],
             "OXIDE_TEST_HOME_FROM_ENV": "1",
-            "OXIDE_POOL": os.path.join(base, "pool"),
+            # The scratch declaration, the pool strictly inside it and the
+            # explicit budget the product requires for a scratch pool.
+            "OXIDE_SCRATCH_ROOT": paths["scratch"],
+            "OXIDE_POOL": paths["pool"],
             "OXIDE_POOL_CREATE": "1",
             "OXIDE_POOL_CAP": str(POOL_BUDGET),
             "RUSTC_WRAPPER": "",
@@ -602,13 +636,21 @@ def case_env(root: str, case: str, race: str | None) -> tuple[dict, str]:
     )
     # The supervisor's own layout is what arms the debug-only injection.
     for key in ("OXIDE_TASK_SCRATCH_ROOT", "OXIDE_PROOF_DEADLINE_NS", "OXIDE_PROOF_EVIDENCE"):
-        if key in os.environ:
-            env[key] = os.environ[key]
+        if key in inherited:
+            env[key] = inherited[key]
     if race is not None:
         env["OXIDE_TEST_FINDER_RACE"] = race
     for key, value in CASE_ENV.get(case, {}).items():
         env[key] = value
-    return env, base
+    return env
+
+
+def case_env(root: str, case: str, race: str | None) -> tuple[dict, str]:
+    base = case_root(root, case)
+    paths = fixture_paths(base)
+    for path in (paths["home"], paths["cargo_home"], paths["temp"], paths["scratch"]):
+        os.makedirs(path, mode=0o700, exist_ok=True)
+    return fixture_environment(base, case, race, os.environ), base
 
 
 def workspace(env: dict, base: str, name: str, package: str = "app") -> str:
@@ -1512,7 +1554,6 @@ def self_check() -> int:
     """Pure check of the fixture layout budget and the shutdown cutoff: no
     scratch, child or image."""
     problems = []
-    # The approved 30 s shutdown margin, enforced for every running child.
     # Counterfactual: the 420 s selector leaves exactly 390 s of work, and the
     # earlier 25 s margin's 395 s is refused.
     if SHUTDOWN_MARGIN_SECONDS != 30:
@@ -1734,12 +1775,13 @@ def plan() -> int:
         race = RACES[case]
         print(f"  {case:<26} race {race or 'none (control)'}")
     print(
-        f"allocation: {sum(1 for c in CASES if c.startswith('lease_'))} internal 1 MiB "
-        "directory pools on the boot Data volume (the selector's internal-placement "
-        f"exception), {len(PRUNE_SLUGS)} owned 128 MiB sparse images with custody records "
-        "in the guard's evidence directory (one attached at a time and ordinarily "
-        "detached), one private HOME/CARGO_HOME and TMPDIR per case, staged debug oxide "
-        "in owned scratch"
+        f"allocation: {sum(1 for c in CASES if c.startswith('lease_'))} 1 MiB "
+        "directory-budget scratch pools, one per case, each declared with its own "
+        "OXIDE_SCRATCH_ROOT inside the case's run root and an explicit "
+        f"OXIDE_POOL_CAP, {len(PRUNE_SLUGS)} owned 128 MiB sparse images with custody "
+        "records in the guard's evidence directory (one attached at a time and "
+        "ordinarily detached), one private HOME/CARGO_HOME and TMPDIR per case, "
+        "staged debug oxide in owned scratch"
     )
     print("prune fixture layout (product Unix-socket bound %d bytes):" % SOCKET_PATH_BUDGET)
     for case in CASES:
