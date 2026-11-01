@@ -347,7 +347,7 @@ or a socket path that cannot fit under the selected-volume guard prefix):
 | Selector/recipe | Genuine premise |
 | --- | --- |
 | `rust:pool-temp-scratch` (#136) + `:diagnostic` | decision af7df7d6: the Builds guard prefix makes this fixture's shortest admitted slot scratch path (`test-1`) 103 bytes, exceeding the 91-byte product bound; both selectors keep `/private/tmp` |
-| `rust:profile-outputs:base-compat` + `:diagnostic` | pinned pre-S3 base cases 10, 11 and 19 require an internal pool; 300 s / 512 MiB under ea36e265, fit unmeasured |
+| `rust:profile-outputs:base-compat` + `:diagnostic` | pinned pre-S3 base cases 10, 11 and 19 require an internal pool, and case 20 requires boot-Data checkout absence (41307e95); 300 s / 512 MiB under ea36e265, fit unmeasured |
 | `rust:outputs-prune` (#129/#152) + `:diagnostic` | cases 10 and 21 prove checkout absence on the boot Data volume |
 | `rust:prune-absence` (#135) + `:diagnostic` | the missing-ancestor chain must sit on the boot Data volume |
 | the `AGENTS.md` unit-suite recipe (`OXIDE_TEST_INTERNAL_ROOT`) | three macOS fixtures take the boot Data volume and `MNT_IGNORE_OWNERSHIP` premises; `config::tests::git_work_trees_and_aliases_refuse` needs a root off `/Volumes` |

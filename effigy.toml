@@ -156,9 +156,10 @@ run = "python3 scripts/test-installed-handoff.py --plan"
 # stop.
 # Both modes use 512 MiB and ordinary detach. Builds stages only this HEAD's
 # candidate (capability >= 4) and covers the member layout, binding, migration,
-# clean, refusals and root-group prune. Base-compat stages base 4a70b83 and the
+# clean and refusals. Base-compat stages base 4a70b83 and the
 # candidate from authenticated pinned source, asserts distinct binaries and
-# exact base capability 3, and covers the historical base cases 10, 11 and 19.
+# exact base capability 3, and covers base cases 10, 11 and 19 plus case 20
+# root-group prune with its boot-Data checkout-absence premise.
 # Each mode requires its own owner-activated diagnostic, counted author and
 # independent reviewer native at the reviewed head.
 # Builds fixtures use a private OXIDE_SCRATCH_ROOT under the selected runner root.

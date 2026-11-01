@@ -1750,8 +1750,8 @@ def member_payload_state(root: str, member: str) -> tuple:
 ASSERTION_RECEIPT_BYTES = 64 * 1024
 ALL_CASE_IDS = [f"{index:02d}" for index in range(1, 21)]
 MODE = "builds"
-MODE_CASES = {"builds": [c for c in ALL_CASE_IDS if c not in ("10", "19")],
-              "base-compat": ["10", "11", "19"]}
+MODE_CASES = {"builds": [c for c in ALL_CASE_IDS if c not in ("10", "19", "20")],
+              "base-compat": ["10", "11", "19", "20"]}
 CASE_IDS = MODE_CASES[MODE]
 
 # HIGH proof-authoring premises (workflow checklist):
@@ -2058,7 +2058,7 @@ CASE_STEPS = [
     ("17.1", "17", ("07.1",), SHARED_EVERY_STEP + ("first",), ("first", "custody", "pool")),
     ("18.1", "18", ("01.1",), SHARED_EVERY_STEP + ("first",), ("first", "pool")),
     ("19.1", "19", ("11.2",), SHARED_EVERY_STEP, ("pool",)),
-    ("20.1", "20", ("01.1",), SHARED_EVERY_STEP + ("first",), ("pool", "custody")),
+    ("20.1", "20", ("11.2",), SHARED_EVERY_STEP, ("pool", "custody")),
 ]
 CASE_STEP_DEPS = {step: deps for step, _, deps, _, _ in CASE_STEPS}
 CASE_STEP_NEEDS = {step: needs for step, _, _, needs, _ in CASE_STEPS}
@@ -2431,7 +2431,7 @@ def pure_diagnostic_controls() -> None:
         )
         # Every later case runs `oxide` against the same private pool and the
         # same registration, so a changed reserve or pool ledger skips them all.
-        for later in ("16.1", "19.1", "08.1", "03.1", "12.1", "20.1"):
+        for later in ("16.1", "08.1", "03.1", "12.1"):
             expect(not DIAG.enter(later), f"{later} ran after the shared pool/registration was tainted")
             reasons = "; ".join(DIAG.skips[-1]["reasons"])
             expect(
@@ -4771,8 +4771,8 @@ def pure_mode_contract() -> None:
             pass
         else:
             fail("unknown staging mode was accepted")
-        expect(mode_labels("base-compat") == ["10-base", "11-base", "19"], "base table changed")
-        expect(mode_labels("builds") == ["01", "02", "03", "04", "05", "06", "07", "08", "09", "11-source", "12", "13", "14", "15", "16", "17", "18", "20"], "Builds table changed")
+        expect(mode_labels("base-compat") == ["10-base", "11-base", "19", "20"], "base table changed")
+        expect(mode_labels("builds") == ["01", "02", "03", "04", "05", "06", "07", "08", "09", "11-source", "12", "13", "14", "15", "16", "17", "18"], "Builds table changed")
         for mode in MODE_CASES:
             MODE, CASE_IDS = mode, MODE_CASES[mode]
             for step, case, _, _, _ in CASE_STEPS:
@@ -4796,6 +4796,18 @@ def pure_mode_contract() -> None:
         DIAG.reset()
         DIAG.mode = True
         expect(not DIAG.enter("10.2") and not DIAG.enter("11.2"), "missing base prerequisites admitted")
+        DIAG.reset()
+        DIAG.mode = True
+        expect(not DIAG.enter("20.1"), "case 20 admitted without case 11")
+        DIAG.reset()
+        DIAG.mode = True
+        DIAG.done.append("11.2")
+        expect(DIAG.enter("20.1"), "case 20 refused after case 11")
+        record = diagnostic_record(None, None, None, [])
+        expect(record["mode"] == "base-compat" and "20" in record["case_table"], "base receipt omitted case 20")
+        MODE, CASE_IDS = "builds", MODE_CASES["builds"]
+        record = diagnostic_record(None, None, None, [])
+        expect("20" not in record["case_table"] and "20" not in record["cases"]["completed"], "Builds receipt claims case 20")
         DIAG.reset()
         # Verify the native entry calls the diagnostic control before setup.
         with mock.patch.dict(os.environ, {}), mock.patch(__name__ + ".pure_diagnostic_controls") as control, mock.patch(__name__ + ".pure_registry_controls", side_effect=RuntimeError("stop after control")):
