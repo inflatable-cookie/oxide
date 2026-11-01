@@ -135,9 +135,9 @@ replaces it.
    `TMPDIR=<root>/fx/inherited-tmp`. State: the pool is absent, the fixture is a
    same-device sibling, no owned scratch. Grammar: current identifier, `dir=`
    canonical inherited, `temp: inherited <canonical>`, the product's
-   `oxide: creating the build pool at` line, and post-conditions read from the
+   ordinary or scratch creation line, and post-conditions read from the
    created pool (`config.json` backend, payload, ledger, device, slot). A
-   successful create already passed the product's Time Machine exclusion gate.
+   successful create passed the applicable product admission gates.
 3. unusable inherited TMPDIR (case 3): `oxide check` over absent/file/relative/
    unwritable/symlink values, plus a device-gated other-device value. State:
    each bad value under `root/fx`, the device from the monitored root. Grammar:
@@ -316,7 +316,7 @@ def pool_path(root: str) -> str:
     An empty pre-created directory is classed by the product as an unknown
     existing pool (`Found::Unknown`), so creation is skipped and opening
     `config.json` fails. Only the product may create the pool, on its own
-    creation path, with its own Time Machine exclusion and format checks.
+    creation path, with its applicable admission and format checks.
     """
     return os.path.join(root, "p")
 
@@ -1737,11 +1737,13 @@ def inherited_kept(world: World, crate: str) -> None:
         open(keep, encoding="utf-8").read() == "retained",
         "the inherited directory's content changed",
     )
-    # Creation happened on the product's own path; that path's Time Machine
-    # exclusion gate and format checks had to pass for this command to exit 0,
-    # so no separate `tmutil` probe is needed (or permitted) here.
+    # The selected-volume path has its own creation notice; the internal
+    # fallback retains the ordinary notice. Both are product creation paths.
     expect(
-        "oxide: creating the build pool at" in result.stderr,
+        any(notice in result.stderr for notice in (
+            "oxide: creating the build pool at",
+            "oxide: creating a scratch build pool on volume",
+        )),
         f"the first leased command did not create the pool: {result.stderr[-1500:]}",
     )
     expect(os.path.isdir(world.pool), "the first leased command did not create the pool")

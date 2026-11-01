@@ -327,7 +327,7 @@ each script's own selector text and case bodies.
 | --- | --- |
 | `rust:installed-handoff` (#122) | two cases create a real directory pool; needs the diagnostic apparatus authored first (S4) |
 | `rust:profile-outputs` (#133) + `:diagnostic` | 20 private directory-budget fixture pools |
-| `rust:pool-temp-scratch` (#136) + `:diagnostic` | directory-budget pool plus one owned image; no boot-Data premise |
+| `rust:pool-temp-scratch` (#136) + `:diagnostic` | migrated to selected-volume scratch pool plus one owned image; migrated-head native evidence pending |
 | `rust:recorded-slot-accounting` (#146) + `:diagnostic` | genuine directory-budget pool, verified from the product's own config |
 | `rust:exec-output-inference` (#160) + `:diagnostic` | control pool is a directory-budget pool |
 | `rust:auto-adopt-ineligible` (#154) + `:diagnostic` | control pool is a directory-budget pool |
