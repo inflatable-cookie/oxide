@@ -115,6 +115,14 @@ def check_child_env(env: dict) -> None:
                "fixture TMPDIR must be writable on the directory pool device")
 
 
+def image_slot_model(mount: str) -> str:
+    # Fixture labels are at most nine bytes (untracked); fresh and ignore
+    # checkout labels are shortened below. A private pool starts with eight
+    # digest digits and IDs below 100; the observed paths are checked too, so
+    # a collision, wider ID or unexpected label never silently weakens this.
+    return os.path.join(mount, "oxide-pool", "slots", "untracked-ffffffff", "release-99", "scratch")
+
+
 def check_image_slot_paths(mount: str) -> None:
     """Check actual image slot names, including collision and ID expansion."""
     for slot in glob.glob(os.path.join(mount, "oxide-pool", "slots", "*", "*")):
@@ -602,6 +610,8 @@ def attach_image(
     ]
     expect(len(mounts) == 1, f"expected one mount, got {mounts}")
     proof.mount = mounts[0]
+    model = image_slot_model(proof.mount)
+    expect(len(os.fsencode(model)) <= 80, f"image slot scratch model exceeds 80 bytes: {model}")
     return mounts[0]
 
 
@@ -3290,6 +3300,8 @@ def exec_self_test() -> None:
         expect(pin in output_source, f"current product oracle changed: {pin}")
     expect('OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/3"' in control_source, "fence version changed")
     expect(PRE_FEATURE == "8c9b5aeab57b8d0ca285b5358e07c89606724c8d", "historical base changed")
+    expect(len(os.fsencode(image_slot_model("/Volumes/OxEx12345678"))) <= 80, "image model exceeds 80 bytes")
+    expect(len(os.fsencode(image_slot_model("/Volumes/" + "x" * 40))) > 80, "overlong image model accepted")
     with patch("glob.glob", return_value=["/Volumes/x/oxide-pool/slots/f-12345678/quick-1"]), \
          patch("os.path.isdir", return_value=True):
         check_image_slot_paths("/Volumes/x")
