@@ -620,7 +620,7 @@ def proof_env(pool: str, home: str, cargo_home: str) -> dict:
     return env
 
 
-def run(proof: Proof, repo: str) -> None:
+def run(proof: Proof, repo: str, base_compat: bool = False) -> None:
     source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
     dirty = (
         proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30)
@@ -652,10 +652,13 @@ def run(proof: Proof, repo: str) -> None:
     proof.env = env
 
     app = write_tree(os.path.join(root, "app"), APP)
-    keep = write_plain(os.path.join(root, "keep"))
-    foreign = write_plain(os.path.join(root, "foreign"))
-    untracked = write_plain(os.path.join(root, "untracked"))
-    for fixture in (app, keep, foreign, untracked):
+    fixtures = [app]
+    if not base_compat:
+        keep = write_plain(os.path.join(root, "keep"))
+        foreign = write_plain(os.path.join(root, "foreign"))
+        untracked = write_plain(os.path.join(root, "untracked"))
+        fixtures.extend((keep, foreign, untracked))
+    for fixture in fixtures:
         proof.run(["git", "init", "-q"], cwd=fixture, timeout=30)
         # A first conversion needs Git to ignore the exact non-directory link
         # path (oxide#125); `/.oxide-outputs/` is still left to `oxide init`.
@@ -731,57 +734,59 @@ def run(proof: Proof, repo: str) -> None:
     good = real_uuid(pool)
     proof.phase("after drive registration")
 
-    # 1. A nonempty real target refuses, with no mutation.
-    keep_target = os.path.join(keep, "target")
-    os.makedirs(keep_target, exist_ok=True)
-    with open(os.path.join(keep_target, "keep.txt"), "wb") as handle:
-        handle.write(b"warm build")
-    report = plan(proof, keep, "plan with a nonempty target")
-    expect(report["current_target"] == "real-nonempty" and report["action"] == "refuse", report)
-    expect("never moves" in report["reason"], report)
-    code, _, stderr = proof.oxide(["outputs", "adopt"], "adopt a nonempty target", keep)
-    expect(code != 0 and "never moves" in stderr, stderr)
-    expect(read_bytes(os.path.join(keep_target, "keep.txt")) == b"warm build", "target mutated")
-    expect(os.path.isdir(keep_target), "the real target directory was replaced")
-    expect(not os.path.exists(os.path.join(keep, ".oxide-outputs")), "refused adopt wrote a root")
+    if not base_compat:
+        # 1. A nonempty real target refuses, with no mutation.
+        keep_target = os.path.join(keep, "target")
+        os.makedirs(keep_target, exist_ok=True)
+        with open(os.path.join(keep_target, "keep.txt"), "wb") as handle:
+            handle.write(b"warm build")
+        report = plan(proof, keep, "plan with a nonempty target")
+        expect(report["current_target"] == "real-nonempty" and report["action"] == "refuse", report)
+        expect("never moves" in report["reason"], report)
+        code, _, stderr = proof.oxide(["outputs", "adopt"], "adopt a nonempty target", keep)
+        expect(code != 0 and "never moves" in stderr, stderr)
+        expect(read_bytes(os.path.join(keep_target, "keep.txt")) == b"warm build", "target mutated")
+        expect(os.path.isdir(keep_target), "the real target directory was replaced")
+        expect(not os.path.exists(os.path.join(keep, ".oxide-outputs")), "refused adopt wrote a root")
 
-    # 2. A foreign symlink refuses, with no mutation.
-    outside = os.path.join(root, "outside")
-    os.makedirs(outside)
-    with open(os.path.join(outside, "sentinel"), "wb") as handle:
-        handle.write(b"foreign")
-    os.symlink(outside, os.path.join(foreign, "target"))
-    report = plan(proof, foreign, "plan with a foreign symlink")
-    expect(report["current_target"] == "foreign" and report["action"] == "refuse", report)
-    code, _, stderr = proof.oxide(["outputs", "adopt"], "adopt a foreign symlink", foreign)
-    expect(code != 0 and "never moves" in stderr, stderr)
-    expect(os.readlink(os.path.join(foreign, "target")) == outside, "foreign link was replaced")
-    expect(read_bytes(os.path.join(outside, "sentinel")) == b"foreign", "foreign target mutated")
-    # 2b. Without a receipt, permanent mode never hands Cargo the foreign link:
-    #     a build and a selected clean refuse with nothing written or removed
-    #     through it, including a Cargo-shaped artifact planted behind it.
-    os.makedirs(os.path.join(outside, "debug"))
-    with open(os.path.join(outside, "debug", "plain"), "wb") as handle:
-        handle.write(b"planted")
-    outside_before = sorted(
-        os.path.relpath(os.path.join(base, name), outside)
-        for base, dirs, files in os.walk(outside)
-        for name in dirs + files
-    )
-    for args, label in (
-        (["build"], "build through a receiptless foreign link"),
-        (["clean", "-p", "plain"], "selected clean through a receiptless foreign link"),
-    ):
-        code, _, stderr = proof.oxide(args, label, foreign)
-        expect(code != 0 and "never follows" in stderr, stderr)
-        after = sorted(
+        # 2. A foreign symlink refuses, with no mutation.
+        outside = os.path.join(root, "outside")
+        os.makedirs(outside)
+        with open(os.path.join(outside, "sentinel"), "wb") as handle:
+            handle.write(b"foreign")
+        os.symlink(outside, os.path.join(foreign, "target"))
+        report = plan(proof, foreign, "plan with a foreign symlink")
+        expect(report["current_target"] == "foreign" and report["action"] == "refuse", report)
+        code, _, stderr = proof.oxide(["outputs", "adopt"], "adopt a foreign symlink", foreign)
+        expect(code != 0 and "never moves" in stderr, stderr)
+        expect(os.readlink(os.path.join(foreign, "target")) == outside, "foreign link was replaced")
+        expect(read_bytes(os.path.join(outside, "sentinel")) == b"foreign", "foreign target mutated")
+        # 2b. Without a receipt, permanent mode never hands Cargo the foreign link:
+        #     a build and a selected clean refuse with nothing written or removed
+        #     through it, including a Cargo-shaped artifact planted behind it.
+        os.makedirs(os.path.join(outside, "debug"))
+        with open(os.path.join(outside, "debug", "plain"), "wb") as handle:
+            handle.write(b"planted")
+        outside_before = sorted(
             os.path.relpath(os.path.join(base, name), outside)
             for base, dirs, files in os.walk(outside)
             for name in dirs + files
         )
-        expect(after == outside_before, f"{label} changed the link's referent: {after}")
-        expect(os.readlink(os.path.join(foreign, "target")) == outside, f"{label} replaced the link")
-    expect(read_bytes(os.path.join(outside, "debug", "plain")) == b"planted", "the planted artifact changed")
+        for args, label in (
+            (["build"], "build through a receiptless foreign link"),
+            (["clean", "-p", "plain"], "selected clean through a receiptless foreign link"),
+        ):
+            code, _, stderr = proof.oxide(args, label, foreign)
+            expect(code != 0 and "never follows" in stderr, stderr)
+            after = sorted(
+                os.path.relpath(os.path.join(base, name), outside)
+                for base, dirs, files in os.walk(outside)
+                for name in dirs + files
+            )
+            expect(after == outside_before, f"{label} changed the link's referent: {after}")
+            expect(os.readlink(os.path.join(foreign, "target")) == outside, f"{label} replaced the link")
+        expect(read_bytes(os.path.join(outside, "debug", "plain")) == b"planted", "the planted artifact changed")
+
 
     # 3. Explicit conversion of an empty real target.
     shutil.rmtree(os.path.join(app, "target"))
@@ -799,60 +804,58 @@ def run(proof: Proof, repo: str) -> None:
         "no existing output was moved" in stdout,
         f"the conversion did not state the no-move rule: {stdout}",
     )
-    link = os.path.join(app, "target")
-    expect(os.path.islink(link), "target is not a symlink after adopt")
-    external_root = link_target(link)
-    expect(external_root.startswith(mount + "/oxide-outputs/"), external_root)
-    expect(os.path.isfile(os.path.join(external_root, MARKER)), "the root has no marker")
+    # Current first adoption is profile layout (outputs.rs:2230); preserve a
+    # separate legacy whole-target fixture for the historical transition cases.
+    external_root = expect_profile_layout(pool, mount, app, "first explicit adoption")
     marker = read_json(os.path.join(external_root, MARKER))
     expect(marker["version"] == "oxide.outputs.root/2", marker)
-    expect(marker["checkout"] == app and marker["kind"] == "external", marker)
     receipt = read_json(receipt_path(pool, app))
-    expect(
-        receipt["version"] == "oxide.outputs.transition/2"
-        and receipt["state"] == "committed"
-        and receipt["checkout"] == app,
-        receipt,
-    )
+    expect(receipt["version"] == "oxide.outputs.transition/3" and receipt["state"] == "committed", receipt)
     expect(not os.path.exists(os.path.join(app, ".oxide-outputs")), "adopt created a local root")
+    external_root = convert_profile_to_legacy(pool, mount, app, "legacy transition fixture")
+    link = os.path.join(app, "target")
     proof.phase("after first conversion")
 
-    # 4b. Downgrade fence: the last pre-feature Oxide refuses both pools'
-    #     fenced state, so it never builds or cleans through the owned link.
-    pre_src = os.path.join(root, "pre-feature-src")
-    os.makedirs(pre_src)
-    archive = proof.run(
-        ["/bin/sh", "-c", f'git -C "$0" archive {PRE_FEATURE} | tar -x -C "$1"', repo, pre_src],
-        timeout=60,
-    )
-    expect(archive.returncode == 0, f"pre-feature archive failed: {archive.stderr!r}")
-    pre_feature = layout.stage_at(proof, pre_src, "oxide-pre-feature")
-    shutil.rmtree(pre_src)
-    expect(sha256_file(pre_feature) != sha256_file(proof.binary), "the pre-feature binary is the candidate")
-    for state_dir in (os.path.join(pool, "oxide-managed"), os.path.join(pool, "oxide-managed", "removable", "oxide-managed")):
-        fenced = read_json(os.path.join(state_dir, "state.json"))
-        expect(fenced.get("owned_outputs") == "oxide.outputs/2", f"{state_dir} is not fenced: {fenced}")
-    external_before = sorted(os.listdir(external_root))
-    for args, label in (
-        (["check"], "pre-feature check refuses the fenced pool"),
-        (["clean", "-p", "poutputs"], "pre-feature selected clean refuses the fenced pool"),
-    ):
-        child = start_child(proof, [pre_feature] + args, app, env)
-        code, _, stderr = finish_child(proof, child, label)
-        # With current main's pool layout (oxide#118) the pre-feature binary
-        # refuses the pool at accounting before it parses state; either
-        # refusal keeps it off the owned link. The state-parser fence itself
-        # is covered by store::tests::the_owned_outputs_fence_refuses_a_pre_feature_parser.
-        expect(code != 0, f"{label}: the pre-feature binary did not refuse: {stderr}")
-        expect(
-            ("Oxide state is invalid" in stderr and "owned_outputs" in stderr)
-            or "unknown_accounting" in stderr,
-            f"{label}: unexpected refusal: {stderr}",
+    if base_compat:
+        # 4b. Downgrade fence: the last pre-feature Oxide refuses both pools'
+        #     fenced state, so it never builds or cleans through the owned link.
+        pre_src = os.path.join(root, "pre-feature-src")
+        os.makedirs(pre_src)
+        archive = proof.run(
+            ["/bin/sh", "-c", f'git -C "$0" archive {PRE_FEATURE} | tar -x -C "$1"', repo, pre_src],
+            timeout=60,
         )
-        print(f"{label}: refused by {'the state fence' if 'owned_outputs' in stderr else 'pool accounting'}", flush=True)
-        expect(link_target(link) == external_root, f"{label} moved the link")
-        expect(sorted(os.listdir(external_root)) == external_before, f"{label} changed the owned root")
-    proof.phase("after the downgrade fence")
+        expect(archive.returncode == 0, f"pre-feature archive failed: {archive.stderr!r}")
+        pre_feature = layout.stage_at(proof, pre_src, "oxide-pre-feature")
+        shutil.rmtree(pre_src)
+        expect(sha256_file(pre_feature) != sha256_file(proof.binary), "the pre-feature binary is the candidate")
+        for state_dir in (os.path.join(pool, "oxide-managed"), os.path.join(pool, "oxide-managed", "removable", "oxide-managed")):
+            fenced = read_json(os.path.join(state_dir, "state.json"))
+            expect(fenced.get("owned_outputs") == "oxide.outputs/3", f"{state_dir} is not fenced: {fenced}")
+        external_before = sorted(os.listdir(external_root))
+        for args, label in (
+            (["check"], "pre-feature check refuses the fenced pool"),
+            (["clean", "-p", "poutputs"], "pre-feature selected clean refuses the fenced pool"),
+        ):
+            child = start_child(proof, [pre_feature] + args, app, env)
+            code, _, stderr = finish_child(proof, child, label)
+            # With current main's pool layout (oxide#118) the pre-feature binary
+            # refuses the pool at accounting before it parses state; either
+            # refusal keeps it off the owned link. The state-parser fence itself
+            # is covered by store::tests::the_owned_outputs_fence_refuses_a_pre_feature_parser.
+            expect(code != 0, f"{label}: the pre-feature binary did not refuse: {stderr}")
+            expect(
+                ("Oxide state is invalid" in stderr and "owned_outputs" in stderr)
+                or "unknown_accounting" in stderr,
+                f"{label}: unexpected refusal: {stderr}",
+            )
+            print(f"{label}: refused by {'the state fence' if 'owned_outputs' in stderr else 'pool accounting'}", flush=True)
+            expect(link_target(link) == external_root, f"{label} moved the link")
+            expect(sorted(os.listdir(external_root)) == external_before, f"{label} changed the owned root")
+        proof.phase("after the downgrade fence")
+
+        proof.detach()
+        return
 
     # 4. Builds, run, test and profiles through the owned link.
     code, _, stderr = proof.oxide(["build", "--bin", "poutputs"], "build through the link", app)
@@ -954,7 +957,7 @@ def run(proof: Proof, repo: str) -> None:
     code, stdout, stderr = proof.oxide(["outputs", "adopt"], "adopt the untracked fixture", untracked)
     expect(code == 0 and "now selects" in stdout, stdout + stderr)
     untracked_link = os.path.join(untracked, "target")
-    untracked_root = link_target(untracked_link)
+    untracked_root = convert_profile_to_legacy(pool, mount, untracked, "untracked legacy fixture")
     set_recorded_uuid(pool, "00000000-0000-0000-0000-000000000000")
     code, _, stderr = proof.oxide(["check"], "local root where Git would track it", untracked)
     expect(code != 0, "a Git-tracked local fallback root was created")
@@ -1825,11 +1828,11 @@ def detach_run(proof: Proof, repo: str) -> None:
     os.makedirs(outside)
     with open(os.path.join(outside, "sentinel"), "wb") as handle:
         handle.write(b"foreign")
-    os.remove(os.path.join(foreign, "target"))
-    os.symlink(outside, os.path.join(foreign, "target"))
+    os.remove(os.path.join(foreign, "target", "debug"))
+    os.symlink(outside, os.path.join(foreign, "target", "debug"))
     code, stdout, stderr = proof.oxide(["outputs", "detach"], "detach refuses a foreign link", foreign)
     expect(code != 0 and "left untouched" in stderr, stdout + stderr)
-    expect(os.readlink(os.path.join(foreign, "target")) == outside, "the foreign link was replaced")
+    expect(os.readlink(os.path.join(foreign, "target", "debug")) == outside, "the foreign link was replaced")
     expect(read_bytes(os.path.join(outside, "sentinel")) == b"foreign", "the foreign referent changed")
     expect(receipt_state(pool, foreign) == "committed", "a refused detach changed the receipt")
 
@@ -4599,6 +4602,10 @@ def legacy_whole_target(proof: Proof, pool: str, mount: str, checkout: str, labe
         ["outputs", "adopt"], f"{label}: convert to obtain a real root and marker", checkout
     )
     expect(code == 0, stderr)
+    return convert_profile_to_legacy(pool, mount, checkout, label)
+
+
+def convert_profile_to_legacy(pool: str, mount: str, checkout: str, label: str) -> str:
     root = expect_profile_layout(pool, mount, checkout, label)
     receipt = read_json(receipt_file(pool, checkout))
     selected = next(
@@ -6848,11 +6855,12 @@ def main() -> int:
     if diagnostic:
         arguments.remove("--diagnostic")
         expect(
-            tuple(arguments) in (("exec-inference",), ("auto-ineligible",)),
+            tuple(arguments) in (("exec-inference",), ("auto-ineligible",), ("base-compat",)),
             "--diagnostic belongs to the exec-inference or auto-ineligible mode",
         )
     modes = {
         (): (run, "permanent-outputs"),
+        ("base-compat",): (lambda proof, repo: run(proof, repo, True), "base-compat"),
         ("auto-adopt",): (auto_run, "auto-adopt"),
         ("detach-permanent",): (detach_run, "detach-permanent"),
         ("ignore-safety",): (ignore_run, "ignore-safety"),
