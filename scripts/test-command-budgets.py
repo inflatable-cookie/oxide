@@ -42,6 +42,13 @@ Apparatus contract
   checkout `cwd`, so no case can act on this repository or a live pool. A
   missing control (scratch, deadline, evidence, explicit toolchain) refuses
   before any storage effect.
+- Scratch placement (scratch-pools.md S4): the run root is the supervisor's
+  `OXIDE_TASK_SCRATCH_ROOT` on the selected volume. The script creates one
+  private `scratch-pools` directory beneath it, declares that directory as
+  `OXIDE_SCRATCH_ROOT` for every fixture, and places each fixture pool strictly
+  inside it with an explicit `OXIDE_POOL_CAP`. The `/private/tmp` fallback is
+  refused before any effect, because the product refuses boot-volume scratch
+  and that run would not be scratch-pool coverage.
 - Children this script starts are recorded, given bounded lifetimes, and
   released through their own release files or plain `terminate()`/`kill()` on
   the exact PIDs it started. It creates no new session or process group, runs
@@ -99,12 +106,24 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.abspath(__file__)
 BUILDER = "1.97.1"
-# `bounded-test.py` at this HEAD. The owning documentation records the hash
-# this proof source was reviewed against; the supervisor's own receipt, not
-# this helper, remains authoritative for session closure.
-EXPECTED_RUNNER_SHA256 = "961164e797c01432fa8234497627f75e56489ef6395ef66e48824cdb0e48c052"
+# `bounded-test.py` at the current main (the oxide#191/#192/#197 bytes). The
+# pure self-check pins this against the file on disk; the supervisor's own
+# receipt, not this helper, remains authoritative for session closure.
+EXPECTED_RUNNER_SHA256 = "fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b"
 WALL_LIMIT_S = 300
 SCRATCH_BUDGET_MIB = 512
+# Fixture pools live beneath one private directory of the run root, which is
+# the OXIDE_SCRATCH_ROOT every fixture declares (scratch-pools.md S4).
+POOL_SCRATCH_LEAF = "scratch-pools"
+FIXTURE_POOL_CAP = "256MiB"
+# Set by Proof.prepare() before any case runs; the pure check passes its own.
+POOL_SCRATCH_ROOT: str | None = None
+# The product's two pool-creation notices: an ordinary creation and a scratch
+# pool creation (src/bin/oxide/store.rs create_pool, scratch_io.rs create).
+POOL_CREATION_NOTICES = (
+    "oxide: creating the build pool at",
+    "oxide: creating a scratch build pool on volume ",
+)
 SHUTDOWN_MARGIN_S = 30
 # Staging is one debug build of this repository. Four Cargo jobs with 16 codegen
 # units cut its wall time while the staged artifact keeps the same frozen
@@ -186,6 +205,17 @@ DIAGNOSTIC_TEXT = {
     "execution_stop": "oxide: stopped by the execution budget (<N>ms)",
     "event_loss": "oxide: the budget event channel became unusable; typed results are unavailable for this command",
 }
+
+
+def pool_creation_notice(text: str | None) -> bool:
+    """Whether stderr carries an ordinary or a scratch pool-creation notice.
+
+    A scratch pool prints only the scratch notice, so an oracle that matched the
+    ordinary notice alone would fail every scratch fixture as "no pool created".
+    """
+    if not text:
+        return False
+    return any(line.startswith(POOL_CREATION_NOTICES) for line in text.splitlines())
 
 
 class Fault(Exception):
@@ -444,12 +474,102 @@ def stage_identity(commit: str, tree: str, digest: str, script: str) -> dict:
     }
 
 
+# The nine items of the fixed proof-authoring premise checklist
+# (docs/knowledge/contracts/workflow.md#proof-authoring-premise-checklist). Each
+# disposition names the module-level source it depends on; the pure self-check
+# requires every name to exist and pins the fixture environment values, so a
+# disposition cannot outlive the code that satisfies it.
+PREMISE_CHECKLIST = {
+    "1_private_home_and_rustup": {
+        "disposition": (
+            "invoking_rustup_home() is read before any private HOME exists and passed to "
+            "fixture_environment() with RUSTUP_TOOLCHAIN pinned to 1.97.1 and "
+            "RUSTUP_AUTO_INSTALL=0. The only --locked call is the staging build of this "
+            "repository (LOCKED_FLAG, its committed Cargo.lock); fixture crates are "
+            "std-only and never pass --locked, so no fixture lock is seeded and nothing "
+            "is downloaded or installed"
+        ),
+        "source": ["invoking_rustup_home", "fixture_environment", "LOCKED_FLAG", "BUILDER"],
+    },
+    "2_account_home_control": {
+        "disposition": "fixture_environment() sets OXIDE_TEST_HOME_FROM_ENV=1 beside the private HOME",
+        "source": ["fixture_environment"],
+    },
+    "3_environment_isolation": {
+        "disposition": (
+            "stage_subject() drops every inherited OXIDE_ (including OXIDE_SCRATCH_ROOT), "
+            "CARGO_TARGET_/CARGO_BUILD_/SCCACHE_ and encoded compiler key (STAGING_SCRUBBED); "
+            "fixture_environment() is an allowlist of private HOME, CARGO_HOME, config, "
+            "scratch pool, pool cap, temp and the toolchain home, so no host pool, config or "
+            "account provenance is inherited"
+        ),
+        "source": ["STAGING_SCRUBBED", "fixture_environment"],
+    },
+    "4_automatic_adoption": {
+        "disposition": (
+            "not applicable: every fixture is a leased command on a private scratch pool, and "
+            "no case places or reads permanent outputs, so no checkout is automatically adopted"
+        ),
+        "source": [],
+    },
+    "5_cargo_external_argv": {
+        "disposition": (
+            "not applicable: no case invokes an external Cargo subcommand; fixtures run "
+            "`oxide exec`/`run` and the staged candidate's own commands only"
+        ),
+        "source": [],
+    },
+    "6_owned_images": {
+        "disposition": (
+            "not applicable: no sparse image is created or attached; the scratch pools are "
+            "directories on the selected scratch volume, which may be removable"
+        ),
+        "source": [],
+    },
+    "7_compiler_flags": {
+        "disposition": (
+            "staging freezes RUSTFLAGS through STAGING_ENV_REQUIRED and drops every encoded "
+            "form (CARGO_ENCODED_RUSTFLAGS); fixture_environment() passes no RUSTFLAGS at all, "
+            "so an inherited value cannot change the staged candidate or a fixture"
+        ),
+        "source": ["STAGING_ENV_REQUIRED", "STAGING_SCRUBBED", "fixture_environment"],
+    },
+    "8_temporary_storage": {
+        "disposition": (
+            "require_controls() refuses the /private/tmp fallback and a "
+            "non-canonical, foreign-owned or symlinked root before any effect; Proof.prepare() "
+            "creates one private scratch-pools directory beneath OXIDE_TASK_SCRATCH_ROOT; "
+            "fixture_environment() declares it as OXIDE_SCRATCH_ROOT with an explicit cap and "
+            "places every pool strictly inside it; TMPDIR is the fixture root on the same volume. "
+            "The product's DirectoryBudget reserve watchdog is the same class as the internal pool's"
+        ),
+        "source": ["require_controls", "POOL_SCRATCH_LEAF", "POOL_SCRATCH_ROOT", "fixture_environment", "FIXTURE_POOL_CAP"],
+    },
+    "9_macos_mktemp": {
+        "disposition": (
+            "no shell mktemp: every fixture root is a private_dir() beneath the supervisor run "
+            "root, so macOS TMPDIR handling never selects a location. The only tempfile.mkdtemp "
+            "is the pure self-test's, with an explicit dir"
+        ),
+        "source": ["private_dir"],
+    },
+}
+
+
 def plan_document() -> dict:
     return {
         "task": "oxide#140",
         "selector": SELECTOR,
         "command": COMMAND,
         "counted_only_without_argument": True,
+        "premise_checklist": {key: entry["disposition"] for key, entry in PREMISE_CHECKLIST.items()},
+        "scratch": {
+            "placement": "supervisor-selected volume: OXIDE_TASK_SCRATCH_ROOT/scratch-pools is the declared OXIDE_SCRATCH_ROOT",
+            "pool": "one scratch pool per fixture, strictly inside that root, named pool-<case>",
+            "cap": FIXTURE_POOL_CAP + " explicit per fixture (scratch pools have no implicit budget)",
+            "fallback": "a /private/tmp fallback refuses before any effect; it is not scratch-pool coverage",
+            "not_a_cap": "the per-pool cap is the product's soft budget for that fixture; the guard's 512 MiB monitored scratch budget governs the whole run",
+        },
         "modes": ["--plan", "--self-check", "--self-test", "--diagnostic", "--help"],
         "cases": [
             {"name": "fast-start-axes", "oracle": "both budgets: started then finished(child_exit 0), spawn_late false, both budget fields present; execution-only: admission_ms null; admission-only: execution_ms and execution_started_ms null; no budget diagnostic (exact report_stop/LOSS_NOTE grammar) in any axis"},
@@ -467,7 +587,7 @@ def plan_document() -> dict:
             {"name": "events-broken-reader", "oracle": "read end closed before start: exit 0, parent survives, one loss note, no typed record"},
             {"name": "unknown-closure-held", "oracle": "debug closure hook + 1s execution: exit 1, finished(unconfirmed_closure), drain not complete, lease held, status shows the held slot"},
             {"name": "preparation-stop-124", "oracle": "fake cargo sleeping in locate-project + 1ms admission: exit 124, no primary marker"},
-            {"name": "late-start", "oracle": "one delay-free seed launch of the same private pool, checkout and tool argv with the spawn-delay hook absent (exit 0, pool-creation notice, recorded control state), then the timed launch under a 6s window with a 7s debug delay after the last admission check: it must reuse the prepared state (no second pool-creation notice, same control root) and report exactly one started exec_tool record with spawn_late and admission_expired_before_start true, a positive overshoot and admission_elapsed_ms past 6000, terminal admission_deadline with an admission origin, exit 124, the exact stop line, and a delay-free follow-up exec that reuses the released slot; a no-started pre-spawn expiry or a second pool creation is an unexercised fixture FAIL"},
+            {"name": "late-start", "oracle": "one delay-free seed launch of the same private pool, checkout and tool argv with the spawn-delay hook absent (exit 0, an ordinary or scratch pool-creation notice, recorded control state), then the timed launch under a 6s window with a 7s debug delay after the last admission check: it must reuse the prepared state (no second pool-creation notice, same control root) and report exactly one started exec_tool record with spawn_late and admission_expired_before_start true, a positive overshoot and admission_elapsed_ms past 6000, terminal admission_deadline with an admission origin, exit 124, the exact stop line, and a delay-free follow-up exec that reuses the released slot; a no-started pre-spawn expiry or a second pool creation is an unexercised fixture FAIL"},
             {"name": "no-mutation", "oracle": "a refused input leaves home/config/pool unchanged; a successful budgeted command adds no settings file, no new control-state fields and no budget lines in status"},
             {"name": "unbudgeted", "oracle": "exit 3 preserved, no budget diagnostic, no events required"},
         ],
@@ -517,7 +637,7 @@ def plan_document() -> dict:
         },
         "provenance": {
             "staging": "invoking Cargo home, offline, explicit target/build in scratch; not a claim that staging never reads it",
-            "fixtures": "private HOME/CARGO_HOME/OXIDE_CONFIG/OXIDE_POOL/temp and a private tiny checkout cwd",
+            "fixtures": "private HOME/CARGO_HOME/OXIDE_CONFIG, a scratch pool (OXIDE_SCRATCH_ROOT scratch-pools with OXIDE_POOL_CAP) and temp on the selected volume, and a private tiny checkout cwd",
             "private_home": "OXIDE_TEST_HOME_FROM_ENV=1 with explicit private config and pool (oxide#143 convention)",
             "toolchain": "RUSTUP_TOOLCHAIN=1.97.1, RUSTUP_AUTO_INSTALL=0, RUSTUP_HOME captured before HOME is replaced",
             "lockfile": "the only --locked call is the staging build of this repository, whose committed Cargo.lock is present; fixture crates are std-only, are never invoked with --locked, and Cargo writes their lock beside each fixture manifest in its private checkout",
@@ -669,30 +789,57 @@ def require_controls() -> tuple[str, str]:
     expect(bool(evidence), "OXIDE_PROOF_EVIDENCE is not set")
     scratch = os.path.abspath(scratch)
     evidence = os.path.abspath(evidence)
-    expect(
-        scratch.startswith("/private/tmp/") or scratch.startswith("/tmp/"),
-        f"scratch root {scratch} is not a private temporary directory",
+    is_directory = os.path.isdir(scratch)
+    owner = os.stat(scratch).st_uid if is_directory else -1
+    reason = scratch_root_refusal(
+        scratch,
+        os.path.realpath(scratch),
+        is_directory,
+        os.path.islink(scratch),
+        owner,
+        os.geteuid(),
     )
-    expect(os.path.isdir(scratch), f"scratch root {scratch} is not a directory")
+    expect(reason is None, reason or "")
     expect(os.path.isdir(evidence), f"evidence directory {evidence} does not exist")
     return (scratch, evidence)
 
 
-def fixture_env(root: str, label: str) -> dict:
-    """A private allowlisted environment: no host Oxide, XDG or Cargo setting."""
-    home = private_dir(os.path.join(root, f"home-{label}"))
-    cargo_home = private_dir(os.path.join(root, f"cargo-home-{label}"))
-    config = os.path.join(root, f"oxide-config-{label}.toml")
-    write_private(config, "")
-    pool = os.path.join(root, f"pool-{label}")
+def scratch_root_refusal(
+    scratch: str, canonical: str, is_directory: bool, is_link: bool, owner: int, user: int
+) -> str | None:
+    """The first reason a declared scratch root is unusable, or None (pure).
+
+    The /private/tmp fallback is the internal boot volume, which the product
+    refuses as scratch (scratch-pools.md row 8); refusing it here keeps a
+    fallback run from reporting as scratch-pool coverage.
+    """
+    if canonical != scratch:
+        return f"scratch root {scratch} is not canonical"
+    if scratch.startswith(("/private/tmp/", "/tmp/")):
+        return f"scratch root {scratch} is the /private/tmp fallback; scratch-pool coverage needs the selected volume"
+    if not is_directory or is_link:
+        return f"scratch root {scratch} is not a directory"
+    if owner != user:
+        return f"scratch root {scratch} is not owned by this user"
+    return None
+
+
+def fixture_environment(root: str, label: str, pool_scratch: str) -> dict:
+    """The pure allowlisted environment of one fixture: no effect, no directory.
+
+    Its pool lies strictly inside `pool_scratch`, which is declared as the
+    OXIDE_SCRATCH_ROOT with an explicit cap, so the pool is a scratch pool on
+    the supervisor-selected volume. Temp is the fixture root, on that volume.
+    """
     env = {
-        "HOME": home,
+        "HOME": os.path.join(root, f"home-{label}"),
         "OXIDE_TEST_HOME_FROM_ENV": "1",
-        "OXIDE_CONFIG": config,
-        "OXIDE_POOL": pool,
+        "OXIDE_CONFIG": os.path.join(root, f"oxide-config-{label}.toml"),
+        "OXIDE_SCRATCH_ROOT": pool_scratch,
+        "OXIDE_POOL": os.path.join(pool_scratch, f"pool-{label}"),
         "OXIDE_POOL_BACKEND": "directory-budget",
-        "OXIDE_POOL_CAP": "256MiB",
-        "CARGO_HOME": cargo_home,
+        "OXIDE_POOL_CAP": FIXTURE_POOL_CAP,
+        "CARGO_HOME": os.path.join(root, f"cargo-home-{label}"),
         "TMPDIR": root,
         "TMP": root,
         "TEMP": root,
@@ -708,7 +855,17 @@ def fixture_env(root: str, label: str) -> dict:
     for name in ("OXIDE_TASK_SCRATCH_ROOT", "OXIDE_PROOF_DEADLINE_NS", "OXIDE_PROOF_EVIDENCE"):
         if name in os.environ:
             env[name] = os.environ[name]
-    say(f"fixture {label}: private home, cargo home, config, pool and temp")
+    return env
+
+
+def fixture_env(root: str, label: str) -> dict:
+    """A private allowlisted environment: no host Oxide, XDG or Cargo setting."""
+    expect(POOL_SCRATCH_ROOT is not None, "the scratch-pool root is not prepared")
+    private_dir(os.path.join(root, f"home-{label}"))
+    private_dir(os.path.join(root, f"cargo-home-{label}"))
+    env = fixture_environment(root, label, POOL_SCRATCH_ROOT)
+    write_private(env["OXIDE_CONFIG"], "")
+    say(f"fixture {label}: private home, cargo home, config, scratch pool and temp")
     return env
 
 
@@ -1553,7 +1710,7 @@ def case_late_start(root: str, subject: str) -> None:
     )
     expect(seed.returncode == 0, f"the seed launch failed ({seed.returncode}): {stderr_excerpt(seed.stderr)}")
     expect(
-        "creating the build pool" in seed.stderr,
+        pool_creation_notice(seed.stderr),
         f"the seed did not create the fixture pool: {stderr_excerpt(seed.stderr)}",
     )
     control, _keys_before = control_state(base_env)
@@ -1597,7 +1754,7 @@ def case_late_start(root: str, subject: str) -> None:
         spawn_delay_ms=delay_ms,
     )
     expect(
-        "creating the build pool" not in result_run.stderr,
+        not pool_creation_notice(result_run.stderr),
         "the timed launch created another pool instead of reusing the prepared one: "
         f"{stderr_excerpt(result_run.stderr)}",
     )
@@ -2027,6 +2184,9 @@ class Proof:
         # CARGO_HOME, config or pool fixture is created.
         self.capabilities = probe_capabilities(self.subject, self.scratch)
         self.root = private_dir(os.path.join(self.scratch, "fixture-budgets"))
+        # Every fixture pool is a scratch pool beneath this one declared root.
+        global POOL_SCRATCH_ROOT
+        POOL_SCRATCH_ROOT = private_dir(os.path.join(self.scratch, POOL_SCRATCH_LEAF))
 
     def run(self) -> None:
         self.prepare()
@@ -2393,6 +2553,67 @@ def self_check() -> None:
     expect(set(identity) == {"source_commit", "source_tree", "binary_sha256", "script_sha256", "supervisor_sha256", "toolchain"}, "the receipt identity changed")
     expect(sha256_file(SCRIPT) != "", "the script digest is unreadable")
     expect(len(EXPECTED_RUNNER_SHA256) == 64, "the supervisor pin is malformed")
+    # Current-main oracle pins (S4 sweep): the supervisor pin must name the bytes
+    # on disk, so a runner change without a proof update fails here, pure.
+    runner_on_disk = sha256_file(os.path.join(REPO, "scripts", "bounded-test.py"))
+    expect(
+        runner_on_disk == EXPECTED_RUNNER_SHA256,
+        f"the supervisor pin is stale: scripts/bounded-test.py is {runner_on_disk}",
+    )
+    # Pool-creation notices: both product forms are recognised, nothing else is.
+    expect(
+        pool_creation_notice("oxide: creating a scratch build pool on volume 1234; not for ordinary project builds\n"),
+        "the scratch pool-creation notice is not recognised",
+    )
+    expect(
+        pool_creation_notice("oxide: creating the build pool at /x (256 MB soft budget, directory-budget-v1, budget-only)\n"),
+        "the ordinary pool-creation notice is not recognised",
+    )
+    expect(not pool_creation_notice("oxide: waiting for a build slot\n"), "a waiting line was read as pool creation")
+    expect(not pool_creation_notice(None), "missing stderr was read as pool creation")
+    # Scratch root judgement (S4): canonical, owned, directory, never the fallback.
+    fake_root = "/Volumes/Builds/scratch/oxide/run.example/scratch"
+    expect(scratch_root_refusal(fake_root, fake_root, True, False, 501, 501) is None, "a selected-volume root was refused")
+    expect(
+        "fallback" in (scratch_root_refusal("/private/tmp/x", "/private/tmp/x", True, False, 501, 501) or ""),
+        "the /private/tmp fallback was not refused",
+    )
+    expect(scratch_root_refusal(fake_root, "/Volumes/Other/x", True, False, 501, 501) is not None, "a non-canonical root was accepted")
+    expect(scratch_root_refusal(fake_root, fake_root, True, False, 0, 501) is not None, "a foreign-owned root was accepted")
+    expect(scratch_root_refusal(fake_root, fake_root, True, True, 501, 501) is not None, "a symlinked root was accepted")
+    # Fixture environment contract (S4), pure: every fixture pool is a scratch
+    # pool strictly inside one declared root, with an explicit cap, reaching no
+    # /private/tmp value and inheriting no compiler flags.
+    pool_root = os.path.join(fake_root, POOL_SCRATCH_LEAF)
+    fixture_root = os.path.join(fake_root, "fixture-budgets")
+    fixture_values = fixture_environment(fixture_root, "admission", pool_root)
+    expect(fixture_values["OXIDE_SCRATCH_ROOT"] == pool_root, "the fixture does not declare the scratch-pool root")
+    expect(
+        fixture_values["OXIDE_POOL"].startswith(pool_root + os.sep),
+        "the fixture pool escapes the declared scratch-pool root",
+    )
+    expect(fixture_values["OXIDE_POOL_CAP"] == FIXTURE_POOL_CAP, "the fixture pool cap is not the explicit cap")
+    expect(fixture_values["OXIDE_POOL_BACKEND"] == "directory-budget", "the fixture backend changed")
+    expect(fixture_values["OXIDE_TEST_HOME_FROM_ENV"] == "1", "the account-home control is missing")
+    expect(fixture_values["TMPDIR"] == fixture_root == fixture_values["TMP"] == fixture_values["TEMP"], "temp is not the fixture root")
+    for key in ("HOME", "CARGO_HOME", "OXIDE_CONFIG", "OXIDE_SCRATCH_ROOT", "OXIDE_POOL", "TMPDIR"):
+        expect(
+            not fixture_values[key].startswith(("/private/tmp", "/tmp")),
+            f"fixture {key} names the internal /private/tmp root",
+        )
+    expect(
+        "RUSTFLAGS" not in fixture_values and "CARGO_ENCODED_RUSTFLAGS" not in fixture_values,
+        "a fixture inherits compiler flags",
+    )
+    # The premise checklist: nine items, each naming source that exists.
+    expect(len(PREMISE_CHECKLIST) == 9, "the premise checklist does not have nine items")
+    for key, entry in PREMISE_CHECKLIST.items():
+        for name in entry["source"]:
+            expect(name in globals(), f"premise {key} names {name}, which is not in the script")
+    expect(
+        plan["premise_checklist"] == {key: entry["disposition"] for key, entry in PREMISE_CHECKLIST.items()},
+        "the plan does not carry the premise dispositions",
+    )
     print("self-check: ok (pure argument, plan, allocation, sequence, descriptor and recipe checks; not evidence)")
 
 

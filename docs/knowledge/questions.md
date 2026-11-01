@@ -289,3 +289,8 @@ brief. The three composition rules with the now-merged
 (§9, D15); its broker interface for a joined compile and which design lands
 first remain open. Also open: deadline inheritance (Q-018), hostile same-UID
 code and non-macOS/Linux platforms.
+
+
+## Q-021 — How should Oxide's output roots move to Barge?
+
+Open, with a proposed design: [Barge adoption](contracts/barge-adoption.md). The proposal uses Barge's Rust library at a pinned commit, declares `oxide/outputs` only, switches the release prune through a single deleter, keeps the 91 legacy roots Oxide-side unless Tom rules otherwise, and adds no guard call in F6. Barge-side gaps (no release effect verb, `maintain` acting on declared age policies, no release-only policy kind) need the Barge delegate's ruling first. Operator choices: Builds `root_dir`, outputs reserve participation, release from maintain, the 91 legacy roots, parity differences D-1/D-2, pool-slot ownership, declaration authority, and whether to run the read-only census first.
