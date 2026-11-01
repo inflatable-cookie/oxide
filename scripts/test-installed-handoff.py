@@ -23,6 +23,23 @@ replacement between hashing and the last check; skipped commands; and a
 command that reaches final release after effects with newer state, which must
 never execute anything.
 
+HIGH premise dispositions (see the case bodies and helpers below):
+1. stage_subject captures invoking rustup and Cargo cache before a private HOME;
+   fixture children use private HOME/CARGO_HOME, the pinned toolchain, no auto
+   install, and fake Cargo (no fixture --locked invocation).
+2. Fixture.env sets OXIDE_TEST_HOME_FROM_ENV=1 for every product child.
+3. Fixture.env is an allowlist, scrubbing inherited OXIDE_, XDG_, CARGO_ and
+   GIT_; staging scrubs those families before its explicit values.
+4. No permanent-mode adoption is tested; fixture checkouts use scratch pools.
+5. No Cargo external subcommand is invoked; the recording stub is an installed
+   Oxide candidate, not a cargo-* external subcommand.
+6. No disk images are attached or detached.
+7. Staging and fixture children freeze RUSTFLAGS and omit encoded flags.
+8. main derives the private declaration from the supervisor scratch root;
+   Fixture.env supplies that root and an explicit 64 MiB cap to every child.
+9. main uses tempfile.mkdtemp with an explicit supervisor scratch parent; no
+   shell mktemp is used.
+
 Not a benchmark, not full QA and not real-drive or host-install qualification.
 """
 
@@ -70,6 +87,8 @@ DIAGNOSTIC = None
 
 # The platform toolchain stays reachable for `rustc -vV` and `cargo -V`
 # probes; the fixture's own `cargo` and `oxide` stay first on PATH.
+SUBJECT = ""
+SCRATCH_ROOT = ""
 TOOLCHAIN_BIN = os.path.dirname(shutil.which("rustc") or "")
 
 
@@ -234,10 +253,15 @@ def stage_subject(root: str, capability: dict | None = None) -> str:
     """
     stage = os.path.join(root, "stage")
     log = os.path.join(root, "stage.log")
+    invoking_home = os.path.expanduser("~")
+    rustup_home = os.environ.get("RUSTUP_HOME") or os.path.join(invoking_home, ".rustup")
+    cargo_home = os.environ.get("CARGO_HOME") or os.path.join(invoking_home, ".cargo")
+    private_home = os.path.join(root, "stage-home")
+    os.makedirs(private_home, mode=0o700, exist_ok=True)
     env = {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith(("CARGO_TARGET_", "CARGO_BUILD_", "SCCACHE_"))
+        if not key.startswith(("OXIDE_", "XDG_", "CARGO_", "GIT_", "SCCACHE_"))
         and key
         not in (
             "CARGO",
@@ -249,6 +273,9 @@ def stage_subject(root: str, capability: dict | None = None) -> str:
     }
     env.update(
         {
+            "HOME": private_home,
+            "CARGO_HOME": cargo_home,
+            "RUSTUP_HOME": rustup_home,
             "RUSTUP_TOOLCHAIN": BUILDER,
             "RUSTUP_AUTO_INSTALL": "0",
             "RUSTC_WRAPPER": "",
@@ -311,7 +338,7 @@ def stage_subject(root: str, capability: dict | None = None) -> str:
 class Fixture:
     """One private HOME, install receipts and directory pool."""
 
-    def __init__(self, root: str):
+    def __init__(self, root: str, create_pool: bool = True):
         self.root = root
         self.home = os.path.join(root, "home")
         self.pool = os.path.join(root, "pool")
@@ -327,18 +354,11 @@ class Fixture:
             (self.home + "/.local/state", 0o700),
             (os.path.join(self.home, ".local/state/oxide"), 0o700),
             (self.receipts, 0o700),
-            (self.pool, 0o700),
-            (self.control, 0o700),
             (self.cargo_home, 0o700),
             (self.tools, 0o700),
         ):
             os.makedirs(directory, exist_ok=True)
             os.chmod(directory, mode)
-        write(
-            os.path.join(self.pool, "config.json"),
-            json.dumps({"backend": "directory-budget-v1"}),
-            0o644,
-        )
         self.record = os.path.join(root, "record")
         # A recording Cargo that answers version probes and fails workspace
         # discovery: no fixture ever starts the real Cargo, so no toolchain
@@ -354,6 +374,28 @@ class Fixture:
             + "exit 1\n",
             0o755,
         )
+        if create_pool:
+            # Ask the product to create its own bound scratch pool, then plant
+            # the hand-off control data in that genuine private pool.
+            workspace = os.path.join(root, "setup-workspace")
+            manifest = os.path.join(workspace, "Cargo.toml")
+            write(manifest, '[package]\nname = "handoff-setup"\nversion = "0.1.0"\nedition = "2021"\n', 0o644)
+            write(os.path.join(workspace, "src/lib.rs"), "pub fn value() {}\n", 0o644)
+            cargo = os.path.join(self.tools, "cargo")
+            with open(cargo, encoding="utf-8") as handle:
+                original = handle.read()
+            setup = ("#!/bin/sh\n"
+                     "if [ \"$1\" = -V ] || [ \"$1\" = --version ]; then echo 'cargo 1.97.1 (fixture)'; exit 0; fi\n"
+                     "if [ \"$1\" = locate-project ]; then echo " + shlex.quote(manifest) + "; exit 0; fi\n"
+                     "exit 1\n")
+            write(cargo, setup, 0o755)
+            result = subprocess.run([SUBJECT, "check"], cwd=workspace, env=self.env(SUBJECT),
+                                    capture_output=True, text=True, timeout=min(30, work_left()))
+            write(cargo, original, 0o755)
+            expect(result.returncode == 1 and os.path.isfile(os.path.join(self.pool, "ledger.json")),
+                   f"fixture setup did not create its pool: {result.stderr[-2000:]}")
+            expect(os.path.isfile(os.path.join(self.control, "scratch.json")),
+                   f"fixture scratch creation failed: {result.stderr[-2000:]}")
 
     @property
     def destination(self) -> str:
@@ -400,6 +442,11 @@ class Fixture:
             "HOME": self.home,
             "OXIDE_TEST_HOME_FROM_ENV": "1",
             "OXIDE_POOL": self.pool,
+            "OXIDE_SCRATCH_ROOT": SCRATCH_ROOT,
+            "OXIDE_POOL_CAP": "64MiB",
+            "RUSTUP_TOOLCHAIN": BUILDER,
+            "RUSTUP_AUTO_INSTALL": "0",
+            "RUSTFLAGS": "-C strip=symbols",
             "CARGO_HOME": self.cargo_home,
             "PATH": ":".join(
                 [
@@ -558,11 +605,9 @@ def check_no_trigger(root: str, binary: str) -> None:
     result = run(fixture, binary, ["status"])
     expect(result.returncode == 0, f"oversized exit {result.returncode}")
     expect(REFUSAL not in result.stderr and NOTICE not in result.stderr, "oversized document handed off")
-    shutil.rmtree(fixture.root, ignore_errors=True)
 
     case("no_pool_means_no_trigger")
-    fixture = Fixture(os.path.join(root, "no-pool"))
-    shutil.rmtree(fixture.pool)
+    fixture = Fixture(os.path.join(root, "no-pool"), create_pool=False)
     fixture.stub()
     fixture.receipt()
     result = run(fixture, binary, ["status"])
@@ -741,15 +786,13 @@ def check_same_binary(root: str, binary: str) -> None:
     before = fixture.control_listing()
     result = run(fixture, subject, ["status"])
     expect_handoff_refusal(result, fixture, "same inode", before)
-    shutil.rmtree(fixture.root, ignore_errors=True)
 
 
 def check_final_release(root: str, binary: str) -> None:
     case("a_final_release_error_never_replays_the_command")
-    fixture = Fixture(os.path.join(root, "final-release"))
+    fixture = Fixture(os.path.join(root, "final-release"), create_pool=False)
     # Let the first command create the pool properly (config, ledger and
     # control), so the real run starts from an existing current-version pool.
-    shutil.rmtree(fixture.pool)
     workspace = os.path.join(fixture.root, "workspace")
     os.makedirs(workspace)
     write(
@@ -833,8 +876,7 @@ def check_final_release(root: str, binary: str) -> None:
 
 def check_cargo_exit_75(root: str, binary: str) -> None:
     case("cargo_exit_75_is_propagated_and_is_not_a_trigger")
-    fixture = Fixture(os.path.join(root, "cargo-75"))
-    shutil.rmtree(fixture.pool)
+    fixture = Fixture(os.path.join(root, "cargo-75"), create_pool=False)
     workspace = os.path.join(fixture.root, "workspace")
     os.makedirs(workspace)
     write(
@@ -939,7 +981,7 @@ def self_check():
 
 
 def main() -> int:
-    global DIAGNOSTIC
+    global DIAGNOSTIC, SUBJECT, SCRATCH_ROOT
     if sys.argv[1:] == ["--plan"]:
         print("installed-handoff groups: " + ", ".join(name for name, _ in GROUPS))
         print("supervisor bounds: 120 s, 64 MiB scratch")
@@ -960,7 +1002,9 @@ def main() -> int:
         for name in ("TMPDIR", "TMP", "TEMP"):
             expect(os.environ.get(name) == scratch, f"{name} differs from the supervisor scratch")
         root = tempfile.mkdtemp(prefix="installed-handoff.", dir=scratch)
+        SCRATCH_ROOT = root
         binary = stage_subject(root)
+        SUBJECT = binary
         digest = sha256(binary)
         print(f"subject {binary} sha256 {digest}")
         compile_stub(root)
