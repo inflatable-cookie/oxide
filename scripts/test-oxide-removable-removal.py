@@ -8,11 +8,11 @@ OXIDE_PROOF_EVIDENCE. It reuses the oxide#104 script's child runner and
 staging; it adds no supervision of its own.
 
 Stages this HEAD's `oxide` offline with 1.97.1. Over a private HOME,
-CARGO_HOME and budget-only internal pool, one owned 128 MiB scratch APFS
-image at a unique `/Volumes/<name>` is attached with `hdiutil -owners on`
-(every attach and re-attach, observed read-only from `/sbin/mount` as
-carrying no `noowners` flag) and registered as the removable pool; the
-product's own registration would refuse an ignore-ownership mount.
+CARGO_HOME and one budget-only `directory-budget-v1` pool, one owned 128 MiB
+scratch APFS image at a unique `/Volumes/<name>` is attached with
+`hdiutil -owners on` (every attach and re-attach, observed read-only from
+`/sbin/mount` as carrying no `noowners` flag) and registered as the removable
+pool; the product's own registration would refuse an ignore-ownership mount.
 Surprise removal is `hdiutil detach -force` of that image's own device, bound
 by image path, device, mount and volume UUID immediately before, in three
 predeclared cases:
@@ -27,6 +27,18 @@ predeclared cases:
 - quarantine: the same with `OXIDE_ALLOW_RUSTC_WRAPPER=1` (a wrapper server
   could outlive the build): after re-attach the slot is kept held with its
   bytes, never reused or deleted.
+
+The fixture's own directory-budget pool is a DECLARED SCRATCH POOL
+([scratch pools](../../docs/knowledge/contracts/scratch-pools.md) S4,
+oxide#212): `private_environment` canonicalizes the run root once, creates one
+private `0700` `OXIDE_SCRATCH_ROOT` inside it, keeps `OXIDE_POOL` strictly
+inside that root and sets an explicit `OXIDE_POOL_CAP`, after dropping every
+inherited `OXIDE_*` value. The root lives on the supervisor-selected volume
+(Builds), so the S3 scratch route admits the pool where the ordinary admission
+would refuse an external path; the selectors pass no `--root-parent
+/private/tmp`. On a `/private/tmp` guard fallback the declaration is inert —
+ordinary admission already succeeds on the internal volume — so such a run is
+not scratch-pool coverage and says so.
 
 Final outputs stay in `<checkout>/target` throughout. Custody of this proof's
 own image is the qualified guard's, not this script's: after each attach the
@@ -126,6 +138,126 @@ WAIT_SECONDS = 60
 FROZEN_RUSTFLAGS = ""
 # One excerpt bound for a recorded case failure in the diagnostic receipt.
 RECEIPT_EXCERPT = 400
+# The fixture's directory-budget pool is a declared scratch pool: one private
+# root inside this run's own guard root, an explicit cap, and the pool strictly
+# inside that root.
+SCRATCH_POOL_ROOT = "scratch-pools"
+SCRATCH_POOL_CAP = "64MiB"
+
+# Every product line this proof's oracles match, pinned to the source text that
+# carries it. The S4 pre-review sweep against main `d0c383b` found each one
+# current, so there is nothing stale to carry; keeping the table makes a later
+# wording change fail the effect-free self-check instead of a native round.
+# Historical product identities are not recorded here: this proof always stages
+# this HEAD, and its only historical evidence is its own earlier receipts.
+PRODUCT_ORACLES = (
+    (
+        "lost-slot reason",
+        "src/lease/control.rs",
+        "lost with the removable volume; deleted whole when the volume returns",
+    ),
+    (
+        "quarantine reason",
+        "src/lease/control.rs",
+        "quarantined: lost with the removable volume and {why}; kept with its bytes, never reused or deleted",
+    ),
+    (
+        "boot-session closure reason",
+        "src/lease/control.rs",
+        "its holder predates this boot session, so it is deleted whole when the volume returns",
+    ),
+    (
+        "released quarantine reason",
+        "src/bin/oxide/store.rs",
+        "quarantined: lost with the removable volume and {}; released on operator confirmation",
+    ),
+    (
+        "lost-slot deletion line",
+        "src/bin/oxide/store.rs",
+        "held when the removable volume was lost (Cargo group {group} empty)",
+    ),
+    (
+        "boot-session deletion line",
+        "src/bin/oxide/store.rs",
+        "lost before this boot (holder started {elapsed} s before boot; a restart ends every process)",
+    ),
+    (
+        "wrapper quarantine reason",
+        "src/bin/oxide/store.rs",
+        "an inherited rustc wrapper was allowed and may outlive the build",
+    ),
+    (
+        "removal stop line",
+        "src/bin/oxide/watchdog.rs",
+        "oxide: removable volume {} is gone; stopped Cargo group {group}: {signals}, stop latency {latency}",
+    ),
+    (
+        "internal fallback selection",
+        "src/bin/oxide/main.rs",
+        "selected for the next build: internal pool (removable volume not used: {reason})",
+    ),
+    (
+        "held-slot status line",
+        "src/bin/oxide/main.rs",
+        "retired and held, never reused ({})",
+    ),
+    (
+        "held-slot tree deletion line",
+        "src/bin/oxide/main.rs",
+        "oxide: deleted the held slot tree {name} outside the pool lock",
+    ),
+    (
+        "removable flush line",
+        "src/bin/oxide/main.rs",
+        "oxide: flushed the removable volume before releasing slot {slot} in {:.1} ms",
+    ),
+    (
+        "lost-slot summary line",
+        "src/bin/oxide/main.rs",
+        "oxide: slot {slot} was lost with the removable volume",
+    ),
+    (
+        "registration line",
+        "src/bin/oxide/removable.rs",
+        "registered removable pool on {} (volume {}, container {})",
+    ),
+    (
+        "release quarantine-required refusal",
+        "src/bin/oxide/removable.rs",
+        "--confirm-writers-stopped is required first",
+    ),
+    (
+        "release dry-run line",
+        "src/bin/oxide/removable.rs",
+        "would release quarantined slot {slot} in {}: {}; census: {}; operator confirmed writers stopped; nothing c",
+    ),
+    (
+        "release line",
+        "src/bin/oxide/removable.rs",
+        "released quarantined slot {} in {}: {}; census: {}; operator confirmed writers stopped",
+    ),
+    (
+        "outputs adoption line",
+        "src/bin/oxide/outputs.rs",
+        "now selects the owned {} root {} (generation {})",
+    ),
+)
+
+
+def check_product_oracles() -> int:
+    """Assert every pinned product line is still in the source file that
+    carries it, so a stale oracle fails here rather than in a native round."""
+    repo = os.path.dirname(HERE)
+    for label, relative, needle in PRODUCT_ORACLES:
+        path = os.path.join(repo, relative)
+        expect(os.path.isfile(path), f"product oracle {label!r} names a missing file {relative}")
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        expect(
+            needle in text,
+            f"product oracle {label!r} is gone from {relative}; re-sweep the proof's oracles",
+        )
+    return len(PRODUCT_ORACLES)
 
 # The boot-session closure mode (oxide#161): a marker only a candidate with
 # the boot fact carries, the ONE debug-only override that names a boot time,
@@ -690,11 +822,21 @@ def staging_environment_scrubbed():
 def private_environment(root: str) -> dict:
     """The private HOME, CARGO_HOME, gate and sanitized command environment
     every fixture child gets; nothing here may reach the operator's account,
-    Cargo home, wrapper or target settings."""
+    Cargo home, wrapper or target settings.
+
+    The fixture's directory-budget pool is a declared scratch pool
+    (scratch-pools S4, oxide#212): the run root is canonicalized once, one
+    private `0700` `scratch-pools` root is created inside it, and the pool is
+    kept strictly inside that root with an explicit cap. The root is on the
+    supervisor-selected volume, so the S3 scratch route admits the pool there.
+    An inherited declaration never reaches a child: every OXIDE_* value is
+    dropped below before this fixture's own are set."""
+    root = os.path.realpath(root)
     home = os.path.join(root, "home")
     cargo_home = os.path.join(root, "cargo-home")
     gate = os.path.join(root, "gate")
-    for path in (home, cargo_home, gate):
+    pool_root = os.path.join(root, SCRATCH_POOL_ROOT)
+    for path in (home, cargo_home, gate, pool_root):
         os.makedirs(path, mode=0o700, exist_ok=True)
     env = dict(os.environ)
     real_rustup = env.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup")
@@ -713,11 +855,12 @@ def private_environment(root: str) -> dict:
             "RUSTUP_TOOLCHAIN",
         ):
             env.pop(key)
-    tmp = os.environ["TMPDIR"]
+    tmp = os.path.realpath(os.environ["TMPDIR"])
     env.update(
         {
-            "OXIDE_POOL": os.path.join(root, "pool"),
-            "OXIDE_POOL_CAP": "64MiB",
+            "OXIDE_SCRATCH_ROOT": pool_root,
+            "OXIDE_POOL": os.path.join(pool_root, "pool"),
+            "OXIDE_POOL_CAP": SCRATCH_POOL_CAP,
             "HOME": home,
             "OXIDE_TEST_HOME_FROM_ENV": "1",
             "CARGO_HOME": cargo_home,
@@ -1928,9 +2071,10 @@ PREMISE_CHECKLIST = (
         "environment isolation",
         "applicable: `private_environment` drops every OXIDE_/XDG_/CARGO_/SCCACHE_/RUSTC* key "
         "(including all CARGO_* configuration and SCCACHE_* values) and re-adds only this fixture's "
-        "controls; `staging_environment_scrubbed` does the same for staging, restores only the "
-        "invoking CARGO_HOME and preserves only the guard's two OXIDE_PROOF_* control variables "
-        "(`GUARD_CONTROLS`), which are not fixture configuration",
+        "controls, among them its own OXIDE_SCRATCH_ROOT, OXIDE_POOL strictly inside it and an "
+        "explicit OXIDE_POOL_CAP; `staging_environment_scrubbed` does the same for staging, restores "
+        "only the invoking CARGO_HOME and preserves only the guard's two OXIDE_PROOF_* control "
+        "variables (`GUARD_CONTROLS`), which are not fixture configuration",
     ),
     (
         "automatic adoption",
@@ -1961,8 +2105,12 @@ PREMISE_CHECKLIST = (
     (
         "temporary storage",
         "applicable: the scratch is one fresh directory inside the qualified supervisor's "
-        "OXIDE_TASK_SCRATCH_ROOT under --root-parent /private/tmp (the owner-accepted "
-        "internal-placement exception bd357a4c), and TMPDIR/TMP/TEMP name that same directory",
+        "OXIDE_TASK_SCRATCH_ROOT on the supervisor-selected volume (the selectors pass no "
+        "--root-parent /private/tmp), TMPDIR/TMP/TEMP name that same directory, and the fixture's "
+        "directory-budget pool is a declared scratch pool: one private 0700 OXIDE_SCRATCH_ROOT "
+        "inside the run root with OXIDE_POOL strictly inside it and an explicit OXIDE_POOL_CAP, so "
+        "the S3 scratch route admits it. On a /private/tmp guard fallback the declaration is inert, "
+        "which is not scratch-pool coverage",
     ),
     (
         "macOS mktemp",
@@ -1980,11 +2128,21 @@ def plan() -> int:
     dispositions. No child, pool, image or supervisor."""
     print("removable-removal proof plan (effect-free)")
     print(f"candidate: this HEAD's debug oxide, staged offline with {runner.BUILDER} from {HERE}")
-    print("selector (main): python3 scripts/bounded-test.py --root-parent /private/tmp "
-          "--limit 300 --scratch-budget-mib 512 -- python3 scripts/test-oxide-removable-removal.py")
+    print("selector (main): python3 scripts/bounded-test.py --limit 300 "
+          "--scratch-budget-mib 512 -- python3 scripts/test-oxide-removable-removal.py")
+    print("selector (boot closure): python3 scripts/bounded-test.py --limit 300 "
+          "--scratch-budget-mib 512 -- python3 scripts/test-oxide-removable-removal.py --boot-closure")
     print("allocation: one owned 128 MiB scratch APFS image at a unique /Volumes/<name> and one "
-          "private budget-only internal directory pool, four fixture checkouts, inside one owned "
-          "scratch inside OXIDE_TASK_SCRATCH_ROOT (monitored peak 99.7 MiB of the 512 MiB budget)")
+          "private budget-only directory-budget scratch pool under this run's OXIDE_SCRATCH_ROOT "
+          "inside OXIDE_TASK_SCRATCH_ROOT on the supervisor-selected volume, four fixture "
+          "checkouts, inside that one owned scratch (monitored peak 99.7 MiB of the 512 MiB budget)")
+    print("scratch pool: the fixture declares OXIDE_SCRATCH_ROOT (one private 0700 root inside the "
+          f"run root), keeps OXIDE_POOL strictly inside it and sets OXIDE_POOL_CAP={SCRATCH_POOL_CAP}; "
+          "no --root-parent is passed, so the guard's selected-volume default is used. A "
+          "/private/tmp fallback is internal, where the declaration is inert and the run is not "
+          "scratch-pool coverage")
+    print("product oracle sweep (main d0c383b, effect-free): " + "; ".join(
+        f"{label} in {relative}" for label, relative, _ in PRODUCT_ORACLES))
     print("limits: 300 s wall including cleanup, 512 MiB monitored scratch, at most one ordinary "
           "detach of this run's own image, performed by the qualified guard after its post-leader "
           "census (never by this script once a child has launched)")
