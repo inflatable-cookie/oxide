@@ -26,7 +26,7 @@ command that reaches final release after effects with newer state, which must
 never execute anything.
 
 HIGH premise dispositions (see the case bodies and helpers below):
-1. stage_subject captures invoking rustup and Cargo cache before a private HOME;
+1. _stage_subject captures invoking rustup and Cargo cache before a private HOME;
    fixture children use private HOME/CARGO_HOME, the pinned toolchain, no auto
    install, and fake Cargo (no fixture --locked invocation).
 2. Fixture.env sets OXIDE_TEST_HOME_FROM_ENV=1 for every product child.
@@ -252,7 +252,12 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILDER = "1.97.1"
 
 
-def stage_subject(root: str, capability: dict | None = None, *, isolated: bool = False) -> str:
+def stage_subject(root: str, capability: dict | None = None) -> str:
+    """Shared staging entry point; CARGO_ENCODED_RUSTFLAGS is scrubbed below."""
+    return _stage_subject(root, capability, isolated=False)
+
+
+def _stage_subject(root: str, capability: dict | None = None, *, isolated: bool) -> str:
     """Stage this HEAD's `oxide` with plain Cargo, offline, in owned scratch.
 
     No Oxide pool is created or touched, and the staged target is deleted once
@@ -1052,7 +1057,7 @@ def main() -> int:
             expect(os.environ.get(name) == scratch, f"{name} differs from the supervisor scratch")
         root = tempfile.mkdtemp(prefix="installed-handoff.", dir=scratch)
         SCRATCH_ROOT = root
-        binary = stage_subject(root, isolated=True)
+        binary = _stage_subject(root, isolated=True)
         SUBJECT = binary
         digest = sha256(binary)
         print(f"subject {binary} sha256 {digest}")
