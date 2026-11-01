@@ -41,8 +41,10 @@ stage_at, sha256 = layout.stage_at, layout.sha256
 # HIGH premises, with executable locations:
 # 1. main captures invoking RUSTUP_HOME and CARGO_HOME before scrubbing;
 #    stage_at uses the checked-in archived lock; the Rust cases create private
-#    homes and use offline fixtures (tests/cold_seed_default_off.rs:48,106).
-# 2. cargo_test_env sets OXIDE_TEST_HOME_FROM_ENV for those fixture children.
+#    homes and use offline fixtures (tests/cold_seed_default_off.rs:67-68,
+#    156-161). The tiny fixture builds offline without --locked; Cargo creates
+#    its lock inside the fixture.
+# 2. cargo_test_env sets OXIDE_TEST_HOME_FROM_ENV, inherited by both cases.
 # 3. main scrubs host OXIDE/XDG/CARGO/GIT; cargo_test_env clears wrappers.
 # 4. The two tests in tests/cold_seed_default_off.rs assert identity, not an
 #    unconverted checkout or adoption receipt.

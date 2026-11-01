@@ -155,7 +155,8 @@ fn tiny_build_matches_staged_base_when_seed_is_off() {
     let scratch = Scratch::new();
     let home = scratch.0.join("home");
     let cargo_home = scratch.0.join("cargo-home");
-    let pool = scratch.0.join("pool");
+    let base_pool = scratch.0.join("base-pool");
+    let candidate_pool = scratch.0.join("candidate-pool");
     let checkout = scratch.0.join("checkout");
     std::fs::create_dir(&home).unwrap();
     std::fs::create_dir(&cargo_home).unwrap();
@@ -170,7 +171,7 @@ fn tiny_build_matches_staged_base_when_seed_is_off() {
         "fn main() { println!(\"seed-off\"); }\n",
     )
     .unwrap();
-    let run = |binary: &OsStr, prior: Option<&Output>| {
+    let run = |binary: &OsStr, pool: &std::path::Path, prior: Option<&Output>| {
         let output = Command::new(binary)
             .args(["build", "--offline"])
             .current_dir(&checkout)
@@ -205,13 +206,17 @@ fn tiny_build_matches_staged_base_when_seed_is_off() {
         assert!(!home.join(".rustup").exists(), "{details}");
         (output, bytes)
     };
-    let old = run(&base, None);
-    std::fs::remove_dir_all(&pool)
-        .unwrap_or_else(|error| panic!("pool cleanup: {error}\n{}", evidence("baseline", &old.0)));
+    // Scratch pool host records outlive a pool leaf. Keep each identity intact
+    // instead of deleting a leaf and reusing its path with a stale record.
+    let old = run(&base, &base_pool, None);
     std::fs::remove_dir_all(checkout.join("target")).unwrap_or_else(|error| {
         panic!("target cleanup: {error}\n{}", evidence("baseline", &old.0))
     });
-    let new = run(OsStr::new(env!("CARGO_BIN_EXE_oxide")), Some(&old.0));
+    let new = run(
+        OsStr::new(env!("CARGO_BIN_EXE_oxide")),
+        &candidate_pool,
+        Some(&old.0),
+    );
     let details = format!(
         "{}\n{}",
         evidence("baseline", &old.0),
