@@ -405,7 +405,7 @@ class HandoffSelectorTests(unittest.TestCase):
 
     def test_exact_commands(self):
         manifest = (SCRIPTS.parent / "effigy.toml").read_text(encoding="utf-8")
-        base = ("python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 128 "
+        base = ("python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 128 "
                 "-- python3 scripts/test-installed-handoff.py")
         self.assertEqual(self.selector_line(manifest, "rust:installed-handoff"), base)
         self.assertEqual(self.selector_line(manifest, "rust:installed-handoff:diagnostic"),

@@ -1730,7 +1730,7 @@ necessary.
   exclusion.
 - **Proof.** `effigy rust:installed-handoff` (heavy) is one fixed script and
   whole command: `bounded-test.py` around `scripts/test-installed-handoff.py`
-  with a 300 s wall limit and 128 MiB monitored scratch (decisions 3017bcb3
+  with a 600 s wall limit and 128 MiB monitored scratch (decisions 5bf3c438
   and 49f52581). The earlier 120 s diagnostic reached its work deadline at
   100 s and the earlier 64 MiB diagnostic faulted at 64.4 MiB; neither has
   qualification credit. The supervisor's
@@ -1755,7 +1755,14 @@ necessary.
   seven completed cases; its receipt lacks the timing needed to apportion the
   278 s and carries no native credit (decision 88c71155). The later `e64850e`
   diagnostic hit the supervisor deadline during staging, before the old
-  in-memory receipt was published; it also has no native credit. The diagnostic and each
+  in-memory receipt was published; it also has no native credit. The `490e935`
+  diagnostic stopped at 282 s after eight reached cases; its recorded staging
+  took 55 s and individual fixture setup checks took 11.5–13 s, with no native
+  credit (decision 5bf3c438). Their stderr reports 0.1–0.4 s in the build
+  summary and `seeding skipped: lock unavailable`; that message names the
+  fixture's unavailable Cargo.lock, not a measured lock wait. The receipt has
+  no per-product-step timing and does not establish which step accounts for
+  the remaining interval. The diagnostic and each
   native session require owner activation at the migrated head; no previous
   receipt carries over. The proof touches no live pool, installed binary or
   real install receipt, and is not a benchmark or full QA.
