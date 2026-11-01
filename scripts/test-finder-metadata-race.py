@@ -1550,10 +1550,217 @@ def settle_case(settle: Settle) -> str:
     return f"{case}: pending after replay, phase {phase}"
 
 
-def self_check() -> int:
-    """Pure check of the fixture layout budget and the shutdown cutoff: no
-    scratch, child or image."""
+# Values this proof's remaining oracles read out of product source, re-checked
+# effect-free against the current tree (the S4 pre-review current-main sweep,
+# oxide#213). Each one is the product truth behind an assertion the script makes
+# at a native head, so a moved constant or reworded refusal fails here instead
+# of inside a native case. Historical identities stay pinned where the proof
+# needs them (`BASE_COMMIT`), and nothing here is a claim about a run.
+ORACLE_PINS = (
+    (
+        "src/bin/oxide/child_temp.rs",
+        "pub(crate) const MAX_SCRATCH_PATH_BYTES: usize = 91;",
+        "the product's per-command temporary path bound",
+    ),
+    (
+        "src/lease/mod.rs",
+        "pub const CAPACITY_POLICY_VERSION: u32 = 3;",
+        "the ledger fence the counterfactual upgrades to",
+    ),
+    (
+        "src/lease/mod.rs",
+        "pub const PREVIOUS_CAPACITY_POLICY_VERSION: u32 = 2;",
+        "the fence the pinned base binary writes",
+    ),
+    (
+        "src/lease/mod.rs",
+        '"pool cap cannot admit a new slot"',
+        "the capacity refusal the nested-file case reads",
+    ),
+    (
+        "src/lease/mod.rs",
+        '"unknown_accounting"',
+        "the accounting refusal reason both lease cases read",
+    ),
+    (
+        "src/bin/oxide/prune.rs",
+        'const REGISTRY_FILE: &str = "registry.json";',
+        "the pool-owned registry leaf",
+    ),
+    (
+        "src/bin/oxide/prune.rs",
+        'const QUARANTINE_PREFIX: &str = ".prune-";',
+        "the quarantined leaf prefix",
+    ),
+    (
+        "src/bin/oxide/prune.rs",
+        'crash_point("terminal")',
+        "the pre-completion crash point",
+    ),
+    (
+        "src/bin/oxide/prune.rs",
+        "{mode}: check {count}, {deleted} entries deleted, {recovered} recovered",
+        "the low-reserve firing line",
+    ),
+    (
+        "src/bin/oxide/prune.rs",
+        "oxide: prune preview SHA-256",
+        "the preview digest line the plan oracle reads",
+    ),
+    ("src/bin/oxide/prune.rs", '["prune", "--dry-run"]', "the preview dispatch"),
+    (
+        "src/bin/oxide/outputs.rs",
+        'pub const EXTERNAL_DIR: &str = "oxide-outputs";',
+        "the owned outputs tree on the drive",
+    ),
+    (
+        "src/bin/oxide/removable.rs",
+        'root.join("oxide-managed")',
+        "the pool control directory the registry lives in",
+    ),
+)
+SELECTOR_RECIPE = {
+    "rust:finder-metadata-race": "python3 scripts/test-finder-metadata-race.py",
+    "rust:finder-metadata-race:diagnostic": (
+        "python3 scripts/test-finder-metadata-race.py --diagnostic"
+    ),
+}
+
+
+def selector_blocks(text: str) -> dict:
+    """The task tables of an `effigy.toml`, keyed by their own header."""
+    blocks = {}
+    current = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            current = stripped
+            blocks[current] = []
+        elif current is not None:
+            blocks[current].append(line)
+    return blocks
+
+
+def scratch_contract_problems(base: str = "/fixture/run") -> list:
+    """The declared scratch pool and the selectors' recipe, with no effect.
+
+    A script left half-migrated — a pool on the boot volume, no declaration, no
+    explicit cap, or a pool outside the declared root — fails here instead of
+    spending a native run whose pool the product would refuse, and a selector
+    that still names the internal root fails with it.
+    """
     problems = []
+    case_base = os.path.join(base, "cases", "lease_control", "0badc0de")
+    # Hostile inherited values: the declaration, the pool, the cap, the account
+    # and the flag overrides must all come from the fixture, never the caller.
+    hostile = {
+        "OXIDE_SCRATCH_ROOT": "/fixture/host-scratch",
+        "OXIDE_POOL": "/fixture/host-pool",
+        "OXIDE_POOL_CAP": "1",
+        "OXIDE_TASK_SCRATCH_ROOT": base,
+        "OXIDE_PROOF_DEADLINE_NS": "981",
+        "OXIDE_PROOF_EVIDENCE": "/fixture/evidence",
+        "OXIDE_TEST_FINDER_RACE": "*:directory",
+        "HOME": "/fixture/host-home",
+        "CARGO_HOME": "/fixture/host-cargo",
+        "TMPDIR": "/fixture/host-temp",
+        "XDG_CONFIG_HOME": "/fixture/xdg",
+        "RUSTFLAGS": "-Ctarget-cpu=native",
+        "CARGO_ENCODED_RUSTFLAGS": "-Ctarget-cpu=native",
+        "RUSTUP_TOOLCHAIN": "nightly",
+    }
+    for case in ("lease_control", "prune_drain_fault"):
+        env = fixture_environment(
+            case_base, case, RACES[case], hostile
+        )
+        scratch = env.get("OXIDE_SCRATCH_ROOT", "")
+        pool = env.get("OXIDE_POOL", "")
+        expected = os.path.join(case_base, SCRATCH_DIRNAME)
+        if scratch != expected:
+            problems.append(
+                f"{case}: the declared scratch root is {scratch!r}, not the case's own {expected}"
+            )
+        if not os.path.isabs(scratch) or os.path.normpath(scratch) != scratch:
+            problems.append(f"{case}: the declared scratch root {scratch!r} is not canonical")
+        elif os.path.commonpath([scratch, base]) != base:
+            problems.append(f"{case}: the declared scratch root {scratch!r} escapes the run root")
+        if os.path.dirname(pool) != scratch or pool == scratch:
+            problems.append(f"{case}: the pool {pool!r} is not strictly inside {scratch!r}")
+        if env.get("OXIDE_POOL_CAP") != str(POOL_BUDGET):
+            problems.append(f"{case}: the pool cap is not the explicit fixture budget")
+        if env.get("OXIDE_POOL_CREATE") != "1":
+            problems.append(f"{case}: the pool creation opt-in is missing")
+        if env.get("OXIDE_TEST_HOME_FROM_ENV") != "1":
+            problems.append(f"{case}: the account-home control is missing")
+        for name, path in (
+            ("HOME", "home"),
+            ("CARGO_HOME", "cargo-home"),
+            ("TMPDIR", "temp"),
+        ):
+            if env.get(name) != os.path.join(case_base, path):
+                problems.append(f"{case}: {name} is not the case's private {path}")
+        if env.get("TMPDIR") != env.get("TMP") or env.get("TMPDIR") != env.get("TEMP"):
+            problems.append(f"{case}: TMPDIR/TMP/TEMP do not agree")
+        if env.get("RUSTFLAGS") != "-C strip=symbols":
+            problems.append(f"{case}: the compiler flags were not frozen")
+        if "CARGO_ENCODED_RUSTFLAGS" in env or "XDG_CONFIG_HOME" in env:
+            problems.append(f"{case}: an encoded flag or XDG override survived the scrub")
+        for key in ("OXIDE_TASK_SCRATCH_ROOT", "OXIDE_PROOF_DEADLINE_NS", "OXIDE_PROOF_EVIDENCE"):
+            if env.get(key) != hostile[key]:
+                problems.append(f"{case}: the supervisor's {key} was not re-added")
+        if case in CASE_ENV:
+            for key, value in CASE_ENV[case].items():
+                if env.get(key) != value:
+                    problems.append(f"{case}: the case's {key} was not set")
+        if RACES[case] is not None and env.get("OXIDE_TEST_FINDER_RACE") != RACES[case]:
+            problems.append(f"{case}: the race injection is not this case's own")
+    if os.path.sep in SCRATCH_DIRNAME or SCRATCH_DIRNAME in (".", ".."):
+        problems.append("the scratch directory name is not a bare leaf name")
+    if os.path.basename(POOL_DIRNAME) != POOL_DIRNAME or POOL_DIRNAME in (".", ".."):
+        problems.append("the pool directory name is not a bare leaf name")
+    path = os.path.join(REPO, "effigy.toml")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            blocks = selector_blocks(handle.read())
+    except OSError as error:
+        return problems + [f"cannot read {path}: {error}"]
+    for selector, body in SELECTOR_RECIPE.items():
+        lines = blocks.get(f'[tasks."{selector}"]')
+        if lines is None:
+            problems.append(f"{selector}: no such selector in effigy.toml")
+            continue
+        run_line = next(
+            (line for line in lines if line.strip().startswith("run =")), None
+        )
+        if run_line is None:
+            problems.append(f"{selector}: the selector has no run command")
+            continue
+        if "--root-parent" in run_line:
+            problems.append(f"{selector}: the selector still names an internal root")
+        if "--limit 420 --scratch-budget-mib 512" not in run_line:
+            problems.append(f"{selector}: the unchanged 420 s / 512 MiB bounds drifted")
+        if not run_line.strip().endswith(f"{body}\""):
+            problems.append(f"{selector}: the selector does not run this proof's body")
+        if "admission = \"heavy\"" not in "".join(lines):
+            problems.append(f"{selector}: heavy admission is missing")
+    return problems
+
+
+def self_check() -> int:
+    """Pure check of the fixture layout budget, the scratch pool contract, the
+    current-main oracles and the shutdown cutoff: no scratch, child or image."""
+    problems = []
+    # The S4 fixture contract and the current-main oracle values, effect-free.
+    problems.extend(scratch_contract_problems())
+    for relative, needle, what in ORACLE_PINS:
+        try:
+            with open(os.path.join(REPO, relative), encoding="utf-8") as handle:
+                source = handle.read()
+        except OSError as error:
+            problems.append(f"{relative}: cannot be read ({error})")
+            continue
+        if needle not in source:
+            problems.append(f"{relative}: {what} drifted (missing {needle!r})")
     # Counterfactual: the 420 s selector leaves exactly 390 s of work, and the
     # earlier 25 s margin's 395 s is refused.
     if SHUTDOWN_MARGIN_SECONDS != 30:
@@ -1689,6 +1896,11 @@ def self_check() -> int:
         problems.append(f"the replay invocation drifted: {seen!r}")
     print("  replay dispatch: both settle handlers share one executed replay body")
     print(f"  settle dispatch: {len(CASES)} cases bind one {Settle.__name__} bundle")
+    print(
+        f"  scratch pools: one declared root per case, the pool strictly inside it, "
+        f"{len(SELECTOR_RECIPE)} selectors on the selected-volume recipe"
+    )
+    print(f"  current-main oracles: {len(ORACLE_PINS)} product values still hold")
     # An overlong volume name must be refused, not attached.
     try:
         assert_prune_path_budget("counterfactual", "oxide155-" + "x" * 40)
@@ -1699,7 +1911,8 @@ def self_check() -> int:
         for problem in problems:
             print(f"self-check: {problem}", file=sys.stderr)
         return 1
-    print("self-check: fixture layout budget holds, old layouts still refused")
+    print("self-check: fixture layout budget holds, old layouts still refused, "
+          "scratch pool contract holds")
     return 0
 
 
