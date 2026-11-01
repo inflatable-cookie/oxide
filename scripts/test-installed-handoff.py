@@ -63,21 +63,14 @@ import time
 MIB = 1024 * 1024
 NOTICE = "oxide: handing off to the installed binary (state is newer than this one).\n"
 REFUSAL = "oxide: oxide was upgraded during this command; re-run.\n"
-# Control-state versions this proof models. Hand-off triggers only on a numeric
-# version GREATER than the running binary's, so "newer than self" is 8.
-# Version 5 is the recorded per-slot accounting fence (oxide#146). Version 7
-# is the eviction-accounting fence (oxide#175). Version 8 is the newest this
-# tree writes: the raised-ceiling fence (oxide#177), which the admission gate
-# installs on every mutating command. The staged subject's capability probe
-# reports 8.
+# Control-state versions and the fences in the documents this proof plants.
 RECORDED_ACCOUNTING_STATE_VERSION = 5
 EVICTION_ACCOUNTING_STATE_VERSION = 7
 SLOT_CEILING_STATE_VERSION = 8
-STATE_VERSION = SLOT_CEILING_STATE_VERSION
+HOLDING_STATE_VERSION = 9
+STATE_VERSION = HOLDING_STATE_VERSION
 NEWER_STATE_VERSION = STATE_VERSION + 1
-# What the product writes for this proof's small fixture pool: the admission
-# gate fences every mutating command at the newest version.
-WITNESS_STATE_VERSION = SLOT_CEILING_STATE_VERSION
+WITNESS_STATE_VERSION = STATE_VERSION
 LEDGER_VERSION = 1
 REGISTRATION_VERSION = 2
 CAPABILITIES_PROBE = "__oxide-build-capabilities"
@@ -138,6 +131,7 @@ def write(path: str, contents: str, mode: int) -> None:
 RECORDED_ACCOUNTING_FENCE = "oxide.accounting/1"
 EVICTION_ACCOUNTING_FENCE = "oxide.eviction-accounting/1"
 SLOT_CEILING_FENCE = "oxide.slots/256"
+HOLDING_FENCE = "oxide.holding/1"
 
 
 def check_source_versions() -> None:
@@ -147,8 +141,8 @@ def check_source_versions() -> None:
             matches = re.findall(r"^pub const " + name + r": u32 = (\d+);$", handle.read(), re.MULTILINE)
         expect(len(matches) == 1, f"cannot read product constant {name}")
         return int(matches[0])
-    expect(STATE_VERSION == literal("src/lease/control.rs", "STATE_VERSION"), "control-state fixture version drift")
-    expect(SLOT_CEILING_STATE_VERSION == literal("src/lease/mod.rs", "CONTROL_FENCE_VERSION"), "control fence fixture drift")
+    expect(STATE_VERSION == literal("src/lease/mod.rs", "CONTROL_FENCE_VERSION"), "control-state fixture version drift")
+    expect(SLOT_CEILING_STATE_VERSION == literal("src/lease/control.rs", "SLOT_CEILING_STATE_VERSION"), "slot ceiling fixture version drift")
     expect(LEDGER_VERSION == literal("src/lease/mod.rs", "LEASE_VERSION"), "ledger fixture version drift")
 
 
@@ -171,6 +165,8 @@ def current_state(version: int = STATE_VERSION) -> str:
         document["eviction_accounting"] = EVICTION_ACCOUNTING_FENCE
     if version >= SLOT_CEILING_STATE_VERSION:
         document["slot_ceiling"] = SLOT_CEILING_FENCE
+    if version >= HOLDING_STATE_VERSION:
+        document["holding"] = HOLDING_FENCE
     return json.dumps(document)
 
 
