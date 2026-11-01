@@ -110,9 +110,10 @@ def same_device_tmp(tmp: str, pool_parent: str) -> bool:
 
 def check_child_env(env: dict) -> None:
     pool = env.get("OXIDE_POOL")
-    if pool and env.get("OXIDE_SCRATCH_ROOT") == os.path.dirname(pool):
-        expect(same_device_tmp(env.get("TMPDIR", ""), os.path.dirname(pool)),
-               "fixture TMPDIR must be writable on the directory pool device")
+    expect(bool(pool) and env.get("OXIDE_SCRATCH_ROOT") == os.path.dirname(pool),
+           "fixture pool or scratch declaration is missing")
+    expect(same_device_tmp(env.get("TMPDIR", ""), os.path.dirname(pool)),
+           "fixture TMPDIR must be writable on the directory pool device")
 
 
 def image_slot_model(mount: str) -> str:
@@ -162,10 +163,12 @@ class Proof(layout.Proof):
         self.devices = []
         self.detach_confirmed = False
         self.detach_attempted = False
+        self.fixture_ready = False
 
     def run(self, command, *, cwd=None, env=None, timeout=120):
-        child_env = self.env if env is None else env
-        check_child_env(child_env)
+        child_env = env or self.env
+        if self.fixture_ready:
+            check_child_env(child_env)
         result = super().run(command, cwd=cwd, env=env, timeout=timeout)
         if self.mount and os.path.ismount(self.mount):
             check_image_slot_paths(self.mount)
@@ -734,6 +737,7 @@ def run(proof: Proof, repo: str, base_compat: bool = False, diagnostic: bool = F
         os.makedirs(path, mode=0o700)
     env = proof_env(pool, home, cargo_home)
     proof.env = env
+    proof.fixture_ready = True
 
     app = write_tree(os.path.join(root, "app"), APP)
     fixtures = [app]
@@ -1725,6 +1729,7 @@ def detach_run(proof: Proof, repo: str, diagnostic: bool = False) -> None:
     for path in (home, cargo_home):
         os.makedirs(path, mode=0o700)
     proof.env = proof_env(pool, home, cargo_home)
+    proof.fixture_ready = True
     image = proof.image
 
     maker = fresh_checkout(proof, root, "pool-maker")
@@ -1994,6 +1999,7 @@ def auto_run(proof: Proof, repo: str, diagnostic: bool = False) -> None:
     for path in (home, cargo_home):
         os.makedirs(path, mode=0o700)
     proof.env = proof_env(pool, home, cargo_home)
+    proof.fixture_ready = True
     image = proof.image
 
     # The internal pool exists before any drive is registered: a build then
@@ -2472,6 +2478,7 @@ def ignore_run(proof: Proof, repo: str, diagnostic: bool = False) -> None:
     for path in (home, cargo_home):
         os.makedirs(path, mode=0o700)
     proof.env = proof_env(pool, home, cargo_home)
+    proof.fixture_ready = True
 
     maker = fresh_checkout(proof, root, "pool-maker")
     code, _, stderr = proof.oxide(["build"], "internal pool before the drive", maker)
@@ -5166,6 +5173,7 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
     for path in (home, cargo_home):
         os.makedirs(path, mode=0o700)
     proof.env = proof_env(pool, home, cargo_home)
+    proof.fixture_ready = True
     # The same frozen flag set for every fixture child (premise 7).
     freeze_compiler_flags(proof.env)
     expect(proof.env["RUSTFLAGS"] == FROZEN_RUSTFLAGS, "the fixture environment is not frozen")
@@ -6629,6 +6637,7 @@ def auto_ineligible_run(proof: Proof, repo: str, diagnostic: bool) -> None:
     for path in (home, cargo_home):
         os.makedirs(path, mode=0o700)
     proof.env = proof_env(pool, home, cargo_home)
+    proof.fixture_ready = True
     freeze_compiler_flags(proof.env)
 
     # The shared premises: an internal pool, then one owned 128 MiB image
