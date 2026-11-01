@@ -3484,12 +3484,12 @@ preserved: the `96f0767` collection recorded a fixture `NameError` as one failed
 case and kept going (corrected, not excused), and the `93bb6db` diagnostic and
 counted receipts stay bound to their own bytes.
 
-`test rust`, the profile proofs, `rust:pool-scale`,
-`rust:oxide-exec` and `rust:front-door-accounting` keep their invocation and
-get this supervisor once oxide#109 merges. Their recorded evidence ran under
-the old guard at `3d947a9` and stays historical; none has run under the new
-one. Pool-scale's own `mktemp` scratch lies outside the supervisor's owned
-bytes.
+The earlier `test rust`, profile, `rust:pool-scale`, `rust:oxide-exec` and
+`rust:front-door-accounting` evidence under the old guard at `3d947a9` stays
+historical. Front-door accounting now uses the shared supervisor's default
+selected-volume scratch and a private `OXIDE_SCRATCH_ROOT`; its migrated-head
+native chain remains pending. Pool-scale's own `mktemp` scratch lies outside
+the supervisor's owned bytes.
 `scripts/bounded_runner.py` (oxide#097) stays separate and unqualified.
 
 ### Bounded offline lock seeder

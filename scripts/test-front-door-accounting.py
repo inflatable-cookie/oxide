@@ -58,10 +58,7 @@ build and the recovered cold build.
 
 The walk counts show routing only, not a resource gate. The scratch is one
 fresh directory inside the qualified supervisor's `OXIDE_TASK_SCRATCH_ROOT`
-(the selector passes `--root-parent /private/tmp`, the owner-accepted
-internal-placement exception `bd357a4c`, because the fixture's pool is a
-genuine internal `directory-budget` pool that the product refuses on an
-external volume), so the supervisor's continuous reserve watchdog, scratch
+(using the guard's selected-volume default), so the supervisor's continuous reserve watchdog, scratch
 budget and closure census cover the actual work. The script stops 30 s before
 the guard's exported deadline, and its own phase samples are observations,
 not gates. Bounds: 300 s and 512 MiB monitored scratch under
@@ -164,7 +161,7 @@ PREMISE_CHECKLIST = (
         "conversion; every checkout keeps its target local",
     ),
     ("Cargo external argv", "not applicable: no external Cargo subcommand runs in this proof"),
-    ("owned images", "not applicable: no disk image, mount or removable media"),
+    ("owned images", "not applicable: no owned image or mount; pools use the selected volume under the guard"),
     (
         "compiler flags",
         "applicable: RUSTFLAGS is the fixed FROZEN_RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS is removed for "
@@ -173,8 +170,8 @@ PREMISE_CHECKLIST = (
     (
         "temporary storage",
         "applicable: the scratch is one fresh directory inside the qualified supervisor's "
-        "OXIDE_TASK_SCRATCH_ROOT under --root-parent /private/tmp (the owner-accepted "
-        "internal-placement exception bd357a4c), and TMPDIR/TMP/TEMP name one owned directory inside it",
+        "OXIDE_TASK_SCRATCH_ROOT; pools use a private scratch root there, and TMPDIR/TMP/TEMP "
+        "name one owned directory inside it. A /private/tmp fallback is internal, not scratch-pool coverage",
     ),
     (
         "macOS mktemp",
@@ -401,7 +398,8 @@ def fixture_environment(parent: str) -> dict:
     home = os.path.join(parent, "home")
     cargo_home = os.path.join(parent, "cargo-home")
     tmp = os.path.join(parent, "tmp")
-    for path in (home, cargo_home, tmp, os.path.join(parent, "walks")):
+    pool_root = os.path.join(parent, "scratch-pools")
+    for path in (home, cargo_home, tmp, pool_root, os.path.join(parent, "walks")):
         os.makedirs(path, mode=0o700, exist_ok=True)
     env = {
         name: value
@@ -419,6 +417,8 @@ def fixture_environment(parent: str) -> dict:
     env.update(
         {
             "OXIDE_TEST_HOME_FROM_ENV": "1",
+            "OXIDE_SCRATCH_ROOT": pool_root,
+            "OXIDE_POOL_CAP": str(SCRATCH_LIMIT_BYTES),
             "HOME": home,
             "CARGO_HOME": cargo_home,
             "RUSTUP_HOME": invoking_rustup(),
@@ -600,7 +600,8 @@ class Proof:
     def __init__(self, parent: str, oxide: str, env: dict):
         self.parent = parent
         self.oxide = oxide
-        self.pool = os.path.join(parent, "pool")
+        relative = os.path.relpath(parent, os.path.dirname(env["OXIDE_SCRATCH_ROOT"]))
+        self.pool = os.path.join(env["OXIDE_SCRATCH_ROOT"], "pool" if relative == "." else relative + "-pool")
         self.env = {**env, "OXIDE_POOL": self.pool, "OXIDE_POOL_CREATE": "1"}
         self.logs = 0
         self.dirs = {}
@@ -1240,9 +1241,9 @@ def plan() -> int:
     """Print the fixed case table, allocation and premise dispositions. No effect."""
     print("front-door accounting proof plan (effect-free)")
     print(f"candidate: this HEAD's debug oxide, staged offline with {BUILDER} from {REPO}")
-    print("selector: python3 scripts/bounded-test.py --root-parent /private/tmp "
+    print("selector: python3 scripts/bounded-test.py "
           "--limit 300 --scratch-budget-mib 512 -- python3 scripts/test-front-door-accounting.py")
-    print("allocation: one main internal directory-budget pool with two slots, one idle slot of more "
+    print("allocation: one main scratch directory-budget pool with two slots, one idle slot of more "
           f"than {BIG_ENTRIES:,} entries, two fixture checkouts and one `oxide new` crate; plus one "
           f"separate pool for the hard-link control, whose one retained slot holds a "
           f"{LINK_BYTES // MIB} MiB file with {LINK_NAMES} names for one inode and no foreign entry "
@@ -1350,6 +1351,8 @@ def self_check() -> int:
             os.environ.update(
                 {
                     "OXIDE_POOL": "/fixture/host-pool",
+                    "OXIDE_SCRATCH_ROOT": "/fixture/host-scratch",
+                    "OXIDE_POOL_CAP": "1",
                     "OXIDE_CONFIG": "/fixture/host-config",
                     "OXIDE_TEST_HOME_FROM_ENV": "0",
                     "XDG_CONFIG_HOME": "/fixture/xdg",
@@ -1366,6 +1369,12 @@ def self_check() -> int:
             )
             fixture_root = os.path.join(root, "fixture")
             env = fixture_environment(fixture_root)
+            expect_true(env["OXIDE_SCRATCH_ROOT"] == os.path.join(fixture_root, "scratch-pools"), "scratch root is not private")
+            expect_true(env["OXIDE_POOL_CAP"] == str(SCRATCH_LIMIT_BYTES), "pool cap is not explicit")
+            main_pool = Proof(fixture_root, "oxide", env).pool
+            other_pool = Proof(os.path.join(fixture_root, "hardlink"), "oxide", env).pool
+            expect_true(main_pool == os.path.join(env["OXIDE_SCRATCH_ROOT"], "pool"), "main pool escaped scratch root")
+            expect_true(other_pool == os.path.join(env["OXIDE_SCRATCH_ROOT"], "hardlink-pool"), "hardlink pool escaped scratch root")
             expect_true(env["OXIDE_TEST_HOME_FROM_ENV"] == "1", "account-home control was not set")
             expect_true(env["HOME"] == os.path.join(fixture_root, "home"), "HOME is not private")
             expect_true(env["CARGO_HOME"] == os.path.join(fixture_root, "cargo-home"),
@@ -1653,7 +1662,7 @@ def self_check() -> int:
                     os.makedirs(parent, mode=0o700)
                 else:
                     os.makedirs(parent, mode=0o700)
-                case = Proof(parent, "/fixture/oxide", {})
+                case = Proof(parent, "/fixture/oxide", {"OXIDE_SCRATCH_ROOT": os.path.join(parent, "scratch-pools")})
                 walks = os.path.join(parent, "walks")
                 expect_true(os.path.isdir(walks), f"{label}: no walks directory at {walks}")
                 expect_true(stat.S_IMODE(os.stat(walks).st_mode) == 0o700,
@@ -1753,7 +1762,7 @@ def self_check() -> int:
 
             globals()["resolve_source"] = lambda: "a" * 40
             globals()["stage"] = lambda parent, env: "/fixture/oxide"
-            globals()["fixture_environment"] = lambda parent: {}
+            globals()["fixture_environment"] = lambda parent: {"OXIDE_SCRATCH_ROOT": os.path.join(parent, "scratch-pools")}
             globals()["run_cases"] = aborting_cases
             outcome = diagnostic_outcome()
             try:

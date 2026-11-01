@@ -496,8 +496,8 @@ bytes whose ownership and writer closure are not a private slot's.
 
 **Selectors and their oracles.** `effigy rust:holding-delete` is the focused
 native proof (one fixed script under the qualified shared supervisor,
-`--root-parent /private/tmp` for its genuine internal fixture pool, 300 s,
-512 MiB), `effigy rust:holding-delete:diagnostic` its uncounted keep-going twin,
+the supervisor-selected scratch volume with fixture pools under a private
+`OXIDE_SCRATCH_ROOT` and explicit caps, 300 s, 512 MiB), `effigy rust:holding-delete:diagnostic` its uncounted keep-going twin,
 and `effigy proof:holding-delete:test` its self-check (one private temporary
 directory, removed before it returns; no child, pool or staging), which includes the
 progress-estimator counterfactual: a one-tick and a two-bucket window are rejected,
@@ -523,9 +523,10 @@ every compiler override, and the fixture environment is built from a fixed
 allow-list); automatic adoption, Cargo's external-subcommand argv and owned
 images (all three inapplicable, because no case uses permanent outputs, invokes
 an external subcommand or touches an image); compiler flags (`RUSTFLAGS` frozen
-with the encoded forms dropped); temporary storage (the documented
-`--root-parent /private/tmp` internal-placement exception for the genuine
-internal fixture pool, with per-tree `TMPDIR`/`TMP`/`TEMP`); and macOS `mktemp`
+with the encoded forms dropped); temporary storage (a private `OXIDE_SCRATCH_ROOT` under the supervisor
+run root, with each explicitly capped fixture pool inside it and per-tree
+`TMPDIR`/`TMP`/`TEMP`; a `/private/tmp` fallback exercises the inert internal
+path and is not scratch-pool coverage); and macOS `mktemp`
 (no shell `mktemp` anywhere; the self-check's two temporary directories come from
 `tempfile.mkdtemp`, which honours the supervisor's `TMPDIR`, and are removed).
 The pure self-check binds the map to the source it names — all nine items in
