@@ -300,6 +300,8 @@ NATIVE_CASES = ('01', '02', '03', '04', '05', '06', '07', '08', '09',
 
 
 def fixture():
+    # The helper is read-only; Python must not write a cache beside the repo.
+    sys.dont_write_bytecode = True
     spec = importlib.util.spec_from_file_location('pool_temp_proof', REPO / 'scripts/test-pool-temp-scratch.py')
     helper = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = helper
