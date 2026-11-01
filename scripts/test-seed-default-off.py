@@ -203,6 +203,14 @@ def run(proof: Proof, repo: str, commit: str, diagnostic: bool) -> str:
 
 def self_check() -> None:
     from unittest.mock import patch
+    import tomllib
+    with open(os.path.join(os.path.dirname(HERE), "effigy.toml"), "rb") as handle:
+        tasks = tomllib.load(handle)["tasks"]
+    command = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-seed-default-off.py"
+    assert tasks["rust:seed-default-off"]["run"] == command
+    assert tasks["rust:seed-default-off:diagnostic"]["run"] == command + " --diagnostic"
+    assert all(tasks[name]["admission"] == "heavy" for name in
+               ("rust:seed-default-off", "rust:seed-default-off:diagnostic"))
     class Git:
         def __init__(self, accepted):
             self.accepted = accepted
