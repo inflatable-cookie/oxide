@@ -12,6 +12,27 @@ Keep the marker in the exact run root, bind it to run identity, canonical path a
 
 The qualification bootstrap independently checks selected volume, parent, device, marker, evidence topology, hosting and both sweep results; it and `scripts/test-pool-temp-scratch.py` currently pin the old layout and must be updated together with any other consumers found by a source sweep. The latter pins `/private/tmp`, the run prefix, `scratch`, path arithmetic and its selector's explicit parent. `scripts/test-account-home.py`, `scripts/test-outputs-prune.py`, `scripts/test_supervisor.py` sweep fixtures, and the layout descriptions in `AGENTS.md` and `workflow.md` also require review and coordinated updates where their assumptions apply. Other helpers that assume names or containment require the same audit; consumers must use reported paths rather than infer them where possible. Historical receipts keep their original interpretation and credit.
 
+### Executable layout gates identified
+
+The old spelling is executable policy, not just a receipt convention.
+`src/bin/oxide/config.rs::supervisor_scratch` requires canonical existing
+`oxide-proof.*/scratch` and sibling `evidence` directories and a parseable
+`u64` deadline before enabling the account-home proof control. Its controlled
+home must also be a canonical directory strictly inside scratch. The separate
+`src/bin/oxide/store.rs::supervisor_layout_paths` predicate uses the same
+spelling and deadline rule for debug proof controls; its negative tests and the
+config control tests must migrate with their respective predicates. Neither
+predicate authenticates a supervisor merely from these environment values.
+
+`scripts/test-account-home.py` independently checks the old scratch spelling;
+`scripts/qualify-supervisor.py` is the independent bootstrap oracle, not just
+an ordinary child. `scripts/test-outputs-prune.py` has a separate image-custody
+allocation and synthetic sibling/mode/device tests; its historical layout
+commentary is not itself an authority to relax those checks. Updating these
+consumers requires explicitly testing old, new and mixed layouts. This inventory
+is partial: other proof gates and ownership primitives still require audit
+before an implementation contract can be frozen.
+
 ## Cleanup ownership
 
 The retained #196 review disposition at `da754796` records a recursive deletion attempt against an inherited macOS per-user TMPDIR parent, stopped by a permission error; the extent removed is unknown. It does not establish the exact command or that Oxide's supervisor performed it. A path derived from inherited TMPDIR can name a parent that the run did not create; recursively removing that parent crosses the ownership boundary. No restoration or further cleanup is authorized by that record.
