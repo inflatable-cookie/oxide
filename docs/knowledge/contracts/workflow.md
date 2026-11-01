@@ -1765,13 +1765,33 @@ necessary.
   diagnostic hit the supervisor deadline during staging, before the old
   in-memory receipt was published; it also has no native credit. The `490e935`
   diagnostic stopped at 282 s after eight reached cases; its recorded staging
-  took 55 s and individual fixture setup checks took 11.5–13 s, with no native
-  credit (decision 5bf3c438). Their stderr reports 0.1–0.4 s in the build
-  summary and `seeding skipped: lock unavailable`; that message names the
-  fixture's unavailable Cargo.lock, not a measured lock wait. The receipt has
-  no per-product-step timing and does not establish which step accounts for
-  the remaining interval. The diagnostic and each
-  native session require owner activation at the migrated head; no previous
+  took 55 s, with no native credit (decision 5bf3c438). Its receipt times each
+  child process (`commands[].start_ns`/`end_ns`), not each product step. Source
+  and retained-evidence diagnosis (oxide#225, no run):
+  - **Measured.** All 19 `check` processes in the case set exited 1 at
+    11.27–13.09 s wall. Each printed `creating a scratch build pool`, the
+    pool's first command, and a build summary of 0.1–1.2 s. The 22 `status`
+    processes took at most 17 ms; the newer-state hand-off check, which returns
+    before pool open, took 18 ms.
+  - **Attribution boundary.** The summary's clock starts at `started` in
+    `run_leased`, after pool open, workspace location, removable selection and
+    key resolution, and stops at the print. The gap of about 11.2–12.5 s
+    therefore lies before `started` or after the print. It is nearly constant
+    across 0.1–1.2 s builds, so it is not compile time.
+  - **Not shown.** Source shows no fixed 10 s wait on this path: the pool lock
+    is an uncontended blocking `flock`, and `seed_lock::read` opens
+    non-blockingly, so `seeding skipped: lock unavailable` names an absent
+    input rather than a wait. The creation sub-steps (`scratch_io::evaluate`,
+    `create`, `repair`, `init_scratch_pool`, `Store::open_at`) are unmeasured.
+    The exit-1 status is not explained by the captured stderr.
+  - **Limit.** This fixture's first-command pool creation is not normal
+    daily-command latency.
+  - **Discriminator.** A debug-only, opt-in phase trace on the creation path
+    (the `release_trace::phase` pattern, not that trace, which covers only the
+    release closeout) in one uncounted diagnostic would split the gap. That
+    trace is a standard-tier change. Any change to creation or its timing
+    writes the Builds volume and is Elevated.
+  - Activation. The diagnostic and each native session require owner activation at the migrated head; no previous
   receipt carries over. The proof touches no live pool, installed binary or
   real install receipt, and is not a benchmark or full QA.
 
