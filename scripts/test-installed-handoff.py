@@ -66,6 +66,8 @@ REGISTRATION_VERSION = 2
 CAPABILITIES_PROBE = "__oxide-build-capabilities"
 SHUTDOWN_MARGIN_S = 20
 CASES = []
+DIAGNOSTIC = None
+
 # The platform toolchain stays reachable for `rustc -vV` and `cargo -V`
 # probes; the fixture's own `cargo` and `oxide` stay first on PATH.
 TOOLCHAIN_BIN = os.path.dirname(shutil.which("rustc") or "")
@@ -83,6 +85,11 @@ def expect(condition: bool, message: str) -> None:
 
 def case(name: str) -> None:
     CASES.append(name)
+    if DIAGNOSTIC is not None:
+        if DIAGNOSTIC["active"] is not None:
+            DIAGNOSTIC["completed"].append(DIAGNOSTIC["active"])
+        DIAGNOSTIC["active"] = name
+        DIAGNOSTIC["reached"].append(name)
     print(f"case {name}")
 
 
@@ -871,45 +878,117 @@ def check_cargo_exit_75(root: str, binary: str) -> None:
         expect(json.load(handle)["version"] == WITNESS_STATE_VERSION, "the pool state is not the recorded-accounting version")
 
 
+# Each group has independent fixture roots. A failed oracle can leave a child
+# descendant, so after any child launch the diagnostic aborts and leaves the
+# supervisor to decide closure; it never treats a reaped leader as a census.
+GROUPS = (
+    ("handoff", check_handoff), ("no-trigger", check_no_trigger),
+    ("candidate-refusals", check_candidate_refusals),
+    ("skipped-commands", check_skipped_commands), ("same-binary", check_same_binary),
+    ("cargo-exit", check_cargo_exit_75), ("final-release", check_final_release),
+)
+
+
+def collect(groups, invoke, outcome, launched):
+    for index, (name, body) in enumerate(groups):
+        try:
+            invoke(body)
+            if outcome["active"] is not None:
+                outcome["completed"].append(outcome["active"])
+                outcome["active"] = None
+            outcome["groups_completed"].append(name)
+        except SystemExit as error:
+            outcome["failed"].append({"case": outcome["active"], "group": name,
+                                      "error": str(error)[:256]})
+            outcome["active"] = None
+            if launched():
+                outcome["aborted"] = "writer closure unknown after failure"
+                outcome["unexecuted_groups"] = [item[0] for item in groups[index + 1:]]
+                return
+        except Exception as error:
+            outcome["aborted"] = type(error).__name__
+            outcome["unexecuted_groups"] = [item[0] for item in groups[index + 1:]]
+            return
+
+
+def empty_outcome():
+    return {"qualified": False, "reached": [], "completed": [], "failed": [],
+            "active": None, "groups_completed": [], "unexecuted_groups": [],
+            "aborted": None}
+
+
+def self_check():
+    outcome = empty_outcome()
+    calls = []
+    def invoke(body):
+        calls.append(body)
+        if body == 1:
+            raise SystemExit(1)
+    collect((("one", 1), ("two", 2)), invoke, outcome, lambda: False)
+    assert calls == [1, 2] and len(outcome["failed"]) == 1
+    assert outcome["groups_completed"] == ["two"]
+    outcome = empty_outcome()
+    calls.clear()
+    collect((("one", 1), ("two", 2)), invoke, outcome, lambda: True)
+    assert calls == [1] and outcome["unexecuted_groups"] == ["two"]
+    assert outcome["aborted"] and outcome["qualified"] is False
+    assert len({name for name, _ in GROUPS}) == len(GROUPS)
+    check_source_versions()
+    print("installed-handoff apparatus self-check passed")
+    return 0
+
+
 def main() -> int:
+    global DIAGNOSTIC
     if sys.argv[1:] == ["--plan"]:
-        print("installed-handoff: stage subject and stub; exercise handoff, refusals,")
-        print("skipped commands, same binary, Cargo exit and final release")
+        print("installed-handoff groups: " + ", ".join(name for name, _ in GROUPS))
         print("supervisor bounds: 120 s, 64 MiB scratch")
         return 0
-    check_source_versions()
-    if sys.argv[1:] == ["--self-test"]:
-        print("installed-handoff source version checks passed")
-        return 0
-    expect(not sys.argv[1:], "unknown arguments")
+    if sys.argv[1:] in (["--self-check"], ["--self-test"]):
+        return self_check()
+    diagnostic = sys.argv[1:] == ["--diagnostic"]
+    expect(diagnostic or not sys.argv[1:], "unknown arguments")
+    outcome = empty_outcome()
     evidence = os.environ.get("OXIDE_PROOF_EVIDENCE", "")
     expect(bool(evidence) and os.path.isdir(evidence), "not running under the shared supervisor")
-    scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")
-    expect(bool(scratch) and os.path.realpath(scratch) == scratch, f"scratch {scratch!r} is not canonical")
-    for name in ("TMPDIR", "TMP", "TEMP"):
-        expect(os.environ.get(name) == scratch, f"{name} differs from the supervisor scratch")
-    root = tempfile.mkdtemp(prefix="installed-handoff.", dir=scratch)
+    if diagnostic:
+        DIAGNOSTIC = outcome
     try:
+        check_source_versions()
+        scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")
+        expect(bool(scratch) and os.path.realpath(scratch) == scratch, f"scratch {scratch!r} is not canonical")
+        for name in ("TMPDIR", "TMP", "TEMP"):
+            expect(os.environ.get(name) == scratch, f"{name} differs from the supervisor scratch")
+        root = tempfile.mkdtemp(prefix="installed-handoff.", dir=scratch)
         binary = stage_subject(root)
         digest = sha256(binary)
         print(f"subject {binary} sha256 {digest}")
         compile_stub(root)
-        check_handoff(root, binary)
-        check_no_trigger(root, binary)
-        check_candidate_refusals(root, binary)
-        check_skipped_commands(root, binary)
-        check_same_binary(root, binary)
-        check_cargo_exit_75(root, binary)
-        check_final_release(root, binary)
+        if diagnostic:
+            # Each group launches product children, so a failure after launch
+            # is conservatively an unknown writer outcome.
+            collect(GROUPS, lambda body: body(root, binary), outcome, lambda: True)
+            return 1
+        for _, body in GROUPS:
+            body(root, binary)
+        with open(os.path.join(evidence, "installed-handoff.txt"), "w", encoding="utf-8") as handle:
+            handle.write(f"subject {binary}\nsubject sha256 {digest}\n")
+            handle.write(f"cases {len(CASES)}\n")
+            for name in CASES:
+                handle.write(f"ok {name}\n")
+        print(f"installed-handoff: {len(CASES)} cases passed")
+        return 0
+    except BaseException as error:
+        if diagnostic:
+            outcome["aborted"] = type(error).__name__
+            outcome["unexecuted_groups"] = [name for name, _ in GROUPS if name not in outcome["groups_completed"]]
+        raise
     finally:
-        shutil.rmtree(root, ignore_errors=True)
-    with open(os.path.join(evidence, "installed-handoff.txt"), "w", encoding="utf-8") as handle:
-        handle.write(f"subject {binary}\nsubject sha256 {digest}\n")
-        handle.write(f"cases {len(CASES)}\n")
-        for name in CASES:
-            handle.write(f"ok {name}\n")
-    print(f"installed-handoff: {len(CASES)} cases passed")
-    return 0
+        if diagnostic:
+            # Bounded by the fixed group/case table and truncated error strings.
+            with open(os.path.join(evidence, "installed-handoff-diagnostic.json"), "w", encoding="utf-8") as handle:
+                json.dump(outcome, handle, sort_keys=True)
+                handle.write("\n")
 
 if __name__ == "__main__":
     sys.exit(main())
