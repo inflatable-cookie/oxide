@@ -188,7 +188,7 @@ def bounded_output(value):
     return data[:2048].decode("utf-8", "replace")
 
 
-def observed_run(argv, *, limit, _runner=None, _remaining=None, _merged_log=None, **kwargs):
+def observed_run(argv, *, limit, _runner=None, _remaining=None, _merged_log=None, _fixture=None, **kwargs):
     """Observe the existing child call; the shared supervisor owns custody."""
     runner = subprocess.run if _runner is None else _runner
     remaining = work_left if _remaining is None else _remaining
@@ -197,6 +197,8 @@ def observed_run(argv, *, limit, _runner=None, _remaining=None, _merged_log=None
         row = {"case": DIAGNOSTIC["active"], "command": [str(x)[:512] for x in argv[:16]],
                "start_ns": time.monotonic_ns(), "end_ns": None, "exit": None,
                "stdout": None, "stderr": None, "stop": None, "state": "preparing"}
+        if _fixture is not None:
+            row["fixture"] = _fixture[:128]
         if _merged_log is not None:
             row["merged_log"] = _merged_log
             row["package_cache_wait"] = {"state": "not yet observed", "line": None}
@@ -544,7 +546,8 @@ class Fixture:
                      "exit 1\n")
             write(cargo, setup, 0o755)
             result = observed_run([SUBJECT, "check"], cwd=workspace, env=self.env(SUBJECT),
-                                    capture_output=True, text=True, limit=30)
+                                    capture_output=True, text=True, limit=30,
+                                    _fixture=os.path.basename(self.root))
             write(cargo, original, 0o755)
             expect(result.returncode == 1 and os.path.isfile(os.path.join(self.pool, "ledger.json")),
                    f"fixture setup did not create its pool: {result.stderr[-2000:]}")
@@ -665,6 +668,7 @@ def run(fixture: Fixture, binary: str, args: list, env_extra: dict | None = None
         capture_output=True,
         text=True,
         limit=timeout,
+        _fixture=os.path.basename(fixture.root),
     )
 
 
@@ -1183,10 +1187,12 @@ def self_check():
         DIAGNOSTIC = empty_outcome()
         DIAGNOSTIC["active"] = CASE_PLAN[0]
         fake = lambda argv, **kwargs: subprocess.CompletedProcess(argv, 42, "o" * 3000, "e" * 3000)
-        result = observed_run(["fixture", "check"], limit=30, _runner=fake, _remaining=lambda: 10)
+        result = observed_run(["fixture", "check"], limit=30, _runner=fake, _remaining=lambda: 10,
+                              _fixture="f" * 200)
         row = DIAGNOSTIC["commands"][0]
         assert result.returncode == row["exit"] == 42
         assert row["case"] == CASE_PLAN[0] and row["command"] == ["fixture", "check"]
+        assert row["fixture"] == "f" * 128
         assert row["start_ns"] <= row["end_ns"] and len(row["stderr"]) == len(row["stdout"]) == 2048
         def stopped():
             raise ProofFailure("work deadline")
