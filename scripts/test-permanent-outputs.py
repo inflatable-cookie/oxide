@@ -1869,9 +1869,9 @@ def detach_run(proof: Proof, repo: str, diagnostic: bool = False) -> None:
         expect(report["state"] == "detached" and report["current_target"] == "real-nonempty", report)
         proof.phase("after the real-target builds")
 
-        # 5. Controls. Explicit adopt never converts a NONEMPTY real member (the
-        #    profile contract keeps it local) and writes nothing into the root; a
-        #    missing target beside a detached receipt is never adopted.
+        # 5. Explicit adopt keeps a nonempty real member but can re-adopt
+        # another member. A distinct detached checkout supplies the absent-target
+        # control, so the first adoption cannot silently invalidate its premise.
         before = tree_digest(adopted)
         code, stdout, stderr = proof.oxide(["outputs", "adopt"], "adopt keeps the nonempty real members", app)
         expect(code == 0, f"adopt refused the nonempty members: {stdout}{stderr}")
@@ -1886,11 +1886,21 @@ def detach_run(proof: Proof, repo: str, diagnostic: bool = False) -> None:
             "adopt linked a nonempty real member",
         )
         expect(tree_digest(adopted) == before, "adopt wrote into the root")
-        shutil.rmtree(link)
-        code, _, stderr = proof.oxide(["build"], "a detached receipt with an absent target is never adopted", app)
+        expect(receipt_state(pool, app) == "committed", "explicit re-adoption did not commit")
+        expect(member_link_target(app, "release") == os.path.join(adopted, "release"),
+               "explicit re-adoption did not select the release member")
+        detached = fresh_checkout(proof, root, "detach-missing-target")
+        code, _, stderr = proof.oxide(["build"], "absent-target control first adopts", detached)
+        expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
+        code, _, stderr = proof.oxide(["outputs", "detach"], "absent-target control detaches", detached)
+        expect(code == 0 and receipt_state(pool, detached) == "detached", stderr)
+        detached_target = os.path.join(detached, "target")
+        shutil.rmtree(detached_target)
+        expect(not os.path.lexists(detached_target), "detached control target is still present")
+        code, _, stderr = proof.oxide(["build"], "a detached receipt with an absent target is never adopted", detached)
         expect(code == 0 and not auto_notices(stderr), stderr)
-        expect(os.path.isdir(link) and not os.path.islink(link), "a detached checkout was adopted")
-        expect(receipt_state(pool, app) == "detached", "the receipt left detached state")
+        expect(os.path.isdir(detached_target) and not os.path.islink(detached_target), "a detached checkout was adopted")
+        expect(receipt_state(pool, detached) == "detached", "the receipt left detached state")
         proof.phase("after the absent-target control")
 
 
@@ -2067,8 +2077,10 @@ def auto_run(proof: Proof, repo: str, diagnostic: bool = False) -> None:
     expect(os.path.isfile(binary), "the binary is not reachable through the owned member link")
     expect(os.path.realpath(binary).startswith(mount + os.sep), "the binary is not on the drive")
     expect(slot_state(stderr)[1] == "cold", stderr)
-    code, stdout, stderr = proof.oxide(["status"], "status shows the adopted root", fresh)
+    code, stdout, stderr = proof.oxide(["outputs", "status"], "output status shows the adopted root", fresh)
     expect(code == 0 and fresh_root in stdout, stdout + stderr)
+    adopted_receipt = read_json(receipt_file(pool, fresh))
+    expect(adopted_receipt["state"] == "committed", f"adopted receipt: {adopted_receipt}")
     code, _, stderr = proof.oxide(["build"], "adopted checkout rebuilds warm, no notice", fresh)
     expect(code == 0 and not auto_notices(stderr), stderr)
     expect(slot_state(stderr)[1] == "warm", f"adopted destination key did not reuse: {stderr}")
@@ -2300,13 +2312,22 @@ def repo_relative_target(proof: Proof, checkout: str) -> str:
     return result.stdout.decode(errors="replace").strip() + "target"
 
 
-def git_status_names_target(proof: Proof, checkout: str) -> list[str]:
-    """Exact `git status` entries naming this checkout's `target`.
+def status_target_entries(raw: bytes, expected: str) -> list[str]:
+    """Select the exact target or descendants, never a merely similar prefix."""
+    named = []
+    for part in raw.split(b"\0"):
+        if not part:
+            continue
+        entry = part.decode(errors="replace")
+        expect(len(entry) > 3 and entry[2] == " ", f"unexpected git status entry {entry!r}")
+        path = entry[3:]
+        if any(path == root or path.startswith(root + "/") for root in (expected, "target")):
+            named.append(entry)
+    return named
 
-    NUL delimited, with every untracked file listed: a wholly untracked
-    workspace would otherwise collapse to one entry such as `rust/` and hide an
-    exposed `rust/target`. The path is compared exactly (repository-relative,
-    or the checkout-relative form some Git versions print), never by suffix."""
+
+def git_status_names_target(proof: Proof, checkout: str) -> list[str]:
+    """Return NUL-delimited status entries for the target and its members."""
     expected = repo_relative_target(proof, checkout)
     result = proof.run(
         ["git", "status", "--porcelain", "-z", "--untracked-files=all", "--no-renames"],
@@ -2314,18 +2335,7 @@ def git_status_names_target(proof: Proof, checkout: str) -> list[str]:
         timeout=30,
     )
     expect(result.returncode == 0, f"git status failed in {checkout}: {result.stderr!r}")
-    named = []
-    for part in result.stdout.split(b"\0"):
-        if not part:
-            continue
-        entry = part.decode(errors="replace")
-        expect(
-            len(entry) > 3 and entry[2] == " ",
-            f"unexpected git status entry {entry!r}",
-        )
-        if entry[3:] in (expected, "target"):
-            named.append(entry)
-    return named
+    return status_target_entries(result.stdout, expected)
 
 
 def git_index_names_target(proof: Proof, checkout: str) -> bytes:
@@ -2580,7 +2590,7 @@ def ignore_run(proof: Proof, repo: str, diagnostic: bool = False) -> None:
     def case_negated() -> None:
         # 3. Negated and unignored paths refuse; nothing links.
         _, negated = ignore_fixture(
-            proof, root, "negated", "/target/\n!/target/debug\n/.oxide-outputs/\n"
+            proof, root, "negated", "/target/*\n!/target/debug\n/.oxide-outputs/\n"
         )
         stderr = refused_untouched(
             proof,
@@ -2733,7 +2743,7 @@ def ignore_run(proof: Proof, repo: str, diagnostic: bool = False) -> None:
         _, foreign = ignore_fixture(proof, root, "foreign", "/target\n/.oxide-outputs/\n")
         os.symlink(outside, os.path.join(foreign, "target"))
         code, _, stderr = proof.oxide(["outputs", "adopt"], "a foreign link is kept", foreign)
-        expect(code != 0 and "never moves" in stderr, stderr)
+        expect(code != 0 and "never replaces it" in stderr, stderr)
         expect(os.readlink(os.path.join(foreign, "target")) == outside, "the foreign link was replaced")
         expect(read_bytes(os.path.join(outside, "sentinel")) == b"foreign", "the referent mutated")
 
@@ -2741,7 +2751,7 @@ def ignore_run(proof: Proof, repo: str, diagnostic: bool = False) -> None:
         _, dangling = ignore_fixture(proof, root, "dangling", "/target\n/.oxide-outputs/\n")
         os.symlink(absent, os.path.join(dangling, "target"))
         code, _, stderr = proof.oxide(["outputs", "adopt"], "a dangling link is kept", dangling)
-        expect(code != 0 and "never moves" in stderr, stderr)
+        expect(code != 0 and "left untouched" in stderr, stderr)
         expect(os.readlink(os.path.join(dangling, "target")) == absent, "the dangling link was replaced")
         expect(not os.path.lexists(absent), "the dangling link's root was created")
         proof.phase("after present-target controls")
@@ -2815,8 +2825,9 @@ def ignore_run(proof: Proof, repo: str, diagnostic: bool = False) -> None:
                 expected = repo_relative_target(proof, nested_ok)
                 exposed = git_status_names_target(proof, nested_ok)
                 expect(
-                    any(entry[3:] == expected for entry in exposed),
-                    f"the nested detector missed an exposed target: {exposed}",
+                    all(any(entry[3:] in (expected + "/" + member, "target/" + member)
+                            for entry in exposed) for member in ("debug", "release")),
+                    f"the nested detector missed an exposed member: {exposed}",
                 )
             finally:
                 with open(nested_ignore, "wb") as handle:
@@ -3505,6 +3516,13 @@ def exec_self_test() -> None:
             pass
         else:
             fail(f"{mode}: unbound diagnostic body accepted")
+
+    status = b"?? rust/target/debug\0?? rust/target/release\0?? rust/targeted/debug\0"
+    expect(status_target_entries(status, "rust/target") ==
+           ["?? rust/target/debug", "?? rust/target/release"],
+           "nested status member detection or component boundary drifted")
+    expect(status_target_entries(b"?? target/debug\0", "rust/target") == ["?? target/debug"],
+           "checkout-relative status member was missed")
 
     ran: list[str] = []
 
