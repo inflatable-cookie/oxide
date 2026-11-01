@@ -188,7 +188,41 @@ def bounded_output(value):
     return data[:2048].decode("utf-8", "replace")
 
 
-def observed_run(argv, *, limit, _runner=None, _remaining=None, _merged_log=None, _fixture=None, **kwargs):
+def trace_layout(env, evidence, run_id):
+    """Refuse anything except the owned supervisor and this private fixture."""
+    try:
+        scratch = env["OXIDE_TASK_SCRATCH_ROOT"]
+        fixture_root = env["OXIDE_SCRATCH_ROOT"]
+        home = env["HOME"]
+        root = os.path.dirname(scratch)
+        paths = (scratch, evidence, fixture_root, home, root)
+        if any(not os.path.isabs(p) or os.path.realpath(p) != p for p in paths):
+            return False
+        if (os.path.basename(scratch) != "scratch" or evidence != os.path.join(root, "evidence")
+                or os.path.commonpath((scratch, fixture_root)) != scratch
+                or os.path.commonpath((fixture_root, home)) != fixture_root
+                or env.get("OXIDE_TEST_HOME_FROM_ENV") != "1"
+                or env.get("OXIDE_POOL") != os.path.join(os.path.dirname(home), "pool")):
+            return False
+        info = os.lstat(root)
+        marker_path = os.path.join(root, ".oxide-scratch.json")
+        marker_info = os.lstat(marker_path)
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077
+                or not stat.S_ISREG(marker_info.st_mode) or marker_info.st_uid != info.st_uid
+                or marker_info.st_mode & 0o077 or marker_info.st_size > 4096):
+            return False
+        with open(marker_path, "rb") as handle:
+            marker = json.load(handle)
+        return (isinstance(run_id, str) and re.fullmatch(r"[0-9a-f]{32}", run_id) is not None
+                and marker.get("run_id") == run_id and marker.get("root") == root
+                and marker.get("owner_uid") == info.st_uid and marker.get("device") == info.st_dev
+                and marker.get("inode") == info.st_ino and marker.get("outcome") == "running"
+                and marker.get("concluded_unix", False) is None)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
+def observed_run(argv, *, limit, _runner=None, _remaining=None, _merged_log=None, _fixture=None, _trace=False, **kwargs):
     """Observe the existing child call; the shared supervisor owns custody."""
     runner = subprocess.run if _runner is None else _runner
     remaining = work_left if _remaining is None else _remaining
@@ -213,6 +247,22 @@ def observed_run(argv, *, limit, _runner=None, _remaining=None, _merged_log=None
             row["state"] = "launching"
             publish_diagnostic(DIAGNOSTIC)
         left = remaining()
+        if row is not None and _fixture is not None and _trace and _runner is None:
+            env = kwargs.get("env", {})
+            evidence = os.environ.get("OXIDE_PROOF_EVIDENCE", "")
+            run_id = os.environ.get("OXIDE_PROOF_RUN_ID", "")
+            row["trace"] = {"state": "layout refused"}
+            if trace_layout(env, evidence, run_id):
+                try:
+                    fd, path = tempfile.mkstemp(prefix="handoff-trace.", dir=evidence)
+                    os.close(fd)
+                    env = dict(env, OXIDE_HANDOFF_TRACE="1", OXIDE_HANDOFF_TRACE_FILE=path,
+                               OXIDE_PROOF_EVIDENCE=evidence, OXIDE_PROOF_RUN_ID=run_id)
+                    kwargs["env"] = env
+                    row["trace"] = {"state": "allocated", "file": os.path.basename(path), "run": run_id}
+                except OSError:
+                    row["trace"] = {"state": "allocation failed"}
+            publish_diagnostic(DIAGNOSTIC)
         result = runner(argv, timeout=min(limit, left) if limit is not None else left, **kwargs)
         if row is not None:
             row.update(exit=result.returncode, stdout=bounded_output(result.stdout),
@@ -547,7 +597,7 @@ class Fixture:
             write(cargo, setup, 0o755)
             result = observed_run([SUBJECT, "check"], cwd=workspace, env=self.env(SUBJECT),
                                     capture_output=True, text=True, limit=30,
-                                    _fixture=os.path.basename(self.root))
+                                    _fixture=os.path.basename(self.root), _trace=True)
             write(cargo, original, 0o755)
             expect(result.returncode == 1 and os.path.isfile(os.path.join(self.pool, "ledger.json")),
                    f"fixture setup did not create its pool: {result.stderr[-2000:]}")
@@ -1288,6 +1338,29 @@ def self_check():
             os.environ.pop("OXIDE_TASK_SCRATCH_ROOT", None)
         else:
             os.environ["OXIDE_TASK_SCRATCH_ROOT"] = old_scratch
+    # Synthetic supervisor layout: no product child or live account is read.
+    with tempfile.TemporaryDirectory(prefix="handoff-layout.", dir=os.environ["TMPDIR"]) as root:
+        scratch = os.path.join(root, "scratch")
+        evidence = os.path.join(root, "evidence")
+        fixture_root = os.path.join(scratch, "installed-handoff.fixture")
+        home = os.path.join(fixture_root, "case", "home")
+        os.makedirs(home, mode=0o700)
+        os.mkdir(evidence, 0o700)
+        info = os.stat(root)
+        marker = {"run_id": "a" * 32, "root": root, "owner_uid": info.st_uid,
+                  "device": info.st_dev, "inode": info.st_ino, "outcome": "running",
+                  "concluded_unix": None}
+        write(os.path.join(root, ".oxide-scratch.json"), json.dumps(marker), 0o600)
+        env = {"HOME": home, "OXIDE_POOL": os.path.join(os.path.dirname(home), "pool"),
+               "OXIDE_TASK_SCRATCH_ROOT": scratch, "OXIDE_SCRATCH_ROOT": fixture_root,
+               "OXIDE_TEST_HOME_FROM_ENV": "1"}
+        assert trace_layout(env, evidence, "a" * 32)
+        assert not trace_layout(env, evidence, "b" * 32)
+        assert not trace_layout(env, root, "a" * 32)
+        assert not trace_layout({}, evidence, "a" * 32)
+        marker["outcome"] = "closed"
+        write(os.path.join(root, ".oxide-scratch.json"), json.dumps(marker), 0o600)
+        assert not trace_layout(env, evidence, "a" * 32)
     check_source_versions()
     print("installed-handoff apparatus self-check passed")
     return 0

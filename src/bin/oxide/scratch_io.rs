@@ -355,8 +355,10 @@ pub(crate) fn create(settings: &Settings, uuid: &str, budget: u64) -> Result<(),
         "oxide: creating a scratch build pool on volume {}; not for ordinary project builds",
         config::bounded(uuid)
     );
-    oxide_storage::lease::managed::init_scratch_pool(&leaf, &binding, budget)
-        .map_err(|e| e.to_string())?;
+    crate::handoff_trace::phase("scratch-init", || {
+        oxide_storage::lease::managed::init_scratch_pool(&leaf, &binding, budget)
+    })
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

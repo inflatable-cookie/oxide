@@ -20,6 +20,7 @@ mod describe;
 mod freshness;
 mod guidance;
 mod handoff;
+mod handoff_trace;
 mod identity;
 mod incremental;
 mod launch;
@@ -413,7 +414,11 @@ fn cold_seed_notice_when(qualified: bool, value: Option<&std::ffi::OsStr>) -> Op
         .then_some("seeding not yet qualified on this Cargo; enabled after the qualification proof")
 }
 
-fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
+fn run_invocation(invocation: Invocation) -> Result<u8, String> {
+    handoff_trace::phase("invocation", || run_invocation_inner(invocation))
+}
+
+fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
     if let Some(reason) =
         cold_seed_qualification_notice(std::env::var_os("OXIDE_COLD_SEED").as_deref())
     {
@@ -444,15 +449,14 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     if budget::admission_expired() {
         return Ok(stop_for_admission());
     }
-    let internal = prep!(Store::open_or_create());
+    let internal = prep!(handoff_trace::phase("store", Store::open_or_create));
     let output_control = internal.control().to_path_buf();
     if budget::admission_expired() {
         return Ok(stop_for_admission());
     }
-    let checkout = prep!(identity::locate_workspace(
-        CARGO,
-        invocation.manifest_path.as_deref()
-    ));
+    let checkout = prep!(handoff_trace::phase("workspace", || {
+        identity::locate_workspace(CARGO, invocation.manifest_path.as_deref())
+    }));
     if budget::admission_expired() {
         return Ok(stop_for_admission());
     }
@@ -464,7 +468,9 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
     // The intermediate pool is selected first: outputs select the external
     // root only when this command's slot comes from the removable pool, whose
     // watchdog supervises the drive's removal.
-    let selected = prep!(removable::select(internal));
+    let selected = prep!(handoff_trace::phase("removable", || removable::select(
+        internal
+    )));
     if budget::admission_expired() {
         return Ok(stop_for_admission());
     }
@@ -601,13 +607,14 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
         guarded,
     ));
     let destination = outputs::destination_facts(planned.as_ref());
-    let key = prep!(SlotKey::resolve_in(
+    let incremental_key = prep!(incremental::key_component(&checkout, &invocation));
+    let key = prep!(handoff_trace::phase("key", || SlotKey::resolve_in(
         &checkout,
         invocation.profile.recipe_key(),
         invocation.target.as_deref(),
         &destination,
-        &prep!(incremental::key_component(&checkout, &invocation)),
-    ));
+        &incremental_key,
+    )));
     test_pause_with("keyed", &destination);
     if budget::admission_expired() {
         return Ok(stop_for_admission());
@@ -623,7 +630,7 @@ fn run_invocation(mut invocation: Invocation) -> Result<u8, String> {
             eprintln!("oxide: {note}");
         }
     }
-    let started = Instant::now();
+    let started = handoff_trace::phase("summary-clock", Instant::now);
     let mut waits = store::WaitAccounting::default();
     let mut grants = LeaseGrants::new();
     let resolution = cli::resolution(&invocation.cargo_args);
@@ -1716,39 +1723,41 @@ fn print_summary(
     note: Option<&str>,
     waits: &store::WaitAccounting,
 ) {
-    let strategy = match invocation.command.as_str() {
-        "run" | "test" | "exec" => "build+execute",
-        _ => "build",
-    };
-    let size = match measured {
-        Some(measured) => format!(
-            "slot {} was {} MiB when leased",
-            measured.slot_id,
-            measured.unique_allocated_bytes / MIB
-        ),
-        None if !warm => "new slot".to_owned(),
-        None => "slot size unknown".to_owned(),
-    };
-    let pool = format!(
-        "{size}, {} MiB budget, pool total: see oxide status",
-        store.command_budget() / MIB
-    );
-    let backend = match store.backend {
-        Backend::DirectoryBudget => format!(" ({}, budget-only)", store.backend.tag()),
-        Backend::ApfsVolume => format!(
-            " ({}, budget-only, removable {})",
-            store.backend.tag(),
-            store.payload.display()
-        ),
-    };
-    let note = note.map(|note| format!(", {note}")).unwrap_or_default();
-    let wait = waits.summary_suffix().unwrap_or_default();
-    eprintln!(
+    handoff_trace::phase("summary", || {
+        let strategy = match invocation.command.as_str() {
+            "run" | "test" | "exec" => "build+execute",
+            _ => "build",
+        };
+        let size = match measured {
+            Some(measured) => format!(
+                "slot {} was {} MiB when leased",
+                measured.slot_id,
+                measured.unique_allocated_bytes / MIB
+            ),
+            None if !warm => "new slot".to_owned(),
+            None => "slot size unknown".to_owned(),
+        };
+        let pool = format!(
+            "{size}, {} MiB budget, pool total: see oxide status",
+            store.command_budget() / MIB
+        );
+        let backend = match store.backend {
+            Backend::DirectoryBudget => format!(" ({}, budget-only)", store.backend.tag()),
+            Backend::ApfsVolume => format!(
+                " ({}, budget-only, removable {})",
+                store.backend.tag(),
+                store.payload.display()
+            ),
+        };
+        let note = note.map(|note| format!(", {note}")).unwrap_or_default();
+        let wait = waits.summary_suffix().unwrap_or_default();
+        eprintln!(
         "oxide: {} profile, {strategy} strategy, slot {slot} {}, {:.1}s, {pool}{backend}{note}{wait}",
         invocation.profile.label(),
         if warm { "warm" } else { "cold" },
         started.elapsed().as_secs_f64()
     );
+    });
 }
 
 /// What one `oxide status` run asks for (oxide#128). `Recorded` is the

@@ -1787,6 +1787,13 @@ necessary.
     The exit-1 status is not explained by the captured stderr.
   - **Limit.** This fixture's first-command pool creation is not normal
     daily-command latency.
+  - **Trace scope.** The diagnostic's private fixture setup may request a
+    debug-only trace to a bounded per-command evidence file, after matching
+    the supervisor's running owner marker, scratch/evidence layout and private
+    HOME/pool. Each named start and end uses a single monotonic clock; an absent
+    end is unknown. Release builds do not emit this trace. Trace records are
+    observations, not timing or closure gates; a missing trace cannot establish
+    a duration. No new diagnostic has yet attributed the historical gap.
   - **Discriminator.** A debug-only, opt-in phase trace on the creation path
     (the `release_trace::phase` pattern, not that trace, which covers only the
     release closeout) in one uncounted diagnostic would split the gap. That

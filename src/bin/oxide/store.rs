@@ -1837,7 +1837,9 @@ impl Store {
         let settings = settings()?;
         let path = settings.pool.clone();
         let source = settings.pool_source;
-        let scratch = crate::scratch_io::evaluate(&settings, false)?;
+        let scratch = crate::handoff_trace::phase("scratch-evaluate", || {
+            crate::scratch_io::evaluate(&settings, false)
+        })?;
         // A pasted `oxide status` annotation is not part of a path, so it
         // refuses for every pool state: an absent path and an existing
         // ordinary directory both get the hint instead of the generic open
@@ -1858,7 +1860,9 @@ impl Store {
                     if available < HOST_RESERVE_BYTES {
                         return Err("refusing to create the pool: host free space is below the 20 GiB reserve".into());
                     }
-                    crate::scratch_io::create(&settings, uuid, admission_budget(&settings))?;
+                    crate::handoff_trace::phase("scratch-create", || {
+                        crate::scratch_io::create(&settings, uuid, admission_budget(&settings))
+                    })?;
                 } else {
                     create_pool(&path, admission_budget(&settings))?;
                 }
@@ -1867,23 +1871,26 @@ impl Store {
             Found::Directory | Found::Unknown => {}
         }
         if let Some(uuid) = &scratch {
-            crate::scratch_io::repair(&settings, uuid)?;
+            crate::handoff_trace::phase("scratch-repair", || {
+                crate::scratch_io::repair(&settings, uuid)
+            })?;
         }
-        let store = match Self::open_at(&path, &settings) {
-            Ok(store) => store,
-            // An explicit path that exists but holds no recognizable Oxide
-            // pool is still this command's pool: name it in the refusal
-            // (oxide#182), so a typo or a non-pool directory is actionable.
-            Err(error)
-                if matches!(
-                    settings.pool_source,
-                    config::Source::Environment("OXIDE_POOL")
-                ) =>
-            {
-                return Err(format!("OXIDE_POOL names {}: {error}", path.display()))
-            }
-            Err(error) => return Err(error),
-        };
+        let store =
+            match crate::handoff_trace::phase("store-open", || Self::open_at(&path, &settings)) {
+                Ok(store) => store,
+                // An explicit path that exists but holds no recognizable Oxide
+                // pool is still this command's pool: name it in the refusal
+                // (oxide#182), so a typo or a non-pool directory is actionable.
+                Err(error)
+                    if matches!(
+                        settings.pool_source,
+                        config::Source::Environment("OXIDE_POOL")
+                    ) =>
+                {
+                    return Err(format!("OXIDE_POOL names {}: {error}", path.display()))
+                }
+                Err(error) => return Err(error),
+            };
         if !config::has_sticky_exclusion(&store.pool) {
             match config::exclude_from_backup(&store.pool) {
                 Backup::Excluded | Backup::NotApplicable => {}
