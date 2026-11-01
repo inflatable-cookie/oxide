@@ -317,6 +317,8 @@ never a raw path dump, bounded and escaped as today.
 
 `rust:holding-delete` and its diagnostic now use a scratch pool under the supervisor-selected volume (oxide#202); their native evidence must be established at the migrated head.
 
+`rust:permanent-outputs`, `rust:auto-adopt-outputs`, `rust:outputs-detach-permanent`, `rust:outputs-ignore-safety`, `rust:exec-output-inference` and `rust:auto-adopt-ineligible` use declared scratch pools under the supervisor-selected root (oxide#210); their native evidence remains separately owner-activated. A /private/tmp fallback does not prove scratch-pool placement.
+
 `bd357a4c` is only about `--root-parent /private/tmp`. Pool premise is read from
 each script's own selector text and case bodies.
 
@@ -328,8 +330,6 @@ each script's own selector text and case bodies.
 | `rust:installed-handoff` (#122) | two cases create a real directory pool; needs the diagnostic apparatus authored first (S4) |
 | `rust:profile-outputs` (#133) + `:diagnostic` | 20 private directory-budget fixture pools |
 | `rust:recorded-slot-accounting` (#146) + `:diagnostic` | genuine directory-budget pool, verified from the product's own config |
-| `rust:exec-output-inference` (#160) + `:diagnostic` | control pool is a directory-budget pool |
-| `rust:auto-adopt-ineligible` (#154) + `:diagnostic` | control pool is a directory-budget pool |
 | `rust:prune-authority` (#134) + `:diagnostic` | internal pool placement only |
 | `rust:oxide-removable-boot-closure` (#161) + `:diagnostic` | directory-budget base pool plus one owned image |
 | `rust:finder-metadata-race` (#155) + `:diagnostic` | every fixture pool is a directory-budget pool |
@@ -346,6 +346,7 @@ or a socket path that cannot fit under the selected-volume guard prefix):
 
 | Selector/recipe | Genuine premise |
 | --- | --- |
+| `rust:permanent-outputs:base-compat` + `:diagnostic` | decision de52775e: the pinned pre-S3 base binary cannot open an external pool |
 | `rust:pool-temp-scratch` (#136) + `:diagnostic` | decision af7df7d6: the Builds guard prefix makes this fixture's shortest admitted slot scratch path (`test-1`) 103 bytes, exceeding the 91-byte product bound; both selectors keep `/private/tmp` |
 | `rust:outputs-prune` (#129/#152) + `:diagnostic` | cases 10 and 21 prove checkout absence on the boot Data volume |
 | `rust:prune-absence` (#135) + `:diagnostic` | the missing-ancestor chain must sit on the boot Data volume |
