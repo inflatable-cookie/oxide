@@ -218,7 +218,7 @@ pub fn run(args: &[OsString]) -> Result<u8, String> {
         ["set-mode", mode] => set_mode(DriveMode::parse(mode)?),
         ["set-mode", ..] => Err(USAGE.to_owned()),
         ["recover-interrupted", slot] => {
-            let Some(internal) = Store::open_existing_for_recovery()? else {
+            let Some(internal) = Store::open_existing()? else {
                 return Err("no pool exists".to_owned());
             };
             let target = match registration(&internal)? {

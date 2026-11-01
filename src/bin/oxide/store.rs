@@ -1947,11 +1947,11 @@ impl Store {
         }
     }
 
-    /// Open an existing pool. Never creates one; a retired image pool
-    /// refuses without being touched.
+    /// Open an existing pool for guarded recovery, repairing scratch identity.
+    /// Never creates a pool; a retired image pool refuses without being touched.
     pub fn open_existing() -> Result<Option<Self>, String> {
         let settings = settings()?;
-        Self::open_existing_with(&settings)
+        Self::open_existing_mode(&settings, true)
     }
 
     /// Open an existing internal pool using settings already resolved for
@@ -1963,12 +1963,6 @@ impl Store {
     /// A guarded mutating operation repairs an absent scratch record.
     pub fn open_existing_for_clean(settings: &Settings) -> Result<Option<Self>, String> {
         Self::open_existing_mode(settings, true)
-    }
-
-    /// Recovery is a guarded mutating open and must repair scratch identity first.
-    pub fn open_existing_for_recovery() -> Result<Option<Self>, String> {
-        let settings = settings()?;
-        Self::open_existing_mode(&settings, true)
     }
 
     fn open_existing_mode(settings: &Settings, repair: bool) -> Result<Option<Self>, String> {
