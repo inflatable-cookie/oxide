@@ -191,6 +191,7 @@ IMAGE_RESERVE = "16MiB"
 LOW_RESERVE_MIB = 200
 SHUTDOWN_MARGIN_S = 30
 MARKER = ".oxide-output.json"
+HELP_EXTERNAL_ARGV = b"nextest --help"
 CAPABILITIES = "__oxide-build-capabilities"
 STATE3_FENCE = "oxide.outputs/2"
 STATE4_FENCE = "oxide.outputs/3"
@@ -1753,8 +1754,8 @@ CASE_IDS = MODE_CASES[MODE]
 # 3. perm.proof_env scrubs inherited OXIDE_*, XDG_* and sets fixture controls.
 # 4. case 01 creates an empty target before explicit adopt; cases 12/13 use
 #    source_legacy to construct the legacy whole-target migration premise.
-# 5. Case 05 invokes a fake Cargo external subcommand and asserts its recorded
-#    argv includes the subcommand token: `nextest run --help`.
+# 5. Case 05 uses a fake Cargo external subcommand: the help fast path
+#    forwards `cargo nextest --help`, so the recorded argv is `nextest --help`.
 # 6. attach_owned_image uses -owners on; existing identity and detach gates apply.
 # 7. run freezes both compiler flag variables before staging and fixture setup.
 # 8. Builds uses a private scratch pool under the runner root; base-compat
@@ -3365,10 +3366,9 @@ def run(proof: Proof, repo: str) -> None:
             code, _, stderr = perm.oxide_env(proof, ["nextest", "run", "--help"], "05 unlinked external", plain, fake_env)
             expect(code == 0, f"05: the positive fake external tool did not run in an unlinked checkout: {stderr}")
             expect(
-                # Cargo's own external-subcommand convention: the tool is invoked
-            # as `<tool> nextest run --help`, so the recorded argv carries the
-            # subcommand token as well (pinned native8 observed it directly).
-            perm.read_bytes(external_marker) == b"nextest run --help",
+                # Oxide's help fast path forwards `cargo nextest --help`,
+                # discarding `run`; Cargo includes the subcommand token.
+                perm.read_bytes(external_marker) == HELP_EXTERNAL_ARGV,
                 f"05: the unlinked external tool's argv changed: {perm.read_bytes(external_marker)!r}",
             )
             expect(
@@ -4756,6 +4756,8 @@ def pure_mode_contract() -> None:
         else:
             fail("base capability must remain exactly 3")
         OBSERVED_CAPABILITIES.update(base=None, candidate=None)
+        expect(HELP_EXTERNAL_ARGV == b"nextest --help", "external help argv changed")
+        expect(HELP_EXTERNAL_ARGV != b"nextest run --help", "stale help argv accepted")
         expect(not stages_base("builds"), "Builds must not stage the base")
         expect(stages_base("base-compat"), "base-compat must stage the base")
         try:
