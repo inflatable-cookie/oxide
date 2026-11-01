@@ -267,7 +267,7 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # source confirmation and separate activation.
 [tasks."rust:pool-temp-scratch"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-pool-temp-scratch.py"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-pool-temp-scratch.py"
 
 # Pure regression of the proof's own apparatus (fixture layout, rerun
 # completeness, observation freshness, readiness parsing, refusal targeting,
@@ -284,7 +284,7 @@ run = "python3 scripts/test-pool-temp-scratch.py --self-check"
 # receipt is explicitly unqualified and is never counted native evidence.
 [tasks."rust:pool-temp-scratch:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-pool-temp-scratch.py --diagnostic"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-pool-temp-scratch.py --diagnostic"
 
 # Recorded per-slot accounting (oxide#146): admission and byte-pressure
 # eviction from closed per-slot observations, O(slots) with zero inventory

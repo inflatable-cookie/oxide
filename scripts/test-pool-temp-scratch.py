@@ -235,10 +235,10 @@ scratch root, the toolchain decision or staging.
 7. Frozen build flags: `FROZEN_RUSTFLAGS` is shared by staging and every
    fixture child, and an inherited `CARGO_ENCODED_RUSTFLAGS` (which outranks
    RUSTFLAGS in Cargo) is scrubbed, so the recipe cannot drift.
-8. TMPDIR/scratch selection on the selected volume: not applicable inside this
-   proof, which *is* the oxide#136 source under test; its fixture TMPDIR is the
-   proof's own private scratch, and no oxide#145 default or unqualified temp
-   root is borrowed.
+8. TMPDIR and the scratch-pool declaration use the supervisor-selected volume: 
+   `World` sets its private root as `OXIDE_SCRATCH_ROOT`, with both directory
+   pools strictly beneath it and an explicit 64 MiB cap. A /private/tmp fallback
+   exercises the internal path and is not scratch-pool coverage.
 9. `mktemp` without a template ignores TMPDIR: not applicable, this proof calls
    no `mktemp`; every scratch directory is an explicit `private_dir(...)` under
    `OXIDE_TASK_SCRATCH_ROOT` inside the qualified guard.
@@ -1465,6 +1465,7 @@ class World:
                 "TMPDIR": self.scratch,
                 "TMP": self.scratch,
                 "TEMP": self.scratch,
+                "OXIDE_SCRATCH_ROOT": self.root,
                 "OXIDE_POOL": self.pool,
                 "OXIDE_POOL_CREATE": "1",
                 "OXIDE_POOL_CAP": "64MiB",
@@ -2441,7 +2442,7 @@ def refusals(world: World, crate: str) -> None:
     # An over-bound derived path refuses instead of leaving the child on the
     # machine default. The pool leaf stays absent, so the command must reach
     # the product's own creation path before the length refusal.
-    long_parent = private_dir(os.path.join(world.root, "nested" * 8))
+    long_parent = private_dir(os.path.join(world.base["OXIDE_SCRATCH_ROOT"], "nested" * 8))
     long_pool = os.path.join(long_parent, "pool")
     expect(
         not os.path.lexists(long_pool),
