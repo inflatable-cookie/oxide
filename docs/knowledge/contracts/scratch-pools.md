@@ -1,11 +1,11 @@
 # Scratch build pools on an external validation volume
 
-**Status: S1–S3 implemented; migration slices remain proposed.** This contract records
+**Status: S1–S3 implemented; S4 migrations proceed one proof at a time.** This contract records
 a design for an explicit, UUID-bound `directory-budget-v1` "scratch pool" on a verified external
 volume, so validation and proof fixtures can keep their scratch on the Builds
 drive instead of declaring the internal-root exception (decision `bd357a4c`) for
 `/private/tmp`. S1 adds typed path judgement and an unreachable pure scratch
-admission decision. S2 wired read-only admission; S3 adds creation, binding and leased-open repair with a focused proof. No migration recipe, host setting or real pool change is implied. The internal-root exception stays
+admission decision. S2 wired read-only admission; S3 adds creation, binding and leased-open repair with a focused proof. No host setting or real pool change is implied. The internal-root exception stays
 current truth until each slice below lands and passes its own review. Oxide#173.
 
 Owning neighbours: [workflow](workflow.md#temporary-scratch-placement) owns
@@ -313,6 +313,10 @@ never a raw path dump, bounded and escaped as today.
 
 ## Migration list
 
+`rust:slot-headroom` and its diagnostic now use a private scratch pool under the selected supervisor root (Queue task `4ee40830-e9f5-428a-bf15-01f3b059be7d`); their native evidence must be re-established at the migrated head.
+
+`rust:holding-delete` and its diagnostic now use a scratch pool under the supervisor-selected volume (oxide#202); their native evidence must be established at the migrated head.
+
 `bd357a4c` is only about `--root-parent /private/tmp`. Pool premise is read from
 each script's own selector text and case bodies.
 
@@ -345,12 +349,7 @@ Not in scope: proofs that never carried `bd357a4c` but assert their own
 `/private/tmp` scratch (`rust:oxide-exec`, `rust:pool-scale`,
 `rust:accounting-vanished`, `rust:accounting-guards`, `rust:status-fast`,
 `rust:oxide-finder-metadata`, `rust:oxide-pool-layout`). They migrate, if at
-all, in their own briefs with their own activations. `rust:front-door-accounting`
-used to be one of them; oxide#191 moved it onto the explicit internal root
-(`--root-parent /private/tmp`, the `bd357a4c` exception, because its one pool is
-a genuine `directory-budget-v1` pool) with every fixture inside
-`OXIDE_TASK_SCRATCH_ROOT`, so it now meets this document's premise rule but is
-not part of the ten sub-slices listed below.
+all, in their own briefs with their own activations. `rust:front-door-accounting` uses the S4 migration: both fixture pools use the selected-volume scratch root; its diagnostic and native evidence at the migrated head remain pending.
 
 `rust:cold-slot-seeding` and its diagnostic now use the selected-volume scratch pool recipe (oxide#204); their new native evidence remains owner-activated.
 
