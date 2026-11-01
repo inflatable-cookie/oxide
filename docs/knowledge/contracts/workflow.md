@@ -1768,13 +1768,13 @@ necessary.
   took 55 s, with no native credit (decision 5bf3c438). Its receipt times each
   child process (`commands[].start_ns`/`end_ns`), not each product step. Source
   and retained-evidence diagnosis (oxide#225, no run):
-  - **Measured.** All 19 `check` processes in the case set exited 1 at
+  - **Measured.** All 19 exit-1 `check` processes in the case set ran at
     11.27–13.09 s wall. Each printed `creating a scratch build pool`, the
     pool's first command, and a build summary of 0.1–1.2 s. The 22 `status`
     processes took at most 17 ms; the newer-state hand-off check, which returns
     before pool open, took 18 ms.
   - **Attribution boundary.** The summary's clock starts at `started` in
-    `run_leased`, after pool open, workspace location, removable selection and
+    `run_invocation`, after pool open, workspace location, removable selection and
     key resolution, and stops at the print. The gap of about 11.2–12.5 s
     therefore lies before `started` or after the print. It is nearly constant
     across 0.1–1.2 s builds, so it is not compile time.
