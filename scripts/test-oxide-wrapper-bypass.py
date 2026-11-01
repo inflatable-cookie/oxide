@@ -300,7 +300,7 @@ def seed_and_stage(
     (proof.evidence / "seed.json").write_text(json.dumps(seed, indent=2))
     print(
         f"wrapper-bypass seed: {seed['packages']} registry packages, "
-        f"{len(seed['git']['candidates'])} Git candidates, {seed['aggregate_bytes']} bytes, "
+        f"{len(offline_seed.git_candidates(seed))} Git candidates, {seed['aggregate_bytes']} bytes, "
         f"{seed['entries']} entries, lock sha256 {seed['lock_sha256'][:12]}"
     )
     env = proof.env(
@@ -342,8 +342,9 @@ def seed_and_stage(
     )
     if code:
         fail(f"staging build failed: {stderr[-2000:]}")
-    git_source = seed["git"]
-    if git_source.get("candidates"):
+    # Every locked Git repository (Longhorn and Barge, oxide#219) must hold its
+    # own private checkout at the locked commit before the staged build runs.
+    for git_source in seed["git_sources"]:
         try:
             chosen = offline_seed.verify_private_checkout(
                 cargo_home,
@@ -352,10 +353,10 @@ def seed_and_stage(
                 deadline_ns=proof.deadline_ns,
             )
         except offline_seed.SeedRefusal as error:
-            fail(f"private Longhorn checkout is not the locked commit: {error}")
+            fail(f"private {git_source['repository']} checkout is not the locked commit: {error}")
         git_source["chosen_ident"] = chosen
         (proof.evidence / "seed.json").write_text(json.dumps(seed, indent=2))
-        print(f"wrapper-bypass private checkout: {chosen} at {git_source['rev'][:12]}")
+        print(f"wrapper-bypass private checkout: {git_source['repository']} {chosen} at {git_source['rev'][:12]}")
     oxide = (seed_root / "target" / "debug" / "oxide").resolve()
     if not oxide.is_file() or not os.access(oxide, os.X_OK):
         fail("staged oxide is missing")

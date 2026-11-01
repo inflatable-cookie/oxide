@@ -306,8 +306,7 @@ def stage(proof: Proof) -> Path:
     code, _, err = proof.run([cargo, "build", "--offline", "--locked", "--bin", "oxide"], env, "stage", cwd=REPO)
     if code != 0:
         raise RuntimeError(f"staging failed: {err[-400:]}")
-    git_source = seed["git"]
-    if git_source.get("candidates"):
+    for git_source in seed["git_sources"]:
         chosen = offline_seed.verify_private_checkout(
             cargo_home,
             git_source["rev"],

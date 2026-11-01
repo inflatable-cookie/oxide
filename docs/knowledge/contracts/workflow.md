@@ -3515,11 +3515,13 @@ proof never copies the host registry whole.
   (`index.crates.io-1949cf8c6b5b557f`), matched on index and cache: the
   namespace `config.json`, one sparse-index `.cache` entry per locked registry
   package and one `.crate` archive per package whose bytes must equal the lock
-  checksum. Workspace and path packages are skipped. One pinned Git source
-  (exact URL, name, version and full 40-hex commit) seeds its bare database
-  candidates; more than one Git source, another registry source, a duplicate
-  or malformed lock entry, or an unsafe name, version, checksum or revision
-  refuses.
+  checksum. Workspace and path packages are skipped. Pinned Git sources (exact
+  URL, name, version and full 40-hex commit) seed their bare database
+  candidates, one database per locked repository: the locked Longhorn source
+  and, since oxide#219, the Barge library. Packages from one repository must
+  name one revision, and more than four repositories refuse before any copy.
+  Another registry source, a duplicate or malformed lock entry, or an unsafe
+  name, version, checksum or revision refuses.
 - **Anchored reads.** One opened host root; every source component is opened
   descriptor-relative with `O_NOFOLLOW` on the root's device, so a symlink,
   special file, foreign device or missing component refuses. Each copied file
@@ -3539,7 +3541,8 @@ proof never copies the host registry whole.
   record says so. The seed refuses when no attempted candidate resolves the
   commit.
 - **Bounds, charged across the whole seed.** 256 MiB of copied bytes checked
-  before each write; at most 8 Git candidates; at most 100,000 enumerated
+  before each write; at most 8 Git candidates per locked repository and at most four
+  repositories; at most 100,000 enumerated
   entries and depth 64; at most 1 MiB for one manifest read and 8 MiB of
   manifest reads; at most 64 KiB of Git output and 10 s for one Git command;
   at most 45 s of seed work and never past the caller's exported absolute

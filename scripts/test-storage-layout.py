@@ -117,7 +117,7 @@ def seed_private_cargo_home(host_home: str, private_home: str) -> None:
         fail(f"bounded offline seed refused: {error}")
     print(
         f"private offline Cargo seed: {seed['packages']} registry packages, "
-        f"{len(seed['git']['candidates'])} Git candidates, "
+        f"{len(offline_seed.git_candidates(seed))} Git candidates, "
         f"{seed['aggregate_bytes']} bytes, {seed['entries']} entries"
     )
 

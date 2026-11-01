@@ -29,12 +29,18 @@ defects that proof disclosed rather than closed:
   attempted candidate resolves the commit. No byte, entry or metadata charge
   is reset per attempt and copied bytes are never removed.
 
+Locked Git sources (oxide#219): one bare database per locked repository, so
+the seed serves Longhorn and Barge together. Packages from one repository must
+name one revision, and more than `MAX_GIT_SOURCES` repositories refuse before
+any copy. Each repository's candidates follow the same rules below.
+
 Bounds, all charged across the whole seed with no per-attempt reset:
 
 - 256 MiB of copied bytes, checked before each write and before the generated
   private git config is written;
-- at most 8 Git candidates for one locked source, refused above that before
-  any copy;
+- at most `MAX_GIT_SOURCES` (4) locked Git repositories;
+- at most 8 Git candidates for one locked repository, refused above that
+  before any copy;
 - at most 100,000 enumerated entries and a depth of 64 while copying a Git
   candidate; no unbounded list, sort or tree copy;
 - at most 1 MiB for one manifest read and 8 MiB of manifest reads in total;
@@ -96,6 +102,8 @@ REV_RE = re.compile(r"^[0-9a-f]{40}$")
 BACKSLASH = chr(92)
 PATH_BASE = "/usr/bin:/bin:/usr/sbin:/sbin"
 GIT_TIMEOUT_S = 10
+# Locked Git repositories one seed serves: Longhorn and Barge (oxide#219).
+MAX_GIT_SOURCES = 4
 
 
 class SeedRefusal(RuntimeError):
@@ -700,10 +708,15 @@ def _seed_registry(
     return {"namespace": namespace, "files": manifest}
 
 
+def git_candidates(seed: dict) -> list[dict]:
+    """Every Git candidate record of a seed, across its locked repositories."""
+    return [candidate for source in seed["git_sources"] for candidate in source["candidates"]]
+
+
 def verify_seed_tree(cargo_home: Path, seed: dict) -> None:
     """The private seed holds exactly the selected files, nothing else."""
     expected = {entry["path"] for entry in seed["files"]}
-    for candidate in seed["git"]["candidates"]:
+    for candidate in git_candidates(seed):
         expected.update(entry["path"] for entry in candidate["files"])
     actual = set()
     for root in ("registry", "git"):
@@ -722,6 +735,40 @@ def verify_seed_tree(cargo_home: Path, seed: dict) -> None:
 
 def _seed_git(
     host: Anchor, cargo_home: Path, git_packages: list[dict], budget: Budget
+) -> list[dict]:
+    """One source record per locked Git repository, in lock order (oxide#219).
+
+    Packages from one repository share its one bare database, so they must name
+    one revision; a second revision refuses before any copy. More than
+    `MAX_GIT_SOURCES` repositories is an unsupported lock shape, not a silent
+    partial seed. Every repository runs `_seed_git_source` against the same
+    aggregate budget.
+    """
+    if not git_packages:
+        return []
+    repositories: dict[str, dict] = {}
+    members: dict[str, list[str]] = {}
+    for package in git_packages:
+        known = repositories.setdefault(package["repository"], package)
+        if known["rev"] != package["rev"]:
+            raise SeedRefusal(
+                f"{package['repository']} is locked at two revisions; one database serves one revision"
+            )
+        members.setdefault(package["repository"], []).append(f"{package['name']} {package['version']}")
+    if len(repositories) > MAX_GIT_SOURCES:
+        raise SeedRefusal(
+            f"{len(repositories)} locked Git repositories; the seed serves at most {MAX_GIT_SOURCES}"
+        )
+    sources: list[dict] = []
+    for repository, package in repositories.items():
+        source = _seed_git_source(host, cargo_home, package, budget)
+        source["packages"] = members[repository]
+        sources.append(source)
+    return sources
+
+
+def _seed_git_source(
+    host: Anchor, cargo_home: Path, package: dict, budget: Budget
 ) -> dict:
     """Copy bare-database candidates, then verify the locked commit privately.
 
@@ -735,13 +782,6 @@ def _seed_git(
     remaining budget is not attempted, its entries stay charged, and its
     record says so. No byte, entry or metadata charge is reset per attempt.
     """
-    if not git_packages:
-        return {"candidates": []}
-    # One locked Git source per seed keeps the aggregate accounting legible;
-    # more than that is an unsupported lock shape, not a silent partial seed.
-    if len(git_packages) > 1:
-        raise SeedRefusal("more than one locked Git source; the seed serves one")
-    package = git_packages[0]
     host_db = ("git", "db")
     candidate_re = re.compile(r"^" + re.escape(package["repository"]) + r"-[0-9a-f]{16}$")
     names = [
@@ -891,7 +931,7 @@ def seed_cargo_home(
         "entries": budget.entries_used,
         "manifest_bytes": budget.manifest_used,
         "files": registry["files"],
-        "git": git,
+        "git_sources": git,
         "limits": limits.document(),
     }
     verify_seed_tree(destination, seed)
@@ -1051,8 +1091,8 @@ def self_test(root: Path | str) -> list[dict]:
         config = (cargo_home / "git" / "db" / "seedrepo-0123456789abcdef" / "config").read_bytes()
         assert config == GIT_CONFIG, config
         assert b"include" not in config
-        assert seed["git"]["candidates"][0]["commit_present"] is True
-        assert seed["git"]["candidates"][0]["generated"] is True
+        assert git_candidates(seed)[0]["commit_present"] is True
+        assert git_candidates(seed)[0]["generated"] is True
         return f"seed {seed['aggregate_bytes']} bytes, {seed['entries']} entries"
 
     def wrong_commit(directory: Path) -> str:
@@ -1119,10 +1159,10 @@ def self_test(root: Path | str) -> list[dict]:
         cargo_home = directory / "cargo-home"
         seed = seed_cargo_home(host, cargo_home, _lock_text(rev, checksum).encode(), deadline_ns=deadline)
         private = cargo_home / "git" / "db" / "seedrepo-0123456789abcdef"
-        assert seed["git"]["candidates"][0]["commit_present"] is True
+        assert git_candidates(seed)[0]["commit_present"] is True
         assert (private / "config").read_bytes() == GIT_CONFIG, "the host config was not replaced"
         assert not (private / "hooks").exists(), "host hooks were copied"
-        copied = {entry["path"] for entry in seed["git"]["candidates"][0]["files"]}
+        copied = {entry["path"] for entry in git_candidates(seed)[0]["files"]}
         assert not any("/hooks/" in path for path in copied), copied
         return "symlinked host config and hooks skipped; private config generated"
 
@@ -1192,8 +1232,8 @@ def self_test(root: Path | str) -> list[dict]:
         assert other != rev
         cargo_home = directory / "cargo-home"
         seed = seed_cargo_home(host, cargo_home, _lock_text(rev, checksum).encode(), deadline_ns=deadline)
-        copied = [c for c in seed["git"]["candidates"] if c["copied"]]
-        rejected = [c for c in seed["git"]["candidates"] if c["rejected"]]
+        copied = [c for c in git_candidates(seed) if c["copied"]]
+        rejected = [c for c in git_candidates(seed) if c["rejected"]]
         assert len(copied) == 2 and len(rejected) == 1, "unexpected candidate outcomes"
         assert rejected[0]["bytes"] > 0 and rejected[0]["commit_present"] is False
         assert (cargo_home / "git" / "db" / rejected[0]["database"]).is_dir(), "the rejected copy was removed"
@@ -1212,12 +1252,102 @@ def self_test(root: Path | str) -> list[dict]:
             limits=Limits(aggregate_bytes=1 * MIB),
             deadline_ns=deadline,
         )
-        skipped = [c for c in seed["git"]["candidates"] if c["skipped"]]
+        skipped = [c for c in git_candidates(seed) if c["skipped"]]
         assert len(skipped) == 1 and skipped[0]["copied"] is False, "unexpected candidate outcomes"
         assert seed["aggregate_bytes"] <= 1 * MIB
         return f"oversized candidate measured {skipped[0]['measured_bytes']} bytes and not attempted"
 
+    def two_sources(directory: Path) -> tuple[Path, str, str, str]:
+        """Longhorn-shaped seedrepo plus a second barge database at its own commit."""
+        host, rev, checksum = _fixture_host(directory)
+        other = second_database(host, directory, "barge-fedcba9876543210", b"barge payload\n")
+        return host, rev, checksum, other
+
+    def two_source_lock(rev: str, checksum: str, barge_rev: str) -> str:
+        return _lock_text(rev, checksum) + (
+            "\n[[package]]\n"
+            'name = "seedbarge"\nversion = "0.1.0"\n'
+            f'source = "git+https://example.invalid/barge.git?rev={barge_rev}#{barge_rev}"\n'
+        )
+
+    def two_sources_positive(directory: Path) -> str:
+        host, rev, checksum, barge_rev = two_sources(directory)
+        cargo_home = directory / "cargo-home"
+        seed = seed_cargo_home(host, cargo_home, two_source_lock(rev, checksum, barge_rev).encode(), deadline_ns=deadline)
+        sources = {source["repository"]: source for source in seed["git_sources"]}
+        assert set(sources) == {"seedrepo", "barge"}, sorted(sources)
+        assert sources["seedrepo"]["rev"] == rev and sources["barge"]["rev"] == barge_rev
+        assert sources["barge"]["packages"] == ["seedbarge 0.1.0"], sources["barge"]["packages"]
+        for name in ("seedrepo-0123456789abcdef", "barge-fedcba9876543210"):
+            assert (cargo_home / "git" / "db" / name / "config").read_bytes() == GIT_CONFIG, name
+        assert all(candidate["commit_present"] is True for candidate in git_candidates(seed))
+        assert len(git_candidates(seed)) == 2, len(git_candidates(seed))
+        return f"two repositories seeded at their locked commits, {seed['aggregate_bytes']} bytes"
+
+    def second_wrong_commit(directory: Path) -> str:
+        # The barge database exists and is copied, but the lock names a commit
+        # it does not carry: the candidate is rejected and its bytes stay charged.
+        host, rev, checksum, _ = two_sources(directory)
+        cargo_home = directory / "cargo-home"
+        outcome = expect_refusal(
+            lambda: seed_cargo_home(host, cargo_home, two_source_lock(rev, checksum, "0" * 40).encode(), deadline_ns=deadline),
+            "resolves the locked commit",
+        )
+        assert (cargo_home / "git" / "db" / "barge-fedcba9876543210").is_dir(), "the rejected barge copy was not kept charged"
+        return outcome["refusal"]
+
+    def second_missing(directory: Path) -> str:
+        host, rev, checksum = _fixture_host(directory)
+        other = "1" * 40
+        return expect_refusal(
+            lambda: seed_cargo_home(host, directory / "cargo-home", two_source_lock(rev, checksum, other).encode(), deadline_ns=deadline),
+            "found 0",
+        )["refusal"]
+
+    def second_symlinked(directory: Path) -> str:
+        host, rev, checksum, barge_rev = two_sources(directory)
+        elsewhere = directory / "elsewhere.pack"
+        _write(elsewhere, b"not a pack\n")
+        (host / "git" / "db" / "barge-fedcba9876543210" / "objects" / "link").symlink_to(elsewhere)
+        return expect_refusal(
+            lambda: seed_cargo_home(host, directory / "cargo-home", two_source_lock(rev, checksum, barge_rev).encode(), deadline_ns=deadline),
+            "symlink",
+        )["refusal"]
+
+    def repository_refusals(directory: Path) -> str:
+        host, rev, checksum = _fixture_host(directory)
+        other = "2" * 40
+        revisions = _lock_text(rev, checksum) + (
+            "\n[[package]]\n"
+            'name = "seedother"\nversion = "0.1.0"\n'
+            f'source = "git+https://example.invalid/seedrepo.git?rev={other}#{other}"\n'
+        )
+        outcomes = [
+            expect_refusal(
+                lambda: seed_cargo_home(host, directory / "two-revisions", revisions.encode(), deadline_ns=deadline),
+                "two revisions",
+            )
+        ]
+        crowded = _lock_text(rev, checksum) + "".join(
+            f'\n[[package]]\nname = "crowd{index}"\nversion = "0.1.0"\n'
+            f'source = "git+https://example.invalid/crowd{index}.git?rev={index:040x}#{index:040x}"\n'
+            for index in range(1, MAX_GIT_SOURCES + 1)
+        )
+        outcomes.append(
+            expect_refusal(
+                lambda: seed_cargo_home(host, directory / "crowded", crowded.encode(), deadline_ns=deadline),
+                f"at most {MAX_GIT_SOURCES}",
+            )
+        )
+        assert not (directory / "two-revisions" / "git").exists(), "a repeated repository copied before refusing"
+        return outcomes[0]["refusal"]
+
     case("registry-git-positive", positive)
+    case("two-git-sources-positive", two_sources_positive)
+    case("second-source-wrong-commit", second_wrong_commit)
+    case("second-source-missing", second_missing)
+    case("second-source-symlink", second_symlinked)
+    case("repository-revision-and-count", repository_refusals)
     case("host-config-and-hooks", host_config_and_hooks)
     case("rejected-candidate", rejected_candidate)
     case("oversized-candidate", oversized_candidate)
@@ -1230,10 +1360,14 @@ def self_test(root: Path | str) -> list[dict]:
 
 
 def main(argv: list) -> int:
-    if len(argv) == 3 and argv[1] == "--self-test":
-        root = argv[2]
+    if len(argv) in (2, 3) and argv[1] == "--self-test":
+        # Without ROOT the cases go under the supervisor's task scratch root, so
+        # the effigy selector runs inside the bounded runner's owned directory.
+        root = argv[2] if len(argv) == 3 else os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")
+        if len(argv) == 2 and root:
+            root = os.path.join(root, "offline-seed")
         if not os.path.isabs(root):
-            print("the self-test root must be absolute", file=sys.stderr)
+            print("the self-test root must be absolute (ROOT, or an absolute OXIDE_TASK_SCRATCH_ROOT)", file=sys.stderr)
             return 2
         records = self_test(root)
         for record in records:

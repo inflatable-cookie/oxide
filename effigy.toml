@@ -1044,8 +1044,8 @@ admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-max-active.py"
 
 # Storage roots from longhorn-storage-layout (oxide#103), under the qualified
-# #109 shared supervisor. Copies only the locked crates and the tagged Longhorn
-# git checkout into a private CARGO_HOME, records the normal dependency tree
+# #109 shared supervisor. Copies only the locked crates and the locked Longhorn
+# and Barge git sources (oxide#219) into a private CARGO_HOME, records the normal dependency tree
 # (exactly one sha2), stages oxide offline with 1.97.1 and runs `oxide status`
 # on a private HOME with spaces and Unicode: default macOS config and pool
 # paths, XDG ignored, overrides without HOME, refusal without HOME, legacy
@@ -1086,7 +1086,7 @@ run = "python3 scripts/test-oxide-cli.py --cargo-matrix 1.99.1"
 # (oxide#109, 300 s absolute, 512 MiB monitored scratch including seeding,
 # staging, fixtures and cleanup). It runs the seeder's synthetic cases first,
 # seeds HEAD's Cargo.lock into a private offline CARGO_HOME through the shared
-# bounded seeder (registry and the one pinned Longhorn Git source), stages
+# bounded seeder (registry and the pinned Longhorn and Barge Git sources), stages
 # `oxide` offline with 1.97.1 from it, then on tiny std-only fixtures with a
 # private HOME, CARGO_HOME and directory pool proves leased
 # check/build/test/clippy and an external subcommand's `$CARGO` never run a
@@ -1097,6 +1097,19 @@ run = "python3 scripts/test-oxide-cli.py --cargo-matrix 1.99.1"
 [tasks."rust:oxide-wrapper-bypass"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-oxide-wrapper-bypass.py"
+
+# Offline seeder synthetic cases (oxide#131, oxide#219): `scripts/offline_seed.py
+# --self-test` alone, under the qualified shared supervisor (300 s, 512 MiB
+# monitored scratch). Its cases write only fresh fixtures under the supervisor's
+# task scratch root: no host Cargo home write, no network, no image, no pool. They
+# cover registry+Git positive, the Longhorn and Barge locked Git sources together
+# (exact commit, wrong or missing second commit, a symlinked second candidate),
+# the repository revision and count refusals, rejected and oversized candidates,
+# host config and hooks, malformed locks, symlinked inputs and the cap negatives.
+# Synthetic only: not a native proof, a benchmark or an alias for full QA.
+[tasks."proof:offline-seed:test"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/offline_seed.py --self-test"
 
 # Focused proof for `oxide pool describe --json` (oxide#112). The script's gate
 # RUN_BOUND is True after the apparatus PASS (53ec48e4). It runs inside the

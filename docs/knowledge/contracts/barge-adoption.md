@@ -145,6 +145,16 @@ its schema versions and the selectors that prove it. A Barge schema Oxide does
 not read is `unknown` and keeps the root. Oxide never reads Barge's state
 directory itself.
 
+**Landed: `O1` (oxide#219).** `Cargo.toml` declares `barge` by full rev
+`4af9360bd09629e970c143080ca159de8eef2562`, the merge commit of Barge PR #39 on
+`main`. That commit contains R1 (`d0a88c8`, `db0bc59`), R2 (`fb3002c`), R4
+(`0d9b419`, `d4b5d90`) and the PR #39 release-proof corrections (`cc8d142` to
+`346076e`). The feature-off library is used; `proof-synthetic-account` stays off.
+`Cargo.lock` gains only the `barge` package, depending on the already-pinned
+`serde`, `serde_json` and `libc`. The bounded seeder serves the locked Barge
+source beside Longhorn, one database per repository. The pin is not a release,
+and no output placement, prune, admission or host behaviour changed.
+
 ### D2. Areas
 
 | Area | Declared in | Folder | Absent | Prune | Reserve | Why |
