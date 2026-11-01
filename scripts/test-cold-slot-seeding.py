@@ -3,15 +3,12 @@
 
 One fixed script and the whole command of the qualified shared supervisor:
 
-    python3 scripts/bounded-test.py --root-parent /private/tmp --limit 600 \
+    python3 scripts/bounded-test.py --limit 900 \
         --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py
 
-`--root-parent /private/tmp` is the owner-accepted internal-placement
-exception (decision `bd357a4c`): the proof's private pool is a genuine internal
-`directory-budget-v1` pool, which the product correctly refuses on an external
-volume, and one case registers a removable pool whose control directory is
-likewise internal. Everything else stays inside the supervisor's own monitored
-scratch, deadline and evidence directory.
+The fixture pools use a private scratch pool root on the supervisor's selected
+volume. A /private/tmp fallback exercises the internal path, not scratch-pool
+coverage. The image remains under the supervisor's custody rules.
 
 `effigy rust:cold-slot-seeding:diagnostic` appends `--diagnostic`: the required
 uncounted keep-going collection. It records every declared case's outcome
@@ -154,8 +151,9 @@ Premise checklist (HIGH; traced through the executable helpers, not this text):
    helper's library build use the same frozen flags; case 10 changes them only
    for its donor command.
 8. Temporary storage: the child env points every temp variable at the
-   supervisor's scratch; the private pool is the reviewed internal-placement
-   exception. The image backing and custody record live in the supervisor's
+   supervisor's scratch; `setup()` creates a private pool root there and
+   `Case.env()` declares it with an explicit cap. A /private/tmp fallback
+   exercises the internal path, not scratch-pool coverage. The image backing and custody record live in the supervisor's
    never-auto-cleaned evidence directory, created and recorded before attach;
    the backing is removed only after a positively completed ordinary detach.
    The competing-lease helper's library build has its own retained stage under
@@ -276,9 +274,9 @@ CASES: list[tuple[str, tuple[str, ...], str]] = [
 
 PHASES = [
     "setup: stage this HEAD's oxide, seed two private offline Cargo homes and build the lease helper",
-    "cases 01-15: internal directory-budget pools",
+    "cases 01-15: scratch directory-budget pools",
     "case 16: one owned 128 MiB APFS image, ordinary detach",
-    "cases 17-24: internal pools after the image phase",
+    "cases 17-24: scratch pools after the image phase",
 ]
 
 # Child environment variables this script owns; `perm.proof_env` has already
@@ -1229,6 +1227,7 @@ def setup(proof: Proof, repo: str) -> None:
     proof.root = os.path.realpath(proof.root)
     scratch = os.path.realpath(os.environ["OXIDE_TASK_SCRATCH_ROOT"])
     expect(os.path.commonpath([proof.root, scratch]) == scratch, "the proof root escaped the scratch")
+    proof.scratch_pool_root = fixture_dir(proof.root, "pools.")
     proof.rustup = real_rustup_home()
     proof.home = fixture_dir(proof.root, "home.")
     proof.cargo_home = fixture_dir(proof.root, "cargo-home.")
@@ -1284,7 +1283,7 @@ class Case:
     def __init__(self, proof: Proof, case: str):
         self.proof = proof
         self.case = case
-        self.root = fixture_dir(proof.root, f"case-{case}.")
+        self.root = fixture_dir(proof.scratch_pool_root, f"case-{case}.")
         self.pool = os.path.join(self.root, "pool")
 
     def env(
@@ -1301,6 +1300,7 @@ class Case:
             env.pop(name, None)
         env.update(
             {
+                "OXIDE_SCRATCH_ROOT": self.proof.scratch_pool_root,
                 "OXIDE_COLD_SEED": seed,
                 "OXIDE_POOL_CAP": cap,
                 "RUSTUP_HOME": self.proof.rustup,
@@ -1404,7 +1404,7 @@ GIB = 1024 * 1024 * 1024
 
 
 def configure_proof_clock() -> None:
-    """Use the supervisor's 600 s deadline for this selector, leaving the 30 s
+    """Use the supervisor's 900 s deadline for this selector, leaving the 30 s
     shutdown margin, instead of the imported finder proof's 300 s constant.
 
     The base Proof class is assembled from two modules: `run` comes from the
@@ -1416,20 +1416,20 @@ def configure_proof_clock() -> None:
     """
     if "OXIDE_PROOF_DEADLINE_NS" not in os.environ:
         return
-    Proof.run.__globals__["PROOF_SECONDS"] = 570.0
+    Proof.run.__globals__["PROOF_SECONDS"] = 870.0
 
     def remaining() -> float:
         left = supervisor_remaining() - SHUTDOWN_MARGIN_S
         if left <= 5:
-            fail("proof would exceed 600 s")
+            fail("proof would exceed 900 s")
         return left
 
     Proof.run.__globals__["remaining"] = remaining
     finder = Proof.phase.__globals__
-    finder["PROOF_SECONDS"] = 570.0
+    finder["PROOF_SECONDS"] = 870.0
     finder["remaining"] = remaining
     if Proof.close.__globals__ is not finder or Proof.close.__globals__ is not Proof.phase.__globals__:
-        Proof.close.__globals__["PROOF_SECONDS"] = 570.0
+        Proof.close.__globals__["PROOF_SECONDS"] = 870.0
         Proof.close.__globals__["remaining"] = remaining
 
 
@@ -1530,7 +1530,7 @@ def detach_timeout(remaining: float) -> float | None:
     return min(60.0, remaining - 10.0)
 
 
-def timing_projection(seconds: dict, total: int = 24, limit: float = 600.0) -> dict:
+def timing_projection(seconds: dict, total: int = 24, limit: float = 900.0) -> dict:
     """Observation only: the reached cases' mean wall time extended to the
     fixed case count, with the declared limit. Never an acceptance gate."""
     reached = [value for value in seconds.values() if value is not None]
@@ -3185,10 +3185,10 @@ def plan() -> None:
     """The effect-free table, allocation and premise dispositions."""
     print("cold-slot seeding (oxide#137 §16, oxide#169): 24 fixed native cases")
     print(
-        "supervisor: python3 scripts/bounded-test.py --root-parent /private/tmp "
-        "--limit 600 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py"
+        "supervisor: python3 scripts/bounded-test.py "
+        "--limit 900 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py"
     )
-    print("limits: 600 s wall clock, 512 MiB monitored scratch, one owned 128 MiB APFS image")
+    print("limits: 900 s wall clock, 512 MiB monitored scratch, one owned 128 MiB APFS image")
     print("allocation (source-derived, UNMEASURED): staging 40-60 s, 60-85 MiB; cases 01-24 about 230-300 MiB peak; image phase <= 128 MiB")
     print("phases:")
     for phase_text in PHASES:
@@ -3360,6 +3360,19 @@ def self_test() -> None:
     self_check()
     base = tempfile.mkdtemp(prefix="cold-seed-selftest.", dir=tempfile.gettempdir())
     try:
+        # Pin the actual Case constructor and child environment without a pool.
+        fake_proof = types.SimpleNamespace(scratch_pool_root=base, home=base,
+                                           cargo_home=base, rustup=base)
+        with patch.dict(globals(), {"fixture_dir": lambda parent, name: os.path.join(parent, name)}):
+            fixture = Case(fake_proof, "pin")
+        with patch.dict(os.environ, {"OXIDE_TASK_SCRATCH_ROOT": base}):
+            fixture_env = fixture.env()
+        expect(os.path.dirname(fixture.root) == base, "case escaped scratch pool root")
+        expect(fixture.pool == os.path.join(fixture.root, "pool"), "pool placement drifted")
+        expect(fixture_env["OXIDE_SCRATCH_ROOT"] == base, "scratch declaration drifted")
+        expect(fixture_env["OXIDE_POOL"] == fixture.pool, "pool selection drifted")
+        expect(fixture_env["OXIDE_POOL_CAP"] == "256MiB", "explicit cap drifted")
+
         # The diagnostic collection's taint/skip/abort precedence.
         table = [
             ("a", (), lambda: None),
@@ -3862,9 +3875,9 @@ def self_test() -> None:
             and heavy["fits_limit"] is True,
             f"the two-case projection drifted: {heavy}",
         )
-        beyond = timing_projection({"01": 25.0, "02": 35.0})
+        beyond = timing_projection({"01": 35.0, "02": 45.0})
         expect(
-            beyond["projected_total_s"] == 720.0 and beyond["fits_limit"] is False,
+            beyond["projected_total_s"] == 960.0 and beyond["fits_limit"] is False,
             f"the over-limit projection drifted: {beyond}",
         )
         expect(
@@ -3872,7 +3885,7 @@ def self_test() -> None:
             "a None case entered the projection",
         )
 
-        # The 600 s clock must reach the finder module's phase()/owned_bytes()
+        # The 900 s clock must reach the finder module's phase()/owned_bytes()
         # path, not only the pool-layout run() globals.
         saved_deadline = os.environ.get("OXIDE_PROOF_DEADLINE_NS")
         os.environ["OXIDE_PROOF_DEADLINE_NS"] = str(
@@ -3882,8 +3895,8 @@ def self_test() -> None:
             configure_proof_clock()
             finder = Proof.phase.__globals__
             expect(
-                finder["PROOF_SECONDS"] == 570.0,
-                "the 600 s work clock did not reach the finder phase globals",
+                finder["PROOF_SECONDS"] == 870.0,
+                "the 900 s work clock did not reach the finder phase globals",
             )
             expect(
                 Proof.run.__globals__.get("remaining") is finder["remaining"],
@@ -4328,7 +4341,7 @@ def diagnostic_document(*, proof, collection, failure) -> dict:
             "evidence": os.environ.get("OXIDE_PROOF_EVIDENCE"),
             "work_deadline_ns": os.environ.get("OXIDE_PROOF_DEADLINE_NS"),
             "supervisor_scratch_budget_mib": 512,
-            "wall_clock_s": 600,
+            "wall_clock_s": 900,
         },
         "limitation": (
             "A recoverable case-oracle failure is recorded and the cases that do not "

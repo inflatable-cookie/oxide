@@ -351,6 +351,8 @@ Not in scope: proofs that never carried `bd357a4c` but assert their own
 `rust:oxide-finder-metadata`, `rust:oxide-pool-layout`). They migrate, if at
 all, in their own briefs with their own activations. `rust:front-door-accounting` uses the S4 migration: both fixture pools use the selected-volume scratch root; its diagnostic and native evidence at the migrated head remain pending.
 
+`rust:cold-slot-seeding` and its diagnostic now use the selected-volume scratch pool recipe (oxide#204); their new native evidence remains owner-activated.
+
 ## Recipe changes
 
 The supervisor needs no change: with no caller root it already puts its owned
