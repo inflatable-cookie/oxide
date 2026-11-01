@@ -1760,14 +1760,11 @@ precedence.
 300 s total with the supervisor's 30 s stop margin and 512 MiB monitored
 scratch are unchanged; every write stays inside the owned root, no session,
 group or census is started. The supervisor this tree runs is `scripts/bounded-test.py` sha256
-`94b1aba60a7475a31b5620039986336f13e1c88d58dd3732b5736290dc63685b`: the
-qualified oxide#151 guard (merged `af08749`, sha256 `bc24b238…`) plus
-oxide#191's opt-in post-census image detach and oxide#197's ancestor-chain
-exclusion, so those added bytes are
-unqualified until their own diagnostic, author and reviewer qualifications pass
-([shared proof supervisor](workflow.md#shared-proof-supervisor)). The earlier
-oxide#147 `5e5b6617`, oxide#145 `a6d73326` and `961164e7` bytes are history and
-are not used.
+`fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b`,
+qualified in `evidence-195-b29ef6c-20261101T043444Z`
+([shared proof supervisor](workflow.md#shared-proof-supervisor)). Fixture pools
+use `OXIDE_SCRATCH_ROOT` on the selected volume; a `/private/tmp` fallback is
+not scratch-pool coverage. Earlier runner evidence remains historical.
 These figures
 are planning arithmetic, not measurements: the proof's own `--plan` prints them
 and any activation re-measures and reports a **fit blocker** rather than
