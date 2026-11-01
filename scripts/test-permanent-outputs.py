@@ -11,8 +11,8 @@ permanent drive as one owned 128 MiB APFS sparse image attached at a unique
 
 - an effect-free JSON plan, and refusals that never move, adopt or replace a
   nonempty real target or a foreign symlink;
-- explicit conversion of a missing/empty target into an owned link, builds,
-  `run`, `test`, profiles and `target/debug` binaries through it;
+- explicit conversion of a missing/empty target into profile member links,
+  plus builds, `run`, `test` and profiles through a legacy whole-target fixture;
 - the checkout-local fallback root while the drive is absent, and redocking
   with both roots retained and nothing copied or deleted;
 - a wrong recorded volume UUID selects the local root without writing to the
@@ -604,13 +604,13 @@ def plan(proof: Proof, cwd: str, label: str) -> dict:
 
 
 def attach_image(
-    proof: Proof, root: str, name: str, owners: bool = False, image_name: str = "volume.sparseimage"
+    proof: Proof, root: str, name: str, image_name: str = "volume.sparseimage"
 ) -> str:
-    """Attach this proof's OWNED sparse image. `owners` is an optional
-    `hdiutil attach -owners on` request used only by a proof that needs
-    filesystem ownership honored on its private image; `root` and `image_name`
-    select its backing. Callers choose an evidence directory when the backing
-    must survive supervisor scratch cleanup."""
+    """Attach the owned image with owners honored and verify the mounted entity.
+
+    The backing remains in the selected evidence directory; all callers,
+    including re-attaches, pass through this single mandatory ownership gate.
+    """
     image = os.path.join(root, image_name)
     proof.image = image
     proof.detach_confirmed = False
@@ -624,10 +624,7 @@ def attach_image(
             timeout=60,
         )
         expect(created.returncode == 0, f"image creation failed: {created.stderr!r}")
-    attach_command = ["/usr/bin/hdiutil", "attach", "-nobrowse", "-plist"]
-    if owners:
-        attach_command.extend(["-owners", "on"])
-    attach_command.append(image)
+    attach_command = ["/usr/bin/hdiutil", "attach", "-nobrowse", "-plist", "-owners", "on", image]
     attached = proof.run(attach_command, timeout=60)
     expect(
         attached.returncode == 0,
@@ -643,6 +640,7 @@ def attach_image(
     ]
     expect(len(mounts) == 1, f"expected one mount, got {mounts}")
     proof.mount = mounts[0]
+    owners_honored(proof, proof.mount, "owned image attachment")
     model = image_slot_model(proof.mount)
     expect(len(os.fsencode(model)) <= 80, f"image slot scratch model exceeds 80 bytes: {model}")
     return mounts[0]
@@ -654,9 +652,9 @@ def attach_image(
 # (3) It scrubs inherited Oxide/XDG/Git/build controls before setting fixtures.
 # (4) Auto-adoption controls establish the target/receipt premise explicitly.
 # (5) exec-inference's external tool checks Cargo's subcommand argv; other
-# modes have no external Cargo subcommand. (6) Owned-image attachment and
-# identity/custody stay with attach_image and Proof.detach; exec/auto-ineligible
-# request owners and verify the mount; product registration is a second check.
+# modes have no external Cargo subcommand. (6) Every image attachment and
+# re-attachment requests owners-on and observes the mount read-only in
+# attach_image; Proof.detach retains custody, and registration is a second check.
 # (7) main freezes RUSTFLAGS before staging and proof_env inherits those flags.
 # (8) proof_env puts TMPDIR under supervisor scratch and check_child_env checks
 # writability and pool device for every fixture child; image_slot_model and
@@ -3916,7 +3914,6 @@ def exec_self_test() -> None:
     for call in (
         "write_tools",
         "attach_image",
-        "owners_honored",
         "proof_env",
         "fresh_checkout",
         "stage_at",
@@ -4278,19 +4275,66 @@ def exec_self_test() -> None:
     commands = []
     def fake_run(command, **kwargs):
         commands.append(command)
+        if command == ["/sbin/mount"]:
+            return SimpleNamespace(returncode=0, stdout=b"/dev/disk-test on /Volumes/fake (apfs, local)\n", stderr=b"")
         payload = plistlib.dumps({"system-entities": [
             {"mount-point": "/Volumes/fake", "dev-entry": "/dev/disk-test"}
         ]})
         return SimpleNamespace(returncode=0, stdout=payload, stderr=b"")
     fake_attach.run = fake_run
     with patch("os.path.exists", return_value=False):
-        attach_image(fake_attach, "/evidence/owned-image", "fake", owners=True,
+        attach_image(fake_attach, "/evidence/owned-image", "fake",
                      image_name="isolated.sparseimage")
     expected_image = "/evidence/owned-image/isolated.sparseimage"
     expect(fake_attach.image == expected_image, "attachment lost caller's image path")
     expect(commands[0][-1] == expected_image and commands[1][-1] == expected_image,
            "creation and attachment disagree with caller's image path")
-    expect("-owners" in commands[1], "attachment lost its owners option")
+    expect(commands[1][-3:] == ["-owners", "on", expected_image], "attachment lost mandatory owners-on")
+    expect(commands[2] == ["/sbin/mount"], "attachment skipped mount observation")
+
+    # Every mode and every re-attach calls the same helper; no caller can
+    # supply an ownership override, including the base-compat route through run.
+    import ast
+    with open(__file__, encoding="utf-8") as handle:
+        syntax = ast.parse(handle.read())
+    functions = {node.name: node for node in syntax.body if isinstance(node, ast.FunctionDef)}
+    expected_attach_counts = {"run": 3, "auto_run": 2, "detach_run": 1,
+                              "ignore_run": 1, "exec_inference": 2, "auto_ineligible_run": 1}
+    for mode, expected_count in expected_attach_counts.items():
+        calls = [node for node in ast.walk(functions[mode]) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name) and node.func.id == "attach_image"]
+        expect(len(calls) == expected_count, f"{mode}: attach and re-attach paths changed")
+        expect(all(len(call.args) == 3 and not call.keywords for call in calls),
+               f"{mode}: an attachment bypasses the owners-on helper")
+    expect("base_compat" in {arg.arg for arg in functions["run"].args.args},
+           "base-compat no longer uses run's shared attach")
+    try:
+        attach_image(fake_attach, "/evidence/owned-image", "fake", owners=False)
+    except TypeError:
+        pass
+    else:
+        fail("owners-off override was accepted")
+    def fake_noowners(command, **kwargs):
+        if command == ["/sbin/mount"]:
+            return SimpleNamespace(returncode=0, stdout=b"/dev/disk-test on /Volumes/fake (apfs, noowners)\n", stderr=b"")
+        return fake_run(command, **kwargs)
+    fake_attach.run = fake_noowners
+    with patch("os.path.exists", return_value=True):
+        try:
+            attach_image(fake_attach, "/evidence/owned-image", "fake")
+        except RuntimeError:
+            expect(fake_attach.mount == "/Volumes/fake" and not fake_attach.detach_confirmed,
+                   "ownership refusal lost image custody")
+        else:
+            fail("the shared attachment accepted a noowners mount")
+    noowners = SimpleNamespace(run=lambda *args, **kwargs: SimpleNamespace(
+        returncode=0, stdout=b"/dev/disk-test on /Volumes/fake (apfs, local, noowners)\n", stderr=b""))
+    try:
+        owners_honored(noowners, "/Volumes/fake", "counterfactual")
+    except RuntimeError:
+        pass
+    else:
+        fail("a noowners mount was accepted")
 
     # The shared helper must retain the backing if detach reports success but
     # either the mount or a recorded device survives.
@@ -5163,8 +5207,8 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
        checkout), so Cargo's convention is exercised and asserted: the tool is
        invoked as `<tool> oxfixture …`, refuses any other first argument, and
        records that exact argv before it calls the inherited `$CARGO build`.
-    6. owned images: every attach goes through `attach_image(..., owners=True)`
-       and `owners_honored` observes the mount read-only; the product's own
+    6. owned images: every attach goes through `attach_image`, which always
+       requests owners-on and observes the mount read-only; the product's own
        `pool register-removable` is the second control, since it refuses an
        ignore-ownership mount.
     7. compiler flags: `freeze_compiler_flags` sets one `RUSTFLAGS` (empty) and
@@ -5227,9 +5271,8 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
     # Premise 6: this proof's own image is attached with filesystem owners on
     # and observed read-only; the product registration that follows is the
     # second control (it refuses an ignore-ownership mount).
-    mounted = attach_image(proof, os.environ["OXIDE_PROOF_EVIDENCE"], name, owners=True)
+    mounted = attach_image(proof, os.environ["OXIDE_PROOF_EVIDENCE"], name)
     expect(mounted == mount, f"scratch volume mounted at {mounted}, not {mount}")
-    owners_honored(proof, mount, "exec-inference attach")
     code, stdout, stderr = proof.oxide(
         [
             "pool",
@@ -6352,12 +6395,11 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
         force_detach(proof, proof.image, mount, volume_uuid)
 
         def reattach() -> None:
-            mounted_now = attach_image(proof, os.environ["OXIDE_PROOF_EVIDENCE"], name, owners=True)
+            mounted_now = attach_image(proof, os.environ["OXIDE_PROOF_EVIDENCE"], name)
             expect(
                 mounted_now == mount,
                 f"24: the scratch volume re-attached at {mounted_now}, not {mount}",
             )
-            owners_honored(proof, mount, "24 re-attach")
 
         # No `finally`: the re-attach happens only after this case COMPLETED.
         # A custody abort inside it retains the detached volume instead of
@@ -6680,9 +6722,8 @@ def auto_ineligible_run(proof: Proof, repo: str, diagnostic: bool) -> None:
     maker = fresh_checkout(proof, root, "pool-maker")
     code, _, stderr = proof.oxide(["build"], "internal pool before the drive", maker)
     expect(code == 0, stderr)
-    mounted = attach_image(proof, os.environ["OXIDE_PROOF_EVIDENCE"], name, owners=True)
+    mounted = attach_image(proof, os.environ["OXIDE_PROOF_EVIDENCE"], name)
     expect(mounted == mount, f"scratch volume mounted at {mounted}, not {mount}")
-    owners_honored(proof, mount, "auto-ineligible image")
     code, stdout, stderr = proof.oxide(
         [
             "pool",

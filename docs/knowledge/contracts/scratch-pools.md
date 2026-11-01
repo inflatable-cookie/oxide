@@ -319,6 +319,8 @@ never a raw path dump, bounded and escaped as today.
 
 `rust:permanent-outputs`, `rust:auto-adopt-outputs`, `rust:outputs-detach-permanent`, `rust:outputs-ignore-safety`, `rust:exec-output-inference` and `rust:auto-adopt-ineligible` use declared scratch pools under the supervisor-selected root (oxide#210); their native evidence remains separately owner-activated. A /private/tmp fallback does not prove scratch-pool placement.
 
+All seven permanent-outputs modes, including base-compat, attach and re-attach their owned image with `hdiutil -owners on`; the shared helper observes `/sbin/mount` read-only and refuses a `noowners` mount before registration or further fixture work. At `6c07980`, five uncounted diagnostics failed registration on `MNT_IGNORE_OWNERSHIP`; exec-inference and auto-adopt-ineligible completed, but none of those seven diagnostics carries credit across the shared-helper correction. Their logs remain under `/Volumes/Builds/scratch/oxide/wpmo-logs/diag-*-6c07980.log`; the fresh seven diagnostic, author and reviewer native chains remain Supervisor-owned.
+
 `bd357a4c` is only about `--root-parent /private/tmp`. Pool premise is read from
 each script's own selector text and case bodies.
 
