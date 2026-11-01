@@ -7,7 +7,10 @@ of its own. Default baseline is `git merge-base HEAD origin/main`; override
 with `OXIDE_SEED_BASELINE_COMMIT` or one commit argument. Stages that source
 offline, `--locked`, with 1.97.1 into owned scratch, exports
 `OXIDE_SEED_BASELINE_BINARY`, and runs `tests/cold_seed_default_off.rs` with
-`--ignored`. Not a native proof and not an alias for full QA.
+`--ignored`. The baseline must contain S3 (79e55f4). `--plan` and
+`--self-check` are effect-free; `--diagnostic` runs independent cases in an
+uncounted collection. A /private/tmp fallback exercises the inert internal
+path and is not scratch-pool coverage. Not an alias for full QA.
 """
 
 from __future__ import annotations
@@ -35,16 +38,21 @@ Proof = layout.Proof
 expect, fail, MIB = layout.expect, layout.fail, layout.MIB
 stage_at, sha256 = layout.stage_at, layout.sha256
 
-# Premise dispositions: (1) rustup is captured before fixture HOME replacement;
-# the Rust cases create private HOME/CARGO_HOME and the checked-in lock is used.
-# (2) Fixture children honour private HOME via OXIDE_TEST_HOME_FROM_ENV.
-# (3) Host OXIDE, XDG, Cargo build, Git and compiler controls are scrubbed.
-# (4) The identity cases do not assert an unconverted checkout.
-# (5) No Cargo external subcommand is used.
-# (6) No image is attached or detached.
-# (7) Both stage and fixture use empty encoded and ordinary rust flags.
-# (8) TMPDIR and fixture pools are under the supervisor's selected-volume root.
-# (9) Python mkdtemp and the Rust mkdtemp both name their owned parent explicitly.
+# HIGH premises, with executable locations:
+# 1. main captures invoking RUSTUP_HOME and CARGO_HOME before scrubbing;
+#    stage_at uses the checked-in archived lock; the Rust cases create private
+#    homes and use offline fixtures (tests/cold_seed_default_off.rs:48,106).
+# 2. cargo_test_env sets OXIDE_TEST_HOME_FROM_ENV for those fixture children.
+# 3. main scrubs host OXIDE/XDG/CARGO/GIT; cargo_test_env clears wrappers.
+# 4. The two tests in tests/cold_seed_default_off.rs assert identity, not an
+#    unconverted checkout or adoption receipt.
+# 5. run invokes Cargo test, no external Cargo subcommand.
+# 6. Neither run nor the two Rust cases attach images.
+# 7. main freezes both RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS for all children.
+# 8. main creates the private scratch-pools child; cargo_test_env directs
+#    fixture TMPDIR there, under the supervisor's monitored root.
+# 9. main uses tempfile.mkdtemp(dir=scratch); Scratch::new in
+#    tests/cold_seed_default_off.rs uses mkdtemp with an explicit template.
 BUILDER = "1.97.1"
 S3 = "79e55f4"
 POOL_CAP = "128MiB"
@@ -117,7 +125,7 @@ def archive_baseline(proof: Proof, repo: str, commit: str, dest: str) -> None:
     expect(os.path.isfile(os.path.join(dest, "Cargo.lock")), f"archived {commit} has no Cargo.lock")
 
 
-def cargo_test_env(root: str, baseline: str) -> dict:
+def cargo_test_env(root: str, baseline: str, pool_root: str) -> dict:
     env = dict(os.environ)
     for name in list(env):
         if name.startswith(("SCCACHE_", "CARGO_BUILD_", "CARGO_TARGET_")) or name in (
@@ -128,15 +136,15 @@ def cargo_test_env(root: str, baseline: str) -> dict:
         ):
             env.pop(name)
     rustup = env.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup")
-    internal = os.path.join(root, "internal")
-    os.makedirs(internal, mode=0o700)
     env.update(
         {
             "OXIDE_SEED_BASELINE_BINARY": baseline,
-            "OXIDE_SCRATCH_ROOT": os.environ["OXIDE_TASK_SCRATCH_ROOT"],
+            "OXIDE_SCRATCH_ROOT": pool_root,
+            "TMPDIR": pool_root,
+            "TMP": pool_root,
+            "TEMP": pool_root,
             "OXIDE_POOL_CAP": POOL_CAP,
             "OXIDE_TEST_HOME_FROM_ENV": "1",
-            "OXIDE_TEST_INTERNAL_ROOT": internal,
             "RUSTUP_HOME": rustup,
             "RUSTUP_TOOLCHAIN": BUILDER,
             "RUSTUP_AUTO_INSTALL": "0",
@@ -164,7 +172,7 @@ def expect_both_passed(stdout: str, stderr: str) -> None:
     expect("test result: ok." in combined, f"cargo test did not report ok:\n{combined[-4000:]}")
 
 
-def run(proof: Proof, repo: str, commit: str, diagnostic: bool) -> str:
+def run(proof: Proof, repo: str, commit: str, diagnostic: bool, pool_root: str) -> str:
     print(f"seed-default-off baseline {commit} builder {BUILDER}")
     proof.phase("start")
     base_src = os.path.join(proof.root, "base-src")
@@ -175,8 +183,22 @@ def run(proof: Proof, repo: str, commit: str, diagnostic: bool) -> str:
     expect(os.path.isfile(baseline), f"staged baseline is not a file: {baseline}")
     print(f"staged baseline sha256 {sha256(baseline)}")
     proof.phase("after staging")
-    env = cargo_test_env(proof.root, baseline)
+    env = cargo_test_env(proof.root, baseline, pool_root)
+    execute_tests(proof, repo, env, diagnostic)
+    proof.phase("after tests")
+    return commit
+
+
+def execute_tests(proof, repo: str, env: dict, diagnostic: bool) -> None:
     outcomes = []
+    def save(failure=None):
+        if diagnostic:
+            receipt = {"qualified": False, "cases": outcomes,
+                       "skipped": list(TESTS[len(outcomes):])}
+            if failure is not None:
+                receipt["failure"] = str(failure)[:512]
+            record("diagnostic.json", json.dumps(receipt) + "\n")
+    save()
     # Each ignored test has its own scratch fixture. In diagnostic mode a
     # completed failing case does not prevent the other independent case.
     for name in TESTS if diagnostic else (None,):
@@ -184,7 +206,11 @@ def run(proof: Proof, repo: str, commit: str, diagnostic: bool) -> str:
         if name:
             command.append(name)
         command += ["--ignored", "--nocapture"]
-        result = proof.run(command, cwd=repo, env=env, timeout=work_left())
+        try:
+            result = proof.run(command, cwd=repo, env=env, timeout=work_left())
+        except BaseException as error:
+            save(error)
+            raise
         stdout, stderr = result.stdout.decode(errors="replace"), result.stderr.decode(errors="replace")
         print(f"----- cargo test {name or 'all'}: exit {result.returncode} -----\n{stdout}{stderr}", flush=True)
         passed = result.returncode == 0 and all(
@@ -192,13 +218,13 @@ def run(proof: Proof, repo: str, commit: str, diagnostic: bool) -> str:
             for test in ((name,) if name else TESTS)
         ) and "test result: ok." in stdout + stderr
         outcomes.append({"case": name or "all", "passed": bool(passed), "exit": result.returncode})
+        save()
+        if result.returncode < 0:
+            fail(f"test child terminated by signal {-result.returncode}; remaining cases skipped")
         if not diagnostic:
             expect(passed, "ignored identity tests failed")
     if diagnostic:
-        record("diagnostic.json", json.dumps({"qualified": False, "cases": outcomes}) + "\n")
         fail("diagnostic is uncounted; see diagnostic.json")
-    proof.phase("after tests")
-    return commit
 
 
 def self_check() -> None:
@@ -231,13 +257,94 @@ def self_check() -> None:
         assert len(old.commands) == 2 and old.commands[-1][-2:] == [S3, "a" * 40]
         current = Git(True)
         assert resolve_baseline(current, "/repo") == "a" * 40
-    with patch.dict(os.environ, {"OXIDE_TASK_SCRATCH_ROOT": "/Volumes/Builds/owned"}, clear=True), \
-         patch.object(os, "makedirs") as mkdir:
-        env = cargo_test_env("/Volumes/Builds/owned/case", "/baseline")
-        assert env["OXIDE_SCRATCH_ROOT"] == "/Volumes/Builds/owned"
+    # Exercise the actual entry point, with git and every effectful boundary
+    # mocked. Both override and default paths must refuse before fixture or
+    # build child creation; the accepted path must reach fixture creation.
+    guard = {"OXIDE_TASK_SCRATCH_ROOT": "/Volumes/Builds/owned",
+             "OXIDE_PROOF_EVIDENCE": "/evidence", "OXIDE_PROOF_DEADLINE_NS": "1",
+             "TMPDIR": "/Volumes/Builds/owned", "TMP": "/Volumes/Builds/owned",
+             "TEMP": "/Volumes/Builds/owned", "CARGO_HOME": "/invoking/cargo"}
+    for argv, accepted in ((["proof", "baseline"], False), (["proof"], False), (["proof"], True)):
+        git = Git(accepted)
+        def git_run(command, *, cwd, timeout, capture_output):
+            return git.run(command, cwd=cwd, timeout=timeout)
+        with patch.object(sys, "argv", argv), patch.object(sys, "platform", "darwin"), \
+             patch.dict(os.environ, guard, clear=True), \
+             patch.object(os.path, "realpath", side_effect=lambda path: path), \
+             patch.object(os.path, "isdir", return_value=True), \
+             patch.object(subprocess, "run", side_effect=git_run), \
+             patch.object(subprocess, "Popen") as popen, \
+             patch.object(tempfile, "mkdtemp", side_effect=RuntimeError("fixture boundary")) as mkdtemp, \
+             patch.object(os, "mkdir") as mkdir, patch.object(globals()["Proof"], "run") as child, \
+             patch.dict(globals(), {"stage_at": lambda *args: (_ for _ in ()).throw(AssertionError("stage"))}):
+            try:
+                main()
+            except RuntimeError as error:
+                assert ("fixture boundary" if accepted else "must contain scratch-pools S3") in str(error)
+            else:
+                raise AssertionError("entry point did not stop")
+            assert mkdtemp.call_count == (1 if accepted else 0)
+            mkdir.assert_not_called()
+            popen.assert_not_called()
+            child.assert_not_called()
+            assert git.commands[0][1:3] == (["rev-parse", "--verify"] if len(argv) > 1 else ["merge-base", "HEAD"])
+            if accepted:
+                assert os.environ["CARGO_HOME"] == "/invoking/cargo"
+                assert "OXIDE_TEST_INTERNAL_ROOT" not in os.environ
+    from types import SimpleNamespace
+    git = Git(True)
+    with patch.object(sys, "argv", ["proof"]), patch.object(sys, "platform", "darwin"), \
+         patch.dict(os.environ, guard, clear=True), \
+         patch.object(os.path, "realpath", side_effect=lambda path: path), \
+         patch.object(os.path, "isdir", return_value=True), \
+         patch.object(os, "stat", return_value=SimpleNamespace(st_dev=7)), \
+         patch.object(subprocess, "run", side_effect=lambda command, cwd, timeout, capture_output:
+                      git.run(command, cwd=cwd, timeout=timeout)), \
+         patch.object(tempfile, "mkdtemp", return_value="/Volumes/Builds/owned/case") as mkdtemp, \
+         patch.object(os, "mkdir") as mkdir, \
+         patch.object(signal, "signal", side_effect=RuntimeError("setup boundary")):
+        try:
+            main()
+        except RuntimeError as error:
+            assert str(error) == "setup boundary"
+        else:
+            raise AssertionError("setup boundary not reached")
+        mkdtemp.assert_called_once_with(prefix="seed-default-off.", dir=guard["TMPDIR"])
+        mkdir.assert_called_once_with("/Volumes/Builds/owned/case/scratch-pools", 0o700)
+    with patch.dict(os.environ, {"CARGO_HOME": "/invoking/cargo"}, clear=True):
+        pool = "/Volumes/Builds/owned/case/scratch-pools"
+        env = cargo_test_env("/Volumes/Builds/owned/case", "/baseline", pool)
+        assert env["OXIDE_SCRATCH_ROOT"] == pool and env["TMPDIR"] == pool
+        assert env["CARGO_HOME"] == "/invoking/cargo"
         assert env["OXIDE_POOL_CAP"] == POOL_CAP and env["OXIDE_TEST_HOME_FROM_ENV"] == "1"
-        assert env["OXIDE_TEST_INTERNAL_ROOT"].startswith(env["OXIDE_SCRATCH_ROOT"] + "/")
-        mkdir.assert_called_once()
+        assert "OXIDE_TEST_INTERNAL_ROOT" not in env
+    # Preserve the first case if a later child raises; a signal exit aborts
+    # without starting the second case. No subprocess or fixture is created.
+    class Cases:
+        def __init__(self, second):
+            self.calls = 0
+            self.second = second
+        def run(self, command, **kwargs):
+            self.calls += 1
+            if self.calls == 2 and isinstance(self.second, BaseException):
+                raise self.second
+            code = self.second if self.calls == 1 and isinstance(self.second, int) else 0
+            out = (f"test {TESTS[self.calls - 1]} ... ok\ntest result: ok.\n").encode()
+            return subprocess.CompletedProcess(command, code, out, b"")
+    for second in (RuntimeError("child failed"), -9):
+        cases = Cases(second)
+        receipts = []
+        with patch.dict(globals(), {"record": lambda name, data: receipts.append(json.loads(data)),
+                                    "work_left": lambda: 10}):
+            try:
+                execute_tests(cases, "/repo", {}, True)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("diagnostic did not abort")
+        assert cases.calls == (1 if isinstance(second, int) else 2)
+        assert len(receipts[-1]["cases"]) == 1 and receipts[-1]["skipped"] == [TESTS[1]]
+        assert receipts[-1]["qualified"] is False
     print("seed-default-off effect-free contract checks passed")
 
 
@@ -270,19 +377,24 @@ def main() -> int:
             return subprocess.run(command, cwd=cwd, timeout=timeout, capture_output=True)
     commit = resolve_baseline(GitReader(), repo)
     rustup = os.environ.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup")
+    cargo_home = os.environ.get("CARGO_HOME") or os.path.join(os.path.expanduser("~"), ".cargo")
     for name in list(os.environ):
         if name.startswith(("OXIDE_", "XDG_", "CARGO_", "SCCACHE_", "GIT_")) and name not in (
             "OXIDE_TASK_SCRATCH_ROOT", "OXIDE_PROOF_EVIDENCE", "OXIDE_PROOF_DEADLINE_NS",
         ):
             os.environ.pop(name)
-    os.environ.update({"RUSTUP_HOME": rustup, "RUSTFLAGS": "", "CARGO_ENCODED_RUSTFLAGS": ""})
+    os.environ.update({"RUSTUP_HOME": rustup, "CARGO_HOME": cargo_home, "RUSTFLAGS": "", "CARGO_ENCODED_RUSTFLAGS": ""})
     root = tempfile.mkdtemp(prefix="seed-default-off.", dir=scratch)
+    pool_root = os.path.join(root, "scratch-pools")
+    os.mkdir(pool_root, 0o700)
+    expect(os.path.realpath(pool_root) == pool_root and os.stat(pool_root).st_dev == os.stat(scratch).st_dev,
+           "scratch-pools must be canonical and on the selected device")
     signal.signal(signal.SIGTERM, terminated)
     signal.signal(signal.SIGALRM, overdue)
     signal.setitimer(signal.ITIMER_REAL, work_left())
     proof = Proof(root)
     try:
-        commit = run(proof, repo, commit, diagnostic)
+        commit = run(proof, repo, commit, diagnostic, pool_root)
     except BaseException as failure:
         if diagnostic:
             receipt = os.path.join(os.environ["OXIDE_PROOF_EVIDENCE"], "diagnostic.json")

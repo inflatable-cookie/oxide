@@ -87,7 +87,8 @@ default = false
 # --ignored. Default baseline is git merge-base HEAD origin/main; override
 # with OXIDE_SEED_BASELINE_COMMIT. 300 s / 512 MiB owned scratch. The
 # fixture uses a scratch pool on the supervisor-selected volume. Baselines
-# must contain scratch-pools S3 (79e55f4). Not an alias for full QA.
+# must contain scratch-pools S3 (79e55f4). A /private/tmp fallback exercises
+# the inert internal path and is not scratch-pool coverage. Not full QA.
 [tasks."rust:seed-default-off"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-seed-default-off.py"
