@@ -326,6 +326,21 @@ nonce and marker identity; checkout absence, including the ancestor-missing clas
 (111 rows in 2026-10-26); the boot-Data legacy rule; volume UUID and mount
 verification; writer custody across both pools (G6); and the operator list (D4).
 
+### O2 capture boundary (design)
+
+The O1-pinned production `barge::release::plan` reads its volume registry and
+constructs `OxideSnapshot` inside the planner; its request does not accept an
+already captured Oxide snapshot. Oxide's `evaluate` likewise reads receipts and
+other authority while evaluating. Calling the two in sequence therefore does
+not establish that they evaluated identical facts. A shadow must bind the
+registry, receipts, markers, volume and absence observations, writer custody,
+control fence and declaration to one bounded capture and its observation window.
+It must report insufficient evidence wherever either evaluator's actual inputs
+cannot be bound to that capture. A digest of only the files that happen to be
+read, or a stable-looking pair of sequential plans, is not proof of identical
+inputs. This constraint does not authorize redirecting production account trust
+or enabling Barge's synthetic-account feature in the production dependency.
+
 ## Failure and race matrix
 
 "Keeps" means the root, its marker, its registry row and any pending intent are
