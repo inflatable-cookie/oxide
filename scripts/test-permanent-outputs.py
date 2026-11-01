@@ -528,6 +528,8 @@ def finish_child(proof: Proof, child: subprocess.Popen, label: str) -> tuple[int
             print(f"child {child.pid} not reaped: {error!r}", file=sys.stderr)
         raise
     proof.unclosed.discard(child.pid)
+    if proof.mount and os.path.ismount(proof.mount):
+        check_image_slot_paths(proof.mount)
     stdout, stderr = out.decode(errors="replace"), err.decode(errors="replace")
     print(f"----- {label}: exit {child.returncode} -----\n{stdout}{stderr}", flush=True)
     if CHILD_CUSTODY_GUARD is not None:
@@ -3270,6 +3272,35 @@ def exec_self_test() -> None:
     expect(not mode_allows("base-compat", "ordinary-controls"), "base mode accepted other cases")
     for mode in ("permanent-outputs", "auto-adopt", "detach-permanent", "ignore-safety", "exec-inference", "auto-ineligible"):
         expect(not mode_allows(mode, "historical-base"), f"{mode} accepted historical base")
+
+    # Current-main oracle sweep (caf44ac): outputs.rs:64-76 and :2230
+    # name whole-target /2, profile /3, plan /2 and profile first adoption;
+    # src/lease/control.rs:121 names the /3 fence. /1 and PRE_FEATURE remain
+    # historical controls. The candidate source is read only, with no child.
+    with open(os.path.join(HERE, "..", "src", "bin", "oxide", "outputs.rs"), encoding="utf-8") as handle:
+        output_source = handle.read()
+    with open(os.path.join(HERE, "..", "src", "lease", "control.rs"), encoding="utf-8") as handle:
+        control_source = handle.read()
+    for pin in ('const RECEIPT_VERSION: &str = "oxide.outputs.transition/2"',
+                'const PROFILE_RECEIPT_VERSION: &str = "oxide.outputs.transition/3"',
+                'const PLAN_VERSION: &str = "oxide.outputs.plan/2"',
+                'Only the explicit first conversion selects the profile layout',
+                'permanent drive mode: outputs use the checkout-local fallback root',
+                'is left untouched'):
+        expect(pin in output_source, f"current product oracle changed: {pin}")
+    expect('OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/3"' in control_source, "fence version changed")
+    expect(PRE_FEATURE == "8c9b5aeab57b8d0ca285b5358e07c89606724c8d", "historical base changed")
+    with patch("glob.glob", return_value=["/Volumes/x/oxide-pool/slots/f-12345678/quick-1"]), \
+         patch("os.path.isdir", return_value=True):
+        check_image_slot_paths("/Volumes/x")
+    with patch("glob.glob", return_value=["/Volumes/x/oxide-pool/slots/" + "f" * 70 + "/quick-1"]), \
+         patch("os.path.isdir", return_value=True):
+        try:
+            check_image_slot_paths("/Volumes/x")
+        except (RuntimeError, SystemExit):
+            pass
+        else:
+            fail("overlong image slot scratch was accepted")
 
     ran: list[str] = []
 
