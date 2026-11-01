@@ -313,6 +313,9 @@ never a raw path dump, bounded and escaped as today.
 
 ## Migration list
 
+`rust:slot-headroom` and its diagnostic now use a private scratch pool under the selected supervisor root (#203); their native evidence must be re-established at the migrated head.
+
+
 `bd357a4c` is only about `--root-parent /private/tmp`. Pool premise is read from
 each script's own selector text and case bodies.
 
