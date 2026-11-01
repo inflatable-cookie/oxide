@@ -1770,13 +1770,33 @@ def member_payload_state(root: str, member: str) -> tuple:
 
 
 ASSERTION_RECEIPT_BYTES = 64 * 1024
-CASE_IDS = [f"{index:02d}" for index in range(1, 21)]
+ALL_CASE_IDS = [f"{index:02d}" for index in range(1, 21)]
+MODE = "builds"
+MODE_CASES = {"builds": [c for c in ALL_CASE_IDS if c not in ("10", "19")],
+              "base-compat": ["10", "11", "19"]}
+CASE_IDS = MODE_CASES[MODE]
+
+# HIGH proof-authoring premises (workflow checklist):
+# 1. perm.proof_env captures rustup before private HOME, pins 1.97.1 and disables
+#    auto-install; make_checkout supplies fixture lock, stage_at uses --locked.
+# 2. perm.proof_env sets OXIDE_TEST_HOME_FROM_ENV=1.
+# 3. perm.proof_env scrubs inherited OXIDE_*, XDG_* and sets fixture controls.
+# 4. case 01 creates an empty target before explicit adopt; cases 12/13 use
+#    auto_legacy to assert the automatic whole-target conversion.
+# 5. This proof does not invoke a Cargo external subcommand.
+# 6. attach_owned_image uses -owners on; existing identity and detach gates apply.
+# 7. run freezes both compiler flag variables before staging and fixture setup.
+# 8. Builds uses a private scratch pool under the runner root; base-compat
+#    requires the internal root for its pinned pre-S3 base.
+# 9. Python tempfile.mkdtemp uses the explicit runner root; no shell mktemp.
+
 _CASE_PROGRESS = {"reached": [], "started_ms": None}
 
 
 def case_reached(case_id: str) -> None:
     """Record that one fixed case block has started, in execution order."""
     reached = _CASE_PROGRESS["reached"]
+    expect(case_id in CASE_IDS, f"case {case_id} is forbidden in {MODE}")
     if case_id not in reached:
         reached.append(case_id)
     if _CASE_PROGRESS["started_ms"] is None:
@@ -1814,6 +1834,7 @@ def write_assertion_receipt(outcome: str, failure) -> str:
         failed_in = reached[-1] if reached else None
         unexecuted = [case for case in CASE_IDS if case not in reached]
     record = {
+        "mode": MODE,
         "version": "oxide.outputs.proof-assertions/1",
         "outcome": outcome,
         "primary_failure": None if failure is None else str(failure)[-2000:],
@@ -2080,6 +2101,9 @@ class Diagnostic:
 
     def enter(self, step: str, fixtures: tuple = ()) -> bool:
         """Whether this step may run at all. Default mode always may."""
+        case = CASE_STEP_CASE[step]
+        if case not in CASE_IDS:
+            return False
         if not self.mode:
             return True
         reasons = []
@@ -2197,7 +2221,8 @@ def diagnostic_record(proof, started_ms, primary, secondary) -> dict:
     )
     return {
         "version": "oxide.outputs.proof-diagnostic/1",
-        "mode": "diagnostic",
+        "mode": MODE,
+        "collection": "diagnostic",
         "qualified": False,
         "outcome": outcome,
         "claims": "diagnostic case coverage only; never a counted native PASS, closure, census or gate claim",
@@ -2672,6 +2697,8 @@ def pure_diagnostic_controls() -> None:
 
 
 def run(proof: Proof, repo: str) -> None:
+    os.environ.pop("CARGO_ENCODED_RUSTFLAGS", None)
+    os.environ["RUSTFLAGS"] = ""
     pure_diagnostic_controls()
     pure_registry_controls()
     pure_detach_record_control()
@@ -2691,22 +2718,31 @@ def run(proof: Proof, repo: str) -> None:
     # Explicit CPU controls for a 6 CPU / 8 GiB planning request. The two
     # stages are sequential and each is bounded to 6 Cargo jobs (passed
     # explicitly to the shared helper, which sanitizes CARGO_BUILD_* first).
-    base_src = source_at(proof, repo, BASE, "base")
-    base = layout.stage_at(proof, base_src, "base", jobs=STAGE_JOBS)
-    shutil.rmtree(base_src)
+    base = None
+    if MODE == "base-compat":
+        base_src = source_at(proof, repo, BASE, "base")
+        base = layout.stage_at(proof, base_src, "base", jobs=STAGE_JOBS)
+        shutil.rmtree(base_src)
     candidate = layout.stage_at(proof, repo, "candidate", jobs=STAGE_JOBS)
-    expect(perm.sha256_file(base) != perm.sha256_file(candidate), "base and candidate binaries are identical")
-    expect(capabilities(base) == 3, f"base binary is not a state-3 binary")
+    if base is not None:
+        expect(perm.sha256_file(base) != perm.sha256_file(candidate), "base and candidate binaries are identical")
+        expect(capabilities(base) == 3, "base binary is not a state-3 binary")
     expect(capabilities(candidate) == 4, "candidate binary is not a state-4 binary")
-    print(f"base {perm.sha256_file(base)} candidate {perm.sha256_file(candidate)}", flush=True)
+    print(f"candidate {perm.sha256_file(candidate)}" + (f" base {perm.sha256_file(base)}" if base else ""), flush=True)
     proof.binary = candidate
 
-    pool = os.path.join(proof.root, "pool")
+    scratch_pool = os.path.join(proof.root, "scratch-pools")
+    if MODE == "builds":
+        os.mkdir(scratch_pool, 0o700)
+    pool = os.path.join(scratch_pool if MODE == "builds" else proof.root, "pool")
     home = os.path.join(proof.root, "home")
     cargo_home = os.path.join(proof.root, "cargo-home")
     for directory in (home, cargo_home):
         os.makedirs(directory)
     proof.env = perm.proof_env(pool, home, cargo_home)
+    if MODE == "builds":
+        proof.env["OXIDE_SCRATCH_ROOT"] = scratch_pool
+    proof.env["OXIDE_POOL_CAP"] = "64MiB"
     # Every fixture Cargo child (oxide build/test/bench/doc/check/metadata)
     # inherits this bound. At most two gated fixture writers run at once, so
     # the fixture peak is 2 x FIXTURE_JOBS = 4 jobs; staging is sequential and
@@ -2744,24 +2780,25 @@ def run(proof: Proof, repo: str) -> None:
     # key prepared under the base-compatible registration before ANY candidate
     # command runs in this pool. The candidate must later reuse that exact
     # slot, receipt and link unchanged.
-    legacy = make_checkout(proof, "legacy")
-    result = proof.run([base, "outputs", "adopt"], cwd=legacy, env=proof.env, timeout=120)
-    expect(result.returncode == 0, f"10: base whole-target adopt failed: {result.stderr.decode(errors='replace')}")
-    legacy_root = root_of(pool, legacy)
-    expect(
-        legacy_root.startswith(os.path.join(proof.mount, "oxide-outputs") + os.sep),
-        f"10: the base legacy root {legacy_root} is not on the registered volume",
-    )
-    expect(os.path.islink(os.path.join(legacy, "target")), "10: base did not publish a whole-target link")
-    expect(item(pool, legacy, "version") == "oxide.outputs.transition/2", "10: base receipt is not /2")
-    result = proof.run([base, "build"], cwd=legacy, env=proof.env, timeout=180)
-    expect(result.returncode == 0, f"10: base build failed: {result.stderr.decode(errors='replace')[-2000:]}")
-    base_slot, _ = perm.slot_state(result.stderr.decode(errors="replace"))
-    # A7: keep the EXACT base receipt bytes and link facts, so the candidate's
-    # no-mutation claim is a byte comparison rather than a version/member spot
-    # check.
-    base_receipt_bytes = perm.read_bytes(perm.receipt_path(pool, legacy))
-    base_link_text = link_at(os.path.join(legacy, "target"))
+    if MODE == "base-compat":
+        legacy = make_checkout(proof, "legacy")
+        result = proof.run([base, "outputs", "adopt"], cwd=legacy, env=proof.env, timeout=120)
+        expect(result.returncode == 0, f"10: base whole-target adopt failed: {result.stderr.decode(errors='replace')}")
+        legacy_root = root_of(pool, legacy)
+        expect(
+            legacy_root.startswith(os.path.join(proof.mount, "oxide-outputs") + os.sep),
+            f"10: the base legacy root {legacy_root} is not on the registered volume",
+        )
+        expect(os.path.islink(os.path.join(legacy, "target")), "10: base did not publish a whole-target link")
+        expect(item(pool, legacy, "version") == "oxide.outputs.transition/2", "10: base receipt is not /2")
+        result = proof.run([base, "build"], cwd=legacy, env=proof.env, timeout=180)
+        expect(result.returncode == 0, f"10: base build failed: {result.stderr.decode(errors='replace')[-2000:]}")
+        base_slot, _ = perm.slot_state(result.stderr.decode(errors="replace"))
+        # A7: keep the EXACT base receipt bytes and link facts, so the candidate's
+        # no-mutation claim is a byte comparison rather than a version/member spot
+        # check.
+        base_receipt_bytes = perm.read_bytes(perm.receipt_path(pool, legacy))
+        base_link_text = link_at(os.path.join(legacy, "target"))
     if DIAG.enter("11.1", fixtures=()):
         try:
             # ----- case 11: explicit migration of a base-created checkout ---------
@@ -2771,7 +2808,11 @@ def run(proof: Proof, repo: str) -> None:
             # prepared under the SAME base-compatible registration as case 10's, and
             # the candidate migrates it only after case 10's base warm check.
             migrated = make_checkout(proof, "migrate")
-            base_legacy(proof, base, pool, migrated)
+            if MODE == "base-compat":
+                base_legacy(proof, base, pool, migrated)
+            else:
+                os.makedirs(os.path.join(migrated, "target"))
+                perm.legacy_whole_target(proof, pool, proof.mount, migrated, "11 source fixture")
             # The base binary's committed whole-target /2 state is made source-shaped
             # BEFORE any migration: a root/1 marker and no nonce in the receipt or
             # registry, so the only path that can reach the profile layout is the
@@ -2809,31 +2850,32 @@ def run(proof: Proof, repo: str) -> None:
                     with open(os.path.join(evidence, f"case11-{name}-pre.json"), "wb") as handle:
                         handle.write(perm.read_bytes(path))
 
-            # Case 10 (candidate half): only after BOTH base-created legacy states
-            # (this warm-slot checkout and case 11's migration checkout) exist does the
-            # first candidate command run in this pool.
-            code, _, stderr = oxide(proof, ["build"], "10 candidate warm on base slot", legacy)
-            expect(code == 0, f"10: candidate build on the base legacy slot failed: {stderr}")
-            candidate_slot, candidate_state = perm.slot_state(stderr)
-            expect(candidate_state == "warm", f"10: candidate did not reuse the base key: {summary(stderr)}")
-            expect(candidate_slot == base_slot, f"10: candidate changed the base slot {base_slot} -> {candidate_slot}")
-            expect(os.path.islink(os.path.join(legacy, "target")), "10: the base legacy link changed")
-            expect(link_at(os.path.join(legacy, "target")) == legacy_root, "10: the base legacy link text changed")
-            expect(item(pool, legacy, "version") == "oxide.outputs.transition/2", "10: the base receipt was rewritten")
-            base_links = item(pool, legacy, "links")
-            expect(base_links[0]["member"] == "target", "10: the base placement changed")
-            expect(
-                perm.read_bytes(perm.receipt_path(pool, legacy)) == base_receipt_bytes,
-                "10: the candidate rewrote the base receipt bytes",
-            )
-            expect(
-                link_at(os.path.join(legacy, "target")) == base_link_text,
-                "10: the candidate changed the base link text",
-            )
-            expect(
-                "uses the whole-target layout" in stderr and "oxide outputs adopt" in stderr,
-                f"10: the candidate did not print the one adopt notice: {stderr}",
-            )
+            if MODE == "base-compat":
+                # Case 10 (candidate half): only after BOTH base-created legacy states
+                # (this warm-slot checkout and case 11's migration checkout) exist does the
+                # first candidate command run in this pool.
+                code, _, stderr = oxide(proof, ["build"], "10 candidate warm on base slot", legacy)
+                expect(code == 0, f"10: candidate build on the base legacy slot failed: {stderr}")
+                candidate_slot, candidate_state = perm.slot_state(stderr)
+                expect(candidate_state == "warm", f"10: candidate did not reuse the base key: {summary(stderr)}")
+                expect(candidate_slot == base_slot, f"10: candidate changed the base slot {base_slot} -> {candidate_slot}")
+                expect(os.path.islink(os.path.join(legacy, "target")), "10: the base legacy link changed")
+                expect(link_at(os.path.join(legacy, "target")) == legacy_root, "10: the base legacy link text changed")
+                expect(item(pool, legacy, "version") == "oxide.outputs.transition/2", "10: the base receipt was rewritten")
+                base_links = item(pool, legacy, "links")
+                expect(base_links[0]["member"] == "target", "10: the base placement changed")
+                expect(
+                    perm.read_bytes(perm.receipt_path(pool, legacy)) == base_receipt_bytes,
+                    "10: the candidate rewrote the base receipt bytes",
+                )
+                expect(
+                    link_at(os.path.join(legacy, "target")) == base_link_text,
+                    "10: the candidate changed the base link text",
+                )
+                expect(
+                    "uses the whole-target layout" in stderr and "oxide outputs adopt" in stderr,
+                    f"10: the candidate did not print the one adopt notice: {stderr}",
+                )
             DIAG.finished("11.1")
         except BaseException as error:
             DIAG.failed_step(proof, "11.1", error)
@@ -2885,147 +2927,148 @@ def run(proof: Proof, repo: str) -> None:
             validate_migrated_registry(rows, migrated_root, nonce, upgraded.get("volume_uuid"), upgraded["generation"])
             expect(migrated_receipt["version"] == "oxide.outputs.transition/3", "11: migrated receipt version")
 
-            # Explicit positive control BEFORE any external-root oracle: the
-            # registered removable volume is really selected, so an internal-pool
-            # fallback can never masquerade as external-placement evidence.
-            expect(proof.mount is not None, "the private image is not mounted")
-            expect(os.path.isfile(perm.registration_path(pool)), "no removable registration")
-            selected = make_checkout(proof, "selected-removable")
-            os.makedirs(os.path.join(selected, "target"))
-            adopt(proof, selected, "selected-removable adopt")
-            selected_root = root_of(pool, selected)
-            expect(
-                selected_root.startswith(os.path.join(proof.mount, "oxide-outputs") + os.sep),
-                f"the selected root {selected_root} is not under {proof.mount}/oxide-outputs",
-            )
-            code, _, stderr = oxide(proof, ["build"], "selected-removable build", selected)
-            expect(code == 0, f"selected-removable build failed: {stderr}")
-            expect(
-                "fallback" not in summary(stderr),
-                f"the registered removable pool was not selected: {summary(stderr)}",
-            )
-            expect(
-                os.readlink(member_link(selected, "debug")) == member_destination(selected_root, "debug"),
-                "the member link does not select the registered external root",
-            )
-            # A SEPARATE deliberate low-reserve control: a reserve above the image's
-            # free space must fall back to the internal pool with an honest warning and
-            # must not claim an external placement.
-            # A SEPARATE deliberate low-reserve control: the private pool's recorded
-            # registration reserve is temporarily raised above the image's free space,
-            # then its exact bytes are restored. No second image or pool is created and
-            # no real drive or host setting is touched.
-            registration_file = perm.registration_path(pool)
-            original_registration = perm.read_bytes(registration_file)
-            registration = json.loads(original_registration)
-            registration["reserve_bytes"] = LOW_RESERVE_MIB * 1024 * 1024
-            with open(registration_file, "w", encoding="utf-8") as handle:
-                json.dump(registration, handle, indent=2)
-                handle.write("\n")
-            os.chmod(registration_file, 0o600)
-            low = make_checkout(proof, "low-reserve")
-            os.makedirs(os.path.join(low, "target"))
-            code, _, stderr = oxide(proof, ["outputs", "adopt"], "low-reserve adopt", low)
-            expect(code == 0, f"low-reserve adopt failed: {stderr}")
-            low_root = root_of(pool, low)
-            expect(
-                low_root.startswith(low + os.sep + ".oxide-outputs" + os.sep),
-                f"the low-reserve control selected {low_root} instead of the checkout-local fallback",
-            )
-            code, _, stderr = oxide(proof, ["build"], "low-reserve build", low)
-            expect(code == 0, f"low-reserve build failed: {stderr}")
-            expect(
-                "not above the" in stderr and "reserve" in stderr,
-                f"the low-reserve control did not report its fallback honestly: {stderr}",
-            )
-            # Restore the exact recorded registration bytes this fixture changed.
-            with open(registration_file, "wb") as handle:
-                handle.write(original_registration)
-            os.chmod(registration_file, 0o600)
-            expect(
-                perm.read_bytes(registration_file) == original_registration,
-                "the low-reserve control did not restore the recorded registration",
-            )
+            if MODE == "builds":
+                # Explicit positive control BEFORE any external-root oracle: the
+                # registered removable volume is really selected, so an internal-pool
+                # fallback can never masquerade as external-placement evidence.
+                expect(proof.mount is not None, "the private image is not mounted")
+                expect(os.path.isfile(perm.registration_path(pool)), "no removable registration")
+                selected = make_checkout(proof, "selected-removable")
+                os.makedirs(os.path.join(selected, "target"))
+                adopt(proof, selected, "selected-removable adopt")
+                selected_root = root_of(pool, selected)
+                expect(
+                    selected_root.startswith(os.path.join(proof.mount, "oxide-outputs") + os.sep),
+                    f"the selected root {selected_root} is not under {proof.mount}/oxide-outputs",
+                )
+                code, _, stderr = oxide(proof, ["build"], "selected-removable build", selected)
+                expect(code == 0, f"selected-removable build failed: {stderr}")
+                expect(
+                    "fallback" not in summary(stderr),
+                    f"the registered removable pool was not selected: {summary(stderr)}",
+                )
+                expect(
+                    os.readlink(member_link(selected, "debug")) == member_destination(selected_root, "debug"),
+                    "the member link does not select the registered external root",
+                )
+                # A SEPARATE deliberate low-reserve control: a reserve above the image's
+                # free space must fall back to the internal pool with an honest warning and
+                # must not claim an external placement.
+                # A SEPARATE deliberate low-reserve control: the private pool's recorded
+                # registration reserve is temporarily raised above the image's free space,
+                # then its exact bytes are restored. No second image or pool is created and
+                # no real drive or host setting is touched.
+                registration_file = perm.registration_path(pool)
+                original_registration = perm.read_bytes(registration_file)
+                registration = json.loads(original_registration)
+                registration["reserve_bytes"] = LOW_RESERVE_MIB * 1024 * 1024
+                with open(registration_file, "w", encoding="utf-8") as handle:
+                    json.dump(registration, handle, indent=2)
+                    handle.write("\n")
+                os.chmod(registration_file, 0o600)
+                low = make_checkout(proof, "low-reserve")
+                os.makedirs(os.path.join(low, "target"))
+                code, _, stderr = oxide(proof, ["outputs", "adopt"], "low-reserve adopt", low)
+                expect(code == 0, f"low-reserve adopt failed: {stderr}")
+                low_root = root_of(pool, low)
+                expect(
+                    low_root.startswith(low + os.sep + ".oxide-outputs" + os.sep),
+                    f"the low-reserve control selected {low_root} instead of the checkout-local fallback",
+                )
+                code, _, stderr = oxide(proof, ["build"], "low-reserve build", low)
+                expect(code == 0, f"low-reserve build failed: {stderr}")
+                expect(
+                    "not above the" in stderr and "reserve" in stderr,
+                    f"the low-reserve control did not report its fallback honestly: {stderr}",
+                )
+                # Restore the exact recorded registration bytes this fixture changed.
+                with open(registration_file, "wb") as handle:
+                    handle.write(original_registration)
+                os.chmod(registration_file, 0o600)
+                expect(
+                    perm.read_bytes(registration_file) == original_registration,
+                    "the low-reserve control did not restore the recorded registration",
+                )
 
-            # A separate parent-ignore control: a directory-only `/target/`
-            # rule genuinely covers the `target/<member>` links a first
-            # conversion publishes (oxide#160), so the automatic conversion
-            # publishes the profile layout rather than staying unconverted - a
-            # real `target` holding an owned debug/release pair into ONE root on
-            # the drive, one notice and a committed profile receipt - and no
-            # checkout-local root appears.
-            parent = make_checkout(proof, "parent-ignore", PARENT_IGNORE_APP)
-            parent_target = os.path.join(parent, "target")
-            code, _, stderr = oxide(proof, ["build"], "parent-ignore auto-adopt", parent)
-            expect(
-                code == 0,
-                f"the directory-only parent rule did not convert: exit {code}: {stderr}",
-            )
-            expect(
-                stderr.count(perm.AUTO_NOTICE) == 1,
-                f"the automatic conversion did not print exactly one notice: {stderr}",
-            )
-            expect(
-                "not converted to owned outputs" not in stderr,
-                f"a covering directory-only rule was treated as ineligible: {stderr}",
-            )
-            parent_root = root_of(pool, parent)
-            expect(
-                parent_root.startswith(os.path.join(proof.mount, "oxide-outputs") + os.sep),
-                f"the parent-ignore root {parent_root} is not on the drive",
-            )
-            expect_layout(
-                parent,
-                {"debug": f"link:{parent_root}", "release": f"link:{parent_root}"},
-            )
-            expect(
-                is_real_dir(parent_target),
-                f"the conversion left no real target: {parent_target}",
-            )
-            expect(
-                not os.path.lexists(os.path.join(parent, ".oxide-outputs")),
-                "the conversion created a checkout-local owned root",
-            )
-            expect(
-                perm.read_json(perm.receipt_file(pool, parent))["state"] == "committed",
-                "the parent-ignore conversion did not commit its receipt",
-            )
-            code, _, stderr = oxide(proof, ["build"], "parent-ignore build", parent)
-            expect(code == 0, f"the converted parent-ignore checkout did not build: {stderr}")
-            expect(
-                "fallback" not in summary(stderr),
-                f"parent-ignore: external placement unexpectedly fell back: {summary(stderr)}",
-            )
-            expect_layout(
-                parent,
-                {"debug": f"link:{parent_root}", "release": f"link:{parent_root}"},
-            )
-            # The same rule stays a valid parent ignore for profile members under
-            # the real target directory, so a separate real-empty checkout also
-            # adopts its member links through the explicitly requested conversion.
-            member_parent = make_checkout(proof, "parent-ignore-member", PARENT_IGNORE_APP)
-            os.makedirs(os.path.join(member_parent, "target"))
-            adopt(proof, member_parent, "parent-ignore-member adopt")
-            member_root = root_of(pool, member_parent)
-            expect_layout(member_parent, {"debug": f"link:{member_root}"})
-            code, _, stderr = oxide(proof, ["build"], "parent-ignore-member build", member_parent)
-            expect(code == 0, f"the adopted parent-ignore checkout did not build: {stderr}")
-            expect("fallback" not in summary(stderr), f"parent-ignore-member: external placement unexpectedly fell back: {summary(stderr)}")
-            expect_layout(member_parent, {"debug": f"link:{member_root}"})
+                # A separate parent-ignore control: a directory-only `/target/`
+                # rule genuinely covers the `target/<member>` links a first
+                # conversion publishes (oxide#160), so the automatic conversion
+                # publishes the profile layout rather than staying unconverted - a
+                # real `target` holding an owned debug/release pair into ONE root on
+                # the drive, one notice and a committed profile receipt - and no
+                # checkout-local root appears.
+                parent = make_checkout(proof, "parent-ignore", PARENT_IGNORE_APP)
+                parent_target = os.path.join(parent, "target")
+                code, _, stderr = oxide(proof, ["build"], "parent-ignore auto-adopt", parent)
+                expect(
+                    code == 0,
+                    f"the directory-only parent rule did not convert: exit {code}: {stderr}",
+                )
+                expect(
+                    stderr.count(perm.AUTO_NOTICE) == 1,
+                    f"the automatic conversion did not print exactly one notice: {stderr}",
+                )
+                expect(
+                    "not converted to owned outputs" not in stderr,
+                    f"a covering directory-only rule was treated as ineligible: {stderr}",
+                )
+                parent_root = root_of(pool, parent)
+                expect(
+                    parent_root.startswith(os.path.join(proof.mount, "oxide-outputs") + os.sep),
+                    f"the parent-ignore root {parent_root} is not on the drive",
+                )
+                expect_layout(
+                    parent,
+                    {"debug": f"link:{parent_root}", "release": f"link:{parent_root}"},
+                )
+                expect(
+                    is_real_dir(parent_target),
+                    f"the conversion left no real target: {parent_target}",
+                )
+                expect(
+                    not os.path.lexists(os.path.join(parent, ".oxide-outputs")),
+                    "the conversion created a checkout-local owned root",
+                )
+                expect(
+                    perm.read_json(perm.receipt_file(pool, parent))["state"] == "committed",
+                    "the parent-ignore conversion did not commit its receipt",
+                )
+                code, _, stderr = oxide(proof, ["build"], "parent-ignore build", parent)
+                expect(code == 0, f"the converted parent-ignore checkout did not build: {stderr}")
+                expect(
+                    "fallback" not in summary(stderr),
+                    f"parent-ignore: external placement unexpectedly fell back: {summary(stderr)}",
+                )
+                expect_layout(
+                    parent,
+                    {"debug": f"link:{parent_root}", "release": f"link:{parent_root}"},
+                )
+                # The same rule stays a valid parent ignore for profile members under
+                # the real target directory, so a separate real-empty checkout also
+                # adopts its member links through the explicitly requested conversion.
+                member_parent = make_checkout(proof, "parent-ignore-member", PARENT_IGNORE_APP)
+                os.makedirs(os.path.join(member_parent, "target"))
+                adopt(proof, member_parent, "parent-ignore-member adopt")
+                member_root = root_of(pool, member_parent)
+                expect_layout(member_parent, {"debug": f"link:{member_root}"})
+                code, _, stderr = oxide(proof, ["build"], "parent-ignore-member build", member_parent)
+                expect(code == 0, f"the adopted parent-ignore checkout did not build: {stderr}")
+                expect("fallback" not in summary(stderr), f"parent-ignore-member: external placement unexpectedly fell back: {summary(stderr)}")
+                expect_layout(member_parent, {"debug": f"link:{member_root}"})
 
-            # Nonvacuous top-level preservation on its own checkout, so the cleaned
-            # `first` checkout never carries a foreign entry.
-            top = make_checkout(proof, "top-level")
-            os.makedirs(os.path.join(top, "target"))
-            control_file = os.path.join(top, "target", "oxide-proof-top-level-control")
-            with open(control_file, "wb") as handle:
-                handle.write(b"control")
-            adopt(proof, top, "top-level adopt")
-            code, _, stderr = oxide(proof, ["build"], "top-level build", top)
-            expect(code == 0, f"top-level build failed: {stderr}")
-            expect(os.path.isfile(control_file) and not os.path.islink(control_file), "the ordinary top-level control file was removed or replaced")
-            expect(perm.read_bytes(control_file) == b"control", "the top-level control file changed")
-            expect_layout(top, {"debug": f"link:{root_of(pool, top)}"})
+                # Nonvacuous top-level preservation on its own checkout, so the cleaned
+                # `first` checkout never carries a foreign entry.
+                top = make_checkout(proof, "top-level")
+                os.makedirs(os.path.join(top, "target"))
+                control_file = os.path.join(top, "target", "oxide-proof-top-level-control")
+                with open(control_file, "wb") as handle:
+                    handle.write(b"control")
+                adopt(proof, top, "top-level adopt")
+                code, _, stderr = oxide(proof, ["build"], "top-level build", top)
+                expect(code == 0, f"top-level build failed: {stderr}")
+                expect(os.path.isfile(control_file) and not os.path.islink(control_file), "the ordinary top-level control file was removed or replaced")
+                expect(perm.read_bytes(control_file) == b"control", "the top-level control file changed")
+                expect_layout(top, {"debug": f"link:{root_of(pool, top)}"})
             DIAG.finished("11.2")
         except BaseException as error:
             DIAG.failed_step(proof, "11.2", error)
@@ -4739,7 +4782,12 @@ def diagnostic_main(proof: Proof, repo: str) -> int:
 def main() -> int:
     ATTACHMENT["uncertain"] = None
     ATTACHMENT["writers_uncertain"] = None
+    global MODE, CASE_IDS
     arguments = sys.argv[1:]
+    if "--base-compat" in arguments:
+        MODE = "base-compat"
+        CASE_IDS = MODE_CASES[MODE]
+        arguments.remove("--base-compat")
     if arguments == ["--plan"]:
         return plan_only()
     if arguments == ["--self-check"]:

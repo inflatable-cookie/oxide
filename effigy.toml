@@ -173,7 +173,7 @@ run = "python3 scripts/test-profile-outputs.py --self-check"
 
 [tasks."rust:profile-outputs"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-profile-outputs.py"
+run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-profile-outputs.py"
 
 # The SAME fixed 20-case proof in its own opt-in diagnostic collection mode
 # (`--diagnostic`, decision 1e4feb57): recoverable oracle failures are recorded
@@ -187,7 +187,15 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 600 --
 # and the unchanged 600 s / 512 MiB bound.
 [tasks."rust:profile-outputs:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-profile-outputs.py --diagnostic"
+run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-profile-outputs.py --diagnostic"
+
+[tasks."rust:profile-outputs:base-compat"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 128 -- python3 scripts/test-profile-outputs.py --base-compat"
+
+[tasks."rust:profile-outputs:base-compat:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 128 -- python3 scripts/test-profile-outputs.py --base-compat --diagnostic"
 
 # Enumerated paths that disappear during accounting (oxide#113): the
 # qualified session supervisor bounds one fixed native proof covering the
