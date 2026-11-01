@@ -28,6 +28,8 @@ mod outputs;
 mod process;
 mod prune;
 mod removable;
+#[allow(dead_code)] // S1 is deliberately unreachable until S2.
+mod scratch_admission;
 #[allow(dead_code)] // Integrated by the cold-seeding front door.
 mod seed_catalog;
 #[allow(dead_code)] // Integrated by the cold-seeding front door.
