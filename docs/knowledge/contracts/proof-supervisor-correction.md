@@ -379,6 +379,22 @@ item remain to be specified and reviewed. This analysis does not authorize a
 speculative group signal, change the existing supervisor, or resolve the
 Cargo-survivor papercut.
 
+**Fixture retention ruling (Tom, 2026-11-01).** On the question of the
+qualified supervisor potentially cleaning scratch after a fixture child leaves
+its session and its owner dies, Tom chose “Stop for redesign”: preserve the
+source findings and hold the fixture until a separately scoped retention
+mechanism is designed. The supervisor's census is limited to its cooperative
+session and previously tracked identities; an escaped, untracked child may be
+classified foreign. Closure additionally depends on output-pipe EOF, but a
+closed pipe is not positive reap or proof of the escaped child's identity or
+writer closure. A nonzero command status alone does not force the guard's
+keep decision. These are source observations, not a native reproduction or a
+claim that all possible designs are impossible. The brief requires uncertain
+custody to retain resources and prohibits both supervisor changes and a new
+supervision harness. Do not launch this fixture or treat its pure decision
+model as native evidence while the retention gap remains unresolved. This
+ruling does not change the retrospective no-go or any product signal authority.
+
 Before implementation, independently review the ownership and deadline
  contract and obtain any necessary operator ruling. First discriminate whether
  the supported macOS child and group lifetime semantics actually support a held
