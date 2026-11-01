@@ -10,6 +10,8 @@ pools are created; no installed binary, host state or network is involved. The s
 inside the 64 MiB gate by single-threaded, single-codegen-unit, debug-free,
 symbol-stripped, size-optimised codegen: the staged tree peaks near 58 MiB,
 the fixtures near 2 MiB, and staging takes about 37 s.
+A fallback to `/private/tmp` exercises the internal path, where the scratch
+declaration is inert; it does not provide scratch-pool coverage.
 
 Every fixture has a private HOME with receipts and a candidate stub, a private
 `OXIDE_POOL` scratch pool with planted control files, a private CARGO_HOME,

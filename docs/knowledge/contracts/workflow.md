@@ -1732,7 +1732,9 @@ necessary.
   whole command: `bounded-test.py` around `scripts/test-installed-handoff.py`
   with a 120 s wall limit and 64 MiB monitored scratch. The supervisor's
   selected-volume root on Builds holds all fixtures; each product child declares
-  that scratch root and an explicit pool cap. The script stages this HEAD's
+  that scratch root and an explicit pool cap. A `/private/tmp` fallback uses
+  the internal path where the declaration is inert, so it is not scratch-pool
+  coverage. The script stages this HEAD's
   debug `oxide` offline with 1.97.1, then exercises private HOME, receipt and
   scratch-pool fixtures with a recording candidate. It covers newer state and
   registration versions, refusals, skipped commands, and a final-release error
