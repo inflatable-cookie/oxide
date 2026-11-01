@@ -9679,6 +9679,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn explicit_adopt_of_committed_whole_target_never_hits_member_transition_hooks() {
+        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
+        for hook in ["prepared", "linked", "renamed"] {
+            let (fixture, legacy) = legacy_checkout();
+            register(&fixture, DriveMode::Permanent);
+            let context = fixture.context();
+            let root = legacy.selected().unwrap().root().to_path_buf();
+            let nonce = read_marker(&root).unwrap().nonce().unwrap().to_owned();
+            let store = pool_store(&fixture.root.join("pool"));
+            std::env::set_var(CRASH_ENVIRONMENT, hook);
+            let result = adopt_at(&context, || Ok(Some(store)));
+            std::env::remove_var(CRASH_ENVIRONMENT);
+            assert_eq!(result, Ok(0), "legacy hook {hook} interrupted migration");
+            let receipt = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt.layout(), LayoutKind::Profile, "{hook}");
+            assert_eq!(receipt.state, ReceiptState::Committed, "{hook}");
+            assert_eq!(read_marker(&root).unwrap().nonce(), Some(nonce.as_str()));
+        }
+    }
+
     /// oxide#182: `oxide outputs plan` on a committed whole-target checkout
     /// that `adopt` would migrate reports that migration — the action, the
     /// members `adopt` classifies, and the root/1→root/2 marker upgrade with

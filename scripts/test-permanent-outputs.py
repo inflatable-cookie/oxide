@@ -131,6 +131,22 @@ def check_image_slot_paths(mount: str) -> None:
             expect(len(os.fsencode(path)) <= 80, f"image slot scratch exceeds 80 bytes: {path}")
 
 
+MIGRATION_HOOKS = ("migration-p0", "migration-staged", "migration-marker", "migration-backed-up", "migration-swapped", "migration-p4")
+LEGACY_HOOKS = ("prepared", "linked", "renamed")
+
+
+def require_migration_fixture(receipt: dict | None, checkout: str, case: str) -> None:
+    expect(receipt is not None and receipt.get("state") == "committed"
+           and receipt.get("version") in ("oxide.outputs.transition/1", "oxide.outputs.transition/2")
+           and receipt.get("checkout") == checkout and os.path.islink(os.path.join(checkout, "target")),
+           f"{case}: migration requires a committed whole-target fixture")
+
+
+def require_legacy_fixture(receipt: dict | None, checkout: str, case: str) -> None:
+    expect(receipt is None and not os.path.lexists(os.path.join(checkout, "target")),
+           f"{case}: transition hook requires a never-converted checkout")
+
+
 def mode_allows(mode: str, case: str) -> bool:
     return (case == "historical-base") if mode == "base-compat" else (case != "historical-base")
 
@@ -1120,49 +1136,44 @@ def run(proof: Proof, repo: str, base_compat: bool = False) -> None:
     set_recorded_uuid(pool, good)
     proof.phase("after the second-command transition")
 
-    # 8b. An active writer blocks the output barrier until it closes.
-    code, _, stderr = proof.oxide(["build", "--bin", "poutputs"], "relink to external before the adopt", app)
-    expect(code == 0 and link_target(link) == external_root, f"pre-adopt relink failed: {stderr}")
-    gate_env = dict(env)
-    gate_env["OXIDE_OUTPUT_GATE"] = gate
-    reset_gate(gate)
-    writer = start_child(proof, [proof.binary, "check"], app, gate_env)
+    # A1: a distinct committed whole-target fixture keeps the later legacy
+    # cases independent of explicit adoption's migration.
+    migration_app = fresh_checkout(proof, root, "writer-migration")
+    migration_root = legacy_whole_target(proof, pool, mount, migration_app, "A1 writer")
+    migration_marker = read_json(os.path.join(migration_root, MARKER))
+    before = read_json(receipt_file(pool, migration_app))
+    require_migration_fixture(before, migration_app, "A1")
+    writer_gate = os.path.join(root, "writer-migration-gate")
+    writer_env = dict(env, OXIDE_OUTPUT_GATE=writer_gate)
+    reset_gate(writer_gate)
+    writer = start_child(proof, [proof.binary, "check"], migration_app, writer_env)
     try:
-        wait_for(os.path.join(gate, "started"), "gated build script")
-        expect(writer.poll() is None, "the gated build exited early")
-        set_recorded_uuid(pool, wrong)
-        waiting = start_child(
-            proof, [proof.binary, "outputs", "adopt"], app, env
-        )
+        wait_for(os.path.join(writer_gate, "started"), "A1 gated writer")
+        expect(writer.poll() is None, "A1 writer exited early")
+        waiting = start_child(proof, [proof.binary, "outputs", "adopt"], migration_app, env)
         time.sleep(2.0)
-        if waiting.poll() is not None:
-            early_out, early_err = waiting.communicate(timeout=5)
-            proof.unclosed.discard(waiting.pid)
-            fail(
-                "outputs adopt did not wait for the active writer in the checkout: "
-                f"exit {waiting.returncode}\n{early_out.decode(errors='replace')}"
-                f"{early_err.decode(errors='replace')}"
-            )
-        expect(link_target(link) == external_root, "a swap redirected the running build")
-        with open(os.path.join(gate, "release"), "wb") as handle:
+        expect(waiting.poll() is None, "A1 adopt did not wait for the writer")
+        expect(os.path.islink(os.path.join(migration_app, "target")), "A1 changed the target while the writer ran")
+        os.makedirs(writer_gate, exist_ok=True)
+        with open(os.path.join(writer_gate, "release"), "wb") as handle:
             handle.write(b"release")
-        writer_code, _, writer_stderr = finish_child(proof, writer, "gated build")
-        expect(writer_code == 0, f"the gated build failed: {writer_stderr}")
-        adopt_code, adopt_stdout, adopt_stderr = finish_child(proof, waiting, "adopt after the writer")
-        expect(adopt_code == 0, f"adopt after the writer failed: {adopt_stdout}{adopt_stderr}")
-        expect(link_target(link) == local_root, "adopt did not relink after the writer closed")
-        expect(
-            os.path.isdir(os.path.join(external_root, "debug")),
-            "the running build did not write to the external root",
-        )
+        writer_code, _, writer_err = finish_child(proof, writer, "A1 writer")
+        expect(writer_code == 0, writer_err)
+        adopt_code, adopt_out, adopt_err = finish_child(proof, waiting, "A1 migration")
+        expect(adopt_code == 0, adopt_out + adopt_err)
+        expect(expect_profile_layout(pool, mount, migration_app, "A1 migration") == migration_root,
+               "A1 changed the selected root")
+        after = read_json(receipt_file(pool, migration_app))
+        expect(after["version"] == "oxide.outputs.transition/3", "A1 did not publish /3")
+        expect(read_json(os.path.join(migration_root, MARKER))["nonce"] == migration_marker["nonce"],
+               "A1 changed the root nonce")
     finally:
-        os.makedirs(gate, exist_ok=True)
-        with open(os.path.join(gate, "release"), "wb") as handle:
+        os.makedirs(writer_gate, exist_ok=True)
+        with open(os.path.join(writer_gate, "release"), "wb") as handle:
             handle.write(b"release")
         if writer.poll() is None:
             writer.kill()
-    set_recorded_uuid(pool, good)
-    proof.phase("after the writer barrier")
+    proof.phase("after A1 writer and migration")
 
     # 8c. A long-lived exec in the checkout does not block a second command
     #     whose destination is unchanged (the second-slot rule), and the exec
@@ -1263,69 +1274,49 @@ def run(proof: Proof, repo: str, base_compat: bool = False) -> None:
     expect(code == 0 and link_target(link) == external_root, f"ancestor restore failed: {stderr}")
     proof.phase("after the barrier and ancestor controls")
 
-    # 9. Crash replay at each write-ahead point.
-    expect(receipt_path(pool, app) and read_json(receipt_path(pool, app))["state"] == "committed", read_json(receipt_path(pool, app)))
-    # Start from the checkout-local root so the first injection has a
-    # transition to stop in.
-    set_recorded_uuid(pool, wrong)
-    code, _, stderr = proof.oxide(["check"], "local root before the first crash", app)
-    expect(code == 0 and link_target(link) == local_root, stderr)
-    set_recorded_uuid(pool, good)
-    crash_env = dict(env)
-    crash_env["OXIDE_TEST_OUTPUTS_CRASH"] = "prepared"
-    code, _, stderr = oxide_env(
-        proof, ["outputs", "adopt"], "injected stop after the prepared receipt", app, crash_env
-    )
-    expect(code != 0 and "injected transition stop" in stderr, stderr)
-    prepared = read_json(receipt_path(pool, app))
-    expect(prepared["state"] == "prepared" and prepared["prepared"], prepared)
-    expect(link_target(link) == local_root, "the prepared receipt changed the live link")
-    code, stdout, stderr = proof.oxide(["outputs", "adopt"], "replay a prepared receipt", app)
-    expect(code == 0 and link_target(link) == external_root, f"replay failed: {stdout}{stderr}")
-    replay = read_json(receipt_path(pool, app))
-    expect(replay["state"] == "committed" and replay["generation"] == prepared["prepared"]["generation"], replay)
-
-    for point in ("linked", "renamed"):
-        set_recorded_uuid(pool, wrong)
-        code, _, stderr = proof.oxide(["check"], f"local root before the {point} crash", app)
-        expect(code == 0 and link_target(link) == local_root, stderr)
-        set_recorded_uuid(pool, good)
-        crash_env["OXIDE_TEST_OUTPUTS_CRASH"] = point
-        code, _, stderr = oxide_env(
-            proof, ["outputs", "adopt"], f"injected stop after {point}", app, crash_env
-        )
-        expect(code != 0 and "injected transition stop" in stderr, stderr)
-        prepared = read_json(receipt_path(pool, app))
-        expect(prepared["state"] == "prepared", prepared)
-        if point == "linked":
-            expect(link_target(link) == local_root, "the linked crash moved the live link")
-            sibling = os.path.join(app, ".target.oxide-new-%d" % prepared["prepared"]["generation"])
-            expect(os.path.islink(sibling), f"no prepared sibling at {sibling}")
-            # A registration that no longer names the prepared root's volume
-            # stops the replay before its rename: link, sibling and receipt kept.
-            prepared_bytes = read_bytes(receipt_path(pool, app))
-            set_recorded_uuid(pool, wrong)
-            code, _, stderr = proof.oxide(["outputs", "adopt"], "replay with a wrong UUID refuses", app)
-            expect(code != 0 and "cannot be replayed" in stderr, stderr)
-            expect(link_target(link) == local_root, "the refused replay moved the live link")
-            expect(os.path.islink(sibling), "the refused replay removed the sibling")
-            expect(read_bytes(receipt_path(pool, app)) == prepared_bytes, "the refused replay rewrote the receipt")
-            set_recorded_uuid(pool, good)
+    # A2: each migration phase gets a new committed whole-target fixture.
+    # The root/1 control makes the optional marker-upgrade hook reachable.
+    for point in MIGRATION_HOOKS:
+        checkout = fresh_checkout(proof, root, "migration-" + point)
+        if point == "migration-marker":
+            migration_root, _, _ = version_one_whole_target(proof, pool, mount, checkout, point)
         else:
-            expect(link_target(link) == external_root, "the renamed crash did not publish the link")
-        code, stdout, stderr = proof.oxide(["outputs", "adopt"], f"replay after {point}", app)
-        expect(code == 0 and link_target(link) == external_root, f"{point} replay failed: {stdout}{stderr}")
-        expect(
-            read_json(receipt_path(pool, app))["state"] == "committed",
-            f"{point} replay did not commit",
-        )
-        expect(
-            not glob.glob(os.path.join(app, ".target.oxide-new-*")),
-            "a prepared sibling was left behind",
-        )
-    code, stdout, _ = proof.oxide(["outputs", "adopt"], "idempotent adopt", app)
-    expect(code == 0 and "already selects" in stdout, stdout)
-    proof.phase("after crash replay")
+            migration_root = legacy_whole_target(proof, pool, mount, checkout, point)
+        before = read_json(receipt_file(pool, checkout))
+        require_migration_fixture(before, checkout, point)
+        old_marker = read_json(os.path.join(migration_root, MARKER))
+        crash_env = dict(env, OXIDE_TEST_OUTPUTS_CRASH=point)
+        code, _, stderr = oxide_env(proof, ["outputs", "adopt"], point, checkout, crash_env)
+        expect(code != 0 and "injected transition stop" in stderr, f"{point}: {stderr}")
+        journal = read_json(receipt_file(pool, checkout))
+        expect(journal.get("transition") is not None, f"{point}: no migration journal: {journal}")
+        code, stdout, stderr = proof.oxide(["outputs", "adopt"], point + " replay", checkout)
+        expect(code == 0, f"{point}: replay failed: {stdout}{stderr}")
+        expect(expect_profile_layout(pool, mount, checkout, point) == migration_root,
+               f"{point}: migration changed root")
+        final = read_json(receipt_file(pool, checkout))
+        expect(final["version"] == "oxide.outputs.transition/3" and not final.get("transition"),
+               f"{point}: migration did not settle: {final}")
+        if "nonce" in old_marker:
+            expect(read_json(os.path.join(migration_root, MARKER))["nonce"] == old_marker["nonce"],
+                   f"{point}: migration changed nonce")
+        print(f"A2 {point}: stopped, replayed and committed", flush=True)
+    # L1-L3: the current profile first-adopt path reaches transition_at's
+    # prepared/linked/renamed hooks. No receipt exists before each attempt.
+    for point in LEGACY_HOOKS:
+        checkout = fresh_checkout(proof, root, "legacy-hook-" + point)
+        require_legacy_fixture(None, checkout, point)
+        expect(not os.path.exists(receipt_file(pool, checkout)), f"{point}: receipt already exists")
+        crash_env = dict(env, OXIDE_TEST_OUTPUTS_CRASH=point)
+        code, _, stderr = oxide_env(proof, ["outputs", "adopt"], point, checkout, crash_env)
+        expect(code != 0 and "injected transition stop" in stderr, f"{point}: {stderr}")
+        pending = read_json(receipt_file(pool, checkout))
+        expect(pending["state"] == "prepared", f"{point}: no prepared receipt")
+        code, stdout, stderr = proof.oxide(["outputs", "adopt"], point + " replay", checkout)
+        expect(code == 0, f"{point}: replay failed: {stdout}{stderr}")
+        expect_profile_layout(pool, mount, checkout, point)
+        print(f"L {point}: stopped, replayed and committed", flush=True)
+    proof.phase("after A2 migration and L1-L3 replay")
 
     # 9b. A same-device symlink in place of `.oxide-outputs` is not the real
     #     checkout-local root: build and clean refuse and the tree it points
@@ -3327,6 +3318,27 @@ def exec_self_test() -> None:
             pass
         else:
             fail("overlong image slot scratch was accepted")
+
+    expect(set(MIGRATION_HOOKS).isdisjoint(LEGACY_HOOKS), "hook families overlap")
+    committed = {"state": "committed", "version": "oxide.outputs.transition/2", "checkout": "/c"}
+    with patch("os.path.islink", return_value=True), patch("os.path.lexists", return_value=False):
+        require_migration_fixture(committed, "/c", "A1")
+        for case in MIGRATION_HOOKS:
+            require_migration_fixture(committed, "/c", case)
+        for case in LEGACY_HOOKS:
+            require_legacy_fixture(None, "/c", case)
+            try:
+                require_legacy_fixture(committed, "/c", case)
+            except RuntimeError:
+                pass
+            else:
+                fail(f"{case} accepted a committed migration fixture")
+        try:
+            require_migration_fixture(None, "/c", "A2")
+        except RuntimeError:
+            pass
+        else:
+            fail("A2 accepted a never-converted fixture")
 
     ran: list[str] = []
 
