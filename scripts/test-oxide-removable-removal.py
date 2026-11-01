@@ -33,8 +33,8 @@ The fixture's own directory-budget pool is a DECLARED SCRATCH POOL
 oxide#212): `private_environment` canonicalizes the run root once, creates one
 private `0700` `OXIDE_SCRATCH_ROOT` inside it, keeps `OXIDE_POOL` strictly
 inside that root and sets an explicit `OXIDE_POOL_CAP`, after dropping every
-inherited `OXIDE_*` value. The root lives on the supervisor-selected volume
-(Builds), so the S3 scratch route admits the pool where the ordinary admission
+inherited `OXIDE_*` value. The root lives on the supervisor-selected validation
+volume, so the S3 scratch route admits the pool where the ordinary admission
 would refuse an external path; the selectors pass no `--root-parent
 /private/tmp`. On a `/private/tmp` guard fallback the declaration is inert —
 ordinary admission already succeeds on the internal volume — so such a run is
@@ -258,6 +258,7 @@ def check_product_oracles() -> int:
             f"product oracle {label!r} is gone from {relative}; re-sweep the proof's oracles",
         )
     return len(PRODUCT_ORACLES)
+
 
 # The boot-session closure mode (oxide#161): a marker only a candidate with
 # the boot fact carries, the ONE debug-only override that names a boot time,
@@ -3226,6 +3227,7 @@ def self_check() -> int:
         check_product_oracles() == len(PRODUCT_ORACLES),
         "the product oracle sweep did not check every pinned line",
     )
+
     # The shared staging helper's narrowly scoped retention opt-in, exercised
     # through the REAL `layout.stage_at` route with a fake staged build (no
     # Cargo): the default removes the staged tree exactly as before, and the
