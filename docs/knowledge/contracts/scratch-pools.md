@@ -1,11 +1,11 @@
 # Scratch build pools on an external validation volume
 
-**Status: S1–S3 implemented; migration slices remain proposed.** This contract records
+**Status: S1–S3 implemented; S4 migrations proceed one proof at a time.** This contract records
 a design for an explicit, UUID-bound `directory-budget-v1` "scratch pool" on a verified external
 volume, so validation and proof fixtures can keep their scratch on the Builds
 drive instead of declaring the internal-root exception (decision `bd357a4c`) for
 `/private/tmp`. S1 adds typed path judgement and an unreachable pure scratch
-admission decision. S2 wired read-only admission; S3 adds creation, binding and leased-open repair with a focused proof. No migration recipe, host setting or real pool change is implied. The internal-root exception stays
+admission decision. S2 wired read-only admission; S3 adds creation, binding and leased-open repair with a focused proof. No host setting or real pool change is implied. The internal-root exception stays
 current truth until each slice below lands and passes its own review. Oxide#173.
 
 Owning neighbours: [workflow](workflow.md#temporary-scratch-placement) owns
@@ -313,6 +313,8 @@ never a raw path dump, bounded and escaped as today.
 
 ## Migration list
 
+`rust:holding-delete` and its diagnostic now use a scratch pool under the supervisor-selected volume (oxide#202); their native evidence must be established at the migrated head.
+
 `bd357a4c` is only about `--root-parent /private/tmp`. Pool premise is read from
 each script's own selector text and case bodies.
 
@@ -347,7 +349,7 @@ Not in scope: proofs that never carried `bd357a4c` but assert their own
 `rust:oxide-finder-metadata`, `rust:oxide-pool-layout`). They migrate, if at
 all, in their own briefs with their own activations. `rust:front-door-accounting` uses the S4 migration: both fixture pools use the selected-volume scratch root; its diagnostic and native evidence at the migrated head remain pending.
 
-## Recipe changes (design, not applied)
+## Recipe changes
 
 The supervisor needs no change: with no caller root it already puts its owned
 root in `<mount>/scratch/oxide` of the selected volume, and falls back to
