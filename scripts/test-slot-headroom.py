@@ -1137,6 +1137,18 @@ def self_check() -> None:
         == os.path.join(self_slots, "fences-abc", "quick-257"),
         "the labelled own-slot walk root is wrong",
     )
+    # Exercise the child environment builder without creating a pool.
+    fixture_pool = os.path.join(SCRATCH_POOL_ROOT, "pool-self-check")
+    env = base_env(None, fixture_pool)
+    expect(env["OXIDE_SCRATCH_ROOT"] == os.path.join(ROOT, "scratch-pools"), "scratch root contract")
+    expect(env["OXIDE_POOL"] == fixture_pool and env["OXIDE_POOL_CAP"] == "64MiB", "pool contract")
+    expect(env["TMPDIR"] == ROOT, "temporary storage contract")
+    try:
+        base_env(None, os.path.join(ROOT, "outside-pool"))
+    except Exception:
+        pass
+    else:
+        fail("pool outside scratch root was accepted")
     print("slot-headroom self-check PASS: diagnostic collection, taint, abort, receipt bounds and own-slot walk paths", flush=True)
 
 
