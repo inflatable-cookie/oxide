@@ -3441,6 +3441,10 @@ def self_check() -> int:
         layout_pre_creates_pool("/x/pt", constructor_paths("/x/pt") + ["/x/pt/p/fx"]),
     )
     property_true("the pool path is the product's own directory", probe.pool == "/x/pt/p")
+    property_true("scratch declaration and cap bind the pool",
+                  probe.base.get("OXIDE_SCRATCH_ROOT") == "/x/pt"
+                  and is_inside(probe.pool, probe.base["OXIDE_SCRATCH_ROOT"])
+                  and probe.base.get("OXIDE_POOL_CAP") == "64MiB")
     property_true(
         "the fixture directory is never inside the pool",
         not is_inside("/x/pt/fx", probe.pool),
