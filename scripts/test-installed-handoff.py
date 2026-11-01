@@ -971,6 +971,18 @@ def empty_outcome():
             "aborted": None}
 
 
+def diagnostic_exit(outcome):
+    """A clean collection is still unqualified; incomplete evidence is failure."""
+    clean = (outcome["qualified"] is False and not outcome["failed"]
+             and outcome["aborted"] is None and outcome["active"] is None
+             and not outcome["unexecuted_groups"]
+             and outcome["groups_completed"] == [name for name, _ in GROUPS]
+             and outcome["reached"] == list(CASE_PLAN)
+             and outcome["completed"] == list(CASE_PLAN)
+             and outcome["states"] == {name: "completed" for name in CASE_PLAN})
+    return 0 if clean else 1
+
+
 def self_check():
     outcome = empty_outcome()
     calls = []
@@ -986,6 +998,24 @@ def self_check():
     collect((("one", 1), ("two", 2)), invoke, outcome, lambda: True)
     assert calls == [1] and outcome["unexecuted_groups"] == ["two"]
     assert outcome["aborted"] and outcome["qualified"] is False
+    assert diagnostic_exit(outcome) == 1
+    clean = empty_outcome()
+    clean["groups_completed"] = [name for name, _ in GROUPS]
+    clean["reached"] = list(CASE_PLAN)
+    clean["completed"] = list(CASE_PLAN)
+    clean["states"] = {name: "completed" for name in CASE_PLAN}
+    assert diagnostic_exit(clean) == 0 and clean["qualified"] is False
+    clean["states"][CASE_PLAN[-1]] = "unexecuted"
+    assert diagnostic_exit(clean) == 1
+    clean["states"][CASE_PLAN[-1]] = "completed"
+    clean["failed"].append({"case": CASE_PLAN[0]})
+    assert diagnostic_exit(clean) == 1
+    clean["failed"].clear()
+    clean["aborted"] = "uncertain"
+    assert diagnostic_exit(clean) == 1
+    clean["aborted"] = None
+    clean["qualified"] = True
+    assert diagnostic_exit(clean) == 1
     assert parse_mode([]) == "native" and parse_mode(["--diagnostic"]) == "diagnostic"
     assert parse_mode(["--self-check"]) == "self-check" and parse_mode(["--plan"]) == "plan"
     assert parse_mode(["--diagnostic", "--plan"]) is None
@@ -1066,7 +1096,7 @@ def main() -> int:
             # Each group launches product children, so a failure after launch
             # is conservatively an unknown writer outcome.
             collect(GROUPS, lambda body: body(root, binary), outcome, lambda: True)
-            return 1
+            return diagnostic_exit(outcome)
         for _, body in GROUPS:
             body(root, binary)
         with open(os.path.join(evidence, "installed-handoff.txt"), "w", encoding="utf-8") as handle:
