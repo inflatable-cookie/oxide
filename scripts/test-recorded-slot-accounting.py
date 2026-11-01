@@ -17,7 +17,7 @@ before that HOME exists and handed to staging and every fixture child with
 `RUSTUP_TOOLCHAIN=1.97.1`, `RUSTUP_AUTO_INSTALL=0` and offline Cargo; every
 `--locked` call is preceded by a manifest-consistent `Cargo.lock`; a pool path
 is absent until the product creates it. Byte pressure is driven by the
-documented `OXIDE_POOL_CAP` soft byte budget (applied at pool creation), never
+documented `OXIDE_POOL_CAP` soft byte budget (applied at creation and admission), never
 by a proof-invented variable.
 
 The directory-budget fact is the product's own serialized `config.json`
@@ -93,10 +93,10 @@ SHUTDOWN_MARGIN_S = 30
 # Bytes the fixture build script writes into its slot, so a slot is visibly
 # large enough that a walk would be visible in the log.
 SLOT_FILLER_BYTES = 3 * MIB
-# The documented `OXIDE_POOL_CAP` soft byte budgets (applied at creation).
+# The documented `OXIDE_POOL_CAP` soft byte budgets.
 GENEROUS_BUDGET = 64 * MIB
 PRESSURE_BUDGET = 8 * MIB
-OVERCOUNT_BUDGET = 6 * MIB
+OLD_OVERCOUNT_BUDGET = 6 * MIB  # Historical pre-Builds fixture value.
 # The shared hard-link payload for case E.
 SHARED_INODE_BYTES = 4 * MIB
 RECORDED_TOTAL_NEEDLE = "recorded slot sizes (ledger):"
@@ -128,6 +128,7 @@ PENDING_ABORT: bool = False
 # Set by the pure modes: a check there always raises, never exits the process.
 PURE_MODE: bool = False
 DIAGNOSTIC_MODE = DIAGNOSTIC in sys.argv
+CASE_E_BUDGET: dict[str, int] = {}
 
 
 # --------------------------------------------------------------------------
@@ -683,6 +684,32 @@ def union_allocated(roots: list[str]) -> tuple[int, int]:
                 seen.add(key)
                 total += info.st_blocks * 512
     return total, len(seen)
+
+
+def per_name_allocated(roots: list[str]) -> int:
+    """Allocated bytes for each regular-file name in the fixture slot trees."""
+    total = 0
+    for root in roots:
+        for base, directories, files in os.walk(root):
+            directories.sort()
+            for name in sorted(files):
+                path = os.path.join(base, name)
+                info = os.lstat(path)
+                if not os.path.islink(path) and os.path.isfile(path):
+                    total += info.st_blocks * 512
+    return total
+
+
+def select_overcount_budget(union: int, per_name: int, recorded: int) -> dict[str, int]:
+    """Leave a positive margin on both sides and force recorded pressure."""
+    upper = min(per_name, recorded)
+    if union < 0 or upper - union < 2:
+        raise CaseFailure("no integer budget strictly between union and both sums", abort=False)
+    budget = union + (upper - union) // 2
+    return {"union_bytes": union, "per_name_bytes": per_name, "recorded_sum_bytes": recorded,
+            "budget_bytes": budget, "union_margin_bytes": budget - union,
+            "per_name_margin_bytes": per_name - budget,
+            "recorded_margin_bytes": recorded - budget}
 
 
 def file_identity(path: str) -> tuple[int, int, int, int]:
@@ -1333,7 +1360,7 @@ def case_d_byte_pressure_evicts_only_the_idle_slot(root: str, subject: str) -> N
 
 def case_e_cross_slot_hard_link_overcount(root: str, subject: str) -> None:
     case("e_cross_slot_hard_link_overcount")
-    fx = Fixture(root, "e", budget_bytes=OVERCOUNT_BUDGET)
+    fx = Fixture(root, "e", budget_bytes=GENEROUS_BUDGET)
     shared = os.path.join(fx.root, "shared inode.bin")
     with open(shared, "wb") as handle:
         handle.write(b"h" * SHARED_INODE_BYTES)
@@ -1358,33 +1385,24 @@ def case_e_cross_slot_hard_link_overcount(root: str, subject: str) -> None:
         shared_inode_precondition([root_a, root_b], shared_key),
         "the shared inode is not present in both slot trees",
     )
-    # The union is the *fixture's own* device/inode union, not a product
-    # measurement claim: it exists only to prove the 6 MiB budget sits between
-    # the two figures the design distinguishes.
+    # Measure actual allocation on this filesystem, including every file name.
+    # The admission cap is supplied through the documented environment, not a
+    # rewrite of the pool's creation record or a debug-only budget override.
     union_bytes, union_inodes = union_allocated([root_a, root_b])
+    per_name_bytes = per_name_allocated([root_a, root_b])
+    CASE_E_BUDGET.clear()
+    CASE_E_BUDGET.update(union_bytes=union_bytes, per_name_bytes=per_name_bytes,
+                         recorded_sum_bytes=recorded_sum)
+    CASE_E_BUDGET.update(select_overcount_budget(union_bytes, per_name_bytes, recorded_sum))
+    budget = CASE_E_BUDGET["budget_bytes"]
+    fx.budget_bytes = budget
     survivor_record = min(fx.recorded(slot)["unique_bytes"] for slot in idle)
-    print(
-        f"  case e premise: fixture union={union_bytes} ({union_inodes} inodes)"
-        f" recorded sum={recorded_sum} survivor record={survivor_record}"
-        f" (budget {OVERCOUNT_BUDGET})",
-        flush=True,
-    )
-    expect(
-        recorded_sum >= 2 * SHARED_INODE_BYTES,
-        f"the recorded sum ({recorded_sum}) did not count the shared inode twice",
-    )
-    expect(
-        recorded_sum >= OVERCOUNT_BUDGET,
-        f"the recorded sum ({recorded_sum}) is not at or above the budget",
-    )
-    expect(
-        union_bytes < OVERCOUNT_BUDGET,
-        f"the fixture union ({union_bytes}) is already at or above the budget",
-    )
-    expect(
-        survivor_record < OVERCOUNT_BUDGET,
-        f"one surviving record ({survivor_record}) is at or above the budget",
-    )
+    print(f"  case e premise: {CASE_E_BUDGET}, union inodes={union_inodes},"
+          f" survivor record={survivor_record}", flush=True)
+    expect(recorded_sum >= 2 * SHARED_INODE_BYTES,
+           f"the recorded sum ({recorded_sum}) did not count the shared inode twice")
+    expect(survivor_record < budget,
+           f"one surviving record ({survivor_record}) is at or above the budget")
 
     fx.reset_logs()
     before = fx.walks()
@@ -1776,7 +1794,7 @@ def case_states() -> dict[str, str]:
 
 
 def receipt_document(head: str, script_hash: str, guard_hash: str, subject_hash: str | None,
-                      evidence: str) -> dict:
+                      evidence: str, mode: str = "diagnostic") -> dict:
     states = case_states()
     counts = {
         "pass": sum(1 for state in states.values() if state == "pass"),
@@ -1787,7 +1805,7 @@ def receipt_document(head: str, script_hash: str, guard_hash: str, subject_hash:
     }
     document = {
         "schema": "oxide.recorded-slot-accounting.receipt/2",
-        "mode": "diagnostic",
+        "mode": mode,
         "qualified": False,
         "head": head,
         "script_sha256": script_hash,
@@ -1797,6 +1815,7 @@ def receipt_document(head: str, script_hash: str, guard_hash: str, subject_hash:
                       "installed": TOOLCHAIN_INSTALLED},
         "premises": PREMISES,
         "premise_checklist": PREMISE_CHECKLIST,
+        "case_e_budget": dict(CASE_E_BUDGET) if CASE_E_BUDGET else None,
         "dependencies": DEPENDS,
         "case_states": states,
         "counts": counts,
@@ -1817,7 +1836,7 @@ def receipt_document(head: str, script_hash: str, guard_hash: str, subject_hash:
             "receipt_bytes": MAX_RECEIPT_BYTES,
             "receipt_entries": MAX_RECEIPT_ENTRIES,
         },
-        "claim": "uncounted diagnostic collection; never a PASS, closure or native credit",
+        "claim": "fixture observations only; not a guard closure or native qualification",
     }
     encoded = json.dumps(document, indent=2, sort_keys=True)
     if len(encoded.encode()) > MAX_RECEIPT_BYTES:
@@ -1834,7 +1853,7 @@ def receipt_document(head: str, script_hash: str, guard_hash: str, subject_hash:
 def write_receipt(evidence: str, document: dict) -> str:
     path = os.path.join(
         evidence,
-        f"recorded-slot-accounting-diagnostic-{os.getpid()}-{time.time_ns()}.json",
+        f"recorded-slot-accounting-{'diagnostic' if DIAGNOSTIC_MODE else 'counted'}-{os.getpid()}-{time.time_ns()}.json",
     )
     try:
         with open(path, "w", encoding="utf-8") as handle:
@@ -1851,10 +1870,11 @@ def write_receipt(evidence: str, document: dict) -> str:
 ALLOCATION = {
     "product_controls": {
         "budget_env": "OXIDE_POOL_CAP",
-        "budget_semantics": "soft byte budget applied at pool creation",
+        "budget_semantics": "soft byte budget applied at creation and each admission",
         "generous_budget_bytes": GENEROUS_BUDGET,
         "pressure_budget_bytes": PRESSURE_BUDGET,
-        "overcount_budget_bytes": OVERCOUNT_BUDGET,
+        "overcount_budget": "midpoint between measured union and the smaller of per-name and recorded sums",
+        "historical_overcount_budget_bytes": OLD_OVERCOUNT_BUDGET,
     },
     "phases": {
         "admission": "read while the gated command is Held, before its release",
@@ -1915,6 +1935,27 @@ def self_check() -> None:
     finally:
         os.environ.clear()
         os.environ.update(saved_env)
+    # f3afed4 Builds diagnostic: the old cap is below the observed union.
+    observed_union = 7_823_360
+    synthetic_sum = observed_union + 4 * MIB
+    expect(OLD_OVERCOUNT_BUDGET <= observed_union, "historical counterfactual changed")
+    chosen = select_overcount_budget(observed_union, synthetic_sum, synthetic_sum)
+    expect(chosen["union_bytes"] < chosen["budget_bytes"] < chosen["per_name_bytes"]
+           and chosen["union_margin_bytes"] > 0 and chosen["per_name_margin_bytes"] > 0,
+           "measured budget counterfactual failed")
+    CASE_E_BUDGET.update(chosen)
+    receipt = receipt_document("a" * 40, "b" * 64, GUARD_SHA256, None, "/nonexistent")
+    expect(receipt["case_e_budget"] == chosen, "receipt lost measured budget and margins")
+    CASE_E_BUDGET.clear()
+    expect(select_overcount_budget(10, 20, 16)["budget_bytes"] == 13,
+           "recorded sum did not constrain the budget")
+    for values in ((10, 10, 20), (10, 11, 20), (10, 20, 10)):
+        try:
+            select_overcount_budget(*values)
+        except CaseFailure:
+            pass
+        else:
+            fail(f"invalid overcount interval accepted: {values}")
     # R1 — the render functions the counted run actually calls.
     rendered = render_build_rs(SLOT_FILLER_BYTES)
     expect("__SLOT_FILLER_BYTES__" not in rendered, "the filler placeholder survived")
@@ -2050,6 +2091,8 @@ def self_check() -> None:
     document = receipt_document("a" * 40, "b" * 64, GUARD_SHA256, "c" * 64, "/nonexistent")
     expect(document["mode"] == "diagnostic", "the receipt is not a diagnostic receipt")
     expect(document["qualified"] is False, "a diagnostic receipt claimed qualification")
+    counted = receipt_document("a" * 40, "b" * 64, GUARD_SHA256, None, "/nonexistent", "counted")
+    expect(counted["mode"] == "counted" and counted["qualified"] is False, "counted receipt claimed qualification")
     expect(len(json.dumps(document).encode()) <= MAX_RECEIPT_BYTES, "the receipt exceeds its bound")
     expect(document["counts"]["planned"] == len(CASE_NAMES), "the receipt lost planned cases")
     long_failure = "x" * (MAX_RECEIPT_EXCERPT * 4)
@@ -2680,14 +2723,17 @@ def main() -> None:
         else:
             raise
     finally:
-        if DIAGNOSTIC_MODE and evidence:
+        if evidence:
             try:
-                document = receipt_document(head, script_hash, guard_hash, subject_hash or "", evidence)
+                document = receipt_document(head, script_hash, guard_hash, subject_hash or "", evidence,
+                                            "diagnostic" if DIAGNOSTIC_MODE else "counted")
                 path = write_receipt(evidence, document)
-                print(f"diagnostic receipt: {path}")
+                print(f"fixture receipt: {path}")
             except CaseFailure as receipt_failure:
                 SECONDARY.append(f"receipt: {receipt_failure}")
-                print(f"diagnostic receipt failed: {receipt_failure}", flush=True)
+                print(f"fixture receipt failed: {receipt_failure}", flush=True)
+                if not DIAGNOSTIC_MODE:
+                    raise SystemExit(1)
                 exit_code = 1
 
     if DIAGNOSTIC_MODE:

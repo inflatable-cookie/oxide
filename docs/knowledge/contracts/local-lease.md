@@ -1691,7 +1691,7 @@ shared supervisor): tiny private fixtures only, debug staging with
   asserts an empty walk log: neither the 256-slot pool ceiling nor the
   twelve-slot project cap has a cheap CLI fixture, and `OXIDE_POOL_CAP` is a
   byte budget, not a slot count. Byte pressure in the CLI proof comes from that
-  documented budget at pool creation, never from a proof-invented variable;
+  documented budget at pool creation or admission, never from a proof-invented variable;
 - B: one unrecorded idle slot → exactly one slot walk, published, and the
   second admission of the same shape walks nothing;
 - C: release publishes a record and the next reuse clears it, with the result
@@ -1703,8 +1703,15 @@ shared supervisor): tiny private fixtures only, debug staging with
   `recorded_backend()`, which refuses a missing, malformed, unknown or
   removable backend by name; the ledger records no backend at all, so no case
   may read one from there;
-- E: cross-slot hard-link overcount (sum ≥ union) plus a refusal case with
-  untouched bytes/inodes;
+- E: cross-slot hard-link overcount. After both slots are built under a
+  generous cap, the fixture measures allocated unique-inode union and per-name
+  sum, and sets `OXIDE_POOL_CAP` for admission to the midpoint between the
+  union and the smaller of the per-name and recorded sums. It requires positive
+  margins and a surviving record below the cap. The fixture receipt records
+  both measurements, the recorded sum, chosen cap and margins. The prior
+  uncounted Builds diagnostic at `f3afed4` passed A–D but failed E before its
+  oracle: the old 6 MiB cap was below the 7,823,360-byte union. It is history,
+  not native credit; the changed head needs a fresh diagnostic and native chain;
 - F: legacy ledger convergence across two admissions and one crash replay;
 - G: default `status` shows recorded totals and walks nothing; `--measure`
   walks and still writes nothing.
@@ -1730,7 +1737,9 @@ cases whose prerequisites are intact, writes one uniquely named bounded
 receipt in the evidence root labelled `mode: diagnostic`,
 `qualified: false`, with reached/completed/failed/skipped/unexecuted counts,
 every reason, the taint set, the primary and secondary errors, and explicit
-incomplete counts at its bounds. Counted default stays fail-fast. Any unknown
+incomplete counts at its bounds. Counted default stays fail-fast and also
+writes a bounded fixture receipt with the case E measurements; neither receipt
+claims supervisor closure. Any unknown
 child/writer/device effect, pending custody, timeout, infrastructure or
 protocol failure aborts rather than continuing; nothing is repaired by
 assumption; a non-zero direct leader exit is never read as descendant closure.
@@ -1773,6 +1782,13 @@ and the new scope log — are `debug_assertions`-gated, which the staging recipe
 keeps on and the fixture checks through the built-in capability probe before
 any case asserts a count, and a release build must refuse control presence at
 any value.
+
+The allocation-sensitive fixture sweep retained D's 8 MiB cap: its held-slot,
+stray and idle-record measurements explicitly require pressure and relief, and
+D passed in the historical diagnostic. C's 3 MiB filler is an asserted minimum,
+not a budget boundary, and passed there; the generous 64 MiB cap supports A–C,
+F and G without a demonstrated stale assumption. No result from that diagnostic
+is carried as credit for the changed head.
 
 **Recipe binding.** Fixture directory-budget pools use an explicit cap and
 `OXIDE_SCRATCH_ROOT` within the supervisor's selected-volume run root.
