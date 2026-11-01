@@ -4431,10 +4431,43 @@ def run(proof: Proof, repo: str) -> None:
             code, stdout, stderr = oxide(proof, ["outputs", "prune", "--dry-run"], "20 peer keep", group)
             expect(code == 0, f"20: the peer-reference dry run failed: {stderr}")
             kept_preview = json.loads(stdout)
-            expect(
-                not any(candidate["root"] == gone_root for candidate in kept_preview["candidates"]),
-                f"20: another checkout's reference did not keep the root: {kept_preview['candidates']}",
-            )
+            # This deliberately mismatched synthetic receipt names `target`,
+            # while the copied registry rows name profile members. The product
+            # must conservatively keep the entire batch before per-root reasons.
+            expect(incomplete_peer_preview(kept_preview, gone_root),
+                   f"20: inconsistent snapshot did not keep the whole batch: {kept_preview}")
+
+            # Reconcile this fixture-created contradiction, not product state:
+            # the real gone checkout's profile receipt supplies the exact member
+            # selections represented by its rows; give that document the peer's
+            # checkout identity. The synthetic peer is still not a bind-produced
+            # receipt. Keep only selected source rows, with their original member
+            # names and identity facts, and publish one consistent fixture pair.
+            peer_receipt = perm.read_json(receipt_file(pool, gone))
+            peer_receipt["checkout"] = peer
+            peer_receipt["checkout_id"] = peer_id
+            registry["rows"] = [row for row in registry["rows"] if row["checkout_id"] != peer_id]
+            for row in rows:
+                if not row.get("selected"):
+                    continue
+                reference = dict(row)
+                reference.update(checkout_id=peer_id, checkout=peer, receipt=peer_receipt_path,
+                                 pending=False, pruning=None, pruned_ms=None,
+                                 reservation=None, cancelling=None)
+                registry["rows"].append(reference)
+            registry["revision"] += 1
+            with open(peer_receipt_path, "w", encoding="utf-8") as handle:
+                json.dump(peer_receipt, handle, indent=2)
+                handle.write("\n")
+            os.chmod(peer_receipt_path, 0o600)
+            with open(registry_path, "w", encoding="utf-8") as handle:
+                json.dump(registry, handle, indent=2)
+                handle.write("\n")
+            os.chmod(registry_path, 0o600)
+            code, stdout, stderr = oxide(proof, ["outputs", "prune", "--dry-run"], "20 reconciled peer keep", group)
+            expect(code == 0, f"20: reconciled peer preview failed: exit {code}: {stderr[-2000:]}")
+            kept_preview = json.loads(stdout)
+            expect(not any(candidate["root"] == gone_root for candidate in kept_preview["candidates"]), "20: reconciled peer did not keep root")
 
             expect(os.path.isdir(gone_root), "20: the peer-referenced root was removed")
             kept_reason = next(
@@ -4723,6 +4756,14 @@ USAGE = (
 )
 
 
+def incomplete_peer_preview(preview: dict, root: str) -> bool:
+    reason = "the registry snapshot is incomplete (a receipt reference is missing or contradictory in the registry); the whole batch is kept"
+    kept = preview.get("kept", [])
+    return (not preview.get("candidates") and bool(kept)
+            and all(entry.get("reason") == reason for entry in kept)
+            and any(entry.get("root") == root for entry in kept))
+
+
 def pure_scratch_path_contract() -> None:
     # Product layout: slots/<unique 2-byte label>-<8 hex>/<profile>-<u64>/scratch.
     # Unique checkout labels and the fresh private pool prevent prefix collisions,
@@ -4763,6 +4804,11 @@ def pure_mode_contract() -> None:
         for required in ("OXIDE_FAKE_EXTERNAL_WRITE", "target/debug/external-proof", "target/release/external-proof", "linked_receipt", "17 foreign external", "07 derived exec"):
             expect(required in source, f"external inference fixture missing {required}")
         expect("linked external command was not refused" not in source, "stale linked external refusal remains")
+        reason = "the registry snapshot is incomplete (a receipt reference is missing or contradictory in the registry); the whole batch is kept"
+        sample = {"candidates": [], "kept": [{"root": "/a", "reason": reason}]}
+        expect(incomplete_peer_preview(sample, "/a"), "whole-batch keep not recognized")
+        expect(not incomplete_peer_preview({**sample, "candidates": [{"root": "/b"}]}, "/a"), "candidate accepted in incomplete batch")
+        expect(not incomplete_peer_preview({"candidates": [], "kept": [{"root": "/a", "reason": "another checkout's live reference"}]}, "/a"), "per-root keep mistaken for incomplete batch")
         expect(HELP_EXTERNAL_ARGV == b"nextest --help", "external help argv changed")
         expect(HELP_EXTERNAL_ARGV != b"nextest run --help", "stale help argv accepted")
         expect(not stages_base("builds"), "Builds must not stage the base")
