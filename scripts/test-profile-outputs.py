@@ -1718,7 +1718,7 @@ CASE_IDS = MODE_CASES[MODE]
 
 # HIGH proof-authoring premises (workflow checklist):
 # 1. perm.proof_env captures rustup before private HOME, pins 1.97.1 and disables
-#    auto-install; make_checkout supplies fixture lock, stage_at uses --locked.
+#    auto-install; fixture commands omit --locked, stage_at uses the source lock.
 # 2. perm.proof_env sets OXIDE_TEST_HOME_FROM_ENV=1.
 # 3. perm.proof_env scrubs inherited OXIDE_*, XDG_* and sets fixture controls.
 # 4. case 01 creates an empty target before explicit adopt; cases 12/13 use
