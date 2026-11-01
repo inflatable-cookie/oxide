@@ -342,6 +342,16 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py"
 
+# de52775e: the pre-S3 base cannot open a pool on /Volumes. Only its
+# downgrade compatibility case uses the internal-root keep mode.
+[tasks."rust:permanent-outputs:base-compat"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py base-compat"
+
+[tasks."rust:permanent-outputs:base-compat:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py base-compat --diagnostic"
+
 # Automatic first conversion (oxide#121): the focused `auto-adopt` mode of the
 # #117 fixture, under the same qualified shared supervisor (300 s, 512 MiB
 # monitored scratch, ordinary detach) and one owned 128 MiB scratch image.
@@ -423,23 +433,13 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # convention, `-owners on` plus a read-only mount observation and one bounded
 # forced detach of this run's own image followed by an `-owners on` re-attach,
 # one frozen RUSTFLAGS with CARGO_ENCODED_RUSTFLAGS
-# removed for staging and every fixture child, the internal monitored scratch
+# removed for staging and every fixture child, the selected monitored scratch
 # root described below, and mkdtemp-only fixture temp roots.
 # `--plan` prints the fixed table and allocation with no effect.
 #
-# `--root-parent /private/tmp` is the owner-accepted internal-placement
-# exception (decision bd357a4c, Tom-approved apparatus correction 2026-10-26),
-# exactly as `rust:profile-outputs`, `rust:command-budgets`,
-# `rust:pool-temp-scratch`, `rust:recorded-slot-accounting` and
-# `rust:outputs-prune` use it: this fixture's control pool is a genuine
-# internal `directory-budget` pool, which the product correctly refuses on the
-# selected external volume (the diagnostic at 171ae6fb failed there before
-# attaching its image). The internal pool, the supervisor's monitored root,
-# the image backing and every fixture temp path stay inside the same monitored
-# 512 MiB root, and the owned 128 MiB image is attached with `-owners on` and
-# registered as the operating removable pool after the internal-pool fixture,
-# with the same 300 s limit and the same ordinary detach. It is not a limit
-# change or a different scratch location.
+# The control pool uses OXIDE_SCRATCH_ROOT beneath the selected supervisor
+# root; /private/tmp fallback exercises the internal path only. The image,
+# fixtures and temporary paths remain within the same 512 MiB budget.
 # `rust:exec-output-inference:diagnostic` appends `--diagnostic`: the same
 # bounded guard and the same cases, uncounted, run keep-going. Every declared
 # case is recorded as completed, failed, skipped because a dependency did not
@@ -491,12 +491,8 @@ run = "python3 scripts/test-permanent-outputs.py exec-inference --self-test"
 # Automatic-adoption ineligibility (oxide#154): the focused `auto-ineligible`
 # mode of the #117 fixture under the same qualified shared supervisor (300 s,
 # 512 MiB monitored scratch, ordinary detach) and one owned 128 MiB scratch
-# image. `--root-parent /private/tmp` is the owner-accepted internal-placement
-# exception (decision bd357a4c), not a default change: the fixture needs a
-# genuine internal directory-budget pool (`OXIDE_POOL` at the directory
-# default), and the product correctly refuses that backend on an external
-# volume. The supervisor monitors that same root, so the image, fixtures and
-# evidence stay inside one 512 MiB budget. The first conversion publishes
+# image. The control pool uses the selected-volume scratch declaration;
+# /private/tmp fallback is not scratch-pool coverage. The first conversion publishes
 # owned `target/<member>` links (oxide#160), so eligibility is asked per
 # member: an expected ignore-safety ineligibility (no repository, no Git on
 # `PATH`, an unignored or negated path, an already-tracked member, a Git that

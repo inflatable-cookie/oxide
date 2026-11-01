@@ -52,9 +52,9 @@ The focused modes reuse this fixture and staging helpers:
   reports the same refusal, one explicit adopt upgrades it through the shipped
   migration with its old outputs intact, and a noncommitted version-1 control
   keeps its exact bytes (oxide#163). It runs
-  under `--root-parent /private/tmp`, the owner-accepted internal-placement
-  exception (decision bd357a4c): its control pool is a genuine internal
-  `directory-budget` pool, which the product refuses on an external volume.
+  with a private declared scratch pool under the supervisor-selected root.
+  The separate `base-compat` mode keeps /private/tmp for the pre-S3 binary
+  (decision de52775e).
 
 Not a benchmark, not real-drive qualification and not full QA.
 """
@@ -99,6 +99,38 @@ def positively_absent(path: str) -> bool:
     return False
 
 
+def same_device_tmp(tmp: str, pool_parent: str) -> bool:
+    """Read-only precondition for inherited temporary storage on the pool device."""
+    try:
+        return (os.path.isdir(tmp) and os.access(tmp, os.W_OK | os.X_OK)
+                and os.stat(tmp).st_dev == os.stat(pool_parent).st_dev)
+    except OSError:
+        return False
+
+
+def check_child_env(env: dict) -> None:
+    pool = env.get("OXIDE_POOL")
+    if pool and env.get("OXIDE_SCRATCH_ROOT") == os.path.dirname(pool):
+        expect(same_device_tmp(env.get("TMPDIR", ""), os.path.dirname(pool)),
+               "fixture TMPDIR must be writable on the directory pool device")
+
+
+def check_image_slot_paths(mount: str) -> None:
+    """Check actual image slot names, including collision and ID expansion."""
+    for slot in glob.glob(os.path.join(mount, "oxide-pool", "slots", "*", "*")):
+        if os.path.isdir(slot):
+            path = os.path.join(slot, "scratch")
+            expect(len(os.fsencode(path)) <= 80, f"image slot scratch exceeds 80 bytes: {path}")
+
+
+def mode_allows(mode: str, case: str) -> bool:
+    return (case == "historical-base") if mode == "base-compat" else (case != "historical-base")
+
+
+def require_case(mode: str, case: str) -> None:
+    expect(mode_allows(mode, case), f"{case} is not permitted in {mode}")
+
+
 class Proof(layout.Proof):
     def __init__(self, root: str):
         super().__init__(root)
@@ -106,6 +138,14 @@ class Proof(layout.Proof):
         self.devices = []
         self.detach_confirmed = False
         self.detach_attempted = False
+
+    def run(self, command, *, cwd=None, env=None, timeout=120):
+        child_env = self.env if env is None else env
+        check_child_env(child_env)
+        result = super().run(command, cwd=cwd, env=env, timeout=timeout)
+        if self.mount and os.path.ismount(self.mount):
+            check_image_slot_paths(self.mount)
+        return result
 
     def detach(self) -> None:
         if self.detach_confirmed:
@@ -336,6 +376,7 @@ def link_target(path: str) -> str:
 
 
 def start_child(proof: Proof, command: list, cwd: str, env: dict) -> subprocess.Popen:
+    check_child_env(env)
     child = subprocess.Popen(
         command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
@@ -735,6 +776,7 @@ def run(proof: Proof, repo: str, base_compat: bool = False) -> None:
     proof.phase("after drive registration")
 
     if not base_compat:
+        require_case("permanent-outputs", "ordinary-controls")
         # 1. A nonempty real target refuses, with no mutation.
         keep_target = os.path.join(keep, "target")
         os.makedirs(keep_target, exist_ok=True)
@@ -817,6 +859,8 @@ def run(proof: Proof, repo: str, base_compat: bool = False) -> None:
     proof.phase("after first conversion")
 
     if base_compat:
+        require_case("base-compat", "historical-base")
+        proof.base_case_started = True
         # 4b. Downgrade fence: the last pre-feature Oxide refuses both pools'
         #     fenced state, so it never builds or cleans through the owned link.
         pre_src = os.path.join(root, "pre-feature-src")
@@ -853,6 +897,7 @@ def run(proof: Proof, repo: str, base_compat: bool = False) -> None:
             expect(link_target(link) == external_root, f"{label} moved the link")
             expect(sorted(os.listdir(external_root)) == external_before, f"{label} changed the owned root")
         proof.phase("after the downgrade fence")
+        proof.base_case_completed = True
 
         proof.detach()
         return
@@ -888,7 +933,7 @@ def run(proof: Proof, repo: str, base_compat: bool = False) -> None:
     expect(not os.path.lexists(mount), "the detached mount point still exists")
     code, stdout, stderr = proof.oxide(["build", "--bin", "poutputs"], "build with the drive absent", app)
     expect(code == 0, f"fallback build failed: {stderr}")
-    expect("WARNING: permanent drive mode" in stderr, stderr)
+    expect("permanent drive mode: outputs use the checkout-local fallback root" in stderr, stderr)
     expect("checkout-local" in stderr, stderr)
     local_root = os.path.join(app, ".oxide-outputs", "local")
     expect(link_target(link) == local_root, f"the link did not fall back: {os.readlink(link)}")
@@ -950,7 +995,7 @@ def run(proof: Proof, repo: str, base_compat: bool = False) -> None:
         "the redocked binary did not return to the external root",
     )
     code, stdout, _ = proof.oxide(["outputs", "status"], "status with both roots", app)
-    expect("preserved local fallback root" in stdout, stdout)
+    expect("local fallback root" in stdout and "present" in stdout, stdout)
     proof.phase("after redock")
 
     # 6b. The local fallback root refuses to appear where Git would track it.
@@ -990,7 +1035,7 @@ def run(proof: Proof, repo: str, base_compat: bool = False) -> None:
     entries_before = sorted(os.listdir(external_root))
     set_recorded_uuid(pool, wrong)
     code, _, stderr = proof.oxide(["check"], "build with a wrong recorded UUID", app)
-    expect(code == 0 and "WARNING: permanent drive mode" in stderr, stderr)
+    expect(code == 0 and "permanent drive mode: outputs use the checkout-local fallback root" in stderr, stderr)
     expect(link_target(link) == local_root, "a wrong UUID did not fall back to the local root")
     expect(read_bytes(os.path.join(external_root, MARKER)) == marker_before, "the wrong UUID wrote a marker")
     expect(sorted(os.listdir(external_root)) == entries_before, "the wrong UUID wrote into the root")
@@ -1480,7 +1525,7 @@ def run(proof: Proof, repo: str, base_compat: bool = False) -> None:
     expect(read_bytes(os.path.join(local_root, "local-sentinel")) == b"local kept", "clean deleted a root")
     expect("are kept" in stderr, stderr)
     code, stdout, _ = proof.oxide(["outputs", "status"], "status after clean", app)
-    expect("preserved local fallback root" in stdout, stdout)
+    expect("local fallback root" in stdout and "present" in stdout, stdout)
     proof.phase("after clean")
 
     # 12. Detach in ephemeral mode, then restore a real directory. Permanent
@@ -1859,7 +1904,10 @@ def fresh_checkout(proof: Proof, root: str, name: str, ignore: str | None = "/ta
     """A fresh checkout in its own Git work tree. `ignore` is its whole
     `.gitignore`; a first conversion needs Git to ignore the exact
     non-directory link path (oxide#125)."""
-    path = write_tree(os.path.join(root, "checkouts", name), APP)
+    short = "f" + hashlib.sha256(name.encode()).hexdigest()[:6]
+    if " " in name:
+        short += " x"
+    path = write_tree(os.path.join(root, "checkouts", short), APP)
     proof.run(["git", "init", "-q"], cwd=path, timeout=30)
     if ignore is not None:
         with open(os.path.join(path, ".gitignore"), "w", encoding="utf-8") as handle:
@@ -2213,7 +2261,7 @@ def ignore_fixture(
     """A tiny Cargo checkout in its own Git work tree. `ignore` is the whole
     repository `.gitignore`; `relative` nests the checkout under that root so
     its owned link has a nested repository-relative path."""
-    repo = os.path.join(root, "ignore", name)
+    repo = os.path.join(root, "ignore", "f" + hashlib.sha256(name.encode()).hexdigest()[:6])
     os.makedirs(repo)
     checkout = write_tree(os.path.join(repo, relative) if relative else repo, APP)
     if git:
@@ -2768,16 +2816,14 @@ def plan_exec_inference() -> None:
     """The effect-free table and allocation, printed by `--plan`."""
     print("exec-inference (oxide#160): S1 derived exec member sets + S4b profile first conversion")
     print(
-        "supervisor: python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 "
+        "supervisor: python3 scripts/bounded-test.py --limit 300 "
         "--scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py exec-inference"
     )
     print("limits: 300 s wall clock, 512 MiB monitored scratch, one owned 128 MiB APFS image")
     print("        attached with hdiutil -owners on, ordinary detach")
-    print("root:   --root-parent /private/tmp, the owner-accepted internal-placement exception")
-    print("        (decision bd357a4c): the fixture's internal directory-budget pool, the")
-    print("        supervisor scratch, the image backing and fixture temp paths stay inside")
-    print("        one monitored 512 MiB root; the image-backed removable pool is registered")
-    print("        as the operating pool afterwards")
+    print("root: supervisor-selected scratch; private OXIDE_SCRATCH_ROOT and explicit 64 MiB pool cap")
+    print("        fallback to /private/tmp exercises the internal path, not scratch-pool coverage")
+    print("        image-backed removable pool is registered as the operating pool afterwards")
     print("fixture work, sequential, one Cargo child at a time: 4 Cargo jobs for the single")
     print("        staging and 1 per fixture child; planning demand 4 CPU / 6 GiB")
     print("cases (counted fail-fast; the diagnostic records each one, in this order):")
@@ -3213,6 +3259,15 @@ def exec_self_test() -> None:
     expect(env["OXIDE_POOL"] == "/fixture/root/private/pool", "pool selection drifted")
     expect(env["OXIDE_POOL_CAP"] == "64MiB", "pool cap drifted")
     expect(all(env[k] == "/fixture/root" for k in ("TMPDIR", "TMP", "TEMP")), "temporary root drifted")
+
+    with patch("os.path.isdir", return_value=True), patch("os.access", return_value=True), \
+         patch("os.stat", side_effect=lambda path: type("Stat", (), {"st_dev": 1 if path == "/tmp-a" else 2})()):
+        expect(same_device_tmp("/tmp-a", "/tmp-a"), "same-device control refused")
+        expect(not same_device_tmp("/tmp-a", "/pool-b"), "cross-device TMPDIR accepted")
+    expect(mode_allows("base-compat", "historical-base"), "base case refused")
+    expect(not mode_allows("base-compat", "ordinary-controls"), "base mode accepted other cases")
+    for mode in ("permanent-outputs", "auto-adopt", "detach-permanent", "ignore-safety", "exec-inference", "auto-ineligible"):
+        expect(not mode_allows(mode, "historical-base"), f"{mode} accepted historical base")
 
     ran: list[str] = []
 
@@ -4877,18 +4932,10 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
        removes `CARGO_ENCODED_RUSTFLAGS` on `os.environ` BEFORE staging and on
        the fixture environment afterwards, so the staged binary and every
        fixture child build under the same flag set.
-    8. temporary storage: this fixture's control pool is a genuine internal
-       `directory-budget` pool, which the product correctly refuses on an
-       external volume, so the selector runs under the owner-accepted internal
-       monitored root (`--root-parent /private/tmp`, decision `bd357a4c`,
-       Tom-approved 2026-10-26): the internal pool, the supervisor scratch, the
-       image backing and the fixture `TMPDIR` all stay inside one monitored
-       512 MiB root (asserted as `TMPDIR == OXIDE_TASK_SCRATCH_ROOT`), the
-       owned image is attached with `-owners on` and registered as the
-       operating removable pool afterwards, and the guard is the qualified
-       shared supervisor with its unchanged 300 s limit. The uncounted
-       diagnostic at `171ae6fb` failed exactly on the missing exception, which
-       is apparatus evidence, not a product defect.
+    8. temporary storage: `proof_env` places the declared pool and private
+       HOME under the supervisor-selected run root; TMPDIR is that root. The
+       same-device writable precondition and image-slot path limit are checked
+       by the fixture. A /private/tmp fallback is not scratch-pool coverage.
     9. macOS `mktemp`: every fixture temp root is `tempfile.mkdtemp` under
        `OXIDE_TASK_SCRATCH_ROOT` and the gate/release paths are fixed names
        inside it; no fixture or tool calls `mktemp`.
@@ -4926,7 +4973,7 @@ def exec_inference(proof: Proof, repo: str, diagnostic: bool, collection: Collec
     expect(proof.env["RUSTFLAGS"] == FROZEN_RUSTFLAGS, "the fixture environment is not frozen")
     expect("CARGO_ENCODED_RUSTFLAGS" not in proof.env, "an encoded rustflags value survives")
     # Premises 8 and 9: the fixture's own temp paths are templates under the
-    # supervisor's monitored root (`--root-parent /private/tmp`), and no fixture
+    # supervisor's selected monitored root, and no fixture
     # calls `mktemp` outside it.
     expect(proof.env["TMPDIR"] == os.environ["OXIDE_TASK_SCRATCH_ROOT"], "the fixture TMPDIR is not the supervisor scratch")
     tools = write_tools(root)
@@ -6810,6 +6857,9 @@ def cleanup_after_failure(proof: Proof, collection: "Collection | None" = None) 
 def main() -> int:
     # `--plan` is effect-free and needs no supervisor: it prints the fixed
     # exec-inference table and allocation, then returns.
+    if sys.argv[1:] == ["base-compat", "--plan"]:
+        print("base-compat (de52775e): internal /private/tmp, 300 s, 512 MiB; pinned pre-S3 base downgrade case only")
+        return 0
     if "--plan" in sys.argv[1:]:
         expect(
             [argument for argument in sys.argv[1:] if argument != "--plan"] == ["exec-inference"],
@@ -6876,6 +6926,7 @@ def main() -> int:
     expect(tuple(arguments) in modes, f"unknown mode {arguments!r}")
     scenario, label = modes[tuple(arguments)]
     root = tempfile.mkdtemp(prefix="permanent-outputs.", dir=scratch)
+    freeze_compiler_flags(os.environ)
     repo = os.path.dirname(HERE)
     signal.signal(signal.SIGTERM, terminated)
     signal.signal(signal.SIGALRM, overdue)
@@ -6884,6 +6935,8 @@ def main() -> int:
     try:
         scenario(proof, repo)
     except BaseException as failure:
+        if label == "base-compat":
+            record("base-compat-receipt.json", json.dumps({"mode": "diagnostic" if diagnostic else "counted", "cases": ([{"case": "historical-base", "outcome": "failed"}] if getattr(proof, "base_case_started", False) else []), "qualified": False, "failure": repr(failure)[:600]}))
         cleanup = cleanup_after_failure(proof, getattr(proof, "collection", None))
         record(
             "result.txt",
@@ -6902,6 +6955,8 @@ def main() -> int:
         raise
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
+    if label == "base-compat":
+        record("base-compat-receipt.json", json.dumps({"mode": "diagnostic" if diagnostic else "counted", "cases": [{"case": "historical-base", "outcome": "completed"}], "qualified": False}))
     expect(proof.detach_confirmed, f"ordinary detach unconfirmed; retained {proof.image}")
     proof.remove_backing()
     elapsed = time.monotonic() - layout.runner.STARTED
