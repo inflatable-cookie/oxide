@@ -7021,15 +7021,15 @@ def main() -> int:
     signal.signal(signal.SIGALRM, overdue)
     signal.setitimer(signal.ITIMER_REAL, work_left())
     proof = Proof(root)
-    if diagnostic and label == "permanent-outputs":
+    if label == "permanent-outputs":
         proof.collection = Collection()
     try:
         scenario(proof, repo)
     except BaseException as failure:
-        if diagnostic and label == "permanent-outputs":
-            record("permanent-outputs-diagnostic.json", json.dumps({"mode": label, "qualified": False, "cases": getattr(proof.collection, "outcomes", {}), "failures": proof.collection.failures, "aborted": proof.collection.aborted, "failure": repr(failure)[:600]}))
+        if label == "permanent-outputs":
+            record("permanent-outputs-cases.json", json.dumps({"mode": label, "kind": "diagnostic" if diagnostic else "counted", "qualified": False, "cases": getattr(proof.collection, "outcomes", {}), "failures": proof.collection.failures, "aborted": proof.collection.aborted, "failure": repr(failure)[:600]}))
         if label == "base-compat":
-            record("base-compat-receipt.json", json.dumps({"mode": "diagnostic" if diagnostic else "counted", "cases": ([{"case": "historical-base", "outcome": "failed"}] if getattr(proof, "base_case_started", False) else []), "qualified": False, "failure": repr(failure)[:600]}))
+            record("base-compat-receipt.json", json.dumps({"mode": "base-compat", "kind": "diagnostic" if diagnostic else "counted", "cases": ([{"case": "historical-base", "outcome": "failed"}] if getattr(proof, "base_case_started", False) else []), "qualified": False, "failure": repr(failure)[:600]}))
         cleanup = cleanup_after_failure(proof, getattr(proof, "collection", None))
         record(
             "result.txt",
@@ -7048,10 +7048,10 @@ def main() -> int:
         raise
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
-    if diagnostic and label == "permanent-outputs":
-        record("permanent-outputs-diagnostic.json", json.dumps({"mode": label, "qualified": False, "cases": proof.collection.outcomes, "failures": proof.collection.failures, "aborted": proof.collection.aborted}))
+    if label == "permanent-outputs":
+        record("permanent-outputs-cases.json", json.dumps({"mode": label, "kind": "diagnostic" if diagnostic else "counted", "qualified": False, "cases": proof.collection.outcomes, "failures": proof.collection.failures, "aborted": proof.collection.aborted}))
     if label == "base-compat":
-        record("base-compat-receipt.json", json.dumps({"mode": "diagnostic" if diagnostic else "counted", "cases": [{"case": "historical-base", "outcome": "completed"}], "qualified": False}))
+        record("base-compat-receipt.json", json.dumps({"mode": "base-compat", "kind": "diagnostic" if diagnostic else "counted", "cases": [{"case": "historical-base", "outcome": "completed"}], "qualified": False}))
     expect(proof.detach_confirmed, f"ordinary detach unconfirmed; retained {proof.image}")
     proof.remove_backing()
     elapsed = time.monotonic() - layout.runner.STARTED
