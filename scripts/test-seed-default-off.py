@@ -58,7 +58,7 @@ S3 = "79e55f4"
 POOL_CAP = "128MiB"
 SHUTDOWN_MARGIN_S = 30
 TESTS = (
-    "status_off_matches_ignored_opt_in_and_held_adds_only_its_notice",
+    "status_qualified_modes_match_baseline_without_side_effects",
     "tiny_build_matches_staged_base_when_seed_is_off",
 )
 

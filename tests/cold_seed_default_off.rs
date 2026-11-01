@@ -57,7 +57,7 @@ fn baseline_binary() -> std::ffi::OsString {
 
 #[test]
 #[ignore = "needs OXIDE_SEED_BASELINE_BINARY; run via effigy rust:seed-default-off"]
-fn status_off_matches_ignored_opt_in_and_held_adds_only_its_notice() {
+fn status_qualified_modes_match_baseline_without_side_effects() {
     let real_home = std::env::var_os("HOME").expect("invoking HOME");
     let rustup_home = std::env::var_os("RUSTUP_HOME")
         .filter(|value| !value.is_empty())
@@ -90,13 +90,13 @@ fn status_off_matches_ignored_opt_in_and_held_adds_only_its_notice() {
     let default = run(candidate, None);
     let off = run(candidate, Some("0"));
     let on = run(candidate, Some("1"));
-    let base = run(&baseline_binary(), Some("0"));
+    let base = run(&baseline_binary(), None);
     let details = format!(
         "{}\n{}\n{}\n{}",
         evidence("candidate unset", &default),
         evidence("candidate 0", &off),
         evidence("candidate 1", &on),
-        evidence("baseline 0", &base)
+        evidence("baseline unset", &base)
     );
     assert!(
         default.status.success()
@@ -108,7 +108,7 @@ fn status_off_matches_ignored_opt_in_and_held_adds_only_its_notice() {
     // No recorded seed exists in this read-only fixture. Qualified status has
     // no hold notice, and opt-out suppresses recorded seed information.
     let old_notice = "seeding skipped: seeding not yet qualified on this Cargo; enabled after the qualification proof";
-    for output in [&default, &off, &on] {
+    for output in [&default, &off, &on, &base] {
         assert!(
             !String::from_utf8_lossy(&output.stdout).contains(old_notice),
             "{details}"
@@ -118,6 +118,8 @@ fn status_off_matches_ignored_opt_in_and_held_adds_only_its_notice() {
         !String::from_utf8_lossy(&off.stdout).contains("recorded seed:"),
         "{details}"
     );
+    assert_eq!(default.stdout, off.stdout, "{details}");
+    assert_eq!(default.stderr, off.stderr, "{details}");
     assert_eq!(default.stdout, on.stdout, "{details}");
     assert_eq!(default.stderr, on.stderr, "{details}");
     assert_eq!(base.status.code(), off.status.code(), "{details}");
