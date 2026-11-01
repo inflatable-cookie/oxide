@@ -704,7 +704,7 @@ def proof_env(pool: str, home: str, cargo_home: str) -> dict:
     return env
 
 
-def run(proof: Proof, repo: str, base_compat: bool = False) -> None:
+def run(proof: Proof, repo: str, base_compat: bool = False, diagnostic: bool = False) -> None:
     source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
     dirty = (
         proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30)
@@ -1136,45 +1136,6 @@ def run(proof: Proof, repo: str, base_compat: bool = False) -> None:
     set_recorded_uuid(pool, good)
     proof.phase("after the second-command transition")
 
-    # A1: a distinct committed whole-target fixture keeps the later legacy
-    # cases independent of explicit adoption's migration.
-    migration_app = fresh_checkout(proof, root, "writer-migration")
-    migration_root = legacy_whole_target(proof, pool, mount, migration_app, "A1 writer")
-    migration_marker = read_json(os.path.join(migration_root, MARKER))
-    before = read_json(receipt_file(pool, migration_app))
-    require_migration_fixture(before, migration_app, "A1")
-    writer_gate = os.path.join(root, "writer-migration-gate")
-    writer_env = dict(env, OXIDE_OUTPUT_GATE=writer_gate)
-    reset_gate(writer_gate)
-    writer = start_child(proof, [proof.binary, "check"], migration_app, writer_env)
-    try:
-        wait_for(os.path.join(writer_gate, "started"), "A1 gated writer")
-        expect(writer.poll() is None, "A1 writer exited early")
-        waiting = start_child(proof, [proof.binary, "outputs", "adopt"], migration_app, env)
-        time.sleep(2.0)
-        expect(waiting.poll() is None, "A1 adopt did not wait for the writer")
-        expect(os.path.islink(os.path.join(migration_app, "target")), "A1 changed the target while the writer ran")
-        os.makedirs(writer_gate, exist_ok=True)
-        with open(os.path.join(writer_gate, "release"), "wb") as handle:
-            handle.write(b"release")
-        writer_code, _, writer_err = finish_child(proof, writer, "A1 writer")
-        expect(writer_code == 0, writer_err)
-        adopt_code, adopt_out, adopt_err = finish_child(proof, waiting, "A1 migration")
-        expect(adopt_code == 0, adopt_out + adopt_err)
-        expect(expect_profile_layout(pool, mount, migration_app, "A1 migration") == migration_root,
-               "A1 changed the selected root")
-        after = read_json(receipt_file(pool, migration_app))
-        expect(after["version"] == "oxide.outputs.transition/3", "A1 did not publish /3")
-        expect(read_json(os.path.join(migration_root, MARKER))["nonce"] == migration_marker["nonce"],
-               "A1 changed the root nonce")
-    finally:
-        os.makedirs(writer_gate, exist_ok=True)
-        with open(os.path.join(writer_gate, "release"), "wb") as handle:
-            handle.write(b"release")
-        if writer.poll() is None:
-            writer.kill()
-    proof.phase("after A1 writer and migration")
-
     # 8c. A long-lived exec in the checkout does not block a second command
     #     whose destination is unchanged (the second-slot rule), and the exec
     #     is not redirected.
@@ -1274,9 +1235,50 @@ def run(proof: Proof, repo: str, base_compat: bool = False) -> None:
     expect(code == 0 and link_target(link) == external_root, f"ancestor restore failed: {stderr}")
     proof.phase("after the barrier and ancestor controls")
 
-    # A2: each migration phase gets a new committed whole-target fixture.
-    # The root/1 control makes the optional marker-upgrade hook reachable.
-    for point in MIGRATION_HOOKS:
+    # A1/A2/L1-L3 use independent checkouts and share only the owned image.
+    # A diagnostic records each hook separately and continues only while the
+    # common image, registration, writers and resource checks remain certain.
+    def writer_migration() -> None:
+        # A1: a distinct committed whole-target fixture keeps the later legacy
+        # cases independent of explicit adoption's migration.
+        migration_app = fresh_checkout(proof, root, "writer-migration")
+        migration_root = legacy_whole_target(proof, pool, mount, migration_app, "A1 writer")
+        migration_marker = read_json(os.path.join(migration_root, MARKER))
+        before = read_json(receipt_file(pool, migration_app))
+        require_migration_fixture(before, migration_app, "A1")
+        writer_gate = os.path.join(root, "writer-migration-gate")
+        writer_env = dict(env, OXIDE_OUTPUT_GATE=writer_gate)
+        reset_gate(writer_gate)
+        writer = start_child(proof, [proof.binary, "check"], migration_app, writer_env)
+        try:
+            wait_for(os.path.join(writer_gate, "started"), "A1 gated writer")
+            expect(writer.poll() is None, "A1 writer exited early")
+            waiting = start_child(proof, [proof.binary, "outputs", "adopt"], migration_app, env)
+            time.sleep(2.0)
+            expect(waiting.poll() is None, "A1 adopt did not wait for the writer")
+            expect(os.path.islink(os.path.join(migration_app, "target")), "A1 changed the target while the writer ran")
+            os.makedirs(writer_gate, exist_ok=True)
+            with open(os.path.join(writer_gate, "release"), "wb") as handle:
+                handle.write(b"release")
+            writer_code, _, writer_err = finish_child(proof, writer, "A1 writer")
+            expect(writer_code == 0, writer_err)
+            adopt_code, adopt_out, adopt_err = finish_child(proof, waiting, "A1 migration")
+            expect(adopt_code == 0, adopt_out + adopt_err)
+            expect(expect_profile_layout(pool, mount, migration_app, "A1 migration") == migration_root,
+                   "A1 changed the selected root")
+            after = read_json(receipt_file(pool, migration_app))
+            expect(after["version"] == "oxide.outputs.transition/3", "A1 did not publish /3")
+            expect(read_json(os.path.join(migration_root, MARKER))["nonce"] == migration_marker["nonce"],
+                   "A1 changed the root nonce")
+        finally:
+            os.makedirs(writer_gate, exist_ok=True)
+            with open(os.path.join(writer_gate, "release"), "wb") as handle:
+                handle.write(b"release")
+            if writer.poll() is None:
+                writer.kill()
+        proof.phase("after A1 writer and migration")
+
+    def migration_case(point: str) -> None:
         checkout = fresh_checkout(proof, root, "migration-" + point)
         if point == "migration-marker":
             migration_root, _, _ = version_one_whole_target(proof, pool, mount, checkout, point)
@@ -1301,9 +1303,7 @@ def run(proof: Proof, repo: str, base_compat: bool = False) -> None:
             expect(read_json(os.path.join(migration_root, MARKER))["nonce"] == old_marker["nonce"],
                    f"{point}: migration changed nonce")
         print(f"A2 {point}: stopped, replayed and committed", flush=True)
-    # L1-L3: the current profile first-adopt path reaches transition_at's
-    # prepared/linked/renamed hooks. No receipt exists before each attempt.
-    for point in LEGACY_HOOKS:
+    def legacy_case(point: str) -> None:
         checkout = fresh_checkout(proof, root, "legacy-hook-" + point)
         require_legacy_fixture(None, checkout, point)
         expect(not os.path.exists(receipt_file(pool, checkout)), f"{point}: receipt already exists")
@@ -1316,7 +1316,25 @@ def run(proof: Proof, repo: str, base_compat: bool = False) -> None:
         expect(code == 0, f"{point}: replay failed: {stdout}{stderr}")
         expect_profile_layout(pool, mount, checkout, point)
         print(f"L {point}: stopped, replayed and committed", flush=True)
-    proof.phase("after A2 migration and L1-L3 replay")
+
+    def after_hook_case(case: str) -> None:
+        if proof.unclosed or not proof.mount or not os.path.ismount(proof.mount):
+            raise ProofAbort(f"{case}: image or writer custody is not closed")
+        if not os.path.isfile(registration_path(pool)):
+            raise ProofAbort(f"{case}: removable registration is absent")
+        phase(proof, f"after {case}")
+
+    cases = [("A1:writer-migration", (), writer_migration)]
+    cases += [("A2:" + point, (), lambda point=point: migration_case(point)) for point in MIGRATION_HOOKS]
+    cases += [("L:" + point, (), lambda point=point: legacy_case(point)) for point in LEGACY_HOOKS]
+    collection = getattr(proof, "collection", None)
+    if diagnostic:
+        guard_writer_custody(proof)
+    collect_cases(cases, diagnostic=diagnostic, work_left=guard_work_left,
+                  after_case=after_hook_case, record=collection)
+    if diagnostic and (collection.failures or collection.aborted):
+        fail("hook diagnostic did not complete cleanly")
+    proof.phase("after A1/A2/L1-L3")
 
     # 9b. A same-device symlink in place of `.oxide-outputs` is not the real
     #     checkout-local root: build and clean refuse and the tree it points
@@ -6976,11 +6994,11 @@ def main() -> int:
     if diagnostic:
         arguments.remove("--diagnostic")
         expect(
-            tuple(arguments) in (("exec-inference",), ("auto-ineligible",), ("base-compat",)),
-            "--diagnostic belongs to exec-inference, auto-ineligible or base-compat",
+            tuple(arguments) in ((), ("exec-inference",), ("auto-ineligible",), ("base-compat",)),
+            "--diagnostic belongs to permanent-outputs, exec-inference, auto-ineligible or base-compat",
         )
     modes = {
-        (): (run, "permanent-outputs"),
+        (): (lambda proof, repo: run(proof, repo, diagnostic=diagnostic), "permanent-outputs"),
         ("base-compat",): (lambda proof, repo: run(proof, repo, True), "base-compat"),
         ("auto-adopt",): (auto_run, "auto-adopt"),
         ("detach-permanent",): (detach_run, "detach-permanent"),
@@ -7003,9 +7021,13 @@ def main() -> int:
     signal.signal(signal.SIGALRM, overdue)
     signal.setitimer(signal.ITIMER_REAL, work_left())
     proof = Proof(root)
+    if diagnostic and label == "permanent-outputs":
+        proof.collection = Collection()
     try:
         scenario(proof, repo)
     except BaseException as failure:
+        if diagnostic and label == "permanent-outputs":
+            record("permanent-outputs-diagnostic.json", json.dumps({"mode": label, "qualified": False, "cases": getattr(proof.collection, "outcomes", {}), "failures": proof.collection.failures, "aborted": proof.collection.aborted, "failure": repr(failure)[:600]}))
         if label == "base-compat":
             record("base-compat-receipt.json", json.dumps({"mode": "diagnostic" if diagnostic else "counted", "cases": ([{"case": "historical-base", "outcome": "failed"}] if getattr(proof, "base_case_started", False) else []), "qualified": False, "failure": repr(failure)[:600]}))
         cleanup = cleanup_after_failure(proof, getattr(proof, "collection", None))
@@ -7026,6 +7048,8 @@ def main() -> int:
         raise
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
+    if diagnostic and label == "permanent-outputs":
+        record("permanent-outputs-diagnostic.json", json.dumps({"mode": label, "qualified": False, "cases": proof.collection.outcomes, "failures": proof.collection.failures, "aborted": proof.collection.aborted}))
     if label == "base-compat":
         record("base-compat-receipt.json", json.dumps({"mode": "diagnostic" if diagnostic else "counted", "cases": [{"case": "historical-base", "outcome": "completed"}], "qualified": False}))
     expect(proof.detach_confirmed, f"ordinary detach unconfirmed; retained {proof.image}")

@@ -343,6 +343,10 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py"
 
+[tasks."rust:permanent-outputs:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py --diagnostic"
+
 # de52775e: the pre-S3 base cannot open a pool on /Volumes. Only its
 # downgrade compatibility case uses the internal-root keep mode.
 [tasks."rust:permanent-outputs:base-compat"]
