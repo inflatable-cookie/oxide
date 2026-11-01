@@ -778,8 +778,8 @@ def case(case_id: str) -> _Case:
 def preview_report(preview: dict) -> str:
     """One bounded line naming why every evaluated root was kept.
 
-    Every assertion about an individual keep or a candidate set carries this
-    map, because a preview the product refused as a WHOLE (an incomplete
+    Selected eligibility assertions carry this map, because a preview the
+    product refused as a WHOLE (an incomplete
     snapshot) keeps every root for one shared reason and sets no candidate at
     all: without the map that is indistinguishable from a per-root refusal, and
     a failure prints only an empty candidate set.
@@ -2922,7 +2922,8 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
         world.vanish(lam)
         fired = os.path.join(os.environ["OXIDE_PROOF_EVIDENCE"], "prune-low-reserve-fired")
         plan, sha, preview = world.plan_file("reserve dry run", alpha)
-        expect(world.candidates(preview) == {lam_root}, f"candidates {world.candidates(preview)}")
+        world.complete(preview, "reserve dry run")
+        expect(world.candidates(preview) == {lam_root}, world.report(preview))
         before = tree_bytes(lam_root)
         code, _, stderr = world.real_run("low reserve before rename", alpha, plan, sha, extra={"OXIDE_TEST_PRUNE_LOW_RESERVE_AT": "1"})
         expect(code == 2 and "reserve" in stderr, f"low reserve before rename exited {code}")
@@ -3543,9 +3544,8 @@ def self_test() -> int:
     check("control format pins", control_format_pins)
 
     def keep_diagnostics() -> None:
-        # Every individual-keep or candidate-set assertion carries the bounded
-        # reason map, and every such premise asserts a COMPLETE snapshot, so a
-        # whole-batch refusal can never again print as an empty candidate set.
+        # Pin the selected eligibility and case-12 completeness premises. Other
+        # assertions do not yet all carry the same guard and reason map.
         # The 6798e5b diagnostic failed exactly that way: case 08 reported
         # "candidates set()" with no way to tell a per-root keep from the one
         # shared whole-batch reason.
@@ -3570,7 +3570,16 @@ def self_test() -> int:
         assert not symlink_root_guarded(body.replace(
             '        world.complete(preview, "symlink root dry run")\n', '', 1
         )), "removing the symlink root premise must fail the source check"
-        assert body.count("world.complete(preview,") >= 7, body.count("world.complete(preview,")
+        reserve_guard = (
+            'plan, sha, preview = world.plan_file("reserve dry run", alpha)\n'
+            '        world.complete(preview, "reserve dry run")\n'
+            '        expect(world.candidates(preview) == {lam_root}, world.report(preview))'
+        )
+        assert reserve_guard in body, "reserve assertion lacks its completeness premise or report"
+        assert reserve_guard not in body.replace(
+            '        world.complete(preview, "reserve dry run")\n', '', 1
+        ), "removing the reserve premise must fail the source check"
+        assert body.count("world.complete(preview,") >= 8, body.count("world.complete(preview,")
         assert body.count("world.report(preview)") >= 8, body.count("world.report(preview)")
         # The corrupt-receipt case expects the whole batch and says so.
         assert 'get("complete") is False' in body, "the corrupt-receipt case no longer pins incompleteness"

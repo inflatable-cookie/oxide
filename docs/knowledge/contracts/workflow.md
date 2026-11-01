@@ -6201,14 +6201,13 @@ because every earlier head failed at case 01, so that case's premise was never
 proven. The retained receipts cannot decide between the two: the failing assertion
 printed only the candidate set, and a whole-batch refusal is indistinguishable there
 from a per-root decision. The proof therefore now makes the premise explicit —
-`World.complete` requires a COMPLETE preview before any individual-keep or
-candidate-set assertion (canonical dry run, non-reserving control, eligibility, live
-detached, released vanished, registered image), the corrupt-receipt case requires the
-whole batch so the two directions are pinned, and every such assertion carries
-`preview_report`'s bounded root→reason map, which also reaches the diagnostic
-receipt's case detail. That correction is diagnostic and premise-tightening only: no
-product behaviour is changed, and the next exact-head diagnostic names the shared
-reason (if any) instead of an empty set. No live prune, dry run,
+`World.complete` requires a COMPLETE preview for the canonical dry run,
+non-reserving control, eligibility, live detached, released vanished, registered
+image, and case-12 symlink-root and reserve previews. Those assertions use
+`preview_report`'s bounded root→reason map; the corrupt-receipt case requires the
+whole batch. Other candidate and keep assertions do not all enforce completeness or
+report the map, so the proof does not claim that coverage throughout. This correction
+is diagnostic and premise-tightening only: no product behaviour is changed. No live prune, dry run,
 `resolve-intent`, mode, consumer or pool mutation is authorized by this implementation.
 
 ## Adaptive sccache location (proposed)
