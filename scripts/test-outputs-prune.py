@@ -3,15 +3,20 @@
 
 Run only as an Effigy heavy task under the shared proof supervisor
 (`scripts/bounded-test.py`, SHA-256
-94b1aba60a7475a31b5620039986336f13e1c88d58dd3732b5736290dc63685b, which is
-the qualified oxide#151 supervisor merged from main af08749c plus oxide#191's
-opt-in post-census image detach and oxide#197's ancestor and launcher-sibling exclusions). Those
-added bytes are unqualified until their
-own uncounted diagnostic, one counted author and one separate independent
-reviewer `effigy proof:supervisor:qualify` pass at the merged head; the
-oxide#151 qualification files stay history for their own runs (bootstrap
-585e3395..., suite 37ea34f0..., runner bc24b238...; earlier declarations named
-5e5b6617 and d89115f1, which are historical):
+fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b). Those are the
+integrated oxide#195 custody-hardening bytes over oxide#197's ancestor and
+launcher-sibling exclusions, oxide#192's admission reports and oxide#191's
+opt-in post-census image detach; every path that signals a merely observed
+non-child PID is gone, a census round's same-session survivors are recorded and
+never signalled, and the deciding census is bound to the message the
+custodian's decision named (workflow.md, "Cooperative-session survivors"). The
+control-integrity record for those bytes, and the native qualification chain
+that binds them, are in workflow.md's shared-supervisor sections; this proof
+declares the exact digest it will run under and its `--self-test` recomputes
+that digest from the file, so a different supervisor fails the pure check
+instead of passing silently. The oxide#151 qualification files stay history for
+their own runs (bootstrap 585e3395..., suite 37ea34f0..., runner bc24b238...;
+earlier declarations named 5e5b6617 and d89115f1, which are historical):
 
   rust:outputs-prune             the counted proof (fail-fast)
   rust:outputs-prune:diagnostic  the same script with `--diagnostic`
@@ -332,7 +337,7 @@ def _load(name: str, file: str):
     return module
 
 
-SUPERVISOR = "94b1aba60a7475a31b5620039986336f13e1c88d58dd3732b5736290dc63685b"
+SUPERVISOR = "fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b"
 LIMIT_SECONDS = 360
 SCRATCH_MIB = 512
 CASES = 22
@@ -3110,6 +3115,19 @@ def self_test() -> int:
         )]
 
     check("case table", table)
+
+    def declared_supervisor() -> None:
+        # The exact bytes this proof runs under: the declared digest must be the
+        # file on disk, so a merged or corrected supervisor cannot be run under a
+        # stale declaration (and the digest is never inferred from the receipt).
+        path = os.path.join(HERE, "bounded-test.py")
+        with open(path, "rb") as handle:
+            digest = hashlib.sha256(handle.read()).hexdigest()
+        assert SUPERVISOR == digest, (SUPERVISOR, digest)
+        assert "fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b" == SUPERVISOR
+        assert "oxide#195" in (__doc__ or ""), "the supervisor provenance is undocumented"
+
+    check("declared supervisor digest", declared_supervisor)
 
     def documented_matrix() -> None:
         # The owning docstring must describe exactly the bodies this run

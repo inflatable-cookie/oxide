@@ -2065,6 +2065,14 @@ fn evidence_for<'a>(
         .and_then(|entry| entry.evidence.as_ref())
 }
 
+/// Whether the plan's eligible root set is exactly the fresh snapshot's.
+///
+/// The checkout, member, root, nonce, inode and marker digest are the root's
+/// immutable identity. The device is not: macOS renumbers a mounted volume's
+/// `st_dev` after a reboot or reattach, so a plan made before one still binds the
+/// same unchanged roots. The fresh snapshot's own device is the one every later
+/// step of this run binds (`RootSession::open`), and a renumbered inode, a
+/// changed marker or a different volume still refuses the plan.
 fn same_candidates(plan: &[&Candidate], fresh: &[&Candidate]) -> bool {
     if plan.len() != fresh.len() {
         return false;
@@ -2075,7 +2083,6 @@ fn same_candidates(plan: &[&Candidate], fresh: &[&Candidate]) -> bool {
                 && planned.member == current.member
                 && planned.root == current.root
                 && planned.nonce == current.nonce
-                && planned.dev == current.dev
                 && planned.ino == current.ino
                 && planned.marker_digest == current.marker_digest
         })
@@ -2477,10 +2484,13 @@ fn evaluate(
         }
         let selected: Vec<&Row> = members.iter().copied().filter(|row| row.selected).collect();
         if let Some(first) = selected.first() {
+            // The recorded device is one observation and may be stale on either
+            // side of a reboot, so it is not part of the recorded identity
+            // these references must agree on; the immutable inode, generation,
+            // nonce, marker digest, kind and volume are.
             if selected.iter().any(|row| {
                 row.nonce != first.nonce
                     || row.generation != first.generation
-                    || row.root_dev != first.root_dev
                     || row.root_ino != first.root_ino
                     || row.marker_digest != first.marker_digest
                     || row.root_kind != first.root_kind
@@ -3526,6 +3536,22 @@ fn observe_row_root(row: &Row) -> Result<RootState, String> {
             )))
         }
     };
+    observe_root_in(&binding, row)
+}
+
+/// The descriptor half of [`observe_row_root`], over an already verified mount
+/// binding.
+///
+/// The recorded device number is an observation, not an identity: macOS gives a
+/// mounted volume a new `st_dev` after a reboot or a reattach, so a registry row
+/// written before one carries a stale number for an unchanged root. The root's
+/// identity is the verified volume UUID (checked by the binding and again on the
+/// owner marker here), the inode, the generation and the nonce, and the recorded
+/// marker digest; those are compared exactly. A stale device is therefore
+/// replaced by the number the live descriptor reports rather than making the row
+/// unknown, and every other difference — a renumbered inode, another volume, a
+/// changed marker or digest — still keeps the root.
+fn observe_root_in(binding: &Binding, row: &Row) -> Result<RootState, String> {
     let outer = binding
         .dir_at(binding.fd(), outputs::EXTERNAL_DIR, false)
         .map_err(|error| format!("cannot open the outputs directory: {error}"))?;
@@ -3559,11 +3585,13 @@ fn observe_row_root(row: &Row) -> Result<RootState, String> {
     }
     let dev = u64::try_from(stat.st_dev).unwrap_or(u64::MAX);
     let ino = stat.st_ino;
-    if row.root_dev != Some(dev) || row.root_ino != Some(ino) {
+    if row.root_ino != Some(ino) {
         return Ok(RootState::Unknown(
-            "the recorded root's device or inode changed".to_owned(),
+            "the recorded root's inode changed".to_owned(),
         ));
     }
+    // A recorded device that differs is only a renumbered volume: every fact
+    // that identifies the root is still compared below.
     let root = binding
         .dir_at(outer.as_fd(), &name.to_string_lossy(), false)
         .map_err(|error| format!("cannot open the recorded root: {error}"))?;
@@ -3600,37 +3628,73 @@ fn observe_row_root(row: &Row) -> Result<RootState, String> {
             )))
         }
     };
-    let legacy = marker.is_legacy();
-    if !marker.is_owned_by(&row.checkout, &row.checkout_id) {
+    let observed = ObservedIdentity {
+        dev,
+        ino,
+        legacy: marker.is_legacy(),
+        marker,
+        marker_digest: sha256_hex(&bytes),
+    };
+    if !observed.marker.is_owned_by(&row.checkout, &row.checkout_id) {
         return Ok(RootState::Unknown(
             "the owner marker names another checkout".to_owned(),
         ));
     }
-    if marker.kind() != row.root_kind
-        || marker.generation() != row.generation
-        || marker.volume_uuid() != row.volume_uuid.as_deref()
-        || marker.nonce() != row.nonce.as_deref()
-    {
-        return Ok(RootState::Unknown(
-            "the owner marker does not match the recorded root identity".to_owned(),
-        ));
+    match judge_recorded_root(row, &observed) {
+        Ok(dev) => Ok(RootState::Present(RootFacts {
+            dev,
+            ino,
+            marker_digest: observed.marker_digest,
+            legacy: observed.legacy,
+        })),
+        Err(reason) => Ok(RootState::Unknown(reason)),
     }
-    let digest = sha256_hex(&bytes);
+}
+
+/// One live observation of a recorded root's descriptor and owner marker.
+struct ObservedIdentity {
+    dev: u64,
+    ino: u64,
+    marker: Marker,
+    marker_digest: String,
+    legacy: bool,
+}
+
+/// Compare one live observation with the recorded row, returning the device this
+/// run should bind.
+///
+/// The recorded device number is one observation, not an identity: macOS gives a
+/// mounted volume a fresh `st_dev` after a reboot or a reattach, so a row written
+/// before one carries a stale number for a root that never changed. Everything
+/// that identifies the root is still compared exactly — the inode, the kind, the
+/// generation, the nonce, the marker's own volume UUID and the recorded marker
+/// digest — so a stale number is replaced by the live one while a reused inode on
+/// another volume, a re-created root or an edited marker is never reconciled.
+fn judge_recorded_root(row: &Row, observed: &ObservedIdentity) -> Result<u64, String> {
+    if row.root_ino != Some(observed.ino) {
+        return Err("the recorded root's inode changed".to_owned());
+    }
+    // A row with no recorded device predates the version-2 registry identity and
+    // is only ever considered through an explicit operator list; this rule
+    // reconciles a recorded number, it never invents one.
+    if row.root_dev.is_none() {
+        return Err("the recorded root has no device".to_owned());
+    }
+    if observed.marker.kind() != row.root_kind
+        || observed.marker.generation() != row.generation
+        || observed.marker.volume_uuid() != row.volume_uuid.as_deref()
+        || observed.marker.nonce() != row.nonce.as_deref()
+    {
+        return Err("the owner marker does not match the recorded root identity".to_owned());
+    }
     if row
         .marker_digest
         .as_deref()
-        .is_some_and(|recorded| recorded != digest)
+        .is_some_and(|recorded| recorded != observed.marker_digest)
     {
-        return Ok(RootState::Unknown(
-            "the owner marker changed since it was recorded".to_owned(),
-        ));
+        return Err("the owner marker changed since it was recorded".to_owned());
     }
-    Ok(RootState::Present(RootFacts {
-        dev,
-        ino,
-        marker_digest: digest,
-        legacy,
-    }))
+    Ok(observed.dev)
 }
 
 fn account_candidates(evaluated: &mut [Evaluated], control: &Path) {
@@ -3859,10 +3923,44 @@ struct RootSession {
 
 impl RootSession {
     fn open(candidate: &Candidate) -> Result<Self, String> {
-        let Some(uuid) = candidate.volume_uuid.as_deref() else {
+        // The candidate's device came from this run's own observation, so the
+        // reopened descriptor must still report it.
+        Self::open_path(
+            &candidate.root,
+            candidate.volume_uuid.as_deref(),
+            candidate.ino,
+            Some(candidate.dev),
+        )
+    }
+
+    /// Reopen the exact root a journal recorded, in a later run or after a
+    /// restart. The journal's device number was observed before the crash or
+    /// reboot and macOS may have renumbered the mounted volume since, so identity
+    /// rests on the recorded inode and the verified volume; the caller compares
+    /// the owner marker's recorded nonce, generation and digest before any
+    /// effect.
+    fn open_recorded(identity: &RootIdentity) -> Result<Self, String> {
+        Self::open_path(
+            &identity.root,
+            identity.volume_uuid.as_deref(),
+            identity.ino,
+            None,
+        )
+    }
+
+    /// Open the recorded root leaf under its verified volume and judge the
+    /// descriptor against the recorded identity. `recorded_dev` is the number
+    /// this run is bound to, or `None` for a journal from an earlier run whose
+    /// number a reboot may have made stale.
+    fn open_path(
+        root_path: &Path,
+        uuid: Option<&str>,
+        ino: u64,
+        recorded_dev: Option<u64>,
+    ) -> Result<Self, String> {
+        let Some(uuid) = uuid else {
             return Err("the root has no recorded volume UUID".to_owned());
         };
-        let root_path = &candidate.root;
         let outputs_dir = root_path
             .parent()
             .ok_or("the root has no parent directory")?;
@@ -3889,13 +3987,7 @@ impl RootSession {
             .into_owned();
         let root = binding.dir_at(outputs.as_fd(), &leaf, false)?;
         let facts = fstat_fd(&root)?;
-        let dev = u64::try_from(facts.st_dev).unwrap_or(u64::MAX);
-        if facts.st_ino != candidate.ino || dev != candidate.dev {
-            return Err("the root's device or inode changed".to_owned());
-        }
-        if dev != binding.verify()?.dev {
-            return Err("the root is not on the verified volume".to_owned());
-        }
+        let dev = judge_root_identity(&facts, binding.verify()?.dev, recorded_dev, ino)?;
         Ok(Self {
             binding,
             registration,
@@ -4127,15 +4219,9 @@ impl RootSession {
         let outputs = binding.dir_at(binding.fd(), outputs::EXTERNAL_DIR, false)?;
         let root = binding.dir_at(outputs.as_fd(), leaf, false)?;
         let facts = fstat_fd(&root)?;
-        let dev = u64::try_from(facts.st_dev).unwrap_or(u64::MAX);
-        // The rename kept the root's inode: anything else under the
-        // intent's quarantine name is not the recorded root.
-        if dev != identity.dev || facts.st_ino != identity.ino {
-            return Err(
-                "the quarantine is not the recorded root (device or inode differs); it is kept"
-                    .to_owned(),
-            );
-        }
+        let dev = judge_root_identity(&facts, binding.verify()?.dev, None, identity.ino).map_err(
+            |reason| format!("the quarantine is not the recorded root ({reason}); it is kept"),
+        )?;
         Ok(Self {
             binding,
             registration,
@@ -4157,6 +4243,34 @@ fn fstat_fd(fd: &OwnedFd) -> Result<libc::stat, String> {
         ));
     }
     Ok(stat)
+}
+
+/// Judge one opened root descriptor against its recorded identity.
+///
+/// The inode is the durable identity a rename keeps, and the descriptor must be
+/// on the volume the binding verified. `recorded_dev` is the device number this
+/// run is bound to: `Some` only when this run observed it itself, so a difference
+/// is a changed mount or root; `None` for a journal written by an earlier run,
+/// whose number macOS may have renumbered on a reboot or reattach, so only the
+/// inode and the verified volume decide and the caller compares the owner marker
+/// before any effect. A device number is never accepted as identity on its own.
+fn judge_root_identity(
+    facts: &libc::stat,
+    volume_dev: u64,
+    recorded_dev: Option<u64>,
+    ino: u64,
+) -> Result<u64, String> {
+    let dev = u64::try_from(facts.st_dev).unwrap_or(u64::MAX);
+    if facts.st_ino != ino {
+        return Err("the root's inode changed".to_owned());
+    }
+    if dev != volume_dev {
+        return Err("the root is not on the verified volume".to_owned());
+    }
+    if recorded_dev.is_some_and(|recorded| recorded != dev) {
+        return Err("the root's device changed".to_owned());
+    }
+    Ok(dev)
 }
 
 fn registration_for(uuid: &str) -> Result<removable::Registration, String> {
@@ -5248,9 +5362,11 @@ fn verified_group(registry: &Registry, candidate: &Candidate) -> Result<Vec<Grou
     let current: Vec<&Row> = rows.iter().copied().filter(|row| row.selected).collect();
     if let Some(first) = current.first() {
         for row in &current {
+            // A recorded device may be stale on either side of a reboot, which is
+            // not a disagreement about the root's identity; the immutable facts
+            // below are.
             if row.nonce != first.nonce
                 || row.generation != first.generation
-                || row.root_dev != first.root_dev
                 || row.root_ino != first.root_ino
                 || row.marker_digest != first.marker_digest
                 || row.root_kind != first.root_kind
@@ -5262,8 +5378,11 @@ fn verified_group(registry: &Registry, candidate: &Candidate) -> Result<Vec<Grou
                 );
             }
         }
+        // The candidate's device was observed by this run, so a differing
+        // recorded number is the stale one: the inode and the marker digest (with
+        // the marker's own volume, nonce and generation, verified by the
+        // observation) are what prove this is the recorded root.
         if first.nonce != candidate.nonce
-            || first.root_dev != Some(candidate.dev)
             || first.root_ino != Some(candidate.ino)
             || first.marker_digest.as_deref() != Some(candidate.marker_digest.as_str())
         {
@@ -5456,7 +5575,14 @@ fn journal_intent(
         )
         .map_err(Stop::Refuse)?;
         was_selected = verified.iter().any(|row| row.selected);
-        // Atomically mark ALL of the group's rows: one root, one owner.
+        // Atomically mark ALL of the group's rows: one root, one owner. The
+        // recorded device is refreshed to this run's own observation in the same
+        // publication: macOS renumbers a mounted volume's `st_dev` on a reboot or
+        // reattach, and the locked recheck has just proved by the row's inode,
+        // the verified volume and the owner marker that this is that root. The
+        // intent's group records the same refreshed number, so a rollback
+        // compares the journal with rows written under it rather than with a
+        // number that predates the reboot.
         for row in registry
             .rows
             .iter_mut()
@@ -5465,8 +5591,15 @@ fn journal_intent(
             row.selected = false;
             row.pending = false;
             row.pruning = Some(id.to_owned());
+            row.root_dev = Some(candidate.dev);
         }
-        group = verified;
+        group = verified
+            .into_iter()
+            .map(|row| GroupRow {
+                root_dev: Some(candidate.dev),
+                ..row
+            })
+            .collect();
     }
     while registry.intents.len() >= MAX_INTENTS {
         let completed = registry
@@ -5936,7 +6069,10 @@ fn resume_intent(store: &Store, control: &Path, intent: &Intent) -> Result<Resum
         IntentPhase::Intent => {
             // No filesystem effect is recorded. If the original root is still
             // present and unchanged, the journal can be rolled back exactly;
-            // any other state is uncertain and stays pending.
+            // any other state is uncertain and stays pending. The journal's
+            // device number may predate a reboot, so the reopen proves identity by
+            // the inode and the verified volume and the marker comparison below
+            // binds the reserved nonce, generation and recorded digest.
             let candidate = Candidate {
                 checkout_id: intent.identity.checkout_id.clone(),
                 checkout: intent.identity.checkout.clone(),
@@ -5956,13 +6092,13 @@ fn resume_intent(store: &Store, control: &Path, intent: &Intent) -> Result<Resum
                 accounting_complete: false,
                 receiptless: false,
             };
-            let session = match RootSession::open(&candidate) {
+            let session = match RootSession::open_recorded(&intent.identity) {
                 Ok(session) => session,
                 Err(original) => {
                     // A crash between the exclusive rename and its journal
                     // phase leaves the root under the intent's own random
-                    // quarantine leaf. Only that exact device and inode,
-                    // with the recorded marker, resumes deletion.
+                    // quarantine leaf. Only that exact inode, on the recorded
+                    // volume, with the recorded marker, resumes deletion.
                     let session = RootSession::open_quarantine(
                         &intent.identity,
                         &quarantine_leaf(intent)?,
@@ -8870,6 +9006,380 @@ mod tests {
                 row.member
             );
         }
+    }
+
+    /// Write one real owner marker for `row` and observe its fixture root the
+    /// way the product observes a recorded root: the descriptor's metadata, the
+    /// parsed marker and the marker's own digest.
+    fn write_root_marker(root: &Path, document: &serde_json::Value) {
+        fs::write(
+            root.join(outputs::MARKER),
+            serde_json::to_vec(document).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn root_marker(row: &Row) -> serde_json::Value {
+        serde_json::json!({
+            "version": "oxide.outputs.root/2",
+            "checkout": row.checkout.to_string_lossy(),
+            "checkout_id": row.checkout_id,
+            "label": "app",
+            "recipe": outputs::RECIPE_PUBLIC,
+            "kind": "external",
+            "volume_uuid": row.volume_uuid,
+            "nonce": row.nonce,
+            "generation": row.generation,
+            "created_ms": 1u64,
+        })
+    }
+
+    fn observe_fixture_root(row: &Row) -> ObservedIdentity {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(&row.root).unwrap();
+        let marker = outputs::read_marker_for_prune(&row.root).unwrap();
+        ObservedIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            legacy: marker.is_legacy(),
+            marker,
+            marker_digest: outputs::marker_digest(&row.root).unwrap(),
+        }
+    }
+
+    fn fixture_stat(path: &Path) -> libc::stat {
+        let fd: std::os::fd::OwnedFd = fs::File::open(path).unwrap().into();
+        fstat_fd(&fd).unwrap()
+    }
+
+    /// A reboot or a reattach renumbers a mounted volume's `st_dev`. The
+    /// unchanged root is still the recorded one — same inode, same marker, same
+    /// verified volume — so its stale device is reconciled instead of making the
+    /// row unknown, while a changed inode never is.
+    #[test]
+    fn a_renumbered_device_reconciles_an_unchanged_root() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = Fixture::new();
+        let mut row = row_for(&fixture.root);
+        fs::create_dir_all(&row.root).unwrap();
+        write_root_marker(&row.root, &root_marker(&row));
+        let observed = observe_fixture_root(&row);
+        assert_eq!(row.root_dev, Some(1));
+        assert_ne!(
+            observed.dev, 1,
+            "the fixture root reported the stale recorded device"
+        );
+        assert_eq!(
+            row.root_ino,
+            Some(2),
+            "the fixture row must start from a stale inode"
+        );
+        // The stale inode still keeps the root; the fixed inode reconciles the
+        // stale device and reports the device this run binds.
+        assert_eq!(
+            judge_recorded_root(&row, &observed).unwrap_err(),
+            "the recorded root's inode changed"
+        );
+        row.root_ino = Some(observed.ino);
+        row.marker_digest = Some(observed.marker_digest.clone());
+        assert_eq!(judge_recorded_root(&row, &observed), Ok(observed.dev));
+        // A renumbered device is never accepted on its own: an inode that
+        // changed stays a different root.
+        let mut changed = row.clone();
+        changed.root_ino = Some(observed.ino + 1);
+        assert_eq!(
+            judge_recorded_root(&changed, &observed).unwrap_err(),
+            "the recorded root's inode changed"
+        );
+        // And the same root observed a second time (a later run in the same boot
+        // session, where the number no longer differs) binds the same device.
+        assert_eq!(
+            judge_recorded_root(&row, &observe_fixture_root(&row)),
+            Ok(observed.dev)
+        );
+    }
+
+    /// Every identity fact except the device still has to match: another volume's
+    /// marker, a different nonce or generation, and a changed marker digest each
+    /// keep the root unknown.
+    #[test]
+    fn a_changed_volume_nonce_generation_or_marker_keeps_the_root_unknown() {
+        let fixture = Fixture::new();
+        let mut row = row_for(&fixture.root);
+        fs::create_dir_all(&row.root).unwrap();
+        write_root_marker(&row.root, &root_marker(&row));
+        let observed = observe_fixture_root(&row);
+        row.root_ino = Some(observed.ino);
+        row.marker_digest = Some(observed.marker_digest.clone());
+        assert_eq!(judge_recorded_root(&row, &observed), Ok(observed.dev));
+
+        // Another volume: the marker names a different UUID than the row was
+        // recorded with. A copied root is not the recorded one even when its
+        // device number happens to be unchanged.
+        let mut other_volume = root_marker(&row);
+        other_volume["volume_uuid"] = serde_json::json!("99999999-8888-7777-6666-555555555555");
+        write_root_marker(&row.root, &other_volume);
+        assert_eq!(
+            judge_recorded_root(&row, &observe_fixture_root(&row)).unwrap_err(),
+            "the owner marker does not match the recorded root identity"
+        );
+
+        // A different nonce is a different root creation.
+        let mut other_nonce = root_marker(&row);
+        other_nonce["nonce"] = serde_json::json!("e".repeat(32));
+        write_root_marker(&row.root, &other_nonce);
+        assert_eq!(
+            judge_recorded_root(&row, &observe_fixture_root(&row)).unwrap_err(),
+            "the owner marker does not match the recorded root identity"
+        );
+
+        // A different generation is a different root creation too.
+        let mut other_generation = root_marker(&row);
+        other_generation["generation"] = serde_json::json!(2u64);
+        write_root_marker(&row.root, &other_generation);
+        assert_eq!(
+            judge_recorded_root(&row, &observe_fixture_root(&row)).unwrap_err(),
+            "the owner marker does not match the recorded root identity"
+        );
+
+        // The recorded digest is the preimage pin: the same identity facts with an
+        // edited marker document is still a changed marker.
+        write_root_marker(&row.root, &root_marker(&row));
+        let mut edited = root_marker(&row);
+        edited["created_ms"] = serde_json::json!(2u64);
+        write_root_marker(&row.root, &edited);
+        assert_eq!(
+            judge_recorded_root(&row, &observe_fixture_root(&row)).unwrap_err(),
+            "the owner marker changed since it was recorded"
+        );
+        // A marker that matches again reconciles, so the digest pin is not a
+        // one-way refusal.
+        write_root_marker(&row.root, &root_marker(&row));
+        assert_eq!(
+            judge_recorded_root(&row, &observe_fixture_root(&row)),
+            Ok(observed.dev)
+        );
+
+        // A row that never recorded a device predates this identity entirely;
+        // only the explicit operator list may consider it and no number is
+        // invented here.
+        let mut unrecorded = row.clone();
+        unrecorded.root_dev = None;
+        assert_eq!(
+            judge_recorded_root(&unrecorded, &observe_fixture_root(&row)).unwrap_err(),
+            "the recorded root has no device"
+        );
+    }
+
+    /// The real-run plan gate: a plan made before a reboot still binds the same
+    /// unchanged roots, and every other recorded fact still refuses it.
+    #[test]
+    fn a_plan_made_before_a_renumbered_device_still_binds_the_same_roots() {
+        let fixture = Fixture::new();
+        let mut row = row_for(&fixture.root);
+        fs::create_dir_all(&row.root).unwrap();
+        write_root_marker(&row.root, &root_marker(&row));
+        let observed = observe_fixture_root(&row);
+        row.root_dev = Some(1);
+        row.root_ino = Some(observed.ino);
+        row.marker_digest = Some(observed.marker_digest.clone());
+        let planned = candidate_of(&row);
+        let mut fresh = planned.clone();
+        fresh.dev = observed.dev;
+        assert_ne!(planned.dev, fresh.dev, "the fixture did not renumber");
+        assert!(same_candidates(&[&planned], &[&fresh]));
+
+        // The same root observed under another volume has a different marker
+        // digest (the marker records the volume UUID), so the plan refuses it.
+        let mut swapped = fresh.clone();
+        swapped.marker_digest = "9".repeat(64);
+        assert!(!same_candidates(&[&planned], &[&swapped]));
+        let mut reused = fresh.clone();
+        reused.ino = observed.ino + 1;
+        assert!(!same_candidates(&[&planned], &[&reused]));
+        let mut recreated = fresh.clone();
+        recreated.nonce = Some("d".repeat(32));
+        assert!(!same_candidates(&[&planned], &[&recreated]));
+        // A root that left the plan is a different set, never a silent match.
+        assert!(!same_candidates(&[&planned], &[]));
+    }
+
+    /// A pending intent and a crash replay across a renumbering: the journaled
+    /// group is published with this run's observation in one write, and a replay
+    /// from an earlier session proves identity by the recorded inode and the
+    /// verified volume rather than by the stale number.
+    #[test]
+    fn a_pending_intent_replays_across_a_renumbered_device() {
+        let fixture = Fixture::new();
+        let mut root = row_for(&fixture.root);
+        fs::create_dir_all(&root.root).unwrap();
+        write_root_marker(&root.root, &root_marker(&root));
+        let observed = observe_fixture_root(&root);
+        root.root_ino = Some(observed.ino);
+        root.marker_digest = Some(observed.marker_digest.clone());
+        let mut debug = root.clone();
+        debug.member = "debug".to_owned();
+        let mut release = debug.clone();
+        release.member = "release".to_owned();
+        release.selected = false;
+        let control = ready_control(&fixture, vec![debug.clone(), release.clone()], Vec::new());
+        let receipt_path = outputs::receipt_path_public(&control, &debug.checkout_id);
+        fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
+        fs::write(
+            &receipt_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": "oxide.outputs.transition/3",
+                "checkout": debug.checkout.to_string_lossy(),
+                "checkout_id": debug.checkout_id,
+                "generation": 1,
+                "state": "committed",
+                "layout": "profile",
+                "links": [{
+                    "member": "debug",
+                    "selected": {
+                        "kind": "external",
+                        "root": debug.root.to_string_lossy(),
+                        "volume_uuid": debug.volume_uuid,
+                        "nonce": debug.nonce,
+                        "generation": 1
+                    }
+                }],
+                "updated_ms": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600)).unwrap();
+        // The row records the stale number a pre-reboot write left behind; the
+        // candidate carries this run's own observation.
+        let mut candidate = candidate_of(&debug);
+        candidate.dev = observed.dev;
+        candidate.ino = observed.ino;
+        candidate.marker_digest = observed.marker_digest.clone();
+        let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
+        let id = "a".repeat(32);
+        let quarantine = fixture.root.join(format!("{QUARANTINE_PREFIX}{id}"));
+        let revision = ready_registry(&control).unwrap().revision;
+        match journal_intent(
+            &store,
+            &control,
+            &candidate,
+            &"f".repeat(64),
+            &id,
+            &quarantine,
+            revision,
+        ) {
+            Ok(true) => {}
+            Ok(false) => panic!("the journal did not publish"),
+            Err(stop) => panic!("the journal refused: {}", stop_text(stop)),
+        }
+        let journaled = ready_registry(&control).unwrap();
+        let intent = journaled.intent(&id).cloned().unwrap();
+        assert_eq!(intent.identity.dev, observed.dev);
+        assert_eq!(intent.group.len(), 2);
+        assert!(
+            intent
+                .group
+                .iter()
+                .all(|row| row.root_dev == Some(observed.dev)),
+            "the intent kept a stale device for its own group"
+        );
+        assert!(
+            journaled
+                .rows
+                .iter()
+                .filter(|row| row.root == debug.root)
+                .all(|row| row.root_dev == Some(observed.dev)),
+            "the registry publication did not refresh the group's device"
+        );
+
+        // A later session (or a replay after the reboot) reopens the recorded
+        // root: the journal's number may be stale, so identity rests on the
+        // inode and the verified volume, and the owner marker is compared
+        // against the intent before any effect.
+        let stat = fixture_stat(&root.root);
+        let live_dev = u64::try_from(stat.st_dev).unwrap();
+        assert_eq!(
+            judge_root_identity(&stat, live_dev, None, observed.ino),
+            Ok(live_dev)
+        );
+        // A fresh candidate is different: its device came from this run, so a
+        // difference there is a changed mount or root.
+        assert_eq!(
+            judge_root_identity(&stat, live_dev, Some(live_dev + 1), observed.ino).unwrap_err(),
+            "the root's device changed"
+        );
+        // A renumbered device still never rescues a changed inode, and a
+        // descriptor off the verified volume is refused whatever it records.
+        assert_eq!(
+            judge_root_identity(&stat, live_dev, None, observed.ino + 1).unwrap_err(),
+            "the root's inode changed"
+        );
+        assert_eq!(
+            judge_root_identity(&stat, live_dev + 1, None, observed.ino).unwrap_err(),
+            "the root is not on the verified volume"
+        );
+
+        // The exact rollback of that journal still restores both members (its
+        // comparison is journal against registry, never against a live device).
+        rollback_intent(&store, &control, &intent).unwrap();
+        let rolled = ready_registry(&control).unwrap();
+        for row in rolled.rows.iter().filter(|row| row.root == debug.root) {
+            assert!(row.pruning.is_none(), "{} kept a pruning mark", row.member);
+            assert_eq!(row.root_dev, Some(observed.dev));
+        }
+        assert!(rolled.intents.is_empty(), "the rolled-back journal remains");
+    }
+
+    /// A group with a stale recorded device is ONE owner. The selected references
+    /// may disagree about the observational number (a sibling written in an
+    /// earlier session) and still be the same root, while a disagreement about
+    /// the inode, nonce or digest still refuses.
+    #[test]
+    fn a_group_tolerates_only_the_observational_device() {
+        let fixture = Fixture::new();
+        let mut debug = row_for(&fixture.root);
+        debug.member = "debug".to_owned();
+        debug.root_dev = Some(1);
+        let mut release = debug.clone();
+        release.member = "release".to_owned();
+        release.root_dev = Some(777);
+        let registry = Registry {
+            version: REGISTRY_VERSION.to_owned(),
+            schema: REGISTRY_SCHEMA,
+            revision: 3,
+            complete: true,
+            incomplete: None,
+            created_by: "a".repeat(32),
+            rows: vec![debug.clone(), release.clone()],
+            intents: Vec::new(),
+            cancelled_overflow: Vec::new(),
+        };
+        let mut candidate = candidate_of(&debug);
+        candidate.dev = 777;
+        candidate.ino = 2;
+        candidate.marker_digest = "c".repeat(64);
+        assert!(verified_group(&registry, &candidate).is_ok());
+        let mut changed = registry.clone();
+        for row in &mut changed.rows {
+            if row.member == "release" {
+                row.root_ino = Some(9);
+            }
+        }
+        let refused = verified_group(&changed, &candidate).unwrap_err();
+        assert!(refused.contains("disagree about its identity"), "{refused}");
+        let mut changed = registry.clone();
+        for row in &mut changed.rows {
+            if row.member == "release" {
+                row.nonce = Some("d".repeat(32));
+            }
+        }
+        assert!(verified_group(&changed, &candidate).is_err());
+        // The candidate's own inode and digest are the plan's identity.
+        let mut stale_inode = candidate.clone();
+        stale_inode.ino = 3;
+        assert!(verified_group(&registry, &stale_inode).is_err());
     }
 
     /// A deleted or resolved intent whose checkout receipt has not committed
