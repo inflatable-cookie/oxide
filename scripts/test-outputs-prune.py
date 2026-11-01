@@ -3,15 +3,20 @@
 
 Run only as an Effigy heavy task under the shared proof supervisor
 (`scripts/bounded-test.py`, SHA-256
-94b1aba60a7475a31b5620039986336f13e1c88d58dd3732b5736290dc63685b, which is
-the qualified oxide#151 supervisor merged from main af08749c plus oxide#191's
-opt-in post-census image detach and oxide#197's ancestor and launcher-sibling exclusions). Those
-added bytes are unqualified until their
-own uncounted diagnostic, one counted author and one separate independent
-reviewer `effigy proof:supervisor:qualify` pass at the merged head; the
-oxide#151 qualification files stay history for their own runs (bootstrap
-585e3395..., suite 37ea34f0..., runner bc24b238...; earlier declarations named
-5e5b6617 and d89115f1, which are historical):
+fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b). Those are the
+integrated oxide#195 custody-hardening bytes over oxide#197's ancestor and
+launcher-sibling exclusions, oxide#192's admission reports and oxide#191's
+opt-in post-census image detach; every path that signals a merely observed
+non-child PID is gone, a census round's same-session survivors are recorded and
+never signalled, and the deciding census is bound to the message the
+custodian's decision named (workflow.md, "Cooperative-session survivors"). The
+control-integrity record for those bytes, and the native qualification chain
+that binds them, are in workflow.md's shared-supervisor sections; this proof
+declares the exact digest it will run under and its `--self-test` recomputes
+that digest from the file, so a different supervisor fails the pure check
+instead of passing silently. The oxide#151 qualification files stay history for
+their own runs (bootstrap 585e3395..., suite 37ea34f0..., runner bc24b238...;
+earlier declarations named 5e5b6617 and d89115f1, which are historical):
 
   rust:outputs-prune             the counted proof (fail-fast)
   rust:outputs-prune:diagnostic  the same script with `--diagnostic`
@@ -93,9 +98,19 @@ own machine-checked matrix: `--self-test` fails if it drifts from
 CASE_PLAN/CASE_NAMES, and the dependency column is exactly what a
 `--diagnostic` run uses to decide which cases may still run.
 
-  01 init: adopt publishes the current control format (state version 4 with
-     the `oxide.outputs/3` owned-outputs fence and a ready transaction in both
-     controls) and the current registry document is exactly
+  01 init: adopt publishes the current control format in BOTH paired
+     controls, each at the version its OWN fences imply (`Store::save`: a
+     document names the highest fence it carries, never a binary-wide
+     maximum). The internal pool admitted the bootstrap build, so it is fully
+     fenced: version 9 with `oxide.outputs/3`, `oxide.accounting/1`,
+     `oxide.eviction-accounting/1`, `oxide.slots/256` and `oxide.holding/1`.
+     The paired removable pool was created by registration and only received
+     the owned-outputs fence from this adopt (no leased command has admitted
+     into it yet), so it stays at the recorded-accounting version 5 and
+     carries no later fence. `control_state_version(document)` derives each
+     from the document, so one number can never be asserted for both. Both
+     controls must also carry a ready transaction, and the current registry
+     document is exactly
      `oxide.outputs.registry/2` with schema 2 and `complete: true` — the pair
      this head writes, checked against the frozen `prune.rs` literals by the
      pure selector; a legacy 1/1 document is readable by the product but is
@@ -167,8 +182,8 @@ CASE_PLAN/CASE_NAMES, and the dependency column is exactly what a
   10 receiptless legacy roots: the one whose checkout is on the boot Data
      volume (device + APFS UUID proof) gets its exclusive pruning receipt and
      is deleted (receipt `pruned`/`deleted`); the one whose checkout is on the
-     attached scratch image, a foreign directory and a marker whose checkout
-     identity is not its path digest are kept, bytes unchanged.
+     attached scratch image is kept. Separate foreign-marker and forged-digest
+     controls refuse the whole batch before deletion, with bytes unchanged.
   11 active writer: a build script holds Cargo Running in a vanished checkout;
      its root is kept with a writer reason.
   12 containment and reserve: a root replaced by a symlink is kept; a symlink
@@ -332,7 +347,7 @@ def _load(name: str, file: str):
     return module
 
 
-SUPERVISOR = "94b1aba60a7475a31b5620039986336f13e1c88d58dd3732b5736290dc63685b"
+SUPERVISOR = "fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b"
 LIMIT_SECONDS = 360
 SCRATCH_MIB = 512
 CASES = 22
@@ -391,13 +406,45 @@ OLD_SHA = "bd52cb42842c06451b0f8a9bc364ba7de74cfe6f014d33804890c4adbc51fc2b"
 OLD_SIZE = 2_756_576
 OLD_BINARY_CAP = 8 * 1024 * 1024
 OLD_RECEIPT_CAP = 64 * 1024
+# The released d246d400 artifact's OWN control state, from its install receipt and
+# its capability probe. It is a property of that fixed historical input, never
+# this head's control state; the two must differ, and the older binary must
+# refuse a pool fenced at the current version.
+OLD_CONTROL_STATE = 2
 CAPABILITIES_PROBE = "__oxide-build-capabilities"
-# The control state and fence this proof's head writes (src/bin/oxide/store.rs
-# STATE_VERSION / OWNED_OUTPUTS_FENCE) and the exact capability probe the staged
-# candidate must report. A bump is a deliberate proof correction, never a
-# silently accepted drift.
-CONTROL_STATE_VERSION = 4
+# The control state and fences this proof's head writes, and the exact capability
+# probe the staged candidate must report. The numbers and literals are current
+# source, not a guess: `--self-test` reads them back from
+# `src/lease/mod.rs` (`CONTROL_FENCE_VERSION`, the fence literals) and
+# `src/lease/control.rs` (`STATE_VERSION`, `OWNED_OUTPUTS_FENCE`), so a fence
+# bump fails the pure check loudly instead of a native run silently checking a
+# stale format. A bump is a deliberate proof correction, never an accepted
+# drift.
+CONTROL_STATE_VERSION = 9
 OWNED_OUTPUTS_FENCE = "oxide.outputs/3"
+# Version 9 requires all four of these fences in a ready control document: the
+# recorded-accounting fence (oxide#146, version 5), the eviction-accounting fence
+# (oxide#175, version 7), the raised slot ceiling (oxide#177, version 8) and the
+# whole-tree holding fence (oxide#190, version 9).
+RECORDED_ACCOUNTING_FENCE = "oxide.accounting/1"
+EVICTION_ACCOUNTING_FENCE = "oxide.eviction-accounting/1"
+SLOT_CEILING_FENCE = "oxide.slots/256"
+HOLDING_FENCE = "oxide.holding/1"
+ONE_USE_FENCE = "oxide.one-use/1"
+# The numeric versions a control document can carry, one per fence
+# (`src/lease/control.rs`). A document's version names the HIGHEST fence it
+# actually carries (`Store::save`, `src/bin/oxide/store.rs`), not this binary's
+# maximum: a pool that has never admitted a build is not forced to the current
+# one. CONTROL_STATE_VERSION is therefore only the fully fenced maximum, and
+# case 01 scopes it to the control that has actually admitted a build.
+HOLDING_STATE_VERSION = CONTROL_STATE_VERSION
+SLOT_CEILING_STATE_VERSION = 8
+EVICTION_ACCOUNTING_STATE_VERSION = 7
+ONE_USE_STATE_VERSION = 6
+RECORDED_ACCOUNTING_STATE_VERSION = 5
+PREVIOUS_STATE_VERSION = 4
+OLDER_STATE_VERSION = 3
+LEGACY_FIELDS_STATE_VERSION = 2
 # The registry document this head WRITES (prune.rs REGISTRY_VERSION /
 # REGISTRY_SCHEMA): initialization creates 2/2 and a profile receipt promotes a
 # legacy 1/1 document to 2/2, so 2/2 is the current-write format case 01 must
@@ -411,6 +458,9 @@ CANDIDATE_CAPABILITY = {
     "test_controls": True,
 }
 HANDOFF_NOTICE = "handing off to the installed binary"
+# The released predecessor of the owned-outputs fence; a document carrying it is
+# version 3 (`Store::save`), never this head's write.
+LEGACY_OWNED_OUTPUTS_FENCE = "oxide.outputs/2"
 # A build script that holds Cargo running until its gate releases it
 # (bounded at 60 s), so a writer is positively Running, not pre-launch.
 GATED_BUILD = r"""
@@ -431,6 +481,12 @@ DONE: list[str] = []
 def plan() -> int:
     print("oxide#129 owned-output prune proof plan")
     print(f"supervisor bounded-test.py sha256 {SUPERVISOR}")
+    print(
+        f"control format: fully fenced {CONTROL_STATE_VERSION} ({OWNED_OUTPUTS_FENCE}, "
+        f"{RECORDED_ACCOUNTING_FENCE}, {EVICTION_ACCOUNTING_FENCE}, {SLOT_CEILING_FENCE}, "
+        f"{HOLDING_FENCE}); a pool that has not admitted a build keeps "
+        f"{RECORDED_ACCOUNTING_STATE_VERSION}"
+    )
     print(f"wall limit {LIMIT_SECONDS} s; monitored owned scratch {SCRATCH_MIB} MiB")
     print("static allocation:")
     total = 0
@@ -717,6 +773,87 @@ class _Skippable:
 
 def case(case_id: str) -> _Case:
     return _Case(case_id)
+
+
+def preview_report(preview: dict) -> str:
+    """One bounded line naming why every evaluated root was kept.
+
+    Selected eligibility assertions carry this map, because a preview the
+    product refused as a WHOLE (an incomplete
+    snapshot) keeps every root for one shared reason and sets no candidate at
+    all: without the map that is indistinguishable from a per-root refusal, and
+    a failure prints only an empty candidate set.
+    """
+    coverage = preview.get("coverage") or {}
+    kept = [
+        f"{(row.get('root') or row.get('checkout_id') or '?')}: {row.get('reason')}"
+        for row in preview.get("kept") or []
+    ]
+    return (
+        f"coverage complete={coverage.get('complete')} "
+        f"candidates={coverage.get('candidate_roots')} kept={coverage.get('kept_roots')}; "
+        + " | ".join(kept[:12])
+    )
+
+
+def symlink_root_refusal(preview: dict, root: str) -> bool:
+    """A changed recorded root makes this snapshot incomplete, not a per-root keep."""
+    reasons = [row.get("reason", "") for row in preview.get("kept", []) if row.get("root") == root]
+    return (
+        (preview.get("coverage") or {}).get("complete") is False
+        and not preview.get("candidates")
+        and len(reasons) == 1
+        and "the recorded root is not a real directory" in reasons[0]
+        and "the whole batch is kept" in reasons[0]
+    )
+
+
+def control_state_version(document: dict) -> "int | None":
+    """The numeric version a control document implies from its OWN fences.
+
+    The product's `State` writer does not stamp a binary-wide maximum: it writes
+    the version of the highest fence the document carries (`Store::save`,
+    `src/bin/oxide/store.rs` — holding, then slot ceiling, then eviction
+    accounting, then one-use, then recorded accounting, then the SUCCESSOR
+    `oxide.outputs/3` fence, and only then the previous shape, which is an
+    initialization record or the released `oxide.outputs/2` fence, and finally a
+    bare document). Order matters in both places: the successor fence is checked
+    BEFORE the initialization record in the product, so a document that carries
+    both and no later fence is version 4, never 3. So an internal pool that has
+    admitted a build is fully fenced at the current maximum, while a paired
+    removable pool that only received the owned-outputs fence from an
+    initialization stays at the recorded-accounting version. Deriving the
+    expected version from the document is what keeps this proof honest in both
+    cases; `None` means a present fence value is not the one this head writes,
+    which is a failure, not a version.
+    """
+
+    for name, expected, version in (
+        ("holding", HOLDING_FENCE, HOLDING_STATE_VERSION),
+        ("slot_ceiling", SLOT_CEILING_FENCE, SLOT_CEILING_STATE_VERSION),
+        (
+            "eviction_accounting",
+            EVICTION_ACCOUNTING_FENCE,
+            EVICTION_ACCOUNTING_STATE_VERSION,
+        ),
+        ("one_use_workspaces", ONE_USE_FENCE, ONE_USE_STATE_VERSION),
+        ("recorded_accounting", RECORDED_ACCOUNTING_FENCE, RECORDED_ACCOUNTING_STATE_VERSION),
+    ):
+        value = document.get(name)
+        if value is None:
+            continue
+        if value != expected:
+            return None
+        return version
+    # The product tests `successor` before `previous`: a document carrying the
+    # current owned-outputs fence is version 4 even when it also carries an
+    # initialization record, and only a document WITHOUT that fence falls to the
+    # version-3 shape (an initialization record or the released `/2` fence).
+    if document.get("owned_outputs") == OWNED_OUTPUTS_FENCE:
+        return PREVIOUS_STATE_VERSION
+    if document.get("outputs_init") is not None or document.get("owned_outputs") == LEGACY_OWNED_OUTPUTS_FENCE:
+        return OLDER_STATE_VERSION
+    return LEGACY_FIELDS_STATE_VERSION
 
 
 def registry_is_current(registry: dict) -> bool:
@@ -1933,6 +2070,24 @@ class World:
                 return kept["reason"]
         return ""
 
+    def report(self, preview: dict) -> str:
+        """[`preview_report`] for one preview."""
+        return preview_report(preview)
+
+    def complete(self, preview: dict, label: str) -> None:
+        """Require a COMPLETE snapshot before reasoning about individual keeps.
+
+        A per-root keep is only evidence when the snapshot that produced it was
+        complete; the product keeps the whole batch for one shared reason when
+        required authority is missing. Making that an explicit premise keeps a
+        broken fixture (or a genuinely incomplete registry) from masquerading as
+        a correct per-root decision, and names the shared reason when it does.
+        """
+        expect(
+            (preview.get("coverage") or {}).get("complete") is True,
+            f"{label}: the whole batch was kept instead of a per-root decision: {preview_report(preview)}",
+        )
+
     def intents(self) -> list:
         return self.registry_doc().get("intents", [])
 
@@ -2057,7 +2212,10 @@ def _copy_old_artifact(root: str) -> str:
         f"receipt installed.path {installed.get('path')} is not the historical {OLD_INSTALLED_PATH}",
     )
     expect(installed.get("sha256") == OLD_SHA and receipt.get("built_sha256") == OLD_SHA, "receipt hash mismatch")
-    expect(receipt.get("control_state_version") == 2, f"receipt control state {receipt.get('control_state_version')}")
+    expect(
+        receipt.get("control_state_version") == OLD_CONTROL_STATE,
+        f"receipt control state {receipt.get('control_state_version')}",
+    )
     expect(installed.get("size") == OLD_SIZE, f"receipt size {installed.get('size')} is not {OLD_SIZE}")
     expect(OLD_ARTIFACT_PATH != OLD_INSTALLED_PATH, "the artifact source path is the installed path")
     binary, binary_id = read_nofollow(OLD_ARTIFACT_PATH, OLD_BINARY_CAP)
@@ -2083,7 +2241,7 @@ def _copy_old_artifact(root: str) -> str:
                 "source_pin": OLD_PIN,
                 "binary_sha256": OLD_SHA,
                 "binary_size": len(binary),
-                "control_state_version": 2,
+                "control_state_version": OLD_CONTROL_STATE,
                 "source_artifact_path": OLD_ARTIFACT_PATH,
                 "historical_installed_path": OLD_INSTALLED_PATH,
                 "historical_installed_path_note": (
@@ -2120,6 +2278,41 @@ def tree_snapshot(root: str) -> dict:
     return snapshot
 
 
+def owned_tree_snapshot(root: str) -> dict:
+    """Capture the root and every entry, including link text, without following links.
+
+    Scandir and reads raise on failure; a missing or unreadable subtree cannot
+    be mistaken for an empty one. Access times are excluded because reads change them.
+    """
+    snapshot = {}
+
+    def visit(path: str, relative: str) -> None:
+        facts = os.lstat(path)
+        entry = (facts.st_mode, facts.st_uid, facts.st_gid, facts.st_dev,
+                 facts.st_ino, facts.st_size, facts.st_mtime_ns)
+        if stat.S_ISDIR(facts.st_mode):
+            snapshot[relative] = entry
+            with os.scandir(path) as entries:
+                names = sorted(entry.name for entry in entries)
+            for name in names:
+                visit(os.path.join(path, name), os.path.join(relative, name))
+        elif stat.S_ISREG(facts.st_mode):
+            snapshot[relative] = entry + (hashlib.sha256(permanent.read_bytes(path)).hexdigest(),)
+        elif stat.S_ISLNK(facts.st_mode):
+            snapshot[relative] = entry + (os.readlink(path),)
+        else:
+            raise RuntimeError(f"unexpected entry in fixture tree: {path}")
+
+    if not stat.S_ISDIR(os.lstat(root).st_mode):
+        raise RuntimeError(f"fixture root is not a real directory: {root}")
+    visit(root, ".")
+    return snapshot
+
+
+def symlink_root_unchanged(before: dict, after: dict, link_target: str, expected_target: str) -> bool:
+    return before == after and link_target == expected_target
+
+
 def marker(root: str) -> dict:
     return permanent.read_json(os.path.join(root, ".oxide-output.json"))
 
@@ -2136,9 +2329,9 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
     proof.phase("start")
 
     # The staged candidate's compiled capabilities, pinned exactly for THIS
-    # head: state version 4 and the `oxide.outputs/3` owned-outputs fence,
-    # debug-only proof controls. The shared helper's default stays unchanged
-    # for its other caller.
+    # head: control state version 9 and the `oxide.outputs/3` owned-outputs
+    # fence, debug-only proof controls. The shared helper's default stays
+    # unchanged for its other caller.
     proof.binary = handoff.stage_subject(proof.root, capability=CANDIDATE_CAPABILITY)
     proof.phase("after staging")
 
@@ -2181,19 +2374,62 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
         # registry or row is written by hand.
         world.version_one = world.version_one_fixture()
         world.adopt(alpha)
-        for control in (world.control, os.path.join(world.control, "removable", "oxide-managed")):
+        # Both paired controls are current writes, but their NUMERIC version
+        # differs and must: a document names the highest fence it carries
+        # (`Store::save`), not this binary's maximum.
+        #   - the internal pool admitted the bootstrap build above, so the
+        #     admission gate forward-fenced it: the fully fenced maximum with
+        #     every fence;
+        #   - the paired removable pool was created by registration and only
+        #     received the owned-outputs fence from this adopt, because no
+        #     leased command has admitted into it yet: the recorded-accounting
+        #     version, with the fences it has and no others.
+        # Pinning one number for both controls asserted a fact the product never
+        # promises and the 4d5e47b counted run failed on it (state version 5 at
+        # the removable control).
+        for control, admitted in (
+            (world.control, True),
+            (os.path.join(world.control, "removable", "oxide-managed"), False),
+        ):
             state_file = os.path.join(control, "state.json")
             expect(os.path.isfile(state_file), f"paired control state {state_file} is missing")
             state = permanent.read_json(state_file)
-            # The current control format at this head (store.rs STATE_VERSION and
-            # OWNED_OUTPUTS_FENCE): a bump fails this proof loudly instead of
-            # letting it check a stale format.
-            expect(state["version"] == CONTROL_STATE_VERSION, f"{control}: state version {state['version']}")
+            expect(
+                state.get("version") == control_state_version(state),
+                f"{control}: state version {state.get('version')} does not follow its own fences {state}",
+            )
             expect(
                 state.get("owned_outputs") == OWNED_OUTPUTS_FENCE,
-                f"{control}: {state.get('owned_outputs')}",
+                f"{control}: {state.get('owned_outputs')!r} is not {OWNED_OUTPUTS_FENCE!r}",
             )
             expect("ready" in json.dumps(state.get("outputs_init")), f"{control}: {state.get('outputs_init')}")
+            if admitted:
+                expect(
+                    state.get("version") == CONTROL_STATE_VERSION,
+                    f"{control}: an admitted pool is {state.get('version')}, not {CONTROL_STATE_VERSION}",
+                )
+                for name, expected in (
+                    ("recorded_accounting", RECORDED_ACCOUNTING_FENCE),
+                    ("eviction_accounting", EVICTION_ACCOUNTING_FENCE),
+                    ("slot_ceiling", SLOT_CEILING_FENCE),
+                    ("holding", HOLDING_FENCE),
+                ):
+                    expect(
+                        state.get(name) == expected,
+                        f"{control}: {name} {state.get(name)!r} is not {expected!r}",
+                    )
+            else:
+                expect(
+                    state.get("version") == RECORDED_ACCOUNTING_STATE_VERSION,
+                    f"{control}: a pool that has not admitted a build is {state.get('version')}, "
+                    f"not the recorded-accounting version {RECORDED_ACCOUNTING_STATE_VERSION}",
+                )
+                expect(
+                    state.get("recorded_accounting") == RECORDED_ACCOUNTING_FENCE,
+                    f"{control}: {state.get('recorded_accounting')!r}",
+                )
+                for name in ("eviction_accounting", "slot_ceiling", "holding"):
+                    expect(name not in state, f"{control}: {name} is set before this pool admitted a build")
         registry = world.registry_doc()
         expect(registry_is_current(registry), registry)
         # Older-binary fence control: the exact d246d400 artifact's copy reports
@@ -2203,7 +2439,10 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
         old = copy_old_artifact(proof.root)
         probe = proof.run([old, CAPABILITIES_PROBE], cwd=alpha, env=proof.env, timeout=30)
         expect(probe.returncode == 0, f"old capability probe exit {probe.returncode}")
-        expect(json.loads(probe.stdout).get("control_state_version") == 2, f"old probe {probe.stdout!r}")
+        expect(
+            json.loads(probe.stdout).get("control_state_version") == OLD_CONTROL_STATE,
+            f"old probe {probe.stdout!r}",
+        )
         watched = [world.pool, os.path.join(mount, "oxide-outputs"), alpha]
         before = [tree_snapshot(path) for path in watched]
         for args in (["check"], ["outputs", "adopt"]):
@@ -2415,11 +2654,12 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
                 code, _, stderr = control.finish(world, refused, "local-fallback starter")
                 expect(code != 0, f"the refused local-fallback starter exited {code}: {stderr}")
             _, _, preview = world.plan_file("non-reserving control dry run", alpha)
+            world.complete(preview, "non-reserving control dry run")
             reason = world.kept(preview, beta_root)
-            expect(reason, f"the non-reserving control root is neither kept nor explained: {reason}")
+            expect(reason, f"the non-reserving control root is neither kept nor explained: {world.report(preview)}")
             expect(
                 beta_root not in world.candidates(preview),
-                "the non-reserving control root became a candidate",
+                f"the non-reserving control root became a candidate: {world.report(preview)}",
             )
         finally:
             permanent.set_recorded_uuid(world.pool, recorded)
@@ -2484,6 +2724,7 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
         expect("outputs/registry.json" in before and len(volume_before) > 0, "the byte oracle saw nothing")
         path, sha, preview = world.plan_file("dry run", alpha)
         expect(preview["version"] == "oxide.outputs.prune-preview/1", preview["version"])
+        world.complete(preview, "canonical dry run")
         expect(tree_bytes(world.control) == before, "a dry run changed control bytes")
         expect(tree_bytes(os.path.join(mount, "oxide-outputs")) == volume_before, "a dry run changed volume bytes")
 
@@ -2498,27 +2739,55 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
             handle.write(b"{corrupt")
         code, stdout, _ = world.dry_run("dry run with a corrupt receipt", alpha)
         preview = json.loads(stdout)
-        expect(code == 0 and not preview["candidates"], f"candidates despite a corrupt receipt: {preview['candidates']}")
-        expect("whole batch" in world.kept(preview, delta_root), world.kept(preview, delta_root))
+        expect(
+            code == 0 and not preview["candidates"],
+            f"candidates despite a corrupt receipt: {preview['candidates']}",
+        )
+        expect(
+            (preview.get("coverage") or {}).get("complete") is False,
+            f"a corrupt receipt left a complete snapshot: {world.report(preview)}",
+        )
+        expect(
+            "whole batch" in world.kept(preview, delta_root),
+            f"the corrupt receipt did not refuse the batch: {world.report(preview)}",
+        )
         with open(gamma_receipt, "wb") as handle:
             handle.write(saved_receipt)
 
     # ---- eligibility --------------------------------------------------------
     with case("08") as scope, scope.run():
         _, _, preview = world.plan_file("eligibility dry run", alpha)
-        expect(world.candidates(preview) == {delta_root}, f"candidates {world.candidates(preview)}")
-        expect("present" in world.kept(preview, world.selected(alpha)["root"]), "alpha not kept as present")
+        world.complete(preview, "eligibility dry run")
+        expect(
+            world.candidates(preview) == {delta_root},
+            f"candidates {world.candidates(preview)}: {world.report(preview)}",
+        )
+        expect(
+            "present" in world.kept(preview, world.selected(alpha)["root"]),
+            f"alpha not kept as present: {world.report(preview)}",
+        )
         epsilon = world.checkout("epsilon")
         epsilon_root = world.adopt(epsilon)["links"][0]["selected"]["root"]
         code, _, stderr = world.oxide(["outputs", "detach"], "detach epsilon", epsilon)
         expect(code == 0, stderr)
         _, _, preview = world.plan_file("live detached dry run", alpha)
-        expect(epsilon_root not in world.candidates(preview), "a live detached root became a candidate")
-        expect("present" in world.kept(preview, epsilon_root), world.kept(preview, epsilon_root))
+        world.complete(preview, "live detached dry run")
+        expect(
+            epsilon_root not in world.candidates(preview),
+            f"a live detached root became a candidate: {world.report(preview)}",
+        )
+        expect(
+            "present" in world.kept(preview, epsilon_root),
+            f"the live detached root is not kept as present: {world.report(preview)}",
+        )
         # The same released root becomes eligible once its checkout is gone.
         epsilon_away = world.vanish(epsilon)
         _, _, preview = world.plan_file("released vanished dry run", alpha)
-        expect(epsilon_root in world.candidates(preview), f"a released vanished root was kept: {world.kept(preview, epsilon_root)}")
+        world.complete(preview, "released vanished dry run")
+        expect(
+            epsilon_root in world.candidates(preview),
+            f"a released vanished root was kept: {world.report(preview)}",
+        )
         world.restore(epsilon, epsilon_away)
 
         # A registered checkout on the attached image: absence is proved through
@@ -2527,7 +2796,11 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
         omega_root = world.adopt(omega)["links"][0]["selected"]["root"]
         omega_away = world.vanish(omega)
         _, _, preview = world.plan_file("registered image checkout dry run", alpha)
-        expect(omega_root in world.candidates(preview), f"a registered /Volumes checkout was kept: {world.kept(preview, omega_root)}")
+        world.complete(preview, "registered image checkout dry run")
+        expect(
+            omega_root in world.candidates(preview),
+            f"a registered /Volumes checkout was kept: {world.report(preview)}",
+        )
         world.restore(omega, omega_away)
 
     with case("09") as scope, scope.run():
@@ -2597,18 +2870,40 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
         with open(os.path.join(forged_root, ".oxide-output.json"), "w", encoding="utf-8") as handle:
             json.dump(forged_marker, handle)
         kept_before = {root: tree_bytes(root) for root in (foreign_root, forged_root, image_root)}
+        # Delta is present for all three previews, so it cannot be pruned by
+        # a control. Each invalid listed authority must refuse the WHOLE batch,
+        # including the otherwise eligible legacy root, without any effect.
+        world.restore(delta, delta_away)
+        for label, bad_root, reason in (
+            ("foreign", foreign_root, "no readable owner marker"),
+            ("forged", forged_root, "digest"),
+        ):
+            bad_list = os.path.join(proof.root, f"list-{label}.json")
+            with open(bad_list, "w", encoding="utf-8") as handle:
+                json.dump([legacy_root, bad_root], handle)
+            before = {root: tree_bytes(root) for root in (legacy_root, bad_root)}
+            authority_before = tree_bytes(world.control)
+            plan, sha, preview = world.plan_file(f"{label} refusal dry run", alpha, bad_list)
+            expect((preview.get("coverage") or {}).get("complete") is False, world.report(preview))
+            expect(not world.candidates(preview), world.report(preview))
+            expect(reason in world.kept(preview, legacy_root), world.report(preview))
+            code, _, stderr = world.real_run(f"{label} refusal real run", alpha, plan, sha, bad_list)
+            expect(code == 2, f"{label} refusal exited {code}: {stderr}")
+            expect(tree_bytes(world.control) == authority_before, f"{label} refusal changed control")
+            for root, digest in before.items():
+                expect(os.path.isdir(root) and tree_bytes(root) == digest, f"{label} refusal changed {root}")
+            expect(not os.path.exists(permanent.receipt_file(world.pool, legacy_checkout)),
+                   f"{label} refusal created a legacy receipt")
+            expect(not world.intents() and not world.quarantines(), f"{label} refusal journaled")
+
         listed = os.path.join(proof.root, "list-legacy.json")
         with open(listed, "w", encoding="utf-8") as handle:
-            json.dump([legacy_root, image_root, foreign_root, forged_root], handle)
-        # Delta (an ordinary eligible root) is present for this run so only the
-        # listed legacy roots are candidates; it vanishes again afterwards.
-        world.restore(delta, delta_away)
+            json.dump([legacy_root, image_root], handle)
         plan, sha, preview = world.plan_file("legacy dry run", alpha, listed)
-        expect(legacy_root in world.candidates(preview), f"legacy root not a candidate: {world.kept(preview, legacy_root)}")
-        expect(image_root not in world.candidates(preview), "a legacy root of an image checkout became a candidate")
-        expect("volume" in world.kept(preview, image_root), world.kept(preview, image_root))
-        expect(foreign_root not in world.candidates(preview), "a foreign directory became a candidate")
-        expect("digest" in world.kept(preview, forged_root), world.kept(preview, forged_root))
+        world.complete(preview, "legacy dry run")
+        expect(legacy_root in world.candidates(preview), world.report(preview))
+        expect(image_root not in world.candidates(preview), world.report(preview))
+        expect("volume" in world.kept(preview, image_root), world.report(preview))
         code, stdout, stderr = world.real_run("legacy real run", alpha, plan, sha, listed)
         expect(code == 0, f"legacy real run exited {code}: {stderr}")
         expect(not os.path.lexists(legacy_root), "the legacy root remains")
@@ -2674,12 +2969,36 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
         kappa_slot, _ = permanent.slot_state(stderr)
         kappa_pool = "removable pool:" if "removable" in permanent.summary(stderr) else "internal pool:"
         kappa_away = world.vanish(kappa)
+        _, _, preview = world.plan_file("before symlink root dry run", alpha)
+        world.complete(preview, "before symlink root dry run")
+        expect(kappa_root in world.candidates(preview), world.report(preview))
+        sentinel = os.path.join(kappa_root, "symlink-root-sentinel")
+        with open(sentinel, "wb") as handle:
+            handle.write(b"untouched")
+        original = os.stat(kappa_root)
+        marker_before = permanent.read_bytes(os.path.join(kappa_root, ".oxide-output.json"))
+        control_before = tree_bytes(world.control)
         os.rename(kappa_root, kappa_root + ".real")
-        os.symlink(kappa_root + ".real", kappa_root)
-        _, _, preview = world.plan_file("symlink root dry run", alpha)
-        expect(kappa_root not in world.candidates(preview), "a symlink root became a candidate")
+        expected_target = kappa_root + ".real"
+        os.symlink(expected_target, kappa_root)
+        root_before = owned_tree_snapshot(expected_target)
+        plan, sha, preview = world.plan_file("symlink root dry run", alpha)
+        expect(symlink_root_refusal(preview, kappa_root), world.report(preview))
+        code, _, stderr = world.real_run("symlink root refusal", alpha, plan, sha)
+        expect(code == 2, f"symlink root refusal exited {code}: {stderr}")
+        expect(os.path.islink(kappa_root), "the root symlink changed")
+        expect(symlink_root_unchanged(root_before, owned_tree_snapshot(expected_target),
+                                      os.readlink(kappa_root), expected_target),
+               "the root tree or symlink destination changed")
+        expect(os.stat(kappa_root + ".real").st_ino == original.st_ino, "the real root changed")
+        expect(permanent.read_bytes(os.path.join(kappa_root + ".real", "symlink-root-sentinel")) == b"untouched", "the symlink target was touched")
+        expect(permanent.read_bytes(os.path.join(kappa_root + ".real", ".oxide-output.json")) == marker_before, "the marker changed")
+        expect(tree_bytes(world.control) == control_before and not world.intents() and not world.quarantines(), "the symlink refusal changed control or journaled")
         os.unlink(kappa_root)
         os.rename(kappa_root + ".real", kappa_root)
+        _, _, preview = world.plan_file("restored root dry run", alpha)
+        world.complete(preview, "restored root dry run")
+        expect(kappa_root in world.candidates(preview), world.report(preview))
         world.restore(kappa, kappa_away)
         # Reserve: a low reserve at the check before the rename refuses with the
         # root unchanged (exit 2); a low reserve between delete batches of a
@@ -2695,7 +3014,8 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
         world.vanish(lam)
         fired = os.path.join(os.environ["OXIDE_PROOF_EVIDENCE"], "prune-low-reserve-fired")
         plan, sha, preview = world.plan_file("reserve dry run", alpha)
-        expect(world.candidates(preview) == {lam_root}, f"candidates {world.candidates(preview)}")
+        world.complete(preview, "reserve dry run")
+        expect(world.candidates(preview) == {lam_root}, world.report(preview))
         before = tree_bytes(lam_root)
         code, _, stderr = world.real_run("low reserve before rename", alpha, plan, sha, extra={"OXIDE_TEST_PRUNE_LOW_RESERVE_AT": "1"})
         expect(code == 2 and "reserve" in stderr, f"low reserve before rename exited {code}")
@@ -3055,8 +3375,9 @@ def self_test() -> int:
     (counted fail-fast, keep-going, taint skips, abort precedence) and the
     bounded unqualified receipt are driven with synthetic bodies.
     """
-    global permanent, DIAG
+    global permanent, DIAG, expect, fail
     restore = permanent
+    saved_expect, saved_fail = expect, fail
     fake = type(
         "FakePermanent",
         (),
@@ -3067,9 +3388,14 @@ def self_test() -> int:
                 if condition
                 else (_ for _ in ()).throw(RuntimeError(message))
             ),
+            "fail": staticmethod(lambda message: (_ for _ in ()).throw(RuntimeError(message))),
         },
     )
     permanent = fake
+    # The case bodies and `World` helpers use the module-level `expect`/`fail`
+    # that a real run binds to the permanent fixture; the pure checks drive the
+    # same code, so bind the fake's pair for the duration.
+    expect, fail = fake.expect, fake.fail
     failures = 0
 
     def check(label: str, body) -> None:
@@ -3111,6 +3437,301 @@ def self_test() -> int:
 
     check("case table", table)
 
+    def declared_supervisor() -> None:
+        # The exact bytes this proof runs under: the declared digest must be the
+        # file on disk, so a merged or corrected supervisor cannot be run under a
+        # stale declaration (and the digest is never inferred from the receipt).
+        path = os.path.join(HERE, "bounded-test.py")
+        with open(path, "rb") as handle:
+            digest = hashlib.sha256(handle.read()).hexdigest()
+        assert SUPERVISOR == digest, (SUPERVISOR, digest)
+        assert "fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b" == SUPERVISOR
+        assert "oxide#195" in (__doc__ or ""), "the supervisor provenance is undocumented"
+
+    check("declared supervisor digest", declared_supervisor)
+
+    def control_format_pins() -> None:
+        # Every control-format pin is CURRENT SOURCE, read back here instead of
+        # assumed: a fence bump, a moved declaration, a changed capability field
+        # or a changed registration version fails this pure check before any
+        # native run can check a stale format.
+        repo = os.path.dirname(HERE)
+
+        def read(relative: str) -> str:
+            with open(os.path.join(repo, relative), encoding="utf-8") as handle:
+                return handle.read(2 * 1024 * 1024)
+
+        lease = read(os.path.join("src", "lease", "mod.rs"))
+        control = read(os.path.join("src", "lease", "control.rs"))
+        version = re.search(r"^pub const CONTROL_FENCE_VERSION: u32 = (\d+);$", lease, re.MULTILINE)
+        assert version is not None, "src/lease/mod.rs no longer declares CONTROL_FENCE_VERSION"
+        assert int(version.group(1)) == CONTROL_STATE_VERSION, (version.group(1), CONTROL_STATE_VERSION)
+        # State and holding versions delegate to that one number, which is why a
+        # version-9 document must carry every fence case 01 asserts.
+        for name in ("STATE_VERSION", "HOLDING_STATE_VERSION"):
+            assert f"pub const {name}: u32 = super::CONTROL_FENCE_VERSION;" in control, (
+                "src/lease/control.rs no longer derives " + name + " from the control fence"
+            )
+        # The per-fence numeric versions a control document can carry, and the
+        # order `Store::save` derives its version from the fences present.
+        for name, version in (
+            ("SLOT_CEILING_STATE_VERSION", SLOT_CEILING_STATE_VERSION),
+            ("EVICTION_ACCOUNTING_STATE_VERSION", EVICTION_ACCOUNTING_STATE_VERSION),
+            ("ONE_USE_STATE_VERSION", ONE_USE_STATE_VERSION),
+            ("RECORDED_ACCOUNTING_STATE_VERSION", RECORDED_ACCOUNTING_STATE_VERSION),
+            ("PREVIOUS_STATE_VERSION", PREVIOUS_STATE_VERSION),
+            ("OLDER_STATE_VERSION", OLDER_STATE_VERSION),
+            ("LEGACY_FIELDS_STATE_VERSION", LEGACY_FIELDS_STATE_VERSION),
+        ):
+            found = re.search(r"^pub const " + name + r": u32 = (\d+);$", control, re.MULTILINE)
+            assert found is not None, f"src/lease/control.rs no longer declares {name}"
+            assert int(found.group(1)) == version, (found.group(1), version)
+        store = read(os.path.join("src", "bin", "oxide", "store.rs"))
+        for line in (
+            "let recorded = fenced.recorded_accounting.is_some();",
+            "let slot_ceiling = fenced.slot_ceiling.is_some();",
+            "let holding = fenced.holding.is_some();",
+            "let successor = fenced.owned_outputs.as_deref() == Some(OWNED_OUTPUTS_FENCE);",
+            "fenced.version = if holding {",
+            "} else if slot_ceiling {",
+            "} else if fenced.eviction_accounting.is_some() {",
+            "} else if recorded {",
+            "} else if successor {",
+            "} else if previous {",
+        ):
+            assert line in store, f"the version ladder in store.rs changed: {line}"
+        # ORDER, not only presence: `successor` (the owned-outputs fence, version
+        # 4) is decided before `previous` (an initialization record or the
+        # released `/2` fence, version 3). The oracle above mirrors that order,
+        # and this comparison is what fails if the product ever swaps them.
+        ladder = store.index("fenced.version = if holding {")
+        assert store.index("} else if successor {", ladder) < store.index(
+            "} else if previous {", ladder
+        ), "Store::save now decides the previous shape before the successor fence"
+        # The owned-outputs fence is a literal in control.rs; the four later
+        # fences live in mod.rs under the shared `CONTROL_` prefix.
+        assert f'pub const OWNED_OUTPUTS_FENCE: &str = "{OWNED_OUTPUTS_FENCE}";' in control, (
+            "src/lease/control.rs no longer declares this owned-outputs fence"
+        )
+        assert (
+            f'pub const LEGACY_OWNED_OUTPUTS_FENCE: &str = "{LEGACY_OWNED_OUTPUTS_FENCE}";' in control
+        ), "src/lease/control.rs no longer declares this predecessor owned-outputs fence"
+        for name, value in (
+            ("CONTROL_RECORDED_ACCOUNTING_FENCE", RECORDED_ACCOUNTING_FENCE),
+            ("CONTROL_EVICTION_ACCOUNTING_FENCE", EVICTION_ACCOUNTING_FENCE),
+            ("CONTROL_SLOT_CEILING_FENCE", SLOT_CEILING_FENCE),
+            ("CONTROL_ONE_USE_FENCE", ONE_USE_FENCE),
+            ("CONTROL_HOLDING_FENCE", HOLDING_FENCE),
+        ):
+            found = re.search(r"^pub const " + name + r': &str = "([^"]+)";$', lease, re.MULTILINE)
+            assert found is not None, f"src/lease/mod.rs no longer declares {name}"
+            assert found.group(1) == value, (found.group(1), value)
+        # The capability probe answers exactly these fields; the registration
+        # version is the product's own literal.
+        handoff = read(os.path.join("src", "bin", "oxide", "handoff.rs"))
+        assert f'pub const CAPABILITIES_PROBE: &str = "{CAPABILITIES_PROBE}";' in handoff, (
+            "the hidden capability probe's own spelling changed"
+        )
+        for field_name in ("control_state_version", "registration_version", "test_controls"):
+            assert field_name in handoff, f"the capability probe no longer reports {field_name}"
+        assert CANDIDATE_CAPABILITY == {
+            "control_state_version": CONTROL_STATE_VERSION,
+            "registration_version": 2,
+            "test_controls": True,
+        }, CANDIDATE_CAPABILITY
+        removable = read(os.path.join("src", "bin", "oxide", "removable.rs"))
+        registration = re.search(
+            r"^pub\(crate\) const REGISTRATION_VERSION: u32 = (\d+);$", removable, re.MULTILINE
+        )
+        assert registration is not None, "removable.rs no longer declares REGISTRATION_VERSION"
+        assert int(registration.group(1)) == CANDIDATE_CAPABILITY["registration_version"], (
+            registration.group(1),
+            CANDIDATE_CAPABILITY["registration_version"],
+        )
+        # Case 01 scopes the fully fenced maximum to the control that admitted a
+        # build and derives the other control's version from its own fences, so a
+        # single binary-wide number can never be asserted for both again.
+        case_one = inspect.getsource(run)
+        for name in (
+            "OWNED_OUTPUTS_FENCE",
+            "RECORDED_ACCOUNTING_FENCE",
+            "EVICTION_ACCOUNTING_FENCE",
+            "SLOT_CEILING_FENCE",
+            "HOLDING_FENCE",
+        ):
+            assert name in case_one, f"case 01 no longer checks {name}"
+        assert "control_state_version(state)" in case_one, "case 01 stopped deriving the version"
+        assert "(world.control, True)," in case_one, case_one
+        assert 'os.path.join(world.control, "removable", "oxide-managed"), False' in case_one, case_one
+        assert 'state.get("version") == CONTROL_STATE_VERSION' in case_one, case_one
+        assert 'state.get("version") == RECORDED_ACCOUNTING_STATE_VERSION' in case_one, case_one
+
+        # The derived oracle itself, on synthetic documents: each rung of the
+        # product's ladder, the two owned-outputs fallbacks, a bare document and
+        # an unknown fence value, which is a failure rather than a version.
+        assert control_state_version({"holding": HOLDING_FENCE}) == HOLDING_STATE_VERSION
+        assert control_state_version({"slot_ceiling": SLOT_CEILING_FENCE}) == 8
+        assert control_state_version({"eviction_accounting": EVICTION_ACCOUNTING_FENCE}) == 7
+        assert control_state_version({"one_use_workspaces": ONE_USE_FENCE}) == 6
+        assert control_state_version({"recorded_accounting": RECORDED_ACCOUNTING_FENCE}) == 5
+        assert control_state_version({"owned_outputs": OWNED_OUTPUTS_FENCE}) == 4
+        assert control_state_version({"outputs_init": {"state": "ready"}}) == 3
+        assert control_state_version({"owned_outputs": LEGACY_OWNED_OUTPUTS_FENCE}) == 3
+        # The counterexample the product's own order requires: a valid
+        # initialized control carrying the CURRENT owned-outputs fence and no
+        # later fence is version 4. `Store::save` tests `successor` before
+        # `previous`, so the initialization record must not shadow it back to 3.
+        assert (
+            control_state_version(
+                {"owned_outputs": OWNED_OUTPUTS_FENCE, "outputs_init": {"state": "ready"}}
+            )
+            == PREVIOUS_STATE_VERSION
+        )
+        assert (
+            control_state_version(
+                {
+                    "owned_outputs": OWNED_OUTPUTS_FENCE,
+                    "outputs_init": {"state": "ready"},
+                    "recorded_accounting": RECORDED_ACCOUNTING_FENCE,
+                }
+            )
+            == RECORDED_ACCOUNTING_STATE_VERSION
+        )
+        assert control_state_version({}) == 2
+        assert control_state_version({"holding": "oxide.holding/2"}) is None
+        assert control_state_version({"recorded_accounting": "oxide.accounting/2"}) is None
+        # The two documents case 01 actually reads, shape for shape: the
+        # internal pool the bootstrap build forward-fenced, and the paired
+        # removable pool that only received the owned-outputs fence.
+        assert (
+            control_state_version(
+                {
+                    "version": CONTROL_STATE_VERSION,
+                    "owned_outputs": OWNED_OUTPUTS_FENCE,
+                    "recorded_accounting": RECORDED_ACCOUNTING_FENCE,
+                    "eviction_accounting": EVICTION_ACCOUNTING_FENCE,
+                    "slot_ceiling": SLOT_CEILING_FENCE,
+                    "holding": HOLDING_FENCE,
+                    "outputs_init": {"state": "ready"},
+                }
+            )
+            == CONTROL_STATE_VERSION
+        )
+        assert (
+            control_state_version(
+                {
+                    "version": RECORDED_ACCOUNTING_STATE_VERSION,
+                    "owned_outputs": OWNED_OUTPUTS_FENCE,
+                    "recorded_accounting": RECORDED_ACCOUNTING_FENCE,
+                    "outputs_init": {"state": "ready"},
+                }
+            )
+            == RECORDED_ACCOUNTING_STATE_VERSION
+        )
+        # The maximum and the recorded-accounting rung are distinct, so the
+        # scoping in case 01 is not a no-op.
+        assert CONTROL_STATE_VERSION != RECORDED_ACCOUNTING_STATE_VERSION
+        assert HOLDING_STATE_VERSION == CONTROL_STATE_VERSION
+
+    check("control format pins", control_format_pins)
+
+    def keep_diagnostics() -> None:
+        # Pin the selected eligibility and case-12 completeness premises. Other
+        # assertions do not yet all carry the same guard and reason map.
+        # The 6798e5b diagnostic failed exactly that way: case 08 reported
+        # "candidates set()" with no way to tell a per-root keep from the one
+        # shared whole-batch reason.
+        body = inspect.getsource(run)
+        for label in (
+            "eligibility dry run",
+            "live detached dry run",
+            "released vanished dry run",
+            "registered image checkout dry run",
+            "non-reserving control dry run",
+            "canonical dry run",
+        ):
+            assert label in body, label
+        # The nonmutation comparator rejects both lost content and retargeting.
+        fixture_tree = {".": (1,), "./file": (2, "digest"), "./empty": (3,)}
+        assert symlink_root_unchanged(fixture_tree, dict(fixture_tree), "/real", "/real")
+        assert not symlink_root_unchanged(fixture_tree, {".": (1,), "./empty": (3,)}, "/real", "/real")
+        assert not symlink_root_unchanged(fixture_tree, dict(fixture_tree), "/other", "/real")
+        snapshot_source = inspect.getsource(owned_tree_snapshot)
+        for required in ("os.lstat", "os.scandir", "os.readlink", "hashlib.sha256", 'visit(root, ".")'):
+            assert required in snapshot_source, required
+        symlink_preview = {
+            "coverage": {"complete": False}, "candidates": [],
+            "kept": [{"root": "/root", "reason": "the recorded root is not a real directory; the whole batch is kept"}],
+        }
+        assert symlink_root_refusal(symlink_preview, "/root")
+        assert not symlink_root_refusal({**symlink_preview, "coverage": {"complete": True}}, "/root")
+        assert not symlink_root_refusal({**symlink_preview, "candidates": [{"root": "/root"}]}, "/root")
+        assert not symlink_root_refusal({**symlink_preview, "kept": [{"root": "/root", "reason": "whole batch is kept"}]}, "/root")
+        for fragment in (
+            'world.complete(preview, "before symlink root dry run")',
+            'expect(symlink_root_refusal(preview, kappa_root), world.report(preview))',
+            'world.real_run("symlink root refusal", alpha, plan, sha)',
+            'root_before = owned_tree_snapshot(expected_target)',
+            'expect(symlink_root_unchanged(root_before, owned_tree_snapshot(expected_target),',
+            'os.readlink(kappa_root), expected_target)',
+            'world.complete(preview, "restored root dry run")',
+        ):
+            assert fragment in body, fragment
+        reserve_guard = (
+            'plan, sha, preview = world.plan_file("reserve dry run", alpha)\n'
+            '        world.complete(preview, "reserve dry run")\n'
+            '        expect(world.candidates(preview) == {lam_root}, world.report(preview))'
+        )
+        assert reserve_guard in body, "reserve assertion lacks its completeness premise or report"
+        assert reserve_guard not in body.replace(
+            '        world.complete(preview, "reserve dry run")\n', '', 1
+        ), "removing the reserve premise must fail the source check"
+        assert body.count("world.complete(preview,") >= 8, body.count("world.complete(preview,")
+        assert body.count("world.report(preview)") >= 8, body.count("world.report(preview)")
+        # The corrupt-receipt case expects the whole batch and says so.
+        assert 'get("complete") is False' in body, "the corrupt-receipt case no longer pins incompleteness"
+        # Case 10 must test each bad listed authority before its isolated positive.
+        for fragment in (
+            '("foreign", foreign_root, "no readable owner marker")',
+            '("forged", forged_root, "digest")',
+            'json.dump([legacy_root, bad_root], handle)',
+            'json.dump([legacy_root, image_root], handle)',
+            'world.complete(preview, "legacy dry run")',
+            'expect(code == 2, f"{label} refusal exited {code}: {stderr}")',
+        ):
+            assert fragment in body, fragment
+
+
+        # The report itself is bounded and names the coverage and the reasons.
+        report = preview_report(
+            {
+                "coverage": {"complete": False, "candidate_roots": 0, "kept_roots": 2},
+                "kept": [
+                    {"root": "/r1", "reason": "the checkout is present"},
+                    {"root": "/r2", "reason": "the registry snapshot is incomplete (x); the whole batch is kept"},
+                ],
+            }
+        )
+        assert "complete=False" in report and "/r1: the checkout is present" in report, report
+        assert "whole batch" in report and len(report) < 4000, (len(report), report)
+        assert World.kept(None, {"kept": [{"root": "/r1", "reason": "kept"}]}, "/r1") == "kept"
+
+        # The completeness premise accepts a complete snapshot and refuses an
+        # incomplete one with the shared reason.
+        World.complete(None, {"coverage": {"complete": True}}, "complete control")
+        for incomplete in (
+            {"coverage": {"complete": False}, "kept": []},
+            {},
+        ):
+            try:
+                World.complete(None, incomplete, "incomplete control")
+            except RuntimeError as error:
+                assert "whole batch" in str(error), error
+            else:
+                raise AssertionError("an incomplete preview satisfied the completeness premise")
+
+    check("keep and completeness diagnostics", keep_diagnostics)
+
     def documented_matrix() -> None:
         # The owning docstring must describe exactly the bodies this run
         # dispatches: same ids, same order, same names, same dependencies.
@@ -3134,8 +3755,20 @@ def self_test() -> int:
         assert parameters["capability"].default is None, parameters["capability"].default
         assert "CARGO_ENCODED_RUSTFLAGS" in inspect.getsource(helper.stage_subject)
         # This proof pins the current control format literally; a product bump
-        # must update this constant, case 01 and the staged capability together.
-        assert CONTROL_STATE_VERSION == 4 and OWNED_OUTPUTS_FENCE == "oxide.outputs/3"
+        # must update the constants, case 01 and the staged capability together.
+        assert CONTROL_STATE_VERSION == 9 and OWNED_OUTPUTS_FENCE == "oxide.outputs/3"
+        assert (
+            RECORDED_ACCOUNTING_FENCE,
+            EVICTION_ACCOUNTING_FENCE,
+            SLOT_CEILING_FENCE,
+            HOLDING_FENCE,
+        ) == ("oxide.accounting/1", "oxide.eviction-accounting/1", "oxide.slots/256", "oxide.holding/1")
+        assert (
+            HOLDING_STATE_VERSION,
+            SLOT_CEILING_STATE_VERSION,
+            EVICTION_ACCOUNTING_STATE_VERSION,
+            RECORDED_ACCOUNTING_STATE_VERSION,
+        ) == (9, 8, 7, 5)
         assert CANDIDATE_CAPABILITY == {
             "control_state_version": CONTROL_STATE_VERSION,
             "registration_version": 2,
@@ -3176,7 +3809,10 @@ def self_test() -> int:
         case_one = inspect.getsource(run)
         assert "copy_old_artifact(proof.root)" in case_one, "case 01 does not verify the artifact"
         assert "probe = proof.run([old, CAPABILITIES_PROBE]" in case_one, case_one
-        assert 'json.loads(probe.stdout).get("control_state_version") == 2' in case_one, case_one
+        assert (
+            'json.loads(probe.stdout).get("control_state_version") == OLD_CONTROL_STATE' in case_one
+        ), case_one
+        assert OLD_CONTROL_STATE == 2 and OLD_CONTROL_STATE != CONTROL_STATE_VERSION
         assert '(["check"], ["outputs", "adopt"])' in case_one
 
     check("older-binary artifact input path", artifact_inputs)
@@ -4159,6 +4795,7 @@ def self_test() -> int:
     check("counted mode writes no diagnostic receipt", counted_never_writes)
 
     permanent = restore
+    expect, fail = saved_expect, saved_fail
     DIAG = Diagnostics(enabled=False)
     if failures:
         print(f"test-outputs-prune self-test: {failures} check(s) failed", file=sys.stderr)
