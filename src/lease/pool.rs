@@ -738,12 +738,15 @@ pub mod managed {
     use super::{
         lock_pool, measure_within as measure_walks, open_budget_payload, prepare_new_pool,
         random_hex, read_config, read_consistent_pair, read_ledger, recorded_volume,
-        refuse_foreign_pool_entries, refuse_retired_image_pool, snapshot_of, write_config,
-        write_ledger, Ledger, Payload, Pool, PoolConfig, SlotPersistState, VolumeConfig,
+        refuse_foreign_pool_entries, refuse_retired_image_pool, snapshot_of,
+        verify_scratch_initializer, write_config, write_ledger, Ledger, Payload, Pool, PoolConfig,
+        SlotPersistState, VolumeConfig,
     };
     use crate::lease::HeldEvictionFailure;
     use crate::volume::Binding;
-    use std::os::fd::AsFd;
+    use std::fs::File;
+    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::unix::fs::MetadataExt;
     use std::path::Path;
     use std::time::Duration;
 
@@ -847,6 +850,92 @@ pub mod managed {
         }
         let pool = prepare_new_pool(pool)?;
         let _lock = lock_pool(&pool)?;
+        init_budget_pool_locked(&pool, budget_bytes)
+    }
+
+    /// Capability issued only by exclusive creation of the leaf in this process.
+    pub struct ScratchLeaf {
+        path: std::path::PathBuf,
+        file: File,
+    }
+
+    pub fn create_scratch_leaf(pool: &Path) -> Result<ScratchLeaf, LeaseError> {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(pool)
+            .map_err(io_error)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(pool)
+            .map_err(io_error)?;
+        Ok(ScratchLeaf {
+            path: pool.to_path_buf(),
+            file,
+        })
+    }
+
+    impl ScratchLeaf {
+        /// Compensate only while the path still names the held leaf.
+        pub fn remove_if_owned(&self, binding: &[u8]) -> Result<(), LeaseError> {
+            verify_scratch_initializer(&self.path, &self.file, binding, false)?;
+            let current = std::fs::symlink_metadata(&self.path).map_err(io_error)?;
+            let held = self.file.metadata().map_err(io_error)?;
+            if !current.is_dir()
+                || current.file_type().is_symlink()
+                || current.dev() != held.dev()
+                || current.ino() != held.ino()
+            {
+                return Err(LeaseError::InvalidInput(
+                    "scratch-incomplete: leaf identity changed",
+                ));
+            }
+            // Remove only the binding this invocation wrote, never arbitrary entries.
+            let control =
+                super::open_directory_at(self.file.as_fd(), c"oxide-managed").map_err(io_error)?;
+            let names = super::holding_names(control.as_fd(), 2)?;
+            if names.len() != 1 || names[0].as_bytes() != b"scratch.json" {
+                return Err(LeaseError::InvalidInput(
+                    "scratch-incomplete: unexpected entries",
+                ));
+            }
+            let unlink = |dir: std::os::fd::BorrowedFd<'_>, name: &std::ffi::CStr, flags| {
+                if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), flags) } == 0 {
+                    Ok(())
+                } else {
+                    Err(io_error(std::io::Error::last_os_error()))
+                }
+            };
+            unlink(control.as_fd(), c"scratch.json", 0)?;
+            unlink(self.file.as_fd(), c"oxide-managed", libc::AT_REMOVEDIR)?;
+            let current = std::fs::symlink_metadata(&self.path).map_err(io_error)?;
+            if current.dev() != held.dev() || current.ino() != held.ino() {
+                return Err(LeaseError::InvalidInput(
+                    "scratch-incomplete: leaf identity changed",
+                ));
+            }
+            std::fs::remove_dir(&self.path).map_err(io_error)
+        }
+    }
+
+    /// Initialize only a leaf exclusively created and prepared by this caller.
+    pub fn init_scratch_pool(
+        leaf: &ScratchLeaf,
+        binding: &[u8],
+        budget_bytes: u64,
+    ) -> Result<PoolInfo, LeaseError> {
+        let pool = leaf.path.as_path();
+        if budget_bytes == 0 {
+            return Err(LeaseError::InvalidInput("budget must be positive"));
+        }
+        verify_scratch_initializer(pool, &leaf.file, binding, false)?;
+        let _lock = lock_pool(pool)?;
+        verify_scratch_initializer(pool, &leaf.file, binding, true)?;
+        init_budget_pool_locked(pool, budget_bytes)
+    }
+
+    fn init_budget_pool_locked(pool: &Path, budget_bytes: u64) -> Result<PoolInfo, LeaseError> {
         if pool.join(CONFIG_NAME).symlink_metadata().is_ok() {
             return Err(LeaseError::InvalidInput("pool already initialized"));
         }
@@ -6008,6 +6097,71 @@ fn prepare_new_pool(pool: &Path) -> Result<PathBuf, LeaseError> {
         Err(error) => return Err(io_error(error)),
     }
     canonical_existing_dir(pool, true)
+}
+
+/// Check the creator's held leaf and the complete prepared shape under the init lock.
+fn verify_scratch_initializer(
+    pool: &Path,
+    leaf: &File,
+    expected: &[u8],
+    locked: bool,
+) -> Result<(), LeaseError> {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    let incomplete =
+        || LeaseError::InvalidInput("scratch-incomplete: prepared pool requires operator cleanup");
+    if expected.len() > 16384 {
+        return Err(incomplete());
+    }
+    let current = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(pool)
+        .map_err(|_| incomplete())?;
+    let held_meta = leaf.metadata().map_err(|_| incomplete())?;
+    let meta = current.metadata().map_err(|_| incomplete())?;
+    if !meta.is_dir()
+        || meta.uid() != current_uid()
+        || meta.mode() & 0o7777 != 0o700
+        || (meta.dev(), meta.ino()) != (held_meta.dev(), held_meta.ino())
+    {
+        return Err(incomplete());
+    }
+    let names = holding_names(current.as_fd(), 3).map_err(|_| incomplete())?;
+    let has_managed = names.iter().any(|n| n.as_bytes() == b"oxide-managed");
+    let has_lock = names.iter().any(|n| n.as_bytes() == b"lock");
+    if !has_managed || names.len() != 1 + usize::from(has_lock) || (locked && !has_lock) {
+        return Err(incomplete());
+    }
+    let managed = open_directory_at(current.as_fd(), c"oxide-managed").map_err(|_| incomplete())?;
+    let managed_names = holding_names(managed.as_fd(), 2).map_err(|_| incomplete())?;
+    if managed_names.len() != 1 || managed_names[0].as_bytes() != b"scratch.json" {
+        return Err(incomplete());
+    }
+    let raw = unsafe {
+        libc::openat(
+            managed.as_raw_fd(),
+            c"scratch.json".as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(incomplete());
+    }
+    let file = unsafe { File::from_raw_fd(raw) };
+    let binding_meta = file.metadata().map_err(|_| incomplete())?;
+    if !binding_meta.is_file() || binding_meta.uid() != current_uid() || binding_meta.len() > 16384
+    {
+        return Err(incomplete());
+    }
+    let mut bytes = Vec::new();
+    file.take(16385)
+        .read_to_end(&mut bytes)
+        .map_err(|_| incomplete())?;
+    if bytes != expected {
+        return Err(incomplete());
+    }
+    Ok(())
 }
 
 /// Empty, or only the CLI's leftover `lock` from a failed init.

@@ -1,11 +1,11 @@
-# Scratch build pools on an external validation volume (proposed design)
+# Scratch build pools on an external validation volume
 
-**Status: S2 implemented; later slices remain proposed.** This contract records
+**Status: S1–S3 implemented; migration slices remain proposed.** This contract records
 a design for an explicit, UUID-bound `directory-budget-v1` "scratch pool" on a verified external
 volume, so validation and proof fixtures can keep their scratch on the Builds
 drive instead of declaring the internal-root exception (decision `bd357a4c`) for
 `/private/tmp`. S1 adds typed path judgement and an unreachable pure scratch
-admission decision. S2 wires read-only admission; creation and missing-record repair remain unavailable until S3. No selector, recipe, host setting, real pool or native run exists. The internal-root exception stays
+admission decision. S2 wired read-only admission; S3 adds creation, binding and leased-open repair with a focused proof. No migration recipe, host setting or real pool change is implied. The internal-root exception stays
 current truth until each slice below lands and passes its own review. Oxide#173.
 
 Owning neighbours: [workflow](workflow.md#temporary-scratch-placement) owns
@@ -144,7 +144,7 @@ provenance.
 - **On-volume binding.** On first use the creating command makes the pool leaf
   exclusively (0700), then writes `<pool>/oxide-managed/scratch.json` atomically
   (0600, private temp plus one replace) **before** the library initialises the
-  pool payload. Schema `oxide.scratch-pool/1`, strict (`deny_unknown_fields`),
+  pool payload. The scratch-only initializer rechecks the exclusively created leaf identity and exact binding bytes under its init lock; ordinary initialization retains its empty-directory rule. Schema `oxide.scratch-pool/1`, strict (`deny_unknown_fields`),
   16 KiB bound, containing exactly: `schema`, `volume_uuid`, `mount_point`
   (canonical), `scratch_root` (canonical), `pool` (canonical) and `created_ms`.
   It proves the volume's own bytes agree with the placement; the frozen pool
@@ -419,10 +419,10 @@ zero-walk regression (including an absent volume with and without a record), and
 one CLI case on a private internal fixture showing the declaration changes
 nothing there. Selectors: as S1. 300 s, 512 MiB.
 
-S2 temporarily refuses admitted absent pools with `scratch-creation-unavailable` and bound pools missing host records with `scratch-record-repair-unavailable`, before any effect.
+S2 temporarily refused absent pools and bound pools missing host records; S3 removes both temporary refusals.
 
 **S3 — creation, binding, record and open on a verified volume. ELEVATED.**
-S3 removes both temporary refusals and implements creation and leased-open record repair.
+S3 removes both temporary refusals and implements creation and leased-open record repair, using the single identity-checked scratch initializer.
 This slice enables a `directory-budget-v1` pool on removable media, so the
 actual trigger is: its admission walk decides whole-slot deletion on a volume
 outside the boot disk. Write and verify the on-volume binding and the host
@@ -438,9 +438,11 @@ selectors `effigy rust:scratch-pool:diagnostic` (uncounted, required first, HIGH
 premise checklist) and `effigy rust:scratch-pool` (counted author native), both
 one fixed script and the whole command of the qualified shared supervisor
 (`bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3
-scripts/test-scratch-pool.py`), 300 s, 512 MiB, one owned 128 MiB APFS image
+scripts/test-scratch-pool.py`), 300 s, 512 MiB, two owned 128 MiB APFS images in total, at most one attached at a time,
 attached with `hdiutil -owners on` and ordinarily detached, private `HOME`,
-`CARGO_HOME` and config. **ELEVATED also requires one distinct independent
+`CARGO_HOME` and config. The tiny image cannot meet the unchanged 20 GiB pool
+reserve, so this debug fixture supplies scoped pool and watchdog readings; the
+shared supervisor independently enforces the real host reserve and scratch budget. **ELEVATED also requires one distinct independent
 reviewer native `effigy rust:scratch-pool` at the exact head**, in addition to
 the reviewer's exact-head source review of the author's evidence; the author's
 native and the reviewer's are separate owner activations.
@@ -451,20 +453,17 @@ declaration; (03) the same pool without the declaration takes the ordinary
 external refusal, with binding, record and pool bytes unchanged; (04) pool path
 equal to the root, a sibling-prefix path and a missing parent each refuse with
 nothing created, and an external path inside a Git work tree refuses with the
-Git message while an internal one keeps today's; (05) no explicit budget
+Git message; the internal Git-message control is unit-proved by `store::scratch_internal_tests::internal_git_refusal_is_unchanged_by_scratch_declaration`; (05) no explicit budget
 refuses; (06) a declared root that is a symlink, group-writable, or a mount root
-refuses, while a declared root on the boot volume is inert and the same recipe
-builds an ordinary internal pool; (07) ordinary detach, with the host record case 01 wrote still present:
+refuses; the boot-volume inertness control is unit-proved by `store::scratch_internal_tests::scratch_declaration_is_inert_on_boot_volume`: two fresh pools have equal parsed configs except their distinct, validated `store_id` values, identical entry names and no scratch identity (decision 8ee50015); (07) ordinary detach, with the host record case 01 wrote still present:
 `status` reports `unavailable (scratch volume <uuid> absent)` with no walk and
 no write, a leased command refuses naming the same UUID from the record, no
 shadow directory appears and the mount point is not recreated; (08) re-attach the same image:
 same UUID, warm reuse; (09) a *different* image at the same mount name refuses
 by UUID; (10) a copied pool (binding edited to another UUID, then the original
-bytes restored) refuses and the pool is untouched; (11) a regular directory left
-at the mount name (a stale mount point) is not a mounted volume root and refuses
-as unverified; (12) the host record removed while the volume is present: `status` writes
+bytes restored) refuses and the pool is untouched; (11) a stale mount directory is unit-proved through `scratch_admission::tests::stale_volume_directory_refuses_without_creation`, since an unprivileged user cannot create a stale `/Volumes` entry; (12) the host record removed while the volume is present: `status` writes
 nothing and reports exactly as today (no scratch fact), and a leased open
-repairs the record once, after which `status` shows the UUID label; (13) the
+repairs the record on a guarded recovery open and on a leased open, after which `status` shows the UUID label; (13) the
 host record edited to another UUID refuses as a mismatch with both records and
 the pool bytes unchanged; (14) an
 unreadable, malformed, symlinked or oversized host record refuses as invalid;
@@ -552,8 +551,7 @@ itself, add the `retired.toml` entry in the same change. `effigy docs:check`.
 
 ## Limits of this design
 
-- Unmeasured: no case has run, so the native proof's fit, its image usage and
-  its wall clock are planning figures only.
+- Native cases exclude the internal Git control, boot-volume inertness and stale mount directory; these are unit-proved under the named tests. Native execution and resource fit require the separately activated evidence chain.
 - A scratch pool inside an owned run root is deleted with that root; a pool
   kept outside a run root is the harness owner's retention problem, not a
   product policy, and this design sets none.

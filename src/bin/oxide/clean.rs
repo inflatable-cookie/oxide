@@ -591,7 +591,7 @@ fn run_whole(
     }
     process::install_signal_handlers()?;
     let mut waits = WaitAccounting::default();
-    let store = crate::removable::coordinate(Store::open_existing_with(settings)?)?;
+    let store = crate::removable::coordinate(Store::open_existing_for_clean(settings)?)?;
     let guard = match &store {
         // `Recovering` mode never returns `Busy`; only a guarded verb's
         // `Barrier` mode does, so this arm is unreachable here.
@@ -729,7 +729,7 @@ fn run_selected(args: &[OsString], workspace: &Path, settings: &Settings) -> Res
     protect_pool(&workspace.join("target"), &settings.pool)?;
     process::install_signal_handlers()?;
     let mut waits = WaitAccounting::default();
-    let store = crate::removable::coordinate(Store::open_existing_with(settings)?)?;
+    let store = crate::removable::coordinate(Store::open_existing_for_clean(settings)?)?;
     let mut guard = match &store {
         // `Recovering` mode never returns `Busy`; only a guarded verb's
         // `Barrier` mode does, so this arm is unreachable here.
