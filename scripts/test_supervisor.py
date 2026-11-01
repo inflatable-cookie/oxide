@@ -672,6 +672,49 @@ def census(table, sid=100, terminal_allowed=False, ancestors=()):
 
 
 class PureCensus(unittest.TestCase):
+    def test_work_ledger_validates_snapshot_before_admission(self):
+        work = bounded.CensusWork()
+        with self.assertRaises(bounded.CensusWorkStopped):
+            work.seed([row(1), row(1, start=2)])
+        self.assertEqual((work.status, work.snapshot_count, work.entries), ("invalid", 0, {}))
+
+    def test_work_ledger_reopens_without_losing_omitted_obligations(self):
+        work = bounded.CensusWork()
+        work.seed([row(1)])
+        identity, _ = work.next()
+        work.resolve(identity, "foreign")
+        for pid in range(2, 24):
+            work.replacement(row(pid))
+        work.replacement(row(1))
+        summary = work.summary()
+        self.assertEqual((summary["snapshot"], summary["replacement"], summary["pending"]), (1, 22, 23))
+        self.assertEqual((len(summary["rows"]), summary["omitted"]), (20, 3))
+        self.assertEqual(work.queue[-1], identity)
+
+    def test_work_ledger_caps_replacements_without_discarding_prior_work(self):
+        work = bounded.CensusWork()
+        work.seed([row(1)])
+        for start in range(128):
+            work.replacement(row(2, start=start))
+        with self.assertRaises(bounded.CensusWorkStopped):
+            work.replacement(row(2, start=128))
+        self.assertEqual((work.status, work.replacement_count, len(work.entries)), ("identity_cap", 128, 129))
+        self.assertEqual((work.summary()["status"], work.summary()["pending"]), ("identity_cap", 129))
+
+    def test_work_ledger_charges_failures_and_rejects_late_returns(self):
+        ticks = [0]
+        work = bounded.CensusWork(clock=lambda: ticks[0])
+        def fail():
+            raise OSError("unreadable")
+        with self.assertRaises(OSError):
+            work.call(fail)
+        self.assertEqual(work.reads, 1)
+        def late():
+            ticks[0] = 2 * bounded.NS
+        with self.assertRaises(bounded.CensusWorkStopped):
+            work.call(late)
+        self.assertEqual((work.status, work.reads), ("deadline", 2))
+
     def test_member_and_foreign(self):
         table = FakeTable([row(101), row(200)], {101: 100, 200: 7})
         result = census(table).round()

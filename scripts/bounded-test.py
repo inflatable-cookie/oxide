@@ -1054,6 +1054,135 @@ def _ancestor_identity_set(identities):
     return frozenset(kept)
 
 
+# Per-round bounds for the replacement census (oxide#233).  The work ledger is
+# independent of the truncated evidence rows: omission never resolves work.
+CENSUS_SNAPSHOT_CAP = 4096
+CENSUS_REPLACEMENT_CAP = 128
+CENSUS_READ_CAP = 131072
+CENSUS_PHASE_NS = 2 * NS
+CENSUS_WORK_ROWS = 20
+
+
+class CensusWorkStopped(Exception):
+    """A round cannot establish certainty under its fixed bounds."""
+
+
+class CensusWork:
+    def __init__(self, clock=now_ns):
+        self.clock = clock
+        self.deadline = clock() + CENSUS_PHASE_NS
+        self.status = "complete"
+        self.reads = 0
+        self.snapshot_count = 0
+        self.replacement_count = 0
+        self.entries = {}  # identity -> [row, disposition]; insertion order is FIFO
+        self.queue = []
+        self.cursor = 0
+
+    def stop(self, status):
+        if self.status == "complete":
+            self.status = status
+        raise CensusWorkStopped(self.status)
+
+    def check(self):
+        if self.status != "complete":
+            raise CensusWorkStopped(self.status)
+        if self.clock() >= self.deadline:
+            self.stop("deadline")
+
+    def call(self, fn, *args):
+        """Charge before each reader; a late return or exception cannot evade the clock."""
+        self.check()
+        if self.reads >= CENSUS_READ_CAP:
+            self.stop("read_cap")
+        self.reads += 1
+        try:
+            return fn(*args)
+        finally:
+            self.check()
+
+    def pause(self, fn, seconds):
+        self.check()
+        try:
+            return fn(seconds)
+        finally:
+            self.check()
+
+    @staticmethod
+    def identity(row):
+        if not isinstance(row, dict):
+            return None
+        pid, start = row.get("pid"), row.get("start")
+        if (type(pid) is not int or not 0 < pid <= U64MAX or type(start) is not int
+                or not -U64MAX <= start <= U64MAX):
+            return None
+        return pid, start
+
+    def seed(self, rows):
+        """Validate the entire snapshot before admitting any identity."""
+        self.check()
+        if not isinstance(rows, list):
+            self.stop("invalid")
+        if len(rows) > CENSUS_SNAPSHOT_CAP:
+            self.stop("identity_cap")
+        identities = [self.identity(row) for row in rows]
+        if any(identity is None for identity in identities) or len({i[0] for i in identities}) != len(rows):
+            self.stop("invalid")
+        for identity, row in zip(identities, rows):
+            self.entries[identity] = [row, "pending"]
+            self.queue.append(identity)
+        self.snapshot_count = len(rows)
+        self.check()
+
+    def replacement(self, row):
+        self.check()
+        identity = self.identity(row)
+        if identity is None:
+            self.stop("invalid")
+        if identity in self.entries:
+            # A fresh observation can invalidate any earlier disposition.
+            if self.entries[identity][1] != "pending":
+                self.entries[identity] = [row, "pending"]
+                self.queue.append(identity)
+            return identity
+        if self.replacement_count >= CENSUS_REPLACEMENT_CAP:
+            self.stop("identity_cap")
+        self.replacement_count += 1
+        self.entries[identity] = [row, "pending"]
+        self.queue.append(identity)
+        return identity
+
+    def next(self):
+        self.check()
+        if self.cursor >= len(self.queue):
+            return None
+        identity = self.queue[self.cursor]
+        self.cursor += 1
+        return identity, self.entries[identity][0]
+
+    def resolve(self, identity, disposition):
+        self.check()
+        self.entries[identity][1] = disposition
+
+    def summary(self):
+        if self.status == "complete":
+            self.check()
+        rows = [{"pid": pid, "start": start, "state": entry[1]}
+                for (pid, start), entry in list(self.entries.items())[:CENSUS_WORK_ROWS]]
+        result = {"snapshot": self.snapshot_count, "replacement": self.replacement_count,
+                  "reads": self.reads,
+                  "pending": sum(entry[1] == "pending" for entry in self.entries.values()),
+                  "status": self.status, "rows": rows, "omitted": len(self.entries) - len(rows)}
+        # Fail closed on unencodable output rather than publishing incomplete evidence.
+        try:
+            json.dumps(result, ensure_ascii=True, separators=(',', ':')).encode("utf-8")
+        except Exception:
+            self.stop("invalid")
+        if self.status == "complete":
+            self.check()
+        return result
+
+
 class Census:
     """Classifies every process against session `sid` (the leader's PID).
 
