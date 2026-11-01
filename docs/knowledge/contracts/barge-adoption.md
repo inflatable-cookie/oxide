@@ -1,9 +1,18 @@
 # Barge adoption: Oxide's output roots and the release prune
 
-**Status: proposed design, not frozen.** This contract covers stage 4 `F6` and
-the Oxide part of stage 1 `S8` in Barge. It is design only. It changes no code,
-selector, host job, install, Builds registration or real data. Until a slice
-here lands, `oxide outputs prune` stays the authority for Oxide's output roots.
+**Status (2026-11-01): design frozen; `O1` landed (oxide#219).** Tom's F6
+decisions (`8058e38a`, with Q-A to Q-H answered in `12729764` and Q-D in
+`55636dc8`) freeze this design. Oxide's library pin and offline seeding are in
+place under [D1](#d1-integration-surface-rust-library-at-a-pinned-commit) and the
+[landed O1 note](#d1-integration-surface-rust-library-at-a-pinned-commit). Later
+slices (`O2`, `O3`, `O4`, `S8-*`) are not landed. No output placement, prune,
+admission, host job, install or Builds registration has changed.
+
+The text below is the pre-freeze proposal. Its "proposed design" and "changes
+no code" statements describe the 2026-11-01 proposal only and are kept as dated
+evidence. Where a later slice lands, its own note in this file is the current
+truth. Until `O3` lands, `oxide outputs prune` stays the authority for Oxide's
+output roots.
 
 The contract decides how Oxide uses Barge, which Oxide areas Barge declares,
 how the prune switches to Barge's release gate, what happens to the 91 legacy
@@ -144,6 +153,16 @@ Version rules: a Barge pin changes only with a brief that names the commit,
 its schema versions and the selectors that prove it. A Barge schema Oxide does
 not read is `unknown` and keeps the root. Oxide never reads Barge's state
 directory itself.
+
+**Landed: `O1` (oxide#219).** `Cargo.toml` declares `barge` by full rev
+`4af9360bd09629e970c143080ca159de8eef2562`, the merge commit of Barge PR #39 on
+`main`. That commit contains R1 (`d0a88c8`, `db0bc59`), R2 (`fb3002c`), R4
+(`0d9b419`, `d4b5d90`) and the PR #39 release-proof corrections (`cc8d142` to
+`346076e`). The feature-off library is used; `proof-synthetic-account` stays off.
+`Cargo.lock` gains only the `barge` package, depending on the already-pinned
+`serde`, `serde_json` and `libc`. The bounded seeder serves the locked Barge
+source beside Longhorn, one database per repository. The pin is not a release,
+and no output placement, prune, admission or host behaviour changed.
 
 ### D2. Areas
 
