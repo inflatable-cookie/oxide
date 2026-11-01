@@ -36,7 +36,7 @@ the release walk is asserted separately.
 | Case | Command | cwd | Prerequisite | Observed phase |
 | --- | --- | --- | --- | --- |
 | A all-recorded admission | `oxide check` (gated) | fixture crate B | slot A idle with a current record | admission (`Held`), then release |
-| B missing record | `oxide check` (gated) | fixture crate C | A and B idle, B's record dropped, `capacity_policy` 2 | admission, then release |
+| B missing record | `oxide check` (gated) | fixture crate C | A and B idle, B's record dropped, `capacity_policy` 3 | admission, then release |
 | C release/reuse | `oxide check` (gated) | fixture crate A | A idle with a current record | admission (reuse), then release; stdout read after release |
 | D byte pressure | `oxide check` (gated) + held writer | pressure crate | one idle slot, one held slot, an out-of-slot stray, byte budget, directory backend recorded in `config.json` | admission, then releases |
 | E hard-link overcount | `oxide check` (gated) | pressure crate | two idle slots sharing one inode, budget between union and sum | admission, then release |
@@ -1128,7 +1128,7 @@ def case_b_missing_record_walks_only_that_slot(root: str, subject: str) -> None:
     # The product must read exactly this legacy shape before the admission.
     read_back = fx.ledger()
     expect(
-        read_back["capacity_policy"] == 2
+        read_back["capacity_policy"] == 3
         and all(str(slot["id"]) != victim or slot.get("recorded") is None for slot in read_back["slots"]),
         "the ledger edit did not produce the intended missing-record shape",
     )
@@ -1876,6 +1876,23 @@ def self_check() -> None:
     """Pure: real rendering, the recipe validator and the receipt rules."""
     global PURE_MODE
     PURE_MODE = True
+    # Current-main oracle sweep: src/lease/mod.rs policy 3 (1 is the
+    # deliberate legacy input in case F); main.rs status and store.rs slot
+    # wording; handoff.rs test_controls; qualified runner archive above.
+    source = open(os.path.join(REPO, "src/lease/mod.rs"), encoding="utf-8").read()
+    expect("pub const CAPACITY_POLICY_VERSION: u32 = 3;" in source, "capacity policy drift")
+    for path, needle in (("src/bin/oxide/main.rs", RECORDED_TOTAL_NEEDLE),
+                         ("src/bin/oxide/store.rs", RECORDED_SLOT_NEEDLE),
+                         ("src/bin/oxide/handoff.rs", "test_controls")):
+        expect(needle in open(os.path.join(REPO, path), encoding="utf-8").read(), f"oracle drift: {path}")
+    fx = Fixture.__new__(Fixture)
+    fx.home, fx.cargo_home, fx.scratch_root = "/run/home", "/run/cargo", "/run/pools"
+    fx.pool, fx.temp, fx.walk_log, fx.scope_log = "/run/pools/a", "/run/temp", "/run/walk", "/run/scope"
+    fx.budget_bytes = GENEROUS_BUDGET
+    env = fx.env()
+    expect(env["OXIDE_SCRATCH_ROOT"] == fx.scratch_root and env["OXIDE_POOL"] == fx.pool,
+           "fixture scratch contract drift")
+    expect(env["OXIDE_POOL_CAP"] == str(GENEROUS_BUDGET), "fixture cap drift")
     # R1 — the render functions the counted run actually calls.
     rendered = render_build_rs(SLOT_FILLER_BYTES)
     expect("__SLOT_FILLER_BYTES__" not in rendered, "the filler placeholder survived")
