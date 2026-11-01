@@ -345,12 +345,7 @@ Not in scope: proofs that never carried `bd357a4c` but assert their own
 `/private/tmp` scratch (`rust:oxide-exec`, `rust:pool-scale`,
 `rust:accounting-vanished`, `rust:accounting-guards`, `rust:status-fast`,
 `rust:oxide-finder-metadata`, `rust:oxide-pool-layout`). They migrate, if at
-all, in their own briefs with their own activations. `rust:front-door-accounting`
-used to be one of them; oxide#191 moved it onto the explicit internal root
-(`--root-parent /private/tmp`, the `bd357a4c` exception, because its one pool is
-a genuine `directory-budget-v1` pool) with every fixture inside
-`OXIDE_TASK_SCRATCH_ROOT`, so it now meets this document's premise rule but is
-not part of the ten sub-slices listed below.
+all, in their own briefs with their own activations. `rust:front-door-accounting` migrated in oxide#201: both fixture pools use the selected-volume scratch root; its diagnostic and native evidence at the migrated head remain pending.
 
 ## Recipe changes (design, not applied)
 
