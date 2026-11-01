@@ -422,10 +422,11 @@ def prove_fences_and_exhaustion(proof: Proof, app: str, pool: str, env: dict) ->
     expect(slot["rank"] == 2 and slot["state"] == "idle", f"release did not stamp the idle rank: {slot}")
     state_path = os.path.join(pool, "oxide-managed", "state.json")
     state = read_json(state_path)
-    expect(state["version"] == 8, f"the first mutation did not install the version-8 control fences: {state}")
+    expect(state["version"] == 9, f"the first mutation did not install the version-9 control fences: {state}")
     expect(state.get("slot_ceiling") == "oxide.slots/256", f"the raised-ceiling fence is missing: {state}")
     expect(state.get("eviction_accounting") == "oxide.eviction-accounting/1", f"the eviction-accounting fence is missing: {state}")
-    RESULTS.append({"case": "fences-installed", "ledger_policy": 3, "state_version": 8})
+    expect(state.get("holding") == "oxide.holding/1", f"the holding fence is missing: {state}")
+    RESULTS.append({"case": "fences-installed", "ledger_policy": 3, "state_version": 9})
 
     # A legacy representation (no fence, rank 0) still reads for status and
     # is not migrated by the observer.
@@ -446,7 +447,7 @@ def prove_fences_and_exhaustion(proof: Proof, app: str, pool: str, env: dict) ->
     # A genuinely legacy document carries none of the forward fences; keeping
     # the recorded-accounting or raised-ceiling fence would test a shape no
     # legacy binary wrote.
-    for fence in ("recorded_accounting", "one_use_workspaces", "eviction_accounting", "slot_ceiling"):
+    for fence in ("recorded_accounting", "one_use_workspaces", "eviction_accounting", "slot_ceiling", "holding"):
         legacy_state.pop(fence, None)
     legacy_state["version"] = 1
     write_json(state_path, legacy_state)
@@ -458,14 +459,15 @@ def prove_fences_and_exhaustion(proof: Proof, app: str, pool: str, env: dict) ->
     run(proof, ["exec", "--", sys.executable, "-c", "pass"], "legacy-first-write", app, env)
     fenced = read_json(ledger_path)
     fenced_state = read_json(state_path)
-    expect(fenced.get("capacity_policy") == 3 and fenced_state["version"] == 8,
-           "the first revised mutation did not install the version-8 control fences")
+    expect(fenced.get("capacity_policy") == 3 and fenced_state["version"] == 9,
+           "the first revised mutation did not install the version-9 control fences")
     # Fence first: even this one-slot pool gains the raised-ceiling and
     # eviction-accounting fences before its first ledger write.
     expect(fenced_state.get("slot_ceiling") == "oxide.slots/256",
            f"the first revised mutation did not fence the raised ceiling: {fenced_state}")
     expect(fenced_state.get("eviction_accounting") == "oxide.eviction-accounting/1",
            f"the first revised mutation did not fence eviction accounting: {fenced_state}")
+    expect(fenced_state.get("holding") == "oxide.holding/1", f"the holding fence is missing: {fenced_state}")
     RESULTS.append({"case": "legacy-read-no-migration", "fenced_on_mutation": True, "raised_fence": True})
 
     # Counter exhaustion refuses before any transition.
@@ -550,7 +552,8 @@ def prove_raised_fence(proof: Proof, pool: str, env: dict, workdir: str) -> None
     )
     state = read_json(os.path.join(pool, "oxide-managed", "state.json"))
     expect(
-        state["version"] == 8 and state.get("slot_ceiling") == "oxide.slots/256",
+        state["version"] == 9 and state.get("slot_ceiling") == "oxide.slots/256"
+        and state.get("holding") == "oxide.holding/1",
         f"the 129th slot did not make the raised-ceiling control fence durable: {state}",
     )
     RESULTS.append({
@@ -618,7 +621,8 @@ def prove_pool_ceiling(proof: Proof, app: str, pool: str, env: dict) -> None:
     # models the same consistent pair instead of a state no writer produces.
     state_path = os.path.join(pool, "oxide-managed", "state.json")
     state = read_json(state_path)
-    state["version"] = 8
+    state["version"] = 9
+    state["holding"] = "oxide.holding/1"
     state["slot_ceiling"] = "oxide.slots/256"
     state["eviction_accounting"] = "oxide.eviction-accounting/1"
     write_json(state_path, state)
@@ -685,7 +689,8 @@ def prove_pool_ceiling(proof: Proof, app: str, pool: str, env: dict) -> None:
     expect(after.get("capacity_policy") == 4, "the 257th slot did not raise the ledger fence")
     state = read_json(state_path)
     expect(
-        state["version"] == 8 and state.get("slot_ceiling") == "oxide.slots/256",
+        state["version"] == 9 and state.get("slot_ceiling") == "oxide.slots/256"
+        and state.get("holding") == "oxide.holding/1",
         f"an ordinary release dropped the raised-ceiling control fence: {state}",
     )
     RESULTS.append({
@@ -786,12 +791,14 @@ def prove_project_cap(proof: Proof, pool: str, env: dict, workdir: str) -> None:
         proof, ["exec", "--", sys.executable, "-c", "pass"], "project-cap-unknown", app, env, code=1
     )
     expect(
-        "unknown_accounting" in refused and "depth_limit" in refused,
+        f"unmeasured slot(s) {victim_record['id']}" in refused
+        and "are kept and never evicted on a partial walk" in refused,
         f"the project replacement refused without naming its accounting gap: {refused}",
     )
     expect(os.path.isdir(victim), "the victim was deleted before complete accounting")
     expect(
-        len(read_json(os.path.join(pool, "ledger.json"))["slots"]) == PROJECT_SLOT_CAP,
+        {record["id"] for record in read_json(ledger_path)["slots"]}
+        == {record["id"] for record in unrecorded["slots"]},
         "an incomplete-accounting refusal changed the project membership",
     )
     RESULTS.append({"case": "project-cap-unknown-refuses-before-deletion", "victim": victim_record["id"]})
@@ -1061,11 +1068,10 @@ def reset_collection() -> None:
 
 
 def self_check() -> None:
+    """Pure apparatus check: no child, scratch, pool or evidence write."""
     with open(os.path.join(REPO, "scripts", "bounded-test.py"), "rb") as handle:
         runner_hash = hashlib.sha256(handle.read()).hexdigest()
     expect(runner_hash == RUNNER_SHA256, f"qualified runner hash mismatch: {runner_hash}")
-    """Pure apparatus check of the diagnostic collection: no child, scratch,
-    pool or evidence write."""
     global PHASE_NAMES, PHASE_FAILURES, PHASE_SKIPS
 
     def ok() -> None:

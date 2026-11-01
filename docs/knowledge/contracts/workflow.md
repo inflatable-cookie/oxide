@@ -4727,10 +4727,10 @@ Rules:
   inventory, the evicted slot is never walked, a release walks only its own
   slot, and default `status` at 256 walks nothing; it also crosses the legacy
   128-slot ceiling natively and requires `capacity_policy: 4` plus the
-  version-8 `oxide.slots/256` control fence, which the admission gate writes
+  version-9 control fence carrying `oxide.slots/256` and `oxide.holding/1`, which the admission gate writes
   as the command's first durable effect and a locked `Pool::open` raises
   itself before reconciliation, before any journal start or ledger write, so
-  an older binary meets version 8 and hands off or refuses before reading the
+  an older binary meets version 9 and hands off or refuses before reading the
   ledger.
   Worst-valid ledger/control serialization — including the reachable
   one-journal `Evicting` state — round-trip and oversized-field refusals are
