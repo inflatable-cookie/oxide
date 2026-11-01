@@ -98,9 +98,12 @@ own machine-checked matrix: `--self-test` fails if it drifts from
 CASE_PLAN/CASE_NAMES, and the dependency column is exactly what a
 `--diagnostic` run uses to decide which cases may still run.
 
-  01 init: adopt publishes the current control format (state version 4 with
-     the `oxide.outputs/3` owned-outputs fence and a ready transaction in both
-     controls) and the current registry document is exactly
+  01 init: adopt publishes the current control format (state version 9 with
+     the `oxide.outputs/3` owned-outputs fence, the v9-required
+     `oxide.accounting/1` and `oxide.eviction-accounting/1` fences, the
+     `oxide.slots/256` raised-ceiling fence and the `oxide.holding/1`
+     whole-tree holding fence, plus a ready transaction in both controls) and
+     the current registry document is exactly
      `oxide.outputs.registry/2` with schema 2 and `complete: true` — the pair
      this head writes, checked against the frozen `prune.rs` literals by the
      pure selector; a legacy 1/1 document is readable by the product but is
@@ -396,13 +399,30 @@ OLD_SHA = "bd52cb42842c06451b0f8a9bc364ba7de74cfe6f014d33804890c4adbc51fc2b"
 OLD_SIZE = 2_756_576
 OLD_BINARY_CAP = 8 * 1024 * 1024
 OLD_RECEIPT_CAP = 64 * 1024
+# The released d246d400 artifact's OWN control state, from its install receipt and
+# its capability probe. It is a property of that fixed historical input, never
+# this head's control state; the two must differ, and the older binary must
+# refuse a pool fenced at the current version.
+OLD_CONTROL_STATE = 2
 CAPABILITIES_PROBE = "__oxide-build-capabilities"
-# The control state and fence this proof's head writes (src/bin/oxide/store.rs
-# STATE_VERSION / OWNED_OUTPUTS_FENCE) and the exact capability probe the staged
-# candidate must report. A bump is a deliberate proof correction, never a
-# silently accepted drift.
-CONTROL_STATE_VERSION = 4
+# The control state and fences this proof's head writes, and the exact capability
+# probe the staged candidate must report. The numbers and literals are current
+# source, not a guess: `--self-test` reads them back from
+# `src/lease/mod.rs` (`CONTROL_FENCE_VERSION`, the fence literals) and
+# `src/lease/control.rs` (`STATE_VERSION`, `OWNED_OUTPUTS_FENCE`), so a fence
+# bump fails the pure check loudly instead of a native run silently checking a
+# stale format. A bump is a deliberate proof correction, never an accepted
+# drift.
+CONTROL_STATE_VERSION = 9
 OWNED_OUTPUTS_FENCE = "oxide.outputs/3"
+# Version 9 requires all four of these fences in a ready control document: the
+# recorded-accounting fence (oxide#146, version 5), the eviction-accounting fence
+# (oxide#175, version 7), the raised slot ceiling (oxide#177, version 8) and the
+# whole-tree holding fence (oxide#190, version 9).
+RECORDED_ACCOUNTING_FENCE = "oxide.accounting/1"
+EVICTION_ACCOUNTING_FENCE = "oxide.eviction-accounting/1"
+SLOT_CEILING_FENCE = "oxide.slots/256"
+HOLDING_FENCE = "oxide.holding/1"
 # The registry document this head WRITES (prune.rs REGISTRY_VERSION /
 # REGISTRY_SCHEMA): initialization creates 2/2 and a profile receipt promotes a
 # legacy 1/1 document to 2/2, so 2/2 is the current-write format case 01 must
@@ -436,6 +456,10 @@ DONE: list[str] = []
 def plan() -> int:
     print("oxide#129 owned-output prune proof plan")
     print(f"supervisor bounded-test.py sha256 {SUPERVISOR}")
+    print(
+        f"control format: state version {CONTROL_STATE_VERSION}, {OWNED_OUTPUTS_FENCE}, "
+        f"{SLOT_CEILING_FENCE}, {HOLDING_FENCE}"
+    )
     print(f"wall limit {LIMIT_SECONDS} s; monitored owned scratch {SCRATCH_MIB} MiB")
     print("static allocation:")
     total = 0
@@ -2062,7 +2086,10 @@ def _copy_old_artifact(root: str) -> str:
         f"receipt installed.path {installed.get('path')} is not the historical {OLD_INSTALLED_PATH}",
     )
     expect(installed.get("sha256") == OLD_SHA and receipt.get("built_sha256") == OLD_SHA, "receipt hash mismatch")
-    expect(receipt.get("control_state_version") == 2, f"receipt control state {receipt.get('control_state_version')}")
+    expect(
+        receipt.get("control_state_version") == OLD_CONTROL_STATE,
+        f"receipt control state {receipt.get('control_state_version')}",
+    )
     expect(installed.get("size") == OLD_SIZE, f"receipt size {installed.get('size')} is not {OLD_SIZE}")
     expect(OLD_ARTIFACT_PATH != OLD_INSTALLED_PATH, "the artifact source path is the installed path")
     binary, binary_id = read_nofollow(OLD_ARTIFACT_PATH, OLD_BINARY_CAP)
@@ -2088,7 +2115,7 @@ def _copy_old_artifact(root: str) -> str:
                 "source_pin": OLD_PIN,
                 "binary_sha256": OLD_SHA,
                 "binary_size": len(binary),
-                "control_state_version": 2,
+                "control_state_version": OLD_CONTROL_STATE,
                 "source_artifact_path": OLD_ARTIFACT_PATH,
                 "historical_installed_path": OLD_INSTALLED_PATH,
                 "historical_installed_path_note": (
@@ -2141,9 +2168,9 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
     proof.phase("start")
 
     # The staged candidate's compiled capabilities, pinned exactly for THIS
-    # head: state version 4 and the `oxide.outputs/3` owned-outputs fence,
-    # debug-only proof controls. The shared helper's default stays unchanged
-    # for its other caller.
+    # head: control state version 9 and the `oxide.outputs/3` owned-outputs
+    # fence, debug-only proof controls. The shared helper's default stays
+    # unchanged for its other caller.
     proof.binary = handoff.stage_subject(proof.root, capability=CANDIDATE_CAPABILITY)
     proof.phase("after staging")
 
@@ -2190,14 +2217,20 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
             state_file = os.path.join(control, "state.json")
             expect(os.path.isfile(state_file), f"paired control state {state_file} is missing")
             state = permanent.read_json(state_file)
-            # The current control format at this head (store.rs STATE_VERSION and
-            # OWNED_OUTPUTS_FENCE): a bump fails this proof loudly instead of
-            # letting it check a stale format.
+            # The current control format at this head (src/lease/mod.rs
+            # CONTROL_FENCE_VERSION and the fence literals, src/lease/control.rs
+            # STATE_VERSION and OWNED_OUTPUTS_FENCE): a bump fails this proof
+            # loudly instead of letting it check a stale format. Version 9
+            # requires the owned-outputs fence and all four later fences.
             expect(state["version"] == CONTROL_STATE_VERSION, f"{control}: state version {state['version']}")
-            expect(
-                state.get("owned_outputs") == OWNED_OUTPUTS_FENCE,
-                f"{control}: {state.get('owned_outputs')}",
-            )
+            for name, expected in (
+                ("owned_outputs", OWNED_OUTPUTS_FENCE),
+                ("recorded_accounting", RECORDED_ACCOUNTING_FENCE),
+                ("eviction_accounting", EVICTION_ACCOUNTING_FENCE),
+                ("slot_ceiling", SLOT_CEILING_FENCE),
+                ("holding", HOLDING_FENCE),
+            ):
+                expect(state.get(name) == expected, f"{control}: {name} {state.get(name)!r} is not {expected!r}")
             expect("ready" in json.dumps(state.get("outputs_init")), f"{control}: {state.get('outputs_init')}")
         registry = world.registry_doc()
         expect(registry_is_current(registry), registry)
@@ -2208,7 +2241,10 @@ def run(proof, repo: str, custody: ImageCustody) -> None:
         old = copy_old_artifact(proof.root)
         probe = proof.run([old, CAPABILITIES_PROBE], cwd=alpha, env=proof.env, timeout=30)
         expect(probe.returncode == 0, f"old capability probe exit {probe.returncode}")
-        expect(json.loads(probe.stdout).get("control_state_version") == 2, f"old probe {probe.stdout!r}")
+        expect(
+            json.loads(probe.stdout).get("control_state_version") == OLD_CONTROL_STATE,
+            f"old probe {probe.stdout!r}",
+        )
         watched = [world.pool, os.path.join(mount, "oxide-outputs"), alpha]
         before = [tree_snapshot(path) for path in watched]
         for args in (["check"], ["outputs", "adopt"]):
@@ -3129,6 +3165,81 @@ def self_test() -> int:
 
     check("declared supervisor digest", declared_supervisor)
 
+    def control_format_pins() -> None:
+        # Every control-format pin is CURRENT SOURCE, read back here instead of
+        # assumed: a fence bump, a moved declaration, a changed capability field
+        # or a changed registration version fails this pure check before any
+        # native run can check a stale format.
+        repo = os.path.dirname(HERE)
+
+        def read(relative: str) -> str:
+            with open(os.path.join(repo, relative), encoding="utf-8") as handle:
+                return handle.read(2 * 1024 * 1024)
+
+        lease = read(os.path.join("src", "lease", "mod.rs"))
+        control = read(os.path.join("src", "lease", "control.rs"))
+        version = re.search(r"^pub const CONTROL_FENCE_VERSION: u32 = (\d+);$", lease, re.MULTILINE)
+        assert version is not None, "src/lease/mod.rs no longer declares CONTROL_FENCE_VERSION"
+        assert int(version.group(1)) == CONTROL_STATE_VERSION, (version.group(1), CONTROL_STATE_VERSION)
+        # State and holding versions delegate to that one number, which is why a
+        # version-9 document must carry every fence case 01 asserts.
+        for name in ("STATE_VERSION", "HOLDING_STATE_VERSION"):
+            assert f"pub const {name}: u32 = super::CONTROL_FENCE_VERSION;" in control, (
+                "src/lease/control.rs no longer derives " + name + " from the control fence"
+            )
+        assert "pub const SLOT_CEILING_STATE_VERSION: u32 = 8;" in control, (
+            "the raised-ceiling state version moved; case 01's ceiling fence premise changed"
+        )
+        # The owned-outputs fence is a literal in control.rs; the four later
+        # fences live in mod.rs under the shared `CONTROL_` prefix.
+        assert f'pub const OWNED_OUTPUTS_FENCE: &str = "{OWNED_OUTPUTS_FENCE}";' in control, (
+            "src/lease/control.rs no longer declares this owned-outputs fence"
+        )
+        for name, value in (
+            ("CONTROL_RECORDED_ACCOUNTING_FENCE", RECORDED_ACCOUNTING_FENCE),
+            ("CONTROL_EVICTION_ACCOUNTING_FENCE", EVICTION_ACCOUNTING_FENCE),
+            ("CONTROL_SLOT_CEILING_FENCE", SLOT_CEILING_FENCE),
+            ("CONTROL_HOLDING_FENCE", HOLDING_FENCE),
+        ):
+            found = re.search(r"^pub const " + name + r': &str = "([^"]+)";$', lease, re.MULTILINE)
+            assert found is not None, f"src/lease/mod.rs no longer declares {name}"
+            assert found.group(1) == value, (found.group(1), value)
+        # The capability probe answers exactly these fields; the registration
+        # version is the product's own literal.
+        handoff = read(os.path.join("src", "bin", "oxide", "handoff.rs"))
+        assert f'pub const CAPABILITIES_PROBE: &str = "{CAPABILITIES_PROBE}";' in handoff, (
+            "the hidden capability probe's own spelling changed"
+        )
+        for field_name in ("control_state_version", "registration_version", "test_controls"):
+            assert field_name in handoff, f"the capability probe no longer reports {field_name}"
+        assert CANDIDATE_CAPABILITY == {
+            "control_state_version": CONTROL_STATE_VERSION,
+            "registration_version": 2,
+            "test_controls": True,
+        }, CANDIDATE_CAPABILITY
+        removable = read(os.path.join("src", "bin", "oxide", "removable.rs"))
+        registration = re.search(
+            r"^pub\(crate\) const REGISTRATION_VERSION: u32 = (\d+);$", removable, re.MULTILINE
+        )
+        assert registration is not None, "removable.rs no longer declares REGISTRATION_VERSION"
+        assert int(registration.group(1)) == CANDIDATE_CAPABILITY["registration_version"], (
+            registration.group(1),
+            CANDIDATE_CAPABILITY["registration_version"],
+        )
+        # Case 01 asserts every fence, so a new required fence cannot be pinned
+        # here and left unchecked there.
+        case_one = inspect.getsource(run)
+        for name in (
+            "OWNED_OUTPUTS_FENCE",
+            "RECORDED_ACCOUNTING_FENCE",
+            "EVICTION_ACCOUNTING_FENCE",
+            "SLOT_CEILING_FENCE",
+            "HOLDING_FENCE",
+        ):
+            assert name in case_one, f"case 01 no longer checks {name}"
+
+    check("control format pins", control_format_pins)
+
     def documented_matrix() -> None:
         # The owning docstring must describe exactly the bodies this run
         # dispatches: same ids, same order, same names, same dependencies.
@@ -3152,8 +3263,14 @@ def self_test() -> int:
         assert parameters["capability"].default is None, parameters["capability"].default
         assert "CARGO_ENCODED_RUSTFLAGS" in inspect.getsource(helper.stage_subject)
         # This proof pins the current control format literally; a product bump
-        # must update this constant, case 01 and the staged capability together.
-        assert CONTROL_STATE_VERSION == 4 and OWNED_OUTPUTS_FENCE == "oxide.outputs/3"
+        # must update the constants, case 01 and the staged capability together.
+        assert CONTROL_STATE_VERSION == 9 and OWNED_OUTPUTS_FENCE == "oxide.outputs/3"
+        assert (
+            RECORDED_ACCOUNTING_FENCE,
+            EVICTION_ACCOUNTING_FENCE,
+            SLOT_CEILING_FENCE,
+            HOLDING_FENCE,
+        ) == ("oxide.accounting/1", "oxide.eviction-accounting/1", "oxide.slots/256", "oxide.holding/1")
         assert CANDIDATE_CAPABILITY == {
             "control_state_version": CONTROL_STATE_VERSION,
             "registration_version": 2,
@@ -3194,7 +3311,10 @@ def self_test() -> int:
         case_one = inspect.getsource(run)
         assert "copy_old_artifact(proof.root)" in case_one, "case 01 does not verify the artifact"
         assert "probe = proof.run([old, CAPABILITIES_PROBE]" in case_one, case_one
-        assert 'json.loads(probe.stdout).get("control_state_version") == 2' in case_one, case_one
+        assert (
+            'json.loads(probe.stdout).get("control_state_version") == OLD_CONTROL_STATE' in case_one
+        ), case_one
+        assert OLD_CONTROL_STATE == 2 and OLD_CONTROL_STATE != CONTROL_STATE_VERSION
         assert '(["check"], ["outputs", "adopt"])' in case_one
 
     check("older-binary artifact input path", artifact_inputs)
