@@ -324,6 +324,15 @@ The protocol needs an authenticated per-run channel established before Cargo
  keep the lease and proof resources, never imply success. A cooperative stop
  cannot repair the historical orphan or guarantee closure after its owner dies.
 
+A preliminary source discriminator, not yet a custody conclusion: in Apple's
+[XNU `forkproc` at `f6217f891ac0`](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_fork.c),
+PID allocation checks the process, process-group and session hashes while
+holding the process-list lock. This source observation (examined 2026-11-01)
+does not establish when an exited child leaves its group, when a zombie leaves
+the process hash, or whether a particular deployed macOS version has these
+semantics. Those lifetime paths and supported public API guarantees still need
+independent analysis before a group-signal fixture can be authorized.
+
 Before implementation, independently review the ownership and deadline
  contract and obtain any necessary operator ruling. First discriminate whether
  the supported macOS child and group lifetime semantics actually support a held
