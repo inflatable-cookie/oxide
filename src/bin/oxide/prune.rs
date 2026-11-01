@@ -3376,21 +3376,85 @@ fn injected_eacces(_directory: &Path) -> bool {
     false
 }
 
-/// The evidence directory of an armed debug proof fixture: only under the
-/// shared proof supervisor (a deadline, canonical scratch below
-/// /private/tmp, evidence nested in it or its `evidence/` sibling).
+/// The evidence directory of an armed debug proof fixture, under the shared
+/// proof supervisor (a deadline, canonical owned scratch, evidence nested in
+/// it or its `evidence/` sibling). The caller decides placement.
+#[cfg(debug_assertions)]
+fn supervisor_evidence() -> Option<PathBuf> {
+    oxide_storage::proof::evidence()
+}
+
+/// The one placement rule of the shared debug fixture gate, `proof_evidence`.
+/// Every `OXIDE_TEST_PRUNE_*` hook routed through it arms on the internal volume
+/// (scratch below /private/tmp), or under a declared scratch pool that is a
+/// canonical strict child of the supervisor scratch. `given` is the declaration
+/// as the proof spelled it and `canonical` its resolved form, so a symlinked or
+/// non-canonical declaration refuses.
+#[cfg(debug_assertions)]
+fn declaration_allowed(scratch: &Path, given: Option<&Path>, canonical: Option<&Path>) -> bool {
+    if scratch.starts_with("/private/tmp") {
+        return true;
+    }
+    match (given, canonical) {
+        (Some(given), Some(canonical)) => {
+            given == canonical && canonical != scratch && canonical.starts_with(scratch)
+        }
+        _ => false,
+    }
+}
+
+/// The evidence directory of an armed debug proof fixture, through the one
+/// shared gate: supervised evidence plus the declaration rule above. Hooks that
+/// need a control directory apply their own control checks on top
+/// (`hook_control_allowed`). Used by the EACCES, low-reserve and control hooks.
 #[cfg(debug_assertions)]
 fn proof_evidence() -> Option<PathBuf> {
-    // The shared guard (`oxide_storage::proof`) requires the supervisor's
-    // deadline, canonical owned scratch and nested-or-sibling evidence; the
-    // prune hooks additionally stay on the internal volume, which is where
-    // their own proofs run.
-    let evidence = oxide_storage::proof::evidence()?;
+    let evidence = supervisor_evidence()?;
     let scratch = fs::canonicalize(std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")?).ok()?;
-    if !scratch.starts_with("/private/tmp") {
-        return None;
+    let given = std::env::var_os("OXIDE_SCRATCH_ROOT").map(PathBuf::from);
+    let canonical = given
+        .as_deref()
+        .and_then(|path| fs::canonicalize(path).ok());
+    declaration_allowed(&scratch, given.as_deref(), canonical.as_deref()).then_some(evidence)
+}
+
+/// Where an armed prune fixture may place its control directory (oxide#211, S4,
+/// decision 7aedd5af). Internal: the supervisor scratch is below /private/tmp.
+/// Selected volume: the control directory must sit under the proof's DECLARED
+/// scratch pool root (`OXIDE_SCRATCH_ROOT`), which is a strict child of the
+/// supervisor scratch. The declaration itself was verified by the product at
+/// admission; this only names where a test hook may fire.
+#[cfg(debug_assertions)]
+fn hook_placement_allowed(scratch: &Path, declared: Option<&Path>, control: &Path) -> bool {
+    if scratch.starts_with("/private/tmp") {
+        return true;
     }
-    Some(evidence)
+    match declared {
+        Some(declared) => {
+            declared != scratch
+                && declared.starts_with(scratch)
+                && control != declared
+                && control.starts_with(declared)
+        }
+        None => false,
+    }
+}
+
+/// The control-directory conditions of [`prune_fixture_fault`] as pure path
+/// facts: `given` is the path the proof named, `canonical` its resolved form.
+/// A symlinked or non-canonical control, the supervisor scratch root itself and
+/// any control outside the armed placement all refuse.
+#[cfg(debug_assertions)]
+fn hook_control_allowed(
+    given: &Path,
+    canonical: &Path,
+    scratch: &Path,
+    declared: Option<&Path>,
+) -> bool {
+    canonical == given
+        && canonical != scratch
+        && canonical.starts_with(scratch)
+        && hook_placement_allowed(scratch, declared, canonical)
 }
 
 /// Debug builds only, under [`proof_evidence`]: a low-reserve reading for
@@ -3744,12 +3808,12 @@ fn prune_fixture_fault(control: &Path, variable: &str, target: &Path, marker: &s
     else {
         return false;
     };
+    let declared =
+        std::env::var_os("OXIDE_SCRATCH_ROOT").and_then(|path| fs::canonicalize(path).ok());
     let Ok(canonical_control) = fs::canonicalize(control) else {
         return false;
     };
-    if canonical_control != control
-        || canonical_control == scratch
-        || !canonical_control.starts_with(&scratch)
+    if !hook_control_allowed(control, &canonical_control, &scratch, declared.as_deref())
         || !matches!(store::open_control_directory(control), Ok(Some(_)))
         || std::env::var_os(variable).as_deref() != Some(target.as_os_str())
     {
@@ -7056,6 +7120,155 @@ pub(crate) fn test_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// oxide#211 (decision 7aedd5af): a prune test hook arms on the internal
+    /// volume, or under a DECLARED scratch pool inside the supervisor scratch.
+    /// Every other placement stays inert, including a declaration equal to the
+    /// scratch root, a control outside the declared pool and a prefix lookalike.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn prune_hook_placement_is_internal_or_a_declared_scratch_pool() {
+        let scratch = Path::new("/Volumes/Builds/scratch/oxide/run/scratch");
+        let declared = scratch.join("scratch-pools");
+        let control = declared.join("pool/oxide-managed");
+        assert!(hook_placement_allowed(scratch, Some(&declared), &control));
+        assert!(hook_placement_allowed(
+            Path::new("/private/tmp/run/scratch"),
+            None,
+            Path::new("/private/tmp/run/scratch/pool/oxide-managed"),
+        ));
+        assert!(!hook_placement_allowed(scratch, None, &control));
+        assert!(!hook_placement_allowed(scratch, Some(scratch), &control));
+        assert!(!hook_placement_allowed(
+            scratch,
+            Some(Path::new("/Volumes/Builds/other/scratch-pools")),
+            &control,
+        ));
+        assert!(!hook_placement_allowed(
+            scratch,
+            Some(&declared),
+            &scratch.join("checkouts/pool/oxide-managed"),
+        ));
+        assert!(!hook_placement_allowed(scratch, Some(&declared), &declared));
+        assert!(!hook_placement_allowed(
+            scratch,
+            Some(&declared),
+            &scratch.join("scratch-pools-evil/pool/oxide-managed"),
+        ));
+
+        // The control-directory conditions: the canonical strict child passes;
+        // a symlinked or non-canonical spelling, the scratch root itself, a
+        // task-root sibling and an outside path all refuse.
+        assert!(hook_control_allowed(
+            &control,
+            &control,
+            scratch,
+            Some(&declared)
+        ));
+        let real = declared.join("pool/real");
+        let link = declared.join("pool/link");
+        assert!(
+            !hook_control_allowed(&link, &real, scratch, Some(&declared)),
+            "symlinked control"
+        );
+        assert!(
+            !hook_control_allowed(
+                &declared.join("pool/../pool/oxide-managed"),
+                &control,
+                scratch,
+                Some(&declared),
+            ),
+            "non-canonical control"
+        );
+        assert!(
+            !hook_control_allowed(scratch, scratch, scratch, Some(&declared)),
+            "scratch root itself"
+        );
+        let sibling_declared = Path::new("/Volumes/Builds/scratch/oxide/run/sibling/scratch-pools");
+        let sibling_control = sibling_declared.join("pool/oxide-managed");
+        assert!(
+            !hook_control_allowed(
+                &sibling_control,
+                &sibling_control,
+                scratch,
+                Some(sibling_declared),
+            ),
+            "task-root sibling declaration"
+        );
+        let outside = Path::new("/Volumes/Builds/other/pool/oxide-managed");
+        assert!(
+            !hook_control_allowed(outside, outside, scratch, None),
+            "outside path"
+        );
+
+        // The shared gate (`proof_evidence`), routed by the EACCES, low-reserve and
+        // control hooks alike: the declaration must be a canonical strict child of
+        // the scratch. `injected_low_reserve` has no control path, so its accepted
+        // and refused cases are decided here by the declaration alone.
+        let lookalike = Path::new("/Volumes/Builds/scratch/oxide/run/scratch-evil/scratch-pools");
+        assert!(
+            declaration_allowed(scratch, Some(&declared), Some(&declared)),
+            "low-reserve: declared strict child"
+        );
+        assert!(
+            declaration_allowed(Path::new("/private/tmp/run/scratch"), None, None),
+            "internal, no declaration"
+        );
+        assert!(
+            !declaration_allowed(scratch, None, None),
+            "low-reserve: no declaration on the selected volume"
+        );
+        assert!(
+            !declaration_allowed(scratch, Some(scratch), Some(scratch)),
+            "low-reserve: declaration is the scratch root"
+        );
+        assert!(
+            !declaration_allowed(scratch, Some(sibling_declared), Some(sibling_declared)),
+            "low-reserve: task-root sibling"
+        );
+        assert!(
+            !declaration_allowed(scratch, Some(&link), Some(&real)),
+            "low-reserve: symlinked declaration"
+        );
+        assert!(
+            !declaration_allowed(
+                scratch,
+                Some(&scratch.join("scratch-pools/../scratch-pools")),
+                Some(&declared),
+            ),
+            "low-reserve: non-canonical declaration"
+        );
+        assert!(
+            !declaration_allowed(scratch, Some(outside), Some(outside)),
+            "low-reserve: outside declaration"
+        );
+        assert!(
+            !declaration_allowed(scratch, Some(&lookalike), Some(&lookalike)),
+            "low-reserve: prefix lookalike"
+        );
+    }
+
+    /// Release builds carry no low-reserve fixture: the stub never reads a reserve.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn prune_low_reserve_hook_is_absent_in_release() {
+        assert!(!injected_low_reserve(0, 0));
+        assert!(!injected_low_reserve(u64::MAX, u64::MAX));
+    }
+
+    /// Release builds carry none of the prune fixture hooks: the stub never fires.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn prune_fixture_hooks_are_absent_in_release() {
+        let path =
+            Path::new("/Volumes/Builds/scratch/oxide/run/scratch/scratch-pools/pool/oxide-managed");
+        assert!(!prune_fixture_fault(
+            path,
+            "OXIDE_TEST_PRUNE_DIAGNOSTIC_DELAY",
+            path,
+            "prune-diagnostic-delay-fired",
+        ));
+    }
 
     /// oxide#155: a Finder-metadata race that did not remove the quarantine is
     /// a pending intent for every caller, never a completed deletion. The

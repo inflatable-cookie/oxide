@@ -2,32 +2,25 @@
 """Focused native proof for recorded per-slot accounting (oxide#146).
 
 One fixed script and the whole command of the shared proof supervisor
-(`bounded-test.py`, guard sha256 94b1aba6..., the oxide#191 bytes that add the
-opt-in post-census image detach to the qualified oxide#151 guard, plus
-oxide#197's ancestor and launcher-sibling exclusions). That pin is
-checked against the actual runner file before any effect, so a branch that
-still carries different guard bytes refuses here instead of spending a run;
-these bytes are unqualified until their own author and reviewer qualifications
-pass at the merged head. The
-approved recipe is an INTERNAL directory pool, so both heavy selectors pass
-`--root-parent /private/tmp` explicitly (Tom's internal-root exception): a
-pool inside a selected-volume root would be refused by the product itself.
+(`bounded-test.py`, qualified archive evidence-195-b29ef6c-20261101T043444Z).
+Fixture pools use OXIDE_SCRATCH_ROOT inside the supervisor's selected-volume
+run root; a /private/tmp fallback is not scratch-pool coverage.
 Bounds are unchanged: 300 s wall, 512 MiB monitored scratch, 270 s work and a
 30 s shutdown margin.
 
 Everything is private: each fixture has its own `HOME`, `CARGO_HOME`,
-`OXIDE_POOL`, `TMPDIR`/`TMP`/`TEMP` and walk/scope logs beside the pool, all
-inside the one owned monitored root. Inherited `OXIDE_*`/`XDG_*` and encoded
-compiler-flag values are scrubbed; `OXIDE_TEST_HOME_FROM_ENV=1` makes the
+`OXIDE_POOL`, `TMPDIR`/`TMP`/`TEMP` and walk/scope logs, all inside the
+one owned monitored root. Inherited `OXIDE_*`/`XDG_*`/`CARGO_*`/`GIT_*`/
+`SCCACHE_*` and compiler-flag overrides are scrubbed; `OXIDE_TEST_HOME_FROM_ENV=1` makes the
 private `HOME` authoritative; the **invoking** toolchain home is resolved
 before that HOME exists and handed to staging and every fixture child with
 `RUSTUP_TOOLCHAIN=1.97.1`, `RUSTUP_AUTO_INSTALL=0` and offline Cargo; every
 `--locked` call is preceded by a manifest-consistent `Cargo.lock`; a pool path
 is absent until the product creates it. Byte pressure is driven by the
-documented `OXIDE_POOL_CAP` soft byte budget (applied at pool creation), never
+documented `OXIDE_POOL_CAP` soft byte budget (applied at creation and admission), never
 by a proof-invented variable.
 
-The internal-pool fact is the product's own serialized `config.json`
+The directory-budget fact is the product's own serialized `config.json`
 (`backend: "directory-budget-v1"`, and no `volume` entry), read through
 `recorded_backend()`; a missing, malformed, unknown or removable backend
 refuses by name. The ledger has no backend field at all, so a case may never
@@ -43,9 +36,9 @@ the release walk is asserted separately.
 | Case | Command | cwd | Prerequisite | Observed phase |
 | --- | --- | --- | --- | --- |
 | A all-recorded admission | `oxide check` (gated) | fixture crate B | slot A idle with a current record | admission (`Held`), then release |
-| B missing record | `oxide check` (gated) | fixture crate C | A and B idle, B's record dropped, `capacity_policy` 2 | admission, then release |
+| B missing record | `oxide check` (gated) | fixture crate C | A and B idle, B's record dropped, `capacity_policy` 3 | admission, then release |
 | C release/reuse | `oxide check` (gated) | fixture crate A | A idle with a current record | admission (reuse), then release; stdout read after release |
-| D byte pressure | `oxide check` (gated) + held writer | pressure crate | one idle slot, one held slot, an out-of-slot stray, byte budget, internal backend recorded in `config.json` | admission, then releases |
+| D byte pressure | `oxide check` (gated) + held writer | pressure crate | one idle slot, one held slot, an out-of-slot stray, byte budget, directory backend recorded in `config.json` | admission, then releases |
 | E hard-link overcount | `oxide check` (gated) | pressure crate | two idle slots sharing one inode, budget between union and sum | admission, then release |
 | F legacy + crash | `oxide check` (gated, then killed) | third crate, then a fresh crate | every record dropped, `capacity_policy` 1 | admission, then release, then product recovery |
 | G status/audit | `oxide status`, `oxide status --measure` | fixture work dir | one idle slot with a record | no `oxide check`, so no release walk |
@@ -81,8 +74,8 @@ import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILDER = "1.97.1"
-# The qualified shared supervisor this proof's whole command runs under.
-GUARD_SHA256 = "94b1aba60a7475a31b5620039986336f13e1c88d58dd3732b5736290dc63685b"
+# Qualified archive: evidence-195-b29ef6c-20261101T043444Z.
+GUARD_SHA256 = "fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b"
 GUARD_PATH = os.path.join(REPO, "scripts", "bounded-test.py")
 
 # The product's serialized pool facts, bound to source by `--self-test`. The
@@ -100,10 +93,10 @@ SHUTDOWN_MARGIN_S = 30
 # Bytes the fixture build script writes into its slot, so a slot is visibly
 # large enough that a walk would be visible in the log.
 SLOT_FILLER_BYTES = 3 * MIB
-# The documented `OXIDE_POOL_CAP` soft byte budgets (applied at creation).
+# The documented `OXIDE_POOL_CAP` soft byte budgets.
 GENEROUS_BUDGET = 64 * MIB
 PRESSURE_BUDGET = 8 * MIB
-OVERCOUNT_BUDGET = 6 * MIB
+OLD_OVERCOUNT_BUDGET = 6 * MIB  # Historical pre-Builds fixture value.
 # The shared hard-link payload for case E.
 SHARED_INODE_BYTES = 4 * MIB
 RECORDED_TOTAL_NEEDLE = "recorded slot sizes (ledger):"
@@ -135,6 +128,7 @@ PENDING_ABORT: bool = False
 # Set by the pure modes: a check there always raises, never exits the process.
 PURE_MODE: bool = False
 DIAGNOSTIC_MODE = DIAGNOSTIC in sys.argv
+CASE_E_BUDGET: dict[str, int] = {}
 
 
 # --------------------------------------------------------------------------
@@ -322,11 +316,13 @@ def staging_recipe(scratch: str, rustup_home: str | None = None) -> tuple[list[s
     env = {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith(("CARGO_TARGET_", "CARGO_BUILD_", "SCCACHE_", "OXIDE_"))
+        if not key.startswith(("CARGO_", "SCCACHE_", "OXIDE_", "XDG_", "GIT_"))
         and key not in ("CARGO", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
                         "CARGO_ENCODED_RUSTFLAGS", "RUSTFLAGS", "RUSTUP_HOME",
                         "RUSTUP_TOOLCHAIN", "RUSTUP_AUTO_INSTALL", "CARGO_NET_OFFLINE")
     }
+    # Staging needs the invoking offline registry cache; restore only this Cargo value.
+    env["CARGO_HOME"] = os.environ.get("CARGO_HOME") or os.path.join(os.environ["HOME"], ".cargo")
     env.update(toolchain_env(rustup_home if rustup_home is not None else INVOKING_RUSTUP_HOME))
     env.update(
         {
@@ -408,7 +404,7 @@ def source_identity() -> str:
 def recorded_backend(config: object, where: str = "the pool config") -> str:
     """The pool's recorded backend from its serialized `config.json`.
 
-    Only a positively recorded internal directory pool passes. A missing,
+    Only a positively recorded directory-budget pool passes. A missing,
     malformed, unknown or removable backend refuses by name: the fixture never
     assumes its own placement, and it never reads a backend out of the ledger,
     which has no such field.
@@ -419,7 +415,7 @@ def recorded_backend(config: object, where: str = "the pool config") -> str:
     if not isinstance(backend, str) or not backend:
         abort(f"{where} records no backend")
     if backend == VOLUME_BACKEND:
-        abort(f"{where} records the removable backend {backend!r}, not an internal directory pool")
+        abort(f"{where} records the removable backend {backend!r}, not a directory-budget pool")
     if backend != BUDGET_BACKEND:
         abort(f"{where} records an unknown backend {backend!r}")
     if "volume" in config:
@@ -690,6 +686,32 @@ def union_allocated(roots: list[str]) -> tuple[int, int]:
     return total, len(seen)
 
 
+def per_name_allocated(roots: list[str]) -> int:
+    """Allocated bytes for each regular-file name in the fixture slot trees."""
+    total = 0
+    for root in roots:
+        for base, directories, files in os.walk(root):
+            directories.sort()
+            for name in sorted(files):
+                path = os.path.join(base, name)
+                info = os.lstat(path)
+                if not os.path.islink(path) and os.path.isfile(path):
+                    total += info.st_blocks * 512
+    return total
+
+
+def select_overcount_budget(union: int, per_name: int, recorded: int) -> dict[str, int]:
+    """Leave a positive margin on both sides and force recorded pressure."""
+    upper = min(per_name, recorded)
+    if union < 0 or upper - union < 2:
+        raise CaseFailure("no integer budget strictly between union and both sums", abort=False)
+    budget = union + (upper - union) // 2
+    return {"union_bytes": union, "per_name_bytes": per_name, "recorded_sum_bytes": recorded,
+            "budget_bytes": budget, "union_margin_bytes": budget - union,
+            "per_name_margin_bytes": per_name - budget,
+            "recorded_margin_bytes": recorded - budget}
+
+
 def file_identity(path: str) -> tuple[int, int, int, int]:
     """(device, inode, size, allocated) of one owned fixture file."""
     info = os.lstat(path)
@@ -735,15 +757,17 @@ class Fixture:
         self.root = os.path.join(root, label)
         self.home = os.path.join(self.root, "home")
         self.cargo_home = os.path.join(self.root, "cargo")
-        self.pool = os.path.join(self.root, "pool")
+        self.scratch_root = os.path.join(root, "pools")
+        self.pool = os.path.join(self.scratch_root, label)
         self.work = os.path.join(self.root, "work")
         self.temp = os.path.join(self.root, "temp")
         self.walk_log = os.path.join(self.root, "walk.log")
         self.scope_log = os.path.join(self.root, "scope.log")
         self.budget_bytes = budget_bytes
-        for path in (self.home, self.cargo_home, self.temp, self.work):
+        for path in (self.home, self.cargo_home, self.temp, self.work, self.scratch_root):
             os.makedirs(path, exist_ok=True)
         os.chmod(self.root, 0o700)
+        os.chmod(self.scratch_root, 0o700)
 
     # -- fixture crates -------------------------------------------------
 
@@ -803,10 +827,11 @@ class Fixture:
         env = {
             key: value
             for key, value in os.environ.items()
-            if not key.startswith(("OXIDE_", "XDG_"))
+            if not key.startswith(("OXIDE_", "XDG_", "CARGO_", "GIT_", "SCCACHE_"))
             and key not in ("TMPDIR", "TMP", "TEMP", "CARGO_ENCODED_RUSTFLAGS", "RUSTFLAGS",
                             "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "RUSTUP_AUTO_INSTALL",
-                            "CARGO_NET_OFFLINE")
+                            "CARGO_NET_OFFLINE", "CARGO", "RUSTC", "RUSTC_WRAPPER",
+                            "RUSTC_WORKSPACE_WRAPPER")
         }
         env.update(toolchain_env(INVOKING_RUSTUP_HOME))
         env.update(
@@ -815,8 +840,8 @@ class Fixture:
                 "CARGO_HOME": self.cargo_home,
                 "OXIDE_TEST_HOME_FROM_ENV": "1",
                 "OXIDE_POOL": self.pool,
-                # The fixture creates its own pool, outside the published
-                # task scratch root, so it takes the explicit opt-in.
+                "OXIDE_SCRATCH_ROOT": self.scratch_root,
+                # Explicit pool creation opt-in.
                 "OXIDE_POOL_CREATE": "1",
                 # The documented soft byte budget for the next pool creation.
                 "OXIDE_POOL_CAP": str(self.budget_bytes),
@@ -908,7 +933,7 @@ class Fixture:
         except ValueError as error:
             abort(f"the pool config at {path} is not JSON: {error}")
 
-    def require_internal_directory_backend(self) -> str:
+    def require_directory_backend(self) -> str:
         return recorded_backend(self.pool_config(), f"the pool config at {self.pool}")
 
     def ledger(self) -> dict:
@@ -1133,7 +1158,7 @@ def case_b_missing_record_walks_only_that_slot(root: str, subject: str) -> None:
     # The product must read exactly this legacy shape before the admission.
     read_back = fx.ledger()
     expect(
-        read_back["capacity_policy"] == 2
+        read_back["capacity_policy"] == 3
         and all(str(slot["id"]) != victim or slot.get("recorded") is None for slot in read_back["slots"]),
         "the ledger edit did not produce the intended missing-record shape",
     )
@@ -1221,8 +1246,8 @@ def case_d_byte_pressure_evicts_only_the_idle_slot(root: str, subject: str) -> N
         f"the fixture did not get its byte budget: {fx.ledger()['cap_bytes']}",
     )
     expect(
-        fx.require_internal_directory_backend() == BUDGET_BACKEND,
-        f"the fixture is not the internal directory pool: {fx.pool_config()}",
+        fx.require_directory_backend() == BUDGET_BACKEND,
+        f"the fixture is not a directory-budget pool: {fx.pool_config()}",
     )
     idle_record = fx.recorded(idle[0])
     expect(idle_record is not None, "the idle slot has no current record to count")
@@ -1335,7 +1360,7 @@ def case_d_byte_pressure_evicts_only_the_idle_slot(root: str, subject: str) -> N
 
 def case_e_cross_slot_hard_link_overcount(root: str, subject: str) -> None:
     case("e_cross_slot_hard_link_overcount")
-    fx = Fixture(root, "e", budget_bytes=OVERCOUNT_BUDGET)
+    fx = Fixture(root, "e", budget_bytes=GENEROUS_BUDGET)
     shared = os.path.join(fx.root, "shared inode.bin")
     with open(shared, "wb") as handle:
         handle.write(b"h" * SHARED_INODE_BYTES)
@@ -1360,33 +1385,24 @@ def case_e_cross_slot_hard_link_overcount(root: str, subject: str) -> None:
         shared_inode_precondition([root_a, root_b], shared_key),
         "the shared inode is not present in both slot trees",
     )
-    # The union is the *fixture's own* device/inode union, not a product
-    # measurement claim: it exists only to prove the 6 MiB budget sits between
-    # the two figures the design distinguishes.
+    # Measure actual allocation on this filesystem, including every file name.
+    # The admission cap is supplied through the documented environment, not a
+    # rewrite of the pool's creation record or a debug-only budget override.
     union_bytes, union_inodes = union_allocated([root_a, root_b])
+    per_name_bytes = per_name_allocated([root_a, root_b])
+    CASE_E_BUDGET.clear()
+    CASE_E_BUDGET.update(union_bytes=union_bytes, per_name_bytes=per_name_bytes,
+                         recorded_sum_bytes=recorded_sum)
+    CASE_E_BUDGET.update(select_overcount_budget(union_bytes, per_name_bytes, recorded_sum))
+    budget = CASE_E_BUDGET["budget_bytes"]
+    fx.budget_bytes = budget
     survivor_record = min(fx.recorded(slot)["unique_bytes"] for slot in idle)
-    print(
-        f"  case e premise: fixture union={union_bytes} ({union_inodes} inodes)"
-        f" recorded sum={recorded_sum} survivor record={survivor_record}"
-        f" (budget {OVERCOUNT_BUDGET})",
-        flush=True,
-    )
-    expect(
-        recorded_sum >= 2 * SHARED_INODE_BYTES,
-        f"the recorded sum ({recorded_sum}) did not count the shared inode twice",
-    )
-    expect(
-        recorded_sum >= OVERCOUNT_BUDGET,
-        f"the recorded sum ({recorded_sum}) is not at or above the budget",
-    )
-    expect(
-        union_bytes < OVERCOUNT_BUDGET,
-        f"the fixture union ({union_bytes}) is already at or above the budget",
-    )
-    expect(
-        survivor_record < OVERCOUNT_BUDGET,
-        f"one surviving record ({survivor_record}) is at or above the budget",
-    )
+    print(f"  case e premise: {CASE_E_BUDGET}, union inodes={union_inodes},"
+          f" survivor record={survivor_record}", flush=True)
+    expect(recorded_sum >= 2 * SHARED_INODE_BYTES,
+           f"the recorded sum ({recorded_sum}) did not count the shared inode twice")
+    expect(survivor_record < budget,
+           f"one surviving record ({survivor_record}) is at or above the budget")
 
     fx.reset_logs()
     before = fx.walks()
@@ -1553,12 +1569,12 @@ def case_g_status_readonly_and_measure_audit(root: str, subject: str) -> None:
 PREMISE_CHECKLIST = {
     "1_private_home_and_rustup": "invoking_rustup_home()/toolchain_env()/establish_lock()",
     "2_account_home_control": "Fixture.env() sets OXIDE_TEST_HOME_FROM_ENV=1; capability probe",
-    "3_environment_isolation": "Fixture.env() scrub of OXIDE_*/XDG_*/flag/TMP overrides",
+    "3_environment_isolation": "Fixture.env()/staging_recipe() scrub OXIDE_*/XDG_*/CARGO_*/GIT_*/SCCACHE_* and flags",
     "4_automatic_adoption": "not applicable: no case uses permanent outputs or a target/ placement",
     "5_cargo_external_argv": "not applicable: no case invokes an external Cargo subcommand",
-    "6_owned_images": "not applicable: internal directory pool only; no image, mount or device",
+    "6_owned_images": "not applicable: directory-budget pool only; no image, mount or device",
     "7_compiler_flags": "toolchain_env() frozen RUSTFLAGS, encoded flags removed, recipe_problems()",
-    "8_temporary_storage": "internal-root selectors; Fixture.env() TMPDIR inside the owned root",
+    "8_temporary_storage": "Fixture.env() puts TMPDIR and scratch pools inside the owned root",
     "9_macos_mktemp": "not applicable: fixtures use explicit os.makedirs paths, never mktemp",
 }
 NA_PREMISES = ("4_automatic_adoption", "5_cargo_external_argv", "6_owned_images", "9_macos_mktemp")
@@ -1778,7 +1794,7 @@ def case_states() -> dict[str, str]:
 
 
 def receipt_document(head: str, script_hash: str, guard_hash: str, subject_hash: str | None,
-                      evidence: str) -> dict:
+                      evidence: str, mode: str = "diagnostic") -> dict:
     states = case_states()
     counts = {
         "pass": sum(1 for state in states.values() if state == "pass"),
@@ -1789,7 +1805,7 @@ def receipt_document(head: str, script_hash: str, guard_hash: str, subject_hash:
     }
     document = {
         "schema": "oxide.recorded-slot-accounting.receipt/2",
-        "mode": "diagnostic",
+        "mode": mode,
         "qualified": False,
         "head": head,
         "script_sha256": script_hash,
@@ -1799,6 +1815,7 @@ def receipt_document(head: str, script_hash: str, guard_hash: str, subject_hash:
                       "installed": TOOLCHAIN_INSTALLED},
         "premises": PREMISES,
         "premise_checklist": PREMISE_CHECKLIST,
+        "case_e_budget": dict(CASE_E_BUDGET) if CASE_E_BUDGET else None,
         "dependencies": DEPENDS,
         "case_states": states,
         "counts": counts,
@@ -1819,7 +1836,7 @@ def receipt_document(head: str, script_hash: str, guard_hash: str, subject_hash:
             "receipt_bytes": MAX_RECEIPT_BYTES,
             "receipt_entries": MAX_RECEIPT_ENTRIES,
         },
-        "claim": "uncounted diagnostic collection; never a PASS, closure or native credit",
+        "claim": "fixture observations only; not a guard closure or native qualification",
     }
     encoded = json.dumps(document, indent=2, sort_keys=True)
     if len(encoded.encode()) > MAX_RECEIPT_BYTES:
@@ -1836,7 +1853,7 @@ def receipt_document(head: str, script_hash: str, guard_hash: str, subject_hash:
 def write_receipt(evidence: str, document: dict) -> str:
     path = os.path.join(
         evidence,
-        f"recorded-slot-accounting-diagnostic-{os.getpid()}-{time.time_ns()}.json",
+        f"recorded-slot-accounting-{'diagnostic' if DIAGNOSTIC_MODE else 'counted'}-{os.getpid()}-{time.time_ns()}.json",
     )
     try:
         with open(path, "w", encoding="utf-8") as handle:
@@ -1853,10 +1870,11 @@ def write_receipt(evidence: str, document: dict) -> str:
 ALLOCATION = {
     "product_controls": {
         "budget_env": "OXIDE_POOL_CAP",
-        "budget_semantics": "soft byte budget applied at pool creation",
+        "budget_semantics": "soft byte budget applied at creation and each admission",
         "generous_budget_bytes": GENEROUS_BUDGET,
         "pressure_budget_bytes": PRESSURE_BUDGET,
-        "overcount_budget_bytes": OVERCOUNT_BUDGET,
+        "overcount_budget": "midpoint between measured union and the smaller of per-name and recorded sums",
+        "historical_overcount_budget_bytes": OLD_OVERCOUNT_BUDGET,
     },
     "phases": {
         "admission": "read while the gated command is Held, before its release",
@@ -1881,6 +1899,63 @@ def self_check() -> None:
     """Pure: real rendering, the recipe validator and the receipt rules."""
     global PURE_MODE
     PURE_MODE = True
+    # Current-main oracle sweep: src/lease/mod.rs policy 3 (1 is the
+    # deliberate legacy input in case F); main.rs status and store.rs slot
+    # wording; handoff.rs test_controls; qualified runner archive above.
+    source = open(os.path.join(REPO, "src/lease/mod.rs"), encoding="utf-8").read()
+    expect("pub const CAPACITY_POLICY_VERSION: u32 = 3;" in source, "capacity policy drift")
+    for path, needle in (("src/bin/oxide/main.rs", RECORDED_TOTAL_NEEDLE),
+                         ("src/bin/oxide/store.rs", RECORDED_SLOT_NEEDLE),
+                         ("src/bin/oxide/handoff.rs", "test_controls")):
+        expect(needle in open(os.path.join(REPO, path), encoding="utf-8").read(), f"oracle drift: {path}")
+    fx = Fixture.__new__(Fixture)
+    fx.home, fx.cargo_home, fx.scratch_root = "/run/home", "/run/cargo", "/run/pools"
+    fx.pool, fx.temp, fx.walk_log, fx.scope_log = "/run/pools/a", "/run/temp", "/run/walk", "/run/scope"
+    fx.budget_bytes = GENEROUS_BUDGET
+    env = fx.env()
+    expect(env["OXIDE_SCRATCH_ROOT"] == fx.scratch_root and env["OXIDE_POOL"] == fx.pool,
+           "fixture scratch contract drift")
+    expect(env["OXIDE_POOL_CAP"] == str(GENEROUS_BUDGET), "fixture cap drift")
+    # Exercise both real environment builders against hostile inherited values.
+    hostile = {key: "hostile" for key in ("OXIDE_POOL", "XDG_CONFIG_HOME", "CARGO_TARGET_DIR",
+               "CARGO_PROFILE_DEV_DEBUG", "GIT_CONFIG_GLOBAL", "SCCACHE_DIR", "RUSTC_WRAPPER")}
+    saved_env = dict(os.environ)
+    try:
+        os.environ.update(hostile)
+        os.environ["CARGO_HOME"] = "/invoking/cargo"
+        _, stage_env = staging_recipe("/run", rustup_home="/toolchain")
+        fixture_env = fx.env()
+        expect(stage_env["CARGO_HOME"] == "/invoking/cargo", "staging lost offline cache")
+        expect(fixture_env["CARGO_HOME"] == fx.cargo_home, "fixture cargo home leaked")
+        for key in hostile:
+            expect(stage_env.get(key) != "hostile", f"staging inherited {key}")
+            expect(fixture_env.get(key) != "hostile", f"fixture inherited {key}")
+        expect(stage_env["CARGO_PROFILE_DEV_DEBUG"] == "0", "staging profile not restored")
+        expect(fixture_env["OXIDE_POOL"] == fx.pool, "fixture pool not restored")
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_env)
+    # f3afed4 Builds diagnostic: the old cap is below the observed union.
+    observed_union = 7_823_360
+    synthetic_sum = observed_union + 4 * MIB
+    expect(OLD_OVERCOUNT_BUDGET <= observed_union, "historical counterfactual changed")
+    chosen = select_overcount_budget(observed_union, synthetic_sum, synthetic_sum)
+    expect(chosen["union_bytes"] < chosen["budget_bytes"] < chosen["per_name_bytes"]
+           and chosen["union_margin_bytes"] > 0 and chosen["per_name_margin_bytes"] > 0,
+           "measured budget counterfactual failed")
+    CASE_E_BUDGET.update(chosen)
+    receipt = receipt_document("a" * 40, "b" * 64, GUARD_SHA256, None, "/nonexistent")
+    expect(receipt["case_e_budget"] == chosen, "receipt lost measured budget and margins")
+    CASE_E_BUDGET.clear()
+    expect(select_overcount_budget(10, 20, 16)["budget_bytes"] == 13,
+           "recorded sum did not constrain the budget")
+    for values in ((10, 10, 20), (10, 11, 20), (10, 20, 10)):
+        try:
+            select_overcount_budget(*values)
+        except CaseFailure:
+            pass
+        else:
+            fail(f"invalid overcount interval accepted: {values}")
     # R1 — the render functions the counted run actually calls.
     rendered = render_build_rs(SLOT_FILLER_BYTES)
     expect("__SLOT_FILLER_BYTES__" not in rendered, "the filler placeholder survived")
@@ -2016,6 +2091,8 @@ def self_check() -> None:
     document = receipt_document("a" * 40, "b" * 64, GUARD_SHA256, "c" * 64, "/nonexistent")
     expect(document["mode"] == "diagnostic", "the receipt is not a diagnostic receipt")
     expect(document["qualified"] is False, "a diagnostic receipt claimed qualification")
+    counted = receipt_document("a" * 40, "b" * 64, GUARD_SHA256, None, "/nonexistent", "counted")
+    expect(counted["mode"] == "counted" and counted["qualified"] is False, "counted receipt claimed qualification")
     expect(len(json.dumps(document).encode()) <= MAX_RECEIPT_BYTES, "the receipt exceeds its bound")
     expect(document["counts"]["planned"] == len(CASE_NAMES), "the receipt lost planned cases")
     long_failure = "x" * (MAX_RECEIPT_EXCERPT * 4)
@@ -2316,7 +2393,7 @@ def self_test() -> None:
         expect(document["collection_complete"] is False, "an aborted receipt claimed completeness")
         expect(document["case_states"] == states, "the receipt states disagree with the run")
 
-        # F1: the internal-pool fact is the pool's serialized `config.json`
+        # F1: the directory-budget fact is the pool's serialized `config.json`
         # backend, bound to product source. The ledger struct has no backend
         # field, which is exactly what used to crash case D.
         pool_source = open(os.path.join(REPO, "src", "lease", "pool.rs"), encoding="utf-8").read()
@@ -2324,7 +2401,7 @@ def self_test() -> None:
         expect(f'const CONFIG_NAME: &str = "{CONFIG_NAME}";' in mod_source,
                f"the config name {CONFIG_NAME!r} is not the product's")
         expect(f'BUDGET_BACKEND_DIRECTORY_V1: &str = "{BUDGET_BACKEND}";' in mod_source,
-               f"the internal backend tag {BUDGET_BACKEND!r} is not the product's")
+               f"the directory backend tag {BUDGET_BACKEND!r} is not the product's")
         expect(f'VOLUME_BACKEND_APFS_V1: &str = "{VOLUME_BACKEND}";' in mod_source,
                f"the removable backend tag {VOLUME_BACKEND!r} is not the product's")
         ledger_struct = pool_source.split("struct Ledger {", 1)[1].split("\n}", 1)[0]
@@ -2332,7 +2409,7 @@ def self_test() -> None:
                "the ledger now records a backend: rebind the F1 premise before trusting it again")
         expect(
             recorded_backend({"version": 5, "backend": BUDGET_BACKEND, "cap_bytes": 1}) == BUDGET_BACKEND,
-            "the real internal-pool config was not accepted",
+            "the directory-budget config was not accepted",
         )
         for rejected in (
             {"version": 5, "store_id": "x", "cap_bytes": 1, "next_slot": 1, "next_lease": 1, "slots": []},
@@ -2347,7 +2424,7 @@ def self_test() -> None:
             except CaseFailure as failure:
                 expect(failure.abort, f"a wrong backend was treated as recoverable: {rejected!r}")
             else:
-                fail(f"a pool without a recorded internal backend was accepted: {rejected!r}")
+                fail(f"a pool without a recorded directory backend was accepted: {rejected!r}")
 
         # F2: a case that dies of an unexpected exception is a failure, never a
         # pass, and the remaining cases are explicitly not run after the abort.
@@ -2646,14 +2723,17 @@ def main() -> None:
         else:
             raise
     finally:
-        if DIAGNOSTIC_MODE and evidence:
+        if evidence:
             try:
-                document = receipt_document(head, script_hash, guard_hash, subject_hash or "", evidence)
+                document = receipt_document(head, script_hash, guard_hash, subject_hash or "", evidence,
+                                            "diagnostic" if DIAGNOSTIC_MODE else "counted")
                 path = write_receipt(evidence, document)
-                print(f"diagnostic receipt: {path}")
+                print(f"fixture receipt: {path}")
             except CaseFailure as receipt_failure:
                 SECONDARY.append(f"receipt: {receipt_failure}")
-                print(f"diagnostic receipt failed: {receipt_failure}", flush=True)
+                print(f"fixture receipt failed: {receipt_failure}", flush=True)
+                if not DIAGNOSTIC_MODE:
+                    raise SystemExit(1)
                 exit_code = 1
 
     if DIAGNOSTIC_MODE:

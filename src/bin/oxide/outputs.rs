@@ -1748,6 +1748,9 @@ struct MemberPlanView {
     state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     root: Option<PathBuf>,
+    /// First-adoption prediction: keep, convert, or refuse this member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adoption: Option<&'static str>,
 }
 
 fn plan_report(context: &Context) -> Result<PlanReport, String> {
@@ -1818,6 +1821,7 @@ fn plan_report(context: &Context) -> Result<PlanReport, String> {
                         member: placement.member().to_owned(),
                         state: state.code(),
                         root: state.link_root().map(Path::to_path_buf),
+                        adoption: None,
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?,
@@ -1857,10 +1861,47 @@ fn plan_report(context: &Context) -> Result<PlanReport, String> {
                 }
             }
             TargetState::RealNonEmpty => {
-                report.reason = Some(
-                    "the existing target directory has content; Oxide never moves, adopts or deletes it. Move it aside yourself if you accept losing its warm build, then re-run `oxide outputs adopt`"
-                        .to_owned(),
-                );
+                report.layout = "profile";
+                report.action = "create-owned-link";
+                for member in ["debug", "release"] {
+                    let link = link_path(&context.workspace, member);
+                    let state = link_state(&link, &context.workspace, &context.checkout_id)?;
+                    let adoption = match &state {
+                        TargetState::RealNonEmpty => "keep",
+                        TargetState::Foreign => "refuse",
+                        TargetState::Missing
+                        | TargetState::RealEmpty
+                        | TargetState::OwnedLink(_)
+                        | TargetState::Dangling(_) => "convert",
+                    };
+                    if adoption == "refuse" && report.reason.is_none() {
+                        report.action = "refuse";
+                        report.reason = Some(format!(
+                            "{} is {}; it is never followed or replaced; earlier members may already be converted",
+                            link.display(), state.label()
+                        ));
+                    }
+                    report.members.push(MemberPlanView {
+                        member: member.to_owned(),
+                        state: state.code(),
+                        root: state.link_root().map(Path::to_path_buf),
+                        adoption: Some(adoption),
+                    });
+                }
+                if report.reason.is_none() {
+                    if report
+                        .members
+                        .iter()
+                        .all(|member| member.adoption == Some("keep"))
+                    {
+                        report.action = "refuse";
+                        report.reason = Some("both profile members are nonempty real directories; adoption keeps them local, creates no owned link and commits no root".to_owned());
+                    } else if let Err(reason) = &usable {
+                        report.reason = Some(format!(
+                            "the volume is not usable ({reason}); converted members would select the checkout-local fallback root"
+                        ));
+                    }
+                }
             }
             TargetState::Foreign => {
                 report.reason = Some(
@@ -2154,6 +2195,60 @@ fn adopt_command() -> Result<u8, String> {
     adopt_at(&context, output_store)
 }
 
+/// Whether this explicit adoption can publish an output transition, and so must
+/// have the shared forward format and the registry established first
+/// (oxide#217).
+///
+/// `prune::ensure_ready` takes the same admission lock the caller's publication
+/// guard holds, so it can only run **before** that guard and, to keep a refusal
+/// that publishes nothing effect-free, must not run on such a refusal. This is
+/// the effect-free classification the adoption itself dispatches on, in the
+/// creator's own order: every receipt is conservative (a replay, a relink, a
+/// migration or a prepared transition may write); a positively missing or empty
+/// real target always converts the members the profile layout places; and a
+/// real nonempty target converts only the members that are not already real
+/// nonempty directories — the route that used to reach `transition_at` with no
+/// registry at all on a fresh pool. The scan stops at the first member that
+/// refuses that conversion, so it answers whether an **earlier** member would
+/// already have published. An owned or dangling whole-target link and a foreign
+/// target refuse here with nothing to publish.
+fn adoption_publishes_a_transition(context: &Context, control: &Path) -> Result<bool, String> {
+    if read_receipt_for_adopt(control, &context.workspace, &context.checkout_id)?.is_some() {
+        return Ok(true);
+    }
+    match context.target()? {
+        TargetState::Missing | TargetState::RealEmpty => Ok(true),
+        TargetState::RealNonEmpty => {
+            // A receiptless checkout's first conversion places exactly the host
+            // profile pair here (a receipt may add more members, and any
+            // receipt already answered above). Every state except a real
+            // nonempty directory publishes a transition: a missing member or an
+            // empty real one is created, and an owned or dangling member link is
+            // relinked, because a first conversion has no committed selection.
+            let mut publishes = false;
+            for member in ["debug", "release"] {
+                let state = link_state(
+                    &link_path(&context.workspace, member),
+                    &context.workspace,
+                    &context.checkout_id,
+                )?;
+                match state {
+                    TargetState::RealNonEmpty => {}
+                    // The profile creator refuses this member; whatever an
+                    // earlier member already published bounds the answer.
+                    TargetState::Foreign => return Ok(publishes),
+                    TargetState::Missing
+                    | TargetState::RealEmpty
+                    | TargetState::OwnedLink(_)
+                    | TargetState::Dangling(_) => publishes = true,
+                }
+            }
+            Ok(publishes)
+        }
+        _ => Ok(false),
+    }
+}
+
 /// `oxide outputs adopt` against one already-opened context and a **lazy** pool
 /// provider, so the guarded refusal is decided before the pool is opened or
 /// coordinated (design §4.1: nothing at all happens first) and the verb-level
@@ -2202,16 +2297,13 @@ fn adopt_at(
     }
     let outcome = (|| {
         refuse_unknown_custody(&internal, &context.workspace, "relink")?;
-        // Fence a pre-feature Oxide out of both pools before any link or
-        // receipt can be published: an existing receipt may need a replay
-        // write. A target adopt refuses outright with no receipt changes
-        // nothing, so it initializes nothing.
-        if read_receipt_for_adopt(&control, &context.workspace, &context.checkout_id)?.is_some()
-            || !matches!(
-                context.target()?,
-                TargetState::RealNonEmpty | TargetState::Foreign
-            )
-        {
+        // Fence a pre-feature Oxide out of both pools before any link, receipt
+        // or registry row can be published: an existing receipt may need a
+        // replay write, and every conversion arm that publishes a transition
+        // needs the registry `transition_at` requires (oxide#217). The
+        // decision is made from effect-free facts here because initialization
+        // takes the same admission lock the publication guard below holds.
+        if adoption_publishes_a_transition(&context, &control)? {
             crate::prune::ensure_ready(&internal, &context.workspace)?;
         }
         let _admission = store::publication_guard(&control)?;
@@ -6345,9 +6437,9 @@ pub fn refuse_unknown_layout(
 }
 
 /// The real executable for a Cargo-reported program path, when that program's
-/// member is an owned link into `root`: `target/<member>/<rest>` maps to
-/// `root/<member>/<rest>`. A real (unlinked) member keeps Cargo's own path, so
-/// a mixed checkout never runs another member's artifact.
+/// member or legacy whole target is an owned link into `root`:
+/// `target/<member>/<rest>` maps to `root/<member>/<rest>`. A real
+/// (unlinked) member keeps Cargo's own path.
 pub fn program_target(checkout: &Path, root: &Path, program: &Path) -> Option<PathBuf> {
     let relative = program.strip_prefix(&checkout.join("target")).ok()?;
     let mut components = relative
@@ -6367,6 +6459,21 @@ pub fn program_target(checkout: &Path, root: &Path, program: &Path) -> Option<Pa
         format!("{first}/{second}")
     };
     crate::layout::Member::parse(&member).ok()?;
+    // The caller supplies the root bound under the held lease. A legacy
+    // target link must still name that exact root and carry this checkout's
+    // owner marker; an unverified link keeps the existing Cargo-path fallback.
+    if fs::read_link(checkout.join("target")).ok().as_deref() == Some(root) {
+        let checkout_id = identity::digest(&checkout.to_string_lossy());
+        owned_root(checkout, &checkout_id, root).ok()?;
+        if !relative
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+        {
+            return None;
+        }
+        let mapped = root.join(relative);
+        return mapped.is_file().then_some(mapped);
+    }
     let target = fs::read_link(link_path(checkout, &member)).ok()?;
     if target != member_destination(root, &member) {
         return None;
@@ -7451,6 +7558,12 @@ fn transition_at(
     let control = context
         .control()
         .ok_or("no internal pool exists; there is no place for an output receipt")?;
+    // Transition publication requires the ready registry. Every adopting verb
+    // establishes it first, before its publication lock — automatic adoption in
+    // its own barrier window and explicit `oxide outputs adopt` through
+    // `adoption_publishes_a_transition` — while a leased command's transition or
+    // replay refuses here and names that upgrade, because a command holding a
+    // slot is itself an open writer (oxide#217).
     crate::prune::require_registry(control)?;
     let link = link_path(&context.workspace, member);
     let profile_member = member != MEMBER;
@@ -9677,6 +9790,29 @@ mod tests {
             replay_migration(&context, &control, migrated.clone()).unwrap(),
             migrated
         );
+    }
+
+    #[test]
+    fn explicit_adopt_of_committed_whole_target_never_hits_member_transition_hooks() {
+        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
+        for hook in ["prepared", "linked", "renamed"] {
+            let (fixture, legacy) = legacy_checkout();
+            register(&fixture, DriveMode::Permanent);
+            let context = fixture.context();
+            let root = legacy.selected().unwrap().root().to_path_buf();
+            let nonce = read_marker(&root).unwrap().nonce().unwrap().to_owned();
+            let store = Store::for_tests(&fixture.root.join("pool"));
+            std::env::set_var(CRASH_ENVIRONMENT, hook);
+            let result = adopt_at(&context, || Ok(Some(store)));
+            std::env::remove_var(CRASH_ENVIRONMENT);
+            assert_eq!(result, Ok(0), "legacy hook {hook} interrupted migration");
+            let receipt = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt.layout(), LayoutKind::Profile, "{hook}");
+            assert_eq!(receipt.state, ReceiptState::Committed, "{hook}");
+            assert_eq!(read_marker(&root).unwrap().nonce(), Some(nonce.as_str()));
+        }
     }
 
     /// oxide#182: `oxide outputs plan` on a committed whole-target checkout
@@ -12095,6 +12231,445 @@ mod tests {
         assert!(replay(&context, journal_receipt).is_err());
     }
 
+    /// A fresh internal pool that has never adopted owned outputs: no registry
+    /// transaction is recorded and no registry document exists (oxide#217). It
+    /// is registered as the permanent drive so `adopt` proceeds, with an absent
+    /// mount point so the conversion selects the checkout-local root.
+    fn fresh_pool(fixture: &Fixture) -> (Store, Context) {
+        let store = Store::for_tests(&fixture.root.join("pool"));
+        register_at(fixture, store.control(), DriveMode::Permanent);
+        let context = Context::new(
+            Some(store.control().to_path_buf()),
+            fixture.checkout.clone(),
+        );
+        assert!(!registry_document(&store).exists());
+        assert!(store.outputs_initialization().unwrap().is_none());
+        (store, context)
+    }
+
+    fn registry_document(store: &Store) -> PathBuf {
+        store.control().join("outputs").join("registry.json")
+    }
+
+    #[test]
+    fn first_profile_plan_agrees_with_adopt_for_member_classes() {
+        for class in [
+            "nonempty",
+            "empty",
+            "missing",
+            "foreign-file",
+            "foreign-symlink",
+            "all-keep",
+        ] {
+            let fixture = Fixture::new();
+            let (store, context) = fresh_pool(&fixture);
+            let target = context.link();
+            fs::create_dir(&target).unwrap();
+            fs::write(target.join("keep.txt"), b"warm").unwrap();
+            let debug = target.join("debug");
+            match class {
+                "nonempty" | "all-keep" => {
+                    fs::create_dir(&debug).unwrap();
+                    fs::write(debug.join("keep"), b"member").unwrap();
+                    if class == "all-keep" {
+                        let release = target.join("release");
+                        fs::create_dir(&release).unwrap();
+                        fs::write(release.join("keep"), b"release").unwrap();
+                    }
+                }
+                "empty" => fs::create_dir(&debug).unwrap(),
+                "foreign-file" => fs::write(&debug, b"foreign").unwrap(),
+                "foreign-symlink" => {
+                    let outside = fixture.root.join("foreign");
+                    fs::create_dir(&outside).unwrap();
+                    symlink(outside, &debug).unwrap();
+                }
+                "missing" => {}
+                _ => unreachable!(),
+            }
+            let report = plan_report(&context).unwrap();
+            assert_eq!(report.layout, "profile", "{class}");
+            assert!(!report.data_move);
+            let member = report.members.iter().find(|m| m.member == "debug").unwrap();
+            let foreign = class.starts_with("foreign");
+            let expected = if foreign {
+                "refuse"
+            } else if class == "nonempty" || class == "all-keep" {
+                "keep"
+            } else {
+                "convert"
+            };
+            assert_eq!(member.adoption, Some(expected), "{class}");
+            assert_eq!(
+                report.action == "refuse",
+                foreign || class == "all-keep",
+                "{class}"
+            );
+            if class == "all-keep" {
+                assert_eq!(report.action, "refuse");
+                assert!(report.members.iter().all(|m| m.adoption == Some("keep")));
+            }
+            if foreign {
+                assert!(report.reason.as_ref().unwrap().contains("debug"));
+            }
+            assert!(
+                !registry_document(&store).exists(),
+                "plan wrote registry: {class}"
+            );
+            assert!(
+                !receipt_path(store.control(), &context.checkout_id).exists(),
+                "plan wrote receipt: {class}"
+            );
+            assert_eq!(fs::read(target.join("keep.txt")).unwrap(), b"warm");
+
+            let result = adopt_at(&context, || Ok(Some(store.handle_for_tests())));
+            assert_eq!(
+                result.is_err(),
+                foreign || class == "all-keep",
+                "{class}: {result:?}"
+            );
+            if class == "all-keep" {
+                assert!(result.unwrap_err().contains("adoption committed no root"));
+            }
+            if class == "nonempty" || class == "all-keep" {
+                assert_eq!(fs::read(debug.join("keep")).unwrap(), b"member");
+                assert!(!fs::symlink_metadata(&debug)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
+            } else if !foreign {
+                assert!(
+                    fs::symlink_metadata(&debug)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink(),
+                    "{class}"
+                );
+            } else if class == "foreign-file" {
+                assert_eq!(fs::read(&debug).unwrap(), b"foreign");
+            } else {
+                assert!(fs::symlink_metadata(&debug)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
+            }
+            if class == "all-keep" {
+                let release = target.join("release");
+                assert_eq!(fs::read(release.join("keep")).unwrap(), b"release");
+                assert!(!fs::symlink_metadata(release)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
+                assert!(!receipt_path(store.control(), &context.checkout_id).exists());
+            }
+            assert_eq!(fs::read(target.join("keep.txt")).unwrap(), b"warm");
+        }
+    }
+
+    /// A committed whole-target receipt for this fixture's checkout.
+    fn committed_receipt(fixture: &Fixture) -> Receipt {
+        let mut receipt = fixture.receipt();
+        receipt.state = ReceiptState::Committed;
+        receipt.generation = 1;
+        receipt.link_mut().selected = Some(fixture.local().selected(1));
+        receipt.roots = vec![fixture.local().selected(1)];
+        receipt
+    }
+
+    /// Publish a receipt document as bytes: a pool whose registry is gone cannot
+    /// write one through the registry authority.
+    fn write_receipt_bytes(control: &Path, checkout_id: &str, receipt: &Receipt) {
+        let directory = control.join("outputs");
+        fs::create_dir_all(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = receipt_path(control, checkout_id);
+        fs::write(&path, serde_json::to_vec_pretty(receipt).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// oxide#217: on a fresh pool the outputs registry does not exist yet, and
+    /// the first explicit adoption of a real nonempty target whose profile
+    /// members are both absent used to reach `transition_at` with no registry
+    /// and refuse. Every conversion path that can publish a transition has it
+    /// ready first, so the documented first adoption succeeds.
+    #[test]
+    fn a_fresh_pool_initializes_the_registry_before_its_first_profile_adoption() {
+        let fixture = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+        let (store, context) = fresh_pool(&fixture);
+        // What a completed checkout-local build leaves behind: a real nonempty
+        // target with no owned profile member inside it.
+        fs::create_dir(context.link()).unwrap();
+        fs::write(context.link().join("CACHEDIR.TAG"), b"warm").unwrap();
+        assert!(adoption_publishes_a_transition(&context, store.control()).unwrap());
+
+        let status = adopt_at(&context, || Ok(Some(store.handle_for_tests()))).unwrap();
+        assert_eq!(status, 0);
+        assert!(registry_document(&store).is_file());
+        assert!(matches!(
+            store.outputs_initialization().unwrap(),
+            Some(crate::store::OutputsInit::Ready { .. })
+        ));
+        let receipt = read_receipt(store.control(), &fixture.checkout, &context.checkout_id)
+            .unwrap()
+            .expect("the adoption published a receipt");
+        assert_eq!(receipt.layout(), LayoutKind::Profile);
+        assert_eq!(receipt.state, ReceiptState::Committed);
+        // Both members are ownet links into one root; the real nonempty
+        // directory underneath and its content were never moved.
+        let root = receipt
+            .selected()
+            .expect("a selected root")
+            .root()
+            .to_path_buf();
+        for member in ["debug", "release"] {
+            let link = context.link().join(member);
+            assert!(
+                fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{member} stayed a real directory"
+            );
+            assert_eq!(
+                fs::read_link(&link).unwrap(),
+                member_destination(&root, member)
+            );
+            assert!(receipt.selected_for(member).is_some(), "{member}");
+        }
+        assert_eq!(
+            fs::read(context.link().join("CACHEDIR.TAG")).unwrap(),
+            b"warm"
+        );
+        assert!(fs::symlink_metadata(context.link())
+            .unwrap()
+            .file_type()
+            .is_dir());
+    }
+
+    /// The same fresh pool through the empty-target route: `adopt` converts a
+    /// real empty target's members, and that transition needs the registry
+    /// initialized first too. The automatic first conversion keeps its own
+    /// establishment before its publication lock.
+    #[test]
+    fn a_fresh_pool_initializes_the_registry_for_an_empty_target_adoption() {
+        let fixture = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+        let (store, context) = fresh_pool(&fixture);
+        fs::create_dir(context.link()).unwrap();
+        assert!(adoption_publishes_a_transition(&context, store.control()).unwrap());
+        let status = adopt_at(&context, || Ok(Some(store.handle_for_tests()))).unwrap();
+        assert_eq!(status, 0);
+        assert!(registry_document(&store).is_file());
+        let receipt = read_receipt(store.control(), &fixture.checkout, &context.checkout_id)
+            .unwrap()
+            .expect("the adoption published a receipt");
+        assert_eq!(receipt.layout(), LayoutKind::Profile);
+        assert!(receipt.selected_for("debug").is_some());
+        assert!(receipt.selected_for("release").is_some());
+    }
+
+    /// A pool whose state records a ready registry but whose registry document
+    /// is gone is genuinely legacy: it is never rebuilt from receipts, markers
+    /// or a fresh initialization, and the existing upgrade refusal stands with
+    /// the receipt, the target and the pool unchanged.
+    #[test]
+    fn a_legacy_pool_without_its_registry_still_refuses_a_first_adoption() {
+        let fixture = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+        let store = Store::for_tests(&fixture.root.join("pool"));
+        register_at(&fixture, store.control(), DriveMode::Permanent);
+        let context = Context::new(
+            Some(store.control().to_path_buf()),
+            fixture.checkout.clone(),
+        );
+        // What a pool that had already initialized looks like once its registry
+        // document disappears: the state says ready, the document is absent.
+        store
+            .initialize_outputs(&"c".repeat(32), Some(&fixture.checkout), &|_, _| Ok(()))
+            .unwrap();
+        assert!(!registry_document(&store).exists());
+        // A committed receipt makes it a legacy pool rather than a fresh one.
+        write_receipt_bytes(
+            store.control(),
+            &context.checkout_id,
+            &committed_receipt(&fixture),
+        );
+        let receipt_path = receipt_path(store.control(), &context.checkout_id);
+        let before = fs::read(&receipt_path).unwrap();
+        fs::create_dir(context.link()).unwrap();
+        fs::write(context.link().join("keep"), b"warm").unwrap();
+        assert!(adoption_publishes_a_transition(&context, store.control()).unwrap());
+
+        let refused = adopt_at(&context, || Ok(Some(store.handle_for_tests()))).unwrap_err();
+        assert!(
+            refused.contains("records a ready registry; refusing to rebuild it"),
+            "{refused}"
+        );
+        assert!(!registry_document(&store).exists());
+        assert_eq!(fs::read(&receipt_path).unwrap(), before);
+        assert!(fs::symlink_metadata(context.link().join("debug")).is_err());
+        assert!(fs::symlink_metadata(context.link().join("release")).is_err());
+    }
+
+    /// A refused target initializes nothing: the adoption refuses with its
+    /// existing text, and the fresh pool still has no registry, no receipt and
+    /// no link. The same holds for a member the conversion refuses before it
+    /// publishes anything; a member refusal after an earlier conversion is not
+    /// an effect-free refusal, and the earlier transition is real work.
+    #[test]
+    fn a_refused_target_initializes_no_registry() {
+        // A foreign target: a link to somewhere Oxide does not own.
+        let fixture = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+        let (store, context) = fresh_pool(&fixture);
+        let elsewhere = fixture.root.join("elsewhere");
+        fs::create_dir_all(elsewhere.join("debug")).unwrap();
+        symlink(&elsewhere, context.link()).unwrap();
+        assert!(!adoption_publishes_a_transition(&context, store.control()).unwrap());
+        let refused = adopt_at(&context, || Ok(Some(store.handle_for_tests()))).unwrap_err();
+        assert!(refused.contains("Oxide never replaces it"), "{refused}");
+        assert!(!registry_document(&store).exists());
+        assert!(!store.control().join("outputs").exists());
+        assert!(fs::symlink_metadata(&elsewhere.join("debug"))
+            .unwrap()
+            .file_type()
+            .is_dir());
+
+        // A real nonempty target whose first member is foreign: the conversion
+        // refuses it before publishing anything, so nothing is initialized.
+        let fixture = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+        let (store, context) = fresh_pool(&fixture);
+        let elsewhere = fixture.root.join("elsewhere");
+        fs::create_dir(context.link()).unwrap();
+        fs::write(context.link().join("keep"), b"warm").unwrap();
+        fs::create_dir(&elsewhere).unwrap();
+        symlink(&elsewhere, context.link().join("debug")).unwrap();
+        assert!(!adoption_publishes_a_transition(&context, store.control()).unwrap());
+        let refused = adopt_at(&context, || Ok(Some(store.handle_for_tests()))).unwrap_err();
+        assert!(
+            refused.contains("it is never followed or replaced"),
+            "{refused}"
+        );
+        assert!(!registry_document(&store).exists());
+        assert!(fs::symlink_metadata(context.link().join("release")).is_err());
+    }
+
+    /// Every arm the profile conversion dispatches on decides readiness the same
+    /// way (oxide#217), so no arm can publish a transition on a fresh pool
+    /// without the registry, and no refusal that publishes nothing initializes
+    /// one.
+    #[test]
+    fn adoption_readiness_follows_every_conversion_arm() {
+        let no_receipt = |prepare: &dyn Fn(&Context, &Fixture)| -> bool {
+            let fixture = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+            let (store, context) = fresh_pool(&fixture);
+            prepare(&context, &fixture);
+            adoption_publishes_a_transition(&context, store.control()).unwrap()
+        };
+        let populated = |context: &Context, _: &Fixture| {
+            fs::create_dir(context.link()).unwrap();
+            fs::write(context.link().join("keep"), b"warm").unwrap();
+        };
+        let nonempty_member = |context: &Context, member: &str| {
+            fs::create_dir(context.link().join(member)).unwrap();
+            fs::write(context.link().join(member).join("keep"), b"warm").unwrap();
+        };
+
+        // A missing or empty real target always places every member.
+        assert!(no_receipt(&|_, _| {}));
+        assert!(no_receipt(&|context, _| {
+            fs::create_dir(context.link()).unwrap();
+        }));
+        // A real nonempty target publishes only a member that is not already a
+        // real nonempty directory.
+        assert!(!no_receipt(&|context, fixture| {
+            populated(context, fixture);
+            nonempty_member(context, "debug");
+            nonempty_member(context, "release");
+        }));
+        assert!(no_receipt(&|context, fixture| {
+            populated(context, fixture);
+            nonempty_member(context, "debug");
+        }));
+        assert!(no_receipt(&|context, fixture| {
+            populated(context, fixture);
+            nonempty_member(context, "release");
+        }));
+        // An empty real member directory is converted by an explicit adoption,
+        // so it publishes too.
+        assert!(no_receipt(&|context, fixture| {
+            populated(context, fixture);
+            fs::create_dir(context.link().join("debug")).unwrap();
+            nonempty_member(context, "release");
+        }));
+        // An owned member link and a dangling one are relinked: a first
+        // conversion has no committed selection, so both publish.
+        assert!(no_receipt(&|context, fixture| {
+            populated(context, fixture);
+            let spec = fixture.local();
+            ensure_root(context, &spec, 1).unwrap();
+            ensure_member_directory(spec.root(), "debug").unwrap();
+            symlink(
+                member_destination(spec.root(), "debug"),
+                context.link().join("debug"),
+            )
+            .unwrap();
+            nonempty_member(context, "release");
+        }));
+        assert!(no_receipt(&|context, fixture| {
+            populated(context, fixture);
+            symlink(
+                fixture.root.join("absent-root/debug"),
+                context.link().join("debug"),
+            )
+            .unwrap();
+            nonempty_member(context, "release");
+        }));
+        // A foreign member the conversion meets first refuses before any
+        // transition, so nothing is initialized for it...
+        assert!(!no_receipt(&|context, fixture| {
+            populated(context, fixture);
+            symlink(&fixture.root, context.link().join("debug")).unwrap();
+            fs::create_dir(context.link().join("release")).unwrap();
+        }));
+        // ...while a foreign member after an earlier publishing member cannot
+        // un-publish that work, so the registry is needed.
+        assert!(no_receipt(&|context, fixture| {
+            populated(context, fixture);
+            symlink(&fixture.root, context.link().join("release")).unwrap();
+        }));
+
+        // A whole-target owned or dangling link and a foreign target refuse
+        // with nothing to publish.
+        let fixture = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+        let (store, context) = fresh_pool(&fixture);
+        let spec = fixture.local();
+        ensure_root(&context, &spec, 1).unwrap();
+        symlink(spec.root(), context.link()).unwrap();
+        assert!(!adoption_publishes_a_transition(&context, store.control()).unwrap());
+        let fixture = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+        let (store, context) = fresh_pool(&fixture);
+        symlink(fixture.root.join("absent-root"), context.link()).unwrap();
+        assert!(!adoption_publishes_a_transition(&context, store.control()).unwrap());
+        let fixture = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+        let (store, context) = fresh_pool(&fixture);
+        symlink(&fixture.root, context.link()).unwrap();
+        assert!(!adoption_publishes_a_transition(&context, store.control()).unwrap());
+
+        // Any receipt is conservative: a replay, relink, migration or prepared
+        // transition may write.
+        let fixture = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+        let store = Store::for_tests(&fixture.root.join("pool"));
+        register_at(&fixture, store.control(), DriveMode::Permanent);
+        let context = Context::new(
+            Some(store.control().to_path_buf()),
+            fixture.checkout.clone(),
+        );
+        write_receipt_bytes(
+            store.control(),
+            &context.checkout_id,
+            &committed_receipt(&fixture),
+        );
+        assert!(adoption_publishes_a_transition(&context, store.control()).unwrap());
+    }
+
     #[test]
     fn adoption_selects_the_profile_layout_and_keeps_real_members() {
         let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
@@ -12495,6 +13070,38 @@ mod tests {
         let relative = PathBuf::from("../../.oxide-outputs/local/aarch64-apple-darwin/debug");
         symlink(&relative, &triple_link).unwrap();
         check_untouched("relative link", &triple_link, &relative);
+    }
+
+    #[test]
+    fn whole_target_run_maps_only_the_verified_bound_root() {
+        let (fixture, receipt) = legacy_checkout();
+        let root = receipt.selected().unwrap().root().to_path_buf();
+        let target = fixture.checkout.join("target");
+        let program = target.join("debug/app");
+        let mapped = root.join("debug/app");
+        fs::create_dir_all(mapped.parent().unwrap()).unwrap();
+        fs::write(&mapped, b"program").unwrap();
+        assert_eq!(
+            program_target(&fixture.checkout, &root, &program),
+            Some(mapped)
+        );
+
+        let foreign = fixture.root.join("foreign");
+        fs::create_dir_all(foreign.join("debug")).unwrap();
+        fs::write(foreign.join("debug/app"), b"foreign").unwrap();
+        assert_eq!(program_target(&fixture.checkout, &foreign, &program), None);
+        let marker = root.join(MARKER);
+        let marker_bytes = fs::read(&marker).unwrap();
+        fs::write(&marker, b"unverified").unwrap();
+        assert_eq!(program_target(&fixture.checkout, &root, &program), None);
+        fs::write(&marker, marker_bytes).unwrap();
+        fs::remove_file(&target).unwrap();
+        symlink(&foreign, &target).unwrap();
+        assert_eq!(program_target(&fixture.checkout, &root, &program), None);
+        fs::remove_file(&target).unwrap();
+        fs::create_dir_all(target.join("debug")).unwrap();
+        fs::write(&program, b"real").unwrap();
+        assert_eq!(program_target(&fixture.checkout, &root, &program), None);
     }
 
     #[test]

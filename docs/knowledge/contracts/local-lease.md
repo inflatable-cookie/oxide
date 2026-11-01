@@ -1691,7 +1691,7 @@ shared supervisor): tiny private fixtures only, debug staging with
   asserts an empty walk log: neither the 256-slot pool ceiling nor the
   twelve-slot project cap has a cheap CLI fixture, and `OXIDE_POOL_CAP` is a
   byte budget, not a slot count. Byte pressure in the CLI proof comes from that
-  documented budget at pool creation, never from a proof-invented variable;
+  documented budget at pool creation or admission, never from a proof-invented variable;
 - B: one unrecorded idle slot → exactly one slot walk, published, and the
   second admission of the same shape walks nothing;
 - C: release publishes a record and the next reuse clears it, with the result
@@ -1703,8 +1703,15 @@ shared supervisor): tiny private fixtures only, debug staging with
   `recorded_backend()`, which refuses a missing, malformed, unknown or
   removable backend by name; the ledger records no backend at all, so no case
   may read one from there;
-- E: cross-slot hard-link overcount (sum ≥ union) plus a refusal case with
-  untouched bytes/inodes;
+- E: cross-slot hard-link overcount. After both slots are built under a
+  generous cap, the fixture measures allocated unique-inode union and per-name
+  sum, and sets `OXIDE_POOL_CAP` for admission to the midpoint between the
+  union and the smaller of the per-name and recorded sums. It requires positive
+  margins and a surviving record below the cap. The fixture receipt records
+  both measurements, the recorded sum, chosen cap and margins. The prior
+  uncounted Builds diagnostic at `f3afed4` passed A–D but failed E before its
+  oracle: the old 6 MiB cap was below the 7,823,360-byte union. It is history,
+  not native credit; the changed head needs a fresh diagnostic and native chain;
 - F: legacy ledger convergence across two admissions and one crash replay;
 - G: default `status` shows recorded totals and walks nothing; `--measure`
   walks and still writes nothing.
@@ -1714,7 +1721,7 @@ Every case applies the nine-item
 with an executable location or a concrete not-applicable reason: the script
 records all nine in `PREMISE_CHECKLIST` (private HOME and rustup, account-home
 control, environment isolation, no adopting conversion, no external Cargo
-subcommand, no image, frozen compiler flags, the internal-root temporary
+subcommand, no image, frozen compiler flags, selected-volume temporary
 storage, no `mktemp`), `--self-check` asserts the map is complete, and the
 diagnostic receipt carries it. The uncounted `--diagnostic` gate below runs
 before the first counted native. The
@@ -1730,7 +1737,9 @@ cases whose prerequisites are intact, writes one uniquely named bounded
 receipt in the evidence root labelled `mode: diagnostic`,
 `qualified: false`, with reached/completed/failed/skipped/unexecuted counts,
 every reason, the taint set, the primary and secondary errors, and explicit
-incomplete counts at its bounds. Counted default stays fail-fast. Any unknown
+incomplete counts at its bounds. Counted default stays fail-fast and also
+writes a bounded fixture receipt with the case E measurements; neither receipt
+claims supervisor closure. Any unknown
 child/writer/device effect, pending custody, timeout, infrastructure or
 protocol failure aborts rather than continuing; nothing is repaired by
 assumption; a non-zero direct leader exit is never read as descendant closure.
@@ -1760,14 +1769,11 @@ precedence.
 300 s total with the supervisor's 30 s stop margin and 512 MiB monitored
 scratch are unchanged; every write stays inside the owned root, no session,
 group or census is started. The supervisor this tree runs is `scripts/bounded-test.py` sha256
-`94b1aba60a7475a31b5620039986336f13e1c88d58dd3732b5736290dc63685b`: the
-qualified oxide#151 guard (merged `af08749`, sha256 `bc24b238…`) plus
-oxide#191's opt-in post-census image detach and oxide#197's ancestor-chain
-exclusion, so those added bytes are
-unqualified until their own diagnostic, author and reviewer qualifications pass
-([shared proof supervisor](workflow.md#shared-proof-supervisor)). The earlier
-oxide#147 `5e5b6617`, oxide#145 `a6d73326` and `961164e7` bytes are history and
-are not used.
+`fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b`,
+qualified in `evidence-195-b29ef6c-20261101T043444Z`
+([shared proof supervisor](workflow.md#shared-proof-supervisor)). Fixture pools
+use `OXIDE_SCRATCH_ROOT` on the selected volume; a `/private/tmp` fallback is
+not scratch-pool coverage. Earlier runner evidence remains historical.
 These figures
 are planning arithmetic, not measurements: the proof's own `--plan` prints them
 and any activation re-measures and reports a **fit blocker** rather than
@@ -1777,10 +1783,16 @@ keeps on and the fixture checks through the built-in capability probe before
 any case asserts a count, and a release build must refuse control presence at
 any value.
 
-**Recipe binding.** The proof needs a genuine internal `directory-budget-v1`
-pool, so both heavy commands pass `--root-parent /private/tmp` explicitly
-(Tom's answered internal-root exception); a pool under a selected volume would
-be refused by the product itself. Staging is one function with the real argv
+The allocation-sensitive fixture sweep retained D's 8 MiB cap: its held-slot,
+stray and idle-record measurements explicitly require pressure and relief, and
+D passed in the historical diagnostic. C's 3 MiB filler is an asserted minimum,
+not a budget boundary, and passed there; the generous 64 MiB cap supports A–C,
+F and G without a demonstrated stale assumption. No result from that diagnostic
+is carried as credit for the changed head.
+
+**Recipe binding.** Fixture directory-budget pools use an explicit cap and
+`OXIDE_SCRATCH_ROOT` within the supervisor's selected-volume run root.
+Staging is one function with the real argv
 and environment, and `--self-check` mutates it (one job, one codegen unit,
 profile drift, a leaked encoded-flags value, a build directory outside the
 stage) so the pure check fails if the recipe regresses. Fixtures keep one Cargo
