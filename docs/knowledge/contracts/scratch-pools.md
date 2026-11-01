@@ -387,6 +387,8 @@ root in `<mount>/scratch/oxide` of the selected volume, and falls back to
    list, and the mirrored selector text loses its exception note as each proof
    migrates.
 
+`rust:holding-delete` and its diagnostic now use a scratch pool under the supervisor-selected volume (oxide#202); their native evidence must be established at the migrated head.
+
 ## Implementation slices
 
 Each slice is its own Queue brief with independent exact-head review; none is
