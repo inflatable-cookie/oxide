@@ -153,12 +153,18 @@ fn tiny_build_matches_staged_base_when_seed_is_off() {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(real_home).join(".rustup"));
     let scratch = Scratch::new();
-    let home = scratch.0.join("home");
+    let base_home = scratch.0.join("base-home");
+    let candidate_home = scratch.0.join("candidate-home");
     let cargo_home = scratch.0.join("cargo-home");
-    let base_pool = scratch.0.join("base-pool");
-    let candidate_pool = scratch.0.join("candidate-pool");
+    let pool = scratch.0.join("pool");
     let checkout = scratch.0.join("checkout");
-    std::fs::create_dir(&home).unwrap();
+    let base_paths = (&base_home, &pool, &checkout);
+    let candidate_paths = (&candidate_home, &pool, &checkout);
+    assert_ne!(base_paths.0, candidate_paths.0);
+    assert_eq!(base_paths.1, candidate_paths.1);
+    assert_eq!(base_paths.2, candidate_paths.2);
+    std::fs::create_dir(&base_home).unwrap();
+    std::fs::create_dir(&candidate_home).unwrap();
     std::fs::create_dir(&cargo_home).unwrap();
     std::fs::create_dir_all(checkout.join("src")).unwrap();
     std::fs::write(
@@ -171,7 +177,8 @@ fn tiny_build_matches_staged_base_when_seed_is_off() {
         "fn main() { println!(\"seed-off\"); }\n",
     )
     .unwrap();
-    let run = |binary: &OsStr, pool: &std::path::Path, prior: Option<&Output>| {
+    let run = |binary: &OsStr, paths: (&PathBuf, &PathBuf, &PathBuf), prior: Option<&Output>| {
+        let (home, pool, checkout) = paths;
         let output = Command::new(binary)
             .args(["build", "--offline"])
             .current_dir(&checkout)
@@ -206,15 +213,26 @@ fn tiny_build_matches_staged_base_when_seed_is_off() {
         assert!(!home.join(".rustup").exists(), "{details}");
         (output, bytes)
     };
-    // Scratch pool host records outlive a pool leaf. Keep each identity intact
-    // instead of deleting a leaf and reusing its path with a stale record.
-    let old = run(&base, &base_pool, None);
+    // Scratch host records live under HOME. A fresh second HOME permits a new
+    // binding at the same path, which the byte-identity comparison requires.
+    let old = run(&base, base_paths, None);
+    let details = evidence("baseline", &old.0);
+    assert!(
+        std::fs::read_dir(&candidate_home)
+            .unwrap_or_else(|error| panic!("candidate home read: {error}\n{details}"))
+            .next()
+            .is_none(),
+        "{details}"
+    );
+    std::fs::remove_dir_all(&pool)
+        .unwrap_or_else(|error| panic!("pool cleanup: {error}\n{details}"));
+    assert!(!pool.exists(), "{details}");
     std::fs::remove_dir_all(checkout.join("target")).unwrap_or_else(|error| {
         panic!("target cleanup: {error}\n{}", evidence("baseline", &old.0))
     });
     let new = run(
         OsStr::new(env!("CARGO_BIN_EXE_oxide")),
-        &candidate_pool,
+        candidate_paths,
         Some(&old.0),
     );
     let details = format!(
