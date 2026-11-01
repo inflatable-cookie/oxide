@@ -7172,14 +7172,20 @@ def main() -> int:
     signal.setitimer(signal.ITIMER_REAL, work_left())
     proof = Proof(root)
     proof.diagnostic = diagnostic
-    if label in ("permanent-outputs", "auto-adopt", "detach-permanent", "ignore-safety"):
+    if label in ("permanent-outputs", "auto-adopt", "detach-permanent", "ignore-safety", "base-compat"):
         proof.collection = Collection()
+    if diagnostic and label == "base-compat":
+        guard_writer_custody(proof)
     try:
         scenario(proof, repo)
     except BaseException as failure:
         if label in ("permanent-outputs", "auto-adopt", "detach-permanent", "ignore-safety"):
             record(label + "-cases.json", json.dumps({"mode": label, "kind": "diagnostic" if diagnostic else "counted", "qualified": False, "cases": getattr(proof.collection, "outcomes", {}), "failures": proof.collection.failures, "aborted": proof.collection.aborted, "failure": repr(failure)[:600]}))
         if label == "base-compat":
+            if uncertain_outcome(failure):
+                proof.collection.aborted = repr(failure)[:600]
+            else:
+                proof.collection.failures.append({"case": "historical-base", "fault": repr(failure)[:600]})
             record("base-compat-receipt.json", json.dumps({"mode": "base-compat", "kind": "diagnostic" if diagnostic else "counted", "cases": ([{"case": "historical-base", "outcome": "failed"}] if getattr(proof, "base_case_started", False) else []), "qualified": False, "failure": repr(failure)[:600]}))
         cleanup = cleanup_after_failure(proof, getattr(proof, "collection", None))
         record(
