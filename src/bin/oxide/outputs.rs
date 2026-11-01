@@ -9688,7 +9688,7 @@ mod tests {
             let context = fixture.context();
             let root = legacy.selected().unwrap().root().to_path_buf();
             let nonce = read_marker(&root).unwrap().nonce().unwrap().to_owned();
-            let store = pool_store(&fixture.root.join("pool"));
+            let store = Store::for_tests(&fixture.root.join("pool"));
             std::env::set_var(CRASH_ENVIRONMENT, hook);
             let result = adopt_at(&context, || Ok(Some(store)));
             std::env::remove_var(CRASH_ENVIRONMENT);
