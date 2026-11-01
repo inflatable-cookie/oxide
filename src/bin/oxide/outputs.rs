@@ -1889,7 +1889,14 @@ fn plan_report(context: &Context) -> Result<PlanReport, String> {
                     });
                 }
                 if report.reason.is_none() {
-                    if let Err(reason) = &usable {
+                    if report
+                        .members
+                        .iter()
+                        .all(|member| member.adoption == Some("keep"))
+                    {
+                        report.action = "refuse";
+                        report.reason = Some("both profile members are nonempty real directories; adoption keeps them local, creates no owned link and commits no root".to_owned());
+                    } else if let Err(reason) = &usable {
                         report.reason = Some(format!(
                             "the volume is not usable ({reason}); converted members would select the checkout-local fallback root"
                         ));
@@ -12237,6 +12244,7 @@ mod tests {
             "missing",
             "foreign-file",
             "foreign-symlink",
+            "all-keep",
         ] {
             let fixture = Fixture::new();
             let (store, context) = fresh_pool(&fixture);
@@ -12245,9 +12253,14 @@ mod tests {
             fs::write(target.join("keep.txt"), b"warm").unwrap();
             let debug = target.join("debug");
             match class {
-                "nonempty" => {
+                "nonempty" | "all-keep" => {
                     fs::create_dir(&debug).unwrap();
                     fs::write(debug.join("keep"), b"member").unwrap();
+                    if class == "all-keep" {
+                        let release = target.join("release");
+                        fs::create_dir(&release).unwrap();
+                        fs::write(release.join("keep"), b"release").unwrap();
+                    }
                 }
                 "empty" => fs::create_dir(&debug).unwrap(),
                 "foreign-file" => fs::write(&debug, b"foreign").unwrap(),
@@ -12266,13 +12279,21 @@ mod tests {
             let foreign = class.starts_with("foreign");
             let expected = if foreign {
                 "refuse"
-            } else if class == "nonempty" {
+            } else if class == "nonempty" || class == "all-keep" {
                 "keep"
             } else {
                 "convert"
             };
             assert_eq!(member.adoption, Some(expected), "{class}");
-            assert_eq!(report.action == "refuse", foreign, "{class}");
+            assert_eq!(
+                report.action == "refuse",
+                foreign || class == "all-keep",
+                "{class}"
+            );
+            if class == "all-keep" {
+                assert_eq!(report.action, "refuse");
+                assert!(report.members.iter().all(|m| m.adoption == Some("keep")));
+            }
             if foreign {
                 assert!(report.reason.as_ref().unwrap().contains("debug"));
             }
@@ -12287,8 +12308,15 @@ mod tests {
             assert_eq!(fs::read(target.join("keep.txt")).unwrap(), b"warm");
 
             let result = adopt_at(&context, || Ok(Some(store.handle_for_tests())));
-            assert_eq!(result.is_err(), foreign, "{class}: {result:?}");
-            if class == "nonempty" {
+            assert_eq!(
+                result.is_err(),
+                foreign || class == "all-keep",
+                "{class}: {result:?}"
+            );
+            if class == "all-keep" {
+                assert!(result.unwrap_err().contains("adoption committed no root"));
+            }
+            if class == "nonempty" || class == "all-keep" {
                 assert_eq!(fs::read(debug.join("keep")).unwrap(), b"member");
                 assert!(!fs::symlink_metadata(&debug)
                     .unwrap()
@@ -12309,6 +12337,15 @@ mod tests {
                     .unwrap()
                     .file_type()
                     .is_symlink());
+            }
+            if class == "all-keep" {
+                let release = target.join("release");
+                assert_eq!(fs::read(release.join("keep")).unwrap(), b"release");
+                assert!(!fs::symlink_metadata(release)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
+                assert!(!receipt_path(store.control(), &context.checkout_id).exists());
             }
             assert_eq!(fs::read(target.join("keep.txt")).unwrap(), b"warm");
         }
