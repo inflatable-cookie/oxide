@@ -3,15 +3,12 @@
 
 One fixed script and the whole command of the qualified shared supervisor:
 
-    python3 scripts/bounded-test.py --root-parent /private/tmp --limit 600 \
+    python3 scripts/bounded-test.py --limit 600 \
         --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py
 
-`--root-parent /private/tmp` is the owner-accepted internal-placement
-exception (decision `bd357a4c`): the proof's private pool is a genuine internal
-`directory-budget-v1` pool, which the product correctly refuses on an external
-volume, and one case registers a removable pool whose control directory is
-likewise internal. Everything else stays inside the supervisor's own monitored
-scratch, deadline and evidence directory.
+The fixture pools use a private scratch pool root on the supervisor's selected
+volume. A /private/tmp fallback exercises the internal path, not scratch-pool
+coverage. The image remains under the supervisor's custody rules.
 
 `effigy rust:cold-slot-seeding:diagnostic` appends `--diagnostic`: the required
 uncounted keep-going collection. It records every declared case's outcome
@@ -154,8 +151,9 @@ Premise checklist (HIGH; traced through the executable helpers, not this text):
    helper's library build use the same frozen flags; case 10 changes them only
    for its donor command.
 8. Temporary storage: the child env points every temp variable at the
-   supervisor's scratch; the private pool is the reviewed internal-placement
-   exception. The image backing and custody record live in the supervisor's
+   supervisor's scratch; `setup()` creates a private pool root there and
+   `Case.env()` declares it with an explicit cap. A /private/tmp fallback
+   exercises the internal path, not scratch-pool coverage. The image backing and custody record live in the supervisor's
    never-auto-cleaned evidence directory, created and recorded before attach;
    the backing is removed only after a positively completed ordinary detach.
    The competing-lease helper's library build has its own retained stage under
@@ -276,9 +274,9 @@ CASES: list[tuple[str, tuple[str, ...], str]] = [
 
 PHASES = [
     "setup: stage this HEAD's oxide, seed two private offline Cargo homes and build the lease helper",
-    "cases 01-15: internal directory-budget pools",
+    "cases 01-15: scratch directory-budget pools",
     "case 16: one owned 128 MiB APFS image, ordinary detach",
-    "cases 17-24: internal pools after the image phase",
+    "cases 17-24: scratch pools after the image phase",
 ]
 
 # Child environment variables this script owns; `perm.proof_env` has already
@@ -1229,6 +1227,7 @@ def setup(proof: Proof, repo: str) -> None:
     proof.root = os.path.realpath(proof.root)
     scratch = os.path.realpath(os.environ["OXIDE_TASK_SCRATCH_ROOT"])
     expect(os.path.commonpath([proof.root, scratch]) == scratch, "the proof root escaped the scratch")
+    proof.scratch_pool_root = fixture_dir(proof.root, "pools.")
     proof.rustup = real_rustup_home()
     proof.home = fixture_dir(proof.root, "home.")
     proof.cargo_home = fixture_dir(proof.root, "cargo-home.")
@@ -1284,7 +1283,7 @@ class Case:
     def __init__(self, proof: Proof, case: str):
         self.proof = proof
         self.case = case
-        self.root = fixture_dir(proof.root, f"case-{case}.")
+        self.root = fixture_dir(proof.scratch_pool_root, f"case-{case}.")
         self.pool = os.path.join(self.root, "pool")
 
     def env(
@@ -1301,6 +1300,7 @@ class Case:
             env.pop(name, None)
         env.update(
             {
+                "OXIDE_SCRATCH_ROOT": self.proof.scratch_pool_root,
                 "OXIDE_COLD_SEED": seed,
                 "OXIDE_POOL_CAP": cap,
                 "RUSTUP_HOME": self.proof.rustup,
@@ -3185,7 +3185,7 @@ def plan() -> None:
     """The effect-free table, allocation and premise dispositions."""
     print("cold-slot seeding (oxide#137 §16, oxide#169): 24 fixed native cases")
     print(
-        "supervisor: python3 scripts/bounded-test.py --root-parent /private/tmp "
+        "supervisor: python3 scripts/bounded-test.py "
         "--limit 600 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py"
     )
     print("limits: 600 s wall clock, 512 MiB monitored scratch, one owned 128 MiB APFS image")

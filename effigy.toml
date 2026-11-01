@@ -1216,7 +1216,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --
 # independently activated reviewer native are separately owner-activated.
 [tasks."rust:cold-slot-seeding"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py"
+run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py"
 
 # Uncounted keep-going collection for oxide#169, run through the same
 # qualified guard, root, bounds and custody. Its receipt is distinctly
@@ -1226,7 +1226,7 @@ run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 600 --
 # outcome aborts and retains the image.
 [tasks."rust:cold-slot-seeding:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py --diagnostic"
+run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-cold-slot-seeding.py --diagnostic"
 
 # The pure apparatus of the cold-slot seeding proof: the case table, the
 # keep-going/fail-fast collection semantics, the receipt builder, the lock
