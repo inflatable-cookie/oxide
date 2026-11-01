@@ -775,17 +775,22 @@ run = "python3 scripts/test-oxide-removable-removal.py --self-check"
 # started before the current boot session is positively closed. Stages this
 # HEAD's debug `oxide` offline with 1.97.1 and, over one owned 128 MiB scratch
 # APFS image at a unique /Volumes/<name> (`-owners on`) with a private HOME
-# and CARGO_HOME, proves three independent cases: a quarantined `exec` slot
+# and CARGO_HOME, proves four independent cases: a quarantined `exec` slot
 # (the product's own removal path: the removal stop ends the blocked tool and
 # its release flush fails with the mount gone) whose debug-only override
 # boot time follows its holder start is reported closed by `status`, an
 # explicit adopt of a whole-target fixture then migrates, and the next
 # admission deletes the slot whole; a slot whose override boot time precedes
 # its holder start stays kept with its bytes; an unreadable override stays
-# kept. The explicit internal root is the owner-accepted exception for this
-# fixture's genuine directory-budget internal pool (a pool under /Volumes
-# refuses). 300 s, 512 MiB monitored scratch, ordinary detach. No reinstall,
-# live pool or live slot mutation. Not a benchmark or full QA.
+# kept; and the operator-confirmed release (oxide#196) refuses while an
+# `oxide exec` tool's forked child, which leaves the product's exec group by
+# joining the supervisor's leader process group, holds a file in its slot
+# scratch after observing the detach and then the re-attach (a fresh handle;
+# readiness never precedes removal), then deletes the slot whole through the
+# holding area once that writer is stopped. The explicit internal root is the owner-accepted
+# exception for this fixture's genuine directory-budget internal pool (a pool
+# under /Volumes refuses). 300 s, 512 MiB monitored scratch, ordinary detach.
+# No reinstall, live pool or live slot mutation. Not a benchmark or full QA.
 [tasks."rust:oxide-removable-boot-closure"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-oxide-removable-removal.py --boot-closure"

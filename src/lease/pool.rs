@@ -9,10 +9,10 @@ use super::{
     canonical_existing_dir, current_uid, ensure_private_dir, io_error, is_finder_metadata,
     is_tolerated_metadata_file, open_verified_directory, persist_private_file, random_hex,
     read_private_file, unexpected_entry, unlink_at, AccountingCoverage, AccountingGap,
-    AccountingGapKind, AccountingScan, LeaseEnvironment, LeaseError, LeaseGrant, Leased,
-    LedgerSlot, LedgerView, MeasuredPool, PassiveSnapshot, PoolStatus, Profile, RecordedFact,
-    RecordedVolume, ReleaseReceipt, ReuseMeasurement, SlotOccupancy, SlotStatus, UnmeasuredSlot,
-    ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES,
+    AccountingGapKind, AccountingScan, HeldEvictionFailure, LeaseEnvironment, LeaseError,
+    LeaseGrant, Leased, LedgerSlot, LedgerView, MeasuredPool, PassiveSnapshot, PoolStatus, Profile,
+    RecordedFact, RecordedVolume, ReleaseReceipt, ReuseMeasurement, SlotOccupancy, SlotStatus,
+    UnmeasuredSlot, ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES,
     CAPACITY_POLICY_VERSION, CONFIG_NAME, LEASE_VERSION, LEDGER_NAME,
     LEGACY_CAPACITY_POLICY_VERSION, LEGACY_MAX_SLOTS, LOCK_NAME, MAX_HOLDER_BYTES,
     MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_REFUSAL_SLOTS, MAX_SLOTS,
@@ -741,6 +741,7 @@ pub mod managed {
         refuse_foreign_pool_entries, refuse_retired_image_pool, snapshot_of, write_config,
         write_ledger, Ledger, Payload, Pool, PoolConfig, SlotPersistState, VolumeConfig,
     };
+    use crate::lease::HeldEvictionFailure;
     use crate::volume::Binding;
     use std::os::fd::AsFd;
     use std::path::Path;
@@ -1037,6 +1038,20 @@ pub mod managed {
         Pool::open(pool)?.evict_idle(slot_id)
     }
 
+    /// Retire one held slot by ID and its exact lease, for the
+    /// operator-confirmed quarantined release (oxide#196). A failed rename or
+    /// row write leaves the slot held; only a completed transaction moves the
+    /// tree into the payload's private holding area.
+    pub fn evict_held_slot(
+        pool: &Path,
+        slot_id: &str,
+        lease_id: &str,
+    ) -> Result<Vec<String>, HeldEvictionFailure> {
+        Pool::open_held_eviction(pool)
+            .map_err(HeldEvictionFailure::PreCommit)?
+            .evict_held(slot_id, lease_id)
+    }
+
     /// The holding entry name one generation derives, from facts a caller
     /// already holds (`store_id`, slot, incarnation and the generation's lease
     /// ID). A command that evicted a slot by ID therefore names the entry it
@@ -1098,6 +1113,15 @@ pub(super) fn evict_idle_slot_injected(
     slot_id: &str,
 ) -> Result<Vec<String>, LeaseError> {
     managed::evict_idle_slot(pool, slot_id)
+}
+
+#[cfg(test)]
+pub(super) fn evict_held_slot_injected(
+    pool: &Path,
+    slot_id: &str,
+    lease_id: &str,
+) -> Result<Vec<String>, HeldEvictionFailure> {
+    managed::evict_held_slot(pool, slot_id, lease_id)
 }
 
 #[cfg(test)]
@@ -1283,9 +1307,9 @@ pub(super) fn write_hold_intent_injected(
     write_ledger(pool, &ledger)
 }
 
-/// Test-only: record the durable rename intent of one idle slot straight into
-/// the ledger, so a test can model the interruption windows around an eviction's
-/// rename without opening (and reconciling) the pool.
+/// Test-only: record the durable rename intent of one idle **or held** slot
+/// straight into the ledger, so a test can model the interruption windows
+/// around an eviction's rename without opening (and reconciling) the pool.
 #[cfg(test)]
 pub(super) fn hold_intent_for_test(
     pool: &Path,
@@ -1300,7 +1324,7 @@ pub(super) fn hold_intent_for_test(
         .iter_mut()
         .find(|slot| slot.id == slot_id)
         .ok_or(LeaseError::UnknownAccounting)?;
-    if slot.state != SlotPersistState::Idle {
+    if !matches!(slot.state, SlotPersistState::Idle | SlotPersistState::Held) {
         return Err(LeaseError::UnknownAccounting);
     }
     let name = derived_holding_name(&store_id, slot.id, slot.incarnation, &slot.last_lease_id)
@@ -1317,6 +1341,18 @@ pub(super) fn hold_intent_for_test(
 /// expected root identity, without reconciliation, so a test can prove the
 /// rename boundary refuses a replaced root. Writes nothing durable beyond the
 /// rename; the caller inspects the pool itself.
+/// Test-only: whether one slot row still carries a hold intent, read without
+/// opening (and reconciling) the pool.
+#[cfg(test)]
+pub(super) fn hold_intent_present_injected(pool: &Path, slot_id: u64) -> bool {
+    read_ledger(pool).ok().is_some_and(|ledger| {
+        ledger
+            .slots
+            .iter()
+            .any(|slot| slot.id == slot_id && slot.hold_intent.is_some())
+    })
+}
+
 #[cfg(test)]
 pub(super) fn hold_expecting_injected(
     pool: &Path,
@@ -1377,19 +1413,66 @@ pub(super) fn lease_with_charges_injected(
     Ok((leased, charges))
 }
 
+/// The phase a held move reached. Only `Contained`/`ContainmentFailed` name a
+/// different object; `Unverified` is a completed rename whose identity was not
+/// observed; `NotMoved` is a pre-rename failure (a collision included).
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MovePhase {
+    NotMoved,
+    Unverified(String),
+    Contained(String),
+    ContainmentFailed(String),
+}
+
+/// Classify a held eviction's failure after its durable intent, from the phase
+/// the move actually reached. An object that was not verified as this slot's
+/// tree is never called the slot tree; a pre-existing entry or a swapped
+/// object is never attributed to this slot by name.
+fn post_commit_failure(phase: MovePhase, error: &LeaseError) -> HeldEvictionFailure {
+    let reason = match phase {
+        MovePhase::NotMoved => format!(
+            "the hold intent is durable but the tree was not moved ({error}); an existing holding entry of the same name is not this slot's"
+        ),
+        MovePhase::Unverified(name) => format!(
+            "the hold intent is durable and a rename into the holding area as {name} completed, but the object's identity could not be observed; it is not verified as this slot's tree and the next locked open adopts it only by the recorded identity; the slot stays held ({error})"
+        ),
+        MovePhase::Contained(name) => format!(
+            "the hold intent is durable but a different object was moved into the holding area and contained as {name}; the verified slot tree was not moved, and that object is not this slot's, never adopted or deleted as one; the slot stays held ({error})"
+        ),
+        MovePhase::ContainmentFailed(name) => format!(
+            "the hold intent is durable but a different object was moved into the holding area and its containment rename failed without replacing any existing entry; it remains at {name}, the verified slot tree was not moved, and that object is not this slot's, never adopted or deleted as one; the slot stays held ({error})"
+        ),
+    };
+    HeldEvictionFailure::PostCommit(reason)
+}
+
 impl Pool {
     /// Open a budget-only directory or removable-volume pool. Any other
     /// recorded backend, including the retired `apfs-sparse-image-v1`,
     /// refuses before anything under the pool is touched.
     pub(super) fn open(root: &Path) -> Result<Self, LeaseError> {
-        Self::open_inner(root, false)
+        Self::open_inner(root, false, true, true)
     }
 
     fn open_for_release(root: &Path) -> Result<Self, LeaseError> {
-        Self::open_inner(root, true)
+        Self::open_inner(root, true, true, true)
     }
 
-    fn open_inner(root: &Path, trace_release: bool) -> Result<Self, LeaseError> {
+    /// The held eviction's locked open (oxide#196): the pool lock is taken, but
+    /// no control fence is written and nothing is reconciled before the
+    /// caller's held-row validation and its durable hold intent. A pre-commit
+    /// failure therefore leaves the pool bytes and identity unchanged. A pool
+    /// with pending recorded reconciliation refuses in the caller.
+    fn open_held_eviction(root: &Path) -> Result<Self, LeaseError> {
+        Self::open_inner(root, false, false, false)
+    }
+
+    fn open_inner(
+        root: &Path,
+        trace_release: bool,
+        reconcile: bool,
+        fence_control: bool,
+    ) -> Result<Self, LeaseError> {
         let root = canonical_existing_dir(root, true)?;
         refuse_foreign_pool_entries(&root)?;
         refuse_retired_image_pool(&root)?;
@@ -1407,7 +1490,9 @@ impl Pool {
         // state reaches the current fence version before this open can start a
         // recovery journal or finish a recorded deletion. A library fixture
         // has no control state and nothing to fence.
-        super::fence_managed_control(&root)?;
+        if fence_control {
+            super::fence_managed_control(&root)?;
+        }
         let config = read_config(&root)?;
         let paths = BackingPaths::under(&root);
         let backing = match config.backend.as_str() {
@@ -1458,12 +1543,22 @@ impl Pool {
         // what makes the migration window recoverable: the interrupted
         // `Evicting` row is adopted here, so the legacy replay never meets a
         // root that its own rename already moved.
-        if trace_release {
-            crate::release_trace::phase("holding reconciliation", || pool.reconcile_holding())?;
-            crate::release_trace::phase("pool reconciliation", || pool.reconcile_evicting())?;
+        if reconcile {
+            if trace_release {
+                crate::release_trace::phase("holding reconciliation", || pool.reconcile_holding())?;
+                crate::release_trace::phase("pool reconciliation", || pool.reconcile_evicting())?;
+            } else {
+                pool.reconcile_holding()?;
+                pool.reconcile_evicting()?;
+            }
         } else {
-            pool.reconcile_holding()?;
-            pool.reconcile_evicting()?;
+            // No reconciliation ran: pending recorded work makes the held
+            // deletion refuse before its intent rather than reconcile here.
+            pool.reconciliation_blocked = pool
+                .ledger
+                .slots
+                .iter()
+                .any(|slot| slot.state == SlotPersistState::Evicting || slot.capture.is_some());
         }
         Ok(pool)
     }
@@ -2156,6 +2251,87 @@ impl Pool {
             return Err(LeaseError::Busy);
         };
         self.retire_idle_slot(id, incarnation, &project, profile)?;
+        Ok(std::mem::take(&mut self.created_holding))
+    }
+
+    /// Retire one **held** recorded slot by ID and its lease (oxide#196). This
+    /// is the operator-confirmed quarantined release's deletion path: unlike
+    /// releasing the lease first, a failure before the rename leaves the row
+    /// held and the tree in place, so custody never becomes idle on an error.
+    /// The tree is renamed whole into the payload's holding area and the row
+    /// moves to the holding ledger in one durable write, under this lock.
+    fn evict_held(
+        &mut self,
+        slot_id: &str,
+        lease_id: &str,
+    ) -> Result<Vec<String>, HeldEvictionFailure> {
+        let pre = HeldEvictionFailure::PreCommit;
+        let id = slot_id
+            .parse::<u64>()
+            .ok()
+            .filter(|id| *id != 0)
+            .ok_or(LeaseError::InvalidInput(
+                "slot ID must be a positive integer",
+            ))
+            .map_err(pre)?;
+        let Some((incarnation, project, profile)) = self
+            .slot(id)
+            .filter(|slot| {
+                slot.state == SlotPersistState::Held && slot.lease_id.as_deref() == Some(lease_id)
+            })
+            .map(|slot| (slot.incarnation, slot.project.clone(), slot.profile))
+        else {
+            return Err(HeldEvictionFailure::PreCommit(LeaseError::Busy));
+        };
+        if self.reconciliation_blocked
+            || self.ledger.slots.iter().any(|slot| slot.capture.is_some())
+        {
+            return Err(HeldEvictionFailure::PreCommit(
+                LeaseError::UnknownAccounting,
+            ));
+        }
+        self.ensure_capacity_policy().map_err(pre)?;
+        self.next_rank().map_err(pre)?;
+        let (path, identity) = self
+            .validate_held_slot_scope(id, incarnation, &project, profile, lease_id)
+            .map_err(pre)?;
+        // The durable hold intent is the commit point. Everything above is a
+        // read-only pre-commit check; a failure there leaves the pool bytes and
+        // identity unchanged. The intent write itself replaces the ledger
+        // before it syncs the directory, so a failed write is classified by
+        // re-reading the ledger: a visible intent (or an unreadable ledger) is
+        // conservatively post-commit, never a byte-identical pre-commit.
+        if let Err(error) = self.record_hold_intent(id, identity) {
+            let durable = match read_ledger(&self.root) {
+                Ok(ledger) => ledger
+                    .slots
+                    .iter()
+                    .find(|slot| slot.id == id)
+                    .is_some_and(|slot| slot.hold_intent.is_some()),
+                Err(_) => true,
+            };
+            return Err(if durable {
+                HeldEvictionFailure::PostCommit(format!(
+                    "the ledger replacement carrying the hold intent may be durable but its directory sync failed, so the commit boundary is unknown; the tree was not moved and the next locked open resolves the recorded intent ({error})"
+                ))
+            } else {
+                HeldEvictionFailure::PreCommit(error)
+            });
+        }
+        let mut phase = MovePhase::NotMoved;
+        let row = match self.hold_slot_tree_with_phase(id, &path, Some(identity), &mut phase) {
+            Ok(row) => row,
+            Err(error) => return Err(post_commit_failure(phase, &error)),
+        };
+        let name = row.name.clone();
+        self.created_holding.push(row.name.clone());
+        self.ledger.slots.retain(|slot| slot.id != id);
+        self.ledger.holding.push(row);
+        if let Err(error) = self.persist_revised() {
+            return Err(HeldEvictionFailure::PostCommit(format!(
+                "the tree was moved to the holding area as {name} but the ledger row write failed ({error})"
+            )));
+        }
         Ok(std::mem::take(&mut self.created_holding))
     }
 
@@ -3279,7 +3455,35 @@ impl Pool {
         {
             return Err(LeaseError::UnknownAccounting);
         }
+        self.validate_slot_tree(id)
+    }
 
+    /// The held-slot form of the scope check (oxide#196): the row must still
+    /// be exactly the held generation this lease names. The tree checks are
+    /// the idle path's, so a quarantined tree is moved only when it is this
+    /// pool's own private, owner-only slot directory.
+    fn validate_held_slot_scope(
+        &self,
+        id: u64,
+        incarnation: u64,
+        project: &Path,
+        profile: Profile,
+        lease_id: &str,
+    ) -> Result<(PathBuf, (u64, u64)), LeaseError> {
+        let slot = self.slot(id).ok_or(LeaseError::UnknownAccounting)?;
+        if slot.id != id
+            || slot.incarnation != incarnation
+            || slot.state != SlotPersistState::Held
+            || slot.lease_id.as_deref() != Some(lease_id)
+            || slot.project.as_path() != project
+            || slot.profile != profile
+        {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        self.validate_slot_tree(id)
+    }
+
+    fn validate_slot_tree(&self, id: u64) -> Result<(PathBuf, (u64, u64)), LeaseError> {
         let path = self.slot_path(id)?;
         let slots_root = self.backing.payload_root().join(SLOTS_NAME);
         let slots_root = canonical_existing_dir(&slots_root, true)?;
@@ -4559,6 +4763,22 @@ impl Pool {
         path: &Path,
         expected: Option<(u64, u64)>,
     ) -> Result<HoldingRecord, LeaseError> {
+        let mut phase = MovePhase::NotMoved;
+        self.hold_slot_tree_with_phase(id, path, expected, &mut phase)
+    }
+
+    /// [`Pool::hold_slot_tree`] with the rename phase reported in `moved`:
+    /// `None` while the tree is still at its slot path, and the holding entry
+    /// name once the rename succeeded (the derived name, or the containment
+    /// name if a swapped object was contained). A caller never infers an
+    /// entry's ownership from its name.
+    fn hold_slot_tree_with_phase(
+        &mut self,
+        id: u64,
+        path: &Path,
+        expected: Option<(u64, u64)>,
+        phase: &mut MovePhase,
+    ) -> Result<HoldingRecord, LeaseError> {
         if self.ledger.holding.len() >= MAX_HOLDING_ENTRIES {
             return Err(LeaseError::UnknownAccounting);
         }
@@ -4627,6 +4847,14 @@ impl Pool {
         }
         #[cfg(test)]
         crate::test_fs::run_before_holding_rename();
+        // oxide#196: an injected failure at the rename, after the durable hold
+        // intent, exercises the post-commit window.
+        #[cfg(test)]
+        if crate::test_fs::take_holding_rename_failure() {
+            return Err(io_error(std::io::Error::other(
+                "injected holding rename failure",
+            )));
+        }
         // One rename moves the whole tree; nothing is read, copied or
         // journaled, and the name is the only path the deleter needs.
         // SAFETY: both descriptors and both C strings are live for the call.
@@ -4641,6 +4869,15 @@ impl Pool {
         if renamed != 0 {
             return Err(io_error(std::io::Error::last_os_error()));
         }
+        *phase = MovePhase::Unverified(name.clone());
+        // oxide#196: an injected post-rename observation failure leaves the
+        // tree in the holding area while the ledger row stays held.
+        #[cfg(test)]
+        if crate::test_fs::take_post_rename_observation_failure() {
+            return Err(io_error(std::io::Error::other(
+                "injected post-rename observation failure",
+            )));
+        }
         // The moved entry must be the very object whose descriptor was
         // verified. A swap in the rename window is detected here, and the
         // foreign tree that took its place is **contained**: it is moved to a
@@ -4650,20 +4887,50 @@ impl Pool {
         let moved =
             crate::owned_delete::observe_entry(holding.as_fd(), &target).map_err(io_error)?;
         if (moved.device, moved.inode) != identity {
-            let contained = std::ffi::CString::new(unverified_holding_name(&name))
-                .map_err(|_| LeaseError::UnknownAccounting)?;
-            // SAFETY: both names are inside the held holding-area descriptor.
-            unsafe {
-                libc::renameat(
-                    holding.as_raw_fd(),
-                    target.as_ptr(),
-                    holding.as_raw_fd(),
-                    contained.as_ptr(),
-                );
+            let contained_name = unverified_holding_name(&name);
+            let mut contained_ok = false;
+            if let Ok(contained) = std::ffi::CString::new(contained_name.as_bytes()) {
+                #[cfg(test)]
+                let inject_failure = crate::test_fs::take_containment_rename_failure();
+                #[cfg(not(test))]
+                let inject_failure = false;
+                if !inject_failure {
+                    // The containment must never replace a pre-existing entry:
+                    // an atomic no-replace rename preserves unknown ownership
+                    // at the containment name.
+                    #[cfg(target_os = "macos")]
+                    {
+                        // SAFETY: both names are inside the held holding-area
+                        // descriptor.
+                        contained_ok = unsafe {
+                            libc::renameatx_np(
+                                holding.as_raw_fd(),
+                                target.as_ptr(),
+                                holding.as_raw_fd(),
+                                contained.as_ptr(),
+                                libc::RENAME_EXCL,
+                            )
+                        } == 0;
+                    }
+                    // The removable backend is macOS-only; without an atomic
+                    // no-replace rename the object is left at the derived name
+                    // and reported as uncontained.
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        let _ = (&holding, &target, &contained);
+                    }
+                }
             }
-            return Err(LeaseError::UnsafePath(
-                "the held tree is not the slot that was verified",
-            ));
+            *phase = if contained_ok {
+                MovePhase::Contained(contained_name)
+            } else {
+                MovePhase::ContainmentFailed(name.clone())
+            };
+            return Err(LeaseError::UnsafePath(if contained_ok {
+                "the held tree is not the slot that was verified; it was contained"
+            } else {
+                "the held tree is not the slot that was verified; its containment failed"
+            }));
         }
         #[cfg(test)]
         crate::test_fs::run_after_holding_rename();
@@ -4687,9 +4954,12 @@ impl Pool {
     /// because a directory merely carries the right name.
     fn record_hold_intent(&mut self, id: u64, expected: (u64, u64)) -> Result<(), LeaseError> {
         let slot = self.slot(id).ok_or(LeaseError::UnknownAccounting)?;
+        // Held is the operator-confirmed quarantined release's deletion path
+        // (oxide#196): the row stays held until the same transaction moves the
+        // tree into the holding area, so a failure here never releases it.
         if !matches!(
             slot.state,
-            SlotPersistState::Idle | SlotPersistState::Evicting
+            SlotPersistState::Idle | SlotPersistState::Evicting | SlotPersistState::Held
         ) {
             return Err(LeaseError::UnknownAccounting);
         }
@@ -4800,10 +5070,11 @@ impl Pool {
         // is left untouched and stays counted by the payload walk.
         let mut adopted: Vec<(u64, HoldingRecord)> = Vec::new();
         for slot in &self.ledger.slots {
-            // Only the two windows that rename a tree exist: an idle slot's
-            // eviction and a legacy pending deletion's migration. A held row's
-            // tree is this command's live build directory; it is never moved
-            // into the holding area, so a name that happens to match its
+            // Three windows can rename a tree: an idle slot's eviction, a
+            // legacy pending deletion's migration, and the operator-confirmed
+            // quarantined release's held eviction (oxide#196). A held row
+            // without a recorded intent is a live build directory; it is never
+            // moved into the holding area, so a name that happens to match its
             // generation must not be adopted as one (see the match below).
             let path = self.slot_path_in(slot.id, slot.dir.as_deref())?;
             match holding_presence(&path) {
@@ -4827,13 +5098,12 @@ impl Pool {
             // charged by the payload walk and left to a replay, never deleted on
             // a name alone.
             let bound = match slot.state {
-                SlotPersistState::Idle | SlotPersistState::Evicting => {
+                SlotPersistState::Idle | SlotPersistState::Evicting | SlotPersistState::Held => {
                     match self.recorded_hold_intent(slot) {
                         Some(intent) => (intent.device, intent.inode),
                         None => continue,
                     }
                 }
-                SlotPersistState::Held => continue,
             };
             let Ok(target) = std::ffi::CString::new(name.as_bytes()) else {
                 continue;
@@ -5949,13 +6219,15 @@ fn validate_ledger_read(ledger: &Ledger) -> Result<(), LeaseError> {
             return Err(LeaseError::UnknownAccounting);
         }
         // A hold intent names a rename a deletion is about to perform and the
-        // root identity it verified. Only the two states that can be a rename
+        // root identity it verified. Only the states that can be a rename
         // source may carry one: an idle slot waiting for its eviction's write,
-        // and a recorded legacy deletion. A held row can never carry it.
+        // a recorded legacy deletion, and the operator-confirmed quarantined
+        // release's held eviction (oxide#196), which stays held until the same
+        // transaction moves it.
         if slot.hold_intent.is_some()
             && (!matches!(
                 slot.state,
-                SlotPersistState::Idle | SlotPersistState::Evicting
+                SlotPersistState::Idle | SlotPersistState::Evicting | SlotPersistState::Held
             ) || !slot
                 .hold_intent
                 .as_ref()

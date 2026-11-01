@@ -267,7 +267,7 @@ impl Lost {
                 "lost with the removable volume; deleted whole when the volume returns".to_owned()
             }
             (Some(why), false) => format!(
-                "quarantined: lost with the removable volume and {why}; kept with its bytes, never reused or deleted"
+                "quarantined: lost with the removable volume and {why}; kept with its bytes, never reused or deleted; release with `oxide pool release-quarantined <slot>` once its writers are stopped"
             ),
             (Some(why), true) => format!(
                 "lost with the removable volume and {why}; its holder predates this boot session, so it is deleted whole when the volume returns"

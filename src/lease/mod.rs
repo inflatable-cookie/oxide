@@ -250,6 +250,25 @@ pub enum LeaseError {
     Io(String),
 }
 
+/// A held eviction's failure class (oxide#196). The durable hold intent is
+/// the commit point: a pre-commit failure leaves the pool bytes and identity
+/// unchanged, while a post-commit failure names the recorded partial state
+/// that the next locked open resumes or rolls back.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HeldEvictionFailure {
+    PreCommit(LeaseError),
+    PostCommit(String),
+}
+
+impl std::fmt::Display for HeldEvictionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PreCommit(error) => error.fmt(formatter),
+            Self::PostCommit(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
 impl LeaseError {
     /// 0 is success. 1 usage/invalid/io. 2 busy or holder conflict. 3 full,
     /// unknown accounting or ledger exhaustion. 4 unsafe path or mismatched
@@ -923,6 +942,15 @@ fn persist_private_file(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
         let _ = fs::remove_file(&temp_path);
         return Err(io_error(error));
     }
+    // oxide#196: an injected failure after the replacement but before the
+    // parent-directory sync leaves the new ledger visible while the write
+    // errors, so callers must classify the commit boundary conservatively.
+    #[cfg(test)]
+    if crate::test_fs::take_ledger_dir_sync_failure() {
+        return Err(io_error(std::io::Error::other(
+            "injected ledger directory sync failure",
+        )));
+    }
     File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(io_error)
@@ -1088,6 +1116,15 @@ fn persist_control_state(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
     if let Err(error) = fs::rename(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
         return Err(io_error(error));
+    }
+    // oxide#196: an injected failure after the replacement but before the
+    // parent-directory sync leaves the new ledger visible while the write
+    // errors, so callers must classify the commit boundary conservatively.
+    #[cfg(test)]
+    if crate::test_fs::take_ledger_dir_sync_failure() {
+        return Err(io_error(std::io::Error::other(
+            "injected ledger directory sync failure",
+        )));
     }
     File::open(parent)
         .and_then(|directory| directory.sync_all())
