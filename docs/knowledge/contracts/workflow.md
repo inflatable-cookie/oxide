@@ -6449,7 +6449,114 @@ cannot be achieved without weakening the existing final/named census or
 fault-latching contract, retain the current conservative behavior and stop.
 The #214/#212 persistent same-identity ESRCH case remains unresolved by this
 candidate; no bounded reread can turn the same non-zombie row into proven
-absence. This is a proposal for review, not a frozen contract.
+absence. This remains a design subject to independent exact-head review.
+
+**Bounded implementation contract (oxide#230).** This design is against
+`78364942c8dec9253d557cfc63a7775fe9284848`, runner SHA-256
+`fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b`,
+suite SHA-256 `c95d46aa0e590285c3c412294ffb215c0d45b19ba804f2243f0d2ebd62158d7b`,
+and this section before this amendment. It is a design, not implemented or
+qualified behavior. The following fixes the open choices in the candidate above.
+
+Each round owns one FIFO of exact identities and one ledger, independent of
+receipt storage. Admit at most 4096 distinct snapshot identities and 128
+additional distinct replacement identities; duplicate `(pid, start)` work is
+coalesced, but a new start at the same PID consumes another replacement slot.
+Duplicate snapshot PIDs or malformed identities invalidate the round; never
+use a partial snapshot to remove tracked identities. A repeated observation of
+an already resolved identity reopens it if its prior disposition could be stale;
+retain its ledger entry and charge all new reads. Never discard an obligation
+because its diagnostic row was omitted. A snapshot beyond the cap is uncertain,
+with tracking retained. These are conservative availability limits, not a claim
+about host process counts.
+
+Charge every attempted process-table snapshot, PID identity read, getsid,
+getsid/group read used by structural rules, and parent identity revalidation
+(including failed calls) to one 131072-call round budget, before the call.
+One snapshot counts as one call; each separately invoked reader counts once,
+including both sides of a paired observation. No helper may bypass the ledger.
+The budget accommodates 4096 existing rows at 20 confirmation reads plus a
+final read (86016), leaving 45056 calls for session, structural and replacement
+work; it is a ceiling, not a promise that every maximal round completes. Keep
+20 confirmation attempts and 19 shared 50 ms pauses, plus the separate final
+read. Start one 2 second monotonic phase deadline at round entry, never renew
+it for replacement or a pass; check before and after each reader, pause and
+publication. A call that returns after the deadline invalidates the round. The
+2 seconds leave margin inside the existing 3 second join; neither deadline
+interrupts a blocked kernel call, so an expired join still refuses closure.
+The outer settlement and custody deadlines remain authoritative and are never
+extended. Budget, identity-cap, deadline, malformed read and interrupted work
+all set `certain: false`, `uncertain >= 1`, and invalidate terminal counts;
+retain any tracking not positively resolved. Do not start an unbudgeted final
+read in an attempt to rescue exhaustion.
+
+Algorithm: validate the complete snapshot and seed the FIFO in snapshot order.
+For each identity apply the existing structural rules only with their exact
+fresh identity and parent proofs; a replacement has no inferred parent proof
+from the old row. Otherwise read identity, getsid, identity in that order,
+charging each; only matching complete identities on both sides bind the session.
+A bound leader session tracks the identity, including a different group; a
+bound foreign session excludes only an untracked identity. On actual ESRCH,
+perform the first confirmation immediately after getsid and pair it with that
+identity's own initial row. Pending identities share the existing spaced passes;
+late arrivals join the next pass and receive their own 20 attempts only if the
+single deadline and budget permit. Do not restart the 19-pass schedule: a late
+arrival unable to complete its required reads is uncertain. Run final reads
+for eligible unresolved ESRCH identities; drain replacements from *all* first,
+shared, final and ordinary post-getsid reads through the same FIFO before
+publishing. Every safe different-identity read proves only the old identity
+absent at that instant: remove only that exact tracked identity and enqueue the
+new complete row. A `None` resolves only the identity read, not future occupants.
+Never transfer a session, terminal witness, parent proof or tracked attribution
+to a replacement. A tracked identity remains a member despite foreign or
+unreadable session until exact absence; terminal acceptance remains subject to
+the existing allowlist and every paired read, with contradictions tainting the
+count. If a queued identity changes again, enqueue the new identity under the
+same caps. Deduplication does not erase a later observation or its obligation.
+No recursive retry or fresh clock is permitted.
+
+A round can publish certain empty only after the queue and pending/final reads
+are drained and every observed identity has a positive disposition. Record a
+bounded `replacement_work` summary with snapshot and replacement admitted,
+reads consumed, pending count, status (`complete`, `identity_cap`, `read_cap`,
+`deadline`, `invalid`, `interrupted`) and capped identity rows plus omitted
+count. Counts and unresolved status come from the ledger, never the capped
+rows; overflow or inability to serialize the summary is uncertain. Diagnostic
+omission alone is not an exclusion. The deciding message carries the resulting
+certainty and counts and is bound to the monitor's exact sent sequence as today.
+A named certain-empty message cannot cure a later nonempty or uncertain final
+round: both must independently be certain and empty, the census thread must
+join within its existing bound, both required EOFs must be observed, and any
+latched fault vetoes cleanup. Missing/unmatched messages, expired join, missing
+EOF, or a post-decision uncertain/nonempty result refuse closure and keep
+custody; no new signalling authority is created.
+
+| Failure or observation | Round and closure consequence |
+| --- | --- |
+| First/shared/final read sees B after A | Resolve only A; B is an obligation in this round. |
+| A→B→C exceeds any cap or deadline | Uncertain, even if the receipt omits C; no cleanup. |
+| Bound foreign B, untracked | B may be foreign; a tracked B remains a member. |
+| Bound same-session B | Track B; report member even if later reads contradict it. |
+| Parent reuse, unreadable/malformed row or failed binding | No structural inference; unresolved work blocks certainty. |
+| Zombie contradiction or missing paired read | No terminal acceptance; retain tracking or uncertainty. |
+| Named/final divergence, expired join, missing EOF or fault | Refuse closure, keep evidence and custody. |
+
+The minimal subsequent implementation slice changes the census and its monitor
+message/receipt handling in `scripts/bounded-test.py`, pure and controlled real
+fixtures in `scripts/test_supervisor.py`, and owning workflow knowledge. It
+must inventory `effigy.toml` and consumer hashes; consumer pin reconciliation
+is separately scoped, not implicitly authorized. Pure controls must discriminate
+the old certain-empty final-replacement behavior, exercise A→B→C exhaustion,
+first/shared/final replacements, foreign and same-session B, tracked A and B,
+parent reuse, malformed and unreadable rows, terminal contradictions, named
+versus final divergence, expired join and missing EOF. Controlled real fixtures
+exercise attribution and closure without relying on kernel PID reuse, including
+a same-session different-group survivor and no-signal control. The separate
+persistent same non-zombie identity with getsid ESRCH (`37529b20`) remains
+unknown/UNCLOSED; related recycled-identity paper `631e4462` and historical
+packets gain no closure or credit. This slice is HIGH/ELEVATED because it changes
+writer closure; its independent reviewer must run the distinct native session.
+The existing qualification bounds and activation order below remain fixed.
 
 | Interleaving / counterexample | Required disposition |
 | --- | --- |
