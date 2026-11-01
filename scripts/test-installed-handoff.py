@@ -75,6 +75,7 @@ LEDGER_VERSION = 1
 REGISTRATION_VERSION = 2
 CAPABILITIES_PROBE = "__oxide-build-capabilities"
 SHUTDOWN_MARGIN_S = 20
+CASE_PLAN = ('newer_state_hands_off_once', 'marker_present_refuses_even_with_newer_state', 'marker_is_inert_without_newer_state', 'non_numeric_older_and_malformed_documents_do_not_trigger', 'malformed_and_oversized_documents_keep_the_existing_refusal', 'no_pool_means_no_trigger', 'newer_registration_without_a_candidate_refuses', 'newer_state_without_receipts_or_candidate_refuses', 'a_receipt_that_does_not_cover_a_newer_registration_refuses', 'the_newest_receipt_is_the_only_candidate', 'a_replacement_before_the_last_check_refuses', 'plain_passthrough_skips_the_hand_off_check', 'usage_only_exec_skips_the_hand_off_check', 'launch_check_probe_skips_the_hand_off_check', 'the_running_binary_refuses_to_hand_off_to_itself', 'cargo_exit_75_is_propagated_and_is_not_a_trigger', 'a_final_release_error_never_replays_the_command')
 CASES = []
 DIAGNOSTIC = None
 
@@ -100,8 +101,11 @@ def case(name: str) -> None:
     if DIAGNOSTIC is not None:
         if DIAGNOSTIC["active"] is not None:
             DIAGNOSTIC["completed"].append(DIAGNOSTIC["active"])
+            DIAGNOSTIC["states"][DIAGNOSTIC["active"]] = "completed"
         DIAGNOSTIC["active"] = name
         DIAGNOSTIC["reached"].append(name)
+        expect(name in CASE_PLAN and DIAGNOSTIC["states"][name] == "unexecuted", "case plan drift")
+        DIAGNOSTIC["states"][name] = "active"
     print(f"case {name}")
 
 
@@ -938,24 +942,29 @@ def collect(groups, invoke, outcome, launched):
             invoke(body)
             if outcome["active"] is not None:
                 outcome["completed"].append(outcome["active"])
+                outcome["states"][outcome["active"]] = "completed"
                 outcome["active"] = None
             outcome["groups_completed"].append(name)
         except SystemExit as error:
             outcome["failed"].append({"case": outcome["active"], "group": name,
                                       "error": str(error)[:256]})
+            if outcome["active"] is not None:
+                outcome["states"][outcome["active"]] = "failed"
             outcome["active"] = None
             if launched():
                 outcome["aborted"] = "writer closure unknown after failure"
                 outcome["unexecuted_groups"] = [item[0] for item in groups[index + 1:]]
                 return
         except Exception as error:
+            if outcome["active"] is not None:
+                outcome["states"][outcome["active"]] = "aborted"
             outcome["aborted"] = type(error).__name__
             outcome["unexecuted_groups"] = [item[0] for item in groups[index + 1:]]
             return
 
 
 def empty_outcome():
-    return {"qualified": False, "reached": [], "completed": [], "failed": [],
+    return {"qualified": False, "states": {name: "unexecuted" for name in CASE_PLAN}, "reached": [], "completed": [], "failed": [],
             "active": None, "groups_completed": [], "unexecuted_groups": [],
             "aborted": None}
 
@@ -976,6 +985,7 @@ def self_check():
     assert calls == [1] and outcome["unexecuted_groups"] == ["two"]
     assert outcome["aborted"] and outcome["qualified"] is False
     assert len({name for name, _ in GROUPS}) == len(GROUPS)
+    assert len(set(CASE_PLAN)) == len(CASE_PLAN) == 17
     # Construct only an object in memory: no directories, pool, or child.
     global SCRATCH_ROOT
     old_root = SCRATCH_ROOT
@@ -1014,6 +1024,8 @@ def main() -> int:
     global DIAGNOSTIC, SUBJECT, SCRATCH_ROOT
     if sys.argv[1:] == ["--plan"]:
         print("installed-handoff groups: " + ", ".join(name for name, _ in GROUPS))
+        for name in CASE_PLAN:
+            print("  " + name)
         print("supervisor bounds: 120 s, 64 MiB scratch")
         return 0
     if sys.argv[1:] in (["--self-check"], ["--self-test"]):

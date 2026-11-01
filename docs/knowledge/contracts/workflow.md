@@ -1730,34 +1730,21 @@ necessary.
   exclusion.
 - **Proof.** `effigy rust:installed-handoff` (heavy) is one fixed script and
   whole command: `bounded-test.py` around `scripts/test-installed-handoff.py`
-  with a 120 s wall limit and 64 MiB monitored scratch. Its selector names an
-  explicit `--root-parent /private/tmp` because two of its cases create a real
-  internal directory pool; the selected-volume default would be refused by the
-  product, exactly as for the other genuine internal-placement proofs, and this
-  is the same owner-accepted exception rather than a global default change.
-  Inside that scratch
-  the script stages this HEAD's debug `oxide` with plain Cargo offline and the
-  pinned 1.97.1, then deletes the staged target before the fixtures, so it
-  creates no Oxide pool and touches no live pool, installed binary, install
-  receipt or host state. The stage fits the 64 MiB gate by building with one
-  job, one codegen unit, no debug info, stripped symbols and size-optimised
-  codegen: the staged tree peaks near 58 MiB, the fixtures near 2 MiB, and
-  staging takes about 37 s. Over private HOME, receipt and directory-pool
-  fixtures with a compiled stub candidate, it covers newer state
-  and registration versions; malformed, older and non-`u32` documents that must
-  not trigger; one hand-off with exact argv and environment plus the marker;
-  marker refusal and inertness; foreign, path, hash, size, capability,
-  ownership, `PATH`, same-inode and replacement refusals; skipped commands; and
-  a final-release error after effects that never executes anything. What it
-  exercises is a binary staged from this HEAD carrying control state version 8
-  with a compiled recording stub candidate that reports the newer version 9; it
-  is not a real installed version-4 binary handing off to version 5, and it
-  claims no host install. `effigy proof:installed-handoff:test` checks the
-  fixture control-state and ledger versions against product constants without
-  staging a binary. That real forward-fence hand-off stays behind the
-  separate QA-compatibility-window and receipt-matching install gate. It never
-  touches the real `~/.local/bin/oxide`, a real install receipt or a live pool,
-  and is not a benchmark or an alias for full QA.
+  with a 120 s wall limit and 64 MiB monitored scratch. The supervisor's
+  selected-volume root on Builds holds all fixtures; each product child declares
+  that scratch root and an explicit pool cap. The script stages this HEAD's
+  debug `oxide` offline with 1.97.1, then exercises private HOME, receipt and
+  scratch-pool fixtures with a recording candidate. It covers newer state and
+  registration versions, refusals, skipped commands, and a final-release error
+  after effects. The current candidate reports a version newer than the staged
+  subject's control version 9; this is not a real installed-version transition.
+  `effigy proof:installed-handoff:test` checks the apparatus and fixture
+  environment without staging a binary; `proof:installed-handoff:plan` prints
+  the case plan. The uncounted `rust:installed-handoff:diagnostic` uses the
+  same bounds and aborts on unknown writer closure. The diagnostic and each
+  native session require owner activation at the migrated head; no previous
+  receipt carries over. The proof touches no live pool, installed binary or
+  real install receipt, and is not a benchmark or full QA.
 
 ### Version identity (oxide#130)
 
