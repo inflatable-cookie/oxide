@@ -536,12 +536,6 @@ def malformed(message):
             required["complete"] = bool
         elif message.get("kind") != "reserve":
             return "unknown reading kind"
-    if kind == "census":
-        work = message.get("replacement_work")
-        if not valid_replacement_work(work):
-            return "invalid replacement work"
-        if work["status"] != "complete" and (message.get("certain") is not False or not message.get("uncertain")):
-            return "inconsistent replacement work"
     if kind == "output_eof" and message.get("stream") not in ("stdout", "stderr"):
         return "unknown stream"
     for name, kind_ in required.items():
@@ -549,6 +543,12 @@ def malformed(message):
             return f"missing {name}"
         if not typed(message[name], kind_):
             return f"ill-typed {name}"
+    if kind == "census":
+        work = message.get("replacement_work")
+        if not valid_replacement_work(work):
+            return "invalid replacement work"
+        if work["status"] != "complete" and (message.get("certain") is not False or not message.get("uncertain")):
+            return "inconsistent replacement work"
     return None
 
 
@@ -1601,8 +1601,8 @@ class Census:
 
     def round(self):
         """Classify every identity observed during one bounded census round."""
-        self.reset_stats()
         work = CensusWork()
+        self.reset_stats()
         self.round_deadline = work.deadline
         self._work = work
         self._round_records = records = {}
@@ -4716,6 +4716,28 @@ class Monitor:
         self.send("census_join_incomplete", reason=reason)
         return reason
 
+    def census_entry(self, after):
+        """An unexpected thread failure can never leave a stale empty final round."""
+        try:
+            self.census_loop(after)
+        except BaseException:
+            result = {"certain": False, "members": 0, "uncertain": 1,
+                      "member_rows": [], "uncertain_rows": [],
+                      "terminal_count_status": "invalid", "terminal_nonwriters": None,
+                      "replacement_work": {"snapshot": 0, "replacement": 0, "reads": 0,
+                                           "pending": 0, "status": "interrupted", "rows": [], "omitted": 0}}
+            with self.lock:
+                self.census_last = result
+                if isinstance(self.receipt, dict):
+                    post = self.receipt.get("census_after_stop") or {"rounds": 0}
+                    post["last"] = {key: result[key] for key in
+                                    ("certain", "members", "uncertain", "replacement_work")}
+                    self.receipt["census_after_stop"] = post
+            try:
+                self.send("census_join_incomplete", reason="census thread interrupted")
+            except BaseException:
+                pass  # the invalid final census still vetoes monitor-side cleanup
+
     def census_loop(self, after):
         started = now_ns()
         self.note(thread_start_ns=started, phase="thread-start")
@@ -5004,7 +5026,7 @@ class Monitor:
                         time.sleep(LIMIT_S)
                 if self.leader is not None:
                     self.census_thread = threading.Thread(
-                        target=self.census_loop, args=(command["seq"],), daemon=True)
+                        target=self.census_entry, args=(command["seq"],), daemon=True)
                     self.census_thread.start()
             elif kind in ("cleanup", "keep"):
                 decision = kind

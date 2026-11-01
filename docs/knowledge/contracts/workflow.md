@@ -6485,7 +6485,7 @@ clock described below. The receipt and census message carry bounded
 a late publication refuses certainty. The original snapshot/confirmation/final
 zombie witnesses and the exact named and final census, EOF, joined-thread and
 fault gates remain independent. The qualification suite currently contains
-402 pure cases and 59 real cases by its loader: the two new real cases label
+405 pure cases and 59 real cases by its loader: the two new real cases label
 synthetic replacement observations alongside the actual kernel snapshot. They
 are not kernel PID reuse, and no signal authority follows. The 382 pure / 57
 real #197 claims remain historical at their own bytes.
@@ -6503,11 +6503,12 @@ called. Existing suite cases and the enclosing bootstrap retain their own
 premises, bounds and custody rules. This source sweep is not a native diagnostic.
 
 These candidate bytes are **unqualified**. Main's `fcfda2b0…` runner remains
-the deployed qualified route; no prior receipt migrates. After independent
-exact-published-head source review, the Queue-held chain requires one separately
-activated uncounted diagnostic, then separately activated counted author and
-distinct reviewer native sessions, followed by exact-head rejudgment and scoped
-consumer readiness. The 600 s outer / 560 s candidate / 530 s suite bounds,
+the deployed qualified route; no prior receipt migrates. Under Tom's task-specific
+ruling `c8991f99`, the single retained Queue reviewer judges the exact published
+source and, after source approval, one separately activated source-immutable
+uncounted diagnostic. Further qualification and active-consumer safety remain
+planner-owned release gates; counted author and reviewer native sessions are not
+authorized by this brief. The 600 s outer / 560 s candidate / 530 s suite bounds,
 512 MiB monitored scratch and host custody remain unchanged. The persistent
 same-identity non-zombie ESRCH (`37529b20`) and recycled-identity report
 (`631e4462`) gain no retrospective closure or signal authority.
@@ -6615,8 +6616,9 @@ a same-session different-group survivor and no-signal control. The separate
 persistent same non-zombie identity with getsid ESRCH (`37529b20`) remains
 unknown/UNCLOSED; related recycled-identity paper `631e4462` and historical
 packets gain no closure or credit. This slice is HIGH/ELEVATED because it changes
-writer closure; its independent reviewer must run the distinct native session.
-The existing qualification bounds and activation order below remain fixed.
+writer closure. The original design's separate reviewer-native requirement was
+superseded for oxide#233 by Tom's task-specific ruling `c8991f99`; the fixed
+qualification bounds remain unchanged.
 
 | Interleaving / counterexample | Required disposition |
 | --- | --- |
@@ -6659,17 +6661,17 @@ fixtures and test-only controlled seams to exercise replacement attribution and
 closure end to end, alongside actual same-session different-group survivor,
 foreign churn, EOF veto, join and no-signal controls; do not depend on forcing
 kernel PID reuse or a quiet host. Distinguish simulated interleavings from real
-kernel observations in receipts. Run the pure selector and covering checks once,
-then an owner-activated uncounted keep-going diagnostic, counted author and
-distinct independent reviewer native qualifications at the exact published
-head, under the then-approved 600 s outer / 560 s candidate / 530 s suite and
-512 MiB bounds, reserve watchdog and custody rules. Any changed bounds require
-an explicit brief amendment, not a reset. This changes writer-closure decisions,
-so future implementation is Elevated; retain the independent reviewer native.
-No native is authorized by this design.
+kernel observations in receipts. Run the covering selectors, then the one Queue-activated uncounted keep-going
+diagnostic at the exact published head after retained-reviewer source approval,
+under the 600 s outer / 560 s candidate / 530 s suite and 512 MiB bounds,
+reserve watchdog and custody rules. Tom's task-specific ruling `c8991f99`
+supersedes the original separate author and reviewer native sessions for this
+task; further qualification is a planner-owned release gate. Any changed bounds
+require an explicit brief amendment, not a reset. This changes writer-closure
+decisions and is Elevated. No native is authorized by this design alone.
 
-The candidate runner remains unqualified until that chain and exact-head review
-pass. Inventory direct consumers in `effigy.toml` and all hash checks at the
+The candidate runner remains unqualified until the applicable qualification
+requirements are met. Inventory direct consumers in `effigy.toml` and all hash checks at the
 implementation head; update each applicable pin only under its own approved
 scope, with new consumer evidence where required. At this source head explicit
 `fcfda2b0…` checks occur in `test-command-budgets.py`,

@@ -823,6 +823,36 @@ class PureCensus(unittest.TestCase):
         self.assertEqual(result["replacement_work"]["omitted"], 5)
         self.assertIn((506, 7), check.tracked)
 
+    def test_churn_budget_and_deadline_keep_omitted_obligations(self):
+        a, b, c = (row(509, start=i) for i in (1, 2, 3))
+        snapshot = [a] + [row(800 + i) for i in range(24)]
+        table = FakeTable(snapshot, {509: 7}, reread={509: [a, b, b, c]})
+        with patched(bounded, "CENSUS_READ_CAP", 4):
+            limited = census(table).round()
+        self.assertEqual(limited["replacement_work"]["status"], "read_cap")
+        self.assertEqual(limited["replacement_work"]["replacement"], 1)
+        self.assertGreater(limited["replacement_work"]["omitted"], 0)
+        self.assertGreater(limited["replacement_work"]["pending"], 0)
+        self.assertFalse(limited["certain"])
+        ticks, seen = [0], []
+        def changing(_reads):
+            value = (a, b, b, c)[min(len(seen), 3)]
+            seen.append(value["start"])
+            if len(seen) == 4:
+                ticks[0] = 2 * NS
+            return value
+        sessions = {509: 7, **{800 + i: 7 for i in range(24)}}
+        table = FakeTable(snapshot, sessions, reread={509: changing})
+        real_work = bounded.CensusWork
+        with patched(bounded, "CensusWork", lambda: real_work(clock=lambda: ticks[0])):
+            late = census(table).round()
+        self.assertEqual(seen, [1, 2, 2, 3])
+        self.assertEqual(late["replacement_work"]["status"], "deadline")
+        self.assertGreater(late["replacement_work"]["omitted"], 0)
+        self.assertGreater(late["replacement_work"]["pending"], 0)
+        self.assertFalse(late["certain"])
+        self.assertEqual(late["terminal_count_status"], "invalid")
+
     def test_late_pause_invalidates_round(self):
         ticks = [0]
         real_work = bounded.CensusWork
@@ -1447,9 +1477,17 @@ class PureCensusFinalAbsence(unittest.TestCase):
     def test_final_replacement_is_classified_in_same_round(self):
         # The replacement has a bound leader session; the old implementation
         # drops it and incorrectly reports a certain empty deciding census.
-        table = FakeTable([row(110, start=5)],
-                          {110: [ProcessLookupError(3, "gone"), 100]},
-                          reread={110: lambda reads: row(110, start=5) if reads <= 21 else row(110, start=9)})
+        table = FakeTable([row(110, start=5)], {110: [ProcessLookupError(3, "gone"), 100]})
+        confirmations = [0]
+        def read(_reads):
+            sessions = table.session_reads.get(110, 0)
+            if sessions == 0:  # the new identity-before-getsid read
+                return row(110, start=5)
+            if sessions == 1:
+                confirmations[0] += 1
+                return row(110, start=5 if confirmations[0] <= 20 else 9)
+            return row(110, start=9)
+        table.rereads = {110: read}
         check = census(table)
         result = check.round()
         self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 1, 0))
@@ -2071,6 +2109,14 @@ class PureProtocol(unittest.TestCase):
         self.assertIn("census uncertain", custodian.guard.fault)
         self.assertFalse(custodian.census_ok)
         self.assertFalse(custodian.closure(True))
+
+    def test_missing_census_fields_keep_the_launch_refusal_reason(self):
+        message = self.message(self.custodian(), "ready")
+        message["type"] = "census"
+        self.assertTrue(bounded.malformed(message).startswith("missing "))
+        valid = self.message(self.custodian(), "census", after=1, certain=True, members=0, uncertain=0)
+        valid["replacement_work"] = {"status": "complete"}
+        self.assertEqual(bounded.malformed(valid), "invalid replacement work")
 
     def test_malformed_fields_latch_instead_of_raising(self):
         # Review 6318598212: missing or ill-typed fields latch a protocol fault.
@@ -8660,6 +8706,22 @@ class PureSettlement(unittest.TestCase):
                 message = json.loads(os.read(ctl_r, 1 << 16).decode())
                 self.assertEqual(message["replacement_work"], evidence["work"])
                 self.assertIsNone(bounded.malformed(message))
+
+    def test_interrupted_census_thread_cannot_leave_stale_empty_evidence(self):
+        monitor, ctl_r = self.monitor()
+        monitor.census_last = {"certain": True, "members": 0, "uncertain": 0,
+                               "replacement_work": fixture_work()}
+        def interrupted(_after):
+            raise RuntimeError("injected before round initialization")
+        monitor.census_loop = interrupted
+        monitor.census_entry(7)
+        self.assertFalse(monitor.census_last["certain"])
+        self.assertEqual(monitor.census_last["replacement_work"]["status"], "interrupted")
+        self.assertEqual(monitor.census_last["terminal_count_status"], "invalid")
+        message = json.loads(os.read(ctl_r, 1 << 16).decode())
+        self.assertEqual(message["type"], "census_join_incomplete")
+        self.assertFalse(bounded.census_settled({"joined": True}, monitor.census_last,
+                                                monitor.census_last)[0])
 
     def test_a_late_census_message_invalidates_final_round(self):
         monitor, ctl_r = self.monitor()
