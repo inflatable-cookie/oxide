@@ -58,11 +58,16 @@ mod debug {
             return None;
         }
         let mut bytes = Vec::new();
-        File::open(marker_path)
-            .ok()?
-            .take(4097)
-            .read_to_end(&mut bytes)
+        let marker_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(marker_path)
             .ok()?;
+        let opened_marker = marker_file.metadata().ok()?;
+        if (marker_info.dev(), marker_info.ino()) != (opened_marker.dev(), opened_marker.ino()) {
+            return None;
+        }
+        marker_file.take(4097).read_to_end(&mut bytes).ok()?;
         if bytes.len() > 4096 {
             return None;
         }
@@ -75,8 +80,10 @@ mod debug {
             || marker["owner_uid"].as_u64()? != u64::from(info.uid())
             || marker["device"].as_u64()? != info.dev()
             || marker["inode"].as_u64()? != info.ino()
+            || marker["version"].as_u64()? != 1
             || marker["outcome"].as_str()? != "running"
-            || !marker["concluded_unix"].is_null()
+            || marker["closure"].as_str()? != "none"
+            || marker.get("concluded_unix")? != &serde_json::Value::Null
         {
             return None;
         }
@@ -149,7 +156,7 @@ mod debug {
             let info = std::fs::metadata(&base).unwrap();
             let run = "a".repeat(32);
             let marker = serde_json::json!({"run_id":run, "root":base, "owner_uid":info.uid(),
-                "device":info.dev(), "inode":info.ino(), "outcome":"running", "concluded_unix":null});
+                "device":info.dev(), "inode":info.ino(), "version":1, "outcome":"running", "closure":"none", "concluded_unix":null});
             let marker_path = base.join(".oxide-scratch.json");
             std::fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
             std::fs::set_permissions(&marker_path, std::fs::Permissions::from_mode(0o600)).unwrap();

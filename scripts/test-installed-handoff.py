@@ -216,7 +216,8 @@ def trace_layout(env, evidence, run_id):
         return (isinstance(run_id, str) and re.fullmatch(r"[0-9a-f]{32}", run_id) is not None
                 and marker.get("run_id") == run_id and marker.get("root") == root
                 and marker.get("owner_uid") == info.st_uid and marker.get("device") == info.st_dev
-                and marker.get("inode") == info.st_ino and marker.get("outcome") == "running"
+                and marker.get("inode") == info.st_ino and marker.get("version") == 1
+                and marker.get("outcome") == "running" and marker.get("closure") == "none"
                 and marker.get("concluded_unix", False) is None)
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return False
@@ -1349,8 +1350,8 @@ def self_check():
         os.mkdir(evidence, 0o700)
         info = os.stat(root)
         marker = {"run_id": "a" * 32, "root": root, "owner_uid": info.st_uid,
-                  "device": info.st_dev, "inode": info.st_ino, "outcome": "running",
-                  "concluded_unix": None}
+                  "device": info.st_dev, "inode": info.st_ino, "version": 1,
+                  "outcome": "running", "closure": "none", "concluded_unix": None}
         write(os.path.join(root, ".oxide-scratch.json"), json.dumps(marker), 0o600)
         env = {"HOME": home, "OXIDE_POOL": os.path.join(os.path.dirname(home), "pool"),
                "OXIDE_TASK_SCRATCH_ROOT": scratch, "OXIDE_SCRATCH_ROOT": fixture_root,
