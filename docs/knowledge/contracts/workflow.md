@@ -6469,6 +6469,12 @@ suite SHA-256 `c95d46aa0e590285c3c412294ffb215c0d45b19ba804f2243f0d2ebd62158d7b`
 and this section before this amendment. It is a design, not implemented or
 qualified behavior. The following fixes the open choices in the candidate above.
 
+The project planner froze this bounded design on 2026-11-01 after independent
+exact-head review `6565343955` of `ecd2129b771b74e7a29ff6f38687cad88e9418ca`.
+The freeze authorizes a separately scoped implementation brief, not a native
+start, qualification, consumer repin or new signal authority. The earlier
+candidate's open bounds are superseded only by this bounded contract.
+
 Each round owns one FIFO of exact identities and one ledger, independent of
 receipt storage. Admit at most 4096 distinct snapshot identities and 128
 additional distinct replacement identities; duplicate `(pid, start)` work is
