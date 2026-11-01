@@ -3417,7 +3417,7 @@ def exec_self_test() -> None:
             pass
         else:
             fail("a fixture child on another device was accepted")
-    with patch("same_device_tmp", return_value=True):
+    with patch.object(sys.modules[__name__], "same_device_tmp", return_value=True):
         check_child_env(env)
         incomplete = dict(env)
         incomplete.pop("OXIDE_SCRATCH_ROOT")
