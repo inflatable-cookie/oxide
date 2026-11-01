@@ -103,9 +103,17 @@ fn refusal(reason: Refusal, pool: &Path, status: bool) -> String {
 }
 /// A verified scratch UUID, or no scratch fact. Performs no writes or pool walk.
 pub(crate) fn evaluate(settings: &Settings, status: bool) -> Result<Option<String>, String> {
-    let ordinary = config::judge_pool_path(&settings.pool);
     let normalized: PathBuf = settings.pool.components().collect();
     let pool = &normalized;
+    // Status consults the host record before judging a potentially absent volume.
+    let status_record = status.then(|| match record_path(pool) {
+        Ok(p) => read_document(&p, 4096),
+        Err(_) => ReadDocument::Invalid,
+    });
+    if matches!(status_record, Some(ReadDocument::Missing)) {
+        return Ok(None);
+    }
+    let ordinary = config::judge_pool_path(&settings.pool);
     let declaration = if status {
         None
     } else {
@@ -144,13 +152,10 @@ pub(crate) fn evaluate(settings: &Settings, status: bool) -> Result<Option<Strin
     if !status && ordinary.is_ok() && !declared_non_boot_mount {
         return Ok(None);
     }
-    let record = match record_path(pool) {
+    let record = status_record.unwrap_or_else(|| match record_path(pool) {
         Ok(p) => read_document(&p, 4096),
         Err(_) => ReadDocument::Invalid,
-    };
-    if status && matches!(record, ReadDocument::Missing) {
-        return Ok(None);
-    }
+    });
     let parsed = match &record {
         ReadDocument::Bytes(b) => serde_json::from_slice::<Record>(b)
             .ok()
