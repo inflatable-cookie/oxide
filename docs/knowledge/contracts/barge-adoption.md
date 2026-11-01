@@ -341,6 +341,12 @@ read, or a stable-looking pair of sequential plans, is not proof of identical
 inputs. This constraint does not authorize redirecting production account trust
 or enabling Barge's synthetic-account feature in the production dependency.
 
+**Synthetic comparison boundary (Tom, 2026-11-01).** Use exclusively owned
+fixtures with attributable equivalent inputs for O2. Live comparisons without
+an adequate capture seam remain insufficient. O3 remains blocked until O2's
+parity requirements are satisfied. This ruling changes neither production
+account trust nor the separate G0 gate.
+
 ### D8 comparison cases and source boundaries
 
 These are required comparisons, not parity evidence. Each case needs the same
