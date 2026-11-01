@@ -1761,7 +1761,7 @@ def self_check() -> int:
 
             globals()["resolve_source"] = lambda: "a" * 40
             globals()["stage"] = lambda parent, env: "/fixture/oxide"
-            globals()["fixture_environment"] = lambda parent: {}
+            globals()["fixture_environment"] = lambda parent: {"OXIDE_SCRATCH_ROOT": os.path.join(parent, "scratch-pools")}
             globals()["run_cases"] = aborting_cases
             outcome = diagnostic_outcome()
             try:
