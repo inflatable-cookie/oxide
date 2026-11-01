@@ -252,19 +252,9 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # reports the longest injected path in bytes and characters against the
 # 91-byte socket bound. No live pool, registered drive, install or consumer is
 # touched. Not a benchmark and not an alias for full QA.
-# Owner-accepted single exception (decision bd357a4c, 2026-10-25: "Accept the
-# internal-root exception for internal-placement proofs (#136 now, similar
-# proofs later)"). The oxide#136 proof needs a genuine *internal* directory
-# pool, and the product correctly refuses a directory-budget internal pool on
-# an external volume, so this one recipe declares the internal root explicitly
-# (`--root-parent /private/tmp`) instead of the qualified supervisor's
-# selected-volume default. The guard still owns ONE fresh monitored root under
-# the canonical internal directory, and the unchanged 300 s / 512 MiB / 22 GiB
-# reserve / custody / cleanup rules apply to everything inside it, including
-# staging, the fixture pool, temp and the single owned 128 MiB image. Builds,
-# tests and ordinary proofs keep the drive default. The acceptance covers this
-# and similar internal-placement proofs only; execution still needs its own
-# source confirmation and separate activation.
+# Directory fixtures use OXIDE_SCRATCH_ROOT inside the selected-volume run
+# root; a /private/tmp fallback exercises the internal path and is not
+# scratch-pool coverage. The 300 s / 512 MiB bounds are unchanged.
 [tasks."rust:pool-temp-scratch"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-pool-temp-scratch.py"
@@ -275,6 +265,9 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # scratch, child process, toolchain, image or pool: it dispatches before them.
 [tasks."proof:pool-temp:test"]
 run = "python3 scripts/test-pool-temp-scratch.py --self-check"
+
+[tasks."proof:pool-temp:plan"]
+run = "python3 scripts/test-pool-temp-scratch.py --plan"
 
 # The uncounted diagnostic of the same proof (architect 1841baa1). It is
 # REQUIRED before the next counted rust:pool-temp-scratch run, keeps the same

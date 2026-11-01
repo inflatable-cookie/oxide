@@ -76,7 +76,7 @@ Cases (each one is a real child, nothing is simulated):
     child's temporary files land on the image, the inherited fixture scratch
     (another device) is replaced, release removes the directory, and after an
     ordinary detach the same registration's selection falls back to the
-    internal pool, whose own scratch is used with no stale `/Volumes/<name>`
+    original directory pool, whose own scratch is used with no stale `/Volumes/<name>`
     directory created. With an inherited same-device `TMPDIR`, the fallback
     keeps it and creates nothing. The custody directory is derived from the
     supervisor's own published `OXIDE_TASK_SCRATCH_ROOT`/`OXIDE_PROOF_EVIDENCE`
@@ -186,10 +186,10 @@ replaces it.
     `diskutil info -plist`, `oxide pool register-removable`, `oxide check`,
     bounded `hdiutil detach`, then two more `oxide check` runs. State: the image
     and its intent/attachment records under the supervisor evidence directory,
-    device/UUID/owners-on bound before registration, the internal pool present
+    device/UUID/owners-on bound before registration, the original directory pool present
     for the fallback. Grammar: the mount point, the build's `temp: oxide` path
     under `<mount>/oxide-pool`, positive detach (not mounted, mount point not
-    recreated), the internal pool's fallback path, and the same-device inherited
+    recreated), the original directory pool's fallback path, and the same-device inherited
     directory kept with no owned directory created.
 12. socket bound (case 12): `oxide check` with no inherited TMPDIR. State: the
     pool and crate from earlier cases, a fresh identifier. Grammar: the current
@@ -201,47 +201,50 @@ the same batch as the lock fix: (a) the `--locked` oracle ran without the lock
 precondition (the native-2 failure), and (b) case 9 read `test result: ok` from
 stderr, where Cargo never writes it.
 
-Fixed proof-authoring checklist sweep (Supervisor b18d0552), each item either
-an executable-body fact or an explicit not-applicable reason. `--self-check`
-is a pure, pre-scratch regression of items 1, 2, 3, 5 and 7; it creates no
-scratch, no child process and no toolchain, and it dispatches before the
-scratch root, the toolchain decision or staging.
+Proof-authoring premise checklist (workflow.md):
+1. `resolve_toolchain_home` and `toolchain_environment` preserve the invoking
+   rustup home, pin 1.97.1, disable installation and stay offline. `World` owns
+   private HOME/CARGO_HOME; `new_fixture` establishes a manifest-consistent
+   lock before the fixture's `--locked` oracle. Staging uses the repo lock.
+2. `fixture_environment` sets `OXIDE_TEST_HOME_FROM_ENV=1` for the debug build.
+3. `fixture_environment` is built fresh; `World` adds only fixture controls.
+   `staging_environment` scrubs ambient OXIDE_, XDG_, GIT_, CARGO_, SCCACHE_
+   and compiler overrides, then restores only the invoking Cargo cache and the
+   explicit offline settings. `--self-check` exercises hostile controls.
+4. `make_fixture` asserts no target, and this proof registers no permanent
+   mode; the first build cannot start from an adopted checkout.
+5. `CARGO_BUILD_ARGV`, `CARGO_ORACLE_ARGV` and `LOCK_ARGV` include their Cargo
+   subcommands; there is no fake external Cargo subcommand in this proof.
+6. `removable_flow` uses `-owners on`, verifies device, UUID and ownership,
+   records intent and one ordinary detach, and keeps uncertain custody.
+7. `toolchain_environment` freezes `RUSTFLAGS` for both environments and
+   neither imports `CARGO_ENCODED_RUSTFLAGS`.
+8. `scratch_root` canonicalizes the supervisor root; `run_session` creates the
+   private `pt` workspace beneath it. `World` declares it as
+   `OXIDE_SCRATCH_ROOT`, with both directory pools strictly beneath it and an
+   explicit 64 MiB cap. Staging and fixture temp directories are within the
+   workspace. A /private/tmp fallback exercises the internal path and is not
+   scratch-pool coverage. The independently registered image is its own owned
+   removable fixture, with backing and custody in supervisor evidence.
+9. No `mktemp` is called. `private_dir` creates named directories under the
+   supervisor's fresh owned run root.
 
-1. Toolchain provenance: `resolve_toolchain_home` honours an absolute, usable
-   inherited `RUSTUP_HOME`, else resolves the account default `<HOME>/.rustup`
-   from the *original* HOME before any private fixture HOME exists, and
-   `toolchain_environment` publishes that absolute path to staging and every
-   fixture child with `RUSTUP_TOOLCHAIN=1.97.1` and `RUSTUP_AUTO_INSTALL=0`.
-   A missing, relative or absent toolchain home refuses before scratch or
-   staging instead of hiding behind a fake HOME. (The first authorised author
-   native failed exactly here: the fixture HOME hid the installed 1.97.1.)
-2. Private account home: every fixture child carries the debug build's
-   `OXIDE_TEST_HOME_FROM_ENV=1`, so the private fixture HOME is the account home
-   and the real account's config, pool record and status are untouched.
-3. No imported ambient controls: the fixture environment is built fresh (it can
-   carry only `OXIDE_TEST_HOME_FROM_ENV` plus the proof's own explicit pool
-   controls), and the staging environment scrubs `OXIDE_*`, `XDG_*` and
-   `CARGO_ENCODED_RUSTFLAGS`; the self-check rejects a hostile parent that
-   would import any of them.
-4. Auto-adopt premise: `make_fixture` asserts the fresh checkout has no
-   `target/`, and the internal pool has no permanent registration, so the first
-   build cannot mistake a converted root for fresh work.
-5. External Cargo argv: the only external Cargo invocations are the recorded
-   `CARGO_BUILD_ARGV` (staging) and `CARGO_ORACLE_ARGV` (premise oracle), both
-   with the subcommand name in argv, which the self-check asserts.
-6. Owned removable image: case 11 attaches it with `-owners on`, parses the
-   mount point from the plist and confirms `GlobalPermissionsEnabled` through
-   `diskutil` before registration (the mount-root rule).
-7. Frozen build flags: `FROZEN_RUSTFLAGS` is shared by staging and every
-   fixture child, and an inherited `CARGO_ENCODED_RUSTFLAGS` (which outranks
-   RUSTFLAGS in Cargo) is scrubbed, so the recipe cannot drift.
-8. TMPDIR and the scratch-pool declaration use the supervisor-selected volume: 
-   `World` sets its private root as `OXIDE_SCRATCH_ROOT`, with both directory
-   pools strictly beneath it and an explicit 64 MiB cap. A /private/tmp fallback
-   exercises the internal path and is not scratch-pool coverage.
-9. `mktemp` without a template ignores TMPDIR: not applicable, this proof calls
-   no `mktemp`; every scratch directory is an explicit `private_dir(...)` under
-   `OXIDE_TASK_SCRATCH_ROOT` inside the qualified guard.
+Current-main oracle sweep (15ce0e3415f6c01a3aad7e9125336dc498e2efd3):
+`--version` checks only the oxide identity, not a product version equality;
+0.1.0 is the generated fixture's own package and lock, not a product pin.
+The staged binary's SHA256 is measured at runtime; no runner or source digest
+is pinned. `src/bin/oxide/scratch_io.rs` `create` prints the scratch creation
+notice; `store.rs` `create_pool` prints the ordinary fallback notice. Both
+initializers use the directory-budget-v1 backend (`src/lease/pool.rs` and
+`src/lease/mod.rs`). `child_temp.rs` supplies the temp summaries, real-directory,
+marker and Unix-socket refusal wording and the 91-byte bound. `main.rs`
+`slot_line` and `store.rs` `SlotSize::describe` supply the measured status
+format; the proof parses the fixture's own slot and allocated figure. The
+image-selection and fallback are derived from `removable.rs` `select`, and
+its image UUID/device come from this run, not historical identity constants.
+The builder 1.97.1 is the explicit proof toolchain, not a product version.
+No case requires boot Data placement; the other-device probe only reads device
+metadata and the image case uses a separately owned mount.
 
 `--plan` prints the allocation and cases and touches nothing. No live pool,
 registered drive, install receipt, host setting or consumer is touched; the
@@ -338,6 +341,16 @@ def layout_pre_creates_pool(root: str, paths=None) -> bool:
     return any(
         os.path.normpath(path) == pool or is_inside(path, pool) for path in paths
     )
+
+
+SCRATCH_CREATION_NOTICE = "oxide: creating a scratch build pool on volume"
+ORDINARY_CREATION_NOTICE = "oxide: creating the build pool at"
+
+
+def creation_notice_matches(stderr: str, scratch_binding: bool) -> bool:
+    """The product uses distinct creation paths on scratch and boot storage."""
+    notice = SCRATCH_CREATION_NOTICE if scratch_binding else ORDINARY_CREATION_NOTICE
+    return notice in stderr
 
 
 OBSERVATION_MARKER = "OXIDE-TEMP nonce="
@@ -620,7 +633,8 @@ def plan() -> None:
   supervisor: bounded-test.py --limit 300 --scratch-budget-mib 512
   work stops before the supervisor's 30 s shutdown margin
   staging: plain Cargo, pinned 1.97.1, offline, 1 job, target deleted after
-  fixtures: one private HOME, CARGO_HOME, OXIDE_POOL and tiny std-only crates
+  fixtures: private HOME, CARGO_HOME, OXIDE_SCRATCH_ROOT and OXIDE_POOL with
+            a 64 MiB cap; fallback to /private/tmp is not scratch-pool coverage
   removable: one owned 128 MiB APFS scratch image at a unique /Volumes/<name>,
              ordinary detach only, never a real drive
   cases:"""
@@ -645,7 +659,7 @@ CASE_NAMES = [
     "crash with a surviving group keeps it; the leftover never survives closure",
     "test, exec and run children observe the chosen directory",
     "foreign, linked and over-bound positions refuse",
-    "removable image and absent-volume internal fallback",
+    "removable image and absent-volume directory-pool fallback",
     "longest injected path against the socket bound",
 ]
 
@@ -1071,14 +1085,14 @@ def toolchain_environment(toolchain_home: str) -> dict:
     }
 
 
-def staging_environment(environ, toolchain_home: str) -> dict:
+def staging_environment(environ, toolchain_home: str, scratch: str) -> dict:
     """The staging child's environment: the caller's own, minus Cargo/target
     and wrapper overrides, plus the shared toolchain facts."""
     env = {
         key: value
         for key, value in environ.items()
         if not key.startswith(
-            ("CARGO_TARGET_", "CARGO_BUILD_", "SCCACHE_", "OXIDE_", "XDG_")
+            ("CARGO_", "SCCACHE_", "OXIDE_", "XDG_", "GIT_", "RUSTC_")
         )
         and key
         not in (
@@ -1092,6 +1106,10 @@ def staging_environment(environ, toolchain_home: str) -> dict:
     env.update(toolchain_environment(toolchain_home))
     env.update(
         {
+            "CARGO_HOME": environ.get("CARGO_HOME") or os.path.join(environ.get("HOME") or os.path.expanduser("~"), ".cargo"),
+            "TMPDIR": scratch,
+            "TMP": scratch,
+            "TEMP": scratch,
             "RUSTC_WRAPPER": "",
             "RUSTC_WORKSPACE_WRAPPER": "",
         }
@@ -1124,7 +1142,7 @@ def stage_subject(root: str, toolchain_home: str) -> str:
     """
     stage = os.path.join(root, "stage")
     log = os.path.join(root, "stage.log")
-    env = staging_environment(os.environ, toolchain_home)
+    env = staging_environment(os.environ, toolchain_home, root)
     env.update(
         {
             "CARGO_TARGET_DIR": os.path.join(stage, "target"),
@@ -1740,10 +1758,9 @@ def inherited_kept(world: World, crate: str) -> None:
     # The selected-volume path has its own creation notice; the internal
     # fallback retains the ordinary notice. Both are product creation paths.
     expect(
-        any(notice in result.stderr for notice in (
-            "oxide: creating the build pool at",
-            "oxide: creating a scratch build pool on volume",
-        )),
+        creation_notice_matches(
+            result.stderr, os.path.isfile(os.path.join(world.pool, "oxide-managed", "scratch.json"))
+        ),
         f"the first leased command did not create the pool: {result.stderr[-1500:]}",
     )
     expect(os.path.isdir(world.pool), "the first leased command did not create the pool")
@@ -2594,7 +2611,7 @@ def removable(
     """
     case(CASE_NAMES[10])
     if sys.platform != "darwin":
-        say("not macOS: no removable fixture, the internal pool stands")
+        say("not macOS: no removable fixture, the original directory pool stands")
         return
     removable_flow(
         world,
@@ -2848,7 +2865,7 @@ def removable_flow(
             effects.canonical(observed).startswith(
                 effects.canonical(os.path.join(world.pool, "payload")) + os.sep
             ),
-            f"the fallback did not use the internal pool's scratch: {observed}",
+            f"the fallback did not use the original directory pool's scratch: {observed}",
         )
         say(
             "post-detach selection: "
@@ -2963,6 +2980,7 @@ def self_check() -> int:
     staging = staging_environment(
         {"PATH": "/usr/bin", "HOME": "/home/tom", "CARGO_HOME": "/home/tom/.cargo"},
         resolved,
+        "/scratch/fixture",
     )
     fixture = fixture_environment(
         {"PATH": "/usr/bin", "HOME": "/home/tom"},
@@ -3013,11 +3031,14 @@ def self_check() -> int:
         "OXIDE_TEST_WALK_LOG": "/tmp/walk",
         "XDG_CONFIG_HOME": "/home/tom/.config",
         "XDG_CACHE_HOME": "/home/tom/.cache",
+        "GIT_CONFIG_GLOBAL": "/host/git",
+        "CARGO_PROFILE_DEV_DEBUG": "2",
+        "TMPDIR": "/host/tmp",
     }
     scrubbed_fixture = fixture_environment(
         hostile, "/home/tom/.rustup", "/scratch/fixture/home", "/scratch/fixture/cargo-home"
     )
-    scrubbed_staging = staging_environment(hostile, "/home/tom/.rustup")
+    scrubbed_staging = staging_environment(hostile, "/home/tom/.rustup", "/scratch/fixture")
     for label, env in (("fixture", scrubbed_fixture), ("staging", scrubbed_staging)):
         property_true(
             f"{label} env imports no ambient OXIDE_/XDG_ control",
@@ -3034,6 +3055,12 @@ def self_check() -> int:
             f"{label} env freezes RUSTFLAGS",
             env["RUSTFLAGS"] == FROZEN_RUSTFLAGS == "-C strip=symbols",
         )
+    property_true(
+        "staging keeps only explicit Cargo controls and owned temp",
+        "GIT_CONFIG_GLOBAL" not in scrubbed_staging
+        and "CARGO_PROFILE_DEV_DEBUG" not in scrubbed_staging
+        and all(scrubbed_staging[key] == "/scratch/fixture" for key in ("TMPDIR", "TMP", "TEMP")),
+    )
     property_true(
         "explicit fixture controls are the only OXIDE_* the fixture env carries",
         {key for key in scrubbed_fixture if key.startswith("OXIDE_")}
@@ -3406,6 +3433,17 @@ def self_check() -> int:
         and not regressed["HOME"].startswith("/scratch/fixture/")
     )
     property_true("negative parent breaks preservation", not preserved)
+
+    property_true(
+        "scratch creation notice cannot pass as ordinary creation",
+        creation_notice_matches(SCRATCH_CREATION_NOTICE, True)
+        and not creation_notice_matches(ORDINARY_CREATION_NOTICE, True),
+    )
+    property_true(
+        "ordinary creation notice cannot pass as scratch creation",
+        creation_notice_matches(ORDINARY_CREATION_NOTICE, False)
+        and not creation_notice_matches(SCRATCH_CREATION_NOTICE, False),
+    )
 
     # 6. The real constructor, through narrow directory/device/exists seams:
     #    it creates the account homes, the sibling fixture directory and the

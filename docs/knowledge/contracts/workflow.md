@@ -1290,7 +1290,7 @@ shared proof supervisor (`bounded-test.py --limit 300
 --scratch-budget-mib 512`; an ELEVATED trigger: it deletes owned scratch, decides
 writer closure and writes to an owned removable fixture volume). It stages
 this clean HEAD's debug `oxide` offline with 1.97.1 and covers, on tiny
-fixtures with a private `HOME`, `CARGO_HOME` and directory pool. Staging and
+fixtures with a private `HOME`, `CARGO_HOME` and directory pool under a private `OXIDE_SCRATCH_ROOT` on the selected volume. A `/private/tmp` fallback exercises the internal path and is not scratch-pool coverage. Staging and
 every fixture child share one resolved absolute toolchain home — an inherited
 `RUSTUP_HOME` when it is absolute and usable, else the account default
 `$HOME/.rustup` resolved from the original HOME *before* the private fixture
@@ -1342,7 +1342,7 @@ group closes; a foreign entry, a link and an over-bound
 derived path each refusing the command without spawning, deleting or
 following anything; and one owned 128 MiB scratch APFS image used as the
 removable pool, where a build's temporary files land on the image, then an
-ordinary detach selects the internal pool's scratch with no stale
+ordinary detach selects the original directory pool's scratch with no stale
 `/Volumes/<name>` directory written. It reports the longest injected path in
 bytes and characters against the bound. It never touches a live pool or the
 registered drive, and it is not a benchmark or an alias for full QA.
@@ -1352,7 +1352,7 @@ the account homes, the crate, its own scratch and the sibling fixture
 directory, and never the pool directory. The first production `oxide` command
 that needs the pool creates it, and the proof then verifies the created
 `config.json` backend, payload, ledger, device and the inherited-directory
-observation, so the product's own exclusion gate is the oracle rather than a
+observation, so the product's own applicable admission gates are the oracle rather than a
 separate probe. Every fixture launch mints a fresh observation identifier that
 the build script declares to Cargo and echoes, and every consumed observation
 is refused unless it carries the current identifier, so a replayed warning from
@@ -1390,7 +1390,7 @@ cases 1-10 and aborted at the removable case, whose containment check compared
 the custody directory against the workspace and its parent instead of the
 supervisor's published owned root; that topology and its custody decision are
 corrected here, and the run stays a spent failure. The pure self-check
-(`effigy proof:pool-temp:test`, 149 properties) covers the constructor layout,
+(`effigy proof:pool-temp:test`, 153 properties) covers the constructor layout,
 rerun completeness, observation freshness, readiness parsing, refusal
 targeting, accounting deltas, the published-root containment refusals, the
 removable flow's custody decisions (including a missing or swapped device
