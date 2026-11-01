@@ -33,6 +33,51 @@ consumers requires explicitly testing old, new and mixed layouts. This inventory
 is partial: other proof gates and ownership primitives still require audit
 before an implementation contract can be frozen.
 
+### Further source constraints
+
+| Source | Current constraint and migration consequence |
+| --- | --- |
+| `src/supervisor.rs::armed` and its tests; `src/bin/oxide/admission.rs` tests | Accept nested evidence or the old named siblings, with a parseable deadline. Admission and debug hooks use this shared decision; preserve adopted nested runs separately and test mixed siblings. Recognition is not authentication. |
+| `src/inventory.rs` mutation control | Independently accepts nested evidence or old siblings, and requires scratch under `/private/tmp`. The internal-placement restriction is a real control, not a short-name assumption to remove. |
+| `scripts/test-accounting-vanished.py` | Requires internal scratch, nested evidence or old siblings and matching temp variables; update its sibling discriminator without erasing the internal exception. |
+| `scripts/test-command-budgets.py`, `scripts/test-accounting-guards.py` | Receipt writers accept nested evidence or old named siblings. Test new and mixed sibling names and component containment, including character-prefix impostors. |
+| `scripts/test-recorded-slot-accounting.py` | Evidence must be a real sibling outside scratch and not a filesystem-root child; tests include wrong export and both containment directions. Names are not its discriminator; preserve those negative controls. |
+| `scripts/test-outputs-prune.py` | Image custody requires canonical sibling paths, owner, non-writable modes and same device; the exact names are not the custody check. Preserve these checks and synthetic refusals. |
+| `scripts/test-pool-temp-scratch.py` | Pins old prefix, child names, and eight-character random spelling in its supervisor topology and socket model; other `scratch` matches describe product slot scratch and must remain unchanged. |
+| `scripts/test_supervisor.py` | Contains old-name sweep roots, negative controls, bootstrap oracles and glob assertions. Retain old fixtures as historical/negative controls while explicitly adding new cases; do not reinterpret old receipts. |
+
+This table supplements, rather than completes, the consumer inventory. A full
+audit must also classify every environment gate and source pin before changing
+any consumer.
+
+### Deletion mechanism: current no-go
+
+The current `scripts/bounded-test.py::empty_directory_entries` opens
+subdirectories with `O_NOFOLLOW` and checks device and owner, but unlinks or
+removes a *name* after checking it. `remove_marked_root` likewise checks the
+root before a later pathname `rmdir`. Replacement between those operations
+can select a different entry. Descriptor-relative traversal and two identity
+observations alone do not close that gap. The current
+`scripts/rust-test-600.py` wrapper uses `shutil.rmtree(...,
+ignore_errors=True)` on its two created roots after a successful child and on
+some setup failures; it is not evidence of identity-atomic cleanup.
+
+`src/owned_delete.rs` supplies a source-grounded alternative building block:
+a same-directory exclusive rename (`renameatx_np(RENAME_EXCL)` on macOS,
+`renameat2(RENAME_NOREPLACE)` on Linux), with bounded collision retries and
+journaled captures. Capturing may itself capture a replacement: its identity
+must be checked *after* capture and a foreign capture retained under journal
+custody, not deleted. Its existence does not prove the Python supervisor has
+an integrated, qualified recursive deletion protocol or exclude a cooperating
+owner moving a name after capture. Until a future design binds every removal
+to a protected captured entry, defines recovery and proves the cooperative
+boundary and mount/writer checks, the short-layout implementation must
+**KEEP and report** rather than use these primitives as claimed proof. It
+must not remove a replacement, retry an ambiguous deletion, or treat an
+unreadable observation as absence. Partial work remains retained and reported.
+This is a precise no-go for the new cleanup mechanism, not a retroactive
+judgment of historical receipts.
+
 ## Cleanup ownership
 
 The retained #196 review disposition at `da754796` records a recursive deletion attempt against an inherited macOS per-user TMPDIR parent, stopped by a permission error; the extent removed is unknown. It does not establish the exact command or that Oxide's supervisor performed it. A path derived from inherited TMPDIR can name a parent that the run did not create; recursively removing that parent crosses the ownership boundary. No restoration or further cleanup is authorized by that record.
