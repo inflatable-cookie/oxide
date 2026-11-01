@@ -131,8 +131,9 @@ run = "python3 scripts/test-installed-handoff.py --plan"
 # unactivated. The helper work cutoff is about 565 s (30 s reserve plus a 5 s
 # refusal margin), inside which cleanup and image detach must finish. The
 # published estimate is UNMEASURED. CPU controls support a 6 CPU / 8 GiB
-# planning request: the two independent stagings are sequential and each is
-# explicitly bounded to 6 Cargo jobs, fixture Cargo children to 2 jobs with at
+# planning request: Builds stages the candidate; base-compat stages the base
+# and candidate sequentially, each bounded to 6 Cargo jobs. Fixture Cargo
+# children are bounded to 2 jobs with at
 # most two gated writers overlapping, so the proof peaks at 6 concurrent Cargo
 # jobs; the shared staging helper takes that bound explicitly and keeps its
 # default for other selectors. Its private 128 MiB image is attached with
@@ -153,13 +154,13 @@ run = "python3 scripts/test-installed-handoff.py --plan"
 # The selected-clean reserve stop uses a positively created directory-budget
 # pool; the removable watchdog is removal-only and is not claimed as a reserve
 # stop.
-# Scratch stays 512 MiB and the detach is ordinary. It
-# stages base 4a70b83 and this HEAD's candidate independently and sequentially
-# from authenticated pinned source, asserts distinct binaries and state-3 /
-# state-4 capabilities, and covers the member layout, binding, migration,
-# clean, refusals and the root-group prune. It has not run: each side's run is
-# a separately counted owner activation, and the merge hold requires the exact
-# head author and reviewer native receipts.
+# Both modes use 512 MiB and ordinary detach. Builds stages only this HEAD's
+# candidate (capability >= 4) and covers the member layout, binding, migration,
+# clean, refusals and root-group prune. Base-compat stages base 4a70b83 and the
+# candidate from authenticated pinned source, asserts distinct binaries and
+# exact base capability 3, and covers the historical base cases 10, 11 and 19.
+# Each mode requires its own owner-activated diagnostic, counted author and
+# independent reviewer native at the reviewed head.
 # Builds fixtures use a private OXIDE_SCRATCH_ROOT under the selected runner root.
 # The scoped base-compat selectors alone retain the internal root (bd357a4c).
 [tasks."proof:profile-outputs:test"]
