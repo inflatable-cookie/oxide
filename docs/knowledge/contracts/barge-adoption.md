@@ -1004,6 +1004,140 @@ current source in the comparison report or recorded as blocking, and O3 stays
 held while any blocking row stands. `D-1`/`D-2` (Q-E) and `D-3` (Q-D) keep
 their existing operator decision points.
 
+## Shared private-build validation gate (oxide#248)
+
+The capture tasks' private debug-build validation shares one common
+canonical provider in this repository: `scripts/test-private-build-validation.py`
+(oxide#248, project-owner decision `a451b488`). It owns the common admission
+prerequisites for Oxide #240/PR230 and Barge #041/PR41 so neither product
+worker re-implements the gate. The capture Rust source itself is unchanged;
+this apparatus authorizes nothing by existing and grants no cleanup, deletion
+or deployment authority.
+
+**Artifact interface.** The provider prepares and validates exactly the
+runtime documents the two reviewed wrappers consume — no new competing
+schema:
+
+- `barge.validation-source-audit/1`, `barge.private-roots/1` and
+  `barge.validation-block/1` (the accepted Barge launcher shapes at
+  `864fc8e878ca039805733b82253fbbd3f50b8193`), built from private source
+  copies staged under the prepared task root, with component analyses bound
+  to the audited source sites and host executable digests measured live;
+- the accepted Oxide #240 launcher shapes: `budget.json`,
+  `history-discovery.json` and the eleven-field `block-authorization.json`,
+  whose `binding_sha256`, `ledger_sha256`, `history_sha256` and `one_use_id`
+  stay null in proposals and are planner-bound at issue;
+- one gate receipt, `oxide.private-build-validation/1`, whose qualification
+  state is always `unqualified` — receipt judgment is retained Queue review,
+  never this tool.
+
+Documents are deterministic (sorted keys, compact separators, trailing
+newline, no timestamps, no live sizes), so a preparation packet can be
+reviewed and digest-bound before the single execution re-derives them and
+requires byte equality. Discovery records candidate roots from the retained
+Queue records and packets, with honest unknowns: quiescence is the planner's
+affirmative issued admission, never a discovery claim; shared live pool and
+output sizes stay unknown and unread; planner-240/review-230 directories are
+named non-root evidence with disposition pending; `oxide-233-fix.*` is not
+attributable and never read.
+
+**Execution model.** Both effect-carrying modes (`--prepare`, `--diagnostic`)
+run only as the whole command of the qualified shared supervisor
+(`bounded-test.py` bytes `fcfda2b0…`): the supervisor's exported run identity
+binds every claim and allowance record, and its reserve/scratch coverage
+covers the whole command from the first walk — there is no directly
+invocable child entry point. The one-use claim covers both issued blocks,
+written exclusively inside the supervisor's evidence directory. One global
+prospective allowance on `CLOCK_UPTIME_RAW` (the same cross-process clock as
+`OXIDE_PROOF_DEADLINE_NS`) bounds setup, documents, accounting, the single
+300 s debug-Oxide bootstrap (exact argv `cargo build --offline --locked
+--bin oxide --message-format=json` under the nested qualified supervisor with
+cwd `oxide-source`), the inventory-bracketed private status dry gate (the
+accepted Barge archive selector `rust:test:tape-private-status` from the
+extracted `barge-source` root), the final live/retained equality brackets
+and the exports. No phase resets the clock; no uncertain outcome is replayed;
+same-bytes inode replacement cannot pass (inventory rows carry inode
+identity).
+
+**Host admission.** `EFFIGY_ADMISSION_HOOK` and `QUEUE_ADMISSION_SOCKET` are
+preserved exactly as the independent audit binds them; an unset hook is not
+host admission. The audited Effigy must be the direct executable, never an
+unbound shebang shim. The bootstrap's host admission is the gate task's own
+heavy Effigy admission through the audited hook, with the audited pair
+preserved in every child environment; no second admission seam exists and no
+Git-verified source archive is ever edited.
+
+**Resource clamps (review 6584174560).** Whole-block scratch is a measured
+clamp of each grant minus retained bytes — on Oxide's 6 GiB grant with the
+reported 5591.8 MiB retained total, about 552 MiB, not the 1024 MiB nominal
+bootstrap maximum. The effective figure is measured at runtime, disclosed in
+the receipt, never silently raised, and never a claim that a phase fits: an
+impossible fit is an exact measured shortfall and refuses.
+
+**Selectors.** `proof:private-build-validation:test` (pure mocked
+counterfactuals covering every gate/refusal control: missing/unissued/duplicate
+block, exhausted time/disk, cross-process id/deadline mismatch, wrong
+source/digest/child env, absent admission hook/socket/runtime binding,
+unknown/incomplete/non-quiescent roots, empty/malformed inventory,
+same-content inode replacement, failed closure, real-tree accounting and
+clamp arithmetic, packet/schema conformance, supervisor-context binding);
+`proof:private-build-validation:plan` (effect-free);
+`proof:private-build-validation:diagnostic` (heavy, whole command under the
+qualified supervisor). The diagnostic declaration carries no issued binding
+and refuses before any effect until the planner amends the command with the
+bound inputs. The exact command template the planner binds at issue:
+
+    python3 scripts/bounded-test.py --limit 1200 --scratch-budget-mib 512 -- \
+      python3 scripts/test-private-build-validation.py --diagnostic \
+      --oxide-repo <canonical oxide checkout> --oxide-head <40-hex approved head> \
+      --barge-repo <canonical barge checkout> --barge-head <40-hex> \
+      --barge-root /Volumes/Builds/scratch/barge/<prepared root> \
+      --oxide-root /Volumes/Builds/scratch/oxide/<prepared root> \
+      --expect-audit <sha256> --expect-ledger <sha256> \
+      --expect-budget <sha256> --expect-history <sha256> [--planner-reference <string>]
+
+with the issued documents and their digests in the environment
+(`BARGE_VALIDATION_BLOCK[+_SHA256]`, `BARGE_VALIDATION_SOURCE_AUDIT[+_SHA256]`,
+`BARGE_VALIDATION_ROOT_LEDGER[+_SHA256]`, `BARGE_VALIDATION_EFFIGY`,
+`BARGE_VALIDATION_GIT`, `BARGE_VALIDATION_SUPERVISOR`, `BARGE_PINNED_RUSTC`,
+`TAPE_BLOCK_APPROVAL_SHA256`). The gate's task roots lie outside the
+supervisor's own scratch, so their aggregate accounting is the gate's own
+bounded no-follow walks, disclosed in the receipt rather than hidden.
+`planner_reference` must be confirmed by the planner at binding (the
+proposal carries the brief-v11 string; the held brief is now v12).
+
+**Integration and removal plan for the obsolete local scaffold.** The #240
+local route (`scripts/tape-isolation-check.py` sequence/bootstrap/preflight/
+cover actions and the `proof:tape-prune:*` launch selectors at `657023bd`)
+is NOT source-approved and must not be executed or relied on. In ONE later
+correction, after this provider is independently reviewed and the planner
+binds its first execution, the #240 author (whose branch is not edited from
+here) delegates to the shared artifacts: consume this gate's exports (the
+issued Oxide block, `budget.json`, `history-discovery.json` and the debug
+receipt) instead of the local packet builders, route the covering execution
+through the shared diagnostic's exported remaining allowance, retire the
+local sequence/launch selectors, and keep the accepted cfg(test) capture
+source and its harness untouched. Until then the local scaffold stays
+unexecuted, and its review's confirmed ideas (CLOCK_UPTIME_RAW deadline,
+budget clamp arithmetic shape, retained inventory before/after equality)
+re-enter only through this provider's own reviewed source.
+
+**Premise dispositions (HIGH, proof-apparatus authoring).** (1) Private
+HOME/CARGO_HOME with the invoking `RUSTUP_HOME` captured before replacement,
+pinned 1.97.1, `RUSTUP_AUTO_INSTALL=0`, offline lock from the extracted
+archive, seeded by the shared bounded seeder from the invoking CARGO_HOME —
+never a download. (2) `OXIDE_TEST_HOME_FROM_ENV=1` on every product child.
+(3) The child environment is an explicit allowlist that drops inherited
+`OXIDE_*`, `XDG_*`, `CARGO_*`, `SCCACHE_*` values and passes only the audited
+admission pair plus the declared controls. (4)–(5) No automatic adoption and
+no Cargo external argv are involved. (6) No image, attach or detach. (7)
+`RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS` are not inherited (the allowlist
+drops them; the bootstrap is a plain offline debug build). (8) The gate's own
+scratch lives under the supervisor's adopted root; task roots live under the
+task scratch bases with the gate's own accounting. (9) Fixture temp in the
+self-test uses a `mktemp` template under `OXIDE_TASK_SCRATCH_ROOT` or the
+temp directory, resolved canonically.
+
 ## Failure and race matrix
 
 "Keeps" means the root, its marker, its registry row and any pending intent are
