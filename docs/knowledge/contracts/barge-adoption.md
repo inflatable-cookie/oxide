@@ -1089,8 +1089,10 @@ alone is insufficient.
   historical 2 GiB limit remains bound to the earlier runs. The planner then
   extended the task's aggregate limit prospectively to 4 GiB at a measured
   3041 MiB baseline, preserving all earlier evidence and the historical 2 GiB
-  and 3 GiB limits. The 1200 s cumulative wall and inventory gates are unchanged;
-  any increase beyond 4 GiB requires Tom.
+  and 3 GiB limits. Tom subsequently approved a prospective 6 GiB ceiling for
+  the fresh isolated route at a measured 3468 MiB retained-root baseline (Queue
+  decision 1fb64e41); every prior and future root still counts. The historical
+  limits, 1200 s cumulative wall, reserve and inventory gates remain unchanged.
   Preserve the earlier contaminated sessions and the operator's live-state
   disposition separately in Queue.
 - **Harness composition.** The harness crate re-roots the actual library and
