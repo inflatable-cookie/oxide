@@ -403,6 +403,14 @@ def control_case(case, name, root, facts):
     return problems
 
 
+# Only these two ordinary cases publish the bounded synthetic fixture record;
+# its contents remain independently verified by the cases oracle below.
+REPLACEMENT_FIXTURE_CASES = frozenset({
+    "test_synthetic_replacement_member_reaches_real_receipt",
+    "test_synthetic_replacement_foreign_reaches_real_receipt",
+})
+
+
 def nested_cases(results, record, facts=None):
     """Every nested real case must run inside the monitored owned root and keep
     its receipt there after the candidate's cleanup; the evidence directory is
@@ -424,6 +432,10 @@ def nested_cases(results, record, facts=None):
             problems += control_case(case, name, root, facts)
             continue
         unexpected = set(case) - ORDINARY_KEYS
+        if name in REPLACEMENT_FIXTURE_CASES and "replacement_fixture" in unexpected:
+            unexpected.remove("replacement_fixture")
+            if not isinstance(case["replacement_fixture"], dict):
+                problems.append(f"nested case {name} has a malformed replacement fixture")
         if unexpected:
             problems.append(f"nested case {name} recorded an unmodelled field: {sorted(unexpected)}")
         directory = case.get("dir")

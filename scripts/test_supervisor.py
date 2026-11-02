@@ -6211,6 +6211,26 @@ class PureQualificationTopology(unittest.TestCase):
                     "outcome": {}, "census": 0, "wall_s": 1.0, "signals": []}
         results = {"cases": [ordinary] + self.control_records(parent, root, kept)}
         self.assertEqual(qualify.nested_cases(results, record, guard_facts), [])
+        # Both named fixture records carry a separately checked bounded field;
+        # the old oracle rejected them as unmodelled even with valid custody.
+        for name in qualify.REPLACEMENT_FIXTURE_CASES:
+            fixture = dict(ordinary, case=name, replacement_fixture={"source": "synthetic"})
+            self.assertEqual(qualify.nested_cases({"cases": [fixture]}, record, guard_facts), [])
+            bad_type = dict(fixture, replacement_fixture="invalid")
+            self.assertTrue(any("malformed replacement fixture" in p for p in
+                                qualify.nested_cases({"cases": [bad_type]}, record, guard_facts)))
+            bad_path = dict(fixture, dir="/private/tmp/outside")
+            self.assertTrue(any("outside the monitored root" in p for p in
+                                qualify.nested_cases({"cases": [bad_path]}, record, guard_facts)))
+            missing = dict(fixture, dir=os.path.join(evidence, "nested", "absent"))
+            self.assertTrue(any("evidence missing after cleanup" in p for p in
+                                qualify.nested_cases({"cases": [missing]}, record, guard_facts)))
+            other = dict(fixture, case="unrelated")
+            self.assertTrue(any("unmodelled field" in p for p in
+                                qualify.nested_cases({"cases": [other]}, record, guard_facts)))
+            extra = dict(fixture, unknown_field=True)
+            self.assertTrue(any("unmodelled field" in p for p in
+                                qualify.nested_cases({"cases": [extra]}, record, guard_facts)))
         # A control that claims a receipt although setup was refused is wrong.
         os.makedirs(os.path.join(kept, "evidence"))
         open(os.path.join(kept, "evidence", "receipt.json"), "w").write("{}")

@@ -6517,6 +6517,26 @@ The independent source and proof judgment and any fresh exact-head proof route
 remain with the same retained Queue reviewer and owner; this correction supplies
 no native qualification and does not reset the failed session.
 
+**Corrected-head diagnostic and nested-record schema.** The separately activated
+uncounted Queue diagnostic at `535ebbcb` exercised 465/465 cases successfully,
+including all four previously failing fixture cases. The candidate guard closed
+with status 0, no fault or deadline, and peak monitored scratch of 67.8 MiB.
+The diagnostic still failed: 11/12 checks passed, with `nested-cases` rejecting
+the two synthetic cases' `replacement_fixture` field as unmodelled. The packet
+at `/Volumes/Builds/scratch/oxide/oxide-supervisor-qualify.lli9efki` and
+`/Volumes/Builds/scratch/oxide/oxide-proof.ukf8izwb/evidence` is retained;
+`cases.json` SHA-256 `b22135446fdb9fe6bc94bdbd0a1d2165125308ca74d2a65d03b3c381931aa89f`,
+`topology.json` `6fd46774800df97d70593a93211e5c3541d53792fd962bed4742f95af3e3dc9e`,
+and guard receipt `6d12aad516bde8dedaae50eb2daedb7d98d0b0bf4d5735a56d17cc426321b4bc`.
+This is an uncounted failed diagnostic, never qualification credit. The next
+source correction permits that field only for the two named synthetic cases;
+the independent cases oracle still checks its exact contents and no-signal
+condition, and all nested-root and receipt checks remain in force. Pure controls
+also reject this field on other cases, malformed values, missing evidence,
+outside-root paths and unknown fields. No native run or allowance reset follows
+from this source correction; any further proof needs the Queue owner and the same
+retained reviewer's exact-head judgment.
+
 The proof-authoring premise sweep for the new cases follows their executable
 route: `Real.replacement_fixture` calls `Real.guardian` with `fixture("pass")`;
 that fixture is Python-only and makes no Oxide, Cargo or rustup call. Therefore
