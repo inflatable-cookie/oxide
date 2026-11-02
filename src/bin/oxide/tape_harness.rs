@@ -1018,6 +1018,7 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
     tape::finish_and_write(&descriptor_path, TapeEngineOutcome::Completed { result: serde_json::json!({}) }, None).map_err(|error| CheckFailure { what: error })?;
     let descriptor_doc = read_transcript(&descriptor_path).map_err(|error| CheckFailure { what: error })?;
     check(observed_bytes == b"original" && descriptor_doc.reads.iter().any(|row| row.get("kind").and_then(|v| v.as_str()) == Some("authority-read@pure::descriptor") && row.pointer("/identity/ino").and_then(|v| v.as_u64()) == Some(observed_identity)), "descriptor binding survives path replacement")?;
+    check(descriptor_doc.reads.len() == 1, "one authority read produces one identity-bound row")?;
     let build = |digest: String| -> Vec<u8> {
         tape::begin("oxide", "PURE", "manifest", "pure");
         for occurrence in 0..3 {

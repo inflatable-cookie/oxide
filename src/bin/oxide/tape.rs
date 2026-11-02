@@ -218,7 +218,7 @@ struct TapeState {
 }
 
 struct PendingAuthorityRead {
-    digest: String,
+    outcome: TapeOutcome,
     cap: u64,
 }
 
@@ -675,51 +675,22 @@ pub(crate) fn classify_row(kind: &str, identity: &str, value: &str) {
     });
 }
 
-/// The core of one `authority_read`, recorded inside the leaf: the digest of
-/// the bytes actually returned, the cap charge and the budget state. On
-/// refusal the row is published immediately and no identity bind is pending
-/// (the caller's bind statement is never reached past `?`); on success the
-/// digest is held for the caller's `authority_bind`, which publishes the
-/// identity-bearing row for the same read.
+/// Hold the result until its caller binds the actual read identity. This is
+/// bookkeeping for one read, not a second synthetic read row.
 pub(crate) fn authority_core(bytes: &[u8], cap: u64, budget_failed: bool, refused: bool) {
     with_state(|state| {
-        let digest = sha256_hex(bytes);
-        let outcome = if refused {
-            TapeOutcome::Refusal {
-                reason: "authority read refused".to_owned(),
-            }
-        } else {
-            TapeOutcome::Digest {
-                digest: digest.clone(),
-            }
-        };
-        let _ = budget_failed;
-        let key = "authority-read@core".to_owned();
-        let identity = TapeIdentity {
-            path: None,
-            parent_dev: None,
-            parent_ino: None,
-            dev: None,
-            ino: None,
-            uuid: None,
-            mount_point: None,
-            device: None,
-            key: key.clone(),
-        };
-        let (occurrence, counted) = occurrence(state, &key);
-        let epoch = next_epoch(state);
-        let row = TapeReadRow {
-            kind: "authority-read@core".to_owned(),
-            identity,
-            outcome,
-            cap,
-            epoch,
-            occurrence,
-        };
-        if counted {
-            push_read(state, row);
+        if state.pending_authority.is_some() {
+            state.notes.push("an authority read was replaced before identity binding".to_owned());
         }
-        state.pending_authority = (!refused).then(|| PendingAuthorityRead { digest, cap });
+        let outcome = if refused {
+            TapeOutcome::Refusal { reason: "authority read refused".to_owned() }
+        } else {
+            TapeOutcome::Digest { digest: sha256_hex(bytes) }
+        };
+        if budget_failed {
+            state.notes.push("the authority budget failed".to_owned());
+        }
+        state.pending_authority = Some(PendingAuthorityRead { outcome, cap });
     });
 }
 
@@ -730,13 +701,11 @@ pub(crate) fn authority_bind(site: &str, path: &Path, cap: u64) {
     with_state(|state| {
         let Some(pending) = state.pending_authority.take() else {
             state.notes.push(format!(
-                "authority-bind at {site} found no pending read; the core row stays unbound"
+                "authority-bind at {site} found no pending read; the read stays unbound"
             ));
             return;
         };
-        let outcome = TapeOutcome::Digest {
-            digest: pending.digest.clone(),
-        };
+        let outcome = pending.outcome;
         let identity = file_identity(path, &outcome);
         let key = format!("{site}|{}", identity.key);
         let (occurrence, counted) = occurrence(state, &key);
