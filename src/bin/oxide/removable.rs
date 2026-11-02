@@ -655,6 +655,8 @@ pub(crate) fn read_registration(control: &Path) -> Result<Option<Registration>, 
     if fd < 0 {
         let error = std::io::Error::last_os_error();
         #[cfg(test)]
+        let saved_errno = crate::tape::observer_errno();
+        #[cfg(test)]
         crate::tape::read_row(
             "removable:registration-open",
             &control.join(REGISTRATION),
@@ -667,23 +669,41 @@ pub(crate) fn read_registration(control: &Path) -> Result<Option<Registration>, 
             },
             0,
         );
+        #[cfg(test)]
+        crate::tape::restore_observer_errno(saved_errno);
         return if error.kind() == std::io::ErrorKind::NotFound {
             Ok(None)
         } else {
             Err(format!("cannot read the removable registration: {error}"))
         };
     }
+    #[cfg(test)]
+    {
+        let saved_errno = crate::tape::observer_errno();
+        crate::tape::read_row("removable:registration-open", &control.join(REGISTRATION),
+            crate::tape::TapeOutcome::Facts { facts: "opened; descriptor identity pending".to_owned() }, 0);
+        crate::tape::restore_observer_errno(saved_errno);
+    }
     // SAFETY: `fd` is a newly opened descriptor owned by this function.
     let file = unsafe { File::from_raw_fd(fd) };
+    #[cfg(not(test))]
     let metadata = file
         .metadata()
         .map_err(|error| format!("cannot read the removable registration: {error}"))?;
     #[cfg(test)]
-    crate::tape::read_row_dev(
-        "removable:registration-open", &control.join(REGISTRATION),
-        metadata.dev(), metadata.ino(),
-        crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0,
-    );
+    let metadata = {
+        let result = file.metadata();
+        let saved_errno = crate::tape::observer_errno();
+        match &result {
+            Ok(metadata) => crate::tape::read_row_dev("removable:registration-held", &control.join(REGISTRATION),
+                metadata.dev(), metadata.ino(),
+                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
+            Err(error) => crate::tape::read_row("removable:registration-held", &control.join(REGISTRATION),
+                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, 0),
+        }
+        crate::tape::restore_observer_errno(saved_errno);
+        result.map_err(|error| format!("cannot read the removable registration: {error}"))?
+    };
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
     if !metadata.is_file()

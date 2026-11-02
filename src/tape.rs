@@ -78,6 +78,10 @@ fn next_epoch(state: &mut TapeState) -> u64 {
 }
 
 fn occurrence(state: &mut TapeState, key: &str) -> (u64, bool) {
+    if !state.occurrences.contains_key(key) && state.occurrences.len() >= MAX_ROWS * 2 {
+        state.occurrences_truncated = true;
+        return (0, false);
+    }
     let next = state.occurrences.entry(key.to_owned()).or_insert(0);
     *next = next.saturating_add(1);
     if *next > MAX_OCCURRENCES_PER_KEY as u64 {

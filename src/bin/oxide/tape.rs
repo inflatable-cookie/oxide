@@ -372,6 +372,10 @@ fn next_epoch(state: &mut TapeState) -> u64 {
 /// Reserve the next occurrence number for one identity key, or report
 /// exhaustion (recorded as truncation, never a dropped row).
 fn occurrence(state: &mut TapeState, key: &str) -> (u64, bool) {
+    if !state.occurrences.contains_key(key) && state.occurrences.len() >= MAX_READ_ROWS * 2 {
+        state.truncation.occurrences_truncated = true;
+        return (0, false);
+    }
     let next = state.occurrences.entry(key.to_owned()).or_insert(0);
     *next = next.saturating_add(1);
     if *next > MAX_OCCURRENCES_PER_KEY as u64 {
@@ -386,6 +390,15 @@ fn charge_document(state: &mut TapeState, row_bytes: usize) {
     state.document_bytes = state.document_bytes.saturating_add(row_bytes);
     if state.document_bytes > MAX_DOCUMENT_BYTES {
         state.truncation.document_truncated = true;
+    }
+}
+
+fn push_note(state: &mut TapeState, note: String) {
+    if state.notes.len() >= MAX_READ_ROWS {
+        state.truncation.document_truncated = true;
+    } else {
+        charge_document(state, note.len().saturating_add(16));
+        state.notes.push(note);
     }
 }
 
@@ -432,7 +445,7 @@ fn file_identity(path: &Path, outcome: &TapeOutcome) -> TapeIdentity {
 pub(crate) fn read_row(kind: &str, path: &Path, outcome: TapeOutcome, cap: u64) {
     with_state(|state| {
         let identity = file_identity(path, &outcome);
-        state.notes.push(format!("object or parent identity unproven at {kind}"));
+        push_note(state, format!("object or parent identity unproven at {kind}"));
         let key = format!("{kind}|{}", identity_key(&identity));
         let (occurrence, counted) = occurrence(state, &key);
         let epoch = next_epoch(state);
@@ -519,7 +532,7 @@ pub(crate) fn component_without_parent(kind: &str, name: &std::ffi::OsStr, outco
             path: None, parent_dev: None, parent_ino: None, dev, ino,
             uuid: None, mount_point: None, device: None, key: key.clone(),
         };
-        state.notes.push(format!("component parent identity unproven at {kind}"));
+        push_note(state, format!("component parent identity unproven at {kind}"));
         let (occurrence, counted) = occurrence(state, &format!("{kind}|{key}"));
         let epoch = next_epoch(state);
         if counted {
@@ -580,13 +593,9 @@ pub(crate) fn volume_row(
 pub(crate) fn unbound_effect(site: &str, succeeded: bool) {
     let saved_errno = observer_errno();
     with_state(|state| {
-        if state.notes.len() >= MAX_READ_ROWS {
-            state.truncation.document_truncated = true;
-        } else {
-            state.notes.push(format!(
-                "descriptor-only effect at {site}: succeeded={succeeded}; identity unproven; insufficient"
-            ));
-        }
+        push_note(state, format!(
+            "descriptor-only effect at {site}: succeeded={succeeded}; identity unproven; insufficient"
+        ));
     });
     restore_observer_errno(saved_errno);
 }
@@ -612,7 +621,7 @@ pub(crate) fn effect_row(kind: &str, path: &Path) {
             _ => verb,
         };
         if !matches!(verb, "create" | "save" | "fence" | "reconcile" | "lock-create" | "rename" | "unlink") {
-            state.notes.push(format!("unknown effect kind at {kind}"));
+            push_note(state, format!("unknown effect kind at {kind}"));
             return;
         }
         if state.effects.len() >= MAX_READ_ROWS {
@@ -620,7 +629,7 @@ pub(crate) fn effect_row(kind: &str, path: &Path) {
             return;
         }
         if attempted {
-            state.notes.push(format!("attempted effect at {site} remains insufficient"));
+            push_note(state, format!("attempted effect at {site} remains insufficient"));
         }
         state.effects.push(TapeEffectRow {
             kind: verb.to_owned(),
@@ -682,7 +691,7 @@ pub(crate) fn monotonic_observed(kind: &str, observed: Instant) {
                 });
                 charge_document(state, 48);
             }
-            None => state.notes.push(format!("monotonic reading before window at {kind}; insufficient")),
+            None => push_note(state, format!("monotonic reading before window at {kind}; insufficient")),
         }
     });
     restore_observer_errno(saved_errno);
@@ -690,7 +699,7 @@ pub(crate) fn monotonic_observed(kind: &str, observed: Instant) {
 
 /// A clock the engine could not obtain remains explicitly unproven.
 pub(crate) fn clock_unproven(kind: &str) {
-    with_state(|state| state.notes.push(format!("clock unproven at {kind}")));
+    with_state(|state| push_note(state, format!("clock unproven at {kind}")));
 }
 
 /// Record one classification observation (custody record classes, boot
@@ -737,7 +746,7 @@ pub(crate) fn authority_core(bytes: &[u8], cap: u64, budget_failed: bool, refuse
             }
         };
         if budget_failed {
-            state.notes.push("the authority budget failed".to_owned());
+            push_note(state, "the authority budget failed".to_owned());
         }
         state.pending_authority = Some(PendingAuthorityRead { outcome, cap });
     });
@@ -749,14 +758,14 @@ pub(crate) fn authority_core(bytes: &[u8], cap: u64, budget_failed: bool, refuse
 pub(crate) fn authority_bind(site: &str, path: &Path, cap: u64) {
     with_state(|state| {
         let Some(pending) = state.pending_authority.take() else {
-            state.notes.push(format!(
+            push_note(state, format!(
                 "authority-bind at {site} found no pending read; the read stays unbound"
             ));
             return;
         };
         let outcome = pending.outcome;
         let identity = file_identity(path, &outcome);
-        state.notes.push(format!("descriptor and parent identity unproven at {site}"));
+        push_note(state, format!("descriptor and parent identity unproven at {site}"));
         let key = format!("{site}|{}", identity.key);
         let (occurrence, counted) = occurrence(state, &key);
         let epoch = next_epoch(state);
@@ -800,7 +809,7 @@ pub(crate) fn read_row_without_parent(
             device: None,
             key: key.clone(),
         };
-        state.notes.push(format!("parent identity unproven at {kind}"));
+        push_note(state, format!("parent identity unproven at {kind}"));
         let (occurrence, counted) = occurrence(state, &format!("{kind}|{key}"));
         let epoch = next_epoch(state);
         if counted {
@@ -844,7 +853,7 @@ pub(crate) fn authority_bind_descriptor(
 pub(crate) fn authority_unbound(site: &str, reason: &str) {
     with_state(|state| {
         state.pending_authority = None;
-        state.notes.push(format!(
+        push_note(state, format!(
             "descriptor identity unavailable at {site}: {reason}"
         ));
     });
@@ -869,11 +878,7 @@ pub(crate) fn descriptor_row(site: &str, fd: i32, outcome: TapeOutcome) {
             uuid: None, mount_point: None, device: None,
             key: format!("descriptor:{fd}|process-start=unproven|dev={dev:?}|ino={ino:?}"),
         };
-        if state.notes.len() < MAX_READ_ROWS {
-            state.notes.push(format!("descriptor path, parent and process-start unproven at {site}"));
-        } else {
-            state.truncation.document_truncated = true;
-        }
+        push_note(state, format!("descriptor path, parent and process-start unproven at {site}"));
         let (occurrence, counted) = occurrence(state, &format!("{site}|{}", identity.key));
         let epoch = next_epoch(state);
         if counted {
@@ -893,7 +898,7 @@ pub(crate) fn lock_row(kind: &str, path: &Path, outcome: TapeOutcome) {
             } else {
                 state.truncation.read_rows_truncated = true;
             }
-            state.notes.push("counterfactual: pool lock routed away from shared tape; insufficient".to_owned());
+            push_note(state, "counterfactual: pool lock routed away from shared tape; insufficient".to_owned());
             true
         } else {
             false
@@ -914,7 +919,7 @@ pub(crate) fn disconnect_pool_lock_for_counterfactual() {
 /// budget state every read charges against.
 pub(crate) fn budget_begin(allowance_bytes: u64) {
     with_state(|state| {
-        state.notes.push("authority monotonic deadline identity unproven".to_owned());
+        push_note(state, "authority monotonic deadline identity unproven".to_owned());
     });
     classify_row(
         "authority-budget",
@@ -936,7 +941,7 @@ pub(crate) fn budget_end(failed: bool, remaining: u64) {
 /// Never issue a second path or descriptor syscall to fill that gap.
 pub(crate) fn fd_dev_ino(_fd: std::os::fd::BorrowedFd<'_>) -> Option<(u64, u64)> {
     with_state(|state| {
-        state.notes.push("descriptor identity unproven at observation site".to_owned());
+        push_note(state, "descriptor identity unproven at observation site".to_owned());
     });
     None
 }

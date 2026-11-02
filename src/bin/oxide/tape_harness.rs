@@ -1722,6 +1722,21 @@ fn read_row_cap_check(temp: &Path) -> Result<(), CheckFailure> {
 
 /// The unbound authority read: a pending read left at window close is an
 /// explicit note, never silence.
+fn unique_key_cap_check(temp: &Path) -> Result<(), CheckFailure> {
+    tape::begin("oxide", "UNIQUE-KEY-CAP", "manifest", "pure");
+    for index in 0..=tape::MAX_READ_ROWS * 2 {
+        tape::read_row("unique-key-cap", &temp.join(index.to_string()),
+            tape::TapeOutcome::Absent, 0);
+    }
+    let transcript = temp.join("unique-key-cap.json");
+    tape::finish_and_write(&transcript, TapeEngineOutcome::Completed {
+        result: serde_json::json!({"complete": false, "entries": []}),
+    }, None).map_err(|what| CheckFailure { what })?;
+    let doc = read_transcript(&transcript).map_err(|what| CheckFailure { what })?;
+    check(doc.truncation.get("occurrences_truncated").and_then(|v| v.as_bool()) == Some(true),
+        "the bounded distinct-key table reports truncation")
+}
+
 fn effect_attempt_check(temp: &Path) -> Result<(), CheckFailure> {
     tape::begin("oxide", "EFFECT-ATTEMPT", "manifest", "pure");
     {
@@ -2209,6 +2224,7 @@ fn self_check(pure_only: bool) -> Result<(), String> {
         unbound_authority_note_check(&dir).map_err(|failure| failure.what)?;
         config_inspect_absence_check(&dir).map_err(|failure| failure.what)?;
         effect_attempt_check(&dir).map_err(|failure| failure.what)?;
+        unique_key_cap_check(&dir).map_err(|failure| failure.what)?;
         if !pure_only {
             let external = fixture_volume(&dir).is_some();
             for case in [

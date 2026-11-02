@@ -1217,20 +1217,29 @@ alone is insufficient.
   each returned entry/error and observed end are recorded without a second
   syscall. The payload wrapper also records the real metadata calls. Non-test
   loop statements stay verbatim, and parent identity is unproven because the
-  iterator does not expose a bound parent. This is a
-  source claim, not an executed inventory. The engine fixture is a fresh
+  iterator does not expose a bound parent. Inventory's actual directory-open,
+  returned names, type/metadata results, guard samples, root verification and
+  filesystem-free result are likewise observed without replaying those calls.
+  This is a source claim, not an executed inventory. The engine fixture is a fresh
   re-exec with `env_clear`; `test_fs` injection and race hooks start as empty
   thread-local cells, and `volume::verified_facts` starts `None`. The harness
   does not arm those adapters. Fault-injection debug environment hooks are
-  absent from that child environment; the existing test-home control is set. This documents those reachable seams, not a complete cfg
+  absent from that child environment; the existing test-home control is set.
+  This documents those reachable seams, not a complete cfg
   audit or proof that another subprocess kept the same environment.
   `lease::persist_private_file` and
   `persist_control_state` retain the non-test write/sync/rename statements;
   test arms record temp creation, actual write result, cleanup when it succeeds
   and the final replacement separately, including a write before later sync
   failure. `store::save` similarly distinguishes an uncertain create/truncate,
-  write result and final rename. `store::private_file` records the actual open
-  and held-descriptor metadata result separately. Descriptor-relative recovery
+  write result and final rename. `store::private_file` and
+  `store::open_control_directory` record the actual open and held-descriptor
+  metadata result separately. `scratch_io::read_document` records actual
+  open, metadata and read errors rather than a generic refusal;
+  `removable::read_registration` records `openat` and held metadata, and
+  `outputs` records marker open/lstat results alongside the authority read.
+  Note storage and the distinct-key table are bounded and mark truncation.
+  Descriptor-relative recovery
   records the actual `stat_at` result without fabricating its parent, and its
   reached chmod and put-back sites note the real success or failure as an
   unbound effect; a descriptor-only result without a path is insufficient. In
