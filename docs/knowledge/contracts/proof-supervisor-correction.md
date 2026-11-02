@@ -324,6 +324,242 @@ The protocol needs an authenticated per-run channel established before Cargo
  keep the lease and proof resources, never imply success. A cooperative stop
  cannot repair the historical orphan or guarantee closure after its owner dies.
 
+### Proposed #244 zombie-group witness (unaccepted design checkpoint)
+
+The single diagnostic at `994a69d` **failed**: c01 and c02 observed
+`kill(pid, 0)=0` and `killpg(pgid, 0)=EPERM`; c03 and c07 were skipped on
+those dependencies. Four of eight native cases completed, all six spawned
+children were positively reaped, and three source-only cases remained HELD.
+The outer guard closed without fault or deadline; the nested outcome is
+unknown, unqualified and uncounted, and its root remains unconcluded and kept.
+The nested receipt `cargo-group-custody.6140f23968590c00/receipt.json` has
+SHA256 `be0de8f905c16b708321ec4d3297f7439f916930afc25766b41de0fcc7d8c648`;
+the command log has SHA256
+`63ab7a67ccb7780ea895e278df2687a04cfbf79550c7ae5bfadfaf0f217f028a`.
+These observations do not establish the original positive group-lifetime
+claim. They do not revise the two earlier #242 packets or their counts.
+
+Apple's archived [kill](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/kill.2.html)
+manual describes signal zero as error checking without signal delivery. For a
+group, its EPERM description says it is returned “if any members of the
+group could not be signaled”. Its
+[killpg](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/killpg.2.html)
+manual describes EPERM as a permission failure. Neither identifies a particular
+held child as a member. In Apple's XNU revision
+[`f6217f891ac0` kern_sig.c](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_sig.c),
+`killpg1` finds the group then filters `SZOMB` and system processes before
+its callback; the callback counts permitted targets and only sends a nonzero
+signal. With no counted target the POSIX path returns EPERM. The callback's
+separate exited-process branch checks `cansignal_nomac`, but that does not
+undo the group iterator's zombie filter. Thus that source provides a plausible
+mechanism for this observation, not evidence that the observed EPERM proves
+membership or even that permission was the sole cause. The packet identifies
+the macOS-only guard and its command, but neither receipt nor command log
+records a macOS build, Darwin release or XNU version. At review and again at
+this correction, the current host reports macOS 26.6.2 (25G83), Darwin 25.6.0,
+`xnu-12377.161.14~5`, arm64 (retained review comment 6569891769, verdict
+`host-version-binding`). This is a later observation, not the packet’s host
+version. The version corresponding to `f6217f891ac0` has not been established,
+and the reviewer found no `xnu-12377.161.14` tag. Its gap from the currently
+reported kernel cannot be quantified; neither observation binds that revision
+to the kernel that ran the diagnostic. Its behavior is not a public,
+version-independent guarantee; no host-version equivalence is assumed.
+
+**Candidate, not approved:** retain exclusive direct-parent custody from raw
+fork through the single positive wait; establish the live child's PID, start,
+parent, session and group in `HeldChild.bind` and the child report; reassert
+non-auto-reap disposition and serialize every wait. During the existing
+bounded window, read the qualified `Kinfo.one` before and after each observation
+and compare its PID/start, direct parent, PGID and zombie fields; zombie-row
+PGID equality is an unverified reader/kernel premise, not established membership;
+retain the actual signal-zero results as observations, not authority. Finally
+require the sole positive wait with settled state recorded before publication.
+The existing safe reader (`scripts/bounded-test.py` `Kinfo.one`/`parse`) has
+PID, start, parent, PGID and zombie fields but **no session field**; its layout
+check compares the current live process, not zombie field semantics. The
+existing fixture's `wait_exit`, `observe_zombie_window`, `reap`, `settle`,
+`probe_wait_live`, `case_c01`/`case_c02`, `case_c06` and `case_c07` are the
+sites that would need review; `bind` currently reads group and session in
+separate syscalls. This is a proposed evidence chain, not a replacement oracle.
+
+The source discriminator below supplies a conditional lifetime argument for
+its cited XNU revision: [`reap_child_locked`](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_exit.c)
+removes the child from its group and process hash, and the session leader
+cannot move itself by setpgid. This is conditional on the live, exclusive
+parent premise: `proc_exit` also calls `reap_child_locked` with
+`REAP_DEAD_PARENT` for its zombie children when their parent exits. Group
+removal can therefore happen during parent exit without its positive wait. Exclusive unreaped custody limits PID reuse, but a start token and matching parent/group observations are still
+required; neither a recycled PID nor a reused PGID is a handle. A moved or
+replaced identity, failed or malformed read, permission denial, missing row,
+non-zombie or unverifiable session/group is unknown. A before/after pair is
+not an atomic syscall and cannot alone exclude a change between reads; early
+collection or an unobserved concurrent waiter destroys the custody premise.
+A successful final wait proves collection then, not that prior samples or the
+whole interval had the asserted group membership. A zombie being visible in
+one row does not prove the reader reports its group correctly on this host.
+The already-recorded rows do not contain the proposed paired parent/group
+observations, so they cannot be retroactively upgraded. No observation adds
+signal authority, descendant containment or permission to signal a historical
+PID.
+
+**NO-GO for equivalence at this checkpoint:** the host kernel/source binding,
+zombie row semantics and interval continuity under all permitted transitions
+are not established. The candidate could support a narrower sampled-identity
+observation, but is not yet shown to prove the same positive group-lifetime
+proposition. A future source-backed design must identify applicable kernel and
+public semantics, show why identity/group cannot change between samples under
+its exact custody premises, and address the separate session reads and TOCTOU.
+Tom's ruling relayed by Queue planner `d070792d` on decision
+`535ec990-1577-49fb-9741-480dc7434eeb` authorizes a **weaker sampled
+held-identity claim for a separately reviewed design**. The intended claim is
+limited to the exact direct child observed at the stated samples: under the
+fixture's exclusive, unreaped parent custody, the bounded non-consuming reader
+reports the bound PID/start and parent with zombie state and a PGID field
+equal to the live binding, followed by the single positive wait. The meaning
+of that zombie PGID equality is an unverified premise, not group membership. It asserts neither continuous group lifetime nor that a
+group signal would succeed, and it cannot turn EPERM into positive evidence.
+Missing, malformed, denied or inconsistent facts remain unknown. The positive
+held-zombie group-lifetime proposition remains an open follow-up, not a proven
+result or an abandoned historical failure. This ruling authorizes design and
+review, not an executable oracle change, new signal authority or a native run.
+
+### Sampled witness: implementation and review
+
+The following design was accepted at `003ef92` (retained review comment
+`6572820333`, verdict `sampled-witness-design`), and its sampled fixture
+implementation is pending independent source review and native diagnostic. The
+stronger **positive held-zombie group-lifetime claim remains OPEN**: neither
+failed diagnostic proves it, and this sampled proposition is not equivalent.
+
+**Premises and samples.** The fixture is the living direct parent of the child
+it forked, keeps `SIGCHLD` at the reasserted `SIG_DFL` without `SA_NOCLDWAIT`,
+and serializes all waits; it never delegates custody. The live binding in
+`HeldChild.bind` reads PID/start/parent and PGID from Kinfo, and PGID and
+session through `getpgid` and `getsid`; the child report supplies its own live
+session/group observations. Timestamp each actual read separately. During each
+existing zombie-window sample, read `Kinfo.one(pid)` before and after the
+zero-signal observations. Each row must actually report the bound PID/start,
+direct parent, `zombie=true`, and a PGID field equal to the live bound PGID.
+That last comparison is only equality of reported numbers: whether this
+reader's zombie PGID field accurately represents membership on the host is an
+**unverified premise**, not a positive group-membership fact. The reader has
+no session field. A session or group result from the live binding is never
+presented as a zombie-time read; zombie session is unknown.
+
+In the cited XNU revision, [`getpgid` and `getsid`](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_prot.c)
+use `proc_find` and return ESRCH when it cannot obtain the process. The
+[process lookup](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_proc.c)
+does not furnish a live reference for an exited zombie, so those calls cannot
+supply the required zombie readings on that revision. The prior proposal to
+require them was unsatisfiable there; this design makes no zombie-time
+`getpgid` or `getsid` calls and does not convert ESRCH into a positive result.
+In contrast, the cited [`kill` path](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_sig.c)
+falls back after failed `proc_find` to `pzfind`, which checks an exited process
+by PID under the process-list lock and returns success if found. This provides
+a possible explanation for `kill(pid,0)=0` in the packet; the result alone
+neither binds the start token nor proves group or session membership. The
+packet did not record zombie-time group/session calls or the host kernel
+version, so neither an observed ESRCH nor the source-to-host match is claimed.
+
+Any absent, malformed, denied, failed, replaced, contradictory or unavailable
+required row makes the sample unknown; no guessed value, signal-zero result or
+previous sample fills it. Each row proves only what the bounded reader returned
+at that instant, conditional on its layout and kernel semantics. Matching
+before/after rows detect discrepancies but do not make intervening calls atomic
+or prove continuity. A later single positive wait establishes actual collection
+and its returned exit status; it does not validate earlier rows. These facts do
+not prove continuous group existence, PGID reservation or nonreuse between
+samples, group-wide custody, descendant containment, zombie-time session, or
+signal authority. Unknown custody, parent death, auto-reap or early collection
+prevents a positive sampled verdict.
+
+**Proposed cases and receipt.** Keep the eight native case slots and their
+existing dependency edges and three source-only HELD slots. Retain stable case
+IDs `c01-bind-live-hold` and `c02-zombie-group-lifetime` for existing receipt
+consumers and historical comparison, but change c02's displayed summary and
+detail to “sampled held-zombie identity” and explicitly mark its legacy ID as
+not a lifetime claim. c01 must bind live, obtain its existing two samples,
+then positively reap; c02 must obtain its existing five samples before its
+single positive reap. `c03` and `c07` remain dependent on c01. The existing
+`case_c01`, `case_c02`, `HeldChild.bind`, `wait_exit`,
+`observe_zombie_window`, `probe_wait_live`, `reap`, `FixtureChildren.settle`,
+`NestedReceipt` and case-dispatch/plan tables are the proposed source sites.
+The implementation retains these case IDs and dependencies.
+
+The fixture writes receipt `schema: 2` with unchanged top-level case IDs, counts,
+closure and signal rows, plus a bounded `sampled_witness` object on each
+zombie-observation identity row. It contains a sample ordinal and, for each
+of `before` and `after`, an `at_ns`, `state` (`observed` or `unknown`),
+actual row when observed, and bounded error category when unknown. Row values
+are PID/start/ppid/pgid/zombie; no SID or zombie-time group syscall is invented.
+The separate live binding carries its own actual group/session readings and
+timestamps, explicitly labelled live. Record `kill_pid_0` and `killpg_pgid_0` exactly as observations and
+never map EPERM to membership. A sample verdict is positive only when every
+required actual row field matches, with custody still held; the PGID field
+comparison is reported as an unverified premise, not established membership;
+otherwise it is unknown or a case failure, never positive. Retain the 64 KiB,
+32 case, 32 signal and 64 identity caps: each sample is one bounded identity
+row and an omitted required row or receipt/publication failure prevents a
+positive verdict. Schema 1 remains historical as written; readers must
+explicitly recognize schema 2 and its changed c02 meaning, reject unknown
+schemas, and never interpret schema 1's bound `sid`/`pgid` fields as
+post-exit readings. A repository source audit of scripts and selectors found no readers of this
+nested receipt or its case/identity rows outside the fixture; the guard reads
+its own distinct receipt. There is no schema-1 migration or generic nested
+receipt reader, so no unknown-version read is accepted by this apparatus.
+Historical packets are never rewritten.
+
+The successful consuming wait is still exactly one: immediately mark settled
+and reaped before any fallible publication, publish only the actual collected
+status, and refuse any later signal or helper reap without a syscall. An
+unexpected positive live WNOHANG probe itself settles and fails the case; the
+explicit c06 post-reap ECHILD control remains separate. The sampled witness
+neither adds signal authority nor weakens the existing signal ledger, custody,
+root retention, writer-closure or unknown-outcome rules.
+
+**Discrimination and later proof.** Pure seam tests must drive both actual case
+bodies and helper transitions, including matching paired rows and separate
+actual live session/group reads; inject absent/malformed/permission-denied rows,
+changed PID/start/parent/PGID/zombie and inaccessible or changed live binding,
+replaced rows between calls, early wait, changed SIGCHLD and publication
+failure after collection. Check that no such unknown yields a positive sample,
+EPERM alone never passes, retained post-reap refusals issue no syscall, and
+schema 1 is not upgraded. Counterfactuals must fail when a live session is
+labelled a zombie-time read, PGID equality is claimed as proven membership,
+one row is reused as both reads, EPERM alone passes, or a
+case skips the actual collection; they must exercise real case paths rather
+than only a model. Receipt caps and omitted required evidence must fail closed.
+An accepted design still needs separately scoped implementation, pure selector,
+plan and docs checks and independent exact-head source/premise review. A later
+single planner-declared native diagnostic at genuinely changed executable bytes
+must preserve heavy admission, qualified guard, reserve/watchdog, 300 s / 512
+MiB limits, 8 native / 3 HELD inventory and actual sample/receipt/retention
+accounting. It requires fresh input hashes and runtime readiness; this docs-only
+checkpoint activates no proof.
+
+The later Queue execution `2f77ba1e` at docs-only `76740c2` repeated unchanged
+native inputs and is historical waste, not fresh validation: c01/c02 failed
+with kill=0 and killpg=EPERM, c03/c07 skipped, four of eight completed, all six
+children were reaped and three cases stayed HELD; outer closed and nested
+unknown/unqualified/uncounted with root kept unconcluded. Its retained nested
+receipt `cargo-group-custody.123ae935143cecc2/receipt.json` SHA256 is
+`af31b35cb7ea26ad85be961688a0cd9a174701c260ef722f2bf2b5fba0eba43b` and
+command log SHA256 is
+`8113461535ffb841852c7bf7b25b242a6299ace0141730a49e6f0dd5dab55dc8`.
+This remains separate from the failed `5c94c76d` packet above; neither is
+reclassified, credited, retried, cleaned or used to infer a new verdict.
+
+The retained reviewer must assess the implementation against the accepted design.
+Its effect-free seam regressions must cover
+positive paired rows and each missing, malformed, denied, changed PID/start,
+parent, PGID and zombie case, and ensure zombie session stays unknown; counterfactuals must exercise
+the real case bodies, early or second wait, receipt failure and post-reap
+signal refusal, and demonstrate that EPERM alone never passes. A separately
+planner-declared exact-head native diagnostic would need the same 8 native and
+3 HELD cases, actual paired observations and one positive reap, the existing
+300 s / 512 MiB bound, qualified guard, reserve/watchdog, ledger caps,
+retention and no-new-signal rules. No fresh proof, retry or cleanup follows from this source change.
+
 ### Held-child source discriminator
 
 The following is source analysis, not an approved signal protocol or native
@@ -364,8 +600,9 @@ examined 2026-11-01, `forkproc` checks the process, group and session hashes
 when allocating a PID under the process-list lock. In the same revision,
 [`kern_exit.c`](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_exit.c)
 places an exiting process on the zombie list, and `reap_child_locked` removes
-it from its group and process hash under that lock; its `P_NOCLDWAIT` path
-permits kernel reaping. This explains that revision's relevant mechanism,
+it from its group and process hash under that lock. During parent exit the
+`REAP_DEAD_PARENT` path can reap its zombie children; its `P_NOCLDWAIT` path
+also permits kernel reaping. This explains that revision's relevant mechanism,
 not a version-independent public guarantee or evidence of the host kernel's
 exact source. No native observation or qualification follows from it.
 
@@ -639,25 +876,96 @@ identities, and distinguishes `outer` (never claimed by the fixture) from
 cases, and EOF, nonzero exit, an absent observed PID or an outer closed never
 turn nested unknown into closed.
 
-The native case map proves, on the fixture's own controlled direct children
+The native case map attempts, on the fixture's own controlled direct children
 only: child-created session/group membership and identity binding;
 `EPERM`-refused `setpgid`/second-`setsid` escapes for the session leader;
 exclusive unreaped custody with `SIGCHLD` `SIG_DFL` (the `SIG_IGN`
 counterfactual demo shows kernel auto-reap, `ECHILD`, no zombie); `WNOHANG`
 collecting nothing while live and `ECHILD` on a second wait; bounded
-`kill`/`killpg`-0 zombie persistence with the same `(PID, start)` identity;
+paired zombie reader samples for `(PID, start)` with `kill`/`killpg`-0
+results as observations and PGID-field equality an unverified premise;
 the prospective cooperative stop (bounded `killpg` TERM, escalating KILL,
 only under positive held custody, then the single positive reap); refusal
 after settled custody with no syscall; and vacuous `kill(0,0)`/`killpg(0,0)`
-as the demonstration that observations are not signal handles. These cases
-correspond to the source discriminator above: a zombie held unreaped by its
-parent keeps its group alive until the reap, and the kernel cannot auto-reap
-behind a `SIG_DFL` holder that never waits concurrently. `s01` owner death,
+as the demonstration that observations are not signal handles. The stronger positive held-zombie group-lifetime claim remains open; the
+source discriminator is conditional and these samples do not establish it. `s01` owner death,
 `s02` owner-unresponsive and `s03` descendant group escape remain HELD
 source/pure-only: no bounded no-new-authority containment/lifetime argument
 has been accepted, so the script refuses to execute them natively. The
-apparatus is unqualified: no native run has happened, native execution is
+apparatus is unqualified: two diagnostics failed as recorded above; the
+corrected sampled implementation has no native result. Native execution is
 gated on the retained Queue reviewer's exact-head source/premise approval,
 the one counted-path diagnostic runs through the task's proof route (never
 by author or reviewer), fit is unmeasured, and nothing here is a product
 closure claim, a supervisor change, or progress on papercut `9ff7386d`.
+
+##### Slice B correction: the consuming-wait-as-observation defect (oxide#244, unqualified)
+
+The first two diagnostic executions of the slice-B fixture (oxide#242, 2026-11-03,
+both at source `31920b1` under the accidental double launch; the superseded and
+recorded packets are retained evidence at `/Volumes/Builds/scratch/oxide`) failed
+with zero native cases completed. The reviewer's judgment traced it to a real
+fixture defect: `HeldChild.wait_exit` polled `os.waitpid(pid, WNOHANG)`, which is
+non-blocking but NOT non-consuming (Apple waitpid(2) RETURN VALUES; a poll that
+returns the child has already reaped it), and marked the returned child
+`held-exited` — unreaped — instead of collected. Every later step therefore ran
+against a consumed child: the held-zombie window answered `ESRCH` and the single
+positive reap answered `ECHILD`. The recorded packet counts stand: 0/8 native
+cases completed, three children spawned and none recorded as positively reaped,
+c01/c02 failed, c03 skipped on its failed dependency, c04 aborted on the `ECHILD`
+uncertainty, c05–c08 unexecuted; c05 was never reached, so no environment
+auto-reap fact was established or ruled out. No environment-only retry is claimed
+and no receipt is retrospectively repaired or concluded.
+
+The bounded correction (oxide#244) keeps the same qualified guard, bounds, case
+map (8 native + 3 HELD source-only) and every retention/ledger oracle, and changes
+only the fixture's helper and case bodies:
+
+* `wait_exit` no longer calls `waitpid` at all. Exit is observed WITHOUT
+  collecting through the safe non-consuming `kinfo_proc` reader's zombie flag
+  (the same qualified observation the supervisor's census uses), bounded by the
+  case cap; an absent, unreadable, not-yet-zombie or identity-replaced row is an
+  unknown observation that neither settles nor collects, and the window ends in
+  `Uncertain` with custody unchanged. The observation publishes an
+  `exited-observed` row carrying no status; an exit status is never invented.
+* The single consuming wait is `reap`'s blocking `waitpid`, which only ever runs
+  after a positive exit observation (or with the state already
+  `held-exited`) and marks in-memory settled truth — state, reaped flag and the
+  actual collected status — before the fallible receipt row, so a publication
+  failure after collection can never cause a second collection attempt, a
+  repeated signal or a claimed-held child. A second reap/signal still refuses
+  without a syscall.
+* The consuming `waitpid(WNOHANG)` live probes in c01/c06 moved into one helper,
+  `probe_wait_live`: a positive return IS the collection this call made, so it
+  records the settled truth immediately and fails the case instead of raising
+  while leaving held state behind; `ECHILD` and other probe errors are recorded
+  unknown observations that end in `Uncertain`, never collection or liveness.
+* c06's known timing premise is addressed by a positively controlled
+  hold/release lifecycle instead of racing a self-exit child: a hold child that
+  cannot exit before its stop file stages the `WNOHANG == 0` live probe, then
+  the release, the non-consuming exit observation, the single positive reap and
+  the unchanged intentional explicit post-reap `ECHILD` negative control.
+* `derive_nested_outcome`'s second branch was dead code (its condition equalled
+  the first branch's), so a fully reaped, receipt-published run with a failed
+  case lost its truthful writer-closure fact. The branch now reads
+  `receipt_ok and all_reaped`: writer closure is reported positively when every
+  owned child is positively reaped under a published receipt even when a case
+  failed, and a clean outer run still never turns nested unknown into closed.
+
+The pure `--self-check` gained five seam-driven regressions (isolated
+`os.waitpid`/Kinfo/receipt seams, no child, no scratch): the collecting-wait
+observation is refused, a non-consuming observation preserves held identity
+until the sole positive wait, an unexpectedly positive live probe settles
+collected truth immediately, unknown/`ECHILD` observations never settle and the
+helper never falls back to a consuming wait, receipt failure after the positive
+wait retains settled truth with no extra wait or signal, and writer closure
+survives failed cases. The observation, unknown-observation and receipt-failure checks discriminate
+the retired helper (retained review `f33b4eaf`, verdict
+`contract-counterfactual-list`).
+A separate regression drives both actual c01 and c06 case bodies with a positive
+live wait; restoring their retired inline waits fails that regression because
+they leave collected custody marked held. The qualification dependency stays the exact
+pinned runner `fcfda2b0…`; no product, supervisor or consumer bytes change, the
+native diagnostic remains gated (exact-head source/premise review, actual pins
+and the single-flight launch fix), and this correction carries no native credit
+and no product closure claim.
