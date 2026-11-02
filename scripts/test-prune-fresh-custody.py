@@ -2,7 +2,7 @@
 """Fresh per-row custody witnesses for the prune authority window (oxide#235).
 
 One candidate binary; one private 128 MiB APFS image attached `-owners on`
-and ordinary-detached; no installed binary or live pool. The whole command is
+and submitted for guard-owned detach; no installed binary or live pool. The whole command is
 the QUALIFIED candidate runner at its fixed path
 (`scripts/bounded-test-candidate.py`, SHA-256 c5782431…, planner decision
 9575afc9): the supervisor owns reserve, deadline, scratch accounting and
@@ -147,9 +147,8 @@ PREMISE = (
     "before the explicit `outputs adopt`; synthetic scale roots and receipts are "
     "hand-built owned fixture data, never built or adopted.",
     "5 Cargo external argv: not used; no external-subcommand fixture.",
-    "6 owned images: ImageCustody attaches with `hdiutil attach -nobrowse -owners "
-    "on` and records exactly one ordinary-detach disposition (detach_once), "
-    "keeping the backing on any uncertain custody.",
+    "6 owned images: publish image custody before attach, then request one "
+    "guard-owned detach only after known child closure; uncertainty keeps the backing.",
     "7 compiler flags: seed_and_stage scrubs encoded and plain flags; prepare "
     "sets RUSTFLAGS to empty and pops CARGO_ENCODED_RUSTFLAGS for every fixture "
     "child.",
@@ -252,17 +251,8 @@ def entry_digest(path: str) -> tuple:
 
 
 def tree_digest(root: str) -> dict:
-    """Every name under `root` and one nested level: mode, size, content
-    digest and identity. A created, removed, rewritten, re-moded or replaced
-    entry changes the mapping, so this is the no-effect oracle for a refused
-    or read-only route."""
-    digest = {}
-    for entry in sorted(os.scandir(root), key=lambda item: item.name):
-        digest[entry.name] = entry_digest(entry.path)
-        if entry.is_dir(follow_symlinks=False):
-            for nested in sorted(os.scandir(entry.path), key=lambda item: item.name):
-                digest[f"{entry.name}/{nested.name}"] = entry_digest(nested.path)
-    return digest
+    """Snapshot the complete tree without following links."""
+    return prior.owned_tree_snapshot(root)
 
 
 def links_snapshot(checkouts: list) -> dict:
@@ -274,14 +264,14 @@ def links_snapshot(checkouts: list) -> dict:
         snapshot[checkout] = {}
         for member in ("debug", "release"):
             link = os.path.join(target_dir, member)
-            try:
-                snapshot[checkout][member] = (
-                    os.readlink(link),
-                    entry_digest(link)[:1] + entry_digest(link)[3:],
-                    entry_digest(os.path.realpath(link)),
-                )
-            except (FileNotFoundError, OSError):
-                snapshot[checkout][member] = ("absent",)
+            facts = os.lstat(link)
+            require(stat.S_ISLNK(facts.st_mode), f"expected member symlink: {link}")
+            target = os.readlink(link)
+            resolved = os.path.realpath(link)
+            snapshot[checkout][member] = (
+                target, facts.st_dev, facts.st_ino,
+                prior.owned_tree_snapshot(resolved) if os.path.isdir(resolved) else entry_digest(resolved),
+            )
     return snapshot
 
 
@@ -309,6 +299,12 @@ def atomic_write(path: str, data: bytes, mode: int = 0o600) -> None:
         handle.write(data)
     os.chmod(temp, mode)
     os.replace(temp, path)
+
+
+def image_document(evidence: Path, name: str, body: dict) -> None:
+    target = evidence / name
+    require(not target.exists(), f"image protocol document already exists: {target}")
+    atomic_write(str(target), json.dumps(body).encode())
 
 
 def in_place_write(path: str, data: bytes) -> int:
@@ -438,7 +434,7 @@ def scale_oracle() -> dict:
     """The arithmetic that makes the scale case discriminating: one witnessed
     read of each state document fits the aggregate budget, while re-reading
     the states once per custody-reaching row does not."""
-    internal_bytes = 5 * 1024
+    internal_bytes = 96 * 1024
     removable_bytes = 150 * 1024
     per_row = internal_bytes + removable_bytes
     old_route = SCALE_ROOTS * per_row
@@ -447,8 +443,8 @@ def scale_oracle() -> dict:
         "roots": SCALE_ROOTS,
         "rows": SCALE_ROWS,
         "writer_keeps": SCALE_WRITERS,
-        "historical_internal_state_bytes": internal_bytes,
-        "historical_removable_state_bytes": removable_bytes,
+        "estimated_internal_state_bytes": internal_bytes,
+        "estimated_removable_state_bytes": removable_bytes,
         "old_route_per_row_re-read_bytes": old_route,
         "old_route_exceeds_budget": old_route > SNAPSHOT_BUDGET_BYTES,
         "witnessed_route_bytes": new_route,
@@ -458,12 +454,27 @@ def scale_oracle() -> dict:
 
 
 class PruneProof(wrapper.Proof):
+    def __init__(self):
+        super().__init__()
+        self.unclosed = set()
+        self.mount = None
+
     def env(self, extra=None):
         env = super().env(extra)
         for key in list(env):
             if key.startswith(("XDG_", "GIT_")):
                 env.pop(key)
         return env
+
+    def run(self, argv, **kwargs):
+        code, out, err = super().run(argv, **kwargs)
+        try:
+            permanent.require_normal_exit(str(argv[0]), code)
+            permanent.require_confirmed_closure(str(argv[0]), err)
+        except permanent.ProofAbort:
+            self.closure_known = False
+            raise
+        return code, out, err
 
 
 class Adapter:
@@ -509,14 +520,27 @@ class Collector:
         self.cases.append({"case": name, "state": "reached"})
         try:
             body()
+            permanent.require_case_custody(
+                unclosed=self.proof.unclosed, mount=self.proof.mount,
+                registration=self.proof.registration, case=name,
+            )
             self.cases[-1]["state"] = "completed"
         except BaseException as error:
             self.cases[-1].update(state="failed", reason=f"{type(error).__name__}: {error}")
             self.tainted = True
+            try:
+                permanent.require_case_custody(
+                    unclosed=self.proof.unclosed, mount=self.proof.mount,
+                    registration=self.proof.registration, case=name,
+                )
+            except BaseException:
+                self.proof.closure_known = False
+                raise
             if (
                 not self.diagnostic
-                or isinstance(error, (prior.Aborted, KeyboardInterrupt, SystemExit))
+                or isinstance(error, (prior.Aborted, permanent.ProofAbort, KeyboardInterrupt, SystemExit))
                 or not self.proof.closure_known
+                or self.proof.unclosed
             ):
                 raise
 
@@ -533,6 +557,9 @@ def prepare(proof, custody):
     source = str(registry.parent)
     oxide, provenance = wrapper.seed_and_stage(proof, jobs=6, host_cargo_home=source)
     provenance["seed_source"] = source
+    provenance["head"] = wrapper.git(proof, "rev-parse", "HEAD")
+    provenance["proof_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    provenance["manifest_sha256"] = hashlib.sha256((HERE.parent / "effigy.toml").read_bytes()).hexdigest()
     provenance["candidate_runner_sha256"] = hashlib.sha256(
         (HERE.parent / CANDIDATE_RUNNER).read_bytes()
     ).hexdigest()
@@ -572,7 +599,11 @@ def prepare(proof, custody):
     code, _, err = world.oxide(["check"], "private pool bootstrap", boot)
     require(code == 0, err)
     custody.allocate(str(proof.evidence), str(proof.root))
+    image_document(proof.evidence, "image-custody.json",
+                   {"version": 1, "backings": [os.path.realpath(custody.backing)]})
     world.mount = custody.attach()
+    proof.mount = world.mount
+    proof.registration = control_paths(world)["registration"]
     code, out, err = world.oxide(
         [
             "pool", "register-removable", world.mount,
@@ -595,6 +626,16 @@ def run_cases(proof, adapter, world, boot, collector):
         )
         world.adopt(checkout)
     roots = [world.selected(checkout)["root"] for checkout in checkouts]
+    link_locations = list(checkouts)
+    for checkout, root in zip(checkouts, roots):
+        for member in ("debug", "release"):
+            link = os.path.join(checkout, "target", member)
+            require(os.path.islink(link), f"fixture member is not a link: {link}")
+            destination = os.path.realpath(link)
+            require(os.path.commonpath((root, destination)) == root and destination != root,
+                    f"fixture member escaped its owned root: {destination}")
+            os.makedirs(destination, mode=0o700, exist_ok=True)
+            Path(destination, "custody-sentinel").write_bytes(b"untouched")
     rows = world.registry_doc()["rows"]
     for root in roots:
         members = sorted(
@@ -629,9 +670,9 @@ def run_cases(proof, adapter, world, boot, collector):
         # case's custody decision must be reached, and presence keeps a root
         # before custody is consulted.
         before_links = links_snapshot(checkouts)
+        for index, path in enumerate(checkouts[:2]):
+            link_locations[index] = world.vanish(path)
         before_control = tree_digest(world.control)
-        for path in checkouts[:2]:
-            world.vanish(path)
         code, out, _ = world.dry_run("absent custody", boot)
         require(code == 0, "absent-custody dry run failed")
         doc = json.loads(out)
@@ -648,7 +689,7 @@ def run_cases(proof, adapter, world, boot, collector):
             tree_digest(world.control) == before_control,
             "the custody decisions changed the control tree",
         )
-        require(links_snapshot(checkouts) == before_links, "a member link moved")
+        require(list(links_snapshot(link_locations).values()) == list(before_links.values()), "a member link moved")
     collector.case("absent-custody", absent_custody)
 
     def dynamic_writer():
@@ -656,11 +697,12 @@ def run_cases(proof, adapter, world, boot, collector):
         # the sibling absent checkouts stay candidates, and once the writer
         # settles the next window offers the same root again.
         build_script = os.path.join(checkouts[2], "build.rs")
-        Path(build_script).write_text(
-            "fn main() { std::thread::sleep(std::time::Duration::from_secs(6)); }\n"
-        )
+        Path(build_script).write_text(prior.GATED_BUILD)
+        gate = os.path.join(adapter.root, "writer-gate")
+        os.mkdir(gate, 0o700)
+        writer_env = dict(adapter.env, PRUNE_GATE=gate)
         child = permanent.start_child(
-            proof, [adapter.binary, "check"], checkouts[2], adapter.env
+            proof, [adapter.binary, "check"], checkouts[2], writer_env
         )
         try:
             deadline = time.monotonic() + min(60, permanent.work_left())
@@ -674,7 +716,8 @@ def run_cases(proof, adapter, world, boot, collector):
                 raise RuntimeError("the writer's record never became active")
             # The checkout stays vanished with its writer alive: absence and
             # active custody are decided about the same row.
-            world.vanish(checkouts[2])
+            permanent.wait_for(os.path.join(gate, "started"), "running writer")
+            link_locations[2] = world.vanish(checkouts[2])
             code, out, _ = world.dry_run("writer holds", boot)
             require(code == 0, "writer-holds dry run failed")
             doc = json.loads(out)
@@ -688,7 +731,15 @@ def run_cases(proof, adapter, world, boot, collector):
                 world.report(doc),
             )
         finally:
-            permanent.finish_child(proof, child, "writer child")
+            Path(gate, "release").write_bytes(b"release")
+            try:
+                code, _, stderr = permanent.finish_child(proof, child, "writer child")
+                permanent.require_normal_exit("writer child", code)
+                permanent.require_confirmed_closure("writer child", stderr)
+                require(code == 0, f"writer child failed: {stderr[-400:]}")
+            except BaseException:
+                proof.closure_known = False
+                raise
         deadline = time.monotonic() + min(60, permanent.work_left())
         while time.monotonic() < deadline:
             state = read_json_bounded(paths["removable_state"])
@@ -712,31 +763,61 @@ def run_cases(proof, adapter, world, boot, collector):
     collector.case("dynamic-writer", dynamic_writer)
 
     def in_place_witness():
-        # An in-place mutation of the same inode: device and inode still match
-        # the witnessed document, so only the change metadata can detect it. A
-        # dev/ino-only cache would reuse the stale parse and offer this root.
+        # Pause after the first row's decision and mutate the same open inode
+        # before the next row. The debug-only pause is guarded by the existing
+        # supervised private-fixture gate and the original authority deadline.
+        import fcntl
+
         state_path = paths["removable_state"]
         original = Path(state_path).read_bytes()
+        ordered = sorted(range(3), key=lambda i: hashlib.sha256(checkouts[i].encode()).hexdigest())
+        first, later = ordered[:2]
+        env = dict(adapter.env, OXIDE_TEST_PRUNE_WITNESS_PAUSE=checkouts[first])
+        child = permanent.start_child(
+            proof, [adapter.binary, "outputs", "prune", "--dry-run"], boot, env
+        )
         try:
+            permanent.wait_for(str(proof.evidence / "witness-paused"), "first custody decision")
             state = json.loads(original)
             state["records"].append(
-                custody_record(checkouts[0], "spawning", 4_100_000)
+                custody_record(checkouts[later], "spawning", 4_100_000)
             )
-            inode = in_place_write(state_path, json.dumps(state).encode())
-            code, out, _ = world.dry_run("in-place writer", boot)
+            locks = []
+            try:
+                for lock_path in (paths["internal_lock"], paths["removable_lock"]):
+                    descriptor = os.open(lock_path, os.O_RDWR)
+                    locks.append(descriptor)
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                inode = in_place_write(state_path, json.dumps(state).encode())
+            finally:
+                for descriptor in reversed(locks):
+                    os.close(descriptor)
+            (proof.evidence / "witness-release").write_bytes(b"release")
+            code, out, stderr = permanent.finish_child(proof, child, "in-place preview")
+            permanent.require_normal_exit("in-place preview", code)
+            permanent.require_confirmed_closure("in-place preview", stderr)
             require(code == 0, "in-place dry run failed")
             doc = json.loads(out)
             world.complete(doc, "in-place writer")
             require(
-                roots[0] not in world.candidates(doc),
+                roots[first] in world.candidates(doc) and roots[later] not in world.candidates(doc),
                 "an in-place state mutation was not witnessed: the stale parse was reused",
             )
             require(
-                world.kept(doc, roots[0]) == "an active writer still holds this checkout",
+                world.kept(doc, roots[later]) == "an active writer still holds this checkout",
                 world.report(doc),
             )
             require(os.lstat(state_path).st_ino == inode, "the tamper changed the inode")
         finally:
+            if child.pid in proof.unclosed:
+                (proof.evidence / "witness-release").write_bytes(b"release")
+                try:
+                    code, _, stderr = permanent.finish_child(proof, child, "in-place preview cleanup")
+                    permanent.require_normal_exit("in-place preview cleanup", code)
+                    permanent.require_confirmed_closure("in-place preview cleanup", stderr)
+                except BaseException:
+                    proof.closure_known = False
+                    raise
             atomic_write(state_path, original)
         code, out, _ = world.dry_run("restored", boot)
         require(code == 0, "restored dry run failed")
@@ -751,12 +832,11 @@ def run_cases(proof, adapter, world, boot, collector):
     def lock_refusals():
         import fcntl
 
-        before_links = links_snapshot(checkouts)
-        before_control = tree_digest(world.control)
-
+        before_links = links_snapshot(link_locations)
         def held_refusal(lock_path, *parts):
             descriptor = os.open(lock_path, os.O_RDWR)
             try:
+                before_control = tree_digest(world.control)
                 fcntl.flock(descriptor, fcntl.LOCK_EX)
                 code, out, _ = world.dry_run("busy lock", boot)
                 require(code == 0, "a busy lock must keep the batch, not fail")
@@ -766,6 +846,7 @@ def run_cases(proof, adapter, world, boot, collector):
                     "writer custody could not be witnessed",
                     *parts,
                 )
+                require(tree_digest(world.control) == before_control, "busy refusal changed control")
             finally:
                 os.close(descriptor)
 
@@ -786,6 +867,7 @@ def run_cases(proof, adapter, world, boot, collector):
         lock = paths["internal_lock"]
         os.rename(lock, lock + ".custody-held")
         try:
+            before_control = tree_digest(world.control)
             code, out, _ = world.dry_run("missing lock", boot)
             require(code == 0, "a missing lock must keep the batch, not fail")
             doc = json.loads(out)
@@ -794,60 +876,64 @@ def run_cases(proof, adapter, world, boot, collector):
                 not os.path.lexists(lock),
                 "the route created the missing admission lock",
             )
+            require(tree_digest(world.control) == before_control, "missing-lock refusal changed control")
         finally:
             os.rename(lock + ".custody-held", lock)
-        require(
-            tree_digest(world.control) == before_control,
-            "the lock refusals changed the control tree",
-        )
-        require(links_snapshot(checkouts) == before_links, "a member link moved")
+        require(links_snapshot(link_locations) == before_links, "a member link moved")
     collector.case("lock-refusals", lock_refusals)
 
     def unprovable_sibling():
         state_path = paths["removable_state"]
-        original = Path(state_path).read_bytes()
         original_mode = stat.S_IMODE(os.lstat(state_path).st_mode)
         require(original_mode == 0o600, "fixture state must be owner-only")
-        before_links = links_snapshot(checkouts)
+        before_links = links_snapshot(link_locations)
         try:
             os.rename(state_path, state_path + ".custody-held")
+            before_control = tree_digest(world.control)
             code, out, _ = world.dry_run("sibling without state", boot)
             require(code == 0, "a sibling without state must keep the batch, not fail")
             require_refusal_names(
                 doc := json.loads(out),
                 "the removable pool's state document is missing",
             )
+            require(tree_digest(world.control) == before_control, "missing-state refusal changed control")
             Path(state_path).write_bytes(b"{not json")
             os.chmod(state_path, 0o600)
+            before_control = tree_digest(world.control)
             code, out, _ = world.dry_run("sibling with invalid state", boot)
             require(code == 0, "an invalid sibling state must keep the batch, not fail")
             require_refusal_names(
                 json.loads(out), "the removable pool's state document is invalid"
             )
+            require(tree_digest(world.control) == before_control, "invalid-state refusal changed control")
             os.truncate(state_path, 0)
             with open(state_path, "wb") as handle:
                 handle.truncate(32 * 1024 * 1024 + 1)
             os.chmod(state_path, 0o600)
+            before_control = tree_digest(world.control)
             code, out, _ = world.dry_run("sibling with oversized state", boot)
             require(code == 0, "an oversized sibling state must keep the batch, not fail")
             require_refusal_names(
                 json.loads(out), "the removable pool's state document exceeds its byte limit"
             )
+            require(tree_digest(world.control) == before_control, "oversized-state refusal changed control")
         finally:
-            atomic_write(state_path, original, original_mode)
+            os.replace(state_path + ".custody-held", state_path)
         code, out, _ = world.dry_run("sibling restored", boot)
         require(code == 0, "the restored sibling did not complete")
         require(json.loads(out)["coverage"]["complete"], "restored snapshot incomplete")
-        require(links_snapshot(checkouts) == before_links, "a member link moved")
+        require(links_snapshot(link_locations) == before_links, "a member link moved")
     collector.case("unprovable-sibling", unprovable_sibling)
 
     def scale_unchanged():
         # Historical scale, synthetic owned data: 709 roots, 1189 rows, with
         # 650 custody-reaching writer keeps so the candidate count stays under
-        # the preview cap. Both state documents sit at their historical sizes,
-        # so a route that re-read states per row would exhaust the 64 MiB
+        # the preview cap. Both synthetic state documents are large enough
+        # that a route that re-read states per row would exhaust the 64 MiB
         # aggregate budget; the witnessed route reads each document once.
         registry_original = Path(world.registry).read_bytes()
+        internal_path = paths["internal_state"]
+        internal_original = Path(internal_path).read_bytes()
         state_path = paths["removable_state"]
         state_original = Path(state_path).read_bytes()
         synthetic_roots = []
@@ -864,7 +950,8 @@ def run_cases(proof, adapter, world, boot, collector):
             image_uuid = template_marker["volume_uuid"]
             registry_doc = json.loads(registry_original)
             state = json.loads(state_original)
-            written = 1189
+            internal_state = json.loads(internal_original)
+            written = 0
             for index in range(SCALE_ROOTS):
                 checkout = os.path.join(world.mount, "synthetic-checkouts", f"s{index}")
                 checkout_id = hashlib.sha256(checkout.encode()).hexdigest()
@@ -894,7 +981,8 @@ def run_cases(proof, adapter, world, boot, collector):
                 receipt = json.loads(json.dumps(template_receipt))
                 receipt["checkout"] = checkout
                 receipt["checkout_id"] = checkout_id
-                for placement in receipt.get("links", []):
+                receipt["links"] = [p for p in receipt["links"] if p["member"] in members]
+                for placement in receipt["links"]:
                     selected = placement.get("selected") or {}
                     if selected.get("root") == roots[2]:
                         selected["root"] = root
@@ -903,6 +991,9 @@ def run_cases(proof, adapter, world, boot, collector):
                     prepared = placement.get("prepared")
                     if prepared and prepared.get("to") == roots[2]:
                         prepared["to"] = root
+                for selected in receipt.get("roots", []):
+                    if selected.get("root") == roots[2]:
+                        selected.update(root=root, nonce=marker.get("nonce"), generation=1)
                 receipt_path = os.path.join(world.outputs, f"{checkout_id}.json")
                 atomic_write(receipt_path, json.dumps(receipt).encode())
                 synthetic_receipts.append(receipt_path)
@@ -934,36 +1025,52 @@ def run_cases(proof, adapter, world, boot, collector):
                     registry_doc["rows"].append(row)
                     written += 1
                 if index < SCALE_WRITERS:
-                    state["records"].append(
+                    destination = internal_state if index < SCALE_WRITERS // 2 else state
+                    destination["records"].append(
                         custody_record(checkout, "spawning", 4_200_000 + index)
                     )
                 synthetic_roots.append(root)
             require(written == SCALE_ROWS, f"the scale fixture wrote {written} rows")
             registry_doc["revision"] = registry_doc.get("revision", 0) + 1
             atomic_write(world.registry, json.dumps(registry_doc).encode())
-            atomic_write(state_path, json.dumps(state).encode())
+            require(len(state["records"]) <= 512 and len(internal_state["records"]) <= 512,
+                    "synthetic state exceeds MAX_RECORDS")
+            atomic_write(internal_path, json.dumps(internal_state).encode())
+            # Whitespace is valid JSON and provides the historical byte size
+            # without exceeding the state format's per-record field bounds.
+            state_bytes = json.dumps(state).encode().ljust(150 * 1024, b" ")
+            atomic_write(state_path, state_bytes)
             internal_size = os.lstat(paths["internal_state"]).st_size
             removable_size = os.lstat(state_path).st_size
             require(
-                2 * 1024 <= internal_size <= 64 * 1024,
-                f"the internal state is not at its historical size: {internal_size}",
+                2 * 1024 <= internal_size <= 32 * 1024 * 1024,
+                f"the internal state is outside its valid size: {internal_size}",
             )
             require(
                 removable_size >= 96 * 1024,
                 f"the removable state is not at its historical size: {removable_size}",
             )
-            oracle = scale_oracle()
-            require(oracle["old_route_exceeds_budget"], "the scale counterfactual does not discriminate")
-            require(oracle["witnessed_route_fits_budget"], "the witnessed route does not fit")
+            require((internal_size + removable_size) * SCALE_ROOTS > SNAPSHOT_BUDGET_BYTES,
+                    "actual state sizes do not discriminate per-row rereads")
             started = time.monotonic()
-            code, out, _ = world.dry_run("scale", boot)
+            code, out, stderr = world.dry_run(
+                "scale", boot, extra={"OXIDE_TEST_PRUNE_BYTES": world.control}
+            )
             elapsed = time.monotonic() - started
             require(code == 0, f"the scale dry run failed after {elapsed:.1f}s")
+            byte_lines = [line for line in stderr.splitlines()
+                          if line.startswith("oxide proof: authority bytes ")]
+            require(len(byte_lines) == 1, f"missing authority byte observation: {byte_lines}")
+            charged = int(byte_lines[0].rsplit(" ", 1)[1])
+            require(internal_size + removable_size <= charged < SNAPSHOT_BUDGET_BYTES,
+                    f"unexpected actual authority byte charge: {charged}")
+            print(f"----- scale actual authority bytes: {charged}; "
+                  f"per-row state reread: {(internal_size + removable_size) * SCALE_ROOTS}", flush=True)
             doc = json.loads(out)
             world.complete(doc, "scale")
             coverage = doc["coverage"]
             require(
-                coverage["registry_roots"] == SCALE_ROOTS + 3
+                coverage["registry_roots"] == len(registry_doc["rows"])
                 and coverage["roots_scanned"] == SCALE_ROOTS + 3,
                 f"the scale snapshot did not scan every root: {coverage}",
             )
@@ -983,6 +1090,7 @@ def run_cases(proof, adapter, world, boot, collector):
             print(f"----- scale preview: {elapsed:.2f}s for {SCALE_ROOTS} roots", flush=True)
         finally:
             atomic_write(world.registry, registry_original)
+            atomic_write(internal_path, internal_original)
             atomic_write(state_path, state_original)
             for receipt in synthetic_receipts:
                 os.unlink(receipt)
@@ -1070,14 +1178,14 @@ def self_check() -> int:
             pass
         else:
             raise AssertionError(f"{mode} accepted {name}")
-    collector = Collector(SimpleNamespace(closure_known=True), "builds", False, [])
+    collector = Collector(SimpleNamespace(closure_known=True, unclosed=set()), "builds", False, [])
     try:
         collector.case("absent-custody", lambda: None)
     except RuntimeError:
         pass
     else:
         raise AssertionError("the collector accepted an out-of-order case")
-    ordered = Collector(SimpleNamespace(closure_known=True), "builds", False, [])
+    ordered = Collector(SimpleNamespace(closure_known=True, unclosed=set(), mount="/", registration=__file__), "builds", False, [])
     ordered.case("baseline-no-effect", lambda: None)
     ordered.case("absent-custody", lambda: None)
     require(ordered.cases[-1]["state"] == "completed", "collector state")
@@ -1216,6 +1324,10 @@ def self_check() -> int:
     require(oracle["witnessed_route_fits_budget"], "witnessed-route arithmetic does not fit")
     require(oracle["budget_bytes"] == 64 * 1024 * 1024, "budget figure")
     require(SCALE_WRITERS < SCALE_ROOTS, "every synthetic checkout must not be a writer")
+    control_source = (HERE.parent / "src" / "lease" / "control.rs").read_text()
+    require("pub const MAX_RECORDS: usize = 512;" in control_source, "record limit drifted")
+    require(SCALE_WRITERS // 2 < 512 and SCALE_WRITERS - SCALE_WRITERS // 2 < 512,
+            "synthetic writer distribution exceeds a pool's limit")
     require(
         (SCALE_ROOTS - SCALE_WRITERS) + 3 < 512,
         "the preview candidate cap would truncate the scale candidates",
@@ -1264,19 +1376,38 @@ def self_check() -> int:
         first = tree_digest(directory)
         (nested / "extra.json").write_bytes(b"extra")
         second = tree_digest(directory)
-        require(set(second) - set(first) == {"outputs/extra.json"}, "creation oracle")
+        require(set(second) - set(first) == {"./outputs/extra.json"}, "creation oracle")
         (nested / "registry.json").write_bytes(b"changed")
         require(tree_digest(directory) != second, "byte oracle")
         os.chmod(nested / "registry.json", 0o644)
-        require(tree_digest(directory)["outputs/registry.json"][0] == 0o644, "mode oracle")
+        require(stat.S_IMODE(tree_digest(directory)["./outputs/registry.json"][0]) == 0o644, "mode oracle")
         os.rename(nested / "registry.json", nested / "moved.json")
         (nested / "registry.json").write_bytes(b"changed")
-        require(tree_digest(directory) != tree_digest(directory) or True, "identity read")
         require(
-            tree_digest(directory)["outputs/registry.json"][3:5]
-            != second["outputs/registry.json"][3:5],
+            tree_digest(directory)["./outputs/registry.json"][3:5]
+            != second["./outputs/registry.json"][3:5],
             "identity oracle: a replaced file changes its device and inode",
         )
+
+    with tempfile.TemporaryDirectory(prefix="prune-links-") as directory:
+        checkout = Path(directory, "checkout")
+        target = checkout / "target"
+        target.mkdir(parents=True)
+        destination = Path(directory, "destination")
+        destination.mkdir()
+        (destination / "sentinel").write_bytes(b"original")
+        for member in ("debug", "release"):
+            (target / member).symlink_to(destination)
+        before = links_snapshot([str(checkout)])
+        (destination / "sentinel").write_bytes(b"changed")
+        require(links_snapshot([str(checkout)]) != before, "link target mutation was missed")
+        (target / "debug").unlink()
+        try:
+            links_snapshot([str(checkout)])
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError("missing member link was treated as a valid snapshot")
 
     # The effect-free plan: bounds, runner pins, table and nine premises.
     document = plan_document()
@@ -1361,7 +1492,7 @@ def main():
         return plan()
     proof = PruneProof()
     require(wrapper.git(proof, "status", "--porcelain") == "", "source is not clean")
-    custody = prior.ImageCustody("Ox235" + secrets.token_hex(4))
+    custody = prior.ImageCustody("Ox235" + secrets.token_hex(4), custody_protocol=True)
     cases, error = [], None
     try:
         adapter, world, boot = prepare(proof, custody)
@@ -1370,7 +1501,16 @@ def main():
     except BaseException as exc:
         error = exc
     finally:
-        disposition = custody.detach_once(sessions_closed=proof.closure_known)
+        disposition = "retained"
+        if error is None and proof.closure_known and not proof.unclosed and custody.state == "attached":
+            require(custody.volume_uuid and custody.device and custody.mount, "image identity unknown")
+            image_document(proof.evidence, "detach-request.json", {
+                "version": 1, "backing": os.path.realpath(custody.backing),
+                "mount": custody.mount, "device": custody.device,
+                "volume_uuid": custody.volume_uuid.lower(),
+                "note": "fresh custody proof",
+            })
+            disposition = "requested"
     recorded = {item["case"] for item in cases}
     cases.extend(
         {"case": name, "state": "unexecuted"}
@@ -1393,10 +1533,11 @@ def main():
     if error is not None:
         raise error
     require(
-        disposition == "completed" and all(case["state"] == "completed" for case in cases),
+        disposition == "requested" and all(case["state"] == "completed" for case in cases),
         "proof incomplete",
     )
+    return 1 if diagnostic else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

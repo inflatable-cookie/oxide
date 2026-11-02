@@ -1717,10 +1717,29 @@ impl AuthorityScope {
             self.custody = Some(store::CustodyWitness::open(control)?);
         }
         let deadline = AUTHORITY.with(|cell| cell.borrow().as_ref().map(|budget| budget.deadline));
-        self.custody
+        let result = self
+            .custody
             .as_mut()
             .expect("the witness was just created")
-            .decide(deadline, checkout, cleans)
+            .decide(deadline, checkout, cleans);
+        #[cfg(debug_assertions)]
+        if result.is_ok()
+            && prune_fixture_fault(
+                control,
+                "OXIDE_TEST_PRUNE_WITNESS_PAUSE",
+                checkout,
+                "witness-paused",
+            )
+        {
+            let evidence = proof_evidence().ok_or("fixture evidence unavailable")?;
+            while !evidence.join("witness-release").exists() {
+                if deadline.is_none_or(|end| Instant::now() >= end) {
+                    return Err("fixture pause reached the authority deadline".to_owned());
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        result
     }
 }
 
@@ -2648,6 +2667,22 @@ fn evaluate(
         return Ok(Evaluation {
             entries: evaluated,
             complete: false,
+        });
+    }
+    #[cfg(debug_assertions)]
+    if prune_fixture_fault(
+        control,
+        "OXIDE_TEST_PRUNE_BYTES",
+        control,
+        "prune-bytes-observed",
+    ) {
+        AUTHORITY.with(|cell| {
+            if let Some(budget) = cell.borrow().as_ref() {
+                eprintln!(
+                    "oxide proof: authority bytes {}",
+                    SNAPSHOT_MAX_BYTES - budget.remaining
+                );
+            }
         });
     }
     // Diagnostics do not consume authority time or input budget.

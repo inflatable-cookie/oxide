@@ -12827,7 +12827,7 @@ mod fresh_custody_tests {
     use crate::removable::{self, DriveMode, Registration, REGISTRATION};
     use std::fs::{self, File};
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
 
     struct CustodyFixture {
@@ -13201,11 +13201,11 @@ mod fresh_custody_tests {
         assert!(reason.contains("invalid"), "{reason}");
     }
 
-    /// A replacement with the same byte size is still re-read: the
+    /// An in-place change with the same byte size is still re-read: the
     /// high-resolution change metadata witnesses the document, not its size
     /// alone.
     #[test]
-    fn same_size_replacement_is_reread_from_change_metadata() {
+    fn same_size_in_place_change_is_reread_from_change_metadata() {
         let fixture = CustodyFixture::new("same-size");
         fixture.prime();
         let checkout = checkout(&fixture);
@@ -13219,8 +13219,8 @@ mod fresh_custody_tests {
             checkout: checkout.clone(),
             process_group: None,
         });
-        // Pad both documents to byte-identical lengths with a placeholder
-        // identity so only the content and change metadata differ.
+        // JSON permits trailing whitespace. Preserve the inode and size so
+        // only the content and change metadata distinguish the documents.
         let mut clean_bytes = serde_json::to_vec(&clean).unwrap();
         let writing_bytes = serde_json::to_vec(&writing).unwrap();
         assert!(writing_bytes.len() > clean_bytes.len());
@@ -13236,10 +13236,14 @@ mod fresh_custody_tests {
             witness.decide(None, &checkout, true).unwrap().verdict,
             CheckoutCustody::Clear
         );
-        let temp = fixture.control.join("state.json.custody-tmp");
-        fs::write(&temp, &writing_bytes).unwrap();
-        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).unwrap();
-        fs::rename(&temp, fixture.control.join("state.json")).unwrap();
+        let before = fs::metadata(&state_path).unwrap();
+        fs::write(&state_path, &writing_bytes).unwrap();
+        let after = fs::metadata(&state_path).unwrap();
+        assert_eq!(before.ino(), after.ino());
+        assert_ne!(
+            (before.ctime(), before.ctime_nsec()),
+            (after.ctime(), after.ctime_nsec())
+        );
         assert_eq!(
             fs::metadata(&state_path).unwrap().len(),
             clean_bytes.len() as u64
@@ -13247,7 +13251,7 @@ mod fresh_custody_tests {
         assert_eq!(
             witness.decide(None, &checkout, true).unwrap().verdict,
             CheckoutCustody::Writers,
-            "a same-size replacement must be witnessed by its change metadata"
+            "a same-size in-place change must be witnessed by its change metadata"
         );
     }
 
