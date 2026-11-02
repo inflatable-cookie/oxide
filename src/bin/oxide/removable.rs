@@ -654,11 +654,41 @@ pub(crate) fn read_registration(control: &Path) -> Result<Option<Registration>, 
     };
     if fd < 0 {
         let error = std::io::Error::last_os_error();
+        #[cfg(test)]
+        crate::tape::read_row(
+            "removable:registration-open",
+            &control.join(REGISTRATION),
+            if error.kind() == std::io::ErrorKind::NotFound {
+                crate::tape::TapeOutcome::Absent
+            } else {
+                crate::tape::TapeOutcome::Refusal {
+                    reason: error.to_string(),
+                }
+            },
+            0,
+        );
         return if error.kind() == std::io::ErrorKind::NotFound {
             Ok(None)
         } else {
             Err(format!("cannot read the removable registration: {error}"))
         };
+    }
+    #[cfg(test)]
+    {
+        match crate::tape::path_dev_ino(&control.join(REGISTRATION)) {
+            Some((dev, ino)) => crate::tape::read_row(
+                "removable:registration-open",
+                &control.join(REGISTRATION),
+                crate::tape::TapeOutcome::Opened { dev, ino },
+                0,
+            ),
+            None => crate::tape::read_row(
+                "removable:registration-open",
+                &control.join(REGISTRATION),
+                crate::tape::TapeOutcome::Absent,
+                0,
+            ),
+        }
     }
     // SAFETY: `fd` is a newly opened descriptor owned by this function.
     let file = unsafe { File::from_raw_fd(fd) };
@@ -677,6 +707,12 @@ pub(crate) fn read_registration(control: &Path) -> Result<Option<Registration>, 
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     crate::prune::authority_read(file.take(MAX_REGISTRATION_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read the removable registration: {error}"))?;
+    #[cfg(test)]
+    crate::tape::authority_bind(
+        "removable::read_registration",
+        &control.join(REGISTRATION),
+        MAX_REGISTRATION_BYTES,
+    );
     if bytes.len() as u64 > MAX_REGISTRATION_BYTES {
         return Err("the removable registration exceeds its byte limit".to_owned());
     }
@@ -987,9 +1023,21 @@ pub fn coordinate(internal: Option<Store>) -> Result<Option<Store>, String> {
         return Ok(None);
     };
     if registration(&internal)?.is_none() {
+        #[cfg(test)]
+        crate::tape::classify_row(
+            "removable:coordinate",
+            &internal.control().display().to_string(),
+            "no-registration; internal pool only",
+        );
         return Ok(Some(internal));
     }
     let control = removable_control(internal.control());
+    #[cfg(test)]
+    crate::tape::classify_row(
+        "removable:coordinate",
+        &internal.control().display().to_string(),
+        &format!("sibling-control={}", control.display()),
+    );
     Ok(Some(internal.with_sibling(&control, false)))
 }
 

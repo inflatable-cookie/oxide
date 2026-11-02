@@ -439,6 +439,21 @@ pub fn inventory_directory(
 ) -> Result<InventoryReport, InventoryError> {
     #[cfg(debug_assertions)]
     walk_observer::record(root);
+    #[cfg(test)]
+    crate::tape::read_row(
+        "accounting-walk:start",
+        root,
+        crate::tape::TapeOutcome::Facts {
+            facts: format!(
+                "max_entries={}|max_depth={}|max_output_bytes={}|max_elapsed_ms={}",
+                limits.max_entries,
+                limits.max_depth,
+                limits.max_output_bytes,
+                limits.max_elapsed_ms,
+            ),
+        },
+        limits.max_entries,
+    );
     inventory_with(root, limits, &[], &[])
 }
 
@@ -510,6 +525,18 @@ fn inventory_with(
     }
     let root_device = root_metadata.dev();
     let root_inode = root_metadata.ino();
+    #[cfg(test)]
+    crate::tape::read_row_dev(
+        "accounting-walk:root",
+        &canonical,
+        root_device,
+        root_inode,
+        crate::tape::TapeOutcome::Opened {
+            dev: root_device,
+            ino: root_inode,
+        },
+        limits.max_entries,
+    );
     let started = Instant::now();
     let mut walker = Walker::new(&canonical, root_device, root_inode, limits, started, stops);
     walker.isolated = isolated;

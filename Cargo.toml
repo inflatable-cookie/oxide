@@ -36,6 +36,18 @@ path = "src/bin/storage_inventory.rs"
 name = "oxide"
 path = "src/bin/oxide/main.rs"
 
+# The prune capture harness (X-S1, barge-adoption.md): an in-crate test
+# executable whose argv contract is `--fixture-root --manifest
+# --transcript-out --case`. It re-roots the binary modules with cfg(test) set
+# so their recorder statements are active, drives the actual dry_run decision
+# prefix through evaluate, and always writes one oxide.capture.transcript/1
+# document. `cargo test --test tape_prune_eval` runs its embedded unit
+# fixture end to end (no arguments, or --self-check for the pure checks).
+[[test]]
+name = "tape_prune_eval"
+path = "src/bin/oxide/tape_harness.rs"
+harness = false
+
 [lib]
 path = "src/lib.rs"
 

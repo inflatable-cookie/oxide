@@ -30,12 +30,54 @@ fn read_document(path: &Path, limit: u64) -> ReadDocument {
         .open(path)
     {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ReadDocument::Missing,
-        Err(_) => return ReadDocument::Invalid,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(test)]
+            crate::tape::read_row(
+                "scratch-io:read-document",
+                path,
+                crate::tape::TapeOutcome::Absent,
+                limit,
+            );
+            return ReadDocument::Missing;
+        }
+        Err(_) => {
+            #[cfg(test)]
+            crate::tape::read_row(
+                "scratch-io:read-document",
+                path,
+                crate::tape::TapeOutcome::Refusal {
+                    reason: "unreadable".to_owned(),
+                },
+                limit,
+            );
+            return ReadDocument::Invalid;
+        }
     };
     let Ok(meta) = file.metadata() else {
         return ReadDocument::Invalid;
     };
+    #[cfg(test)]
+    crate::tape::read_row_dev(
+        "scratch-io:read-document:meta",
+        path,
+        meta.dev(),
+        meta.ino(),
+        if meta.is_file()
+            && meta.uid() == unsafe { libc::getuid() }
+            && meta.mode() & 0o077 == 0
+            && meta.len() <= limit
+        {
+            crate::tape::TapeOutcome::Opened {
+                dev: meta.dev(),
+                ino: meta.ino(),
+            }
+        } else {
+            crate::tape::TapeOutcome::Refusal {
+                reason: "not a small owner-only regular file".to_owned(),
+            }
+        },
+        limit,
+    );
     if !meta.is_file()
         || meta.uid() != unsafe { libc::getuid() }
         || meta.mode() & 0o077 != 0
@@ -45,8 +87,26 @@ fn read_document(path: &Path, limit: u64) -> ReadDocument {
     }
     let mut bytes = Vec::new();
     if file.take(limit + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 > limit {
+        #[cfg(test)]
+        crate::tape::read_row(
+            "scratch-io:read-document:bytes",
+            path,
+            crate::tape::TapeOutcome::Refusal {
+                reason: "over its byte limit".to_owned(),
+            },
+            limit,
+        );
         return ReadDocument::Invalid;
     }
+    #[cfg(test)]
+    crate::tape::read_row(
+        "scratch-io:read-document:bytes",
+        path,
+        crate::tape::TapeOutcome::Digest {
+            digest: crate::tape::sha256_hex(&bytes),
+        },
+        limit,
+    );
     ReadDocument::Bytes(bytes)
 }
 fn record_path(pool: &Path) -> Result<PathBuf, String> {
@@ -171,6 +231,25 @@ pub(crate) fn evaluate(settings: &Settings, status: bool) -> Result<Option<Strin
         .zip(fs::metadata("/Volumes").ok())
         .is_some_and(|(a, b)| a.dev() != b.dev());
     let verified = Binding::open(&mount, None).ok();
+    #[cfg(test)]
+    crate::tape::volume_row(
+        "scratch-io:binding-open",
+        &mount,
+        verified.as_ref().map(|binding| binding.uuid()),
+        verified.as_ref().map(|binding| binding.device()),
+        match verified.as_ref() {
+            Some(binding) => crate::tape::TapeOutcome::Facts {
+                facts: format!(
+                    "mount={}|uuid={}",
+                    binding.mount_point().display(),
+                    binding.uuid()
+                ),
+            },
+            None => crate::tape::TapeOutcome::Refusal {
+                reason: "binding refused".to_owned(),
+            },
+        },
+    );
     let uuid = verified
         .as_ref()
         .map(|v| v.uuid().to_owned())

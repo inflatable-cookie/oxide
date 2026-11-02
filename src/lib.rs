@@ -4,6 +4,11 @@
 #[cfg(all(test, unix))]
 mod test_fs;
 
+/// The library-side observation tape for the prune capture harness (X-S1);
+/// see `src/tape.rs` and `docs/knowledge/contracts/barge-adoption.md`.
+#[cfg(all(test, unix))]
+mod tape;
+
 /// Opt-in diagnostics for lease closeout.
 pub mod release_trace;
 

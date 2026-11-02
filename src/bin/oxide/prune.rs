@@ -689,6 +689,8 @@ fn read_registry(control: &Path) -> Result<Option<Registry>, String> {
     let mut bytes = Vec::new();
     authority_read(file.take(MAX_REGISTRY_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    #[cfg(test)]
+    crate::tape::authority_bind("prune::read_registry", &path, MAX_REGISTRY_BYTES);
     if bytes.len() as u64 > MAX_REGISTRY_BYTES {
         return Err(format!(
             "{} exceeds its {MAX_REGISTRY_BYTES}-byte limit",
@@ -708,12 +710,24 @@ fn require_ready(store: &Store, control: &Path) -> Result<Registry, String> {
     match store.outputs_initialization()? {
         Some(store::OutputsInit::Ready { .. }) => {}
         _ => {
+            #[cfg(test)]
+            crate::tape::classify_row(
+                "outputs-initialization",
+                &control.display().to_string(),
+                "not-ready",
+            );
             return Err(
                 "the output registry is not initialized; run `oxide outputs adopt` once to establish the shared forward format, then prune"
                     .to_owned(),
-            )
+            );
         }
     }
+    #[cfg(test)]
+    crate::tape::classify_row(
+        "outputs-initialization",
+        &control.display().to_string(),
+        "ready",
+    );
     ready_registry(control)
 }
 
@@ -1687,6 +1701,11 @@ impl AuthorityScope {
                 remaining: SNAPSHOT_MAX_BYTES,
                 failed: false,
             });
+            #[cfg(test)]
+            crate::tape::budget_begin(
+                crate::process::now_ms().saturating_add(SNAPSHOT_TIME.as_millis() as u64),
+                SNAPSHOT_MAX_BYTES,
+            );
             Ok(Self)
         })
     }
@@ -1702,6 +1721,12 @@ impl AuthorityScope {
 
 impl Drop for AuthorityScope {
     fn drop(&mut self) {
+        #[cfg(test)]
+        AUTHORITY.with(|cell| {
+            if let Some(budget) = cell.borrow().as_ref() {
+                crate::tape::budget_end(budget.failed, budget.remaining);
+            }
+        });
         AUTHORITY.with(|cell| *cell.borrow_mut() = None);
     }
 }
@@ -1727,6 +1752,13 @@ pub(crate) fn authority_read<R: Read>(reader: R, bytes: &mut Vec<u8>) -> std::io
         }
         budget.failed
     });
+    #[cfg(test)]
+    crate::tape::authority_core(
+        bytes,
+        SNAPSHOT_MAX_BYTES,
+        exhausted,
+        result.is_err() || exhausted,
+    );
     if exhausted && result.is_ok() {
         return Err(std::io::Error::other(
             "the snapshot exceeded its input or time budget",
@@ -2265,6 +2297,16 @@ fn read_operator_list(path: &Path) -> Result<OperatorList, String> {
 fn read_bounded(path: &Path, limit: usize, what: &str) -> Result<Vec<u8>, String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("cannot open the {what} {}: {error}", path.display()))?;
+    #[cfg(test)]
+    crate::tape::read_row(
+        "read-bounded:lstat",
+        path,
+        match crate::tape::path_dev_ino(path) {
+            Some((dev, ino)) => crate::tape::TapeOutcome::Opened { dev, ino },
+            None => crate::tape::TapeOutcome::Absent,
+        },
+        limit as u64,
+    );
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(format!("the {what} {} is not a real file", path.display()));
     }
@@ -2276,9 +2318,21 @@ fn read_bounded(path: &Path, limit: usize, what: &str) -> Result<Vec<u8>, String
     }
     let file = File::open(path)
         .map_err(|error| format!("cannot open the {what} {}: {error}", path.display()))?;
+    #[cfg(test)]
+    crate::tape::read_row(
+        "read-bounded:open",
+        path,
+        match crate::tape::path_dev_ino(path) {
+            Some((dev, ino)) => crate::tape::TapeOutcome::Opened { dev, ino },
+            None => crate::tape::TapeOutcome::Absent,
+        },
+        limit as u64,
+    );
     let mut bytes = Vec::new();
     authority_read(file.take(limit as u64 + 1), &mut bytes)
         .map_err(|error| format!("cannot read the {what} {}: {error}", path.display()))?;
+    #[cfg(test)]
+    crate::tape::authority_bind("prune::read_bounded", path, limit as u64);
     if bytes.len() > limit {
         return Err(format!(
             "the {what} {} exceeds its {limit}-byte limit",
@@ -2903,6 +2957,12 @@ struct HeldFacts {
 impl HeldFacts {
     fn of(fd: BorrowedFd<'_>) -> Result<Self, String> {
         let facts = oxide_storage::volume::observe_held(fd)?;
+        #[cfg(test)]
+        crate::tape::classify_row(
+            "held-facts",
+            &format!("dev={}", facts.dev),
+            &format!("fstype={}|uuid={:?}", facts.fstype, facts.uuid.as_deref()),
+        );
         Ok(Self {
             dev: facts.dev,
             fstype: facts.fstype,
@@ -3031,7 +3091,31 @@ fn revalidate_chain(descriptors: &[OwnedFd], observed: &[ObservedEntry]) -> Resu
     }
     for (index, entry) in observed.iter().enumerate() {
         let opened = fstat_fd(&descriptors[index + 1])?;
+        #[cfg(test)]
+        {
+            if let (Some((pdev, pino)), Some((odev, oino))) = (
+                crate::tape::fd_dev_ino(descriptors[index].as_fd()),
+                crate::tape::fd_dev_ino(descriptors[index + 1].as_fd()),
+            ) {
+                crate::tape::component_row(
+                    "absence-walk:revalidate-descriptor",
+                    pdev,
+                    pino,
+                    &entry.name,
+                    crate::tape::TapeOutcome::Opened {
+                        dev: odev,
+                        ino: oino,
+                    },
+                );
+            }
+        }
         if !entry.matches(&opened) {
+            #[cfg(test)]
+            crate::tape::classify_row(
+                "absence-walk:revalidate",
+                &entry.name.to_string_lossy(),
+                "descriptor-changed",
+            );
             return Err("an ancestor of the checkout changed while it was read".to_owned());
         }
         let name = std::ffi::CString::new(entry.name.as_bytes())
@@ -3047,9 +3131,45 @@ fn revalidate_chain(descriptors: &[OwnedFd], observed: &[ObservedEntry]) -> Resu
             )
         };
         if status != 0 {
+            #[cfg(test)]
+            {
+                let parent = crate::tape::fd_dev_ino(descriptors[index].as_fd());
+                if let Some((pdev, pino)) = parent {
+                    crate::tape::component_row(
+                        "absence-walk:revalidate-name",
+                        pdev,
+                        pino,
+                        &entry.name,
+                        crate::tape::TapeOutcome::Refusal {
+                            reason: std::io::Error::last_os_error().to_string(),
+                        },
+                    );
+                }
+            }
             return Err(std::io::Error::last_os_error().to_string());
         }
+        #[cfg(test)]
+        {
+            if let Some((pdev, pino)) = crate::tape::fd_dev_ino(descriptors[index].as_fd()) {
+                crate::tape::component_row(
+                    "absence-walk:revalidate-name",
+                    pdev,
+                    pino,
+                    &entry.name,
+                    crate::tape::TapeOutcome::Opened {
+                        dev: u64::try_from(stat.st_dev).unwrap_or(u64::MAX),
+                        ino: stat.st_ino,
+                    },
+                );
+            }
+        }
         if !entry.matches(&stat) {
+            #[cfg(test)]
+            crate::tape::classify_row(
+                "absence-walk:revalidate",
+                &entry.name.to_string_lossy(),
+                "entry-changed",
+            );
             return Err("an ancestor of the checkout changed while it was read".to_owned());
         }
     }
@@ -3082,6 +3202,8 @@ fn walk_checkout(
     // is the descriptor `observed[i]` was opened as. Every one stays open for
     // the whole walk.
     let mut descriptors: Vec<OwnedFd> = vec![cursor];
+    #[cfg(test)]
+    crate::tape::walk_start_row("absence-walk:start", &walked, start_dev, start_ino);
     for (index, name) in names.iter().enumerate() {
         let entry = std::ffi::CString::new(name.as_bytes())
             .map_err(|_| "the checkout path contains a NUL".to_owned())?;
@@ -3101,6 +3223,20 @@ fn walk_checkout(
             } else {
                 std::io::Error::last_os_error()
             };
+            #[cfg(test)]
+            {
+                if let Some((pdev, pino)) = crate::tape::fd_dev_ino(descriptors[index].as_fd()) {
+                    crate::tape::component_row(
+                        "absence-walk:fstatat",
+                        pdev,
+                        pino,
+                        name,
+                        crate::tape::TapeOutcome::Refusal {
+                            reason: error.to_string(),
+                        },
+                    );
+                }
+            }
             if error.kind() != std::io::ErrorKind::NotFound {
                 return Ok(Walk::Unknown(error.to_string()));
             }
@@ -3120,6 +3256,21 @@ fn walk_checkout(
             })));
         }
         if index == leaf {
+            #[cfg(test)]
+            {
+                if let Some((pdev, pino)) = crate::tape::fd_dev_ino(descriptors[index].as_fd()) {
+                    crate::tape::component_row(
+                        "absence-walk:fstatat",
+                        pdev,
+                        pino,
+                        name,
+                        crate::tape::TapeOutcome::Opened {
+                            dev: u64::try_from(stat.st_dev).unwrap_or(u64::MAX),
+                            ino: stat.st_ino,
+                        },
+                    );
+                }
+            }
             return Ok(Walk::Present);
         }
         if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
@@ -3136,11 +3287,40 @@ fn walk_checkout(
             )
         };
         if next < 0 {
+            #[cfg(test)]
+            {
+                if let Some((pdev, pino)) = crate::tape::fd_dev_ino(descriptors[index].as_fd()) {
+                    crate::tape::component_row(
+                        "absence-walk:openat",
+                        pdev,
+                        pino,
+                        name.as_os_str(),
+                        crate::tape::TapeOutcome::Refusal {
+                            reason: std::io::Error::last_os_error().to_string(),
+                        },
+                    );
+                }
+            }
             return Ok(Walk::Unknown(std::io::Error::last_os_error().to_string()));
         }
         // SAFETY: `next` is a newly owned descriptor.
         let opened = unsafe { OwnedFd::from_raw_fd(next) };
         let opened_stat = fstat_fd(&opened)?;
+        #[cfg(test)]
+        {
+            if let Some((pdev, pino)) = crate::tape::fd_dev_ino(descriptors[index].as_fd()) {
+                crate::tape::component_row(
+                    "absence-walk:openat",
+                    pdev,
+                    pino,
+                    name.as_os_str(),
+                    crate::tape::TapeOutcome::Opened {
+                        dev: u64::try_from(opened_stat.st_dev).unwrap_or(u64::MAX),
+                        ino: opened_stat.st_ino,
+                    },
+                );
+            }
+        }
         if opened_stat.st_dev != stat.st_dev || opened_stat.st_ino != stat.st_ino {
             return Ok(Walk::Unknown(
                 "the directory the walk opened is not the entry it named".to_owned(),
@@ -3182,6 +3362,16 @@ fn walk_checkout(
 /// recorded UUID. A conflicting or unknown recorded volume is never waived
 /// because today's ancestor happens to sit on the boot Data volume.
 fn judge_recorded_volume(ancestor: &HeldFacts, uuid: &str) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let verdict = matches!(ancestor.fstype.as_str(), "apfs" | "hfs")
+            && ancestor.uuid.as_deref() == Some(uuid);
+        crate::tape::classify_row(
+            "absence-judge:recorded-volume",
+            &format!("ancestor-dev={}|uuid={uuid}", ancestor.dev),
+            &format!("fstype={}|ok={verdict}", ancestor.fstype),
+        );
+    }
     if !matches!(ancestor.fstype.as_str(), "apfs" | "hfs") {
         return Err(format!(
             "the checkout's nearest existing ancestor is on a {} file system, not a verified local volume",
@@ -3201,6 +3391,22 @@ fn judge_recorded_volume(ancestor: &HeldFacts, uuid: &str) -> Result<(), String>
 /// ancestor is a readable directory on the same device and APFS volume UUID as
 /// `/System/Volumes/Data`.
 fn judge_boot_data(ancestor: &HeldFacts, data: &HeldFacts) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let ok = data.fstype == "apfs"
+            && data.uuid.is_some()
+            && ancestor.fstype == "apfs"
+            && ancestor.dev == data.dev
+            && ancestor.uuid == data.uuid;
+        crate::tape::classify_row(
+            "absence-judge:boot-data",
+            &format!("ancestor-dev={}|data-dev={}", ancestor.dev, data.dev),
+            &format!(
+                "ancestor-fstype={}|data-fstype={}|ok={ok}",
+                ancestor.fstype, data.fstype
+            ),
+        );
+    }
     if data.fstype != "apfs" || data.uuid.is_none() {
         return Err("the boot Data volume is not a verified APFS volume".to_owned());
     }
@@ -3227,6 +3433,15 @@ fn boot_data_facts() -> Result<HeldFacts, String> {
         )
     };
     if raw < 0 {
+        #[cfg(test)]
+        crate::tape::read_row(
+            "absence-walk:boot-data",
+            Path::new("/System/Volumes/Data"),
+            crate::tape::TapeOutcome::Refusal {
+                reason: std::io::Error::last_os_error().to_string(),
+            },
+            0,
+        );
         return Err(format!(
             "the boot Data volume is unverifiable ({})",
             std::io::Error::last_os_error()
@@ -3234,6 +3449,19 @@ fn boot_data_facts() -> Result<HeldFacts, String> {
     }
     // SAFETY: `raw` is a newly owned descriptor.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    #[cfg(test)]
+    {
+        if let Some((dev, ino)) = crate::tape::fd_dev_ino(fd.as_fd()) {
+            crate::tape::read_row_dev(
+                "absence-walk:boot-data",
+                Path::new("/System/Volumes/Data"),
+                dev,
+                ino,
+                crate::tape::TapeOutcome::Opened { dev, ino },
+                0,
+            );
+        }
+    }
     HeldFacts::of(fd.as_fd())
 }
 
@@ -3273,11 +3501,37 @@ fn checkout_absence(row: &Row, legacy_exception: bool) -> Result<Absence, String
                 ));
             };
             let binding = match Binding::open(mount, Some(uuid)) {
-                Ok(binding) => binding,
+                Ok(binding) => {
+                    #[cfg(test)]
+                    crate::tape::volume_row(
+                        "absence-walk:binding-open",
+                        binding.mount_point(),
+                        Some(binding.uuid()),
+                        Some(binding.device()),
+                        crate::tape::TapeOutcome::Facts {
+                            facts: format!(
+                                "mount={}|uuid={}",
+                                binding.mount_point().display(),
+                                binding.uuid()
+                            ),
+                        },
+                    );
+                    binding
+                }
                 Err(error) => {
+                    #[cfg(test)]
+                    crate::tape::volume_row(
+                        "absence-walk:binding-open",
+                        mount,
+                        Some(uuid),
+                        None,
+                        crate::tape::TapeOutcome::Refusal {
+                            reason: error.chars().take(240).collect::<String>(),
+                        },
+                    );
                     return Ok(Absence::Unknown(format!(
                         "the recorded volume is not mounted and matching ({error})"
-                    )))
+                    )));
                 }
             };
             // SAFETY: `dup` returns a new owned descriptor on success.
@@ -3300,10 +3554,30 @@ fn checkout_absence(row: &Row, legacy_exception: bool) -> Result<Absence, String
     // The verified mount must still be the same mounted volume after the walk.
     if let Some(binding) = &binding {
         if let Err(reason) = binding.verify() {
+            #[cfg(test)]
+            crate::tape::volume_row(
+                "absence-walk:binding-verify",
+                binding.mount_point(),
+                Some(binding.uuid()),
+                Some(binding.device()),
+                crate::tape::TapeOutcome::Refusal {
+                    reason: reason.chars().take(240).collect::<String>(),
+                },
+            );
             return Ok(Absence::Unknown(format!(
                 "the recorded volume changed during the walk ({reason})"
             )));
         }
+        #[cfg(test)]
+        crate::tape::volume_row(
+            "absence-walk:binding-verify",
+            binding.mount_point(),
+            Some(binding.uuid()),
+            Some(binding.device()),
+            crate::tape::TapeOutcome::Facts {
+                facts: "unchanged".to_owned(),
+            },
+        );
     }
     let Some(missing) = witness.missing else {
         return Ok(Absence::Unknown("the checkout walk ended early".to_owned()));
@@ -3642,11 +3916,37 @@ fn observe_row_root(row: &Row) -> Result<RootState, String> {
         ));
     }
     let binding = match Binding::open(mount, Some(uuid)) {
-        Ok(binding) => binding,
+        Ok(binding) => {
+            #[cfg(test)]
+            crate::tape::volume_row(
+                "root-observe:binding-open",
+                binding.mount_point(),
+                Some(binding.uuid()),
+                Some(binding.device()),
+                crate::tape::TapeOutcome::Facts {
+                    facts: format!(
+                        "mount={}|uuid={}",
+                        binding.mount_point().display(),
+                        binding.uuid()
+                    ),
+                },
+            );
+            binding
+        }
         Err(error) => {
+            #[cfg(test)]
+            crate::tape::volume_row(
+                "root-observe:binding-open",
+                mount,
+                Some(uuid),
+                None,
+                crate::tape::TapeOutcome::Refusal {
+                    reason: error.chars().take(240).collect::<String>(),
+                },
+            );
             return Ok(RootState::Unknown(format!(
                 "the recorded volume is not usable ({error})"
-            )))
+            )));
         }
     };
     observe_root_in(&binding, row)
@@ -3668,6 +3968,20 @@ fn observe_root_in(binding: &Binding, row: &Row) -> Result<RootState, String> {
     let outer = binding
         .dir_at(binding.fd(), outputs::EXTERNAL_DIR, false)
         .map_err(|error| format!("cannot open the outputs directory: {error}"))?;
+    #[cfg(test)]
+    {
+        let outputs_path = binding.mount_point().join(outputs::EXTERNAL_DIR);
+        if let Some((dev, ino)) = crate::tape::fd_dev_ino(outer.as_fd()) {
+            crate::tape::read_row_dev(
+                "root-observe:outputs-dir",
+                &outputs_path,
+                dev,
+                ino,
+                crate::tape::TapeOutcome::Opened { dev, ino },
+                0,
+            );
+        }
+    }
     let Some(name) = row.root.file_name() else {
         return Ok(RootState::Unknown("the root has no leaf name".to_owned()));
     };
@@ -3685,11 +3999,40 @@ fn observe_root_in(binding: &Binding, row: &Row) -> Result<RootState, String> {
     };
     if status != 0 {
         let error = std::io::Error::last_os_error();
+        #[cfg(test)]
+        {
+            if let Some((pdev, pino)) = crate::tape::fd_dev_ino(outer.as_fd()) {
+                crate::tape::component_row(
+                    "root-observe:entry",
+                    pdev,
+                    pino,
+                    name,
+                    crate::tape::TapeOutcome::Refusal {
+                        reason: error.to_string(),
+                    },
+                );
+            }
+        }
         return Ok(if error.kind() == std::io::ErrorKind::NotFound {
             RootState::Absent
         } else {
             RootState::Unknown(error.to_string())
         });
+    }
+    #[cfg(test)]
+    {
+        if let Some((pdev, pino)) = crate::tape::fd_dev_ino(outer.as_fd()) {
+            crate::tape::component_row(
+                "root-observe:entry",
+                pdev,
+                pino,
+                name,
+                crate::tape::TapeOutcome::Opened {
+                    dev: u64::try_from(stat.st_dev).unwrap_or(u64::MAX),
+                    ino: stat.st_ino,
+                },
+            );
+        }
     }
     if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
         return Ok(RootState::Unknown(
@@ -3708,6 +4051,19 @@ fn observe_root_in(binding: &Binding, row: &Row) -> Result<RootState, String> {
     let root = binding
         .dir_at(outer.as_fd(), &name.to_string_lossy(), false)
         .map_err(|error| format!("cannot open the recorded root: {error}"))?;
+    #[cfg(test)]
+    {
+        if let Some((dev, ino)) = crate::tape::fd_dev_ino(root.as_fd()) {
+            crate::tape::read_row_dev(
+                "root-observe:root-dir",
+                &row.root,
+                dev,
+                ino,
+                crate::tape::TapeOutcome::Opened { dev, ino },
+                0,
+            );
+        }
+    }
     let marker_name = std::ffi::CString::new(outputs::MARKER).map_err(|error| error.to_string())?;
     // SAFETY: the root descriptor and C string are live for the call.
     let marker_fd = unsafe {
@@ -3718,6 +4074,15 @@ fn observe_root_in(binding: &Binding, row: &Row) -> Result<RootState, String> {
         )
     };
     if marker_fd < 0 {
+        #[cfg(test)]
+        crate::tape::read_row(
+            "root-observe:marker-open",
+            &row.root.join(outputs::MARKER),
+            crate::tape::TapeOutcome::Refusal {
+                reason: std::io::Error::last_os_error().to_string(),
+            },
+            0,
+        );
         return Ok(RootState::Unknown(format!(
             "the root has no readable owner marker ({})",
             std::io::Error::last_os_error()
@@ -3728,6 +4093,12 @@ fn observe_root_in(binding: &Binding, row: &Row) -> Result<RootState, String> {
     let mut bytes = Vec::new();
     authority_read(marker_file.take(64 * 1024 + 1), &mut bytes)
         .map_err(|error| format!("cannot read the owner marker: {error}"))?;
+    #[cfg(test)]
+    crate::tape::authority_bind(
+        "prune::observe_root_in:marker",
+        &row.root.join(outputs::MARKER),
+        64 * 1024,
+    );
     if bytes.len() > 64 * 1024 {
         return Ok(RootState::Unknown(
             "the owner marker exceeds its byte limit".to_owned(),
@@ -3754,13 +4125,29 @@ fn observe_root_in(binding: &Binding, row: &Row) -> Result<RootState, String> {
         ));
     }
     match judge_recorded_root(row, &observed) {
-        Ok(dev) => Ok(RootState::Present(RootFacts {
-            dev,
-            ino,
-            marker_digest: observed.marker_digest,
-            legacy: observed.legacy,
-        })),
-        Err(reason) => Ok(RootState::Unknown(reason)),
+        Ok(dev) => {
+            #[cfg(test)]
+            crate::tape::classify_row(
+                "root-judge:recorded-root",
+                &row.root.display().to_string(),
+                &format!("ok dev={dev} ino={ino}"),
+            );
+            Ok(RootState::Present(RootFacts {
+                dev,
+                ino,
+                marker_digest: observed.marker_digest,
+                legacy: observed.legacy,
+            }))
+        }
+        Err(reason) => {
+            #[cfg(test)]
+            crate::tape::classify_row(
+                "root-judge:recorded-root",
+                &row.root.display().to_string(),
+                &format!("kept: {reason}"),
+            );
+            Ok(RootState::Unknown(reason))
+        }
     }
 }
 
@@ -3877,9 +4264,30 @@ fn account_candidates(evaluated: &mut [Evaluated], control: &Path) {
                 .unwrap_or(u64::MAX),
         };
         let Ok(report) = inventory::inventory_directory(&candidate.root, limits) else {
+            #[cfg(test)]
+            crate::tape::read_row(
+                "accounting-walk",
+                &candidate.root,
+                crate::tape::TapeOutcome::Refusal {
+                    reason: "the inventory walk refused".to_owned(),
+                },
+                remaining,
+            );
             // Consumption is unknown on error, so no further walk is safe.
             break;
         };
+        #[cfg(test)]
+        crate::tape::read_row(
+            "accounting-walk",
+            &candidate.root,
+            crate::tape::TapeOutcome::Facts {
+                facts: format!(
+                    "entries={} complete={}",
+                    report.entries_visited, report.coverage.complete
+                ),
+            },
+            remaining,
+        );
         remaining = remaining.saturating_sub(report.entries_visited);
         candidate.logical_bytes = report.total.logical_bytes_by_name;
         candidate.allocated_bytes = report.total.allocated_bytes;
@@ -4382,6 +4790,12 @@ fn judge_root_identity(
     ino: u64,
 ) -> Result<u64, String> {
     let dev = u64::try_from(facts.st_dev).unwrap_or(u64::MAX);
+    #[cfg(test)]
+    crate::tape::classify_row(
+        "root-judge:identity",
+        &format!("dev={dev} ino={ino} recorded={recorded_dev:?}"),
+        &format!("volume-dev={volume_dev}"),
+    );
     if facts.st_ino != ino {
         return Err("the root's inode changed".to_owned());
     }
@@ -7252,6 +7666,135 @@ pub(crate) fn test_rows(
             )
         })
         .collect())
+}
+
+/// The prune capture harness's entry into the actual decision chain (X-S1,
+/// barge-adoption.md). Compiled only under `cfg(test)`. It follows the
+/// `dry_run` decision prefix exactly — `AuthorityScope::begin`, then
+/// `paired_store`, then the optional `read_operator_list`, then
+/// `require_ready`, then the unfinished-intent refusal through `unsettled`,
+/// then `evaluate` — and exports every actual `Evaluation` entry and the
+/// completeness flag, or the actual pre-evaluate refusal. It never calls
+/// `dry_run` or `build_preview`, renders no preview, and never redirects
+/// stdout; the real evaluator, its accounting walk and every read stay
+/// unchanged.
+#[cfg(test)]
+pub(crate) mod tape_entry {
+    use super::{
+        evaluate, paired_store, phase_label, read_operator_list, require_ready, unsettled,
+        AuthorityScope, Evaluation,
+    };
+    use std::path::Path;
+
+    /// A pre-evaluate refusal, in the engine's own vocabulary and exit code.
+    pub(crate) struct ChainRefusal {
+        pub(crate) reason: String,
+        pub(crate) exit_code: u8,
+        pub(crate) unsettled: bool,
+    }
+
+    /// One completed chain run: the full bounded actual evaluation export, or
+    /// the actual pre-evaluate refusal. An `Err` from the chain itself is the
+    /// engine's infrastructure refusal (exit 1, as `prune::run` maps it).
+    pub(crate) enum ChainOutcome {
+        Evaluated { result: serde_json::Value },
+        Refused(ChainRefusal),
+    }
+
+    fn export_entry(entry: &super::Evaluated) -> serde_json::Value {
+        let row = &entry.row;
+        let candidate = entry.candidate.as_ref().map(|candidate| {
+            serde_json::json!({
+                "root": candidate.root.display().to_string(),
+                "dev": candidate.dev,
+                "ino": candidate.ino,
+                "marker_digest": candidate.marker_digest,
+                "logical_bytes": candidate.logical_bytes,
+                "allocated_bytes": candidate.allocated_bytes,
+                "accounting_complete": candidate.accounting_complete,
+                "receiptless": candidate.receiptless,
+                "volume_uuid": candidate.volume_uuid,
+                "checkout_volume_uuid": candidate.checkout_volume_uuid,
+                "nonce": candidate.nonce,
+                "generation": candidate.generation,
+                "root_kind": candidate.root_kind,
+            })
+        });
+        serde_json::json!({
+            "checkout_id": row.checkout_id,
+            "checkout": row.checkout.display().to_string(),
+            "checkout_volume_uuid": row.checkout_volume_uuid,
+            "receipt": row.receipt.display().to_string(),
+            "member": row.member,
+            "root": row.root.display().to_string(),
+            "root_kind": row.root_kind,
+            "volume_uuid": row.volume_uuid,
+            "generation": row.generation,
+            "nonce": row.nonce,
+            "selected": row.selected,
+            "pending": row.pending,
+            "pruning": row.pruning,
+            "reservation": row.reservation,
+            "cancelling": row.cancelling,
+            "candidate": candidate,
+            "kept": entry.kept,
+            "legacy": entry.legacy,
+        })
+    }
+
+    fn export_evaluation(evaluated: &Evaluation) -> serde_json::Value {
+        serde_json::json!({
+            "complete": evaluated.complete,
+            "entries": evaluated
+                .entries
+                .iter()
+                .map(export_entry)
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// The actual decision chain, in `dry_run`'s exact order, exporting its
+    /// real result. Nothing here feeds anything back into the engine.
+    pub(crate) fn run_chain(operator_list: Option<&Path>) -> Result<ChainOutcome, String> {
+        let authority = AuthorityScope::begin()?;
+        let store = paired_store()?;
+        let control = store.owner_control().to_path_buf();
+        let list = match operator_list {
+            Some(path) => Some(read_operator_list(path)?),
+            None => None,
+        };
+        // A dry run mutates nothing: it never initializes, replays or
+        // reconciles. The refusal branches below are `dry_run`'s own.
+        let registry = match require_ready(&store, &control) {
+            Ok(registry) => registry,
+            Err(reason) => {
+                return Ok(ChainOutcome::Refused(ChainRefusal {
+                    reason,
+                    exit_code: 2,
+                    unsettled: false,
+                }))
+            }
+        };
+        if let Some(intent) = registry.unfinished_intents().next() {
+            let reason = format!(
+                "prune intent {} is unfinished ({}); settle it with `oxide outputs resolve-intent {}` or restore the recorded root before pruning",
+                intent.id,
+                phase_label(intent.phase),
+                intent.id
+            );
+            let exit_code = unsettled(&control, &reason);
+            return Ok(ChainOutcome::Refused(ChainRefusal {
+                reason,
+                exit_code,
+                unsettled: true,
+            }));
+        }
+        let evaluated = evaluate(&store, &control, &registry, list.as_ref(), &authority)?;
+        drop(authority);
+        Ok(ChainOutcome::Evaluated {
+            result: export_evaluation(&evaluated),
+        })
+    }
 }
 
 #[cfg(test)]

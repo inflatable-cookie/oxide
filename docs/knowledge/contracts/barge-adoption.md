@@ -19,6 +19,14 @@ evidence; landing this checkpoint does not satisfy that prerequisite. A native
 diagnostic at a future implementation head is not a missing proof of this
 design checkpoint.
 
+**X-S1 landed (2026-11-02, oxide#240).** Oxide's half of the capture apparatus
+is implemented under `cfg(test)` only: the leaf tape, transcript adapters and
+the `tape_prune_eval` in-crate harness (implementation record and honest
+limits in [the X-S1 landed note](#x-s1-landed-2026-11-02-oxide240)). This
+establishes no seam output, no parity and no O2 evidence; the counted native
+diagnostic at a source-approved head stays X-S2's separately activated Queue
+proof, and the O3 dispatch hold stands.
+
 The text below is the pre-freeze proposal. Its "proposed design" and "changes
 no code" statements describe the 2026-11-01 proposal only and are kept as dated
 evidence. Where a later slice lands, its own note in this file is the current
@@ -996,6 +1004,130 @@ authorizes a real run, a pin change or a production behaviour change.
   — it is not part of this design and no `awaitingProofs` is recorded for it.
   Stopping criteria: pure selectors green, the report renders for a synthetic
   unit fixture, no fixture, pool or image touched outside pure mode.
+
+#### X-S1 landed (2026-11-02, oxide#240)
+
+The cfg(test)-only leaf tape,
+transcript adapters and the in-crate harness are implemented at this head.
+Status: apparatus complete; this is not parity evidence, and O3 stays held.
+No production statement changed: every addition is a separate
+`#[cfg(test)]`-attributed statement or a cfg(test) module, which the covering
+release-profile check (`RUSTFLAGS='-D warnings'` over `--bins`) and the diff
+review prove.
+
+- **Files.** `src/bin/oxide/tape.rs` (the binary tape engine: the
+  `oxide.capture.transcript/1` document, epochs assigned at the leaf,
+  per-key occurrence bookkeeping under the fixed 64 cap, the 8192 read-row
+  and 8 MiB document caps with explicit `truncation` flags, effect rows,
+  clock rows, an additive bounded `classifications` array, and the
+  additive bounded pre/post `fixture_capture` with its diff),
+  `src/tape.rs` (the library tape: the same leaf signatures over one bounded
+  thread-local buffer, so the library's own `cfg(test)` compilation records
+  and the prebuilt library a `tests/` target links compiles the statements
+  away), and `src/bin/oxide/tape_harness.rs` (the `[[test]]`
+  `tape_prune_eval` target, `harness = false`). Recorder statements sit in
+  `prune.rs` (authority scope and budget, `authority_read` core/bind,
+  `read_registry`, `read_bounded`, the no-follow absence walk start,
+  `fstatat`/`openat`/revalidation component rows keyed to observed parent
+  identities, `HeldFacts`, the recorded-volume and boot-Data judges,
+  `observe_row_root`/`observe_root_in` binding, entry, root-directory and
+  marker rows, `judge_recorded_root`/`judge_root_identity`,
+  `account_candidates`), `store.rs` (`private_file` opens and creates,
+  `load`/`holders` authority binds, `save` as `save@control-state` effects,
+  `outputs_initialization`, `checkout_custody` entry/record/verdict
+  classifications, admission lock rows, the fence effect-kind overrides,
+  `open_existing_mode`/`open_at`/`ledger_view` pool rows, `boot_session`
+  and `closed_by_boot`), `outputs.rs` (`read_receipt_with`,
+  `marker_digest`), `removable.rs` (`coordinate`, the registration open and
+  read), `scratch_io.rs` (`read_document` open/meta/bytes rows, the volume
+  binding), and — library-side — `src/volume.rs` (`Binding::open_in`
+  parent/mount/observe/verify rows), `src/inventory.rs` (walk start and
+  root identity) and `src/lease/pool.rs` + `src/lease/mod.rs`
+  (`ledger_view`, the pool lock, reconcile entry classification,
+  `save@ledger` and `fence@managed-control` effects).
+- **The harness split, and why.** In a `tests/` target the re-rooted binary
+  modules resolve `use oxide_storage::…` to the real prebuilt library
+  (a same-named root module is an ambiguity error, and the modules' `use`
+  statements must stay unchanged), so the library-side leaves record in the
+  library's own `cfg(test)` compilation and the harness records those
+  leaves at its own call sites, with volume UUID/device and mount facts.
+  Library-internal writes are bound as ground truth by the transcript's
+  pre/post fixture capture diff, which is complete for every fixture path.
+  `HoldingSweep` is a no-op stub in the harness crate only.
+- **The entry.** `prune::tape_entry::run_chain` (cfg(test)) follows the
+  `dry_run` prefix exactly — `AuthorityScope::begin`, `paired_store`, the
+  optional `read_operator_list`, `require_ready`, the unfinished-intent
+  refusal through `unsettled`, then `evaluate` — and exports every actual
+  `Evaluation` entry (root identity, candidate or kept reason, legacy flag)
+  and the completeness flag, or the actual pre-evaluate refusal with the
+  engine's exit code (2 registry/fence refusal, 3 unsettled, 1 chain
+  error). It never calls `dry_run`, never renders a preview, never
+  redirects stdout. The static source-site inventory is the list above;
+  two known honest gaps are recorded here: a read whose statement
+  propagates an error with `?` records its core row but cannot bind its
+  identity on that path (the unbound pending is an explicit transcript
+  note), and over-cap occurrences are truncated with the flag set, never
+  dropped silently.
+- **The harness.** Argv contract exactly
+  `--fixture-root --manifest --transcript-out --case`; exit 0 when the
+  transcript is written (any engine outcome), 2 on harness failure. No
+  arguments (the `oxide test` route) runs the embedded unit fixture end to
+  end: the pure tape checks (deterministic field order, epoch and
+  occurrence bookkeeping, both caps' explicit truncation, the unbound
+  authority-read note, effect/clock/classification rows) plus the BASE,
+  EFFECT-1 (absent admission lock), EFFECT-2 (missing accounting fences),
+  REGISTRY-MISSING and UNSETTLED-INTENT unit fixtures, each a fresh
+  exclusively owned fixture and one engine child (this executable
+  re-invoked with a scrubbed environment: private HOME plus
+  `OXIDE_TEST_HOME_FROM_ENV=1`, private `OXIDE_CONFIG`, `OXIDE_POOL`,
+  `OXIDE_POOL_CAP`, `OXIDE_SCRATCH_ROOT` only when the fixture sits under
+  `/Volumes`), every child waited and reaped. `--self-check` runs only the
+  pure checks.
+- **Honest fixture limits.** The engine's `Binding::open` accepts exactly
+  `/Volumes/<name>`, so an external root binds only when the fixture's own
+  `oxide-outputs` sits at a dedicated mount root. On a shared volume's
+  scratch (or the internal fallback) the embedded BASE honestly records an
+  incomplete batch with every root kept and the engine's own reason, and
+  zero effects; the strong BASE surface (present checkout kept,
+  positively absent checkout's root an actual candidate, unlisted legacy
+  root kept, complete snapshot) asserts when X-S2 passes a fixture root
+  that is its own attached proof volume. A prepared fixture carries the
+  four admission fences, `outputs_init` ready, the pool lock and the
+  admission lock, so BASE records zero tape effects and an empty fixture
+  diff; the EFFECT cases record the real `lock-create@admission` and the
+  durable fence save exactly once each, never repaired between runs.
+- **Export/build commands for X-S2.** Stage the exact Oxide head, then:
+  `cargo test --test tape_prune_eval --no-run --locked` (the frozen stable
+  toolchain, offline through the committed lock) and take the printed
+  executable path under `target/debug/deps/tape_prune_eval-<hash>`;
+  record its SHA-256 with the transcript and invoke it once per case with
+  the four arguments against the manifest the orchestrator wrote. The
+  manifest fields the harness binds are `version` (`oxide.capture.manifest/1`),
+  `case`, optional `operator_list` (fixture-relative path) and `expected`.
+- **Validation recorded.** `effigy rust:compile`, `effigy
+  rust:compile-release` (`-D warnings`, proving compile-away),
+  `effigy rust:format`, the covering `effigy test rust` under the sanctioned
+  dual-root recipe, `effigy docs:check`, the focused
+  `effigy proof:tape-prune:test` selector (the embedded self-check, all
+  five unit fixtures and the pure checks green), and the library tape's
+  unit test (`tape::tests::volume_leaf_recorders_fire_in_the_library_test_compilation`).
+  The nine premise dispositions for the future X-S2 execution: (1) private
+  HOME/rustup is the child env the harness itself assembles, with the
+  invoking `RUSTUP_HOME` preserved for staging; (2)
+  `OXIDE_TEST_HOME_FROM_ENV=1` on the engine child, set by the harness;
+  (3) the child environment is an allow-list (`PATH`, `HOME`, the fixture
+  `OXIDE_*` facts), so inherited `OXIDE_*`/`CARGO_*`/`SCCACHE_*`/`XDG_*`
+  values are scrubbed by construction; (4) the fixtures are positively
+  built by fixture code and no build runs in a window; (5) no Cargo
+  external subcommand is invoked — not applicable; (6) volume cases use
+  X-S2's one owned image and its real custody facts, never the tape; (7)
+  frozen `RUSTFLAGS` with `CARGO_ENCODED_RUSTFLAGS` removed at staging;
+  (8) fixture, transcripts and scratch under the caller's selected-volume
+  routing with same-volume `TMPDIR`; (9) fixture roots are `mktemp`
+  templates under the owned scratch parent. All are implemented in
+  `src/bin/oxide/tape_harness.rs` (`self_check`, `fixture_case`, the child
+  env assembly) or are staging obligations that stay with X-S2's
+  orchestrator; none has run under a counted native yet.
 
 Deliverable note for O3: an `EXPLAIN-OR-BLOCK` case that demonstrates a real
 final disagreement (currently `REF-ORPHAN-MARKED`, `RCP-V1`,

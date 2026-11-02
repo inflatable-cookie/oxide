@@ -1002,6 +1002,14 @@ pub mod managed {
     /// Ledger membership without accounting walks; it takes the pool lock
     /// and reconciles recorded evictions before returning.
     pub fn ledger_view(pool: &Path) -> Result<LedgerView, LeaseError> {
+        #[cfg(test)]
+        crate::tape::pool_row(
+            "lease:ledger-view",
+            pool,
+            crate::tape::TapeOutcome::Facts {
+                facts: "entered".to_owned(),
+            },
+        );
         Pool::open(pool)?.ledger_view()
     }
 
@@ -1574,6 +1582,14 @@ impl Pool {
         } else {
             lock_pool(&root)?
         };
+        #[cfg(test)]
+        crate::tape::lock_row(
+            "pool:lock",
+            &root.join("lock"),
+            crate::tape::TapeOutcome::Facts {
+                facts: "locked".to_owned(),
+            },
+        );
         // Debug proof observation (oxide#190): an eviction's reported interval
         // starts at this lock acquisition, so it covers every decision this lock
         // hold makes instead of only the rename transaction.
@@ -1608,6 +1624,8 @@ impl Pool {
                 split_slot_dir(dir, slot.id).ok_or(LeaseError::UnknownAccounting)?;
             }
         }
+        #[cfg(test)]
+        let tape_open_root = root.display().to_string();
         let mut pool = Self {
             _lock: Some(lock),
             root,
@@ -1637,6 +1655,8 @@ impl Pool {
         // `Evicting` row is adopted here, so the legacy replay never meets a
         // root that its own rename already moved.
         if reconcile {
+            #[cfg(test)]
+            crate::tape::classify_row("pool:reconcile", &tape_open_root, "entered");
             if trace_release {
                 crate::release_trace::phase("holding reconciliation", || pool.reconcile_holding())?;
                 crate::release_trace::phase("pool reconciliation", || pool.reconcile_evicting())?;
@@ -1721,7 +1741,10 @@ impl Pool {
     }
 
     fn persist(&self) -> Result<(), LeaseError> {
-        write_ledger(&self.root, &self.ledger)
+        write_ledger(&self.root, &self.ledger)?;
+        #[cfg(test)]
+        crate::tape::effect_row("save@ledger", &self.root.join("ledger.json"));
+        Ok(())
     }
 
     /// A revised mutation: install the permanent capacity-policy fence if

@@ -8211,6 +8211,8 @@ fn read_receipt_with(
     let mut bytes = Vec::new();
     crate::prune::authority_read(file.take(MAX_RECEIPT_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    #[cfg(test)]
+    crate::tape::authority_bind("outputs::read_receipt_with", &path, MAX_RECEIPT_BYTES);
     if bytes.len() as u64 > MAX_RECEIPT_BYTES {
         return Err(format!(
             "{} exceeds its {MAX_RECEIPT_BYTES}-byte limit",
@@ -8295,11 +8297,23 @@ pub(crate) fn read_receipt_for_prune(
 /// The SHA-256 of the exact marker bytes, for the recorded root identity.
 pub(crate) fn marker_digest(root: &Path) -> Result<String, String> {
     let path = root.join(MARKER);
+    #[cfg(test)]
+    crate::tape::read_row(
+        "marker-digest:lstat",
+        &path,
+        match crate::tape::path_dev_ino(&path) {
+            Some((dev, ino)) => crate::tape::TapeOutcome::Opened { dev, ino },
+            None => crate::tape::TapeOutcome::Absent,
+        },
+        0,
+    );
     let file =
         File::open(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let mut bytes = Vec::new();
     crate::prune::authority_read(file.take(MAX_MARKER_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    #[cfg(test)]
+    crate::tape::authority_bind("outputs::marker_digest", &path, MAX_MARKER_BYTES);
     if bytes.len() as u64 > MAX_MARKER_BYTES {
         return Err(format!("{} exceeds its byte limit", path.display()));
     }

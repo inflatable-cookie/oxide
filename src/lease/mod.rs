@@ -942,6 +942,8 @@ fn persist_private_file(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
         let _ = fs::remove_file(&temp_path);
         return Err(io_error(error));
     }
+    #[cfg(test)]
+    crate::tape::effect_row("fence@managed-control", path);
     // oxide#196: an injected failure after the replacement but before the
     // parent-directory sync leaves the new ledger visible while the write
     // errors, so callers must classify the commit boundary conservatively.

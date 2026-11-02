@@ -1,0 +1,1429 @@
+//! The prune capture harness (X-S1, barge-adoption.md).
+//!
+//! One `[[test]]` target with `harness = false`. Its argv contract is exactly
+//! the contract the shared capture contract fixes:
+//!
+//! ```text
+//! tape_prune_eval --fixture-root <dir> --manifest <path> \
+//!                 --transcript-out <path> --case <CASE>
+//! ```
+//!
+//! It follows the actual `dry_run` decision prefix through the actual
+//! `evaluate` (via `prune::tape_entry::run_chain`), exports the full bounded
+//! actual `Evaluation` (or the actual pre-evaluate refusal) into one
+//! `oxide.capture.transcript/1` document, always writes the transcript, and
+//! exits 0 when the transcript was written (any engine outcome). It never
+//! calls `dry_run`, never renders a preview, and never redirects stdout.
+//!
+//! Run with no arguments (the `oxide test` route), it executes its embedded
+//! unit fixture end to end: the pure tape checks plus the BASE,
+//! EFFECT-1 (absent admission lock), EFFECT-2 (missing accounting fences),
+//! REGISTRY-MISSING and UNSETTLED-INTENT unit fixtures, each a fresh
+//! exclusively owned fixture and its own engine child. `--self-check` runs
+//! only the pure checks. The engine child is this executable re-invoked with
+//! a scrubbed environment and the fixture facts; the parent waits and reaps
+//! every child it starts.
+//!
+#![allow(dead_code)]
+// The harness crate compiles the binary's modules for the tape; the command dispatch stays in the binary.
+
+//! Module re-rooting: this file is the root of the harness crate. The binary
+//! modules below are compiled here with `cfg(test)` set, so their
+//! `#[cfg(test)]` recorder statements are active in this crate. They resolve
+//! sibling modules and the root constants through this crate root; `oxide_storage`
+//! remains the real library dependency (a `tests/` target cannot re-root the
+//! prebuilt library without changing its `use` statements), so the
+//! library-side leaves record in the library's own `cfg(test)` compilation
+//! (`src/tape.rs`), and this harness binds library-internal effects as ground
+//! truth through its pre/post fixture capture. `HoldingSweep` is the command
+//! layer's holding pass, stubbed to a no-op here because the prune chain
+//! never evicts; the statement sites in `removable.rs` stay unchanged.
+
+#[path = "admission.rs"]
+mod admission;
+#[path = "adopt.rs"]
+mod adopt;
+#[path = "budget.rs"]
+mod budget;
+#[path = "capacity.rs"]
+mod capacity;
+#[path = "cargo_home.rs"]
+mod cargo_home;
+#[path = "census.rs"]
+mod census;
+#[path = "child_temp.rs"]
+mod child_temp;
+#[path = "cli.rs"]
+mod cli;
+#[path = "config.rs"]
+mod config;
+#[path = "describe.rs"]
+mod describe;
+#[path = "freshness.rs"]
+mod freshness;
+#[path = "guidance.rs"]
+mod guidance;
+#[path = "handoff_trace.rs"]
+mod handoff_trace;
+#[path = "identity.rs"]
+mod identity;
+#[path = "layout.rs"]
+mod layout;
+#[path = "one_use.rs"]
+mod one_use;
+#[path = "outputs.rs"]
+mod outputs;
+#[path = "process.rs"]
+mod process;
+#[path = "prune.rs"]
+mod prune;
+#[path = "removable.rs"]
+mod removable;
+#[path = "scratch_admission.rs"]
+mod scratch_admission;
+#[path = "scratch_io.rs"]
+mod scratch_io;
+#[path = "seed_catalog.rs"]
+mod seed_catalog;
+#[path = "seed_context.rs"]
+mod seed_context;
+#[path = "seed_lock.rs"]
+mod seed_lock;
+#[path = "seed_plan.rs"]
+mod seed_plan;
+#[path = "seed_sources.rs"]
+mod seed_sources;
+#[path = "store.rs"]
+mod store;
+#[path = "tape.rs"]
+mod tape;
+#[path = "watchdog.rs"]
+mod watchdog;
+#[path = "wrapper.rs"]
+mod wrapper;
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use tape::{TapeEngineOutcome, TapeFixtureCapture};
+
+/// The command name the binary crate root defines; modules reference it.
+pub(crate) const CARGO: &str = "cargo";
+/// The binary crate root's mebibyte constant.
+pub(crate) const MIB: u64 = 1024 * 1024;
+
+/// The command layer's holding pass. The prune chain never evicts, so this
+/// harness stub starts no worker and finishes nothing.
+pub(crate) struct HoldingSweep;
+
+impl HoldingSweep {
+    fn start(_pool: PathBuf, _prefer: Option<String>) -> Self {
+        Self
+    }
+
+    fn finish(&mut self) {}
+}
+
+// ---------------------------------------------------------------------------
+// Case definitions and the manifest
+// ---------------------------------------------------------------------------
+
+const MANIFEST_VERSION: &str = "oxide.capture.manifest/1";
+const TRANSCRIPT_VERSION_CHECK: &str = "oxide.capture.transcript/1";
+const ENGINE: &str = "oxide";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Case {
+    Base,
+    Effect1,
+    Effect2,
+    RegistryMissing,
+    UnsettledIntent,
+}
+
+impl Case {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Base => "BASE",
+            Self::Effect1 => "EFFECT-1",
+            Self::Effect2 => "EFFECT-2",
+            Self::RegistryMissing => "REGISTRY-MISSING",
+            Self::UnsettledIntent => "UNSETTLED-INTENT",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "BASE" => Self::Base,
+            "EFFECT-1" => Self::Effect1,
+            "EFFECT-2" => Self::Effect2,
+            "REGISTRY-MISSING" => Self::RegistryMissing,
+            "UNSETTLED-INTENT" => Self::UnsettledIntent,
+            _ => return None,
+        })
+    }
+
+    /// STATIC cases forbid every effect; the EFFECT cases declare theirs.
+    fn static_case(self) -> bool {
+        matches!(
+            self,
+            Self::Base | Self::RegistryMissing | Self::UnsettledIntent
+        )
+    }
+}
+
+/// The manifest the harness reads and binds (`oxide.capture.manifest/1`).
+/// X-S2's orchestrator writes richer manifests; the harness binds exactly
+/// these fields and carries the whole document's SHA-256 in the transcript.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessManifest {
+    version: String,
+    case: String,
+    #[serde(default)]
+    operator_list: Option<String>,
+    expected: ManifestExpectation,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestExpectation {
+    outcome: String,
+    #[serde(default)]
+    exit_code: Option<u8>,
+    #[serde(default)]
+    complete: Option<bool>,
+    #[serde(default)]
+    kept_roots: Vec<String>,
+    #[serde(default)]
+    candidate_roots: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Fixture builder
+// ---------------------------------------------------------------------------
+
+struct FixturePaths {
+    root: PathBuf,
+    pool: PathBuf,
+    control: PathBuf,
+    outputs_dir: PathBuf,
+    checkout_present: PathBuf,
+    checkout_gone: PathBuf,
+    root_ra: PathBuf,
+    root_rb: PathBuf,
+}
+
+fn hex_const(chars: char, count: usize) -> String {
+    std::iter::repeat(chars).take(count).collect()
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// One fixture root's real volume identity: the `/Volumes/<name>` mount above
+/// `root` when it sits on a mounted external volume, else `None` (the
+/// internal route, where external roots cannot bind).
+/// Whether `root` is itself a `/Volumes/<name>` mount root, the only shape
+/// where a fixture's own `oxide-outputs` can sit at the mount and the external
+/// root binding can verify. The engine's `Binding::open` accepts exactly
+/// `/Volumes/<name>`; a fixture under a shared volume's scratch folders binds
+/// no external root, so its honest outcome is an incomplete batch with every
+/// root kept. The stronger BASE surface (an absent checkout's root as an
+/// actual candidate) needs the dedicated proof volume X-S2 attaches.
+fn mount_root(root: &Path) -> bool {
+    let mut components: Vec<std::ffi::OsString> = Vec::new();
+    for component in root.components() {
+        use std::path::Component;
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => components.push(name.to_os_string()),
+            _ => return false,
+        }
+    }
+    components.len() == 2 && components[0].as_encoded_bytes() == b"Volumes".as_slice()
+}
+
+fn fixture_volume(root: &Path) -> Option<(PathBuf, String)> {
+    let mut components: Vec<std::ffi::OsString> = Vec::new();
+    for component in root.components() {
+        use std::path::Component;
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => components.push(name.to_os_string()),
+            _ => return None,
+        }
+    }
+    if components.first().map(|c| c.as_encoded_bytes()) != Some(b"Volumes".as_slice()) {
+        return None;
+    }
+    let mount = Path::new("/Volumes").join(&components[1]);
+    let facts = oxide_storage::volume::observe_path(&mount).ok()?;
+    let uuid = facts.uuid?;
+    Some((mount, uuid))
+}
+
+/// Write every file with owner-only mode through one helper, refusing symlinks.
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    file.write_all(bytes).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn write_private_dir(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    // Recursive builders apply their mode to the leaf; every fixture level
+    // must be owner-only, so each missing component is created in turn.
+    let mut prefix = PathBuf::new();
+    for component in path.components() {
+        prefix.push(component.as_os_str());
+        if prefix.as_os_str().is_empty() {
+            continue;
+        }
+        if prefix.is_dir() {
+            continue;
+        }
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&prefix)
+            .map_err(|error| error.to_string())?;
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::getuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(format!("{} is not an owner-only directory", path.display()));
+    }
+    Ok(())
+}
+
+struct FixtureSpec {
+    case: Case,
+    volume: Option<(PathBuf, String)>,
+    ready: bool,
+    admission_lock: bool,
+    fenced_state: bool,
+    registry: bool,
+    intent: bool,
+}
+
+/// Materialize one fresh fixture instance: pool, control, registry, receipts,
+/// markers and checkouts. Every path is inside `root`; nothing links outside.
+fn build_fixture(root: &Path, spec: &FixtureSpec) -> Result<FixturePaths, String> {
+    let paths = FixturePaths {
+        root: root.to_path_buf(),
+        pool: root.join("scratch/pool"),
+        control: root.join("scratch/pool/oxide-managed"),
+        outputs_dir: root.join("oxide-outputs"),
+        checkout_present: root.join("checkouts/ra-present"),
+        checkout_gone: root.join("checkouts/rb-gone"),
+        root_ra: root.join("oxide-outputs/oxide-ra"),
+        root_rb: root.join("oxide-outputs/oxide-rb"),
+    };
+    write_private_dir(&paths.root)?;
+    write_private_dir(&root.join("scratch"))?;
+    write_private_dir(&root.join("home"))?;
+    write_private_dir(&paths.pool.join("payload"))?;
+    // A real budget-only pool's payload carries its slots root; an empty
+    // payload root is a foreign entry the ledger refuses.
+    write_private_dir(&paths.pool.join("payload/slots"))?;
+    write_private_dir(&paths.control.join("outputs"))?;
+    write_private_dir(&paths.checkout_present)?;
+    // rb-gone: positively absent; its parent chain exists.
+    write_private_dir(&paths.checkout_gone.parent().ok_or("no parent")?)?;
+    write_private_dir(&paths.outputs_dir)?;
+    write_private_dir(&paths.root_ra)?;
+    write_private_dir(&paths.root_rb)?;
+
+    let uuid = spec.volume.as_ref().map(|(_, uuid)| uuid.clone());
+    let store_id = hex_const('1', 32);
+    let checkout_id_ra = hex_const('a', 64);
+    let checkout_id_rb = hex_const('b', 64);
+    let checkout_id_rc = hex_const('c', 64);
+    let nonce_ra = hex_const('4', 32);
+    let nonce_rb = hex_const('5', 32);
+    let transaction = hex_const('7', 64);
+    let generation: u64 = 7;
+    let created = now_ms();
+
+    // The recorded root identity: the actual device and inode of the root
+    // directory, and the exact marker bytes.
+    let mut rows = Vec::new();
+    let mut receipts = Vec::new();
+    for (which, root_dir, checkout, checkout_id, nonce) in [
+        (
+            "ra",
+            &paths.root_ra,
+            &paths.checkout_present,
+            &checkout_id_ra,
+            &nonce_ra,
+        ),
+        (
+            "rb",
+            &paths.root_rb,
+            &paths.checkout_gone,
+            &checkout_id_rb,
+            &nonce_rb,
+        ),
+    ] {
+        let marker_bytes = marker_document(
+            checkout,
+            checkout_id,
+            uuid.as_deref(),
+            nonce,
+            generation,
+            created,
+        );
+        write_private_file(&root_dir.join(outputs::MARKER), marker_bytes.as_bytes())?;
+        let meta = std::fs::symlink_metadata(root_dir).map_err(|error| error.to_string())?;
+        use std::os::unix::fs::MetadataExt;
+        let digest = tape::sha256_hex(marker_bytes.as_bytes());
+        let receipt_path = paths.control.join(format!("outputs/{checkout_id}.json"));
+        let selected = uuid.as_ref().map(|volume_uuid| {
+            serde_json::json!({
+                "kind": "external",
+                "root": root_dir.display().to_string(),
+                "volume_uuid": volume_uuid,
+                "nonce": nonce,
+                "generation": generation,
+            })
+        });
+        receipts.push((
+            receipt_path.clone(),
+            serde_json::json!({
+                "version": "oxide.outputs.transition/2",
+                "checkout": checkout.display().to_string(),
+                "checkout_id": checkout_id,
+                "generation": generation,
+                "state": "committed",
+                "links": [{
+                    "member": "target",
+                    "selected": selected,
+                }],
+                "roots": [],
+                "updated_ms": created,
+            }),
+        ));
+        if which == "ra" || uuid.is_some() {
+            rows.push(serde_json::json!({
+                "checkout_id": checkout_id,
+                "checkout": checkout.display().to_string(),
+                "checkout_volume_uuid": uuid,
+                "receipt": receipt_path.display().to_string(),
+                "member": "target",
+                "root": root_dir.display().to_string(),
+                "root_kind": "external",
+                "volume_uuid": uuid,
+                "recipe": "dev",
+                "nonce": nonce,
+                "generation": generation,
+                "root_dev": meta.dev(),
+                "root_ino": meta.ino(),
+                "marker_digest": digest,
+                "selected": true,
+                "pending": false,
+            }));
+        }
+    }
+    // R-C: the legacy row (no nonce, device, inode or digest), absent
+    // checkout, unlisted. Its receipt carries no selected placement, so the
+    // receipt-reference cross-check still holds.
+    let receipt_rc = paths.control.join(format!("outputs/{checkout_id_rc}.json"));
+    receipts.push((
+        receipt_rc.clone(),
+        serde_json::json!({
+            "version": "oxide.outputs.transition/2",
+            "checkout": paths.checkout_gone.join("rc").display().to_string(),
+            "checkout_id": checkout_id_rc,
+            "generation": 2,
+            "state": "committed",
+            "links": [{"member": "target"}],
+            "roots": [],
+            "updated_ms": created,
+        }),
+    ));
+    if uuid.is_some() {
+        rows.push(serde_json::json!({
+            "checkout_id": checkout_id_rc,
+            "checkout": paths.checkout_gone.join("rc").display().to_string(),
+            "receipt": receipt_rc.display().to_string(),
+            "member": "target",
+            "root": paths.outputs_dir.join("oxide-rc").display().to_string(),
+            "root_kind": "external",
+            "recipe": "dev",
+            "generation": 2,
+            "selected": false,
+            "pending": false,
+        }));
+    }
+
+    // The unfinished intent for the UNSETTLED-INTENT case.
+    let intents: Vec<serde_json::Value> = if spec.intent {
+        vec![serde_json::json!({
+            "version": "oxide.outputs.prune-intent/1",
+            "id": hex_const('9', 32),
+            "identity": {
+                "checkout_id": checkout_id_rb,
+                "checkout": paths.checkout_gone.display().to_string(),
+                "receipt": paths.control.join(format!("outputs/{checkout_id_rb}.json")).display().to_string(),
+                "member": "target",
+                "root": paths.root_rb.display().to_string(),
+                "root_kind": "external",
+                "volume_uuid": uuid,
+                "nonce": nonce_rb,
+                "generation": generation,
+                "dev": 1,
+                "ino": 1,
+                "marker_digest": hex_const('8', 64),
+            },
+            "phase": "intent",
+            "quarantine": paths.outputs_dir.join(".prune-oxide-rb-9").display().to_string(),
+            "preview_sha256": hex_const('6', 64),
+            "created_ms": created,
+            "updated_ms": created,
+            "receipt_settled": false,
+        })]
+    } else {
+        Vec::new()
+    };
+
+    let registry = serde_json::json!({
+        "version": "oxide.outputs.registry/2",
+        "schema": 2,
+        "revision": 1,
+        "complete": true,
+        "created_by": transaction,
+        "rows": rows,
+        "intents": intents,
+    });
+    if spec.registry {
+        write_private_file(
+            &paths.control.join("outputs/registry.json"),
+            &serde_json::to_vec_pretty(&registry).map_err(|error| error.to_string())?,
+        )?;
+    }
+    for (path, document) in receipts {
+        write_private_file(
+            &path,
+            &serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?,
+        )?;
+    }
+
+    // The control state: fully fenced version 9, or the unfenced successor
+    // document the EFFECT-2 case upgrades.
+    let state = if spec.fenced_state {
+        serde_json::json!({
+            "version": 9,
+            "next_id": 1,
+            "next_use": 1,
+            "tickets": [],
+            "cleans": [],
+            "records": [],
+            "recoveries": [],
+            "flushes": [],
+            "owned_outputs": "oxide.outputs/3",
+            "outputs_init": {"ready": {"transaction": transaction, "ready_ms": created}},
+            "recorded_accounting": "oxide.accounting/1",
+            "eviction_accounting": "oxide.eviction-accounting/1",
+            "slot_ceiling": "oxide.slots/256",
+            "holding": "oxide.holding/1",
+        })
+    } else {
+        serde_json::json!({
+            "version": 4,
+            "next_id": 1,
+            "next_use": 1,
+            "tickets": [],
+            "cleans": [],
+            "records": [],
+            "recoveries": [],
+            "flushes": [],
+            "owned_outputs": "oxide.outputs/3",
+            "outputs_init": {"ready": {"transaction": transaction, "ready_ms": created}},
+        })
+    };
+    if spec.ready {
+        write_private_file(
+            &paths.control.join("state.json"),
+            &serde_json::to_vec_pretty(&state).map_err(|error| error.to_string())?,
+        )?;
+    }
+    if spec.admission_lock {
+        write_private_file(&paths.control.join("admission.lock"), b"")?;
+    }
+
+    // The pool's ledger and config (a real directory-budget pool, empty).
+    let cap_bytes: u64 = 1024 * 1024 * 1024;
+    write_private_file(
+        &paths.pool.join("config.json"),
+        serde_json::json!({
+            "version": 1,
+            "backend": "directory-budget-v1",
+            "store_id": store_id,
+            "cap_bytes": cap_bytes,
+            "image_bytes": 0,
+        })
+        .to_string()
+        .as_bytes(),
+    )?;
+    // The pool's flock lock file, pre-created the way `Pool::open` finds it,
+    // so a prepared fixture opens without an effect.
+    write_private_file(&paths.pool.join("lock"), b"")?;
+    write_private_file(
+        &paths.pool.join("ledger.json"),
+        serde_json::json!({
+            "version": 1,
+            "store_id": store_id,
+            "cap_bytes": cap_bytes,
+            "next_slot": 1,
+            "next_lease": 1,
+            "slots": [],
+        })
+        .to_string()
+        .as_bytes(),
+    )?;
+
+    // The declared-scratch documents, when the fixture sits on a mounted
+    // external volume: the pool's binding and the account-state record.
+    if let Some((mount, volume_uuid)) = &spec.volume {
+        let scratch_root = root.join("scratch");
+        let binding = serde_json::json!({
+            "schema": "oxide.scratch-pool/1",
+            "volume_uuid": volume_uuid,
+            "mount_point": mount.display().to_string(),
+            "scratch_root": scratch_root.display().to_string(),
+            "pool": paths.pool.display().to_string(),
+            "created_ms": created,
+        });
+        write_private_file(
+            &paths.pool.join("oxide-managed/scratch.json"),
+            &serde_json::to_vec_pretty(&binding).map_err(|error| error.to_string())?,
+        )?;
+        let record = serde_json::json!({
+            "schema": "oxide.scratch-pool-record/1",
+            "volume_uuid": volume_uuid,
+            "mount_point": mount.display().to_string(),
+            "scratch_root": scratch_root.display().to_string(),
+            "pool": paths.pool.display().to_string(),
+            "created_ms": created,
+        });
+        // The account state root for the child's HOME, derived here so the
+        // record lands exactly where the engine's own resolver reads it.
+        let home = root.join("home");
+        let previous = std::env::var_os("HOME");
+        // SAFETY: single-threaded fixture preparation, before any engine work.
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let state_dir = config::Facts::from_env().state_dir();
+        match previous {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let state_dir = state_dir.map_err(|error| error.to_string())?;
+        let hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(paths.pool.as_os_str().as_encoded_bytes());
+            let digest = hasher.finalize();
+            digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        write_private_file(
+            &state_dir.join("scratch-pools").join(format!("{hash}.json")),
+            &serde_json::to_vec_pretty(&record).map_err(|error| error.to_string())?,
+        )?;
+    }
+    Ok(paths)
+}
+
+fn marker_document(
+    checkout: &Path,
+    checkout_id: &str,
+    volume_uuid: Option<&str>,
+    nonce: &str,
+    generation: u64,
+    created_ms: u64,
+) -> String {
+    format!(
+        r#"{{"version":"oxide.outputs.root/2","checkout":{},"checkout_id":{},"label":"{}","recipe":"dev","kind":"external","volume_uuid":{},"nonce":{},"checkout_volume_uuid":{},"generation":{},"created_ms":{}}}"#,
+        json_string(&checkout.display().to_string()),
+        json_string(checkout_id),
+        json_string(
+            &checkout
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ),
+        volume_uuid
+            .map(|u| json_string(u))
+            .unwrap_or_else(|| "null".to_owned()),
+        json_string(nonce),
+        volume_uuid
+            .map(|u| json_string(u))
+            .unwrap_or_else(|| "null".to_owned()),
+        generation,
+        created_ms,
+    )
+}
+
+fn json_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned())
+}
+
+// ---------------------------------------------------------------------------
+// Engine child: one case run
+// ---------------------------------------------------------------------------
+
+fn run_case(
+    fixture_root: &Path,
+    manifest_path: &Path,
+    transcript_out: &Path,
+    case: Case,
+) -> Result<(), String> {
+    let manifest_bytes = std::fs::read(manifest_path).map_err(|error| {
+        format!(
+            "cannot read the manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    if manifest_bytes.len() as u64 > tape::MAX_MANIFEST_BYTES {
+        return Err("the manifest exceeds its read bound".to_owned());
+    }
+    let manifest: HarnessManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| format!("the manifest is invalid: {error}"))?;
+    if manifest.version != MANIFEST_VERSION || manifest.case != case.name() {
+        return Err(format!(
+            "the manifest does not name this engine case ({} for {})",
+            manifest.case,
+            case.name()
+        ));
+    }
+    let manifest_sha = tape::sha256_hex(&manifest_bytes);
+    let operator_list = manifest
+        .operator_list
+        .as_ref()
+        .map(|rel| fixture_root.join(rel));
+
+    let pre = tape::capture_fixture(fixture_root);
+    tape::begin(
+        ENGINE,
+        case.name(),
+        &manifest_sha,
+        "oxide::prune::tape_entry::run_chain",
+    );
+    let outcome = match prune::tape_entry::run_chain(operator_list.as_deref()) {
+        Ok(prune::tape_entry::ChainOutcome::Evaluated { result }) => {
+            TapeEngineOutcome::Completed { result }
+        }
+        Ok(prune::tape_entry::ChainOutcome::Refused(refusal)) => TapeEngineOutcome::Refused {
+            reason: refusal.reason,
+            exit_code: refusal.exit_code,
+        },
+        Err(reason) => TapeEngineOutcome::Refused {
+            reason,
+            exit_code: 1,
+        },
+    };
+    let mut post = tape::capture_fixture(fixture_root);
+    post.pre = pre.post.clone();
+    post.diff_effects = tape::diff_fixture(&pre.post, &post.post);
+    let capture = TapeFixtureCapture {
+        root: post.root.clone(),
+        truncated: post.truncated || pre.truncated,
+        pre: pre.post,
+        post: post.post,
+        diff_effects: post.diff_effects,
+    };
+    tape::finish_and_write(transcript_out, outcome, Some(capture))
+}
+
+// ---------------------------------------------------------------------------
+// Transcript reading for the self-check
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+struct TranscriptDoc {
+    version: String,
+    engine: String,
+    case: String,
+    manifest_sha256: String,
+    outcome: serde_json::Value,
+    truncation: serde_json::Value,
+    effects: Vec<serde_json::Value>,
+    reads: Vec<serde_json::Value>,
+    clocks: Vec<serde_json::Value>,
+    #[serde(default)]
+    classifications: Vec<serde_json::Value>,
+    #[serde(default)]
+    fixture_capture: Option<serde_json::Value>,
+    #[serde(default)]
+    notes: Vec<String>,
+}
+
+fn read_transcript(path: &Path) -> Result<TranscriptDoc, String> {
+    let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+    let doc: TranscriptDoc = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    Ok(doc)
+}
+
+fn outcome_state(doc: &TranscriptDoc) -> String {
+    doc.outcome
+        .get("state")
+        .and_then(|state| state.as_str())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn outcome_reason(doc: &TranscriptDoc) -> String {
+    doc.outcome
+        .get("reason")
+        .and_then(|reason| reason.as_str())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+// ---------------------------------------------------------------------------
+// Self-check: pure tape checks and the embedded unit fixtures
+// ---------------------------------------------------------------------------
+
+struct CheckFailure {
+    what: String,
+}
+
+fn check(condition: bool, what: &str) -> Result<(), CheckFailure> {
+    if condition {
+        Ok(())
+    } else {
+        Err(CheckFailure {
+            what: what.to_owned(),
+        })
+    }
+}
+
+/// Pure recorder checks: deterministic serialization, epoch and occurrence
+/// bookkeeping, per-key occurrence cap, read-row cap, document bound and the
+/// explicit truncation markers.
+fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
+    let build = |digest: String| -> Vec<u8> {
+        tape::begin("oxide", "PURE", "manifest", "pure");
+        for occurrence in 0..3 {
+            tape::read_row_dev(
+                "pure:read",
+                Path::new("/pure/object"),
+                3,
+                4,
+                tape::TapeOutcome::Digest {
+                    digest: format!("{digest}-{occurrence}"),
+                },
+                128,
+            );
+        }
+        tape::effect_row("save@pure", Path::new("/pure/state.json"));
+        tape::clock_row("pure:clock-ms", 1_234);
+        tape::classify_row("pure:classify", "one", "value");
+        tape::budget_begin(1_000, 1_024);
+        let path = temp.join("pure.json");
+        let outcome = TapeEngineOutcome::Completed {
+            result: serde_json::json!({"complete": true, "entries": []}),
+        };
+        if let Err(error) = tape::finish_and_write(&path, outcome, None) {
+            panic!("pure tape window did not close: {error}");
+        }
+        std::fs::read(&path).unwrap_or_default()
+    };
+    let first = build(tape::sha256_hex(b"first"));
+    let second = build(tape::sha256_hex(b"first"));
+    let strip_windows = |bytes: &[u8]| -> String {
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(bytes).expect("pure transcript parses");
+        if let Some(object) = doc.as_object_mut() {
+            object.remove("window_monotonic_start_ns");
+            object.remove("window_monotonic_end_ns");
+        }
+        serde_json::to_string(&doc).expect("normalized transcript serializes")
+    };
+    check(
+        strip_windows(&first) == strip_windows(&second),
+        "the same facts serialize to byte-identical transcripts (field order and rows)",
+    )?;
+    let doc: TranscriptDoc = serde_json::from_slice(&first).map_err(|error| CheckFailure {
+        what: format!("the pure transcript does not parse: {error}"),
+    })?;
+    check(
+        doc.version == TRANSCRIPT_VERSION_CHECK,
+        "the transcript carries the fixed schema version",
+    )?;
+    check(doc.reads.len() == 3, "every recorded read row is carried")?;
+    check(
+        doc.reads
+            .iter()
+            .all(|row| row.get("occurrence").is_some() && row.get("epoch").is_some()),
+        "read rows carry epoch and occurrence",
+    )?;
+    let occurrences: Vec<u64> = doc
+        .reads
+        .iter()
+        .filter_map(|row| row.get("occurrence").and_then(|v| v.as_u64()))
+        .collect();
+    check(
+        occurrences == vec![1, 2, 3],
+        "occurrences count per identity key in order",
+    )?;
+    check(
+        doc.effects.len() == 1
+            && doc.effects[0].get("kind").and_then(|k| k.as_str()) == Some("save@pure"),
+        "the effect row carries its kind",
+    )?;
+    check(
+        doc.clocks.len() == 2,
+        "the budget and clock rows are carried",
+    )?;
+    check(
+        doc.classifications.len() == 2,
+        "the classification rows are carried (one site row, one budget row)",
+    )?;
+    check(
+        outcome_state(&doc) == "completed",
+        "the outcome is the engine's own completed document",
+    )?;
+    check(doc.notes.is_empty(), "no notes for a clean window")?;
+    Ok(())
+}
+
+fn finish_pure(path: PathBuf) -> bool {
+    let outcome = TapeEngineOutcome::Completed {
+        result: serde_json::json!({"complete": true, "entries": []}),
+    };
+    tape::finish_and_write(&path, outcome, None).is_ok()
+}
+
+/// The occurrence cap: the sixty-fifth occurrence of one key marks the
+/// transcript's occurrence truncation instead of dropping the row.
+fn occurrence_cap_check(temp: &Path) -> Result<(), CheckFailure> {
+    tape::begin("oxide", "PURE-CAP", "manifest", "pure");
+    for _ in 0..(tape::MAX_OCCURRENCES_PER_KEY + 2) {
+        tape::read_row_dev(
+            "cap:read",
+            Path::new("/cap/one"),
+            9,
+            9,
+            tape::TapeOutcome::Digest {
+                digest: "digest".to_owned(),
+            },
+            1,
+        );
+    }
+    let outcome = TapeEngineOutcome::Completed {
+        result: serde_json::json!({"complete": false, "entries": []}),
+    };
+    let path = temp.join("cap.json");
+    tape::finish_and_write(&path, outcome, None).map_err(|error| CheckFailure { what: error })?;
+    let doc = read_transcript(&path).map_err(|error| CheckFailure { what: error })?;
+    let truncated = doc
+        .truncation
+        .get("occurrences_truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    check(truncated, "the occurrence cap records truncation")?;
+    check(
+        doc.reads.len() == tape::MAX_OCCURRENCES_PER_KEY,
+        "the per-key occurrence cap holds the fixed bound and marks the excess",
+    )?;
+    Ok(())
+}
+
+/// The read-row cap: past 8192 rows the document says so.
+fn read_row_cap_check(temp: &Path) -> Result<(), CheckFailure> {
+    tape::begin("oxide", "PURE-ROWS", "manifest", "pure");
+    for index in 0..(tape::MAX_READ_ROWS + 4) {
+        let path = PathBuf::from(format!("/rows/{index}"));
+        tape::read_row(
+            "rows:read",
+            &path,
+            tape::TapeOutcome::Digest {
+                digest: "d".to_owned(),
+            },
+            1,
+        );
+    }
+    let outcome = TapeEngineOutcome::Completed {
+        result: serde_json::json!({"complete": false, "entries": []}),
+    };
+    let path = temp.join("rows.json");
+    tape::finish_and_write(&path, outcome, None).map_err(|error| CheckFailure { what: error })?;
+    let doc = read_transcript(&path).map_err(|error| CheckFailure { what: error })?;
+    let truncated = doc
+        .truncation
+        .get("read_rows_truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    check(truncated, "the read-row cap records truncation")?;
+    check(
+        doc.reads.len() == tape::MAX_READ_ROWS,
+        "the read-row cap holds the fixed bound",
+    )
+}
+
+/// The unbound authority read: a pending read left at window close is an
+/// explicit note, never silence.
+fn unbound_authority_note_check(temp: &Path) -> Result<(), CheckFailure> {
+    tape::begin("oxide", "PURE-UNBOUND", "manifest", "pure");
+    tape::authority_core(b"bytes", 64, false, false);
+    let outcome = TapeEngineOutcome::Completed {
+        result: serde_json::json!({"complete": false, "entries": []}),
+    };
+    let path = temp.join("unbound.json");
+    tape::finish_and_write(&path, outcome, None).map_err(|error| CheckFailure { what: error })?;
+    let doc = read_transcript(&path).map_err(|error| CheckFailure { what: error })?;
+    check(
+        doc.notes
+            .iter()
+            .any(|note| note.contains("without its caller binding its identity")),
+        "an unbound authority read is an explicit note",
+    )?;
+    tape::begin("oxide", "PURE-BOUND", "manifest", "pure");
+    tape::authority_core(b"bytes", 64, false, false);
+    tape::authority_bind("pure::site", Path::new("/bound/file"), 64);
+    let outcome = TapeEngineOutcome::Completed {
+        result: serde_json::json!({"complete": false, "entries": []}),
+    };
+    tape::finish_and_write(&temp.join("bound.json"), outcome, None)
+        .map_err(|error| CheckFailure { what: error })?;
+    let doc =
+        read_transcript(&temp.join("bound.json")).map_err(|error| CheckFailure { what: error })?;
+    check(
+        doc.reads.iter().any(|row| {
+            row.get("kind").and_then(|k| k.as_str()) == Some("authority-read@pure::site")
+        }),
+        "the bound authority read carries its site",
+    )
+}
+
+fn fixture_case(temp: &Path, case: Case) -> Result<(), CheckFailure> {
+    let spec = FixtureSpec {
+        case,
+        volume: fixture_volume(temp),
+        ready: true,
+        admission_lock: !matches!(case, Case::Effect1),
+        fenced_state: !matches!(case, Case::Effect2),
+        registry: !matches!(case, Case::RegistryMissing),
+        intent: matches!(case, Case::UnsettledIntent),
+    };
+    let root = temp.join(format!("fixture-{}", case.name().to_lowercase()));
+    let paths = build_fixture(&root, &spec).map_err(|error| CheckFailure { what: error })?;
+    let manifest = serde_json::json!({
+        "version": MANIFEST_VERSION,
+        "case": case.name(),
+        "operator_list": null,
+        "expected": {"outcome": "completed"},
+    });
+    let manifest_path = root.join("manifest.json");
+    write_private_file(
+        &manifest_path,
+        &serde_json::to_vec_pretty(&manifest).map_err(|error| CheckFailure {
+            what: error.to_string(),
+        })?,
+    )
+    .map_err(|error| CheckFailure { what: error })?;
+    let transcript_path = root.join("transcript.json");
+
+    // The engine child: this executable, one case, scrubbed fixture env.
+    let exe = std::env::current_exe().map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    let mut envs: Vec<(String, String)> = vec![
+        ("HOME".to_owned(), root.join("home").display().to_string()),
+        ("OXIDE_TEST_HOME_FROM_ENV".to_owned(), "1".to_owned()),
+        (
+            "OXIDE_CONFIG".to_owned(),
+            root.join("config.toml").display().to_string(),
+        ),
+        ("OXIDE_POOL".to_owned(), paths.pool.display().to_string()),
+        ("OXIDE_POOL_CAP".to_owned(), "1073741824".to_owned()),
+    ];
+    if spec.volume.is_some() {
+        envs.push((
+            "OXIDE_SCRATCH_ROOT".to_owned(),
+            root.join("scratch").display().to_string(),
+        ));
+    }
+    let output = Command::new(&exe)
+        .arg("--fixture-root")
+        .arg(&root)
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--transcript-out")
+        .arg(&transcript_path)
+        .arg("--case")
+        .arg(case.name())
+        .env_clear()
+        .envs(envs)
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .output()
+        .map_err(|error| CheckFailure {
+            what: format!("cannot run the engine child: {error}"),
+        })?;
+    // The child was waited for above (`output()`); it is reaped by the OS
+    // through that wait. Nothing it started survives: the chain spawns no
+    // process, takes no long-lived lock and leaves no writer.
+    check(
+        output.status.success(),
+        &format!(
+            "the {} engine child exits 0 ({}):\n{}",
+            case.name(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        ),
+    )?;
+    let doc = read_transcript(&transcript_path).map_err(|error| CheckFailure { what: error })?;
+    check(
+        doc.version == TRANSCRIPT_VERSION_CHECK && doc.engine == ENGINE && doc.case == case.name(),
+        "the transcript binds engine, case and schema",
+    )?;
+    let manifest_sha =
+        tape::sha256_hex(
+            &std::fs::read(&manifest_path).map_err(|error| CheckFailure {
+                what: error.to_string(),
+            })?,
+        );
+    check(
+        doc.manifest_sha256 == manifest_sha,
+        "the transcript binds the manifest digest",
+    )?;
+    let diff_effects: Vec<serde_json::Value> = doc
+        .fixture_capture
+        .as_ref()
+        .and_then(|capture| capture.get("diff_effects"))
+        .and_then(|effects| effects.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    match case {
+        Case::Base => {
+            check(
+                outcome_state(&doc) == "completed",
+                &format!("BASE completes: {}", outcome_reason(&doc)),
+            )?;
+            let complete = doc
+                .outcome
+                .get("result")
+                .and_then(|result| result.get("complete"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let entries = doc
+                .outcome
+                .get("result")
+                .and_then(|result| result.get("entries"))
+                .and_then(|entries| entries.as_array())
+                .cloned()
+                .unwrap_or_default();
+            check(entries.len() == 3, "BASE evaluates all three roots")?;
+            let candidate_roots: Vec<String> = entries
+                .iter()
+                .filter(|entry| entry.get("candidate").map_or(false, |c| !c.is_null()))
+                .filter_map(|entry| entry.get("root").and_then(|r| r.as_str()))
+                .map(str::to_owned)
+                .collect();
+            let kept_roots: Vec<String> = entries
+                .iter()
+                .filter(|entry| entry.get("kept").map_or(false, |k| !k.is_null()))
+                .filter_map(|entry| entry.get("root").and_then(|r| r.as_str()))
+                .map(str::to_owned)
+                .collect();
+            if mount_root(&root) {
+                // The dedicated proof-volume route: the fixture's own
+                // oxide-outputs sits at the mount, so the external roots bind
+                // and the real per-root fates are exercised end to end.
+                check(complete, "BASE evaluates a complete snapshot")?;
+                check(
+                    kept_roots.iter().any(|root| root.ends_with("oxide-ra")),
+                    "the present checkout's root is kept",
+                )?;
+                check(
+                    kept_roots.iter().any(|root| root.ends_with("oxide-rc")),
+                    "the unlisted legacy root is kept",
+                )?;
+                check(
+                    candidate_roots
+                        .iter()
+                        .any(|root| root.ends_with("oxide-rb")),
+                    "the positively absent checkout's root is a candidate",
+                )?;
+            } else {
+                // A fixture under a shared volume's scratch (or the internal
+                // fallback) binds no external root: the honest outcome is an
+                // incomplete batch with every root kept, recorded with the
+                // engine's own reason.
+                check(
+                    !complete && candidate_roots.is_empty() && kept_roots.len() == 3,
+                    "without a dedicated volume mount the batch is kept and incomplete",
+                )?;
+                check(
+                    entries.iter().all(|entry| {
+                        entry
+                            .get("kept")
+                            .and_then(|k| k.as_str())
+                            .map(|kept| kept.contains("the registry snapshot is incomplete"))
+                            .unwrap_or(false)
+                    }),
+                    "every kept entry carries the engine's own incomplete-snapshot reason",
+                )?;
+            }
+            check(
+                doc.effects.is_empty() && diff_effects.is_empty(),
+                &format!(
+                    "the STATIC BASE case records zero effects (tape {:?}, diff {:?})",
+                    doc.effects, diff_effects
+                ),
+            )?;
+            check(
+                doc.reads.iter().any(|row| {
+                    row.get("kind").and_then(|k| k.as_str())
+                        == Some("authority-read@prune::read_registry")
+                }),
+                "the registry read is bound",
+            )?;
+            check(
+                doc.reads.iter().any(|row| {
+                    row.get("kind").and_then(|k| k.as_str()) == Some("pool:ledger-view")
+                }),
+                "the pool open is recorded",
+            )?;
+        }
+        Case::Effect1 => {
+            check(
+                doc.effects.iter().any(|effect| {
+                    effect.get("kind").and_then(|k| k.as_str()) == Some("lock-create@admission")
+                }),
+                "the absent admission lock's real create is an effect row",
+            )?;
+            let created_lock = diff_effects.iter().any(|effect| {
+                effect.get("path").and_then(|p| p.as_str())
+                    == Some("scratch/pool/oxide-managed/admission.lock")
+                    && effect.get("kind").and_then(|k| k.as_str()) == Some("create@fixture-diff")
+            });
+            check(
+                created_lock,
+                "the fixture diff positively shows the lock create",
+            )?;
+            check(
+                !doc.effects.iter().any(|effect| {
+                    effect
+                        .get("kind")
+                        .and_then(|k| k.as_str())
+                        .map_or(false, |k| {
+                            k.starts_with("save@control-state") || k.starts_with("fence@")
+                        })
+                }),
+                "an already-fenced control is not rewritten",
+            )?;
+        }
+        Case::Effect2 => {
+            let state_changed = diff_effects.iter().any(|effect| {
+                effect.get("path").and_then(|p| p.as_str())
+                    == Some("scratch/pool/oxide-managed/state.json")
+            });
+            check(state_changed, "the missing fences are durably saved")?;
+            let lock_untouched = !diff_effects.iter().any(|effect| {
+                effect.get("path").and_then(|p| p.as_str())
+                    == Some("scratch/pool/oxide-managed/admission.lock")
+            });
+            check(lock_untouched, "the present lock is not recreated")?;
+        }
+        Case::RegistryMissing => {
+            check(
+                outcome_state(&doc) == "refused",
+                "a missing registry is the engine's own refusal",
+            )?;
+            check(
+                outcome_reason(&doc).contains("is missing"),
+                "the refusal names the missing registry",
+            )?;
+            let exit = doc
+                .outcome
+                .get("exit_code")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            check(
+                exit == 2,
+                "the registry refusal carries the engine's exit code",
+            )?;
+            check(
+                doc.effects.is_empty() && diff_effects.is_empty(),
+                "a pre-evaluate refusal writes nothing",
+            )?;
+        }
+        Case::UnsettledIntent => {
+            check(
+                outcome_state(&doc) == "refused",
+                "an unfinished intent refuses before evaluation",
+            )?;
+            check(
+                outcome_reason(&doc).contains("unfinished"),
+                "the refusal names the unfinished intent",
+            )?;
+            let exit = doc
+                .outcome
+                .get("exit_code")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            check(exit == 3, "the unsettled refusal carries exit 3")?;
+            check(
+                doc.effects.is_empty() && diff_effects.is_empty(),
+                "the unsettled refusal writes nothing",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn self_check(pure_only: bool) -> Result<(), String> {
+    let base = std::env::temp_dir();
+    let dir = base.join(format!(
+        "tape-prune-self-check-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    write_private_dir(&dir)
+        .map_err(|error| format!("cannot create the self-check root: {error}"))?;
+    let result = (|| -> Result<(), String> {
+        pure_checks(&dir).map_err(|failure| failure.what)?;
+        occurrence_cap_check(&dir).map_err(|failure| failure.what)?;
+        read_row_cap_check(&dir).map_err(|failure| failure.what)?;
+        unbound_authority_note_check(&dir).map_err(|failure| failure.what)?;
+        if !pure_only {
+            let external = fixture_volume(&dir).is_some();
+            for case in [
+                Case::RegistryMissing,
+                Case::UnsettledIntent,
+                Case::Base,
+                Case::Effect1,
+                Case::Effect2,
+            ] {
+                fixture_case(&dir, case).map_err(|failure| failure.what)?;
+            }
+            let _ = external;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        eprintln!(
+            "oxide: the self-check root is kept for inspection: {}",
+            dir.display()
+        );
+        return Err(format!("self-check failed: {error}"));
+    }
+    std::fs::remove_dir_all(&dir)
+        .map_err(|error| format!("cannot remove the self-check root: {error}"))?;
+    println!("oxide: prune capture harness self-check passed");
+    Ok(())
+}
+
+fn usage() -> String {
+    "usage: tape_prune_eval [--self-check] [--fixture-root <dir> --manifest <path> --transcript-out <path> --case <CASE>]".to_owned()
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        let code = match self_check(false) {
+            Ok(()) => 0,
+            Err(reason) => {
+                eprintln!("oxide: prune capture harness: {reason}");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
+    match args.first().map(String::as_str) {
+        Some("--self-check") => {
+            let code = match self_check(true) {
+                Ok(()) => 0,
+                Err(reason) => {
+                    eprintln!("oxide: prune capture harness: {reason}");
+                    1
+                }
+            };
+            std::process::exit(code);
+        }
+        Some("--fixture-root") => {
+            let parse = || -> Result<(PathBuf, PathBuf, PathBuf, Case), String> {
+                let mut fixture = None;
+                let mut manifest = None;
+                let mut transcript = None;
+                let mut case = None;
+                let mut index = 0;
+                while index < args.len() {
+                    let value = args
+                        .get(index + 1)
+                        .ok_or_else(|| format!("{} needs a value", args[index]))?;
+                    match args[index].as_str() {
+                        "--fixture-root" => fixture = Some(PathBuf::from(value)),
+                        "--manifest" => manifest = Some(PathBuf::from(value)),
+                        "--transcript-out" => transcript = Some(PathBuf::from(value)),
+                        "--case" => {
+                            case = Some(
+                                Case::parse(value)
+                                    .ok_or_else(|| format!("unknown case {value}"))?,
+                            )
+                        }
+                        other => return Err(format!("unknown argument {other}; {}", usage())),
+                    }
+                    index += 2;
+                }
+                match (fixture, manifest, transcript, case) {
+                    (Some(fixture), Some(manifest), Some(transcript), Some(case)) => {
+                        Ok((fixture, manifest, transcript, case))
+                    }
+                    _ => Err(usage()),
+                }
+            };
+            let parsed = parse();
+            let code = match parsed {
+                Ok((fixture_root, manifest, transcript_out, case)) => {
+                    match run_case(&fixture_root, &manifest, &transcript_out, case) {
+                        Ok(()) => {
+                            println!(
+                                "oxide: prune capture harness wrote {} for {}",
+                                transcript_out.display(),
+                                case.name()
+                            );
+                            0
+                        }
+                        Err(reason) => {
+                            eprintln!("oxide: prune capture harness: {reason}");
+                            2
+                        }
+                    }
+                }
+                Err(reason) => {
+                    eprintln!("oxide: prune capture harness: {reason}");
+                    2
+                }
+            };
+            std::process::exit(code);
+        }
+        _ => {
+            eprintln!("oxide: prune capture harness: {}", usage());
+            std::process::exit(2);
+        }
+    }
+}
