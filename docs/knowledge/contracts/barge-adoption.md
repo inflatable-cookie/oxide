@@ -1128,6 +1128,8 @@ source copies, each with `source`, private relative `destination` and `sha256`;
 the diagnostic recopies and rechecks those same bytes from the retained phase.
 It preserves that phase's receipt and packet, resolves every unknown, reviews
 the source audit and then issues the documents and companion tokens. The
+preparation manifest binds each unissued document digest; audit component
+entries name the source pairs rather than their accompanying analysis text. The
 preparation root is retained and counted before the diagnostic. All command
 and environment bindings are fixed before dispatch; changing the source needs
 new source review. The displayed diagnostic scratch budget is a planner-bound

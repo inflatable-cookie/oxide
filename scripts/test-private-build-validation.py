@@ -2293,7 +2293,7 @@ def prepare(options: dict) -> int:
             "host": host,
             "component_sources": {name: [
                 [str(relative), lines] for relative, lines in pairs]
-                for name, pairs in AUDIT_COMPONENT_SOURCES.items()},
+                for name, (_analysis, pairs) in AUDIT_COMPONENT_SOURCES.items()},
             "note": "components are bound at the diagnostic run from the private "
                     "copies this packet stages; host digests above are null until "
                     "measured, and any drift refuses at execution",
@@ -2574,6 +2574,97 @@ def self_test() -> int:
                    dict(corrected, complete=True), oxide_scratch)
     expect_refusal("corrected packet cannot escape scratch", oxide_packet_roots,
                    dict(corrected, candidates=[{"path": str(oxide_scratch.parent), "disposition": "attributed"}]), oxide_scratch)
+
+    # Exercise the real prepare document assembly and manifest, with only the
+    # external supervisor and Git interfaces replaced by fixture observations.
+    loose[0].write_bytes(b"historic log")
+    for path in map(Path, actual_roots + aux_dirs + [str(oxide_scratch / "mixed"),
+                                                       str(oxide_scratch / "discovery"),
+                                                       str(oxide_scratch / "owner")]):
+        path.mkdir(exist_ok=True)
+    for path in map(Path, aux_files):
+        path.write_bytes(b"retained fixture")
+    prep_root = case_base / "prep"
+    prep_root.mkdir(mode=0o700)
+    prep_evidence = prep_root / "evidence"
+    prep_evidence.mkdir(mode=0o700)
+    write_doc(prep_evidence, "receipt.json", {"owned_bytes": {"budget": 128 * 1024 * 1024}})
+    future_barge = case_base / "future"
+    future_barge.mkdir(mode=0o700)
+    future_oxide = oxide_scratch / "future"
+    future_oxide.mkdir(mode=0o700)
+    oxide_repo_fixture = fixture.root / "oxide-repo"
+    barge_repo_fixture = fixture.root / "barge-repo"
+    for repo in (oxide_repo_fixture, barge_repo_fixture):
+        repo.mkdir()
+        (repo / ".git").mkdir()
+    input_file = case_base / "audit-source"
+    input_file.write_bytes(b"audit source")
+    input_manifest = write_doc(oxide_scratch, "prepare-audit-inputs.json", {"inputs": [{
+        "source": str(input_file), "destination": "effigy-source/admission.rs",
+        "sha256": sha256_file(input_file)}]})
+    prepare_options = {"packet_dir": str(prep_root / "packet"),
+                       "oxide_repo": str(oxide_repo_fixture), "oxide_head": OXIDE_PIN_COMMIT,
+                       "oxide_product_head": "6e8ca1f07a3e26be9e96ff55fd774b0f8185165a",
+                       "barge_repo": str(barge_repo_fixture), "barge_head": BARGE_ACCEPTED_HEAD,
+                       "barge_root": str(future_barge), "oxide_root": str(future_oxide),
+                       "audit_inputs": str(input_manifest), "expect_audit_inputs": sha256_file(input_manifest)}
+    def fixture_git_identity(repo, commit):
+        return commit, OXIDE_PIN_TREE if commit == OXIDE_PIN_COMMIT else "b" * 40
+    def fixture_git_tree(repo, root, commit, tree):
+        return {"scripts/tape/private-wrapper.py": "a" * 64} if repo == barge_repo_fixture else {}
+    from contextlib import redirect_stdout
+    from io import StringIO
+    with patch(__name__ + ".BARGE_SCRATCH", case_base), \
+         patch(__name__ + ".OXIDE_SCRATCH", oxide_scratch), \
+         patch(__name__ + ".SCRATCH_ROOT", fixture.root), \
+         patch(__name__ + ".BARGE_HISTORIC_LEDGER", history_file), \
+         patch(__name__ + ".BARGE_PACKET", case_packet), \
+         patch(__name__ + ".OXIDE_DISCOVERY_PACKET", oxide_scratch / "discovery"), \
+         patch(__name__ + ".OXIDE_OWNER_PACKET", oxide_scratch / "owner"), \
+         patch.object(discover_oxide_roots, "__defaults__", (sha256_file(packet_file),)), \
+         patch.dict(os.environ, {"OXIDE_CORRECTED_DISCOVERY_PACKET": str(packet_file)}), \
+         patch(__name__ + ".supervisor_context", return_value=(prep_evidence, "c" * 32,
+                                                                now_ns() + 120_000_000_000, prep_root)), \
+         patch(__name__ + ".extract_commit_identity", side_effect=fixture_git_identity), \
+         patch(__name__ + ".stage_git_tree", side_effect=fixture_git_tree), \
+         redirect_stdout(StringIO()):
+        prepared = expect_ok("real prepare document assembly", prepare, prepare_options)
+    if prepared != 0:
+        failures.append("prepare did not finish its document assembly")
+    else:
+        manifest_path = prep_root / "packet/packet-manifest.json"
+        manifest_doc = json.loads(manifest_path.read_bytes())
+        expected_documents = {"barge-root-ledger.UNISSUED.json", "oxide-budget.UNISSUED.json",
+                              "oxide-history-discovery.json", "oxide-block.UNISSUED.json",
+                              "barge-block.UNISSUED.json", "source-audit.COMPONENTS.json"}
+        if set(manifest_doc["documents"]) != expected_documents:
+            failures.append("prepare manifest does not bind every proposed document")
+        for name, digest in manifest_doc["documents"].items():
+            if sha256_file(manifest_path.parent / name) != digest:
+                failures.append(f"prepare manifest digest mismatch: {name}")
+        components = json.loads((manifest_path.parent / "source-audit.COMPONENTS.json").read_bytes())
+        expected_components = {name: [[str(path), lines] for path, lines in pairs]
+                               for name, (_analysis, pairs) in AUDIT_COMPONENT_SOURCES.items()}
+        if components["component_sources"] != expected_components:
+            failures.append("prepare audit components do not match their actual source pairs")
+        history = json.loads((manifest_path.parent / "oxide-history-discovery.json").read_bytes())
+        if history["complete"] is not False or not history["unknown"]:
+            failures.append("prepare misrepresented unresolved discovery")
+        barge_proposal = json.loads((manifest_path.parent / "barge-block.UNISSUED.json").read_bytes())
+        oxide_proposal = json.loads((manifest_path.parent / "oxide-block.UNISSUED.json").read_bytes())
+        ledger_proposal = json.loads((manifest_path.parent / "barge-root-ledger.UNISSUED.json").read_bytes())
+        budget_proposal = json.loads((manifest_path.parent / "oxide-budget.UNISSUED.json").read_bytes())
+        if any(barge_proposal[key] is not None for key in ("block_id", "authorization_reference",
+                                                             "oxide_sha256", "audit_sha256", "ledger_sha256")):
+            failures.append("prepare unexpectedly issued a Barge block")
+        if any(oxide_proposal[key] is not None for key in ("one_use_id", "binding_sha256",
+                                                            "ledger_sha256", "history_sha256")):
+            failures.append("prepare unexpectedly issued an Oxide block")
+        if ledger_proposal["review_reference"] is not None or budget_proposal["history_reference"] is not None:
+            failures.append("prepare unexpectedly approved a discovery ledger")
+        if manifest_doc["state"] != "unissued preparation; planner binding and review come first":
+            failures.append("prepare manifest did not preserve its unissued state")
 
     # --- primitives ---------------------------------------------------------
     sample = private_write(private_root, Path("docs/sample.txt"), b"sample bytes\n")
