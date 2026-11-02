@@ -1060,8 +1060,11 @@ pure-check reservation against both prospective blocks. It consumes each
 planner-issued companion token once, under the relevant task root's guard;
 the exclusive persistent claim is retained even after refusal. A direct
 entry requires a matching live supervisor parent, command and receipt, not
-just exported environment variables. Root discovery and block proposals are
-unissued; a planner must resolve their unknowns and bind actual inputs before
+just exported environment variables. The process reader treats the kernel size
+probe as an allocation estimate, retries a bounded `ENOMEM`, and requires one
+exact matching returned row; errors and returned sizes are bounded refusal
+diagnostics, never evidence that an unknown process is absent. Root discovery
+and block proposals are unissued; a planner must resolve their unknowns and bind actual inputs before
 execution. A closed runner receipt and matching live inventories still require
 independent judgment; the diagnostic itself never grants qualification.
 

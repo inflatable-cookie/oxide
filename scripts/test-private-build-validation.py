@@ -45,6 +45,7 @@ inspection, no installed-Oxide build outside the issued block.
 from __future__ import annotations
 
 import ctypes
+import errno
 import hashlib
 import io
 import struct
@@ -1487,20 +1488,41 @@ def root_guard(path_text: str, scratch: Path) -> Path:
 
 
 def process_row(pid: int) -> dict:
-    """Read one Darwin kinfo_proc row; identity start is never a clock."""
+    """Read one Darwin kinfo_proc row; identity start is never a clock.
+
+    Match the qualified supervisor's size-probe plus slack and bounded ENOMEM
+    retries. Only an exact, matching final row is an identity; every other
+    result refuses with bounded numeric diagnostics.
+    """
     libc = ctypes.CDLL(None, use_errno=True)
     mib = (ctypes.c_int * 4)(1, 14, 1, pid)
-    size = ctypes.c_size_t(0)
-    if libc.sysctl(mib, 4, None, ctypes.byref(size), None, 0) or size.value != 648:
-        raise GateRefusal("process identity unavailable")
-    buf = ctypes.create_string_buffer(size.value)
-    if libc.sysctl(mib, 4, buf, ctypes.byref(size), None, 0) or size.value != 648:
-        raise GateRefusal("process identity changed or unreadable")
-    raw = buf.raw
-    sec, usec = struct.unpack_from("<qi", raw)
-    return {"pid": struct.unpack_from("<i", raw, 40)[0],
-            "start": (sec, usec), "ppid": struct.unpack_from("<i", raw, 560)[0],
-            "pgid": struct.unpack_from("<i", raw, 564)[0], "zombie": raw[36] == 5}
+    row_size = 648
+    for attempt in range(3):
+        size = ctypes.c_size_t(0)
+        if libc.sysctl(mib, 4, None, ctypes.byref(size), None, 0):
+            raise GateRefusal(f"process identity size query failed: errno={ctypes.get_errno()} size={size.value}")
+        reported = size.value
+        if reported > 1024 * 1024:
+            raise GateRefusal(f"process identity size exceeds bound: size={reported}")
+        capacity = reported + 64 * row_size
+        buf = ctypes.create_string_buffer(capacity)
+        size = ctypes.c_size_t(capacity)
+        if libc.sysctl(mib, 4, buf, ctypes.byref(size), None, 0):
+            error = ctypes.get_errno()
+            if error == errno.ENOMEM and attempt < 2:
+                continue
+            raise GateRefusal(f"process identity read failed: errno={error} size={size.value} capacity={capacity}")
+        if size.value != row_size:
+            raise GateRefusal(f"process identity row size mismatch: size={size.value} expected={row_size}")
+        raw = buf.raw[:size.value]
+        sec, usec = struct.unpack_from("<qi", raw)
+        actual_pid = struct.unpack_from("<i", raw, 40)[0]
+        if actual_pid != pid:
+            raise GateRefusal(f"process identity PID mismatch: expected={pid} observed={actual_pid}")
+        return {"pid": actual_pid, "start": (sec, usec),
+                "ppid": struct.unpack_from("<i", raw, 560)[0],
+                "pgid": struct.unpack_from("<i", raw, 564)[0], "zombie": raw[36] == 5}
+    raise GateRefusal("process identity read failed: bounded retries exhausted")
 
 
 def process_argv(pid: int) -> list:
@@ -3220,6 +3242,71 @@ def self_test() -> int:
                   host={"effigy_sha256": "1" * 64, "oxide_sha256": "2" * 64,
                         "wrapper_sha256": "3" * 64, "git_sha256": "4" * 64,
                         "rustc_sha256": "5" * 64, "supervisor_sha256": "6" * 64})
+
+    # The size query is an allocation estimate, not an exact row. The final
+    # PID observation remains strict, and kernel errors never become "gone".
+    class FakeKinfo:
+        def __init__(self, *, estimate=1296, read_errno=0, read_failures=0,
+                     returned=648, observed_pid=42, size_errno=0):
+            self.estimate, self.read_errno = estimate, read_errno
+            self.read_failures, self.returned = read_failures, returned
+            self.observed_pid, self.size_errno = observed_pid, size_errno
+            self.probes = self.reads = 0
+
+        def sysctl(self, mib, count, output, size_ptr, new, newlen):
+            size = ctypes.cast(size_ptr, ctypes.POINTER(ctypes.c_size_t))
+            if output is None:
+                self.probes += 1
+                size.contents.value = self.estimate
+                if self.size_errno:
+                    ctypes.set_errno(self.size_errno)
+                    return -1
+                return 0
+            self.reads += 1
+            if self.reads <= self.read_failures:
+                ctypes.set_errno(self.read_errno)
+                return -1
+            raw = bytearray(max(648, self.returned))
+            struct.pack_into("<qi", raw, 0, 12, 34)
+            struct.pack_into("<i", raw, 40, self.observed_pid)
+            struct.pack_into("<i", raw, 560, 10)
+            struct.pack_into("<i", raw, 564, 42)
+            ctypes.memmove(output, bytes(raw), min(len(raw), len(output)))
+            size.contents.value = self.returned
+            return 0
+
+    def exercise_kinfo(fake):
+        from unittest.mock import patch
+        with patch(__name__ + ".ctypes.CDLL", return_value=fake):
+            return process_row(42)
+
+    oversized_estimate = FakeKinfo()
+    row = expect_ok("larger size estimate with one exact row", exercise_kinfo, oversized_estimate)
+    if row is not None and (row["pid"], row["start"]) != (42, (12, 34)):
+        failures.append("process row did not preserve identity")
+    transient = FakeKinfo(read_errno=errno.ENOMEM, read_failures=1)
+    expect_ok("transient ENOMEM retries once", exercise_kinfo, transient)
+    if transient.reads != 2 or transient.probes != 2:
+        failures.append("process row did not re-probe after ENOMEM")
+    expect_refusal("process size syscall failure", exercise_kinfo, FakeKinfo(size_errno=errno.EPERM))
+    expect_refusal("process read syscall failure", exercise_kinfo,
+                   FakeKinfo(read_errno=errno.EPERM, read_failures=1))
+    expect_refusal("process ENOMEM retry exhaustion", exercise_kinfo,
+                   FakeKinfo(read_errno=errno.ENOMEM, read_failures=3))
+    expect_refusal("zero process row remains unknown", exercise_kinfo, FakeKinfo(returned=0))
+    expect_refusal("multiple process rows remain unknown", exercise_kinfo, FakeKinfo(returned=1296))
+    expect_refusal("wrong process identity remains unknown", exercise_kinfo, FakeKinfo(observed_pid=43))
+    expect_refusal("unbounded process size estimate", exercise_kinfo, FakeKinfo(estimate=1024 * 1024 + 1))
+    for fake, expected in ((FakeKinfo(size_errno=errno.EPERM), f"errno={errno.EPERM} size=1296"),
+                           (FakeKinfo(returned=0), "size=0 expected=648"),
+                           (FakeKinfo(read_errno=errno.EPERM, read_failures=1), f"errno={errno.EPERM} size=")):
+        try:
+            exercise_kinfo(fake)
+            failures.append("process diagnostic control unexpectedly succeeded")
+        except GateRefusal as refusal:
+            if expected not in str(refusal):
+                failures.append("process refusal omitted bounded syscall diagnostics")
+
 
     # --- supervisor context binding (review finding 3b) ---------------------
     saved_env = {k: os.environ.get(k) for k in ("OXIDE_PROOF_EVIDENCE",
