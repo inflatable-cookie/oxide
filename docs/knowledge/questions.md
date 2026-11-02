@@ -300,5 +300,7 @@ Open, with a proposed design: [Barge adoption](contracts/barge-adoption.md). The
 
 Open: the positive held-zombie group-lifetime proposition remains unproved.
 Tom authorized a separately reviewed weaker sampled held-identity design,
-which does not resolve that proposition or add signal authority. See the
+which observes paired reader rows but does not establish zombie group or
+session membership, resolve that proposition, or add signal authority.
+Zombie-row PGID equality is an unverified premise. See the
 [proposed witness and failed diagnostics](contracts/proof-supervisor-correction.md#proposed-sampled-witness-review-checkpoint-not-implementation).

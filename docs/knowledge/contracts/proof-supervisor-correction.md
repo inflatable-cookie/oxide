@@ -370,7 +370,8 @@ fork through the single positive wait; establish the live child's PID, start,
 parent, session and group in `HeldChild.bind` and the child report; reassert
 non-auto-reap disposition and serialize every wait. During the existing
 bounded window, read the qualified `Kinfo.one` before and after each observation
-and require the same PID/start, direct parent, expected PGID and zombie state;
+and compare its PID/start, direct parent, PGID and zombie fields; zombie-row
+PGID equality is an unverified reader/kernel premise, not established membership;
 retain the actual signal-zero results as observations, not authority. Finally
 require the sole positive wait with settled state recorded before publication.
 The existing safe reader (`scripts/bounded-test.py` `Kinfo.one`/`parse`) has
@@ -413,8 +414,9 @@ Tom's ruling relayed by Queue planner `d070792d` on decision
 held-identity claim for a separately reviewed design**. The intended claim is
 limited to the exact direct child observed at the stated samples: under the
 fixture's exclusive, unreaped parent custody, the bounded non-consuming reader
-reports the bound PID/start, parent and PGID with zombie state, followed by the
-single positive wait. It asserts neither continuous group lifetime nor that a
+reports the bound PID/start and parent with zombie state and a PGID field
+equal to the live binding, followed by the single positive wait. The meaning
+of that zombie PGID equality is an unverified premise, not group membership. It asserts neither continuous group lifetime nor that a
 group signal would succeed, and it cannot turn EPERM into positive evidence.
 Missing, malformed, denied or inconsistent facts remain unknown. The positive
 held-zombie group-lifetime proposition remains an open follow-up, not a proven
@@ -431,33 +433,44 @@ failed diagnostic proves it, and this sampled proposition is not equivalent.
 **Premises and samples.** The fixture is the living direct parent of the child
 it forked, keeps `SIGCHLD` at the reasserted `SIG_DFL` without `SA_NOCLDWAIT`,
 and serializes all waits; it never delegates custody. The live binding in
-`HeldChild.bind` must actually read PID/start/parent and PGID from Kinfo, and
-PGID and session through `getpgid` and `getsid`; the child report supplies its
-own live session/group observations. Record each read with its own timestamp,
-not one synthetic atomic snapshot. During each existing zombie-window sample,
-read `Kinfo.one(pid)` before and after the zero-signal observations, and
-attempt `getpgid(pid)` and `getsid(pid)` between those rows. Each Kinfo row
-must actually report the bound PID/start, direct parent, expected PGID and
-`zombie=true`; each successful group/session syscall must report the bound
-value. The reader does not provide a session field: a previous live session
-value is not a zombie-session observation. Any absent, malformed, denied,
-failed, replaced, contradictory or unavailable required reading makes that
-sample **unknown**, including an unavailable zombie `getsid`; no guessed
-value, EPERM result or previous sample fills it. Review must decide whether
-these APIs can actually deliver the required facts on the target host; inability
-is insufficient evidence, never an automatic pass or a reason to widen scope.
+`HeldChild.bind` reads PID/start/parent and PGID from Kinfo, and PGID and
+session through `getpgid` and `getsid`; the child report supplies its own live
+session/group observations. Timestamp each actual read separately. During each
+existing zombie-window sample, read `Kinfo.one(pid)` before and after the
+zero-signal observations. Each row must actually report the bound PID/start,
+direct parent, `zombie=true`, and a PGID field equal to the live bound PGID.
+That last comparison is only equality of reported numbers: whether this
+reader's zombie PGID field accurately represents membership on the host is an
+**unverified premise**, not a positive group-membership fact. The reader has
+no session field. A session or group result from the live binding is never
+presented as a zombie-time read; zombie session is unknown.
 
-Each recorded Kinfo row proves only what that bounded reader returned at that
-read, conditional on its layout and kernel semantics; the group/session calls
-prove only their own returned values at their separate instants. Matching
-before/after rows detect discrepancies but do not make the intervening syscalls
-atomic or prove continuity. A later single positive wait establishes actual
-collection and its returned exit status; it does not validate earlier rows.
-Even together these facts do not prove continuous group existence, PGID
-reservation or nonreuse between samples, group-wide custody, descendant
-containment, or authority to signal. They do not close owner-death,
-unresponsive-owner or descendant-escape questions. Unknown custody, parent
-death, auto-reap or early collection prevents a positive sampled verdict.
+In the cited XNU revision, [`getpgid` and `getsid`](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_prot.c)
+use `proc_find` and return ESRCH when it cannot obtain the process. The
+[process lookup](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_proc.c)
+does not furnish a live reference for an exited zombie, so those calls cannot
+supply the required zombie readings on that revision. The prior proposal to
+require them was unsatisfiable there; this design makes no zombie-time
+`getpgid` or `getsid` calls and does not convert ESRCH into a positive result.
+In contrast, the cited [`kill` path](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_sig.c)
+falls back after failed `proc_find` to `pzfind`, which checks an exited process
+by PID under the process-list lock and returns success if found. This provides
+a possible explanation for `kill(pid,0)=0` in the packet; the result alone
+neither binds the start token nor proves group or session membership. The
+packet did not record zombie-time group/session calls or the host kernel
+version, so neither an observed ESRCH nor the source-to-host match is claimed.
+
+Any absent, malformed, denied, failed, replaced, contradictory or unavailable
+required row makes the sample unknown; no guessed value, signal-zero result or
+previous sample fills it. Each row proves only what the bounded reader returned
+at that instant, conditional on its layout and kernel semantics. Matching
+before/after rows detect discrepancies but do not make intervening calls atomic
+or prove continuity. A later single positive wait establishes actual collection
+and its returned exit status; it does not validate earlier rows. These facts do
+not prove continuous group existence, PGID reservation or nonreuse between
+samples, group-wide custody, descendant containment, zombie-time session, or
+signal authority. Unknown custody, parent death, auto-reap or early collection
+prevents a positive sampled verdict.
 
 **Proposed cases and receipt.** Keep the eight native case slots and their
 existing dependency edges and three source-only HELD slots. Retain stable case
@@ -475,12 +488,14 @@ No actual implementation is approved by this text.
 Propose receipt `schema: 2` with unchanged top-level case IDs, counts,
 closure and signal rows, plus a bounded `sampled_witness` object on each
 zombie-observation identity row. It contains a sample ordinal and, for each
-of `before`, `group`, `session`, `after`, an `at_ns`, `state` (`observed` or
-`unknown`), actual value or row when observed, and bounded error category when
-unknown. Row values are PID/start/ppid/pgid/zombie; no SID is invented in
-Kinfo. Record `kill_pid_0` and `killpg_pgid_0` exactly as observations and
+of `before` and `after`, an `at_ns`, `state` (`observed` or `unknown`),
+actual row when observed, and bounded error category when unknown. Row values
+are PID/start/ppid/pgid/zombie; no SID or zombie-time group syscall is invented.
+The separate live binding carries its own actual group/session readings and
+timestamps, explicitly labelled live. Record `kill_pid_0` and `killpg_pgid_0` exactly as observations and
 never map EPERM to membership. A sample verdict is positive only when every
-required actual field and both syscall readings match, with custody still held;
+required actual row field matches, with custody still held; the PGID field
+comparison is reported as an unverified premise, not established membership;
 otherwise it is unknown or a case failure, never positive. Retain the 64 KiB,
 32 case, 32 signal and 64 identity caps: each sample is one bounded identity
 row and an omitted required row or receipt/publication failure prevents a
@@ -501,13 +516,14 @@ root retention, writer-closure or unknown-outcome rules.
 
 **Discrimination and later proof.** Pure seam tests must drive both actual case
 bodies and helper transitions, including matching paired rows and separate
-actual session/group reads; inject absent/malformed/permission-denied rows,
-changed PID/start/parent/PGID/zombie, inaccessible or changed session/group,
+actual live session/group reads; inject absent/malformed/permission-denied rows,
+changed PID/start/parent/PGID/zombie and inaccessible or changed live binding,
 replaced rows between calls, early wait, changed SIGCHLD and publication
 failure after collection. Check that no such unknown yields a positive sample,
 EPERM alone never passes, retained post-reap refusals issue no syscall, and
-schema 1 is not upgraded. Counterfactuals must fail when session is copied from
-the bound value, one row is reused as both reads, EPERM alone passes, or a
+schema 1 is not upgraded. Counterfactuals must fail when a live session is
+labelled a zombie-time read, PGID equality is claimed as proven membership,
+one row is reused as both reads, EPERM alone passes, or a
 case skips the actual collection; they must exercise real case paths rather
 than only a model. Receipt caps and omitted required evidence must fail closed.
 An accepted design still needs separately scoped implementation, pure selector,
@@ -533,7 +549,7 @@ reclassified, credited, retried, cleaned or used to infer a new verdict.
 Before any implementation, the retained reviewer must assess this design.
 A future reviewed implementation would need effect-free seam regressions for
 positive paired rows and each missing, malformed, denied, changed PID/start,
-parent, PGID, zombie and unverified-session case; counterfactuals must exercise
+parent, PGID and zombie case, and ensure zombie session stays unknown; counterfactuals must exercise
 the real case bodies, early or second wait, receipt failure and post-reap
 signal refusal, and demonstrate that EPERM alone never passes. A separately
 planner-declared exact-head native diagnostic would need the same 8 native and
