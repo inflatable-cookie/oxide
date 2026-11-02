@@ -2791,6 +2791,33 @@ def _self_checks(temp):
         finally:
             os.close(fd)
 
+    @check("case-body-live-probe-collection")
+    def _():
+        # Exercise both real case bodies through their live wait, including the
+        # custody state left behind if that wait unexpectedly collects.
+        fixture_dir = tempfile.mkdtemp(prefix="caseprobe.", dir=temp.path)
+        fd = os.open(fixture_dir, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+        original_report = globals()["wait_for_report"]
+        try:
+            globals()["wait_for_report"] = lambda child: {"identity": {"pgid_is_pid": True, "sid_is_pid": True}}
+            for body in (case_c01, case_c06):
+                receipt = NestedReceipt(fd, {"schema": 1, "totals": receipt_totals()})
+                kinfo = _FakeKinfo(os.getpid() + 424_250)
+                child = seam_child(temp, body.__name__, kinfo, receipt)
+                child.bind = lambda: None
+                children = types.SimpleNamespace(spawn=lambda *args: child)
+                with _Patch("waitpid", lambda pid, options: (pid, 9)):
+                    try:
+                        body(None, children, receipt, 0.2)
+                        raise AssertionError("positive live wait did not fail the case")
+                    except CaseFailure:
+                        pass
+                expect(child.state == "settled" and child.reaped and child.exit_status == 9,
+                       body.__name__ + " collected without settling custody")
+        finally:
+            globals()["wait_for_report"] = original_report
+            os.close(fd)
+
     @check("unknown-observations-never-settle")
     def _():
         fixture_dir = tempfile.mkdtemp(prefix="unknownobs.", dir=temp.path)

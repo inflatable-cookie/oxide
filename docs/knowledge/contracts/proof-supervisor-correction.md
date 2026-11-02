@@ -722,8 +722,10 @@ until the sole positive wait, an unexpectedly positive live probe settles
 collected truth immediately, unknown/`ECHILD` observations never settle and the
 helper never falls back to a consuming wait, receipt failure after the positive
 wait retains settled truth with no extra wait or signal, and writer closure
-survives failed cases. The first, second and fourth checks fail against the
-retired helper's actual code paths. The qualification dependency stays the exact
+survives failed cases. The observation and unknown-observation checks discriminate the retired helper.
+A separate regression drives both actual c01 and c06 case bodies with a positive
+live wait; restoring their retired inline waits fails that regression because
+they leave collected custody marked held. The qualification dependency stays the exact
 pinned runner `fcfda2b0…`; no product, supervisor or consumer bytes change, the
 native diagnostic remains gated (exact-head source/premise review, actual pins
 and the single-flight launch fix), and this correction carries no native credit
