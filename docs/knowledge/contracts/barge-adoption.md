@@ -1062,9 +1062,10 @@ the exclusive persistent claim is retained even after refusal. A direct
 entry requires a matching live supervisor parent, command and receipt, not
 just exported environment variables. Parent-command and receipt mismatches name
 the failed predicate without printing the command or environment. The process
-reader treats the kernel size
-probe as an allocation estimate, retries a bounded `ENOMEM`, and requires one
-exact matching returned row; errors and returned sizes are bounded refusal
+reader compares the parent and child interpreter images using the kernel
+for both. It treats the kernel size probe as an allocation estimate, retries
+a bounded `ENOMEM`, and requires one exact matching returned row; errors and
+returned sizes are bounded refusal
 diagnostics, never evidence that an unknown process is absent. Root discovery
 and block proposals are unissued; a planner must resolve their unknowns and bind actual inputs before
 execution. A closed runner receipt and matching live inventories still require

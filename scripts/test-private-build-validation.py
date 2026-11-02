@@ -1558,6 +1558,12 @@ def process_executable(pid: int) -> Path:
     return Path(os.fsdecode(buf.value)).resolve(strict=True)
 
 
+def require_same_interpreter(parent_pid: int) -> None:
+    """Compare the kernel's executable image for both processes."""
+    if process_executable(parent_pid) != process_executable(os.getpid()):
+        raise GateRefusal("parent binding: interpreter executable mismatch")
+
+
 def resolve_parent_binding(path: str | Path, label: str) -> Path:
     try:
         return Path(path).resolve(strict=True)
@@ -1595,8 +1601,7 @@ def supervisor_context() -> tuple:
             raise GateRefusal("parent binding: evidence flag mismatch")
         if resolve_parent_binding(supervisor_flags[5], "evidence path") != evidence.resolve(strict=True):
             raise GateRefusal("parent binding: evidence argument mismatch")
-    if process_executable(parent["pid"]) != Path(sys.executable).resolve(strict=True):
-        raise GateRefusal("parent binding: interpreter executable mismatch")
+    require_same_interpreter(parent["pid"])
     if supervisor.name != "bounded-test.py":
         raise GateRefusal("parent binding: supervisor filename mismatch")
     try:
@@ -3343,6 +3348,11 @@ def self_test() -> int:
                 failures.append("process refusal omitted bounded syscall diagnostics")
 
 
+    # Real kernel-fact positive control: no process spawn, no mocked path.
+    kernel_image = expect_ok("current process kernel image", process_executable, os.getpid())
+    if kernel_image is not None:
+        expect_ok("same kernel process image", require_same_interpreter, os.getpid())
+
     # --- supervisor context binding (review finding 3b) ---------------------
     saved_env = {k: os.environ.get(k) for k in ("OXIDE_PROOF_EVIDENCE",
                                                 "OXIDE_PROOF_RUN_ID",
@@ -3417,10 +3427,12 @@ def self_test() -> int:
         issued_receipt = dict(receipt, command=issued_child, limit_s=120)
         (evidence_dir / "receipt.json").write_bytes(canonical_json(issued_receipt))
         os.environ["OXIDE_PROOF_DEADLINE_NS"] = str(start + 120 * 1_000_000_000)
+        real_process_executable = process_executable
         with patch.object(sys, "argv", [sys.argv[0], *issued_tail]), \
              patch(__name__ + ".process_row", side_effect=lambda pid: me if pid == os.getpid() else parent), \
              patch(__name__ + ".process_argv", return_value=issued_parent) as parent_args, \
-             patch(__name__ + ".process_executable", return_value=Path(sys.executable).resolve(strict=True)) as parent_exe, \
+             patch(__name__ + ".process_executable",
+                   side_effect=lambda pid: real_process_executable(pid) if pid == os.getpid() else kernel_image) as parent_exe, \
              patch(__name__ + ".sha256_file", return_value=SUPERVISOR_SHA256) as supervisor_digest:
             expect_ok("issued 120s 128MiB preparation shape", supervisor_context)
             controls = [
@@ -3439,8 +3451,8 @@ def self_test() -> int:
                 if change is not None:
                     changed_argv[change[0]] = change[1]
                 parent_args.return_value = changed_argv
-                parent_exe.return_value = (supervisor_file if special == "executable"
-                                           else Path(sys.executable).resolve(strict=True))
+                parent_exe.side_effect = (lambda pid: real_process_executable(pid) if pid == os.getpid()
+                                          else supervisor_file if special == "executable" else kernel_image)
                 supervisor_digest.return_value = "0" * 64 if special == "digest" else SUPERVISOR_SHA256
                 try:
                     supervisor_context()
@@ -3449,7 +3461,7 @@ def self_test() -> int:
                     if expected not in str(refusal):
                         failures.append(f"{expected}: wrong diagnostic {refusal}")
             parent_args.return_value = issued_parent
-            parent_exe.return_value = Path(sys.executable).resolve(strict=True)
+            parent_exe.side_effect = lambda pid: real_process_executable(pid) if pid == os.getpid() else kernel_image
             supervisor_digest.return_value = SUPERVISOR_SHA256
             for field, value, message in (("command", ["other"], "receipt command mismatch"),
                                           ("scratch", "/other", "receipt scratch path mismatch"),
