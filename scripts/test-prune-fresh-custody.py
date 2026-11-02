@@ -827,6 +827,53 @@ def run_cases(proof, adapter, world, boot, collector):
             world.candidates(doc) == {roots[0], roots[1], roots[2]},
             f"the restored state did not re-offer every root: {world.report(doc)}",
         )
+        for pool_name in ("internal", "removable"):
+            (proof.evidence / "witness-paused").unlink()
+            (proof.evidence / "witness-release").unlink()
+            replacement_path = paths[pool_name + "_state"]
+            original = Path(replacement_path).read_bytes()
+            child = permanent.start_child(
+                proof, [adapter.binary, "outputs", "prune", "--dry-run"], boot, env
+            )
+            try:
+                permanent.wait_for(str(proof.evidence / "witness-paused"), "first custody decision")
+                changed = json.loads(original)
+                changed["records"].append(custody_record(checkouts[later], "spawning", 4_100_001))
+                locks = []
+                try:
+                    for lock_path in (paths["internal_lock"], paths["removable_lock"]):
+                        descriptor = os.open(lock_path, os.O_RDWR)
+                        locks.append(descriptor)
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    before = os.stat(replacement_path)
+                    atomic_write(replacement_path, json.dumps(changed).encode())
+                    after = os.stat(replacement_path)
+                    require((before.st_dev, before.st_ino) != (after.st_dev, after.st_ino),
+                            "replacement did not change state identity")
+                finally:
+                    for descriptor in reversed(locks):
+                        os.close(descriptor)
+                (proof.evidence / "witness-release").write_bytes(b"release")
+                code, out, stderr = permanent.finish_child(proof, child, f"{pool_name} replacement preview")
+                permanent.require_normal_exit(pool_name, code)
+                permanent.require_confirmed_closure(pool_name, stderr)
+                require(code == 0, f"{pool_name} replacement preview failed")
+                doc = json.loads(out)
+                world.complete(doc, pool_name)
+                require(roots[first] in world.candidates(doc)
+                        and world.kept(doc, roots[later]) == "an active writer still holds this checkout",
+                        f"{pool_name} replacement was not witnessed: {world.report(doc)}")
+            finally:
+                if child.pid in proof.unclosed:
+                    (proof.evidence / "witness-release").write_bytes(b"release")
+                    try:
+                        code, _, stderr = permanent.finish_child(proof, child, f"{pool_name} cleanup")
+                        permanent.require_normal_exit(pool_name, code)
+                        permanent.require_confirmed_closure(pool_name, stderr)
+                    except BaseException:
+                        proof.closure_known = False
+                        raise
+                atomic_write(replacement_path, original)
     collector.case("in-place-witness", in_place_witness)
 
     def lock_refusals():
