@@ -625,30 +625,30 @@ def run_cases(proof, adapter, world, boot, collector):
     collector.case("baseline-no-effect", baseline_no_effect)
 
     def absent_custody():
+        # The checkouts stay vanished for the rest of the run: every later
+        # case's custody decision must be reached, and presence keeps a root
+        # before custody is consulted.
         before_links = links_snapshot(checkouts)
         before_control = tree_digest(world.control)
-        aways = {index: world.vanish(path) for index, path in enumerate(checkouts[:2])}
-        try:
-            code, out, _ = world.dry_run("absent custody", boot)
-            require(code == 0, "absent-custody dry run failed")
-            doc = json.loads(out)
-            world.complete(doc, "absent custody")
-            require(
-                world.candidates(doc) == {roots[0], roots[1]},
-                f"absent checkouts did not become witnessed candidates: {world.report(doc)}",
-            )
-            require(
-                world.kept(doc, roots[2]) == "the checkout is present, so its root is kept",
-                world.report(doc),
-            )
-            require(
-                tree_digest(world.control) == before_control,
-                "the custody decisions changed the control tree",
-            )
-            require(links_snapshot(checkouts) == before_links, "a member link moved")
-        finally:
-            for index, away in aways.items():
-                world.restore(checkouts[index], away)
+        for path in checkouts[:2]:
+            world.vanish(path)
+        code, out, _ = world.dry_run("absent custody", boot)
+        require(code == 0, "absent-custody dry run failed")
+        doc = json.loads(out)
+        world.complete(doc, "absent custody")
+        require(
+            world.candidates(doc) == {roots[0], roots[1]},
+            f"absent checkouts did not become witnessed candidates: {world.report(doc)}",
+        )
+        require(
+            world.kept(doc, roots[2]) == "the checkout is present, so its root is kept",
+            world.report(doc),
+        )
+        require(
+            tree_digest(world.control) == before_control,
+            "the custody decisions changed the control tree",
+        )
+        require(links_snapshot(checkouts) == before_links, "a member link moved")
     collector.case("absent-custody", absent_custody)
 
     def dynamic_writer():
@@ -672,22 +672,21 @@ def run_cases(proof, adapter, world, boot, collector):
                 time.sleep(0.1)
             else:
                 raise RuntimeError("the writer's record never became active")
-            away = world.vanish(checkouts[2])
-            try:
-                code, out, _ = world.dry_run("writer holds", boot)
-                require(code == 0, "writer-holds dry run failed")
-                doc = json.loads(out)
-                world.complete(doc, "writer holds")
-                require(
-                    world.candidates(doc) == {roots[0], roots[1]},
-                    f"the writer's siblings were not witnessed clear: {world.report(doc)}",
-                )
-                require(
-                    world.kept(doc, roots[2]) == "an active writer still holds this checkout",
-                    world.report(doc),
-                )
-            finally:
-                world.restore(checkouts[2], away)
+            # The checkout stays vanished with its writer alive: absence and
+            # active custody are decided about the same row.
+            world.vanish(checkouts[2])
+            code, out, _ = world.dry_run("writer holds", boot)
+            require(code == 0, "writer-holds dry run failed")
+            doc = json.loads(out)
+            world.complete(doc, "writer holds")
+            require(
+                world.candidates(doc) == {roots[0], roots[1]},
+                f"the writer's siblings were not witnessed clear: {world.report(doc)}",
+            )
+            require(
+                world.kept(doc, roots[2]) == "an active writer still holds this checkout",
+                world.report(doc),
+            )
         finally:
             permanent.finish_child(proof, child, "writer child")
         deadline = time.monotonic() + min(60, permanent.work_left())
@@ -853,6 +852,12 @@ def run_cases(proof, adapter, world, boot, collector):
         state_original = Path(state_path).read_bytes()
         synthetic_roots = []
         synthetic_receipts = []
+        # The checkout parent must EXIST so each synthetic leaf's absence is
+        # the ordinary leaf-only ENOENT: the missing-ancestor extension never
+        # applies below a volume mount (workflow.md "Pruning owned output
+        # roots", oxide#135).
+        synthetic_parent = os.path.join(world.mount, "synthetic-checkouts")
+        os.mkdir(synthetic_parent, 0o700)
         try:
             template_receipt = world.receipt(checkouts[2])
             template_marker = prior.marker(roots[2])
@@ -877,6 +882,8 @@ def run_cases(proof, adapter, world, boot, collector):
                     label=f"syn-{index}",
                     generation=1,
                     created_ms=1,
+                    volume_uuid=image_uuid,
+                    checkout_volume_uuid=image_uuid,
                 )
                 marker_bytes = json.dumps(marker).encode()
                 Path(root, ".oxide-output.json").write_bytes(marker_bytes)
@@ -911,6 +918,7 @@ def run_cases(proof, adapter, world, boot, collector):
                         member=member,
                         root=root,
                         volume_uuid=image_uuid,
+                        checkout_volume_uuid=image_uuid,
                         nonce=marker.get("nonce"),
                         generation=1,
                         root_dev=root_identity.st_dev,
@@ -980,6 +988,7 @@ def run_cases(proof, adapter, world, boot, collector):
                 os.unlink(receipt)
             for root in synthetic_roots:
                 shutil.rmtree(root)
+            os.rmdir(synthetic_parent)
     collector.case("scale-unchanged", scale_unchanged)
 
     def effect_reproof():
