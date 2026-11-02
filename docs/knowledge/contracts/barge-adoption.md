@@ -598,11 +598,12 @@ source-backed alternatives were compared:
   `prune.rs` `SNAPSHOT_TIME`/`SNAPSHOT_MAX_BYTES`), `prune::paired_store`,
   optional `prune::read_operator_list`, `prune::require_ready`, the
   `registry.unfinished_intents()` pre-evaluate refusal through
-  `prune::unsettled`, and `prune::evaluate` — capturing the preview bytes that
-  `dry_run` writes to stdout by redirecting file descriptor 1 in the harness
-  (test-side only) and recording them in its transcript. Nothing in the chain
-  is re-implemented; the harness skips only `prune::build_preview`'s stdout
-  publication, which is rendering after the decision. The Barge harness calls
+  `prune::unsettled`, and `prune::evaluate`. A cfg(test) adapter follows
+  that call order and exports every `Evaluation` entry (root identity, candidate
+  or kept reason) and `complete`, or the actual pre-evaluate refusal. It does
+  not call `dry_run`, `build_preview`, or redirect stdout; it produces no preview
+  digest. The actual evaluator and its accounting walk run unchanged. The adapter
+  must be checked against the `dry_run` call order and refusal branches. The Barge harness calls
   the actual `barge::release::plan` exactly as `barge-cli` does
   (`main.rs:1484`): `StatePaths` at the fixture (explicit `override_dir`, the
   production-frozen fixture seam), a test `AccountFacts` returning fixture
@@ -686,8 +687,12 @@ declared dynamic fact, or a declared external allowance; anything else — a
 direct read that skipped a tape site, a read of an object absent from the
 manifest, an entry appearing in an enumeration that the manifest does not
 declare — classifies the whole comparison **insufficient**, with the offending
-row named. Every manifest-declared mandatory fact must appear at least once in
-each engine's transcript.
+row named. Each mandatory obligation names the engine and source site that must observe it.
+A common fact can have obligations for both engines, but an engine is not required
+to read a leaf used only by the other. Every observed occurrence must bind to
+the same manifest fact; missing an applicable obligation is insufficient. Static
+source-site inventory and review of all direct read paths are required alongside
+transcript reconciliation: a transcript alone cannot detect an untaped read.
 
 #### Serialized schemas and caps
 
@@ -707,7 +712,7 @@ facts (the fixture volume's UUID with its real mount point, device and
 `f_mntonname`; writer rows as `(pid, start, uid, descriptor targets,
 lifecycle)`; the external allowances — account-state parents, toolchain home,
 fixture-root parent — by path class); and the case's `mandatory_observations`
-identity keys and expected-effect rows. Caps: at most 4096 file entries,
+(engine, source site, identity key) obligations and expected-effect rows. Caps: at most 4096 file entries,
 32 MiB of bound bytes, 64 roots, 512 process rows, 64 mount rows, 256
 mandatory keys. A cap, a read failure on a mandatory fact, an ambiguous
 root-to-area mapping, or an unclassified actor makes the manifest
@@ -717,8 +722,7 @@ insufficient — never an empty value.
 refusal. Carries: `engine` (`barge`/`oxide`), `case`, `manifest_sha256`, the
 entrypoint identity (symbol and source binding), the outcome
 (`completed`/`refused` with the engine's own refusal vocabulary and exit
-code), the engine's actual result in its own document (the preview bytes
-digest, or the serialized `PruneReport`, with a truncation marker when either
+code), the engine's actual result in its own document (the full bounded `Evaluation` entries and completeness, or the serialized `PruneReport`, with a truncation marker when either
 side's own cap cut rows), `effects` rows (`{kind:
 create|save|fence|reconcile|lock-create|rename|unlink, path, epoch}`), and
 `reads` rows `{kind, identity, outcome, cap, epoch, occurrence}` where
@@ -777,7 +781,7 @@ absent checkout on the same volume, otherwise eligible), R-C (legacy row: no
 nonce/dev/ino/digest, absent checkout, unlisted) — and the matching Barge
 state (`barge.registry/1` volume record naming the real volume UUID,
 expendable, `oxide/outputs` declared with `release_on_reference`, empty intent
-journal, lock files present). Roots never exceed eight per case. All valid
+journal, lock files present). Ordinary cases use at most eight roots. Cap boundaries are separate engine-local refusal tests, not shared parity cases. All valid
 inputs are real fixture bytes read by the real parser paths; each malformed
 counterpart is exercised through the same paths. Expected fates below are
 source-bound declarations the oracle checks; both engines' raw results are
@@ -787,7 +791,7 @@ always recorded.
 | --- | --- | --- | --- | --- |
 | CTL-0 | BASE no-write control (STATIC) | R-A kept (present), R-B candidate, R-C kept (legacy) | R-A kept, R-B release-eligible, R-C kept | MATCH, effects empty, full binding |
 | CTL-1 | registry sticky-incomplete | whole batch kept, incomplete snapshot | whole batch kept | MATCH |
-| CAP-1 | registry over `SNAPSHOT_MAX_RECEIPTS` (8192) | whole batch kept, complete=false, cap bound in transcript | `PLAN_ROOTS` (4096) truncation honestly bound | MATCH (both keep, both truncated) |
+| CAP-1 | more than 8192 representative registry rows | `evaluate` keeps every representative and sets complete=false | not asserted: its root cap concerns a different enumeration | Engine-local cap test; fixture exceeds shared manifest caps, so no shared parity claim. A separate Barge test exercises `PLAN_ROOTS` with its actual root enumeration. |
 | REG-MISSING | registry file absent | `require_ready` refusal, command refused | `OxideRegistry::Unknown`, roots kept | MATCH-KEPT + SCOPE |
 | REG-MALFORMED | registry bytes invalid | refusal | Unknown, kept | MATCH-KEPT |
 | REG-OVERSIZE | registry over its read cap | budget exhaustion → incomplete/kept | `read_bounded_inner` cap → Unknown, kept | MATCH-KEPT |
@@ -809,7 +813,7 @@ always recorded.
 | MRK-REPLACED | marker bytes ≠ recorded digest | identity mismatch → this root kept | verify fails → kept | MATCH |
 | ID-NONCE | row nonce ≠ receipt/marker nonce | error → batch kept | kept | MATCH-KEPT + SCOPE |
 | ID-GENERATION | generation or kind mismatch | error → batch kept | kept | MATCH-KEPT + SCOPE |
-| ID-INODE | root inode changed vs recorded | this root kept (current source scope demonstrated) | that root kept | D-2 (declared; Q-E owns acceptance) |
+| ID-INODE | root inode changed vs recorded | identity error makes snapshot incomplete; whole batch kept | that root kept | D-2 (batch versus root; demonstrate with a second otherwise eligible root) |
 | ID-DEVICE-STALE | recorded device stale; UUID, inode, marker match | accepted by `judge_recorded_root` reconciliation → candidate | remount `Verified` → eligible | MATCH (binds current source, never the stale D-1 prose) |
 | ID-DEVICE-LIVE | volume remounted mid-window (DYNAMIC) | current binding decides (expected unknown → kept) | `Verified` with remount evidence | D-1 (declared; Q-E owns acceptance) |
 | ABS-ANCESTOR-MISSING | checkout parent directory missing | kept: absence unknown (the 111-row class) | absence chain incomplete → kept | MATCH |
@@ -857,8 +861,7 @@ never parity. Each names its realization and oracle.
    proving the detection is not a harness false positive.
 4. **Broken or exhausted tape.** Pure: a transcript missing one mandatory
    leaf, a duplicate/conflicting key, and an over-cap document are each
-   rejected with the named reason. Native: CAP-1 shows both engines' real caps
-   producing honest truncation records, never partial parity.
+   rejected with the named reason. Engine-local cap tests exercise Oxide representative overflow and Barge root overflow independently; neither claims partial parity.
 5. **Identity epoch changes.** CF-5 binds `(pid, start)`: a second writer
    process (naturally different start) never reconciles as the first; the pure
    self-test rejects same-pid/different-start reuse. ID-DEVICE-LIVE and
@@ -1131,8 +1134,9 @@ Each has a recommendation. None blocks the design as a whole.
   from a reviewed plan. Or may maintain release idle-eligible roots?
 - **Q-D. The 91 legacy roots.** Option A (recommended, keep Oxide-side), B (a
   Barge attestation waiver, which needs a ruling against "no override"), or C?
-- **Q-E. Parity D-1 and D-2.** Accept that Barge keeps a root for an inode
-  change and tolerates a device-only change, where Oxide keeps the batch?
+- **Q-E. Parity D-1 and D-2.** Does the demonstrated inode-drift batch-versus-root difference warrant acceptance?
+  Stale device-only drift alone is reconciled by current Oxide; a live remount
+  needs observed evidence before any D-1 difference can be ruled on.
 - **Q-F. Pool slots.** Stay Oxide-owned in F6 (recommended) and declared later
   in `S8-pool`?
 - **Q-G. Declaration authority.** The stored record wins and a library caller
