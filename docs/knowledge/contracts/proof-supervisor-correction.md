@@ -423,10 +423,11 @@ held-zombie group-lifetime proposition remains an open follow-up, not a proven
 result or an abandoned historical failure. This ruling authorizes design and
 review, not an executable oracle change, new signal authority or a native run.
 
-### Proposed sampled witness: review checkpoint, not implementation
+### Sampled witness: implementation and review
 
-The following is a proposed implementation contract under decision
-`535ec990-1577-49fb-9741-480dc7434eeb`. It is not yet design-approved. The
+The following design was accepted at `003ef92` (retained review comment
+`6572820333`, verdict `sampled-witness-design`), and its sampled fixture
+implementation is pending independent source review and native diagnostic. The
 stronger **positive held-zombie group-lifetime claim remains OPEN**: neither
 failed diagnostic proves it, and this sampled proposition is not equivalent.
 
@@ -483,9 +484,9 @@ single positive reap. `c03` and `c07` remain dependent on c01. The existing
 `case_c01`, `case_c02`, `HeldChild.bind`, `wait_exit`,
 `observe_zombie_window`, `probe_wait_live`, `reap`, `FixtureChildren.settle`,
 `NestedReceipt` and case-dispatch/plan tables are the proposed source sites.
-No actual implementation is approved by this text.
+The implementation retains these case IDs and dependencies.
 
-Propose receipt `schema: 2` with unchanged top-level case IDs, counts,
+The fixture writes receipt `schema: 2` with unchanged top-level case IDs, counts,
 closure and signal rows, plus a bounded `sampled_witness` object on each
 zombie-observation identity row. It contains a sample ordinal and, for each
 of `before` and `after`, an `at_ns`, `state` (`observed` or `unknown`),
@@ -502,9 +503,11 @@ row and an omitted required row or receipt/publication failure prevents a
 positive verdict. Schema 1 remains historical as written; readers must
 explicitly recognize schema 2 and its changed c02 meaning, reject unknown
 schemas, and never interpret schema 1's bound `sid`/`pgid` fields as
-post-exit readings. A source audit must identify and update any consumers or
-establish there are none before adopting that schema; historical packets are
-never rewritten.
+post-exit readings. A repository source audit of scripts and selectors found no readers of this
+nested receipt or its case/identity rows outside the fixture; the guard reads
+its own distinct receipt. There is no schema-1 migration or generic nested
+receipt reader, so no unknown-version read is accepted by this apparatus.
+Historical packets are never rewritten.
 
 The successful consuming wait is still exactly one: immediately mark settled
 and reaped before any fallible publication, publish only the actual collected
@@ -546,8 +549,8 @@ command log SHA256 is
 This remains separate from the failed `5c94c76d` packet above; neither is
 reclassified, credited, retried, cleaned or used to infer a new verdict.
 
-Before any implementation, the retained reviewer must assess this design.
-A future reviewed implementation would need effect-free seam regressions for
+The retained reviewer must assess the implementation against the accepted design.
+Its effect-free seam regressions must cover
 positive paired rows and each missing, malformed, denied, changed PID/start,
 parent, PGID and zombie case, and ensure zombie session stays unknown; counterfactuals must exercise
 the real case bodies, early or second wait, receipt failure and post-reap
@@ -555,8 +558,7 @@ signal refusal, and demonstrate that EPERM alone never passes. A separately
 planner-declared exact-head native diagnostic would need the same 8 native and
 3 HELD cases, actual paired observations and one positive reap, the existing
 300 s / 512 MiB bound, qualified guard, reserve/watchdog, ledger caps,
-retention and no-new-signal rules. No fresh proof, retry, cleanup or executable
-oracle change follows from this checkpoint.
+retention and no-new-signal rules. No fresh proof, retry or cleanup follows from this source change.
 
 ### Held-child source discriminator
 
@@ -874,24 +876,24 @@ identities, and distinguishes `outer` (never claimed by the fixture) from
 cases, and EOF, nonzero exit, an absent observed PID or an outer closed never
 turn nested unknown into closed.
 
-The native case map proves, on the fixture's own controlled direct children
+The native case map attempts, on the fixture's own controlled direct children
 only: child-created session/group membership and identity binding;
 `EPERM`-refused `setpgid`/second-`setsid` escapes for the session leader;
 exclusive unreaped custody with `SIGCHLD` `SIG_DFL` (the `SIG_IGN`
 counterfactual demo shows kernel auto-reap, `ECHILD`, no zombie); `WNOHANG`
 collecting nothing while live and `ECHILD` on a second wait; bounded
-`kill`/`killpg`-0 zombie persistence with the same `(PID, start)` identity;
+paired zombie reader samples for `(PID, start)` with `kill`/`killpg`-0
+results as observations and PGID-field equality an unverified premise;
 the prospective cooperative stop (bounded `killpg` TERM, escalating KILL,
 only under positive held custody, then the single positive reap); refusal
 after settled custody with no syscall; and vacuous `kill(0,0)`/`killpg(0,0)`
-as the demonstration that observations are not signal handles. These cases
-correspond to the source discriminator above: a zombie held unreaped by its
-parent keeps its group alive until the reap, and the kernel cannot auto-reap
-behind a `SIG_DFL` holder that never waits concurrently. `s01` owner death,
+as the demonstration that observations are not signal handles. The stronger positive held-zombie group-lifetime claim remains open; the
+source discriminator is conditional and these samples do not establish it. `s01` owner death,
 `s02` owner-unresponsive and `s03` descendant group escape remain HELD
 source/pure-only: no bounded no-new-authority containment/lifetime argument
 has been accepted, so the script refuses to execute them natively. The
-apparatus is unqualified: no native run has happened, native execution is
+apparatus is unqualified: two diagnostics failed as recorded above; the
+corrected sampled implementation has no native result. Native execution is
 gated on the retained Queue reviewer's exact-head source/premise approval,
 the one counted-path diagnostic runs through the task's proof route (never
 by author or reviewer), fit is unmeasured, and nothing here is a product

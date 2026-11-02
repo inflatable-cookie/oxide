@@ -17,7 +17,8 @@ descriptor. Every fixture writer target (HOME, cwd, temp, inputs, outputs,
 control files, receipts) lives inside that directory — never in the guard's
 auto-cleaned scratch.
 
-What it proves, natively, on its OWN controlled direct children only:
+What the fixture attempts on its OWN controlled direct children only (the
+corrected sampled implementation has not yet passed its native diagnostic):
 
 - a fixture child creates its own session and process group (`setsid` before
   exec), and the parent binds that identity (PID, PGID == PID, SID == PID,
@@ -38,11 +39,10 @@ What it proves, natively, on its OWN controlled direct children only:
   answers `ECHILD`); the single consuming wait is the positive reap, and a
   second `waitpid` after it fails `ECHILD` (a wait cannot be undone and a
   concurrent wait is refused);
-- zombie lifetime: an exited child stays a live group member while held
-  unreaped — `kill(pid, 0)` and `killpg(pgid, 0)` persist over a bounded
-  observation window and the `kinfo_proc` row keeps the same
-  (PID, start) identity with its zombie flag set; the group ends only at the
-  positive reap;
+- sampled held-zombie identity: paired non-consuming reader observations
+  report PID/start/parent/zombie and the PGID field; field equality is an
+  unverified premise, not proof of membership or lifetime. Signal-zero
+  results are observations only; the stronger lifetime claim stays open;
 - the prospective cooperative stop mechanics on a fixture-owned child: a
   bounded `killpg(pgid, SIGTERM)` (escalating to `SIGKILL`) is issued ONLY
   while the holder positively holds that unreaped direct child, and the child
@@ -630,6 +630,13 @@ def sigchld_disposition():
         return None
 
 
+def require_non_auto_reap():
+    disposition = sigchld_disposition()
+    if (disposition is None or disposition.get("handler") not in (None, SIG_DFL_VALUE)
+            or disposition.get("flags", 0) & SA_NOCLDWAIT):
+        raise Uncertain("SIGCHLD non-auto-reap premise is unknown or changed")
+
+
 # ---------------------------------------------------------------------------
 # child environment
 
@@ -675,7 +682,9 @@ def child_program(role, report_fd, stop_path, parent_pgid, absent_pgid):
         "def write_report(document):\n"
         "    document['pid'] = os.getpid()\n"
         "    document['pgid_self'] = os.getpgid(0)\n"
+        "    document['pgid_at_ns'] = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)\n"
         "    document['sid_self'] = os.getsid(0)\n"
+        "    document['sid_at_ns'] = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)\n"
         "    payload = json.dumps(document).encode()\n"
         "    if len(payload) > 4096:\n"
         "        os._exit(97)\n"
@@ -887,6 +896,8 @@ class HeldChild:
         self.probes = []
 
     def _identity_row(self, transition, extra=None):
+        if transition in ("bound", "live-child-report", "zombie-observation", "reaped") and len(self.receipt.document.get("identities", [])) >= IDENTITY_ROWS_MAX:
+            raise Uncertain("required identity row would be omitted")
         row = {"case": self.case, "role": self.role, "pid": self.pid,
                "pgid": self.pgid, "sid": self.sid, "start": self.start,
                "state": self.state, "transition": transition}
@@ -912,21 +923,27 @@ class HeldChild:
         self.await_session()
         try:
             pgid = os.getpgid(self.pid)
+            pgid_at_ns = now_ns()
             sid = os.getsid(self.pid)
+            sid_at_ns = now_ns()
         except OSError as error:
             raise CaseFailure(f"the child's identity is unreadable ({type_name(error)})")
         try:
             row = self.module.Kinfo.one(self.pid)
-        except OSError as error:
+            row_at_ns = now_ns()
+        except (OSError, ValueError) as error:
             raise Uncertain(f"the child's kinfo_proc row is unreadable ({type_name(error)})")
         if pgid != self.pid or sid != self.pid:
             raise CaseFailure(f"the child is not its own group/session leader (pgid={pgid}, sid={sid})")
         if row is None:
             raise CaseFailure("the child has no kinfo_proc row")
-        if row["ppid"] != os.getpid() or row["pgid"] != self.pid:
+        if row.get("pid") != self.pid or row.get("ppid") != os.getpid() or row.get("pgid") != self.pid or row.get("zombie") is not False or not isinstance(row.get("start"), int):
             raise CaseFailure(f"the child is not this leader's direct group child (row={row})")
         self.pgid, self.sid, self.start = pgid, sid, row["start"]
-        self._identity_row("bound", {"zombie": row["zombie"], "ppid": row["ppid"]})
+        self._identity_row("bound", {"zombie": row["zombie"], "ppid": row["ppid"],
+                                     "live_binding": {"kinfo": {"at_ns": row_at_ns, "row": row},
+                                                      "group": {"at_ns": pgid_at_ns, "value": pgid},
+                                                      "session": {"at_ns": sid_at_ns, "value": sid}}})
 
     def _probe(self, label, call):
         self.probes.append({"label": label, "at_ns": now_ns()})
@@ -940,33 +957,52 @@ class HeldChild:
     def _kinfo_row(self):
         try:
             return self.module.Kinfo.one(self.pid)
-        except OSError:
+        except (OSError, ValueError, TypeError):
             return None
 
     def observe_zombie_window(self, duration_s, samples):
-        """Verdict-grade while custody is held: the PID cannot be recycled
-        while this holder keeps the child unreaped, so a `kill(pid, 0)`
-        failure means the premise broke, not that identity was reused."""
-        if self.state not in ("held", "held-exited") or self.reaped:
-            raise CustodyLost("zombie observation requires unreaped custody")
+        """Record two independent Kinfo observations, never group authority."""
+        if self.state != "held-exited" or self.reaped:
+            raise CustodyLost("zombie observation requires unreaped exited custody")
         interval = duration_s / max(1, samples)
         seen = []
+
+        def sample_row():
+            try:
+                row = self.module.Kinfo.one(self.pid)
+                at_ns = now_ns()
+                keys = ("pid", "start", "ppid", "pgid", "zombie")
+                if not isinstance(row, dict) or any(key not in row for key in keys):
+                    return {"at_ns": at_ns, "state": "unknown", "error": "missing-or-malformed"}
+                if any(type(row[key]) is not int for key in keys[:-1]) or type(row["zombie"]) is not bool:
+                    return {"at_ns": at_ns, "state": "unknown", "error": "malformed"}
+                return {"at_ns": at_ns, "state": "observed", "row": {key: row[key] for key in keys}}
+            except (OSError, ValueError, TypeError, KeyError):
+                return {"at_ns": now_ns(), "state": "unknown", "error": "unreadable"}
+
         for index in range(samples):
+            require_non_auto_reap()
+            if self.state != "held-exited" or self.reaped:
+                raise CustodyLost("custody lost during sampling")
+            before = sample_row()
             kill_result = self._probe("kill-pid-0", lambda: os.kill(self.pid, 0))
             killpg_result = self._probe("killpg-pgid-0", lambda: os.killpg(self.pgid, 0))
-            row = self._kinfo_row()
-            seen.append((kill_result, killpg_result, row))
-            self.receipt.add_identity({"case": self.case, "role": self.role, "pid": self.pid,
-                                       "pgid": self.pgid, "sid": self.sid, "start": self.start,
-                                       "state": self.state, "transition": "zombie-observation",
-                                       "kill_pid_0": kill_result, "killpg_pgid_0": killpg_result,
-                                       "row_zombie": None if row is None else row["zombie"],
-                                       "row_start": None if row is None else row["start"]})
-            if kill_result != "0" or killpg_result != "0":
-                raise CaseFailure(f"the held exited child did not persist as a group member "
-                                  f"(kill={kill_result}, killpg={killpg_result})")
-            if row is not None and row["start"] != self.start:
-                raise Uncertain("the held child's identity changed while unreaped")
+            after = sample_row()
+            require_non_auto_reap()
+            expected = {"pid": self.pid, "start": self.start, "ppid": os.getpid(),
+                        "pgid": self.pgid, "zombie": True}
+            positive = (self.state == "held-exited" and not self.reaped
+                        and before.get("row") == expected and after.get("row") == expected)
+            sample = {"ordinal": index + 1, "before": before, "after": after,
+                      "verdict": "observed" if positive else "unknown",
+                      "pgid_semantics": "unverified-field-equality", "zombie_session": "unknown"}
+            if len(self.receipt.document.get("identities", [])) >= IDENTITY_ROWS_MAX:
+                raise Uncertain("required sampled identity row would be omitted")
+            self._identity_row("zombie-observation", {"kill_pid_0": kill_result,
+                               "killpg_pgid_0": killpg_result, "sampled_witness": sample})
+            if not positive:
+                raise Uncertain("sampled held identity is unknown or inconsistent")
+            seen.append(sample)
             if index < samples - 1:
                 time.sleep(interval)
         return seen
@@ -1004,8 +1040,8 @@ class HeldChild:
 
         The exit is observed through the safe `kinfo_proc` reader's zombie
         flag (SZOMB), which consumes nothing: the child stays this holder's
-        unreaped zombie with its (PID, start) identity and its group intact
-        until the single positive reap. `waitpid(WNOHANG)` cannot serve this
+        unreaped zombie with its observed (PID, start) identity until the
+        single positive reap; group lifetime is not established. `waitpid(WNOHANG)` cannot serve this
         role — a poll that returns the child HAS collected it (Apple
         waitpid(2): WNOHANG is non-blocking, not non-consuming), which is
         exactly the oxide#242 diagnostic failure (ESRCH at the zombie window,
@@ -1021,6 +1057,8 @@ class HeldChild:
         end = time.monotonic() + max(0.05, cap_s)
         while time.monotonic() < end:
             row = self._kinfo_row()
+            if row is not None and (not isinstance(row, dict) or type(row.get("start")) is not int or type(row.get("zombie")) is not bool):
+                raise Uncertain("the exit observation is malformed")
             if row is not None and self.start is not None and row["start"] != self.start:
                 raise Uncertain("the held child's identity changed while unreaped")
             if row is not None and row["zombie"]:
@@ -1234,6 +1272,16 @@ def wait_for_report(child, cap_s=READINESS_WAIT_S):
     return None
 
 
+def record_live_report(child, report):
+    if not isinstance(report, dict) or any(type(report.get(k)) is not int for k in
+            ("pid", "pgid_self", "sid_self", "pgid_at_ns", "sid_at_ns")):
+        raise Uncertain("child live identity report missing or malformed")
+    if (report["pid"], report["pgid_self"], report["sid_self"]) != (child.pid, child.pgid, child.sid):
+        raise Uncertain("child live report contradicts the bound identity")
+    child._identity_row("live-child-report", {"live_report": {key: report[key] for key in
+                        ("pid", "pgid_self", "sid_self", "pgid_at_ns", "sid_at_ns")}})
+
+
 def check_log_size(children, child):
     size = children.log_size(child)
     if size < 0 or size > LOG_MAX_BYTES:
@@ -1250,8 +1298,7 @@ CASES = [
      "live probes collect nothing (a positive probe would settle collected truth); "
      "stop-file exit observed without collecting; zombie witness; single positive reap"},
     {"name": "c02-zombie-group-lifetime", "kind": "native", "depends": [],
-     "children": 1, "summary": "an exited child stays a group member while held unreaped "
-     "(bounded kill/killpg-0 window, same start identity); the group ends at the reap"},
+     "children": 1, "summary": "sampled held-zombie identity; legacy case ID does not claim group lifetime"},
     {"name": "c03-stop-under-custody", "kind": "native", "depends": ["c01-bind-live-hold"],
      "children": 1, "summary": "the prospective cooperative stop: bounded killpg TERM, "
      "escalating KILL, only while the holder positively holds the unreaped direct child; "
@@ -1294,6 +1341,7 @@ def case_names(kind=None):
 
 
 def case_c01(runner, children, receipt, cap_s):
+    require_non_auto_reap()
     child = children.spawn("c01-bind-live-hold", "hold")
     child.bind()
     end = time.monotonic() + LIVE_HOLD_S
@@ -1311,10 +1359,14 @@ def case_c01(runner, children, receipt, cap_s):
     if not report.get("identity", {}).get("pgid_is_pid") \
             or not report.get("identity", {}).get("sid_is_pid"):
         raise CaseFailure("the child does not verify its own session/group leadership")
+    record_live_report(child, report)
     child.request_stop()
     child.wait_exit(cap_s)
     child.observe_zombie_window(0.3, 2)
+    require_non_auto_reap()
     child.reap(cap_s)
+    if not child.reaped or child.state != "settled" or child.exit_status is None:
+        raise Uncertain("the sampled child was not positively collected")
     check_log_size(children, child)
     if child.exit_status != 0:
         raise CaseFailure(f"the child exited {child.exit_status}")
@@ -1326,15 +1378,21 @@ def case_c01(runner, children, receipt, cap_s):
                               "pgid": child.pgid, "sid": child.sid, "start": child.start,
                               "state": "settled", "transition": "post-reap-probe-inconclusive",
                               "kill_pid_0": kill_result, "killpg_pgid_0": killpg_result})
-    return {"detail": "bound live, held, stopped, zombie witnessed, reaped; identity held across the arc"}
+    return {"detail": "live binding, sampled held-zombie identity, and one positive reap"}
 
 
 def case_c02(runner, children, receipt, cap_s):
+    require_non_auto_reap()
     child = children.spawn("c02-zombie-group-lifetime", "self-exit")
     child.bind()
+    report = wait_for_report(child)
+    record_live_report(child, report)
     child.wait_exit(cap_s)
     child.observe_zombie_window(ZOMBIE_WINDOW_S, ZOMBIE_SAMPLES)
+    require_non_auto_reap()
     child.reap(cap_s)
+    if not child.reaped or child.state != "settled" or child.exit_status is None:
+        raise Uncertain("the sampled child was not positively collected")
     check_log_size(children, child)
     killpg_result = child.zero_probe("killpg-pgid-0-after-reap", lambda: os.killpg(child.pgid, 0))
     if killpg_result != "ESRCH":
@@ -1343,8 +1401,7 @@ def case_c02(runner, children, receipt, cap_s):
                               "start": child.start, "state": "settled",
                               "transition": "post-reap-probe-inconclusive",
                               "killpg_pgid_0": killpg_result})
-    return {"detail": "the zombie persisted as a group member across the bounded window; "
-                      "the group ended at the positive reap"}
+    return {"detail": "sampled held-zombie identity and one positive reap; legacy ID makes no lifetime claim"}
 
 
 def case_c03(runner, children, receipt, cap_s):
@@ -1615,7 +1672,7 @@ def run_native(diagnostic):
 
     fixture = ctx["fixture"]
     receipt_base = {
-        "schema": 1,
+        "schema": 2,
         "task": "oxide#237",
         "mode": mode_name,
         "uncounted": bool(diagnostic),
@@ -2798,7 +2855,9 @@ def _self_checks(temp):
         fixture_dir = tempfile.mkdtemp(prefix="caseprobe.", dir=temp.path)
         fd = os.open(fixture_dir, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
         original_report = globals()["wait_for_report"]
+        original_premise = globals()["require_non_auto_reap"]
         try:
+            globals()["require_non_auto_reap"] = lambda: None
             globals()["wait_for_report"] = lambda child: {"identity": {"pgid_is_pid": True, "sid_is_pid": True}}
             for body in (case_c01, case_c06):
                 receipt = NestedReceipt(fd, {"schema": 1, "totals": receipt_totals()})
@@ -2816,6 +2875,199 @@ def _self_checks(temp):
                        body.__name__ + " collected without settling custody")
         finally:
             globals()["wait_for_report"] = original_report
+            globals()["require_non_auto_reap"] = original_premise
+            os.close(fd)
+
+    @check("sampled-live-binding-and-disposition")
+    def _():
+        fixture_dir = tempfile.mkdtemp(prefix="samplebind.", dir=temp.path)
+        fd = os.open(fixture_dir, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+        original_disposition = globals()["sigchld_disposition"]
+        try:
+            receipt = NestedReceipt(fd, {"schema": 2, "totals": receipt_totals()})
+            kinfo = _FakeKinfo(os.getpid() + 424_256)
+            child = seam_child(temp, "livebind", kinfo, receipt)
+            child.await_session = lambda: None
+            with _Patch("getpgid", lambda pid: pid), _Patch("getsid", lambda pid: pid):
+                child.bind()
+            binding = receipt.document["identities"][-1]["live_binding"]
+            expect(all(type(binding[key]["at_ns"]) is int for key in ("kinfo", "group", "session")),
+                   "live binding lacks actual timestamps")
+            expect(binding["kinfo"]["row"]["pid"] == child.pid
+                   and binding["group"]["value"] == child.pid
+                   and binding["session"]["value"] == child.pid, "live binding misreported values")
+            for value in (None, {"handler": SIG_IGN_VALUE, "flags": 0},
+                          {"handler": SIG_DFL_VALUE, "flags": SA_NOCLDWAIT}):
+                globals()["sigchld_disposition"] = lambda value=value: value
+                try:
+                    require_non_auto_reap()
+                    raise AssertionError("invalid SIGCHLD disposition accepted")
+                except Uncertain:
+                    pass
+        finally:
+            globals()["sigchld_disposition"] = original_disposition
+            os.close(fd)
+
+    @check("sampled-witness-real-cases-and-fail-closed")
+    def _():
+        fixture_dir = tempfile.mkdtemp(prefix="samplecases.", dir=temp.path)
+        fd = os.open(fixture_dir, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+        saved = {name: globals()[name] for name in
+                 ("require_non_auto_reap", "wait_for_report", "check_log_size", "LIVE_HOLD_S")}
+        try:
+            globals()["require_non_auto_reap"] = lambda: None
+            globals()["check_log_size"] = lambda *_: None
+            globals()["LIVE_HOLD_S"] = 0
+            for body in (case_c01, case_c02):
+                receipt = NestedReceipt(fd, {"schema": 2, "totals": receipt_totals()})
+                kinfo = _FakeKinfo(os.getpid() + 424_252)
+                kinfo.row["zombie"] = True
+                child = seam_child(temp, body.__name__, kinfo, receipt)
+                child.bind = lambda: None
+                child.request_stop = lambda: True
+                children = types.SimpleNamespace(spawn=lambda *args: child)
+                report = {"pid": child.pid, "pgid_self": child.pid, "sid_self": child.pid,
+                          "pgid_at_ns": 1, "sid_at_ns": 2,
+                          "identity": {"pgid_is_pid": True, "sid_is_pid": True}}
+                globals()["wait_for_report"] = lambda _: report
+                waits = []
+                def collect(pid, options):
+                    waits.append(options)
+                    return (pid, 0)
+                def eperm(*_):
+                    raise PermissionError(errno.EPERM, "fixture")
+                with _Patch("waitpid", collect), _Patch("kill", lambda *_: None), _Patch("killpg", eperm):
+                    body(None, children, receipt, 0.2)
+                rows = [r for r in receipt.document["identities"] if r.get("transition") == "zombie-observation"]
+                expect(len(rows) == (2 if body is case_c01 else ZOMBIE_SAMPLES), "missing case samples")
+                expect(kinfo.reads >= 2 * len(rows) and waits == [0] and child.reaped,
+                       "case did not read paired rows and collect exactly once")
+                for row in rows:
+                    witness = row["sampled_witness"]
+                    expect(row["killpg_pgid_0"] == "EPERM" and witness["verdict"] == "observed"
+                           and witness["pgid_semantics"] == "unverified-field-equality"
+                           and witness["zombie_session"] == "unknown"
+                           and witness["before"] is not witness["after"], "sample misstates evidence")
+            # Both actual case bodies must reject a missing collection and an
+            # EPERM probe with no identity row, rather than treating the probe
+            # or a returned no-op reap as proof.
+            for body in (case_c01, case_c02):
+                for defect in ("no-collection", "no-row"):
+                    receipt = NestedReceipt(fd, {"schema": 2, "totals": receipt_totals()})
+                    kinfo = _FakeKinfo(os.getpid() + 424_255)
+                    kinfo.row["zombie"] = True
+                    child = seam_child(temp, body.__name__ + defect, kinfo, receipt)
+                    child.bind = lambda: None
+                    child.request_stop = lambda: True
+                    if defect == "no-collection":
+                        child.reap = lambda *_: None
+                    else:
+                        original_one = kinfo.one
+                        def lose_after_exit(pid):
+                            if kinfo.reads >= 1:
+                                return None
+                            return original_one(pid)
+                        kinfo.one = lose_after_exit
+                    children = types.SimpleNamespace(spawn=lambda *args: child)
+                    report = {"pid": child.pid, "pgid_self": child.pid, "sid_self": child.pid,
+                              "pgid_at_ns": 1, "sid_at_ns": 2,
+                              "identity": {"pgid_is_pid": True, "sid_is_pid": True}}
+                    globals()["wait_for_report"] = lambda _: report
+                    def denied(*_):
+                        raise PermissionError(errno.EPERM, "fixture")
+                    with _Patch("kill", lambda *_: None), _Patch("killpg", denied), \
+                            _Patch("waitpid", lambda pid, options: (pid, 0)):
+                        try:
+                            body(None, children, receipt, 0.2)
+                            raise AssertionError(body.__name__ + " accepted " + defect)
+                        except Uncertain:
+                            pass
+            # Every case body must fail closed on each reader/identity defect.
+            for body in (case_c01, case_c02):
+                for defect in ("missing", "malformed", "denied", "pid", "start", "ppid", "pgid", "zombie", "changed"):
+                    receipt = NestedReceipt(fd, {"schema": 2, "totals": receipt_totals()})
+                    kinfo = _FakeKinfo(os.getpid() + 424_257)
+                    kinfo.row["zombie"] = True
+                    child = seam_child(temp, body.__name__ + defect, kinfo, receipt)
+                    child.bind = lambda: None
+                    child.request_stop = lambda: True
+                    original_one = kinfo.one
+                    def case_fault(pid, defect=defect):
+                        row = original_one(pid)
+                        if kinfo.reads == 1 or (defect == "changed" and kinfo.reads == 2):
+                            return row  # exit observation and first sample row
+                        if defect == "missing":
+                            return None
+                        if defect == "malformed":
+                            return {"pid": pid}
+                        if defect == "denied":
+                            raise PermissionError(errno.EPERM, "fixture")
+                        key = "start" if defect == "changed" else defect
+                        row[key] = False if key == "zombie" else row[key] + 1
+                        return row
+                    kinfo.one = case_fault
+                    children = types.SimpleNamespace(spawn=lambda *args: child)
+                    report = {"pid": child.pid, "pgid_self": child.pid, "sid_self": child.pid,
+                              "pgid_at_ns": 1, "sid_at_ns": 2,
+                              "identity": {"pgid_is_pid": True, "sid_is_pid": True}}
+                    globals()["wait_for_report"] = lambda _: report
+                    with _Patch("kill", lambda *_: None), _Patch("killpg", lambda *_: None):
+                        try:
+                            body(None, children, receipt, 0.2)
+                            raise AssertionError(body.__name__ + " accepted " + defect)
+                        except Uncertain:
+                            pass
+                    expect(not child.reaped, "bad sample reached collection")
+            # Drive the real helper on both matching and defective rows, including
+            # a change between its independent calls. EPERM never supplies a row.
+            for fault in ("missing", "malformed", "denied", "pid", "start", "ppid", "pgid", "zombie", "changed"):
+                receipt = NestedReceipt(fd, {"schema": 2, "totals": receipt_totals()})
+                kinfo = _FakeKinfo(os.getpid() + 424_253)
+                kinfo.row["zombie"] = True
+                child = seam_child(temp, fault, kinfo, receipt)
+                child.state = "held-exited"
+                original = kinfo.one
+                def broken(pid, fault=fault):
+                    row = original(pid)
+                    if fault == "denied":
+                        raise PermissionError(errno.EPERM, "fixture")
+                    if fault == "missing":
+                        return None
+                    if fault == "malformed":
+                        return {"pid": pid}
+                    if fault == "changed" and kinfo.reads == 1:
+                        return row
+                    key = "start" if fault == "changed" else fault
+                    row[key] = False if key == "zombie" else row[key] + 1
+                    return row
+                kinfo.one = broken
+                with _Patch("kill", lambda *_: None), _Patch("killpg", lambda *_: None):
+                    try:
+                        child.observe_zombie_window(0, 1)
+                        raise AssertionError(fault + " accepted as positive")
+                    except Uncertain:
+                        pass
+                rows = [r for r in receipt.document["identities"] if r.get("transition") == "zombie-observation"]
+                expect(rows and rows[-1]["sampled_witness"]["verdict"] == "unknown",
+                       fault + " was not recorded unknown")
+            receipt = NestedReceipt(fd, {"schema": 2, "totals": receipt_totals()})
+            kinfo = _FakeKinfo(os.getpid() + 424_254)
+            child = seam_child(temp, "early", kinfo, receipt)
+            child.state, child.reaped = "settled", True
+            try:
+                child.observe_zombie_window(0, 1)
+                raise AssertionError("already reaped child sampled")
+            except CustodyLost:
+                pass
+            globals()["require_non_auto_reap"] = lambda: (_ for _ in ()).throw(Uncertain("changed"))
+            child.state, child.reaped = "held-exited", False
+            try:
+                child.observe_zombie_window(0, 1)
+                raise AssertionError("changed disposition accepted")
+            except Uncertain:
+                pass
+        finally:
+            globals().update(saved)
             os.close(fd)
 
     @check("unknown-observations-never-settle")

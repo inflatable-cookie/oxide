@@ -303,4 +303,4 @@ Tom authorized a separately reviewed weaker sampled held-identity design,
 which observes paired reader rows but does not establish zombie group or
 session membership, resolve that proposition, or add signal authority.
 Zombie-row PGID equality is an unverified premise. See the
-[proposed witness and failed diagnostics](contracts/proof-supervisor-correction.md#proposed-sampled-witness-review-checkpoint-not-implementation).
+[proposed witness and failed diagnostics](contracts/proof-supervisor-correction.md#sampled-witness-implementation-and-review).
