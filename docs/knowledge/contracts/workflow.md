@@ -5421,6 +5421,38 @@ author and reviewer native remain unactivated.
   never-converted checkout are unchanged, and no other refusal is relaxed.
   `oxide exec` and an external subcommand's own builds bind through the same
   path and get the same recreation.
+- **A task-local cleanup that meets an interrupted transition (oxide#236).**
+  A write-ahead transition leaves exactly one prepared placement, and the
+  next permanent-mode leased command replays it under the checkout binding
+  mutex and the cross-pool writer-custody gate before Cargo runs — so a
+  task-local build-output cleanup that removed the whole `target` directory
+  (with the member links and the prepared transition's sibling link) does
+  not block the continuation. The replay reads a positively absent sibling
+  and the receipt's old link state alone: nothing published rolls the
+  preparation back to the committed receipt (or detached when nothing was
+  committed yet) and creates nothing; a live sibling or a finished rename
+  still commits under the unchanged verified-root, nonce, identity and Git
+  checks; a foreign or changed member path, an unreadable component or an
+  unknown writer stops with the receipt bytes, the live entries and both
+  roots kept exactly as they are. Inspect with `oxide outputs status`;
+  `oxide outputs adopt` can replay only after the refusal is resolved. After the rollback the binding recreates the real
+  target directory (the deleted-target rule above) and republishes the
+  member links into the same verified root, advancing the receipt generation
+  without moving, adopting or deleting anything. The surfaces that cannot
+  replay at their check point keep their refusals with the explicit recovery
+  named: `oxide exec` and external subcommands refuse a prepared receipt
+  before the slot is keyed (a mid-transition receipt must never key a
+  slot), `oxide clean` refuses before cleaning, ephemeral-drive-mode
+  binding refuses and names the permanent-registration prerequisite (ephemeral
+  mode never transitions automatically), a
+  guarded one-use workspace refuses with the exact guarded diagnostic
+  ([one-use workspaces §4.4](one-use-workspaces.md)), and unknown custody
+  refuses with everything kept. `oxide outputs adopt` in permanent mode
+  replays the same receipt under its own barrier and is the documented
+  recovery for those surfaces once a permanent registration is available;
+  `oxide pool set-mode permanent` changes an existing registration.
+  `oxide outputs status` and `outputs plan`
+  report a pending transition as state, never as a refusal to recover.
 - **Members.** V1 knows exactly `debug`, `release`, `<triple>/debug` and
   `<triple>/release`. A member has at most two components matching
   `[A-Za-z0-9_.-]+`, is neither `.` nor `..`, and is never absolute or an
