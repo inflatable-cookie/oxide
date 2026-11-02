@@ -8,10 +8,8 @@
 //! every crate that compiles those files with `cfg(test)` set: the library's
 //! own unit-test compilation uses this module, and the binary harness crate
 //! re-roots the binary tape under `crate::tape` with the same signatures.
-//! A `tests/` target links the prebuilt library without `cfg(test)`, so these
-//! statements compile away there; the harness records those leaves at its own
-//! call sites and its pre/post fixture capture binds any library-internal
-//! effect as ground truth.
+//! The re-rooted harness crate uses its own shared binary tape for both
+//! module sets; this sink remains for the library's unit-test compilation.
 //!
 //! Like the binary tape this is an observation tape: records are buffered
 //! under one bounded thread-local sink and fed nowhere. Epochs are

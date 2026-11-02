@@ -1410,50 +1410,41 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # truncation, the unbound-read note) plus the BASE, EFFECT-1, EFFECT-2,
 # REGISTRY-MISSING and UNSETTLED-INTENT unit fixtures, each a fresh
 # exclusively owned fixture and one waited child. `proof:tape-prune:self-check`
-# runs only the pure checks. Both build nothing long-lived, touch no image,
-# pool, install or live root, and are not a benchmark, a native proof or an
-# alias for full QA; the counted native diagnostic at a source-approved head
-# stays X-S2's separately activated Queue proof. Validation temp is placed on
-# the selected volume's scratch with the same derivation the covering Rust
-# suite uses.
+# runs only the pure checks. Both use the caller's private build pool and
+# owner-only TMPDIR. They are not a benchmark, native proof or full QA; the
+# counted diagnostic at a source-approved head remains X-S2's Queue proof.
 [tasks."proof:tape-prune:test"]
-run = """scratch_base=$(python3 - <<'PY'
-import importlib.util, os, sys
-spec = importlib.util.spec_from_file_location("bounded_test", "scripts/bounded-test.py")
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-probe = module.DefaultProbe()
-selection = module.select_default_parent(os.environ, probe)
-if selection["source"] != "selected-volume":
-    print(selection["reason"] or "no eligible selected volume", file=sys.stderr)
-print(module.validation_parent(selection))
-PY
-)
-mkdir -p "$scratch_base"
-oxide_temp=$(mktemp -d "$scratch_base/run.XXXXXX")
-TMPDIR="$oxide_temp" TMP="$oxide_temp" TEMP="$oxide_temp" \
-  oxide test --test tape_prune_eval
+run = """scratch_base=$(python3 - <<'PYSCRATCH'
+import os, stat, sys
+p = os.environ.get("TMPDIR", "")
+if not p or not os.path.isabs(p) or os.path.realpath(p) != p or not p.startswith("/Volumes/Builds/scratch/oxide/"):
+    sys.exit("private TMPDIR under /Volumes/Builds/scratch/oxide required")
+s = os.stat(p)
+if not stat.S_ISDIR(s.st_mode) or s.st_uid != os.getuid() or s.st_mode & 0o077:
+    sys.exit("TMPDIR must be an owner-only directory")
+print(p)
+PYSCRATCH
+) || exit 1
+oxide_temp=$(mktemp -d "$scratch_base/run.XXXXXX") || exit 1
+TMPDIR="$oxide_temp" TMP="$oxide_temp" TEMP="$oxide_temp" oxide test --test tape_prune_eval
 status=$?
 rm -rf "$oxide_temp"
 exit $status"""
 
 [tasks."proof:tape-prune:self-check"]
-run = """scratch_base=$(python3 - <<'PY'
-import importlib.util, os, sys
-spec = importlib.util.spec_from_file_location("bounded_test", "scripts/bounded-test.py")
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-probe = module.DefaultProbe()
-selection = module.select_default_parent(os.environ, probe)
-if selection["source"] != "selected-volume":
-    print(selection["reason"] or "no eligible selected volume", file=sys.stderr)
-print(module.validation_parent(selection))
-PY
-)
-mkdir -p "$scratch_base"
-oxide_temp=$(mktemp -d "$scratch_base/run.XXXXXX")
-TMPDIR="$oxide_temp" TMP="$oxide_temp" TEMP="$oxide_temp" \
-  oxide test --test tape_prune_eval -- --self-check
+run = """scratch_base=$(python3 - <<'PYSCRATCH'
+import os, stat, sys
+p = os.environ.get("TMPDIR", "")
+if not p or not os.path.isabs(p) or os.path.realpath(p) != p or not p.startswith("/Volumes/Builds/scratch/oxide/"):
+    sys.exit("private TMPDIR under /Volumes/Builds/scratch/oxide required")
+s = os.stat(p)
+if not stat.S_ISDIR(s.st_mode) or s.st_uid != os.getuid() or s.st_mode & 0o077:
+    sys.exit("TMPDIR must be an owner-only directory")
+print(p)
+PYSCRATCH
+) || exit 1
+oxide_temp=$(mktemp -d "$scratch_base/run.XXXXXX") || exit 1
+TMPDIR="$oxide_temp" TMP="$oxide_temp" TEMP="$oxide_temp" oxide test --test tape_prune_eval -- --self-check
 status=$?
 rm -rf "$oxide_temp"
 exit $status"""

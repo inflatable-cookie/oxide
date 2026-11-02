@@ -27,17 +27,34 @@
 #![allow(dead_code)]
 // The harness crate compiles the binary's modules for the tape; the command dispatch stays in the binary.
 
-//! Module re-rooting: this file is the root of the harness crate. The binary
-//! modules below are compiled here with `cfg(test)` set, so their
-//! `#[cfg(test)]` recorder statements are active in this crate. They resolve
-//! sibling modules and the root constants through this crate root; `oxide_storage`
-//! remains the real library dependency (a `tests/` target cannot re-root the
-//! prebuilt library without changing its `use` statements), so the
-//! library-side leaves record in the library's own `cfg(test)` compilation
-//! (`src/tape.rs`), and this harness binds library-internal effects as ground
-//! truth through its pre/post fixture capture. `HoldingSweep` is the command
-//! layer's holding pass, stubbed to a no-op here because the prune chain
-//! never evicts; the statement sites in `removable.rs` stay unchanged.
+//! Both binary and library modules are re-rooted in this crate; the self
+//! alias resolves the unchanged library paths to the same test tape. The
+//! fixture also uses a debug home override, whose authority is under review.
+//! `HoldingSweep` is only reachable from the separate release command.
+
+extern crate self as oxide_storage;
+
+#[path = "../../test_fs.rs"]
+mod test_fs;
+#[path = "../../release_trace.rs"]
+pub mod release_trace;
+#[path = "../../inventory.rs"]
+pub mod inventory;
+#[path = "../../lease/mod.rs"]
+pub mod lease;
+#[path = "../../owned_delete.rs"]
+pub mod owned_delete;
+#[cfg(debug_assertions)]
+#[path = "../../proof.rs"]
+pub mod proof;
+#[path = "../../supervisor.rs"]
+pub mod supervisor;
+#[path = "../../seed_source/mod.rs"]
+pub mod seed_source;
+#[path = "../../dep_info.rs"]
+pub mod dep_info;
+#[path = "../../volume.rs"]
+pub mod volume;
 
 #[path = "admission.rs"]
 mod admission;
@@ -1017,6 +1034,10 @@ fn unbound_authority_note_check(temp: &Path) -> Result<(), CheckFailure> {
     )
 }
 
+fn has_read(rows: &[serde_json::Value], kind: &str) -> bool {
+    rows.iter().any(|row| row.get("kind").and_then(|value| value.as_str()) == Some(kind))
+}
+
 fn fixture_case(temp: &Path, case: Case) -> Result<(), CheckFailure> {
     let spec = FixtureSpec {
         case,
@@ -1116,6 +1137,20 @@ fn fixture_case(temp: &Path, case: Case) -> Result<(), CheckFailure> {
         .cloned()
         .unwrap_or_default();
 
+    if matches!(case, Case::Base | Case::Effect1 | Case::Effect2) {
+        let expected: &[(&str, &str, &str)] = match case {
+            Case::Base => &[],
+            Case::Effect1 => &[("lock-create@admission", "create@fixture-diff", "scratch/pool/oxide-managed/admission.lock")],
+            Case::Effect2 => &[("fence@managed-control", "save@fixture-diff", "scratch/pool/oxide-managed/state.json")],
+            _ => unreachable!(),
+        };
+        check(doc.effects.len() == expected.len() && diff_effects.len() == expected.len(), "declared, taped and observed effect counts agree")?;
+        for (taped, diff, rel) in expected {
+            check(doc.effects.iter().any(|effect| effect.get("kind").and_then(|v| v.as_str()) == Some(*taped) && effect.get("path").and_then(|v| v.as_str()) == root.join(rel).to_str()), "declared effect appears on tape")?;
+            check(diff_effects.iter().any(|effect| effect.get("kind").and_then(|v| v.as_str()) == Some(*diff) && effect.get("path").and_then(|v| v.as_str()) == Some(*rel)), "declared effect appears in fixture diff")?;
+        }
+    }
+
     match case {
         Case::Base => {
             check(
@@ -1187,6 +1222,11 @@ fn fixture_case(temp: &Path, case: Case) -> Result<(), CheckFailure> {
                     "every kept entry carries the engine's own incomplete-snapshot reason",
                 )?;
             }
+            check(has_read(&doc.reads, "pool:lock"), "the actual library pool lock reaches the evaluator tape")?;
+            let disconnected: Vec<_> = doc.reads.iter().filter(|row| {
+                row.get("kind").and_then(|kind| kind.as_str()) != Some("pool:lock")
+            }).cloned().collect();
+            check(!has_read(&disconnected, "pool:lock"), "a disconnected library tape fails the lock obligation")?;
             check(
                 doc.effects.is_empty() && diff_effects.is_empty(),
                 &format!(

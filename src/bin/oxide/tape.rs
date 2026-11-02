@@ -17,12 +17,8 @@
 //! `Evaluation` export, effect rows and the harness entry are provided to
 //! `src/bin/oxide/tape_harness.rs` (the `[[test]]` target whose argv contract
 //! is `--fixture-root --manifest --transcript-out --case`). The library-side
-//! leaves (`src/volume.rs`, `src/inventory.rs`, `src/lease/pool.rs`) record
-//! through `crate::tape` only in the library's own `cfg(test)` compilation
-//! (`src/tape.rs`); a `tests/` target links the prebuilt library without
-//! `cfg(test)`, so those statements compile away there and the harness
-//! records those leaves at its own call sites instead. This split is recorded
-//! in the owning contract.
+//! leaves (`src/volume.rs`, `src/inventory.rs`, `src/lease/pool.rs`) resolve
+//! `crate::tape` to this same sink in the re-rooted harness crate.
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -231,14 +227,6 @@ thread_local! {
     static TAPE: RefCell<Option<TapeState>> = const { RefCell::new(None) };
 }
 
-fn now_ns() -> u64 {
-    use std::time::SystemTime;
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
 /// Begin one engine window. A second begin on one thread is refused: the
 /// harness runs exactly one engine window per process.
 pub(crate) fn begin(engine: &str, case: &str, manifest_sha256: &str, entrypoint: &str) {
@@ -295,10 +283,9 @@ pub(crate) fn finish_and_write(
             case: state.case,
             manifest_sha256: state.manifest_sha256,
             entrypoint: state.entrypoint,
-            window_monotonic_start_ns: now_ns().saturating_sub(
-                u64::try_from(state.started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            ),
-            window_monotonic_end_ns: now_ns(),
+            window_monotonic_start_ns: 0,
+            window_monotonic_end_ns: u64::try_from(state.started.elapsed().as_nanos())
+                .unwrap_or(u64::MAX),
             outcome,
             truncation: state.truncation,
             effects: state.effects,
@@ -311,9 +298,7 @@ pub(crate) fn finish_and_write(
     };
     let bytes = serde_json::to_vec(&transcript).map_err(|error| error.to_string())?;
     if bytes.len() > MAX_DOCUMENT_BYTES {
-        return Err(format!(
-            "the observation transcript exceeds its {MAX_DOCUMENT_BYTES}-byte bound"
-        ));
+        return Err(format!("the observation transcript exceeds its {MAX_DOCUMENT_BYTES}-byte bound"));
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;

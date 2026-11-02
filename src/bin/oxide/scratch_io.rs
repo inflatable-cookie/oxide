@@ -62,19 +62,11 @@ fn read_document(path: &Path, limit: u64) -> ReadDocument {
         path,
         meta.dev(),
         meta.ino(),
-        if meta.is_file()
-            && meta.uid() == unsafe { libc::getuid() }
-            && meta.mode() & 0o077 == 0
-            && meta.len() <= limit
-        {
-            crate::tape::TapeOutcome::Opened {
-                dev: meta.dev(),
-                ino: meta.ino(),
-            }
-        } else {
-            crate::tape::TapeOutcome::Refusal {
-                reason: "not a small owner-only regular file".to_owned(),
-            }
+        crate::tape::TapeOutcome::Facts {
+            facts: format!(
+                "file={}|uid={}|mode={}|size={}",
+                meta.is_file(), meta.uid(), meta.mode(), meta.len()
+            ),
         },
         limit,
     );

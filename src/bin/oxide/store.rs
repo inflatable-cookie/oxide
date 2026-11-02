@@ -305,19 +305,6 @@ fn lost_writers_closed(record: &Record, boot_ms: Option<u64>) -> bool {
 /// Whether a quarantined lost record is closed by the boot session alone: its
 /// recorded reason still stands, but a restart ended its writers.
 fn closed_by_boot(record: &Record, boot_ms: Option<u64>) -> bool {
-    #[cfg(test)]
-    {
-        let closed = record
-            .lost
-            .as_ref()
-            .is_some_and(|lost| lost.unclosed.is_some())
-            && started_before_boot(record, boot_ms);
-        crate::tape::classify_row(
-            "boot-classify:closed-by-boot",
-            &format!("record={}", record.id),
-            &format!("boot={:?}|closed={closed}", boot_ms),
-        );
-    }
     record
         .lost
         .as_ref()
@@ -2516,6 +2503,12 @@ impl Store {
             // this slot's writer: the number may belong to an unrelated
             // process now, so only a group of the current session is checked.
             let boot_closed = closed_by_boot(record, boot);
+            #[cfg(test)]
+            crate::tape::classify_row(
+                "boot-classify:closed-by-boot",
+                &format!("record={}", record.id),
+                &format!("boot={boot:?}|closed={boot_closed}"),
+            );
             if !boot_closed
                 && record
                     .process_group
@@ -3209,7 +3202,22 @@ impl Store {
                         if let Some(why) = lost
                             .unclosed
                             .as_deref()
-                            .filter(|_| !closed_by_boot(record, boot))
+                            .filter(|_| {
+                                #[cfg(not(test))]
+                                {
+                                    !closed_by_boot(record, boot)
+                                }
+                                #[cfg(test)]
+                                {
+                                    let closed = closed_by_boot(record, boot);
+                                    crate::tape::classify_row(
+                                        "boot-classify:closed-by-boot",
+                                        &format!("record={}", record.id),
+                                        &format!("boot={boot:?}|closed={closed}"),
+                                    );
+                                    !closed
+                                }
+                            })
                         {
                             return Ok(CheckoutCustody::Unknown(format!(
                                 "slot {} in the {pool} pool is lost with writers that were never confirmed closed ({why})",

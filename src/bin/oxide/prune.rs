@@ -3362,28 +3362,24 @@ fn walk_checkout(
 /// recorded UUID. A conflicting or unknown recorded volume is never waived
 /// because today's ancestor happens to sit on the boot Data volume.
 fn judge_recorded_volume(ancestor: &HeldFacts, uuid: &str) -> Result<(), String> {
-    #[cfg(test)]
-    {
-        let verdict = matches!(ancestor.fstype.as_str(), "apfs" | "hfs")
-            && ancestor.uuid.as_deref() == Some(uuid);
-        crate::tape::classify_row(
-            "absence-judge:recorded-volume",
-            &format!("ancestor-dev={}|uuid={uuid}", ancestor.dev),
-            &format!("fstype={}|ok={verdict}", ancestor.fstype),
-        );
-    }
     if !matches!(ancestor.fstype.as_str(), "apfs" | "hfs") {
+        #[cfg(test)]
+        crate::tape::classify_row("absence-judge:recorded-volume", uuid, "refused");
         return Err(format!(
             "the checkout's nearest existing ancestor is on a {} file system, not a verified local volume",
             ancestor.fstype
         ));
     }
     if ancestor.uuid.as_deref() != Some(uuid) {
+        #[cfg(test)]
+        crate::tape::classify_row("absence-judge:recorded-volume", uuid, "refused");
         return Err(
             "the checkout's nearest existing ancestor is not on the checkout's recorded volume"
                 .to_owned(),
         );
     }
+    #[cfg(test)]
+    crate::tape::classify_row("absence-judge:recorded-volume", uuid, "accepted");
     Ok(())
 }
 
@@ -3391,31 +3387,21 @@ fn judge_recorded_volume(ancestor: &HeldFacts, uuid: &str) -> Result<(), String>
 /// ancestor is a readable directory on the same device and APFS volume UUID as
 /// `/System/Volumes/Data`.
 fn judge_boot_data(ancestor: &HeldFacts, data: &HeldFacts) -> Result<(), String> {
-    #[cfg(test)]
-    {
-        let ok = data.fstype == "apfs"
-            && data.uuid.is_some()
-            && ancestor.fstype == "apfs"
-            && ancestor.dev == data.dev
-            && ancestor.uuid == data.uuid;
-        crate::tape::classify_row(
-            "absence-judge:boot-data",
-            &format!("ancestor-dev={}|data-dev={}", ancestor.dev, data.dev),
-            &format!(
-                "ancestor-fstype={}|data-fstype={}|ok={ok}",
-                ancestor.fstype, data.fstype
-            ),
-        );
-    }
     if data.fstype != "apfs" || data.uuid.is_none() {
+        #[cfg(test)]
+        crate::tape::classify_row("absence-judge:boot-data", "boot-data", "refused");
         return Err("the boot Data volume is not a verified APFS volume".to_owned());
     }
     if ancestor.fstype != "apfs" || ancestor.dev != data.dev || ancestor.uuid != data.uuid {
+        #[cfg(test)]
+        crate::tape::classify_row("absence-judge:boot-data", "boot-data", "refused");
         return Err(
             "the checkout's nearest existing ancestor is not on the boot Data volume (device and APFS volume UUID differ)"
                 .to_owned(),
         );
     }
+    #[cfg(test)]
+    crate::tape::classify_row("absence-judge:boot-data", "boot-data", "accepted");
     Ok(())
 }
 

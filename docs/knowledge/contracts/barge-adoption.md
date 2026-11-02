@@ -19,13 +19,10 @@ evidence; landing this checkpoint does not satisfy that prerequisite. A native
 diagnostic at a future implementation head is not a missing proof of this
 design checkpoint.
 
-**X-S1 landed (2026-11-02, oxide#240).** Oxide's half of the capture apparatus
-is implemented under `cfg(test)` only: the leaf tape, transcript adapters and
-the `tape_prune_eval` in-crate harness (implementation record and honest
-limits in [the X-S1 landed note](#x-s1-landed-2026-11-02-oxide240)). This
-establishes no seam output, no parity and no O2 evidence; the counted native
-diagnostic at a source-approved head stays X-S2's separately activated Queue
-proof, and the O3 dispatch hold stands.
+Oxide's test-only capture apparatus uses a single re-rooted test crate for
+binary and library leaves. The shared capture contract below remains the
+acceptance authority; this composition alone is not parity evidence. O3
+remains held on equivalent-input D8 evidence.
 
 The text below is the pre-freeze proposal. Its "proposed design" and "changes
 no code" statements describe the 2026-11-01 proposal only and are kept as dated
@@ -1005,15 +1002,11 @@ authorizes a real run, a pin change or a production behaviour change.
   Stopping criteria: pure selectors green, the report renders for a synthetic
   unit fixture, no fixture, pool or image touched outside pure mode.
 
-#### X-S1 landed (2026-11-02, oxide#240)
+#### Oxide test-only capture apparatus
 
-The cfg(test)-only leaf tape,
-transcript adapters and the in-crate harness are implemented at this head.
-Status: apparatus complete; this is not parity evidence, and O3 stays held.
-No production statement changed: every addition is a separate
-`#[cfg(test)]`-attributed statement or a cfg(test) module, which the covering
-release-profile check (`RUSTFLAGS='-D warnings'` over `--bins`) and the diff
-review prove.
+The harness is under review against the shared capture contract. A passing
+release-profile compile is needed to establish compile-away; a source claim
+alone is insufficient.
 
 - **Files.** `src/bin/oxide/tape.rs` (the binary tape engine: the
   `oxide.capture.transcript/1` document, epochs assigned at the leaf,
@@ -1021,10 +1014,7 @@ review prove.
   and 8 MiB document caps with explicit `truncation` flags, effect rows,
   clock rows, an additive bounded `classifications` array, and the
   additive bounded pre/post `fixture_capture` with its diff),
-  `src/tape.rs` (the library tape: the same leaf signatures over one bounded
-  thread-local buffer, so the library's own `cfg(test)` compilation records
-  and the prebuilt library a `tests/` target links compiles the statements
-  away), and `src/bin/oxide/tape_harness.rs` (the `[[test]]`
+  `src/tape.rs` (the separate sink used only by library unit tests), and `src/bin/oxide/tape_harness.rs` (the `[[test]]`
   `tape_prune_eval` target, `harness = false`). Recorder statements sit in
   `prune.rs` (authority scope and budget, `authority_read` core/bind,
   `read_registry`, `read_bounded`, the no-follow absence walk start,
@@ -1045,15 +1035,14 @@ review prove.
   root identity) and `src/lease/pool.rs` + `src/lease/mod.rs`
   (`ledger_view`, the pool lock, reconcile entry classification,
   `save@ledger` and `fence@managed-control` effects).
-- **The harness split, and why.** In a `tests/` target the re-rooted binary
-  modules resolve `use oxide_storage::…` to the real prebuilt library
-  (a same-named root module is an ambiguity error, and the modules' `use`
-  statements must stay unchanged), so the library-side leaves record in the
-  library's own `cfg(test)` compilation and the harness records those
-  leaves at its own call sites, with volume UUID/device and mount facts.
-  Library-internal writes are bound as ground truth by the transcript's
-  pre/post fixture capture diff, which is complete for every fixture path.
-  `HoldingSweep` is a no-op stub in the harness crate only.
+- **Harness composition.** The harness crate re-roots the actual library and
+  binary modules and aliases itself as `oxide_storage`, sharing one tape.
+  Library observations must come from their actual leaf sites; a fixture diff
+  cannot replace them. `HoldingSweep` belongs to the release command, while
+  `paired_store` calls `removable::coordinate`, which only reads registration
+  and constructs the sibling store.
+  The planner authorized a narrow test-only split at the `closed_by_boot`
+  call site to record its actual result, retaining the non-test predicate.
 - **The entry.** `prune::tape_entry::run_chain` (cfg(test)) follows the
   `dry_run` prefix exactly — `AuthorityScope::begin`, `paired_store`, the
   optional `read_operator_list`, `require_ready`, the unfinished-intent

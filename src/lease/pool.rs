@@ -1742,8 +1742,6 @@ impl Pool {
 
     fn persist(&self) -> Result<(), LeaseError> {
         write_ledger(&self.root, &self.ledger)?;
-        #[cfg(test)]
-        crate::tape::effect_row("save@ledger", &self.root.join("ledger.json"));
         Ok(())
     }
 
@@ -4987,6 +4985,8 @@ impl Pool {
         if renamed != 0 {
             return Err(io_error(std::io::Error::last_os_error()));
         }
+        #[cfg(test)]
+        crate::tape::effect_row("rename@holding", &self.holding_root().join(&name));
         *phase = MovePhase::Unverified(name.clone());
         // oxide#196: an injected post-rename observation failure leaves the
         // tree in the holding area while the ledger row stays held.
