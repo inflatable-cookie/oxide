@@ -1837,7 +1837,9 @@ impl Store {
         let settings = settings()?;
         let path = settings.pool.clone();
         let source = settings.pool_source;
-        let scratch = crate::scratch_io::evaluate(&settings, false)?;
+        let scratch = crate::handoff_trace::phase("scratch-evaluate", || {
+            crate::scratch_io::evaluate(&settings, false)
+        })?;
         // A pasted `oxide status` annotation is not part of a path, so it
         // refuses for every pool state: an absent path and an existing
         // ordinary directory both get the hint instead of the generic open
@@ -1858,7 +1860,9 @@ impl Store {
                     if available < HOST_RESERVE_BYTES {
                         return Err("refusing to create the pool: host free space is below the 20 GiB reserve".into());
                     }
-                    crate::scratch_io::create(&settings, uuid, admission_budget(&settings))?;
+                    crate::handoff_trace::phase("scratch-create", || {
+                        crate::scratch_io::create(&settings, uuid, admission_budget(&settings))
+                    })?;
                 } else {
                     create_pool(&path, admission_budget(&settings))?;
                 }
@@ -1867,23 +1871,26 @@ impl Store {
             Found::Directory | Found::Unknown => {}
         }
         if let Some(uuid) = &scratch {
-            crate::scratch_io::repair(&settings, uuid)?;
+            crate::handoff_trace::phase("scratch-repair", || {
+                crate::scratch_io::repair(&settings, uuid)
+            })?;
         }
-        let store = match Self::open_at(&path, &settings) {
-            Ok(store) => store,
-            // An explicit path that exists but holds no recognizable Oxide
-            // pool is still this command's pool: name it in the refusal
-            // (oxide#182), so a typo or a non-pool directory is actionable.
-            Err(error)
-                if matches!(
-                    settings.pool_source,
-                    config::Source::Environment("OXIDE_POOL")
-                ) =>
-            {
-                return Err(format!("OXIDE_POOL names {}: {error}", path.display()))
-            }
-            Err(error) => return Err(error),
-        };
+        let store =
+            match crate::handoff_trace::phase("store-open", || Self::open_at(&path, &settings)) {
+                Ok(store) => store,
+                // An explicit path that exists but holds no recognizable Oxide
+                // pool is still this command's pool: name it in the refusal
+                // (oxide#182), so a typo or a non-pool directory is actionable.
+                Err(error)
+                    if matches!(
+                        settings.pool_source,
+                        config::Source::Environment("OXIDE_POOL")
+                    ) =>
+                {
+                    return Err(format!("OXIDE_POOL names {}: {error}", path.display()))
+                }
+                Err(error) => return Err(error),
+            };
         if !config::has_sticky_exclusion(&store.pool) {
             match config::exclude_from_backup(&store.pool) {
                 Backup::Excluded | Backup::NotApplicable => {}
@@ -7707,7 +7714,40 @@ pub(crate) mod tests {
         assert_eq!(calls, 2, "revalidated before each decision");
         let refused = match outcome {
             Ok(Cleaning::Busy(reason)) => reason,
-            _ => panic!("the second decision refuses the planted dead record"),
+            other => {
+                let outcome = match other {
+                    Ok(Cleaning::Guard(_)) => "guard".to_owned(),
+                    Ok(Cleaning::Interrupted(signal)) => format!("interrupted {signal}"),
+                    Ok(Cleaning::Retry(reason)) => {
+                        format!("retry: {}", reason.chars().take(256).collect::<String>())
+                    }
+                    Err(error) => format!("error: {}", error.chars().take(256).collect::<String>()),
+                    Ok(Cleaning::Busy(_)) => unreachable!(),
+                };
+                let state = internal.load();
+                let facts = state.as_ref().map(|state| {
+                    state
+                        .records
+                        .iter()
+                        .take(8)
+                        .map(|record| {
+                            (
+                                record.id,
+                                record.checkout.clone(),
+                                record.phase,
+                                record.process_group,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let lock = match probe_lock(&internal.lock_path(7), false) {
+                    Ok(Probe::Free(_)) => "free",
+                    Ok(Probe::Held) => "held",
+                    Ok(Probe::Missing) => "missing",
+                    Err(_) => "unreadable",
+                };
+                panic!("the second decision refuses the planted dead record: outcome={outcome}, record_lock={lock}, records={facts:?}");
+            }
         };
         assert!(refused.contains("record 7"), "{refused}");
         assert!(refused.contains("clean barrier refused"), "{refused}");

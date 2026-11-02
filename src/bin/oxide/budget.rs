@@ -1553,11 +1553,29 @@ mod tests {
         })
         .unwrap();
         let fd = events_fd().unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let reader_info = reader.metadata().unwrap();
+        let writer_info = writer.metadata().unwrap();
         drop(reader);
-        // SAFETY: epipe on our private duplicate is exactly the failure path.
-        let _ = fd;
         arm_execution(Instant::now(), Phase::PrimaryCargo);
-        assert!(events_lost());
+        let mut observation = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: one initialized descriptor row; timeout zero never waits.
+        let polled = unsafe { libc::poll(&mut observation, 1, 0) };
+        // SAFETY: read-only flag observations on the still-owned descriptors.
+        let (duplicate_flags, writer_flags) = unsafe {
+            (
+                libc::fcntl(fd, libc::F_GETFD),
+                libc::fcntl(writer.as_raw_fd(), libc::F_GETFD),
+            )
+        };
+        assert!(events_lost(),
+            "reader dev/inode={}/{}, writer dev/inode={}/{}, duplicate fd={}, fd_flags={}, writer_flags={}, poll={}, revents={}",
+            reader_info.dev(), reader_info.ino(), writer_info.dev(), writer_info.ino(), fd,
+            duplicate_flags, writer_flags, polled, observation.revents);
         assert_eq!(std::process::id(), std::process::id());
         reset();
     }

@@ -1784,6 +1784,7 @@ necessary.
     pool's first command, and a build summary of 0.1–1.2 s. The 22 `status`
     processes took at most 17 ms; the newer-state hand-off check, which returns
     before pool open, took 18 ms.
+  - **Recovered packet.** `/Volumes/Builds/scratch/oxide/evidence-225-recovered-490e935-20261101T225233Z` contains `SHA256SUMS` and `recovery-provenance.json` binding the copied session and log to `490e935`. This is a newly hashed copy, not a historical manifest or native pass. The original `oxide-proof.u7ktgeuh/evidence` recorded 19 exit-1 checks at 11.272969375–13.084510875 s, summaries of 0.1–1.2 s, 22 status calls at most 16.900167 ms, one exit-42 handoff at 18.4845 ms, and one check without a terminal record at the deadline. Its exit remains unknown; the failed diagnostic has no native credit.
   - **Attribution boundary.** The summary's clock starts at `started` in
     `run_invocation`, after pool open, workspace location, removable selection and
     key resolution, and stops at the print. The gap of about 11.2–12.5 s
@@ -1797,6 +1798,19 @@ necessary.
     The exit-1 status is not explained by the captured stderr.
   - **Limit.** This fixture's first-command pool creation is not normal
     daily-command latency.
+  - **Validation clarification (Tom, 2026-11-01).** The no-live-cleanup
+    restriction forbids explicit maintenance; ordinary admission eviction by
+    the required installed-Oxide covering build is accepted build residue. It
+    does not authorize a prune, clean, registry repair or restoration of an
+    evicted slot. Subsequent covering builds for this task use a private scratch
+    pool and a commit-bound disposable source snapshot.
+  - **Trace scope.** The diagnostic's private fixture setup may request a
+    debug-only trace to a bounded per-command evidence file, after matching
+    the supervisor's running owner marker, scratch/evidence layout and private
+    HOME/pool. Each named start and end uses a single monotonic clock; an absent
+    end is unknown. Release builds do not emit this trace. Trace records are
+    observations, not timing or closure gates; a missing trace cannot establish
+    a duration. No new diagnostic has yet attributed the historical gap.
   - **Discriminator.** A debug-only, opt-in phase trace on the creation path
     (the `release_trace::phase` pattern, not that trace, which covers only the
     release closeout) in one uncounted diagnostic would split the gap. That
