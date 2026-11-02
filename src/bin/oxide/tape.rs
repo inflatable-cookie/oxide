@@ -161,9 +161,8 @@ pub(crate) struct TapeTranscript {
     pub(crate) clocks: Vec<TapeClockRow>,
     pub(crate) classifications: Vec<TapeClassifyRow>,
     /// Additive (documented): the harness's own pre/post fixture identity
-    /// capture. The diff of the two captures is ground truth for effects,
-    /// including writes made inside the prebuilt library that this process
-    /// cannot tape directly.
+    /// capture. The diff is an independent cross-check for recorded effects;
+    /// it cannot substitute for an observation at a write site.
     pub(crate) fixture_capture: Option<TapeFixtureCapture>,
     /// Additive (documented): notes the harness must carry, e.g. an unbound
     /// authority read pending at close or an unknown extra identity.
@@ -191,7 +190,7 @@ pub(crate) struct TapeFixtureCapture {
     pub(crate) truncated: bool,
     pub(crate) pre: Vec<TapeFixtureEntry>,
     pub(crate) post: Vec<TapeFixtureEntry>,
-    /// Ground-truth effect rows derived from the pre/post diff.
+    /// Observed net fixture changes derived from the pre/post diff.
     pub(crate) diff_effects: Vec<TapeEffectRow>,
 }
 
@@ -268,7 +267,7 @@ pub(crate) fn finish_and_write(
     fixture_capture: Option<TapeFixtureCapture>,
 ) -> Result<(), String> {
     let taken = TAPE.with(|cell| cell.borrow_mut().take());
-    let transcript = {
+    let mut transcript = {
         let state = taken.ok_or_else(|| "the observation tape was not active".to_owned())?;
         let mut notes = state.notes.clone();
         if state.pending_authority.is_some() {
@@ -296,15 +295,41 @@ pub(crate) fn finish_and_write(
             notes,
         }
     };
-    let bytes = serde_json::to_vec(&transcript).map_err(|error| error.to_string())?;
+    let mut bytes = serde_json::to_vec(&transcript).map_err(|error| error.to_string())?;
     if bytes.len() > MAX_DOCUMENT_BYTES {
-        return Err(format!("the observation transcript exceeds its {MAX_DOCUMENT_BYTES}-byte bound"));
+        transcript.truncation.document_truncated = true;
+        transcript.reads.clear();
+        transcript.effects.clear();
+        transcript.clocks.clear();
+        transcript.classifications.clear();
+        transcript.fixture_capture = None;
+        transcript.notes.clear();
+        bytes = serde_json::to_vec(&transcript).map_err(|error| error.to_string())?;
+        if bytes.len() > MAX_DOCUMENT_BYTES {
+            transcript.outcome = match transcript.outcome {
+                TapeEngineOutcome::Completed { .. } => TapeEngineOutcome::Completed {
+                    result: serde_json::json!({"truncated": true}),
+                },
+                TapeEngineOutcome::Refused { exit_code, .. } => TapeEngineOutcome::Refused {
+                    reason: "refusal detail exceeded the document cap".to_owned(), exit_code,
+                },
+            };
+            bytes = serde_json::to_vec(&transcript).map_err(|error| error.to_string())?;
+        }
+        if bytes.len() > MAX_DOCUMENT_BYTES {
+            return Err("transcript header exceeds the document cap".to_owned());
+        }
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     let temp = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&temp, &bytes).map_err(|error| error.to_string())?;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
+        .mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&temp)
+        .map_err(|error| error.to_string())?;
+    file.write_all(&bytes).map_err(|error| error.to_string())?;
     std::fs::rename(&temp, path).map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -399,7 +424,7 @@ fn file_identity(path: &Path, outcome: &TapeOutcome) -> TapeIdentity {
 pub(crate) fn read_row(kind: &str, path: &Path, outcome: TapeOutcome, cap: u64) {
     with_state(|state| {
         let identity = file_identity(path, &outcome);
-        let key = identity_key(&identity);
+        let key = format!("{kind}|{}", identity_key(&identity));
         let (occurrence, counted) = occurrence(state, &key);
         let epoch = next_epoch(state);
         let row = TapeReadRow {
@@ -435,7 +460,7 @@ pub(crate) fn read_row_dev(
                 (Some(m.dev()), Some(m.ino()))
             })
             .unwrap_or((None, None));
-        let key = format!("file:{path}|dev={dev}/ino={ino}", path = path.display());
+        let key = format!("file:{path}|parent={parent_dev:?}/{parent_ino:?}|dev={dev}/ino={ino}", path = path.display());
         let identity = TapeIdentity {
             path: Some(path.display().to_string()),
             parent_dev,
@@ -447,7 +472,7 @@ pub(crate) fn read_row_dev(
             device: None,
             key: key.clone(),
         };
-        let (occurrence, counted) = occurrence(state, &key);
+        let (occurrence, counted) = occurrence(state, &format!("{kind}|{key}"));
         let epoch = next_epoch(state);
         let row = TapeReadRow {
             kind: kind.to_owned(),
@@ -473,19 +498,23 @@ pub(crate) fn component_row(
     outcome: TapeOutcome,
 ) {
     with_state(|state| {
-        let key = format!("component:parent={parent_dev}/{parent_ino}|name={name:?}",);
+        let (dev, ino) = match &outcome {
+            TapeOutcome::Opened { dev, ino } => (Some(*dev), Some(*ino)),
+            _ => (None, None),
+        };
+        let key = format!("component:parent={parent_dev}/{parent_ino}|name={name:?}|dev={dev:?}/ino={ino:?}");
         let identity = TapeIdentity {
             path: None,
             parent_dev: Some(parent_dev),
             parent_ino: Some(parent_ino),
-            dev: None,
-            ino: None,
+            dev,
+            ino,
             uuid: None,
             mount_point: None,
             device: None,
             key,
         };
-        let (occurrence, counted) = occurrence(state, &identity.key);
+        let (occurrence, counted) = occurrence(state, &format!("{kind}|{}", identity.key));
         let epoch = next_epoch(state);
         let row = TapeReadRow {
             kind: kind.to_owned(),
@@ -519,7 +548,7 @@ pub(crate) fn volume_row(
         let epoch = next_epoch(state);
         let uuid = uuid.map(str::to_owned);
         let key = format!(
-            "volume:mount={mount}|uuid={uuid:?}|epoch-window",
+            "volume:mount={mount}|uuid={uuid:?}|device={device:?}",
             mount = mount.display()
         );
         let identity = TapeIdentity {
@@ -533,7 +562,7 @@ pub(crate) fn volume_row(
             device: device.map(str::to_owned),
             key,
         };
-        let (occurrence, counted) = occurrence(state, &identity.key);
+        let (occurrence, counted) = occurrence(state, &format!("{kind}|{}", identity.key));
         let row = TapeReadRow {
             kind: kind.to_owned(),
             identity,
@@ -723,6 +752,21 @@ pub(crate) fn authority_bind(site: &str, path: &Path, cap: u64) {
         if counted {
             push_read(state, row);
         }
+    });
+}
+
+/// Record a read against the descriptor that supplied the bytes.
+pub(crate) fn authority_bind_descriptor(
+    site: &str, path: &Path, dev: u64, ino: u64, cap: u64, outcome: TapeOutcome,
+) {
+    with_state(|state| { state.pending_authority = None; });
+    read_row_dev(&format!("authority-read@{site}"), path, dev, ino, outcome, cap);
+}
+
+pub(crate) fn authority_unbound(site: &str, reason: &str) {
+    with_state(|state| {
+        state.pending_authority = None;
+        state.notes.push(format!("descriptor identity unavailable at {site}: {reason}"));
     });
 }
 

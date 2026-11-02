@@ -687,10 +687,12 @@ fn read_registry(control: &Path) -> Result<Option<Registry>, String> {
         return Ok(None);
     };
     let mut bytes = Vec::new();
+    #[cfg(not(test))]
     authority_read(file.take(MAX_REGISTRY_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     #[cfg(test)]
-    crate::tape::authority_bind("prune::read_registry", &path, MAX_REGISTRY_BYTES);
+    authority_read_observed(&file, &path, "prune::read_registry", MAX_REGISTRY_BYTES, &mut bytes)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     if bytes.len() as u64 > MAX_REGISTRY_BYTES {
         return Err(format!(
             "{} exceeds its {MAX_REGISTRY_BYTES}-byte limit",
@@ -1767,6 +1769,31 @@ pub(crate) fn authority_read<R: Read>(reader: R, bytes: &mut Vec<u8>) -> std::io
     result
 }
 
+/// Test-only observation of the exact descriptor passed to authority_read.
+/// The production call below remains unchanged; the descriptor stays open
+/// until the real read result has been recorded.
+#[cfg(test)]
+pub(crate) fn authority_read_observed(
+    file: &File,
+    path: &Path,
+    site: &str,
+    limit: u64,
+    bytes: &mut Vec<u8>,
+) -> std::io::Result<usize> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata();
+    let result = authority_read(file.take(limit + 1), bytes);
+    let outcome = match &result {
+        Ok(_) => crate::tape::TapeOutcome::Digest { digest: crate::tape::sha256_hex(bytes) },
+        Err(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+    };
+    match metadata {
+        Ok(metadata) => crate::tape::authority_bind_descriptor(site, path, metadata.dev(), metadata.ino(), limit, outcome),
+        Err(error) => crate::tape::authority_unbound(site, &error.to_string()),
+    }
+    result
+}
+
 /// One evaluated root: either a candidate or an explicit keep reason.
 struct Evaluated {
     row: Row,
@@ -2319,20 +2346,23 @@ fn read_bounded(path: &Path, limit: usize, what: &str) -> Result<Vec<u8>, String
     let file = File::open(path)
         .map_err(|error| format!("cannot open the {what} {}: {error}", path.display()))?;
     #[cfg(test)]
-    crate::tape::read_row(
-        "read-bounded:open",
-        path,
-        match crate::tape::path_dev_ino(path) {
-            Some((dev, ino)) => crate::tape::TapeOutcome::Opened { dev, ino },
-            None => crate::tape::TapeOutcome::Absent,
-        },
-        limit as u64,
-    );
+    {
+        use std::os::unix::fs::MetadataExt;
+        match file.metadata() {
+            Ok(metadata) => crate::tape::read_row_dev(
+                "read-bounded:open", path, metadata.dev(), metadata.ino(),
+                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, limit as u64,
+            ),
+            Err(error) => crate::tape::authority_unbound("prune::read_bounded:open", &error.to_string()),
+        }
+    }
     let mut bytes = Vec::new();
+    #[cfg(not(test))]
     authority_read(file.take(limit as u64 + 1), &mut bytes)
         .map_err(|error| format!("cannot read the {what} {}: {error}", path.display()))?;
     #[cfg(test)]
-    crate::tape::authority_bind("prune::read_bounded", path, limit as u64);
+    authority_read_observed(&file, path, "prune::read_bounded", limit as u64, &mut bytes)
+        .map_err(|error| format!("cannot read the {what} {}: {error}", path.display()))?;
     if bytes.len() > limit {
         return Err(format!(
             "the {what} {} exceeds its {limit}-byte limit",
@@ -4077,14 +4107,12 @@ fn observe_root_in(binding: &Binding, row: &Row) -> Result<RootState, String> {
     // SAFETY: `marker_fd` is a newly owned descriptor.
     let marker_file = unsafe { File::from_raw_fd(marker_fd) };
     let mut bytes = Vec::new();
+    #[cfg(not(test))]
     authority_read(marker_file.take(64 * 1024 + 1), &mut bytes)
         .map_err(|error| format!("cannot read the owner marker: {error}"))?;
     #[cfg(test)]
-    crate::tape::authority_bind(
-        "prune::observe_root_in:marker",
-        &row.root.join(outputs::MARKER),
-        64 * 1024,
-    );
+    authority_read_observed(&marker_file, &row.root.join(outputs::MARKER), "prune::observe_root_in:marker", 64 * 1024, &mut bytes)
+        .map_err(|error| format!("cannot read the owner marker: {error}"))?;
     if bytes.len() > 64 * 1024 {
         return Ok(RootState::Unknown(
             "the owner marker exceeds its byte limit".to_owned(),

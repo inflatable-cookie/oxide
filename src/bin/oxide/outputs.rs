@@ -8209,10 +8209,12 @@ fn read_receipt_with(
         return Ok(None);
     };
     let mut bytes = Vec::new();
+    #[cfg(not(test))]
     crate::prune::authority_read(file.take(MAX_RECEIPT_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     #[cfg(test)]
-    crate::tape::authority_bind("outputs::read_receipt_with", &path, MAX_RECEIPT_BYTES);
+    crate::prune::authority_read_observed(&file, &path, "outputs::read_receipt_with", MAX_RECEIPT_BYTES, &mut bytes)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     if bytes.len() as u64 > MAX_RECEIPT_BYTES {
         return Err(format!(
             "{} exceeds its {MAX_RECEIPT_BYTES}-byte limit",
@@ -8310,10 +8312,12 @@ pub(crate) fn marker_digest(root: &Path) -> Result<String, String> {
     let file =
         File::open(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let mut bytes = Vec::new();
+    #[cfg(not(test))]
     crate::prune::authority_read(file.take(MAX_MARKER_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     #[cfg(test)]
-    crate::tape::authority_bind("outputs::marker_digest", &path, MAX_MARKER_BYTES);
+    crate::prune::authority_read_observed(&file, &path, "outputs::marker_digest", MAX_MARKER_BYTES, &mut bytes)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     if bytes.len() as u64 > MAX_MARKER_BYTES {
         return Err(format!("{} exceeds its byte limit", path.display()));
     }
@@ -8552,7 +8556,11 @@ fn read_marker(root: &Path) -> Result<Marker, String> {
     let file =
         File::open(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let mut bytes = Vec::new();
+    #[cfg(not(test))]
     crate::prune::authority_read(file.take(MAX_MARKER_BYTES + 1), &mut bytes)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    #[cfg(test)]
+    crate::prune::authority_read_observed(&file, &path, "outputs::read_marker", MAX_MARKER_BYTES, &mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     if bytes.len() as u64 > MAX_MARKER_BYTES {
         return Err(format!("{} exceeds its byte limit", path.display()));

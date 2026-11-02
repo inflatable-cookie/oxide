@@ -1081,7 +1081,11 @@ pub fn recorded_last_use(control: &Path) -> Result<Option<LastUse>, String> {
     let path = control.join("state.json");
     let file = private_file(&path, false)?.ok_or("no Oxide control state")?;
     let mut bytes = Vec::new();
+    #[cfg(not(test))]
     crate::prune::authority_read(file.take(MAX_STATE_BYTES + 1), &mut bytes)
+        .map_err(|error| error.to_string())?;
+    #[cfg(test)]
+    crate::prune::authority_read_observed(&file, &path, "store::recorded_last_use", MAX_STATE_BYTES, &mut bytes)
         .map_err(|error| error.to_string())?;
     let state: State = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     Ok(state
@@ -1105,7 +1109,11 @@ pub fn recorded_lost(control: &Path) -> Result<Vec<(String, Option<PathBuf>, Str
         return Ok(Vec::new());
     };
     let mut bytes = Vec::new();
+    #[cfg(not(test))]
     crate::prune::authority_read(file.take(MAX_STATE_BYTES + 1), &mut bytes)
+        .map_err(|error| error.to_string())?;
+    #[cfg(test)]
+    crate::prune::authority_read_observed(&file, &path, "store::recorded_lost", MAX_STATE_BYTES, &mut bytes)
         .map_err(|error| error.to_string())?;
     let state: State = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     let boot = boot_session();
@@ -1145,10 +1153,12 @@ fn holders(control: &Path, checkout: &Path, cleans: bool) -> Result<Vec<String>,
         return Ok(Vec::new());
     };
     let mut bytes = Vec::new();
+    #[cfg(not(test))]
     crate::prune::authority_read(file.take(MAX_STATE_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read Oxide state: {error}"))?;
     #[cfg(test)]
-    crate::tape::authority_bind("store::active_holders", &path, MAX_STATE_BYTES);
+    crate::prune::authority_read_observed(&file, &path, "store::active_holders", MAX_STATE_BYTES, &mut bytes)
+        .map_err(|error| format!("cannot read Oxide state: {error}"))?;
     if bytes.len() as u64 > MAX_STATE_BYTES {
         return Err("Oxide state exceeds its byte limit".to_owned());
     }
@@ -3047,7 +3057,10 @@ impl Store {
         let sibling = self.sibling.as_ref()?;
         let file = private_file(&sibling.control.join("state.json"), false).ok()??;
         let mut bytes = Vec::new();
+        #[cfg(not(test))]
         crate::prune::authority_read(file.take(MAX_STATE_BYTES + 1), &mut bytes).ok()?;
+        #[cfg(test)]
+        crate::prune::authority_read_observed(&file, &sibling.control.join("state.json"), "store::sibling_state", MAX_STATE_BYTES, &mut bytes).ok()?;
         serde_json::from_slice::<State>(&bytes).ok()
     }
 
@@ -3086,7 +3099,11 @@ impl Store {
             return Ok(None);
         };
         let mut bytes = Vec::new();
+    #[cfg(not(test))]
         crate::prune::authority_read(file.take(MAX_STATE_BYTES + 1), &mut bytes)
+            .map_err(|error| format!("the other pool's record state is unreadable: {error}"))?;
+        #[cfg(test)]
+        crate::prune::authority_read_observed(&file, &path, "store::sibling_state_checked", MAX_STATE_BYTES, &mut bytes)
             .map_err(|error| format!("the other pool's record state is unreadable: {error}"))?;
         if bytes.len() as u64 > MAX_STATE_BYTES {
             return Err("the other pool's record state exceeds its byte limit".to_owned());
@@ -5126,7 +5143,10 @@ impl Store {
     fn trusted_origin(&self, record: &Record) -> Option<Built> {
         let file = private_file(&self.origin_path(record.id), false).ok()??;
         let mut bytes = Vec::new();
+        #[cfg(not(test))]
         crate::prune::authority_read(file.take(MAX_ORIGIN_BYTES + 1), &mut bytes).ok()?;
+        #[cfg(test)]
+        crate::prune::authority_read_observed(&file, &self.origin_path(record.id), "store::trusted_origin", MAX_ORIGIN_BYTES, &mut bytes).ok()?;
         if bytes.len() as u64 > MAX_ORIGIN_BYTES {
             return None;
         }
@@ -5403,14 +5423,12 @@ impl Store {
             return Ok(State::default());
         };
         let mut bytes = Vec::new();
+        #[cfg(not(test))]
         crate::prune::authority_read(file.take(MAX_STATE_BYTES + 1), &mut bytes)
             .map_err(|error| format!("cannot read Oxide state: {error}"))?;
         #[cfg(test)]
-        crate::tape::authority_bind(
-            "store::load",
-            &self.control.join("state.json"),
-            MAX_STATE_BYTES,
-        );
+        crate::prune::authority_read_observed(&file, &self.control.join("state.json"), "store::load", MAX_STATE_BYTES, &mut bytes)
+            .map_err(|error| format!("cannot read Oxide state: {error}"))?;
         // The shared parser is the fence's acceptance test too
         // (`oxide_storage::lease::control::parse_state`), so the two writers
         // cannot disagree about what a valid control document is.
@@ -6033,7 +6051,11 @@ fn read_observations(control: &Path) -> Result<Option<Observations>, String> {
         return Ok(None);
     };
     let mut bytes = Vec::new();
+    #[cfg(not(test))]
     crate::prune::authority_read(file.take(MAX_OBSERVATIONS_BYTES + 1), &mut bytes)
+        .map_err(|error| format!("cannot read recorded observations: {error}"))?;
+    #[cfg(test)]
+    crate::prune::authority_read_observed(&file, &path, "store::read_observations", MAX_OBSERVATIONS_BYTES, &mut bytes)
         .map_err(|error| format!("cannot read recorded observations: {error}"))?;
     if bytes.len() as u64 > MAX_OBSERVATIONS_BYTES {
         return Err("recorded observations exceed their byte limit".to_owned());
@@ -6251,8 +6273,6 @@ pub fn dead_clean_mark_for_tests(store: &Store, checkout: &Path, id: u64) {
 
 /// Open an owner-only regular control file without following symlinks.
 pub(crate) fn private_file(path: &Path, create: bool) -> Result<Option<File>, String> {
-    #[cfg(test)]
-    let tape_pre_existed = crate::tape::path_dev_ino(path);
     let mut options = OpenOptions::new();
     options
         .read(true)
@@ -6286,31 +6306,19 @@ pub(crate) fn private_file(path: &Path, create: bool) -> Result<Option<File>, St
             return Err(format!("cannot open {}: {error}", path.display()));
         }
     };
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
     #[cfg(test)]
     {
-        match crate::tape::path_dev_ino(path) {
-            Some((dev, ino)) => {
-                if create && tape_pre_existed.is_none() {
-                    crate::tape::effect_row("create@private-file", path);
-                }
-                crate::tape::read_row(
-                    "private-file:open",
-                    path,
-                    crate::tape::TapeOutcome::Opened { dev, ino },
-                    0,
-                );
-            }
-            None => {
-                crate::tape::read_row(
-                    "private-file:open",
-                    path,
-                    crate::tape::TapeOutcome::Absent,
-                    0,
-                );
-            }
+        // O_CREAT without O_EXCL cannot prove from the return value whether
+        // the file existed; the attempt must remain visible and unqualified.
+        if create {
+            crate::tape::effect_row("attempt@private-file-create", path);
         }
+        crate::tape::read_row_dev(
+            "private-file:open", path, metadata.dev(), metadata.ino(),
+            crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0,
+        );
     }
-    let metadata = file.metadata().map_err(|error| error.to_string())?;
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
     if !metadata.is_file() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {

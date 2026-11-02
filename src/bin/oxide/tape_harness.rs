@@ -188,31 +188,14 @@ impl Case {
     }
 }
 
-/// The manifest the harness reads and binds (`oxide.capture.manifest/1`).
-/// X-S2's orchestrator writes richer manifests; the harness binds exactly
-/// these fields and carries the whole document's SHA-256 in the transcript.
+/// Fields consumed by the evaluator; remaining fields are preserved by the
+/// digest and checked by the shared reconciliation step.
 #[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 struct HarnessManifest {
-    version: String,
+    schema: String,
     case: String,
     #[serde(default)]
     operator_list: Option<String>,
-    expected: ManifestExpectation,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ManifestExpectation {
-    outcome: String,
-    #[serde(default)]
-    exit_code: Option<u8>,
-    #[serde(default)]
-    complete: Option<bool>,
-    #[serde(default)]
-    kept_roots: Vec<String>,
-    #[serde(default)]
-    candidate_roots: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -292,9 +275,9 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .map_err(|error| error.to_string())?;
     file.write_all(bytes).map_err(|error| error.to_string())?;
@@ -329,6 +312,133 @@ fn write_private_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Bounded manifest envelope validation. It never consumes expected outcomes
+/// as evaluator inputs. Detailed reconciliation remains X-S2's oracle.
+fn validate_manifest_envelope(doc: &serde_json::Value) -> Result<(), String> {
+    let allowed = ["schema", "case", "window", "source", "fixture", "dynamic", "mandatory_observations", "expected_effects", "expected", "barge", "operator_list"];
+    let object = doc.as_object().ok_or("manifest is not an object")?;
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) { return Err("unknown manifest field".to_owned()); }
+    for key in ["schema", "case", "window", "source", "fixture", "dynamic", "mandatory_observations", "expected_effects", "expected", "barge"] {
+        if doc.get(key).is_none() { return Err(format!("manifest missing {key}")); }
+    }
+    for (pointer, limit) in [("/fixture/entries", 4096usize), ("/fixture/roots", 64),
+        ("/dynamic/volumes", 64), ("/dynamic/writers", 512), ("/mandatory_observations", 256)] {
+        let rows = doc.pointer(pointer).and_then(|v| v.as_array()).ok_or_else(|| format!("invalid {pointer}"))?;
+        if rows.len() > limit { return Err(format!("{pointer} exceeds cap")); }
+    }
+    for (pointer, keys) in [
+        ("/window", &["identity", "start_monotonic_ns", "end_monotonic_ns"][..]),
+        ("/source", &["oxide_commit", "oxide_files", "cargo_lock_sha256", "rust_toolchain_sha256", "barge_pin", "barge_slice_commit", "barge_files", "staged_lock_sha256", "oxide_toolchain", "barge_toolchain", "oxide_executable_sha256", "barge_executable_sha256"][..]),
+        ("/fixture", &["root", "device", "inode", "mode", "entries", "roots"][..]),
+        ("/dynamic", &["volumes", "writers", "external_allowances"][..]),
+        ("/barge", &["volume_uuid", "namespace", "area"][..]),
+    ] {
+        let object = doc.pointer(pointer).and_then(|v| v.as_object()).ok_or_else(|| format!("invalid {pointer}"))?;
+        if keys.iter().any(|key| !object.contains_key(*key)) { return Err(format!("missing field in {pointer}")); }
+    }
+    for row in doc["mandatory_observations"].as_array().ok_or("invalid obligations")? {
+        let engine = row.get("engine").and_then(|v| v.as_str()).ok_or("missing obligation engine")?;
+        let site = row.get("site").and_then(|v| v.as_str()).filter(|v| !v.is_empty()).ok_or("missing obligation site")?;
+        let identity = row.get("identity").and_then(|v| v.as_object()).ok_or("missing obligation identity")?;
+        let complete = ["path", "parent_device", "parent_inode", "device", "inode"].iter().all(|k| identity.contains_key(*k))
+            || ["component", "parent_device", "parent_inode"].iter().all(|k| identity.contains_key(*k))
+            || ["pid", "start", "uid"].iter().all(|k| identity.contains_key(*k))
+            || ["volume_uuid", "mount", "device"].iter().all(|k| identity.contains_key(*k));
+        if !matches!(engine, "oxide" | "barge") || site.is_empty() || !complete { return Err("incomplete mandatory observation".to_owned()); }
+    }
+    let bytes = doc.pointer("/fixture/entries").and_then(|v| v.as_array()).ok_or("missing entries")?
+        .iter().try_fold(0u64, |sum, entry| sum.checked_add(entry.get("size").and_then(|v| v.as_u64()).unwrap_or(0)))
+        .ok_or("fixture byte count overflow")?;
+    if bytes > 32 * 1024 * 1024 { return Err("fixture byte cap exceeded".to_owned()); }
+    Ok(())
+}
+
+/// Resolve the same directory policy as the engine with fixture-only inputs.
+fn fixture_facts(root: &Path) -> config::Facts {
+    let home = root.join("home");
+    config::Facts {
+        macos: cfg!(target_os = "macos"),
+        home: Some(home.clone().into_os_string()),
+        env_home: Some(home.clone().into_os_string()),
+        home_source: config::HomeSource::Injected,
+        directories: config::Directories::Injected(
+            longhorn_storage_layout::PlatformEnvironment::default().with_home_dir(Some(home)),
+        ),
+        oxide_config: Some(root.join("config.toml").into_os_string()),
+        oxide_pool: Some(root.join("scratch/pool").into_os_string()),
+        oxide_pool_cap: Some("1073741824".into()),
+        ..config::Facts::default()
+    }
+}
+
+/// Check every existing component without following a symlink. The root must
+/// be the canonical owner-only fixture; missing suffixes remain under its held
+/// namespace and are created only by the fixture owner.
+fn validate_fixture_path(root: &Path, path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if !root.starts_with("/Volumes/Builds/scratch/oxide/")
+        || std::fs::canonicalize(root).map_err(|e| e.to_string())? != root {
+        return Err("fixture root is not canonical task scratch".to_owned());
+    }
+    let root_meta = std::fs::symlink_metadata(root).map_err(|e| e.to_string())?;
+    if !root_meta.is_dir() || root_meta.uid() != unsafe { libc::getuid() }
+        || root_meta.permissions().mode() & 0o077 != 0 {
+        return Err("fixture root is not owner-only".to_owned());
+    }
+    let relative = path.strip_prefix(root).map_err(|_| "path escapes fixture")?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err("non-normal fixture path".to_owned());
+        };
+        current.push(name);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() || meta.uid() != unsafe { libc::getuid() }
+                || meta.permissions().mode() & 0o077 != 0 => return Err("unsafe fixture component".to_owned()),
+            Ok(_) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(())
+}
+
+fn validate_engine_environment(root: &Path) -> Result<(), String> {
+    if std::env::var_os(config::TEST_HOME_FROM_ENV).as_deref() != Some(std::ffi::OsStr::new("1"))
+        || std::env::var_os(config::TEST_ACCOUNT_HOME).is_some() {
+        return Err("fixture home control missing or conflicting".to_owned());
+    }
+    for (name, expected) in [("HOME", root.join("home")),
+        ("OXIDE_CONFIG", root.join("config.toml")), ("OXIDE_POOL", root.join("scratch/pool"))] {
+        if std::env::var_os(name).as_deref() != Some(expected.as_os_str()) {
+            return Err(format!("{name} is not the fixture path"));
+        }
+        validate_fixture_path(root, &expected)?;
+    }
+    for (name, _) in std::env::vars_os() {
+        let name = name.to_string_lossy();
+        if (name.starts_with("XDG_") || name.starts_with("OXIDE_"))
+            && !matches!(name.as_ref(), "OXIDE_TEST_HOME_FROM_ENV" | "OXIDE_CONFIG" | "OXIDE_POOL" | "OXIDE_POOL_CAP" | "OXIDE_SCRATCH_ROOT") {
+            return Err(format!("unexpected environment control {name}"));
+        }
+    }
+    if std::env::var_os("OXIDE_POOL_CAP").as_deref() != Some(std::ffi::OsStr::new("1073741824")) {
+        return Err("fixture pool cap is missing or invalid".to_owned());
+    }
+    if let Some(scratch) = std::env::var_os("OXIDE_SCRATCH_ROOT") {
+        if Path::new(&scratch) != root.join("scratch") { return Err("scratch root is not fixture-owned".to_owned()); }
+        validate_fixture_path(root, Path::new(&scratch))?;
+    }
+    let actual = config::Facts::from_env();
+    let injected = fixture_facts(root);
+    let actual_state = actual.state_dir()?;
+    if actual_state != injected.state_dir()? { return Err("fixture state directory differs".to_owned()); }
+    validate_fixture_path(root, &actual_state)?;
+    let settings = config::settings(&actual)?;
+    if settings.pool != root.join("scratch/pool") { return Err("resolved pool differs from fixture".to_owned()); }
+    Ok(())
+}
+
 struct FixtureSpec {
     case: Case,
     volume: Option<(PathBuf, String)>,
@@ -352,6 +462,9 @@ fn build_fixture(root: &Path, spec: &FixtureSpec) -> Result<FixturePaths, String
         root_ra: root.join("oxide-outputs/oxide-ra"),
         root_rb: root.join("oxide-outputs/oxide-rb"),
     };
+    let parent = root.parent().ok_or("fixture has no parent")?;
+    validate_fixture_path(parent, root)?;
+    if root.exists() { return Err("fixture root already exists".to_owned()); }
     write_private_dir(&paths.root)?;
     write_private_dir(&root.join("scratch"))?;
     write_private_dir(&root.join("home"))?;
@@ -639,20 +752,10 @@ fn build_fixture(root: &Path, spec: &FixtureSpec) -> Result<FixturePaths, String
             "pool": paths.pool.display().to_string(),
             "created_ms": created,
         });
-        // The account state root for the child's HOME, derived here so the
-        // record lands exactly where the engine's own resolver reads it.
-        let home = root.join("home");
-        let previous = std::env::var_os("HOME");
-        // SAFETY: single-threaded fixture preparation, before any engine work.
-        unsafe {
-            std::env::set_var("HOME", &home);
-        }
-        let state_dir = config::Facts::from_env().state_dir();
-        match previous {
-            Some(value) => unsafe { std::env::set_var("HOME", value) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-        let state_dir = state_dir.map_err(|error| error.to_string())?;
+        // Resolve the fixture's state using the same platform resolver with
+        // injected facts; preparation must never consult the account home.
+        let state_dir = fixture_facts(root).state_dir()?;
+        validate_fixture_path(root, &state_dir)?;
         let hash = {
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
@@ -663,8 +766,10 @@ fn build_fixture(root: &Path, spec: &FixtureSpec) -> Result<FixturePaths, String
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()
         };
+        let record_path = state_dir.join("scratch-pools").join(format!("{hash}.json"));
+        validate_fixture_path(root, &record_path)?;
         write_private_file(
-            &state_dir.join("scratch-pools").join(format!("{hash}.json")),
+            &record_path,
             &serde_json::to_vec_pretty(&record).map_err(|error| error.to_string())?,
         )?;
     }
@@ -713,39 +818,58 @@ fn run_case(
     fixture_root: &Path,
     manifest_path: &Path,
     transcript_out: &Path,
-    case: Case,
+    case: &str,
 ) -> Result<(), String> {
-    let manifest_bytes = std::fs::read(manifest_path).map_err(|error| {
-        format!(
-            "cannot read the manifest {}: {error}",
-            manifest_path.display()
-        )
-    })?;
-    if manifest_bytes.len() as u64 > tape::MAX_MANIFEST_BYTES {
-        return Err("the manifest exceeds its read bound".to_owned());
+    validate_fixture_path(fixture_root, transcript_out)?;
+    match std::fs::symlink_metadata(transcript_out) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Ok(_) => return Err("transcript destination already exists".to_owned()),
+        Err(error) => return Err(error.to_string()),
     }
-    let manifest: HarnessManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|error| format!("the manifest is invalid: {error}"))?;
-    if manifest.version != MANIFEST_VERSION || manifest.case != case.name() {
-        return Err(format!(
-            "the manifest does not name this engine case ({} for {})",
-            manifest.case,
-            case.name()
-        ));
-    }
-    let manifest_sha = tape::sha256_hex(&manifest_bytes);
+    let read = (|| -> Result<Vec<u8>, String> {
+        use std::io::Read;
+        validate_fixture_path(fixture_root, manifest_path)?;
+        let file = std::fs::File::open(manifest_path).map_err(|error| error.to_string())?;
+        let mut bytes = Vec::new();
+        file.take(tape::MAX_MANIFEST_BYTES + 1).read_to_end(&mut bytes).map_err(|error| error.to_string())?;
+        Ok(bytes)
+    })();
+    let manifest_sha = read.as_ref().ok().filter(|bytes| bytes.len() as u64 <= tape::MAX_MANIFEST_BYTES)
+        .map(|bytes| tape::sha256_hex(bytes)).unwrap_or_default();
+    tape::begin(ENGINE, case, &manifest_sha, "oxide::prune::tape_entry::run_chain");
+    let parsed = (|| -> Result<HarnessManifest, String> {
+        validate_engine_environment(fixture_root)?;
+        let bytes = read?;
+        if bytes.len() as u64 > tape::MAX_MANIFEST_BYTES { return Err("manifest exceeds byte cap".to_owned()); }
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        validate_manifest_envelope(&doc)?;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root_meta = std::fs::symlink_metadata(fixture_root).map_err(|error| error.to_string())?;
+        if doc.pointer("/fixture/root").and_then(|v| v.as_str()) != fixture_root.to_str()
+            || doc.pointer("/fixture/device").and_then(|v| v.as_u64()) != Some(root_meta.dev())
+            || doc.pointer("/fixture/inode").and_then(|v| v.as_u64()) != Some(root_meta.ino())
+            || doc.pointer("/fixture/mode").and_then(|v| v.as_u64()) != Some(u64::from(root_meta.permissions().mode() & 0o777)) {
+            return Err("fixture identity differs from manifest".to_owned());
+        }
+        let manifest: HarnessManifest = serde_json::from_value(doc).map_err(|error| error.to_string())?;
+        if manifest.schema != MANIFEST_VERSION || manifest.case != case { return Err("manifest case or schema mismatch".to_owned()); }
+        Ok(manifest)
+    })();
+    let manifest = match parsed {
+        Ok(value) => value,
+        Err(reason) => return tape::finish_and_write(transcript_out, TapeEngineOutcome::Refused { reason, exit_code: 2 }, None),
+    };
     let operator_list = manifest
         .operator_list
         .as_ref()
         .map(|rel| fixture_root.join(rel));
 
+    if let Some(path) = operator_list.as_deref() {
+        if let Err(reason) = validate_fixture_path(fixture_root, path) {
+            return tape::finish_and_write(transcript_out, TapeEngineOutcome::Refused { reason, exit_code: 2 }, None);
+        }
+    }
     let pre = tape::capture_fixture(fixture_root);
-    tape::begin(
-        ENGINE,
-        case.name(),
-        &manifest_sha,
-        "oxide::prune::tape_entry::run_chain",
-    );
     let outcome = match prune::tape_entry::run_chain(operator_list.as_deref()) {
         Ok(prune::tape_entry::ChainOutcome::Evaluated { result }) => {
             TapeEngineOutcome::Completed { result }
@@ -839,6 +963,61 @@ fn check(condition: bool, what: &str) -> Result<(), CheckFailure> {
 /// bookkeeping, per-key occurrence cap, read-row cap, document bound and the
 /// explicit truncation markers.
 fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
+    let private_state = fixture_facts(temp).state_dir().map_err(|error| CheckFailure { what: error })?;
+    check(validate_fixture_path(temp, &private_state).is_ok(), "injected state stays in fixture")?;
+    check(validate_fixture_path(temp, &temp.join("../escape")).is_err(), "parent traversal is refused")?;
+    let link = temp.join("escape-link");
+    std::os::unix::fs::symlink("/", &link).map_err(|error| CheckFailure { what: error.to_string() })?;
+    check(validate_fixture_path(temp, &link.join("outside")).is_err(), "symlink escape is refused")?;
+    std::fs::remove_file(&link).map_err(|error| CheckFailure { what: error.to_string() })?;
+    let example: serde_json::Value = serde_json::from_str(include_str!("../../../docs/knowledge/contracts/capture-examples/manifest-example.json")).map_err(|error| CheckFailure { what: error.to_string() })?;
+    check(validate_manifest_envelope(&example).is_ok(), "manifest example has required envelope")?;
+    let mut over_bytes = example.clone();
+    over_bytes["fixture"]["entries"][0]["size"] = (32u64 * 1024 * 1024 + 1).into();
+    check(validate_manifest_envelope(&over_bytes).is_err(), "manifest fixture-byte cap refuses")?;
+    for (pointer, limit) in [("/fixture/entries", 4096usize), ("/fixture/roots", 64), ("/dynamic/volumes", 64), ("/dynamic/writers", 512), ("/mandatory_observations", 256)] {
+        let mut over = example.clone();
+        *over.pointer_mut(pointer).ok_or_else(|| CheckFailure { what: format!("missing {pointer}") })? = serde_json::Value::Array(vec![serde_json::Value::Null; limit + 1]);
+        check(validate_manifest_envelope(&over).is_err(), "manifest collection cap refuses")?;
+    }
+    for invalid in [include_str!("../../../docs/knowledge/contracts/capture-examples/invalid-missing-mandatory.json"), include_str!("../../../docs/knowledge/contracts/capture-examples/invalid-missing-source.json"), include_str!("../../../docs/knowledge/contracts/capture-examples/invalid-writers-over-cap.json"), include_str!("../../../docs/knowledge/contracts/capture-examples/invalid-unknown-field.json")] {
+        let doc: serde_json::Value = serde_json::from_str(invalid).map_err(|error| CheckFailure { what: error.to_string() })?;
+        check(validate_manifest_envelope(&doc).is_err(), "invalid manifest envelope refuses")?;
+    }
+    // Each byte string is compiled from the same path used by the re-rooted
+    // module declaration. The digest list is reported as a source map, not as
+    // a substitute for a library call or build-artifact provenance.
+    for (name, bytes) in [
+        ("inventory", include_bytes!("../../inventory.rs").as_slice()),
+        ("lease", include_bytes!("../../lease/mod.rs").as_slice()),
+        ("pool", include_bytes!("../../lease/pool.rs").as_slice()),
+        ("volume", include_bytes!("../../volume.rs").as_slice()),
+    ] {
+        check(!bytes.is_empty(), "re-rooted source is present")?;
+        println!("source-map {name} sha256={}", tape::sha256_hex(bytes));
+    }
+    tape::begin("oxide", "PURE-DOCUMENT-CAP", "manifest", "pure");
+    let capped_path = temp.join("capped-transcript.json");
+    tape::finish_and_write(&capped_path, TapeEngineOutcome::Completed {
+        result: serde_json::json!({"oversized": "x".repeat(tape::MAX_DOCUMENT_BYTES + 1)}),
+    }, None).map_err(|error| CheckFailure { what: error })?;
+    let capped = std::fs::read(&capped_path).map_err(|error| CheckFailure { what: error.to_string() })?;
+    let capped_doc: serde_json::Value = serde_json::from_slice(&capped).map_err(|error| CheckFailure { what: error.to_string() })?;
+    check(capped.len() <= tape::MAX_DOCUMENT_BYTES && capped_doc.pointer("/truncation/document_truncated").and_then(|v| v.as_bool()) == Some(true), "serialized document cap is explicit")?;
+    let observed_path = temp.join("observed-input");
+    write_private_file(&observed_path, b"original").map_err(|error| CheckFailure { what: error })?;
+    let observed_file = std::fs::File::open(&observed_path).map_err(|error| CheckFailure { what: error.to_string() })?;
+    use std::os::unix::fs::MetadataExt;
+    let observed_identity = observed_file.metadata().map_err(|error| CheckFailure { what: error.to_string() })?.ino();
+    std::fs::rename(&observed_path, temp.join("observed-original")).map_err(|error| CheckFailure { what: error.to_string() })?;
+    write_private_file(&observed_path, b"replacement").map_err(|error| CheckFailure { what: error })?;
+    tape::begin("oxide", "PURE-DESCRIPTOR", "manifest", "pure");
+    let mut observed_bytes = Vec::new();
+    prune::authority_read_observed(&observed_file, &observed_path, "pure::descriptor", 64, &mut observed_bytes).map_err(|error| CheckFailure { what: error.to_string() })?;
+    let descriptor_path = temp.join("descriptor-transcript.json");
+    tape::finish_and_write(&descriptor_path, TapeEngineOutcome::Completed { result: serde_json::json!({}) }, None).map_err(|error| CheckFailure { what: error })?;
+    let descriptor_doc = read_transcript(&descriptor_path).map_err(|error| CheckFailure { what: error })?;
+    check(observed_bytes == b"original" && descriptor_doc.reads.iter().any(|row| row.get("kind").and_then(|v| v.as_str()) == Some("authority-read@pure::descriptor") && row.pointer("/identity/ino").and_then(|v| v.as_u64()) == Some(observed_identity)), "descriptor binding survives path replacement")?;
     let build = |digest: String| -> Vec<u8> {
         tape::begin("oxide", "PURE", "manifest", "pure");
         for occurrence in 0..3 {
@@ -1050,12 +1229,18 @@ fn fixture_case(temp: &Path, case: Case) -> Result<(), CheckFailure> {
     };
     let root = temp.join(format!("fixture-{}", case.name().to_lowercase()));
     let paths = build_fixture(&root, &spec).map_err(|error| CheckFailure { what: error })?;
-    let manifest = serde_json::json!({
-        "version": MANIFEST_VERSION,
-        "case": case.name(),
-        "operator_list": null,
-        "expected": {"outcome": "completed"},
-    });
+    // Schema-example data is a unit-test envelope, not source or fixture
+    // qualification evidence. X-S2 supplies observed manifest facts.
+    let mut manifest: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/knowledge/contracts/capture-examples/manifest-example.json"
+    )).map_err(|error| CheckFailure { what: error.to_string() })?;
+    manifest["case"] = serde_json::Value::String(case.name().to_owned());
+    manifest["fixture"]["root"] = serde_json::Value::String(root.display().to_string());
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let root_meta = std::fs::symlink_metadata(&root).map_err(|error| CheckFailure { what: error.to_string() })?;
+    manifest["fixture"]["device"] = root_meta.dev().into();
+    manifest["fixture"]["inode"] = root_meta.ino().into();
+    manifest["fixture"]["mode"] = u64::from(root_meta.permissions().mode() & 0o777).into();
     let manifest_path = root.join("manifest.json");
     write_private_file(
         &manifest_path,
@@ -1405,7 +1590,7 @@ fn main() {
             std::process::exit(code);
         }
         Some("--fixture-root") => {
-            let parse = || -> Result<(PathBuf, PathBuf, PathBuf, Case), String> {
+            let parse = || -> Result<(PathBuf, PathBuf, PathBuf, String), String> {
                 let mut fixture = None;
                 let mut manifest = None;
                 let mut transcript = None;
@@ -1420,10 +1605,7 @@ fn main() {
                         "--manifest" => manifest = Some(PathBuf::from(value)),
                         "--transcript-out" => transcript = Some(PathBuf::from(value)),
                         "--case" => {
-                            case = Some(
-                                Case::parse(value)
-                                    .ok_or_else(|| format!("unknown case {value}"))?,
-                            )
+                            case = Some(value.to_owned())
                         }
                         other => return Err(format!("unknown argument {other}; {}", usage())),
                     }
@@ -1439,12 +1621,12 @@ fn main() {
             let parsed = parse();
             let code = match parsed {
                 Ok((fixture_root, manifest, transcript_out, case)) => {
-                    match run_case(&fixture_root, &manifest, &transcript_out, case) {
+                    match run_case(&fixture_root, &manifest, &transcript_out, &case) {
                         Ok(()) => {
                             println!(
                                 "oxide: prune capture harness wrote {} for {}",
                                 transcript_out.display(),
-                                case.name()
+                                case
                             );
                             0
                         }

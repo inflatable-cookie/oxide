@@ -710,6 +710,20 @@ the same manifest fact; missing an applicable obligation is insufficient. Static
 source-site inventory and review of all direct read paths are required alongside
 transcript reconciliation: a transcript alone cannot detect an untaped read.
 
+#### Manifest field proposal
+
+[`oxide-capture-manifest.schema.json`](oxide-capture-manifest.schema.json)
+and [`manifest-example.json`](capture-examples/manifest-example.json) propose
+one machine-readable representation for the semantic contract below. They
+are unaccepted until the retained reviewer judges the shape. Examples are
+illustrative, with placeholder identities and digests; they are not evidence.
+The Barge proposal's `barge.volume_uuid`, `namespace`, `area`, optional
+`named_roots` and `volume_mount`, and its optional `fixture.volume` are
+represented. The authoritative aggregate 32 MiB fixture-byte limit and
+cross-field, identity, source-binding and refusal obligations are semantic
+checks in addition to JSON Schema. An invalid or unbound manifest can never
+establish parity. X-S2 must reconcile the reviewed shape with B-S1 before use.
+
 #### Serialized schemas and caps
 
 One manifest and two transcripts per case window, JSON, deterministic field
@@ -1035,14 +1049,36 @@ alone is insufficient.
   root identity) and `src/lease/pool.rs` + `src/lease/mod.rs`
   (`ledger_view`, the pool lock, reconcile entry classification,
   `save@ledger` and `fence@managed-control` effects).
+- **Descriptor-read inventory.** The test-only descriptor wrapper currently
+  covers `prune::read_registry`, `prune::read_bounded`, the root marker read,
+  `store::recorded_last_use`, `recorded_lost`, `active_holders`,
+  `sibling_state`, `sibling_state_checked`, `trusted_origin`, `load`, and
+  `read_observations`, `outputs::read_receipt_with`, `marker_digest` and
+  `read_marker`, and `removable::read_registration`. The non-test read
+  statements remain in their original cfg branches. Parent identities are
+  still observed independently and must be reviewed for race-free binding;
+  this inventory is not proof that every direct read in the contract is taped.
+- **Fixture configuration.** Preparation uses `config::Facts` with injected
+  platform-directory inputs; the evaluator child uses the existing debug-only
+  `OXIDE_TEST_HOME_FROM_ENV=1` control and explicit fixture paths. The child
+  must check its controls and resolved state and pool before entering the
+  engine. This proves no production account-home equivalence. The isolated
+  wrapper route for covering checks is not yet established: the installed
+  release Oxide rejects the test-home control, and its normal scratch-pool
+  registration derives an account-state path. Validation must not start until
+  an independently reviewed route confines that registration before any write.
+  Preserve the earlier contaminated sessions and the operator's live-state
+  disposition separately in Queue.
 - **Harness composition.** The harness crate re-roots the actual library and
   binary modules and aliases itself as `oxide_storage`, sharing one tape.
   Library observations must come from their actual leaf sites; a fixture diff
   cannot replace them. `HoldingSweep` belongs to the release command, while
   `paired_store` calls `removable::coordinate`, which only reads registration
   and constructs the sibling store.
-  The planner authorized a narrow test-only split at the `closed_by_boot`
-  call site to record its actual result, retaining the non-test predicate.
+  Narrow `cfg(test)`/`cfg(not(test))` splits are permitted at individual
+  observation sites: the non-test statement remains verbatim, while the test
+  branch calls the real operation once and records its returned value or error.
+  Descriptor reads must bind the held descriptor, not a later path lookup.
 - **The entry.** `prune::tape_entry::run_chain` (cfg(test)) follows the
   `dry_run` prefix exactly — `AuthorityScope::begin`, `paired_store`, the
   optional `read_operator_list`, `require_ready`, the unfinished-intent
@@ -1052,11 +1088,9 @@ alone is insufficient.
   engine's exit code (2 registry/fence refusal, 3 unsettled, 1 chain
   error). It never calls `dry_run`, never renders a preview, never
   redirects stdout. The static source-site inventory is the list above;
-  two known honest gaps are recorded here: a read whose statement
-  propagates an error with `?` records its core row but cannot bind its
-  identity on that path (the unbound pending is an explicit transcript
-  note), and over-cap occurrences are truncated with the flag set, never
-  dropped silently.
+  the descriptor-bound read sites and their failure paths still require
+  source and execution review. An unbound or unknown observation is never
+  parity, and over-cap occurrences explicitly mark truncation.
 - **The harness.** Argv contract exactly
   `--fixture-root --manifest --transcript-out --case`; exit 0 when the
   transcript is written (any engine outcome), 2 on harness failure. No
@@ -1085,38 +1119,16 @@ alone is insufficient.
   admission lock, so BASE records zero tape effects and an empty fixture
   diff; the EFFECT cases record the real `lock-create@admission` and the
   durable fence save exactly once each, never repaired between runs.
-- **Export/build commands for X-S2.** Stage the exact Oxide head, then:
-  `cargo test --test tape_prune_eval --no-run --locked` (the frozen stable
-  toolchain, offline through the committed lock) and take the printed
-  executable path under `target/debug/deps/tape_prune_eval-<hash>`;
-  record its SHA-256 with the transcript and invoke it once per case with
-  the four arguments against the manifest the orchestrator wrote. The
-  manifest fields the harness binds are `version` (`oxide.capture.manifest/1`),
-  `case`, optional `operator_list` (fixture-relative path) and `expected`.
-- **Validation recorded.** `effigy rust:compile`, `effigy
-  rust:compile-release` (`-D warnings`, proving compile-away),
-  `effigy rust:format`, the covering `effigy test rust` under the sanctioned
-  dual-root recipe, `effigy docs:check`, the focused
-  `effigy proof:tape-prune:test` selector (the embedded self-check, all
-  five unit fixtures and the pure checks green), and the library tape's
-  unit test (`tape::tests::volume_leaf_recorders_fire_in_the_library_test_compilation`).
-  The nine premise dispositions for the future X-S2 execution: (1) private
-  HOME/rustup is the child env the harness itself assembles, with the
-  invoking `RUSTUP_HOME` preserved for staging; (2)
-  `OXIDE_TEST_HOME_FROM_ENV=1` on the engine child, set by the harness;
-  (3) the child environment is an allow-list (`PATH`, `HOME`, the fixture
-  `OXIDE_*` facts), so inherited `OXIDE_*`/`CARGO_*`/`SCCACHE_*`/`XDG_*`
-  values are scrubbed by construction; (4) the fixtures are positively
-  built by fixture code and no build runs in a window; (5) no Cargo
-  external subcommand is invoked — not applicable; (6) volume cases use
-  X-S2's one owned image and its real custody facts, never the tape; (7)
-  frozen `RUSTFLAGS` with `CARGO_ENCODED_RUSTFLAGS` removed at staging;
-  (8) fixture, transcripts and scratch under the caller's selected-volume
-  routing with same-volume `TMPDIR`; (9) fixture roots are `mktemp`
-  templates under the owned scratch parent. All are implemented in
-  `src/bin/oxide/tape_harness.rs` (`self_check`, `fixture_case`, the child
-  env assembly) or are staging obligations that stay with X-S2's
-  orchestrator; none has run under a counted native yet.
+- **Validation and export.** The final executable and its build route must be
+  identified from the reviewed source and recorded with its digest, lock and
+  toolchain before X-S2 consumes it. The final head still needs its covering
+  compile, release compile, format, Rust suite, docs and focused selectors.
+  No earlier fixture run supplies that evidence. The fixed nine-premise
+  checklist remains mandatory for future execution: private HOME/rustup,
+  account control, environment scrubbing, no unintended adoption, Cargo argv,
+  image custody if applicable, frozen compiler flags, temporary placement and
+  explicit macOS mktemp templates. These are conditions to verify, not proof
+  that the current apparatus satisfies them.
 
 Deliverable note for O3: an `EXPLAIN-OR-BLOCK` case that demonstrates a real
 final disagreement (currently `REF-ORPHAN-MARKED`, `RCP-V1`,
