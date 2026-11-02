@@ -1338,6 +1338,25 @@ fn check(condition: bool, what: &str) -> Result<(), CheckFailure> {
 /// bookkeeping, per-key occurrence cap, read-row cap, document bound and the
 /// explicit truncation markers.
 fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
+    use std::os::unix::fs::PermissionsExt;
+    // The covering Rust recipe supplies a fresh child of this sibling as
+    // TMPDIR. Exercise the real guard on that owned root when it does so;
+    // never create an independent fixture outside the caller's temp root.
+    if temp.starts_with("/Volumes/Builds/scratch/oxide-validation/") {
+        check(validate_fixture_path(temp, &temp.join("new-entry")).is_ok(),
+            "canonical private validation sibling is accepted")?;
+    }
+    let lookalike = Path::new("/Volumes/Builds/scratch/oxide-validation-x/not-a-fixture");
+    check(validate_fixture_path(lookalike, lookalike).is_err(),
+        "validation sibling lookalike is refused")?;
+    let insecure = temp.join("insecure-validation-root");
+    write_private_dir(&insecure).map_err(|what| CheckFailure { what })?;
+    std::fs::set_permissions(&insecure, std::fs::Permissions::from_mode(0o755))
+        .map_err(|error| CheckFailure { what: error.to_string() })?;
+    let refused = validate_fixture_path(&insecure, &insecure).is_err();
+    std::fs::set_permissions(&insecure, std::fs::Permissions::from_mode(0o700))
+        .map_err(|error| CheckFailure { what: error.to_string() })?;
+    check(refused, "non-owner-only fixture root is refused")?;
     let private_state = fixture_facts(temp)
         .state_dir()
         .map_err(|error| CheckFailure { what: error })?;
@@ -1886,6 +1905,7 @@ fn effect_attempt_check(temp: &Path) -> Result<(), CheckFailure> {
         tape::effect_row("attempt@temporary-open", Path::new("/fixture/temp"));
         tape::effect_row("attempt-save@temporary-write", Path::new("/fixture/temp"));
         tape::effect_row("attempt-rename@temporary-move", Path::new("/fixture/destination"));
+        tape::effect_row("attempt-unlink@temporary-cleanup", Path::new("/fixture/temp"));
         tape::effect_row("save@control-state", Path::new("/fixture/state"));
     }
     let transcript = temp.join("effect-attempt.json");
@@ -1893,14 +1913,16 @@ fn effect_attempt_check(temp: &Path) -> Result<(), CheckFailure> {
         result: serde_json::json!({"complete": false, "entries": []}),
     }, None).map_err(|what| CheckFailure { what })?;
     let doc = read_transcript(&transcript).map_err(|what| CheckFailure { what })?;
-    check(doc.effects.len() == 4, "all attempted and completed effects are retained")?;
+    check(doc.effects.len() == 5, "all attempted and completed effects are retained")?;
     check(doc.effects[0]["kind"] == "create" && doc.effects[0]["attempted"] == true,
         "uncertain create stays an attempt")?;
     check(doc.effects[1]["kind"] == "save" && doc.effects[1]["attempted"] == true,
         "failed write stays an attempt")?;
     check(doc.effects[2]["kind"] == "rename" && doc.effects[2]["attempted"] == true,
         "failed rename stays an attempt")?;
-    check(doc.effects[3]["kind"] == "fence" && doc.effects[3]["site"] == "expected",
+    check(doc.effects[3]["kind"] == "unlink" && doc.effects[3]["attempted"] == true,
+        "failed cleanup stays an attempt")?;
+    check(doc.effects[4]["kind"] == "fence" && doc.effects[4]["site"] == "expected",
         "temporary attempts do not consume the final fence override")?;
     check(doc.notes.iter().any(|note| note.contains("attempted effect") && note.contains("insufficient")),
         "attempts cannot be silently treated as parity")

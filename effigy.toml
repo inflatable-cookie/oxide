@@ -1410,8 +1410,8 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # truncation, the unbound-read note) plus the BASE, EFFECT-1, EFFECT-2,
 # REGISTRY-MISSING and UNSETTLED-INTENT unit fixtures, plus a fresh BASE
 # disconnected-sink counterfactual, each with one waited child. `proof:tape-prune:self-check`
-# runs only the pure checks. Both use the caller's private build pool and
-# owner-only TMPDIR. They are not a benchmark, native proof or full QA; the
+# runs only the pure checks. The launcher binds both to its private context,
+# including the pool and owner-only TMPDIR. They are not a benchmark, native proof or full QA; the
 # counted diagnostic at a source-approved head remains X-S2's Queue proof.
 [tasks."proof:tape-prune:isolation-test"]
 run = "python3 scripts/test_tape_isolation.py"

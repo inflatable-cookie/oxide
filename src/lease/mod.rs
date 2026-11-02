@@ -984,9 +984,9 @@ fn persist_private_file(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
             else { "attempt-save@pool-private-temp" }, &temp_path);
         crate::tape::restore_observer_errno(saved_errno);
         if let Err(error) = write.and_then(|()| file.sync_all()) {
-            if fs::remove_file(&temp_path).is_ok() {
-                crate::tape::effect_row("unlink@pool-private-temp", &temp_path);
-            }
+            let removed = fs::remove_file(&temp_path);
+            crate::tape::effect_row(if removed.is_ok() { "unlink@pool-private-temp" }
+                else { "attempt-unlink@pool-private-temp" }, &temp_path);
             return Err(io_error(error));
         }
     }
@@ -998,9 +998,10 @@ fn persist_private_file(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
     }
     #[cfg(test)]
     if let Err(error) = fs::rename(&temp_path, path) {
-        if fs::remove_file(&temp_path).is_ok() {
-            crate::tape::effect_row("unlink@pool-private-temp", &temp_path);
-        }
+        crate::tape::effect_row("attempt-rename@pool-private-file", path);
+        let removed = fs::remove_file(&temp_path);
+        crate::tape::effect_row(if removed.is_ok() { "unlink@pool-private-temp" }
+            else { "attempt-unlink@pool-private-temp" }, &temp_path);
         return Err(io_error(error));
     }
     #[cfg(test)]
@@ -1313,9 +1314,9 @@ fn persist_control_state(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
             else { "attempt-save@managed-control-temp" }, &temp_path);
         crate::tape::restore_observer_errno(saved_errno);
         if let Err(error) = write.and_then(|()| file.sync_all()) {
-            if fs::remove_file(&temp_path).is_ok() {
-                crate::tape::effect_row("unlink@managed-control-temp", &temp_path);
-            }
+            let removed = fs::remove_file(&temp_path);
+            crate::tape::effect_row(if removed.is_ok() { "unlink@managed-control-temp" }
+                else { "attempt-unlink@managed-control-temp" }, &temp_path);
             return Err(io_error(error));
         }
     }
@@ -1327,9 +1328,10 @@ fn persist_control_state(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
     }
     #[cfg(test)]
     if let Err(error) = fs::rename(&temp_path, path) {
-        if fs::remove_file(&temp_path).is_ok() {
-            crate::tape::effect_row("unlink@managed-control-temp", &temp_path);
-        }
+        crate::tape::effect_row("attempt-rename@managed-control", path);
+        let removed = fs::remove_file(&temp_path);
+        crate::tape::effect_row(if removed.is_ok() { "unlink@managed-control-temp" }
+            else { "attempt-unlink@managed-control-temp" }, &temp_path);
         return Err(io_error(error));
     }
     #[cfg(test)]

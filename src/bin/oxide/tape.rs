@@ -820,11 +820,12 @@ pub(crate) fn effect_row(kind: &str, path: &Path) {
             kind.to_owned()
         };
         let (verb, site) = kind.split_once('@').unwrap_or((&kind, "unknown"));
-        let attempted = matches!(verb, "attempt" | "attempt-save" | "attempt-rename");
+        let attempted = matches!(verb, "attempt" | "attempt-save" | "attempt-rename" | "attempt-unlink");
         let verb = match verb {
             "attempt" => "create",
             "attempt-save" => "save",
             "attempt-rename" => "rename",
+            "attempt-unlink" => "unlink",
             _ => verb,
         };
         if !matches!(verb, "create" | "save" | "fence" | "reconcile" | "lock-create" | "rename" | "unlink") {
@@ -1280,14 +1281,21 @@ fn walk_fixture(
         } else {
             None
         };
+        let (parent_dev, parent_ino) = match std::fs::metadata(dir) {
+            Ok(parent) => (Some(parent.dev()), Some(parent.ino())),
+            Err(_) => {
+                *truncated = true;
+                (None, None)
+            }
+        };
         entries.push(TapeFixtureEntry {
             rel,
             kind,
             size: meta.len(),
             dev: meta.dev(),
             ino: meta.ino(),
-            parent_dev: std::fs::metadata(dir).ok().map(|m| m.dev()),
-            parent_ino: std::fs::metadata(dir).ok().map(|m| m.ino()),
+            parent_dev,
+            parent_ino,
             mode: meta.permissions().mode(),
             bytes_sha256,
         });

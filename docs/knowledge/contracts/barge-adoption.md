@@ -1191,6 +1191,51 @@ alone is insufficient.
   limits, 1200 s cumulative wall, reserve and inventory gates remain unchanged.
   Preserve the earlier contaminated sessions and the operator's live-state
   disposition separately in Queue.
+- **Private launcher context for a future authorized run.** Nothing in these
+  instructions authorizes a bootstrap or a live inventory. After the source
+  and isolation gates are approved, prepare a fresh `mktemp -d` child of
+  `/Volumes/Builds/scratch/oxide` with mode 0700, and use its canonical path
+  as `TAPE_RUN_ROOT`. Create owner-only directories `work/source`, `work/home`,
+  `work/cargo-home`, `work/scratch/tmp`, `work/bin`, and `bootstrap-target`
+  inside it. Create `work/config.toml` as a regular, empty, single-link 0600
+  file. Extract `git archive --format=tar HEAD` from the clean task checkout
+  into `work/source`, preserving executable bits and without links or extra
+  files. Set `TAPE_REPOSITORY` to the canonical task checkout, not the archive.
+  The launcher independently compares every staged file and executable bit
+  to the clean queue branch's archive, commit and tree; an unqualified archive
+  cannot attest itself. Do not run it with a dirty checkout or a different head.
+
+  Populate `work/cargo-home` with the already available offline dependency
+  cache using real owner-only directories and regular files, without symlinks,
+  Cargo config files or downloads. Copy the existing Northstar skill tree into
+  `work/home/.agents/skills/northstar` with the same private, no-link rules;
+  set `TAPE_NORTHSTAR_DIR` to its canonical original for the launcher's
+  content comparison. Set `RUSTUP_HOME` to the existing canonical Rustup
+  home and `TAPE_TOOLCHAIN_BIN` to its installed `toolchains/1.97.1-*/bin`
+  directory. Set `TAPE_EFFIGY` to the canonical existing Effigy executable.
+  For `cover-test` only, `TAPE_TEST_INTERNAL_ROOT` names a fresh empty,
+  owner-only child of `/private/tmp`, as allowed by the existing boot-Data
+  suite exception; no other action uses that exception. The launcher supplies
+  HOME, config, pool, scratch, TMP and the scrubbed subprocess environment.
+
+  Create `budget.json` in the run root as a single-link 0600 JSON file with
+  `task` equal to `d41de092-b0b0-495d-b159-8c4d1730d6b4`, a nonempty
+  `history_reference`, numeric `covering_seconds_charged`, and `retained_roots`
+  containing the new run root and every earlier non-overlapping owned Builds
+  root. Obtain the reference, actual cumulative covering charges and exact
+  root list from retained Queue records and packets; verify them against that
+  history before use. The 3468 MiB historical baseline is a lower bound, not
+  a complete inventory or permission to assume zero elapsed time. Missing or
+  uncertain history refuses the run; the launcher cannot authenticate a
+  caller-supplied ledger by itself. Keep receipts and failed packets.
+
+  Once those prerequisites and the source, resource and fresh inventory gates
+  are independently satisfied, run the task-local Effigy selectors in order:
+  `proof:tape-prune:bootstrap`, `proof:tape-prune:preflight-build`, then
+  `proof:tape-prune:path-preflight`; only a passed dry inventory gate permits
+  the one authorized focused rerun and remaining applicable `cover-*` checks.
+  Every action rebinds the source and records its own before/after inventory.
+  This source recipe supplies no execution, isolation or parity evidence.
 - **Harness composition.** The harness crate re-roots the actual library and
   binary modules and aliases itself as `oxide_storage`, sharing one tape.
   Library observations must come from their actual leaf sites; a fixture diff
@@ -1258,9 +1303,9 @@ alone is insufficient.
   unbound effect; a descriptor-only result without a path is insufficient. In
   `open_verified_step` the observer runs only after the restoration guard is
   armed, preserving its custody ordering. These changes are source-only;
-  the remaining `Pool::open` transitive enumeration, other write/error sites,
-  subprocess environment and cfg-equivalence audits are not established by
-  this map and cannot be inferred from a transcript or fixture diff.
+  the statement map below identifies the pool-open recovery and error paths.
+  Subprocess environment closure needs the separate executable and inventory
+  gates and cannot be inferred from a transcript or fixture diff.
 - **Prefix reachability and effect boundaries.** `Pool::open` calls
   `open_inner(root, false, true, true)`: canonical root and directory
   enumeration precede the lock, managed-control fence, config, backend
@@ -1280,6 +1325,29 @@ alone is insufficient.
   including error conversion, errno, short circuit, ownership and descriptor
   lifetime. A source map and candidate hooks are present; their complete
   equivalence and transitive coverage have not been independently established.
+  The following statement map is for the actual chain, including error exits;
+  links name the source containing both the non-test statement and its test
+  observation. It does not assert that an unbound row meets an identity
+  obligation or that a failed write succeeded.
+
+  | Source and reached statements | Production/test relationship and outcome |
+  | --- | --- |
+  | [`prune.rs`](../../../src/bin/oxide/prune.rs), `tape_entry::run_chain`, `paired_store`, `require_ready`, `evaluate` | The test entry calls the real chain in that order. Authority clocks and bounded reads have one real call in each cfg arm; read error, cap, missing registry, unsettled state and evaluation result retain the real branch. `dry_run`, preview rendering and deletion entrypoints are not called. |
+  | [`config.rs`](../../../src/bin/oxide/config.rs), `config_file`, `read_config`, `inspect` | Metadata, canonicalization and actual file read retain the non-test statements; test arms record the corresponding result or error before the same propagation/short circuit. |
+  | [`store.rs`](../../../src/bin/oxide/store.rs), `private_file`, `open_control_directory`, `holders`, `save`, `open_admission_file`, `lock_admission_inner` | The original non-test opens, descriptor metadata, state write/sync/rename and lock statements remain in their cfg arms. Test arms record the one real result; rename failure is an attempt and successful state replacement is recorded before directory sync. The `O_CREAT` cases remain attempts when creation is not proven. Holder wall starts do not establish kernel starts. |
+  | [`scratch_io.rs`](../../../src/bin/oxide/scratch_io.rs), `read_document`; [`outputs.rs`](../../../src/bin/oxide/outputs.rs), `read_receipt_with`, `marker_digest`, `read_marker`; [`removable.rs`](../../../src/bin/oxide/removable.rs), `read_registration`, `coordinate` | Test arms observe the actual open, metadata, bounded read, marker and registration results; non-test statements and their error returns remain. `coordinate` selects the paired store; it does not invoke a holding deleter. |
+  | [`lease/mod.rs`](../../../src/lease/mod.rs), `canonical_existing_dir`, `read_private_file_bounded`, `fence_managed_control`, `persist_private_file`, `persist_control_state`, `random_hex` | Non-test calls retain canonicalization, bounded read, entropy, create/write/sync/rename and cleanup order. The test branch records real create/write, failed rename/cleanup attempts, successful cleanup and the replacement before the directory sync. The managed admission open is an attempt, not a claimed new lock. A failed sync is propagated even if the replacement was already recorded. |
+  | [`lease/pool.rs`](../../../src/lease/pool.rs), `Pool::open_inner`, `lock_pool_inner`, `read_config`, `read_ledger`, `open_budget_payload`, `open_volume_payload`, `refuse_foreign_pool_entries`, `validate_lease_payload_entries` | Root canonicalization and listing precede the real lock and fence; config and ledger use the private-file reader. Backend probes, listing results/errors, lock open/metadata/flock and actual held metadata are taped at the corresponding operations. Unsupported backing, bad metadata, listing and lock errors keep their original returns. The non-test directory iterators and syscall statements remain, with test-only wrappers calling each original iterator once. |
+  | [`lease/pool.rs`](../../../src/lease/pool.rs), `reconcile_holding`, `reconcile_evicting`, `reconcile_slot_capture`, `record_slot_capture`, `persist_revised`, `persist`, `hold_slot_tree_with_phase` | A stale or adopted holding row changes the ledger only through `persist_revised` → `persist` → `persist_private_file`; a pending eviction can record intent, restore captures, create a holding directory, rename a tree and persist a revised ledger. Create and rename results are taped where attempted; failed checks retain/block the record. Successful rename is taped before subsequent verification and sync; a containment rename is separately recorded. A prepared pool with no pending rows does not take these recovery branches. |
+  | [`owned_delete.rs`](../../../src/owned_delete.rs), `observe_entry`, `open_verified_step`, `restore_root_capture`, `put_back`; [`lease/pool.rs`](../../../src/lease/pool.rs), `rollback_captures` | Recovery uses the real held-descriptor metadata and no-follow operations. Where chmod or rename has no observed path binding, the actual success/failure is an explicit unbound effect, not an invented pathname. The mode restoration guard is armed before the test observer runs. The outside-lock `delete_holding_children` and `holding_names` deleter path is not called by `open_inner` or the evaluator. |
+  | [`inventory.rs`](../../../src/inventory.rs), `inventory_directory`, `inventory_with`, `Walker`, `probe_filesystem_free`; [`volume.rs`](../../../src/volume.rs), binding/open/verification | Existing root, iterator, metadata, deadline and filesystem-free results feed the same accounting and refusal branches. Test rows record returned results, not a second inventory or a recomputed policy; volume descriptor and parent fields stay unproven where the original operation supplies none. |
+  | [`tape.rs`](../../../src/bin/oxide/tape.rs), [`tape_harness.rs`](../../../src/bin/oxide/tape_harness.rs), [`src/tape.rs`](../../../src/tape.rs), [`lib.rs`](../../../src/lib.rs) | The tape and harness are test-only; the library-side module is `cfg(all(test, unix))`. The re-rooted harness resolves the real modules into one sink. Production release compile-away remains an execution obligation, not a consequence inferred from this table. |
+
+  Initializer-only `prepare_new_pool`, `verify_scratch_initializer` and
+  `refuse_occupied_init_directory` are reached by initialization, not by
+  `Pool::open_inner`. `HoldingSweep` and its actual unlink traversal belong to
+  release, not the `run_chain` call graph. A recovery rollback can still do
+  descriptor-only chmod or rename, so it is not classified as a no-op.
 - **The entry.** `prune::tape_entry::run_chain` (cfg(test)) follows the
   `dry_run` prefix exactly — `AuthorityScope::begin`, `paired_store`, the
   optional `read_operator_list`, `require_ready`, the unfinished-intent

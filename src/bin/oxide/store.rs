@@ -5581,8 +5581,11 @@ impl Store {
             .map_err(|error| format!("cannot replace Oxide state: {error}"))?;
         #[cfg(test)]
         {
-            fs::rename(&temp, self.control.join("state.json"))
-                .map_err(|error| format!("cannot replace Oxide state: {error}"))?;
+            let renamed = fs::rename(&temp, self.control.join("state.json"));
+            if renamed.is_err() {
+                crate::tape::effect_row("attempt-rename@control-state", &tape_state_path);
+            }
+            renamed.map_err(|error| format!("cannot replace Oxide state: {error}"))?;
             crate::tape::effect_row("save@control-state", &tape_state_path);
             File::open(&self.control)
                 .and_then(|directory| directory.sync_all())
