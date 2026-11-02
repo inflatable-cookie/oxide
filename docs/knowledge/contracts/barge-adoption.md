@@ -563,6 +563,433 @@ must test the actual circumstances and must not be forced to disagree. D-2's
 batch-versus-root scope and D-3's legacy partition likewise need demonstrated
 results. Any other disagreement remains unexplained and blocks O3.
 
+### Shared capture contract and implementation slices (F6-O2 design, 2026-11-02)
+
+**Disposition: design, not a seam and not parity.** This section turns the
+source audit above into the concrete contract an implementer can follow. It
+binds the merged PR222 checkpoint/source (Oxide `main` merge `150369b`, whose
+audit is `0a51530` and whose carried flag-predicate regression is
+`prune::tests::shadow_reference_flags_and_incomplete_registry`) and the exact
+O1 Barge pin `4af9360bd09629e970c143080ca159de8eef2562`. The sibling Barge
+checkout at `39064baf` has no `crates/` diff from that pin, so every source
+claim below reads identically at both. It specifies the two cfg(test)-only
+observation seams, the versioned capture/transcript schemas with exact caps,
+the reconciliation oracle, the finite D8 case matrix, the seven mandatory
+counterfactual realizations, and three reviewable implementation slices. It
+authorizes no implementation, no production API or behaviour change, no pin
+change, no native proof and no live read. O2 parity stays unproved and the
+O3 dispatch hold stands until later accepted actual comparison evidence
+releases it. Native proof is not a requirement or a missing proof of this
+design PR; the future implementation declares one exact-head Queue proof that
+its own retained reviewer judges.
+
+#### Entry point and no-write decision (resolved)
+
+The comparison calls each engine's actual decision chain against one privately
+owned fixture; it never injects parsed records, never stubs a custody or
+absence verdict, never copies a policy engine, and never enables Barge's
+`proof-synthetic-account` feature in the production dependency. Three
+source-backed alternatives were compared:
+
+- **Chosen: test-only entrypoints over the actual evaluators, with real
+  prepared fixture stores.** The Oxide harness calls, in process and in the
+  frozen order, the actual `prune::dry_run` chain —
+  `AuthorityScope::begin` (the real 10 s / 64 MiB authority budget,
+  `prune.rs` `SNAPSHOT_TIME`/`SNAPSHOT_MAX_BYTES`), `prune::paired_store`,
+  optional `prune::read_operator_list`, `prune::require_ready`, the
+  `registry.unfinished_intents()` pre-evaluate refusal through
+  `prune::unsettled`, and `prune::evaluate` — capturing the preview bytes that
+  `dry_run` writes to stdout by redirecting file descriptor 1 in the harness
+  (test-side only) and recording them in its transcript. Nothing in the chain
+  is re-implemented; the harness skips only `prune::build_preview`'s stdout
+  publication, which is rendering after the decision. The Barge harness calls
+  the actual `barge::release::plan` exactly as `barge-cli` does
+  (`main.rs:1484`): `StatePaths` at the fixture (explicit `override_dir`, the
+  production-frozen fixture seam), a test `AccountFacts` returning fixture
+  paths (test build only; production account resolution untouched), the real
+  platform object for all five trait arguments, a real `ReleaseRequest` with
+  `ReleaseBounds::design()` and `now_ms: state::now_ms()`, and serializes the
+  returned `PruneReport` into its transcript.
+- **Rejected: the full CLI command paths** (`oxide outputs prune --dry-run`,
+  `barge prune --plan`). Their decision content is identical to the entrypoints
+  above; what they add is exit plumbing and stdout rendering, and the CLI
+  surfaces only the capped kept-row preview rather than the full bounded
+  evaluated set the comparison binds. A CLI wrapper would add no authority and
+  one more process to keep inside the window.
+- **Rejected: a production read-only reader or custody correction.** None is
+  required by this contract. `store::private_file` opens read-write, but the
+  fixture is a writable private directory, so nothing fails; the admission
+  lock and fence behaviour of `Store::checkout_custody`
+  (`sibling_admission`/`admission` → `lock_admission` →
+  `open_admission_file(create=true)` → `fence_admission_state`) is a real,
+  bounded effect that a prepared fixture avoids in the control and that two
+  declared cases exercise and record honestly. If a future implementation finds
+  a premise the test-only seams cannot satisfy, the minimal production change
+  goes to Tom as an exact reviewed proposal — an operator scope question with
+  the file, symbol and behaviour named — never as a silent inference from this
+  design. This contract raises no new operator scope question; Q-E (D-1/D-2)
+  and the O3 gate remain the decision points.
+
+Effects policy. Every case is **STATIC** (one shared fixture instance, both
+engines' windows on the same bytes and identities, effects forbidden) or
+**DYNAMIC** (each engine runs its own fresh instance materialized from the same
+declared spec, declared effects and declared actor lifecycles, parity claimed
+only on the declared outcome surfaces). A STATIC case with any effect row is
+insufficient; an effect case's actual effect set must equal its declared set
+exactly. Effects are never repaired between engines, and an attempted write is
+never read as read-only success.
+
+#### The two observation seams (cfg(test)-only, in-crate)
+
+Both seams are **observation tapes, not injection stubs**: they record what the
+real syscalls and parsers actually returned, and feed nothing back. The real
+evaluator policies and strict parsers remain the code under test. Each addition
+inside a production function body is a separate `#[cfg(test)]`-attributed
+statement calling a cfg(test) recorder, so a production build compiles zero new
+code and every existing statement stays byte-for-byte unchanged; the covering
+release-profile check and the diff review prove both halves. Barge's
+testkit stays `pub(crate)` under `cfg(test)` (`lib.rs`); nothing becomes
+`pub`; Oxide's dependency keeps the feature-off library with no new feature
+enabled.
+
+Barge seam (B-S1) — the leaf facts the audit named, each recorded at its
+source symbol:
+
+| Leaf | Source symbol at the O1 pin | Recorded facts |
+| --- | --- | --- |
+| Process table | `MacOs::process_table` (sysctl `KERN_PROC_ALL`) | row identities (pid, effective uid, start), bound, epoch |
+| Per-process identity | `ProcessObserver::effective_uid`/`boot_identity`/`process_start` (`macos.rs`) | uid, boot id, `(pid, start)` or positively-gone, epoch |
+| Per-fd listing and vnode | `PROC_PIDLISTFDS` / `PROC_PIDFDVNODEPATHINFO` reads under `scan_processes`/`scan_table` | each fd's vnode identity or errno class, retry/backoff occurrence, epoch |
+| Platform verification | `ProcessObserver::verify_platform_binary` | answer class per classified identity, epoch |
+| Direct state reads | `state::read_bounded_inner`, `state::read_intents`, `registry::read`, `area::show`, `BargeReferences::read`, `reference::read_registry`/`read_receipts_with`/`read_oxide_marker`, `pool_custody::read_document`, `identity::read`, `area::read_holds` | path, parent identity, bytes digest or refusal class, cap, occurrence, epoch |
+| Locks | `StateLock::shared_if_present`, `LockSet::observe_registry`/`observe_volume`/`observe_unit`/`observe_root` | lock path, taken/held/absent outcome, epoch |
+| Enumeration and activity | `area::list_names`, `area::scan_activity_within`, `identity::verify`, `area::VolumeRoot::open_with`, `area::resolve_by` (via `DirOps` leaves in `os/macos.rs`) | entries with component identity, activity times, volume/mount facts, epochs |
+| Custody | `custody::decide` (under `take_custody_by`), `PoolCustody::read`/`classify`, `os::prove_absence` | intermediate classification and the leaf observations above, epochs |
+| Caller clock | `ReleaseRequest.now_ms` value | the value bound to the declared window |
+
+Oxide seam (X-S1) — the same discipline at Oxide's read and effect sites:
+
+| Leaf | Source symbol | Recorded facts |
+| --- | --- | --- |
+| Authority reads | `prune::authority_read` + `AuthorityScope` | bytes digest, cap charge, budget state, epoch |
+| Store and pool open | `Store::open_existing_with`/`open_at`, `lease::pool::Pool::ledger_view` → `Pool::open`/`open_inner`, `removable::coordinate`/`registration` | lock outcomes, **effect rows** (fence write, holding/evicting reconciliation), sibling identity, epochs |
+| Control and registry | `Store::outputs_initialization`, `Store::load`/`save`, `prune::read_registry` | bytes digests, **effect rows** for every save, epochs |
+| Receipts and markers | `outputs::read_receipt_for_prune`/`read_receipt_with`, `outputs::marker_digest` | bytes digest or refusal class, cap, epochs |
+| Absence walk | `prune::checkout_path`/`walk_checkout`/`revalidate_chain`, `judge_recorded_volume`, `judge_boot_data` | every no-follow `openat`/`fstatat` component identity, walk start, epoch |
+| Root observation | `prune::observe_row_root`/`observe_root_in`, `judge_recorded_root`, `judge_root_identity`, `volume::Binding::open`/`open_in`/`verify` | mount census and `fstatfs` facts, UUID binding, marker identity, epochs |
+| Writer custody | `Store::checkout_custody`, `Store::sibling_admission`/`admission`/`lock_admission`/`open_admission_file`/`fence_admission_state`/`fence_recorded_accounting`, `store::active_holders`, `boot_session`/`closed_by_boot` | lock/effect rows, state bytes digests, record classifications, epochs |
+| Enumeration and clocks | `prune::account_candidates` → `inventory::inventory_directory`, `scratch_io::evaluate` read sites, `prune::read_operator_list` | walk roots and outcomes, cap charges, epochs |
+
+**Unobserved or extra direct reads are rejected.** The reconciler accepts a
+transcript read row only when its identity key binds to a manifest entry, a
+declared dynamic fact, or a declared external allowance; anything else — a
+direct read that skipped a tape site, a read of an object absent from the
+manifest, an entry appearing in an enumeration that the manifest does not
+declare — classifies the whole comparison **insufficient**, with the offending
+row named. Every manifest-declared mandatory fact must appear at least once in
+each engine's transcript.
+
+#### Serialized schemas and caps
+
+One manifest and two transcripts per case window, JSON, deterministic field
+order, SHA-256 bound in every header.
+
+**`oxide.capture.manifest/1`** — written by the orchestrator immediately before
+each engine's window. Carries: `case`; the window identity; the source binding
+(Oxide commit with a clean tracked worktree, per-file source digests over
+`src/`, `Cargo.lock`, `rust-toolchain.toml`; Barge pin `4af9360`, Barge slice
+commit, per-file `crates/barge/src` digests, the staged lockfile digest, both
+toolchain versions, the exported test-executable digests); the fixture custody
+(root path, owner-only mode, root dev/inode); the fixture entries, each as
+`{rel, kind, bytes_sha256, size, dev, ino, parent_dev, parent_ino, mode}` or an
+explicit `{absent}` or `{unreadable, reason}` result; the declared dynamic
+facts (the fixture volume's UUID with its real mount point, device and
+`f_mntonname`; writer rows as `(pid, start, uid, descriptor targets,
+lifecycle)`; the external allowances — account-state parents, toolchain home,
+fixture-root parent — by path class); and the case's `mandatory_observations`
+identity keys and expected-effect rows. Caps: at most 4096 file entries,
+32 MiB of bound bytes, 64 roots, 512 process rows, 64 mount rows, 256
+mandatory keys. A cap, a read failure on a mandatory fact, an ambiguous
+root-to-area mapping, or an unclassified actor makes the manifest
+insufficient — never an empty value.
+
+**`oxide.capture.transcript/1`** — one per engine, always written, including on
+refusal. Carries: `engine` (`barge`/`oxide`), `case`, `manifest_sha256`, the
+entrypoint identity (symbol and source binding), the outcome
+(`completed`/`refused` with the engine's own refusal vocabulary and exit
+code), the engine's actual result in its own document (the preview bytes
+digest, or the serialized `PruneReport`, with a truncation marker when either
+side's own cap cut rows), `effects` rows (`{kind:
+create|save|fence|reconcile|lock-create|rename|unlink, path, epoch}`), and
+`reads` rows `{kind, identity, outcome, cap, epoch, occurrence}` where
+`identity` is the complete object identity — absolute path, parent dev/ino and
+own dev/ino for files; component name plus observed parent identity for path
+components; `(pid, start, uid)` for processes; UUID plus mount epoch for
+volumes — and `outcome` is a bytes digest, an explicit absent, or a refusal
+errno class. Clock rows (`now_ms`, monotonic) are separate and bound to the
+declared window. Caps: 8192 read rows, 8 MiB, at most 64 occurrences per
+identity key, 512 process rows. An exhausted cap is recorded as truncation and
+makes the comparison insufficient, never quietly complete.
+
+**Key grammar and epochs.** A key is `(kind, complete object or process
+identity)`; a component path is bound to its observed parent identity, never to
+a string alone, and a process is never identified by a PID without its start
+identity. Epochs are engine-local, monotonic, assigned at the leaf. The
+reconciler never compares raw epochs or raw read order across engines: it
+compares the bound fact SET and per-key occurrence behaviour. Different read
+orders reconcile; a missing key, an extra key, or any occurrence whose outcome
+differs from the manifest — including a second read of the same object whose
+result differs from the first within one engine's window — is insufficient.
+No engine is ever handed an invented return sequence: both read the real
+fixture through their real syscalls, and the manifest records what is really
+there once.
+
+#### Reconciliation oracle (the acceptance test)
+
+The reconciler, in order, and insufficient on any failure with the reason
+named: (1) verify both manifests' fixture custody against the tree as it
+exists now (identity, not hash-only: same bytes under a changed inode, parent
+or opened-descriptor identity fails); (2) verify the source binding — the
+staged sources and binaries digest-match the manifest, the Barge slice
+commit's non-cfg(test) diff against `4af9360` is empty, and Oxide's worktree
+is clean at the recorded commit; (3) for each engine, bind every read row
+(manifest, declared dynamic, or declared allowance) and demand every mandatory
+key; (4) demand the declared effect set exactly — empty for STATIC cases;
+(5) compare the engines' actual per-root fates against the case's declared
+expectation, accepting only `MATCH` (equal keep/release fate with reasons
+preserved), a pre-declared `D-1`/`D-2`/`D-3` label demonstrated by the
+captured facts, `SCOPE` (same fate, pre-declared different surface
+granularity, e.g. Oxide's whole-command refusal beside Barge's named-root
+row), `CONFIG` (declared configuration difference, no parity claim), or
+`EXPLAIN-OR-BLOCK` (a difference that must be explained from current source
+before O3 or it blocks, recorded with both raw results). A refusal from either
+engine is that engine's actual outcome; it is never an absent root and never a
+match.
+
+#### The finite D8 case matrix
+
+Fixture base (`BASE`): one private fixture tree on one real selected volume,
+holding one real Oxide internal directory pool (ledger and control with all
+four admission fences set, `admission.lock` present, empty records), a
+complete `oxide.outputs.registry/2` with three roots — R-A (present checkout,
+committed `/3` receipt, valid `/2` marker, full identity), R-B (positively
+absent checkout on the same volume, otherwise eligible), R-C (legacy row: no
+nonce/dev/ino/digest, absent checkout, unlisted) — and the matching Barge
+state (`barge.registry/1` volume record naming the real volume UUID,
+expendable, `oxide/outputs` declared with `release_on_reference`, empty intent
+journal, lock files present). Roots never exceed eight per case. All valid
+inputs are real fixture bytes read by the real parser paths; each malformed
+counterpart is exercised through the same paths. Expected fates below are
+source-bound declarations the oracle checks; both engines' raw results are
+always recorded.
+
+| ID | Family / delta | Oxide expectation | Barge expectation | Relationship |
+| --- | --- | --- | --- | --- |
+| CTL-0 | BASE no-write control (STATIC) | R-A kept (present), R-B candidate, R-C kept (legacy) | R-A kept, R-B release-eligible, R-C kept | MATCH, effects empty, full binding |
+| CTL-1 | registry sticky-incomplete | whole batch kept, incomplete snapshot | whole batch kept | MATCH |
+| CAP-1 | registry over `SNAPSHOT_MAX_RECEIPTS` (8192) | whole batch kept, complete=false, cap bound in transcript | `PLAN_ROOTS` (4096) truncation honestly bound | MATCH (both keep, both truncated) |
+| REG-MISSING | registry file absent | `require_ready` refusal, command refused | `OxideRegistry::Unknown`, roots kept | MATCH-KEPT + SCOPE |
+| REG-MALFORMED | registry bytes invalid | refusal | Unknown, kept | MATCH-KEPT |
+| REG-OVERSIZE | registry over its read cap | budget exhaustion → incomplete/kept | `read_bounded_inner` cap → Unknown, kept | MATCH-KEPT |
+| REG-CONTRADICTORY | two live rows, one root, two checkouts | both roots kept (shared-reference rule) | both kept | MATCH |
+| REG-OVERFLOW | sticky incompleteness + cancelled-overflow tag | whole batch kept | whole batch kept | MATCH |
+| REF-PENDING | row `pending` | kept (prepared transition) | kept (not current) | MATCH + SCOPE |
+| REF-RESERVATION | row `reservation` | kept | kept | MATCH |
+| REF-CANCELLING | row `cancelling` | kept | kept | MATCH |
+| REF-PRUNING | row `pruning`, intent unfinished | pre-evaluate `unsettled` refusal | pending intent names the root, kept | MATCH-KEPT + SCOPE (whole-command vs named-root, pre-declared) |
+| REF-SELECTED-NOT-CURRENT | row selected, receipt not selecting | snapshot error, whole batch kept | reference incomplete, kept | MATCH-KEPT + SCOPE |
+| REF-ORPHAN-MARKED | root folder + valid marker, no registry row | not evaluated (outside registry scope; recorded as observation) | per actual gate: released only if its reference set is positively empty and identity verifies | EXPLAIN-OR-BLOCK |
+| RCP-V1 | committed `/1` whole-target receipt + `/1` marker, recorded identity | eligible candidate (committed v1 is eligible; oxide#152 rules) | `read_oxide_marker` reports `/1` unknown → kept | EXPLAIN-OR-BLOCK (O3 needs an operator ruling or the D-4/D-3 route; never silently folded) |
+| RCP-MISSING | receipt file absent | snapshot error, whole batch kept | incomplete, kept | MATCH-KEPT + SCOPE |
+| RCP-MALFORMED | receipt bytes invalid | snapshot error, kept | Unknown, kept | MATCH-KEPT |
+| RCP-NONCOMMITTED | prepared/detached receipt | kept | kept (not current) | MATCH |
+| RCP-CONTRADICTORY | receipt identity ≠ registry checkout | snapshot error, whole batch kept | reference mismatch, kept | MATCH-KEPT + SCOPE |
+| MRK-MISSING | root marker absent | unknown root state → kept | identity read fails → kept | MATCH |
+| MRK-MALFORMED | marker bytes invalid | kept | kept (`/1`-unknown is not a parse) | MATCH |
+| MRK-REPLACED | marker bytes ≠ recorded digest | identity mismatch → this root kept | verify fails → kept | MATCH |
+| ID-NONCE | row nonce ≠ receipt/marker nonce | error → batch kept | kept | MATCH-KEPT + SCOPE |
+| ID-GENERATION | generation or kind mismatch | error → batch kept | kept | MATCH-KEPT + SCOPE |
+| ID-INODE | root inode changed vs recorded | this root kept (current source scope demonstrated) | that root kept | D-2 (declared; Q-E owns acceptance) |
+| ID-DEVICE-STALE | recorded device stale; UUID, inode, marker match | accepted by `judge_recorded_root` reconciliation → candidate | remount `Verified` → eligible | MATCH (binds current source, never the stale D-1 prose) |
+| ID-DEVICE-LIVE | volume remounted mid-window (DYNAMIC) | current binding decides (expected unknown → kept) | `Verified` with remount evidence | D-1 (declared; Q-E owns acceptance) |
+| ABS-ANCESTOR-MISSING | checkout parent directory missing | kept: absence unknown (the 111-row class) | absence chain incomplete → kept | MATCH |
+| ABS-ANCESTOR-REPLACED | ancestor directory replaced, new inode | `revalidate_chain` refuses → kept | identity/absence fails → kept | MATCH |
+| ABS-BOOT-DATA | listed legacy row, recorded checkout on the boot Data volume (internal-placement fixture) | legacy exception admits boot-Data absence → candidate | no registered volume for the boot-Data path → kept | D-3-scope (declared) |
+| ABS-UUID-CONFLICT | recorded volume UUID ≠ live mount | binding fails → kept | `VolumeRoot` refusal → kept | MATCH |
+| VOL-ABSENT | fixture volume detached | roots unobservable → batch kept, incomplete | `VolumeState::Absent`, permanent loud report, no rows observed | MATCH-KEPT + SCOPE |
+| VOL-REMOVED-DURING | detach between windows (DYNAMIC) | each window binds its own mount census | same | declared dynamic; parity only on declared outcomes |
+| VOL-DUP-REGISTRY | two volume records, one UUID (document level) | n/a (Oxide has no such document) | registry duplicate → refusal/unknown, kept | declared per-engine record, no parity claim |
+| VOL-DUP-LIVE | real duplicate-UUID mount census | coverage limit (below) | census refusal covered by Barge in-crate units | coverage limit, not parity |
+| WRT-LIVE-THIS | running record + live fd, this pool | `Writers` → kept | custody not safe (ledger + descriptor scan) → kept | MATCH, writer bound by `(pid, start)` in both transcripts |
+| WRT-LIVE-OTHER | running record in the registered removable sibling | removable-pool holder refusal → kept | both pools read → kept | MATCH |
+| WRT-UNKNOWN | retired record, unresolved lost writer | `Unknown` → error → whole batch kept | classify unknown → kept | MATCH-KEPT + SCOPE |
+| WRT-ACQUIRING | spawning record | writers → kept | acquiring classified held → kept | MATCH |
+| WRT-RETIRED-CLEAN | retired record, no lost fact, no holders | skipped → custody clear → may proceed to candidate | retired without lost fact classified unknown → kept | EXPLAIN-OR-BLOCK |
+| FENCE-MISSING | outputs control fence absent | `require_ready` refusal (not initialized), nothing written | control unknown → every covered root kept | MATCH-KEPT |
+| FENCE-UNKNOWN | unknown fence version/owner | keep/refuse batch | keep every covered root | MATCH |
+| EFFECT-1 | `admission.lock` absent (DYNAMIC) | real lock create + fence saves recorded as effects, custody then evaluated | `shared_if_present` observes nothing; no effect | declared effects exactly; per-engine record |
+| EFFECT-2 | admission state missing accounting fences (DYNAMIC) | real fence saves recorded as effects; evaluation proceeds | custody parse unaffected → proceeds | MATCH on fates + declared Oxide effects |
+| DECL-MISSING | area not declared | unaffected (candidate) | command refusal: no release policy | SCOPE (declared refusal; no per-root parity) |
+| DECL-POLICY-NONE | area declared `prune: none` | candidate | kept by policy | CONFIG (configuration difference, no parity claim) |
+| LEG-UNLISTED | R-C unlisted (BASE) | kept: legacy, operator list required | kept: D-3 partition | MATCH |
+| LEG-LISTED | R-C listed | legacy exception evaluated; checkout absent → candidate | kept (no waiver at the pin) | D-3 (declared; Q-D owns acceptance) |
+| LEG-LISTED-MARKED | full identity recorded, listed | evaluated normally → candidate | normal gate | MATCH |
+| LEG-RECEIPTLESS | legacy + receipt missing | snapshot error → kept | kept | MATCH |
+
+#### Mandatory counterfactual realizations (the audit's seven)
+
+Every one must end **insufficient or as an honest effect counterexample** —
+never parity. Each names its realization and oracle.
+
+1. **Escaped direct untaped read** (including Barge's `state::read_bounded_inner`
+   path). Pure: reconciler self-tests reject a transcript row binding to no
+   manifest entry, allowance or dynamic declaration. Native: CF-1 plants an
+   undeclared extra folder in the enumerated area; the engines' directory
+   listings observe it, no manifest entry binds it → insufficient, named.
+2. **Controlled writer between runs, including one that later closes.** CF-2
+   starts a declared holder (real process, real descriptor) for window A only;
+   window B's manifest records it absent. Each engine binds its own window's
+   custody facts; cross-window parity is not claimed (declared dynamic), and an
+   unbound custody observation is insufficient.
+3. **Same bytes, changed identity.** CF-3 replaces R-B's marker (identical
+   bytes, new inode) after manifest capture; the engine's read binds a foreign
+   identity → insufficient. The harness then re-captures cleanly and re-runs,
+   proving the detection is not a harness false positive.
+4. **Broken or exhausted tape.** Pure: a transcript missing one mandatory
+   leaf, a duplicate/conflicting key, and an over-cap document are each
+   rejected with the named reason. Native: CAP-1 shows both engines' real caps
+   producing honest truncation records, never partial parity.
+5. **Identity epoch changes.** CF-5 binds `(pid, start)`: a second writer
+   process (naturally different start) never reconciles as the first; the pure
+   self-test rejects same-pid/different-start reuse. ID-DEVICE-LIVE and
+   VOL-REMOVED-DURING bind the changed mount/device/UUID epoch; a same-UUID
+   remount must reconcile as a declared remount, never as a fresh identity.
+6. **Absent admission lock and missing fence cause real create/save
+   attempts.** EFFECT-1/EFFECT-2 record them as effect rows and a per-engine
+   record; they are never hidden by a mock, repaired between engines, or read
+   as attempted write parity. Pending holding or eviction reconciliation
+   reached through `ledger_view` is recorded the same way and is a stop, not a
+   read.
+7. **Second reads under changed epochs.** Barge's marker reread under its
+   second root-id lock and Oxide's ancestry revalidation must each appear as a
+   distinct bound occurrence whose outcome equals the first and the manifest;
+   the pure self-test rejects an internally inconsistent reread. Coverage
+   asserts the reread actually happened.
+
+**Coverage limits (declared, never parity).** A real duplicate-UUID mount
+census cannot be produced from synthetic fixtures without kernel forgery: the
+census-side refusal is covered by Barge's in-crate unit tests, and
+VOL-DUP-LIVE stays a limit for the G0-style live route. A descriptor that dies
+mid-scan (the `DeadHandle` path) and platform-binary blind spots are Barge
+platform-verification units; the cross-engine window covers the
+stable-holder path only. Synthetic equivalent-input evidence establishes the
+seam and the case outcomes; it never qualifies a live Builds comparison or the
+O3 cutover, and taped observations never authorize signal, image attach/detach,
+deletion or any custody conclusion — the future proof's real image custody
+uses real kernel facts, not the tape.
+
+#### Premise dispositions for the future proof
+
+The nine-item proof-authoring premise checklist applies to the future
+implementation's executable case bodies; this section fixes the intended
+dispositions so the implementation brief inherits them: (1) private HOME and
+rustup with the invoking `RUSTUP_HOME` preserved and the staged Barge build
+tree built offline from its committed lock; (2) `OXIDE_TEST_HOME_FROM_ENV=1`
+on the Oxide engine child, Barge fixture selection through explicit
+`StatePaths`/`AccountFacts` only; (3) the orchestrator scrubs inherited
+`OXIDE_*`, `BARGE_*`, `XDG_*`, `CARGO_*` and `SCCACHE_*` values before setting
+fixture facts; (4) automatic adoption premises are positively built by fixture
+code, no build runs in the window; (5) no Cargo external subcommand is
+invoked — not applicable; (6) volume cases use one owned 128 MiB image,
+`hdiutil attach -owners on`, ordinary detach, real custody facts; (7) frozen
+`RUSTFLAGS` with `CARGO_ENCODED_RUSTFLAGS` removed for both stagings;
+(8) fixture, transcripts and build scratch under the qualified supervisor's
+selected-volume routing, same-volume `TMPDIR`; (9) `mktemp` templates under
+the owned scratch parent. Each disposition's actual helper location is
+recorded at implementation before any counted run; the single Queue diagnostic
+route and the shared supervisor's bounds (300 s / 512 MiB, at most one image
+and one ordinary detach) stay as frozen, with fit unmeasured and reviewed at
+implementation.
+
+#### Implementation slices
+
+Finite, in order, each landing with its own tests and doc updates. None
+authorizes a real run, a pin change or a production behaviour change.
+
+- **B-S1 (Barge repository): cfg(test)-only leaf tape and in-crate harness.**
+  Files: the cfg(test) recorder module and the leaf record statements in
+  `crates/barge/src/os/macos.rs` (process table, per-fd and vnode leaves,
+  `DirOps`/`MountRoot`/`VolumeFacts`/`ProcessObserver` leaves,
+  `verify_platform_binary`), `state.rs` (`read_bounded_inner`, lock outcomes),
+  `reference.rs` (`read_registry`, `read_receipts_with`, `read_oxide_marker`,
+  `control_directory_with`, `pools_holding`), `pool_custody.rs`
+  (`read_document`, `classify`), `identity.rs` (`read`, `verify`), `area.rs`
+  (`show`, `read_holds`, `scan_activity_within`), `registry.rs` (`read`),
+  `custody.rs` (`decide` observation points), a cfg(test) transcript writer
+  implementing `oxide.capture.transcript/1`, and the `[[test]]` harness
+  (proposed `crates/barge/tests/tape_eval.rs`) whose argv contract is
+  `--fixture-root --manifest --transcript-out --case`, which builds the
+  fixture `StatePaths` and `AccountFacts`, calls the real `release::plan` with
+  the real platform object, and always writes its transcript. Predecessor and
+  source binding: the O1 pin `4af9360`; the PR's diff adds only
+  `#[cfg(test)]` statements and cfg(test) modules, with a per-file digest map
+  in the PR description proving every production statement byte-unchanged.
+  Dependencies: none outside Barge. Validation: Barge's own covering
+  selectors (compile, release-profile check, format, its test suite) plus
+  pure tape self-tests (recorder round-trip, schema serialization, a
+  no-public-surface assertion). Stopping criteria: all green, production
+  digests unchanged, the harness runs its embedded unit fixture end to end.
+  No Oxide-side work depends on it except X-S2 integration.
+- **X-S1 (Oxide repository): cfg(test)-only leaf tape, transcript adapters,
+  in-crate harness.** Files: the cfg(test) recorder and leaf record/effect
+  statements in `src/bin/oxide/prune.rs` (the `dry_run` chain, authority
+  reads, absence walk, root observation, judges, `account_candidates`,
+  `read_registry`, `read_operator_list`), `src/bin/oxide/store.rs`
+  (`private_file`, `load`/`save` as effect rows, admission lock and fence
+  paths, `checkout_custody`, `active_holders`, `boot_session`),
+  `src/bin/oxide/outputs.rs` (`read_receipt_for_prune`, `marker_digest`),
+  `src/bin/oxide/removable.rs` (`coordinate`, `registration`), `src/volume.rs`
+  (`Binding` opens/verify, mount census, `fstatfs`), `src/lease/pool.rs`
+  (`ledger_view`, `Pool::open`/`open_inner` lock and reconcile effect rows),
+  `src/inventory.rs` (`inventory_directory`), `src/bin/oxide/scratch_io.rs`
+  (read sites), a cfg(test) manifest/transcript writer, and the `[[test]]`
+  harness (proposed `tests/tape_prune_eval.rs`) with the same argv contract,
+  calling the actual `dry_run` chain with descriptor-1 capture. Predecessor
+  and source binding: Oxide at the merged checkpoint `150369b` (or its
+  successor main at brief time), diff discipline identical to B-S1.
+  Dependencies: none for landing; the schema constants are fixed by this
+  document. Validation: `effigy rust:compile`, `effigy rust:compile-release`,
+  `effigy rust:format`, `effigy test rust` (the cfg(test) additions must
+  compile away in the release profile), plus in-crate pure tape self-tests.
+  Stopping criteria: all covering selectors green, the harness proves its
+  transcript and effect rows on a unit fixture.
+- **X-S2 (Oxide repository): bounded orchestration, reconciliation and the
+  D8 comparison, read-only reporting.** Files: `scripts/test-barge-capture.py`
+  (proposed): fixture builder and one owner (creation, custody records,
+  setup-writer closure — every child waited and reaped, pids and starts
+  recorded), manifest capture, engine invocation through the two exported
+  harness executables (staged from the exact Barge slice commit via the
+  seeded offline Git candidate plus a committed build-tree lockfile, and the
+  exact Oxide head, with digest verification before any window), the
+  reconciler implementing the oracle above, and the read-only difference
+  report naming every unexplained difference; pure self-test modes for the
+  reconciler, the fixture spec compiler and the staging verifier
+  (`--self-test`, `--plan`; effect-free). Predecessor binding: B-S1 and X-S1
+  landed. Validation: its own pure selectors plus `effigy docs:check`; the
+  counted native (shared supervisor, the frozen 300 s / 512 MiB / one image /
+  one ordinary detach bounds, unless a reviewed brief amends them with
+  measurements) is that implementation's own separately activated Queue proof
+  — it is not part of this design and no `awaitingProofs` is recorded for it.
+  Stopping criteria: pure selectors green, the report renders for a synthetic
+  unit fixture, no fixture, pool or image touched outside pure mode.
+
+Deliverable note for O3: an `EXPLAIN-OR-BLOCK` case that demonstrates a real
+final disagreement (currently `REF-ORPHAN-MARKED`, `RCP-V1`,
+`WRT-RETIRED-CLEAN`) is not folded into a match. Each is either explained from
+current source in the comparison report or recorded as blocking, and O3 stays
+held while any blocking row stands. `D-1`/`D-2` (Q-E) and `D-3` (Q-D) keep
+their existing operator decision points.
+
 ## Failure and race matrix
 
 "Keeps" means the root, its marker, its registry row and any pending intent are
