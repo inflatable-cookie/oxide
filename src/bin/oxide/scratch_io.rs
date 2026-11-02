@@ -65,7 +65,10 @@ fn read_document(path: &Path, limit: u64) -> ReadDocument {
         crate::tape::TapeOutcome::Facts {
             facts: format!(
                 "file={}|uid={}|mode={}|size={}",
-                meta.is_file(), meta.uid(), meta.mode(), meta.len()
+                meta.is_file(),
+                meta.uid(),
+                meta.mode(),
+                meta.len()
             ),
         },
         limit,

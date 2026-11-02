@@ -8213,8 +8213,14 @@ fn read_receipt_with(
     crate::prune::authority_read(file.take(MAX_RECEIPT_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     #[cfg(test)]
-    crate::prune::authority_read_observed(&file, &path, "outputs::read_receipt_with", MAX_RECEIPT_BYTES, &mut bytes)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    crate::prune::authority_read_observed(
+        &file,
+        &path,
+        "outputs::read_receipt_with",
+        MAX_RECEIPT_BYTES,
+        &mut bytes,
+    )
+    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     if bytes.len() as u64 > MAX_RECEIPT_BYTES {
         return Err(format!(
             "{} exceeds its {MAX_RECEIPT_BYTES}-byte limit",
@@ -8316,8 +8322,14 @@ pub(crate) fn marker_digest(root: &Path) -> Result<String, String> {
     crate::prune::authority_read(file.take(MAX_MARKER_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     #[cfg(test)]
-    crate::prune::authority_read_observed(&file, &path, "outputs::marker_digest", MAX_MARKER_BYTES, &mut bytes)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    crate::prune::authority_read_observed(
+        &file,
+        &path,
+        "outputs::marker_digest",
+        MAX_MARKER_BYTES,
+        &mut bytes,
+    )
+    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     if bytes.len() as u64 > MAX_MARKER_BYTES {
         return Err(format!("{} exceeds its byte limit", path.display()));
     }
@@ -8560,8 +8572,14 @@ fn read_marker(root: &Path) -> Result<Marker, String> {
     crate::prune::authority_read(file.take(MAX_MARKER_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     #[cfg(test)]
-    crate::prune::authority_read_observed(&file, &path, "outputs::read_marker", MAX_MARKER_BYTES, &mut bytes)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    crate::prune::authority_read_observed(
+        &file,
+        &path,
+        "outputs::read_marker",
+        MAX_MARKER_BYTES,
+        &mut bytes,
+    )
+    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     if bytes.len() as u64 > MAX_MARKER_BYTES {
         return Err(format!("{} exceeds its byte limit", path.display()));
     }

@@ -709,8 +709,14 @@ pub(crate) fn read_registration(control: &Path) -> Result<Option<Registration>, 
     crate::prune::authority_read(file.take(MAX_REGISTRATION_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read the removable registration: {error}"))?;
     #[cfg(test)]
-    crate::prune::authority_read_observed(&file, &control.join(REGISTRATION), "removable::read_registration", MAX_REGISTRATION_BYTES, &mut bytes)
-        .map_err(|error| format!("cannot read the removable registration: {error}"))?;
+    crate::prune::authority_read_observed(
+        &file,
+        &control.join(REGISTRATION),
+        "removable::read_registration",
+        MAX_REGISTRATION_BYTES,
+        &mut bytes,
+    )
+    .map_err(|error| format!("cannot read the removable registration: {error}"))?;
     if bytes.len() as u64 > MAX_REGISTRATION_BYTES {
         return Err("the removable registration exceeds its byte limit".to_owned());
     }

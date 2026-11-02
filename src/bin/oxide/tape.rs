@@ -311,7 +311,8 @@ pub(crate) fn finish_and_write(
                     result: serde_json::json!({"truncated": true}),
                 },
                 TapeEngineOutcome::Refused { exit_code, .. } => TapeEngineOutcome::Refused {
-                    reason: "refusal detail exceeded the document cap".to_owned(), exit_code,
+                    reason: "refusal detail exceeded the document cap".to_owned(),
+                    exit_code,
                 },
             };
             bytes = serde_json::to_vec(&transcript).map_err(|error| error.to_string())?;
@@ -326,8 +327,12 @@ pub(crate) fn finish_and_write(
     let temp = path.with_extension(format!("tmp-{}", std::process::id()));
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
-        .mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&temp)
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temp)
         .map_err(|error| error.to_string())?;
     file.write_all(&bytes).map_err(|error| error.to_string())?;
     std::fs::rename(&temp, path).map_err(|error| error.to_string())?;
@@ -460,7 +465,10 @@ pub(crate) fn read_row_dev(
                 (Some(m.dev()), Some(m.ino()))
             })
             .unwrap_or((None, None));
-        let key = format!("file:{path}|parent={parent_dev:?}/{parent_ino:?}|dev={dev}/ino={ino}", path = path.display());
+        let key = format!(
+            "file:{path}|parent={parent_dev:?}/{parent_ino:?}|dev={dev}/ino={ino}",
+            path = path.display()
+        );
         let identity = TapeIdentity {
             path: Some(path.display().to_string()),
             parent_dev,
@@ -502,7 +510,9 @@ pub(crate) fn component_row(
             TapeOutcome::Opened { dev, ino } => (Some(*dev), Some(*ino)),
             _ => (None, None),
         };
-        let key = format!("component:parent={parent_dev}/{parent_ino}|name={name:?}|dev={dev:?}/ino={ino:?}");
+        let key = format!(
+            "component:parent={parent_dev}/{parent_ino}|name={name:?}|dev={dev:?}/ino={ino:?}"
+        );
         let identity = TapeIdentity {
             path: None,
             parent_dev: Some(parent_dev),
@@ -680,12 +690,18 @@ pub(crate) fn classify_row(kind: &str, identity: &str, value: &str) {
 pub(crate) fn authority_core(bytes: &[u8], cap: u64, budget_failed: bool, refused: bool) {
     with_state(|state| {
         if state.pending_authority.is_some() {
-            state.notes.push("an authority read was replaced before identity binding".to_owned());
+            state
+                .notes
+                .push("an authority read was replaced before identity binding".to_owned());
         }
         let outcome = if refused {
-            TapeOutcome::Refusal { reason: "authority read refused".to_owned() }
+            TapeOutcome::Refusal {
+                reason: "authority read refused".to_owned(),
+            }
         } else {
-            TapeOutcome::Digest { digest: sha256_hex(bytes) }
+            TapeOutcome::Digest {
+                digest: sha256_hex(bytes),
+            }
         };
         if budget_failed {
             state.notes.push("the authority budget failed".to_owned());
@@ -726,16 +742,32 @@ pub(crate) fn authority_bind(site: &str, path: &Path, cap: u64) {
 
 /// Record a read against the descriptor that supplied the bytes.
 pub(crate) fn authority_bind_descriptor(
-    site: &str, path: &Path, dev: u64, ino: u64, cap: u64, outcome: TapeOutcome,
+    site: &str,
+    path: &Path,
+    dev: u64,
+    ino: u64,
+    cap: u64,
+    outcome: TapeOutcome,
 ) {
-    with_state(|state| { state.pending_authority = None; });
-    read_row_dev(&format!("authority-read@{site}"), path, dev, ino, outcome, cap);
+    with_state(|state| {
+        state.pending_authority = None;
+    });
+    read_row_dev(
+        &format!("authority-read@{site}"),
+        path,
+        dev,
+        ino,
+        outcome,
+        cap,
+    );
 }
 
 pub(crate) fn authority_unbound(site: &str, reason: &str) {
     with_state(|state| {
         state.pending_authority = None;
-        state.notes.push(format!("descriptor identity unavailable at {site}: {reason}"));
+        state.notes.push(format!(
+            "descriptor identity unavailable at {site}: {reason}"
+        ));
     });
 }
 
