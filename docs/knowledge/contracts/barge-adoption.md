@@ -1220,7 +1220,7 @@ alone is insufficient.
 
   Create `budget.json` in the run root as a single-link 0600 JSON file with
   `task` equal to `d41de092-b0b0-495d-b159-8c4d1730d6b4`, a nonempty
-  `history_reference`, numeric `covering_seconds_charged`, and `retained_roots`
+  `history_reference`, `covering_seconds_charged: 1200`, and `retained_roots`
   containing the new run root and every earlier non-overlapping owned Builds
   root. Obtain the reference, actual cumulative covering charges and exact
   root list from retained Queue records and packets; verify them against that
@@ -1229,13 +1229,54 @@ alone is insufficient.
   uncertain history refuses the run; the launcher cannot authenticate a
   caller-supplied ledger by itself. Keep receipts and failed packets.
 
-  Once those prerequisites and the source, resource and fresh inventory gates
-  are independently satisfied, run the task-local Effigy selectors in order:
-  `proof:tape-prune:bootstrap`, `proof:tape-prune:preflight-build`, then
-  `proof:tape-prune:path-preflight`; only a passed dry inventory gate permits
-  the one authorized focused rerun and remaining applicable `cover-*` checks.
-  Every action rebinds the source and records its own before/after inventory.
-  This source recipe supplies no execution, isolation or parity evidence.
+  The 1200 is the planner's conservative admission charge, not a measured
+  elapsed time. The separate proposed block is at most another 1200 seconds,
+  so the charged total cannot exceed 2400; neither original history nor the
+  6 GiB aggregate is reset. Prepare `history-discovery.json` with task ID,
+  complete verified retained-root list and evidence digests, and a separate
+  `block-authorization.json` binding that file, `budget.json`, the exact run
+  root, source commit/tree, full canonical launcher binding, planner reference,
+  1200-second original admission charge, 1200-second prospective maximum and
+  a unique 64-hex one-use ID. The context binding digest is SHA-256 of the
+  launcher's `binding` JSON encoded with sorted keys and compact separators.
+  `TAPE_BLOCK_APPROVAL_SHA256` must be the planner-bound authorization digest;
+  an environment value or an owner-created JSON document alone does not prove
+  planner authorization. The caller must receive that binding from Queue after
+  independent source/discovery review. The block binds an affirmative retained
+  root quiescence admission; the current implementation does not monitor other
+  roots continuously and that assertion needs an independently justified
+  mechanism before runtime. An incomplete discovery packet refuses.
+
+  The candidate entry `proof:tape-prune:sequence` wraps the whole ordered
+  bootstrap, harness build, path preflight, focused checks and covering checks
+  in the existing shared supervisor under one monotonic deadline. It reserves
+  300 seconds before each action and retains one-use markers on interruption;
+  individual action selectors refuse outside this sequence. An action's own
+  300-second limit and scratch bound remain. The sequence stops when the
+  remaining block cannot admit an action; it does not grant a new block. The
+  preflight is the test-only resolver, while `preflight-build` itself runs the
+  debug front door and may open the pool before that resolver; source/env
+  analysis and each before/after inventory are not yet a positive dry proof
+  of all build/admission descendants. A current-head planner binding, qualified
+  quiescence and a source-proven actual dry gate remain prerequisites. This
+  recipe and this candidate source are not executable admission or evidence.
+  Source trace: `config::Facts::from_env` calls `proof_controls` and, with the
+  existing debug control set to `1`, `resolve_home` returns the supplied HOME
+  before account lookup. `Facts::state_dir` supplies the parent of
+  `config::known_pools`'s `pools.json`; `config_file` honors the explicit
+  OXIDE_CONFIG and settings honors OXIDE_POOL. `cli::classify` sends `check`
+  and `test` through the modelled leased path, and `main.rs` sets Cargo's
+  target to the checkout target. The launcher constructs a fresh environment
+  with those private controls and without inherited XDG values. That source
+  path explains the intended routing; it does not prove that every compiler,
+  build script, admission helper or test descendant preserves it. The
+  test-only resolver's cfg equivalence to the debug binary, the pre-registration
+  build route, live inventory equality, independently authenticated block
+  binding, continuous quiescence of retained roots and nested supervisor
+  custody remain runtime/admission premises. A Boolean quiescence field is
+  only a required planner input, not measurement of other roots. An interrupted
+  launch before its durable one-use marker and cross-context uniqueness also
+  require planner-side custody; the local file alone is not a global authority.
 - **Harness composition.** The harness crate re-roots the actual library and
   binary modules and aliases itself as `oxide_storage`, sharing one tape.
   Library observations must come from their actual leaf sites; a fixture diff

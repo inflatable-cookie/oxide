@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Oxide 240 prospective validation block proposal",
+  "description": "Planner-bound input shape, not an authorization or runtime receipt.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task", "root", "planner_reference", "original_admission_charge_seconds", "prospective_max_seconds", "source_commit", "source_tree", "binding_sha256", "ledger_sha256", "history_sha256", "one_use_id", "retained_roots_quiescent"],
+  "properties": {
+    "task": {"const": "d41de092-b0b0-495d-b159-8c4d1730d6b4"},
+    "root": {"type": "string", "minLength": 1},
+    "planner_reference": {"const": "brief-v11:d133e22524df289aba98b74d0c87995d1902a594b5d574edb8035e0a1d12d0d4"},
+    "original_admission_charge_seconds": {"const": 1200},
+    "prospective_max_seconds": {"const": 1200},
+    "source_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "source_tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "binding_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ledger_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "history_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "one_use_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "retained_roots_quiescent": {"const": true}
+  }
+}

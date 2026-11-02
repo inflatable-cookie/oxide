@@ -5,6 +5,8 @@ These mock the live inventory and supervised child; no live account tree,
 fixture, compiler, or subprocess is touched by this test module.
 """
 import importlib.util
+import hashlib
+import json
 import os
 from pathlib import Path
 import sys
@@ -18,8 +20,46 @@ spec.loader.exec_module(route)
 
 
 class InventoryGateTests(unittest.TestCase):
+    def test_missing_block_binding_refuses_before_child(self):
+        with mock.patch.object(route, 'private_file', side_effect=lambda path, root: path), \
+             mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(route.Refusal):
+                route.block_inputs(Path('/owned'), {'commit': 'c', 'tree': 't'})
+
+    def test_block_binds_source_history_ledger_and_unique_id(self):
+        root = Path('/owned')
+        binding = {'commit': 'c', 'tree': 't', 'files': {'launcher': 'digest'}}
+        binding_sha = hashlib.sha256(json.dumps(binding, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        ledger = {'retained_roots': ['/owned']}
+        history = {'task': route.TASK_ID, 'complete': True, 'retained_roots': ['/owned']}
+        block = {'task': route.TASK_ID, 'root': '/owned', 'planner_reference': route.PLANNER_AUTHORITY,
+                 'original_admission_charge_seconds': 1200, 'prospective_max_seconds': 1200,
+                 'source_commit': 'c', 'source_tree': 't', 'binding_sha256': binding_sha,
+                 'ledger_sha256': 'ledger', 'history_sha256': 'history',
+                 'one_use_id': 'a' * 64, 'retained_roots_quiescent': True}
+        content = {'budget.json': ledger, 'history-discovery.json': history,
+                   'block-authorization.json': block}
+        def read(path, *args, **kwargs):
+            return json.dumps(content[path.name])
+        def digest(path):
+            return {'budget.json': 'ledger', 'history-discovery.json': 'history',
+                    'block-authorization.json': 'b' * 64}[path.name]
+        with mock.patch.object(route, 'private_file', side_effect=lambda path, root: path), \
+             mock.patch.object(Path, 'read_text', read), mock.patch.object(route, 'digest', side_effect=digest), \
+             mock.patch.dict(os.environ, {'TAPE_BLOCK_APPROVAL_SHA256': 'b' * 64}, clear=True):
+            self.assertEqual(route.block_inputs(root, binding)[0]['one_use_id'], 'a' * 64)
+            history['complete'] = False
+            with self.assertRaises(route.Refusal):
+                route.block_inputs(root, binding)
+            history['complete'] = True
+            block['source_tree'] = 'different'
+            with self.assertRaises(route.Refusal):
+                route.block_inputs(root, binding)
+
     def invoke(self, inventories, outcome=None):
         saved = []
+        inventories = [[{'path': '.'}, {'path': 'state/pools.json', **row}]
+                       for [row] in inventories]
         def record(path, value):
             saved.append((path.name, value))
         with mock.patch.object(route, 'budget', return_value=(512, 'ledger-digest')), \
@@ -41,8 +81,9 @@ class InventoryGateTests(unittest.TestCase):
             self.invoke([[{'ino': 1, 'sha256': 'same'}], [{'ino': 2, 'sha256': 'same'}]])
 
     def test_child_failure_still_takes_after_inventory(self):
+        inventory_rows = [{'path': '.'}, {'path': 'state/pools.json', 'ino': 1}]
         with mock.patch.object(route, 'budget', return_value=(512, 'ledger-digest')), \
-             mock.patch.object(route, 'inventory_account', side_effect=[[{'ino': 1}], [{'ino': 1}]]) as inventory, \
+             mock.patch.object(route, 'inventory_account', side_effect=[inventory_rows, inventory_rows]) as inventory, \
              mock.patch.object(route, 'receipt'), \
              mock.patch.object(route, 'revalidate_sources'), \
              mock.patch.object(route, 'run_bounded', side_effect=route.Refusal('failed')):
@@ -55,6 +96,14 @@ class InventoryGateTests(unittest.TestCase):
              mock.patch.object(route, 'inventory_account', side_effect=OSError('unreadable')), \
              mock.patch.object(route, 'run_bounded') as child:
             with self.assertRaises(OSError):
+                route.guarded_run(Path('/owned'), {'tmp': Path('/owned/tmp'), 'work': Path('/owned/work')}, {}, 'probe', ['child'], {'commit': 'c', 'tree': 't'})
+        child.assert_not_called()
+
+    def test_empty_inventory_never_runs_child(self):
+        with mock.patch.object(route, 'budget', return_value=(512, 'ledger-digest')), \
+             mock.patch.object(route, 'inventory_account', return_value=[]), \
+             mock.patch.object(route, 'run_bounded') as child:
+            with self.assertRaises(route.Refusal):
                 route.guarded_run(Path('/owned'), {'tmp': Path('/owned/tmp'), 'work': Path('/owned/work')}, {}, 'probe', ['child'], {'commit': 'c', 'tree': 't'})
         child.assert_not_called()
 

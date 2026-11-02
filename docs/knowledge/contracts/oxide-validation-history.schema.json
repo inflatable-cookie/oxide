@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Oxide 240 retained-root discovery input proposal",
+  "description": "A complete, independently reviewed discovery is required for admission; this shape alone proves no history or quiescence.",
+  "type": "object",
+  "required": ["task", "complete", "retained_roots", "evidence"],
+  "properties": {
+    "task": {"const": "d41de092-b0b0-495d-b159-8c4d1730d6b4"},
+    "complete": {"type": "boolean"},
+    "retained_roots": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "evidence": {"type": "object", "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
+    "unknown": {"type": "array", "items": {"type": "string"}}
+  },
+  "additionalProperties": false
+}

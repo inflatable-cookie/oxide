@@ -28,6 +28,9 @@ BRANCH = 'ns-d41de092-b0b0-495d-b159-8c4d1730d6b4'
 SUPERVISOR_SHA256 = 'fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b'
 MAX_ARCHIVE = 64 * 1024 * 1024
 MAX_LOG_LINE = 8 * 1024 * 1024
+PLANNER_AUTHORITY = 'brief-v11:d133e22524df289aba98b74d0c87995d1902a594b5d574edb8035e0a1d12d0d4'
+TASK_ID = 'd41de092-b0b0-495d-b159-8c4d1730d6b4'
+BLOCK_DEADLINE = None
 COVER = {'cover-compile': ['rust:compile'], 'cover-release': ['rust:compile-release'],
          'cover-format': ['rust:format'], 'cover-test': ['test', 'rust'],
          'cover-docs': ['docs:check']}
@@ -405,14 +408,14 @@ def inventory_account():
 
 
 def budget(root, paths, action):
-    """Apply a Queue-supplied ledger; its completeness still needs owner review."""
+    """Count retained bytes; the one prospective wall block is separate."""
     ledger_path = private_file(root / 'budget.json', root)
     ledger = json.loads(ledger_path.read_text())
-    require(ledger.get('task') == 'd41de092-b0b0-495d-b159-8c4d1730d6b4'
+    require(ledger.get('task') == TASK_ID
             and ledger.get('history_reference'), 'missing task budget history')
     charged = ledger.get('covering_seconds_charged')
     require(isinstance(charged, (int, float)) and not isinstance(charged, bool)
-            and 0 <= charged <= 1200, 'invalid historical covering charge')
+            and charged == 1200, 'original allowance must be charged as 1200, not measured')
     roots = [Path(value) for value in ledger.get('retained_roots', [])]
     require(root in roots and len(roots) >= 5 and len(roots) == len(set(roots)), 'incomplete retained root list')
     require(all(path.is_absolute() and path != BASE and path.is_relative_to(BASE) for path in roots),
@@ -434,19 +437,8 @@ def budget(root, paths, action):
         sizes[path] = size_of(path)
     require(sum(size for path, size in sizes.items() if path != root) >= 3468 * 1024 * 1024,
             'retained roots do not cover the historical baseline')
-    success_files = {'bootstrap': 'bootstrap-receipt.json', 'preflight-build': 'harness-receipt.json',
-                     'preflight': 'preflight-gate.json', 'test': 'test-success.json',
-                     'self-check': 'self-check-success.json',
-                     **{phase: phase + '-success.json' for phase in COVER}}
-    for phase, success in success_files.items():
-        record = root / success
-        if record.exists():
-            private_file(record, root)
-            elapsed = json.loads(record.read_text()).get('elapsed_seconds')
-            require(isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool)
-                    and 0 <= elapsed <= 1200, 'missing or invalid prior elapsed time')
-            charged += elapsed
-    require(charged + 300 <= 1200, 'insufficient covering wall for fixed 300-second bound')
+    require(BLOCK_DEADLINE is not None and time.monotonic() + 300 <= BLOCK_DEADLINE,
+            'single prospective block has insufficient remaining wall')
     monitored = sizes[root] if action == 'bootstrap' else size_of(paths['work'])
     outside = sum(sizes.values()) - monitored
     remaining_mib = (6 * 1024**3 - outside) // (1024 * 1024)
@@ -467,6 +459,8 @@ def guarded_run(root, paths, env, action, argv, binding):
     scratch_mib, ledger_sha256 = budget(root, paths, action)
     env = dict(env, OXIDE_TASK_SCRATCH_ROOT=str(root if action == 'bootstrap' else paths['work']))
     before = inventory_account()
+    require(len(before) > 1 and any(row.get('path') == 'state/pools.json' for row in before),
+            'live inventory is empty or lacks the expected state registry')
     receipt(root / (action + '-inventory-before.json'), before)
     error = None
     command = None
@@ -513,11 +507,8 @@ def log_lines(path):
             yield line
 
 
-def main():
+def run_action(action):
     os.umask(0o077)
-    require(len(sys.argv) == 2 and sys.argv[1] in (*COVER, 'bootstrap', 'preflight-build', 'preflight', 'test', 'self-check'),
-            'choose a task-local bootstrap, preflight, focused or covering action')
-    action = sys.argv[1]
     root, paths, toolchain, binding, env = context()
     # A failed, interrupted or changed inventory can never be erased by
     # starting another action in this context.
@@ -643,8 +634,137 @@ def main():
             'harness_sha256': digest(harness), 'elapsed_seconds': command['elapsed_seconds'], 'command': command})
 
 
+def block_inputs(root, binding):
+    """Check a separately planner-bound authorization; it is not self-issued."""
+    approval = private_file(root / 'block-authorization.json', root)
+    expected = os.environ.get('TAPE_BLOCK_APPROVAL_SHA256', '')
+    require(len(expected) == 64 and all(c in '0123456789abcdef' for c in expected)
+            and digest(approval) == expected, 'missing or mismatched planner block binding')
+    block = json.loads(approval.read_text())
+    require(isinstance(block, dict) and set(block) == {
+        'task', 'root', 'planner_reference', 'original_admission_charge_seconds',
+        'prospective_max_seconds', 'source_commit', 'source_tree', 'binding_sha256',
+        'ledger_sha256', 'history_sha256', 'one_use_id', 'retained_roots_quiescent',
+    }, 'invalid block authorization fields')
+    ledger = private_file(root / 'budget.json', root)
+    history = private_file(root / 'history-discovery.json', root)
+    ledger_doc = json.loads(ledger.read_text())
+    history_doc = json.loads(history.read_text())
+    binding_bytes = json.dumps(binding, sort_keys=True, separators=(',', ':')).encode()
+    require(block.get('task') == TASK_ID and block.get('root') == str(root)
+            and block.get('planner_reference') == PLANNER_AUTHORITY
+            and block.get('original_admission_charge_seconds') == 1200
+            and block.get('prospective_max_seconds') == 1200
+            and block.get('source_commit') == binding['commit']
+            and block.get('source_tree') == binding['tree']
+            and block.get('binding_sha256') == hashlib.sha256(binding_bytes).hexdigest()
+            and block.get('ledger_sha256') == digest(ledger)
+            and block.get('history_sha256') == digest(history),
+            'planner block does not bind this context, history and source')
+    require(history_doc.get('complete') is True
+            and history_doc.get('task') == TASK_ID
+            and history_doc.get('retained_roots') == ledger_doc.get('retained_roots')
+            and block.get('retained_roots_quiescent') is True,
+            'incomplete root discovery or no quiescence admission')
+    block_id = block.get('one_use_id')
+    require(isinstance(block_id, str) and len(block_id) == 64
+            and all(c in '0123456789abcdef' for c in block_id), 'invalid one-use block identity')
+    return block, expected
+
+
+def main():
+    """A single supervisor owns the entire prospective block, including setup."""
+    global BLOCK_DEADLINE
+    os.umask(0o077)
+    require(len(sys.argv) == 2 and sys.argv[1] == 'sequence',
+            'individual actions are disabled; use one planner-bound sequence')
+    started = time.monotonic()
+    BLOCK_DEADLINE = started + 1200
+    root = Path(os.environ.get('TAPE_RUN_ROOT', ''))
+    require(root.is_absolute() and root != BASE and root.is_relative_to(BASE), 'invalid block root')
+    private_dir(BASE)
+    private_dir(root, BASE)
+    approval = private_file(root / 'block-authorization.json', root)
+    approval_sha = os.environ.get('TAPE_BLOCK_APPROVAL_SHA256', '')
+    require(len(approval_sha) == 64 and all(c in '0123456789abcdef' for c in approval_sha)
+            and digest(approval) == approval_sha, 'missing or mismatched planner block binding')
+    block = json.loads(approval.read_text())
+    require(isinstance(block, dict) and block.get('task') == TASK_ID
+            and block.get('root') == str(root)
+            and block.get('planner_reference') == PLANNER_AUTHORITY
+            and isinstance(block.get('one_use_id'), str)
+            and len(block['one_use_id']) == 64
+            and all(c in '0123456789abcdef' for c in block['one_use_id']),
+            'invalid initial block authorization')
+    # Exclusive marker is durable for this root/id even after an interruption.
+    # The planner binds the unique id to this root; cross-root uniqueness and
+    # receipt authenticity are planner admission, not a claim from this file.
+    receipt(root / 'block-used.json', {'one_use_id': block['one_use_id'],
+            'approval_sha256': approval_sha, 'started_monotonic': started})
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(root_fd)
+    finally:
+        os.close(root_fd)
+    root2, paths, _, binding, env = context()
+    require(root2 == root, 'block context root changed')
+    block_inputs(root, binding)
+    scratch_mib, _ = budget(root, paths, 'bootstrap')
+    remaining = int(BLOCK_DEADLINE - time.monotonic())
+    require(remaining >= 300, 'setup exhausted prospective block')
+    # The outer existing supervisor owns the wall and process custody. Inner
+    # actions retain their own 300 s / scratch bounds and all their inventory
+    # work falls inside this one outer deadline. There is no restart path.
+    child_env = dict(env, TAPE_RUN_ROOT=str(root),
+                     TAPE_REPOSITORY=os.environ['TAPE_REPOSITORY'],
+                     TAPE_NORTHSTAR_DIR=os.environ['TAPE_NORTHSTAR_DIR'],
+                     TAPE_EFFIGY=os.environ['TAPE_EFFIGY'],
+                     TAPE_BLOCK_APPROVAL_SHA256=approval_sha,
+                     TAPE_BLOCK_DEADLINE=str(BLOCK_DEADLINE),
+                     OXIDE_TASK_SCRATCH_ROOT=str(root))
+    if 'TAPE_TEST_INTERNAL_ROOT' in os.environ:
+        child_env['TAPE_TEST_INTERNAL_ROOT'] = os.environ['TAPE_TEST_INTERNAL_ROOT']
+    command = [str(Path(sys.executable).resolve(strict=True)), str(paths['source'] / 'scripts/bounded-test.py'),
+               '--limit', str(remaining), '--scratch-budget-mib', str(scratch_mib), '--',
+               str(Path(sys.executable).resolve(strict=True)),
+               str(paths['source'] / 'scripts/tape-isolation-check.py'), '--sequence-child']
+    result = subprocess.run(command, cwd=paths['source'], env=child_env, check=False)
+    require(result.returncode == 0, f'prospective block failed: {result.returncode}')
+
+
+def sequence_child():
+    global BLOCK_DEADLINE
+    os.umask(0o077)
+    root, _, _, binding, _ = context()
+    evidence = Path(os.environ.get('OXIDE_PROOF_EVIDENCE', ''))
+    run_id = os.environ.get('OXIDE_PROOF_RUN_ID', '')
+    deadline_ns = os.environ.get('OXIDE_PROOF_DEADLINE_NS', '')
+    require(evidence.is_absolute() and evidence.is_relative_to(root)
+            and len(run_id) == 32 and all(c in '0123456789abcdef' for c in run_id)
+            and deadline_ns.isdigit(), 'missing outer supervisor context')
+    private_dir(evidence, root)
+    block, approval_sha = block_inputs(root, binding)
+    marker = private_file(root / 'block-used.json', root)
+    used = json.loads(marker.read_text())
+    require(used.get('one_use_id') == block['one_use_id']
+            and used.get('approval_sha256') == approval_sha, 'block marker mismatch')
+    BLOCK_DEADLINE = float(os.environ['TAPE_BLOCK_DEADLINE'])
+    require(BLOCK_DEADLINE > time.monotonic() and BLOCK_DEADLINE <= used['started_monotonic'] + 1200,
+            'invalid block deadline')
+    receipt(root / 'block-child-started.json', {'one_use_id': block['one_use_id']})
+    for action in ('bootstrap', 'preflight-build', 'preflight', 'test',
+                   'self-check', 'cover-compile', 'cover-release', 'cover-format',
+                   'cover-test', 'cover-docs'):
+        run_action(action)
+    receipt(root / 'block-complete.json', {'one_use_id': block['one_use_id'],
+            'elapsed_seconds': time.monotonic() - used['started_monotonic']})
+
+
 if __name__ == '__main__':
     try:
-        main()
+        if sys.argv[1:] == ['--sequence-child']:
+            sequence_child()
+        else:
+            main()
     except (Refusal, OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         sys.exit(f'oxide#240 private route refused: {error}')
