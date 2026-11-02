@@ -1436,3 +1436,36 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 [tasks."rust:scratch-pool"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-scratch-pool.py"
+
+# Shared private-build validation admission/preparation gate (oxide#248): the
+# common canonical provider for the capture tasks' private validation
+# prerequisites (Oxide #240/PR230 and Barge #041/PR41). It binds actual
+# sources/heads/trees/locks/toolchains/binaries/manifests/helpers, keeps the
+# attributable task-private root discovery ledgers, validates the
+# planner-issued one-use execution blocks and receipts, and runs — only under
+# the qualified supervisor — the single 300 s debug-Oxide bootstrap, the
+# inventory-bracketed private status dry gate and the retained-root quiescence
+# snapshots, exporting the wrapper-consumable artifacts and the measured
+# remaining allowance. Whole-block scratch is a measured clamp of each grant
+# minus retained bytes (about 552 MiB on Oxide's 6 GiB grant at the reported
+# 5591.8 MiB retained total), disclosed and never silently raised.
+# `proof:private-build-validation:test` is the pure mocked counterfactual
+# apparatus (effect-free, fixtures under a fresh temp template);
+# `proof:private-build-validation:plan` is effect-free.
+# `proof:private-build-validation:diagnostic` is the planner's ONE
+# proofExecution: this fixed declaration carries no issued binding and the
+# script refuses before any effect until the planner amends the command with
+# the bound roots, document digests, planner reference and issued blocks
+# (details and the exact command template: docs/knowledge/contracts/
+# barge-adoption.md, "Shared private-build validation gate"). Its task-root
+# accounting requires the adopted whole task root and separately guarded
+# Oxide claim root; retained-root walks set the measured clamps.
+[tasks."proof:private-build-validation:test"]
+run = "python3 scripts/test-private-build-validation.py --self-test"
+
+[tasks."proof:private-build-validation:plan"]
+run = "python3 scripts/test-private-build-validation.py --plan"
+
+[tasks."proof:private-build-validation:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 1200 --scratch-budget-mib 512 -- python3 scripts/test-private-build-validation.py --diagnostic"
