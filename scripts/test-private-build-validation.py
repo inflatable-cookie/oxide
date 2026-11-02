@@ -128,6 +128,7 @@ BLOCK_ID = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 
 MAX_DOC_BYTES = 8 * 1024 * 1024
 MAX_AUDIT_SOURCE_BYTES = 64 * 1024 * 1024
+MAX_ADMISSION_ARTIFACT_BYTES = 256 * 1024 * 1024
 INVENTORY_ROW_CAP = 50000
 INVENTORY_CONTENT_CAP = 256 * 1024 * 1024
 RETAINED_ROW_CAP = 200000
@@ -541,7 +542,7 @@ def audited_admission(inherited: dict, audit: dict) -> dict:
             if (not path.is_absolute() or path.is_symlink()
                     or path.resolve(strict=True) != path or not path.is_file()
                     or not isinstance(item["sha256"], str) or not HEX64.fullmatch(item["sha256"])
-                    or sha256_file(path) != item["sha256"]):
+                    or sha256_file(path, cap=MAX_ADMISSION_ARTIFACT_BYTES) != item["sha256"]):
                 raise GateRefusal(f"{name} is missing or changed on this host")
     return {"EFFIGY_ADMISSION_HOOK": hook, "QUEUE_ADMISSION_SOCKET": socket}
 
@@ -2970,6 +2971,20 @@ def self_test() -> int:
     inherited = {"EFFIGY_ADMISSION_HOOK": "hook-command",
                  "QUEUE_ADMISSION_SOCKET": "/sockets/admission.sock"}
     expect_ok("audited admission present", audited_admission, inherited, good_audit)
+    admission_large = private_write(private_root, Path("bin/admission-large"), b"a" * (MAX_DOC_BYTES + 1))
+    admission_hash = hashlib.sha256(b"a" * (MAX_DOC_BYTES + 1)).hexdigest()
+    for field in ("admission_executables", "admission_runtime_files"):
+        large_binding = json.loads(canonical_json(good_audit))
+        large_binding[field] = [{"path": str(admission_large), "sha256": admission_hash}]
+        expect_ok(f"large {field} accepted", audited_admission, inherited, large_binding)
+        large_binding[field][0]["sha256"] = "0" * 64
+        expect_refusal(f"large {field} digest drift", audited_admission, inherited, large_binding)
+        large_binding[field][0]["sha256"] = admission_hash
+        with admission_large.open("r+b") as file:
+            file.truncate(MAX_ADMISSION_ARTIFACT_BYTES + 1)
+        expect_refusal(f"oversized {field} refused", audited_admission, inherited, large_binding)
+        with admission_large.open("r+b") as file:
+            file.truncate(MAX_DOC_BYTES + 1)
     expect_refusal("admission hook unset", audited_admission,
                    {"QUEUE_ADMISSION_SOCKET": "/sockets/admission.sock"}, good_audit)
     expect_refusal("admission hook mismatch", audited_admission,

@@ -1128,6 +1128,8 @@ source copies, each with `source`, private relative `destination` and `sha256`;
 the diagnostic recopies and rechecks those same bytes from the retained phase.
 Each audit component source is bounded to 64 MiB for both construction and
 validation, matching the per-file staging limit; documents retain their 8 MiB limit.
+Admission executables and runtime files use the 256 MiB host-artifact digest
+bound and must still match their canonical paths and audited digests.
 The same digest-bound manifest requires `retained_roots`, a nonempty list of
 at most 64 canonical, owned, non-group-writable task-private directories under
 the Barge or Oxide scratch subtree. It must name entire prior preparation and
