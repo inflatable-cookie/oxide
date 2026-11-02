@@ -217,13 +217,13 @@ the first Barge real run. Barge keeps a root that Oxide still marks pending, and
 it never settles an Oxide intent.
 
 **Parity.** Before `O3`, a read-only shadow (`O2`) runs both evaluators on the
-same snapshot and reports every difference. The intentional differences are:
+same snapshot and reports every difference. The source-bound differences and candidate differences are:
 
-- **D-1, device-only drift.** Oxide keeps the whole batch when any row's device
-  changed. Barge reads a device change as a remount (`Verified`, with
-  `remount.device_changed`), and keeps only a root whose inode changed. Barge's
-  rule follows the carried finding (`stage4-design.md`, "What the finding does
-  and does not prove"). It differs from Oxide's, so it needs Tom's acceptance (Q-E).
+- **D-1, device-only drift.** Current Oxide reconciles a stale recorded device
+  when the verified volume, inode and marker match. Barge can report a remount
+  as `Verified` with `remount.device_changed`. A live remount remains subject
+  to each engine's current binding; a difference requires observed evidence
+  before Q-E can decide it.
 - **D-2, inode drift.** Oxide keeps the batch. Barge keeps that one root.
 - **D-3, legacy roots.** Oxide releases them only under an operator list. Barge
   keeps them until D4 is decided.
@@ -824,7 +824,7 @@ always recorded.
 | VOL-REMOVED-DURING | detach between windows (DYNAMIC) | each window binds its own mount census | same | declared dynamic; parity only on declared outcomes |
 | VOL-DUP-REGISTRY | two volume records, one UUID (document level) | n/a (Oxide has no such document) | registry duplicate → refusal/unknown, kept | declared per-engine record, no parity claim |
 | VOL-DUP-LIVE | real duplicate-UUID mount census | coverage limit (below) | census refusal covered by Barge in-crate units | coverage limit, not parity |
-| WRT-LIVE-THIS | running record + live fd, this pool | `Writers` → kept | custody not safe (ledger + descriptor scan) → kept | MATCH, writer bound by `(pid, start)` in both transcripts |
+| WRT-LIVE-THIS | running record + live fd, this pool | `Writers` → kept | custody not safe (ledger + descriptor scan) → kept | MATCH on keep fate only; Oxide binds the ledger record and pid if present, Barge binds `(pid, start)` and descriptor targets |
 | WRT-LIVE-OTHER | running record in the registered removable sibling | removable-pool holder refusal → kept | both pools read → kept | MATCH |
 | WRT-UNKNOWN | retired record, unresolved lost writer | `Unknown` → error → whole batch kept | classify unknown → kept | MATCH-KEPT + SCOPE |
 | WRT-ACQUIRING | spawning record | writers → kept | acquiring classified held → kept | MATCH |
@@ -957,7 +957,7 @@ authorizes a real run, a pin change or a production behaviour change.
   `src/inventory.rs` (`inventory_directory`), `src/bin/oxide/scratch_io.rs`
   (read sites), a cfg(test) manifest/transcript writer, and the `[[test]]`
   harness (proposed `tests/tape_prune_eval.rs`) with the same argv contract,
-  calling the actual `dry_run` chain with descriptor-1 capture. Predecessor
+  following the `dry_run` decision prefix through the actual `evaluate` and exporting the full `Evaluation` or pre-evaluate refusal, without calling `dry_run`, rendering a preview, or redirecting stdout. Predecessor
   and source binding: Oxide at the merged checkpoint `150369b` (or its
   successor main at brief time), diff discipline identical to B-S1.
   Dependencies: none for landing; the schema constants are fixed by this
