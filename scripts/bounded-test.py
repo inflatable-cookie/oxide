@@ -308,7 +308,7 @@ SWEEP_ROWS = 20  # bounded result rows in the receipt; the rest count as omitted
 INJECTIONS = {
     "setup-stall", "setup-delay", "no-detector", "ack-eof", "ack-wrong", "cancel-before-ack", "monitor-die",
     "monitor-stall", "cleanup-interrupt", "custodian-timeout-after-monitor", "census-uncertain",
-    "census-uncertain-first", "census-replacement-member", "census-replacement-foreign", "reserve-low-after", "cancel-after-ack", "cancel-at-gate",
+    "census-uncertain-first", "census-replacement-member", "census-replacement-foreign", "census-fixture-witness", "reserve-low-after", "cancel-after-ack", "cancel-at-gate",
     "pump-exception", "kqueue-exception", "malformed-message", "stop-exception",
     "reserve-delay-stall", "scratch-delay-stall",
     "detach-fail", "detach-timeout", "detach-ambiguous", "detach-withdraw",
@@ -1222,6 +1222,49 @@ def valid_replacement_work(value):
         return False
 
 
+# Optional qualification-only attribution, independent of all classifier decisions.
+# The caller names at most twelve exact fixture identities; missing remains unknown.
+FIXTURE_IDENTITY_CAP = 12
+
+
+def fixture_observations(work, records, identities):
+    """Project exact requested identities from this round's ledger without reads."""
+    if not isinstance(identities, (list, tuple)) or len(identities) > FIXTURE_IDENTITY_CAP:
+        return None
+    rows, seen = [], set()
+    for identity in identities:
+        if not isinstance(identity, (list, tuple)) or len(identity) != 2:
+            return None
+        pid, start = identity
+        if CensusWork.identity({"pid": pid, "start": start}) != (pid, start) or (pid, start) in seen:
+            return None
+        seen.add((pid, start))
+        entry = work.entries.get((pid, start))
+        state = entry[1] if entry is not None else "unobserved"
+        witness = records.get((pid, start), {}).get("terminal") if state == "terminal" else None
+        rows.append({"pid": pid, "start": start, "state": state, "terminal_witness": witness})
+    return {"source": "test-only-ledger", "rows": rows}
+
+
+def fixture_identity_request(raw):
+    """Parse only the bounded test fixture request; malformed means no evidence."""
+    try:
+        if not isinstance(raw, str) or len(raw.encode("utf-8")) > 2048:
+            return ()
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list) or len(parsed) > FIXTURE_IDENTITY_CAP:
+            return ()
+        seen = set()
+        for pair in parsed:
+            if not isinstance(pair, list) or len(pair) != 2 or CensusWork.identity(
+                    {"pid": pair[0], "start": pair[1]}) != tuple(pair) or tuple(pair) in seen:
+                return ()
+            seen.add(tuple(pair))
+        return tuple(tuple(pair) for pair in parsed)
+    except BaseException:
+        return ()
+
+
 class Census:
     """Classifies every process against session `sid` (the leader's PID).
 
@@ -1314,7 +1357,8 @@ class Census:
     and they never change classification."""
 
     def __init__(self, sid, snapshot=Kinfo.all, getsid=os.getsid, reread=Kinfo.one, pause=time.sleep,
-                 terminal_allowed=False, ancestors=(), getpgid=os.getpgid):
+                 terminal_allowed=False, ancestors=(), getpgid=os.getpgid, fixture_identities=()):
+        self.fixture_identities = fixture_identities
         self.sid, self.snapshot, self.getsid, self.reread, self.pause = sid, snapshot, getsid, reread, pause
         self.terminal_allowed = terminal_allowed if terminal_allowed is True else False
         self.ancestors = _ancestor_identity_set(ancestors)
@@ -1825,6 +1869,10 @@ class Census:
             self.stats["esrch_rows"] = diag_attempted
             self.stats["terminal"] = terminal_count
             result["replacement_work"] = work.summary()
+            if self.fixture_identities:
+                observed = fixture_observations(work, records, self.fixture_identities)
+                if observed is not None:
+                    result["fixture_observations"] = observed
             work.check()
             return result
         except CensusWorkStopped:
@@ -4751,7 +4799,11 @@ class Monitor:
         fixture_mode = next((mode for mode in ("census-replacement-member", "census-replacement-foreign")
                              if mode in self.inject), None)
         readers = {}
+        fixture_identities = ()
+        if "census-fixture-witness" in self.inject:
+            fixture_identities = fixture_identity_request(os.environ.get("OXIDE_SUPERVISOR_TEST_WITNESSES"))
         if fixture_mode:
+            fixture_identities = ((2_147_483_647, 2),)
             # Test-only synthetic rows supplement, never replace, the real snapshot.
             # They are not kernel facts and carry no signalling authority.
             fake_pid = 2_147_483_647
@@ -4777,6 +4829,8 @@ class Monitor:
                     raise ProcessLookupError(errno.ESRCH, "synthetic replacement")
                 return self.leader[0] if fixture_mode == "census-replacement-member" else 1
             readers = {"snapshot": snapshot, "reread": reread, "getsid": getsid}
+        if fixture_identities:
+            readers["fixture_identities"] = fixture_identities
         census = Census(self.leader[0], terminal_allowed=(
             self.ctx.get("terminal_mode", {}).get("mode") == "allowlisted"),
             ancestors=record.get("identities") or (), **readers)
@@ -4823,7 +4877,8 @@ class Monitor:
                     self.receipt["replacement_fixture"] = {
                         "source": "synthetic", "mode": fixture_mode,
                         "certain": result.get("certain"), "members": result.get("members"),
-                        "uncertain": result.get("uncertain"), "work": result.get("replacement_work")}
+                        "uncertain": result.get("uncertain"), "work": result.get("replacement_work"),
+                        "observations": result.get("fixture_observations")}
                 if self.census_bound:
                     post = self.receipt.get("census_after_stop")
                     if not isinstance(post, dict):

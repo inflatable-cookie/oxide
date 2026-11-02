@@ -6485,10 +6485,37 @@ clock described below. The receipt and census message carry bounded
 a late publication refuses certainty. The original snapshot/confirmation/final
 zombie witnesses and the exact named and final census, EOF, joined-thread and
 fault gates remain independent. The qualification suite currently contains
-405 pure cases and 59 real cases by its loader: the two new real cases label
+406 pure cases and 59 real cases by its loader: the two new real cases label
 synthetic replacement observations alongside the actual kernel snapshot. They
 are not kernel PID reuse, and no signal authority follows. The 382 pure / 57
 real #197 claims remain historical at their own bytes.
+
+**Failed diagnostic and fixture attribution correction.** The one Queue-activated
+uncounted diagnostic at `e6ed727` recorded 464 cases, 460 completed and four
+failed: both labelled synthetic replacement cases and the one- and twelve-held
+zombie witnesses. Its candidate guard closed with status 1, no fault or deadline,
+and monitored scratch peaked at 68,931,584 of 536,870,912 bytes. The failed
+packet is preserved: `cases.json` SHA-256
+`2c7d557182e3cef2ed84b9323a4611149678c66bc73bc7c879521037b5f050ab`,
+`topology.json` `7fee338b62238f8af34594f8cfac0d0e7b7ff8d1f91d1f039b2c60afeb258e85`,
+and guard receipt `3d918de9af3a6672f5c95203397a7b7190f60fb925446c9610a1497f9689bf1e`
+under `/Volumes/Builds/scratch/oxide/oxide-supervisor-qualify.l1rp7zy1` and
+`/Volumes/Builds/scratch/oxide/oxide-proof.rz6m7o9t/evidence`. Its four nested
+receipts show more than 1,100 snapshot identities and 40 or more ESRCH rows:
+the unchanged 20-row work/diagnostic prefixes omitted the named replacement or
+held zombies, and no terminal witness fit in the shared diagnostics budget.
+The counts and closure do not by themselves attribute an owned identity.
+
+The corrected candidate adds an opt-in, test-only projection of at most twelve
+fixture-named exact identities from the completed round ledger and its actual
+terminal witness records. Missing or unmatched identities remain `unobserved`;
+no ambient row substitutes for the named identity. The projection consumes no
+kernel read and changes no classification, certainty, cap, signal or closure
+decision. The two synthetic fixtures and the held-zombie cases assert that
+projection; the old clipped rows, omission counts and negative controls remain.
+The independent source and proof judgment and any fresh exact-head proof route
+remain with the same retained Queue reviewer and owner; this correction supplies
+no native qualification and does not reset the failed session.
 
 The proof-authoring premise sweep for the new cases follows their executable
 route: `Real.replacement_fixture` calls `Real.guardian` with `fixture("pass")`;

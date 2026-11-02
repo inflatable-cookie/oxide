@@ -887,6 +887,47 @@ class PureCensus(unittest.TestCase):
         self.assertEqual(result["terminal_count_status"], "invalid")
         self.assertNotIn("terminal_witnesses", result)
 
+    def test_fixture_attribution_survives_clipped_diagnostics_without_changing_census(self):
+        # Old bytes clip the wanted row when 25 ambient rows consume the prefix.
+        target = row(999, start=7, zombie=True)
+        ambient = [row(1000 + i, start=7, zombie=True) for i in range(25)]
+        table = FakeTable(ambient + [target], {r["pid"]: ProcessLookupError(3, "gone") for r in ambient + [target]})
+        check = census(table, terminal_allowed=True)
+        check.fixture_identities = ((999, 7),)
+        result = check.round()
+        self.assertEqual((result["certain"], result["terminal_nonwriters"]), (True, 26))
+        control_table = FakeTable(ambient + [target], {r["pid"]: ProcessLookupError(3, "gone") for r in ambient + [target]})
+        control = census(control_table, terminal_allowed=True).round()
+        self.assertEqual({k: v for k, v in result.items() if k != "fixture_observations"}, control)
+        self.assertEqual(result["diagnostics"]["retained"], 20)
+        self.assertEqual(result.get("terminal_witnesses"), [])
+        rows = result["fixture_observations"]["rows"]
+        self.assertEqual([(r["pid"], r["start"], r["state"]) for r in rows], [(999, 7, "terminal")])
+        self.assertEqual(owned_witness_problems([rows[0]["terminal_witness"]], {999: 7}), [])
+        self.assertTrue(owned_witness_problems(result.get("terminal_witnesses"), {999: 7}))
+        # The A -> B fixture is also beyond the clipped work rows, yet its exact
+        # final disposition comes from the same ledger and not the clipped list.
+        a, b = row(900, start=1), row(900, start=2)
+        others = [row(1100 + i) for i in range(25)]
+        sessions = {r["pid"]: 7 for r in others}
+        sessions[900] = [ProcessLookupError(3, "gone"), 100]
+        table = FakeTable([a] + others, sessions, reread={900: [a, b, b, b]})
+        check = census(table)
+        check.fixture_identities = ((900, 2),)
+        result = check.round()
+        self.assertNotIn({"pid": 900, "start": 2, "state": "member"}, result["replacement_work"]["rows"])
+        self.assertEqual(result["fixture_observations"]["rows"], [{"pid": 900, "start": 2,
+                         "state": "member", "terminal_witness": None}])
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 1, 0))
+        control = census(FakeTable([a] + others, sessions, reread={900: [a, b, b, b]})).round()
+        self.assertEqual({k: v for k, v in result.items() if k != "fixture_observations"}, control)
+        self.assertEqual(bounded.fixture_identity_request("[[999,7]]"), ((999, 7),))
+        for malformed in ("null", "[[true,7]]", "[[999,7],[999,7]]", "x" * 2049,
+                          json.dumps([[i + 1, 1] for i in range(13)])):
+            self.assertEqual(bounded.fixture_identity_request(malformed), ())
+        self.assertIsNone(bounded.fixture_observations(bounded.CensusWork(), {}, [(True, 7)]))
+        self.assertEqual(bounded.fixture_observations(bounded.CensusWork(), {}, [(999, 8)])["rows"][0]["state"], "unobserved")
+
     def test_member_and_foreign(self):
         table = FakeTable([row(101), row(200)], {101: 100, 200: 7})
         result = census(table).round()
@@ -6219,7 +6260,9 @@ class PureQualificationTopology(unittest.TestCase):
                         rows=[{"pid": 1, "start": 1, "state": "gone"},
                               {"pid": 2_147_483_647, "start": 2, "state": state}])
             cases.append({"case": name, "signal_targets": [], "replacement_fixture":
-                          {"source": "synthetic", "mode": mode, "work": work}})
+                          {"source": "synthetic", "mode": mode, "work": work,
+                           "observations": {"source": "test-only-ledger", "rows": [
+                               {"pid": 2_147_483_647, "start": 2, "state": state, "terminal_witness": None}]}}})
             outcomes.append(["__main__.Real." + name, "pass"])
         results = {"outcomes": outcomes, "cases": cases}
         plan = dict(qualify.check_plan({}, results, {}, None, None, None))
@@ -6231,6 +6274,12 @@ class PureQualificationTopology(unittest.TestCase):
             signalled = dict(cases[0], signal_targets=[2_147_483_647])
             bad = dict(qualify.check_plan({}, dict(results, cases=[signalled, cases[1]]), {}, None, None, None))["cases"]()
             self.assertTrue(any("signalled" in issue for issue in bad))
+            wrong_fixture = dict(cases[0]["replacement_fixture"])
+            wrong_fixture["observations"] = {"source": "test-only-ledger", "rows": [
+                {"pid": 2_147_483_647, "start": 3, "state": "member", "terminal_witness": None}]}
+            wrong = dict(cases[0], replacement_fixture=wrong_fixture)
+            bad = dict(qualify.check_plan({}, dict(results, cases=[wrong, cases[1]]), {}, None, None, None))["cases"]()
+            self.assertTrue(any("inconsistent synthetic replacement" in issue for issue in bad))
 
     def test_nested_cases_and_evidence_stay_inside_the_monitored_root(self):
         sandbox, parent, root, evidence, scratch, case, registration, facts = self.layout()
@@ -8702,7 +8751,8 @@ class PureSettlement(unittest.TestCase):
                     monitor.census_loop(after=7)
                 evidence = monitor.receipt["replacement_fixture"]
                 self.assertEqual((evidence["source"], evidence["mode"]), ("synthetic", mode))
-                self.assertIn({"pid": 2_147_483_647, "start": 2, "state": expected}, evidence["work"]["rows"])
+                self.assertEqual(evidence["observations"]["rows"], [{"pid": 2_147_483_647,
+                    "start": 2, "state": expected, "terminal_witness": None}])
                 message = json.loads(os.read(ctl_r, 1 << 16).decode())
                 self.assertEqual(message["replacement_work"], evidence["work"])
                 self.assertIsNone(bounded.malformed(message))
@@ -9909,7 +9959,8 @@ class Real(unittest.TestCase):
         self.assertEqual(observed["uncertain"], 0)
         work = observed["work"]
         self.assertEqual((work["status"], work["replacement"], work["pending"]), ("complete", 1, 0))
-        self.assertIn({"pid": 2_147_483_647, "start": 2, "state": expected_state}, work["rows"])
+        self.assertEqual(observed["observations"], {"source": "test-only-ledger", "rows": [
+            {"pid": 2_147_483_647, "start": 2, "state": expected_state, "terminal_witness": None}]})
         signalled = [r["target"] for r in self.receipt["custodian"] if r["event"] == "signal"]
         self.assertNotIn(2_147_483_647, signalled)
         CASES[-1]["replacement_fixture"] = observed
@@ -10429,18 +10480,25 @@ class Real(unittest.TestCase):
             self.assertIsNotNone(start_row, "held child left the process table")
             self.assertTrue(start_row.get("zombie"), "held child is not yet a zombie")
             held_start = start_row["start"]
+            request = json.dumps([[held, held_start]])
             self.assertEqual(
-                self.guardian(fixture("open(os.environ['CASE_DIR'] + '/ran', 'w')\n")), 0)
+                self.guardian(fixture("open(os.environ['CASE_DIR'] + '/ran', 'w')\n"),
+                              inject=["census-fixture-witness"],
+                              extra_env={"OXIDE_SUPERVISOR_TEST_WITNESSES": request}), 0)
             self.assertEqual(self.outcome()["closure"], "closed")
             self.assertIsNone(self.outcome()["fault"])
             nested = self.receipt["census"]
             self.assertEqual(self.receipt.get("terminal_mode", {}).get("mode"), "allowlisted")
             self.assertGreaterEqual(nested["terminal_nonwriters"], 1)
             self.assertEqual(nested["terminal_count_status"], "valid")
-            witnesses = nested.get("terminal_witnesses", [])
-            self.assertTrue(
-                any(w.get("pid") == held and w.get("start") == held_start for w in witnesses),
-                f"exact held (PID, start) witness missing for {held}")
+            attributed = nested.get("fixture_observations") or {}
+            self.assertEqual(attributed.get("source"), "test-only-ledger")
+            rows = attributed.get("rows") or []
+            self.assertEqual(len(rows), 1)
+            self.assertEqual((rows[0]["pid"], rows[0]["start"], rows[0]["state"]),
+                             (held, held_start, "terminal"))
+            witnesses = [rows[0].get("terminal_witness")]
+            self.assertEqual(owned_witness_problems(witnesses, {held: held_start}), [])
         finally:
             try:
                 os.waitpid(held, 0)
@@ -10474,8 +10532,11 @@ class Real(unittest.TestCase):
                 if len(starts) < 12:
                     time.sleep(0.01)
             self.assertEqual(len(starts), 12, "not every held child became an unreaped zombie")
+            request = json.dumps([[pid, starts[pid]] for pid in held])
             self.assertEqual(
-                self.guardian(fixture("open(os.environ['CASE_DIR'] + '/ran', 'w')\n")), 0)
+                self.guardian(fixture("open(os.environ['CASE_DIR'] + '/ran', 'w')\n"),
+                              inject=["census-fixture-witness"],
+                              extra_env={"OXIDE_SUPERVISOR_TEST_WITNESSES": request}), 0)
             outcome = self.outcome()
             self.assertEqual(outcome["closure"], "closed")
             self.assertIsNone(outcome["fault"])
@@ -10492,13 +10553,16 @@ class Real(unittest.TestCase):
             self.assertEqual(self.receipt.get("terminal_mode", {}).get("mode"), "allowlisted")
             self.assertEqual(nested["terminal_count_status"], "valid")
             self.assertGreaterEqual(nested["terminal_nonwriters"], 12)
-            # The global host census may legitimately retain ambient allowlisted
-            # terminal rows. They are observations, never foreign writers, and
-            # they can never stand in for an identity this fixture holds. The
-            # witness list is byte-budget clipped, so report exactly which owned
-            # identities were witnessed and which were clipped away; a clipped
-            # list with no owned witness fails rather than being relaxed.
-            report = owned_witness_report(nested.get("terminal_witnesses"), starts)
+            # Ambient witnesses cannot stand in for these exact held identities.
+            # The generic witness list may be clipped; the explicit test-only
+            # projection records each requested identity's actual ledger result.
+            # Missing or nonterminal entries and mismatched witnesses still fail.
+            attributed = nested.get("fixture_observations") or {}
+            self.assertEqual(attributed.get("source"), "test-only-ledger")
+            rows = attributed.get("rows") or []
+            self.assertEqual({(r["pid"], r["start"], r["state"]) for r in rows},
+                             {(pid, start, "terminal") for pid, start in starts.items()})
+            report = owned_witness_report([r.get("terminal_witness") for r in rows], starts)
             self.assertEqual(report["problems"], [])
             self.assertTrue(report["owned"], "a nonvacuous exact owned witness is required")
             print("[oxide#147] held=%d witnessed=%s omitted=%s ambient=%d"

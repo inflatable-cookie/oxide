@@ -77,7 +77,7 @@ WALL_NS = 600 * NS  # oxide#192 amendment (2026-10-31): was 420 s (#191), 300 s 
 CANDIDATE_LIMIT = 560  # oxide#192 amendment: was 380 s (#191), 280 s before
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-EXPECTED_CASES = 464  # 405 pure + 59 real; derived from the suite loader at oxide#233.
+EXPECTED_CASES = 465  # 406 pure + 59 real; derived from the suite loader at oxide#233.
                       # Earlier 382 pure + 57 real remain historical. oxide#151 added the routing, marker,
                       # nested-window protection, bounded-sweep, qualify-entry,
                       # shared-ancestor/private-leaf and readiness cases; oxide#191
@@ -813,9 +813,11 @@ def check_plan(receipt, results, expected, record=None, facts=None, base=None):
                 continue
             fixture = rows[0].get("replacement_fixture") or {}
             work = fixture.get("work") or {}
-            identity = {"pid": 2_147_483_647, "start": 2, "state": state}
-            if (fixture.get("source"), fixture.get("mode"), work.get("status"), work.get("replacement"),
-                    work.get("pending")) != ("synthetic", mode, "complete", 1, 0) or identity not in work.get("rows", []):
+            observations = fixture.get("observations") or {}
+            identity = {"pid": 2_147_483_647, "start": 2, "state": state, "terminal_witness": None}
+            if ((fixture.get("source"), fixture.get("mode"), work.get("status"), work.get("replacement"),
+                    work.get("pending")) != ("synthetic", mode, "complete", 1, 0)
+                    or observations.get("source") != "test-only-ledger" or observations.get("rows") != [identity]):
                 problems.append(f"cases: {name} has missing or inconsistent synthetic replacement evidence")
             if 2_147_483_647 in (rows[0].get("signal_targets") or []):
                 problems.append(f"cases: {name} signalled the synthetic identity")
