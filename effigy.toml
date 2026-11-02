@@ -1294,6 +1294,69 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-command-budgets.py --diagnostic"
 
+# Held-child custody retained-evidence fixtures (oxide#237, slice B of the
+# frozen retention design): one fixed script and the whole command of the
+# qualified shared supervisor under heavy admission (300 s absolute, 512 MiB
+# monitored scratch). It runs as the guard's proof leader, validates the
+# already-published default selected-volume owned-root receipt and topology
+# (refusing adopted scratch, explicit --root-parent/--evidence, the fallback,
+# aliases, mount crossings, stale/changed/unmarked roots and equated run
+# tokens), reads and hashes the exact pinned qualified runner bytes and loads
+# only those verified bytes, calls the runner's own `protect_nested_scope`
+# and independently re-verifies the hosting readback BEFORE any fixture
+# resource, then creates one private `evidence/cargo-group-custody.<random>/`
+# directory and proves the direct-child custody premises on its own controlled
+# children: child-created session/group membership and identity binding,
+# a session leader's EPERM-refused setpgid/setsid escapes, exclusive unreaped
+# custody with SIGCHLD SIG_DFL (a SIG_IGN demo shows kernel auto-reap),
+# WNOHANG collecting nothing while live, ECHILD on a second wait, bounded
+# kill/killpg-0 zombie persistence with the same (PID, start) identity, the
+# prospective cooperative stop (bounded killpg TERM escalating to KILL only
+# under positive held custody, then positive reap), model refusal after
+# settled custody with no syscall, and vacuous kill(0,0)/killpg(0,0) probes.
+# Parent-death, owner-unresponsive and descendant-group-escape cases are
+# HELD source/pure-only. No Cargo, toolchain, image, mount, live pool or
+# account read; the nested receipt binds the supervisor and marker tokens
+# separately, distinguishes outer from nested custody, is bounded to 64 KiB
+# with 32/32/64 row caps and totals/omissions, and never concludes the
+# hosting root (it stays hosting, unconcluded and retained even on success).
+# Native execution is gated on the retained Queue reviewer's exact-head
+# source/premise approval; the one counted-path diagnostic then runs through
+# the task's proof route. Fit is unmeasured; this declaration activates
+# nothing.
+[tasks."rust:cargo-group-custody"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-cargo-group-custody.py"
+
+# Uncounted keep-going collection for oxide#237, run through the same
+# qualified guard, bounds and custody: the fixed script's --diagnostic mode
+# records recoverable case failures, continues only into
+# dependency-independent cases, marks dependent cases skipped, aborts on an
+# infrastructure, device, writer, custody or receipt uncertainty, and writes
+# one bounded `qualified: false` receipt. It is never a counted PASS.
+[tasks."rust:cargo-group-custody:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-cargo-group-custody.py --diagnostic"
+
+# Pure apparatus check of the oxide#237 custody fixtures, through the
+# script's existing `--self-check` mode only: it stages nothing, starts no
+# child, and writes only inside one private temporary directory under TMPDIR
+# that it removes before returning. It drives the actual loader, validation,
+# protection and custody-model seams against a fake of the guard's default
+# owned-root topology and the loaded qualified runner, and pins the script's
+# source discipline (no conclusion, sweep, cleanup or restoration anywhere
+# outside the self-check's own temp removal). This selector is deliberately
+# not heavy, is not the native proof and advances no gate.
+[tasks."proof:cargo-group-custody:test"]
+run = "python3 scripts/test-cargo-group-custody.py --self-check"
+
+# Effect-free plan for oxide#237: prints the counted and diagnostic commands,
+# bounds, the case table with dependencies and held source-only cases, the
+# resource sketch, receipt caps, refusal premises and the nine
+# proof-authoring premise-checklist dispositions. No filesystem effect.
+[tasks."proof:cargo-group-custody:plan"]
+run = "python3 scripts/test-cargo-group-custody.py --plan"
+
 # Cold-slot seeding (oxide#137 §16, oxide#169 slice 4): one fixed 24-case
 # script and the whole command of the qualified shared supervisor, with
 # default selected-volume scratch and explicitly capped scratch pools. 900 s (Tom 09c6cd03), 512 MiB monitored scratch, one owned

@@ -613,3 +613,51 @@ Before implementation, independently review the ownership and deadline
  consumer and explicitly rebind only the affected proofs after qualification;
  prior receipts remain bound to their original bytes. No native execution or
  behavior change is implied by this investigation.
+
+#### Slice B implemented: the fixture apparatus (2026-11-02, unqualified)
+
+Slice B is implemented at `scripts/test-cargo-group-custody.py` with the
+selectors `effigy rust:cargo-group-custody`, `:diagnostic`,
+`proof:cargo-group-custody:test` (pure `--self-check`) and `:plan`. It follows
+the setup-and-ownership sequence above against the pinned qualified runner
+`fcfda2b0…` (missing or changed bytes refuse; only the verified bytes are
+compiled and executed, with bytecode writing disabled and no path switch),
+validates the guard's published receipt and topology before any fixture
+resource (refusing adopted, explicit-parent/evidence, fallback, unmarked,
+stale, replaced or foreign placements and any equation of the supervisor and
+marker tokens), calls the runner's `protect_nested_scope` and independently
+re-reads `hosting`/`running`/null-conclusion plus the root/marker binding,
+and then creates `evidence/cargo-group-custody.<random>/` (0700, by evidence
+descriptor, no symlink following) as the only writer target for HOME, cwd,
+temp, child reports, logs, stop files and the nested receipt. The bounded
+receipt (64 KiB, 32 case / 32 signal-refusal / 64 identity rows with totals
+and omission counts, republished atomically — not power-loss durably — after
+every transition, including the leader's own bounded TERM/INT settle) binds
+the two tokens separately and the exact dev/inode
+identities, and distinguishes `outer` (never claimed by the fixture) from
+`nested` custody; a missing, partial or unwritable receipt aborts later
+cases, and EOF, nonzero exit, an absent observed PID or an outer closed never
+turn nested unknown into closed.
+
+The native case map proves, on the fixture's own controlled direct children
+only: child-created session/group membership and identity binding;
+`EPERM`-refused `setpgid`/second-`setsid` escapes for the session leader;
+exclusive unreaped custody with `SIGCHLD` `SIG_DFL` (the `SIG_IGN`
+counterfactual demo shows kernel auto-reap, `ECHILD`, no zombie); `WNOHANG`
+collecting nothing while live and `ECHILD` on a second wait; bounded
+`kill`/`killpg`-0 zombie persistence with the same `(PID, start)` identity;
+the prospective cooperative stop (bounded `killpg` TERM, escalating KILL,
+only under positive held custody, then the single positive reap); refusal
+after settled custody with no syscall; and vacuous `kill(0,0)`/`killpg(0,0)`
+as the demonstration that observations are not signal handles. These cases
+correspond to the source discriminator above: a zombie held unreaped by its
+parent keeps its group alive until the reap, and the kernel cannot auto-reap
+behind a `SIG_DFL` holder that never waits concurrently. `s01` owner death,
+`s02` owner-unresponsive and `s03` descendant group escape remain HELD
+source/pure-only: no bounded no-new-authority containment/lifetime argument
+has been accepted, so the script refuses to execute them natively. The
+apparatus is unqualified: no native run has happened, native execution is
+gated on the retained Queue reviewer's exact-head source/premise approval,
+the one counted-path diagnostic runs through the task's proof route (never
+by author or reviewer), fit is unmeasured, and nothing here is a product
+closure claim, a supervisor change, or progress on papercut `9ff7386d`.
