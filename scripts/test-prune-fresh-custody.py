@@ -130,6 +130,7 @@ SCALE_ROWS = 1189
 SCALE_WRITERS = 650
 SNAPSHOT_BUDGET_BYTES = 64 * 1024 * 1024
 MANAGED_NAME = "oxide-managed"
+MIB = 1024 * 1024
 
 # The nine HIGH proof-authoring premise dispositions (workflow.md
 # "Proof-authoring premise checklist"), with the executable source location of
@@ -1020,17 +1021,40 @@ def run_cases(proof, adapter, world, boot, collector):
 
         state_paths = [paths["internal_state"], paths["removable_state"]]
         originals = [Path(path).read_bytes() for path in state_paths]
-        padded = [data.ljust(30 * 1024 * 1024, b" ") for data in originals]
+        # Readiness reads the internal state once before the witness reads
+        # both states. Two 30 MiB states therefore exceed the shared window;
+        # the asymmetric pair fits once but cannot fit a second removable
+        # read. The observed byte charge, not this arithmetic, is the oracle.
+        symmetric = [data.ljust(30 * MIB, b" ") for data in originals]
+        padded = [originals[0].ljust(2 * MIB, b" "), originals[1].ljust(31 * MIB, b" ")]
+        require([len(data) for data in symmetric] == [30 * MIB, 30 * MIB]
+                and [len(data) for data in padded] == [2 * MIB, 31 * MIB],
+                "fixture states exceed their planned individual sizes")
         byte_marker = proof.evidence / "prune-bytes-observed"
         pause_marker = proof.evidence / "witness-paused"
         release_marker = proof.evidence / "witness-release"
         child = None
         try:
-            for path, data in zip(state_paths, padded):
+            for path, data in zip(state_paths, symmetric):
                 atomic_write(path, data)
             byte_marker.unlink(missing_ok=True)
+            before_control = tree_digest(world.control)
+            before_links = links_snapshot(link_locations)
             code, out, stderr = world.dry_run(
-                "large valid states", boot, extra={"OXIDE_TEST_PRUNE_BYTES": world.control}
+                "two large valid states", boot, extra={"OXIDE_TEST_PRUNE_BYTES": world.control}
+            )
+            require(code == 0, "large-state refusal did not produce a preview")
+            require_refusal_names(json.loads(out), "the snapshot exceeded its input or time budget")
+            observed = [line for line in stderr.splitlines() if line.startswith("oxide proof: authority bytes ")]
+            require(len(observed) == 1 and int(observed[0].rsplit(" ", 1)[1]) == SNAPSHOT_BUDGET_BYTES,
+                    f"two-state refusal did not charge the full budget: {observed}")
+            require(tree_digest(world.control) == before_control, "large-state refusal changed control")
+            require(links_snapshot(link_locations) == before_links, "large-state refusal changed links or targets")
+            for path, data in zip(state_paths, padded):
+                atomic_write(path, data)
+            byte_marker.unlink()
+            code, out, stderr = world.dry_run(
+                "asymmetric valid states", boot, extra={"OXIDE_TEST_PRUNE_BYTES": world.control}
             )
             require(code == 0, "large valid state preview failed")
             doc = json.loads(out)
@@ -1039,8 +1063,10 @@ def run_cases(proof, adapter, world, boot, collector):
             observed = [line for line in stderr.splitlines() if line.startswith("oxide proof: authority bytes ")]
             require(len(observed) == 1, "large-state byte observation missing")
             used = int(observed[0].rsplit(" ", 1)[1])
-            require(60 * 1024 * 1024 <= used < SNAPSHOT_BUDGET_BYTES,
-                    f"large-state byte charge unexpected: {used}")
+            require(2 * len(padded[0]) + len(padded[1]) <= used < SNAPSHOT_BUDGET_BYTES,
+                    f"asymmetric-state byte charge unexpected: {used}")
+            require(used + len(padded[1]) > SNAPSHOT_BUDGET_BYTES,
+                    "a second removable-state read would not exhaust the budget")
             byte_marker.unlink()
             pause_marker.unlink(missing_ok=True)
             release_marker.unlink(missing_ok=True)
@@ -1619,6 +1645,15 @@ def self_check() -> int:
     prune_source = (HERE.parent / "src" / "bin" / "oxide" / "prune.rs").read_text()
     require("const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024;" in prune_source, "budget literal")
     require("const SNAPSHOT_TIME: Duration = Duration::from_secs(10);" in prune_source, "time literal")
+    ready_source = prune_source.split("fn require_ready", 1)[1].split("\n}", 1)[0]
+    require("store.outputs_initialization()?" in ready_source,
+            "preview readiness no longer reads the internal initialization state")
+    init_source = store_source.split("pub fn outputs_initialization", 1)[1].split("\n    }", 1)[0]
+    require("self.load()?" in init_source, "initialization no longer loads the state")
+    require(3 * 30 * MIB > SNAPSHOT_BUDGET_BYTES
+            and 2 * 2 * MIB + 31 * MIB < SNAPSHOT_BUDGET_BYTES
+            and 2 * 2 * MIB + 2 * 31 * MIB > SNAPSHOT_BUDGET_BYTES,
+            "large-state counterfactual arithmetic")
     require(
         'matches!(record.phase, Phase::Spawning | Phase::Running)' in store_source,
         "the writer-phase arm the custody verdict counts",
