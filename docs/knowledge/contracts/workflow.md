@@ -1811,6 +1811,44 @@ necessary.
     end is unknown. Release builds do not emit this trace. Trace records are
     observations, not timing or closure gates; a missing trace cannot establish
     a duration. No new diagnostic has yet attributed the historical gap.
+  - **Instrument finding (oxide#239).** The first diagnostic of that
+    instrument (`/Volumes/Builds/scratch/oxide/oxide-proof.tj837y2a/evidence`,
+    diagnostic receipt SHA-256 `a44391d1540063f72da10a0d6c5723076cc3407007ef0b9d1c5bc1d6ccd37939`,
+    guard receipt SHA-256 `c47eca0216d73291d935c4af55c1017ab7ed3cf2dba77f460c9e328c8d723161`)
+    completed 17/17 cases with the guard closed, no fault and no deadline
+    (417 s of 600 s, 71.6 MiB of 128 MiB), but every one of the 31 instrumented
+    commands recorded `layout refused` and no trace file existed: both
+    validators required `marker.run_id == OXIDE_PROOF_RUN_ID`, while the guard
+    receipt's `run_id` is the supervisor session token and the scratch
+    marker's `run_id` is the monitor's independent marker token. The
+    historical 11–13 s outside-summary gap therefore stays unattributed; that
+    packet keeps its failed uncounted outcome with no evidence rewrite.
+  - **Two-token binding (oxide#239).** The trace layout now binds each token
+    to its own source and never equates them: the exported `OXIDE_PROOF_RUN_ID`
+    (session token) must equal the guard's published `receipt.json` `run_id`,
+    read as one bounded no-follow regular-file snapshot with a 64 KiB cap
+    that refuses missing, symlinked, foreign-owned, oversized, malformed or
+    cross-run documents and accounts for the monitor's atomic replace by
+    refusing a snapshot whose file identity changed between `lstat` and
+    `open`; the marker's `run_id` must equal that receipt's
+    `scratch_marker.run_id` and the receipt must name the verified root,
+    scratch and evidence paths and a published phase, while the marker's
+    canonical root, UID, device and inode still bind to the already verified
+    private descriptor topology. The supervisor's token generation is
+    unchanged. Activation stays debug-only, opt-in, bounded at 64 events and
+    silent in ordinary and release code.
+  - **Trace attribution (oxide#239).** The fixed diagnostic now records a
+    separate bounded trace-attribution result — expected instrumented
+    commands, per-command allocation and raw phase evidence with starts, ends
+    and unpaired starts as unknown ends, and the guard receipt's two
+    identities — and requires actual nonempty raw phase evidence from every
+    reached creation-path command: layout refusals or absent traces are an
+    insufficient-instrumentation outcome (diagnostic exit 1), never a
+    successful attribution beside passing cases. Missing ends stay unknown;
+    no timing is invented and no requirement reproduces the historical gap;
+    trace totals and time comparisons are observations, not performance
+    acceptance thresholds. Native and kernel custody remain real and are
+    never inferred from trace or command success.
   - **Discriminator.** A debug-only, opt-in phase trace on the creation path
     (the `release_trace::phase` pattern, not that trace, which covers only the
     release closeout) in one uncounted diagnostic would split the gap. That

@@ -11610,6 +11610,10 @@ mod tests {
     /// left exactly where it was.
     #[test]
     fn a_migration_links_discovered_triple_pairs_one_level_down() {
+        // migrate_layout consults the process-global crash-injection
+        // environment, so every caller serializes under the same lock as the
+        // tests that set it.
+        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
         let (fixture, legacy) = legacy_checkout();
         let context = fixture.context();
         let root = legacy.selected().unwrap().root().to_path_buf();
@@ -11711,6 +11715,9 @@ mod tests {
 
     #[test]
     fn an_explicit_migration_publishes_profile_links_and_resumes() {
+        // Serialize against the crash-environment tests: migrate_layout
+        // consults the process-global OXIDE_TEST_OUTPUTS_CRASH value.
+        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
         let (fixture, legacy) = legacy_checkout();
         let context = fixture.context();
         let root = legacy.selected().unwrap().root().to_path_buf();
@@ -11779,6 +11786,7 @@ mod tests {
     /// destination is absent here and this test's first assertion fails.
     #[test]
     fn a_migration_creates_every_member_directory_before_its_link() {
+        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
         let (fixture, legacy) = legacy_checkout();
         let context = fixture.context();
         let root = legacy.selected().unwrap().root().to_path_buf();
