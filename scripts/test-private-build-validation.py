@@ -1322,7 +1322,7 @@ USAGE = """usage:
   test-private-build-validation.py --plan
   test-private-build-validation.py --prepare --packet-dir DIR --oxide-repo REPO
       --oxide-head HEX40 --oxide-product-head HEX40 --barge-repo REPO --barge-head HEX40
-      --barge-root ROOT --oxide-root ROOT
+      --barge-root ROOT --oxide-root ROOT --audit-inputs PATH --expect-audit-inputs HEX64
   test-private-build-validation.py --diagnostic --oxide-repo REPO --oxide-head HEX40 --oxide-product-head HEX40
       --barge-repo REPO --barge-head HEX40 --barge-root ROOT --oxide-root ROOT
       --expect-audit HEX64 --expect-ledger HEX64 --expect-budget HEX64 --expect-history HEX64
@@ -1933,6 +1933,7 @@ def diagnostic(options: dict) -> int:
         "preparation_receipt_sha256": options["expect_preparation"],
     }
     commands = [
+        {"phase": "oxide-claim", "argv": claim_argv, "exit": 0},
         {"phase": "bootstrap", "argv": bootstrap_argv, "exit": 0},
         {"phase": STATUS_SELECTOR, "argv": status_argv, "exit": 0},
     ]
@@ -1951,7 +1952,8 @@ def diagnostic(options: dict) -> int:
                   "rustc": sha256_file(rustc_tool, cap=256 * 1024 * 1024), "git": sha256_file(git_tool, cap=256 * 1024 * 1024),
                   "supervisor": SUPERVISOR_SHA256, "wrapper": wrapper_hash},
         commands=commands,
-        observations={"live_inventory_sha256": sha256_bytes(live_before_doc),
+        observations={"oxide_claim_receipt_sha256": sha256_file(oxide_claim_evidence / "receipt.json"),
+                      "live_inventory_sha256": sha256_bytes(live_before_doc),
                       "retained_snapshot_sha256": sha256_bytes(canonical_json(retained_after)),
                       "barge_aggregate_bytes": barge_outside + barge_monitored,
                       "barge_effective_bootstrap_mib": barge_effective_mib,
@@ -1960,8 +1962,8 @@ def diagnostic(options: dict) -> int:
                       "oxide_effective_note": "measured clamp of the 6 GiB grant minus "
                       "retained bytes; about 552 MiB at the reported 5591.8 MiB "
                       "retained total, never a claim that a phase fits",
-                      "barge_root_monitored_by": "this gate's allocated-bytes walks, "
-                      "outside the supervisor's own scratch; disclosed, not hidden"},
+                      "barge_root_monitored_by": "outer qualified supervisor adopted scratch; "
+                      "periodic samples do not establish an instantaneous peak"},
         exports=exports, failures=[], decisions=decisions)
     private_write(allowance_dir, Path("receipt.json"), canonical_json(receipt_doc))
     if now_ns() - publication_start > 10 * 1_000_000_000:
