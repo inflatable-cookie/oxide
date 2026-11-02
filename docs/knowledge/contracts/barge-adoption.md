@@ -1041,23 +1041,25 @@ output sizes stay unknown and unread; planner-240/review-230 directories are
 named non-root evidence with disposition pending; `oxide-233-fix.*` is not
 attributable and never read.
 
-**Execution model.** Both effect-carrying modes (`--prepare`, `--diagnostic`)
-run only as the whole command of the qualified shared supervisor
-(`bounded-test.py` bytes `fcfda2b0…`): the supervisor's exported run identity
-binds every claim and allowance record, and its reserve/scratch coverage
-covers the whole command from the first walk — there is no directly
-invocable child entry point. The one-use claim covers both issued blocks,
-written exclusively inside the supervisor's evidence directory. One global
-prospective allowance on `CLOCK_UPTIME_RAW` (the same cross-process clock as
-`OXIDE_PROOF_DEADLINE_NS`) bounds setup, documents, accounting, the single
-300 s debug-Oxide bootstrap (exact argv `cargo build --offline --locked
---bin oxide --message-format=json` under the nested qualified supervisor with
-cwd `oxide-source`), the inventory-bracketed private status dry gate (the
-accepted Barge archive selector `rust:test:tape-private-status` from the
-extracted `barge-source` root), the final live/retained equality brackets
-and the exports. No phase resets the clock; no uncertain outcome is replayed;
-same-bytes inode replacement cannot pass (inventory rows carry inode
-identity).
+**Execution model.** Preparation and the diagnostic use separate Barge
+phase roots, with the qualified supervisor adopting and sampling the entire
+active root, including its evidence and exports. The diagnostic verifies a
+closed preparation receipt and charges its wall time and a conservative 120 s
+pure-check reservation against both prospective blocks. It consumes each
+planner-issued companion token once, under the relevant task root's guard;
+the exclusive persistent claim is retained even after refusal. A direct
+entry requires a matching live supervisor parent, command and receipt, not
+just exported environment variables. Root discovery and block proposals are
+unissued; a planner must resolve their unknowns and bind actual inputs before
+execution. A closed runner receipt and matching live inventories still require
+independent judgment; the diagnostic itself never grants qualification.
+
+The Barge bootstrap builds pinned Oxide `3de2413`; the independent Oxide
+product head is a separate input bound to the Oxide block. The global
+allowance includes setup, bootstrap, status and exports. The diagnostic
+brackets the retained inactive roots and account inventory, with inode and
+content equality; uncertainty refuses. The supervisor samples scratch usage,
+so a sample maximum is evidence, not an instantaneous peak measurement.
 
 **Host admission.** `EFFIGY_ADMISSION_HOOK` and `QUEUE_ADMISSION_SOCKET` are
 preserved exactly as the independent audit binds them; an unset hook is not
@@ -1087,22 +1089,51 @@ qualified supervisor). The diagnostic declaration carries no issued binding
 and refuses before any effect until the planner amends the command with the
 bound inputs. The exact command template the planner binds at issue:
 
-    python3 scripts/bounded-test.py --limit 1200 --scratch-budget-mib 512 -- \
+    OXIDE_TASK_SCRATCH_ROOT=<guarded-barge-root> python3 scripts/bounded-test.py --limit 1200 --scratch-budget-mib <reviewed-mib-at-most-512> -- \
       python3 scripts/test-private-build-validation.py --diagnostic \
-      --oxide-repo <canonical oxide checkout> --oxide-head <40-hex approved head> \
+      --oxide-repo <canonical oxide checkout> --oxide-head 3de241325dd286ae44a5759fa6825b05a81c7b4e \
+      --oxide-product-head <40-hex independently approved Oxide product head> \
       --barge-repo <canonical barge checkout> --barge-head <40-hex> \
       --barge-root /Volumes/Builds/scratch/barge/<prepared root> \
       --oxide-root /Volumes/Builds/scratch/oxide/<prepared root> \
       --expect-audit <sha256> --expect-ledger <sha256> \
-      --expect-budget <sha256> --expect-history <sha256> [--planner-reference <string>]
+      --expect-budget <sha256> --expect-history <sha256> --expect-oxide-binding <sha256> \
+      --preparation-receipt <closed guard receipt> --expect-preparation <sha256> \
+      [--planner-reference <string>]
+
+Preparation is a separate guarded document phase with a fresh adopted Barge
+root. The planner binds `--prepare --packet-dir <path inside preparation root>`
+plus the same repository, head and planned task-root arguments shown above.
+Its `--audit-inputs <manifest> --expect-audit-inputs <sha256>` names bounded
+source copies, each with `source`, private relative `destination` and `sha256`;
+the diagnostic recopies and rechecks those same bytes from the retained phase.
+It preserves that phase's receipt and packet, resolves every unknown, reviews
+the source audit and then issues the documents and companion tokens. The
+preparation root is retained and counted before the diagnostic. All command
+and environment bindings are fixed before dispatch; changing the source needs
+new source review. The displayed diagnostic scratch budget is a planner-bound
+clamp, and the repository selector's 512 MiB default refuses if it does not
+fit the measured remainders.
 
 with the issued documents and their digests in the environment
 (`BARGE_VALIDATION_BLOCK[+_SHA256]`, `BARGE_VALIDATION_SOURCE_AUDIT[+_SHA256]`,
 `BARGE_VALIDATION_ROOT_LEDGER[+_SHA256]`, `BARGE_VALIDATION_EFFIGY`,
 `BARGE_VALIDATION_GIT`, `BARGE_VALIDATION_SUPERVISOR`, `BARGE_PINNED_RUSTC`,
-`TAPE_BLOCK_APPROVAL_SHA256`). The gate's task roots lie outside the
-supervisor's own scratch, so their aggregate accounting is the gate's own
-bounded no-follow walks, disclosed in the receipt rather than hidden.
+`TAPE_BLOCK_APPROVAL_SHA256`, `EFFIGY_ADMISSION_HOOK`,
+`QUEUE_ADMISSION_SOCKET`, `CARGO_HOME`, `RUSTUP_TOOLCHAIN`, and optionally
+`RUSTUP_HOME`). The Barge phase root must be the outer guard's adopted scratch
+root, including its evidence; the short Oxide claim phase's guard adopts the
+Oxide root. The planner binds the appropriate measured
+whole-root caps and includes the preparation root in the retained ledger.
+The issued blocks have owner-only `<block-name>.token` companions containing
+the block digest and a newline. A fixed exclusive hard-link claim burns each
+token across runs; a partial claim is never retried. `CARGO_HOME` identifies
+the invoking offline seed; `RUSTUP_HOME` falls back to the invoking
+`HOME/.rustup` before HOME is replaced, and `RUSTUP_TOOLCHAIN` is pinned.
+The audited admission hook, socket, direct Effigy, Git, supervisor, rustc and
+child PATH must all match the issued audit. The planner supplies and reviews
+source component copies, host provenance, the complete root ledger and both
+issued blocks; proposed documents alone are not an admission packet.
 `planner_reference` must be confirmed by the planner at binding (the
 proposal carries the brief-v11 string; the held brief is now v12).
 

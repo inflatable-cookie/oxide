@@ -1458,8 +1458,8 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # the bound roots, document digests, planner reference and issued blocks
 # (details and the exact command template: docs/knowledge/contracts/
 # barge-adoption.md, "Shared private-build validation gate"). Its task-root
-# accounting is the gate's own bounded no-follow walks, disclosed in its
-# receipt, because the task roots lie outside the supervisor's own scratch.
+# accounting requires the adopted whole task root and separately guarded
+# Oxide claim root; retained-root walks set the measured clamps.
 [tasks."proof:private-build-validation:test"]
 run = "python3 scripts/test-private-build-validation.py --self-test"
 
