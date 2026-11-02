@@ -6724,6 +6724,36 @@ the relocated diagnostic route, not counted qualification or consumer promotion.
 The default qualified runner remains `fcfda2b0`; retained nested fault fixtures
 and all historical failures stay unchanged.
 
+**Counted candidate qualification.** The counted selector
+`effigy proof:supervisor:qualify` ran once at the same `0ddc306` source in
+execution `a7c3c9da`. Its actual receipt schema emits `result: "pass"` and
+`problems: []`; counted mode does not emit a top-level `qualified` property.
+Only diagnostic mode adds `qualified: false`. A future qualification brief
+must use that actual schema, together with the source, case, custody and
+resource oracles, rather than demand a nonexistent `qualified: true` field.
+The exact manifest is bound by the fifth independently verified Queue input
+and clean source commit; the printed `sha256` object binds the candidate,
+qualified default, suite and bootstrap.
+
+Planner release-gate acceptance `9575afc9-4a46-4302-8f33-c660977454cd`
+accepts this counted evidence for the isolated `c5782431` bytes. All 465
+outcomes passed, with no problems, candidate closed at status 0, no fault or
+deadline, a certain empty deciding census and no survivors. Worker wall was
+417.07 s, peak monitored scratch 71,032,832 bytes and minimum sampled free
+304.9 GiB. Nested fault fixtures and the bootstrap base remain retained;
+both startup sweeps removed nothing. The original combined log at
+`/Volumes/Builds/scratch/oxide/qualification.BRF2xdS5/qualification.log` has
+SHA-256 `56010506433b3eff6ba49bd62991e893942d7da856e236ae36a3496446ee80b9`;
+its 166,100 bytes were outside guarded accounting. The matching guard receipt
+at `/Volumes/Builds/scratch/oxide/oxide-proof.dgi2n6oi/evidence/receipt.json`
+has SHA-256 `c2764ebcf79a41598a32ea5630198a9abeb02d467c251a1360d8cae785de6323`.
+No receipt, missing field or reviewer finding was rewritten by the acceptance.
+It qualifies only these bytes within the declared cooperative macOS scope;
+it supplies no stronger group-lifetime or historical-survivor closure claim.
+The ordinary default remains `fcfda2b0`. Using the qualified candidate's fixed
+path in a new proof needs its own scoped consumer disposition and pin audit;
+qualification alone performs no global promotion or consumer repin.
+
 The proof-authoring premise sweep for the new cases follows their executable
 route: `Real.replacement_fixture` calls `Real.guardian` with `fixture("pass")`;
 that fixture is Python-only and makes no Oxide, Cargo or rustup call. Therefore
@@ -6736,13 +6766,15 @@ supervisor evidence inside the qualification-owned root; no shell `mktemp` is
 called. Existing suite cases and the enclosing bootstrap retain their own
 premises, bounds and custody rules. This source sweep is not a native diagnostic.
 
-These candidate bytes are **unqualified**. Main's `fcfda2b0…` runner remains
-the deployed qualified route; no prior receipt migrates. Under Tom's task-specific
+These candidate bytes have the counted qualification and attributed planner
+acceptance recorded above. Main's `fcfda2b0…` runner remains the deployed
+default route; no prior receipt migrates. Under Tom's task-specific
 ruling `c8991f99`, the single retained Queue reviewer judges the exact published
 source and, after source approval, one separately activated source-immutable
-uncounted diagnostic. Further qualification and active-consumer safety remain
-planner-owned release gates; counted author and reviewer native sessions are not
-authorized by this brief. The 600 s outer / 560 s candidate / 530 s suite bounds,
+uncounted diagnostic. Qualification and active-consumer safety are distinct
+planner-owned release gates; the later counted execution is a separate
+qualification disposition, not an additional reviewer native. The 600 s outer /
+560 s candidate / 530 s suite bounds,
 512 MiB monitored scratch and host custody remain unchanged. The persistent
 same-identity non-zombie ESRCH (`37529b20`) and recycled-identity report
 (`631e4462`) gain no retrospective closure or signal authority.
