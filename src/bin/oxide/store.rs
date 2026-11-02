@@ -264,7 +264,11 @@ fn boot_session() -> Option<u64> {
     }
     let boot = process::boot_ms();
     #[cfg(test)]
-    crate::tape::clock_row("boot-session-ms", boot.unwrap_or(0));
+    if let Some(value) = boot {
+        crate::tape::clock_row("boot-session-ms", value);
+    } else {
+        crate::tape::clock_unproven("boot-session-ms");
+    }
     boot
 }
 
@@ -5541,11 +5545,19 @@ impl Store {
         file.write_all(&bytes)
             .and_then(|()| file.sync_all())
             .map_err(|error| format!("cannot write Oxide state: {error}"))?;
+        #[cfg(not(test))]
         fs::rename(&temp, self.control.join("state.json"))
             .and_then(|()| File::open(&self.control)?.sync_all())
             .map_err(|error| format!("cannot replace Oxide state: {error}"))?;
         #[cfg(test)]
-        crate::tape::effect_row("save@control-state", &tape_state_path);
+        {
+            fs::rename(&temp, self.control.join("state.json"))
+                .map_err(|error| format!("cannot replace Oxide state: {error}"))?;
+            crate::tape::effect_row("save@control-state", &tape_state_path);
+            File::open(&self.control)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| format!("cannot replace Oxide state: {error}"))?;
+        }
         Ok(())
     }
 }
@@ -6331,6 +6343,10 @@ pub(crate) fn private_file(path: &Path, create: bool) -> Result<Option<File>, St
         }
         Err(error) => {
             #[cfg(test)]
+            if create {
+                crate::tape::effect_row("attempt@private-file-create", path);
+            }
+            #[cfg(test)]
             crate::tape::read_row(
                 "private-file:open",
                 path,
@@ -6342,14 +6358,14 @@ pub(crate) fn private_file(path: &Path, create: bool) -> Result<Option<File>, St
             return Err(format!("cannot open {}: {error}", path.display()));
         }
     };
+    // O_CREAT without O_EXCL cannot prove whether the file existed.
+    #[cfg(test)]
+    if create {
+        crate::tape::effect_row("attempt@private-file-create", path);
+    }
     let metadata = file.metadata().map_err(|error| error.to_string())?;
     #[cfg(test)]
     {
-        // O_CREAT without O_EXCL cannot prove from the return value whether
-        // the file existed; the attempt must remain visible and unqualified.
-        if create {
-            crate::tape::effect_row("attempt@private-file-create", path);
-        }
         crate::tape::read_row_dev(
             "private-file:open",
             path,

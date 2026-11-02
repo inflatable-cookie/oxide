@@ -964,13 +964,32 @@ fn physical_core_count() -> PhysicalCoreCount {
 fn read_config(path: &Path) -> Result<FileConfig, String> {
     let named = |error: String| format!("{}: {error}", path.display());
     let metadata = fs::metadata(path).map_err(|error| named(error.to_string()))?;
+    #[cfg(test)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        crate::tape::read_row_dev(
+            "config:read-config:metadata", path, metadata.dev(), metadata.ino(),
+            crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, MAX_CONFIG_BYTES,
+        );
+    }
     if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
         return Err(named("not a small regular file".to_owned()));
     }
     let mut text = String::new();
+    #[cfg(not(test))]
     fs::File::open(path)
         .and_then(|file| file.take(MAX_CONFIG_BYTES).read_to_string(&mut text))
         .map_err(|error| named(error.to_string()))?;
+    #[cfg(test)]
+    match fs::File::open(path).and_then(|file| file.take(MAX_CONFIG_BYTES).read_to_string(&mut text)) {
+        Ok(_) => crate::tape::read_row("config:read-config", path,
+            crate::tape::TapeOutcome::Digest { digest: crate::tape::sha256_hex(text.as_bytes()) }, MAX_CONFIG_BYTES),
+        Err(error) => {
+            crate::tape::read_row("config:read-config", path,
+                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, MAX_CONFIG_BYTES);
+            return Err(named(error.to_string()));
+        }
+    }
     parse_config(&text).map_err(named)
 }
 
@@ -1203,8 +1222,22 @@ pub fn inspect(path: &Path) -> Found {
         Ok(metadata) if metadata.is_file() && metadata.len() <= MAX_CONFIG_BYTES => {}
         _ => return Found::Unknown,
     }
+    #[cfg(not(test))]
     let Ok(bytes) = fs::read(&config) else {
         return Found::Unknown;
+    };
+    #[cfg(test)]
+    let bytes = match fs::read(&config) {
+        Ok(bytes) => {
+            crate::tape::read_row("config:inspect:bytes", &config,
+                crate::tape::TapeOutcome::Digest { digest: crate::tape::sha256_hex(&bytes) }, MAX_CONFIG_BYTES);
+            bytes
+        }
+        Err(error) => {
+            crate::tape::read_row("config:inspect:bytes", &config,
+                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, MAX_CONFIG_BYTES);
+            return Found::Unknown;
+        }
     };
     let backend = serde_json::from_slice::<serde_json::Value>(&bytes)
         .ok()

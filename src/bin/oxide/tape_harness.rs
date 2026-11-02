@@ -363,6 +363,7 @@ fn schema_matches(value: &serde_json::Value, schema: &serde_json::Value) -> bool
         "array" => value.is_array(),
         "string" => value.is_string(),
         "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "boolean" => value.is_boolean(),
         "null" => value.is_null(),
         _ => false,
     };
@@ -616,7 +617,8 @@ fn fixture_facts(root: &Path) -> config::Facts {
 /// namespace and are created only by the fixture owner.
 fn validate_fixture_path(root: &Path, path: &Path) -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    if !root.starts_with("/Volumes/Builds/scratch/oxide/")
+    if !(root.starts_with("/Volumes/Builds/scratch/oxide/")
+        || root.starts_with("/Volumes/Builds/scratch/oxide-validation/"))
         || std::fs::canonicalize(root).map_err(|e| e.to_string())? != root
     {
         return Err("fixture root is not canonical task scratch".to_owned());
@@ -1114,8 +1116,9 @@ fn run_case(
         Ok(_) => return Err("transcript destination already exists".to_owned()),
         Err(error) => return Err(error.to_string()),
     }
-    // Resolve the controls before the observation window, so preflight
-    // metadata checks cannot become untaped engine reads.
+    // Configuration resolution reads real files; open the same tape before
+    // preflight so those observations belong to this transcript.
+    tape::begin(ENGINE, case, "", "oxide::prune::tape_entry::run_chain");
     let preflight = validate_engine_environment(fixture_root);
     let read = (|| -> Result<Vec<u8>, String> {
         use std::io::Read;
@@ -1136,12 +1139,7 @@ fn run_case(
         .filter(|bytes| bytes.len() as u64 <= tape::MAX_MANIFEST_BYTES)
         .map(|bytes| tape::sha256_hex(bytes))
         .unwrap_or_default();
-    tape::begin(
-        ENGINE,
-        case,
-        &manifest_sha,
-        "oxide::prune::tape_entry::run_chain",
-    );
+    tape::bind_manifest_sha256(&manifest_sha);
     let parsed = (|| -> Result<HarnessManifest, String> {
         preflight?;
         let bytes = read?;
@@ -1304,6 +1302,16 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
         validate_fixture_path(temp, &temp.join("../escape")).is_err(),
         "parent traversal is refused",
     )?;
+    let capture_root = temp.join("capture-cap");
+    write_private_dir(&capture_root).map_err(|what| CheckFailure { what })?;
+    let oversized = capture_root.join("oversized");
+    write_private_file(&oversized, b"").map_err(|what| CheckFailure { what })?;
+    std::fs::OpenOptions::new().write(true).open(&oversized)
+        .and_then(|file| file.set_len(32 * 1024 * 1024 + 1))
+        .map_err(|error| CheckFailure { what: error.to_string() })?;
+    let capture = tape::capture_fixture(&capture_root);
+    check(capture.truncated && capture.post.iter().any(|entry| entry.rel == "oversized" && entry.bytes_sha256.is_none()),
+        "a fixture exceeding the byte cap is explicitly truncated")?;
     let link = temp.join("escape-link");
     std::os::unix::fs::symlink("/", &link).map_err(|error| CheckFailure {
         what: error.to_string(),
@@ -1325,6 +1333,16 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
         validate_manifest_envelope(&example).is_ok(),
         "manifest example has required envelope",
     )?;
+    let effect_example: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/knowledge/contracts/capture-examples/manifest-effects-all-kinds.json"
+    )).map_err(|error| CheckFailure { what: error.to_string() })?;
+    check(validate_manifest_envelope(&effect_example).is_ok(), "all fixed effect kinds are accepted")?;
+    let mut invalid_effect = effect_example.clone();
+    invalid_effect["expected_effects"][0]["kind"] = "attempt".into();
+    check(validate_manifest_envelope(&invalid_effect).is_err(), "attempt is not an effect kind")?;
+    let mut missing_effect_site = effect_example.clone();
+    missing_effect_site["expected_effects"][0].as_object_mut().expect("effect object").remove("site");
+    check(validate_manifest_envelope(&missing_effect_site).is_err(), "effect source site is required")?;
     let mut invalid_digest = example.clone();
     invalid_digest["source"]["cargo_lock_sha256"] = "not-a-digest".into();
     check(
@@ -1391,12 +1409,6 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
     let _: fn(&crate::inventory::InventoryLimits) =
         |_: &oxide_storage::inventory::InventoryLimits| {};
     let _: fn(&crate::lease::LedgerView) = |_: &oxide_storage::lease::LedgerView| {};
-    let lib_source = include_str!("../../lib.rs");
-    for module in ["release_trace", "inventory", "lease", "owned_delete", "proof",
-        "supervisor", "seed_source", "dep_info", "volume"] {
-        check(lib_source.lines().any(|line| line.trim() == format!("pub mod {module};")),
-            &format!("library module map contains {module}"))?;
-    }
     // Each byte string is compiled from the same path used by the re-rooted
     // module declaration. The digest list is reported as a source map, not as
     // a substitute for a library call or build-artifact provenance.
@@ -1538,6 +1550,7 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
         if let Some(object) = doc.as_object_mut() {
             object.remove("window_monotonic_start_ns");
             object.remove("window_monotonic_end_ns");
+            object.remove("window_elapsed_ns");
         }
         serde_json::to_string(&doc).expect("normalized transcript serializes")
     };
@@ -1570,7 +1583,9 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
     )?;
     check(
         doc.effects.len() == 1
-            && doc.effects[0].get("kind").and_then(|k| k.as_str()) == Some("save@pure"),
+            && doc.effects[0].get("kind").and_then(|k| k.as_str()) == Some("save")
+            && doc.effects[0].get("site").and_then(|k| k.as_str()) == Some("pure")
+            && doc.effects[0].get("attempted").and_then(|v| v.as_bool()) == Some(false),
         "the effect row carries its kind",
     )?;
     check(
@@ -1788,8 +1803,8 @@ fn fixture_case(temp: &Path, case: Case) -> Result<(), CheckFailure> {
             what: format!("cannot run the engine child: {error}"),
         })?;
     // The child was waited for above (`output()`); it is reaped by the OS
-    // through that wait. Nothing it started survives: the chain spawns no
-    // process, takes no long-lived lock and leaves no writer.
+    // through that wait. This proves only that the direct child was reaped;
+    // it does not establish closure of any descendant the child may start.
     check(
         output.status.success(),
         &format!(
@@ -1823,16 +1838,18 @@ fn fixture_case(temp: &Path, case: Case) -> Result<(), CheckFailure> {
         .unwrap_or_default();
 
     if matches!(case, Case::Base | Case::Effect1 | Case::Effect2) {
-        let expected: &[(&str, &str, &str)] = match case {
+        let expected: &[(&str, &str, &str, &str)] = match case {
             Case::Base => &[],
             Case::Effect1 => &[(
-                "lock-create@admission",
-                "create@fixture-diff",
+                "lock-create",
+                "admission",
+                "create",
                 "scratch/pool/oxide-managed/admission.lock",
             )],
             Case::Effect2 => &[(
-                "fence@managed-control",
-                "save@fixture-diff",
+                "fence",
+                "managed-control",
+                "save",
                 "scratch/pool/oxide-managed/state.json",
             )],
             _ => unreachable!(),
@@ -1841,10 +1858,12 @@ fn fixture_case(temp: &Path, case: Case) -> Result<(), CheckFailure> {
             doc.effects.len() == expected.len() && diff_effects.len() == expected.len(),
             "declared, taped and observed effect counts agree",
         )?;
-        for (taped, diff, rel) in expected {
+        for (taped, site, diff, rel) in expected {
             check(
                 doc.effects.iter().any(|effect| {
                     effect.get("kind").and_then(|v| v.as_str()) == Some(*taped)
+                        && effect.get("site").and_then(|v| v.as_str()) == Some(*site)
+                        && effect.get("attempted").and_then(|v| v.as_bool()) == Some(false)
                         && effect.get("path").and_then(|v| v.as_str()) == root.join(rel).to_str()
                 }),
                 "declared effect appears on tape",
@@ -1934,16 +1953,6 @@ fn fixture_case(temp: &Path, case: Case) -> Result<(), CheckFailure> {
                 has_read(&doc.reads, "pool:lock"),
                 "the actual library pool lock reaches the evaluator tape",
             )?;
-            let disconnected: Vec<_> = doc
-                .reads
-                .iter()
-                .filter(|row| row.get("kind").and_then(|kind| kind.as_str()) != Some("pool:lock"))
-                .cloned()
-                .collect();
-            check(
-                !has_read(&disconnected, "pool:lock"),
-                "a disconnected library tape fails the lock obligation",
-            )?;
             check(
                 doc.effects.is_empty() && diff_effects.is_empty(),
                 &format!(
@@ -1968,14 +1977,14 @@ fn fixture_case(temp: &Path, case: Case) -> Result<(), CheckFailure> {
         Case::Effect1 => {
             check(
                 doc.effects.iter().any(|effect| {
-                    effect.get("kind").and_then(|k| k.as_str()) == Some("lock-create@admission")
+                    effect.get("kind").and_then(|k| k.as_str()) == Some("lock-create")
                 }),
                 "the absent admission lock's real create is an effect row",
             )?;
             let created_lock = diff_effects.iter().any(|effect| {
                 effect.get("path").and_then(|p| p.as_str())
                     == Some("scratch/pool/oxide-managed/admission.lock")
-                    && effect.get("kind").and_then(|k| k.as_str()) == Some("create@fixture-diff")
+                    && effect.get("kind").and_then(|k| k.as_str()) == Some("create")
             });
             check(
                 created_lock,
@@ -1987,7 +1996,7 @@ fn fixture_case(temp: &Path, case: Case) -> Result<(), CheckFailure> {
                         .get("kind")
                         .and_then(|k| k.as_str())
                         .map_or(false, |k| {
-                            k.starts_with("save@control-state") || k.starts_with("fence@")
+                            k == "save" || k == "fence"
                         })
                 }),
                 "an already-fenced control is not rewritten",

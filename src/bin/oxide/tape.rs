@@ -95,11 +95,12 @@ pub(crate) struct TapeReadRow {
 
 /// One recorded effect row: `{kind, path, epoch}`. Kinds are drawn from the
 /// fixed effect vocabulary (`create`, `save`, `fence`, `reconcile`,
-/// `lock-create`, `rename`, `unlink`), suffixed with the source site so the
-/// reconciler can bind each row to its obligation.
+/// `lock-create`, `rename`, `unlink`); the source site is a separate field.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct TapeEffectRow {
     pub(crate) kind: String,
+    pub(crate) site: String,
+    pub(crate) attempted: bool,
     pub(crate) path: String,
     pub(crate) epoch: u64,
 }
@@ -151,8 +152,9 @@ pub(crate) struct TapeTranscript {
     pub(crate) case: String,
     pub(crate) manifest_sha256: String,
     pub(crate) entrypoint: String,
-    pub(crate) window_monotonic_start_ns: u64,
-    pub(crate) window_monotonic_end_ns: u64,
+    pub(crate) window_monotonic_start_ns: Option<u64>,
+    pub(crate) window_monotonic_end_ns: Option<u64>,
+    pub(crate) window_elapsed_ns: u64,
     pub(crate) outcome: TapeEngineOutcome,
     pub(crate) truncation: TapeTruncation,
     pub(crate) effects: Vec<TapeEffectRow>,
@@ -254,6 +256,11 @@ pub(crate) fn begin(engine: &str, case: &str, manifest_sha256: &str, entrypoint:
     });
 }
 
+/// Bind the exact manifest bytes after the already-open observation window.
+pub(crate) fn bind_manifest_sha256(digest: &str) {
+    with_state(|state| state.manifest_sha256 = digest.to_owned());
+}
+
 pub(crate) fn active() -> bool {
     TAPE.with(|cell| cell.borrow().is_some())
 }
@@ -269,6 +276,7 @@ pub(crate) fn finish_and_write(
     let mut transcript = {
         let state = taken.ok_or_else(|| "the observation tape was not active".to_owned())?;
         let mut notes = state.notes.clone();
+        notes.push("absolute monotonic window origin and end unproven".to_owned());
         if state.pending_authority.is_some() {
             notes.push(
                 "an authority read ended its window without its caller binding its identity"
@@ -281,8 +289,9 @@ pub(crate) fn finish_and_write(
             case: state.case,
             manifest_sha256: state.manifest_sha256,
             entrypoint: state.entrypoint,
-            window_monotonic_start_ns: 0,
-            window_monotonic_end_ns: u64::try_from(state.started.elapsed().as_nanos())
+            window_monotonic_start_ns: None,
+            window_monotonic_end_ns: None,
+            window_elapsed_ns: u64::try_from(state.started.elapsed().as_nanos())
                 .unwrap_or(u64::MAX),
             outcome,
             truncation: state.truncation,
@@ -557,12 +566,9 @@ pub(crate) fn volume_row(
     });
 }
 
-/// Record one actual effect. Kinds come from the fixed vocabulary with their
-/// source site: `save@control-state`, `fence@recorded-accounting`,
-/// `lock-create@admission`, and so on. Only a positively completed write is
-/// recorded; a refused write is the engine's refusal, never an effect. An
-/// effect-kind override installed by `effect_kind_override` relabels exactly
-/// the next effect row (used so a fence's save records its fence kind).
+/// Record a completed effect or an explicitly unqualified create attempt.
+/// Internal labels carry `kind@site`; serialized fields separate them. A fence
+/// override relabels only the next save, avoiding a duplicate effect row.
 pub(crate) fn effect_row(kind: &str, path: &Path) {
     with_state(|state| {
         let epoch = next_epoch(state);
@@ -570,8 +576,17 @@ pub(crate) fn effect_row(kind: &str, path: &Path) {
             .pending_effect_kind
             .take()
             .unwrap_or_else(|| kind.to_owned());
+        let (verb, site) = kind.split_once('@').unwrap_or((&kind, "unknown"));
+        let attempted = verb == "attempt";
+        let verb = if attempted { "create" } else { verb };
+        if !matches!(verb, "create" | "save" | "fence" | "reconcile" | "lock-create" | "rename" | "unlink") {
+            state.notes.push(format!("unknown effect kind at {kind}"));
+            return;
+        }
         state.effects.push(TapeEffectRow {
-            kind,
+            kind: verb.to_owned(),
+            site: site.to_owned(),
+            attempted,
             path: path.display().to_string(),
             epoch,
         });
@@ -608,26 +623,9 @@ pub(crate) fn clock_row(kind: &str, value_ms: u64) {
     });
 }
 
-/// Record one monotonic reading (nanoseconds since some fixed anchor of this
-/// process; bound to the declared window by the transcript's window fields).
-pub(crate) fn monotonic_row(kind: &str) {
-    with_state(|state| {
-        let epoch = next_epoch(state);
-        state.clocks.push(TapeClockRow {
-            kind: kind.to_owned(),
-            value: monotonic_anchor_ns().saturating_add(
-                u64::try_from(state.started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            ),
-            epoch,
-        });
-        charge_document(state, 48);
-    });
-}
-
-fn monotonic_anchor_ns() -> u64 {
-    // One stable anchor per process: the transcript's window fields carry the
-    // same anchor's offsets, so rows reconcile without exposing raw epochs.
-    0
+/// A clock the engine could not obtain remains explicitly unproven.
+pub(crate) fn clock_unproven(kind: &str) {
+    with_state(|state| state.notes.push(format!("clock unproven at {kind}")));
 }
 
 /// Record one classification observation (custody record classes, boot
@@ -851,7 +849,8 @@ fn config_bounded(text: &str) -> String {
 pub(crate) fn capture_fixture(root: &Path) -> TapeFixtureCapture {
     let mut entries = Vec::new();
     let mut truncated = false;
-    walk_fixture(root, root, &mut entries, &mut truncated);
+    let mut remaining = 32_u64 * 1024 * 1024;
+    walk_fixture(root, root, &mut entries, &mut truncated, &mut remaining);
     TapeFixtureCapture {
         root: root.display().to_string(),
         truncated,
@@ -866,6 +865,7 @@ fn walk_fixture(
     dir: &Path,
     entries: &mut Vec<TapeFixtureEntry>,
     truncated: &mut bool,
+    remaining: &mut u64,
 ) {
     let read_dir = match std::fs::read_dir(dir) {
         Ok(read_dir) => read_dir,
@@ -875,11 +875,14 @@ fn walk_fixture(
         }
     };
     let mut names: Vec<(String, PathBuf)> = Vec::new();
-    for entry in read_dir.flatten() {
-        names.push((
-            entry.file_name().to_string_lossy().into_owned(),
-            entry.path(),
-        ));
+    for entry in read_dir {
+        match entry {
+            Ok(entry) => names.push((
+                entry.file_name().to_string_lossy().into_owned(),
+                entry.path(),
+            )),
+            Err(_) => *truncated = true,
+        }
     }
     names.sort();
     for (_name, path) in names {
@@ -906,7 +909,20 @@ fn walk_fixture(
             "other".to_owned()
         };
         let bytes_sha256 = if meta.is_file() {
-            std::fs::read(&path).ok().map(|bytes| sha256_hex(&bytes))
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            let read = std::fs::File::open(&path)
+                .and_then(|file| file.take(remaining.saturating_add(1)).read_to_end(&mut bytes));
+            match read {
+                Ok(_) if bytes.len() as u64 <= *remaining => {
+                    *remaining -= bytes.len() as u64;
+                    Some(sha256_hex(&bytes))
+                }
+                _ => {
+                    *truncated = true;
+                    None
+                }
+            }
         } else {
             None
         };
@@ -922,14 +938,13 @@ fn walk_fixture(
             bytes_sha256,
         });
         if meta.is_dir() && !meta.file_type().is_symlink() {
-            walk_fixture(root, &path, entries, truncated);
+            walk_fixture(root, &path, entries, truncated, remaining);
         }
     }
 }
 
-/// The ground-truth effect set: the pre/post fixture capture diff. A created
-/// entry is `create`, a removed entry is `unlink`, and a changed entry
-/// (different dev/ino/size/bytes) is `save` at its path.
+/// A net pre/post fixture diff for cross-checking recorded effects. It cannot
+/// observe transient or failed writes and is never a substitute for a tape.
 pub(crate) fn diff_fixture(
     pre: &[TapeFixtureEntry],
     post: &[TapeFixtureEntry],
@@ -944,7 +959,9 @@ pub(crate) fn diff_fixture(
         seen.insert(entry.rel.clone());
         match index.get(&entry.rel) {
             None => effects.push(TapeEffectRow {
-                kind: "create@fixture-diff".to_owned(),
+                kind: "create".to_owned(),
+                site: "fixture-diff".to_owned(),
+                attempted: false,
                 path: entry.rel.clone(),
                 epoch: 0,
             }),
@@ -962,7 +979,9 @@ pub(crate) fn diff_fixture(
                     || (is_dir && before.bytes_sha256 != entry.bytes_sha256);
                 if changed {
                     effects.push(TapeEffectRow {
-                        kind: "save@fixture-diff".to_owned(),
+                        kind: "save".to_owned(),
+                site: "fixture-diff".to_owned(),
+                attempted: false,
                         path: entry.rel.clone(),
                         epoch: 0,
                     });
@@ -973,7 +992,9 @@ pub(crate) fn diff_fixture(
     for entry in pre {
         if !seen.contains(&entry.rel) {
             effects.push(TapeEffectRow {
-                kind: "unlink@fixture-diff".to_owned(),
+                kind: "unlink".to_owned(),
+                site: "fixture-diff".to_owned(),
+                attempted: false,
                 path: entry.rel.clone(),
                 epoch: 0,
             });

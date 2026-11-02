@@ -1077,7 +1077,19 @@ alone is insufficient.
   fixture, dynamic, mandatory-observation, expected-effect and expected
   fields. The minimal Barge fixture alone is therefore not a complete shared
   manifest. Retained review of one common shape remains required before either
-  harness treats it as an accepted interface.
+  harness treats it as an accepted interface. Effect rows use one fixed
+  kind (`create`, `save`, `fence`, `reconcile`, `lock-create`, `rename` or
+  `unlink`), with a separate source site and an explicit attempted flag;
+  attempted creation is not a successful effect. The all-kinds manifest
+  example exercises that proposed shape.
+- **Preflight observation.** The tape window begins before fixture configuration
+  resolution because that resolution reads config and pool state. Actual config
+  and private-file read bytes or errors are recorded without a second read;
+  descriptor and parent identities remain explicitly unproven where the real
+  operation did not observe them. The absolute monotonic origin/end and the
+  authority deadline remain unproven, not a synthetic zero or wall clock.
+  Fixture snapshot read errors or the 32 MiB byte bound mark the snapshot
+  truncated; a pre/post diff cannot replace effect observations.
 - **Fixture configuration.** Preparation uses `config::Facts` with injected
   platform-directory inputs; the evaluator child uses the existing debug-only
   `OXIDE_TEST_HOME_FROM_ENV=1` control and explicit fixture paths. The child
@@ -1099,10 +1111,12 @@ alone is insufficient.
   bind private scratch and an effect-free preflight must produce a zero-delta
   live-state inventory. The test-only path preflight calls the existing config
   functions without opening a pool; its debug cfg must match the wrapper.
-  The current `proof:tape-prune:preflight-build` selector itself runs
+  The earlier `proof:tape-prune:preflight-build` selector ran
   `oxide test --no-run`, which enters `Store::open_or_create` and may create
-  or register a pool before the resolver executable runs. It therefore cannot
-  establish its own pre-registration confinement. The `OXIDE_POOL` source
+  or register a pool before the resolver executable runs. It could not
+  establish its own pre-registration confinement. The preflight and tape
+  selectors now refuse before invoking Oxide until a source-bound route is
+  established; refusal is not a proof or a completed validation. The `OXIDE_POOL` source
   branch skips `config::remember_pool`, but the saved packet does not bind
   every executable and subprocess and cannot attribute the live inode change.
   A replacement route must establish these bindings before that effect and

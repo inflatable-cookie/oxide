@@ -20,6 +20,11 @@
 use std::cell::RefCell;
 use std::path::Path;
 
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 pub(crate) const MAX_ROWS: usize = 8192;
 pub(crate) const MAX_OCCURRENCES_PER_KEY: usize = 64;
 

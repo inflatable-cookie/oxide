@@ -970,7 +970,24 @@ fn read_private_file(path: &Path) -> Result<Vec<u8>, LeaseError> {
 }
 
 fn read_private_file_bounded(path: &Path, max: u64) -> Result<Vec<u8>, LeaseError> {
+    #[cfg(not(test))]
     let metadata = fs::symlink_metadata(path).map_err(io_error)?;
+    #[cfg(test)]
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            use std::os::unix::fs::MetadataExt;
+            crate::tape::read_row_dev(
+                "lease:private-file:metadata", path, metadata.dev(), metadata.ino(),
+                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, max,
+            );
+            metadata
+        }
+        Err(error) => {
+            crate::tape::read_row("lease:private-file:metadata", path,
+                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, max);
+            return Err(io_error(error));
+        }
+    };
     if metadata.file_type().is_symlink()
         || !metadata.file_type().is_file()
         || metadata.permissions().mode() & 0o077 != 0
@@ -979,11 +996,36 @@ fn read_private_file_bounded(path: &Path, max: u64) -> Result<Vec<u8>, LeaseErro
     {
         return Err(LeaseError::UnknownAccounting);
     }
+    #[cfg(not(test))]
     let file = File::open(path).map_err(io_error)?;
+    #[cfg(test)]
+    let file = match File::open(path) {
+        Ok(file) => {
+            crate::tape::read_row("lease:private-file:open", path,
+                crate::tape::TapeOutcome::Facts { facts: "opened; descriptor identity unproven".to_owned() }, max);
+            file
+        }
+        Err(error) => {
+            crate::tape::read_row("lease:private-file:open", path,
+                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, max);
+            return Err(io_error(error));
+        }
+    };
     let mut bytes = Vec::new();
+    #[cfg(not(test))]
     file.take(max + 1)
         .read_to_end(&mut bytes)
         .map_err(io_error)?;
+    #[cfg(test)]
+    match file.take(max + 1).read_to_end(&mut bytes) {
+        Ok(_) => crate::tape::read_row("lease:private-file:bytes", path,
+            crate::tape::TapeOutcome::Digest { digest: crate::tape::sha256_hex(&bytes) }, max),
+        Err(error) => {
+            crate::tape::read_row("lease:private-file:bytes", path,
+                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, max);
+            return Err(io_error(error));
+        }
+    }
     if bytes.len() as u64 > max {
         return Err(LeaseError::LedgerExhausted);
     }

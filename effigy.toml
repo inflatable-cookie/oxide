@@ -1414,7 +1414,8 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # owner-only TMPDIR. They are not a benchmark, native proof or full QA; the
 # counted diagnostic at a source-approved head remains X-S2's Queue proof.
 [tasks."proof:tape-prune:test"]
-run = """scratch_base=$(python3 - <<'PYSCRATCH'
+run = """python3 scripts/tape-isolation-check.py || exit $?
+scratch_base=$(python3 - <<'PYSCRATCH'
 import os, stat, sys
 p = os.environ.get("TMPDIR", "")
 if not p or not os.path.isabs(p) or os.path.realpath(p) != p or not p.startswith("/Volumes/Builds/scratch/oxide/"):
@@ -1436,7 +1437,8 @@ fi
 exit $status"""
 
 [tasks."proof:tape-prune:self-check"]
-run = """scratch_base=$(python3 - <<'PYSCRATCH'
+run = """python3 scripts/tape-isolation-check.py || exit $?
+scratch_base=$(python3 - <<'PYSCRATCH'
 import os, stat, sys
 p = os.environ.get("TMPDIR", "")
 if not p or not os.path.isabs(p) or os.path.realpath(p) != p or not p.startswith("/Volumes/Builds/scratch/oxide/"):
@@ -1461,12 +1463,12 @@ exit $status"""
 # CARGO_HOME, CARGO_TARGET_DIR and HOME under owned Builds scratch.
 [tasks."proof:tape-prune:bootstrap"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 2200 -- cargo build --offline --locked --bin oxide"
+run = "python3 scripts/tape-isolation-check.py && python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 2048 -- cargo build --offline --locked --bin oxide"
 
 # Task-only isolated preflight preparation; the executable runs only the
 # actual configuration resolver and never opens or registers a pool.
 [tasks."proof:tape-prune:preflight-build"]
-run = "oxide test --test tape_prune_eval --no-run --locked"
+run = "python3 scripts/tape-isolation-check.py"
 
 [tasks."proof:tape-prune:path-preflight"]
-run = '''env -i PATH="$PATH" HOME="$HOME" OXIDE_TEST_HOME_FROM_ENV="$OXIDE_TEST_HOME_FROM_ENV" OXIDE_CONFIG="$OXIDE_CONFIG" OXIDE_POOL="$OXIDE_POOL" OXIDE_POOL_CAP="$OXIDE_POOL_CAP" OXIDE_SCRATCH_ROOT="$OXIDE_SCRATCH_ROOT" "$TAPE_PREFLIGHT_EXE" --path-preflight "$TAPE_PREFLIGHT_ROOT"'''
+run = '''python3 scripts/tape-isolation-check.py && env -i PATH="$PATH" HOME="$HOME" OXIDE_TEST_HOME_FROM_ENV="$OXIDE_TEST_HOME_FROM_ENV" OXIDE_CONFIG="$OXIDE_CONFIG" OXIDE_POOL="$OXIDE_POOL" OXIDE_POOL_CAP="$OXIDE_POOL_CAP" OXIDE_SCRATCH_ROOT="$OXIDE_SCRATCH_ROOT" "$TAPE_PREFLIGHT_EXE" --path-preflight "$TAPE_PREFLIGHT_ROOT"'''
