@@ -1050,6 +1050,34 @@ def git_output(repo: Path, *args: str) -> bytes:
     return result.stdout
 
 
+def audit_retained_roots(manifest: dict) -> list:
+    """Validate explicit task-private roots before any retained-tree walk."""
+    roots = manifest.get("retained_roots") if isinstance(manifest, dict) else None
+    if not isinstance(roots, list) or not roots or len(roots) > 64:
+        raise GateRefusal("audit manifest needs a bounded retained-root list")
+    paths = []
+    for value in roots:
+        if not isinstance(value, str):
+            raise GateRefusal("audit retained root is not a path")
+        path = Path(value)
+        if (not path.is_absolute() or ".." in path.parts
+                or not any(path != base and path.is_relative_to(base)
+                           for base in (BARGE_SCRATCH, OXIDE_SCRATCH))):
+            raise GateRefusal("audit retained root escapes task scratch")
+        try:
+            info = os.lstat(path)
+            resolved = path.resolve(strict=True)
+        except OSError:
+            raise GateRefusal("audit retained root is missing or unreadable") from None
+        if (resolved != path or not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != os.geteuid() or info.st_mode & 0o022):
+            raise GateRefusal("audit retained root is aliased, foreign or writable by others")
+        if path in paths:
+            raise GateRefusal("audit retained roots contain a duplicate")
+        paths.append(path)
+    return paths
+
+
 def stage_audit_inputs(root: Path, manifest: dict) -> None:
     """Copy only explicit, digest-bound audit inputs into an owned phase root."""
     entries = manifest.get("inputs") if isinstance(manifest, dict) else None
@@ -2216,7 +2244,12 @@ def prepare(options: dict) -> int:
         raise GateRefusal("preparation needs a distinct guarded Barge phase root")
     audit_manifest_path = canonical_file(Path(options["audit_inputs"]))
     audit_manifest = read_json_bound(audit_manifest_path, options["expect_audit_inputs"])
-    input_paths = [audit_manifest_path]
+    explicit_retained = audit_retained_roots(audit_manifest)
+    active_roots = (barge_root, oxide_root, adopted_scratch)
+    if any(p == active or p in active.parents or active in p.parents
+           for p in explicit_retained for active in active_roots):
+        raise GateRefusal("audit retained root overlaps an active or future root")
+    input_paths = [audit_manifest_path, *explicit_retained]
     inputs = audit_manifest.get("inputs")
     if not isinstance(inputs, list):
         raise GateRefusal("audit input manifest is malformed")
@@ -2235,6 +2268,12 @@ def prepare(options: dict) -> int:
                                       if p not in (barge_root, adopted_scratch)],
                                      BARGE_CAP_BYTES, deadline_ns)
     oxide_retained = allocated_bytes(oxide_roots, OXIDE_CAP_BYTES, deadline_ns)
+    # The explicitly supplied roots are shared preparation history. Count them
+    # against both grants, without counting either tree twice within a grant.
+    barge_retained += allocated_bytes([p for p in explicit_retained if p.is_relative_to(OXIDE_SCRATCH)],
+                                      BARGE_CAP_BYTES, deadline_ns)
+    oxide_retained += allocated_bytes([p for p in explicit_retained if p.is_relative_to(BARGE_SCRATCH)],
+                                      OXIDE_CAP_BYTES, deadline_ns)
     prep_budget = json.loads((evidence_dir / "receipt.json").read_bytes()).get("owned_bytes", {}).get("budget")
     allowed_mib = min(clamp_mib(BARGE_CAP_BYTES, barge_retained, BOOTSTRAP_MAX_MIB),
                       clamp_mib(OXIDE_CAP_BYTES, oxide_retained, BOOTSTRAP_MAX_MIB))
@@ -2600,9 +2639,27 @@ def self_test() -> int:
         (repo / ".git").mkdir()
     input_file = case_base / "audit-source"
     input_file.write_bytes(b"audit source")
+    prior_partial = case_base / "prior-partial"
+    prior_partial.mkdir(mode=0o700)
+    prior_payload = prior_partial / "partial-source.bin"
+    prior_payload.write_bytes(b"retained payload" * 1024)
     input_manifest = write_doc(oxide_scratch, "prepare-audit-inputs.json", {"inputs": [{
         "source": str(input_file), "destination": "effigy-source/admission.rs",
-        "sha256": sha256_file(input_file)}]})
+        "sha256": sha256_file(input_file)}], "retained_roots": [str(prior_partial)]})
+    with patch(__name__ + ".BARGE_SCRATCH", case_base), patch(__name__ + ".OXIDE_SCRATCH", oxide_scratch):
+        expect_ok("owned retained root accepted", audit_retained_roots,
+                  {"retained_roots": [str(prior_partial)]})
+        expect_refusal("shared base refused", audit_retained_roots, {"retained_roots": [str(case_base)]})
+        expect_refusal("outside retained root refused", audit_retained_roots, {"retained_roots": [str(fixture.root)]})
+        expect_refusal("missing retained root refused", audit_retained_roots, {"retained_roots": [str(case_base / "absent")]})
+        alias = case_base / "partial-alias"
+        os.symlink(prior_partial, alias)
+        expect_refusal("aliased retained root refused", audit_retained_roots, {"retained_roots": [str(alias)]})
+        expect_refusal("duplicate retained root refused", audit_retained_roots,
+                       {"retained_roots": [str(prior_partial), str(prior_partial)]})
+    unsafe_manifest = write_doc(oxide_scratch, "unsafe-audit-inputs.json", {"inputs": [{
+        "source": str(input_file), "destination": "effigy-source/admission.rs",
+        "sha256": sha256_file(input_file)}], "retained_roots": [str(case_base)]})
     prepare_options = {"packet_dir": str(prep_root / "packet"),
                        "oxide_repo": str(oxide_repo_fixture), "oxide_head": OXIDE_PIN_COMMIT,
                        "oxide_product_head": "6e8ca1f07a3e26be9e96ff55fd774b0f8185165a",
@@ -2628,8 +2685,17 @@ def self_test() -> int:
                                                                 now_ns() + 120_000_000_000, prep_root)), \
          patch(__name__ + ".extract_commit_identity", side_effect=fixture_git_identity), \
          patch(__name__ + ".stage_git_tree", side_effect=fixture_git_tree), \
+         patch(__name__ + ".allocated_bytes", wraps=allocated_bytes) as allocation_spy, \
          redirect_stdout(StringIO()):
         prepared = expect_ok("real prepare document assembly", prepare, prepare_options)
+        prior_calls = [call for call in allocation_spy.call_args_list if prior_partial in call.args[0]]
+        if {call.args[1] for call in prior_calls} != {BARGE_CAP_BYTES, OXIDE_CAP_BYTES}:
+            failures.append("prepare did not count prior partial root against both grants")
+        unsafe_options = dict(prepare_options, packet_dir=str(prep_root / "unsafe-packet"),
+                              audit_inputs=str(unsafe_manifest), expect_audit_inputs=sha256_file(unsafe_manifest))
+        expect_refusal("prepare refuses a shared scratch base", prepare, unsafe_options)
+        if (prep_root / "unsafe-packet").exists():
+            failures.append("prepare wrote a packet after unsafe-root refusal")
     if prepared != 0:
         failures.append("prepare did not finish its document assembly")
     else:
@@ -2654,6 +2720,12 @@ def self_test() -> int:
         barge_proposal = json.loads((manifest_path.parent / "barge-block.UNISSUED.json").read_bytes())
         oxide_proposal = json.loads((manifest_path.parent / "oxide-block.UNISSUED.json").read_bytes())
         ledger_proposal = json.loads((manifest_path.parent / "barge-root-ledger.UNISSUED.json").read_bytes())
+        if str(prior_partial) not in ledger_proposal["roots"]:
+            failures.append("prepare ledger omitted prior partial root")
+        else:
+            counted = expect_ok("prior partial root allocated", allocated_bytes, [prior_partial], BARGE_CAP_BYTES)
+            if counted is None or counted < prior_payload.stat().st_blocks * 512:
+                failures.append("prior partial payload was not counted")
         budget_proposal = json.loads((manifest_path.parent / "oxide-budget.UNISSUED.json").read_bytes())
         if any(barge_proposal[key] is not None for key in ("block_id", "authorization_reference",
                                                              "oxide_sha256", "audit_sha256", "ledger_sha256")):

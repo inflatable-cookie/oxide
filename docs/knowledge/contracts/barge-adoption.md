@@ -1126,6 +1126,14 @@ input manifest through diagnostic execution. Its `--audit-inputs <manifest>
 --expect-audit-inputs <sha256>` names bounded
 source copies, each with `source`, private relative `destination` and `sha256`;
 the diagnostic recopies and rechecks those same bytes from the retained phase.
+The same digest-bound manifest requires `retained_roots`, a nonempty list of
+at most 64 canonical, owned, non-group-writable task-private directories under
+the Barge or Oxide scratch subtree. It must name entire prior preparation and
+future-runtime roots, including partial archives, not just receipt files.
+The guard validates the list before any tree walk or packet write and counts
+the named shared history against both grants. Bases, aliases, escapes, missing
+roots and active/future-root overlaps refuse. The planner still verifies
+attribution, completeness and quiescence; a list alone does not establish them.
 It preserves that phase's receipt and packet, resolves every unknown, reviews
 the source audit and then issues the documents and companion tokens. The
 preparation manifest binds each unissued document digest; audit component
