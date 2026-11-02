@@ -4513,7 +4513,7 @@ def self_test() -> int:
         return canonical_json({"reason": "compiler-artifact",
                                "executable": str(path),
                                "target": {"name": "oxide", "kind": ["bin"],
-                                          "src_path": str(source / "src/bin/oxide/main.rs")}}).decode()
+                                          "src_path": str(source / "src/bin/oxide/main.rs")}}).decode().rstrip("\n")
 
     success_root, success_source = provenance_case("success")
     success_artifact = success_source / "target/debug/oxide"
@@ -4524,7 +4524,7 @@ def self_test() -> int:
         "not json at all",
         "[1,2]",
         artifact_line(success_source / "target/debug/other", fixture.root),
-        canonical_json({"reason": "build-script-executed"}).decode(),
+        canonical_json({"reason": "build-script-executed"}).decode().rstrip("\n"),
     )) + "\n"
     ambient_clean = ambient_cargo_config_scan(
         success_source, private_root=success_root,
@@ -4552,9 +4552,14 @@ def self_test() -> int:
             write_bootstrap_provenance(success_root, document)
             before_rows = [["/x", [1, 1, 1, 1, 1], "d"]]
             after_rows = [["/x", [1, 2, 1, 1, 1], "d"]]
-            expect_refusal("real inventory failure after provenance",
-                           verify_inventory, before_rows, after_rows,
-                           "bootstrap", success_root / "evidence")
+            try:
+                verify_inventory(before_rows, after_rows, "bootstrap",
+                                 success_root / "evidence")
+                failures.append("real inventory failure after provenance: expected a refusal")
+            except GateRefusal as refusal:
+                if "isolation failed" not in str(refusal):
+                    failures.append("real inventory failure after provenance: "
+                                    f"wrong diagnostic {refusal}")
             retained = json.loads((success_root / PROVENANCE_PATH).read_bytes())
             if (retained.get("kind") != "bootstrap-provenance"
                     or retained.get("artifact", {}).get("sha256")
@@ -4612,7 +4617,10 @@ def self_test() -> int:
     oversized["padding"] = "x" * (MAX_PROVENANCE_BYTES + 1)
     expect_refusal("oversized provenance refuses without retention",
                    write_bootstrap_provenance, success_root, oversized)
-    if b"padding" in (success_root / PROVENANCE_PATH).read_bytes():
+    retained_path = success_root / PROVENANCE_PATH
+    if not retained_path.is_file():
+        failures.append("oversized provenance check: success packet was never retained")
+    elif b"padding" in retained_path.read_bytes():
         failures.append("oversized provenance replaced the retained packet")
     scrubbed = child_environment(
         {"HOME": "/real/home", "RUSTUP_TOOLCHAIN": TOOLCHAIN,
