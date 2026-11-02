@@ -1480,7 +1480,7 @@ fn fixture_case(temp: &Path, case: Case) -> Result<(), CheckFailure> {
             )?;
             check(
                 outcome_reason(&doc).contains("is missing"),
-                "the refusal names the missing registry",
+                &format!("the refusal names the missing registry: {}", outcome_reason(&doc)),
             )?;
             let exit = doc
                 .outcome

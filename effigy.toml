@@ -1428,7 +1428,11 @@ PYSCRATCH
 oxide_temp=$(mktemp -d "$scratch_base/run.XXXXXX") || exit 1
 TMPDIR="$oxide_temp" TMP="$oxide_temp" TEMP="$oxide_temp" oxide test --test tape_prune_eval
 status=$?
-rm -rf "$oxide_temp"
+if [ "$status" -eq 0 ]; then
+  rm -rf "$oxide_temp"
+else
+  printf 'retained fixture temp: %s\n' "$oxide_temp" >&2
+fi
 exit $status"""
 
 [tasks."proof:tape-prune:self-check"]
@@ -1446,7 +1450,11 @@ PYSCRATCH
 oxide_temp=$(mktemp -d "$scratch_base/run.XXXXXX") || exit 1
 TMPDIR="$oxide_temp" TMP="$oxide_temp" TEMP="$oxide_temp" oxide test --test tape_prune_eval -- --self-check
 status=$?
-rm -rf "$oxide_temp"
+if [ "$status" -eq 0 ]; then
+  rm -rf "$oxide_temp"
+else
+  printf 'retained fixture temp: %s\n' "$oxide_temp" >&2
+fi
 exit $status"""
 
 # Task-only private debug wrapper bootstrap. The caller supplies an isolated
