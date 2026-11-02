@@ -387,8 +387,7 @@ removes the child from its group and process hash, and the session leader
 cannot move itself by setpgid. This is conditional on the live, exclusive
 parent premise: `proc_exit` also calls `reap_child_locked` with
 `REAP_DEAD_PARENT` for its zombie children when their parent exits. Group
-removal can therefore happen during parent exit without its positive wait. Exclusive unreaped custody limits PID
-reuse, but a start token and matching parent/group observations are still
+removal can therefore happen during parent exit without its positive wait. Exclusive unreaped custody limits PID reuse, but a start token and matching parent/group observations are still
 required; neither a recycled PID nor a reused PGID is a handle. A moved or
 replaced identity, failed or malformed read, permission denial, missing row,
 non-zombie or unverifiable session/group is unknown. A before/after pair is
@@ -409,9 +408,18 @@ observation, but is not yet shown to prove the same positive group-lifetime
 proposition. A future source-backed design must identify applicable kernel and
 public semantics, show why identity/group cannot change between samples under
 its exact custody premises, and address the separate session reads and TOCTOU.
-If that cannot be established, the smallest operator decision is whether to
-replace the positive group-lifetime claim with an explicitly weaker sampled
-held-identity claim; that change is not authorized here.
+Tom's ruling relayed by Queue planner `d070792d` on decision
+`535ec990-1577-49fb-9741-480dc7434eeb` authorizes a **weaker sampled
+held-identity claim for a separately reviewed design**. The intended claim is
+limited to the exact direct child observed at the stated samples: under the
+fixture's exclusive, unreaped parent custody, the bounded non-consuming reader
+reports the bound PID/start, parent and PGID with zombie state, followed by the
+single positive wait. It asserts neither continuous group lifetime nor that a
+group signal would succeed, and it cannot turn EPERM into positive evidence.
+Missing, malformed, denied or inconsistent facts remain unknown. The positive
+held-zombie group-lifetime proposition remains an open follow-up, not a proven
+result or an abandoned historical failure. This ruling authorizes design and
+review, not an executable oracle change, new signal authority or a native run.
 
 Before any implementation, the retained reviewer must assess this design.
 A future reviewed implementation would need effect-free seam regressions for
