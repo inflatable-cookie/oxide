@@ -661,3 +661,70 @@ gated on the retained Queue reviewer's exact-head source/premise approval,
 the one counted-path diagnostic runs through the task's proof route (never
 by author or reviewer), fit is unmeasured, and nothing here is a product
 closure claim, a supervisor change, or progress on papercut `9ff7386d`.
+
+##### Slice B correction: the consuming-wait-as-observation defect (oxide#244, unqualified)
+
+The first two diagnostic executions of the slice-B fixture (oxide#242, 2026-11-03,
+both at source `31920b1` under the accidental double launch; the superseded and
+recorded packets are retained evidence at `/Volumes/Builds/scratch/oxide`) failed
+with zero native cases completed. The reviewer's judgment traced it to a real
+fixture defect: `HeldChild.wait_exit` polled `os.waitpid(pid, WNOHANG)`, which is
+non-blocking but NOT non-consuming (Apple waitpid(2) RETURN VALUES; a poll that
+returns the child has already reaped it), and marked the returned child
+`held-exited` — unreaped — instead of collected. Every later step therefore ran
+against a consumed child: the held-zombie window answered `ESRCH` and the single
+positive reap answered `ECHILD`. The recorded packet counts stand: 0/8 native
+cases completed, three children spawned and none recorded as positively reaped,
+c01/c02 failed, c03 skipped on its failed dependency, c04 aborted on the `ECHILD`
+uncertainty, c05–c08 unexecuted; c05 was never reached, so no environment
+auto-reap fact was established or ruled out. No environment-only retry is claimed
+and no receipt is retrospectively repaired or concluded.
+
+The bounded correction (oxide#244) keeps the same qualified guard, bounds, case
+map (8 native + 3 HELD source-only) and every retention/ledger oracle, and changes
+only the fixture's helper and case bodies:
+
+* `wait_exit` no longer calls `waitpid` at all. Exit is observed WITHOUT
+  collecting through the safe non-consuming `kinfo_proc` reader's zombie flag
+  (the same qualified observation the supervisor's census uses), bounded by the
+  case cap; an absent, unreadable, not-yet-zombie or identity-replaced row is an
+  unknown observation that neither settles nor collects, and the window ends in
+  `Uncertain` with custody unchanged. The observation publishes an
+  `exited-observed` row carrying no status; an exit status is never invented.
+* The single consuming wait is `reap`'s blocking `waitpid`, which only ever runs
+  after a positive exit observation (or with the state already
+  `held-exited`) and marks in-memory settled truth — state, reaped flag and the
+  actual collected status — before the fallible receipt row, so a publication
+  failure after collection can never cause a second collection attempt, a
+  repeated signal or a claimed-held child. A second reap/signal still refuses
+  without a syscall.
+* The consuming `waitpid(WNOHANG)` live probes in c01/c06 moved into one helper,
+  `probe_wait_live`: a positive return IS the collection this call made, so it
+  records the settled truth immediately and fails the case instead of raising
+  while leaving held state behind; `ECHILD` and other probe errors are recorded
+  unknown observations that end in `Uncertain`, never collection or liveness.
+* c06's known timing premise is addressed by a positively controlled
+  hold/release lifecycle instead of racing a self-exit child: a hold child that
+  cannot exit before its stop file stages the `WNOHANG == 0` live probe, then
+  the release, the non-consuming exit observation, the single positive reap and
+  the unchanged intentional explicit post-reap `ECHILD` negative control.
+* `derive_nested_outcome`'s second branch was dead code (its condition equalled
+  the first branch's), so a fully reaped, receipt-published run with a failed
+  case lost its truthful writer-closure fact. The branch now reads
+  `receipt_ok and all_reaped`: writer closure is reported positively when every
+  owned child is positively reaped under a published receipt even when a case
+  failed, and a clean outer run still never turns nested unknown into closed.
+
+The pure `--self-check` gained five seam-driven regressions (isolated
+`os.waitpid`/Kinfo/receipt seams, no child, no scratch): the collecting-wait
+observation is refused, a non-consuming observation preserves held identity
+until the sole positive wait, an unexpectedly positive live probe settles
+collected truth immediately, unknown/`ECHILD` observations never settle and the
+helper never falls back to a consuming wait, receipt failure after the positive
+wait retains settled truth with no extra wait or signal, and writer closure
+survives failed cases. The first, second and fourth checks fail against the
+retired helper's actual code paths. The qualification dependency stays the exact
+pinned runner `fcfda2b0…`; no product, supervisor or consumer bytes change, the
+native diagnostic remains gated (exact-head source/premise review, actual pins
+and the single-flight launch fix), and this correction carries no native credit
+and no product closure claim.

@@ -1314,11 +1314,17 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # children: child-created session/group membership and identity binding,
 # a session leader's EPERM-refused setpgid/setsid escapes, exclusive unreaped
 # custody with SIGCHLD SIG_DFL (a SIG_IGN demo shows kernel auto-reap),
-# WNOHANG collecting nothing while live, ECHILD on a second wait, bounded
-# kill/killpg-0 zombie persistence with the same (PID, start) identity, the
-# prospective cooperative stop (bounded killpg TERM escalating to KILL only
-# under positive held custody, then positive reap), model refusal after
-# settled custody with no syscall, and vacuous kill(0,0)/killpg(0,0) probes.
+# consuming WNOHANG live probes that collect nothing while live (a positive
+# probe settles collected truth; oxide#244 corrected the retired helper whose
+# collecting WNOHANG poll marked consumed children held-exited and failed
+# oxide#242's diagnostics with ESRCH/ECHILD), exit observed WITHOUT collecting
+# through the non-consuming kinfo_proc zombie flag with the single consuming
+# wait being the positive reap, ECHILD on a second wait, c06's live probe
+# positively staged by a hold/release lifecycle, bounded kill/killpg-0 zombie
+# persistence with the same (PID, start) identity, the prospective cooperative
+# stop (bounded killpg TERM escalating to KILL only under positive held
+# custody, then positive reap), model refusal after settled custody with no
+# syscall, and vacuous kill(0,0)/killpg(0,0) probes.
 # Parent-death, owner-unresponsive and descendant-group-escape cases are
 # HELD source/pure-only. No Cargo, toolchain, image, mount, live pool or
 # account read; the nested receipt binds the supervisor and marker tokens
