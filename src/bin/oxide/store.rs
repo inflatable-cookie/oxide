@@ -7714,7 +7714,40 @@ pub(crate) mod tests {
         assert_eq!(calls, 2, "revalidated before each decision");
         let refused = match outcome {
             Ok(Cleaning::Busy(reason)) => reason,
-            _ => panic!("the second decision refuses the planted dead record"),
+            other => {
+                let outcome = match other {
+                    Ok(Cleaning::Guard(_)) => "guard".to_owned(),
+                    Ok(Cleaning::Interrupted(signal)) => format!("interrupted {signal}"),
+                    Ok(Cleaning::Retry(reason)) => {
+                        format!("retry: {}", reason.chars().take(256).collect::<String>())
+                    }
+                    Err(error) => format!("error: {}", error.chars().take(256).collect::<String>()),
+                    Ok(Cleaning::Busy(_)) => unreachable!(),
+                };
+                let state = internal.load();
+                let facts = state.as_ref().map(|state| {
+                    state
+                        .records
+                        .iter()
+                        .take(8)
+                        .map(|record| {
+                            (
+                                record.id,
+                                record.checkout.clone(),
+                                record.phase,
+                                record.process_group,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let lock = match probe_lock(&internal.lock_path(7), false) {
+                    Ok(Probe::Free(_)) => "free",
+                    Ok(Probe::Held) => "held",
+                    Ok(Probe::Missing) => "missing",
+                    Err(_) => "unreadable",
+                };
+                panic!("the second decision refuses the planted dead record: outcome={outcome}, record_lock={lock}, records={facts:?}");
+            }
         };
         assert!(refused.contains("record 7"), "{refused}");
         assert!(refused.contains("clean barrier refused"), "{refused}");
