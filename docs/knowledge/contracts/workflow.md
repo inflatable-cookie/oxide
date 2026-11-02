@@ -1849,6 +1849,56 @@ necessary.
     trace totals and time comparisons are observations, not performance
     acceptance thresholds. Native and kernel custody remain real and are
     never inferred from trace or command success.
+  - **Verified 239 observation boundary.** The passing 239 diagnostic packet
+    (`/Volumes/Builds/scratch/oxide/oxide-proof.direkfwy/evidence`, receipt
+    SHA-256 `27744de3ecbb52c34abdab361887d18972f1ea83caf9b3419d234a4e332a8347`,
+    guard receipt SHA-256
+    `45250b772d2466c9864613d6fa9aaef492d4ccdfd05daa592867d733db17f2bf`,
+    17/17 cases, 31/31 commands with nonempty paired traces, worker 447 s of
+    600 s and 106.8 MiB of 128 MiB) measured each instrumented command at
+    11.44–14.75 s wall with only 4–15 ms outside the trace window and
+    `scratch-create` at 53–677 ms; the `store` phase closed about 11.07–11.14 s
+    after `store-open` in every one of the 31 traces. That fixes only the
+    region: the uninstrumented tail of `Store::open_or_create` after
+    `Self::open_at` returned carried the remaining time. It is not proof of
+    which step costs it, and it is not a latency fix; `tmutil` is not
+    concluded as the cause from that packet. The prior 231 uninstrumented
+    `tj837y2a` failure stays historical with no trace credit.
+  - **Post-open tail partition (oxide#243, observation only).** The same
+    guarded `handoff_trace::phase` instrument now partitions that measured
+    tail, wrapping exactly one existing step each and changing no statement,
+    order, result or branch: `sticky-exclusion` (`config::has_sticky_exclusion`),
+    `backup-exclude` (the conditional `config::exclude_from_backup` call)
+    with its nested real `tmutil` children `backup-addexclusion` and
+    `backup-isexcluded` (the `budget::output` calls, so every caller of
+    `backup_state` measures its own child), `remember-pool` (the conditional
+    `config::remember_pool` call) and `ensure-control` (`Store::ensure_control`).
+    Activation, the two-token binding, the no-follow receipt snapshot and the
+    trace destination are unchanged; the 64-event cap does not grow: one
+    creation-path command reaches at most 38 events (19 paired phases;
+    `remember-pool` is unreachable for the proof's `OXIDE_POOL` commands).
+    The parser refuses a file with more than 64 event lines as not product
+    output. The attributable per-command summary gains each paired phase's
+    actual duration, the measured `store-open`-end-to-`store`-end span with
+    its explicit residual (window time no paired phase covers, union-counted
+    so nested phases never count twice), and honest per-phase states
+    (measured / unknown / not-applicable / absent) for the plan. A trace that
+    itself shows `store-open` and `workspace` paired completed the reached
+    creation path, and every applicable planned phase must then be paired
+    there: a clean 17/17 collection whose reached-path instrumentation is
+    absent is insufficient and exits 1, and the pure self-check discriminates
+    the pre-243 unpartitioned output, a missing applicable phase, an unpaired
+    nested phase and an all-old-events collection. This is a partition of
+    observations, not a product verdict: no cause is concluded, no step is
+    optimized or skipped, no timing is an acceptance gate, and papercut
+    18fc63cf stays open. The one declared
+    `effigy rust:installed-handoff:diagnostic` runs through Queue at this
+    head after retained exact-head source approval, under the qualified
+    `fcfda2b0…` supervisor bytes unchanged; author and reviewer run no
+    native themselves and the same retained reviewer judges its one receipt
+    (Tom `c8991f99`). Its native attribution can establish a measured
+    responsible phase or an honest remaining unknown with the precise
+    coverage reason; until then no result is claimed here.
   - **Discriminator.** A debug-only, opt-in phase trace on the creation path
     (the `release_trace::phase` pattern, not that trace, which covers only the
     release closeout) in one uncounted diagnostic would split the gap. That

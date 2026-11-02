@@ -1833,6 +1833,10 @@ impl Store {
     /// `OXIDE_POOL_CREATE=1` or the path is inside the caller's task scratch
     /// root (oxide#182); the config file and the built-in default are
     /// unchanged.
+    ///
+    /// The debug-only `handoff_trace::phase` calls partition the guarded
+    /// creation path for the installed-handoff proof; each wraps exactly one
+    /// existing step and changes no statement, order, result or branch.
     pub fn open_or_create() -> Result<Self, String> {
         let settings = settings()?;
         let path = settings.pool.clone();
@@ -1891,8 +1895,12 @@ impl Store {
                 }
                 Err(error) => return Err(error),
             };
-        if !config::has_sticky_exclusion(&store.pool) {
-            match config::exclude_from_backup(&store.pool) {
+        if !crate::handoff_trace::phase("sticky-exclusion", || {
+            config::has_sticky_exclusion(&store.pool)
+        }) {
+            match crate::handoff_trace::phase("backup-exclude", || {
+                config::exclude_from_backup(&store.pool)
+            }) {
                 Backup::Excluded | Backup::NotApplicable => {}
                 Backup::NotExcluded(reason) => {
                     return Err(format!(
@@ -1903,11 +1911,13 @@ impl Store {
             }
         }
         if !matches!(settings.pool_source, config::Source::Environment(_)) {
-            if let Err(error) = config::remember_pool(&Facts::from_env(), &store.pool) {
+            if let Err(error) = crate::handoff_trace::phase("remember-pool", || {
+                config::remember_pool(&Facts::from_env(), &store.pool)
+            }) {
                 eprintln!("oxide: could not record the pool path for status: {error}");
             }
         }
-        store.ensure_control()?;
+        crate::handoff_trace::phase("ensure-control", || store.ensure_control())?;
         Ok(store)
     }
 
