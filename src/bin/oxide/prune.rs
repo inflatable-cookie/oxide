@@ -1667,13 +1667,18 @@ thread_local! {
     static AUTHORITY: std::cell::RefCell<Option<AuthorityBudget>> = const { std::cell::RefCell::new(None) };
 }
 
+struct AuthorityScope {
+    /// The window's fresh-custody witness (oxide#235), created on its first
+    /// custody decision and dropped with the window, so no parsed state,
+    /// descriptor or verdict crosses an authority window.
+    custody: Option<store::CustodyWitness>,
+}
+
 struct AuthorityBudget {
     deadline: Instant,
     remaining: u64,
     failed: bool,
 }
-
-struct AuthorityScope;
 
 impl AuthorityScope {
     fn begin() -> Result<Self, String> {
@@ -1687,7 +1692,7 @@ impl AuthorityScope {
                 remaining: SNAPSHOT_MAX_BYTES,
                 failed: false,
             });
-            Ok(Self)
+            Ok(Self { custody: None })
         })
     }
 
@@ -1697,6 +1702,44 @@ impl AuthorityScope {
                 !budget.failed && budget.remaining > 0 && Instant::now() <= budget.deadline
             })
         })
+    }
+
+    /// One row's custody through the fresh-witness route inside this window
+    /// (oxide#235), creating the window's witness on first use. `Err` refuses
+    /// the whole authority batch.
+    fn fresh_custody(
+        &mut self,
+        control: &Path,
+        checkout: &Path,
+        cleans: bool,
+    ) -> Result<store::RowCustody, String> {
+        if self.custody.is_none() {
+            self.custody = Some(store::CustodyWitness::open(control)?);
+        }
+        let deadline = AUTHORITY.with(|cell| cell.borrow().as_ref().map(|budget| budget.deadline));
+        let result = self
+            .custody
+            .as_mut()
+            .expect("the witness was just created")
+            .decide(deadline, checkout, cleans);
+        #[cfg(debug_assertions)]
+        if result.is_ok()
+            && prune_fixture_fault(
+                control,
+                "OXIDE_TEST_PRUNE_WITNESS_PAUSE",
+                checkout,
+                "witness-paused",
+            )
+        {
+            let evidence = proof_evidence().ok_or("fixture evidence unavailable")?;
+            while !evidence.join("witness-release").exists() {
+                if deadline.is_none_or(|end| Instant::now() >= end) {
+                    return Err("fixture pause reached the authority deadline".to_owned());
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        result
     }
 }
 
@@ -1772,7 +1815,7 @@ impl<'a> IntoIterator for &'a Evaluation {
 
 /// `oxide outputs prune --dry-run`
 fn dry_run(operator_list: Option<&Path>) -> Result<u8, String> {
-    let authority = AuthorityScope::begin()?;
+    let mut authority = AuthorityScope::begin()?;
     let store = paired_store()?;
     let control = store.owner_control().to_path_buf();
     let list = match operator_list {
@@ -1795,7 +1838,7 @@ fn dry_run(operator_list: Option<&Path>) -> Result<u8, String> {
             ),
         ));
     }
-    let evaluated = evaluate(&store, &control, &registry, list.as_ref(), &authority)?;
+    let evaluated = evaluate(&store, &control, &registry, list.as_ref(), &mut authority)?;
     drop(authority);
     let preview = build_preview(&registry, &evaluated, list.as_ref(), evaluated.complete);
     preview.validate()?;
@@ -1928,7 +1971,7 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
     }
     // Start one fresh authority window after any exact intent replay. The
     // registry and optional list are re-read inside that window.
-    let authority = AuthorityScope::begin()?;
+    let mut authority = AuthorityScope::begin()?;
     let fresh_store = paired_store()?;
     if fresh_store.owner_control() != control {
         return Ok(refused("the internal pool changed during revalidation"));
@@ -1968,7 +2011,13 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
         }
         None => None,
     };
-    let evaluated = match evaluate(&store, &control, &registry, fresh_list.as_ref(), &authority) {
+    let evaluated = match evaluate(
+        &store,
+        &control,
+        &registry,
+        fresh_list.as_ref(),
+        &mut authority,
+    ) {
         Ok(evaluated) => evaluated,
         Err(reason) if !completed_roots.is_empty() => {
             return Ok(partial(
@@ -2296,7 +2345,7 @@ fn evaluate(
     control: &Path,
     registry: &Registry,
     list: Option<&OperatorList>,
-    authority: &AuthorityScope,
+    authority: &mut AuthorityScope,
 ) -> Result<Evaluation, String> {
     let mut budget = SNAPSHOT_MAX_BYTES;
     let mut receipts: std::collections::HashMap<String, Result<Receipt, String>> =
@@ -2387,6 +2436,7 @@ fn evaluate(
                 &row,
                 receipt,
                 list,
+                authority,
                 &mut budget,
                 false,
                 &mut evidence,
@@ -2450,7 +2500,7 @@ fn evaluate(
             if registry.rows.iter().any(|row| &row.root == root) {
                 continue;
             }
-            let mut entry = evaluate_receiptless(store, control, registry, root, false);
+            let mut entry = evaluate_receiptless(store, control, registry, root, false, authority);
             if entry.candidate.is_some() {
                 extra += 1;
                 if registry.rows.len() + extra > MAX_ROWS {
@@ -2607,6 +2657,22 @@ fn evaluate(
         snapshot_error
             .get_or_insert_with(|| "the snapshot exceeded its input or time budget".to_owned());
     }
+    #[cfg(debug_assertions)]
+    if prune_fixture_fault(
+        control,
+        "OXIDE_TEST_PRUNE_BYTES",
+        control,
+        "prune-bytes-observed",
+    ) {
+        AUTHORITY.with(|cell| {
+            if let Some(budget) = cell.borrow().as_ref() {
+                eprintln!(
+                    "oxide proof: authority bytes {}",
+                    SNAPSHOT_MAX_BYTES - budget.remaining
+                );
+            }
+        });
+    }
     if let Some(reason) = snapshot_error {
         for entry in &mut evaluated {
             entry.candidate = None;
@@ -2635,8 +2701,8 @@ fn evaluate_test(
     registry: &Registry,
     list: Option<&OperatorList>,
 ) -> Result<Evaluation, String> {
-    let authority = AuthorityScope::begin()?;
-    evaluate(store, control, registry, list, &authority)
+    let mut authority = AuthorityScope::begin()?;
+    evaluate(store, control, registry, list, &mut authority)
 }
 
 /// The eligibility predicates for one row. `Ok(None)` means every predicate
@@ -2644,12 +2710,13 @@ fn evaluate_test(
 /// refuses the batch where the snapshot itself is untrustworthy.
 #[allow(clippy::too_many_arguments)]
 fn eligibility(
-    store: &Store,
+    _store: &Store,
     control: &Path,
     registry: &Registry,
     row: &Row,
     receipt: Option<&Receipt>,
     list: Option<&OperatorList>,
+    authority: &mut AuthorityScope,
     _budget: &mut u64,
     under_barrier: bool,
     evidence: &mut Option<SnapshotEvidence>,
@@ -2770,10 +2837,11 @@ fn eligibility(
             )));
         }
     }
-    // Writer custody across both pools, and library ledger holders. A
-    // caller holding the checkout's barrier excludes only its own barrier.
+    // Writer custody across both pools, recomputed from freshly witnessed
+    // durable states under both admission locks (oxide#235). A caller holding
+    // the checkout's barrier excludes only its own barrier.
     if under_barrier {
-        if let Err(reason) = custody_clear_under_barrier(store, control, &row.checkout) {
+        if let Err(reason) = custody_clear_under_barrier(authority, control, &row.checkout) {
             return Ok(Some(reason));
         }
         return Ok(None);
@@ -2786,7 +2854,10 @@ fn eligibility(
     ) {
         return Err("writer custody is unknown (injected fixture)".to_owned());
     }
-    match store.checkout_custody(&row.checkout, 0)? {
+    let custody = authority
+        .fresh_custody(control, &row.checkout, true)
+        .map_err(|reason| format!("writer custody could not be witnessed ({reason})"))?;
+    match custody.verdict {
         CheckoutCustody::Clear => {}
         CheckoutCustody::Writers => {
             return Ok(Some(
@@ -2797,25 +2868,16 @@ fn eligibility(
             return Err(format!("writer custody is unknown ({reason})"))
         }
     }
-    for holder in store::active_holders(control, &row.checkout)? {
+    for holder in custody.internal_holders {
         return Ok(Some(format!(
             "a recorded writer still holds this checkout ({holder})"
         )));
     }
-    // An unreadable removable state is not closure: the root is kept.
-    let removable = removable::removable_control(control);
-    match store::active_holders(&removable, &row.checkout) {
-        Ok(holders) => {
-            if let Some(holder) = holders.into_iter().next() {
-                return Ok(Some(format!(
-                    "a recorded writer in the removable pool still holds this checkout ({holder})"
-                )));
-            }
-        }
-        Err(reason) => {
-            return Err(format!(
-                "the removable pool's writer records are unreadable ({reason})"
-            ))
+    if let Some(holders) = custody.removable_holders {
+        if let Some(holder) = holders.into_iter().next() {
+            return Ok(Some(format!(
+                "a recorded writer in the removable pool still holds this checkout ({holder})"
+            )));
         }
     }
     Ok(None)
@@ -5252,6 +5314,26 @@ fn prune_one_barrier(
             recheck_candidate(store, control, candidate, list, evidence)
         }
         .map_err(Stop::Refuse)?;
+        #[cfg(debug_assertions)]
+        if prune_fixture_fault(
+            control,
+            "OXIDE_TEST_PRUNE_CAS_PAUSE",
+            &candidate.root,
+            &format!("prune-cas-paused-{attempts}"),
+        ) {
+            let evidence = proof_evidence()
+                .ok_or_else(|| Stop::Refuse("fixture evidence unavailable".to_owned()))?;
+            let stop = Instant::now() + Duration::from_secs(5);
+            while !evidence
+                .join(format!("prune-cas-release-{attempts}"))
+                .exists()
+            {
+                if Instant::now() >= stop {
+                    return Err(Stop::Refuse("fixture CAS pause expired".to_owned()));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         // Publication custody is taken for EVERY root, not only a receiptless
         // one, and it is taken BEFORE the deciding ancestry comparison below:
         // the reread above is an early refusal, and nothing it proved may be
@@ -5346,7 +5428,7 @@ fn recheck_candidate(
     ) {
         return Err("the locked fixture recheck refused".to_owned());
     }
-    let authority = AuthorityScope::begin()?;
+    let mut authority = AuthorityScope::begin()?;
     let registry = ready_registry(control)?;
     registry.validate()?;
     if !registry.complete {
@@ -5380,6 +5462,7 @@ fn recheck_candidate(
         &row,
         Some(&receipt),
         list,
+        &mut authority,
         &mut budget,
         true,
         &mut fresh,
@@ -6528,17 +6611,28 @@ fn journaled(control: &Path, intent: &str) -> bool {
 }
 
 /// Writer closure for one checkout, outside or (with `under_barrier`) inside
-/// its clean barrier. `Some(reason)` keeps the root.
+/// its clean barrier, through the fresh per-row custody witness (oxide#235).
+/// `Some(reason)` keeps the root.
 fn custody_reason(
-    store: &Store,
+    authority: &mut AuthorityScope,
     control: &Path,
     checkout: &Path,
     under_barrier: bool,
 ) -> Result<Option<String>, String> {
     if under_barrier {
-        return Ok(custody_clear_under_barrier(store, control, checkout).err());
+        return Ok(custody_clear_under_barrier(authority, control, checkout).err());
     }
-    match store.checkout_custody(checkout, 0)? {
+    let custody = match authority.fresh_custody(control, checkout, true) {
+        Ok(custody) => custody,
+        Err(reason) => {
+            // A witness or lock failure is unknown custody, not closure: the
+            // snapshot classifies it as incomplete authority.
+            return Ok(Some(format!(
+                "writer custody could not be witnessed ({reason})"
+            )));
+        }
+    };
+    match custody.verdict {
         CheckoutCustody::Clear => {}
         CheckoutCustody::Writers => {
             return Ok(Some(
@@ -6549,16 +6643,16 @@ fn custody_reason(
             return Ok(Some(format!("writer custody is unknown ({reason})")))
         }
     }
-    for pool_control in [control.to_path_buf(), removable::removable_control(control)] {
-        match store::active_holders(&pool_control, checkout) {
-            Ok(holders) => {
-                if let Some(holder) = holders.into_iter().next() {
-                    return Ok(Some(format!(
-                        "a recorded writer still holds this checkout ({holder})"
-                    )));
-                }
-            }
-            Err(reason) => return Ok(Some(format!("writer records are unreadable ({reason})"))),
+    if let Some(holder) = custody.internal_holders.into_iter().next() {
+        return Ok(Some(format!(
+            "a recorded writer still holds this checkout ({holder})"
+        )));
+    }
+    if let Some(holders) = custody.removable_holders {
+        if let Some(holder) = holders.into_iter().next() {
+            return Ok(Some(format!(
+                "a recorded writer in the removable pool still holds this checkout ({holder})"
+            )));
         }
     }
     Ok(None)
@@ -6577,6 +6671,7 @@ fn evaluate_receiptless(
     registry: &Registry,
     root: &Path,
     under_barrier: bool,
+    authority: &mut AuthorityScope,
 ) -> Evaluated {
     let mut row = Row {
         checkout_id: String::new(),
@@ -6607,6 +6702,7 @@ fn evaluate_receiptless(
         registry,
         root,
         under_barrier,
+        authority,
         &mut row,
         &mut evidence,
     );
@@ -6629,11 +6725,12 @@ fn evaluate_receiptless(
 }
 
 fn receiptless_candidate(
-    store: &Store,
+    _store: &Store,
     control: &Path,
     registry: &Registry,
     root: &Path,
     under_barrier: bool,
+    authority: &mut AuthorityScope,
     row: &mut Row,
     evidence: &mut Option<SnapshotEvidence>,
 ) -> Result<Candidate, String> {
@@ -6718,7 +6815,7 @@ fn receiptless_candidate(
         Absence::Present => return Err("the checkout is present, so its root is kept".to_owned()),
         Absence::Unknown(reason) => return Err(format!("checkout absence is unknown ({reason})")),
     }
-    if let Some(reason) = custody_reason(store, control, &row.checkout, under_barrier)? {
+    if let Some(reason) = custody_reason(authority, control, &row.checkout, under_barrier)? {
         return Err(reason);
     }
     let facts = match observe_row_root(row)? {
@@ -6755,10 +6852,17 @@ fn recheck_receiptless(
     candidate: &Candidate,
     evidence: &SnapshotEvidence,
 ) -> Result<u64, String> {
-    let authority = AuthorityScope::begin()?;
+    let mut authority = AuthorityScope::begin()?;
     let registry = ready_registry(control)?;
     registry.validate()?;
-    let entry = evaluate_receiptless(store, control, &registry, &candidate.root, true);
+    let entry = evaluate_receiptless(
+        store,
+        control,
+        &registry,
+        &candidate.root,
+        true,
+        &mut authority,
+    );
     let Some(current) = entry.candidate else {
         return Err(entry
             .kept
@@ -6968,7 +7072,7 @@ fn resolve_intent(id: &str) -> Result<u8, String> {
 /// Every positive gate resolution needs, in one place so the pre-effect check
 /// and the under-custody recheck are identical.
 fn resolve_precheck(
-    store: &Store,
+    _store: &Store,
     control: &Path,
     intent: &Intent,
     registry: &Registry,
@@ -7066,20 +7170,37 @@ fn resolve_precheck(
             ));
         }
     }
-    custody_clear_under_barrier(store, control, &intent.identity.checkout)
+    // No authority window covers this settlement: one witnessed custody
+    // decision, then the witness drops with the barrier still held.
+    let mut witness = store::CustodyWitness::open(control)
+        .map_err(|reason| format!("writer custody could not be witnessed ({reason})"))?;
+    let custody = witness
+        .decide(None, &intent.identity.checkout, false)
+        .map_err(|reason| format!("writer custody could not be witnessed ({reason})"))?;
+    custody_under_barrier_refusal(custody)
 }
 
 /// Writer closure for a checkout whose clean barrier and binding lock the
 /// caller holds: cooperative custody in both pools is clear and neither
-/// pool's state records an active command for it. The caller's own barrier
-/// is the only one `begin_clean` admits, so barriers are not counted. An
-/// unreadable state in either pool is not closure.
+/// pool's witnessed state records an active command for it (oxide#235). The
+/// caller's own barrier is the only one `begin_clean` admits, so barriers are
+/// not counted. Any witness, lock or state failure is not closure.
 fn custody_clear_under_barrier(
-    store: &Store,
+    authority: &mut AuthorityScope,
     control: &Path,
     checkout: &Path,
 ) -> Result<(), String> {
-    match store.checkout_custody(checkout, 0)? {
+    let custody = authority
+        .fresh_custody(control, checkout, false)
+        .map_err(|reason| format!("writer custody could not be witnessed ({reason})"))?;
+    custody_under_barrier_refusal(custody)
+}
+
+/// Map one fresh custody decision onto the under-barrier refusal contract:
+/// the caller holds the checkout's clean barrier, so recorded barriers are
+/// not counted, and any holder or unknown writer refuses.
+fn custody_under_barrier_refusal(custody: store::RowCustody) -> Result<(), String> {
+    match custody.verdict {
         CheckoutCustody::Clear => {}
         CheckoutCustody::Writers => {
             return Err("an active writer still holds the checkout".to_owned())
@@ -7088,19 +7209,17 @@ fn custody_clear_under_barrier(
             return Err(format!("writer custody is unknown ({reason})"))
         }
     }
-    if let Some(holder) = store::active_records(control, checkout)?.into_iter().next() {
+    if let Some(holder) = custody.internal_holders.into_iter().next() {
         return Err(format!(
             "a recorded writer still holds this checkout ({holder})"
         ));
     }
-    let removable = removable::removable_control(control);
-    if let Some(holder) = store::active_records(&removable, checkout)?
-        .into_iter()
-        .next()
-    {
-        return Err(format!(
-            "a recorded writer in the removable pool still holds this checkout ({holder})"
-        ));
+    if let Some(holders) = custody.removable_holders {
+        if let Some(holder) = holders.into_iter().next() {
+            return Err(format!(
+                "a recorded writer in the removable pool still holds this checkout ({holder})"
+            ));
+        }
     }
     Ok(())
 }
@@ -9377,6 +9496,7 @@ mod tests {
             outputs::read_receipt_for_prune(&control, &debug.checkout, &debug.checkout_id).unwrap();
         let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
         let mut budget = SNAPSHOT_MAX_BYTES;
+        let mut authority = AuthorityScope::begin().unwrap();
         let reason = eligibility(
             &store,
             &control,
@@ -9384,6 +9504,7 @@ mod tests {
             &debug,
             receipt.as_ref(),
             None,
+            &mut authority,
             &mut budget,
             false,
             &mut None,
@@ -9406,6 +9527,7 @@ mod tests {
             &debug,
             receipt.as_ref(),
             None,
+            &mut authority,
             &mut budget,
             false,
             &mut None,
@@ -10729,6 +10851,7 @@ mod tests {
         let registry = ready_registry(&control).unwrap();
         let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
         let mut budget = SNAPSHOT_MAX_BYTES;
+        let mut authority = AuthorityScope::begin().unwrap();
         let reason = eligibility(
             &store,
             &control,
@@ -10736,6 +10859,7 @@ mod tests {
             &row,
             None,
             None,
+            &mut authority,
             &mut budget,
             false,
             &mut None,
@@ -10759,6 +10883,7 @@ mod tests {
             &row,
             None,
             None,
+            &mut authority,
             &mut budget,
             false,
             &mut None,
@@ -10769,6 +10894,109 @@ mod tests {
             reason.contains("another checkout's live reference"),
             "another checkout's reference did not keep the root: {reason}"
         );
+    }
+
+    /// Custody that cannot be witnessed — here a control whose admission
+    /// lock is missing — is unknown, not closure: the route refuses with a
+    /// reason the snapshot classifies as incomplete authority, and it creates
+    /// nothing while refusing (oxide#235).
+    #[test]
+    fn unprovable_custody_refuses_instead_of_reporting_clear() {
+        let fixture = Fixture::new();
+        let control = fixture.root.join("control");
+        fs::create_dir(&control).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).unwrap();
+        let checkout = fixture.root.join("gone/checkout");
+        let mut authority = AuthorityScope::begin().unwrap();
+        let reason = custody_reason(&mut authority, &control, &checkout, false)
+            .unwrap()
+            .expect("unprovable custody must keep, never report clear");
+        assert!(reason.contains("could not be witnessed"), "{reason}");
+        // The snapshot classifies this keep as incomplete authority: it is
+        // none of the per-root keep shapes evaluate exempts.
+        assert_ne!(reason, "the checkout is present, so its root is kept");
+        assert_ne!(reason, "an active writer still holds this checkout");
+        assert!(!reason.starts_with("a recorded writer still holds this checkout ("));
+        assert!(!reason.starts_with("checkout absence is unknown ("));
+        assert!(!control.join("admission.lock").exists());
+        assert!(!control.join("state.json").exists());
+    }
+
+    /// One witnessed custody decision maps onto the keep contract exactly:
+    /// an active writer keeps its root with the long-standing text, a
+    /// witnessed clean barrier keeps with the barrier holder text, and a
+    /// clear witnessed snapshot keeps nothing. The barrier is excluded only
+    /// under the caller's own barrier, where the records-only split applies.
+    #[test]
+    fn witnessed_custody_maps_onto_the_keep_contract() {
+        let fixture = Fixture::new();
+        let control = fixture.root.join("control");
+        fs::create_dir(&control).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).unwrap();
+        store::lock_admission(&control).unwrap();
+        let checkout = fixture.root.join("gone/checkout");
+        let write_state = |state: &crate::store::State| {
+            let bytes = serde_json::to_vec(state).unwrap();
+            let temp = control.join("state.json.custody-tmp");
+            fs::write(&temp, bytes).unwrap();
+            fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::rename(&temp, control.join("state.json")).unwrap();
+        };
+        let mut clean = crate::store::State::default();
+        clean.cleans.push(crate::store::Clean {
+            id: 1,
+            checkout: checkout.clone(),
+            process_group: None,
+        });
+        write_state(&clean);
+        let mut authority = AuthorityScope::begin().unwrap();
+        let reason = custody_reason(&mut authority, &control, &checkout, false).unwrap();
+        assert_eq!(
+            reason.as_deref(),
+            Some("a recorded writer still holds this checkout (oxide clean barrier)"),
+            "{reason:?}"
+        );
+        // Under the caller's own barrier the recorded barrier is excluded.
+        let refusal = custody_clear_under_barrier(&mut authority, &control, &checkout);
+        assert!(refusal.is_ok(), "{refusal:?}");
+        let mut writing = crate::store::State::default();
+        writing.records.push(crate::store::Record {
+            id: 2,
+            identity: "identity".to_owned(),
+            compatibility: "compatibility".to_owned(),
+            profile: "quick".to_owned(),
+            checkout: Some(checkout.clone()),
+            phase: crate::store::Phase::Running,
+            process_group: None,
+            last_used: 1,
+            holder: None,
+            lease_id: None,
+            pending_recovery: None,
+            retired: None,
+            lost: None,
+            last_used_ms: Some(1),
+            class: crate::store::WorkspaceClass::Normal,
+            class_reason: None,
+        });
+        write_state(&writing);
+        let reason = custody_reason(&mut authority, &control, &checkout, false).unwrap();
+        assert_eq!(
+            reason.as_deref(),
+            Some("an active writer still holds this checkout"),
+            "{reason:?}"
+        );
+        let refusal = custody_clear_under_barrier(&mut authority, &control, &checkout).unwrap_err();
+        assert!(
+            refusal.contains("an active writer still holds the checkout"),
+            "{refusal}"
+        );
+        write_state(&crate::store::State::default());
+        let reason = custody_reason(&mut authority, &control, &checkout, false).unwrap();
+        assert_eq!(reason, None, "{reason:?}");
+        let refusal = custody_clear_under_barrier(&mut authority, &control, &checkout);
+        assert!(refusal.is_ok(), "{refusal:?}");
     }
 
     /// A registered `/Volumes` checkout's mount is `/Volumes/<name>`

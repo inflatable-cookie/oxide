@@ -642,6 +642,34 @@ run = "python3 scripts/test-prune-authority.py --self-check"
 [tasks."proof:prune-authority:plan"]
 run = "python3 scripts/test-prune-authority.py --plan"
 
+# oxide#235 fresh per-row custody witnesses (frozen design oxide#229, brief v4):
+# one fixed script as the whole command of the QUALIFIED candidate runner at its
+# fixed path (planner decision 9575afc9; candidate SHA-256 c5782431…, consumed
+# only through this narrow new-proof route), under heavy admission. 360 s wall,
+# 512 MiB monitored scratch including staging/cleanup, at most one owned 128 MiB
+# image. Selected-volume scratch placement, no --root-parent. The counted run is
+# fail-fast; the diagnostic is the uncounted keep-going twin and is never a
+# native PASS. Each native run needs separate owner activation.
+[tasks."rust:prune-fresh-custody"]
+admission = "heavy"
+run = "python3 scripts/bounded-test-candidate.py --limit 360 --scratch-budget-mib 512 -- python3 scripts/test-prune-fresh-custody.py"
+
+# Uncounted keep-going diagnostic; it never grants native PASS credit.
+[tasks."rust:prune-fresh-custody:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test-candidate.py --limit 360 --scratch-budget-mib 512 -- python3 scripts/test-prune-fresh-custody.py --diagnostic"
+
+# Pure apparatus check: case tables, counterfactual oracles, bounds, the scale
+# arithmetic, source-literal pins and the exact selector text. No scratch,
+# child, image or pool.
+[tasks."proof:prune-fresh-custody:test"]
+run = "python3 scripts/test-prune-fresh-custody.py --self-check"
+
+# Effect-free: prints the case table, bounds, runner pins, the scale oracle and
+# the nine premise dispositions.
+[tasks."proof:prune-fresh-custody:plan"]
+run = "python3 scripts/test-prune-fresh-custody.py --plan"
+
 # oxide#135 focused checked-out-absence proof: one fixed script under the
 # qualified shared supervisor. A checkout path outside /Volumes may be proved
 # absent with missing ancestors only from a no-follow descriptor walk whose held
