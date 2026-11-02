@@ -395,6 +395,200 @@ supervision harness. Do not launch this fixture or treat its pure decision
 model as native evidence while the retention gap remains unresolved. This
 ruling does not change the retrospective no-go or any product signal authority.
 
+### Retention redesign for the held-child fixture (2026-11-02)
+
+**Recommendation:** use the qualified predecessor's existing hosting marker and
+its retained evidence subtree together. This is an implementation-ready design
+for review, not an implemented protocol, a native result, or authority to run
+an owner-death or escape experiment. It is limited to the cooperative host and
+the actual verified default owned-root topology below. Do not use the active
+oxide#233 candidate as if it were qualified. The predecessor examined here is
+`scripts/bounded-test.py` SHA-256
+`fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b`;
+its historical qualification and the existing receipts remain bound to their
+own bytes. `proof-scratch-design.md` is not present in this checkout; the
+scratch contract is the [workflow shared supervisor](workflow.md#shared-proof-supervisor)
+and the pinned executable and tests cited below.
+
+#### Source basis and scope
+
+* `Monitor.owned_root` selects the prepared private `<mount>/scratch/oxide`
+  parent, runs one bounded startup sweep, creates a fresh private root, and
+  writes its owner marker before the monitor creates scratch/evidence or
+  launches the proof. `Monitor.setup` sets `scratch = <root>/scratch` and the
+  default `evidence = <root>/evidence`; `Monitor.run` creates evidence and
+  publishes `receipt.json` before sending setup and ready. The custodian exports
+  `OXIDE_TASK_SCRATCH_ROOT`, `TMPDIR`, `TMP`, and `TEMP` as **scratch**, and
+  `OXIDE_PROOF_EVIDENCE` as evidence. Evidence is never immediate-cleaned by
+  that runner, but that does not make it permanently immune to expiry or manual
+  cleanup. The fixture must overwrite its own and every child's temp variables:
+  inheriting the guard's scratch temp is unsafe for escaped writers.
+* `protect_nested_scope` reads the existing strict marker, refuses absent,
+  concluded or non-running state, and changes `nested_scope` to `hosting` with
+  `write_marker`. The latter checks a private bounded marker, canonical owned
+  root and expected marker inode before writing a private temporary file and
+  atomically replacing the marker. An already-hosting marker is returned
+  without a write. The fixture must verify the result by an independent strict
+  reread, not trust the return value alone. These are path-based checks, not a
+  hostile same-UID exclusion or a filesystem transaction. The code does not
+  fsync the file or directory; atomic replacement is not a power-loss durability
+  guarantee. Loss, torn or unreadable publication is refusal/unknown, never a
+  signal or a positive closure. The initial and protected states are both
+  unconcluded; neither by itself makes the root sweep-eligible. Power-loss and
+  filesystem corruption beyond these source guarantees are not qualified by
+  this design.
+* `record_conclusion` refuses positive outer closure for a hosting marker unless
+  `nested_concluded=True`. `Monitor.conclude_marker` does not pass that flag:
+  on outer closure it records `nested-protected`; on uncertainty it can record
+  a non-conclusion or report an unknown marker. The pure
+  `test_a_hosting_root_is_never_concluded_from_outer_closure` and
+  `test_a_hosting_root_with_retained_unknown_is_never_eligible` are source
+  witnesses, not new test executions or native credit. No fixture in this
+  design passes `nested_concluded=True`, records its own conclusion, or calls
+  a sweep. A future separate owner disposition needs its own authority.
+* `Monitor.run` may nevertheless `shutil.rmtree(ctx["scratch"])` on its own
+  cleanup decision before `conclude_marker`; hosting does **not** protect that
+  scratch leaf. An outer keep or failed/partial cleanup keeps scratch; an outer
+  cleanup does not remove `<root>/evidence`. `sweep_one_root` only considers a
+  strictly validated, identity-matching marker with positive conclusion and an
+  eligible reason older than seven days; an unconcluded, malformed, replaced,
+  unreadable or otherwise ineligible marker is skipped. `remove_marked_root`
+  rechecks root/marker identity and walks without following links. A hosting
+  root left unconcluded therefore is not a future expiry candidate, even after
+  an outer clean exit; a manual deletion or third-party sweeper is outside this
+  contract.
+* `Monitor.sample_owned` calls `tree_bytes(ctx["root"])`, so both scratch and
+  evidence are in the same sampled allocated-byte budget, with deduplication by
+  device/inode and no symlink following. A vanished entry is skipped; other
+  traversal errors are measurement faults. Sampling is not an atomic snapshot
+  or a hard capacity ceiling, and accounting stops with the outer run. Retained
+  writers after that point are not monitored; the fixture must have intrinsically
+  bounded output and no post-owner unbounded writing. The existing reserve
+  watchdog and 300 s / 512 MiB session limits are not extended.
+
+#### Setup and ownership sequence
+
+The future fixed fixture starts as the guard's proof leader, with the qualified
+runner supplied by a separately accepted source binding. Before any fixture
+resource, child, IPC endpoint or writer exists:
+
+1. Refuse inherited adopted root, explicit `--root-parent`, explicit `--evidence`,
+   fallback, unmarked root, or any unsupported topology. Read the guard's
+   already-published `<evidence>/receipt.json` with a bounded no-follow regular
+   file read and validate its schema and initial phase, `scratch_owned`,
+   `scratch_default.source`, run ID and selected device. Compare its run ID to
+   `OXIDE_PROOF_RUN_ID` and its exact root, scratch and evidence paths to the
+   environment. The marker's random `scratch_marker.run_id` is a **different**
+   token from the supervisor run ID: compare each to its own receipt field,
+   never equate them. Refuse missing, partial, stale, changed or ambiguous facts.
+2. Verify with no-follow component/descriptor checks that root, its selected
+   private parent, scratch and evidence are real canonical directories on the
+   same selected device, owned by the invoking UID, with root and private parent
+   0700 and scratch/evidence not group/other writable; validate the receipt and
+   marker as private or otherwise non-writable by group/other as appropriate.
+   Check marker's root path, UID, device and inode against the opened root and
+   the receipt's `scratch_marker` identity. Verify that evidence and scratch are
+   distinct direct children of that root, no aliases or mount crossings. Hold
+   directory descriptors and recheck name-to-descriptor identity before each
+   publication and launch; replacement, unexpected mount, symlink, permission,
+   or unreadable data refuses without launching. These checks assume no hostile
+   same-UID actor and do not turn mode bits on an ownership-disabled volume into
+   a security boundary.
+3. Hash and load the exact qualified runner bytes, without importing a changed
+   path after hashing (read no-follow, verify stable file identity and SHA-256,
+   compile/load those verified bytes with bytecode writing disabled). Call its
+   `protect_nested_scope(root, DefaultProbe())`, then independently reread the
+   same root marker and verify `hosting`, `running`, null conclusion, run token,
+   UID, device and inode; revalidate the held root and evidence descriptors.
+   If publication, readback or binding is uncertain, refuse before creating any
+   fixture resource. A partial marker temp is not authorization.
+4. Exclusively create `<root>/evidence/cargo-group-custody.<random>/` as a
+   0700 directory relative to the verified evidence descriptor, no symlink
+   following. All private HOME, cwd, TMPDIR/TMP/TEMP, child inputs, output,
+   local control files, and bounded fixture receipts live beneath it, never in
+   `<root>/scratch` or external mounts. Scrub inherited `OXIDE_POOL`,
+   `OXIDE_CONFIG`, `OXIDE_TEST_*`, `XDG_*`, and redirect temp and HOME for
+   every child. No Cargo, rustup, images, account-home reads, live pools, or
+   compiler flags are involved. Use no `mktemp` without an explicit owned
+   template. Child stdout/stderr must be bounded and any files pre-created
+   exclusively within this directory; do not rely on a pipe remaining open.
+   Confirm the new directory identity, containment and device before launch.
+5. Only then create a fresh owned direct fixture child and establish its
+   independently reviewed group/membership premise. Publish a bounded receipt
+   of binding and each transition in that directory; on any publication or
+   custody fault abort subsequent cases and retain. No process pattern, observed
+   non-child PID, old receipt or group-zero probe is signal authority.
+
+| Interruption or failure | Required result |
+| --- | --- |
+| Before verified hosting | No fixture resources or children exist; refuse. A partially written marker is not a grant. |
+| After hosting, before fixture directory | No fixture child exists; the root remains unconcluded, including if its owner dies. |
+| During exclusive directory creation or receipt publication | No child launches until identity and complete readback pass; keep the protected root and any partial evidence. |
+| After child launch, owner unresponsive/dead, reply late/missing, observation stale, or output/receipt malformed | Nested state UNKNOWN/UNCLOSED, no new signal by an observer; retain evidence and the unconcluded root regardless of outer cleanup, exit status or EOF. |
+| Marker/root/evidence replacement, alias, mount, unreadability or device/ownership mismatch | Before launch refuse; after launch do not retarget or conclude, retain known resources and report UNKNOWN. Invalid marker is ineligible for the qualified sweep. Same-UID hostile replacement and independent external deletion are outside the cooperative boundary. |
+| Deadline, monitor fault, reserve/budget fault or partial cleanup | No new allowance or retry; keep nested uncertainty. The guard reports its own closure/cleanup independently and may remove only scratch on its cleanup path. |
+| Owner positively reaps all owned children and the separately justified final group/session facts are complete | Record the nested facts, but this first design still never concludes or deletes the hosting root. |
+
+The receipt must bind supervisor and marker run IDs separately, exact opened
+root/evidence/fixture device and inode, protection readback and publication
+phase, parent/child/group identity and held interval, every attempted or refused
+signal, actual direct-child reap, observed group/session facts and their
+limitations. It must distinguish `outer` (guard's own closure, cleanup,
+watchdog and measured bytes) from `nested` (per-fixture custody, reaps,
+remaining or unknown writers, census scope and retained root). A missing or
+partial nested receipt is UNKNOWN, even when the later outer receipt says
+closed. A retained directory preserves evidence; it does not close a writer.
+No receipt may use a positive leader as descendant containment.
+
+The direct-child signal premise remains separate: an alive owning parent must
+have itself spawned and still exclusively hold the child unreaped, prevent
+`SIGCHLD` auto-reap and concurrent waits, and have positively established and
+retained group membership through any group signal; a spent window, reap,
+owner death, group/session escape or ambiguous binding refuses it. A group
+leader alone does not prevent other-group descendants, and no signal authority
+is conferred over an observed non-child. Source/pure negative controls must
+precede any native case. In particular, an actual parent-death or session-escape
+case is **source/pure-only** until its own bounded, no-new-authority lifetime
+and containment argument establishes that any surviving fixture cannot write
+unboundedly and that no unsafe cleanup or signal follows. Neither a keep-alive
+pipe nor nonzero exit is such an argument.
+
+#### Finite follow-on slices and acceptance
+
+* **A — retention primitive, conditional.** The recommended existing mechanism
+  needs no runner implementation if independent review accepts the topology,
+  readback, crash windows and bounded-writer limits above. If any fails, do not
+  substitute an unreviewed marker or proceed. Separately scope an opt-in
+  shared-runner KEEP contract only after oxide#233's reviewed disposition and
+  a safe qualified-input transition: custodian binds a bounded request to its
+  own run/root and acknowledges KEEP before the child gate opens; the obligation
+  is monotonic through owner death, checked before both scratch cleanup and
+  conclusion/expiry, and unreadable, malformed, missing after opt-in, stale,
+  late or unacknowledged state keeps/refuses. A bounded schema must name version,
+  run token, root device/inode and nonce; the receipt records request, ack,
+  decision and fault. Define one fixed maximum document/read and the existing
+  remaining deadline, no new clock, signals, discovery or keeper. Absence of
+  opt-in preserves request-free bytes and behavior. Separate pure crash/order,
+  alias, replacement, malformed, legacy and custody tests plus the runner's
+  independently reviewed fixed qualification chain are required. This fallback
+  is design only; its exact atomic persistence and acknowledgement implementation
+  must be specified and reviewed in that separately bounded slice.
+* **B — fixture apparatus.** Against the accepted retention contract and exact
+  qualified runner, implement the fixed case table and executable nine-item
+  premise checklist, bounded receipts, fail-fast counted path and diagnostic
+  that continues only with independent known fixture state and aborts on
+  infrastructure, writer, device, custody or receipt uncertainty. Effect-free
+  self-check and plan prove refusal and case dispatch first; independent
+  exact-published-head source review approves ownership, topology, resource
+  basis and negative controls before a separately activated uncounted
+  diagnostic, counted author and distinct reviewer native. Native bounds are
+  300 s / 512 MiB, no Cargo or images. Parent-death/session-escape native cases
+  remain held until the separate containment argument above is accepted.
+* **C — product integration.** Independently design and scope the authenticated
+  per-run channel, cancellation and shared-supervisor integration, including any
+  required operator contract ruling. This design neither changes product waits
+  nor fixes papercut `9ff7386d`; no historical run or pass is migrated.
+
 Before implementation, independently review the ownership and deadline
  contract and obtain any necessary operator ruling. First discriminate whether
  the supported macOS child and group lifetime semantics actually support a held

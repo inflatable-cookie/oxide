@@ -1321,11 +1321,3 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 [tasks."rust:scratch-pool"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-scratch-pool.py"
-
-# oxide#232: preliminary pure custody decision model and effect-free plan.
-# No native selector or proof credit until the complete apparatus is reviewed.
-[tasks."proof:cargo-group-custody:test"]
-run = "python3 scripts/test-cargo-group-custody.py --self-check"
-
-[tasks."proof:cargo-group-custody:plan"]
-run = "python3 scripts/test-cargo-group-custody.py --plan"
