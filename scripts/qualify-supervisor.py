@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bootstrap for `effigy proof:supervisor:qualify` (oxide#109).
 
-The supervisor (`scripts/bounded-test.py`) is the candidate under test, not
+The supervisor (`scripts/bounded-test-candidate.py`) is the candidate under test, not
 an already-qualified guard, and this bootstrap does not supply the
 qualification it evaluates. Its own bounds: Effigy heavy admission (before
 this script starts), a clean checkout, a reserve reading before and after,
@@ -114,7 +114,8 @@ ACTOR_MARGIN_NS = 2 * NS  # the actor's own KILL, reap and exit
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPTS)
 SOURCES = {
-    "supervisor": os.path.join(SCRIPTS, "bounded-test.py"),
+    "supervisor": os.path.join(SCRIPTS, "bounded-test-candidate.py"),
+    "qualified_supervisor": os.path.join(SCRIPTS, "bounded-test.py"),
     "suite": os.path.join(SCRIPTS, "test_supervisor.py"),
     "bootstrap": os.path.abspath(__file__),
 }
@@ -192,6 +193,24 @@ def sha256(path):
         return hashlib.sha256(handle.read()).hexdigest()
 
 
+# Fixed source identities: qualification never falls back to the deployed runner.
+SOURCE_BINDINGS = {
+    "supervisor": "c578243126a2470cde0dfd19530254b3ec61b4ea5bb1fa43c6bbd2d41853c2b7",
+    "qualified_supervisor": "fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b",
+}
+
+
+def verify_bindings(digest=None):
+    digest = sha256 if digest is None else digest
+    for name, expected in SOURCE_BINDINGS.items():
+        try:
+            actual = digest(SOURCES[name])
+        except OSError as error:
+            raise ValueError(f"{name} is unreadable") from error
+        if actual != expected:
+            raise ValueError(f"{name} digest mismatch")
+
+
 def git(*args):
     return subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True, timeout=20, check=True).stdout
 
@@ -263,10 +282,19 @@ CANDIDATE = []
 def candidate():
     """The candidate guard's own module: this bootstrap reuses its routing,
     preparation, marker and sweep seams instead of copying their rules."""
+    verify_bindings()
     if not CANDIDATE:
         spec = importlib.util.spec_from_file_location("bounded_test", SOURCES["supervisor"])
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        try:
+            with open(SOURCES["supervisor"], "rb") as handle:
+                source = handle.read()
+        except OSError as error:
+            raise ValueError("supervisor is unreadable") from error
+        if hashlib.sha256(source).hexdigest() != SOURCE_BINDINGS["supervisor"]:
+            raise ValueError("supervisor digest mismatch")
+        # Execute the bytes just verified, never a stale path-based pyc.
+        exec(compile(source, SOURCES["supervisor"], "exec"), module.__dict__)
         CANDIDATE.append(module)
     return CANDIDATE[0]
 
@@ -873,7 +901,11 @@ def preflight(argv):
     if argv != [PREFLIGHT_FLAG]:
         print(f"refused: preflight takes no arguments (got {argv})", file=sys.stderr)
         return 2
-    guard = candidate()
+    try:
+        guard = candidate()
+    except ValueError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
     selection = guard.select_default_parent(os.environ)
     result = {"selector": "proof:supervisor:preflight", "head": git("rev-parse", "HEAD").strip(),
               "readiness": guard.readiness(selection)}
@@ -943,6 +975,10 @@ def qualify(diagnostic=False):
     if git("status", "--porcelain").strip():
         return refusal("refused: the checkout is not clean, so HEAD does not name the tested source",
                        diagnostic)
+    try:
+        verify_bindings()
+    except ValueError as error:
+        return refusal(f"refused: {error}; no proof started", diagnostic)
     expected = selection()
     print(f"default scratch selection: {json.dumps(expected)}", flush=True)
     if expected.get("source") != "selected-volume":
@@ -988,6 +1024,10 @@ def qualify(diagnostic=False):
     env["OXIDE_SUPERVISOR_LAYOUT"] = os.path.join(base, "topology.json")
     # The Popen handle is a local: its name must not shadow the module-level
     # `candidate()` loader resolved above (diagnostic2 UnboundLocalError).
+    try:
+        verify_bindings()
+    except ValueError as error:
+        return refusal(f"refused: {error}; marked scratch base {base} is kept", diagnostic)
     candidate_process = subprocess.Popen(
         [sys.executable, SOURCES["supervisor"], "--limit", str(CANDIDATE_LIMIT), "--scratch-budget-mib", "512",
          "--", sys.executable, SOURCES["suite"]], env=env)

@@ -5,7 +5,7 @@ Runs inside the candidate supervisor's own session under
 `proof:supervisor:qualify`. Pure cases (run first) drive the guard,
 precedence, census, control-protocol and owned-byte traversal logic with fake
 inputs or with owned fixtures: nothing is spawned. Real cases run
-`bounded-test.py` as a separate process around tiny Python fixtures, with
+`bounded-test-candidate.py` as a separate process around tiny Python fixtures, with
 test-only injected faults (OXIDE_SUPERVISOR_INJECT) and injected readings; the
 disk is never filled.
 
@@ -27,6 +27,7 @@ import ast
 import contextlib
 import errno
 import gc
+import hashlib
 import importlib.util
 import inspect
 import io
@@ -52,19 +53,43 @@ from contextlib import contextmanager
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent
-SUPERVISOR = SCRIPTS / "bounded-test.py"
+SUPERVISOR = SCRIPTS / "bounded-test-candidate.py"
+QUALIFIED_SUPERVISOR = SCRIPTS / "bounded-test.py"
 BOOTSTRAP = SCRIPTS / "qualify-supervisor.py"
+SOURCE_BINDINGS = {
+    SUPERVISOR: "c578243126a2470cde0dfd19530254b3ec61b4ea5bb1fa43c6bbd2d41853c2b7",
+    QUALIFIED_SUPERVISOR: "fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b",
+}
+
+
+def verify_bindings(digest=None):
+    def source_digest(path):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = source_digest if digest is None else digest
+    for path, expected in SOURCE_BINDINGS.items():
+        try:
+            actual = digest(path)
+        except OSError as error:
+            raise ValueError(f"{path.name} is unreadable") from error
+        if actual != expected:
+            raise ValueError(f"{path.name} digest mismatch")
+
+
+verify_bindings()  # before importing a guard or creating suite scratch
+spec = importlib.util.spec_from_file_location("bounded_test", SUPERVISOR)
+bounded = importlib.util.module_from_spec(spec)
+source = SUPERVISOR.read_bytes()
+if hashlib.sha256(source).hexdigest() != SOURCE_BINDINGS[SUPERVISOR]:
+    raise ValueError("candidate digest changed before import")
+exec(compile(source, str(SUPERVISOR), "exec"), bounded.__dict__)
+
+
 SCRATCH = Path(tempfile.mkdtemp(prefix="suite.", dir=os.environ.get("OXIDE_TASK_SCRATCH_ROOT") or None)).resolve()
 OUTER_EVIDENCE = os.environ.get("OXIDE_PROOF_EVIDENCE")
 NS = 1_000_000_000
 GIB = 1024 ** 3
 VERDICT_S, FALLBACK_S = 45, 60
 CASES = []
-
-spec = importlib.util.spec_from_file_location("bounded_test", SUPERVISOR)
-bounded = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(bounded)
-
 
 def now_ns():
     return time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
@@ -6013,6 +6038,7 @@ class QualifyEntry(unittest.TestCase):
             "git": lambda *args: "deadbeef\n" if tuple(args[:2]) == ("rev-parse", "HEAD") else "",
             "selection": lambda: dict(selection),
             "candidate": loader,
+            "verify_bindings": lambda: None,
             "subprocess": types.SimpleNamespace(Popen=forbid("subprocess.Popen")),
             "tempfile": types.SimpleNamespace(mkdtemp=forbid("tempfile.mkdtemp")),
             "reserve_readings": forbid("reserve_readings"),
@@ -6052,6 +6078,63 @@ class QualifyEntry(unittest.TestCase):
         self.assertEqual(observed["calls"], ["signal", "signal", "candidate-loader", "probe", "prepare"])
         self.assertEqual(observed["forbidden"], [],
                          "a host, filesystem, directory, sweep, marker or child effect was attempted")
+        # Fixed-path source binding is shared by both loaders. Missing, changed,
+        # or swapped bytes must refuse before loading or any host operation.
+        expected = {str(path): digest for path, digest in SOURCE_BINDINGS.items()}
+        self.assertEqual(str(SUPERVISOR), qualify.SOURCES["supervisor"])
+        self.assertEqual(str(QUALIFIED_SUPERVISOR), qualify.SOURCES["qualified_supervisor"])
+        self.assertEqual(expected, {qualify.SOURCES[k]: v for k, v in qualify.SOURCE_BINDINGS.items()})
+        for verifier in (verify_bindings, qualify.verify_bindings):
+            verifier(lambda path: expected[str(path)])
+            for path in expected:
+                with self.subTest(verifier=verifier.__module__, path=path):
+                    def missing(candidate_path):
+                        if str(candidate_path) == path:
+                            raise FileNotFoundError(path)
+                        return expected[str(candidate_path)]
+                    with self.assertRaises(ValueError):
+                        verifier(missing)
+                    with self.assertRaises(ValueError):
+                        verifier(lambda candidate_path: "0" * 64 if str(candidate_path) == path
+                                 else expected[str(candidate_path)])
+            swapped = dict(zip(expected, reversed(list(expected.values()))))
+            with self.assertRaises(ValueError):
+                verifier(lambda path: swapped[str(path)])
+        with patched(qualify, "sha256", lambda _path: "0" * 64):
+            with self.assertRaises(ValueError):
+                qualify.candidate()  # even an already-cached module cannot bypass binding
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(qualify.preflight([qualify.PREFLIGHT_FLAG]), 2)
+        # The actual qualification entry refuses before selection/preparation
+        # when a source binding fails, and never falls back to the default.
+        def broken_binding():
+            raise ValueError("injected binding failure")
+        def forbidden_selection():
+            raise AssertionError("selection must not run after binding refusal")
+        fake_signal = types.SimpleNamespace(SIGINT=2, SIGTERM=15, signal=lambda *_args: None)
+        with patched(qualify, "verify_bindings", broken_binding), patched(qualify, "selection", forbidden_selection), \
+                patched(qualify, "git", lambda *_args: ""), patched(qualify, "signal", fake_signal), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(qualify.qualify(diagnostic=True), 1)
+        source_text = Path(__file__).read_text()
+        self.assertLess(source_text.index("verify_bindings()  # before importing"), source_text.index("SCRATCH = Path("))
+        self.assertLess(source_text.index("exec(compile(source, str(SUPERVISOR)"), source_text.index("SCRATCH = Path("))
+        # Every ordinary Python/shell consumer and Effigy route keeps the fixed
+        # deployed path; only the suite and bootstrap know the candidate path.
+        candidate_name = SUPERVISOR.name
+        manifest = (SCRIPTS.parent / "effigy.toml").read_text()
+        self.assertNotIn(candidate_name, manifest)
+        self.assertIn("scripts/bounded-test.py oxide test", manifest)
+        wrapper = (SCRIPTS / "rust-test-600.py").read_text()
+        self.assertIn('"bounded-test.py"', wrapper)
+        for path in SCRIPTS.rglob("*"):
+            if path.suffix not in (".py", ".sh") or path in (SUPERVISOR, BOOTSTRAP, Path(__file__).resolve()):
+                continue
+            self.assertNotIn(candidate_name, path.read_text(), str(path))
+        for path in (SUPERVISOR, QUALIFIED_SUPERVISOR):
+            tree = ast.parse(path.read_text())
+            self.assertFalse(any(isinstance(node, ast.Name) and node.id == "__file__" for node in ast.walk(tree)),
+                             f"path-sensitive guard: {path}")
         # No local binding in the entry may shadow a module helper it calls.
         body = ast.parse(inspect.getsource(qualify.qualify)).body[0]
         bound = {node.id for node in ast.walk(body)
@@ -9906,6 +9989,7 @@ class Real(unittest.TestCase):
             args += ["--root-parent", str(self.dir)]
         else:
             env["OXIDE_TASK_SCRATCH_ROOT"] = str(self.dir)
+        verify_bindings()
         with open(self.dir / "guardian.log", "wb") as log:
             guardian = subprocess.Popen(args + ["--"] + (command or [sys.executable, "-c", code]), env=env,
                                         stdout=subprocess.DEVNULL, stderr=log)
@@ -10799,6 +10883,7 @@ class Real(unittest.TestCase):
         env = dict(os.environ, CASE_DIR=str(self.dir), FIXTURE_DEADLINE_NS=str(self.started + FALLBACK_S * NS),
                    OXIDE_TASK_SCRATCH_ROOT=str(self.dir), OXIDE_SUPERVISOR_INJECT="")
         command = [sys.executable, "-c", fixture("open(os.environ['CASE_DIR'] + '/ran', 'w')\n")]
+        verify_bindings()
         with open(self.dir / "guardian.log", "wb") as log:
             guardian = subprocess.Popen([sys.executable, str(SUPERVISOR), "--limit", "35", "--evidence",
                                          str(self.dir / "evidence"), "--"] + command, env=env,
@@ -10982,6 +11067,7 @@ class DetachReal(unittest.TestCase):
         env.update(extra)
         args = [sys.executable, str(SUPERVISOR), "--limit", "60", "--root-parent", str(self.dir),
                 "--evidence", str(self.dir / "evidence"), "--", sys.executable, "-c", DETACH_CASE]
+        verify_bindings()
         with open(self.dir / "guardian.log", "wb") as log:
             guardian = subprocess.Popen(args, env=env, stdout=subprocess.DEVNULL, stderr=log)
             try:

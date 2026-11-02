@@ -6537,6 +6537,36 @@ outside-root paths and unknown fields. No native run or allowance reset follows
 from this source correction; any further proof needs the Queue owner and the same
 retained reviewer's exact-head judgment.
 
+**Qualified default and isolated candidate (safe landing).** The ordinary
+`scripts/bounded-test.py` is restored byte-for-byte to the deployed qualified
+`fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b` source.
+The unchanged oxide#233 candidate `c578243126a2470cde0dfd19530254b3ec61b4ea5bb1fa43c6bbd2d41853c2b7`
+resides at `scripts/bounded-test-candidate.py` and is used only by the existing
+qualification bootstrap, suite, preflight and pure tests. Those routes bind
+both fixed paths and hashes, refuse absent, changed or swapped bytes, and never
+fall back to the ordinary runner. Ordinary selectors, wrappers and consumer
+imports retain their existing default paths and pins. Promotion of this candidate
+is a separate release step after actual qualification and is not authorized here.
+
+Queue diagnostic `0e148446` at source `8b4c2e0`, independently judged by the
+same retained reviewer (review `6567647646`, verdict `v10-fresh-diagnostic-8b4c2e06`),
+completed 465/465 cases and 12/12 checks with zero problems; the candidate guard
+closed status 0 with no fault or deadline, 419.38 s worker wall, 71,045,120 bytes
+peak monitored scratch and 288.3 GiB minimum sampled free. Intentional exit 1 and
+`qualified: false` remain: this is uncounted evidence, not a counted qualification,
+promotion or consumer proof. Its retained `cases.json` SHA-256
+`2a9983f387703ca1654401ba4fcecf3d16bbae47712d70677e618ae9f57f34c9` and
+`topology.json` `4b32f4a1b64b2d50fc3b5b70735ba806fc6cd3dd58abbf20b3f2b30903b23b9e`
+are in `/Volumes/Builds/scratch/oxide/oxide-supervisor-qualify.iy_vrps8`; the
+nested guard receipt SHA-256
+`bfaa86c19b82f5ee0acb3ad6d1e50816f3efd05b8128c7d4fce65198d003f97d` is in
+`/Volumes/Builds/scratch/oxide/oxide-proof.eziis49o/evidence`. The reviewer
+assessed the pre-existing fixture-thread traceback separately (verdict
+`v11-traceback-assessment`); that assessment does not migrate evidence to this
+relocated source head. The earlier failed packets remain unchanged. The retained
+reviewer must judge this routing revision; any changed-head diagnostic is separately
+owner-activated under its fixed limits and cannot qualify deployment by itself.
+
 The proof-authoring premise sweep for the new cases follows their executable
 route: `Real.replacement_fixture` calls `Real.guardian` with `fixture("pass")`;
 that fixture is Python-only and makes no Oxide, Cargo or rustup call. Therefore
