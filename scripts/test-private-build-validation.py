@@ -1558,6 +1558,13 @@ def process_executable(pid: int) -> Path:
     return Path(os.fsdecode(buf.value)).resolve(strict=True)
 
 
+def resolve_parent_binding(path: str | Path, label: str) -> Path:
+    try:
+        return Path(path).resolve(strict=True)
+    except (OSError, ValueError):
+        raise GateRefusal(f"parent binding: {label} unavailable") from None
+
+
 def supervisor_context() -> tuple:
     """Bind the direct parent and live supervisor receipt before any effect."""
     evidence = Path(os.environ.get("OXIDE_PROOF_EVIDENCE", ""))
@@ -1579,31 +1586,59 @@ def supervisor_context() -> tuple:
     divider = argv.index("--")
     if divider < 6 or len(argv[divider + 1:]) < 2:
         raise GateRefusal("supervisor command is incomplete")
-    supervisor = Path(argv[1]).resolve(strict=True)
+    supervisor = resolve_parent_binding(argv[1], "supervisor path")
     supervisor_flags = argv[2:divider]
-    if (len(supervisor_flags) not in (4, 6)
-            or (len(supervisor_flags) == 6 and
-                (supervisor_flags[4] != "--evidence" or
-                 Path(supervisor_flags[5]).resolve(strict=True) != evidence.resolve(strict=True)))):
-        raise GateRefusal("supervisor evidence arguments do not match")
-    if (process_executable(parent["pid"]) != Path(sys.executable).resolve(strict=True)
-            or supervisor.name != "bounded-test.py" or sha256_file(supervisor, cap=512 * 1024) != SUPERVISOR_SHA256
-            or argv[2] != "--limit" or not argv[3].isdigit()
-            or not 1 <= int(argv[3]) <= 1200
-            or argv[4] != "--scratch-budget-mib" or not argv[5].isdigit()
-            or not 1 <= int(argv[5]) <= 1024
-            or Path(argv[divider + 2]).resolve(strict=True) != Path(sys.argv[0]).resolve(strict=True)
-            or argv[divider + 3:] != sys.argv[1:]):
-        raise GateRefusal("parent command is not the pinned fixed supervisor route")
+    if len(supervisor_flags) not in (4, 6):
+        raise GateRefusal("parent binding: supervisor flag count mismatch")
+    if len(supervisor_flags) == 6:
+        if supervisor_flags[4] != "--evidence":
+            raise GateRefusal("parent binding: evidence flag mismatch")
+        if resolve_parent_binding(supervisor_flags[5], "evidence path") != evidence.resolve(strict=True):
+            raise GateRefusal("parent binding: evidence argument mismatch")
+    if process_executable(parent["pid"]) != Path(sys.executable).resolve(strict=True):
+        raise GateRefusal("parent binding: interpreter executable mismatch")
+    if supervisor.name != "bounded-test.py":
+        raise GateRefusal("parent binding: supervisor filename mismatch")
+    try:
+        supervisor_digest = sha256_file(supervisor, cap=512 * 1024)
+    except (OSError, GateRefusal):
+        raise GateRefusal("parent binding: supervisor digest unavailable") from None
+    if supervisor_digest != SUPERVISOR_SHA256:
+        raise GateRefusal("parent binding: supervisor digest mismatch")
+    if argv[2] != "--limit":
+        raise GateRefusal("parent binding: limit flag mismatch")
+    if not argv[3].isdigit() or not 1 <= int(argv[3]) <= 1200:
+        raise GateRefusal("parent binding: invalid limit value")
+    if argv[4] != "--scratch-budget-mib":
+        raise GateRefusal("parent binding: scratch flag mismatch")
+    if not argv[5].isdigit() or not 1 <= int(argv[5]) <= 1024:
+        raise GateRefusal("parent binding: invalid scratch budget")
+    if resolve_parent_binding(argv[divider + 2], "child script") != resolve_parent_binding(sys.argv[0], "current script"):
+        raise GateRefusal("parent binding: child script mismatch")
+    if argv[divider + 3:] != sys.argv[1:]:
+        raise GateRefusal("parent binding: child argument mismatch")
     receipt = json.loads((evidence / "receipt.json").read_bytes())
-    if (receipt.get("phase") != "started: incomplete" or receipt.get("run_id") != run_id
-            or receipt.get("command") != argv[divider + 1:]
-            or receipt.get("evidence") != str(evidence) or receipt.get("scratch") != str(scratch)
-            or receipt.get("limit_s") != int(argv[3]) or type(receipt.get("start_ns")) is not int
-            or not (receipt["start_ns"] + int(argv[3]) * 1_000_000_000
-                    <= int(deadline) <= receipt["start_ns"] + (int(argv[3]) + 600) * 1_000_000_000)
-            or receipt["start_ns"] > now_ns() or process_row(parent["pid"]) != parent):
-        raise GateRefusal("live supervisor receipt or parent identity does not match")
+    if receipt.get("phase") != "started: incomplete":
+        raise GateRefusal("parent binding: receipt phase mismatch")
+    if receipt.get("run_id") != run_id:
+        raise GateRefusal("parent binding: receipt run identity mismatch")
+    if receipt.get("command") != argv[divider + 1:]:
+        raise GateRefusal("parent binding: receipt command mismatch")
+    if receipt.get("evidence") != str(evidence):
+        raise GateRefusal("parent binding: receipt evidence path mismatch")
+    if receipt.get("scratch") != str(scratch):
+        raise GateRefusal("parent binding: receipt scratch path mismatch")
+    if receipt.get("limit_s") != int(argv[3]):
+        raise GateRefusal("parent binding: receipt limit mismatch")
+    start = receipt.get("start_ns")
+    if type(start) is not int:
+        raise GateRefusal("parent binding: receipt start is invalid")
+    if not start + int(argv[3]) * 1_000_000_000 <= int(deadline) <= start + (int(argv[3]) + 600) * 1_000_000_000:
+        raise GateRefusal("parent binding: receipt deadline mismatch")
+    if start > now_ns():
+        raise GateRefusal("parent binding: receipt start is in the future")
+    if process_row(parent["pid"]) != parent:
+        raise GateRefusal("parent binding: parent identity changed")
     return evidence, run_id, int(deadline), scratch
 
 
@@ -3363,6 +3398,70 @@ def self_test() -> int:
             os.environ["OXIDE_PROOF_RUN_ID"] = "a" * 32
             os.environ["OXIDE_PROOF_DEADLINE_NS"] = str(start + 1199 * 1_000_000_000)
             expect_refusal("foreign supervisor deadline", supervisor_context)
+
+        # The actual issued form uses a 120 s/128 MiB direct supervisor with
+        # --prepare and a complete argument tail; all observations are mocks.
+        issued_tail = ["--prepare", "--packet-dir", "/fixture/packet",
+                       "--oxide-repo", "/fixture/oxide", "--oxide-head", OXIDE_PIN_COMMIT,
+                       "--oxide-product-head", "6e8ca1f07a3e26be9e96ff55fd774b0f8185165a",
+                       "--barge-repo", "/fixture/barge", "--barge-head", BARGE_ACCEPTED_HEAD,
+                       "--barge-root", "/fixture/barge-root", "--oxide-root", "/fixture/oxide-root",
+                       "--audit-inputs", "/fixture/audit.json", "--expect-audit-inputs", "a" * 64]
+        issued_child = [sys.executable, sys.argv[0], *issued_tail]
+        other_supervisor = fixture.root / "not-bounded.py"
+        other_supervisor.write_bytes(b"mock")
+        other_script = fixture.root / "other-script.py"
+        other_script.write_bytes(b"mock")
+        issued_parent = [sys.executable, str(supervisor_file), "--limit", "120",
+                         "--scratch-budget-mib", "128", "--", *issued_child]
+        issued_receipt = dict(receipt, command=issued_child, limit_s=120)
+        (evidence_dir / "receipt.json").write_bytes(canonical_json(issued_receipt))
+        os.environ["OXIDE_PROOF_DEADLINE_NS"] = str(start + 120 * 1_000_000_000)
+        with patch.object(sys, "argv", [sys.argv[0], *issued_tail]), \
+             patch(__name__ + ".process_row", side_effect=lambda pid: me if pid == os.getpid() else parent), \
+             patch(__name__ + ".process_argv", return_value=issued_parent) as parent_args, \
+             patch(__name__ + ".process_executable", return_value=Path(sys.executable).resolve(strict=True)) as parent_exe, \
+             patch(__name__ + ".sha256_file", return_value=SUPERVISOR_SHA256) as supervisor_digest:
+            expect_ok("issued 120s 128MiB preparation shape", supervisor_context)
+            controls = [
+                ("interpreter executable mismatch", None, "executable"),
+                ("supervisor digest mismatch", None, "digest"),
+                ("supervisor filename mismatch", (1, str(other_supervisor)), None),
+                ("limit flag mismatch", (2, "--wrong-limit"), None),
+                ("invalid limit value", (3, "1201"), None),
+                ("scratch flag mismatch", (4, "--wrong-scratch"), None),
+                ("invalid scratch budget", (5, "1025"), None),
+                ("child script mismatch", (8, str(other_script)), None),
+                ("child argument mismatch", (-1, "changed"), None),
+            ]
+            for expected, change, special in controls:
+                changed_argv = list(issued_parent)
+                if change is not None:
+                    changed_argv[change[0]] = change[1]
+                parent_args.return_value = changed_argv
+                parent_exe.return_value = (supervisor_file if special == "executable"
+                                           else Path(sys.executable).resolve(strict=True))
+                supervisor_digest.return_value = "0" * 64 if special == "digest" else SUPERVISOR_SHA256
+                try:
+                    supervisor_context()
+                    failures.append(f"{expected}: expected refusal")
+                except GateRefusal as refusal:
+                    if expected not in str(refusal):
+                        failures.append(f"{expected}: wrong diagnostic {refusal}")
+            parent_args.return_value = issued_parent
+            parent_exe.return_value = Path(sys.executable).resolve(strict=True)
+            supervisor_digest.return_value = SUPERVISOR_SHA256
+            for field, value, message in (("command", ["other"], "receipt command mismatch"),
+                                          ("scratch", "/other", "receipt scratch path mismatch"),
+                                          ("limit_s", 121, "receipt limit mismatch")):
+                mutated_receipt = dict(issued_receipt, **{field: value})
+                (evidence_dir / "receipt.json").write_bytes(canonical_json(mutated_receipt))
+                try:
+                    supervisor_context()
+                    failures.append(f"{message}: expected refusal")
+                except GateRefusal as refusal:
+                    if message not in str(refusal):
+                        failures.append(f"{message}: wrong diagnostic {refusal}")
 
     finally:
         for key, value in saved_env.items():
