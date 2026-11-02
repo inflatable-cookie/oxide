@@ -5781,7 +5781,7 @@ pub fn exec_declaration(
     match receipt.state {
         ReceiptState::Committed | ReceiptState::Detached => {}
         ReceiptState::Prepared => {
-            return Err("outputs: an interrupted owned-output transition is pending; run `oxide outputs adopt` to replay it before running an exec tool".to_owned())
+            return Err("outputs: an interrupted owned-output transition is pending; ensure a permanent drive registration, then run `oxide outputs adopt` to replay it before running an exec tool".to_owned())
         }
         ReceiptState::Pruning => {
             return Err("outputs: a listed legacy root of this checkout is being pruned; nothing changes until `oxide outputs prune` replays it or `oxide outputs resolve-intent` settles it".to_owned())
@@ -9188,7 +9188,7 @@ pub fn clean_placement(workspace: &Path) -> Result<Option<CleanPlacement>, Strin
         ReceiptState::Prepared => Err(if guarded {
             crate::one_use::PREPARED_GUARDED.to_owned()
         } else {
-            "clean refused: an interrupted owned-output transition is pending; run `oxide outputs adopt` to replay it before cleaning"
+            "clean refused: an interrupted owned-output transition is pending; ensure a permanent drive registration, then run `oxide outputs adopt` to replay it before cleaning"
                 .to_owned()
         }),
         ReceiptState::Committed => {
