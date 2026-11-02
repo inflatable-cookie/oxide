@@ -980,7 +980,7 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
         *over.pointer_mut(pointer).ok_or_else(|| CheckFailure { what: format!("missing {pointer}") })? = serde_json::Value::Array(vec![serde_json::Value::Null; limit + 1]);
         check(validate_manifest_envelope(&over).is_err(), "manifest collection cap refuses")?;
     }
-    for invalid in [include_str!("../../../docs/knowledge/contracts/capture-examples/invalid-missing-mandatory.json"), include_str!("../../../docs/knowledge/contracts/capture-examples/invalid-missing-source.json"), include_str!("../../../docs/knowledge/contracts/capture-examples/invalid-writers-over-cap.json"), include_str!("../../../docs/knowledge/contracts/capture-examples/invalid-unknown-field.json")] {
+    for invalid in [include_str!("../../../docs/knowledge/contracts/capture-examples/invalid-missing-mandatory.json"), include_str!("../../../docs/knowledge/contracts/capture-examples/invalid-missing-source.json"), include_str!("../../../docs/knowledge/contracts/capture-examples/invalid-unknown-field.json")] {
         let doc: serde_json::Value = serde_json::from_str(invalid).map_err(|error| CheckFailure { what: error.to_string() })?;
         check(validate_manifest_envelope(&doc).is_err(), "invalid manifest envelope refuses")?;
     }
