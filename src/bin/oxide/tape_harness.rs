@@ -1385,6 +1385,18 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
             "invalid manifest envelope refuses",
         )?;
     }
+    // These assignments compile only if the unchanged oxide_storage paths
+    // resolve to the same actual types as the re-rooted crate modules.
+    let _: fn(&crate::volume::Binding) = |_: &oxide_storage::volume::Binding| {};
+    let _: fn(&crate::inventory::InventoryLimits) =
+        |_: &oxide_storage::inventory::InventoryLimits| {};
+    let _: fn(&crate::lease::LedgerView) = |_: &oxide_storage::lease::LedgerView| {};
+    let lib_source = include_str!("../../lib.rs");
+    for module in ["release_trace", "inventory", "lease", "owned_delete", "proof",
+        "supervisor", "seed_source", "dep_info", "volume"] {
+        check(lib_source.lines().any(|line| line.trim() == format!("pub mod {module};")),
+            &format!("library module map contains {module}"))?;
+    }
     // Each byte string is compiled from the same path used by the re-rooted
     // module declaration. The digest list is reported as a source map, not as
     // a substitute for a library call or build-artifact provenance.
