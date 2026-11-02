@@ -340,7 +340,9 @@ These observations do not establish the original positive group-lifetime
 claim. They do not revise the two earlier #242 packets or their counts.
 
 Apple's archived [kill](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/kill.2.html)
-manual describes signal zero as error checking without signal delivery; its
+manual describes signal zero as error checking without signal delivery. For a
+group, its EPERM description says it is returned “if any members of the
+group could not be signaled”. Its
 [killpg](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/killpg.2.html)
 manual describes EPERM as a permission failure. Neither identifies a particular
 held child as a member. In Apple's XNU revision
@@ -353,8 +355,14 @@ undo the group iterator's zombie filter. Thus that source provides a plausible
 mechanism for this observation, not evidence that the observed EPERM proves
 membership or even that permission was the sole cause. The packet identifies
 the macOS-only guard and its command, but neither receipt nor command log
-records a macOS build, Darwin release or XNU version. This revision cannot be
-bound to the host kernel from that packet. Its behavior is not a public,
+records a macOS build, Darwin release or XNU version. At review and again at
+this correction, the current host reports macOS 26.6.2 (25G83), Darwin 25.6.0,
+`xnu-12377.161.14~5`, arm64 (retained review comment 6569891769, verdict
+`host-version-binding`). This is a later observation, not the packet’s host
+version. The version corresponding to `f6217f891ac0` has not been established,
+and the reviewer found no `xnu-12377.161.14` tag. Its gap from the currently
+reported kernel cannot be quantified; neither observation binds that revision
+to the kernel that ran the diagnostic. Its behavior is not a public,
 version-independent guarantee; no host-version equivalence is assumed.
 
 **Candidate, not approved:** retain exclusive direct-parent custody from raw
@@ -374,8 +382,12 @@ sites that would need review; `bind` currently reads group and session in
 separate syscalls. This is a proposed evidence chain, not a replacement oracle.
 
 The source discriminator below supplies a conditional lifetime argument for
-its cited XNU revision: group/hash removal occurs at reap and the session
-leader cannot move itself by setpgid. Exclusive unreaped custody limits PID
+its cited XNU revision: [`reap_child_locked`](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_exit.c)
+removes the child from its group and process hash, and the session leader
+cannot move itself by setpgid. This is conditional on the live, exclusive
+parent premise: `proc_exit` also calls `reap_child_locked` with
+`REAP_DEAD_PARENT` for its zombie children when their parent exits. Group
+removal can therefore happen during parent exit without its positive wait. Exclusive unreaped custody limits PID
 reuse, but a start token and matching parent/group observations are still
 required; neither a recycled PID nor a reused PGID is a handle. A moved or
 replaced identity, failed or malformed read, permission denial, missing row,
@@ -453,8 +465,9 @@ examined 2026-11-01, `forkproc` checks the process, group and session hashes
 when allocating a PID under the process-list lock. In the same revision,
 [`kern_exit.c`](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_exit.c)
 places an exiting process on the zombie list, and `reap_child_locked` removes
-it from its group and process hash under that lock; its `P_NOCLDWAIT` path
-permits kernel reaping. This explains that revision's relevant mechanism,
+it from its group and process hash under that lock. During parent exit the
+`REAP_DEAD_PARENT` path can reap its zombie children; its `P_NOCLDWAIT` path
+also permits kernel reaping. This explains that revision's relevant mechanism,
 not a version-independent public guarantee or evidence of the host kernel's
 exact source. No native observation or qualification follows from it.
 
