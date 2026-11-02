@@ -673,28 +673,17 @@ pub(crate) fn read_registration(control: &Path) -> Result<Option<Registration>, 
             Err(format!("cannot read the removable registration: {error}"))
         };
     }
-    #[cfg(test)]
-    {
-        match crate::tape::path_dev_ino(&control.join(REGISTRATION)) {
-            Some((dev, ino)) => crate::tape::read_row(
-                "removable:registration-open",
-                &control.join(REGISTRATION),
-                crate::tape::TapeOutcome::Opened { dev, ino },
-                0,
-            ),
-            None => crate::tape::read_row(
-                "removable:registration-open",
-                &control.join(REGISTRATION),
-                crate::tape::TapeOutcome::Absent,
-                0,
-            ),
-        }
-    }
     // SAFETY: `fd` is a newly opened descriptor owned by this function.
     let file = unsafe { File::from_raw_fd(fd) };
     let metadata = file
         .metadata()
         .map_err(|error| format!("cannot read the removable registration: {error}"))?;
+    #[cfg(test)]
+    crate::tape::read_row_dev(
+        "removable:registration-open", &control.join(REGISTRATION),
+        metadata.dev(), metadata.ino(),
+        crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0,
+    );
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
     if !metadata.is_file()

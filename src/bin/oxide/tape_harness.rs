@@ -1459,7 +1459,7 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
     prune::authority_read_observed(
         &observed_file,
         &observed_path,
-        "pure::descriptor",
+        "prune::read_bounded",
         64,
         &mut observed_bytes,
     )
@@ -1480,7 +1480,7 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
     check(
         observed_bytes == b"original"
             && descriptor_doc.reads.iter().any(|row| {
-                row.get("kind").and_then(|v| v.as_str()) == Some("authority-read@pure::descriptor")
+                row.get("kind").and_then(|v| v.as_str()) == Some("authority-read@prune::read_bounded")
                     && row.pointer("/identity/ino").and_then(|v| v.as_u64())
                         == Some(observed_identity)
                     && row
@@ -1493,8 +1493,8 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
         "descriptor binding survives path replacement",
     )?;
     check(
-        descriptor_doc.reads.len() == 1,
-        "one authority read produces one identity-bound row",
+        descriptor_doc.reads.len() == 2,
+        "one descriptor observation binds the open and the authority read",
     )?;
     check(
         descriptor_doc
@@ -1520,7 +1520,7 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
         tape::effect_row("save@pure", Path::new("/pure/state.json"));
         tape::clock_row("pure:clock-ms", 1_234);
         tape::classify_row("pure:classify", "one", "value");
-        tape::budget_begin(1_000, 1_024);
+        tape::budget_begin(1_024);
         let path = temp.join("pure.json");
         let outcome = TapeEngineOutcome::Completed {
             result: serde_json::json!({"complete": true, "entries": []}),
@@ -1574,8 +1574,8 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
         "the effect row carries its kind",
     )?;
     check(
-        doc.clocks.len() == 2,
-        "the budget and clock rows are carried",
+        doc.clocks.len() == 1,
+        "the actual clock row is carried without a fabricated deadline",
     )?;
     check(
         doc.classifications.len() == 2,
@@ -1585,7 +1585,10 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
         outcome_state(&doc) == "completed",
         "the outcome is the engine's own completed document",
     )?;
-    check(doc.notes.is_empty(), "no notes for a clean window")?;
+    check(
+        doc.notes.iter().any(|note| note.contains("parent identity unproven")),
+        "the missing parent remains explicitly unproven",
+    )?;
     Ok(())
 }
 
@@ -1693,8 +1696,14 @@ fn unbound_authority_note_check(temp: &Path) -> Result<(), CheckFailure> {
     check(
         doc.reads.iter().any(|row| {
             row.get("kind").and_then(|k| k.as_str()) == Some("authority-read@pure::site")
+                && row.pointer("/identity/dev").is_some_and(|value| value.is_null())
+                && row.pointer("/identity/parent_dev").is_some_and(|value| value.is_null())
         }),
-        "the bound authority read carries its site",
+        "an unobserved descriptor and parent are not invented",
+    )?;
+    check(
+        doc.notes.iter().any(|note| note.contains("identity unproven")),
+        "an unobserved identity explicitly prevents proof",
     )
 }
 

@@ -1710,10 +1710,7 @@ impl AuthorityScope {
                 failed: false,
             });
             #[cfg(test)]
-            crate::tape::budget_begin(
-                crate::process::now_ms().saturating_add(SNAPSHOT_TIME.as_millis() as u64),
-                SNAPSHOT_MAX_BYTES,
-            );
+            crate::tape::budget_begin(SNAPSHOT_MAX_BYTES);
             Ok(Self)
         })
     }
@@ -1830,9 +1827,13 @@ pub(crate) fn authority_read_observed(
     // The single test-only fstat observes this held descriptor. It never
     // changes the evaluator result, including when the observation fails.
     let before_observation = tape_errno();
-    let metadata = file.metadata();
+    let metadata = if site == "prune::read_bounded" {
+        Some(file.metadata())
+    } else {
+        None
+    };
     if site == "prune::read_bounded" {
-        if let Ok(metadata) = &metadata {
+        if let Some(Ok(metadata)) = &metadata {
             crate::tape::read_row_without_parent(
                 "read-bounded:open",
                 path,
@@ -1858,7 +1859,7 @@ pub(crate) fn authority_read_observed(
         },
     };
     match metadata {
-        Ok(metadata) => crate::tape::authority_bind_descriptor(
+        Some(Ok(metadata)) => crate::tape::authority_bind_descriptor(
             site,
             path,
             metadata.dev(),
@@ -1866,7 +1867,14 @@ pub(crate) fn authority_read_observed(
             limit,
             outcome,
         ),
-        Err(error) => crate::tape::authority_unbound(site, &error.to_string()),
+        Some(Err(error)) => {
+            crate::tape::authority_unbound(site, &error.to_string());
+            crate::tape::read_row(&format!("authority-read@{site}"), path, outcome, limit);
+        }
+        None => {
+            crate::tape::authority_unbound(site, "no authorized descriptor observation");
+            crate::tape::read_row(&format!("authority-read@{site}"), path, outcome, limit);
+        }
     }
     tape_restore_errno(after_read);
     result
@@ -3192,25 +3200,26 @@ fn revalidate_chain(descriptors: &[OwnedFd], observed: &[ObservedEntry]) -> Resu
         return Err("the checkout ancestry chain is not one descriptor per component".to_owned());
     }
     for (index, entry) in observed.iter().enumerate() {
+        #[cfg(not(test))]
         let opened = fstat_fd(&descriptors[index + 1])?;
         #[cfg(test)]
-        {
-            if let (Some((pdev, pino)), Some((odev, oino))) = (
-                crate::tape::fd_dev_ino(descriptors[index].as_fd()),
-                crate::tape::fd_dev_ino(descriptors[index + 1].as_fd()),
-            ) {
-                crate::tape::component_row(
-                    "absence-walk:revalidate-descriptor",
-                    pdev,
-                    pino,
-                    &entry.name,
-                    crate::tape::TapeOutcome::Opened {
-                        dev: odev,
-                        ino: oino,
-                    },
+        let opened = match fstat_fd(&descriptors[index + 1]) {
+            Ok(opened) => opened,
+            Err(error) => {
+                crate::tape::component_without_parent(
+                    "absence-walk:revalidate-descriptor", &entry.name,
+                    crate::tape::TapeOutcome::Refusal { reason: error.clone() },
                 );
+                return Err(error);
             }
-        }
+        };
+        #[cfg(test)]
+        crate::tape::component_without_parent(
+            "absence-walk:revalidate-descriptor", &entry.name,
+            crate::tape::TapeOutcome::Opened {
+                dev: u64::try_from(opened.st_dev).unwrap_or(u64::MAX), ino: opened.st_ino,
+            },
+        );
         if !entry.matches(&opened) {
             #[cfg(test)]
             crate::tape::classify_row(
@@ -3233,38 +3242,25 @@ fn revalidate_chain(descriptors: &[OwnedFd], observed: &[ObservedEntry]) -> Resu
             )
         };
         if status != 0 {
+            #[cfg(not(test))]
+            return Err(std::io::Error::last_os_error().to_string());
             #[cfg(test)]
             {
-                let parent = crate::tape::fd_dev_ino(descriptors[index].as_fd());
-                if let Some((pdev, pino)) = parent {
-                    crate::tape::component_row(
-                        "absence-walk:revalidate-name",
-                        pdev,
-                        pino,
-                        &entry.name,
-                        crate::tape::TapeOutcome::Refusal {
-                            reason: std::io::Error::last_os_error().to_string(),
-                        },
-                    );
-                }
+                let error = std::io::Error::last_os_error();
+                crate::tape::component_without_parent(
+                    "absence-walk:revalidate-name", &entry.name,
+                    crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+                );
+                return Err(error.to_string());
             }
-            return Err(std::io::Error::last_os_error().to_string());
         }
         #[cfg(test)]
-        {
-            if let Some((pdev, pino)) = crate::tape::fd_dev_ino(descriptors[index].as_fd()) {
-                crate::tape::component_row(
-                    "absence-walk:revalidate-name",
-                    pdev,
-                    pino,
-                    &entry.name,
-                    crate::tape::TapeOutcome::Opened {
-                        dev: u64::try_from(stat.st_dev).unwrap_or(u64::MAX),
-                        ino: stat.st_ino,
-                    },
-                );
-            }
-        }
+        crate::tape::component_without_parent(
+            "absence-walk:revalidate-name", &entry.name,
+            crate::tape::TapeOutcome::Opened {
+                dev: u64::try_from(stat.st_dev).unwrap_or(u64::MAX), ino: stat.st_ino,
+            },
+        );
         if !entry.matches(&stat) {
             #[cfg(test)]
             crate::tape::classify_row(
@@ -3327,14 +3323,16 @@ fn walk_checkout(
             };
             #[cfg(test)]
             {
-                if let Some((pdev, pino)) = crate::tape::fd_dev_ino(descriptors[index].as_fd()) {
+                if let Some((pdev, pino)) = Some(if index == 0 { (start_dev, start_ino) } else { (observed[index - 1].dev, observed[index - 1].ino) }) {
                     crate::tape::component_row(
                         "absence-walk:fstatat",
                         pdev,
                         pino,
                         name,
-                        crate::tape::TapeOutcome::Refusal {
-                            reason: error.to_string(),
+                        if error.kind() == std::io::ErrorKind::NotFound {
+                            crate::tape::TapeOutcome::Absent
+                        } else {
+                            crate::tape::TapeOutcome::Refusal { reason: error.to_string() }
                         },
                     );
                 }
@@ -3360,7 +3358,7 @@ fn walk_checkout(
         if index == leaf {
             #[cfg(test)]
             {
-                if let Some((pdev, pino)) = crate::tape::fd_dev_ino(descriptors[index].as_fd()) {
+                if let Some((pdev, pino)) = Some(if index == 0 { (start_dev, start_ino) } else { (observed[index - 1].dev, observed[index - 1].ino) }) {
                     crate::tape::component_row(
                         "absence-walk:fstatat",
                         pdev,
@@ -3389,28 +3387,29 @@ fn walk_checkout(
             )
         };
         if next < 0 {
+            #[cfg(not(test))]
+            return Ok(Walk::Unknown(std::io::Error::last_os_error().to_string()));
             #[cfg(test)]
             {
-                if let Some((pdev, pino)) = crate::tape::fd_dev_ino(descriptors[index].as_fd()) {
-                    crate::tape::component_row(
-                        "absence-walk:openat",
-                        pdev,
-                        pino,
-                        name.as_os_str(),
-                        crate::tape::TapeOutcome::Refusal {
-                            reason: std::io::Error::last_os_error().to_string(),
-                        },
-                    );
-                }
+                let error = std::io::Error::last_os_error();
+                let (pdev, pino) = if index == 0 {
+                    (start_dev, start_ino)
+                } else {
+                    (observed[index - 1].dev, observed[index - 1].ino)
+                };
+                crate::tape::component_row(
+                    "absence-walk:openat", pdev, pino, name.as_os_str(),
+                    crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+                );
+                return Ok(Walk::Unknown(error.to_string()));
             }
-            return Ok(Walk::Unknown(std::io::Error::last_os_error().to_string()));
         }
         // SAFETY: `next` is a newly owned descriptor.
         let opened = unsafe { OwnedFd::from_raw_fd(next) };
         let opened_stat = fstat_fd(&opened)?;
         #[cfg(test)]
         {
-            if let Some((pdev, pino)) = crate::tape::fd_dev_ino(descriptors[index].as_fd()) {
+            if let Some((pdev, pino)) = Some(if index == 0 { (start_dev, start_ino) } else { (observed[index - 1].dev, observed[index - 1].ino) }) {
                 crate::tape::component_row(
                     "absence-walk:openat",
                     pdev,
@@ -4088,19 +4087,14 @@ fn observe_root_in(binding: &Binding, row: &Row) -> Result<RootState, String> {
     if status != 0 {
         let error = std::io::Error::last_os_error();
         #[cfg(test)]
-        {
-            if let Some((pdev, pino)) = crate::tape::fd_dev_ino(outer.as_fd()) {
-                crate::tape::component_row(
-                    "root-observe:entry",
-                    pdev,
-                    pino,
-                    name,
-                    crate::tape::TapeOutcome::Refusal {
-                        reason: error.to_string(),
-                    },
-                );
-            }
-        }
+        crate::tape::component_without_parent(
+            "root-observe:entry", name,
+            if error.kind() == std::io::ErrorKind::NotFound {
+                crate::tape::TapeOutcome::Absent
+            } else {
+                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }
+            },
+        );
         return Ok(if error.kind() == std::io::ErrorKind::NotFound {
             RootState::Absent
         } else {
@@ -4108,20 +4102,12 @@ fn observe_root_in(binding: &Binding, row: &Row) -> Result<RootState, String> {
         });
     }
     #[cfg(test)]
-    {
-        if let Some((pdev, pino)) = crate::tape::fd_dev_ino(outer.as_fd()) {
-            crate::tape::component_row(
-                "root-observe:entry",
-                pdev,
-                pino,
-                name,
-                crate::tape::TapeOutcome::Opened {
-                    dev: u64::try_from(stat.st_dev).unwrap_or(u64::MAX),
-                    ino: stat.st_ino,
-                },
-            );
-        }
-    }
+    crate::tape::component_without_parent(
+        "root-observe:entry", name,
+        crate::tape::TapeOutcome::Opened {
+            dev: u64::try_from(stat.st_dev).unwrap_or(u64::MAX), ino: stat.st_ino,
+        },
+    );
     if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
         return Ok(RootState::Unknown(
             "the recorded root is not a real directory".to_owned(),

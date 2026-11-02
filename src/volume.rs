@@ -291,49 +291,23 @@ impl Binding {
         let mount_point = parent.join(name);
         let parent_fd = open_dir(None, parent)?;
         #[cfg(test)]
-        {
-            match crate::tape::path_dev_ino(parent) {
-                Some((dev, ino)) => crate::tape::read_row_dev(
-                    "volume:open-parent",
-                    parent,
-                    dev,
-                    ino,
-                    crate::tape::TapeOutcome::Opened { dev, ino },
-                    0,
-                ),
-                None => crate::tape::read_row(
-                    "volume:open-parent",
-                    parent,
-                    crate::tape::TapeOutcome::Absent,
-                    0,
-                ),
-            }
-        }
+        crate::tape::read_row(
+            "volume:open-parent", parent,
+            crate::tape::TapeOutcome::Facts { facts: "opened; identity unproven".to_owned() }, 0,
+        );
         let fd = open_dir(Some(parent_fd.as_fd_ref()), Path::new(name)).map_err(|error| {
             #[cfg(test)]
-            crate::tape::component_row(
-                "volume:open-mount",
-                crate::tape::path_dev_ino(parent).map_or(0, |(dev, _)| dev),
-                crate::tape::path_dev_ino(parent).map_or(0, |(_, ino)| ino),
-                std::ffi::OsStr::new(name),
-                crate::tape::TapeOutcome::Refusal {
-                    reason: error.to_string(),
-                },
+            crate::tape::read_row(
+                "volume:open-mount", &mount_point,
+                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, 0,
             );
             format!("{} is not available: {error}", mount_point.display())
         })?;
         #[cfg(test)]
-        {
-            if let Some((dev, ino)) = crate::tape::fd_dev_ino(fd.as_fd_ref()) {
-                crate::tape::component_row(
-                    "volume:open-mount",
-                    crate::tape::path_dev_ino(parent).map_or(0, |(dev, _)| dev),
-                    crate::tape::path_dev_ino(parent).map_or(0, |(_, ino)| ino),
-                    std::ffi::OsStr::new(name),
-                    crate::tape::TapeOutcome::Opened { dev, ino },
-                );
-            }
-        }
+        crate::tape::read_row(
+            "volume:open-mount", &mount_point,
+            crate::tape::TapeOutcome::Facts { facts: "opened; identity unproven".to_owned() }, 0,
+        );
         let facts = observe(fd.as_fd())?;
         #[cfg(test)]
         crate::tape::volume_row(
@@ -435,14 +409,14 @@ impl Binding {
         let by_path = std::fs::symlink_metadata(&self.mount_point)
             .map_err(|error| format!("{} is gone: {error}", self.mount_point.display()))?;
         #[cfg(test)]
-        crate::tape::read_row(
-            "volume:verify:path",
-            &self.mount_point,
-            match crate::tape::path_dev_ino(&self.mount_point) {
-                Some((dev, ino)) => crate::tape::TapeOutcome::Opened { dev, ino },
-                None => crate::tape::TapeOutcome::Absent,
-            },
-            0,
+        crate::tape::read_row_dev(
+            "volume:verify:path", &self.mount_point,
+            std::os::unix::fs::MetadataExt::dev(&by_path),
+            std::os::unix::fs::MetadataExt::ino(&by_path),
+            crate::tape::TapeOutcome::Opened {
+                dev: std::os::unix::fs::MetadataExt::dev(&by_path),
+                ino: std::os::unix::fs::MetadataExt::ino(&by_path),
+            }, 0,
         );
         if by_path.file_type().is_symlink()
             || std::os::unix::fs::MetadataExt::dev(&by_path) != facts.dev

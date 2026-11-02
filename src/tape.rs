@@ -124,17 +124,7 @@ fn push_record(
 /// tree (own and parent device/inode).
 pub(crate) fn read_row(kind: &str, path: &Path, outcome: TapeOutcome, cap: u64) {
     with_state(|state| {
-        use std::os::unix::fs::MetadataExt;
-        let own = std::fs::symlink_metadata(path).ok();
-        let parent = path.parent().and_then(|p| std::fs::metadata(p).ok());
-        let identity = format!(
-            "file:{path}|parent={pdev:?}/{pino:?}|dev={dev:?}/ino={ino:?}",
-            path = path.display(),
-            pdev = parent.as_ref().map(|m| m.dev()),
-            pino = parent.as_ref().map(|m| m.ino()),
-            dev = own.as_ref().map(|m| m.dev()),
-            ino = own.as_ref().map(|m| m.ino()),
-        );
+        let identity = format!("file:{}|identity=unproven", path.display());
         push_record(state, kind, identity, &outcome, cap);
     });
 }
@@ -149,36 +139,9 @@ pub(crate) fn read_row_dev(
     cap: u64,
 ) {
     with_state(|state| {
-        use std::os::unix::fs::MetadataExt;
-        let parent = path.parent().and_then(|p| std::fs::metadata(p).ok());
-        let identity = format!(
-            "file:{path}|parent={pdev:?}/{pino:?}|dev={dev}/ino={ino}",
-            path = path.display(),
-            pdev = parent.as_ref().map(|m| m.dev()),
-            pino = parent.as_ref().map(|m| m.ino()),
-        );
+        let identity = format!("file:{}|parent=unproven|dev={dev}/ino={ino}", path.display());
         push_record(state, kind, identity, &outcome, cap);
     });
-}
-
-/// Test-only helpers binding a row's identity facts from the live tree.
-pub(crate) fn path_dev_ino(path: &Path) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::symlink_metadata(path)
-        .ok()
-        .map(|m| (m.dev(), m.ino()))
-}
-
-pub(crate) fn fd_dev_ino(fd: std::os::fd::BorrowedFd<'_>) -> Option<(u64, u64)> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::MetadataExt;
-    // SAFETY: `fstat` has no preconditions beyond a live descriptor.
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    let status = unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) };
-    if status != 0 {
-        return None;
-    }
-    Some((u64::try_from(stat.st_dev).unwrap_or(u64::MAX), stat.st_ino))
 }
 
 /// Record one component read of a no-follow walk.

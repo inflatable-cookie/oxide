@@ -1061,6 +1061,23 @@ alone is insufficient.
   86249e2c permits one test-only fstat on the held descriptor for identity
   observation only; its failure does not change the real read or policy. This
   inventory is not proof that every direct read in the contract is taped.
+  Only `prune::read_bounded` uses the approved additional held-descriptor
+  fstat. Other authority-read sites preserve the actual read outcome while
+  marking descriptor and parent identity unproven. The tape does not issue
+  later path or descriptor syscalls to manufacture identities; it uses the
+  existing metadata result for the removable registration, admission lock and
+  volume path verification, and existing `fstatat`/`fstat` outcomes for the
+  revalidation walk. Sites without those facts remain insufficient. The
+  authority deadline is not reconstructed from wall time; its monotonic binding
+  remains unproven until captured from the actual decision input.
+- **Schema coordination.** The proposed shared manifest carries Barge's
+  `barge.volume_uuid`, `namespace`, `area`, optional `named_roots` and
+  `volume_mount`. Barge's small consumption surface ignores the remaining
+  envelope; Oxide's proposal additionally requires the window, source,
+  fixture, dynamic, mandatory-observation, expected-effect and expected
+  fields. The minimal Barge fixture alone is therefore not a complete shared
+  manifest. Retained review of one common shape remains required before either
+  harness treats it as an accepted interface.
 - **Fixture configuration.** Preparation uses `config::Facts` with injected
   platform-directory inputs; the evaluator child uses the existing debug-only
   `OXIDE_TEST_HOME_FROM_ENV=1` control and explicit fixture paths. The child
@@ -1081,7 +1098,16 @@ alone is insufficient.
   focused run, actual config, state/registry, cache and pool destinations must
   bind private scratch and an effect-free preflight must produce a zero-delta
   live-state inventory. The test-only path preflight calls the existing config
-  functions without opening a pool; its debug cfg must match the wrapper. For this task only, the planner amended
+  functions without opening a pool; its debug cfg must match the wrapper.
+  The current `proof:tape-prune:preflight-build` selector itself runs
+  `oxide test --no-run`, which enters `Store::open_or_create` and may create
+  or register a pool before the resolver executable runs. It therefore cannot
+  establish its own pre-registration confinement. The `OXIDE_POOL` source
+  branch skips `config::remember_pool`, but the saved packet does not bind
+  every executable and subprocess and cannot attribute the live inode change.
+  A replacement route must establish these bindings before that effect and
+  satisfy the independent live-state gate; the failed packet is not evidence
+  of isolation. For this task only, the planner amended
   the private Builds scratch cap prospectively from 2 GiB to 3 GiB, counting
   earlier and current roots and preserving their evidence; the cumulative
   1200 s wall, reserve and account inventory gates remain unchanged. At the

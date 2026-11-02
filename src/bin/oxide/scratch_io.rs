@@ -81,17 +81,24 @@ fn read_document(path: &Path, limit: u64) -> ReadDocument {
         return ReadDocument::Invalid;
     }
     let mut bytes = Vec::new();
+    #[cfg(not(test))]
     if file.take(limit + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 > limit {
-        #[cfg(test)]
-        crate::tape::read_row(
-            "scratch-io:read-document:bytes",
-            path,
-            crate::tape::TapeOutcome::Refusal {
-                reason: "over its byte limit".to_owned(),
-            },
-            limit,
-        );
         return ReadDocument::Invalid;
+    }
+    #[cfg(test)]
+    {
+        let result = file.take(limit + 1).read_to_end(&mut bytes);
+        if result.is_err() || bytes.len() as u64 > limit {
+            let reason = match result {
+                Err(error) => format!("read failed: {error}"),
+                Ok(_) => "over its byte limit".to_owned(),
+            };
+            crate::tape::read_row(
+                "scratch-io:read-document:bytes", path,
+                crate::tape::TapeOutcome::Refusal { reason }, limit,
+            );
+            return ReadDocument::Invalid;
+        }
     }
     #[cfg(test)]
     crate::tape::read_row(

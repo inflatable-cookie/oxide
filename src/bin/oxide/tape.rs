@@ -23,7 +23,6 @@
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -386,24 +385,12 @@ fn identity_key(identity: &TapeIdentity) -> String {
 }
 
 fn file_identity(path: &Path, outcome: &TapeOutcome) -> TapeIdentity {
-    let parent = path.parent().map(|p| p.to_path_buf());
-    let (parent_dev, parent_ino) = parent
-        .as_deref()
-        .and_then(|p| std::fs::metadata(p).ok())
-        .map(|m| {
-            use std::os::unix::fs::MetadataExt;
-            (Some(m.dev()), Some(m.ino()))
-        })
-        .unwrap_or((None, None));
+    // A later pathname lookup does not identify the object used by the leaf.
+    // Keep only identity returned by the leaf itself; parent binding is absent.
+    let (parent_dev, parent_ino) = (None::<u64>, None::<u64>);
     let (dev, ino) = match outcome {
         TapeOutcome::Opened { dev, ino } => (Some(*dev), Some(*ino)),
-        _ => std::fs::symlink_metadata(path)
-            .ok()
-            .map(|m| {
-                use std::os::unix::fs::MetadataExt;
-                (Some(m.dev()), Some(m.ino()))
-            })
-            .unwrap_or((None, None)),
+        _ => (None, None),
     };
     let key = format!(
         "file:{path}|parent={parent_dev:?}/{parent_ino:?}|dev={dev:?}/ino={ino:?}",
@@ -422,13 +409,12 @@ fn file_identity(path: &Path, outcome: &TapeOutcome) -> TapeIdentity {
     }
 }
 
-/// Record one complete read row for an object at `path`. The identity is
-/// bound from the live tree (parent and own device/inode); a truncated or
-/// over-cap row is still recorded, marked by the transcript's truncation
-/// facts.
+/// Record the facts supplied by a leaf. Unknown identities remain unproven;
+/// the recorder does not make a later pathname lookup to invent a binding.
 pub(crate) fn read_row(kind: &str, path: &Path, outcome: TapeOutcome, cap: u64) {
     with_state(|state| {
         let identity = file_identity(path, &outcome);
+        state.notes.push(format!("object or parent identity unproven at {kind}"));
         let key = format!("{kind}|{}", identity_key(&identity));
         let (occurrence, counted) = occurrence(state, &key);
         let epoch = next_epoch(state);
@@ -455,45 +441,7 @@ pub(crate) fn read_row_dev(
     outcome: TapeOutcome,
     cap: u64,
 ) {
-    with_state(|state| {
-        let parent = path.parent().map(|p| p.to_path_buf());
-        let (parent_dev, parent_ino) = parent
-            .as_deref()
-            .and_then(|p| std::fs::metadata(p).ok())
-            .map(|m| {
-                use std::os::unix::fs::MetadataExt;
-                (Some(m.dev()), Some(m.ino()))
-            })
-            .unwrap_or((None, None));
-        let key = format!(
-            "file:{path}|parent={parent_dev:?}/{parent_ino:?}|dev={dev}/ino={ino}",
-            path = path.display()
-        );
-        let identity = TapeIdentity {
-            path: Some(path.display().to_string()),
-            parent_dev,
-            parent_ino,
-            dev: Some(dev),
-            ino: Some(ino),
-            uuid: None,
-            mount_point: None,
-            device: None,
-            key: key.clone(),
-        };
-        let (occurrence, counted) = occurrence(state, &format!("{kind}|{key}"));
-        let epoch = next_epoch(state);
-        let row = TapeReadRow {
-            kind: kind.to_owned(),
-            identity,
-            outcome,
-            cap,
-            epoch,
-            occurrence,
-        };
-        if counted {
-            push_read(state, row);
-        }
-    });
+    read_row_without_parent(kind, path, dev, ino, outcome, cap);
 }
 
 /// Record one component read of a no-follow walk: the component name bound to
@@ -536,6 +484,28 @@ pub(crate) fn component_row(
         };
         if counted {
             push_read(state, row);
+        }
+    });
+}
+
+/// Record an actual component result when its held parent was not itself
+/// observed at this epoch. The missing parent never becomes a complete key.
+pub(crate) fn component_without_parent(kind: &str, name: &std::ffi::OsStr, outcome: TapeOutcome) {
+    with_state(|state| {
+        let (dev, ino) = match &outcome {
+            TapeOutcome::Opened { dev, ino } => (Some(*dev), Some(*ino)),
+            _ => (None, None),
+        };
+        let key = format!("component:parent=unproven|name={name:?}|dev={dev:?}/ino={ino:?}");
+        let identity = TapeIdentity {
+            path: None, parent_dev: None, parent_ino: None, dev, ino,
+            uuid: None, mount_point: None, device: None, key: key.clone(),
+        };
+        state.notes.push(format!("component parent identity unproven at {kind}"));
+        let (occurrence, counted) = occurrence(state, &format!("{kind}|{key}"));
+        let epoch = next_epoch(state);
+        if counted {
+            push_read(state, TapeReadRow { kind: kind.to_owned(), identity, outcome, cap: 0, epoch, occurrence });
         }
     });
 }
@@ -723,6 +693,7 @@ pub(crate) fn authority_bind(site: &str, path: &Path, cap: u64) {
         };
         let outcome = pending.outcome;
         let identity = file_identity(path, &outcome);
+        state.notes.push(format!("descriptor and parent identity unproven at {site}"));
         let key = format!("{site}|{}", identity.key);
         let (occurrence, counted) = occurrence(state, &key);
         let epoch = next_epoch(state);
@@ -828,8 +799,10 @@ pub(crate) fn lock_row(kind: &str, path: &Path, outcome: TapeOutcome) {
 
 /// The authority budget's beginning: its deadline and input allowance are the
 /// budget state every read charges against.
-pub(crate) fn budget_begin(deadline_ms: u64, allowance_bytes: u64) {
-    clock_row("authority-budget-deadline-ms", deadline_ms);
+pub(crate) fn budget_begin(allowance_bytes: u64) {
+    with_state(|state| {
+        state.notes.push("authority monotonic deadline identity unproven".to_owned());
+    });
     classify_row(
         "authority-budget",
         "allowance",
@@ -846,24 +819,13 @@ pub(crate) fn budget_end(failed: bool, remaining: u64) {
     );
 }
 
-/// Test-only helpers for statements whose site holds a descriptor or path but
-/// no recorded identity: one real observation of the live tree, used only to
-/// bind a row's identity facts.
-pub(crate) fn path_dev_ino(path: &Path) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::symlink_metadata(path)
-        .ok()
-        .map(|m| (m.dev(), m.ino()))
-}
-
-pub(crate) fn fd_dev_ino(fd: std::os::fd::BorrowedFd<'_>) -> Option<(u64, u64)> {
-    // SAFETY: `fstat` has no preconditions beyond a live descriptor.
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    let status = unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) };
-    if status != 0 {
-        return None;
-    }
-    Some((u64::try_from(stat.st_dev).unwrap_or(u64::MAX), stat.st_ino))
+/// An observation site without a captured syscall result is insufficient.
+/// Never issue a second path or descriptor syscall to fill that gap.
+pub(crate) fn fd_dev_ino(_fd: std::os::fd::BorrowedFd<'_>) -> Option<(u64, u64)> {
+    with_state(|state| {
+        state.notes.push("descriptor identity unproven at observation site".to_owned());
+    });
+    None
 }
 
 /// Test-only helper: SHA-256 of bytes, lowercase hex.

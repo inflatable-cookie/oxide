@@ -5883,20 +5883,10 @@ fn open_admission_file(control: &Path, create: bool) -> Result<Option<File>, Str
         if tape_created {
             crate::tape::effect_row("lock-create@admission", &path);
         }
-        match crate::tape::path_dev_ino(&path) {
-            Some((dev, ino)) => crate::tape::read_row(
-                "admission-lock:open",
-                &path,
-                crate::tape::TapeOutcome::Opened { dev, ino },
-                0,
-            ),
-            None => crate::tape::read_row(
-                "admission-lock:open",
-                &path,
-                crate::tape::TapeOutcome::Absent,
-                0,
-            ),
-        }
+        crate::tape::read_row_dev(
+            "admission-lock:open", &path, metadata.dev(), metadata.ino(),
+            crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0,
+        );
     }
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
