@@ -271,7 +271,7 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        write_private_dir(parent)?;
     }
     let mut file = std::fs::OpenOptions::new()
         .write(true)

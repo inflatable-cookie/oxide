@@ -1069,7 +1069,12 @@ alone is insufficient.
   scratch. Before bootstrap and after each execution, compare bounded no-follow
   inventories of the complete live Oxide account state; any change or unknown
   fails the run. The installed release binary remains unchanged, and this
-  authority is not a general Cargo fallback.
+  authority is not a general Cargo fallback. For this task only, the planner amended
+  the private Builds scratch cap prospectively from 2 GiB to 3 GiB, counting
+  earlier and current roots and preserving their evidence; the cumulative
+  1200 s wall, reserve and account inventory gates remain unchanged. At the
+  amendment the measured roots were 29 MiB, 329 MiB and 1525 MiB; the
+  historical 2 GiB limit remains bound to the earlier runs.
   Preserve the earlier contaminated sessions and the operator's live-state
   disposition separately in Queue.
 - **Harness composition.** The harness crate re-roots the actual library and

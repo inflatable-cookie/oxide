@@ -1461,4 +1461,4 @@ exit $status"""
 # CARGO_HOME, CARGO_TARGET_DIR and HOME under owned Builds scratch.
 [tasks."proof:tape-prune:bootstrap"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 1600 -- cargo build --offline --locked --bin oxide"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 2400 -- cargo build --offline --locked --bin oxide"
