@@ -397,8 +397,12 @@ fn schema_matches(value: &serde_json::Value, schema: &serde_json::Value) -> bool
             return false;
         }
         if let Some(pattern) = spec.get("pattern") {
-            if pattern.as_str() != Some("^[0-9a-f]{64}$")
-                || text.len() != 64
+            let length = match pattern.as_str() {
+                Some("^[0-9a-f]{40}$") => 40,
+                Some("^[0-9a-f]{64}$") => 64,
+                _ => return false,
+            };
+            if text.len() != length
                 || !text
                     .bytes()
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -673,18 +677,18 @@ fn validate_engine_environment(root: &Path) -> Result<(), String> {
     }
     for (name, _) in std::env::vars_os() {
         let name = name.to_string_lossy();
-        if (name.starts_with("XDG_") || name.starts_with("OXIDE_"))
-            && !matches!(
-                name.as_ref(),
-                "OXIDE_TEST_HOME_FROM_ENV"
-                    | "OXIDE_CONFIG"
-                    | "OXIDE_POOL"
-                    | "OXIDE_POOL_CAP"
-                    | "OXIDE_SCRATCH_ROOT"
-            )
-        {
+        if !matches!(
+            name.as_ref(),
+            "HOME" | "PATH" | "OXIDE_TEST_HOME_FROM_ENV" | "OXIDE_CONFIG"
+                | "OXIDE_POOL" | "OXIDE_POOL_CAP" | "OXIDE_SCRATCH_ROOT"
+        ) {
             return Err(format!("unexpected environment control {name}"));
         }
+    }
+    if std::env::var_os("PATH").as_deref()
+        != Some(std::ffi::OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin"))
+    {
+        return Err("fixture PATH is not the fixed system path".to_owned());
     }
     if std::env::var_os("OXIDE_POOL_CAP").as_deref() != Some(std::ffi::OsStr::new("1073741824")) {
         return Err("fixture pool cap is missing or invalid".to_owned());
@@ -1109,6 +1113,7 @@ fn run_case(
     manifest_path: &Path,
     transcript_out: &Path,
     case: &str,
+    disconnected: bool,
 ) -> Result<(), String> {
     validate_fixture_path(fixture_root, transcript_out)?;
     match std::fs::symlink_metadata(transcript_out) {
@@ -1119,6 +1124,9 @@ fn run_case(
     // Configuration resolution reads real files; open the same tape before
     // preflight so those observations belong to this transcript.
     tape::begin(ENGINE, case, "", "oxide::prune::tape_entry::run_chain");
+    if disconnected {
+        tape::disconnect_pool_lock_for_counterfactual();
+    }
     let preflight = validate_engine_environment(fixture_root);
     let read = (|| -> Result<Vec<u8>, String> {
         use std::io::Read;
@@ -1175,6 +1183,7 @@ fn run_case(
                 TapeEngineOutcome::Refused {
                     reason,
                     exit_code: 2,
+                    source: "apparatus",
                 },
                 None,
             )
@@ -1192,6 +1201,7 @@ fn run_case(
                 TapeEngineOutcome::Refused {
                     reason,
                     exit_code: 2,
+                    source: "apparatus",
                 },
                 None,
             );
@@ -1205,10 +1215,12 @@ fn run_case(
         Ok(prune::tape_entry::ChainOutcome::Refused(refusal)) => TapeEngineOutcome::Refused {
             reason: refusal.reason,
             exit_code: refusal.exit_code,
+            source: "engine",
         },
         Err(reason) => TapeEngineOutcome::Refused {
             reason,
             exit_code: 1,
+            source: "engine",
         },
     };
     let mut post = tape::capture_fixture(fixture_root);
@@ -1343,6 +1355,24 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
     let mut missing_effect_site = effect_example.clone();
     missing_effect_site["expected_effects"][0].as_object_mut().expect("effect object").remove("site");
     check(validate_manifest_envelope(&missing_effect_site).is_err(), "effect source site is required")?;
+    let mut missing_attempt = effect_example.clone();
+    missing_attempt["expected_effects"][0].as_object_mut().expect("effect object").remove("attempted");
+    check(validate_manifest_envelope(&missing_attempt).is_err(), "effect attempt status is required")?;
+    let mut missing_tree = example.clone();
+    missing_tree["source"].as_object_mut().expect("source object").remove("oxide_tree");
+    check(validate_manifest_envelope(&missing_tree).is_err(), "source tree is required")?;
+    let mut incomplete_unreadable = example.clone();
+    incomplete_unreadable["fixture"]["entries"][2].as_object_mut().expect("entry").remove("reason");
+    check(validate_manifest_envelope(&incomplete_unreadable).is_err(),
+        "an unreadable entry requires its actual reason")?;
+    let mut incomplete_directory = example.clone();
+    incomplete_directory["fixture"]["entries"][3].as_object_mut().expect("entry").remove("inode");
+    check(validate_manifest_envelope(&incomplete_directory).is_err(),
+        "a directory entry requires its observed inode")?;
+    let mut unreadable_file = example.clone();
+    unreadable_file["fixture"]["entries"][0]["bytes_sha256"] = serde_json::Value::Null;
+    check(validate_manifest_envelope(&unreadable_file).is_err(),
+        "a present file needs a digest; unreadable files use the refusal variant")?;
     let mut invalid_digest = example.clone();
     invalid_digest["source"]["cargo_lock_sha256"] = "not-a-digest".into();
     check(
@@ -1692,6 +1722,50 @@ fn read_row_cap_check(temp: &Path) -> Result<(), CheckFailure> {
 
 /// The unbound authority read: a pending read left at window close is an
 /// explicit note, never silence.
+fn effect_attempt_check(temp: &Path) -> Result<(), CheckFailure> {
+    tape::begin("oxide", "EFFECT-ATTEMPT", "manifest", "pure");
+    {
+        let _fence = tape::effect_kind_override("fence@expected");
+        tape::effect_row("attempt@temporary-open", Path::new("/fixture/temp"));
+        tape::effect_row("attempt-save@temporary-write", Path::new("/fixture/temp"));
+        tape::effect_row("attempt-rename@temporary-move", Path::new("/fixture/destination"));
+        tape::effect_row("save@control-state", Path::new("/fixture/state"));
+    }
+    let transcript = temp.join("effect-attempt.json");
+    tape::finish_and_write(&transcript, TapeEngineOutcome::Completed {
+        result: serde_json::json!({"complete": false, "entries": []}),
+    }, None).map_err(|what| CheckFailure { what })?;
+    let doc = read_transcript(&transcript).map_err(|what| CheckFailure { what })?;
+    check(doc.effects.len() == 4, "all attempted and completed effects are retained")?;
+    check(doc.effects[0]["kind"] == "create" && doc.effects[0]["attempted"] == true,
+        "uncertain create stays an attempt")?;
+    check(doc.effects[1]["kind"] == "save" && doc.effects[1]["attempted"] == true,
+        "failed write stays an attempt")?;
+    check(doc.effects[2]["kind"] == "rename" && doc.effects[2]["attempted"] == true,
+        "failed rename stays an attempt")?;
+    check(doc.effects[3]["kind"] == "fence" && doc.effects[3]["site"] == "expected",
+        "temporary attempts do not consume the final fence override")?;
+    check(doc.notes.iter().any(|note| note.contains("attempted effect") && note.contains("insufficient")),
+        "attempts cannot be silently treated as parity")
+}
+
+fn config_inspect_absence_check(temp: &Path) -> Result<(), CheckFailure> {
+    let missing = temp.join("missing-config-inspect-pool");
+    tape::begin("oxide", "CONFIG-INSPECT-ABSENT", "manifest", "pure");
+    let found = config::inspect(&missing);
+    let result = TapeEngineOutcome::Completed {
+        result: serde_json::json!({"complete": false, "entries": []}),
+    };
+    let transcript = temp.join("config-inspect-absent.json");
+    tape::finish_and_write(&transcript, result, None).map_err(|what| CheckFailure { what })?;
+    let doc = read_transcript(&transcript).map_err(|what| CheckFailure { what })?;
+    check(found == config::Found::Absent, "the actual missing pool is absent")?;
+    check(doc.reads.iter().any(|row| {
+        row.get("kind").and_then(|value| value.as_str()) == Some("config:inspect:initial")
+            && row.pointer("/outcome/type").and_then(|value| value.as_str()) == Some("absent")
+    }), "the actual missing metadata result is taped")
+}
+
 fn unbound_authority_note_check(temp: &Path) -> Result<(), CheckFailure> {
     tape::begin("oxide", "PURE-UNBOUND", "manifest", "pure");
     tape::authority_core(b"bytes", 64, false, false);
@@ -1736,7 +1810,7 @@ fn has_read(rows: &[serde_json::Value], kind: &str) -> bool {
         .any(|row| row.get("kind").and_then(|value| value.as_str()) == Some(kind))
 }
 
-fn fixture_case(temp: &Path, case: Case) -> Result<(), CheckFailure> {
+fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), CheckFailure> {
     let spec = FixtureSpec {
         case,
         volume: fixture_volume(temp),
@@ -1746,7 +1820,8 @@ fn fixture_case(temp: &Path, case: Case) -> Result<(), CheckFailure> {
         registry: !matches!(case, Case::RegistryMissing),
         intent: matches!(case, Case::UnsettledIntent),
     };
-    let root = temp.join(format!("fixture-{}", case.name().to_lowercase()));
+    let root = temp.join(format!("fixture-{}{}", case.name().to_lowercase(),
+        if disconnected { "-disconnected" } else { "" }));
     let paths = build_fixture(&root, &spec).map_err(|error| CheckFailure { what: error })?;
     // Schema-example data is a unit-test envelope, not source or fixture
     // qualification evidence. X-S2 supplies observed manifest facts.
@@ -1795,7 +1870,11 @@ fn fixture_case(temp: &Path, case: Case) -> Result<(), CheckFailure> {
             root.join("scratch").display().to_string(),
         ));
     }
-    let output = Command::new(&exe)
+    let mut command = Command::new(&exe);
+    if disconnected {
+        command.arg("--counterfactual-disconnected");
+    }
+    let output = command
         .arg("--fixture-root")
         .arg(&root)
         .arg("--manifest")
@@ -1806,7 +1885,7 @@ fn fixture_case(temp: &Path, case: Case) -> Result<(), CheckFailure> {
         .arg(case.name())
         .env_clear()
         .envs(envs)
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .output()
         .map_err(|error| CheckFailure {
             what: format!("cannot run the engine child: {error}"),
@@ -1838,6 +1917,11 @@ fn fixture_case(temp: &Path, case: Case) -> Result<(), CheckFailure> {
         doc.manifest_sha256 == manifest_sha,
         "the transcript binds the manifest digest",
     )?;
+    check(doc.clocks.iter().any(|clock| {
+        clock.get("kind").and_then(|value| value.as_str())
+            == Some("authority:begin:window-offset-ns")
+            && clock.get("value").and_then(|value| value.as_u64()).is_some()
+    }), "the actual authority start has a monotonic offset from this window")?;
     let diff_effects: Vec<serde_json::Value> = doc
         .fixture_capture
         .as_ref()
@@ -1863,10 +1947,31 @@ fn fixture_case(temp: &Path, case: Case) -> Result<(), CheckFailure> {
             )],
             _ => unreachable!(),
         };
+        let transient_count = if case == Case::Effect2 { 2 } else { 0 };
+        let completed_effects = doc.effects.iter().filter(|effect| {
+            effect.get("attempted").and_then(|value| value.as_bool()) == Some(false)
+        }).count();
         check(
-            doc.effects.len() == expected.len() && diff_effects.len() == expected.len(),
-            "declared, taped and observed effect counts agree",
+            completed_effects == expected.len() + transient_count && diff_effects.len() == expected.len(),
+            "completed transient and persistent effects match their declared counts",
         )?;
+        check(doc.effects.iter().any(|effect| {
+            effect.get("site").and_then(|value| value.as_str()) == Some("pool-lock-open")
+                && effect.get("attempted").and_then(|value| value.as_bool()) == Some(true)
+        }), "the O_CREAT pool-lock open remains an explicitly uncertain attempt")?;
+        if case == Case::Effect2 {
+            for (kind, site, attempted) in [
+                ("create", "managed-admission-open", true),
+                ("create", "managed-control-temp", false),
+                ("save", "managed-control-temp", false),
+            ] {
+                check(doc.effects.iter().filter(|effect| {
+                    effect.get("kind").and_then(|value| value.as_str()) == Some(kind)
+                        && effect.get("site").and_then(|value| value.as_str()) == Some(site)
+                        && effect.get("attempted").and_then(|value| value.as_bool()) == Some(attempted)
+                }).count() == 1, "the reached temporary or uncertain effect occurs exactly once")?;
+            }
+        }
         for (taped, site, diff, rel) in expected {
             check(
                 doc.effects.iter().any(|effect| {
@@ -1959,13 +2064,24 @@ fn fixture_case(temp: &Path, case: Case) -> Result<(), CheckFailure> {
                 )?;
             }
             check(
-                has_read(&doc.reads, "pool:lock"),
-                "the actual library pool lock reaches the evaluator tape",
+                has_read(&doc.reads, "pool:lock") != disconnected,
+                "the reached library pool lock distinguishes the connected sink",
             )?;
+            if disconnected {
+                check(doc.notes.iter().any(|note| note.contains("counterfactual: pool lock")
+                    && note.contains("insufficient")),
+                    "the actual disconnected engine run is explicitly insufficient")?;
+            }
+            check(has_read(&doc.reads, "pool:entries:read-dir-open")
+                && has_read(&doc.reads, "pool:entries:end")
+                && has_read(&doc.reads, "pool:payload-entries:read-dir-open")
+                && has_read(&doc.reads, "pool:payload-entries:end"),
+                "the actual pool and payload enumeration opens and ends reach the tape")?;
             check(
-                doc.effects.is_empty() && diff_effects.is_empty(),
+                doc.effects.iter().all(|effect| effect.get("attempted").and_then(|v| v.as_bool()) == Some(true))
+                    && diff_effects.is_empty(),
                 &format!(
-                    "the STATIC BASE case records zero effects (tape {:?}, diff {:?})",
+                    "BASE has no confirmed effect; uncertain attempts remain insufficient (tape {:?}, diff {:?})",
                     doc.effects, diff_effects
                 ),
             )?;
@@ -2044,9 +2160,12 @@ fn fixture_case(temp: &Path, case: Case) -> Result<(), CheckFailure> {
                 exit == 2,
                 "the registry refusal carries the engine's exit code",
             )?;
+            check(doc.outcome.get("source").and_then(|v| v.as_str()) == Some("engine"),
+                "the registry refusal is attributed to the engine")?;
             check(
-                doc.effects.is_empty() && diff_effects.is_empty(),
-                "a pre-evaluate refusal writes nothing",
+                doc.effects.iter().all(|effect| effect.get("attempted").and_then(|v| v.as_bool()) == Some(true))
+                    && diff_effects.is_empty(),
+                "a pre-evaluate refusal has no confirmed effect; attempts remain insufficient",
             )?;
         }
         Case::UnsettledIntent => {
@@ -2065,8 +2184,9 @@ fn fixture_case(temp: &Path, case: Case) -> Result<(), CheckFailure> {
                 .unwrap_or(0);
             check(exit == 3, "the unsettled refusal carries exit 3")?;
             check(
-                doc.effects.is_empty() && diff_effects.is_empty(),
-                "the unsettled refusal writes nothing",
+                doc.effects.iter().all(|effect| effect.get("attempted").and_then(|v| v.as_bool()) == Some(true))
+                    && diff_effects.is_empty(),
+                "the unsettled refusal has no confirmed effect; attempts remain insufficient",
             )?;
         }
     }
@@ -2087,6 +2207,8 @@ fn self_check(pure_only: bool) -> Result<(), String> {
         occurrence_cap_check(&dir).map_err(|failure| failure.what)?;
         read_row_cap_check(&dir).map_err(|failure| failure.what)?;
         unbound_authority_note_check(&dir).map_err(|failure| failure.what)?;
+        config_inspect_absence_check(&dir).map_err(|failure| failure.what)?;
+        effect_attempt_check(&dir).map_err(|failure| failure.what)?;
         if !pure_only {
             let external = fixture_volume(&dir).is_some();
             for case in [
@@ -2096,8 +2218,9 @@ fn self_check(pure_only: bool) -> Result<(), String> {
                 Case::Effect1,
                 Case::Effect2,
             ] {
-                fixture_case(&dir, case).map_err(|failure| failure.what)?;
+                fixture_case(&dir, case, false).map_err(|failure| failure.what)?;
             }
+            fixture_case(&dir, Case::Base, true).map_err(|failure| failure.what)?;
             let _ = external;
         }
         Ok(())
@@ -2120,7 +2243,15 @@ fn usage() -> String {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let disconnected = args.first().is_some_and(|arg| arg == "--counterfactual-disconnected");
+    if disconnected {
+        args.remove(0);
+        if args.first().map(String::as_str) != Some("--fixture-root") {
+            eprintln!("oxide: disconnected counterfactual requires the fixture entry");
+            std::process::exit(2);
+        }
+    }
     if args.is_empty() {
         let code = match self_check(false) {
             Ok(()) => 0,
@@ -2204,7 +2335,7 @@ fn main() {
             let parsed = parse();
             let code = match parsed {
                 Ok((fixture_root, manifest, transcript_out, case)) => {
-                    match run_case(&fixture_root, &manifest, &transcript_out, &case) {
+                    match run_case(&fixture_root, &manifest, &transcript_out, &case, disconnected) {
                         Ok(()) => {
                             println!(
                                 "oxide: prune capture harness wrote {} for {}",

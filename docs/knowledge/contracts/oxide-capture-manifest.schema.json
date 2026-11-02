@@ -90,6 +90,10 @@
         "barge_executable_sha256": {
           "type": "string",
           "pattern": "^[0-9a-f]{64}$"
+        },
+        "oxide_tree": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
         }
       },
       "required": [
@@ -104,7 +108,8 @@
         "oxide_toolchain",
         "barge_toolchain",
         "oxide_executable_sha256",
-        "barge_executable_sha256"
+        "barge_executable_sha256",
+        "oxide_tree"
       ],
       "additionalProperties": false
     },
@@ -147,8 +152,59 @@
                     "minimum": 0
                   },
                   "kind": {
+                    "const": "file"
+                  },
+                  "bytes_sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "size": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "device": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "inode": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "mode": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "required": [
+                  "rel",
+                  "parent_device",
+                  "parent_inode",
+                  "kind",
+                  "bytes_sha256",
+                  "size",
+                  "device",
+                  "inode",
+                  "mode"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "rel": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "parent_device": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "parent_inode": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "kind": {
                     "enum": [
-                      "file",
                       "directory",
                       "symlink"
                     ]
@@ -601,7 +657,8 @@
         "required": [
           "kind",
           "site",
-          "path"
+          "path",
+          "attempted"
         ],
         "additionalProperties": false
       },

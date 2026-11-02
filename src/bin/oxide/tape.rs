@@ -131,7 +131,7 @@ pub(crate) struct TapeClassifyRow {
 #[serde(rename_all = "snake_case", tag = "state")]
 pub(crate) enum TapeEngineOutcome {
     Completed { result: serde_json::Value },
-    Refused { reason: String, exit_code: u8 },
+    Refused { reason: String, exit_code: u8, source: &'static str },
 }
 
 /// Truncation facts: which cap closed the document, never a quiet drop.
@@ -216,6 +216,8 @@ struct TapeState {
     pending_authority: Option<PendingAuthorityRead>,
     /// The next effect row's replacement kind, consumed once.
     pending_effect_kind: Option<String>,
+    disconnected_pool_lock: bool,
+    disconnected_lock_observations: Vec<(PathBuf, TapeOutcome)>,
 }
 
 struct PendingAuthorityRead {
@@ -252,6 +254,8 @@ pub(crate) fn begin(engine: &str, case: &str, manifest_sha256: &str, entrypoint:
             notes: Vec::new(),
             pending_authority: None,
             pending_effect_kind: None,
+            disconnected_pool_lock: false,
+            disconnected_lock_observations: Vec::new(),
         });
     });
 }
@@ -276,6 +280,10 @@ pub(crate) fn finish_and_write(
     let mut transcript = {
         let state = taken.ok_or_else(|| "the observation tape was not active".to_owned())?;
         let mut notes = state.notes.clone();
+        if state.disconnected_pool_lock {
+            notes.push(format!("counterfactual diverted pool-lock observations: {}",
+                state.disconnected_lock_observations.len()));
+        }
         notes.push("absolute monotonic window origin and end unproven".to_owned());
         if state.pending_authority.is_some() {
             notes.push(
@@ -318,9 +326,10 @@ pub(crate) fn finish_and_write(
                 TapeEngineOutcome::Completed { .. } => TapeEngineOutcome::Completed {
                     result: serde_json::json!({"truncated": true}),
                 },
-                TapeEngineOutcome::Refused { exit_code, .. } => TapeEngineOutcome::Refused {
+                TapeEngineOutcome::Refused { exit_code, source, .. } => TapeEngineOutcome::Refused {
                     reason: "refusal detail exceeded the document cap".to_owned(),
                     exit_code,
+                    source,
                 },
             };
             bytes = serde_json::to_vec(&transcript).map_err(|error| error.to_string())?;
@@ -566,22 +575,52 @@ pub(crate) fn volume_row(
     });
 }
 
+/// An actual effect at a descriptor-only site that cannot bind a path is
+/// explicitly insufficient; a pathname is never guessed after the operation.
+pub(crate) fn unbound_effect(site: &str, succeeded: bool) {
+    let saved_errno = observer_errno();
+    with_state(|state| {
+        if state.notes.len() >= MAX_READ_ROWS {
+            state.truncation.document_truncated = true;
+        } else {
+            state.notes.push(format!(
+                "descriptor-only effect at {site}: succeeded={succeeded}; identity unproven; insufficient"
+            ));
+        }
+    });
+    restore_observer_errno(saved_errno);
+}
+
 /// Record a completed effect or an explicitly unqualified create attempt.
 /// Internal labels carry `kind@site`; serialized fields separate them. A fence
 /// override relabels only the next save, avoiding a duplicate effect row.
 pub(crate) fn effect_row(kind: &str, path: &Path) {
+    let saved_errno = observer_errno();
     with_state(|state| {
         let epoch = next_epoch(state);
-        let kind = state
-            .pending_effect_kind
-            .take()
-            .unwrap_or_else(|| kind.to_owned());
+        let kind = if kind == "save@control-state" {
+            state.pending_effect_kind.take().unwrap_or_else(|| kind.to_owned())
+        } else {
+            kind.to_owned()
+        };
         let (verb, site) = kind.split_once('@').unwrap_or((&kind, "unknown"));
-        let attempted = verb == "attempt";
-        let verb = if attempted { "create" } else { verb };
+        let attempted = matches!(verb, "attempt" | "attempt-save" | "attempt-rename");
+        let verb = match verb {
+            "attempt" => "create",
+            "attempt-save" => "save",
+            "attempt-rename" => "rename",
+            _ => verb,
+        };
         if !matches!(verb, "create" | "save" | "fence" | "reconcile" | "lock-create" | "rename" | "unlink") {
             state.notes.push(format!("unknown effect kind at {kind}"));
             return;
+        }
+        if state.effects.len() >= MAX_READ_ROWS {
+            state.truncation.document_truncated = true;
+            return;
+        }
+        if attempted {
+            state.notes.push(format!("attempted effect at {site} remains insufficient"));
         }
         state.effects.push(TapeEffectRow {
             kind: verb.to_owned(),
@@ -592,6 +631,7 @@ pub(crate) fn effect_row(kind: &str, path: &Path) {
         });
         charge_document(state, 96);
     });
+    restore_observer_errno(saved_errno);
 }
 
 /// Relabel the next effect row (and only that one) with `kind`. The guard
@@ -621,6 +661,31 @@ pub(crate) fn clock_row(kind: &str, value_ms: u64) {
         });
         charge_document(state, 48);
     });
+}
+
+/// Record an Instant the policy already sampled, relative to this window's
+/// own monotonic start. This does not infer a system-wide monotonic origin.
+pub(crate) fn monotonic_observed(kind: &str, observed: Instant) {
+    let saved_errno = observer_errno();
+    with_state(|state| {
+        if state.clocks.len() >= MAX_READ_ROWS {
+            state.truncation.document_truncated = true;
+            return;
+        }
+        match observed.checked_duration_since(state.started) {
+            Some(duration) => {
+                let epoch = next_epoch(state);
+                state.clocks.push(TapeClockRow {
+                    kind: kind.to_owned(),
+                    value: u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
+                    epoch,
+                });
+                charge_document(state, 48);
+            }
+            None => state.notes.push(format!("monotonic reading before window at {kind}; insufficient")),
+        }
+    });
+    restore_observer_errno(saved_errno);
 }
 
 /// A clock the engine could not obtain remains explicitly unproven.
@@ -790,9 +855,59 @@ pub(crate) fn pool_row(kind: &str, pool: &Path, outcome: TapeOutcome) {
     read_row(kind, pool, outcome, 0);
 }
 
+/// A held descriptor's already-observed identity, without inventing its path,
+/// parent or process-start identity.
+pub(crate) fn descriptor_row(site: &str, fd: i32, outcome: TapeOutcome) {
+    let saved_errno = observer_errno();
+    with_state(|state| {
+        let (dev, ino) = match &outcome {
+            TapeOutcome::Opened { dev, ino } => (Some(*dev), Some(*ino)),
+            _ => (None, None),
+        };
+        let identity = TapeIdentity {
+            path: None, parent_dev: None, parent_ino: None, dev, ino,
+            uuid: None, mount_point: None, device: None,
+            key: format!("descriptor:{fd}|process-start=unproven|dev={dev:?}|ino={ino:?}"),
+        };
+        if state.notes.len() < MAX_READ_ROWS {
+            state.notes.push(format!("descriptor path, parent and process-start unproven at {site}"));
+        } else {
+            state.truncation.document_truncated = true;
+        }
+        let (occurrence, counted) = occurrence(state, &format!("{site}|{}", identity.key));
+        let epoch = next_epoch(state);
+        if counted {
+            push_read(state, TapeReadRow { kind: site.to_owned(), identity, outcome,
+                cap: 0, epoch, occurrence });
+        }
+    });
+    restore_observer_errno(saved_errno);
+}
+
 /// Record one lock outcome (admission locks, pool locks).
 pub(crate) fn lock_row(kind: &str, path: &Path, outcome: TapeOutcome) {
-    read_row(kind, path, outcome, 0);
+    let disconnected = with_state(|state| {
+        if kind == "pool:lock" && state.disconnected_pool_lock {
+            if state.disconnected_lock_observations.len() < MAX_READ_ROWS {
+                state.disconnected_lock_observations.push((path.to_path_buf(), outcome.clone()));
+            } else {
+                state.truncation.read_rows_truncated = true;
+            }
+            state.notes.push("counterfactual: pool lock routed away from shared tape; insufficient".to_owned());
+            true
+        } else {
+            false
+        }
+    }).unwrap_or(false);
+    if !disconnected {
+        read_row(kind, path, outcome, 0);
+    }
+}
+
+/// Negative control for the harness's actual engine invocation. It changes
+/// observation only and makes the resulting transcript explicitly insufficient.
+pub(crate) fn disconnect_pool_lock_for_counterfactual() {
+    with_state(|state| state.disconnected_pool_lock = true);
 }
 
 /// The authority budget's beginning: its deadline and input allowance are the
@@ -1002,4 +1117,44 @@ pub(crate) fn diff_fixture(
     }
     effects.sort_by(|a, b| a.path.cmp(&b.path).then(a.kind.cmp(&b.kind)));
     effects
+}
+
+// Preserve the evaluator thread's errno around test-only observation.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+fn observer_errno_slot() -> Option<*mut libc::c_int> {
+    // SAFETY: libc returns this thread's errno location.
+    Some(unsafe { libc::__errno_location() })
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "ios")))]
+fn observer_errno_slot() -> Option<*mut libc::c_int> {
+    // SAFETY: libc returns this thread's errno location.
+    Some(unsafe { libc::__error() })
+}
+
+#[cfg(all(
+    test,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))
+))]
+fn observer_errno_slot() -> Option<*mut libc::c_int> {
+    None
+}
+
+#[cfg(test)]
+pub(crate) fn observer_errno() -> Option<libc::c_int> {
+    // SAFETY: the pointer, when available, is this thread's errno slot.
+    observer_errno_slot().map(|slot| unsafe { *slot })
+}
+
+#[cfg(test)]
+pub(crate) fn restore_observer_errno(value: Option<libc::c_int>) {
+    if let (Some(slot), Some(value)) = (observer_errno_slot(), value) {
+        // SAFETY: the pointer is this thread's errno slot.
+        unsafe { *slot = value };
+    }
 }

@@ -1080,19 +1080,37 @@ alone is insufficient.
   harness treats it as an accepted interface. Effect rows use one fixed
   kind (`create`, `save`, `fence`, `reconcile`, `lock-create`, `rename` or
   `unlink`), with a separate source site and an explicit attempted flag;
-  attempted creation is not a successful effect. The all-kinds manifest
-  example exercises that proposed shape.
+  attempted creation is not a successful effect. The actual pool-lock open
+  uses `O_CREAT` without `O_EXCL` even with a prepared lock. A prior pathname
+  metadata observation does not prove what that later open did, so the tape
+  reports an uncertain create attempt and marks the observation insufficient;
+  BASE can have zero confirmed fixture changes without earning parity. The
+  managed-fence path also creates and writes a randomly named temporary file
+  before its rename: the recorder names those actual temporal effects, and a
+  final fixture diff only corroborates the persistent replacement. The shared
+  manifest's exact predeclared path rule cannot predict that random name; this
+  remains an explicit reconciliation gap, never an invented path or a match.
+  The all-kinds manifest example exercises the proposed vocabulary.
 - **Preflight observation.** The tape window begins before fixture configuration
   resolution because that resolution reads config and pool state. Actual config
   and private-file read bytes or errors are recorded without a second read;
   descriptor and parent identities remain explicitly unproven where the real
   operation did not observe them. The absolute monotonic origin/end and the
   authority deadline remain unproven, not a synthetic zero or wall clock.
+  Authority begin, complete and read checks, and accounting's start,
+  per-candidate and completion checks, record the actual `Instant` each
+  policy branch already consumed as an offset from the tape's own monotonic
+  start; a short-circuited branch does not invent a sample. These offsets are
+  not the unknown absolute origin or deadline.
   Fixture snapshot read errors or the 32 MiB byte bound mark the snapshot
-  truncated; a pre/post diff cannot replace effect observations.
+  truncated; a pre/post diff cannot replace effect observations. Refused
+  transcripts identify `source` as `apparatus` for pre-entry validation or
+  `engine` for the actual prune chain; truncation preserves that distinction.
 - **Fixture configuration.** Preparation uses `config::Facts` with injected
   platform-directory inputs; the evaluator child uses the existing debug-only
-  `OXIDE_TEST_HOME_FROM_ENV=1` control and explicit fixture paths. The child
+  `OXIDE_TEST_HOME_FROM_ENV=1` control and explicit fixture paths. Its
+  environment accepts only the fixture HOME, fixed system PATH and those
+  Oxide controls; extra variables or a different PATH refuse. The child
   must check its controls and resolved state and pool before entering the
   engine. This proves no production account-home equivalence. The isolated
   wrapper route for covering checks is task-scoped by decision cf2c3cf4:
@@ -1114,19 +1132,47 @@ alone is insufficient.
   The earlier `proof:tape-prune:preflight-build` selector ran
   `oxide test --no-run`, which enters `Store::open_or_create` and may create
   or register a pool before the resolver executable runs. It could not
-  establish its own pre-registration confinement. The preflight and tape
-  selectors now refuse before invoking Oxide until a source-bound route is
-  established; refusal is not a proof or a completed validation. The `OXIDE_POOL` source
-  branch skips `config::remember_pool`, but the saved packet does not bind
-  every executable and subprocess and cannot attribute the live inode change.
-  A replacement route must establish these bindings before that effect and
-  satisfy the independent live-state gate; the failed packet is not evidence
-  of isolation. The task's prospective debug-bootstrap bound is 300 seconds
+  establish its own pre-registration confinement. The new task-local launcher
+  is unexecuted source: it compares a private git-archive extraction to the
+  current clean task commit/tree and records per-file, lockfile, toolchain,
+  Python, debug binary and exported harness hashes. It supplies only explicit
+  private HOME, config, state-derived home, pool, scratch, cargo home and temp
+  controls; the existing debug home control is `1`. Its build command is a
+  bounded offline debug bootstrap, and its artifact lookup uses Cargo's actual
+  emitted executable path and digest. Each action takes fresh bounded no-follow
+  live inventories before and after its supervised command and stops on any
+  change or unreadable observation. A reviewed budget ledger must account for
+  all retained roots and prior covering seconds; the code checks those supplied
+  roots but cannot prove that the supplied list is complete. The config-only
+  preflight and the subsequent focused harness executions use the same bound
+  executable; a changed source or digest refuses. The monitored context has a
+  retained bootstrap-target sibling and a work subtree: bootstrap monitors the
+  whole context, while later actions monitor work and count the retained target
+  in the aggregate budget. The source archive, private Cargo cache, home, pool
+  and all later output remain inside work. This is not evidence that a test or
+  build subprocess cannot write outside the monitored subtree. The launcher
+  binds a private copy of the Northstar skill for the docs selector and exposes
+  the named covering selectors through task-local wrapper selectors. Nested
+  Effigy admission and every test-built executable still need source review.
+  The covering Rust suite alone accepts a separately pre-created, owner-only
+  internal temporary root for its already-approved boot-Data fixtures; its
+  nested supervisor adopts that root, while TMPDIR and ordinary task inputs
+  stay in Builds work. No other selector uses the exception, and neither root
+  is automatically removed by this launcher. The route is not qualified by
+  these declarations. A source audit must still
+  establish every subprocess's environment, executable, path and destination,
+  and the owner must verify the ledger and actual remaining budget before any
+  invocation. The earlier failed inode packets remain failures, with no repair
+  or attribution assumption. The `OXIDE_POOL` source branch skips
+  `config::remember_pool`, but the saved packet cannot identify a writer and is
+  not evidence of isolation. The task's prospective debug-bootstrap bound is 300 seconds
   and 1024 MiB monitored scratch (the earlier 512 MiB bound remains historical);
   this does not qualify a route or increase the aggregate 6 GiB or 1200-second
   covering limits. The proposed schema requires each writer descriptor target
   to include its path, parent and object device/inode, and descriptor number;
-  the containing writer supplies process identity. This remains a proposal for
+  the containing writer supplies process identity. A regular-file entry needs
+  a digest; an unreadable file uses the explicit refusal variant. `oxide_tree`
+  carries the staged Git tree identity separately from the commit. This remains a proposal for
   the retained reviewer and B-S1/X-S2 reconciliation, not an accepted shape.
   For this task only, the planner amended
   the private Builds scratch cap prospectively from 2 GiB to 3 GiB, counting
@@ -1145,13 +1191,54 @@ alone is insufficient.
 - **Harness composition.** The harness crate re-roots the actual library and
   binary modules and aliases itself as `oxide_storage`, sharing one tape.
   Library observations must come from their actual leaf sites; a fixture diff
-  cannot replace them. `HoldingSweep` belongs to the release command, while
+  cannot replace them. The harness's negative control reruns the actual BASE
+  engine in a fresh fixture and diverts the reached pool-lock observation to a
+  separate bounded test sink. Its transcript explicitly says insufficient;
+  the ordinary BASE run must contain the same library site on the shared tape.
+  This source regression has not yet been executed. `HoldingSweep` belongs to the release command, while
   `paired_store` calls `removable::coordinate`, which only reads registration
   and constructs the sibling store.
   Narrow `cfg(test)`/`cfg(not(test))` splits are permitted at individual
   observation sites: the non-test statement remains verbatim, while the test
   branch calls the real operation once and records its returned value or error.
   Descriptor reads must bind the held descriptor, not a later path lookup.
+- **Source map for this correction.** `config::config_file` and `inspect`
+  preserve their non-test metadata, canonicalization and read statements;
+  their test arms execute each corresponding operation once, record its real
+  result, preserve errno and retain the original branch order and short circuit.
+  `lease::canonical_existing_dir`, `fence_managed_control`, the private-file
+  reader and `pool::lock_pool_inner` keep their non-test calls verbatim and
+  observe actual test-arm results; parent identity is unproven where no held
+  parent was observed. Pool entry names are recorded from the actual iterator,
+  and each existing listed-entry metadata result is taped without a second read.
+  At `pool::refuse_foreign_pool_entries` and
+  `pool::validate_lease_payload_entries`, test-only local `fs` bindings wrap
+  the same real `read_dir` call and its original iterator: open success/error,
+  each returned entry/error and observed end are recorded without a second
+  syscall. The payload wrapper also records the real metadata calls. Non-test
+  loop statements stay verbatim, and parent identity is unproven because the
+  iterator does not expose a bound parent. This is a
+  source claim, not an executed inventory. The engine fixture is a fresh
+  re-exec with `env_clear`; `test_fs` injection and race hooks start as empty
+  thread-local cells, and `volume::verified_facts` starts `None`. The harness
+  does not arm those adapters. Fault-injection debug environment hooks are
+  absent from that child environment; the existing test-home control is set. This documents those reachable seams, not a complete cfg
+  audit or proof that another subprocess kept the same environment.
+  `lease::persist_private_file` and
+  `persist_control_state` retain the non-test write/sync/rename statements;
+  test arms record temp creation, actual write result, cleanup when it succeeds
+  and the final replacement separately, including a write before later sync
+  failure. `store::save` similarly distinguishes an uncertain create/truncate,
+  write result and final rename. `store::private_file` records the actual open
+  and held-descriptor metadata result separately. Descriptor-relative recovery
+  records the actual `stat_at` result without fabricating its parent, and its
+  reached chmod and put-back sites note the real success or failure as an
+  unbound effect; a descriptor-only result without a path is insufficient. In
+  `open_verified_step` the observer runs only after the restoration guard is
+  armed, preserving its custody ordering. These changes are source-only;
+  the remaining `Pool::open` transitive enumeration, other write/error sites,
+  subprocess environment and cfg-equivalence audits are not established by
+  this map and cannot be inferred from a transcript or fixture diff.
 - **The entry.** `prune::tape_entry::run_chain` (cfg(test)) follows the
   `dry_run` prefix exactly — `AuthorityScope::begin`, `paired_store`, the
   optional `read_operator_list`, `require_ready`, the unfinished-intent

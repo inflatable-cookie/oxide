@@ -22,7 +22,8 @@
     "oxide_toolchain": "example",
     "barge_toolchain": "example",
     "oxide_executable_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-    "barge_executable_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    "barge_executable_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "oxide_tree": "0000000000000000000000000000000000000000"
   },
   "fixture": {
     "root": "/example/fixture",
@@ -106,37 +107,43 @@
       "kind": "create",
       "site": "example::create",
       "path": "/example/fixture/create",
-      "attempted": true
+      "attempted": false
     },
     {
       "kind": "save",
       "site": "example::save",
-      "path": "/example/fixture/save"
+      "path": "/example/fixture/save",
+      "attempted": false
     },
     {
       "kind": "fence",
       "site": "example::fence",
-      "path": "/example/fixture/fence"
+      "path": "/example/fixture/fence",
+      "attempted": false
     },
     {
       "kind": "reconcile",
       "site": "example::reconcile",
-      "path": "/example/fixture/reconcile"
+      "path": "/example/fixture/reconcile",
+      "attempted": false
     },
     {
       "kind": "lock-create",
       "site": "example::lock-create",
-      "path": "/example/fixture/lock-create"
+      "path": "/example/fixture/lock-create",
+      "attempted": false
     },
     {
       "kind": "rename",
       "site": "example::rename",
-      "path": "/example/fixture/rename"
+      "path": "/example/fixture/rename",
+      "attempted": false
     },
     {
       "kind": "unlink",
       "site": "example::unlink",
-      "path": "/example/fixture/unlink"
+      "path": "/example/fixture/unlink",
+      "attempted": false
     }
   ],
   "expected": {

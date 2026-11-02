@@ -1704,11 +1704,22 @@ impl AuthorityScope {
             if active.is_some() {
                 return Err("nested authority snapshot".to_owned());
             }
+            #[cfg(not(test))]
             *active = Some(AuthorityBudget {
                 deadline: Instant::now() + SNAPSHOT_TIME,
                 remaining: SNAPSHOT_MAX_BYTES,
                 failed: false,
             });
+            #[cfg(test)]
+            {
+                let started = Instant::now();
+                crate::tape::monotonic_observed("authority:begin:window-offset-ns", started);
+                *active = Some(AuthorityBudget {
+                    deadline: started + SNAPSHOT_TIME,
+                    remaining: SNAPSHOT_MAX_BYTES,
+                    failed: false,
+                });
+            }
             #[cfg(test)]
             crate::tape::budget_begin(SNAPSHOT_MAX_BYTES);
             Ok(Self)
@@ -1718,7 +1729,18 @@ impl AuthorityScope {
     fn complete(&self) -> bool {
         AUTHORITY.with(|cell| {
             cell.borrow().as_ref().is_some_and(|budget| {
-                !budget.failed && budget.remaining > 0 && Instant::now() <= budget.deadline
+                #[cfg(not(test))]
+                { !budget.failed && budget.remaining > 0 && Instant::now() <= budget.deadline }
+                #[cfg(test)]
+                {
+                    if budget.failed || budget.remaining == 0 {
+                        false
+                    } else {
+                        let now = Instant::now();
+                        crate::tape::monotonic_observed("authority:complete:window-offset-ns", now);
+                        now <= budget.deadline
+                    }
+                }
             })
         })
     }
@@ -1752,8 +1774,22 @@ pub(crate) fn authority_read<R: Read>(reader: R, bytes: &mut Vec<u8>) -> std::io
             return false;
         };
         budget.remaining = budget.remaining.saturating_sub(used);
+        #[cfg(not(test))]
         if result.is_err() || budget.remaining == 0 || Instant::now() > budget.deadline {
             budget.failed = true;
+        }
+        #[cfg(test)]
+        {
+            let expired = if result.is_err() || budget.remaining == 0 {
+                false
+            } else {
+                let now = Instant::now();
+                crate::tape::monotonic_observed("authority:read:window-offset-ns", now);
+                now > budget.deadline
+            };
+            if result.is_err() || budget.remaining == 0 || expired {
+                budget.failed = true;
+            }
         }
         budget.failed
     });
@@ -2408,23 +2444,25 @@ fn read_operator_list(path: &Path) -> Result<OperatorList, String> {
 }
 
 fn read_bounded(path: &Path, limit: usize, what: &str) -> Result<Vec<u8>, String> {
+    #[cfg(not(test))]
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("cannot open the {what} {}: {error}", path.display()))?;
     #[cfg(test)]
-    {
+    let metadata = {
         use std::os::unix::fs::MetadataExt;
-        crate::tape::read_row_without_parent(
-            "read-bounded:lstat",
-            path,
-            metadata.dev(),
-            metadata.ino(),
-            crate::tape::TapeOutcome::Opened {
-                dev: metadata.dev(),
-                ino: metadata.ino(),
-            },
-            limit as u64,
-        );
-    }
+        let result = fs::symlink_metadata(path);
+        let saved_errno = crate::tape::observer_errno();
+        match &result {
+            Ok(metadata) => crate::tape::read_row_without_parent("read-bounded:lstat", path,
+                metadata.dev(), metadata.ino(),
+                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, limit as u64),
+            Err(error) => crate::tape::read_row("read-bounded:lstat", path,
+                if error.kind() == std::io::ErrorKind::NotFound { crate::tape::TapeOutcome::Absent }
+                else { crate::tape::TapeOutcome::Refusal { reason: error.to_string() } }, limit as u64),
+        }
+        crate::tape::restore_observer_errno(saved_errno);
+        result.map_err(|error| format!("cannot open the {what} {}: {error}", path.display()))?
+    };
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(format!("the {what} {} is not a real file", path.display()));
     }
@@ -2434,8 +2472,21 @@ fn read_bounded(path: &Path, limit: usize, what: &str) -> Result<Vec<u8>, String
             path.display()
         ));
     }
+    #[cfg(not(test))]
     let file = File::open(path)
         .map_err(|error| format!("cannot open the {what} {}: {error}", path.display()))?;
+    #[cfg(test)]
+    let file = {
+        let result = File::open(path);
+        let saved_errno = crate::tape::observer_errno();
+        let outcome = match &result {
+            Ok(_) => crate::tape::TapeOutcome::Facts { facts: "opened; descriptor identity pending".to_owned() },
+            Err(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+        };
+        crate::tape::read_row("read-bounded:open", path, outcome, limit as u64);
+        crate::tape::restore_observer_errno(saved_errno);
+        result.map_err(|error| format!("cannot open the {what} {}: {error}", path.display()))?
+    };
     let mut bytes = Vec::new();
     #[cfg(not(test))]
     authority_read(file.take(limit as u64 + 1), &mut bytes)
@@ -4316,18 +4367,29 @@ fn judge_recorded_root(row: &Row, observed: &ObservedIdentity) -> Result<u64, St
 }
 
 fn account_candidates(evaluated: &mut [Evaluated], control: &Path) {
+    #[cfg(not(test))]
     let deadline = Instant::now() + Duration::from_millis(OBSERVATION_MS);
+    #[cfg(test)]
+    let deadline = {
+        let started = Instant::now();
+        crate::tape::monotonic_observed("accounting:begin:window-offset-ns", started);
+        started + Duration::from_millis(OBSERVATION_MS)
+    };
     let mut remaining = OBSERVATION_ENTRIES;
     for candidate in evaluated
         .iter_mut()
         .filter_map(|entry| entry.candidate.as_mut())
     {
         let now = Instant::now();
+        #[cfg(test)]
+        crate::tape::monotonic_observed("accounting:before-delay:window-offset-ns", now);
         if remaining == 0 || now >= deadline {
             break;
         }
         diagnostic_delay(control, &candidate.root);
         let now = Instant::now();
+        #[cfg(test)]
+        crate::tape::monotonic_observed("accounting:after-delay:window-offset-ns", now);
         if now >= deadline {
             break;
         }
@@ -4341,6 +4403,7 @@ fn account_candidates(evaluated: &mut [Evaluated], control: &Path) {
                 .try_into()
                 .unwrap_or(u64::MAX),
         };
+        #[cfg(not(test))]
         let Ok(report) = inventory::inventory_directory(&candidate.root, limits) else {
             #[cfg(test)]
             crate::tape::read_row(
@@ -4355,21 +4418,40 @@ fn account_candidates(evaluated: &mut [Evaluated], control: &Path) {
             break;
         };
         #[cfg(test)]
-        crate::tape::read_row(
-            "accounting-walk",
-            &candidate.root,
-            crate::tape::TapeOutcome::Facts {
-                facts: format!(
-                    "entries={} complete={}",
-                    report.entries_visited, report.coverage.complete
-                ),
-            },
-            remaining,
-        );
+        let report = {
+            let result = inventory::inventory_directory(&candidate.root, limits);
+            let saved_errno = crate::tape::observer_errno();
+            match result {
+                Ok(report) => {
+                    crate::tape::read_row("accounting-walk", &candidate.root,
+                        crate::tape::TapeOutcome::Facts { facts: format!("entries={} complete={}",
+                            report.entries_visited, report.coverage.complete) }, remaining);
+                    crate::tape::restore_observer_errno(saved_errno);
+                    report
+                }
+                Err(error) => {
+                    crate::tape::read_row("accounting-walk", &candidate.root,
+                        crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, remaining);
+                    crate::tape::restore_observer_errno(saved_errno);
+                    break;
+                }
+            }
+        };
         remaining = remaining.saturating_sub(report.entries_visited);
         candidate.logical_bytes = report.total.logical_bytes_by_name;
         candidate.allocated_bytes = report.total.allocated_bytes;
+        #[cfg(not(test))]
         candidate.accounting_complete = report.coverage.complete && Instant::now() <= deadline;
+        #[cfg(test)]
+        {
+            candidate.accounting_complete = if report.coverage.complete {
+                let now = Instant::now();
+                crate::tape::monotonic_observed("accounting:complete:window-offset-ns", now);
+                now <= deadline
+            } else {
+                false
+            };
+        }
     }
 }
 

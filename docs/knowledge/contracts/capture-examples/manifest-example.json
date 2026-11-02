@@ -22,7 +22,8 @@
     "oxide_toolchain": "example",
     "barge_toolchain": "example",
     "oxide_executable_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-    "barge_executable_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    "barge_executable_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "oxide_tree": "0000000000000000000000000000000000000000"
   },
   "fixture": {
     "root": "/example/fixture",
@@ -53,6 +54,28 @@
         "parent_device": 1,
         "parent_inode": 2,
         "reason": "example refusal"
+      },
+      {
+        "rel": "directory",
+        "kind": "directory",
+        "parent_device": 1,
+        "parent_inode": 2,
+        "device": 1,
+        "inode": 4,
+        "mode": 448,
+        "size": 0,
+        "bytes_sha256": null
+      },
+      {
+        "rel": "link",
+        "kind": "symlink",
+        "parent_device": 1,
+        "parent_inode": 2,
+        "device": 1,
+        "inode": 5,
+        "mode": 511,
+        "size": 7,
+        "bytes_sha256": null
       }
     ],
     "roots": [
@@ -77,7 +100,16 @@
         "pid": 1,
         "start": 1,
         "uid": 1,
-        "descriptor_targets": [],
+        "descriptor_targets": [
+          {
+            "path": "/example/fixture/registry",
+            "parent_device": 1,
+            "parent_inode": 2,
+            "device": 1,
+            "inode": 3,
+            "fd": 4
+          }
+        ],
         "lifecycle": "exited"
       }
     ],

@@ -1408,67 +1408,50 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # `tape_prune_eval` in-crate harness — the pure tape checks (deterministic
 # serialization, epoch/occurrence bookkeeping, the fixed caps' explicit
 # truncation, the unbound-read note) plus the BASE, EFFECT-1, EFFECT-2,
-# REGISTRY-MISSING and UNSETTLED-INTENT unit fixtures, each a fresh
-# exclusively owned fixture and one waited child. `proof:tape-prune:self-check`
+# REGISTRY-MISSING and UNSETTLED-INTENT unit fixtures, plus a fresh BASE
+# disconnected-sink counterfactual, each with one waited child. `proof:tape-prune:self-check`
 # runs only the pure checks. Both use the caller's private build pool and
 # owner-only TMPDIR. They are not a benchmark, native proof or full QA; the
 # counted diagnostic at a source-approved head remains X-S2's Queue proof.
+[tasks."proof:tape-prune:isolation-test"]
+run = "python3 scripts/test_tape_isolation.py"
+
 [tasks."proof:tape-prune:test"]
-run = """python3 scripts/tape-isolation-check.py || exit $?
-scratch_base=$(python3 - <<'PYSCRATCH'
-import os, stat, sys
-p = os.environ.get("TMPDIR", "")
-if not p or not os.path.isabs(p) or os.path.realpath(p) != p or not p.startswith("/Volumes/Builds/scratch/oxide/"):
-    sys.exit("private TMPDIR under /Volumes/Builds/scratch/oxide required")
-s = os.stat(p)
-if not stat.S_ISDIR(s.st_mode) or s.st_uid != os.getuid() or s.st_mode & 0o077:
-    sys.exit("TMPDIR must be an owner-only directory")
-print(p)
-PYSCRATCH
-) || exit 1
-oxide_temp=$(mktemp -d "$scratch_base/run.XXXXXX") || exit 1
-TMPDIR="$oxide_temp" TMP="$oxide_temp" TEMP="$oxide_temp" oxide test --test tape_prune_eval
-status=$?
-if [ "$status" -eq 0 ]; then
-  rm -rf "$oxide_temp"
-else
-  printf 'retained fixture temp: %s\n' "$oxide_temp" >&2
-fi
-exit $status"""
+admission = "heavy"
+run = "python3 scripts/tape-isolation-check.py test"
 
 [tasks."proof:tape-prune:self-check"]
-run = """python3 scripts/tape-isolation-check.py || exit $?
-scratch_base=$(python3 - <<'PYSCRATCH'
-import os, stat, sys
-p = os.environ.get("TMPDIR", "")
-if not p or not os.path.isabs(p) or os.path.realpath(p) != p or not p.startswith("/Volumes/Builds/scratch/oxide/"):
-    sys.exit("private TMPDIR under /Volumes/Builds/scratch/oxide required")
-s = os.stat(p)
-if not stat.S_ISDIR(s.st_mode) or s.st_uid != os.getuid() or s.st_mode & 0o077:
-    sys.exit("TMPDIR must be an owner-only directory")
-print(p)
-PYSCRATCH
-) || exit 1
-oxide_temp=$(mktemp -d "$scratch_base/run.XXXXXX") || exit 1
-TMPDIR="$oxide_temp" TMP="$oxide_temp" TEMP="$oxide_temp" oxide test --test tape_prune_eval -- --self-check
-status=$?
-if [ "$status" -eq 0 ]; then
-  rm -rf "$oxide_temp"
-else
-  printf 'retained fixture temp: %s\n' "$oxide_temp" >&2
-fi
-exit $status"""
+admission = "heavy"
+run = "python3 scripts/tape-isolation-check.py self-check"
 
-# Task-only private debug wrapper bootstrap. The caller supplies an isolated
-# CARGO_HOME, CARGO_TARGET_DIR and HOME under owned Builds scratch.
 [tasks."proof:tape-prune:bootstrap"]
 admission = "heavy"
-run = "python3 scripts/tape-isolation-check.py && python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 1024 -- cargo build --offline --locked --bin oxide"
+run = "python3 scripts/tape-isolation-check.py bootstrap"
 
-# Task-only isolated preflight preparation; the executable runs only the
-# actual configuration resolver and never opens or registers a pool.
 [tasks."proof:tape-prune:preflight-build"]
-run = "python3 scripts/tape-isolation-check.py"
+admission = "heavy"
+run = "python3 scripts/tape-isolation-check.py preflight-build"
 
 [tasks."proof:tape-prune:path-preflight"]
-run = '''python3 scripts/tape-isolation-check.py && env -i PATH="$PATH" HOME="$HOME" OXIDE_TEST_HOME_FROM_ENV="$OXIDE_TEST_HOME_FROM_ENV" OXIDE_CONFIG="$OXIDE_CONFIG" OXIDE_POOL="$OXIDE_POOL" OXIDE_POOL_CAP="$OXIDE_POOL_CAP" OXIDE_SCRATCH_ROOT="$OXIDE_SCRATCH_ROOT" "$TAPE_PREFLIGHT_EXE" --path-preflight "$TAPE_PREFLIGHT_ROOT"'''
+admission = "heavy"
+run = "python3 scripts/tape-isolation-check.py preflight"
+
+[tasks."proof:tape-prune:cover-compile"]
+admission = "heavy"
+run = "python3 scripts/tape-isolation-check.py cover-compile"
+
+[tasks."proof:tape-prune:cover-release"]
+admission = "heavy"
+run = "python3 scripts/tape-isolation-check.py cover-release"
+
+[tasks."proof:tape-prune:cover-format"]
+admission = "heavy"
+run = "python3 scripts/tape-isolation-check.py cover-format"
+
+[tasks."proof:tape-prune:cover-test"]
+admission = "heavy"
+run = "python3 scripts/tape-isolation-check.py cover-test"
+
+[tasks."proof:tape-prune:cover-docs"]
+admission = "heavy"
+run = "python3 scripts/tape-isolation-check.py cover-docs"

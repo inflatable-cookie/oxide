@@ -163,6 +163,28 @@ pub(crate) fn component_row(
     });
 }
 
+/// Record a component without fabricating a parent identity.
+pub(crate) fn component_without_parent(kind: &str, name: &std::ffi::OsStr, outcome: TapeOutcome) {
+    with_state(|state| {
+        let identity = format!("component:parent=unproven|name={name:?}");
+        push_record(state, kind, identity, &outcome, 0);
+    });
+}
+
+/// The standalone library sink has no harness window origin.
+pub(crate) fn monotonic_observed(site: &str, _instant: std::time::Instant) {
+    let saved_errno = observer_errno();
+    classify_row("clock-origin-unproven", site, "instant sampled; standalone sink has no window");
+    restore_observer_errno(saved_errno);
+}
+
+/// A descriptor result without a guessed process or path binding.
+pub(crate) fn descriptor_row(site: &str, fd: i32, outcome: TapeOutcome) {
+    let saved_errno = observer_errno();
+    with_state(|state| push_record(state, site, format!("descriptor:{fd}|identity=unproven"), &outcome, 0));
+    restore_observer_errno(saved_errno);
+}
+
 /// Record one volume observation.
 pub(crate) fn volume_row(
     kind: &str,
@@ -213,8 +235,16 @@ pub(crate) fn classify_row(kind: &str, identity: &str, value: &str) {
     });
 }
 
+/// Record the actual result of an unbound descriptor effect without inventing a path.
+pub(crate) fn unbound_effect(site: &str, succeeded: bool) {
+    let saved_errno = observer_errno();
+    classify_row("unbound-effect", site, if succeeded { "succeeded" } else { "failed" });
+    restore_observer_errno(saved_errno);
+}
+
 /// Record one actual effect (positively completed write only).
 pub(crate) fn effect_row(kind: &str, path: &Path) {
+    let saved_errno = observer_errno();
     with_state(|state| {
         let epoch = next_epoch(state);
         state.effects.push(TapeEffect {
@@ -223,6 +253,7 @@ pub(crate) fn effect_row(kind: &str, path: &Path) {
             epoch,
         });
     });
+    restore_observer_errno(saved_errno);
 }
 
 /// The buffered records of this thread's window, then cleared. Library unit
@@ -287,5 +318,45 @@ mod tests {
         assert!(!rows_truncated);
         assert!(!occurrences_truncated);
         let _ = PathBuf::new();
+    }
+}
+
+// Preserve the evaluator thread's errno around test-only observation.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+fn observer_errno_slot() -> Option<*mut libc::c_int> {
+    // SAFETY: libc returns this thread's errno location.
+    Some(unsafe { libc::__errno_location() })
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "ios")))]
+fn observer_errno_slot() -> Option<*mut libc::c_int> {
+    // SAFETY: libc returns this thread's errno location.
+    Some(unsafe { libc::__error() })
+}
+
+#[cfg(all(
+    test,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))
+))]
+fn observer_errno_slot() -> Option<*mut libc::c_int> {
+    None
+}
+
+#[cfg(test)]
+pub(crate) fn observer_errno() -> Option<libc::c_int> {
+    // SAFETY: the pointer, when available, is this thread's errno slot.
+    observer_errno_slot().map(|slot| unsafe { *slot })
+}
+
+#[cfg(test)]
+pub(crate) fn restore_observer_errno(value: Option<libc::c_int>) {
+    if let (Some(slot), Some(value)) = (observer_errno_slot(), value) {
+        // SAFETY: the pointer is this thread's errno slot.
+        unsafe { *slot = value };
     }
 }

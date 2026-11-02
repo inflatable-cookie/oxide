@@ -5534,6 +5534,7 @@ impl Store {
         let temp = self.control.join("state.json.tmp");
         #[cfg(test)]
         let tape_state_path = self.control.join("state.json");
+        #[cfg(not(test))]
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
@@ -5542,9 +5543,30 @@ impl Store {
             .custom_flags(libc::O_NOFOLLOW)
             .open(&temp)
             .map_err(|error| format!("cannot write Oxide state: {error}"))?;
+        #[cfg(test)]
+        let mut file = {
+            let result = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&temp);
+            crate::tape::effect_row("attempt@control-state-temp-open", &temp);
+            result.map_err(|error| format!("cannot write Oxide state: {error}"))?
+        };
+        #[cfg(not(test))]
         file.write_all(&bytes)
             .and_then(|()| file.sync_all())
             .map_err(|error| format!("cannot write Oxide state: {error}"))?;
+        #[cfg(test)]
+        {
+            let write = file.write_all(&bytes);
+            crate::tape::effect_row(if write.is_ok() { "save@control-state-temp" }
+                else { "attempt-save@control-state-temp" }, &temp);
+            write.and_then(|()| file.sync_all())
+                .map_err(|error| format!("cannot write Oxide state: {error}"))?;
+        }
         #[cfg(not(test))]
         fs::rename(&temp, self.control.join("state.json"))
             .and_then(|()| File::open(&self.control)?.sync_all())
@@ -5648,7 +5670,30 @@ fn ensure_private_dir(path: &Path) -> Result<(), String> {
 
 /// Open an existing owner-only control directory without following its final
 /// path component. The descriptor is suitable for relative control-file I/O.
+#[cfg(test)]
+mod control_directory_fs {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+
+    pub(super) fn symlink_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
+        let result = std::fs::symlink_metadata(path);
+        let saved_errno = crate::tape::observer_errno();
+        match &result {
+            Ok(metadata) => crate::tape::read_row_dev("control-directory:named", path,
+                metadata.dev(), metadata.ino(),
+                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
+            Err(error) => crate::tape::read_row("control-directory:named", path,
+                if error.kind() == std::io::ErrorKind::NotFound { crate::tape::TapeOutcome::Absent }
+                else { crate::tape::TapeOutcome::Refusal { reason: error.to_string() } }, 0),
+        }
+        crate::tape::restore_observer_errno(saved_errno);
+        result
+    }
+}
+
 pub(crate) fn open_control_directory(path: &Path) -> Result<Option<File>, String> {
+    #[cfg(test)]
+    use self::control_directory_fs as fs;
     let named = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -5662,14 +5707,43 @@ pub(crate) fn open_control_directory(path: &Path) -> Result<Option<File>, String
             path.display()
         ));
     }
+    #[cfg(not(test))]
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
         .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    #[cfg(test)]
+    let directory = {
+        let result = OpenOptions::new().read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path);
+        let saved_errno = crate::tape::observer_errno();
+        let outcome = match &result {
+            Ok(_) => crate::tape::TapeOutcome::Facts { facts: "opened; descriptor identity pending".to_owned() },
+            Err(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+        };
+        crate::tape::read_row("control-directory:open", path, outcome, 0);
+        crate::tape::restore_observer_errno(saved_errno);
+        result.map_err(|error| format!("cannot open {}: {error}", path.display()))?
+    };
+    #[cfg(not(test))]
     let opened = directory
         .metadata()
         .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    #[cfg(test)]
+    let opened = {
+        let result = directory.metadata();
+        let saved_errno = crate::tape::observer_errno();
+        match &result {
+            Ok(metadata) => crate::tape::read_row_dev("control-directory:held", path,
+                metadata.dev(), metadata.ino(),
+                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
+            Err(error) => crate::tape::read_row("control-directory:held", path,
+                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, 0),
+        }
+        crate::tape::restore_observer_errno(saved_errno);
+        result.map_err(|error| format!("cannot inspect {}: {error}", path.display()))?
+    };
     if !opened.is_dir()
         || opened.uid() != uid
         || opened.mode() & 0o077 != 0
@@ -6330,8 +6404,19 @@ pub(crate) fn private_file(path: &Path, create: bool) -> Result<Option<File>, St
         options.create(true).mode(0o600);
     }
     let file = match options.open(path) {
+        #[cfg(not(test))]
         Ok(file) => file,
+        #[cfg(test)]
+        Ok(file) => {
+            let saved_errno = crate::tape::observer_errno();
+            crate::tape::read_row("private-file:open", path,
+                crate::tape::TapeOutcome::Facts { facts: "opened; descriptor identity unproven".to_owned() }, 0);
+            crate::tape::restore_observer_errno(saved_errno);
+            file
+        }
         Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(test)]
+            let saved_errno = crate::tape::observer_errno();
             #[cfg(test)]
             crate::tape::read_row(
                 "private-file:open",
@@ -6339,9 +6424,13 @@ pub(crate) fn private_file(path: &Path, create: bool) -> Result<Option<File>, St
                 crate::tape::TapeOutcome::Absent,
                 0,
             );
+            #[cfg(test)]
+            crate::tape::restore_observer_errno(saved_errno);
             return Ok(None);
         }
         Err(error) => {
+            #[cfg(test)]
+            let saved_errno = crate::tape::observer_errno();
             #[cfg(test)]
             if create {
                 crate::tape::effect_row("attempt@private-file-create", path);
@@ -6355,6 +6444,8 @@ pub(crate) fn private_file(path: &Path, create: bool) -> Result<Option<File>, St
                 },
                 0,
             );
+            #[cfg(test)]
+            crate::tape::restore_observer_errno(saved_errno);
             return Err(format!("cannot open {}: {error}", path.display()));
         }
     };
@@ -6363,21 +6454,22 @@ pub(crate) fn private_file(path: &Path, create: bool) -> Result<Option<File>, St
     if create {
         crate::tape::effect_row("attempt@private-file-create", path);
     }
+    #[cfg(not(test))]
     let metadata = file.metadata().map_err(|error| error.to_string())?;
     #[cfg(test)]
-    {
-        crate::tape::read_row_dev(
-            "private-file:open",
-            path,
-            metadata.dev(),
-            metadata.ino(),
-            crate::tape::TapeOutcome::Opened {
-                dev: metadata.dev(),
-                ino: metadata.ino(),
-            },
-            0,
-        );
-    }
+    let metadata = {
+        let result = file.metadata();
+        let saved_errno = crate::tape::observer_errno();
+        match &result {
+            Ok(metadata) => crate::tape::read_row_dev(
+                "private-file:metadata", path, metadata.dev(), metadata.ino(),
+                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
+            Err(error) => crate::tape::read_row("private-file:metadata", path,
+                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, 0),
+        }
+        crate::tape::restore_observer_errno(saved_errno);
+        result.map_err(|error| error.to_string())?
+    };
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
     if !metadata.is_file() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {

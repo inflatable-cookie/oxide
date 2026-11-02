@@ -4149,13 +4149,26 @@ fn open_budget_payload(
     if config.version != LEASE_VERSION || config.cap_bytes == 0 || config.image_bytes != 0 {
         return Err(LeaseError::BackingMismatch);
     }
+    #[cfg(not(test))]
     if paths.image.symlink_metadata().is_ok() || paths.receipt.symlink_metadata().is_ok() {
+        return Err(LeaseError::BackingMismatch);
+    }
+    #[cfg(test)]
+    if observe_pool_metadata("pool:budget:image", &paths.image).is_ok()
+        || observe_pool_metadata("pool:budget:receipt", &paths.receipt).is_ok()
+    {
         return Err(LeaseError::BackingMismatch);
     }
     let payload =
         canonical_existing_dir(&paths.mount, true).map_err(|_| LeaseError::BackingMismatch)?;
+    #[cfg(not(test))]
     let root_device = fs::symlink_metadata(root).map_err(io_error)?.dev();
+    #[cfg(test)]
+    let root_device = observe_pool_metadata("pool:budget:root", root).map_err(io_error)?.dev();
+    #[cfg(not(test))]
     let payload_device = fs::symlink_metadata(&payload).map_err(io_error)?.dev();
+    #[cfg(test)]
+    let payload_device = observe_pool_metadata("pool:budget:payload", &payload).map_err(io_error)?.dev();
     if payload != paths.mount || payload_device != root_device {
         return Err(LeaseError::BackingMismatch);
     }
@@ -4173,9 +4186,17 @@ fn open_volume_payload(paths: &BackingPaths, config: &PoolConfig) -> Result<Payl
     if config.version != LEASE_VERSION || config.cap_bytes == 0 || config.image_bytes != 0 {
         return Err(LeaseError::BackingMismatch);
     }
+    #[cfg(not(test))]
     if paths.image.symlink_metadata().is_ok()
         || paths.receipt.symlink_metadata().is_ok()
         || paths.mount.symlink_metadata().is_ok()
+    {
+        return Err(LeaseError::BackingMismatch);
+    }
+    #[cfg(test)]
+    if observe_pool_metadata("pool:volume:image", &paths.image).is_ok()
+        || observe_pool_metadata("pool:volume:receipt", &paths.receipt).is_ok()
+        || observe_pool_metadata("pool:volume:internal-payload", &paths.mount).is_ok()
     {
         return Err(LeaseError::BackingMismatch);
     }
@@ -4186,10 +4207,28 @@ fn open_volume_payload(paths: &BackingPaths, config: &PoolConfig) -> Result<Payl
         .map_err(|_| LeaseError::BackingMismatch)?;
     let root = volume.mount_point.join(&volume.payload_dir);
     let payload = canonical_existing_dir(&root, true).map_err(|_| LeaseError::BackingMismatch)?;
+    #[cfg(not(test))]
     let by_path = fs::symlink_metadata(&payload).map_err(io_error)?;
+    #[cfg(test)]
+    let by_path = observe_pool_metadata("pool:volume:payload-path", &payload).map_err(io_error)?;
+    #[cfg(not(test))]
     let by_fd = fs::File::from(fd.try_clone().map_err(io_error)?)
         .metadata()
         .map_err(io_error)?;
+    #[cfg(test)]
+    let by_fd = {
+        let result = fs::File::from(fd.try_clone().map_err(io_error)?).metadata();
+        let saved_errno = crate::tape::observer_errno();
+        match &result {
+            Ok(metadata) => crate::tape::read_row_dev("pool:volume:payload-held", &payload,
+                metadata.dev(), metadata.ino(),
+                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
+            Err(error) => crate::tape::read_row("pool:volume:payload-held", &payload,
+                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, 0),
+        }
+        crate::tape::restore_observer_errno(saved_errno);
+        result.map_err(io_error)?
+    };
     if payload != root || by_path.dev() != by_fd.dev() || by_path.ino() != by_fd.ino() {
         return Err(LeaseError::BackingMismatch);
     }
@@ -4201,10 +4240,25 @@ fn open_volume_payload(paths: &BackingPaths, config: &PoolConfig) -> Result<Payl
     })
 }
 
+#[cfg(test)]
+mod payload_directory_tape {
+    use std::path::Path;
+
+    pub(super) fn read_dir(path: &Path) -> std::io::Result<super::pool_directory_tape::Entries> {
+        super::pool_directory_tape::read_dir_at(path, "pool:payload-entries")
+    }
+
+    pub(super) fn symlink_metadata(path: impl AsRef<Path>) -> std::io::Result<std::fs::Metadata> {
+        super::observe_pool_metadata("pool:payload:metadata", path.as_ref())
+    }
+}
+
 fn validate_lease_payload_entries(
     payload_root: &Path,
     metadata_dirs: &[&str],
 ) -> Result<(), LeaseError> {
+    #[cfg(test)]
+    use self::payload_directory_tape as fs;
     let root_metadata = fs::symlink_metadata(payload_root).map_err(io_error)?;
     if root_metadata.file_type().is_symlink() || !root_metadata.file_type().is_dir() {
         return Err(LeaseError::UnknownAccounting);
@@ -4778,6 +4832,16 @@ const HOLDING_LIST_BATCH: usize = 4096;
 /// Most per-object refusals one pass reports.
 const HOLDING_MAX_REFUSALS: usize = 8;
 
+#[cfg(test)]
+mod holding_fs_tape {
+    use std::path::Path;
+    pub(super) use std::fs::DirBuilder;
+
+    pub(super) fn symlink_metadata(path: impl AsRef<Path>) -> std::io::Result<std::fs::Metadata> {
+        super::observe_pool_metadata("pool:holding:metadata", path.as_ref())
+    }
+}
+
 impl Pool {
     fn holding_root(&self) -> PathBuf {
         self.backing.payload_root().join(HOLDING_NAME)
@@ -4815,6 +4879,8 @@ impl Pool {
     /// the rename is same-device by construction, so a different device is a
     /// refusal, never a copy.
     fn open_holding_area(&self, create: bool) -> Result<Option<OwnedFd>, LeaseError> {
+        #[cfg(test)]
+        use self::holding_fs_tape as fs;
         let root = self.holding_root();
         let payload = fs::symlink_metadata(self.backing.payload_root()).map_err(io_error)?;
         if create {
@@ -4829,6 +4895,7 @@ impl Pool {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     let mut builder = fs::DirBuilder::new();
                     builder.mode(0o700);
+                    #[cfg(not(test))]
                     match builder.create(&root) {
                         Ok(()) => {}
                         // Another command created it between the probe and the
@@ -4836,10 +4903,22 @@ impl Pool {
                         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                         Err(error) => return Err(io_error(error)),
                     }
+                    #[cfg(test)]
+                    {
+                        let result = builder.create(&root);
+                        crate::tape::effect_row(if result.is_ok() { "create@holding-area" }
+                            else { "attempt@holding-area" }, &root);
+                        match result {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                            Err(error) => return Err(io_error(error)),
+                        }
+                    }
                 }
                 Err(error) => return Err(io_error(error)),
             }
         }
+        #[cfg(not(test))]
         let held = match OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -4849,7 +4928,41 @@ impl Pool {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(io_error(error)),
         };
+        #[cfg(test)]
+        let held = {
+            let result = OpenOptions::new().read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&root);
+            let saved_errno = crate::tape::observer_errno();
+            let outcome = match &result {
+                Ok(_) => crate::tape::TapeOutcome::Facts { facts: "opened; descriptor identity pending".to_owned() },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => crate::tape::TapeOutcome::Absent,
+                Err(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+            };
+            crate::tape::read_row("pool:holding:open", &root, outcome, 0);
+            crate::tape::restore_observer_errno(saved_errno);
+            match result {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(io_error(error)),
+            }
+        };
+        #[cfg(not(test))]
         let metadata = held.metadata().map_err(io_error)?;
+        #[cfg(test)]
+        let metadata = {
+            let result = held.metadata();
+            let saved_errno = crate::tape::observer_errno();
+            match &result {
+                Ok(metadata) => crate::tape::read_row_dev("pool:holding:held-metadata", &root,
+                    metadata.dev(), metadata.ino(),
+                    crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
+                Err(error) => crate::tape::read_row("pool:holding:held-metadata", &root,
+                    crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, 0),
+            }
+            crate::tape::restore_observer_errno(saved_errno);
+            result.map_err(io_error)?
+        };
         if !metadata.is_dir()
             || metadata.uid() != current_uid()
             || metadata.permissions().mode() & 0o077 != 0
@@ -4983,6 +5096,8 @@ impl Pool {
             )
         };
         if renamed != 0 {
+            #[cfg(test)]
+            crate::tape::effect_row("attempt-rename@holding", &self.holding_root().join(&name));
             return Err(io_error(std::io::Error::last_os_error()));
         }
         #[cfg(test)]
@@ -5029,6 +5144,10 @@ impl Pool {
                                 libc::RENAME_EXCL,
                             )
                         } == 0;
+                        #[cfg(test)]
+                        crate::tape::effect_row(if contained_ok { "rename@holding-containment" }
+                            else { "attempt-rename@holding-containment" },
+                            &self.holding_root().join(&contained_name));
                     }
                     // The removable backend is macOS-only; without an atomic
                     // no-replace rename the object is left at the derived name
@@ -5321,6 +5440,8 @@ fn unverified_holding_name(name: &str) -> String {
 /// gone.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn holding_presence(path: &Path) -> Option<bool> {
+    #[cfg(test)]
+    use self::holding_fs_tape as fs;
     match fs::symlink_metadata(path) {
         Ok(_) => Some(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
@@ -6224,6 +6345,7 @@ fn lock_pool(pool: &Path) -> Result<File, LeaseError> {
 
 fn lock_pool_inner(pool: &Path, create: bool, notice: bool) -> Result<File, LeaseError> {
     let path = pool.join(LOCK_NAME);
+    #[cfg(not(test))]
     let existing = match fs::symlink_metadata(&path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -6234,6 +6356,30 @@ fn lock_pool_inner(pool: &Path, create: bool, notice: bool) -> Result<File, Leas
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => None,
         Err(error) => return Err(io_error(error)),
     };
+    #[cfg(test)]
+    let existing = {
+        let result = fs::symlink_metadata(&path);
+        let saved_errno = crate::tape::observer_errno();
+        match &result {
+            Ok(metadata) => crate::tape::read_row_dev("pool:lock:metadata-before", &path,
+                metadata.dev(), metadata.ino(),
+                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
+            Err(error) => crate::tape::read_row("pool:lock:metadata-before", &path,
+                if error.kind() == std::io::ErrorKind::NotFound { crate::tape::TapeOutcome::Absent }
+                else { crate::tape::TapeOutcome::Refusal { reason: error.to_string() } }, 0),
+        }
+        crate::tape::restore_observer_errno(saved_errno);
+        match result {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(LeaseError::UnsafePath("lock file must be a regular file"));
+                }
+                Some(metadata)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => None,
+            Err(error) => return Err(io_error(error)),
+        }
+    };
     let mut options = OpenOptions::new();
     options
         .read(true)
@@ -6243,8 +6389,32 @@ fn lock_pool_inner(pool: &Path, create: bool, notice: bool) -> Result<File, Leas
     if create {
         options.create(true);
     }
+    #[cfg(not(test))]
     let file = options.open(&path).map_err(io_error)?;
+    #[cfg(test)]
+    let file = {
+        let result = options.open(&path);
+        if create {
+            crate::tape::effect_row("attempt@pool-lock-open", &path);
+        }
+        result.map_err(io_error)?
+    };
+    #[cfg(not(test))]
     let metadata = file.metadata().map_err(io_error)?;
+    #[cfg(test)]
+    let metadata = {
+        let result = file.metadata();
+        let saved_errno = crate::tape::observer_errno();
+        match &result {
+            Ok(metadata) => crate::tape::read_row_dev("pool:lock:metadata-held", &path,
+                metadata.dev(), metadata.ino(),
+                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
+            Err(error) => crate::tape::read_row("pool:lock:metadata-held", &path,
+                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, 0),
+        }
+        crate::tape::restore_observer_errno(saved_errno);
+        result.map_err(io_error)?
+    };
     if !metadata.is_file()
         || metadata.permissions().mode() & 0o077 != 0
         || metadata.uid() != current_uid()
@@ -6270,6 +6440,14 @@ fn lock_pool_inner(pool: &Path, create: bool, notice: bool) -> Result<File, Leas
     }
     // SAFETY: `file` is open for the pool lock; flock holds until File drop.
     let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    #[cfg(test)]
+    if status != 0 {
+        let saved_errno = crate::tape::observer_errno();
+        let error = std::io::Error::last_os_error();
+        crate::tape::lock_row("pool:lock:failure", &path,
+            crate::tape::TapeOutcome::Refusal { reason: error.to_string() });
+        crate::tape::restore_observer_errno(saved_errno);
+    }
     if status != 0 {
         return Err(LeaseError::Io("exclusive pool lock failed".into()));
     }
@@ -6562,12 +6740,39 @@ pub(super) fn write_ledger_bytes_injected(
 /// retired image or receipt, or whose config records any backend but the
 /// two current ones, refuses untouched. A missing config is left to the
 /// locked read, which waits for a concurrent creation.
+#[cfg(test)]
+fn observe_pool_metadata(site: &str, path: &Path) -> std::io::Result<fs::Metadata> {
+    let result = fs::symlink_metadata(path);
+    let saved_errno = crate::tape::observer_errno();
+    match &result {
+        Ok(metadata) => crate::tape::read_row_dev(site, path, metadata.dev(), metadata.ino(),
+            crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
+        Err(error) => crate::tape::read_row(site, path,
+            if error.kind() == std::io::ErrorKind::NotFound { crate::tape::TapeOutcome::Absent }
+            else { crate::tape::TapeOutcome::Refusal { reason: error.to_string() } }, 0),
+    }
+    crate::tape::restore_observer_errno(saved_errno);
+    result
+}
+
 fn refuse_retired_image_pool(pool: &Path) -> Result<(), LeaseError> {
     let paths = BackingPaths::under(pool);
+    #[cfg(not(test))]
     if paths.image.symlink_metadata().is_ok() || paths.receipt.symlink_metadata().is_ok() {
         return Err(LeaseError::BackingMismatch);
     }
+    #[cfg(test)]
+    if observe_pool_metadata("pool:retired:image", &paths.image).is_ok()
+        || observe_pool_metadata("pool:retired:receipt", &paths.receipt).is_ok()
+    {
+        return Err(LeaseError::BackingMismatch);
+    }
+    #[cfg(not(test))]
     if pool.join(CONFIG_NAME).symlink_metadata().is_err() {
+        return Ok(());
+    }
+    #[cfg(test)]
+    if observe_pool_metadata("pool:retired:config", &pool.join(CONFIG_NAME)).is_err() {
         return Ok(());
     }
     let config = read_config(pool)?;
@@ -6587,6 +6792,19 @@ fn listed_control_entry(path: &Path) -> Result<Option<fs::Metadata>, LeaseError>
     let metadata = crate::test_fs::symlink_metadata(path);
     #[cfg(not(test))]
     let metadata = fs::symlink_metadata(path);
+    #[cfg(test)]
+    {
+        let saved_errno = crate::tape::observer_errno();
+        match &metadata {
+            Ok(metadata) => crate::tape::read_row_dev("pool:listed-entry", path,
+                metadata.dev(), metadata.ino(),
+                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
+            Err(error) => crate::tape::read_row("pool:listed-entry", path,
+                if error.kind() == std::io::ErrorKind::NotFound { crate::tape::TapeOutcome::Absent }
+                else { crate::tape::TapeOutcome::Refusal { reason: error.to_string() } }, 0),
+        }
+        crate::tape::restore_observer_errno(saved_errno);
+    }
     match metadata {
         Ok(metadata) => Ok(Some(metadata)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -6594,8 +6812,63 @@ fn listed_control_entry(path: &Path) -> Result<Option<fs::Metadata>, LeaseError>
     }
 }
 
+/// Test-only observer for the same `read_dir` and iterator used by the
+/// production loop below. The real directory handle and error flow are kept;
+/// no later pathname lookup is used to invent a parent identity.
+#[cfg(test)]
+mod pool_directory_tape {
+    use std::path::{Path, PathBuf};
+
+    pub(super) fn read_dir(path: &Path) -> std::io::Result<Entries> {
+        read_dir_at(path, "pool:entries")
+    }
+
+    pub(super) fn read_dir_at(path: &Path, site: &'static str) -> std::io::Result<Entries> {
+        let result = std::fs::read_dir(path);
+        let saved_errno = crate::tape::observer_errno();
+        let outcome = match &result {
+            Ok(_) => crate::tape::TapeOutcome::Facts { facts: "directory opened; identity unproven".to_owned() },
+            Err(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+        };
+        crate::tape::read_row(&format!("{site}:read-dir-open"), path, outcome, 0);
+        let wrapped = result.map(|inner| Entries { inner, path: path.to_path_buf(), site });
+        crate::tape::restore_observer_errno(saved_errno);
+        wrapped
+    }
+
+    pub(super) struct Entries {
+        inner: std::fs::ReadDir,
+        path: PathBuf,
+        site: &'static str,
+    }
+
+    impl Iterator for Entries {
+        type Item = std::io::Result<std::fs::DirEntry>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let result = self.inner.next();
+            let saved_errno = crate::tape::observer_errno();
+            match &result {
+                Some(Ok(entry)) => crate::tape::component_without_parent(&format!("{}:name", self.site),
+                    &entry.file_name(), crate::tape::TapeOutcome::Facts { facts: "enumerated".to_owned() }),
+                Some(Err(error)) => crate::tape::read_row(&format!("{}:iteration", self.site), &self.path,
+                    crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, 0),
+                None => crate::tape::read_row(&format!("{}:end", self.site), &self.path,
+                    crate::tape::TapeOutcome::Facts { facts: "end of directory".to_owned() }, 0),
+            }
+            crate::tape::restore_observer_errno(saved_errno);
+            result
+        }
+    }
+}
+
 fn refuse_foreign_pool_entries(pool: &Path) -> Result<(), LeaseError> {
+    #[cfg(test)]
+    use self::pool_directory_tape as fs;
+    #[cfg(not(test))]
     let device = fs::symlink_metadata(pool).map_err(io_error)?.dev();
+    #[cfg(test)]
+    let device = observe_pool_metadata("pool:entries:root", pool).map_err(io_error)?.dev();
     for entry in fs::read_dir(pool).map_err(io_error)? {
         let entry = entry.map_err(io_error)?;
         let name = entry.file_name();

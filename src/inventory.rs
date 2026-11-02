@@ -403,6 +403,19 @@ fn enumerated_directory_metadata(
     }
 }
 
+#[cfg(test)]
+fn observe_metadata_result(site: &str, path: &Path, result: &std::io::Result<fs::Metadata>) {
+    let saved_errno = crate::tape::observer_errno();
+    match result {
+        Ok(metadata) => crate::tape::read_row_dev(site, path, metadata.dev(), metadata.ino(),
+            crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
+        Err(error) => crate::tape::read_row(site, path,
+            if error.kind() == std::io::ErrorKind::NotFound { crate::tape::TapeOutcome::Absent }
+            else { crate::tape::TapeOutcome::Refusal { reason: error.to_string() } }, 0),
+    }
+    crate::tape::restore_observer_errno(saved_errno);
+}
+
 fn entry_relative_metadata(
     entry: &fs::DirEntry,
     path: &Path,
@@ -503,6 +516,7 @@ fn inventory_with(
     isolated: &[PathBuf],
 ) -> Result<InventoryReport, InventoryError> {
     limits.validate()?;
+    #[cfg(not(test))]
     let canonical = fs::canonicalize(root).map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => InventoryError::RootMissing(root.to_path_buf()),
         _ => InventoryError::RootUnreadable {
@@ -510,6 +524,25 @@ fn inventory_with(
             reason: error.to_string(),
         },
     })?;
+    #[cfg(test)]
+    let canonical = {
+        let result = fs::canonicalize(root);
+        let saved_errno = crate::tape::observer_errno();
+        let outcome = match &result {
+            Ok(path) => crate::tape::TapeOutcome::Facts { facts: path.display().to_string() },
+            Err(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+        };
+        crate::tape::read_row("inventory:root-canonicalize", root, outcome, 0);
+        crate::tape::restore_observer_errno(saved_errno);
+        result.map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => InventoryError::RootMissing(root.to_path_buf()),
+        _ => InventoryError::RootUnreadable {
+            root: root.to_path_buf(),
+            reason: error.to_string(),
+        },
+    })?
+    };
+    #[cfg(not(test))]
     let root_metadata = fs::metadata(&canonical).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             InventoryError::RootMissing(canonical.clone())
@@ -520,24 +553,38 @@ fn inventory_with(
             }
         }
     })?;
+    #[cfg(test)]
+    let root_metadata = {
+        let result = fs::metadata(&canonical);
+        let saved_errno = crate::tape::observer_errno();
+        match &result {
+            Ok(metadata) => crate::tape::read_row_dev("accounting-walk:root", &canonical,
+                metadata.dev(), metadata.ino(),
+                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, limits.max_entries),
+            Err(error) => crate::tape::read_row("accounting-walk:root", &canonical,
+                if error.kind() == std::io::ErrorKind::NotFound { crate::tape::TapeOutcome::Absent }
+                else { crate::tape::TapeOutcome::Refusal { reason: error.to_string() } }, limits.max_entries),
+        }
+        crate::tape::restore_observer_errno(saved_errno);
+        result.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            InventoryError::RootMissing(canonical.clone())
+        } else {
+            InventoryError::RootUnreadable {
+                root: canonical.clone(),
+                reason: error.to_string(),
+            }
+        }
+    })?
+    };
     if !root_metadata.is_dir() {
         return Err(InventoryError::RootNotDirectory(canonical));
     }
     let root_device = root_metadata.dev();
     let root_inode = root_metadata.ino();
-    #[cfg(test)]
-    crate::tape::read_row_dev(
-        "accounting-walk:root",
-        &canonical,
-        root_device,
-        root_inode,
-        crate::tape::TapeOutcome::Opened {
-            dev: root_device,
-            ino: root_inode,
-        },
-        limits.max_entries,
-    );
     let started = Instant::now();
+    #[cfg(test)]
+    crate::tape::monotonic_observed("inventory:start:window-offset-ns", started);
     let mut walker = Walker::new(&canonical, root_device, root_inode, limits, started, stops);
     walker.isolated = isolated;
     walker.run()?;
@@ -843,10 +890,21 @@ impl<'a> Walker<'a> {
         if self.deadline_exceeded {
             return true;
         }
+        #[cfg(not(test))]
         if Instant::now() >= self.deadline {
             self.deadline_exceeded = true;
             self.gap(GapKind::ElapsedDeadline);
             return true;
+        }
+        #[cfg(test)]
+        {
+            let now = Instant::now();
+            crate::tape::monotonic_observed("inventory:deadline-check:window-offset-ns", now);
+            if now >= self.deadline {
+                self.deadline_exceeded = true;
+                self.gap(GapKind::ElapsedDeadline);
+                return true;
+            }
         }
         false
     }
@@ -898,6 +956,16 @@ impl<'a> Walker<'a> {
                     },
                     Err,
                 );
+            #[cfg(test)]
+            {
+                let saved_errno = crate::tape::observer_errno();
+                let outcome = match &read_dir {
+                    Ok(_) => crate::tape::TapeOutcome::Facts { facts: "directory opened; identity unproven".to_owned() },
+                    Err(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+                };
+                crate::tape::read_row("inventory:read-dir-open", &directory, outcome, 0);
+                crate::tape::restore_observer_errno(saved_errno);
+            }
             let entries = match read_dir {
                 Ok(entries) => entries,
                 Err(error)
@@ -934,6 +1002,17 @@ impl<'a> Walker<'a> {
                 if self.check_deadline() {
                     return Ok(());
                 }
+                #[cfg(test)]
+                {
+                    let saved_errno = crate::tape::observer_errno();
+                    match &entry {
+                        Ok(entry) => crate::tape::component_without_parent("inventory:entry-name", &entry.file_name(),
+                            crate::tape::TapeOutcome::Facts { facts: "enumerated".to_owned() }),
+                        Err(error) => crate::tape::read_row("inventory:entry-error", &directory,
+                            crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, 0),
+                    }
+                    crate::tape::restore_observer_errno(saved_errno);
+                }
                 let Ok(entry) = entry else {
                     self.gap(GapKind::UnreadableEntry);
                     continue;
@@ -948,6 +1027,17 @@ impl<'a> Walker<'a> {
                 let file_type_result = self
                     .test_hook_error(&path, WalkPoint::BeforeFileType)
                     .map_or_else(|| entry.file_type(), Err);
+                #[cfg(test)]
+                {
+                    let saved_errno = crate::tape::observer_errno();
+                    let outcome = match &file_type_result {
+                        Ok(kind) => crate::tape::TapeOutcome::Facts { facts: format!("file={} directory={} symlink={}",
+                            kind.is_file(), kind.is_dir(), kind.is_symlink()) },
+                        Err(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+                    };
+                    crate::tape::read_row("inventory:entry-type", &path, outcome, 0);
+                    crate::tape::restore_observer_errno(saved_errno);
+                }
                 let file_type = match file_type_result {
                     Ok(file_type) => file_type,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -977,6 +1067,8 @@ impl<'a> Walker<'a> {
                     let metadata = self
                         .test_hook_error(&path, WalkPoint::BeforeSymlinkMetadata)
                         .map_or_else(|| enumerated_directory_metadata(&entry, &path), Err);
+                    #[cfg(test)]
+                    observe_metadata_result("inventory:directory-metadata", &path, &metadata);
                     let metadata = match metadata {
                         // A kind that contradicts the enumerated kind is never
                         // counted, queued or unioned as its replacement.
@@ -1014,6 +1106,13 @@ impl<'a> Walker<'a> {
                     self.other[index] += 1;
                 }
             }
+            #[cfg(test)]
+            {
+                let saved_errno = crate::tape::observer_errno();
+                crate::tape::read_row("inventory:read-dir-end", &directory,
+                    crate::tape::TapeOutcome::Facts { facts: "end of directory".to_owned() }, 0);
+                crate::tape::restore_observer_errno(saved_errno);
+            }
             // A second sample of the same pathname after enumeration. A
             // mismatch discards this directory's newly queued children only;
             // observed entries and bytes are kept and no vanished event is
@@ -1049,6 +1148,8 @@ impl<'a> Walker<'a> {
         // keep their existing debug walk hook and the test-only boundary
         // control rather than the file metadata seam.
         let metadata = fs::symlink_metadata(path);
+        #[cfg(test)]
+        observe_metadata_result("inventory:directory-guard", path, &metadata);
         match metadata {
             Ok(metadata) => {
                 if !metadata.is_dir() {
@@ -1112,6 +1213,8 @@ impl<'a> Walker<'a> {
         let metadata = self
             .test_hook_error(path, WalkPoint::BeforeSymlinkMetadata)
             .map_or_else(|| enumerated_file_metadata(entry, path), Err);
+        #[cfg(test)]
+        observe_metadata_result("inventory:file-metadata", path, &metadata);
         let metadata = match metadata {
             // A kind that contradicts the enumerated kind is never counted or
             // unioned as its replacement.
@@ -1166,6 +1269,7 @@ impl<'a> Walker<'a> {
     }
 
     fn verify_root(&self) -> Result<(), InventoryError> {
+        #[cfg(not(test))]
         let metadata = fs::symlink_metadata(self.root).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 InventoryError::RootMissing(self.root.to_path_buf())
@@ -1176,6 +1280,21 @@ impl<'a> Walker<'a> {
                 }
             }
         })?;
+        #[cfg(test)]
+        let metadata = {
+            let result = fs::symlink_metadata(self.root);
+            observe_metadata_result("inventory:verify-root", self.root, &result);
+            result.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                InventoryError::RootMissing(self.root.to_path_buf())
+            } else {
+                InventoryError::RootUnreadable {
+                    root: self.root.to_path_buf(),
+                    reason: error.to_string(),
+                }
+            }
+        })?
+        };
         if !metadata.is_dir() {
             return Err(InventoryError::RootNotDirectory(self.root.to_path_buf()));
         }
@@ -1463,6 +1582,13 @@ fn probe_filesystem_free(root: &Path, device: u64) -> FilesystemFree {
     // SAFETY: `path` is a valid NUL-terminated C string and `stat` points to
     // writable storage for exactly one `statvfs` value.
     let status = unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) };
+    #[cfg(test)]
+    if status != 0 {
+        let saved_errno = crate::tape::observer_errno();
+        crate::tape::read_row("inventory:statvfs", root,
+            crate::tape::TapeOutcome::Refusal { reason: std::io::Error::last_os_error().to_string() }, 0);
+        crate::tape::restore_observer_errno(saved_errno);
+    }
     if status != 0 {
         return FilesystemFree::Unavailable {
             reason: std::io::Error::last_os_error().to_string(),
@@ -1470,6 +1596,15 @@ fn probe_filesystem_free(root: &Path, device: u64) -> FilesystemFree {
     }
     // SAFETY: a zero return status means `statvfs` initialized the structure.
     let stat = unsafe { stat.assume_init() };
+    #[cfg(test)]
+    {
+        let saved_errno = crate::tape::observer_errno();
+        crate::tape::read_row("inventory:statvfs", root,
+            crate::tape::TapeOutcome::Facts { facts: format!(
+                "device={device} fragment={} blocks={} free={} available={}",
+                stat.f_frsize, stat.f_blocks, stat.f_bfree, stat.f_bavail) }, 0);
+        crate::tape::restore_observer_errno(saved_errno);
+    }
     let block_size = u64::from(stat.f_frsize);
     let multiply =
         |blocks: libc::fsblkcnt_t| -> Option<u64> { u64::from(blocks).checked_mul(block_size) };
