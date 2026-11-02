@@ -127,6 +127,7 @@ HEX40 = re.compile(r"^[0-9a-f]{40}$")
 BLOCK_ID = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 
 MAX_DOC_BYTES = 8 * 1024 * 1024
+MAX_AUDIT_SOURCE_BYTES = 64 * 1024 * 1024
 INVENTORY_ROW_CAP = 50000
 INVENTORY_CONTENT_CAP = 256 * 1024 * 1024
 RETAINED_ROW_CAP = 200000
@@ -634,7 +635,7 @@ def build_barge_audit(*, private: Path, component_sources: dict, host: dict,
             real = canonical_file(path)
             if not real.is_relative_to(private):
                 raise GateRefusal(f"audit source escapes the private root: {relative}")
-            sources.append({"path": str(real), "sha256": sha256_file(real), "lines": lines})
+            sources.append({"path": str(real), "sha256": sha256_file(real, cap=MAX_AUDIT_SOURCE_BYTES), "lines": lines})
         components[name] = audit_component(sources, analysis)
     return {
         "schema": SCHEMA_BARGE_AUDIT,
@@ -861,7 +862,7 @@ def validate_barge_audit(audit, *, private, host: dict) -> None:
                     or not isinstance(item["lines"], str) or not item["lines"].strip()):
                 raise GateRefusal(f"{name}: invalid source identity")
             if (path.is_symlink() or path.resolve(strict=True) != path
-                    or not path.is_file() or sha256_file(path) != expected):
+                    or not path.is_file() or sha256_file(path, cap=MAX_AUDIT_SOURCE_BYTES) != expected):
                 raise GateRefusal(f"{name}: source changed or unreadable")
 
 
@@ -1100,9 +1101,9 @@ def stage_audit_inputs(root: Path, manifest: dict) -> None:
         seen.add(str(destination))
         size = source.stat().st_size
         total += size
-        if size > 64 * 1024 * 1024 or total > 256 * 1024 * 1024:
+        if size > MAX_AUDIT_SOURCE_BYTES or total > 256 * 1024 * 1024:
             raise GateRefusal("audit inputs exceed the bounded copy budget")
-        if sha256_file(source, cap=64 * 1024 * 1024) != digest:
+        if sha256_file(source, cap=MAX_AUDIT_SOURCE_BYTES) != digest:
             raise GateRefusal("audit input source changed")
         data = source.read_bytes()
         if sha256_bytes(data) != digest:
@@ -2908,6 +2909,32 @@ def self_test() -> int:
     expect_refusal("malformed artifact digest", bind_barge_documents,
                    template_block, template_audit, "bad")
     expect_ok("valid audit", validate_barge_audit, good_audit, private=private_root, host={})
+    large_source = private_write(private_root, Path("toolchain/cargo"), b"x" * (MAX_DOC_BYTES + 1))
+    large_audit = json.loads(canonical_json(good_audit))
+    large_audit["components"]["rustup_cargo"]["sources"] = [{
+        "path": str(large_source), "sha256": hashlib.sha256(b"x" * (MAX_DOC_BYTES + 1)).hexdigest(),
+        "lines": "digest-bound binary"}]
+    large_pairs = {name: (analysis, [("toolchain/cargo", "digest-bound binary")])
+                   for name in BARGE_AUDIT_COMPONENTS}
+    built_large = expect_ok("build audit with a large component", build_barge_audit,
+                            private=private_root, component_sources=large_pairs,
+                            host={key: "1" * 64 for key in ("effigy_sha256", "oxide_sha256",
+                                  "wrapper_sha256", "git_sha256", "rustc_sha256", "supervisor_sha256")},
+                            admission={"hook": "hook", "socket": "/socket", "executables": [], "runtime_files": []},
+                            child_facts={"child_path": "/bin", "cargo_sha256": "2" * 64,
+                                         "python_sha256": "3" * 64})
+    if built_large is not None and built_large["components"]["rustup_cargo"]["sources"][0] != \
+            large_audit["components"]["rustup_cargo"]["sources"][0]:
+        failures.append("large audit component builder digest mismatch")
+    expect_ok("audit accepts a component larger than a document", validate_barge_audit,
+              large_audit, private=private_root, host={})
+    large_audit["components"]["rustup_cargo"]["sources"][0]["sha256"] = "0" * 64
+    expect_refusal("large audit component digest drift", validate_barge_audit,
+                   large_audit, private=private_root, host={})
+    with large_source.open("r+b") as large_file:
+        large_file.truncate(MAX_AUDIT_SOURCE_BYTES + 1)
+    expect_refusal("audit component exceeds source bound", validate_barge_audit,
+                   large_audit, private=private_root, host={})
     missing_component = dict(good_audit,
                              components={k: v for k, v in good_audit["components"].items()
                                          if k != "retained_roots"})
