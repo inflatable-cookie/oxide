@@ -1121,7 +1121,14 @@ alone is insufficient.
   every executable and subprocess and cannot attribute the live inode change.
   A replacement route must establish these bindings before that effect and
   satisfy the independent live-state gate; the failed packet is not evidence
-  of isolation. For this task only, the planner amended
+  of isolation. The task's prospective debug-bootstrap bound is 300 seconds
+  and 1024 MiB monitored scratch (the earlier 512 MiB bound remains historical);
+  this does not qualify a route or increase the aggregate 6 GiB or 1200-second
+  covering limits. The proposed schema requires each writer descriptor target
+  to include its path, parent and object device/inode, and descriptor number;
+  the containing writer supplies process identity. This remains a proposal for
+  the retained reviewer and B-S1/X-S2 reconciliation, not an accepted shape.
+  For this task only, the planner amended
   the private Builds scratch cap prospectively from 2 GiB to 3 GiB, counting
   earlier and current roots and preserving their evidence; the cumulative
   1200 s wall, reserve and account inventory gates remain unchanged. At the

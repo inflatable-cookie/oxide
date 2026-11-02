@@ -400,7 +400,14 @@
                       "minLength": 1
                     }
                   },
-                  "required": [],
+                  "required": [
+                    "path",
+                    "parent_device",
+                    "parent_inode",
+                    "device",
+                    "inode",
+                    "fd"
+                  ],
                   "additionalProperties": false
                 },
                 "maxItems": 8192

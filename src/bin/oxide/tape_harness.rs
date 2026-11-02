@@ -1349,6 +1349,15 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
         validate_manifest_envelope(&invalid_digest).is_err(),
         "invalid source digest refuses",
     )?;
+    let mut descriptor = example.clone();
+    descriptor["dynamic"]["writers"][0]["descriptor_targets"] = serde_json::json!([
+        {"path": "/fixture/file", "parent_device": 1, "parent_inode": 2,
+         "device": 1, "inode": 3, "fd": 4}
+    ]);
+    check(validate_manifest_envelope(&descriptor).is_ok(), "complete descriptor target is accepted")?;
+    descriptor["dynamic"]["writers"][0]["descriptor_targets"][0]
+        .as_object_mut().expect("descriptor target").remove("inode");
+    check(validate_manifest_envelope(&descriptor).is_err(), "descriptor target requires object identity")?;
     let mut invalid_identity = example.clone();
     invalid_identity["mandatory_observations"][0]["identity"] = serde_json::json!({"pid": 42});
     check(

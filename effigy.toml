@@ -1463,7 +1463,7 @@ exit $status"""
 # CARGO_HOME, CARGO_TARGET_DIR and HOME under owned Builds scratch.
 [tasks."proof:tape-prune:bootstrap"]
 admission = "heavy"
-run = "python3 scripts/tape-isolation-check.py && python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- cargo build --offline --locked --bin oxide"
+run = "python3 scripts/tape-isolation-check.py && python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 1024 -- cargo build --offline --locked --bin oxide"
 
 # Task-only isolated preflight preparation; the executable runs only the
 # actual configuration resolver and never opens or registers a pool.

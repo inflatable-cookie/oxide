@@ -1799,13 +1799,13 @@ fn tape_errno_slot() -> Option<*mut libc::c_int> {
 }
 
 #[cfg(test)]
-fn tape_errno() -> Option<libc::c_int> {
+pub(crate) fn tape_errno() -> Option<libc::c_int> {
     // SAFETY: the pointer, when available, is this thread's errno slot.
     tape_errno_slot().map(|slot| unsafe { *slot })
 }
 
 #[cfg(test)]
-fn tape_restore_errno(value: Option<libc::c_int>) {
+pub(crate) fn tape_restore_errno(value: Option<libc::c_int>) {
     if let (Some(slot), Some(value)) = (tape_errno_slot(), value) {
         // SAFETY: the pointer is this thread's errno slot.
         unsafe { *slot = value };

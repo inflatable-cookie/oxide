@@ -963,7 +963,21 @@ fn physical_core_count() -> PhysicalCoreCount {
 
 fn read_config(path: &Path) -> Result<FileConfig, String> {
     let named = |error: String| format!("{}: {error}", path.display());
+    #[cfg(not(test))]
     let metadata = fs::metadata(path).map_err(|error| named(error.to_string()))?;
+    #[cfg(test)]
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            let saved_errno = crate::prune::tape_errno();
+            crate::tape::read_row(
+                "config:read-config:metadata", path,
+                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, MAX_CONFIG_BYTES,
+            );
+            crate::prune::tape_restore_errno(saved_errno);
+            return Err(named(error.to_string()));
+        }
+    };
     #[cfg(test)]
     {
         use std::os::unix::fs::MetadataExt;
