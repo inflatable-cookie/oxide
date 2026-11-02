@@ -550,6 +550,12 @@ fn validate_manifest_envelope(doc: &serde_json::Value) -> Result<(), String> {
             return Err(format!("missing field in {pointer}"));
         }
     }
+    let window = doc.pointer("/window/identity").and_then(|v| v.as_str()).ok_or("missing window identity")?;
+    for volume in doc.pointer("/dynamic/volumes").and_then(|v| v.as_array()).ok_or("missing volumes")? {
+        if volume.get("window_identity").and_then(|v| v.as_str()) != Some(window) {
+            return Err("volume belongs to a different window".to_owned());
+        }
+    }
     for row in doc["mandatory_observations"]
         .as_array()
         .ok_or("invalid obligations")?
@@ -579,8 +585,21 @@ fn validate_manifest_envelope(doc: &serde_json::Value) -> Result<(), String> {
             || ["volume_uuid", "mount", "device"]
                 .iter()
                 .all(|k| identity.contains_key(*k));
+        if identity.contains_key("volume_uuid")
+            && identity.get("window_identity").and_then(|v| v.as_str()) != Some(window)
+        {
+            return Err("volume obligation belongs to a different window".to_owned());
+        }
         if !matches!(engine, "oxide" | "barge") || site.is_empty() || !complete {
             return Err("incomplete mandatory observation".to_owned());
+        }
+    }
+    for entry in doc.pointer("/fixture/entries").and_then(|v| v.as_array()).ok_or("missing entries")? {
+        let rel = entry.get("rel").and_then(|v| v.as_str()).ok_or("missing fixture relative path")?;
+        if rel.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+            || !Path::new(rel).components().all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err("fixture relative path is not a plain relative path".to_owned());
         }
     }
     let bytes = doc
@@ -1148,7 +1167,7 @@ fn run_case(
         .map(|bytes| tape::sha256_hex(bytes))
         .unwrap_or_default();
     tape::bind_manifest_sha256(&manifest_sha);
-    let parsed = (|| -> Result<HarnessManifest, String> {
+    let parsed = (|| -> Result<(HarnessManifest, serde_json::Value), String> {
         preflight?;
         let bytes = read?;
         if bytes.len() as u64 > tape::MAX_MANIFEST_BYTES {
@@ -1168,14 +1187,25 @@ fn run_case(
         {
             return Err("fixture identity differs from manifest".to_owned());
         }
+        for effect in doc["expected_effects"].as_array().ok_or("invalid effects")? {
+            let text = effect.get("path").and_then(|value| value.as_str()).ok_or("missing effect path")?;
+            let path = Path::new(text);
+            let relative = path.strip_prefix(fixture_root).map_err(|_| "effect path escapes fixture")?;
+            if relative.as_os_str().is_empty()
+                || text.split('/').any(|part| part == "." || part == "..")
+                || !relative.components().all(|part| matches!(part, std::path::Component::Normal(_)))
+            {
+                return Err("effect path is not strictly inside the fixture".to_owned());
+            }
+        }
         let manifest: HarnessManifest =
-            serde_json::from_value(doc).map_err(|error| error.to_string())?;
+            serde_json::from_value(doc.clone()).map_err(|error| error.to_string())?;
         if manifest.schema != MANIFEST_VERSION || manifest.case != case {
             return Err("manifest case or schema mismatch".to_owned());
         }
-        Ok(manifest)
+        Ok((manifest, doc))
     })();
-    let manifest = match parsed {
+    let (manifest, manifest_document) = match parsed {
         Ok(value) => value,
         Err(reason) => {
             return tape::finish_and_write(
@@ -1223,6 +1253,8 @@ fn run_case(
             source: "engine",
         },
     };
+    tape::check_manifest_obligations(&manifest_document, fixture_root);
+    tape::check_manifest_effects(&manifest_document);
     let mut post = tape::capture_fixture(fixture_root);
     post.pre = pre.post.clone();
     post.diff_effects = tape::diff_fixture(&pre.post, &post.post);
@@ -1233,6 +1265,7 @@ fn run_case(
         post: post.post,
         diff_effects: post.diff_effects,
     };
+    tape::check_fixture_diff(fixture_root, &capture);
     tape::finish_and_write(transcript_out, outcome, Some(capture))
 }
 
@@ -1251,6 +1284,8 @@ struct TranscriptDoc {
     effects: Vec<serde_json::Value>,
     reads: Vec<serde_json::Value>,
     clocks: Vec<serde_json::Value>,
+    #[serde(default)]
+    recorded_holders: Vec<serde_json::Value>,
     #[serde(default)]
     classifications: Vec<serde_json::Value>,
     #[serde(default)]
@@ -1361,6 +1396,9 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
     let mut missing_tree = example.clone();
     missing_tree["source"].as_object_mut().expect("source object").remove("oxide_tree");
     check(validate_manifest_envelope(&missing_tree).is_err(), "source tree is required")?;
+    let mut escaped_entry = example.clone();
+    escaped_entry["fixture"]["entries"][0]["rel"] = "../outside".into();
+    check(validate_manifest_envelope(&escaped_entry).is_err(), "fixture entry traversal refuses")?;
     let mut incomplete_unreadable = example.clone();
     incomplete_unreadable["fixture"]["entries"][2].as_object_mut().expect("entry").remove("reason");
     check(validate_manifest_envelope(&incomplete_unreadable).is_err(),
@@ -1373,6 +1411,17 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
     unreadable_file["fixture"]["entries"][0]["bytes_sha256"] = serde_json::Value::Null;
     check(validate_manifest_envelope(&unreadable_file).is_err(),
         "a present file needs a digest; unreadable files use the refusal variant")?;
+    let mut volume_obligation = example.clone();
+    volume_obligation["mandatory_observations"][0]["identity"] = serde_json::json!({
+        "volume_uuid": "example-uuid", "mount": "/example", "device": "/dev/example",
+        "window_identity": "example-only"
+    });
+    check(validate_manifest_envelope(&volume_obligation).is_ok(), "complete volume identity is accepted")?;
+    volume_obligation["mandatory_observations"][0]["identity"]["device"] = 1.into();
+    check(validate_manifest_envelope(&volume_obligation).is_err(), "volume device requires its string identity")?;
+    let mut stale_volume = example.clone();
+    stale_volume["dynamic"]["volumes"][0]["window_identity"] = "other-window".into();
+    check(validate_manifest_envelope(&stale_volume).is_err(), "stale volume window refuses")?;
     let mut invalid_digest = example.clone();
     invalid_digest["source"]["cargo_lock_sha256"] = "not-a-digest".into();
     check(
@@ -1722,6 +1771,99 @@ fn read_row_cap_check(temp: &Path) -> Result<(), CheckFailure> {
 
 /// The unbound authority read: a pending read left at window close is an
 /// explicit note, never silence.
+fn volume_window_reconciliation_check(temp: &Path) -> Result<(), CheckFailure> {
+    let manifest = serde_json::json!({
+        "window": {"identity": "current"}, "fixture": {"entries": []},
+        "dynamic": {"volumes": [{"uuid": "volume", "mount": "/mount", "device": "/dev/example", "window_identity": "current"}]},
+        "mandatory_observations": [{"engine": "oxide", "site": "volume-site", "identity": {
+            "volume_uuid": "volume", "mount": "/mount", "device": "/dev/example", "window_identity": "current"
+        }}]
+    });
+    tape::begin("oxide", "VOLUME-WINDOW", "manifest", "pure");
+    tape::volume_row("volume-site", Path::new("/mount"), Some("volume"), Some("/dev/example"),
+        tape::TapeOutcome::Facts { facts: "observed".to_owned() });
+    tape::check_manifest_obligations(&manifest, temp);
+    let path = temp.join("volume-window.json");
+    tape::finish_and_write(&path, TapeEngineOutcome::Completed {
+        result: serde_json::json!({"complete": false, "entries": []}),
+    }, None).map_err(|what| CheckFailure { what })?;
+    let doc = read_transcript(&path).map_err(|what| CheckFailure { what })?;
+    check(!doc.notes.iter().any(|note| note.contains("mandatory observation missing")
+        || note.contains("extra or unbound observation")), "a volume identity binds within its declared window")
+}
+
+fn effect_reconciliation_check(temp: &Path) -> Result<(), CheckFailure> {
+    let manifest = serde_json::json!({"expected_effects": [
+        {"kind": "fence", "site": "declared", "path": "/fixture/state", "attempted": false}
+    ]});
+    tape::begin("oxide", "EFFECT-MISSING-EXTRA", "manifest", "pure");
+    tape::effect_row("save@unexpected", Path::new("/fixture/other"));
+    tape::check_manifest_effects(&manifest);
+    let transcript = temp.join("effect-missing-extra.json");
+    tape::finish_and_write(&transcript, TapeEngineOutcome::Completed {
+        result: serde_json::json!({"complete": false, "entries": []}),
+    }, None).map_err(|what| CheckFailure { what })?;
+    let doc = read_transcript(&transcript).map_err(|what| CheckFailure { what })?;
+    check(doc.notes.iter().any(|note| note.contains("missing declared effect")),
+        "a missing declared effect is explicit")?;
+    check(doc.notes.iter().any(|note| note.contains("extra observed effect")),
+        "an extra observed effect is explicit")
+}
+
+fn obligation_reconciliation_check(temp: &Path) -> Result<(), CheckFailure> {
+    let manifest = serde_json::json!({
+        "window": {"identity": "pure-window"},
+        "fixture": {"entries": [{"rel": "entry", "kind": "file",
+            "parent_device": 1, "parent_inode": 2, "device": 3, "inode": 4}]},
+        "dynamic": {"volumes": [], "external_allowances": []},
+        "mandatory_observations": [{"engine": "oxide", "site": "component-site",
+            "identity": {"component": "entry", "parent_device": 1, "parent_inode": 2}}]
+    });
+    tape::begin("oxide", "OBLIGATION-PRESENT", "manifest", "pure");
+    tape::component_row("component-site", 1, 2, std::ffi::OsStr::new("entry"),
+        tape::TapeOutcome::Opened { dev: 3, ino: 4 });
+    tape::check_manifest_obligations(&manifest, temp);
+    let present_path = temp.join("obligation-present.json");
+    tape::finish_and_write(&present_path, TapeEngineOutcome::Completed {
+        result: serde_json::json!({"complete": false, "entries": []}),
+    }, None).map_err(|what| CheckFailure { what })?;
+    let present = read_transcript(&present_path).map_err(|what| CheckFailure { what })?;
+    check(!present.notes.iter().any(|note| note.contains("mandatory observation missing")
+        || note.contains("extra or unbound observation")), "a fully bound component satisfies its obligation")?;
+
+    tape::begin("oxide", "OBLIGATION-MISSING-EXTRA", "manifest", "pure");
+    tape::component_row("unexpected-site", 7, 8, std::ffi::OsStr::new("other"),
+        tape::TapeOutcome::Opened { dev: 9, ino: 10 });
+    tape::check_manifest_obligations(&manifest, temp);
+    let missing_path = temp.join("obligation-missing-extra.json");
+    tape::finish_and_write(&missing_path, TapeEngineOutcome::Completed {
+        result: serde_json::json!({"complete": false, "entries": []}),
+    }, None).map_err(|what| CheckFailure { what })?;
+    let missing = read_transcript(&missing_path).map_err(|what| CheckFailure { what })?;
+    check(missing.notes.iter().any(|note| note.contains("mandatory observation missing")),
+        "a missing mandatory component is insufficient")?;
+    check(missing.notes.iter().any(|note| note.contains("extra or unbound observation")),
+        "an extra component is insufficient")
+}
+
+fn recorded_holder_cap_check(temp: &Path) -> Result<(), CheckFailure> {
+    tape::begin("oxide", "HOLDER-CAP", "manifest", "pure");
+    for id in 0..=tape::MAX_PROCESS_ROWS {
+        tape::recorded_holder("pure-holder", id as u64, id as u32, 42);
+    }
+    let path = temp.join("holder-cap.json");
+    tape::finish_and_write(&path, TapeEngineOutcome::Completed {
+        result: serde_json::json!({"complete": false, "entries": []}),
+    }, None).map_err(|what| CheckFailure { what })?;
+    let doc = read_transcript(&path).map_err(|what| CheckFailure { what })?;
+    check(doc.truncation.get("process_rows_truncated").and_then(|v| v.as_bool()) == Some(true),
+        "recorded holder cap is explicit")?;
+    check(doc.recorded_holders.len() == tape::MAX_PROCESS_ROWS,
+        "recorded holder rows remain bounded")?;
+    check(doc.recorded_holders[0]["kernel_start"].is_null() && doc.recorded_holders[0]["uid"].is_null(),
+        "recorded wall start is not a kernel identity")
+}
+
 fn unique_key_cap_check(temp: &Path) -> Result<(), CheckFailure> {
     tape::begin("oxide", "UNIQUE-KEY-CAP", "manifest", "pure");
     for index in 0..=tape::MAX_READ_ROWS * 2 {
@@ -2225,6 +2367,10 @@ fn self_check(pure_only: bool) -> Result<(), String> {
         config_inspect_absence_check(&dir).map_err(|failure| failure.what)?;
         effect_attempt_check(&dir).map_err(|failure| failure.what)?;
         unique_key_cap_check(&dir).map_err(|failure| failure.what)?;
+        recorded_holder_cap_check(&dir).map_err(|failure| failure.what)?;
+        obligation_reconciliation_check(&dir).map_err(|failure| failure.what)?;
+        effect_reconciliation_check(&dir).map_err(|failure| failure.what)?;
+        volume_window_reconciliation_check(&dir).map_err(|failure| failure.what)?;
         if !pure_only {
             let external = fixture_volume(&dir).is_some();
             for case in [

@@ -1192,6 +1192,10 @@ fn holders(control: &Path, checkout: &Path, cleans: bool) -> Result<Vec<String>,
             continue;
         }
         #[cfg(test)]
+        if let Some(holder) = &record.holder {
+            crate::tape::recorded_holder("store:active-holders", record.id, holder.pid, holder.started_ms);
+        }
+        #[cfg(test)]
         crate::tape::classify_row(
             "custody:holder",
             &format!("record={}|checkout={}", record.id, checkout.display()),
@@ -3234,6 +3238,10 @@ impl Store {
             for record in &state.records {
                 if record.checkout.as_deref() != Some(checkout) || Some(record.id) == exempt {
                     continue;
+                }
+                #[cfg(test)]
+                if let Some(holder) = &record.holder {
+                    crate::tape::recorded_holder("store:checkout-custody", record.id, holder.pid, holder.started_ms);
                 }
                 #[cfg(test)]
                 crate::tape::classify_row(

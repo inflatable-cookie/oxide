@@ -25,6 +25,7 @@ import time
 
 BASE = Path('/Volumes/Builds/scratch/oxide')
 BRANCH = 'ns-d41de092-b0b0-495d-b159-8c4d1730d6b4'
+SUPERVISOR_SHA256 = 'fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b'
 MAX_ARCHIVE = 64 * 1024 * 1024
 MAX_LOG_LINE = 8 * 1024 * 1024
 COVER = {'cover-compile': ['rust:compile'], 'cover-release': ['rust:compile-release'],
@@ -253,6 +254,8 @@ def context():
     refuse_cargo_configs(paths['source'], paths['cargo-home'])
     private_cache_tree(paths['cargo-home'])
     binding = source_binding(repo, paths['source'])
+    require(binding['files'].get('scripts/bounded-test.py') == SUPERVISOR_SHA256,
+            'shared supervisor bytes are not the qualified version')
     skill = Path(os.environ.get('TAPE_NORTHSTAR_DIR', ''))
     binding['northstar_files'] = skill_binding(skill, paths['home'] / '.agents/skills/northstar', root)
     own_script = Path(__file__).resolve(strict=True)
@@ -268,6 +271,13 @@ def context():
     binding['rustfmt_sha256'] = digest(toolchain / 'rustfmt')
     binding['rustdoc_sha256'] = digest(toolchain / 'rustdoc')
     binding['rustup_home'] = str(rustup)
+    system_tools = ('/usr/bin/env', '/bin/sh', '/usr/bin/git', '/usr/bin/python3',
+                    '/usr/sbin/diskutil', '/usr/bin/plutil')
+    binding['system_tools'] = {}
+    for name in system_tools:
+        path = Path(name).resolve(strict=True)
+        require(path.is_file() and os.access(path, os.X_OK), f'system executable unavailable: {name}')
+        binding['system_tools'][name] = {'resolved': str(path), 'sha256': digest(path)}
     effigy = Path(os.environ.get('TAPE_EFFIGY', ''))
     require(effigy.is_absolute() and effigy.resolve(strict=True) == effigy
             and effigy.is_file() and os.access(effigy, os.X_OK), 'TAPE_EFFIGY must be a canonical executable')

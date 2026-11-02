@@ -373,13 +373,18 @@
               "f_mntonname": {
                 "type": "string",
                 "minLength": 1
+              },
+              "window_identity": {
+                "type": "string",
+                "minLength": 1
               }
             },
             "required": [
               "uuid",
               "mount",
               "device",
-              "f_mntonname"
+              "f_mntonname",
+              "window_identity"
             ],
             "additionalProperties": false
           },
@@ -549,8 +554,16 @@
                 "minimum": 0
               },
               "device": {
-                "type": "integer",
-                "minimum": 0
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                ]
               },
               "inode": {
                 "type": "integer",
@@ -579,6 +592,10 @@
               "mount": {
                 "type": "string",
                 "minLength": 1
+              },
+              "window_identity": {
+                "type": "string",
+                "minLength": 1
               }
             },
             "required": [],
@@ -591,7 +608,13 @@
                   "parent_inode",
                   "device",
                   "inode"
-                ]
+                ],
+                "properties": {
+                  "device": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                }
               },
               {
                 "required": [
@@ -611,8 +634,15 @@
                 "required": [
                   "volume_uuid",
                   "mount",
-                  "device"
-                ]
+                  "device",
+                  "window_identity"
+                ],
+                "properties": {
+                  "device": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
               }
             ]
           }

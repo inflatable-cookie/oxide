@@ -1172,8 +1172,11 @@ alone is insufficient.
   to include its path, parent and object device/inode, and descriptor number;
   the containing writer supplies process identity. A regular-file entry needs
   a digest; an unreadable file uses the explicit refusal variant. `oxide_tree`
-  carries the staged Git tree identity separately from the commit. This remains a proposal for
-  the retained reviewer and B-S1/X-S2 reconciliation, not an accepted shape.
+  carries the staged Git tree identity separately from the commit. Volume
+  observations and volume obligations name the same declared window identity;
+  numeric file devices and string volume devices retain distinct variants.
+  This remains a proposal for the retained reviewer and B-S1/X-S2
+  reconciliation, not an accepted shape.
   For this task only, the planner amended
   the private Builds scratch cap prospectively from 2 GiB to 3 GiB, counting
   earlier and current roots and preserving their evidence; the cumulative
@@ -1238,7 +1241,17 @@ alone is insufficient.
   open, metadata and read errors rather than a generic refusal;
   `removable::read_registration` records `openat` and held metadata, and
   `outputs` records marker open/lstat results alongside the authority read.
-  Note storage and the distinct-key table are bounded and mark truncation.
+  The source adds component names to tape identities, binds proposed volume
+  facts to the manifest's named window, and checks mandatory identities,
+  extra/unbound reads and exact declared-effect multisets after the engine
+  returns. A fixture diff checks persistent observed changes only; it cannot
+  account for vanished temporary effects. Actual parsed holder records have a
+  separate 512-row bound; their stored wall-clock starts are never promoted to
+  kernel process-start identities, and missing kernel starts and UIDs remain
+  explicit. Process identities and external allowance identities that the
+  row/schema cannot bind remain insufficient;
+  these checks are not a cross-engine oracle or parity verdict. Note storage
+  and the distinct-key table are bounded and mark truncation.
   Descriptor-relative recovery
   records the actual `stat_at` result without fabricating its parent, and its
   reached chmod and put-back sites note the real success or failure as an
@@ -1248,6 +1261,25 @@ alone is insufficient.
   the remaining `Pool::open` transitive enumeration, other write/error sites,
   subprocess environment and cfg-equivalence audits are not established by
   this map and cannot be inferred from a transcript or fixture diff.
+- **Prefix reachability and effect boundaries.** `Pool::open` calls
+  `open_inner(root, false, true, true)`: canonical root and directory
+  enumeration precede the lock, managed-control fence, config, backend
+  opening and ledger read; holding reconciliation then precedes evicting
+  reconciliation. A prepared fence can avoid a fence write, but the lock's
+  `O_CREAT` is still an attempted effect. A pending reconciliation can write
+  and must not be treated as a static read. `prepare_new_pool`,
+  `verify_scratch_initializer` and `refuse_occupied_init_directory` are
+  initializer paths; `open_inner` does not call them. `holding_names` is used
+  by initialization and the holding-deletion traversal, not the open prefix;
+  the evaluator does not call that deleter. These are call-site distinctions,
+  not a claim that arbitrary pending reconciliation is effect-free.
+  The separate `cfg(not(test))` statements in `config`, `store`, `scratch_io`,
+  `outputs`, `removable`, `inventory`, `lease`, `lease::pool`, `owned_delete`
+  and `volume` are the production side of the equivalence review. The test
+  arms must be checked operation by operation against those statements,
+  including error conversion, errno, short circuit, ownership and descriptor
+  lifetime. A source map and candidate hooks are present; their complete
+  equivalence and transitive coverage have not been independently established.
 - **The entry.** `prune::tape_entry::run_chain` (cfg(test)) follows the
   `dry_run` prefix exactly — `AuthorityScope::begin`, `paired_store`, the
   optional `read_operator_list`, `require_ready`, the unfinished-intent
@@ -1278,16 +1310,18 @@ alone is insufficient.
 - **Honest fixture limits.** The engine's `Binding::open` accepts exactly
   `/Volumes/<name>`, so an external root binds only when the fixture's own
   `oxide-outputs` sits at a dedicated mount root. On a shared volume's
-  scratch (or the internal fallback) the embedded BASE honestly records an
-  incomplete batch with every root kept and the engine's own reason, and
-  zero effects; the strong BASE surface (present checkout kept,
-  positively absent checkout's root an actual candidate, unlisted legacy
-  root kept, complete snapshot) asserts when X-S2 passes a fixture root
-  that is its own attached proof volume. A prepared fixture carries the
-  four admission fences, `outputs_init` ready, the pool lock and the
-  admission lock, so BASE records zero tape effects and an empty fixture
-  diff; the EFFECT cases record the real `lock-create@admission` and the
-  durable fence save exactly once each, never repaired between runs.
+  scratch (or the internal fallback) the embedded BASE is expected to record
+  an incomplete batch with every root kept and the engine's own reason; the
+  strong BASE surface (present checkout kept, positively absent checkout's
+  root an actual candidate, unlisted legacy root kept, complete snapshot)
+  requires a fixture that is its own attached proof volume. A prepared fixture
+  carries the four admission fences, `outputs_init` ready, the pool lock and
+  the admission lock. BASE expects no confirmed effect and an empty fixture
+  diff, but the real pool-lock `O_CREAT` open remains an uncertain attempt,
+  so its transcript is insufficient for parity. The EFFECT cases also record
+  actual temporary operations and uncertain attempts, alongside the final
+  admission-lock creation or fence save; fixture diffs corroborate only the
+  surviving changes. These source assertions have not been executed.
 - **Validation and export.** The final executable and its build route must be
   identified from the reviewed source and recorded with its digest, lock and
   toolchain before X-S2 consumes it. The final head still needs its covering
