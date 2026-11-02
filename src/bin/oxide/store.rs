@@ -1128,14 +1128,6 @@ pub fn active_holders(control: &Path, checkout: &Path) -> Result<Vec<String>, St
     holders(control, checkout, true)
 }
 
-/// [`active_holders`] without clean barriers, for a caller that itself holds
-/// this checkout's clean barrier: `begin_clean` admits one barrier per
-/// checkout across both pools, so any recorded barrier is the caller's own.
-/// Command records are still reported.
-pub fn active_records(control: &Path, checkout: &Path) -> Result<Vec<String>, String> {
-    holders(control, checkout, false)
-}
-
 fn holders(control: &Path, checkout: &Path, cleans: bool) -> Result<Vec<String>, String> {
     let path = control.join("state.json");
     let Some(file) = private_file(&path, false)? else {
@@ -1149,6 +1141,13 @@ fn holders(control: &Path, checkout: &Path, cleans: bool) -> Result<Vec<String>,
     }
     let state: State = serde_json::from_slice(&bytes)
         .map_err(|error| format!("Oxide state is invalid: {error}"))?;
+    Ok(holder_lines(&state, checkout, cleans))
+}
+
+/// One parsed state's holder lines for `checkout`: active records and, when
+/// `cleans`, recorded clean barriers. Shared with the fresh per-row custody
+/// witness (oxide#235) so both routes report the exact same texts.
+fn holder_lines(state: &State, checkout: &Path, cleans: bool) -> Vec<String> {
     let mut holders = Vec::new();
     for record in &state.records {
         if record.checkout.as_deref() != Some(checkout) || !record.active() {
@@ -1170,7 +1169,58 @@ fn holders(control: &Path, checkout: &Path, cleans: bool) -> Result<Vec<String>,
             holders.push("oxide clean barrier".to_owned());
         }
     }
-    Ok(holders)
+    holders
+}
+
+/// Cooperative custody for one checkout across parsed pool states: an active
+/// record in either pool counts as a writer, and a retired slot whose lost
+/// writers were never positively closed — and whose holder predates no boot
+/// boundary — is unknown custody, not activity. Shared by
+/// [`Store::checkout_custody`] and the fresh per-row custody witness
+/// (oxide#235) so both classify records identically. The pool labels appear
+/// verbatim in unknown-custody reasons.
+fn custody_verdict(
+    pools: &[(Option<&State>, &str, Option<u64>)],
+    checkout: &Path,
+    boot: Option<u64>,
+) -> CheckoutCustody {
+    let mut writers = false;
+    // Record IDs are per pool, so the caller's own ID is exempt only in
+    // its own pool's state; an equal ID in the other pool is another command.
+    for (state, pool, exempt) in pools {
+        let Some(state) = state else { continue };
+        for record in &state.records {
+            if record.checkout.as_deref() != Some(checkout) || Some(record.id) == *exempt {
+                continue;
+            }
+            if record.phase == Phase::Retired {
+                if let Some(lost) = record.lost.as_ref() {
+                    // A restart closed a quarantined record whose holder
+                    // predates this boot session; its slot is released and
+                    // deleted whole at the next admission.
+                    if let Some(why) = lost
+                        .unclosed
+                        .as_deref()
+                        .filter(|_| !closed_by_boot(record, boot))
+                    {
+                        return CheckoutCustody::Unknown(format!(
+                            "slot {} in the {pool} pool is lost with writers that were never confirmed closed ({why})",
+                            lost.slot_id
+                        ));
+                    }
+                }
+                continue;
+            }
+            if matches!(record.phase, Phase::Spawning | Phase::Running) {
+                writers = true;
+            }
+        }
+    }
+    if writers {
+        CheckoutCustody::Writers
+    } else {
+        CheckoutCustody::Clear
+    }
 }
 
 /// What a checkout's cooperative custody allows; see
@@ -2916,6 +2966,14 @@ impl Store {
         store
     }
 
+    /// Test-only: fence the control exactly as a real command's first
+    /// admission does, so a custody fixture models a pool a prune preview may
+    /// witness (an existing admission lock and fenced state document).
+    #[cfg(test)]
+    pub fn prime_control_for_tests(&self) {
+        self.admission().unwrap();
+    }
+
     /// Test-only: an independent handle to the same pool, so a test can hand
     /// one to a verb that takes the pool by value and still observe the pool.
     #[cfg(test)]
@@ -3097,47 +3155,12 @@ impl Store {
                 }
             },
         };
-        let mut writers = false;
         let boot = boot_session();
-        // Record IDs are per pool, so the caller's own ID is exempt only in
-        // this store's state; an equal ID in the other pool is another command.
-        for (pool, state, exempt) in [
-            ("this", own_state, Some(own)),
-            ("the other", other_state, None),
-        ] {
-            let Some(state) = state else { continue };
-            for record in &state.records {
-                if record.checkout.as_deref() != Some(checkout) || Some(record.id) == exempt {
-                    continue;
-                }
-                if record.phase == Phase::Retired {
-                    if let Some(lost) = record.lost.as_ref() {
-                        // A restart closed a quarantined record whose holder
-                        // predates this boot session; its slot is released and
-                        // deleted whole at the next admission.
-                        if let Some(why) = lost
-                            .unclosed
-                            .as_deref()
-                            .filter(|_| !closed_by_boot(record, boot))
-                        {
-                            return Ok(CheckoutCustody::Unknown(format!(
-                                "slot {} in the {pool} pool is lost with writers that were never confirmed closed ({why})",
-                                lost.slot_id
-                            )));
-                        }
-                    }
-                    continue;
-                }
-                if matches!(record.phase, Phase::Spawning | Phase::Running) {
-                    writers = true;
-                }
-            }
-        }
-        Ok(if writers {
-            CheckoutCustody::Writers
-        } else {
-            CheckoutCustody::Clear
-        })
+        let pools = [
+            (own_state.as_ref(), "this", Some(own)),
+            (other_state.as_ref(), "the other", None),
+        ];
+        Ok(custody_verdict(&pools, checkout, boot))
     }
 
     /// The sibling pool's admission lock, when this store is the removable
@@ -5485,6 +5508,485 @@ fn verify_private_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Fresh per-row custody witnesses (oxide#235)
+//
+// The prune authority window keeps at most ONE parsed durable state and one
+// still-open state descriptor per pool, only while fresh per-row witnesses
+// prove it remains that same atomically replaced document. At each custody
+// decision both existing admission locks are taken internal-first,
+// non-blocking, through verified no-follow descriptors, without creating a
+// missing lock and without admission fencing; the registration witness is
+// re-read under the internal lock on every row. Each state pathname is then
+// witnessed against its still-open descriptor — same device and inode,
+// regular private file, owner, mode, link count, size and high-resolution
+// change metadata — with pre- and post-checks surrounding any actual read.
+// The descriptor stays open across rows, so an unlinked inode cannot be
+// recycled into a false identity match. A changed witness forces a fresh
+// bounded read and full parse under the locks, charged to the same aggregate
+// budget including failed and partial bytes; an uncertain identity, changed
+// control or lock, missing input, invalid or oversized parse, failed lock or
+// read, or an exhausted deadline refuses the whole authority batch. The locks
+// are released the moment the row's custody decision is computed, before any
+// path traversal or report construction. Dynamic facts — the boot session,
+// record phases — are re-evaluated per row, and no verdict or liveness result
+// is cached across rows or across authority windows.
+
+/// Identity and change metadata pinning one observed document.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WitnessFacts {
+    dev: u64,
+    ino: u64,
+    uid: u32,
+    mode: u32,
+    nlink: u64,
+    size: u64,
+    change_secs: i64,
+    change_nanos: i64,
+}
+
+fn witness_facts(stat: &libc::stat) -> WitnessFacts {
+    WitnessFacts {
+        dev: u64::try_from(stat.st_dev).unwrap_or(u64::MAX),
+        ino: u64::try_from(stat.st_ino).unwrap_or(u64::MAX),
+        uid: stat.st_uid,
+        mode: u32::from(stat.st_mode),
+        nlink: u64::try_from(stat.st_nlink).unwrap_or(u64::MAX),
+        size: u64::try_from(stat.st_size).unwrap_or(u64::MAX),
+        change_secs: stat_change_secs(stat),
+        change_nanos: stat_change_nanos(stat),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn stat_change_secs(stat: &libc::stat) -> i64 {
+    stat.st_ctime
+}
+
+#[cfg(target_os = "macos")]
+fn stat_change_nanos(stat: &libc::stat) -> i64 {
+    i64::from(stat.st_ctime_nsec)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn stat_change_secs(stat: &libc::stat) -> i64 {
+    stat.st_ctim.tv_sec
+}
+
+#[cfg(not(target_os = "macos"))]
+fn stat_change_nanos(stat: &libc::stat) -> i64 {
+    i64::from(stat.st_ctim.tv_nsec)
+}
+
+fn fstat_witness(file: &File) -> Result<WitnessFacts, String> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: the descriptor is live for the call.
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(witness_facts(&stat))
+}
+
+/// `fstatat(AT_SYMLINK_NOFOLLOW)` for `name` under a held directory
+/// descriptor. `Ok(None)` is a positive no-follow absence; any other failure
+/// is an error, never an absence.
+fn fstatat_witness(directory: &File, name: &str) -> Result<Option<WitnessFacts>, String> {
+    let cname = CString::new(name).map_err(|_| format!("{name:?} contains a NUL"))?;
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: the descriptor and C string are live for the call.
+    let status = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            cname.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if status == 0 {
+        return Ok(Some(witness_facts(&stat)));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return Ok(None);
+    }
+    Err(error.to_string())
+}
+
+/// `openat(O_DIRECTORY|O_NOFOLLOW)` for `name` under a held descriptor.
+/// `Ok(None)` is a positive no-follow absence; a symlink, a non-directory or
+/// any other failure is an error, never an absence.
+fn openat_directory(directory: &File, name: &str) -> Result<Option<File>, String> {
+    let cname = CString::new(name).map_err(|_| format!("{name:?} contains a NUL"))?;
+    // SAFETY: the descriptor and C string are live for the call.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            cname.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd >= 0 {
+        // SAFETY: `fd` is a newly opened descriptor owned by this function.
+        return Ok(Some(unsafe { File::from_raw_fd(fd) }));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return Ok(None);
+    }
+    Err(error.to_string())
+}
+
+fn witness_is_private_file(facts: &WitnessFacts) -> bool {
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    (facts.mode & u32::from(libc::S_IFMT)) == u32::from(libc::S_IFREG)
+        && facts.uid == uid
+        && facts.mode & 0o077 == 0
+        && facts.nlink == 1
+}
+
+/// The pinned parsed state of one pool and its still-open descriptor, whose
+/// metadata is the witness every later row checks against.
+struct PinnedState {
+    state: State,
+    file: File,
+    facts: WitnessFacts,
+}
+
+/// One pool's pinned witnesses: its verified control directory descriptor,
+/// the admission lock's observed identity, and the pinned parsed state.
+struct PoolWitness {
+    control: PathBuf,
+    dir: File,
+    dir_identity: (u64, u64),
+    lock_identity: Option<(u64, u64)>,
+    state: Option<PinnedState>,
+}
+
+impl PoolWitness {
+    const STATE_NAME: &'static str = "state.json";
+    const LOCK_NAME: &'static str = "admission.lock";
+
+    fn open(control: &Path) -> Result<Self, String> {
+        let Some(dir) = open_control_directory(control)? else {
+            return Err(format!("{} does not exist", control.display()));
+        };
+        let facts = fstat_witness(&dir)?;
+        Ok(Self {
+            control: control.to_path_buf(),
+            dir_identity: (facts.dev, facts.ino),
+            dir,
+            lock_identity: None,
+            state: None,
+        })
+    }
+
+    /// Take this pool's existing admission lock for one custody decision:
+    /// non-blocking, never creating a missing lock, through the verified
+    /// no-follow control descriptor, and refusing a replaced lock identity.
+    fn take_admission(&mut self, deadline: Option<Instant>, label: &str) -> Result<File, String> {
+        if let Some(deadline) = deadline {
+            if Instant::now() > deadline {
+                return Err(format!(
+                    "the snapshot deadline passed before the {label} pool's custody lock was taken"
+                ));
+            }
+        }
+        // The control path must still name the pinned, verified directory.
+        let fresh = open_control_directory(&self.control)?;
+        let Some(fresh) = fresh else {
+            return Err(format!("the {label} pool's control directory disappeared"));
+        };
+        let fresh_facts =
+            fstat_witness(&fresh).map_err(|error| format!("cannot inspect the {label} pool's control directory: {error}"))?;
+        if (fresh_facts.dev, fresh_facts.ino) != self.dir_identity {
+            return Err(format!(
+                "the {label} pool's control directory changed while it was witnessed"
+            ));
+        }
+        drop(fresh);
+        let name = CString::new(Self::LOCK_NAME).map_err(|error| error.to_string())?;
+        // SAFETY: `name` is a live CString with initialized bytes through its
+        // terminator, and `dir` owns a live descriptor until the call ends.
+        // A missing lock is never created: absence is a refusal, and no
+        // fencing state is written on this read-only route.
+        let fd = unsafe {
+            libc::openat(
+                self.dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.kind() == std::io::ErrorKind::NotFound {
+                Err(format!("the {label} pool's admission lock is missing"))
+            } else {
+                Err(format!(
+                    "cannot open the {label} pool's admission lock: {error}"
+                ))
+            };
+        }
+        // SAFETY: `fd` is a newly opened descriptor owned by this function.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let facts = fstat_witness(&file)
+            .map_err(|error| format!("cannot inspect the {label} pool's admission lock: {error}"))?;
+        if !witness_is_private_file(&facts) {
+            return Err(format!(
+                "the {label} pool's admission lock is not an owner-only regular file"
+            ));
+        }
+        match self.lock_identity {
+            None => self.lock_identity = Some((facts.dev, facts.ino)),
+            Some(recorded) if recorded == (facts.dev, facts.ino) => {}
+            Some(_) => {
+                return Err(format!(
+                    "the {label} pool's admission lock was replaced while it was witnessed"
+                ))
+            }
+        }
+        // Non-blocking: a busy lock refuses this snapshot, never waits.
+        // SAFETY: the descriptor is live for the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.kind() == std::io::ErrorKind::WouldBlock {
+                Err(format!("the {label} pool's admission lock is busy"))
+            } else {
+                Err(format!(
+                    "cannot lock the {label} pool's admission lock: {error}"
+                ))
+            };
+        }
+        Ok(file)
+    }
+
+    /// Whether the pinned state document is still, on this row, the witnessed
+    /// document: the pinned descriptor's object unchanged, and the pathname
+    /// naming exactly that object.
+    fn state_witnessed(&self, label: &str) -> Result<bool, String> {
+        let Some(pinned) = &self.state else {
+            return Ok(false);
+        };
+        let fd_facts = fstat_witness(&pinned.file)
+            .map_err(|error| format!("cannot inspect the pinned {label} pool state: {error}"))?;
+        if fd_facts != pinned.facts {
+            // The pinned object itself changed: an in-place mutation, an
+            // extra link, or an unlinked inode whose number a replacement
+            // reused. None of these is the witnessed document.
+            return Ok(false);
+        }
+        let path_facts = fstatat_witness(&self.dir, Self::STATE_NAME)
+            .map_err(|error| format!("cannot inspect the {label} pool's state path: {error}"))?;
+        let Some(path_facts) = path_facts else {
+            return Err(format!("the {label} pool's state document is missing"));
+        };
+        Ok(path_facts == pinned.facts)
+    }
+
+    /// Read and parse the state document under the row's locks, with pre- and
+    /// post-read witness checks, charged to the authority budget like every
+    /// other snapshot input.
+    fn read_state(&mut self, label: &str) -> Result<(), String> {
+        let name = CString::new(Self::STATE_NAME).map_err(|error| error.to_string())?;
+        // SAFETY: as in `take_admission`: a live C string and descriptor, and
+        // a symlinked document is never followed.
+        let fd = unsafe {
+            libc::openat(
+                self.dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.kind() == std::io::ErrorKind::NotFound {
+                Err(format!("the {label} pool's state document is missing"))
+            } else {
+                Err(format!(
+                    "cannot open the {label} pool's state document: {error}"
+                ))
+            };
+        }
+        // SAFETY: `fd` is a newly opened descriptor owned by this function.
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let facts = fstat_witness(&file).map_err(|error| {
+            format!("cannot inspect the {label} pool's state document: {error}")
+        })?;
+        if !witness_is_private_file(&facts) {
+            return Err(format!(
+                "the {label} pool's state document is not a private regular file"
+            ));
+        }
+        let mut bytes = Vec::new();
+        // The descriptor pins the object through the read, so a document
+        // replaced mid-read fails the post-check below instead of mixing
+        // bytes from two objects.
+        crate::prune::authority_read(
+            std::io::Read::by_ref(&mut file).take(MAX_STATE_BYTES + 1),
+            &mut bytes,
+        )
+            .map_err(|error| {
+                format!("cannot read the {label} pool's state document: {error}")
+            })?;
+        if bytes.len() as u64 > MAX_STATE_BYTES {
+            return Err(format!(
+                "the {label} pool's state document exceeds its byte limit"
+            ));
+        }
+        let after = fstat_witness(&file).map_err(|error| {
+            format!("cannot inspect the {label} pool's state document: {error}")
+        })?;
+        let path_after = fstatat_witness(&self.dir, Self::STATE_NAME)
+            .map_err(|error| format!("cannot inspect the {label} pool's state path: {error}"))?;
+        if after != facts || path_after.as_ref() != Some(&facts) {
+            return Err(format!(
+                "the {label} pool's state document changed while it was being read"
+            ));
+        }
+        // The shared parser is the fence's acceptance test too, so this
+        // route accepts exactly the documents every writer produces.
+        let state = parse_state(&bytes)
+            .map_err(|error| format!("the {label} pool's state document is invalid: {error}"))?;
+        self.state = Some(PinnedState { state, file, facts });
+        Ok(())
+    }
+
+    /// This row's parsed state document, re-read only when its witness
+    /// changed. The pinned descriptor keeps the parsed bytes trustworthy
+    /// across rows.
+    fn witnessed_state(&mut self, label: &str) -> Result<&State, String> {
+        if !self.state_witnessed(label)? {
+            self.read_state(label)?;
+        }
+        Ok(&self.state.as_ref().expect("the state was just read").state)
+    }
+}
+
+/// One authority window's per-pool custody witness (oxide#235). At most one
+/// parsed state and one still-open state descriptor per pool; no part of it
+/// crosses an authority window, because its owning scope drops it.
+pub(crate) struct CustodyWitness {
+    internal: PoolWitness,
+    sibling_path: PathBuf,
+    sibling: Option<PoolWitness>,
+}
+
+/// One row's custody decision: the cooperative verdict across both pools'
+/// witnessed states, and each pool's holder lines.
+#[derive(Debug)]
+pub(crate) struct RowCustody {
+    pub verdict: CheckoutCustody,
+    pub internal_holders: Vec<String>,
+    /// `None` when the row proved no registered sibling, so the removable
+    /// pool contributes no custody on this row.
+    pub removable_holders: Option<Vec<String>>,
+}
+
+impl CustodyWitness {
+    /// Pin the internal control directory for one authority window. Nothing
+    /// is read or locked yet; every row witnesses afresh.
+    pub(crate) fn open(control: &Path) -> Result<Self, String> {
+        Ok(Self {
+            internal: PoolWitness::open(control)?,
+            sibling_path: crate::removable::removable_control(control),
+            sibling: None,
+        })
+    }
+
+    /// One row's custody decision under fresh per-row witnesses. Both
+    /// existing admission locks are taken internal-first, non-blocking; a
+    /// busy second lock releases the first (dropped on this early return) and
+    /// refuses the whole snapshot rather than waiting while holding it.
+    pub(crate) fn decide(
+        &mut self,
+        deadline: Option<Instant>,
+        checkout: &Path,
+        cleans: bool,
+    ) -> Result<RowCustody, String> {
+        let _internal_admission = self.internal.take_admission(deadline, "internal")?;
+        // The registration witness is re-read under the internal admission
+        // lock on every row; inside a prune authority window the read is
+        // charged to the shared budget like every other snapshot input.
+        let registered =
+            crate::removable::read_registration_at(&self.internal.dir)?.is_some();
+        let removable_admission = if registered {
+            let sibling = self.pinned_sibling()?;
+            Some(sibling.take_admission(deadline, "removable")?)
+        } else {
+            // A known absent, unregistered sibling is usable only with a
+            // positive no-follow absence witness repeated on this row, under
+            // the internal lock; an ambiguous absence is unknown.
+            self.witness_sibling_absence()?;
+            None
+        };
+        if let Some(deadline) = deadline {
+            if Instant::now() > deadline {
+                return Err(
+                    "the snapshot deadline passed during this row's custody witnesses".to_owned(),
+                );
+            }
+        }
+        let internal = self.internal.witnessed_state("internal")?;
+        let removable = match &removable_admission {
+            Some(_) => Some(
+                self.sibling
+                    .as_mut()
+                    .expect("the sibling was just pinned")
+                    .witnessed_state("removable")?,
+            ),
+            None => None,
+        };
+        // The locks drop when this function returns, before the caller does
+        // any path traversal or report construction.
+        let boot = boot_session();
+        let pools = [
+            (Some(internal), "this", None),
+            (removable, "the other", None),
+        ];
+        let verdict = custody_verdict(&pools, checkout, boot);
+        let internal_holders = holder_lines(internal, checkout, cleans);
+        let removable_holders = removable.map(|state| holder_lines(state, checkout, cleans));
+        Ok(RowCustody {
+            verdict,
+            internal_holders,
+            removable_holders,
+        })
+    }
+
+    /// The registered sibling's pinned witness, opened on the first row that
+    /// proves a registration. A registered sibling without a provable control
+    /// is unknown, never empty.
+    fn pinned_sibling(&mut self) -> Result<&mut PoolWitness, String> {
+        if self.sibling.is_none() {
+            self.sibling = Some(PoolWitness::open(&self.sibling_path)?);
+        }
+        Ok(self.sibling.as_mut().expect("the sibling was just pinned"))
+    }
+
+    /// Positive no-follow absence of the sibling control on this row: the
+    /// removable payload directory must be absent, or present with the
+    /// managed control positively absent. Anything else is ambiguous and
+    /// refuses.
+    fn witness_sibling_absence(&mut self) -> Result<(), String> {
+        // This row proves absence, never last row's presence.
+        self.sibling = None;
+        let dir = openat_directory(&self.internal.dir, crate::removable::POOL_DIR)
+            .map_err(|error| format!("cannot inspect the removable pool path: {error}"))?;
+        let Some(dir) = dir else {
+            return Ok(());
+        };
+        match fstatat_witness(&dir, MANAGED_NAME)
+            .map_err(|error| format!("cannot inspect the removable control path: {error}"))?
+        {
+            None => Ok(()),
+            Some(_) => Err(
+                "a removable control directory exists without a registration document, so the sibling's absence is ambiguous"
+                    .to_owned(),
+            ),
+        }
+    }
+}
+
 /// Take the internal pool's existing admission lock for metadata updates and
 /// command admission. Only the lock file may be created; the control
 /// directory must already exist.
@@ -7147,7 +7649,9 @@ pub(crate) mod tests {
     }
 
     /// A holder of a checkout's clean barrier excludes only barriers when it
-    /// rechecks writers: command records are still reported.
+    /// rechecks writers: command records are still reported. The prune
+    /// custody routes take the records-only shape through the fresh witness's
+    /// `cleans` split; this pins the split at the shared formatter.
     #[test]
     fn active_records_omit_barriers_but_keep_commands() {
         let (root, internal, _removable) = paired_controls("active-records");
@@ -7163,7 +7667,7 @@ pub(crate) mod tests {
             active_holders(&internal.control, checkout).unwrap(),
             vec!["oxide clean barrier".to_owned()]
         );
-        assert!(active_records(&internal.control, checkout)
+        assert!(holders(&internal.control, checkout, false)
             .unwrap()
             .is_empty());
         let mut running = record(Phase::Running, Some(i32::MAX), Some("v1.a.1.1.1"));
@@ -7171,7 +7675,7 @@ pub(crate) mod tests {
         state.records.push(running);
         internal.save(&state).unwrap();
         assert_eq!(
-            active_records(&internal.control, checkout).unwrap().len(),
+            holders(&internal.control, checkout, false).unwrap().len(),
             1
         );
         fs::remove_dir_all(root).unwrap();
@@ -12306,5 +12810,647 @@ mod scratch_internal_tests {
         assert_eq!(with, without);
         assert!(with.contains("Git work tree"));
         assert!(!settings.pool.exists());
+    }
+}
+
+/// Focused regressions for the fresh per-row custody witnesses (oxide#235):
+/// reuse of one parsed durable state per pool only while fresh witnesses
+/// prove it remains that same atomically replaced document, per-row
+/// non-blocking locks that are never created or fenced on this route, and
+/// refusal of every uncertain identity.
+#[cfg(test)]
+mod fresh_custody_tests {
+    use super::{
+        boot_session, holder_lines, lock_admission, open_control_directory, custody_verdict,
+        CheckoutCustody, CustodyWitness, Lost, Phase, Record, State, WorkspaceClass,
+    };
+    use crate::process;
+    use crate::removable::{self, DriveMode, Registration, REGISTRATION};
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    struct CustodyFixture {
+        root: PathBuf,
+        control: PathBuf,
+    }
+
+    impl CustodyFixture {
+        fn new(label: &str) -> Self {
+            let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let root = base.join(format!(
+                "oxide-fresh-custody-{label}-{}-{}",
+                std::process::id(),
+                process::now_ms()
+            ));
+            fs::create_dir(&root).unwrap();
+            let root = fs::canonicalize(root).unwrap();
+            let control = root.join("control");
+            fs::create_dir(&control).unwrap();
+            fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).unwrap();
+            Self { root, control }
+        }
+
+        /// An existing admission lock and a fenced state document, exactly
+        /// what a real command's first admission leaves behind.
+        fn prime(&self) {
+            lock_admission(&self.control).unwrap();
+            self.replace_state(&State::default());
+        }
+
+        /// Replace `state.json` the way every writer does: one owner-only
+        /// temporary file renamed over the document, never an in-place
+        /// mutation.
+        fn replace_state(&self, state: &State) {
+            let bytes = serde_json::to_vec(state).unwrap();
+            let temp = self.control.join("state.json.custody-tmp");
+            fs::write(&temp, bytes).unwrap();
+            fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::rename(&temp, self.control.join("state.json")).unwrap();
+        }
+
+        /// Rewrite the document's bytes IN PLACE on the same inode, which no
+        /// cooperative writer ever does: the tamper the metadata witness
+        /// exists to catch.
+        fn tamper_state_in_place(&self, state: &State) {
+            let bytes = serde_json::to_vec(state).unwrap();
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(self.control.join("state.json"))
+                .unwrap();
+            file.write_all(&bytes).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        fn registration_bytes() -> Vec<u8> {
+            let registration = Registration {
+                version: removable::REGISTRATION_VERSION,
+                mount_point: PathBuf::from("/Volumes/OxideCustodyFixture"),
+                volume_uuid: "A6AC3ED7-33EA-46B4-8082-7254CF291ED2".to_owned(),
+                container_uuid: "A6AC3ED7-33EA-46B4-8082-7254CF291ED2".to_owned(),
+                reserve_bytes: 1 << 20,
+                cap_bytes: 1 << 20,
+                quota_bytes: None,
+                capacity_bytes: None,
+                registered_ms: 17,
+                mode: DriveMode::Ephemeral,
+            };
+            serde_json::to_vec(&registration).unwrap()
+        }
+
+        /// Register a removable pool whose control has its own admission lock
+        /// and state document, as initialization leaves it.
+        fn register_sibling(&self, state: &State) -> PathBuf {
+            let path = self.control.join(REGISTRATION);
+            fs::write(&path, Self::registration_bytes()).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            let sibling = removable::removable_control(&self.control);
+            fs::create_dir_all(&sibling).unwrap();
+            fs::set_permissions(&sibling, fs::Permissions::from_mode(0o700)).unwrap();
+            lock_admission(&sibling).unwrap();
+            let bytes = serde_json::to_vec(state).unwrap();
+            let temp = sibling.join("state.json.custody-tmp");
+            fs::write(&temp, bytes).unwrap();
+            fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::rename(&temp, sibling.join("state.json")).unwrap();
+            sibling
+        }
+    }
+
+    impl Drop for CustodyFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn custody_record(id: u64, checkout: &Path, phase: Phase, lost: Option<Lost>) -> Record {
+        Record {
+            id,
+            identity: "identity".to_owned(),
+            compatibility: "compatibility".to_owned(),
+            profile: "quick".to_owned(),
+            checkout: Some(checkout.to_path_buf()),
+            phase,
+            process_group: None,
+            last_used: 1,
+            holder: None,
+            lease_id: None,
+            pending_recovery: None,
+            retired: lost.as_ref().map(|lost| lost.describe(false)),
+            lost,
+            last_used_ms: Some(1),
+            class: WorkspaceClass::Normal,
+            class_reason: None,
+        }
+    }
+
+    fn holder_record(id: u64, checkout: &Path, pid: u32, started_ms: u64) -> Record {
+        let mut record = custody_record(id, checkout, Phase::Running, None);
+        record.holder = Some(super::Holder {
+            pid,
+            started_ms,
+            lease_holder: "lease".to_owned(),
+            command: Some("cargo build".to_owned()),
+        });
+        record
+    }
+
+    fn checkout(fixture: &CustodyFixture) -> PathBuf {
+        fixture.root.join("gone/checkout")
+    }
+
+    /// One parsed state is reused across rows, and a replacement between rows
+    /// is re-read under the locks: the same document is still clear, a
+    /// document replaced by a running writer is seen by the next row, and a
+    /// document replaced back is clear again.
+    #[test]
+    fn rows_reuse_one_parsed_state_and_reread_a_replaced_document() {
+        let fixture = CustodyFixture::new("reuse");
+        fixture.prime();
+        let checkout = checkout(&fixture);
+        let mut witness = CustodyWitness::open(&fixture.control).unwrap();
+        assert_eq!(
+            witness.decide(None, &checkout, true).unwrap().verdict,
+            CheckoutCustody::Clear
+        );
+        fixture.replace_state(&State {
+            records: vec![custody_record(1, &checkout, Phase::Running, None)],
+            ..State::default()
+        });
+        assert_eq!(
+            witness.decide(None, &checkout, true).unwrap().verdict,
+            CheckoutCustody::Writers,
+            "a replacement between rows must be witnessed and re-read"
+        );
+        fixture.replace_state(&State::default());
+        assert_eq!(
+            witness.decide(None, &checkout, true).unwrap().verdict,
+            CheckoutCustody::Clear
+        );
+    }
+
+    /// An admission lock replaced between rows is not the witnessed lock: the
+    /// row refuses instead of locking a stranger's file.
+    #[test]
+    fn a_replaced_admission_lock_refuses() {
+        let fixture = CustodyFixture::new("lock-replaced");
+        fixture.prime();
+        let checkout = checkout(&fixture);
+        let mut witness = CustodyWitness::open(&fixture.control).unwrap();
+        witness.decide(None, &checkout, true).unwrap();
+        let lock = fixture.control.join("admission.lock");
+        fs::remove_file(&lock).unwrap();
+        lock_admission(&fixture.control).unwrap();
+        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        assert!(reason.contains("admission lock was replaced"), "{reason}");
+    }
+
+    /// A replaced control directory is refused: the pinned descriptor's
+    /// identity no longer matches the path.
+    #[test]
+    fn a_replaced_control_directory_refuses() {
+        let fixture = CustodyFixture::new("control-replaced");
+        fixture.prime();
+        let checkout = checkout(&fixture);
+        let mut witness = CustodyWitness::open(&fixture.control).unwrap();
+        witness.decide(None, &checkout, true).unwrap();
+        let replacement = fixture.root.join("control-replacement");
+        fs::create_dir(&replacement).unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
+        lock_admission(&replacement).unwrap();
+        let stale = fixture.root.join("control-stale");
+        fs::rename(&fixture.control, &stale).unwrap();
+        fs::rename(&replacement, &fixture.control).unwrap();
+        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        assert!(
+            reason.contains("control directory changed"),
+            "a replaced control directory must refuse: {reason}"
+        );
+    }
+
+    /// A missing admission lock refuses and is never created by this
+    /// read-only route: absence is not permission to mutate the control.
+    #[test]
+    fn a_missing_admission_lock_refuses_without_creation() {
+        let fixture = CustodyFixture::new("lock-missing");
+        fixture.prime();
+        let lock = fixture.control.join("admission.lock");
+        fs::remove_file(&lock).unwrap();
+        let checkout = checkout(&fixture);
+        let mut witness = CustodyWitness::open(&fixture.control).unwrap();
+        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        assert!(reason.contains("admission lock is missing"), "{reason}");
+        assert!(!lock.exists(), "the route must not create the lock");
+    }
+
+    /// A busy second lock releases the first and refuses the snapshot: the
+    /// internal lock is free again immediately after the refusal.
+    #[test]
+    fn a_busy_removable_lock_releases_the_internal_lock_and_refuses() {
+        let fixture = CustodyFixture::new("busy-removable");
+        fixture.prime();
+        let state = State {
+            records: vec![custody_record(1, &checkout(&fixture), Phase::Running, None)],
+            ..State::default()
+        };
+        fixture.register_sibling(&state);
+        let checkout = checkout(&fixture);
+        // A second open of the same lock file conflicts under `flock` even
+        // inside one process, so this holds the removable lock like a writer.
+        let sibling = removable::removable_control(&fixture.control);
+        let held = File::options()
+            .read(true)
+            .write(true)
+            .open(sibling.join("admission.lock"))
+            .unwrap();
+        super::flock_blocking(&held).unwrap();
+        let mut witness = CustodyWitness::open(&fixture.control).unwrap();
+        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        assert!(
+            reason.contains("removable pool's admission lock is busy"),
+            "{reason}"
+        );
+        drop(held);
+        // The first lock was released with the refusal, not held while
+        // waiting: the internal lock is free for the next take.
+        let internal = File::options()
+            .read(true)
+            .write(true)
+            .open(fixture.control.join("admission.lock"))
+            .unwrap();
+        super::flock_nonblocking(&internal).unwrap();
+    }
+
+    /// A busy internal lock refuses without waiting.
+    #[test]
+    fn a_busy_internal_lock_refuses_immediately() {
+        let fixture = CustodyFixture::new("busy-internal");
+        fixture.prime();
+        let held = File::options()
+            .read(true)
+            .write(true)
+            .open(fixture.control.join("admission.lock"))
+            .unwrap();
+        super::flock_blocking(&held).unwrap();
+        let checkout = checkout(&fixture);
+        let mut witness = CustodyWitness::open(&fixture.control).unwrap();
+        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        assert!(
+            reason.contains("internal pool's admission lock is busy"),
+            "{reason}"
+        );
+    }
+
+    /// A registered sibling without a provable control, lock or state is
+    /// unknown at every stage, never empty.
+    #[test]
+    fn a_registered_sibling_without_control_lock_or_state_is_unknown() {
+        let fixture = CustodyFixture::new("sibling-unprovable");
+        fixture.prime();
+        let checkout = checkout(&fixture);
+        let registration = fixture.control.join(REGISTRATION);
+        fs::write(&registration, CustodyFixture::registration_bytes()).unwrap();
+        fs::set_permissions(&registration, fs::Permissions::from_mode(0o600)).unwrap();
+        let sibling = removable::removable_control(&fixture.control);
+        let mut witness = CustodyWitness::open(&fixture.control).unwrap();
+        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        assert!(reason.contains("does not exist"), "{reason}");
+        fs::create_dir_all(&sibling).unwrap();
+        fs::set_permissions(&sibling, fs::Permissions::from_mode(0o700)).unwrap();
+        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        assert!(reason.contains("admission lock is missing"), "{reason}");
+        lock_admission(&sibling).unwrap();
+        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        assert!(
+            reason.contains("state document is missing"),
+            "a registered sibling without proved state is unknown: {reason}"
+        );
+    }
+
+    /// An absent sibling is proved per row, and a registration that appears
+    /// between rows is seen by the next decision.
+    #[test]
+    fn an_absent_sibling_is_rewitnessed_when_a_registration_appears() {
+        let fixture = CustodyFixture::new("absent-sibling");
+        fixture.prime();
+        let checkout = checkout(&fixture);
+        let mut witness = CustodyWitness::open(&fixture.control).unwrap();
+        let row = witness.decide(None, &checkout, true).unwrap();
+        assert_eq!(row.verdict, CheckoutCustody::Clear);
+        assert!(row.removable_holders.is_none());
+        let state = State {
+            records: vec![holder_record(1, &checkout, 7, 1)],
+            ..State::default()
+        };
+        fixture.register_sibling(&state);
+        let row = witness.decide(None, &checkout, true).unwrap();
+        assert_eq!(
+            row.verdict,
+            CheckoutCustody::Writers,
+            "the registration and its writer must be seen on the next row"
+        );
+        assert_eq!(
+            row.removable_holders.unwrap(),
+            vec!["oxide pid 7: cargo build".to_owned()],
+            "the removable pool's own holder line is reported"
+        );
+    }
+
+    /// A removable control directory without a registration document is an
+    /// ambiguous absence, not a known one.
+    #[test]
+    fn an_ambiguous_absence_refuses() {
+        let fixture = CustodyFixture::new("ambiguous-absence");
+        fixture.prime();
+        let sibling = removable::removable_control(&fixture.control);
+        fs::create_dir_all(&sibling).unwrap();
+        fs::set_permissions(&sibling, fs::Permissions::from_mode(0o700)).unwrap();
+        let checkout = checkout(&fixture);
+        let mut witness = CustodyWitness::open(&fixture.control).unwrap();
+        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        assert!(reason.contains("ambiguous"), "{reason}");
+    }
+
+    /// An in-place mutation of the same inode is caught by the change
+    /// metadata and re-read under the locks; invalid replacement bytes in
+    /// place refuse instead of guessing.
+    #[test]
+    fn in_place_mutation_is_reread_and_invalid_bytes_refuse() {
+        let fixture = CustodyFixture::new("in-place");
+        fixture.prime();
+        let checkout = checkout(&fixture);
+        let mut witness = CustodyWitness::open(&fixture.control).unwrap();
+        assert_eq!(
+            witness.decide(None, &checkout, true).unwrap().verdict,
+            CheckoutCustody::Clear
+        );
+        fixture.tamper_state_in_place(&State {
+            records: vec![custody_record(1, &checkout, Phase::Running, None)],
+            ..State::default()
+        });
+        assert_eq!(
+            witness.decide(None, &checkout, true).unwrap().verdict,
+            CheckoutCustody::Writers,
+            "an in-place mutation of the witnessed inode must force a re-read"
+        );
+        fs::write(fixture.control.join("state.json"), b"{not json").unwrap();
+        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        assert!(reason.contains("invalid"), "{reason}");
+    }
+
+    /// A replacement with the same byte size is still re-read: the
+    /// high-resolution change metadata witnesses the document, not its size
+    /// alone.
+    #[test]
+    fn same_size_replacement_is_reread_from_change_metadata() {
+        let fixture = CustodyFixture::new("same-size");
+        fixture.prime();
+        let checkout = checkout(&fixture);
+        let clean = State::default();
+        let mut writing = State {
+            records: vec![custody_record(1, &checkout, Phase::Running, None)],
+            ..State::default()
+        };
+        writing.cleans.push(super::Clean {
+            id: 1,
+            checkout: checkout.clone(),
+            process_group: None,
+        });
+        // Pad both documents to byte-identical lengths with a placeholder
+        // identity so only the content and change metadata differ.
+        let mut clean_bytes = serde_json::to_vec(&clean).unwrap();
+        let mut writing_bytes = serde_json::to_vec(&writing).unwrap();
+        assert!(writing_bytes.len() > clean_bytes.len());
+        clean_bytes.resize(writing_bytes.len(), b' ');
+        fixture.replace_state(&serde_json::from_slice(&clean_bytes).unwrap());
+        let mut witness = CustodyWitness::open(&fixture.control).unwrap();
+        assert_eq!(
+            witness.decide(None, &checkout, true).unwrap().verdict,
+            CheckoutCustody::Clear
+        );
+        let temp = fixture.control.join("state.json.custody-tmp");
+        fs::write(&temp, &writing_bytes).unwrap();
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::rename(&temp, fixture.control.join("state.json")).unwrap();
+        assert_eq!(
+            witness.decide(None, &checkout, true).unwrap().verdict,
+            CheckoutCustody::Writers,
+            "a same-size replacement must be witnessed by its change metadata"
+        );
+    }
+
+    /// A second hard link to the state document makes its identity
+    /// unverifiable, so the row refuses.
+    #[test]
+    fn a_second_hard_link_refuses() {
+        let fixture = CustodyFixture::new("hardlink");
+        fixture.prime();
+        fs::hard_link(
+            fixture.control.join("state.json"),
+            fixture.control.join("state.json.link"),
+        )
+        .unwrap();
+        let checkout = checkout(&fixture);
+        let mut witness = CustodyWitness::open(&fixture.control).unwrap();
+        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        assert!(
+            reason.contains("not a private regular file"),
+            "a linked state document must refuse: {reason}"
+        );
+    }
+
+    /// A symlinked state document is never followed.
+    #[test]
+    fn a_symlinked_state_refuses() {
+        let fixture = CustodyFixture::new("symlink");
+        fixture.prime();
+        let real = fixture.root.join("elsewhere.json");
+        fs::write(&real, serde_json::to_vec(&State::default()).unwrap()).unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o600)).unwrap();
+        let document = fixture.control.join("state.json");
+        fs::remove_file(&document).unwrap();
+        std::os::unix::fs::symlink(&real, &document).unwrap();
+        let checkout = checkout(&fixture);
+        let mut witness = CustodyWitness::open(&fixture.control).unwrap();
+        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        assert!(
+            !reason.contains("clear"),
+            "a symlinked state document must refuse: {reason}"
+        );
+        assert!(reason.contains("state document") || reason.contains("state path"), "{reason}");
+    }
+
+    /// An oversized state document refuses under the same per-input limit
+    /// every other reader applies.
+    #[test]
+    fn an_oversized_state_refuses() {
+        let fixture = CustodyFixture::new("oversized");
+        fixture.prime();
+        let limit = super::MAX_STATE_BYTES;
+        let temp = fixture.control.join("state.json.custody-tmp");
+        let file = File::create(&temp).unwrap();
+        file.set_len(limit + 1).unwrap();
+        file.set_permissions(fs::Permissions::from_mode(0o600)).unwrap();
+        drop(file);
+        fs::rename(&temp, fixture.control.join("state.json")).unwrap();
+        let checkout = checkout(&fixture);
+        let mut witness = CustodyWitness::open(&fixture.control).unwrap();
+        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        assert!(reason.contains("byte limit"), "{reason}");
+    }
+
+    /// A state document that disappears after being witnessed refuses the
+    /// row instead of reading a stranger's document or reporting empty.
+    #[test]
+    fn a_disappeared_state_refuses() {
+        let fixture = CustodyFixture::new("vanished");
+        fixture.prime();
+        let checkout = checkout(&fixture);
+        let mut witness = CustodyWitness::open(&fixture.control).unwrap();
+        witness.decide(None, &checkout, true).unwrap();
+        fs::remove_file(fixture.control.join("state.json")).unwrap();
+        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        assert!(reason.contains("missing"), "{reason}");
+    }
+
+    /// Lost-writer custody and boot closure are recomputed per row from the
+    /// witnessed states and a fresh boot session, never cached.
+    #[test]
+    fn lost_writers_and_boot_closure_are_recomputed_per_row() {
+        let fixture = CustodyFixture::new("lost");
+        fixture.prime();
+        let checkout = checkout(&fixture);
+        let boot = boot_session().unwrap_or_else(|| process::now_ms() + 10_000);
+        let unclosed = Lost {
+            slot_id: "3".to_owned(),
+            at_ms: 2,
+            unclosed: Some("exec may have started processes outside its group".to_owned()),
+        };
+        // A holder recorded before the boot session is closed by the restart:
+        // its start plus the boot safety margin lies before the boot time.
+        let mut closed = custody_record(2, &checkout, Phase::Retired, Some(unclosed.clone()));
+        closed.holder = Some(super::Holder {
+            pid: 4_000_000,
+            started_ms: boot.saturating_sub(super::BOOT_MARGIN_MS + 60_000),
+            lease_holder: "lease".to_owned(),
+            command: None,
+        });
+        // A holder recorded inside this boot session is never closed.
+        let mut open = custody_record(3, &checkout, Phase::Retired, Some(unclosed.clone()));
+        open.holder = Some(super::Holder {
+            pid: 4_000_001,
+            started_ms: process::now_ms(),
+            lease_holder: "lease".to_owned(),
+            command: None,
+        });
+        let mut witness = CustodyWitness::open(&fixture.control).unwrap();
+        fixture.replace_state(&State {
+            records: vec![closed.clone()],
+            ..State::default()
+        });
+        assert_eq!(
+            witness.decide(None, &checkout, true).unwrap().verdict,
+            CheckoutCustody::Clear,
+            "a boot-closed lost writer is not unknown custody"
+        );
+        fixture.replace_state(&State {
+            records: vec![open.clone()],
+            ..State::default()
+        });
+        match witness.decide(None, &checkout, true).unwrap().verdict {
+            CheckoutCustody::Unknown(reason) => {
+                assert!(reason.contains("never confirmed closed"), "{reason}")
+            }
+            other => panic!("expected unknown custody, got {other:?}"),
+        }
+    }
+
+    /// Holder lines keep the exact record and clean-barrier split both routes
+    /// have always reported.
+    #[test]
+    fn holder_lines_match_the_record_and_barrier_split() {
+        let fixture = CustodyFixture::new("holders");
+        fixture.prime();
+        let checkout = checkout(&fixture);
+        let mut state = State {
+            records: vec![holder_record(1, &checkout, 42, 1)],
+            ..State::default()
+        };
+        state.cleans.push(super::Clean {
+            id: 2,
+            checkout: checkout.clone(),
+            process_group: None,
+        });
+        fixture.replace_state(&state);
+        let mut witness = CustodyWitness::open(&fixture.control).unwrap();
+        let row = witness.decide(None, &checkout, true).unwrap();
+        assert_eq!(row.verdict, CheckoutCustody::Writers);
+        assert_eq!(
+            row.internal_holders,
+            vec![
+                "oxide pid 42: cargo build".to_owned(),
+                "oxide clean barrier".to_owned()
+            ]
+        );
+        let row = witness.decide(None, &checkout, false).unwrap();
+        assert_eq!(row.internal_holders, vec!["oxide pid 42: cargo build".to_owned()]);
+        // A recorded barrier for another checkout is never this checkout's
+        // holder.
+        let mut other_state = state.clone();
+        other_state.cleans[0].checkout = fixture.root.join("another");
+        fixture.replace_state(&other_state);
+        let row = witness.decide(None, &checkout, true).unwrap();
+        assert_eq!(row.internal_holders, vec!["oxide pid 42: cargo build".to_owned()]);
+    }
+
+    /// The fresh route classifies records exactly as `checkout_custody` does:
+    /// writers are writers, unknown lost storage is unknown, and the caller's
+    /// own record is exempt only in its own pool.
+    #[test]
+    fn the_verdict_matches_checkout_custody_classification() {
+        let fixture = CustodyFixture::new("verdict-parity");
+        fixture.prime();
+        let checkout = checkout(&fixture);
+        let state = State {
+            records: vec![custody_record(1, &checkout, Phase::Running, None)],
+            ..State::default()
+        };
+        fixture.replace_state(&state);
+        let mut witness = CustodyWitness::open(&fixture.control).unwrap();
+        let witnessed = witness.decide(None, &checkout, true).unwrap().verdict;
+        let parsed = &witness
+            .decide(None, &checkout, true)
+            .unwrap()
+            .verdict;
+        assert_eq!(witnessed, *parsed);
+        // The shared classifier decides the same from one parsed state.
+        let pools = [(Some(&state), "this", Some(1u64))];
+        assert_eq!(
+            custody_verdict(&pools, &checkout, boot_session()),
+            CheckoutCustody::Clear,
+            "the caller's own record is exempt in its own pool"
+        );
+        let pools = [(Some(&state), "this", None)];
+        assert_eq!(
+            custody_verdict(&pools, &checkout, boot_session()),
+            CheckoutCustody::Writers
+        );
+    }
+
+    /// The internal control directory must exist to be pinned at all.
+    #[test]
+    fn an_absent_control_directory_refuses_to_pin() {
+        let fixture = CustodyFixture::new("absent-control");
+        let reason = match CustodyWitness::open(&fixture.root.join("nowhere")) {
+            Err(reason) => reason,
+            Ok(_) => panic!("a missing control directory must not pin"),
+        };
+        assert!(reason.contains("does not exist"), "{reason}");
+        assert!(open_control_directory(&fixture.control).is_ok());
+        let _ = holder_lines(&State::default(), Path::new("/checkout"), true);
     }
 }
