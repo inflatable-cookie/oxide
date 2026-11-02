@@ -1019,8 +1019,10 @@ runtime documents the two reviewed wrappers consume — no new competing
 schema:
 
 - `barge.validation-source-audit/1`, `barge.private-roots/1` and
-  `barge.validation-block/1` (the accepted Barge launcher shapes at
-  `864fc8e878ca039805733b82253fbbd3f50b8193`), built from private source
+  `barge.validation-block/1` (the accepted Barge launcher shapes, pinned to
+  the source-approved cap revision at
+  `60c2c793e0743ebb389dd433cec53251d00a0b87`, retained review run
+  `9c36470a-54ab-44a8-9e15-28ce1789e9c4`), built from private source
   copies staged under the prepared task root, with component analyses bound
   to the audited source sites and host executable digests measured live;
 - the accepted Oxide #240 launcher shapes: `budget.json`,
@@ -1056,7 +1058,32 @@ or shared pool is swept, and no prior point-in-time size is a present peak.
 phase roots, with the qualified supervisor adopting and sampling the entire
 active root, including its evidence and exports. The diagnostic verifies a
 closed preparation receipt and charges its wall time and a conservative 120 s
-pure-check reservation against both prospective blocks. It consumes each
+pure-check reservation against both prospective blocks. **Source-bound
+cross-checkout preparation** (operator decision `af038a7e` v2; planner
+relative-path correction): the authorized continuation prepares at one Queue
+checkout and executes at the eventual merged-source proof-only checkout, so
+the diagnostic no longer compares script paths — the recorded preparation
+path may be relative (`scripts/test-private-build-validation.py`), and a
+path comparison could pass in the diagnostic's own cwd without any byte
+evidence, or error on an absolute path at a checkout that no longer exists.
+Preparation instead writes a deterministic `source-binding.json`
+(`oxide.private-build-validation.source-binding/1`) beside the packet
+manifest, positively binding the whole guard-recorded command verbatim, the
+preparation script's actual SHA-256 (computed in the preparation process,
+where its recorded path is meaningful), the qualified supervisor bytes
+(`fcfda2b0…`) and the packet manifest digest; it prints that binding's
+digest for the planner to bind. The diagnostic requires the planner-bound
+`--expect-source-binding` digest, re-reads the binding and the manifest from
+the retained packet (whose directory it locates only from the recorded
+command, never by resolving the recorded script path), verifies its own
+running script bytes against the bound digest, re-checks every manifest
+binding (run identity, packet, roots, heads, audit-input digest, unissued
+state and each named packet document digest), and refuses a changed script
+or guard, an edited command token, mismatched heads/roots/options, a
+malformed or missing binding or manifest, an edited manifest or packet
+document, or an unclosed preparation. Identical reviewed bytes at a
+different checkout are accepted; an absolute basename, an environment
+assertion or a removed check would not be a source binding. It consumes each
 planner-issued companion token once, under the relevant task root's guard;
 the exclusive persistent claim is retained even after refusal. A direct
 entry requires a matching live supervisor parent, command and receipt, not
@@ -1086,12 +1113,16 @@ heavy Effigy admission through the audited hook, with the audited pair
 preserved in every child environment; no second admission seam exists and no
 Git-verified source archive is ever edited.
 
-**Resource clamps (review 6584174560).** Whole-block scratch is a measured
-clamp of each grant minus retained bytes — on Oxide's 6 GiB grant with the
-reported 5591.8 MiB retained total, about 552 MiB, not the 1024 MiB nominal
-bootstrap maximum. The effective figure is measured at runtime, disclosed in
-the receipt, never silently raised, and never a claim that a phase fits: an
-impossible fit is an exact measured shortfall and refuses.
+**Resource clamps (operator decision `af038a7e` v2; review 6584174560).**
+Whole-block scratch is a measured clamp of each prospective aggregate grant
+minus retained bytes — Barge 3 GiB and Oxide 8 GiB of Builds scratch. The
+prospective grants do not renew or raise any earlier session: the historical
+2 GiB / 6 GiB runs and their evidence (Oxide's reported 5591.8 MiB retained
+total, about 552 MiB effective against the 6 GiB grant) keep their original
+bounds and stand as historical measurement only. The effective figure is
+measured at runtime, disclosed in the receipt, never silently raised, and
+never a claim that a phase fits: an impossible fit is an exact measured
+shortfall and refuses.
 
 **Selectors.** `proof:private-build-validation:test` (pure mocked
 counterfactuals covering every gate/refusal control: missing/unissued/duplicate
@@ -1099,7 +1130,12 @@ block, exhausted time/disk, cross-process id/deadline mismatch, wrong
 source/digest/child env, absent admission hook/socket/runtime binding,
 unknown/incomplete/non-quiescent roots, empty/malformed inventory,
 same-content inode replacement, failed closure, real-tree accounting and
-clamp arithmetic, packet/schema conformance, supervisor-context binding);
+clamp arithmetic (historical and prospective grants), exact/over-cap
+acceptance and refusal, packet/schema conformance, supervisor-context
+binding, and the cross-checkout source binding: identical reviewed bytes at
+a different checkout accepted; changed script/guard bytes, an edited command
+or manifest or packet document, mismatched heads/roots/options and a
+missing or malformed binding refused);
 `proof:private-build-validation:plan` (effect-free);
 `proof:private-build-validation:diagnostic` (heavy, whole command under the
 qualified supervisor). The diagnostic declaration carries no issued binding
@@ -1116,6 +1152,7 @@ bound inputs. The exact command template the planner binds at issue:
       --expect-audit <sha256> --expect-ledger <sha256> \
       --expect-budget <sha256> --expect-history <sha256> --expect-oxide-binding <sha256> \
       --preparation-receipt <closed guard receipt> --expect-preparation <sha256> \
+      --expect-source-binding <sha256> \
       [--planner-reference <string>]
 
 Preparation is a separate guarded document phase with a fresh adopted Barge
@@ -1195,6 +1232,36 @@ source component copies, host provenance, the complete root ledger and both
 issued blocks; proposed documents alone are not an admission packet.
 `planner_reference` must be confirmed by the planner at binding (the
 proposal carries the brief-v11 string; the held brief is now v12).
+
+**Status and the approved continuation (oxide#249; operator decision
+`af038a7e` v2, 2026-11-02).** The gate's source landed source-only as
+#248/PR234 (merged `1854c581`); it grants no qualification. The first
+proofExecution, Queue execution `0feea5af` at `67eea662`, failed after its
+debug bootstrap: the guard closed with exit 2, no fault or deadline, and a
+certain empty census, on the post-bootstrap live-inventory bracket (receipt
+`/Volumes/Builds/scratch/barge/248-retained-runtime.pz0dqxo7/supervisor-evidence.09j75k94/receipt.json`,
+SHA-256 `9dee671b093f1e3a2f9cabe6f48c5f45abf5b5ac31cb8c02377da7cb24c976e0`);
+the single original bootstrap grant is spent, the compared inventories were
+not persisted, and no qualification or acceptance is claimed. That failure
+packet and the earlier preparation packet (`248-retained-prepare.i0okptqk`,
+whose receipt names a relative script path) are historical evidence: old
+packets, receipts and manifests are untouched and carry no binding under the
+source-bound route, and consumed claims are never re-opened. The ruling
+approves ONE further shared Queue diagnostic and at most ONE additional
+300 s private debug bootstrap, inside the SAME at-most-749 s remaining to
+each block (451 s already charged, including the failed run's 58 s and the
+Barge cap revision's safe-check charges applied conservatively to both
+blocks), with the prospective 3 GiB / 8 GiB caps above. Preparation for that
+continuation may run at one Queue checkout and the diagnostic at the
+eventual merged-source proof-only checkout under the source-bound
+`--expect-source-binding` route. No new clock, reset, refund, cleanup,
+install, production redirect, live shared-pool/output read or additional
+runtime is granted; any inode/content delta, unknown custody or exceeded
+bound still refuses, and the retained reviewer judges the actual receipt
+before the planner releases the gate. Both capture tasks remain manually
+held pending the actual new proof-only qualification and its required
+covering evidence; merged source-only #248 and the failed native `0feea5af`
+are distinct facts and neither is a qualification.
 
 **Integration and removal plan for the obsolete local scaffold.** The #240
 local route (`scripts/tape-isolation-check.py` sequence/bootstrap/preflight/

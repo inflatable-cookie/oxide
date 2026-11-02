@@ -31,6 +31,18 @@ gate, re-snapshot every retained root, and export the wrapper-consumable
 artifacts plus the remaining measured allowance. Any unknown refuses without
 repair, retry or attribution.
 
+Cross-checkout preparation binding (operator `af038a7e` v2; planner
+relative-path correction): preparation may run at one Queue checkout while
+the diagnostic runs at the eventual merged-source proof-only checkout, so
+the diagnostic never resolves the receipt's recorded script path (it may be
+relative and would otherwise resolve in the wrong cwd, or pass on shape
+alone). Preparation instead writes a deterministic `source-binding.json`
+beside the packet manifest positively binding the whole guard-recorded
+command, the preparation script's actual SHA-256, the qualified supervisor
+bytes and the packet manifest digest; the diagnostic requires the
+planner-bound `--expect-source-binding` digest, re-reads both retained
+documents, and accepts only identical reviewed source bytes at any checkout.
+
 Modes an author may run (effect-free, through Effigy selectors): `--self-test`
 (mocked counterfactuals only; fixtures under a fresh `TMPDIR` template) and
 `--plan` (no effect). `--prepare` is a planner-owned bounded document round;
@@ -68,7 +80,9 @@ import time
 
 OXIDE_PIN_COMMIT = "3de241325dd286ae44a5759fa6825b05a81c7b4e"
 OXIDE_PIN_TREE = "452a9c2dc6b1432c643c5053655e029955977754"
-BARGE_ACCEPTED_HEAD = "864fc8e878ca039805733b82253fbbd3f50b8193"
+# Source-approved accepted Barge launcher head (`scripts/tape/admission.py`)
+# including its cap revision; retained review run 9c36470a-54ab-44a8-9e15-28ce1789e9c4.
+BARGE_ACCEPTED_HEAD = "60c2c793e0743ebb389dd433cec53251d00a0b87"
 BARGE_RECIPE_HEAD = "249f0e4c904b692de13668af77fd697ff7c5f7fc"
 BARGE_RECIPE_TREE = "1c8cdc151baa5794f5dcfcda4cc801031820dbcb"
 SUPERVISOR_SHA256 = "fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b"
@@ -77,8 +91,13 @@ OXIDE_TASK = "d41de092-b0b0-495d-b159-8c4d1730d6b4"
 BARGE_SCRATCH = Path("/Volumes/Builds/scratch/barge")
 OXIDE_SCRATCH = Path("/Volumes/Builds/scratch/oxide")
 SCRATCH_ROOT = Path("/Volumes/Builds/scratch")
-BARGE_CAP_BYTES = 2 * 1024 * 1024 * 1024
-OXIDE_CAP_BYTES = 6 * 1024 * 1024 * 1024
+BARGE_CAP_BYTES = 3 * 1024 * 1024 * 1024
+OXIDE_CAP_BYTES = 8 * 1024 * 1024 * 1024
+# Prospective aggregate Builds scratch grants (operator decision af038a7e v2,
+# 2026-11-02); the earlier 2 GiB / 6 GiB sessions and their evidence keep
+# their original historical bounds and are never silently raised.
+HISTORIC_BARGE_CAP_BYTES = 2 * 1024 * 1024 * 1024
+HISTORIC_OXIDE_CAP_BYTES = 6 * 1024 * 1024 * 1024
 PROSPECTIVE_MAX_SECONDS = 1200
 BOOTSTRAP_MAX_SECONDS = 300
 BOOTSTRAP_MAX_MIB = 1024
@@ -99,12 +118,14 @@ STATUS_SELECTOR = "rust:test:tape-private-status"
 TOOLCHAIN = "1.97.1"
 
 SCHEMA_GATE_RECEIPT = "oxide.private-build-validation/1"
+SCHEMA_SOURCE_BINDING = "oxide.private-build-validation.source-binding/1"
 SCHEMA_BARGE_AUDIT = "barge.validation-source-audit/1"
 SCHEMA_BARGE_LEDGER = "barge.private-roots/1"
 SCHEMA_BARGE_BLOCK = "barge.validation-block/1"
 
-# The accepted Barge launcher (`scripts/tape/admission.py` at 864fc8e)
-# enforces exactly these selectors and component names; mirrors, kept
+# The accepted Barge launcher (`scripts/tape/admission.py` at 60c2c79, the
+# source-approved cap revision) enforces exactly these selectors and component
+# names; mirrors, kept
 # deliberately identical so one issued packet serves both wrappers.
 BARGE_SAFE_SELECTORS = frozenset((
     "rust:compile", "rust:compile:release", "rust:format", "rust:lint",
@@ -783,7 +804,7 @@ def validate_barge_block(block, *, head, wrapper_hash, oxide_hash, audit_hash,
     if block["max_seconds"] > PROSPECTIVE_MAX_SECONDS:
         raise GateRefusal("block exceeds the one authorized prospective maximum")
     if block["scratch_cap_bytes"] != BARGE_CAP_BYTES:
-        raise GateRefusal("private scratch cap must remain 2 GiB")
+        raise GateRefusal("private scratch cap must be the approved 3 GiB")
     if type(block["pool_cap_bytes"]) is not int or not 0 < block["pool_cap_bytes"] <= BARGE_CAP_BYTES:
         raise GateRefusal("private pool budget is missing or exceeds scratch cap")
     selectors = block["selectors"]
@@ -1012,6 +1033,93 @@ def validate_supervisor_receipt(receipt, expected_command: list, private: Path) 
             or outcome.get("launched") is not True or census.get("certain") is not True
             or census.get("members") != 0 or census.get("uncertain") != 0):
         raise GateRefusal("supervisor receipt does not prove successful closure")
+
+
+def preparation_packet_dir(prep_options: dict, prep_scratch: Path) -> Path:
+    """Locate the retained preparation packet named by the recorded command."""
+    text = prep_options.get("packet_dir") if isinstance(prep_options, dict) else None
+    if not isinstance(text, str) or not text.strip():
+        raise GateRefusal("the prepared command names no packet directory")
+    packet_dir = Path(text)
+    try:
+        if (not packet_dir.is_absolute() or packet_dir.is_symlink()
+                or packet_dir.resolve(strict=True) != packet_dir or not packet_dir.is_dir()):
+            raise GateRefusal("preparation packet directory is missing or aliased")
+    except OSError as error:
+        raise GateRefusal(f"preparation packet directory is unreadable: {error}") from None
+    if not packet_dir.is_relative_to(prep_scratch) or packet_dir == prep_scratch:
+        raise GateRefusal("preparation packet must live inside the retained preparation root")
+    return packet_dir
+
+
+def validate_preparation_binding(*, binding, prep_command: list, prep_run_id,
+                                 prep_scratch: Path, packet_dir: Path,
+                                 current_script_sha256: str, barge_root: Path,
+                                 oxide_root: Path, barge_head: str, oxide_head: str,
+                                 oxide_product_head: str,
+                                 audit_inputs_sha256: str) -> dict:
+    """Bind the preparation's actual bytes, guard, command and packet manifest.
+
+    The recorded script path is never resolved here: it may be relative (the
+    historical receipt names `scripts/test-private-build-validation.py`, which
+    would resolve in this process's cwd and pass without any byte evidence) or
+    absolute at a checkout that no longer exists. The binding document instead
+    carries the actual SHA-256 of the preparation script bytes, computed in
+    the preparation process itself, and this diagnostic compares it with its
+    own running bytes: identical reviewed source at a different checkout is
+    accepted; changed script or guard bytes, an edited command token, a
+    mismatched or edited manifest or packet document refuses.
+    """
+    if (not isinstance(binding, dict) or set(binding) != {
+            "schema", "command", "script_sha256", "supervisor_sha256",
+            "packet_manifest_sha256"}):
+        raise GateRefusal("preparation source binding is missing or malformed")
+    if binding["schema"] != SCHEMA_SOURCE_BINDING:
+        raise GateRefusal("preparation source binding schema mismatch")
+    if binding["supervisor_sha256"] != SUPERVISOR_SHA256:
+        raise GateRefusal("preparation source binding does not name the qualified guard bytes")
+    if binding["command"] != prep_command:
+        raise GateRefusal("preparation source binding does not match the whole prepared command")
+    if binding["script_sha256"] != current_script_sha256:
+        raise GateRefusal("preparation source binding does not match this "
+                          "diagnostic's reviewed script bytes")
+    manifest_path = packet_dir / "packet-manifest.json"
+    try:
+        manifest = read_json_bound(manifest_path, binding["packet_manifest_sha256"])
+    except OSError as error:
+        raise GateRefusal(f"preparation packet manifest is missing or unreadable: {error}") from None
+    expected_keys = {"supervised_run_id", "supervisor_deadline_ns", "clock", "packet_dir",
+                     "barge_root", "oxide_root", "barge_head", "oxide_head",
+                     "oxide_product_head", "audit_inputs_sha256", "documents", "state"}
+    if set(manifest) != expected_keys or manifest["state"] != (
+            "unissued preparation; planner binding and review come first") \
+            or type(manifest["supervisor_deadline_ns"]) is not int:
+        raise GateRefusal("preparation packet manifest shape mismatch")
+    expected = {"supervised_run_id": prep_run_id, "packet_dir": str(packet_dir),
+                "barge_root": str(barge_root), "oxide_root": str(oxide_root),
+                "barge_head": barge_head, "oxide_head": oxide_head,
+                "oxide_product_head": oxide_product_head,
+                "audit_inputs_sha256": audit_inputs_sha256,
+                "clock": "CLOCK_UPTIME_RAW"}
+    for key, value in expected.items():
+        if manifest[key] != value:
+            raise GateRefusal(f"preparation packet manifest does not bind {key}")
+    documents = manifest["documents"]
+    if not isinstance(documents, dict) or not documents or len(documents) > 64:
+        raise GateRefusal("preparation packet manifest document bindings are missing or oversized")
+    for name, digest in documents.items():
+        if (not isinstance(name, str) or not name.endswith(".json")
+                or Path(name).name != name or len(name) > 200
+                or not isinstance(digest, str) or not HEX64.fullmatch(digest)):
+            raise GateRefusal("preparation packet manifest document binding is malformed")
+    for name, digest in sorted(documents.items()):
+        try:
+            if sha256_file(canonical_file(packet_dir / name)) != digest:
+                raise GateRefusal(f"preparation packet document changed: {name}")
+        except OSError as error:
+            raise GateRefusal(f"preparation packet document {name} is missing or unreadable: "
+                              f"{error}") from None
+    return manifest
 
 
 def verify_probe(stdout: str, *, home: Path, config: Path, pool: Path,
@@ -1489,7 +1597,7 @@ USAGE = """usage:
       --barge-repo REPO --barge-head HEX40 --barge-root ROOT --oxide-root ROOT
       --expect-audit HEX64 --expect-ledger HEX64 --expect-budget HEX64 --expect-history HEX64
       --expect-oxide-binding HEX64 --preparation-receipt PATH --expect-preparation HEX64
-      [--planner-reference STRING]
+      --expect-source-binding HEX64 [--planner-reference STRING]
   prepare environment: OXIDE_CORRECTED_DISCOVERY_PACKET (exact reviewed JSON)
   diagnostic environment: OXIDE_PROOF_DEADLINE_NS, OXIDE_PROOF_RUN_ID,
       OXIDE_PROOF_EVIDENCE, OXIDE_TASK_SCRATCH_ROOT (exported by the qualified
@@ -1511,7 +1619,8 @@ def parse_args(argv: list) -> dict:
                     "barge_root", "oxide_root"),
         "diagnostic": ("oxide_repo", "oxide_head", "oxide_product_head", "barge_repo", "barge_head", "barge_root",
                        "oxide_root", "expect_audit", "expect_ledger", "expect_budget",
-                       "expect_history", "expect_oxide_binding", "preparation_receipt", "expect_preparation"),
+                       "expect_history", "expect_oxide_binding", "preparation_receipt", "expect_preparation",
+                       "expect_source_binding"),
     }.get(options["mode"], ())
     index = 1
     while index < len(argv):
@@ -1523,7 +1632,7 @@ def parse_args(argv: list) -> dict:
     for flag in required:
         if flag not in options:
             raise GateRefusal(f"{options['mode']} requires --{flag.replace('_', '-')}\n" + USAGE)
-    for key in ("expect_audit", "expect_ledger", "expect_budget", "expect_history", "expect_oxide_binding", "expect_preparation", "expect_audit_inputs", "digest"):
+    for key in ("expect_audit", "expect_ledger", "expect_budget", "expect_history", "expect_oxide_binding", "expect_preparation", "expect_audit_inputs", "expect_source_binding", "digest"):
         if key in options and not HEX64.fullmatch(options[key]):
             raise GateRefusal(f"--{key.replace('_', '-')} must be 64 hex")
     for key in ("oxide_head", "oxide_product_head", "barge_head"):
@@ -1887,7 +1996,6 @@ def diagnostic(options: dict) -> int:
     prep = read_json_bound(prep_path, options["expect_preparation"])
     prep_command = prep.get("command")
     if (not isinstance(prep_command, list) or len(prep_command) < 3
-            or Path(prep_command[1]).resolve(strict=True) != Path(__file__).resolve(strict=True)
             or prep_command[2] != "--prepare"):
         raise GateRefusal("preparation receipt has no matching whole command")
     prep_options = parse_args(prep_command[2:])
@@ -1903,6 +2011,29 @@ def diagnostic(options: dict) -> int:
     if type(prep_start) is not int or type(prep_end) is not int or not 0 < prep_start <= prep_end <= now_ns():
         raise GateRefusal("preparation wall-clock evidence is invalid")
     prep_seconds = (prep_end - prep_start + 999_999_999) // 1_000_000_000
+    # Cross-checkout source binding (planner relative-path correction): the
+    # recorded script path is never resolved here. The packet's binding
+    # document positively binds the preparation's actual script bytes, the
+    # qualified guard bytes, the whole recorded command and the packet
+    # manifest; identical reviewed source bytes at a different checkout pass.
+    try:
+        current_script_sha256 = sha256_file(Path(sys.argv[0]).resolve(strict=True),
+                                            cap=MAX_AUDIT_SOURCE_BYTES)
+    except (OSError, GateRefusal):
+        raise GateRefusal("the running diagnostic script is unavailable") from None
+    packet_dir = preparation_packet_dir(prep_options, prep_scratch)
+    try:
+        binding = read_json_bound(canonical_file(packet_dir / "source-binding.json"),
+                                  options["expect_source_binding"])
+    except OSError as error:
+        raise GateRefusal(f"preparation source binding is missing or unreadable: {error}") from None
+    validate_preparation_binding(
+        binding=binding, prep_command=prep_command, prep_run_id=prep.get("run_id"),
+        prep_scratch=prep_scratch, packet_dir=packet_dir,
+        current_script_sha256=current_script_sha256,
+        barge_root=barge_root, oxide_root=oxide_root, barge_head=barge_head,
+        oxide_head=oxide_head, oxide_product_head=prep_options["oxide_product_head"],
+        audit_inputs_sha256=prep_options["expect_audit_inputs"])
     # Fixed companion claims survive fresh evidence directories and burn on uncertainty.
     allowance = Allowance(parse_block_head(json.loads(block_path.read_bytes())) - 120 - prep_seconds,
                           deadline_ns, None,
@@ -2193,6 +2324,8 @@ def diagnostic(options: dict) -> int:
         "pure_checks_conservative_charge_seconds": 120,
         "preparation_seconds": prep_seconds,
         "preparation_receipt_sha256": options["expect_preparation"],
+        "preparation_source_binding_sha256": options["expect_source_binding"],
+        "preparation_packet_dir": str(packet_dir),
     }
     commands = [
         {"phase": "oxide-claim", "argv": claim_argv, "exit": 0},
@@ -2221,9 +2354,12 @@ def diagnostic(options: dict) -> int:
                       "barge_effective_bootstrap_mib": barge_effective_mib,
                       "oxide_retained_outside_bytes": oxide_caps["retained_outside_bytes"],
                       "oxide_effective_whole_block_mib": oxide_caps["effective_whole_block_mib"],
-                      "oxide_effective_note": "measured clamp of the 6 GiB grant minus "
-                      "retained bytes; about 552 MiB at the reported 5591.8 MiB "
-                      "retained total, never a claim that a phase fits",
+                      "oxide_effective_note": "measured clamp of the "
+                      f"{OXIDE_CAP_BYTES // (1024 ** 3)} GiB prospective grant minus "
+                      "retained bytes (operator af038a7e v2); the historical 6 GiB "
+                      "measurement (5591.8 MiB retained, about 552 MiB effective) "
+                      "stands in review 6584174560, and no figure claims that a "
+                      "phase fits",
                       "barge_root_monitored_by": "outer qualified supervisor adopted scratch; "
                       "periodic samples do not establish an instantaneous peak"},
         exports=exports, failures=[], decisions=decisions)
@@ -2271,6 +2407,11 @@ def prepare(options: dict) -> int:
     # Preparation is a supervised whole command: every walk and marker below
     # is inside the qualified supervisor's coverage and bound to its identity.
     evidence_dir, run_id, deadline_ns, adopted_scratch = supervisor_context()
+    guard_command = json.loads((evidence_dir / "receipt.json").read_bytes()).get("command")
+    if (not isinstance(guard_command, list) or len(guard_command) < 3
+            or not all(isinstance(part, str) for part in guard_command)
+            or guard_command[2] != "--prepare"):
+        raise GateRefusal("the guard receipt does not record the whole prepared command")
     if (not adopted_scratch.is_relative_to(BARGE_SCRATCH) or adopted_scratch == barge_root
             or not evidence_dir.is_relative_to(adopted_scratch)
             or not packet_dir.is_relative_to(adopted_scratch)):
@@ -2392,9 +2533,28 @@ def prepare(options: dict) -> int:
                       for name in sorted(documents)},
         "state": "unissued preparation; planner binding and review come first",
     }))
+    # The cross-checkout source binding pins the preparation's actual script
+    # bytes (resolved in this preparation process, where the recorded path is
+    # meaningful), the whole guard-recorded command verbatim, the qualified
+    # guard bytes and the manifest digest; the planner binds its digest at
+    # issue and the diagnostic compares script bytes, never script paths.
+    try:
+        script_sha256 = sha256_file(Path(sys.argv[0]).resolve(strict=True),
+                                    cap=MAX_AUDIT_SOURCE_BYTES)
+    except (OSError, GateRefusal):
+        raise GateRefusal("the running gate script is unavailable for its source binding") from None
+    private_write(packet_dir, Path("source-binding.json"), canonical_json({
+        "schema": SCHEMA_SOURCE_BINDING,
+        "command": guard_command,
+        "script_sha256": script_sha256,
+        "supervisor_sha256": SUPERVISOR_SHA256,
+        "packet_manifest_sha256": sha256_file(packet_dir / "packet-manifest.json"),
+    }))
     print(f"prepared packet: {packet_dir}")
     for name in sorted(documents):
         print(f"  {name} sha256={sha256_file(packet_dir / name)}")
+    print(f"  source-binding.json sha256="
+          f"{sha256_file(packet_dir / 'source-binding.json')}")
     print("the packet carries no issued block; planner binding and review come first")
     return 0
 
@@ -2467,9 +2627,11 @@ def plan(options: dict) -> int:
     print("shared private-build validation gate (oxide#248): plan")
     print(f"  supervisor bytes pinned: {SUPERVISOR_SHA256}")
     print(f"  oxide pin: {OXIDE_PIN_COMMIT} tree {OXIDE_PIN_TREE}")
-    print(f"  barge accepted admission source: {BARGE_ACCEPTED_HEAD}")
+    print(f"  barge accepted admission source (cap revision): {BARGE_ACCEPTED_HEAD}")
     print(f"  barge recipe head: {BARGE_RECIPE_HEAD} tree {BARGE_RECIPE_TREE}")
-    print(f"  caps: barge {BARGE_CAP_BYTES} bytes, oxide {OXIDE_CAP_BYTES} bytes, "
+    print(f"  caps: barge {BARGE_CAP_BYTES} bytes, oxide {OXIDE_CAP_BYTES} bytes "
+          f"(prospective aggregate grants, operator af038a7e v2; historical "
+          f"2/6 GiB evidence keeps its original bounds), "
           f"bootstrap {BOOTSTRAP_MAX_SECONDS}s/{BOOTSTRAP_MAX_MIB}MiB, "
           f"prospective block {PROSPECTIVE_MAX_SECONDS}s")
     print(f"  schemas: {SCHEMA_GATE_RECEIPT}, {SCHEMA_BARGE_AUDIT}, "
@@ -2487,6 +2649,7 @@ def plan(options: dict) -> int:
           "--expect-audit <sha256> --expect-ledger <sha256> --expect-budget <sha256> "
           "--expect-history <sha256> --expect-oxide-binding <sha256> "
           "--preparation-receipt <path> --expect-preparation <sha256> "
+          "--expect-source-binding <sha256> "
           "--planner-reference <reference>")
     print("  proposed selectors: proof:private-build-validation:test (pure), "
           "proof:private-build-validation:plan (effect-free), "
@@ -2665,7 +2828,6 @@ def self_test() -> int:
     prep_root.mkdir(mode=0o700)
     prep_evidence = prep_root / "evidence"
     prep_evidence.mkdir(mode=0o700)
-    write_doc(prep_evidence, "receipt.json", {"owned_bytes": {"budget": 128 * 1024 * 1024}})
     future_barge = case_base / "future"
     future_barge.mkdir(mode=0o700)
     future_oxide = oxide_scratch / "future"
@@ -2704,6 +2866,20 @@ def self_test() -> int:
                        "barge_repo": str(barge_repo_fixture), "barge_head": BARGE_ACCEPTED_HEAD,
                        "barge_root": str(future_barge), "oxide_root": str(future_oxide),
                        "audit_inputs": str(input_manifest), "expect_audit_inputs": sha256_file(input_manifest)}
+    # The historical preparation receipt records a RELATIVE script path with
+    # the interpreter's own argv; the fixture mirrors that exact shape.
+    fixture_command = ["python3", "scripts/test-private-build-validation.py", "--prepare",
+                       "--packet-dir", str(prep_root / "packet"),
+                       "--oxide-repo", str(oxide_repo_fixture), "--oxide-head", OXIDE_PIN_COMMIT,
+                       "--oxide-product-head", "6e8ca1f07a3e26be9e96ff55fd774b0f8185165a",
+                       "--barge-repo", str(barge_repo_fixture), "--barge-head", BARGE_ACCEPTED_HEAD,
+                       "--barge-root", str(future_barge), "--oxide-root", str(future_oxide),
+                       "--audit-inputs", str(input_manifest),
+                       "--expect-audit-inputs", sha256_file(input_manifest)]
+    write_doc(prep_evidence, "receipt.json", {"owned_bytes": {"budget": 128 * 1024 * 1024},
+                                              "command": fixture_command,
+                                              "run_id": "c" * 32,
+                                              "phase": "started: incomplete"})
     def fixture_git_identity(repo, commit):
         return commit, OXIDE_PIN_TREE if commit == OXIDE_PIN_COMMIT else "b" * 40
     def fixture_git_tree(repo, root, commit, tree):
@@ -2783,6 +2959,77 @@ def self_test() -> int:
             failures.append("prepare unexpectedly approved a discovery ledger")
         if manifest_doc["state"] != "unissued preparation; planner binding and review come first":
             failures.append("prepare manifest did not preserve its unissued state")
+        # The cross-checkout source binding: prepare must bind its actual
+        # running bytes, the whole guard-recorded command, the qualified guard
+        # bytes and the manifest digest, and the validator must accept the
+        # identical source and refuse every mismatch.
+        binding_path = prep_root / "packet/source-binding.json"
+        binding_doc = json.loads(binding_path.read_bytes())
+        running_digest = sha256_file(Path(sys.argv[0]).resolve(strict=True),
+                                     cap=MAX_AUDIT_SOURCE_BYTES)
+        binding_kwargs = dict(prep_command=fixture_command, prep_run_id="c" * 32,
+                              prep_scratch=prep_root, packet_dir=manifest_path.parent,
+                              barge_root=future_barge, oxide_root=future_oxide,
+                              barge_head=BARGE_ACCEPTED_HEAD, oxide_head=OXIDE_PIN_COMMIT,
+                              oxide_product_head="6e8ca1f07a3e26be9e96ff55fd774b0f8185165a",
+                              audit_inputs_sha256=sha256_file(input_manifest))
+        if (set(binding_doc) != {"schema", "command", "script_sha256", "supervisor_sha256",
+                                 "packet_manifest_sha256"}
+                or binding_doc["schema"] != SCHEMA_SOURCE_BINDING
+                or binding_doc["command"] != fixture_command
+                or binding_doc["script_sha256"] != running_digest
+                or binding_doc["supervisor_sha256"] != SUPERVISOR_SHA256
+                or binding_doc["packet_manifest_sha256"] != sha256_file(manifest_path)):
+            failures.append("prepare did not bind its actual source, guard, command and manifest")
+        expect_ok("prepared binding accepts the identical running source",
+                  validate_preparation_binding, binding=binding_doc,
+                  current_script_sha256=running_digest, **binding_kwargs)
+        absolute_command = ["python3",
+                            "/planning-checkout/scripts/test-private-build-validation.py",
+                            *fixture_command[2:]]
+        absolute_kwargs = dict(binding_kwargs, prep_command=absolute_command)
+        expect_ok("absolute-path preparation binds the same source bytes",
+                  validate_preparation_binding, binding=dict(binding_doc, command=absolute_command),
+                  current_script_sha256=running_digest, **absolute_kwargs)
+        expect_refusal("changed source bytes refuse across checkouts",
+                       validate_preparation_binding, binding=binding_doc,
+                       current_script_sha256="0" * 64, **binding_kwargs)
+        expect_refusal("guard bytes mismatch refuses", validate_preparation_binding,
+                       binding=dict(binding_doc, supervisor_sha256="0" * 64),
+                       current_script_sha256=running_digest, **binding_kwargs)
+        edited_command = list(fixture_command)
+        edited_command[edited_command.index("--oxide-root") + 1] = str(case_base / "elsewhere")
+        expect_refusal("edited command token refuses", validate_preparation_binding,
+                       binding=binding_doc, current_script_sha256=running_digest,
+                       **dict(binding_kwargs, prep_command=edited_command))
+        expect_refusal("manifest root mismatch refuses", validate_preparation_binding,
+                       binding=binding_doc, current_script_sha256=running_digest,
+                       **dict(binding_kwargs, oxide_root=case_base / "other-oxide"))
+        expect_refusal("edited manifest refuses", validate_preparation_binding,
+                       binding=dict(binding_doc, packet_manifest_sha256="1" * 64),
+                       current_script_sha256=running_digest, **binding_kwargs)
+        expect_refusal("missing binding refuses", validate_preparation_binding,
+                       binding=None, current_script_sha256=running_digest, **binding_kwargs)
+        expect_refusal("malformed binding refuses", validate_preparation_binding,
+                       binding={"schema": "other/1"}, current_script_sha256=running_digest,
+                       **binding_kwargs)
+        expect_refusal("packet outside the preparation root refuses", preparation_packet_dir,
+                       {"packet_dir": str(case_base / "outside-packet")}, prep_root)
+        expect_refusal("missing packet directory refuses", preparation_packet_dir,
+                       {"packet_dir": str(prep_root / "absent-packet")}, prep_root)
+        expect_refusal("packet at the preparation root itself refuses", preparation_packet_dir,
+                       {"packet_dir": str(prep_root)}, prep_root)
+        tampered = manifest_path.parent / "barge-block.UNISSUED.json"
+        saved_bytes = tampered.read_bytes()
+        tampered.write_bytes(saved_bytes + b" ")
+        expect_refusal("edited packet document refuses", validate_preparation_binding,
+                       binding=binding_doc, current_script_sha256=running_digest, **binding_kwargs)
+        tampered.write_bytes(saved_bytes)
+        saved_manifest = manifest_path.read_bytes()
+        manifest_path.unlink()
+        expect_refusal("missing packet manifest refuses", validate_preparation_binding,
+                       binding=binding_doc, current_script_sha256=running_digest, **binding_kwargs)
+        manifest_path.write_bytes(saved_manifest)
 
     # --- primitives ---------------------------------------------------------
     sample = private_write(private_root, Path("docs/sample.txt"), b"sample bytes\n")
@@ -2864,6 +3111,25 @@ def self_test() -> int:
                    head=BARGE_RECIPE_HEAD, wrapper_hash=host["wrapper_sha256"],
                    oxide_hash=full_host["oxide_hash"], audit_hash=full_host["audit_hash"],
                    ledger_hash=full_host["ledger_hash"])
+    historic_cap = dict(issued_block, scratch_cap_bytes=HISTORIC_BARGE_CAP_BYTES)
+    expect_refusal("historical 2 GiB cap is not the approved cap", validate_barge_block,
+                   historic_cap, head=BARGE_RECIPE_HEAD, wrapper_hash=host["wrapper_sha256"],
+                   oxide_hash=full_host["oxide_hash"], audit_hash=full_host["audit_hash"],
+                   ledger_hash=full_host["ledger_hash"])
+    beyond_cap = dict(issued_block, scratch_cap_bytes=BARGE_CAP_BYTES + 1)
+    expect_refusal("scratch cap beyond the approved grant", validate_barge_block,
+                   beyond_cap, head=BARGE_RECIPE_HEAD, wrapper_hash=host["wrapper_sha256"],
+                   oxide_hash=full_host["oxide_hash"], audit_hash=full_host["audit_hash"],
+                   ledger_hash=full_host["ledger_hash"])
+    exact_pool = dict(issued_block, pool_cap_bytes=BARGE_CAP_BYTES)
+    exact_pool_bound = expect_ok("pool cap at the approved grant accepted",
+                                 validate_barge_block, exact_pool,
+                                 head=BARGE_RECIPE_HEAD, wrapper_hash=host["wrapper_sha256"],
+                                 oxide_hash=full_host["oxide_hash"],
+                                 audit_hash=full_host["audit_hash"],
+                                 ledger_hash=full_host["ledger_hash"])
+    if exact_pool_bound != issued_block["max_seconds"]:
+        failures.append("pool cap at the approved grant did not return the block bound")
     no_pool = dict(issued_block, pool_cap_bytes=None)
     expect_refusal("missing pool cap", validate_barge_block, no_pool,
                    head=BARGE_RECIPE_HEAD, wrapper_hash=host["wrapper_sha256"],
@@ -3439,16 +3705,37 @@ def self_test() -> int:
                     "--oxide-root", str(OXIDE_SCRATCH / "x")])
     expect_refusal("task root outside its scratch", root_guard, "/tmp/x", BARGE_SCRATCH)
     expect_refusal("task root equal to scratch", root_guard, str(BARGE_SCRATCH), BARGE_SCRATCH)
+    complete_diagnostic = ["--diagnostic", "--oxide-repo", "/r", "--oxide-head", "a" * 40,
+                           "--oxide-product-head", "b" * 40, "--barge-repo", "/b",
+                           "--barge-head", "c" * 40, "--barge-root", str(BARGE_SCRATCH / "x"),
+                           "--oxide-root", str(OXIDE_SCRATCH / "x"), "--expect-audit", "d" * 64,
+                           "--expect-ledger", "e" * 64, "--expect-budget", "f" * 64,
+                           "--expect-history", "1" * 64, "--expect-oxide-binding", "2" * 64,
+                           "--preparation-receipt", "/p/receipt.json",
+                           "--expect-preparation", "3" * 64, "--expect-source-binding", "4" * 64]
+    if expect_ok("complete diagnostic arguments parse", parse_args, complete_diagnostic) is None:
+        failures.append("complete diagnostic arguments refused")
+    binding_flag = complete_diagnostic.index("--expect-source-binding")
+    expect_refusal("diagnostic without the source binding expectation", parse_args,
+                   complete_diagnostic[:binding_flag] + complete_diagnostic[binding_flag + 2:])
+    expect_refusal("non-hex source binding expectation", parse_args,
+                   complete_diagnostic[:binding_flag + 1] + ["nothex"])
 
-    # --- clamp arithmetic (review 6584174560 finding 2) ---------------------
-    expect_ok("552 MiB clamp at the reported retained total", clamp_mib,
-              OXIDE_CAP_BYTES, 5591 * 1024 * 1024 + 838_860, BOOTSTRAP_MAX_MIB)
-    if clamp_mib(OXIDE_CAP_BYTES, 5591 * 1024 * 1024 + 838_860, BOOTSTRAP_MAX_MIB) > 552:
-        failures.append("clamp exceeded the effective whole-block figure")
-    expect_refusal("clamp with retained at the full grant", clamp_mib,
-                   OXIDE_CAP_BYTES, OXIDE_CAP_BYTES, BOOTSTRAP_MAX_MIB)
-    expect_refusal("clamp over the grant", clamp_mib,
-                   OXIDE_CAP_BYTES, OXIDE_CAP_BYTES + 1, BOOTSTRAP_MAX_MIB)
+    # --- clamp arithmetic (review 6584174560 finding 2; af038a7e v2 grants) -
+    historic_retained = 5591 * 1024 * 1024 + 838_860
+    expect_ok("historical 552 MiB clamp at the reported retained total", clamp_mib,
+              HISTORIC_OXIDE_CAP_BYTES, historic_retained, BOOTSTRAP_MAX_MIB)
+    if clamp_mib(HISTORIC_OXIDE_CAP_BYTES, historic_retained, BOOTSTRAP_MAX_MIB) != 552:
+        failures.append("the historical 6 GiB clamp figure moved")
+    if clamp_mib(OXIDE_CAP_BYTES, historic_retained, BOOTSTRAP_MAX_MIB) != BOOTSTRAP_MAX_MIB:
+        failures.append("the prospective 8 GiB grant must still clamp to the per-run bootstrap cap")
+    if clamp_mib(BARGE_CAP_BYTES, 2 * 1024 * 1024 * 1024 + 512 * 1024 * 1024,
+                 BOOTSTRAP_MAX_MIB) != 512:
+        failures.append("the prospective Barge grant did not clamp to its measured remainder")
+    expect_refusal("clamp with retained at the full historical grant", clamp_mib,
+                   HISTORIC_OXIDE_CAP_BYTES, HISTORIC_OXIDE_CAP_BYTES, BOOTSTRAP_MAX_MIB)
+    expect_refusal("clamp over the prospective Barge grant", clamp_mib,
+                   BARGE_CAP_BYTES, BARGE_CAP_BYTES + 1, BOOTSTRAP_MAX_MIB)
     expect_refusal("clamp with a non-integer figure", clamp_mib,
                    OXIDE_CAP_BYTES, 1024 * 1024, "1024")
     if clamp_mib(4 * 1024 * 1024, 1024 * 1024, 1) != 1:
