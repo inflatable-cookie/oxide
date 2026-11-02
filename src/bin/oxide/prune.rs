@@ -1716,8 +1716,7 @@ impl AuthorityScope {
         if self.custody.is_none() {
             self.custody = Some(store::CustodyWitness::open(control)?);
         }
-        let deadline =
-            AUTHORITY.with(|cell| cell.borrow().as_ref().map(|budget| budget.deadline));
+        let deadline = AUTHORITY.with(|cell| cell.borrow().as_ref().map(|budget| budget.deadline));
         self.custody
             .as_mut()
             .expect("the witness was just created")
@@ -2482,8 +2481,7 @@ fn evaluate(
             if registry.rows.iter().any(|row| &row.root == root) {
                 continue;
             }
-            let mut entry =
-                evaluate_receiptless(store, control, registry, root, false, authority);
+            let mut entry = evaluate_receiptless(store, control, registry, root, false, authority);
             if entry.candidate.is_some() {
                 extra += 1;
                 if registry.rows.len() + extra > MAX_ROWS {
@@ -6802,8 +6800,14 @@ fn recheck_receiptless(
     let mut authority = AuthorityScope::begin()?;
     let registry = ready_registry(control)?;
     registry.validate()?;
-    let entry =
-        evaluate_receiptless(store, control, &registry, &candidate.root, true, &mut authority);
+    let entry = evaluate_receiptless(
+        store,
+        control,
+        &registry,
+        &candidate.root,
+        true,
+        &mut authority,
+    );
     let Some(current) = entry.candidate else {
         return Err(entry
             .kept
@@ -10928,8 +10932,7 @@ mod tests {
             Some("an active writer still holds this checkout"),
             "{reason:?}"
         );
-        let refusal = custody_clear_under_barrier(&mut authority, &control, &checkout)
-            .unwrap_err();
+        let refusal = custody_clear_under_barrier(&mut authority, &control, &checkout).unwrap_err();
         assert!(
             refusal.contains("an active writer still holds the checkout"),
             "{refusal}"

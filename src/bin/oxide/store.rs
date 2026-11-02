@@ -5697,8 +5697,9 @@ impl PoolWitness {
         let Some(fresh) = fresh else {
             return Err(format!("the {label} pool's control directory disappeared"));
         };
-        let fresh_facts =
-            fstat_witness(&fresh).map_err(|error| format!("cannot inspect the {label} pool's control directory: {error}"))?;
+        let fresh_facts = fstat_witness(&fresh).map_err(|error| {
+            format!("cannot inspect the {label} pool's control directory: {error}")
+        })?;
         if (fresh_facts.dev, fresh_facts.ino) != self.dir_identity {
             return Err(format!(
                 "the {label} pool's control directory changed while it was witnessed"
@@ -5729,8 +5730,9 @@ impl PoolWitness {
         }
         // SAFETY: `fd` is a newly opened descriptor owned by this function.
         let file = unsafe { File::from_raw_fd(fd) };
-        let facts = fstat_witness(&file)
-            .map_err(|error| format!("cannot inspect the {label} pool's admission lock: {error}"))?;
+        let facts = fstat_witness(&file).map_err(|error| {
+            format!("cannot inspect the {label} pool's admission lock: {error}")
+        })?;
         if !witness_is_private_file(&facts) {
             return Err(format!(
                 "the {label} pool's admission lock is not an owner-only regular file"
@@ -5825,9 +5827,7 @@ impl PoolWitness {
             std::io::Read::by_ref(&mut file).take(MAX_STATE_BYTES + 1),
             &mut bytes,
         )
-            .map_err(|error| {
-                format!("cannot read the {label} pool's state document: {error}")
-            })?;
+        .map_err(|error| format!("cannot read the {label} pool's state document: {error}"))?;
         if bytes.len() as u64 > MAX_STATE_BYTES {
             return Err(format!(
                 "the {label} pool's state document exceeds its byte limit"
@@ -5907,8 +5907,7 @@ impl CustodyWitness {
         // The registration witness is re-read under the internal admission
         // lock on every row; inside a prune authority window the read is
         // charged to the shared budget like every other snapshot input.
-        let registered =
-            crate::removable::read_registration_at(&self.internal.dir)?.is_some();
+        let registered = crate::removable::read_registration_at(&self.internal.dir)?.is_some();
         let removable_admission = if registered {
             let sibling = self.pinned_sibling()?;
             Some(sibling.take_admission(deadline, "removable")?)
@@ -12821,7 +12820,7 @@ mod scratch_internal_tests {
 #[cfg(test)]
 mod fresh_custody_tests {
     use super::{
-        boot_session, holder_lines, lock_admission, open_control_directory, custody_verdict,
+        boot_session, custody_verdict, holder_lines, lock_admission, open_control_directory,
         CheckoutCustody, CustodyWitness, Lost, Phase, Record, State, WorkspaceClass,
     };
     use crate::process;
@@ -13281,7 +13280,10 @@ mod fresh_custody_tests {
             !reason.contains("clear"),
             "a symlinked state document must refuse: {reason}"
         );
-        assert!(reason.contains("state document") || reason.contains("state path"), "{reason}");
+        assert!(
+            reason.contains("state document") || reason.contains("state path"),
+            "{reason}"
+        );
     }
 
     /// An oversized state document refuses under the same per-input limit
@@ -13294,7 +13296,8 @@ mod fresh_custody_tests {
         let temp = fixture.control.join("state.json.custody-tmp");
         let file = File::create(&temp).unwrap();
         file.set_len(limit + 1).unwrap();
-        file.set_permissions(fs::Permissions::from_mode(0o600)).unwrap();
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .unwrap();
         drop(file);
         fs::rename(&temp, fixture.control.join("state.json")).unwrap();
         let checkout = checkout(&fixture);
@@ -13397,14 +13400,20 @@ mod fresh_custody_tests {
             ]
         );
         let row = witness.decide(None, &checkout, false).unwrap();
-        assert_eq!(row.internal_holders, vec!["oxide pid 42: cargo build".to_owned()]);
+        assert_eq!(
+            row.internal_holders,
+            vec!["oxide pid 42: cargo build".to_owned()]
+        );
         // A recorded barrier for another checkout is never this checkout's
         // holder.
         let mut other_state = state.clone();
         other_state.cleans[0].checkout = fixture.root.join("another");
         fixture.replace_state(&other_state);
         let row = witness.decide(None, &checkout, true).unwrap();
-        assert_eq!(row.internal_holders, vec!["oxide pid 42: cargo build".to_owned()]);
+        assert_eq!(
+            row.internal_holders,
+            vec!["oxide pid 42: cargo build".to_owned()]
+        );
     }
 
     /// The fresh route classifies records exactly as `checkout_custody` does:
@@ -13422,10 +13431,7 @@ mod fresh_custody_tests {
         fixture.replace_state(&state);
         let mut witness = CustodyWitness::open(&fixture.control).unwrap();
         let witnessed = witness.decide(None, &checkout, true).unwrap().verdict;
-        let parsed = &witness
-            .decide(None, &checkout, true)
-            .unwrap()
-            .verdict;
+        let parsed = &witness.decide(None, &checkout, true).unwrap().verdict;
         assert_eq!(witnessed, *parsed);
         // The shared classifier decides the same from one parsed state.
         let pools = [(Some(&state), "this", Some(1u64))];
