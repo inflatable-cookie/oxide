@@ -294,3 +294,11 @@ code and non-macOS/Linux platforms.
 ## Q-021 — How should Oxide's output roots move to Barge?
 
 Open, with a proposed design: [Barge adoption](contracts/barge-adoption.md). The proposal uses Barge's Rust library at a pinned commit, declares `oxide/outputs` only, switches the release prune through a single deleter, keeps the 91 legacy roots Oxide-side unless Tom rules otherwise, and adds no guard call in F6. Barge-side gaps (no release effect verb, `maintain` acting on declared age policies, no release-only policy kind) need the Barge delegate's ruling first. Operator choices: Builds `root_dir`, outputs reserve participation, release from maintain, the 91 legacy roots, parity differences D-1/D-2, pool-slot ownership, declaration authority, and whether to run the read-only census first.
+
+
+## Q-022 — Can a held zombie establish its group's lifetime?
+
+Open: the positive held-zombie group-lifetime proposition remains unproved.
+Tom authorized a separately reviewed weaker sampled held-identity design,
+which does not resolve that proposition or add signal authority. See the
+[proposed witness and failed diagnostics](contracts/proof-supervisor-correction.md#proposed-sampled-witness-review-checkpoint-not-implementation).

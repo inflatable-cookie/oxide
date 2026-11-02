@@ -421,6 +421,115 @@ held-zombie group-lifetime proposition remains an open follow-up, not a proven
 result or an abandoned historical failure. This ruling authorizes design and
 review, not an executable oracle change, new signal authority or a native run.
 
+### Proposed sampled witness: review checkpoint, not implementation
+
+The following is a proposed implementation contract under decision
+`535ec990-1577-49fb-9741-480dc7434eeb`. It is not yet design-approved. The
+stronger **positive held-zombie group-lifetime claim remains OPEN**: neither
+failed diagnostic proves it, and this sampled proposition is not equivalent.
+
+**Premises and samples.** The fixture is the living direct parent of the child
+it forked, keeps `SIGCHLD` at the reasserted `SIG_DFL` without `SA_NOCLDWAIT`,
+and serializes all waits; it never delegates custody. The live binding in
+`HeldChild.bind` must actually read PID/start/parent and PGID from Kinfo, and
+PGID and session through `getpgid` and `getsid`; the child report supplies its
+own live session/group observations. Record each read with its own timestamp,
+not one synthetic atomic snapshot. During each existing zombie-window sample,
+read `Kinfo.one(pid)` before and after the zero-signal observations, and
+attempt `getpgid(pid)` and `getsid(pid)` between those rows. Each Kinfo row
+must actually report the bound PID/start, direct parent, expected PGID and
+`zombie=true`; each successful group/session syscall must report the bound
+value. The reader does not provide a session field: a previous live session
+value is not a zombie-session observation. Any absent, malformed, denied,
+failed, replaced, contradictory or unavailable required reading makes that
+sample **unknown**, including an unavailable zombie `getsid`; no guessed
+value, EPERM result or previous sample fills it. Review must decide whether
+these APIs can actually deliver the required facts on the target host; inability
+is insufficient evidence, never an automatic pass or a reason to widen scope.
+
+Each recorded Kinfo row proves only what that bounded reader returned at that
+read, conditional on its layout and kernel semantics; the group/session calls
+prove only their own returned values at their separate instants. Matching
+before/after rows detect discrepancies but do not make the intervening syscalls
+atomic or prove continuity. A later single positive wait establishes actual
+collection and its returned exit status; it does not validate earlier rows.
+Even together these facts do not prove continuous group existence, PGID
+reservation or nonreuse between samples, group-wide custody, descendant
+containment, or authority to signal. They do not close owner-death,
+unresponsive-owner or descendant-escape questions. Unknown custody, parent
+death, auto-reap or early collection prevents a positive sampled verdict.
+
+**Proposed cases and receipt.** Keep the eight native case slots and their
+existing dependency edges and three source-only HELD slots. Retain stable case
+IDs `c01-bind-live-hold` and `c02-zombie-group-lifetime` for existing receipt
+consumers and historical comparison, but change c02's displayed summary and
+detail to “sampled held-zombie identity” and explicitly mark its legacy ID as
+not a lifetime claim. c01 must bind live, obtain its existing two samples,
+then positively reap; c02 must obtain its existing five samples before its
+single positive reap. `c03` and `c07` remain dependent on c01. The existing
+`case_c01`, `case_c02`, `HeldChild.bind`, `wait_exit`,
+`observe_zombie_window`, `probe_wait_live`, `reap`, `FixtureChildren.settle`,
+`NestedReceipt` and case-dispatch/plan tables are the proposed source sites.
+No actual implementation is approved by this text.
+
+Propose receipt `schema: 2` with unchanged top-level case IDs, counts,
+closure and signal rows, plus a bounded `sampled_witness` object on each
+zombie-observation identity row. It contains a sample ordinal and, for each
+of `before`, `group`, `session`, `after`, an `at_ns`, `state` (`observed` or
+`unknown`), actual value or row when observed, and bounded error category when
+unknown. Row values are PID/start/ppid/pgid/zombie; no SID is invented in
+Kinfo. Record `kill_pid_0` and `killpg_pgid_0` exactly as observations and
+never map EPERM to membership. A sample verdict is positive only when every
+required actual field and both syscall readings match, with custody still held;
+otherwise it is unknown or a case failure, never positive. Retain the 64 KiB,
+32 case, 32 signal and 64 identity caps: each sample is one bounded identity
+row and an omitted required row or receipt/publication failure prevents a
+positive verdict. Schema 1 remains historical as written; readers must
+explicitly recognize schema 2 and its changed c02 meaning, reject unknown
+schemas, and never interpret schema 1's bound `sid`/`pgid` fields as
+post-exit readings. A source audit must identify and update any consumers or
+establish there are none before adopting that schema; historical packets are
+never rewritten.
+
+The successful consuming wait is still exactly one: immediately mark settled
+and reaped before any fallible publication, publish only the actual collected
+status, and refuse any later signal or helper reap without a syscall. An
+unexpected positive live WNOHANG probe itself settles and fails the case; the
+explicit c06 post-reap ECHILD control remains separate. The sampled witness
+neither adds signal authority nor weakens the existing signal ledger, custody,
+root retention, writer-closure or unknown-outcome rules.
+
+**Discrimination and later proof.** Pure seam tests must drive both actual case
+bodies and helper transitions, including matching paired rows and separate
+actual session/group reads; inject absent/malformed/permission-denied rows,
+changed PID/start/parent/PGID/zombie, inaccessible or changed session/group,
+replaced rows between calls, early wait, changed SIGCHLD and publication
+failure after collection. Check that no such unknown yields a positive sample,
+EPERM alone never passes, retained post-reap refusals issue no syscall, and
+schema 1 is not upgraded. Counterfactuals must fail when session is copied from
+the bound value, one row is reused as both reads, EPERM alone passes, or a
+case skips the actual collection; they must exercise real case paths rather
+than only a model. Receipt caps and omitted required evidence must fail closed.
+An accepted design still needs separately scoped implementation, pure selector,
+plan and docs checks and independent exact-head source/premise review. A later
+single planner-declared native diagnostic at genuinely changed executable bytes
+must preserve heavy admission, qualified guard, reserve/watchdog, 300 s / 512
+MiB limits, 8 native / 3 HELD inventory and actual sample/receipt/retention
+accounting. It requires fresh input hashes and runtime readiness; this docs-only
+checkpoint activates no proof.
+
+The later Queue execution `2f77ba1e` at docs-only `76740c2` repeated unchanged
+native inputs and is historical waste, not fresh validation: c01/c02 failed
+with kill=0 and killpg=EPERM, c03/c07 skipped, four of eight completed, all six
+children were reaped and three cases stayed HELD; outer closed and nested
+unknown/unqualified/uncounted with root kept unconcluded. Its retained nested
+receipt `cargo-group-custody.123ae935143cecc2/receipt.json` SHA256 is
+`af31b35cb7ea26ad85be961688a0cd9a174701c260ef722f2bf2b5fba0eba43b` and
+command log SHA256 is
+`8113461535ffb841852c7bf7b25b242a6299ace0141730a49e6f0dd5dab55dc8`.
+This remains separate from the failed `5c94c76d` packet above; neither is
+reclassified, credited, retried, cleaned or used to infer a new verdict.
+
 Before any implementation, the retained reviewer must assess this design.
 A future reviewed implementation would need effect-free seam regressions for
 positive paired rows and each missing, malformed, denied, changed PID/start,
