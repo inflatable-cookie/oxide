@@ -3716,8 +3716,13 @@ impl Pool {
         let private = path
             .parent()
             .map(|parent| parent.join(&journal.root.private));
-        fs::symlink_metadata(path).is_err()
-            && private.is_none_or(|private| fs::symlink_metadata(private).is_err())
+        #[cfg(not(test))]
+        let untracked = fs::symlink_metadata(path).is_err()
+            && private.is_none_or(|private| fs::symlink_metadata(private).is_err());
+        #[cfg(test)]
+        let untracked = observe_pool_metadata("pool:untracked:original", path).is_err()
+            && private.is_none_or(|private| observe_pool_metadata("pool:untracked:private", &private).is_err());
+        untracked
     }
 
     /// The pending root one legacy deletion is about to move, verified in O(1)
@@ -3932,6 +3937,19 @@ impl Pool {
         let metadata = crate::test_fs::symlink_metadata(&path);
         #[cfg(not(test))]
         let metadata = fs::symlink_metadata(&path);
+        #[cfg(test)]
+        {
+            let saved_errno = crate::tape::observer_errno();
+            match &metadata {
+                Ok(value) => crate::tape::read_row_dev("pool:slot-root", &path,
+                    value.dev(), value.ino(),
+                    crate::tape::TapeOutcome::Opened { dev: value.dev(), ino: value.ino() }, 0),
+                Err(error) => crate::tape::read_row("pool:slot-root", &path,
+                    if error.kind() == std::io::ErrorKind::NotFound { crate::tape::TapeOutcome::Absent }
+                    else { crate::tape::TapeOutcome::Refusal { reason: error.to_string() } }, 0),
+            }
+            crate::tape::restore_observer_errno(saved_errno);
+        }
         match metadata {
             Ok(metadata) => Ok((path, Some(metadata))),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((path, None)),
@@ -4603,8 +4621,16 @@ fn require_slot_parent(path: &Path, slots_root: &Path) -> Result<(), LeaseError>
     if folder != parent {
         return Err(refuse());
     }
+    #[cfg(not(test))]
     let root_device = fs::symlink_metadata(slots_root).map_err(io_error)?.dev();
+    #[cfg(test)]
+    let root_device = observe_pool_metadata("pool:slot-parent:root", slots_root).map_err(io_error)?.dev();
+    #[cfg(not(test))]
     if fs::symlink_metadata(parent).map_err(io_error)?.dev() != root_device {
+        return Err(LeaseError::UnknownAccounting);
+    }
+    #[cfg(test)]
+    if observe_pool_metadata("pool:slot-parent:parent", parent).map_err(io_error)?.dev() != root_device {
         return Err(LeaseError::UnknownAccounting);
     }
     Ok(())
@@ -5059,7 +5085,11 @@ impl Pool {
         let holding = self
             .open_holding_area(true)?
             .ok_or(LeaseError::UnknownAccounting)?;
+        #[cfg(not(test))]
         let holding_metadata = fs::symlink_metadata(self.holding_root()).map_err(io_error)?;
+        #[cfg(test)]
+        let holding_metadata = observe_pool_metadata("pool:holding:move-metadata", &self.holding_root())
+            .map_err(io_error)?;
         if holding_metadata.dev() != identity.0 {
             return Err(LeaseError::UnsafePath(
                 "the holding area is not on the slot's own device",
@@ -5396,9 +5426,18 @@ impl Pool {
     /// adoption refuses an entry on another device; the holding area is on the
     /// payload's own device by construction, so this only ever narrows.
     fn holding_device(&self) -> u64 {
-        fs::symlink_metadata(self.holding_root())
-            .map(|metadata| metadata.dev())
-            .unwrap_or(0)
+        #[cfg(not(test))]
+        {
+            fs::symlink_metadata(self.holding_root())
+                .map(|metadata| metadata.dev())
+                .unwrap_or(0)
+        }
+        #[cfg(test)]
+        {
+            observe_pool_metadata("pool:holding:device", &self.holding_root())
+                .map(|metadata| metadata.dev())
+                .unwrap_or(0)
+        }
     }
 }
 

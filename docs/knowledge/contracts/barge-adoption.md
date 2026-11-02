@@ -1348,6 +1348,12 @@ alone is insufficient.
   `Pool::open_inner`. `HoldingSweep` and its actual unlink traversal belong to
   release, not the `run_chain` call graph. A recovery rollback can still do
   descriptor-only chmod or rename, so it is not classified as a no-op.
+  In the pending-eviction path, `recorded_root_is_untracked` observes each
+  actually reached original/private `symlink_metadata` in its original
+  short-circuit order; `require_slot_parent` observes the two device reads;
+  `holding_device` observes its real metadata result before the existing
+  fallback; holding moves and slot accounting record their own metadata
+  results. Errors remain errors or the same original conservative fallback.
 - **The entry.** `prune::tape_entry::run_chain` (cfg(test)) follows the
   `dry_run` prefix exactly — `AuthorityScope::begin`, `paired_store`, the
   optional `read_operator_list`, `require_ready`, the unfinished-intent
