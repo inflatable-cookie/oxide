@@ -1069,7 +1069,13 @@ alone is insufficient.
   scratch. Before bootstrap and after each execution, compare bounded no-follow
   inventories of the complete live Oxide account state; any change or unknown
   fails the run. The installed release binary remains unchanged, and this
-  authority is not a general Cargo fallback. For this task only, the planner amended
+  authority is not a general Cargo fallback. Decision 696fa6e9
+  records the identical-content `pools.json` inode replacement as a failed
+  isolation gate, with no repair or attribution assumption. Before another
+  focused run, actual config, state/registry, cache and pool destinations must
+  bind private scratch and an effect-free preflight must produce a zero-delta
+  live-state inventory. The test-only path preflight calls the existing config
+  functions without opening a pool; its debug cfg must match the wrapper. For this task only, the planner amended
   the private Builds scratch cap prospectively from 2 GiB to 3 GiB, counting
   earlier and current roots and preserving their evidence; the cumulative
   1200 s wall, reserve and account inventory gates remain unchanged. At the

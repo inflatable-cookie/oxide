@@ -1462,3 +1462,11 @@ exit $status"""
 [tasks."proof:tape-prune:bootstrap"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 2400 -- cargo build --offline --locked --bin oxide"
+
+# Task-only isolated preflight preparation; the executable runs only the
+# actual configuration resolver and never opens or registers a pool.
+[tasks."proof:tape-prune:preflight-build"]
+run = "oxide test --test tape_prune_eval --no-run --locked"
+
+[tasks."proof:tape-prune:path-preflight"]
+run = '''env -i PATH="$PATH" HOME="$HOME" OXIDE_TEST_HOME_FROM_ENV="$OXIDE_TEST_HOME_FROM_ENV" OXIDE_CONFIG="$OXIDE_CONFIG" OXIDE_POOL="$OXIDE_POOL" OXIDE_POOL_CAP="$OXIDE_POOL_CAP" OXIDE_SCRATCH_ROOT="$OXIDE_SCRATCH_ROOT" "$TAPE_PREFLIGHT_EXE" --path-preflight "$TAPE_PREFLIGHT_ROOT"'''

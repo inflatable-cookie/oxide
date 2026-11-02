@@ -485,17 +485,30 @@ fn validate_engine_environment(root: &Path) -> Result<(), String> {
     if std::env::var_os("OXIDE_POOL_CAP").as_deref() != Some(std::ffi::OsStr::new("1073741824")) {
         return Err("fixture pool cap is missing or invalid".to_owned());
     }
-    if let Some(scratch) = std::env::var_os("OXIDE_SCRATCH_ROOT") {
-        if Path::new(&scratch) != root.join("scratch") { return Err("scratch root is not fixture-owned".to_owned()); }
-        validate_fixture_path(root, Path::new(&scratch))?;
+    let scratch = std::env::var_os("OXIDE_SCRATCH_ROOT")
+        .ok_or("fixture scratch root is missing")?;
+    if Path::new(&scratch) != root.join("scratch") {
+        return Err("scratch root is not fixture-owned".to_owned());
     }
+    validate_fixture_path(root, Path::new(&scratch))?;
     let actual = config::Facts::from_env();
     let injected = fixture_facts(root);
     let actual_state = actual.state_dir()?;
     if actual_state != injected.state_dir()? { return Err("fixture state directory differs".to_owned()); }
-    validate_fixture_path(root, &actual_state)?;
+    for path in [actual_state.clone(), actual_state.join("pools.json"), actual_state.join("scratch-pools")] {
+        validate_fixture_path(root, &path)?;
+    }
+    let actual_cache = config::default_pool(&actual).ok_or("fixture cache root unavailable")?;
+    if Some(&actual_cache) != config::default_pool(&injected).as_ref() {
+        return Err("fixture cache root differs".to_owned());
+    }
+    validate_fixture_path(root, &actual_cache)?;
     let settings = config::settings(&actual)?;
+    if !settings.file.explicit || settings.file.path != root.join("config.toml") {
+        return Err("resolved config differs from fixture".to_owned());
+    }
     if settings.pool != root.join("scratch/pool") { return Err("resolved pool differs from fixture".to_owned()); }
+    validate_fixture_path(root, &settings.pool.join("oxide-managed/outputs/registry.json"))?;
     Ok(())
 }
 
@@ -886,8 +899,12 @@ fn run_case(
         Ok(_) => return Err("transcript destination already exists".to_owned()),
         Err(error) => return Err(error.to_string()),
     }
+    // Resolve the controls before the observation window, so preflight
+    // metadata checks cannot become untaped engine reads.
+    let preflight = validate_engine_environment(fixture_root);
     let read = (|| -> Result<Vec<u8>, String> {
         use std::io::Read;
+        if let Err(reason) = &preflight { return Err(reason.clone()); }
         validate_fixture_path(fixture_root, manifest_path)?;
         let file = std::fs::File::open(manifest_path).map_err(|error| error.to_string())?;
         let mut bytes = Vec::new();
@@ -898,7 +915,7 @@ fn run_case(
         .map(|bytes| tape::sha256_hex(bytes)).unwrap_or_default();
     tape::begin(ENGINE, case, &manifest_sha, "oxide::prune::tape_entry::run_chain");
     let parsed = (|| -> Result<HarnessManifest, String> {
-        validate_engine_environment(fixture_root)?;
+        preflight?;
         let bytes = read?;
         if bytes.len() as u64 > tape::MAX_MANIFEST_BYTES { return Err("manifest exceeds byte cap".to_owned()); }
         let doc: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
@@ -1649,6 +1666,28 @@ fn main() {
         std::process::exit(code);
     }
     match args.first().map(String::as_str) {
+        Some("--path-preflight") => {
+            let result = (|| -> Result<(), String> {
+                if args.len() != 2 { return Err("path preflight needs one root".to_owned()); }
+                if !cfg!(debug_assertions) { return Err("path preflight requires the debug cfg".to_owned()); }
+                let root = Path::new(&args[1]);
+                validate_engine_environment(root)?;
+                let facts = config::Facts::from_env();
+                let settings = config::settings(&facts)?;
+                let state = facts.state_dir()?;
+                let cache = config::default_pool(&facts).ok_or("cache unavailable")?;
+                println!("debug_assertions=true config={} state={} state_registry={} scratch_records={} cache={} pool={} output_registry={}",
+                    settings.file.path.display(), state.display(), state.join("pools.json").display(),
+                    state.join("scratch-pools").display(), cache.display(), settings.pool.display(),
+                    settings.pool.join("oxide-managed/outputs/registry.json").display());
+                println!("config_source_sha256={}", tape::sha256_hex(include_bytes!("config.rs")));
+                Ok(())
+            })();
+            match result {
+                Ok(()) => std::process::exit(0),
+                Err(reason) => { eprintln!("oxide: path preflight: {reason}"); std::process::exit(2); }
+            }
+        }
         Some("--self-check") => {
             let code = match self_check(true) {
                 Ok(()) => 0,
