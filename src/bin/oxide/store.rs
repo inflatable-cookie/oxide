@@ -13222,10 +13222,15 @@ mod fresh_custody_tests {
         // Pad both documents to byte-identical lengths with a placeholder
         // identity so only the content and change metadata differ.
         let mut clean_bytes = serde_json::to_vec(&clean).unwrap();
-        let mut writing_bytes = serde_json::to_vec(&writing).unwrap();
+        let writing_bytes = serde_json::to_vec(&writing).unwrap();
         assert!(writing_bytes.len() > clean_bytes.len());
         clean_bytes.resize(writing_bytes.len(), b' ');
-        fixture.replace_state(&serde_json::from_slice(&clean_bytes).unwrap());
+        let state_path = fixture.control.join("state.json");
+        fs::write(&state_path, &clean_bytes).unwrap();
+        assert_eq!(
+            fs::metadata(&state_path).unwrap().len(),
+            writing_bytes.len() as u64
+        );
         let mut witness = CustodyWitness::open(&fixture.control).unwrap();
         assert_eq!(
             witness.decide(None, &checkout, true).unwrap().verdict,
@@ -13235,6 +13240,10 @@ mod fresh_custody_tests {
         fs::write(&temp, &writing_bytes).unwrap();
         fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).unwrap();
         fs::rename(&temp, fixture.control.join("state.json")).unwrap();
+        assert_eq!(
+            fs::metadata(&state_path).unwrap().len(),
+            clean_bytes.len() as u64
+        );
         assert_eq!(
             witness.decide(None, &checkout, true).unwrap().verdict,
             CheckoutCustody::Writers,
