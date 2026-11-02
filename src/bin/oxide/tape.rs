@@ -740,6 +740,51 @@ pub(crate) fn authority_bind(site: &str, path: &Path, cap: u64) {
     });
 }
 
+/// Record an observed object without inventing the identity of its parent.
+/// A path lookup after the leaf operation cannot bind that parent to the read.
+pub(crate) fn read_row_without_parent(
+    kind: &str,
+    path: &Path,
+    dev: u64,
+    ino: u64,
+    outcome: TapeOutcome,
+    cap: u64,
+) {
+    with_state(|state| {
+        let key = format!(
+            "file:{}|parent=unproven|dev={dev}/ino={ino}",
+            path.display()
+        );
+        let identity = TapeIdentity {
+            path: Some(path.display().to_string()),
+            parent_dev: None,
+            parent_ino: None,
+            dev: Some(dev),
+            ino: Some(ino),
+            uuid: None,
+            mount_point: None,
+            device: None,
+            key: key.clone(),
+        };
+        state.notes.push(format!("parent identity unproven at {kind}"));
+        let (occurrence, counted) = occurrence(state, &format!("{kind}|{key}"));
+        let epoch = next_epoch(state);
+        if counted {
+            push_read(
+                state,
+                TapeReadRow {
+                    kind: kind.to_owned(),
+                    identity,
+                    outcome,
+                    cap,
+                    epoch,
+                    occurrence,
+                },
+            );
+        }
+    });
+}
+
 /// Record a read against the descriptor that supplied the bytes.
 pub(crate) fn authority_bind_descriptor(
     site: &str,
@@ -752,7 +797,7 @@ pub(crate) fn authority_bind_descriptor(
     with_state(|state| {
         state.pending_authority = None;
     });
-    read_row_dev(
+    read_row_without_parent(
         &format!("authority-read@{site}"),
         path,
         dev,

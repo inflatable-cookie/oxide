@@ -1056,8 +1056,11 @@ alone is insufficient.
   `read_observations`, `outputs::read_receipt_with`, `marker_digest` and
   `read_marker`, and `removable::read_registration`. The non-test read
   statements remain in their original cfg branches. Parent identities are
-  still observed independently and must be reviewed for race-free binding;
-  this inventory is not proof that every direct read in the contract is taped.
+  not established by a later path lookup: where the operation did not bind a
+  parent, the descriptor row carries an explicit unproven note. Decision
+  86249e2c permits one test-only fstat on the held descriptor for identity
+  observation only; its failure does not change the real read or policy. This
+  inventory is not proof that every direct read in the contract is taped.
 - **Fixture configuration.** Preparation uses `config::Facts` with injected
   platform-directory inputs; the evaluator child uses the existing debug-only
   `OXIDE_TEST_HOME_FROM_ENV=1` control and explicit fixture paths. The child
@@ -1071,7 +1074,10 @@ alone is insufficient.
   fails the run. The installed release binary remains unchanged, and this
   authority is not a general Cargo fallback. Decision 696fa6e9
   records the identical-content `pools.json` inode replacement as a failed
-  isolation gate, with no repair or attribution assumption. Before another
+  isolation gate, with no repair or attribution assumption. A later replacement
+  from inode 2072777179 to 2072840885 also retained identical bytes and failed
+  its gate. Decision 86249e2c requires no repair and a fresh live inventory
+  immediately before each new dry preflight or run; any change still fails. Before another
   focused run, actual config, state/registry, cache and pool destinations must
   bind private scratch and an effect-free preflight must produce a zero-delta
   live-state inventory. The test-only path preflight calls the existing config

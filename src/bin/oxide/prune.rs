@@ -1775,6 +1775,46 @@ pub(crate) fn authority_read<R: Read>(reader: R, bytes: &mut Vec<u8>) -> std::io
     result
 }
 
+// Preserve the evaluator thread's errno around test-only observation.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+fn tape_errno_slot() -> Option<*mut libc::c_int> {
+    // SAFETY: libc returns this thread's errno location.
+    Some(unsafe { libc::__errno_location() })
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "ios")))]
+fn tape_errno_slot() -> Option<*mut libc::c_int> {
+    // SAFETY: libc returns this thread's errno location.
+    Some(unsafe { libc::__error() })
+}
+
+#[cfg(all(
+    test,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))
+))]
+fn tape_errno_slot() -> Option<*mut libc::c_int> {
+    None
+}
+
+#[cfg(test)]
+fn tape_errno() -> Option<libc::c_int> {
+    // SAFETY: the pointer, when available, is this thread's errno slot.
+    tape_errno_slot().map(|slot| unsafe { *slot })
+}
+
+#[cfg(test)]
+fn tape_restore_errno(value: Option<libc::c_int>) {
+    if let (Some(slot), Some(value)) = (tape_errno_slot(), value) {
+        // SAFETY: the pointer is this thread's errno slot.
+        unsafe { *slot = value };
+    }
+}
+
 /// Test-only observation of the exact descriptor passed to authority_read.
 /// The production call below remains unchanged; the descriptor stays open
 /// until the real read result has been recorded.
@@ -1787,8 +1827,28 @@ pub(crate) fn authority_read_observed(
     bytes: &mut Vec<u8>,
 ) -> std::io::Result<usize> {
     use std::os::unix::fs::MetadataExt;
+    // The single test-only fstat observes this held descriptor. It never
+    // changes the evaluator result, including when the observation fails.
+    let before_observation = tape_errno();
     let metadata = file.metadata();
+    if site == "prune::read_bounded" {
+        if let Ok(metadata) = &metadata {
+            crate::tape::read_row_without_parent(
+                "read-bounded:open",
+                path,
+                metadata.dev(),
+                metadata.ino(),
+                crate::tape::TapeOutcome::Opened {
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                },
+                limit,
+            );
+        }
+    }
+    tape_restore_errno(before_observation);
     let result = authority_read(file.take(limit + 1), bytes);
+    let after_read = tape_errno();
     let outcome = match &result {
         Ok(_) => crate::tape::TapeOutcome::Digest {
             digest: crate::tape::sha256_hex(bytes),
@@ -1808,6 +1868,7 @@ pub(crate) fn authority_read_observed(
         ),
         Err(error) => crate::tape::authority_unbound(site, &error.to_string()),
     }
+    tape_restore_errno(after_read);
     result
 }
 
@@ -2342,15 +2403,20 @@ fn read_bounded(path: &Path, limit: usize, what: &str) -> Result<Vec<u8>, String
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("cannot open the {what} {}: {error}", path.display()))?;
     #[cfg(test)]
-    crate::tape::read_row(
-        "read-bounded:lstat",
-        path,
-        match crate::tape::path_dev_ino(path) {
-            Some((dev, ino)) => crate::tape::TapeOutcome::Opened { dev, ino },
-            None => crate::tape::TapeOutcome::Absent,
-        },
-        limit as u64,
-    );
+    {
+        use std::os::unix::fs::MetadataExt;
+        crate::tape::read_row_without_parent(
+            "read-bounded:lstat",
+            path,
+            metadata.dev(),
+            metadata.ino(),
+            crate::tape::TapeOutcome::Opened {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            },
+            limit as u64,
+        );
+    }
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(format!("the {what} {} is not a real file", path.display()));
     }
@@ -2362,26 +2428,6 @@ fn read_bounded(path: &Path, limit: usize, what: &str) -> Result<Vec<u8>, String
     }
     let file = File::open(path)
         .map_err(|error| format!("cannot open the {what} {}: {error}", path.display()))?;
-    #[cfg(test)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        match file.metadata() {
-            Ok(metadata) => crate::tape::read_row_dev(
-                "read-bounded:open",
-                path,
-                metadata.dev(),
-                metadata.ino(),
-                crate::tape::TapeOutcome::Opened {
-                    dev: metadata.dev(),
-                    ino: metadata.ino(),
-                },
-                limit as u64,
-            ),
-            Err(error) => {
-                crate::tape::authority_unbound("prune::read_bounded:open", &error.to_string())
-            }
-        }
-    }
     let mut bytes = Vec::new();
     #[cfg(not(test))]
     authority_read(file.take(limit as u64 + 1), &mut bytes)

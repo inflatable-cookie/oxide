@@ -1483,12 +1483,25 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
                 row.get("kind").and_then(|v| v.as_str()) == Some("authority-read@pure::descriptor")
                     && row.pointer("/identity/ino").and_then(|v| v.as_u64())
                         == Some(observed_identity)
+                    && row
+                        .pointer("/identity/parent_dev")
+                        .is_some_and(|v| v.is_null())
+                    && row
+                        .pointer("/identity/parent_ino")
+                        .is_some_and(|v| v.is_null())
             }),
         "descriptor binding survives path replacement",
     )?;
     check(
         descriptor_doc.reads.len() == 1,
         "one authority read produces one identity-bound row",
+    )?;
+    check(
+        descriptor_doc
+            .notes
+            .iter()
+            .any(|note| note.contains("parent identity unproven")),
+        "unobserved descriptor parent remains explicitly unproven",
     )?;
     let build = |digest: String| -> Vec<u8> {
         tape::begin("oxide", "PURE", "manifest", "pure");
