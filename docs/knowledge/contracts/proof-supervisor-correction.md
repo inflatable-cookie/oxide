@@ -398,9 +398,12 @@ ruling does not change the retrospective no-go or any product signal authority.
 ### Retention redesign for the held-child fixture (2026-11-02)
 
 **Recommendation:** use the qualified predecessor's existing hosting marker and
-its retained evidence subtree together. This is an implementation-ready design
-for review, not an implemented protocol, a native result, or authority to run
-an owner-death or escape experiment. It is limited to the cooperative host and
+its retained evidence subtree together. The planner froze this retention design
+after retained-reviewer approval `6566191910` at `793f8a2` and merge `aad36e6`
+(2026-11-02). This is a reviewed design, not an implemented protocol, a native
+result, or authority to run an owner-death or escape experiment. The direct-child
+and group signal-lifetime premises still need their own source review before
+executable use. It is limited to the cooperative host and
 the actual verified default owned-root topology below. Do not use the active
 oxide#233 candidate as if it were qualified. The predecessor examined here is
 `scripts/bounded-test.py` SHA-256
@@ -579,10 +582,14 @@ pipe nor nonzero exit is such an argument.
   that continues only with independent known fixture state and aborts on
   infrastructure, writer, device, custody or receipt uncertainty. Effect-free
   self-check and plan prove refusal and case dispatch first; independent
-  exact-published-head source review approves ownership, topology, resource
-  basis and negative controls before a separately activated uncounted
-  diagnostic, counted author and distinct reviewer native. Native bounds are
-  300 s / 512 MiB, no Cargo or images. Parent-death/session-escape native cases
+  exact-published-head review by the retained Queue reviewer approves ownership,
+  topology, resource basis and negative controls before one source-immutable
+  diagnostic through the task's `proof` route. That same reviewer judges the
+  actual receipts. Tom's single-reviewer ruling `c8991f99` supersedes the older
+  counted-author/distinct-reviewer execution chain for this follow-up: no extra
+  reviewer or native-reader agent is launched. Any further native qualification
+  is a planner-owned release gate, with missing evidence recorded honestly.
+  Native bounds are 300 s / 512 MiB, no Cargo or images. Parent-death/session-escape native cases
   remain held until the separate containment argument above is accepted.
 * **C — product integration.** Independently design and scope the authenticated
   per-run channel, cancellation and shared-supervisor integration, including any
