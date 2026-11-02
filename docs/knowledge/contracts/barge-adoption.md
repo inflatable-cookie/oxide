@@ -1133,6 +1133,10 @@ bound and must still match their canonical paths and audited digests.
 An inventory mismatch still refuses isolation. Its bounded refusal identifies
 the phase, total changed rows and up to eight hashed paths with change kinds;
 it does not expose inventory values or establish which actor made a change.
+Comparison keys rows by unique path, independent of traversal order. On a
+mismatch the guarded private evidence directory retains the actual before and
+after rows and difference summary, capped at 8 MiB; excess refuses without
+claiming that the evidence was saved. Duplicate paths also refuse.
 The same digest-bound manifest requires `retained_roots`, a nonempty list of
 at most 64 canonical, owned, non-group-writable task-private directories under
 the Barge or Oxide scratch subtree. It must name entire prior preparation and

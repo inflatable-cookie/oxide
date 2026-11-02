@@ -1033,10 +1033,13 @@ def verify_probe(stdout: str, *, home: Path, config: Path, pool: Path,
         raise GateRefusal("status refused the private pool")
 
 
-def verify_inventory(before: list, after: list, phase: str = "unspecified") -> None:
-    if before != after:
-        old = {row[0]: row for row in before}
-        new = {row[0]: row for row in after}
+def verify_inventory(before: list, after: list, phase: str = "unspecified",
+                     evidence: Path | None = None) -> None:
+    old = {row[0]: row for row in before}
+    new = {row[0]: row for row in after}
+    if len(old) != len(before) or len(new) != len(after):
+        raise GateRefusal("duplicate live inventory path; isolation unproven")
+    if old != new:
         differences = []
         total = 0
         for name in sorted(old.keys() | new.keys()):
@@ -1056,6 +1059,12 @@ def verify_inventory(before: list, after: list, phase: str = "unspecified") -> N
                                     "kind": kind, "fields": fields})
         detail = {"phase": phase, "changed_rows": total, "rows": differences,
                   "omitted": total - len(differences)}
+        if evidence is not None:
+            payload = canonical_json({"phase": phase, "before": before, "after": after,
+                                      "difference": detail})
+            if len(payload) > MAX_DOC_BYTES:
+                raise GateRefusal("live inventory changed; isolation failed; evidence exceeds bound")
+            private_write(evidence, Path(f"live-inventory-{phase}.json"), payload)
         raise GateRefusal("live inventory changed; isolation failed; " +
                           canonical_json(detail).decode("utf-8"))
 
@@ -2070,7 +2079,7 @@ def diagnostic(options: dict) -> int:
 
     # Live isolation bracket: the bootstrap must have changed nothing.
     live_after_bootstrap = live_inventory(LIVE_ACCOUNT_ROOT, deadline_ns)
-    verify_inventory(live_before, live_after_bootstrap, "bootstrap")
+    verify_inventory(live_before, live_after_bootstrap, "bootstrap", evidence)
 
     # The external, one-use templates authorize this exact derivation only.
     # The accepted wrapper receives complete, immutable schema documents;
@@ -2120,7 +2129,7 @@ def diagnostic(options: dict) -> int:
 
     # Final isolation bracket and retained-root quiescence observation.
     final_live = live_inventory(LIVE_ACCOUNT_ROOT, deadline_ns)
-    verify_inventory(live_before, final_live, "private-status")
+    verify_inventory(live_before, final_live, "private-status", evidence)
     retained_after = retained_snapshot(inactive_roots(ledger_roots, oxide_budget_roots,
                                                         barge_root, oxide_root), SCRATCH_ROOT, deadline_ns)
     if retained_before != retained_after:
@@ -3325,7 +3334,16 @@ def self_test() -> int:
     if before is not None and after is not None and before == after:
         failures.append("same-content inode replacement passed as equality")
     expect_ok("inventory equality on an unchanged tree", verify_inventory, before, before)
+    expect_ok("inventory order does not alter equality", verify_inventory, before, list(reversed(before)))
+    expect_refusal("duplicate inventory paths refuse", verify_inventory, before + [before[0]], before)
     expect_refusal("inventory inequality refuses", verify_inventory, before, after)
+    failure_evidence = private_dir(private_root, Path("inventory-evidence"))
+    expect_refusal("inventory mismatch preserves evidence", verify_inventory,
+                   before, after, "bootstrap", failure_evidence)
+    recorded = json.loads((failure_evidence / "live-inventory-bootstrap.json").read_bytes())
+    if (recorded["before"] != before or recorded["after"] != after
+            or recorded["difference"]["changed_rows"] < 1):
+        failures.append("inventory refusal did not preserve the actual comparison")
     try:
         verify_inventory(before, after, "bootstrap")
         failures.append("inventory diagnostic accepted a change")
