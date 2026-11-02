@@ -2278,7 +2278,9 @@ class Fixture:
     """A disposable fixture tree for the pure checks."""
 
     def __init__(self):
-        base = os.environ.get("OXIDE_TASK_SCRATCH_ROOT") or tempfile.gettempdir()
+        base = os.environ.get("TMPDIR", "")
+        if not base or not Path(base).is_absolute() or not Path(base).is_dir():
+            raise GateRefusal("fixture TMPDIR must be an existing absolute directory")
         self.root = Path(tempfile.mkdtemp(prefix="private-build-validation-test.",
                                           dir=base)).resolve(strict=True)
         os.chmod(self.root, 0o700)
