@@ -1477,8 +1477,7 @@ def diagnostic(options: dict) -> int:
         from offline_seed import seed_cargo_home  # type: ignore
         seed_cargo_home(Path(invoking_cargo_home), cache_root,
                         (oxide_source / "Cargo.lock").read_bytes(),
-                        deadline_ns=min(allowance.bootstrap_deadline_ns(),
-                                        now_ns() + allowance.remaining_seconds() * 1_000_000_000))
+                        deadline_ns=deadline_ns)
     finally:
         sys.path.pop(0)
     allowance.finish("setup")
@@ -1496,7 +1495,7 @@ def diagnostic(options: dict) -> int:
     allowance.begin("account")
     ledger_roots = [Path(p) for p in ledger_doc["roots"]]
     barge_outside = allocated_bytes([p for p in ledger_roots if p != barge_root],
-                                    BARGE_CAP_BYTES, allowance.bootstrap_deadline_ns())
+                                    BARGE_CAP_BYTES, deadline_ns)
     barge_monitored = allocated_bytes([barge_root], BARGE_CAP_BYTES,
                                       allowance.bootstrap_deadline_ns())
     barge_effective_mib = clamp_mib(BARGE_CAP_BYTES,
@@ -1507,9 +1506,10 @@ def diagnostic(options: dict) -> int:
     oxide_caps = oxide_effective_caps(oxide_budget_roots, oxide_root)
     if oxide_caps["effective_whole_block_mib"] < 1:
         raise GateRefusal("retained Oxide evidence leaves no whole-block scratch budget")
-    retained_before = retained_snapshot(ledger_roots + oxide_budget_roots, SCRATCH_ROOT,
-                                        allowance.bootstrap_deadline_ns())
-    live_before = live_inventory(LIVE_ACCOUNT_ROOT, allowance.bootstrap_deadline_ns())
+    retained_before = retained_snapshot([p for p in ledger_roots + oxide_budget_roots
+                                         if p not in (barge_root, oxide_root)], SCRATCH_ROOT,
+                                        deadline_ns)
+    live_before = live_inventory(LIVE_ACCOUNT_ROOT, deadline_ns)
     allowance.finish("account")
 
     # The single debug bootstrap: exact argv under the nested qualified
@@ -1555,7 +1555,7 @@ def diagnostic(options: dict) -> int:
     allowance.finish_bootstrap()
 
     # Live isolation bracket: the bootstrap must have changed nothing.
-    live_after_bootstrap = live_inventory(LIVE_ACCOUNT_ROOT, allowance.bootstrap_deadline_ns())
+    live_after_bootstrap = live_inventory(LIVE_ACCOUNT_ROOT, deadline_ns)
     verify_inventory(live_before, live_after_bootstrap)
 
     # The dry gate: the real private status through the same child route.
@@ -1564,25 +1564,26 @@ def diagnostic(options: dict) -> int:
         BARGE_CAP_BYTES, allocated_bytes(ledger_roots, BARGE_CAP_BYTES, deadline_ns), 512)))
     gate_evidence = private_dir(barge_root, Path("evidence/private-status"))
     status_command = [str(effigy), STATUS_SELECTOR]
-    status_receipt, status_out, status_argv = run_supervised(
-        supervisor=supervisor_tool, python=python, command=status_command,
-        cwd=barge_source, env=env, limit_seconds=gate_limit, scratch_mib=gate_mib,
-        evidence=gate_evidence, allowance=allowance, phase="private-status")
-    validate_supervisor_receipt(status_receipt, status_command, barge_root)
     state = private_dir(barge_root / "home", Path("Library/Application Support/oxide/state"))
     cache_probe_root = private_dir(barge_root / "home", Path("Library/Caches/oxide"))
     registry_probe = private_write(barge_root, Path(f"registry-probe-{block_doc['block_id']}"),
                                    block_doc["block_id"].encode())
     cache_probe = private_write(cache_probe_root, Path("build-pool"), block_doc["block_id"].encode())
     private_write(state, Path("pools.json"), canonical_json([str(registry_probe)]))
+    status_receipt, status_out, status_argv = run_supervised(
+        supervisor=supervisor_tool, python=python, command=status_command,
+        cwd=barge_source, env=env, limit_seconds=gate_limit, scratch_mib=gate_mib,
+        evidence=gate_evidence, allowance=allowance, phase="private-status")
+    validate_supervisor_receipt(status_receipt, status_command, barge_root)
     verify_probe(status_out, home=barge_root / "home", config=barge_root / "config.toml",
                  pool=barge_root / "scratch/pool", registry_probe=registry_probe,
                  cache_probe=cache_probe)
 
     # Final isolation bracket and retained-root quiescence observation.
-    final_live = live_inventory(LIVE_ACCOUNT_ROOT, allowance.bootstrap_deadline_ns())
+    final_live = live_inventory(LIVE_ACCOUNT_ROOT, deadline_ns)
     verify_inventory(live_before, final_live)
-    retained_after = retained_snapshot(ledger_roots + oxide_budget_roots, SCRATCH_ROOT, deadline_ns)
+    retained_after = retained_snapshot([p for p in ledger_roots + oxide_budget_roots
+                                         if p not in (barge_root, oxide_root)], SCRATCH_ROOT, deadline_ns)
     if retained_before != retained_after:
         raise GateRefusal("retained roots changed during the gate; quiescence unproven")
 
