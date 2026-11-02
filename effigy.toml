@@ -1448,3 +1448,9 @@ TMPDIR="$oxide_temp" TMP="$oxide_temp" TEMP="$oxide_temp" oxide test --test tape
 status=$?
 rm -rf "$oxide_temp"
 exit $status"""
+
+# Task-only private debug wrapper bootstrap. The caller supplies an isolated
+# CARGO_HOME, CARGO_TARGET_DIR and HOME under owned Builds scratch.
+[tasks."proof:tape-prune:bootstrap"]
+admission = "heavy"
+run = "cargo build --offline --locked --bin oxide"

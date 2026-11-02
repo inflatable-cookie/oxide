@@ -1063,10 +1063,13 @@ alone is insufficient.
   `OXIDE_TEST_HOME_FROM_ENV=1` control and explicit fixture paths. The child
   must check its controls and resolved state and pool before entering the
   engine. This proves no production account-home equivalence. The isolated
-  wrapper route for covering checks is not yet established: the installed
-  release Oxide rejects the test-home control, and its normal scratch-pool
-  registration derives an account-state path. Validation must not start until
-  an independently reviewed route confines that registration before any write.
+  wrapper route for covering checks is task-scoped by decision cf2c3cf4:
+  bootstrap this task's debug Oxide through `proof:tape-prune:bootstrap`,
+  then run the covering selectors with its private fixture HOME, pool and
+  scratch. Before bootstrap and after each execution, compare bounded no-follow
+  inventories of the complete live Oxide account state; any change or unknown
+  fails the run. The installed release binary remains unchanged, and this
+  authority is not a general Cargo fallback.
   Preserve the earlier contaminated sessions and the operator's live-state
   disposition separately in Queue.
 - **Harness composition.** The harness crate re-roots the actual library and
