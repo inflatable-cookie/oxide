@@ -129,6 +129,7 @@ SCALE_ROOTS = 709
 SCALE_ROWS = 1189
 SCALE_WRITERS = 650
 SNAPSHOT_BUDGET_BYTES = 64 * 1024 * 1024
+MANAGED_NAME = "oxide-managed"
 
 # The nine HIGH proof-authoring premise dispositions (workflow.md
 # "Proof-authoring premise checklist"), with the executable source location of
@@ -209,7 +210,7 @@ def declare_scratch(env: dict, task_root: str) -> dict:
 def place_pool(world, pool: str) -> None:
     """Move a World's pool, and every path derived from it, under the scratch root."""
     world.pool = pool
-    world.control = os.path.join(pool, "oxide-managed")
+    world.control = os.path.join(pool, MANAGED_NAME)
     world.outputs = os.path.join(world.control, "outputs")
     world.registry = os.path.join(world.outputs, "registry.json")
 
@@ -217,7 +218,7 @@ def place_pool(world, pool: str) -> None:
 def control_paths(world) -> dict:
     """The control-tree paths this proof witnesses, derived from the same
     layout constants the product uses (pinned in --self-check)."""
-    removable_control = os.path.join(world.control, "removable", "managed")
+    removable_control = os.path.join(world.control, "removable", MANAGED_NAME)
     return {
         "internal_lock": os.path.join(world.control, "admission.lock"),
         "internal_state": os.path.join(world.control, "state.json"),
@@ -226,6 +227,19 @@ def control_paths(world) -> dict:
         "removable_lock": os.path.join(removable_control, "admission.lock"),
         "removable_state": os.path.join(removable_control, "state.json"),
     }
+
+
+def require_control_files(paths: dict) -> None:
+    """The already-created fixture inputs must be private regular files.
+
+    This read-only check never creates or repairs a missing control file.
+    """
+    for name in ("internal_lock", "internal_state", "removable_lock", "removable_state"):
+        path = paths[name]
+        facts = os.lstat(path)
+        require(stat.S_ISREG(facts.st_mode) and facts.st_uid == os.geteuid()
+                and stat.S_IMODE(facts.st_mode) == 0o600 and facts.st_nlink == 1,
+                f"fixture {name} is not a private regular file: {path}")
 
 
 def entry_digest(path: str) -> tuple:
@@ -642,6 +656,7 @@ def run_cases(proof, adapter, world, boot, collector):
             "fixture target already exists",
         )
         world.adopt(checkout)
+    require_control_files(paths)
     roots = [world.selected(checkout)["root"] for checkout in checkouts]
     link_locations = list(checkouts)
     for checkout, root in zip(checkouts, roots):
@@ -1558,15 +1573,49 @@ def self_check() -> int:
     require(paths["internal_lock"] == pool + "/oxide-managed/admission.lock", "internal lock path")
     require(paths["registration"] == pool + "/oxide-managed/removable.json", "registration path")
     require(
-        paths["removable_state"] == pool + "/oxide-managed/removable/managed/state.json",
+        paths["removable_state"] == pool + "/oxide-managed/removable/oxide-managed/state.json",
         "removable state path",
+    )
+    require(
+        paths["removable_lock"] == pool + "/oxide-managed/removable/oxide-managed/admission.lock",
+        "removable lock path",
     )
     source = (HERE.parent / "src" / "bin" / "oxide" / "removable.rs").read_text()
     require('POOL_DIR: &str = "removable"' in source, "the removable pool directory literal")
     require('REGISTRATION: &str = "removable.json"' in source, "the registration file literal")
+    removable_control = source.split("pub fn removable_control", 1)[1].split("\n}", 1)[0]
+    require('.join(POOL_DIR)' in removable_control
+            and '.join(oxide_storage::lease::MANAGED_NAME)' in removable_control,
+            "the witness does not derive its removable control from both product constants")
     store_source = (HERE.parent / "src" / "bin" / "oxide" / "store.rs").read_text()
+    lease_source = (HERE.parent / "src" / "lease" / "mod.rs").read_text()
+    require(f'pub const MANAGED_NAME: &str = "{MANAGED_NAME}";' in lease_source,
+            "the shared managed-control directory literal")
+    removable_store = store_source.split("pub fn open_recorded_removable", 1)[1].split("\n    }", 1)[0]
+    require('control: root.join(MANAGED_NAME)' in removable_store,
+            "the removable Store does not use the shared managed-control name")
     require('const LOCK_NAME: &\'static str = "admission.lock"' in store_source, "lock literal")
     require('const STATE_NAME: &\'static str = "state.json"' in store_source, "state literal")
+    with tempfile.TemporaryDirectory(prefix="prune-control-paths-") as directory:
+        fixture = SimpleNamespace(pool=os.path.join(directory, "pool"), control="", outputs="", registry="")
+        place_pool(fixture, fixture.pool)
+        fixture_paths = control_paths(fixture)
+        for name in ("internal_lock", "internal_state", "removable_lock", "removable_state"):
+            target = Path(fixture_paths[name])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"{}" if name.endswith("state") else b"")
+            target.chmod(0o600)
+        require_control_files(fixture_paths)
+        wrong = dict(fixture_paths)
+        wrong["removable_state"] = os.path.join(fixture.control, "removable", "managed", "state.json")
+        try:
+            require_control_files(wrong)
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError("the historical incorrect removable state path was accepted")
+        require(not os.path.lexists(os.path.dirname(wrong["removable_state"])),
+                "control validation created the historical incorrect directory")
     prune_source = (HERE.parent / "src" / "bin" / "oxide" / "prune.rs").read_text()
     require("const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024;" in prune_source, "budget literal")
     require("const SNAPSHOT_TIME: Duration = Duration::from_secs(10);" in prune_source, "time literal")
