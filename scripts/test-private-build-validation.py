@@ -350,13 +350,64 @@ def retained_snapshot(roots: list, scratch_base: Path, deadline_ns: int | None =
     for other in roots:
         if other == scratch_base or not other.is_relative_to(scratch_base):
             raise GateRefusal(f"retained root escapes its scratch base: {other}")
+        try:
+            if other.parent.resolve(strict=True) != other.parent:
+                raise GateRefusal("retained root parent is not canonical")
+        except OSError as error:
+            raise GateRefusal(f"retained root parent unreadable: {other}: {error}") from None
         rows = []
         size = 0
 
         def on_error(error: OSError, other=other):
             raise GateRefusal(f"retained root unreadable: {other}: {error}")
 
-        for directory, dirs, files in os.walk(other, followlinks=False, onerror=on_error):
+        try:
+            st_root = os.lstat(other)
+        except OSError as error:
+            raise GateRefusal(f"retained root unreadable: {other}: {error}") from None
+        if stat.S_ISREG(st_root.st_mode):
+            if st_root.st_uid != os.geteuid() or st_root.st_mode & 0o444 == 0:
+                raise GateRefusal(f"foreign or unreadable retained file: {other}")
+            if count >= RETAINED_ROW_CAP or (deadline_ns is not None and now_ns() > deadline_ns):
+                raise GateRefusal("retained snapshot row or time cap reached")
+            try:
+                fd = os.open(other, os.O_RDONLY | os.O_NOFOLLOW)
+            except OSError as error:
+                raise GateRefusal(f"retained file unreadable: {other}: {error}") from None
+            try:
+                opened = os.fstat(fd)
+                if (_stable(st_root), st_root.st_ctime_ns) != (_stable(opened), opened.st_ctime_ns):
+                    raise GateRefusal("retained file changed before reading")
+                h = hashlib.sha256()
+                length = 0
+                while True:
+                    if deadline_ns is not None and now_ns() > deadline_ns:
+                        raise GateRefusal("retained file exceeded its time bound")
+                    data = os.read(fd, 1024 * 1024)
+                    if not data:
+                        break
+                    length += len(data)
+                    if length > INVENTORY_CONTENT_CAP:
+                        raise GateRefusal("retained file exceeds content cap")
+                    h.update(data)
+                after = os.fstat(fd)
+                named = os.lstat(other)
+                if ((_stable(opened), opened.st_ctime_ns) != (_stable(after), after.st_ctime_ns)
+                        or (_stable(after), after.st_ctime_ns) != (_stable(named), named.st_ctime_ns)):
+                    raise GateRefusal("retained file changed during reading")
+            except OSError as error:
+                raise GateRefusal(f"retained file unreadable: {other}: {error}") from None
+            finally:
+                os.close(fd)
+            count += 1
+            size = max(st_root.st_size, st_root.st_blocks * 512)
+            rows.append([".", *(_stable(st_root)), st_root.st_uid, st_root.st_gid,
+                         st_root.st_blocks, st_root.st_ctime_ns, h.hexdigest()])
+        elif not stat.S_ISDIR(st_root.st_mode):
+            raise GateRefusal(f"retained root is not a regular file or directory: {other}")
+
+        for directory, dirs, files in (os.walk(other, followlinks=False, onerror=on_error)
+                                        if stat.S_ISDIR(st_root.st_mode) else []):
             for name in [".", *sorted(dirs), *sorted(files)]:
                 path = Path(directory) if name == "." else Path(directory) / name
                 st = os.lstat(path)
@@ -443,6 +494,21 @@ def allocated_bytes(paths: list, cap: int, deadline_ns: int | None = None) -> in
                 walk(fd)
             finally:
                 os.close(fd)
+        elif stat.S_ISREG(st.st_mode):
+            if st.st_uid != os.geteuid() or st.st_mode & 0o444 == 0:
+                raise GateRefusal("foreign or unreadable private file")
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                try:
+                    opened = os.fstat(fd)
+                    after = os.lstat(path)
+                    if ((_stable(st), st.st_ctime_ns) != (_stable(opened), opened.st_ctime_ns)
+                            or (_stable(opened), opened.st_ctime_ns) != (_stable(after), after.st_ctime_ns)):
+                        raise GateRefusal("private file changed while counted")
+                finally:
+                    os.close(fd)
+            except OSError as error:
+                raise GateRefusal(f"private file unreadable: {path}: {error}") from None
     return total
 
 
@@ -1232,7 +1298,7 @@ def discover_barge_roots(extra_roots: list) -> tuple:
         path = Path(item["path"])
         if not path.is_relative_to(BARGE_SCRATCH):
             raise GateRefusal("retained log escapes Barge scratch")
-        roots.add(path if path.is_dir() else path.parent)
+        roots.add(path)
     roots.update(BARGE_SCRATCH.glob("041-pr.*"))
     for name in ("planner-041-approved-block-20261102", "planner-041-author-error-20261102",
                  "planner-041-revision-disposition-20261102",
@@ -1241,6 +1307,11 @@ def discover_barge_roots(extra_roots: list) -> tuple:
         if candidate.exists():
             roots.add(candidate)
     roots.update(Path(p) for p in extra_roots)
+    if any(not path.is_absolute() or path == BARGE_SCRATCH or not path.is_relative_to(BARGE_SCRATCH)
+           or ".." in path.parts for path in roots):
+        raise GateRefusal("Barge discovery cannot include the shared scratch base")
+    roots = {path for path in roots if not any(parent != path and parent in path.parents
+                                                for parent in roots)}
     evidence = []
     for path in (BARGE_HISTORIC_LEDGER, BARGE_PACKET / "root-discovery.json",
                  BARGE_PACKET / "queue-evidence.json",
@@ -1253,62 +1324,60 @@ OXIDE_DISCOVERY_PACKET = OXIDE_SCRATCH / "planner-041-240-unblock-20261102"
 OXIDE_OWNER_PACKET = OXIDE_SCRATCH / "planner-041-240-owner-disposition-20261102"
 
 
-def discover_oxide_roots(extra_roots: list) -> tuple:
-    """Candidate Oxide #240 roots from the retained planner snapshots.
+CORRECTED_OXIDE_PACKET_SHA256 = "1c60e2374b76e9004ac99f27bcb0297623cabddb6d2422e29cbc26cd040bb54a"
 
-    Task-owned Builds roots recorded by Queue's run/cleanup records for task
-    d41de092 plus the retained planner packet directories. Names or reference
-    matches alone are not ownership proofs; the discovery stays honest about
-    that and the planner's issued quiescence admission decides.
-    """
-    roots = {OXIDE_DISCOVERY_PACKET, OXIDE_OWNER_PACKET,
-             OXIDE_SCRATCH / "planner-clock-and-residue-20261102"}
-    for name in ("oxide240.CVGVXlGm", "residue-240-20261102", "v.GcY4", "x.PFjS"):
-        candidate = OXIDE_SCRATCH / name
-        if candidate.exists():
-            roots.add(candidate)
-    roots.update(sorted(OXIDE_SCRATCH.glob("tape-prune-*")))
+
+def oxide_packet_roots(packet: dict, scratch: Path) -> tuple:
+    """Consume attributed candidates, retaining unknown dispositions as unknown."""
+    if (not isinstance(packet, dict) or packet.get("task") != OXIDE_TASK
+            or packet.get("complete") is not False
+            or not isinstance(packet.get("candidates"), list)):
+        raise GateRefusal("corrected Oxide discovery packet is malformed")
+    roots, unknown = set(), []
+    for item in packet["candidates"]:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            raise GateRefusal("corrected Oxide discovery candidate is malformed")
+        path = Path(item["path"])
+        if not path.is_absolute() or path == scratch or not path.is_relative_to(scratch) or ".." in path.parts:
+            raise GateRefusal("corrected Oxide candidate escapes scratch")
+        disposition = item.get("disposition")
+        if disposition == "attributed":
+            if item.get("kind") not in ("file", "directory") or item.get("size_complete") is not True:
+                raise GateRefusal("attributed Oxide candidate lacks its recorded shape")
+            roots.add(path)
+        elif disposition == "unknown":
+            roots.add(path)  # conservatively count, without asserting attribution
+            unknown.append(f"unresolved candidate: {path}: {item.get('basis', 'unknown')}")
+        elif disposition != "not-attributable":
+            raise GateRefusal("corrected Oxide candidate has unknown disposition")
+    proposed = packet.get("retained_roots")
+    if (not isinstance(proposed, list) or not proposed
+            or packet.get("proposed_budget_retained_roots") != proposed
+            or not set(map(Path, proposed)).issubset(roots)):
+        raise GateRefusal("corrected Oxide retained roots do not match attributed candidates")
+    if not isinstance(packet.get("unknown"), list) or any(not isinstance(x, str) for x in packet["unknown"]):
+        raise GateRefusal("corrected Oxide packet unknowns are missing")
+    return roots, unknown + packet["unknown"]
+
+
+def discover_oxide_roots(extra_roots: list, packet_path: Path,
+                         expected_sha256: str = CORRECTED_OXIDE_PACKET_SHA256) -> tuple:
+    """Read the reviewed packet, retaining all attributed evidence and unknowns."""
+    if not packet_path.is_absolute() or not packet_path.is_relative_to(OXIDE_SCRATCH):
+        raise GateRefusal("corrected Oxide packet must be retained under Oxide scratch")
+    packet_path = canonical_file(packet_path)
+    packet = read_json_bound(packet_path, expected_sha256)
+    roots, unknown = oxide_packet_roots(packet, OXIDE_SCRATCH)
+    review = OXIDE_SCRATCH / "planner-240-review-disposition-20261102/queue-detail.json"
+    roots.update((OXIDE_DISCOVERY_PACKET, OXIDE_OWNER_PACKET, packet_path, review))
     roots.update(Path(p) for p in extra_roots)
-    # Review 6584174560 finding 8: the planner-240 directories and review-230
-    # are non-root evidence (disposition pending), and oxide-233-fix.* is not
-    # attributable. They are named honestly in the history unknowns, never
-    # silently counted, and never read.
-    non_root_evidence = sorted(
-        str(p.name) for p in OXIDE_SCRATCH.glob("planner-240-*")
-        if p.is_dir() and p not in roots) + sorted(
-        str(p.name) for p in OXIDE_SCRATCH.glob("review-230*")
-        if p.is_dir() and p not in roots)
-    non_attributable = sorted(str(p.name) for p in OXIDE_SCRATCH.glob("oxide-233-fix.*")
-                              if p not in roots)
-    unknown = [
-        "quiescence of every retained root is not measured by discovery; the "
-        "planner's issued admission decides",
-        "shared live pool/output sizes stay unknown and unread",
-        "the current #240 launcher head is recorded, not approved",
-        "planner_reference must be confirmed by the planner at binding; the "
-        "proposal carries the brief-v11 string and the held brief is now v12",
-    ]
-    if non_root_evidence:
-        unknown.append("planner-240/review-230 directories are retained non-root "
-                       "evidence with disposition pending, outside this ledger: "
-                       + ", ".join(non_root_evidence))
-    if non_attributable:
-        unknown.append("directories not attributable to any task, never read or "
-                       "counted: " + ", ".join(non_attributable))
-    evidence = {}
-    for packet, name in ((OXIDE_DISCOVERY_PACKET, "240-queue-detail.json"),
-                         (OXIDE_DISCOVERY_PACKET, "240-task-next.json"),
-                         (OXIDE_DISCOVERY_PACKET, "240-source-prep-result.json"),
-                         (OXIDE_DISCOVERY_PACKET, "240-resource-amend-result.json"),
-                         (OXIDE_DISCOVERY_PACKET, "041-queue-detail.json"),
-                         (OXIDE_DISCOVERY_PACKET, "041-task-next.json"),
-                         (OXIDE_DISCOVERY_PACKET, "041-validation-spend-decision.json"),
-                         (OXIDE_OWNER_PACKET, "240-owner-source-disposition.json")):
-        path = packet / name
-        if path.is_file():
-            evidence[str(canonical_file(path))] = sha256_file(path)
-    if not evidence:
-        raise GateRefusal("no retained Oxide discovery evidence is available")
+    roots = {path for path in roots if not any(parent != path and parent in path.parents
+                                                for parent in roots)}
+    unknown.extend(["quiescence of retained roots requires actual guarded observation",
+                    "shared live pool/output sizes remain unknown and unread",
+                    "current #240 launcher is not source-approved"])
+    evidence = {str(packet_path): expected_sha256,
+                str(canonical_file(review)): sha256_file(canonical_file(review))}
     return sorted(roots), evidence, unknown
 
 
@@ -1359,6 +1428,7 @@ USAGE = """usage:
       --expect-audit HEX64 --expect-ledger HEX64 --expect-budget HEX64 --expect-history HEX64
       --expect-oxide-binding HEX64 --preparation-receipt PATH --expect-preparation HEX64
       [--planner-reference STRING]
+  prepare environment: OXIDE_CORRECTED_DISCOVERY_PACKET (exact reviewed JSON)
   diagnostic environment: OXIDE_PROOF_DEADLINE_NS, OXIDE_PROOF_RUN_ID,
       OXIDE_PROOF_EVIDENCE, OXIDE_TASK_SCRATCH_ROOT (exported by the qualified
       supervisor), BARGE_VALIDATION_BLOCK[+_SHA256],
@@ -2082,8 +2152,23 @@ def prepare(options: dict) -> int:
             or not evidence_dir.is_relative_to(adopted_scratch)
             or not packet_dir.is_relative_to(adopted_scratch)):
         raise GateRefusal("preparation needs a distinct guarded Barge phase root")
-    barge_roots, barge_evidence = discover_barge_roots([str(barge_root), str(adopted_scratch)])
-    oxide_roots, oxide_evidence, oxide_unknown = discover_oxide_roots([str(oxide_root)])
+    audit_manifest_path = canonical_file(Path(options["audit_inputs"]))
+    audit_manifest = read_json_bound(audit_manifest_path, options["expect_audit_inputs"])
+    input_paths = [audit_manifest_path]
+    inputs = audit_manifest.get("inputs")
+    if not isinstance(inputs, list):
+        raise GateRefusal("audit input manifest is malformed")
+    for item in inputs:
+        if not isinstance(item, dict) or not isinstance(item.get("source"), str):
+            raise GateRefusal("audit input source is malformed")
+        path = Path(item["source"])
+        if path.is_relative_to(SCRATCH_ROOT):
+            input_paths.append(path)
+    barge_extra = [str(barge_root), str(adopted_scratch)] + [str(p) for p in input_paths if p.is_relative_to(BARGE_SCRATCH)]
+    oxide_extra = [str(oxide_root)] + [str(p) for p in input_paths if p.is_relative_to(OXIDE_SCRATCH)]
+    barge_roots, barge_evidence = discover_barge_roots(barge_extra)
+    oxide_packet = Path(os.environ.get("OXIDE_CORRECTED_DISCOVERY_PACKET", ""))
+    oxide_roots, oxide_evidence, oxide_unknown = discover_oxide_roots(oxide_extra, oxide_packet)
     barge_retained = allocated_bytes([p for p in barge_roots
                                       if p not in (barge_root, adopted_scratch)],
                                      BARGE_CAP_BYTES, deadline_ns)
@@ -2327,6 +2412,106 @@ def self_test() -> int:
         except Exception as error:  # noqa: BLE001
             failures.append(f"{label}: unexpected {type(error).__name__}: {error}")
         return None
+
+    # A retained ledger can name loose files without broadening to scratch.
+    from unittest.mock import patch
+    case_base = fixture.root / "historic-barge"
+    case_base.mkdir()
+    case_packet = case_base / "packet"
+    case_packet.mkdir()
+    historic_dir = case_base / "041-budget-ledger-20261102"
+    historic_dir.mkdir()
+    run_root = case_base / "new-run"
+    run_root.mkdir()
+    required_root = case_base / "b041-final.n0hH3Cez"
+    required_root.mkdir()
+    loose = [case_base / "compile.log", case_base / "tape.log"]
+    for file in loose:
+        file.write_bytes(b"historic log")
+    sibling = case_base / "unrelated.log"
+    sibling.write_bytes(b"unrelated")
+    history_file = write_doc(historic_dir, "ledger.json", {
+        "taskId": BARGE_TASK,
+        "known_inner_runtime_logs": [{"path": str(file)} for file in loose]})
+    for name in ("root-discovery.json", "queue-evidence.json", "decision-evidence.json", "pr-41.json"):
+        (case_packet / name).write_bytes(b"{}")
+    with patch(__name__ + ".BARGE_SCRATCH", case_base), \
+         patch(__name__ + ".BARGE_HISTORIC_LEDGER", history_file), \
+         patch(__name__ + ".BARGE_PACKET", case_packet):
+        discovered = expect_ok("loose log discovery", discover_barge_roots, [str(run_root)])
+    if discovered:
+        roots, discovered_evidence = discovered
+        if (case_base in roots or sibling in roots or not set(loose).issubset(roots)):
+            failures.append("discovery widened a loose log to shared scratch")
+        ledger = build_barge_ledger(roots=roots, evidence=discovered_evidence,
+                                    review_reference="fixture review")
+        expect_ok("loose files conform to ledger", validate_barge_ledger, ledger,
+                  private_root=run_root, scratch=case_base, historic=history_file,
+                  required_roots=[historic_dir, required_root, case_packet])
+        expect_ok("loose-file allocation", allocated_bytes, roots, BARGE_CAP_BYTES)
+        loose_bytes = expect_ok("exact loose-file allocation", allocated_bytes, loose, BARGE_CAP_BYTES)
+        if loose_bytes != sum(path.stat().st_blocks * 512 for path in loose):
+            failures.append("loose-file allocation included unrelated siblings")
+        snapshot = expect_ok("loose-file snapshot", retained_snapshot, loose, case_base)
+        if snapshot and (len(snapshot) != 2 or any(row["rows"] != 1 or
+                            row["allocated_or_logical_bytes"] <= 0 for row in snapshot)):
+            failures.append("loose files did not contribute one counted snapshot row each")
+        replacement = case_base / "replacement"
+        replacement.write_bytes(b"historic log")
+        os.replace(replacement, loose[0])
+        changed = expect_ok("replaced loose file snapshot", retained_snapshot, loose, case_base)
+        if snapshot == changed:
+            failures.append("same-content loose-file replacement went undetected")
+        os.chmod(loose[0], 0)
+        expect_refusal("unreadable loose file refused", retained_snapshot, loose, case_base)
+        expect_refusal("unreadable loose file allocation refused", allocated_bytes, loose, BARGE_CAP_BYTES)
+        os.chmod(loose[0], 0o600)
+        loose[0].unlink()
+        expect_refusal("missing loose file refused", retained_snapshot, loose, case_base)
+
+    # Names and dispositions from corrected comment 6583995069, represented
+    # only by fresh fixture paths. The real packet remains an external input.
+    names = ["task240.JMzntJWF", "q.EOYt", "oxide240.CVGVXlGm", "v.GcY4",
+             "x.PFjS", "residue-240-20261102"]
+    actual_roots = [str(oxide_scratch / name) for name in names]
+    aux_files = [str(oxide_scratch / name) for name in (
+        "task240-current-b853", "task240-validation-f521a2ff", "task240-validation-febaeea5",
+        "pr240-audit.FL1RHRml", "pr240-body.pv8ksjFP", "pr240-review.gM5cNBCo")]
+    aux_dirs = [str(oxide_scratch / name) for name in (
+        "review-230", "planner-240-7da-review-disposition-20261102",
+        "planner-240-bf2-continuation-20261102", "planner-240-build-premise-20261102",
+        "planner-240-clarification-20261102", "planner-240-home-boundary-20261102",
+        "planner-240-owner-disposition-20261102", "planner-240-recovery-reconcile-20261102",
+        "planner-240-root-disposition-20261102")]
+    corrected = {"task": OXIDE_TASK, "complete": False,
+                 "retained_roots": actual_roots,
+                 "proposed_budget_retained_roots": actual_roots,
+                 "unknown": ["mixed evidence unresolved"],
+                 "candidates": ([{"path": path, "disposition": "attributed",
+                                  "kind": "directory", "size_complete": True} for path in actual_roots]
+                                + [{"path": path, "disposition": "attributed", "kind": "file", "size_complete": True} for path in aux_files]
+                                + [{"path": path, "disposition": "attributed", "kind": "directory", "size_complete": True} for path in aux_dirs]
+                                + [{"path": str(oxide_scratch / "mixed"), "disposition": "unknown", "basis": "mixed"}])}
+    parsed = expect_ok("corrected Oxide packet", oxide_packet_roots, corrected, oxide_scratch)
+    if parsed and (parsed[0] != set(map(Path, actual_roots + aux_files + aux_dirs + [str(oxide_scratch / "mixed")])) or not parsed[1]):
+        failures.append("corrected Oxide packet omitted attributed inputs or unknowns")
+    packet_file = write_doc(oxide_scratch, "corrected.json", corrected)
+    oxide_review_dir = oxide_scratch / "planner-240-review-disposition-20261102"
+    oxide_review_dir.mkdir()
+    (oxide_review_dir / "queue-detail.json").write_bytes(b"review 6584174560")
+    with patch(__name__ + ".OXIDE_SCRATCH", oxide_scratch), \
+         patch(__name__ + ".OXIDE_DISCOVERY_PACKET", oxide_scratch / "discovery"), \
+         patch(__name__ + ".OXIDE_OWNER_PACKET", oxide_scratch / "owner"):
+        oxide_discovered = expect_ok("digest-bound corrected Oxide discovery", discover_oxide_roots,
+                                     [], packet_file, sha256_file(packet_file))
+        expect_refusal("corrected Oxide packet digest drift", discover_oxide_roots,
+                       [], packet_file, "0" * 64)
+    if oxide_discovered and not set(map(Path, actual_roots + aux_files + aux_dirs)).issubset(oxide_discovered[0]):
+        failures.append("Oxide discovery omitted corrected attributed evidence")
+    expect_refusal("corrected packet cannot claim completeness", oxide_packet_roots,
+                   dict(corrected, complete=True), oxide_scratch)
+    expect_refusal("corrected packet cannot escape scratch", oxide_packet_roots,
+                   dict(corrected, candidates=[{"path": str(oxide_scratch.parent), "disposition": "attributed"}]), oxide_scratch)
 
     # --- primitives ---------------------------------------------------------
     sample = private_write(private_root, Path("docs/sample.txt"), b"sample bytes\n")

@@ -1032,14 +1032,25 @@ schema:
   never this tool.
 
 Documents are deterministic (sorted keys, compact separators, trailing
-newline, no timestamps, no live sizes), so a preparation packet can be
-reviewed and digest-bound before the single execution re-derives them and
-requires byte equality. Discovery records candidate roots from the retained
-Queue records and packets, with honest unknowns: quiescence is the planner's
-affirmative issued admission, never a discovery claim; shared live pool and
-output sizes stay unknown and unread; planner-240/review-230 directories are
-named non-root evidence with disposition pending; `oxide-233-fix.*` is not
-attributable and never read.
+newline, no timestamps, no live sizes). Barge discovery preserves individually
+attributed loose historical logs as exact file entries, never their shared
+scratch parent. A file entry is opened without following links and its owner,
+identity, metadata and content are observed in each retained snapshot; a
+missing, unreadable or replaced file refuses. Neither the snapshot nor its
+allocation count establishes historical peak or continuous quiescence.
+
+For preparation the planner supplies `OXIDE_CORRECTED_DISCOVERY_PACKET` as
+the canonical path, under Oxide scratch, of the exact compact JSON bytes from
+PR 230 comment 6583995069 (SHA-256
+`1c60e2374b76e9004ac99f27bcb0297623cabddb6d2422e29cbc26cd040bb54a`,
+no trailing newline). The provider checks the digest and consumes every
+attributed candidate, including the six task roots, individual evidence files
+and attributed review/planner directories; it also accounts for the packet,
+review export and actual audit-input files. The review 6584174560 and packet
+retain unknown mixed attribution and other gaps; unresolved candidates are
+counted conservatively without asserting ownership. The proposal remains
+`complete: false` and does not authorize execution. No unrelated scratch root
+or shared pool is swept, and no prior point-in-time size is a present peak.
 
 **Execution model.** Preparation and the diagnostic use separate Barge
 phase roots, with the qualified supervisor adopting and sampling the entire
@@ -1104,7 +1115,9 @@ bound inputs. The exact command template the planner binds at issue:
 Preparation is a separate guarded document phase with a fresh adopted Barge
 root. The planner binds `--prepare --packet-dir <path inside preparation root>`
 plus the same repository, head and planned task-root arguments shown above.
-Its `--audit-inputs <manifest> --expect-audit-inputs <sha256>` names bounded
+The Oxide task root must already exist before preparation. Retain the audit
+input manifest through diagnostic execution. Its `--audit-inputs <manifest>
+--expect-audit-inputs <sha256>` names bounded
 source copies, each with `source`, private relative `destination` and `sha256`;
 the diagnostic recopies and rechecks those same bytes from the retained phase.
 It preserves that phase's receipt and packet, resolves every unknown, reviews
