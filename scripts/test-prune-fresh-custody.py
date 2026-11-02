@@ -111,6 +111,7 @@ MODE_CASES = {
         "in-place-witness",
         "lock-refusals",
         "unprovable-sibling",
+        "large-state-budget",
         "scale-unchanged",
         "effect-reproof",
     ),
@@ -305,6 +306,22 @@ def image_document(evidence: Path, name: str, body: dict) -> None:
     target = evidence / name
     require(not target.exists(), f"image protocol document already exists: {target}")
     atomic_write(str(target), json.dumps(body).encode())
+
+
+def request_guard_detach(proof, custody, error):
+    """Keep failures as data so the diagnostic receipt is still published."""
+    try:
+        if error is not None or not proof.closure_known or proof.unclosed or custody.state != "attached":
+            return "retained", error
+        require(custody.volume_uuid and custody.device and custody.mount, "image identity unknown")
+        image_document(proof.evidence, "detach-request.json", {
+            "version": 1, "backing": os.path.realpath(custody.backing),
+            "mount": custody.mount, "device": custody.device,
+            "volume_uuid": custody.volume_uuid.lower(), "note": "fresh custody proof",
+        })
+        return "requested", None
+    except BaseException as exc:
+        return "retained", error or exc
 
 
 def in_place_write(path: str, data: bytes) -> int:
@@ -704,6 +721,7 @@ def run_cases(proof, adapter, world, boot, collector):
         child = permanent.start_child(
             proof, [adapter.binary, "check"], checkouts[2], writer_env
         )
+        away = None
         try:
             deadline = time.monotonic() + min(60, permanent.work_left())
             while time.monotonic() < deadline:
@@ -717,7 +735,8 @@ def run_cases(proof, adapter, world, boot, collector):
             # The checkout stays vanished with its writer alive: absence and
             # active custody are decided about the same row.
             permanent.wait_for(os.path.join(gate, "started"), "running writer")
-            link_locations[2] = world.vanish(checkouts[2])
+            away = world.vanish(checkouts[2])
+            link_locations[2] = away
             code, out, _ = world.dry_run("writer holds", boot)
             require(code == 0, "writer-holds dry run failed")
             doc = json.loads(out)
@@ -731,15 +750,24 @@ def run_cases(proof, adapter, world, boot, collector):
                 world.report(doc),
             )
         finally:
-            Path(gate, "release").write_bytes(b"release")
             try:
-                code, _, stderr = permanent.finish_child(proof, child, "writer child")
-                permanent.require_normal_exit("writer child", code)
-                permanent.require_confirmed_closure("writer child", stderr)
-                require(code == 0, f"writer child failed: {stderr[-400:]}")
+                if away is not None:
+                    world.restore(checkouts[2], away)
+                    link_locations[2] = checkouts[2]
             except BaseException:
                 proof.closure_known = False
                 raise
+            finally:
+                Path(gate, "release").write_bytes(b"release")
+                try:
+                    code, _, stderr = permanent.finish_child(proof, child, "writer child")
+                    permanent.require_normal_exit("writer child", code)
+                    permanent.require_confirmed_closure("writer child", stderr)
+                    require(code == 0, f"writer child failed: {stderr[-400:]}")
+                except BaseException:
+                    proof.closure_known = False
+                    raise
+        link_locations[2] = world.vanish(checkouts[2])
         deadline = time.monotonic() + min(60, permanent.work_left())
         while time.monotonic() < deadline:
             state = read_json_bounded(paths["removable_state"])
@@ -972,6 +1000,80 @@ def run_cases(proof, adapter, world, boot, collector):
         require(links_snapshot(link_locations) == before_links, "a member link moved")
     collector.case("unprovable-sibling", unprovable_sibling)
 
+    def large_state_budget():
+        import fcntl
+
+        state_paths = [paths["internal_state"], paths["removable_state"]]
+        originals = [Path(path).read_bytes() for path in state_paths]
+        padded = [data.ljust(30 * 1024 * 1024, b" ") for data in originals]
+        byte_marker = proof.evidence / "prune-bytes-observed"
+        pause_marker = proof.evidence / "witness-paused"
+        release_marker = proof.evidence / "witness-release"
+        child = None
+        try:
+            for path, data in zip(state_paths, padded):
+                atomic_write(path, data)
+            byte_marker.unlink(missing_ok=True)
+            code, out, stderr = world.dry_run(
+                "large valid states", boot, extra={"OXIDE_TEST_PRUNE_BYTES": world.control}
+            )
+            require(code == 0, "large valid state preview failed")
+            doc = json.loads(out)
+            world.complete(doc, "large valid states")
+            require(world.candidates(doc) == set(roots), "large valid states changed custody")
+            observed = [line for line in stderr.splitlines() if line.startswith("oxide proof: authority bytes ")]
+            require(len(observed) == 1, "large-state byte observation missing")
+            used = int(observed[0].rsplit(" ", 1)[1])
+            require(60 * 1024 * 1024 <= used < SNAPSHOT_BUDGET_BYTES,
+                    f"large-state byte charge unexpected: {used}")
+            byte_marker.unlink()
+            pause_marker.unlink(missing_ok=True)
+            release_marker.unlink(missing_ok=True)
+            first = min(checkouts, key=lambda c: hashlib.sha256(c.encode()).hexdigest())
+            env = dict(adapter.env, OXIDE_TEST_PRUNE_WITNESS_PAUSE=first,
+                       OXIDE_TEST_PRUNE_BYTES=world.control)
+            child = permanent.start_child(
+                proof, [adapter.binary, "outputs", "prune", "--dry-run"], boot, env
+            )
+            permanent.wait_for(str(pause_marker), "large-state first row")
+            locks = []
+            try:
+                for lock_path in (paths["internal_lock"], paths["removable_lock"]):
+                    descriptor = os.open(lock_path, os.O_RDWR)
+                    locks.append(descriptor)
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                atomic_write(state_paths[1], padded[1])
+            finally:
+                for descriptor in reversed(locks):
+                    os.close(descriptor)
+            before_control = tree_digest(world.control)
+            before_links = links_snapshot(link_locations)
+            release_marker.write_bytes(b"release")
+            code, out, stderr = permanent.finish_child(proof, child, "replacement budget preview")
+            permanent.require_normal_exit("replacement budget preview", code)
+            permanent.require_confirmed_closure("replacement budget preview", stderr)
+            require(code == 0, "budget refusal did not produce a preview")
+            require_refusal_names(json.loads(out), "the snapshot exceeded its input or time budget")
+            observed = [line for line in stderr.splitlines() if line.startswith("oxide proof: authority bytes ")]
+            require(len(observed) == 1 and int(observed[0].rsplit(" ", 1)[1]) == SNAPSHOT_BUDGET_BYTES,
+                    f"partial reread was not charged through exhaustion: {observed}")
+            require(tree_digest(world.control) == before_control, "budget refusal changed control")
+            require(links_snapshot(link_locations) == before_links, "budget refusal changed links or targets")
+        finally:
+            if child is not None and child.pid in proof.unclosed:
+                release_marker.write_bytes(b"release")
+                try:
+                    code, _, stderr = permanent.finish_child(proof, child, "budget cleanup")
+                    permanent.require_normal_exit("budget cleanup", code)
+                    permanent.require_confirmed_closure("budget cleanup", stderr)
+                except BaseException:
+                    proof.closure_known = False
+                    raise
+            for path, original in zip(state_paths, originals):
+                atomic_write(path, original)
+            byte_marker.unlink(missing_ok=True)
+    collector.case("large-state-budget", large_state_budget)
+
     def scale_unchanged():
         # Historical scale, synthetic owned data: 709 roots, 1189 rows, with
         # 650 custody-reaching writer keeps so the candidate count stays under
@@ -1147,12 +1249,122 @@ def run_cases(proof, adapter, world, boot, collector):
     collector.case("scale-unchanged", scale_unchanged)
 
     def effect_reproof():
-        before_control = tree_digest(world.control)
         plan, sha, doc = world.plan_file("effect plan", boot)
         require(
             world.candidates(doc) == {roots[0], roots[1], roots[2]},
             f"the effect plan did not offer exactly the witnessed candidates: {world.report(doc)}",
         )
+        receipt_path = permanent.receipt_file(world.pool, checkouts[0])
+        marker_path = os.path.join(roots[0], ".oxide-output.json")
+        registry_original = Path(world.registry).read_bytes()
+        receipt_original = Path(receipt_path).read_bytes()
+        marker_original = Path(marker_path).read_bytes()
+
+        def refuse_changed(label):
+            before_control = tree_digest(world.control)
+            before_links = links_snapshot(link_locations)
+            output_tree = os.path.join(world.mount, "oxide-outputs")
+            before_roots = prior.owned_tree_snapshot(output_tree)
+            code, _, err = world.real_run(label, boot, plan, sha)
+            require(code != 0 and ("fresh authority snapshot is incomplete" in err
+                                  or "eligible root set changed" in err),
+                    f"{label}: no fresh-authority refusal: {err[:400]}")
+            require(tree_digest(world.control) == before_control, f"{label}: control changed")
+            require(links_snapshot(link_locations) == before_links, f"{label}: links or targets changed")
+            require(prior.owned_tree_snapshot(output_tree) == before_roots,
+                    f"{label}: output tree changed")
+            require(not world.intents() and not world.quarantines(), f"{label}: intent created")
+
+        # These are fixture-owned contradictions planted after the preview;
+        # every real run must re-read authority rather than trust the plan.
+        try:
+            changed = json.loads(receipt_original)
+            changed["links"][0]["selected"]["nonce"] = "f" * 32
+            atomic_write(receipt_path, json.dumps(changed).encode())
+            refuse_changed("changed receipt nonce")
+        finally:
+            atomic_write(receipt_path, receipt_original)
+        try:
+            changed = json.loads(receipt_original)
+            changed["links"][0]["selected"]["root"] = roots[0] + ".other"
+            atomic_write(receipt_path, json.dumps(changed).encode())
+            refuse_changed("changed receipt reference")
+        finally:
+            atomic_write(receipt_path, receipt_original)
+        try:
+            changed = json.loads(marker_original)
+            changed["nonce"] = "e" * 32
+            atomic_write(marker_path, json.dumps(changed).encode())
+            refuse_changed("changed owner marker")
+        finally:
+            atomic_write(marker_path, marker_original)
+        try:
+            changed = json.loads(registry_original)
+            for row in changed["rows"]:
+                if row["root"] == roots[0]:
+                    row["generation"] += 1
+            changed["revision"] += 1
+            atomic_write(world.registry, json.dumps(changed).encode())
+            refuse_changed("changed registry generation and revision")
+        finally:
+            atomic_write(world.registry, registry_original)
+        try:
+            changed_receipt = json.loads(receipt_original)
+            selected = changed_receipt["links"][0]["selected"]
+            changed_receipt["reserved"] = {
+                "id": "a" * 32, "nonce": selected["nonce"], "kind": selected["kind"],
+                "root": selected["root"], "volume_uuid": selected.get("volume_uuid"),
+                "generation": selected["generation"], "created_ms": 1,
+            }
+            changed_registry = json.loads(registry_original)
+            for row in changed_registry["rows"]:
+                if row["root"] == roots[0]:
+                    row["reservation"] = "a" * 32
+                    row["pending"] = True
+            changed_registry["revision"] += 1
+            atomic_write(receipt_path, json.dumps(changed_receipt).encode())
+            atomic_write(world.registry, json.dumps(changed_registry).encode())
+            code, out, _ = world.dry_run("reservation preview", boot)
+            require(code == 0, "reservation preview failed")
+            preview = json.loads(out)
+            require(roots[0] not in world.candidates(preview), "reserved root became a candidate")
+            refuse_changed("new reservation")
+        finally:
+            atomic_write(receipt_path, receipt_original)
+            atomic_write(world.registry, registry_original)
+        state_path = paths["internal_state"]
+        state_original = Path(state_path).read_bytes()
+        try:
+            changed = json.loads(state_original)
+            require(changed["version"] >= 6, "fixture control cannot represent one-use records")
+            changed["one_use_workspaces"] = "oxide.one-use/1"
+            record = custody_record(checkouts[0], "spawning", 4_300_000)
+            record.update({"class": "one_use", "class_reason": "fixture writer"})
+            changed["records"].append(record)
+            atomic_write(state_path, json.dumps(changed).encode())
+            code, out, _ = world.dry_run("one-use writer preview", boot)
+            require(code == 0, "one-use preview failed")
+            preview = json.loads(out)
+            world.complete(preview, "one-use writer preview")
+            require(world.kept(preview, roots[0]) == "an active writer still holds this checkout",
+                    "one-use writer was not classified as active")
+            refuse_changed("new one-use writer")
+        finally:
+            atomic_write(state_path, state_original)
+        world.restore(checkouts[0], link_locations[0])
+        try:
+            # The plan's absent-checkout binding cannot authorize a checkout
+            # which has reappeared before the real run.
+            link_locations[0] = checkouts[0]
+            refuse_changed("checkout reappeared")
+        finally:
+            link_locations[0] = world.vanish(checkouts[0])
+        held_root = roots[0] + ".fixture-held"
+        os.rename(roots[0], held_root)
+        try:
+            refuse_changed("changed root identity")
+        finally:
+            os.rename(held_root, roots[0])
         code, _, err = world.real_run("private effect", boot, plan, sha)
         require(code == 0, err)
         for root in roots:
@@ -1236,6 +1448,15 @@ def self_check() -> int:
     ordered.case("baseline-no-effect", lambda: None)
     ordered.case("absent-custody", lambda: None)
     require(ordered.cases[-1]["state"] == "completed", "collector state")
+    proof_stub = SimpleNamespace(closure_known=True, unclosed=set(), evidence=Path("/unused"))
+    image_stub = SimpleNamespace(state="attached", volume_uuid=None, device="/dev/disk1",
+                                 mount="/Volumes/fixture", backing="/unused")
+    disposition, fault = request_guard_detach(proof_stub, image_stub, None)
+    require(disposition == "retained" and "image identity unknown" in str(fault),
+            "unknown image identity must be retained as a reportable fault")
+    source = inspect.getsource(main)
+    require(source.index("request_guard_detach(") < source.index('"qualified": False if diagnostic'),
+            "diagnostic receipt must follow the guarded detach decision")
 
     # The scratch layout is inside the run root and the pool inside it.
     scratch, pool = scratch_layout("/fake/run")
@@ -1548,16 +1769,7 @@ def main():
     except BaseException as exc:
         error = exc
     finally:
-        disposition = "retained"
-        if error is None and proof.closure_known and not proof.unclosed and custody.state == "attached":
-            require(custody.volume_uuid and custody.device and custody.mount, "image identity unknown")
-            image_document(proof.evidence, "detach-request.json", {
-                "version": 1, "backing": os.path.realpath(custody.backing),
-                "mount": custody.mount, "device": custody.device,
-                "volume_uuid": custody.volume_uuid.lower(),
-                "note": "fresh custody proof",
-            })
-            disposition = "requested"
+        disposition, error = request_guard_detach(proof, custody, error)
     recorded = {item["case"] for item in cases}
     cases.extend(
         {"case": name, "state": "unexecuted"}

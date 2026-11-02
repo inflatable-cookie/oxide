@@ -2657,18 +2657,6 @@ fn evaluate(
         snapshot_error
             .get_or_insert_with(|| "the snapshot exceeded its input or time budget".to_owned());
     }
-    if let Some(reason) = snapshot_error {
-        for entry in &mut evaluated {
-            entry.candidate = None;
-            entry.kept = Some(format!(
-                "the registry snapshot is incomplete ({reason}); the whole batch is kept"
-            ));
-        }
-        return Ok(Evaluation {
-            entries: evaluated,
-            complete: false,
-        });
-    }
     #[cfg(debug_assertions)]
     if prune_fixture_fault(
         control,
@@ -2683,6 +2671,18 @@ fn evaluate(
                     SNAPSHOT_MAX_BYTES - budget.remaining
                 );
             }
+        });
+    }
+    if let Some(reason) = snapshot_error {
+        for entry in &mut evaluated {
+            entry.candidate = None;
+            entry.kept = Some(format!(
+                "the registry snapshot is incomplete ({reason}); the whole batch is kept"
+            ));
+        }
+        return Ok(Evaluation {
+            entries: evaluated,
+            complete: false,
         });
     }
     // Diagnostics do not consume authority time or input budget.
