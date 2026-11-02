@@ -5420,8 +5420,8 @@ author and reviewer native remain unactivated.
   still commits under the unchanged verified-root, nonce, identity and Git
   checks; a foreign or changed member path, an unreadable component or an
   unknown writer stops with the receipt bytes, the live entries and both
-  roots kept exactly as they are, naming `oxide outputs status` and
-  `oxide outputs adopt`. After the rollback the binding recreates the real
+  roots kept exactly as they are. Inspect with `oxide outputs status`;
+  `oxide outputs adopt` can replay only after the refusal is resolved. After the rollback the binding recreates the real
   target directory (the deleted-target rule above) and republishes the
   member links into the same verified root, advancing the receipt generation
   without moving, adopting or deleting anything. The surfaces that cannot
@@ -5429,12 +5429,15 @@ author and reviewer native remain unactivated.
   named: `oxide exec` and external subcommands refuse a prepared receipt
   before the slot is keyed (a mid-transition receipt must never key a
   slot), `oxide clean` refuses before cleaning, ephemeral-drive-mode
-  binding refuses (ephemeral mode never transitions automatically), a
+  binding refuses and names the permanent-registration prerequisite (ephemeral
+  mode never transitions automatically), a
   guarded one-use workspace refuses with the exact guarded diagnostic
   ([one-use workspaces §4.4](one-use-workspaces.md)), and unknown custody
   refuses with everything kept. `oxide outputs adopt` in permanent mode
   replays the same receipt under its own barrier and is the documented
-  recovery for those surfaces; `oxide outputs status` and `outputs plan`
+  recovery for those surfaces once a permanent registration is available;
+  `oxide pool set-mode permanent` changes an existing registration.
+  `oxide outputs status` and `outputs plan`
   report a pending transition as state, never as a refusal to recover.
 - **Members.** V1 knows exactly `debug`, `release`, `<triple>/debug` and
   `<triple>/release`. A member has at most two components matching

@@ -4660,7 +4660,7 @@ fn bind_ephemeral(context: &Context, expected: Option<&Plan>) -> Result<Outcome,
         ReceiptState::Detached | ReceiptState::Pruned => Ok(Outcome::default()),
         ReceiptState::Pruning => Err("outputs: a listed legacy root of this checkout is being pruned; nothing changes until `oxide outputs prune` replays it or `oxide outputs resolve-intent` settles it".to_owned()),
         ReceiptState::Prepared => Err(
-            "outputs: an interrupted owned-output transition is pending; run `oxide outputs adopt` to replay it before building"
+            "outputs: an interrupted owned-output transition is pending; restore or set a permanent drive registration, then run `oxide outputs adopt` to replay it before building"
                 .to_owned(),
         ),
         ReceiptState::Committed => {
@@ -18204,7 +18204,7 @@ mod tests {
         };
         assert_eq!(
             refused,
-            "outputs: an interrupted owned-output transition is pending; run `oxide outputs adopt` to replay it before building"
+            "outputs: an interrupted owned-output transition is pending; restore or set a permanent drive registration, then run `oxide outputs adopt` to replay it before building"
         );
         assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
         assert_eq!(durable_digest(&fixture), prepared_digest);
