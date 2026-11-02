@@ -86,6 +86,7 @@ fn private_env(scratch: &Path, bin: &Path, pool: &Path) -> Command {
             ),
         )
         .env("HOME", &home)
+        .env("OXIDE_TEST_HOME_FROM_ENV", "1")
         .env("OXIDE_CONFIG", scratch.join("config.toml"))
         .env("OXIDE_POOL", pool)
         .env("OXIDE_POOL_BACKEND", "directory-budget")
