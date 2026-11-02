@@ -1249,9 +1249,11 @@ packets, receipts and manifests are untouched and carry no binding under the
 source-bound route, and consumed claims are never re-opened. The ruling
 approves ONE further shared Queue diagnostic and at most ONE additional
 300 s private debug bootstrap, inside the SAME at-most-749 s remaining to
-each block (451 s already charged, including the failed run's 58 s and the
-Barge cap revision's safe-check charges applied conservatively to both
-blocks), with the prospective 3 GiB / 8 GiB caps above. Preparation for that
+each block (1200 s minus 451 s already charged, including the failed run's
+58 s). The Barge cap revision's safe checks deduct a further 4 s,
+conservatively charged to both blocks, leaving at most 745 s before the
+continuation's own checks and preparation, with the prospective 3 GiB / 8 GiB
+caps above. Preparation for that
 continuation may run at one Queue checkout and the diagnostic at the
 eventual merged-source proof-only checkout under the source-bound
 `--expect-source-binding` route. No new clock, reset, refund, cleanup,
