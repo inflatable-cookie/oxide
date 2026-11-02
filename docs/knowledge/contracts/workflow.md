@@ -6529,7 +6529,7 @@ Approved design direction (Tom, 2026-10-20). Not implemented. It applies to buil
   [foundation qualification](#qualification-result) record; a heavy-project benefit
   reading remains a separate stage.
 
-### Foreign churn in the supervisor census (design investigation)
+### Foreign churn in the supervisor census
 
 A PID is not an identity: the census identifies an occupant by `(pid, start)`.
 A successful safe reread showing no row or a different start proves only that
@@ -6570,8 +6570,8 @@ census thread, the final and named certain-empty census messages, pipe EOF and
 identity-bound custody remain independent closure requirements; no proposed
 classification grants signal authority. Zombie terminal treatment retains its
 existing allowlist and full paired-read requirements, not a generic exiting
-shortcut. These observations are a design investigation, not an implemented or
-qualified change.
+shortcut. These observations record the original design investigation; the later oxide#233
+candidate below remains unqualified.
 
 **Recommendation: no-go on either papercut shortcut.** A foreign parent's
 session does not bind its child's session: a child may enter the supervised
@@ -6614,8 +6614,120 @@ absence. This remains a design subject to independent exact-head review.
 `78364942c8dec9253d557cfc63a7775fe9284848`, runner SHA-256
 `fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b`,
 suite SHA-256 `c95d46aa0e590285c3c412294ffb215c0d45b19ba804f2243f0d2ebd62158d7b`,
-and this section before this amendment. It is a design, not implemented or
-qualified behavior. The following fixes the open choices in the candidate above.
+and this section before this amendment. It records the frozen design; the
+subsequent oxide#233 candidate is not yet qualified. The following fixes the open choices in the candidate above.
+
+**Candidate implementation (oxide#233).** The branch implements same-round
+replacement accounting using the ledger, shared read budget and fixed phase
+clock described below. The receipt and census message carry bounded
+`replacement_work` evidence, while the uncapped ledger determines obligations;
+a late publication refuses certainty. The original snapshot/confirmation/final
+zombie witnesses and the exact named and final census, EOF, joined-thread and
+fault gates remain independent. The qualification suite currently contains
+406 pure cases and 59 real cases by its loader: the two new real cases label
+synthetic replacement observations alongside the actual kernel snapshot. They
+are not kernel PID reuse, and no signal authority follows. The 382 pure / 57
+real #197 claims remain historical at their own bytes.
+
+**Failed diagnostic and fixture attribution correction.** The one Queue-activated
+uncounted diagnostic at `e6ed727` recorded 464 cases, 460 completed and four
+failed: both labelled synthetic replacement cases and the one- and twelve-held
+zombie witnesses. Its candidate guard closed with status 1, no fault or deadline,
+and monitored scratch peaked at 68,931,584 of 536,870,912 bytes. The failed
+packet is preserved: `cases.json` SHA-256
+`2c7d557182e3cef2ed84b9323a4611149678c66bc73bc7c879521037b5f050ab`,
+`topology.json` `7fee338b62238f8af34594f8cfac0d0e7b7ff8d1f91d1f039b2c60afeb258e85`,
+and guard receipt `3d918de9af3a6672f5c95203397a7b7190f60fb925446c9610a1497f9689bf1e`
+under `/Volumes/Builds/scratch/oxide/oxide-supervisor-qualify.l1rp7zy1` and
+`/Volumes/Builds/scratch/oxide/oxide-proof.rz6m7o9t/evidence`. Its four nested
+receipts show more than 1,100 snapshot identities and 40 or more ESRCH rows:
+the unchanged 20-row work/diagnostic prefixes omitted the named replacement or
+held zombies, and no terminal witness fit in the shared diagnostics budget.
+The counts and closure do not by themselves attribute an owned identity.
+
+The corrected candidate adds an opt-in, test-only projection of at most twelve
+fixture-named exact identities from the completed round ledger and its actual
+terminal witness records. Missing or unmatched identities remain `unobserved`;
+no ambient row substitutes for the named identity. The projection consumes no
+kernel read and changes no classification, certainty, cap, signal or closure
+decision. The two synthetic fixtures and the held-zombie cases assert that
+projection; the old clipped rows, omission counts and negative controls remain.
+The independent source and proof judgment and any fresh exact-head proof route
+remain with the same retained Queue reviewer and owner; this correction supplies
+no native qualification and does not reset the failed session.
+
+**Corrected-head diagnostic and nested-record schema.** The separately activated
+uncounted Queue diagnostic at `535ebbcb` exercised 465/465 cases successfully,
+including all four previously failing fixture cases. The candidate guard closed
+with status 0, no fault or deadline, and peak monitored scratch of 67.8 MiB.
+The diagnostic still failed: 11/12 checks passed, with `nested-cases` rejecting
+the two synthetic cases' `replacement_fixture` field as unmodelled. The packet
+at `/Volumes/Builds/scratch/oxide/oxide-supervisor-qualify.lli9efki` and
+`/Volumes/Builds/scratch/oxide/oxide-proof.ukf8izwb/evidence` is retained;
+`cases.json` SHA-256 `b22135446fdb9fe6bc94bdbd0a1d2165125308ca74d2a65d03b3c381931aa89f`,
+`topology.json` `6fd46774800df97d70593a93211e5c3541d53792fd962bed4742f95af3e3dc9e`,
+and guard receipt `6d12aad516bde8dedaae50eb2daedb7d98d0b0bf4d5735a56d17cc426321b4bc`.
+This is an uncounted failed diagnostic, never qualification credit. The next
+source correction permits that field only for the two named synthetic cases;
+the independent cases oracle still checks its exact contents and no-signal
+condition, and all nested-root and receipt checks remain in force. Pure controls
+also reject this field on other cases, malformed values, missing evidence,
+outside-root paths and unknown fields. No native run or allowance reset follows
+from this source correction; any further proof needs the Queue owner and the same
+retained reviewer's exact-head judgment.
+
+**Qualified default and isolated candidate (safe landing).** The ordinary
+`scripts/bounded-test.py` is restored byte-for-byte to the deployed qualified
+`fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b` source.
+The unchanged oxide#233 candidate `c578243126a2470cde0dfd19530254b3ec61b4ea5bb1fa43c6bbd2d41853c2b7`
+resides at `scripts/bounded-test-candidate.py` and is used only by the existing
+qualification bootstrap, suite, preflight and pure tests. Those routes bind
+both fixed paths and hashes, refuse absent, changed or swapped bytes, and never
+fall back to the ordinary runner. Ordinary selectors, wrappers and consumer
+imports retain their existing default paths and pins. Promotion of this candidate
+is a separate release step after actual qualification and is not authorized here.
+
+Queue diagnostic `0e148446` at source `8b4c2e0`, independently judged by the
+same retained reviewer (review `6567647646`, verdict `v10-fresh-diagnostic-8b4c2e06`),
+completed 465/465 cases and 12/12 checks with zero problems; the candidate guard
+closed status 0 with no fault or deadline, 419.38 s worker wall, 71,045,120 bytes
+peak monitored scratch and 288.3 GiB minimum sampled free. Intentional exit 1 and
+`qualified: false` remain: this is uncounted evidence, not a counted qualification,
+promotion or consumer proof. Its retained `cases.json` SHA-256
+`2a9983f387703ca1654401ba4fcecf3d16bbae47712d70677e618ae9f57f34c9` and
+`topology.json` `4b32f4a1b64b2d50fc3b5b70735ba806fc6cd3dd58abbf20b3f2b30903b23b9e`
+are in `/Volumes/Builds/scratch/oxide/oxide-supervisor-qualify.iy_vrps8`; the
+nested guard receipt SHA-256
+`bfaa86c19b82f5ee0acb3ad6d1e50816f3efd05b8128c7d4fce65198d003f97d` is in
+`/Volumes/Builds/scratch/oxide/oxide-proof.eziis49o/evidence`. The reviewer
+assessed the pre-existing fixture-thread traceback separately (verdict
+`v11-traceback-assessment`); that assessment does not migrate evidence to this
+relocated source head. The earlier failed packets remain unchanged. The retained
+reviewer must judge this routing revision; any changed-head diagnostic is separately
+owner-activated under its fixed limits and cannot qualify deployment by itself.
+
+The proof-authoring premise sweep for the new cases follows their executable
+route: `Real.replacement_fixture` calls `Real.guardian` with `fixture("pass")`;
+that fixture is Python-only and makes no Oxide, Cargo or rustup call. Therefore
+private HOME/rustup and lock generation, Oxide account-home override, inherited
+Oxide configuration and automatic adoption, Cargo external argv, and compiler
+flags are not applicable to these case bodies. They create no image, so the
+owned-image attachment premise is not applicable. `Real.setUp`, `nested_root`
+and `Real.guardian` place their `tempfile.mkdtemp` case directory and nested
+supervisor evidence inside the qualification-owned root; no shell `mktemp` is
+called. Existing suite cases and the enclosing bootstrap retain their own
+premises, bounds and custody rules. This source sweep is not a native diagnostic.
+
+These candidate bytes are **unqualified**. Main's `fcfda2b0…` runner remains
+the deployed qualified route; no prior receipt migrates. Under Tom's task-specific
+ruling `c8991f99`, the single retained Queue reviewer judges the exact published
+source and, after source approval, one separately activated source-immutable
+uncounted diagnostic. Further qualification and active-consumer safety remain
+planner-owned release gates; counted author and reviewer native sessions are not
+authorized by this brief. The 600 s outer / 560 s candidate / 530 s suite bounds,
+512 MiB monitored scratch and host custody remain unchanged. The persistent
+same-identity non-zombie ESRCH (`37529b20`) and recycled-identity report
+(`631e4462`) gain no retrospective closure or signal authority.
 
 The project planner froze this bounded design on 2026-11-01 after independent
 exact-head review `6565343955` of `ecd2129b771b74e7a29ff6f38687cad88e9418ca`.
@@ -6720,8 +6832,9 @@ a same-session different-group survivor and no-signal control. The separate
 persistent same non-zombie identity with getsid ESRCH (`37529b20`) remains
 unknown/UNCLOSED; related recycled-identity paper `631e4462` and historical
 packets gain no closure or credit. This slice is HIGH/ELEVATED because it changes
-writer closure; its independent reviewer must run the distinct native session.
-The existing qualification bounds and activation order below remain fixed.
+writer closure. The original design's separate reviewer-native requirement was
+superseded for oxide#233 by Tom's task-specific ruling `c8991f99`; the fixed
+qualification bounds remain unchanged.
 
 | Interleaving / counterexample | Required disposition |
 | --- | --- |
@@ -6764,17 +6877,17 @@ fixtures and test-only controlled seams to exercise replacement attribution and
 closure end to end, alongside actual same-session different-group survivor,
 foreign churn, EOF veto, join and no-signal controls; do not depend on forcing
 kernel PID reuse or a quiet host. Distinguish simulated interleavings from real
-kernel observations in receipts. Run the pure selector and covering checks once,
-then an owner-activated uncounted keep-going diagnostic, counted author and
-distinct independent reviewer native qualifications at the exact published
-head, under the then-approved 600 s outer / 560 s candidate / 530 s suite and
-512 MiB bounds, reserve watchdog and custody rules. Any changed bounds require
-an explicit brief amendment, not a reset. This changes writer-closure decisions,
-so future implementation is Elevated; retain the independent reviewer native.
-No native is authorized by this design.
+kernel observations in receipts. Run the covering selectors, then the one Queue-activated uncounted keep-going
+diagnostic at the exact published head after retained-reviewer source approval,
+under the 600 s outer / 560 s candidate / 530 s suite and 512 MiB bounds,
+reserve watchdog and custody rules. Tom's task-specific ruling `c8991f99`
+supersedes the original separate author and reviewer native sessions for this
+task; further qualification is a planner-owned release gate. Any changed bounds
+require an explicit brief amendment, not a reset. This changes writer-closure
+decisions and is Elevated. No native is authorized by this design alone.
 
-The candidate runner remains unqualified until that chain and exact-head review
-pass. Inventory direct consumers in `effigy.toml` and all hash checks at the
+The candidate runner remains unqualified until the applicable qualification
+requirements are met. Inventory direct consumers in `effigy.toml` and all hash checks at the
 implementation head; update each applicable pin only under its own approved
 scope, with new consumer evidence where required. At this source head explicit
 `fcfda2b0…` checks occur in `test-command-budgets.py`,
