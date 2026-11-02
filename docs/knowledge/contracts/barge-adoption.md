@@ -406,7 +406,9 @@ live Builds comparison or the later O3 cutover.
 fixtures with attributable equivalent inputs for O2. Live comparisons without
 an adequate capture seam remain insufficient. O3 remains blocked until O2's
 parity requirements are satisfied. This ruling changes neither production
-account trust nor the separate G0 gate.
+account trust nor the separate G0 gate. Tom further ruled that the planner
+will design a test-only equivalence seam before this comparison can be
+qualified; the ruling does not accept equivalence or qualify O3.
 
 ### D8 comparison cases and source boundaries
 
