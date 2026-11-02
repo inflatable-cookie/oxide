@@ -6706,6 +6706,24 @@ relocated source head. The earlier failed packets remain unchanged. The retained
 reviewer must judge this routing revision; any changed-head diagnostic is separately
 owner-activated under its fixed limits and cannot qualify deployment by itself.
 
+The relocated source at `0ddc30650dbdb26ec5dd875d9cc9926e6f082b61` was then
+tested by Queue proof-only diagnostic `41eef47b`. Its retained reviewer accepted
+465/465 cases (406 pure and 59 real), 12/12 checks and zero problems, with the
+candidate closed at status 0, no fault or deadline, 421.7 s worker wall,
+69,967,872 bytes peak monitored scratch and 300.5 GiB minimum sampled free.
+The guard receipt SHA-256 is
+`01482d23938e1f614999cb3dee543d9b9aefe573aeff275ebb0d26b9d6687f1d`, retained
+at `/Volumes/Builds/scratch/oxide/oxide-proof.kh7tju10/evidence/receipt.json`;
+the matching `cases.json` SHA-256 is
+`ea3099ff2b0bcf29850f90b3c36e5f4ac4d91bef9a159d0fc7d078d158f7582b` in
+`/Volumes/Builds/scratch/oxide/oxide-supervisor-qualify.jveh3rik`.
+The twelve printed check rows were captured by Queue rather than retained as
+a separate disk receipt; the reviewer re-derived their inputs from the kept
+artifacts. Intentional exit 1 and `qualified: false` remain: this establishes
+the relocated diagnostic route, not counted qualification or consumer promotion.
+The default qualified runner remains `fcfda2b0`; retained nested fault fixtures
+and all historical failures stay unchanged.
+
 The proof-authoring premise sweep for the new cases follows their executable
 route: `Real.replacement_fixture` calls `Real.guardian` with `fixture("pass")`;
 that fixture is Python-only and makes no Oxide, Cargo or rustup call. Therefore

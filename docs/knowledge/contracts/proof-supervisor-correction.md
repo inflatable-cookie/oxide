@@ -426,8 +426,19 @@ review, not an executable oracle change, new signal authority or a native run.
 ### Sampled witness: implementation and review
 
 The following design was accepted at `003ef92` (retained review comment
-`6572820333`, verdict `sampled-witness-design`), and its sampled fixture
-implementation is pending independent source review and native diagnostic. The
+`6572820333`, verdict `sampled-witness-design`). Its implementation at
+`13c36a1c2acb33d9392b67684b1f04b953c2cef0` passed exact-head source review
+and the separately activated diagnostic `890d6cec`; retained review
+`6575539630` accepted the actual receipt. All eight native cases completed and
+all eight children were positively reaped. The two c01 and five c02 paired
+samples were observed, with zombie session unknown and PGID equality explicitly
+unverified. The outer guard closed with status 0, no fault or deadline, under
+the qualified `fcfda2b0` runner and the existing 300 s / 512 MiB bounds.
+The nested schema-2 receipt SHA-256 is
+`c221556f1846495cff9975fd23eb7d4a22cbc66011569a23309c51886a9d8390`, retained
+at `/Volumes/Builds/scratch/oxide/oxide-proof.u5qpaf51/evidence/cargo-group-custody.670e5c69e6d66484/receipt.json`.
+It remains uncounted, unqualified and retained with its root unconcluded; the
+three source-only cases remain HELD. Earlier failures are not reclassified. The
 stronger **positive held-zombie group-lifetime claim remains OPEN**: neither
 failed diagnostic proves it, and this sampled proposition is not equivalent.
 
