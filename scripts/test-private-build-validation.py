@@ -2277,6 +2277,11 @@ def prepare(options: dict) -> int:
     prep_budget = json.loads((evidence_dir / "receipt.json").read_bytes()).get("owned_bytes", {}).get("budget")
     allowed_mib = min(clamp_mib(BARGE_CAP_BYTES, barge_retained, BOOTSTRAP_MAX_MIB),
                       clamp_mib(OXIDE_CAP_BYTES, oxide_retained, BOOTSTRAP_MAX_MIB))
+    print(json.dumps({"phase": "preparation-resource-observation",
+                      "barge_retained_bytes": barge_retained,
+                      "oxide_retained_bytes": oxide_retained,
+                      "effective_preparation_mib": allowed_mib,
+                      "guard_budget_bytes": prep_budget}, sort_keys=True), flush=True)
     if type(prep_budget) is not int or prep_budget <= 0 or prep_budget > allowed_mib * 1024 * 1024:
         raise GateRefusal("preparation guard budget exceeds the measured aggregate remainder")
     os.makedirs(packet_dir, mode=0o700, exist_ok=False)
@@ -2672,6 +2677,7 @@ def self_test() -> int:
         return {"scripts/tape/private-wrapper.py": "a" * 64} if repo == barge_repo_fixture else {}
     from contextlib import redirect_stdout
     from io import StringIO
+    prep_stdout = StringIO()
     with patch(__name__ + ".BARGE_SCRATCH", case_base), \
          patch(__name__ + ".OXIDE_SCRATCH", oxide_scratch), \
          patch(__name__ + ".SCRATCH_ROOT", fixture.root), \
@@ -2686,7 +2692,7 @@ def self_test() -> int:
          patch(__name__ + ".extract_commit_identity", side_effect=fixture_git_identity), \
          patch(__name__ + ".stage_git_tree", side_effect=fixture_git_tree), \
          patch(__name__ + ".allocated_bytes", wraps=allocated_bytes) as allocation_spy, \
-         redirect_stdout(StringIO()):
+         redirect_stdout(prep_stdout):
         prepared = expect_ok("real prepare document assembly", prepare, prepare_options)
         prior_calls = [call for call in allocation_spy.call_args_list if prior_partial in call.args[0]]
         if {call.args[1] for call in prior_calls} != {BARGE_CAP_BYTES, OXIDE_CAP_BYTES}:
@@ -2699,6 +2705,13 @@ def self_test() -> int:
     if prepared != 0:
         failures.append("prepare did not finish its document assembly")
     else:
+        observations = [json.loads(line) for line in prep_stdout.getvalue().splitlines() if line.startswith("{")]
+        if (len(observations) != 1 or observations[0].get("phase") != "preparation-resource-observation"
+                or observations[0].get("guard_budget_bytes") != 128 * 1024 * 1024
+                or observations[0].get("barge_retained_bytes", 0) < prior_payload.stat().st_blocks * 512
+                or observations[0].get("oxide_retained_bytes", 0) < prior_payload.stat().st_blocks * 512
+                or type(observations[0].get("effective_preparation_mib")) is not int):
+            failures.append("prepare did not report the measured resource observation")
         manifest_path = prep_root / "packet/packet-manifest.json"
         manifest_doc = json.loads(manifest_path.read_bytes())
         expected_documents = {"barge-root-ledger.UNISSUED.json", "oxide-budget.UNISSUED.json",

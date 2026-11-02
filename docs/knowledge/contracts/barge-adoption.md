@@ -1131,8 +1131,11 @@ at most 64 canonical, owned, non-group-writable task-private directories under
 the Barge or Oxide scratch subtree. It must name entire prior preparation and
 future-runtime roots, including partial archives, not just receipt files.
 The guard validates the list before any tree walk or packet write and counts
-the named shared history against both grants. Bases, aliases, escapes, missing
-roots and active/future-root overlaps refuse. The planner still verifies
+the named shared history against both grants. Before copying, it emits one
+bounded stdout observation of the Barge and Oxide retained bytes, effective
+preparation clamp and chosen guard budget; those are current observations,
+not a historical peak. Bases, aliases, escapes, missing roots and
+active/future-root overlaps refuse. The planner still verifies
 attribution, completeness and quiescence; a list alone does not establish them.
 It preserves that phase's receipt and packet, resolves every unknown, reviews
 the source audit and then issues the documents and companion tokens. The
