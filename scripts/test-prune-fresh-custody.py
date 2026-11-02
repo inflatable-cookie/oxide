@@ -1249,6 +1249,69 @@ def run_cases(proof, adapter, world, boot, collector):
     collector.case("scale-unchanged", scale_unchanged)
 
     def effect_reproof():
+        import fcntl
+
+        # Give the CAS exercise exactly one eligible root, so a refusal cannot
+        # be hidden by a successful deletion of a different candidate.
+        for index in (1, 2):
+            world.restore(checkouts[index], link_locations[index])
+            link_locations[index] = checkouts[index]
+        cas_child = None
+        try:
+            cas_plan, cas_sha, cas_doc = world.plan_file("CAS plan", boot)
+            require(world.candidates(cas_doc) == {roots[0]}, "CAS fixture is not single-root")
+            root_before = prior.owned_tree_snapshot(os.path.join(world.mount, "oxide-outputs"))
+            receipt_path = permanent.receipt_file(world.pool, checkouts[0])
+            receipt_before = Path(receipt_path).read_bytes()
+            env = dict(adapter.env, OXIDE_TEST_PRUNE_CAS_PAUSE=roots[0])
+            cas_child = permanent.start_child(
+                proof, [adapter.binary, "outputs", "prune", "--plan", cas_plan,
+                        "--plan-sha256", cas_sha], boot, env
+            )
+            binding_path = os.path.join(world.control, "bindings",
+                                        hashlib.sha256(checkouts[0].encode()).hexdigest() + ".lock")
+            for attempt in range(2):
+                permanent.wait_for(str(proof.evidence / f"prune-cas-paused-{attempt}"), "CAS pause")
+                binding = os.open(binding_path, os.O_RDWR)
+                try:
+                    try:
+                        fcntl.flock(binding, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        pass
+                    else:
+                        raise RuntimeError("prune did not hold checkout binding during its recheck")
+                finally:
+                    os.close(binding)
+                admission = os.open(paths["internal_lock"], os.O_RDWR)
+                try:
+                    fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    registry = read_json_bounded(world.registry)
+                    registry["revision"] += 1
+                    atomic_write(world.registry, json.dumps(registry).encode())
+                finally:
+                    os.close(admission)
+                (proof.evidence / f"prune-cas-release-{attempt}").write_bytes(b"release")
+            code, _, stderr = permanent.finish_child(proof, cas_child, "CAS refusal")
+            permanent.require_normal_exit("CAS refusal", code)
+            permanent.require_confirmed_closure("CAS refusal", stderr)
+            require(code != 0 and "registry changed twice" in stderr, f"CAS refusal missing: {stderr[-800:]}")
+            require(not world.intents() and not world.quarantines(), "CAS race published an intent")
+            require(Path(receipt_path).read_bytes() == receipt_before, "CAS race changed receipt")
+            require(prior.owned_tree_snapshot(os.path.join(world.mount, "oxide-outputs")) == root_before,
+                    "CAS race changed output tree")
+        finally:
+            if cas_child is not None and cas_child.pid in proof.unclosed:
+                for attempt in range(2):
+                    (proof.evidence / f"prune-cas-release-{attempt}").write_bytes(b"release")
+                try:
+                    code, _, stderr = permanent.finish_child(proof, cas_child, "CAS cleanup")
+                    permanent.require_normal_exit("CAS cleanup", code)
+                    permanent.require_confirmed_closure("CAS cleanup", stderr)
+                except BaseException:
+                    proof.closure_known = False
+                    raise
+            for index in (1, 2):
+                link_locations[index] = world.vanish(checkouts[index])
         plan, sha, doc = world.plan_file("effect plan", boot)
         require(
             world.candidates(doc) == {roots[0], roots[1], roots[2]},

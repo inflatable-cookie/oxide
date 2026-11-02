@@ -5314,6 +5314,26 @@ fn prune_one_barrier(
             recheck_candidate(store, control, candidate, list, evidence)
         }
         .map_err(Stop::Refuse)?;
+        #[cfg(debug_assertions)]
+        if prune_fixture_fault(
+            control,
+            "OXIDE_TEST_PRUNE_CAS_PAUSE",
+            &candidate.root,
+            &format!("prune-cas-paused-{attempts}"),
+        ) {
+            let evidence = proof_evidence()
+                .ok_or_else(|| Stop::Refuse("fixture evidence unavailable".to_owned()))?;
+            let stop = Instant::now() + Duration::from_secs(5);
+            while !evidence
+                .join(format!("prune-cas-release-{attempts}"))
+                .exists()
+            {
+                if Instant::now() >= stop {
+                    return Err(Stop::Refuse("fixture CAS pause expired".to_owned()));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         // Publication custody is taken for EVERY root, not only a receiptless
         // one, and it is taken BEFORE the deciding ancestry comparison below:
         // the reread above is an early refusal, and nothing it proved may be
