@@ -8,6 +8,17 @@ place under [D1](#d1-integration-surface-rust-library-at-a-pinned-commit) and th
 slices (`O2`, `O3`, `O4`, `S8-*`) are not landed. No output placement, prune,
 admission, host job, install or Builds registration has changed.
 
+**Capture audit accepted (2026-11-02).** PR #222's source-feasibility design
+checkpoint was accepted at `0a51530` and merged as `150369b`, with its carried
+predicate regression and all five covering checks verified by the retained
+reviewer. This accepts the audit's current-scope no-go; it does not establish a
+shared input seam, implement the shadow comparator or supply parity/native
+evidence. The actual O2 comparison still needs its separately scoped capture
+contract and implementation. O3 remains gated on clean equivalent-input D8
+evidence; landing this checkpoint does not satisfy that prerequisite. A native
+diagnostic at a future implementation head is not a missing proof of this
+design checkpoint.
+
 The text below is the pre-freeze proposal. Its "proposed design" and "changes
 no code" statements describe the 2026-11-01 proposal only and are kept as dated
 evidence. Where a later slice lands, its own note in this file is the current
