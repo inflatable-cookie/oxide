@@ -52,6 +52,10 @@ class InventoryGateTests(unittest.TestCase):
             with self.assertRaises(route.Refusal):
                 route.block_inputs(root, binding)
             history['complete'] = True
+            block['retained_roots_quiescent'] = False
+            with self.assertRaises(route.Refusal):
+                route.block_inputs(root, binding)
+            block['retained_roots_quiescent'] = True
             block['source_tree'] = 'different'
             with self.assertRaises(route.Refusal):
                 route.block_inputs(root, binding)
@@ -63,6 +67,7 @@ class InventoryGateTests(unittest.TestCase):
         def record(path, value):
             saved.append((path.name, value))
         with mock.patch.object(route, 'budget', return_value=(512, 'ledger-digest')), \
+             mock.patch.object(route, 'retained_inventory', return_value=[{'root': '/retained', 'rows': 1, 'allocated_or_logical_bytes': 1}]), \
              mock.patch.object(route, 'inventory_account', side_effect=inventories), \
              mock.patch.object(route, 'receipt', side_effect=record), \
              mock.patch.object(route, 'revalidate_sources'), \
@@ -74,7 +79,7 @@ class InventoryGateTests(unittest.TestCase):
         result, saved = self.invoke([[{'ino': 1}], [{'ino': 1}]])
         self.assertEqual(result['argv'], ['actual-command'])
         self.assertEqual(result['budget_ledger_sha256'], 'ledger-digest')
-        self.assertEqual([name for name, _ in saved], ['probe-inventory-before.json', 'probe-result.json', 'probe-inventory-after.json', 'probe-source-revalidated.json'])
+        self.assertEqual([name for name, _ in saved], ['probe-retained-before.json', 'probe-inventory-before.json', 'probe-result.json', 'probe-inventory-after.json', 'probe-retained-after.json', 'probe-source-revalidated.json'])
 
     def test_same_bytes_replaced_inode_refuses(self):
         with self.assertRaises(route.Refusal):
@@ -83,6 +88,7 @@ class InventoryGateTests(unittest.TestCase):
     def test_child_failure_still_takes_after_inventory(self):
         inventory_rows = [{'path': '.'}, {'path': 'state/pools.json', 'ino': 1}]
         with mock.patch.object(route, 'budget', return_value=(512, 'ledger-digest')), \
+             mock.patch.object(route, 'retained_inventory', return_value=[{'root': '/retained', 'allocated_or_logical_bytes': 1}]), \
              mock.patch.object(route, 'inventory_account', side_effect=[inventory_rows, inventory_rows]) as inventory, \
              mock.patch.object(route, 'receipt'), \
              mock.patch.object(route, 'revalidate_sources'), \
@@ -93,6 +99,8 @@ class InventoryGateTests(unittest.TestCase):
 
     def test_unreadable_initial_inventory_never_runs_child(self):
         with mock.patch.object(route, 'budget', return_value=(512, 'ledger-digest')), \
+             mock.patch.object(route, 'retained_inventory', return_value=[{'root': '/retained', 'allocated_or_logical_bytes': 1}]), \
+             mock.patch.object(route, 'receipt'), \
              mock.patch.object(route, 'inventory_account', side_effect=OSError('unreadable')), \
              mock.patch.object(route, 'run_bounded') as child:
             with self.assertRaises(OSError):
@@ -101,11 +109,37 @@ class InventoryGateTests(unittest.TestCase):
 
     def test_empty_inventory_never_runs_child(self):
         with mock.patch.object(route, 'budget', return_value=(512, 'ledger-digest')), \
+             mock.patch.object(route, 'retained_inventory', return_value=[{'root': '/retained', 'allocated_or_logical_bytes': 1}]), \
+             mock.patch.object(route, 'receipt'), \
              mock.patch.object(route, 'inventory_account', return_value=[]), \
              mock.patch.object(route, 'run_bounded') as child:
             with self.assertRaises(route.Refusal):
                 route.guarded_run(Path('/owned'), {'tmp': Path('/owned/tmp'), 'work': Path('/owned/work')}, {}, 'probe', ['child'], {'commit': 'c', 'tree': 't'})
         child.assert_not_called()
+
+    def test_other_root_change_refuses(self):
+        inventory = [{'path': '.'}, {'path': 'state/pools.json'}]
+        with mock.patch.object(route, 'budget', return_value=(512, 'ledger')), \
+             mock.patch.object(route, 'retained_inventory', side_effect=[[{'allocated_or_logical_bytes': 1}], [{'allocated_or_logical_bytes': 2}]]), \
+             mock.patch.object(route, 'inventory_account', return_value=inventory), \
+             mock.patch.object(route, 'receipt'), \
+             mock.patch.object(route, 'run_bounded', return_value={'exit': 0}):
+            with self.assertRaises(route.Refusal):
+                route.guarded_run(Path('/owned'), {'tmp': Path('/owned/tmp'), 'work': Path('/owned/work')}, {}, 'probe', ['child'], {})
+
+    def test_block_refusal_controls(self):
+        with self.assertRaises(route.Refusal):
+            route.require_remaining(299_999_999_999, 0)
+        with self.assertRaises(route.Refusal):
+            route.require_original_charge(1199)
+        with self.assertRaises(route.Refusal):
+            route.require_child_marker({'one_use_id': 'a'}, 'hash', {'one_use_id': 'b', 'approval_sha256': 'hash'})
+        with mock.patch.object(route.sys, 'argv', ['launcher', 'bootstrap']):
+            with self.assertRaises(route.Refusal):
+                route.main()
+        with mock.patch.object(route.os, 'open', side_effect=FileExistsError):
+            with self.assertRaises(FileExistsError):
+                route.receipt(Path('/owned/block-used.json'), {})
 
     def test_non_builds_context_refuses_before_source_or_child(self):
         with mock.patch.dict(os.environ, {'TAPE_RUN_ROOT': '/Users/tom'}, clear=True), \

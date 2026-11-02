@@ -30,7 +30,7 @@ MAX_ARCHIVE = 64 * 1024 * 1024
 MAX_LOG_LINE = 8 * 1024 * 1024
 PLANNER_AUTHORITY = 'brief-v11:d133e22524df289aba98b74d0c87995d1902a594b5d574edb8035e0a1d12d0d4'
 TASK_ID = 'd41de092-b0b0-495d-b159-8c4d1730d6b4'
-BLOCK_DEADLINE = None
+BLOCK_DEADLINE_NS = None
 COVER = {'cover-compile': ['rust:compile'], 'cover-release': ['rust:compile-release'],
          'cover-format': ['rust:format'], 'cover-test': ['test', 'rust'],
          'cover-docs': ['docs:check']}
@@ -407,6 +407,21 @@ def inventory_account():
     return rows
 
 
+def require_original_charge(charged):
+    require(isinstance(charged, (int, float)) and not isinstance(charged, bool)
+            and charged == 1200, 'original allowance must be charged as 1200, not measured')
+
+
+def require_remaining(deadline_ns, now_ns):
+    require(deadline_ns is not None and now_ns + 300_000_000_000 <= deadline_ns,
+            'single prospective block has insufficient remaining wall')
+
+
+def require_child_marker(block, approval_sha, used):
+    require(used.get('one_use_id') == block['one_use_id']
+            and used.get('approval_sha256') == approval_sha, 'block marker mismatch')
+
+
 def budget(root, paths, action):
     """Count retained bytes; the one prospective wall block is separate."""
     ledger_path = private_file(root / 'budget.json', root)
@@ -414,8 +429,7 @@ def budget(root, paths, action):
     require(ledger.get('task') == TASK_ID
             and ledger.get('history_reference'), 'missing task budget history')
     charged = ledger.get('covering_seconds_charged')
-    require(isinstance(charged, (int, float)) and not isinstance(charged, bool)
-            and charged == 1200, 'original allowance must be charged as 1200, not measured')
+    require_original_charge(charged)
     roots = [Path(value) for value in ledger.get('retained_roots', [])]
     require(root in roots and len(roots) >= 5 and len(roots) == len(set(roots)), 'incomplete retained root list')
     require(all(path.is_absolute() and path != BASE and path.is_relative_to(BASE) for path in roots),
@@ -437,8 +451,7 @@ def budget(root, paths, action):
         sizes[path] = size_of(path)
     require(sum(size for path, size in sizes.items() if path != root) >= 3468 * 1024 * 1024,
             'retained roots do not cover the historical baseline')
-    require(BLOCK_DEADLINE is not None and time.monotonic() + 300 <= BLOCK_DEADLINE,
-            'single prospective block has insufficient remaining wall')
+    require_remaining(BLOCK_DEADLINE_NS, time.clock_gettime_ns(time.CLOCK_UPTIME_RAW))
     monitored = sizes[root] if action == 'bootstrap' else size_of(paths['work'])
     outside = sum(sizes.values()) - monitored
     remaining_mib = (6 * 1024**3 - outside) // (1024 * 1024)
@@ -455,9 +468,53 @@ def revalidate_sources(binding, paths, env):
             'source, executable or private destination changed during command')
 
 
+def retained_inventory(root):
+    """Bounded no-follow point-in-time metadata/size inventory of other roots.
+
+    Equal snapshots do not exclude transient growth or prove a continuous peak.
+    """
+    ledger = json.loads(private_file(root / 'budget.json', root).read_text())
+    roots = [Path(value) for value in ledger['retained_roots'] if Path(value) != root]
+    snapshots = []
+    count = 0
+    for other in roots:
+        private_dir(other, BASE)
+        rows = []
+        size = 0
+        for directory, dirs, files in os.walk(other, followlinks=False,
+                onerror=lambda error: (_ for _ in ()).throw(error)):
+            for name in ['.', *sorted(dirs), *sorted(files)]:
+                path = Path(directory) if name == '.' else Path(directory) / name
+                st = os.lstat(path)
+                require(st.st_uid == os.getuid() and (stat.S_ISDIR(st.st_mode)
+                        or stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)),
+                        'unknown or foreign retained entry')
+                count += 1
+                require(count <= 200000, 'retained inventory row cap')
+                if name != '.':
+                    size += max(st.st_size, st.st_blocks * 512)
+                row = [str(path.relative_to(other)), st.st_dev, st.st_ino, st.st_mode,
+                       st.st_uid, st.st_gid, st.st_size, st.st_blocks, st.st_mtime_ns,
+                       st.st_ctime_ns]
+                if stat.S_ISLNK(st.st_mode):
+                    row.append(os.readlink(path))
+                rows.append(row)
+        rows.sort(key=lambda row: row[0])
+        encoded = json.dumps(rows, separators=(',', ':'), ensure_ascii=True).encode()
+        snapshots.append({'root': str(other), 'allocated_or_logical_bytes': size,
+                          'rows': len(rows), 'inventory_sha256': hashlib.sha256(encoded).hexdigest()})
+    require(snapshots, 'no retained-root inventory')
+    return snapshots
+
+
 def guarded_run(root, paths, env, action, argv, binding):
     scratch_mib, ledger_sha256 = budget(root, paths, action)
     env = dict(env, OXIDE_TASK_SCRATCH_ROOT=str(root if action == 'bootstrap' else paths['work']))
+    retained_before = retained_inventory(root)
+    require(sum(item['allocated_or_logical_bytes'] for item in retained_before)
+            + scratch_mib * 1024 * 1024 <= 6 * 1024**3,
+            'retained bytes and monitored bound exceed aggregate scratch ceiling')
+    receipt(root / (action + '-retained-before.json'), retained_before)
     before = inventory_account()
     require(len(before) > 1 and any(row.get('path') == 'state/pools.json' for row in before),
             'live inventory is empty or lacks the expected state registry')
@@ -473,6 +530,10 @@ def guarded_run(root, paths, env, action, argv, binding):
             'environment': env, 'budget_ledger_sha256': ledger_sha256})
     after = inventory_account()
     receipt(root / (action + '-inventory-after.json'), after)
+    retained_after = retained_inventory(root)
+    receipt(root / (action + '-retained-after.json'), retained_after)
+    require(retained_before == retained_after,
+            f'retained roots changed during {action}; aggregate peak is unproven')
     require(before == after, f'live inventory changed during {action}; inspect retained before/after packets')
     require(error is None and command is not None, f'{action} failed: {error}')
     require(command['exit'] == 0, f'{action} failed; inspect retained result')
@@ -674,12 +735,12 @@ def block_inputs(root, binding):
 
 def main():
     """A single supervisor owns the entire prospective block, including setup."""
-    global BLOCK_DEADLINE
+    global BLOCK_DEADLINE_NS
     os.umask(0o077)
     require(len(sys.argv) == 2 and sys.argv[1] == 'sequence',
             'individual actions are disabled; use one planner-bound sequence')
-    started = time.monotonic()
-    BLOCK_DEADLINE = started + 1200
+    started_ns = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
+    BLOCK_DEADLINE_NS = started_ns + 1_200_000_000_000
     root = Path(os.environ.get('TAPE_RUN_ROOT', ''))
     require(root.is_absolute() and root != BASE and root.is_relative_to(BASE), 'invalid block root')
     private_dir(BASE)
@@ -700,7 +761,7 @@ def main():
     # The planner binds the unique id to this root; cross-root uniqueness and
     # receipt authenticity are planner admission, not a claim from this file.
     receipt(root / 'block-used.json', {'one_use_id': block['one_use_id'],
-            'approval_sha256': approval_sha, 'started_monotonic': started})
+            'approval_sha256': approval_sha, 'started_uptime_raw_ns': started_ns})
     root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         os.fsync(root_fd)
@@ -710,7 +771,7 @@ def main():
     require(root2 == root, 'block context root changed')
     block_inputs(root, binding)
     scratch_mib, _ = budget(root, paths, 'bootstrap')
-    remaining = int(BLOCK_DEADLINE - time.monotonic())
+    remaining = (BLOCK_DEADLINE_NS - time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)) // 1_000_000_000
     require(remaining >= 300, 'setup exhausted prospective block')
     # The outer existing supervisor owns the wall and process custody. Inner
     # actions retain their own 300 s / scratch bounds and all their inventory
@@ -720,7 +781,6 @@ def main():
                      TAPE_NORTHSTAR_DIR=os.environ['TAPE_NORTHSTAR_DIR'],
                      TAPE_EFFIGY=os.environ['TAPE_EFFIGY'],
                      TAPE_BLOCK_APPROVAL_SHA256=approval_sha,
-                     TAPE_BLOCK_DEADLINE=str(BLOCK_DEADLINE),
                      OXIDE_TASK_SCRATCH_ROOT=str(root))
     if 'TAPE_TEST_INTERNAL_ROOT' in os.environ:
         child_env['TAPE_TEST_INTERNAL_ROOT'] = os.environ['TAPE_TEST_INTERNAL_ROOT']
@@ -729,11 +789,14 @@ def main():
                str(Path(sys.executable).resolve(strict=True)),
                str(paths['source'] / 'scripts/tape-isolation-check.py'), '--sequence-child']
     result = subprocess.run(command, cwd=paths['source'], env=child_env, check=False)
+    elapsed_ns = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) - started_ns
+    receipt(root / 'block-result.json', {'one_use_id': block['one_use_id'],
+            'clock': 'CLOCK_UPTIME_RAW', 'elapsed_ns': elapsed_ns, 'exit': result.returncode})
     require(result.returncode == 0, f'prospective block failed: {result.returncode}')
 
 
 def sequence_child():
-    global BLOCK_DEADLINE
+    global BLOCK_DEADLINE_NS
     os.umask(0o077)
     root, _, _, binding, _ = context()
     evidence = Path(os.environ.get('OXIDE_PROOF_EVIDENCE', ''))
@@ -746,18 +809,16 @@ def sequence_child():
     block, approval_sha = block_inputs(root, binding)
     marker = private_file(root / 'block-used.json', root)
     used = json.loads(marker.read_text())
-    require(used.get('one_use_id') == block['one_use_id']
-            and used.get('approval_sha256') == approval_sha, 'block marker mismatch')
-    BLOCK_DEADLINE = float(os.environ['TAPE_BLOCK_DEADLINE'])
-    require(BLOCK_DEADLINE > time.monotonic() and BLOCK_DEADLINE <= used['started_monotonic'] + 1200,
-            'invalid block deadline')
+    require_child_marker(block, approval_sha, used)
+    BLOCK_DEADLINE_NS = int(deadline_ns)
+    require(BLOCK_DEADLINE_NS > time.clock_gettime_ns(time.CLOCK_UPTIME_RAW),
+            'supervisor deadline is already spent')
     receipt(root / 'block-child-started.json', {'one_use_id': block['one_use_id']})
     for action in ('bootstrap', 'preflight-build', 'preflight', 'test',
                    'self-check', 'cover-compile', 'cover-release', 'cover-format',
                    'cover-test', 'cover-docs'):
         run_action(action)
-    receipt(root / 'block-complete.json', {'one_use_id': block['one_use_id'],
-            'elapsed_seconds': time.monotonic() - used['started_monotonic']})
+    receipt(root / 'block-complete.json', {'one_use_id': block['one_use_id']})
 
 
 if __name__ == '__main__':

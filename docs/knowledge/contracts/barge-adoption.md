@@ -1243,13 +1243,19 @@ alone is insufficient.
   an environment value or an owner-created JSON document alone does not prove
   planner authorization. The caller must receive that binding from Queue after
   independent source/discovery review. The block binds an affirmative retained
-  root quiescence admission; the current implementation does not monitor other
-  roots continuously and that assertion needs an independently justified
-  mechanism before runtime. An incomplete discovery packet refuses.
+  root quiescence admission. Each action records a bounded no-follow metadata
+  inventory and size for the other roots before and after, refusing changes or
+  unreadable entries. Equal snapshots do not rule out transient growth or
+  prove a continuous peak; a separate quiescence mechanism remains required.
+  An incomplete discovery packet refuses.
 
   The candidate entry `proof:tape-prune:sequence` wraps the whole ordered
   bootstrap, harness build, path preflight, focused checks and covering checks
-  in the existing shared supervisor under one monotonic deadline. It reserves
+  in the existing shared supervisor under one `CLOCK_UPTIME_RAW` deadline. The
+  child reads the supervisor's own absolute deadline on that same system clock;
+  the parent alone measures its own elapsed time and writes the block result.
+  An interruption without a result remains unknown, and the one-use marker is
+  kept. It reserves
   300 seconds before each action and retains one-use markers on interruption;
   individual action selectors refuse outside this sequence. An action's own
   300-second limit and scratch bound remain. The sequence stops when the
