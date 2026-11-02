@@ -767,6 +767,7 @@ class NestedReceipt:
             rows.append(_bounded_row(row, DETAIL_CAP))
         else:
             self.document["totals"]["cases_omitted"] += 1
+        self._publish_transition()
 
     def add_signal(self, row):
         rows = self.document.setdefault("signals", [])
@@ -775,14 +776,22 @@ class NestedReceipt:
             rows.append(_bounded_row(row, DETAIL_CAP))
         else:
             self.document["totals"]["signals_omitted"] += 1
+        self._publish_transition()
 
     def add_identity(self, row):
+        row = dict(row)
+        row.setdefault("at_ns", now_ns())
         rows = self.document.setdefault("identities", [])
         self.document["totals"]["identities_total"] += 1
         if len(rows) < IDENTITY_ROWS_MAX:
             rows.append(_bounded_row(row, DETAIL_CAP))
         else:
             self.document["totals"]["identities_omitted"] += 1
+        self._publish_transition()
+
+    def _publish_transition(self):
+        if self.write_error is not None or not self.publish():
+            raise Uncertain(f"nested receipt publication failed: {self.write_error}")
 
     def publish(self):
         try:
@@ -1584,6 +1593,8 @@ def run_native(diagnostic):
     if diagnostic:
         receipt_base["qualified"] = False
     receipt = NestedReceipt(fixture["fd"], receipt_base)
+    if not receipt.publish():
+        raise Uncertain(f"initial nested receipt publication failed: {receipt.write_error}")
     child_env = child_environment(os.environ, fixture["path"])
     children = FixtureChildren(runner, ctx, receipt, child_env)
     install_signal_settle(children, receipt)
@@ -1594,7 +1605,10 @@ def run_native(diagnostic):
 
     def record_case(name, status, detail):
         results[name] = status
-        receipt.add_case({"case": name, "status": status, "detail": detail, "at_ns": now_ns()})
+        try:
+            receipt.add_case({"case": name, "status": status, "detail": detail, "at_ns": now_ns()})
+        except Uncertain:
+            pass  # sticky write_error is handled before another case launches
 
     def deadline_exhausted():
         return now_ns() >= ctx["deadline_ns"] - int(DEADLINE_MARGIN_S * 1e9)
@@ -1604,6 +1618,9 @@ def run_native(diagnostic):
     # on infrastructure, device, writer, custody or receipt uncertainty.
     for case in CASES:
         name = case["name"]
+        if receipt.write_error is not None:
+            fault = fault or f"the nested receipt cannot be published ({receipt.write_error})"
+            break
         if deadline_exhausted():
             record_case(name, CASE_STATUS_UNEXECUTED,
                         "the work window before the guard deadline is exhausted; "
@@ -2424,6 +2441,11 @@ def _self_checks(temp):
                 receipt.add_signal({"sig": 0, "result": "0", "call": f"probe-{index}"})
             for index in range(IDENTITY_ROWS_MAX + 11):
                 receipt.add_identity({"transition": "spawned", "pid": index})
+            with open(os.path.join(fixture_dir, RECEIPT_NAME), encoding="utf-8") as handle:
+                persisted = json.load(handle)
+            expect(len(persisted["identities"]) == IDENTITY_ROWS_MAX
+                   and all(isinstance(row.get("at_ns"), int) for row in persisted["identities"]),
+                   "identity transitions were not timestamped and published")
             expect(len(receipt.document["cases"]) == CASE_ROWS_MAX, "case rows over cap")
             expect(len(receipt.document["signals"]) == SIGNAL_ROWS_MAX, "signal rows over cap")
             expect(len(receipt.document["identities"]) == IDENTITY_ROWS_MAX, "identity rows over cap")
