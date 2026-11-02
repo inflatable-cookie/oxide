@@ -433,7 +433,8 @@ def store_tail_states(parsed):
         elif counts:
             states[name] = {"state": "measured",
                             "duration_ns": (durations.get(name) or [None])[0]}
-        elif name == "remember-pool" or name in ("backup-addexclusion", "backup-isexcluded") and not macos:
+        elif (name == "remember-pool"
+              or name in ("backup-addexclusion", "backup-isexcluded") and not macos):
             states[name] = {"state": "not-applicable", "duration_ns": None}
         else:
             states[name] = {"state": "absent", "duration_ns": None}
