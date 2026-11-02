@@ -1033,9 +1033,31 @@ def verify_probe(stdout: str, *, home: Path, config: Path, pool: Path,
         raise GateRefusal("status refused the private pool")
 
 
-def verify_inventory(before: list, after: list) -> None:
+def verify_inventory(before: list, after: list, phase: str = "unspecified") -> None:
     if before != after:
-        raise GateRefusal("live inventory changed; isolation failed")
+        old = {row[0]: row for row in before}
+        new = {row[0]: row for row in after}
+        differences = []
+        total = 0
+        for name in sorted(old.keys() | new.keys()):
+            left, right = old.get(name), new.get(name)
+            if left == right:
+                continue
+            total += 1
+            if len(differences) < 8:
+                kind = "added" if left is None else "removed" if right is None else "changed"
+                fields = []
+                if left is not None and right is not None:
+                    if left[1] != right[1]:
+                        fields.append("metadata")
+                    if left[2:] != right[2:]:
+                        fields.append("content-or-target")
+                differences.append({"path_sha256": sha256_bytes(name.encode("utf-8", "surrogateescape")),
+                                    "kind": kind, "fields": fields})
+        detail = {"phase": phase, "changed_rows": total, "rows": differences,
+                  "omitted": total - len(differences)}
+        raise GateRefusal("live inventory changed; isolation failed; " +
+                          canonical_json(detail).decode("utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -2048,7 +2070,7 @@ def diagnostic(options: dict) -> int:
 
     # Live isolation bracket: the bootstrap must have changed nothing.
     live_after_bootstrap = live_inventory(LIVE_ACCOUNT_ROOT, deadline_ns)
-    verify_inventory(live_before, live_after_bootstrap)
+    verify_inventory(live_before, live_after_bootstrap, "bootstrap")
 
     # The external, one-use templates authorize this exact derivation only.
     # The accepted wrapper receives complete, immutable schema documents;
@@ -2098,7 +2120,7 @@ def diagnostic(options: dict) -> int:
 
     # Final isolation bracket and retained-root quiescence observation.
     final_live = live_inventory(LIVE_ACCOUNT_ROOT, deadline_ns)
-    verify_inventory(live_before, final_live)
+    verify_inventory(live_before, final_live, "private-status")
     retained_after = retained_snapshot(inactive_roots(ledger_roots, oxide_budget_roots,
                                                         barge_root, oxide_root), SCRATCH_ROOT, deadline_ns)
     if retained_before != retained_after:
@@ -3304,6 +3326,23 @@ def self_test() -> int:
         failures.append("same-content inode replacement passed as equality")
     expect_ok("inventory equality on an unchanged tree", verify_inventory, before, before)
     expect_refusal("inventory inequality refuses", verify_inventory, before, after)
+    try:
+        verify_inventory(before, after, "bootstrap")
+        failures.append("inventory diagnostic accepted a change")
+    except GateRefusal as refusal:
+        message = str(refusal)
+        if ("bootstrap" not in message or "metadata" not in message
+                or "path_sha256" not in message or "pools.json" in message):
+            failures.append("inventory diagnostic lost its bounded value-free change facts")
+    synthetic_before = [[f"./private-{i}", [1, i, 0, 1, 1], "digest"] for i in range(12)]
+    try:
+        verify_inventory(synthetic_before, [], "private-status")
+        failures.append("removed inventory rows were accepted")
+    except GateRefusal as refusal:
+        detail = json.loads(str(refusal).split("; ", 2)[2])
+        if (detail["changed_rows"] != 12 or detail["omitted"] != 4
+                or len(detail["rows"]) != 8 or any(row["kind"] != "removed" for row in detail["rows"])):
+            failures.append("inventory diagnostic did not bound removed rows")
     retained_before = expect_ok("retained snapshot", retained_snapshot, [private_root], scratch)
     os.rename(private_root / "docs/sample.txt", private_root / "docs/renamed.txt")
     retained_after = expect_ok("retained snapshot after change", retained_snapshot,
