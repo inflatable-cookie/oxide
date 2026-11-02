@@ -410,6 +410,115 @@ account trust nor the separate G0 gate. Tom further ruled that the planner
 will design a test-only equivalence seam before this comparison can be
 qualified; the ruling does not accept equivalence or qualify O3.
 
+### Leaf-observation tape: source feasibility audit (2026-11-02)
+
+**Disposition: NO-GO for implementation under the current scope.** The
+candidate is an audit design, not an established seam or a parity result. The
+Oxide source is the PR branch based on `bd89999`; Barge is the production O1
+pin `4af9360bd09629e970c143080ca159de8eef2562`. The sibling checkout at
+`39064baf` has no `crates/barge/src` diff from that pin. Both engines must run
+their actual policy and strict file parsers. A tape cannot return a parsed
+receipt, a custody verdict, an absence verdict, a plan row, or an expected
+eligibility decision. Each cell below names the leaf work needed for a future
+seam; it is not evidence that a hook exists or that the case passes.
+
+| Boundary | Source path and observed behavior | Feasibility and required binding |
+| --- | --- | --- |
+| Oxide entry, pool and registration | `prune::dry_run` -> `paired_store` -> `internal_store`, `Store::open_existing_with`/`open_at`, `removable::coordinate` and `registration`; `require_ready` -> `outputs_initialization` -> `load` and `read_registry`. Unfinished intents refuse before `evaluate`. | Real private pool, configuration, ledger, registration, control state and registry bytes must pass their existing readers. Bind account/config resolution, presence and identity of each path, selected pool, sibling relation and registry revision to the manifest. Missing or unreadable sibling is not automatically an absent registration. `open_existing_with` uses `repair=false`, but `open_at` calls `lease::ledger_view` -> `Pool::open` -> `open_inner(reconcile=true, fence_control=true)`: it takes the pool lock, may write the managed control fence and reconciles holding and evicting records. The holding pass can adopt or finish records; the evicting pass can replay recorded work. A prepared clean fixture may take no such effect, but pending reconciliation or a missing control fence is a concrete mutation-risk counterfactual before `evaluate`. Trace `scratch_io::evaluate` and all opening reads too; do not substitute passive `snapshot` and call it the actual path. |
+| Oxide authority and receipt reads | `AuthorityScope` and `authority_read` impose a 10 s / 64 MiB aggregate; `evaluate` caches `outputs::read_receipt_for_prune` by checkout and uses `verify_group_against_receipt`; `store::private_file` opens read-write, no-follow and checks owner/mode. `read_operator_list`, marker reads and pool state readers have distinct bounds. | Keep real descriptor opens, ownership checks, bounded reads, version parsing and cross-record validation. Test-only hooks need to record the opened object's complete path/parent/object identity, read bytes or refusal, cap and every occurrence, then bind them to the common manifest without replacing parser results. Direct reads not passing `authority_read` must also be inventoried. A writable private file is not proof it was unchanged; a read-only mount makes `private_file` fail. |
+| Oxide root and absence | `observe_row_root`/`observe_root_in`, `judge_recorded_root`, `checkout_absence`, `walk_checkout` and `revalidate_chain`; `volume::Binding::open`/`verify` and `observe_held` obtain volume facts. These use real no-follow `openat`/`fstatat`, held descriptors and mount/UUID observations; the boot Data exception is conditional and never waives a conflicting recorded UUID. | Tape only leaf syscall outcomes, identities, component names, UUID/mount and boot Data facts, keyed by the held object and shared epoch. The actual walker, revalidation, marker parser and identity judge remain in place. Preserve missing ancestor versus missing leaf and descriptor-versus-name checks. A canned `Absent`, `Verified` or root verdict is forbidden. No existing cross-engine tape seam is shown. |
+| Oxide writers and locks | `eligibility` calls `Store::checkout_custody` and then `active_holders` for both controls. Custody takes sibling and local admission locks, loads state, uses `boot_session`/`closed_by_boot` and classifies records; `active_holders` reads state separately. | Bind both pools' real state bytes and lock-object identities, lock results, boot and any process/group observations to the same epochs. Do not inject `CheckoutCustody`. Crucially `checkout_custody` calls `admission` -> `lock_admission` -> `open_admission_file(create=true)` and `fence_admission_state`: an absent lock can be created, and an older state lacking accounting/slot/holding fences can be saved. Pre-existing lock plus fully fenced state may avoid those writes; an absent-lock or unfenced counterfactual is a real attempted mutation, not a read-only pass. Do not hide it with a mock or repair the case between engines. |
+| Oxide enumeration, time and accounting | `evaluate` uses representative groups, checks complete receipt/group/identity authority and caps; `account_candidates` walks `inventory_directory` after the authority decision; `build_preview` caps kept rows. `AuthorityScope`/inventory use `Instant`, and output timestamps use `process::now_ms`. | Tape enumeration outcomes, object identities and policy-clock readings without substituting roots or omitting unreported rows. A capped preview is not a complete per-root set: comparison needs the full bounded evaluated set and must say when either side truncated. Keep real wall and reserve deadlines outside the policy tape. Accounting is diagnostic, not eligibility, but any direct walk still belongs in the read/containment transcript or must be excluded by an explicitly reviewed entrypoint. |
+| Barge setup and durable records | `release::plan` -> private `plan_observed`: `read_registry`, `area::show`, `VolumeRoot::open_with`, `resolve_by`, `list_names`, `BargeReferences::read`, `OxideSnapshot::read_within`, `pending_intents`, then `decide_root`. `StatePaths::resolve` selects account state; `reference::control_directory`/`inspect::observe_oxide_at` discover pools and `outputs`; `state::read_bounded_inner`, `reference::read_receipts` and `pool_custody::read_document` directly use filesystem metadata, directory enumeration and file reads outside `DirOps`. | Real fixture registry, declarations, references, intents, control discovery, pools, state, ledgers, receipts and markers must reach the existing parsers. `AccountFacts` can select a test fixture only inside Barge's own test build; production account resolution stays intact. Test-only tracing must cover the direct `std::fs`/`File` paths as well as `DirOps`, recording each actual read, descriptor identity, metadata, presence and enumeration result against the manifest. Merely passing mocked `DirOps` or matching pre/post hashes misses those direct reads and ABA changes. Instrumentation must preserve actual open/read/validation behavior; an unobserved read is insufficient. |
+| Barge root, holds and identity | `decide_root` takes existing volume/root/unit shared locks, may re-read a marker after acquiring a second root-id lock, reads `area::read_holds`, `identity::read`/`verify`, `area::scan_activity`, `reference::read_oxide_marker`, and calls `custody::take_custody_by`. The latter re-reads registry/grants, opens the folder and unit, verifies the marker and scans custody. | Tape leaf path-component, no-follow descriptor facts, directory membership, root/marker IDs, owner, device/inode and UUID, file/hold observations, process identity and activity-time inputs at each named epoch. Keep the actual identity, hold, activity, custody and reference algorithms; second reads are distinct occurrences that must map to a common ordered observation, never independently chosen return sequences. `StateLock::shared_if_present` reads existing locks without creation, but lock outcomes and contention remain dynamic. |
+| Barge absence and process census | `release::prove_references` delegates each reference to `os::prove_absence`; `AbsenceVolume` combines volume facts, UUID lookup and mount root. `ProcessObserver` provides effective uid, boot, process-start identity, platform verification and `scan_open_descriptors`; macOS `scan_processes`/`scan_table` classify processes, retry unreadable listings and handle foreign uid, blind spots and dead handles. | The existing `scan_open_descriptors` trait returns an already classified `DescriptorScan`, not a primitive leaf. Supplying it from a tape would bypass part of the real custody observation algorithm. A separately scoped Barge **in-crate** test seam must instead expose the process table, per-PID identity/start/uid, per-fd listings and vnode outcomes, retry/clock epochs and platform-signature leaf facts below that scan, while retaining actual classification, bounds and retries. Tape component-level absence facts, never a complete `AbsenceEvidence`. The existing `scan_open_descriptors_with` is `pub(crate)`/`cfg(test)` and does not establish the whole two-engine seam. |
+| Barge clocks and limits | `plan_observed` uses `Instant` for the plan deadline, `state::Deadline` uses its own `Instant`, `decide_root` calls `state::now_ms` for marker and activity scans and compares to request `now_ms`; locks and process scans have their own timing. | Bind policy-relevant clock/age readings and each observation epoch; preserve real monotonic session, lock, reserve and shutdown limits independently. A tape must never extend a real deadline or authorize a host effect. A sleep, delayed callback or unclassified live clock read cannot be silently treated as the same observation. |
+
+**Tape and reconciliation contract to design, not yet implemented.** A key must
+include observation kind, fixture/root identity, complete object or process
+identity including start/boot/volume UUID where relevant, and an explicit epoch
+and occurrence. A component path is bound to the observed parent and exact
+entry, not just a string; a process is not identified by PID alone. The owner
+publishes a versioned, size- and count-bounded file manifest and tape under one
+private fixture, closes setup writers, records real fixture custody and starts
+one window. Both in-crate executables read that same root and invoke their own
+actual entrypoints, without restoring or copying it between runs. Actual reads
+and tape requests are recorded separately in bounded transcripts; the
+reconciler rejects a missing/unclassified/extra live read, wrong epoch,
+conflicting result, malformed or oversized tape, unbound file identity, write,
+changed fixture or incomplete root/receipt/row enumeration as **insufficient**.
+The union of rows needs an explicit one-to-one volume/root mapping; a command
+refusal or truncated row is not an absent or matching root. No generic sequence
+may give each engine convenient but incompatible facts. Positive control of all
+writers and every observation remains an unproven premise; hashes alone do not
+prove it, and this audit does not claim a complete read interception.
+
+**D8 case-to-reader obligations.** These are proposed cases, not observed
+results. Every valid input is written as real fixture bytes and read by the
+above parser paths; each malformed, omitted or contradictory counterpart is
+also exercised through those paths. Every case retains both actual results and
+raw reasons, with unknown/unmapped input marked insufficient:
+
+| D8 family | Actual path and controlled counterfactual |
+| --- | --- |
+| Registry and overflow | Oxide `read_registry`/`Registry::validate`/`evaluate`; Barge `reference::read_registry` and `OxideSnapshot::references_for`. Complete, sticky-incomplete, missing, malformed, cap and cancelled-overflow/reservation cases; bind registry bytes, file identity and list coverage. |
+| Selected, pending, cancelling and intent | Oxide `Row::live`, `dry_run`, `eligibility`; Barge `OxideRow::live`, `references_for`, `pending_intents`. Exercise individual flags and groups plus unfinished versus settled intent. Preserve Oxide's whole-command early refusal versus Barge's named-root reference; never invent missing per-root results. |
+| Receipt and marker formats | Oxide `read_receipt_for_prune`, `observe_root_in` and actual marker parser; Barge `read_receipt`, `read_oxide_marker`. Supply both supported formats, missing and malformed bytes, and their real parser limitations; Barge's root/1 unknown is not a successful parse. |
+| Identity and D-1/D-2 | Oxide `judge_recorded_root`/group verification and Barge `identity::verify`/`compare`, `row_names_root`. Independently change nonce, generation, digest, inode, recorded device and same-UUID mount epoch. Assert each raw reason; do not fabricate device drift disagreement after Oxide's reconciliation. |
+| Checkout absence | Oxide `checkout_absence`/`walk_checkout` and Barge `prove_references`/`os::prove_absence`: present, missing leaf, missing ancestor, boot Data legacy, changed ancestry and conflicting UUID. Replay component observations and held identities, never a verdict; an unsupported anchor is insufficient. |
+| Volume | Oxide `Binding`/registration verification and Barge `VolumeRoot::open_with`/UUID lookup: same UUID remounted, duplicate UUID, absent mount and mismatched device. Bind exact mount census and epoch; the real image's own custody uses real facts, not tape. |
+| Both-pool writer custody | Oxide `checkout_custody`/`active_holders` and Barge `PoolCustody::read`/`classify` plus `custody::decide`. Cover closed, live, lost, unknown, acquiring, retired, clean and unattributed records in both pools. Their intermediate classifications differ; only complete final actual results can establish a difference. Writer-snapshot refusal `c9bf3953` remains a limit, not parity. |
+| Fence, declaration and policy | Oxide `outputs_initialization`, state parser and admission fences; Barge `area::show`, `pool_custody::parse_state`, `decide_root` policy/activity. Cover ready/unknown/missing control fence, exact stored declaration and absence, and a fully fenced no-write control. Detect admission lock creation/fence save as an effect, not a successful read-only comparison. |
+| Legacy/operator list D-3 | Oxide `read_operator_list`/`evaluate_receiptless` and Barge identity and reference conditions. Cover listed/unlisted/receiptless legacy and nonlegacy counterfactual; retain D-3 only when actual outcomes and inputs establish it, and do not treat Barge's named-root age waiver as an Oxide legacy waiver. |
+
+**Mandatory negative controls.** The future harness must cause and recognize:
+(1) an escaped direct untaped read, including Barge's `state::read_bounded_inner`
+path; (2) a controlled writer introduced between runs, including a writer that
+later closes; (3) replaced file with identical bytes, changed parent or changed
+opened descriptor identity; (4) a valid-looking tape missing one required leaf,
+a duplicate/conflicting key and an exhausted byte/row/time cap; (5) PID reuse or
+changed start/boot, a changed mount/device/UUID epoch and remount with the same
+UUID; (6) absent admission lock and missing fence causing a real create/save
+attempt, and pending holding or eviction reconciliation reached through
+`ledger_view`, recorded as effects and a stop; and (7) Barge's marker reread under
+its second lock and Oxide's descriptor/name ancestry revalidation seeing
+inconsistent epochs. Every one must result in insufficient or an honest effect
+counterexample, never parity. The oracle must itself use real kernel facts for
+child custody, process signalling, attachment identity, detach and cleanup;
+taped policy facts confer no such authority.
+
+**Cross-repository and proof boundary.** At the pin, Barge `lib.rs` exposes
+`testkit` only as `pub(crate)` under `cfg(test)`; Oxide's dependency cannot
+import it. Two separately built in-crate test executables need a shared,
+versioned tape/manifest specification, bounded export and an orchestrator that
+uses their actual source and verifies the exact source/lock digests. The
+smallest proposed follow-up is a separately scoped Barge change adding
+`cfg(test)`-only leaf instrumentation and a bounded in-crate test entrypoint,
+plus corresponding Oxide-only test instrumentation and a read transcript.
+It must explicitly resolve how to bind that Barge test source to the O1
+production pin without treating changed production code or a duplicated policy
+as the pin. A separate Oxide scope must decide the admission-lock/fence write
+counterexample without stubbing it; a production read-only custody/API change,
+if needed, is material and needs Tom's ruling. No Barge edit, pin change or new
+production seam is authorized here. Until all direct reads, identities, lock
+semantics, dynamic leaves and no-write behavior are accounted for, there is no
+complete equivalent-input mechanism and no clean O2 evidence.
+
+The prospective fixed proof has only the existing qualified supervisor,
+default Builds routing, 300 s / 512 MiB, at most one owned 128 MiB image and one
+ordinary detach, and separate real image custody; its time and disk fit are
+unmeasured. Exact source staging and export of both in-crate executables, their
+lockfiles and dependency caches, as well as transcript and fixture size, need a
+separately reviewed bounded implementation; no native, image or proof ran in this
+audit. All nine workflow proof-authoring premises are **unassessed in actual
+case bodies**, because no harness exists: private HOME/rustup and locks;
+account-home controls; environment scrubbing; auto-adoption; Cargo external
+argv; owned image and detach; compiler flags; temp placement; and explicit
+macOS mktemp templates. Each needs its actual helper location and disposition
+before proof, with real containment facts and the single Queue diagnostic route.
+No existing evidence, the earlier live-pool eviction, or this source audit is a
+native pass; G0 and O3 remain separately gated.
+
 ### D8 comparison cases and source boundaries
 
 These are required comparisons, not parity evidence. Each case needs the same
