@@ -50,6 +50,7 @@ import io
 import struct
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 import shutil
@@ -129,7 +130,7 @@ INVENTORY_ROW_CAP = 50000
 INVENTORY_CONTENT_CAP = 256 * 1024 * 1024
 RETAINED_ROW_CAP = 200000
 ALLOC_ENTRY_CAP = 500000
-LIVE_ACCOUNT_ROOT = Path("/Users/tom/Library/Application Support/oxide")
+LIVE_ACCOUNT_ROOT = Path(pwd.getpwuid(os.getuid()).pw_dir) / "Library/Application Support/oxide"
 
 
 class GateRefusal(Exception):
@@ -726,6 +727,36 @@ def validate_barge_block(block, *, head, wrapper_hash, oxide_hash, audit_hash,
     if "rust:test:tape-stage" in selectors and "rust:test:tape-export" in selectors:
         raise GateRefusal("export already invokes the stage selector")
     return block["max_seconds"]
+
+
+def live_audit_host(*, effigy: Path, git_tool: Path, rustc_tool: Path,
+                    python: Path, wrapper_hash: str, oxide_hash: str) -> dict:
+    cap = 256 * 1024 * 1024
+    return {"effigy_sha256": sha256_file(effigy, cap=cap),
+            "git_sha256": sha256_file(git_tool, cap=cap),
+            "rustc_sha256": sha256_file(rustc_tool, cap=cap),
+            "supervisor_sha256": SUPERVISOR_SHA256,
+            "wrapper_sha256": wrapper_hash, "oxide_sha256": oxide_hash,
+            "cargo_sha256": sha256_file((rustc_tool.parent / "cargo").resolve(strict=True), cap=cap),
+            "python_sha256": sha256_file(python, cap=cap)}
+
+
+def bind_barge_documents(block_template: dict, audit_template: dict, oxide_hash: str) -> tuple:
+    """Derive only the deferred artifact and audit digests from issued templates."""
+    if (not isinstance(block_template, dict) or not isinstance(audit_template, dict)
+            or block_template.get("oxide_sha256", "missing") is not None
+            or block_template.get("audit_sha256", "missing") is not None
+            or audit_template.get("oxide_sha256", "missing") is not None
+            or not isinstance(block_template.get("authorization_reference"), str)
+            or not block_template["authorization_reference"].startswith("derived-artifact-v1:")
+            or not block_template["authorization_reference"][len("derived-artifact-v1:"):].strip()
+            or not isinstance(oxide_hash, str) or not HEX64.fullmatch(oxide_hash)):
+        raise GateRefusal("issued templates must defer exactly the bootstrap artifact binding")
+    audit = dict(audit_template, oxide_sha256=oxide_hash)
+    audit_bytes = canonical_json(audit)
+    block = dict(block_template, oxide_sha256=oxide_hash,
+                 audit_sha256=sha256_bytes(audit_bytes))
+    return block, audit
 
 
 def validate_barge_audit(audit, *, private, host: dict) -> None:
@@ -1477,7 +1508,8 @@ def supervisor_context() -> tuple:
             or receipt.get("command") != argv[divider + 1:]
             or receipt.get("evidence") != str(evidence) or receipt.get("scratch") != str(scratch)
             or receipt.get("limit_s") != int(argv[3]) or type(receipt.get("start_ns")) is not int
-            or receipt["start_ns"] + int(argv[3]) * 1_000_000_000 != int(deadline)
+            or not (receipt["start_ns"] + int(argv[3]) * 1_000_000_000
+                    <= int(deadline) <= receipt["start_ns"] + (int(argv[3]) + 600) * 1_000_000_000)
             or receipt["start_ns"] > now_ns() or process_row(parent["pid"]) != parent):
         raise GateRefusal("live supervisor receipt or parent identity does not match")
     return evidence, run_id, int(deadline), scratch
@@ -1578,6 +1610,16 @@ def parse_block_head(block: dict) -> int:
     return max_seconds
 
 
+def inactive_roots(ledger_roots: list, oxide_roots: list, barge_root: Path, oxide_root: Path) -> list:
+    return [p for p in ledger_roots + oxide_roots if p not in (barge_root, oxide_root)]
+
+
+def run_status_after_sentinels(create_sentinels, run_status):
+    """No status invocation can precede successful sentinel preparation."""
+    sentinels = create_sentinels()
+    return sentinels, run_status()
+
+
 def diagnostic(options: dict) -> int:
     """The planner's one proofExecution: refuse before any effect on any gap."""
     python = Path(sys.executable).resolve(strict=True)
@@ -1589,8 +1631,11 @@ def diagnostic(options: dict) -> int:
     oxide_repo = repo_guard(options["oxide_repo"])
     barge_head = options["barge_head"]
     oxide_head = options["oxide_head"]
-    if deadline_ns - json.loads((evidence / "receipt.json").read_bytes())["start_ns"] != 1200 * 1_000_000_000:
+    outer_receipt = json.loads((evidence / "receipt.json").read_bytes())
+    if outer_receipt.get("limit_s") != 1200:
         raise GateRefusal("the outer diagnostic supervisor must have the fixed 1200-second limit")
+    if (barge_root.resolve(strict=True) != barge_root or oxide_root.resolve(strict=True) != oxide_root):
+        raise GateRefusal("task roots must be canonical existing directories")
     if adopted_scratch != barge_root or not evidence.is_relative_to(barge_root):
         raise GateRefusal("the outer supervisor must monitor the complete Barge task root and evidence")
     if oxide_head != OXIDE_PIN_COMMIT:
@@ -1668,7 +1713,7 @@ def diagnostic(options: dict) -> int:
     # Fixed companion claims survive fresh evidence directories and burn on uncertainty.
     allowance = Allowance(parse_block_head(json.loads(block_path.read_bytes())) - 120 - prep_seconds,
                           deadline_ns, None,
-                          started_ns=deadline_ns - 1200 * 1_000_000_000)
+                          started_ns=outer_receipt["start_ns"])
     claim = {"gate_id": run_id,
              "barge_block_id": json.loads(block_path.read_bytes()).get("block_id"),
              "oxide_one_use_id": oxide_block.get("one_use_id"),
@@ -1717,8 +1762,8 @@ def diagnostic(options: dict) -> int:
         raise GateRefusal("retained Oxide evidence leaves no whole-block scratch budget")
     if supervisor_receipt.get("owned_bytes", {}).get("budget", 0) > oxide_caps["effective_whole_block_mib"] * 1024 * 1024:
         raise GateRefusal("outer supervisor budget exceeds the measured Oxide remainder")
-    retained_before = retained_snapshot([p for p in ledger_roots + oxide_budget_roots
-                                         if p not in (barge_root, oxide_root)], SCRATCH_ROOT,
+    retained_before = retained_snapshot(inactive_roots(ledger_roots, oxide_budget_roots,
+                                                        barge_root, oxide_root), SCRATCH_ROOT,
                                         deadline_ns)
     live_before = live_inventory(LIVE_ACCOUNT_ROOT, deadline_ns)
     allowance.finish("account")
@@ -1767,23 +1812,18 @@ def diagnostic(options: dict) -> int:
     staged_inputs = {"inputs": [dict(entry, source=str(prep_scratch / entry["destination"]))
                                 for entry in audit_inputs["inputs"]]}
     stage_audit_inputs(barge_root, staged_inputs)
-    block_doc = read_json_bound(block_path, block_digest)
-    validate_barge_audit(audit_doc, private=barge_root, host={
-        "effigy_sha256": sha256_file(effigy, cap=256 * 1024 * 1024),
-        "git_sha256": sha256_file(git_tool, cap=256 * 1024 * 1024),
-        "rustc_sha256": sha256_file(rustc_tool, cap=256 * 1024 * 1024),
-        "supervisor_sha256": SUPERVISOR_SHA256,
-        "wrapper_sha256": wrapper_hash,
-        "oxide_sha256": block_doc.get("oxide_sha256"),
-        "cargo_sha256": sha256_file((rustc_tool.parent / "cargo").resolve(strict=True), cap=256 * 1024 * 1024),
-        "python_sha256": sha256_file(python, cap=256 * 1024 * 1024),
-    })
+    block_template = read_json_bound(block_path, block_digest)
+    block_doc, audit_preview = bind_barge_documents(block_template, audit_doc, "0" * 64)
+    validate_barge_audit(audit_preview, private=barge_root, host=live_audit_host(
+        effigy=effigy, git_tool=git_tool, rustc_tool=rustc_tool, python=python,
+        wrapper_hash=wrapper_hash, oxide_hash="0" * 64))
     if audit_doc.get("child_path") != str(barge_root / "bin") + os.pathsep + inherited.get("PATH", ""):
         raise GateRefusal("audited child PATH does not match the effective environment")
     if block_doc.get("barge_tree") != barge_tree:
         raise GateRefusal("issued Barge tree does not match the built archive")
     validate_barge_block(block_doc, head=barge_head, wrapper_hash=wrapper_hash,
-                         oxide_hash=audit_doc["oxide_sha256"], audit_hash=audit_digest,
+                         oxide_hash="0" * 64,
+                         audit_hash=sha256_bytes(canonical_json(audit_preview)),
                          ledger_hash=ledger_digest)
     for name in ("home", "cache", "tmp", "scratch", "bin"):
         private_dir(barge_root, Path(name))
@@ -1848,22 +1888,47 @@ def diagnostic(options: dict) -> int:
     live_after_bootstrap = live_inventory(LIVE_ACCOUNT_ROOT, deadline_ns)
     verify_inventory(live_before, live_after_bootstrap)
 
+    # The external, one-use templates authorize this exact derivation only.
+    # The accepted wrapper receives complete, immutable schema documents;
+    # no guessed binary digest is needed before the single bootstrap.
+    block_doc, issued_audit = bind_barge_documents(block_template, audit_doc, oxide_hash)
+    validate_barge_audit(issued_audit, private=barge_root, host=live_audit_host(
+        effigy=effigy, git_tool=git_tool, rustc_tool=rustc_tool, python=python,
+        wrapper_hash=wrapper_hash, oxide_hash=oxide_hash))
+    audited_admission(inherited, issued_audit)
+    issued_audit_bytes = canonical_json(issued_audit)
+    issued_block_bytes = canonical_json(block_doc)
+    issued_dir = private_dir(barge_root, Path("issued"))
+    issued_audit_path = private_write(issued_dir, Path("source-audit.json"), issued_audit_bytes)
+    issued_block_path = private_write(issued_dir, Path("validation-block.json"), issued_block_bytes)
+    issued_audit_digest = sha256_bytes(issued_audit_bytes)
+    env.update({"BARGE_VALIDATION_SOURCE_AUDIT": str(issued_audit_path),
+                "BARGE_VALIDATION_SOURCE_AUDIT_SHA256": issued_audit_digest,
+                "BARGE_VALIDATION_BLOCK": str(issued_block_path),
+                "BARGE_VALIDATION_BLOCK_SHA256": sha256_bytes(issued_block_bytes),
+                "BARGE_VALIDATION_ROOT_LEDGER": str(ledger_path),
+                "BARGE_VALIDATION_ROOT_LEDGER_SHA256": ledger_digest})
+
     # The dry gate: the real private status through the same child route.
     allowance.require(60, "private-status")
     gate_limit = min(300, allowance.remaining_seconds())
     gate_mib = min(barge_effective_mib, oxide_caps["effective_whole_block_mib"], 512)
     gate_evidence = private_dir(barge_root, Path("evidence/private-status"))
     status_command = [str(effigy), STATUS_SELECTOR]
-    state = private_dir(barge_root / "home", Path("Library/Application Support/oxide/state"))
-    cache_probe_root = private_dir(barge_root / "home", Path("Library/Caches/oxide"))
-    registry_probe = private_write(barge_root, Path(f"registry-probe-{block_doc['block_id']}"),
-                                   block_doc["block_id"].encode())
-    cache_probe = private_write(cache_probe_root, Path("build-pool"), block_doc["block_id"].encode())
-    private_write(state, Path("pools.json"), canonical_json([str(registry_probe)]))
-    status_receipt, status_out, status_argv = run_supervised(
-        supervisor=supervisor_tool, python=python, command=status_command,
-        cwd=barge_source, env=env, limit_seconds=gate_limit, scratch_mib=gate_mib,
-        evidence=gate_evidence, allowance=allowance, phase="private-status")
+    def create_sentinels():
+        state = private_dir(barge_root / "home", Path("Library/Application Support/oxide/state"))
+        cache_probe_root = private_dir(barge_root / "home", Path("Library/Caches/oxide"))
+        registry_probe = private_write(barge_root, Path(f"registry-probe-{block_doc['block_id']}"),
+                                       block_doc["block_id"].encode())
+        cache_probe = private_write(cache_probe_root, Path("build-pool"), block_doc["block_id"].encode())
+        private_write(state, Path("pools.json"), canonical_json([str(registry_probe)]))
+        return registry_probe, cache_probe
+
+    (registry_probe, cache_probe), (status_receipt, status_out, status_argv) = run_status_after_sentinels(
+        create_sentinels, lambda: run_supervised(
+            supervisor=supervisor_tool, python=python, command=status_command,
+            cwd=barge_source, env=env, limit_seconds=gate_limit, scratch_mib=gate_mib,
+            evidence=gate_evidence, allowance=allowance, phase="private-status"))
     validate_supervisor_receipt(status_receipt, status_command, barge_root)
     verify_probe(status_out, home=barge_root / "home", config=barge_root / "config.toml",
                  pool=barge_root / "scratch/pool", registry_probe=registry_probe,
@@ -1872,14 +1937,14 @@ def diagnostic(options: dict) -> int:
     # Final isolation bracket and retained-root quiescence observation.
     final_live = live_inventory(LIVE_ACCOUNT_ROOT, deadline_ns)
     verify_inventory(live_before, final_live)
-    retained_after = retained_snapshot([p for p in ledger_roots + oxide_budget_roots
-                                         if p not in (barge_root, oxide_root)], SCRATCH_ROOT, deadline_ns)
+    retained_after = retained_snapshot(inactive_roots(ledger_roots, oxide_budget_roots,
+                                                        barge_root, oxide_root), SCRATCH_ROOT, deadline_ns)
     if retained_before != retained_after:
         raise GateRefusal("retained roots changed during the gate; quiescence unproven")
 
     # Full block validation now that the built oxide digest exists.
     max_seconds = validate_barge_block(block_doc, head=barge_head, wrapper_hash=wrapper_hash,
-                                       oxide_hash=oxide_hash, audit_hash=audit_digest,
+                                       oxide_hash=oxide_hash, audit_hash=issued_audit_digest,
                                        ledger_hash=ledger_digest)
 
     # Exports: the wrapper-consumable debug receipt and the measured
@@ -1927,6 +1992,10 @@ def diagnostic(options: dict) -> int:
                                            debug_bytes)),
         "debug_receipt_sha256": sha256_bytes(debug_bytes),
         "remaining_allowance": published_allowance,
+        "issued_barge_block": str(issued_block_path),
+        "issued_barge_block_sha256": sha256_bytes(issued_block_bytes),
+        "issued_barge_audit": str(issued_audit_path),
+        "issued_barge_audit_sha256": issued_audit_digest,
         "authorized_barge_max_seconds": max_seconds,
         "pure_checks_conservative_charge_seconds": 120,
         "preparation_seconds": prep_seconds,
@@ -1947,7 +2016,7 @@ def diagnostic(options: dict) -> int:
     receipt_doc = gate_receipt(
         gate_id=run_id,
         blocks={"barge_block_sha256": block_digest, "oxide_block_sha256": approval},
-        allowance=allowance.document(),
+        allowance=published_allowance,
         bindings={"effigy": sha256_file(effigy, cap=256 * 1024 * 1024), "oxide": oxide_hash,
                   "rustc": sha256_file(rustc_tool, cap=256 * 1024 * 1024), "git": sha256_file(git_tool, cap=256 * 1024 * 1024),
                   "supervisor": SUPERVISOR_SHA256, "wrapper": wrapper_hash},
@@ -2185,8 +2254,16 @@ def plan(options: dict) -> int:
     for line in REFUSAL_CASES:
         print("   -", line)
     print("  proposed diagnostic command (planner binds every placeholder):")
-    print("    python3 scripts/bounded-test.py --limit 1200 --scratch-budget-mib 512 -- "
-          "python3 scripts/test-private-build-validation.py --diagnostic")
+    print("    OXIDE_TASK_SCRATCH_ROOT=<barge-root> python3 scripts/bounded-test.py --limit 1200 "
+          "--scratch-budget-mib <reviewed-mib-at-most-512> -- "
+          "python3 scripts/test-private-build-validation.py --diagnostic "
+          "--oxide-repo <repo> --oxide-head " + OXIDE_PIN_COMMIT + " "
+          "--oxide-product-head <approved-head> --barge-repo <repo> --barge-head <head> "
+          "--barge-root <barge-root> --oxide-root <oxide-root> "
+          "--expect-audit <sha256> --expect-ledger <sha256> --expect-budget <sha256> "
+          "--expect-history <sha256> --expect-oxide-binding <sha256> "
+          "--preparation-receipt <path> --expect-preparation <sha256> "
+          "--planner-reference <reference>")
     print("  proposed selectors: proof:private-build-validation:test (pure), "
           "proof:private-build-validation:plan (effect-free), "
           "proof:private-build-validation:diagnostic (heavy)")
@@ -2383,6 +2460,28 @@ def self_test() -> int:
         "components": {name: audit_component([dict(sources[0])], analysis)
                        for name in BARGE_AUDIT_COMPONENTS},
     }
+    template_block = dict(issued_block, oxide_sha256=None, audit_sha256=None,
+                          authorization_reference="derived-artifact-v1:reviewed-issue")
+    template_audit = dict(good_audit, oxide_sha256=None)
+    derived = expect_ok("deferred artifact documents bind after bootstrap", bind_barge_documents,
+                        template_block, template_audit, "a" * 64)
+    if derived is not None:
+        final_block, final_audit = derived
+        if (final_block["oxide_sha256"] != "a" * 64
+                or final_audit["oxide_sha256"] != "a" * 64
+                or final_block["audit_sha256"] != sha256_bytes(canonical_json(final_audit))):
+            failures.append("derived audit and block did not bind the actual artifact")
+        expect_ok("derived block retains accepted schema", validate_barge_block, final_block,
+                  head=BARGE_RECIPE_HEAD, wrapper_hash=host["wrapper_sha256"],
+                  oxide_hash="a" * 64, audit_hash=final_block["audit_sha256"],
+                  ledger_hash=full_host["ledger_hash"])
+    expect_refusal("prefilled artifact is not a deferred authorization", bind_barge_documents,
+                   dict(template_block, oxide_sha256="b" * 64), template_audit, "a" * 64)
+    expect_refusal("missing derivation authority", bind_barge_documents,
+                   dict(template_block, authorization_reference="ordinary-block"),
+                   template_audit, "a" * 64)
+    expect_refusal("malformed artifact digest", bind_barge_documents,
+                   template_block, template_audit, "bad")
     expect_ok("valid audit", validate_barge_audit, good_audit, private=private_root, host={})
     missing_component = dict(good_audit,
                              components={k: v for k, v in good_audit["components"].items()
@@ -2670,11 +2769,28 @@ def self_test() -> int:
         if wall.remaining_seconds() != 1178:
             failures.append("overlap or unrecorded work changed wall-clock charge")
 
+    events = []
+    expect_ok("sentinels precede status", run_status_after_sentinels,
+              lambda: events.append("sentinels"), lambda: events.append("status"))
+    if events != ["sentinels", "status"]:
+        failures.append("status ran before sentinels")
+    events.clear()
+    def failed_sentinels():
+        raise GateRefusal("synthetic sentinel refusal")
+    expect_refusal("failed sentinel prevents status", run_status_after_sentinels,
+                   failed_sentinels, lambda: events.append("status"))
+    if events:
+        failures.append("status ran after sentinel refusal")
+    if inactive_roots([private_root, historic_root], [oxide_run_root],
+                      private_root, oxide_run_root) != [historic_root]:
+        failures.append("active roots included in retained quiescence bracket")
+
     # --- allowance: exhaustion, reset and replay refusals -------------------
     allowance = Allowance(1200, None, None)
     allowance.begin("setup")
     allowance.finish("setup")
     expect_ok("allowance tracks spend", lambda: allowance.remaining_seconds() <= 1200)
+    expect_refusal("bootstrap deadline before opening", allowance.bootstrap_deadline_ns)
     expect_ok("first bootstrap window opens", allowance.begin_bootstrap)
     allowance.bootstrap_deadline_ns()
     expect_refusal("second bootstrap refused", allowance.begin_bootstrap)
@@ -2965,6 +3081,9 @@ def self_test() -> int:
              patch(__name__ + ".process_executable", return_value=Path(sys.executable).resolve(strict=True)), \
              patch(__name__ + ".sha256_file", return_value=SUPERVISOR_SHA256):
             expect_ok("bound direct supervisor and receipt", supervisor_context)
+            os.environ["OXIDE_PROOF_DEADLINE_NS"] = str(start + 1250 * 1_000_000_000)
+            expect_ok("granted admission extension retains actual start", supervisor_context)
+            os.environ["OXIDE_PROOF_DEADLINE_NS"] = str(start + 1200 * 1_000_000_000)
             os.environ["OXIDE_PROOF_RUN_ID"] = "b" * 32
             expect_refusal("foreign supervisor run id", supervisor_context)
             os.environ["OXIDE_PROOF_RUN_ID"] = "a" * 32
@@ -3014,6 +3133,6 @@ if __name__ == "__main__":
         sys.exit(2)
     except (KeyError, OSError, ValueError, TypeError, UnicodeError,
             subprocess.SubprocessError) as error:
-        print(f"private-build-validation refused: {type(error).__name__}: {error}",
+        print(f"private-build-validation error: {type(error).__name__}: {error}",
               file=sys.stderr)
-        sys.exit(2)
+        sys.exit(3)

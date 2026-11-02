@@ -1125,9 +1125,25 @@ with the issued documents and their digests in the environment
 root, including its evidence; the short Oxide claim phase's guard adopts the
 Oxide root. The planner binds the appropriate measured
 whole-root caps and includes the preparation root in the retained ledger.
-The issued blocks have owner-only `<block-name>.token` companions containing
-the block digest and a newline. A fixed exclusive hard-link claim burns each
-token across runs; a partial claim is never retried. `CARGO_HOME` identifies
+Before the diagnostic the planner creates the canonical owner-only Oxide root
+and places `budget.json`, `history-discovery.json`, and the issued
+`block-authorization.json` directly there; the last has an owner-only
+`block-authorization.json.token` companion. In the guarded Barge root the
+planner places the reviewed source-audit template, the root ledger, and the
+issued Barge block template, plus its `<block-name>.token` companion. Each
+token contains its block-template digest and a newline. Both the Barge block
+template's `oxide_sha256` and `audit_sha256` and the audit template's
+`oxide_sha256` must be JSON null. Its `authorization_reference` starts with
+`derived-artifact-v1:` followed by the external issue reference: this
+explicitly authorizes the provider to fill only those fields from the one
+supervised bootstrap and the resulting canonical audit digest. The provider
+writes the resulting complete wrapper-compatible audit and block to the Barge
+root's `issued/` directory, records the template and derived digests, and the
+wrapper receives the derived bytes and digests. No second build, issuer or
+pre-run binary digest is assumed. The planner reviews the template and this
+specific derivation before issuing; the provider cannot extend its bounds.
+A fixed exclusive hard-link claim burns each token across runs; a partial
+claim is never retried. `CARGO_HOME` identifies
 the invoking offline seed; `RUSTUP_HOME` falls back to the invoking
 `HOME/.rustup` before HOME is replaced, and `RUSTUP_TOOLCHAIN` is pinned.
 The audited admission hook, socket, direct Effigy, Git, supervisor, rustc and
