@@ -312,9 +312,69 @@ fn write_private_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate the finite JSON Schema vocabulary used by the checked-in
+/// proposal. Unknown schema keywords fail closed rather than weakening it.
+fn schema_matches(value: &serde_json::Value, schema: &serde_json::Value) -> bool {
+    let Some(spec) = schema.as_object() else { return false; };
+    const KEYS: &[&str] = &["$schema", "$id", "title", "description", "type", "properties", "required", "additionalProperties", "items", "maxItems", "minimum", "minLength", "pattern", "const", "enum", "oneOf", "anyOf"];
+    if spec.keys().any(|key| !KEYS.contains(&key.as_str())) { return false; }
+    if let Some(expected) = spec.get("const") { if value != expected { return false; } }
+    if let Some(options) = spec.get("enum").and_then(|v| v.as_array()) { if !options.contains(value) { return false; } }
+    for (key, exact) in [("oneOf", true), ("anyOf", false)] {
+        if let Some(options) = spec.get(key).and_then(|v| v.as_array()) {
+            let count = options.iter().filter(|s| schema_matches(value, s)).count();
+            if (exact && count != 1) || (!exact && count == 0) { return false; }
+        }
+    }
+    let matches_type = |kind: &str| match kind {
+        "object" => value.is_object(), "array" => value.is_array(),
+        "string" => value.is_string(), "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "null" => value.is_null(), _ => false,
+    };
+    if let Some(kind) = spec.get("type") {
+        let valid = if let Some(name) = kind.as_str() { matches_type(name) }
+            else if let Some(names) = kind.as_array() { names.iter().filter_map(|v| v.as_str()).any(matches_type) }
+            else { false };
+        if !valid { return false; }
+    }
+    if let Some(minimum) = spec.get("minimum").and_then(|v| v.as_i64()) {
+        if value.as_i64().map(|n| n < minimum).unwrap_or_else(|| value.as_u64().is_none()) { return false; }
+    }
+    if let Some(text) = value.as_str() {
+        if spec.get("minLength").and_then(|v| v.as_u64()).is_some_and(|min| text.chars().count() < min as usize) { return false; }
+        if let Some(pattern) = spec.get("pattern") {
+            if pattern.as_str() != Some("^[0-9a-f]{64}$") || text.len() != 64
+                || !text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) { return false; }
+        }
+    }
+    if let Some(items) = value.as_array() {
+        if spec.get("maxItems").and_then(|v| v.as_u64()).is_some_and(|max| items.len() > max as usize) { return false; }
+        if let Some(item_schema) = spec.get("items") {
+            if !items.iter().all(|item| schema_matches(item, item_schema)) { return false; }
+        }
+    }
+    if let Some(object) = value.as_object() {
+        if let Some(required) = spec.get("required").and_then(|v| v.as_array()) {
+            if !required.iter().all(|key| key.as_str().is_some_and(|key| object.contains_key(key))) { return false; }
+        }
+        let properties = spec.get("properties").and_then(|v| v.as_object());
+        for (key, item) in object {
+            if let Some(child) = properties.and_then(|p| p.get(key)) {
+                if !schema_matches(item, child) { return false; }
+            } else if let Some(additional) = spec.get("additionalProperties") {
+                if additional == &serde_json::Value::Bool(false) || (additional.is_object() && !schema_matches(item, additional)) { return false; }
+            }
+        }
+    }
+    true
+}
+
 /// Bounded manifest envelope validation. It never consumes expected outcomes
 /// as evaluator inputs. Detailed reconciliation remains X-S2's oracle.
 fn validate_manifest_envelope(doc: &serde_json::Value) -> Result<(), String> {
+    let schema: serde_json::Value = serde_json::from_str(include_str!("../../../docs/knowledge/contracts/oxide-capture-manifest.schema.json"))
+        .map_err(|error| format!("manifest schema invalid: {error}"))?;
+    if !schema_matches(doc, &schema) { return Err("manifest schema violation".to_owned()); }
     let allowed = ["schema", "case", "window", "source", "fixture", "dynamic", "mandatory_observations", "expected_effects", "expected", "barge", "operator_list"];
     let object = doc.as_object().ok_or("manifest is not an object")?;
     if object.keys().any(|key| !allowed.contains(&key.as_str())) { return Err("unknown manifest field".to_owned()); }
@@ -972,6 +1032,15 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
     std::fs::remove_file(&link).map_err(|error| CheckFailure { what: error.to_string() })?;
     let example: serde_json::Value = serde_json::from_str(include_str!("../../../docs/knowledge/contracts/capture-examples/manifest-example.json")).map_err(|error| CheckFailure { what: error.to_string() })?;
     check(validate_manifest_envelope(&example).is_ok(), "manifest example has required envelope")?;
+    let mut invalid_digest = example.clone();
+    invalid_digest["source"]["cargo_lock_sha256"] = "not-a-digest".into();
+    check(validate_manifest_envelope(&invalid_digest).is_err(), "invalid source digest refuses")?;
+    let mut invalid_identity = example.clone();
+    invalid_identity["mandatory_observations"][0]["identity"] = serde_json::json!({"pid": 42});
+    check(validate_manifest_envelope(&invalid_identity).is_err(), "incomplete process identity refuses")?;
+    let mut unknown_nested = example.clone();
+    unknown_nested["source"]["unknown"] = true.into();
+    check(validate_manifest_envelope(&unknown_nested).is_err(), "unknown nested source field refuses")?;
     let mut over_bytes = example.clone();
     over_bytes["fixture"]["entries"][0]["size"] = (32u64 * 1024 * 1024 + 1).into();
     check(validate_manifest_envelope(&over_bytes).is_err(), "manifest fixture-byte cap refuses")?;
