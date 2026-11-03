@@ -66,6 +66,7 @@ def sample():
         'product_head': '1' * 40, 'product_tree': '2' * 40,
         'producer_oxide_block_sha256': 'prior-block',
         'retained_roots': ['/old'],
+        'oxide_retained_roots': [], 'barge_retained_roots': ['/old'],
         'offline_cache_source': '/old/cache',
         'admission_env': {'EFFIGY_ADMISSION_HOOK': '/hook', 'QUEUE_ADMISSION_SOCKET': '/socket'},
         'admission_audit': {'example': 'audit'},
@@ -85,6 +86,7 @@ def sample():
         'one_use_id': 'b' * 64, 'consumer_sha256': 'consumer', 'provider_sha256': 'provider',
         'tools': tools, 'rustup_home': '/rustup', 'scratch_mib': 512, 'pool_cap_bytes': 1,
         'expires_ns': 900, 'retained_roots': ['/old'], 'offline_cache_source': '/old/cache',
+        'oxide_retained_roots': [], 'barge_retained_roots': ['/old'],
         'admission_env': qualification['admission_env'],
         'admission_audit': qualification['admission_audit'],
         'test_internal_root': qualification['test_internal_root'],
@@ -109,6 +111,8 @@ class CandidateTest(unittest.TestCase):
             return consumer.verify_documents(d['gate'], d['candidate'], d['qualification'],
                                              d['issuance'], digests, '1' * 40, '2' * 40)
         self.assertEqual(check(docs), 1000)
+        self.assertEqual(consumer.verify_candidate_facts(docs['gate'], docs['candidate'],
+                         docs['qualification'], digests, '1' * 40, '2' * 40), 1000)
         for name, section, key, value in (
             ('unqualified', 'qualification', 'state', 'unqualified'),
             ('bootstrap confusion', 'candidate', 'mode', 'bootstrap'),
@@ -117,6 +121,7 @@ class CandidateTest(unittest.TestCase):
             ('changed receipt', 'qualification', 'candidate_sha256', 'different'),
             ('wrong producer ruling', 'candidate', 'ruling', 'other'),
             ('missing qualification', 'qualification', 'review_reference', ''),
+            ('foreign selector contract', 'issuance', 'selectors', ['barge:test']),
         ):
             changed = copy.deepcopy(docs)
             changed[section][key] = value

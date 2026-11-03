@@ -1745,8 +1745,14 @@ amends the command with every bound argument.
 **Capture handoff.** The obsolete #240 local sequence and admission schemas
 are removed. `scripts/private_build_candidate.py` is the source-owned
 candidate consumer: Barge may stage and hash this exact component alongside
-`scripts/test-private-build-validation.py` and invoke its `consume(options)`;
-it must not copy the verification policy. The thin tape entry accepts only
+`scripts/test-private-build-validation.py` and invoke
+`verify_candidate_facts(gate, candidate, qualification, digests, product_head,
+product_tree)`. It returns the producer's remaining seconds or raises the
+provider's `GateRefusal`; the caller must first read and hash the actual
+documents and must independently enforce its own fixed selector contract,
+guard, claim, paths and limits. Oxide's `verify_documents` and `consume`
+add its fixed selectors and guarded execution; Barge must not copy that fact
+policy or treat the fact function alone as admission. The thin tape entry accepts only
 `--input <path> --sha256 <planner-digest>` under the shared supervisor. The
 input's `paths` and `digests` bind the producer gate and candidate receipts,
 outer and status-case guard receipts, both live inventories, independent

@@ -27,7 +27,7 @@ def require(condition, reason):
         raise provider.GateRefusal(reason)
 
 
-def verify_documents(gate, candidate, qualification, issuance, digests, product_head, product_tree):
+def verify_candidate_facts(gate, candidate, qualification, digests, product_head, product_tree):
     """Validate actual candidate exports plus an independent positive judgment.
 
     `digests` are computed from the retained bytes, not supplied values. The
@@ -96,20 +96,29 @@ def verify_documents(gate, candidate, qualification, issuance, digests, product_
             and qualification.get('product_head') == product_head
             and qualification.get('product_tree') == product_tree
             and qualification.get('producer_oxide_block_sha256') == gate.get('blocks', {}).get('oxide_block_sha256')
-            and qualification.get('retained_roots') == issuance.get('retained_roots')
+            and qualification.get('live_before_sha256') == digests['live_before']
+            and qualification.get('live_after_sha256') == digests['live_after'],
+            'independent positive qualification is missing or mismatched')
+    return remaining
+
+
+def verify_documents(gate, candidate, qualification, issuance, digests, product_head, product_tree):
+    """Apply Oxide's fixed selector contract to the shared candidate facts."""
+    remaining = verify_candidate_facts(gate, candidate, qualification, digests, product_head, product_tree)
+    require(qualification.get('retained_roots') == issuance.get('retained_roots')
+            and qualification.get('oxide_retained_roots') == issuance.get('oxide_retained_roots')
+            and qualification.get('barge_retained_roots') == issuance.get('barge_retained_roots')
             and qualification.get('offline_cache_source') == issuance.get('offline_cache_source')
             and qualification.get('admission_env') == issuance.get('admission_env')
             and qualification.get('admission_audit') == issuance.get('admission_audit')
             and qualification.get('test_internal_root') == issuance.get('test_internal_root')
-            and qualification.get('test_validation_tmp') == issuance.get('test_validation_tmp')
-            and qualification.get('live_before_sha256') == digests['live_before']
-            and qualification.get('live_after_sha256') == digests['live_after'],
-            'independent positive qualification is missing or mismatched')
+            and qualification.get('test_validation_tmp') == issuance.get('test_validation_tmp'),
+            'capture issuance differs from qualified destinations')
     require(issuance.get('schema') == ISSUANCE_SCHEMA
             and issuance.get('qualification_sha256') == digests['qualification']
             and issuance.get('product_head') == product_head
             and issuance.get('product_tree') == product_tree
-            and issuance.get('candidate_sha256') == copy.get('sha256')
+            and issuance.get('candidate_sha256') == candidate.get('copy', {}).get('sha256')
             and issuance.get('selectors') == list(SELECTORS)
             and type(issuance.get('max_seconds')) is int
             and 0 < issuance['max_seconds'] <= remaining
@@ -254,9 +263,16 @@ def consume(options, *, execute=None):
     guard_budget = guard_live.get('owned_bytes', {}).get('budget')
     require(type(guard_budget) is int and 0 < guard_budget <= issuance['scratch_mib'] * 1024 * 1024,
             'active outer guard scratch bound differs')
-    outside = provider.allocated_bytes(retained, provider.OXIDE_CAP_BYTES, deadline_ns)
-    require(outside + guard_budget <= provider.OXIDE_CAP_BYTES,
-            'retained bytes and outer guard exceed aggregate cap')
+    oxide_retained = [Path(value) for value in issuance['oxide_retained_roots']]
+    barge_retained = [Path(value) for value in issuance['barge_retained_roots']]
+    require(set(oxide_retained).isdisjoint(barge_retained)
+            and set(oxide_retained + barge_retained) == set(retained),
+            'retained roots do not match the qualified engine allocation')
+    oxide_outside = provider.allocated_bytes(oxide_retained, provider.OXIDE_CAP_BYTES, deadline_ns)
+    barge_outside = provider.allocated_bytes(barge_retained, provider.BARGE_CAP_BYTES, deadline_ns)
+    require(oxide_outside + guard_budget <= provider.OXIDE_CAP_BYTES
+            and barge_outside <= provider.BARGE_CAP_BYTES,
+            'retained bytes and outer guard exceed an engine aggregate cap')
     before = provider.live_inventory(provider.LIVE_ACCOUNT_ROOT, deadline_ns)
     retained_before = provider.retained_snapshot(retained, provider.SCRATCH_ROOT, deadline_ns)
     try:
@@ -271,6 +287,10 @@ def consume(options, *, execute=None):
 
 def _execute_guarded(issuance, candidate, repo, head, tree, scratch, evidence, deadline_ns, allowance):
     """Stage the exact source and seed its private Cargo home, then run once."""
+    cache_source = Path(issuance['offline_cache_source'])
+    require(cache_source.is_absolute() and cache_source.resolve(strict=True) == cache_source
+            and cache_source.is_dir() and cache_source.stat().st_uid == os.geteuid(),
+            'offline cache source is not the qualified owner directory')
     root = provider.private_dir(scratch, Path('capture-covering'))
     source = provider.private_dir(root, Path('source'))
     files = provider.stage_git_tree(repo, source, head, tree)
@@ -284,7 +304,7 @@ def _execute_guarded(issuance, candidate, repo, head, tree, scratch, evidence, d
     sys.path.insert(0, str(source / 'scripts'))
     try:
         from offline_seed import seed_cargo_home
-        seed_cargo_home(Path(issuance['offline_cache_source']), cache,
+        seed_cargo_home(cache_source, cache,
                         (source / 'Cargo.lock').read_bytes(), deadline_ns=deadline_ns)
     finally:
         sys.path.pop(0)
