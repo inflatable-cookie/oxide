@@ -117,6 +117,8 @@ BARGE_SCRATCH = Path("/Volumes/Builds/scratch/barge")
 OXIDE_SCRATCH = Path("/Volumes/Builds/scratch/oxide")
 SCRATCH_ROOT = Path("/Volumes/Builds/scratch")
 BARGE_CAP_BYTES = 4 * 1024 * 1024 * 1024
+# Preserve the existing pool-validator ceiling; current issuance uses 256 MiB.
+BARGE_POOL_VALIDATOR_MAX_BYTES = 3 * 1024 * 1024 * 1024
 OXIDE_CAP_BYTES = 8 * 1024 * 1024 * 1024
 # Prospective aggregate Builds scratch grants (operator decision af038a7e v2,
 # 2026-11-02); the earlier 2 GiB / 6 GiB sessions and their evidence keep
@@ -884,7 +886,7 @@ def validate_barge_block(block, *, head, wrapper_hash, oxide_hash, audit_hash,
         raise GateRefusal("block exceeds the one authorized prospective maximum")
     if type(block["scratch_cap_bytes"]) is not int or block["scratch_cap_bytes"] != BARGE_CAP_BYTES:
         raise GateRefusal("private scratch cap must be the approved 4 GiB")
-    if type(block["pool_cap_bytes"]) is not int or not 0 < block["pool_cap_bytes"] <= BARGE_CAP_BYTES:
+    if type(block["pool_cap_bytes"]) is not int or not 0 < block["pool_cap_bytes"] <= BARGE_POOL_VALIDATOR_MAX_BYTES:
         raise GateRefusal("private pool budget is missing or exceeds scratch cap")
     selectors = block["selectors"]
     if (not isinstance(selectors, list) or not selectors
@@ -2030,7 +2032,7 @@ def parse_block_head(block: dict) -> int:
     if not isinstance(block.get("block_id"), str) or not BLOCK_ID.fullmatch(block["block_id"]):
         raise GateRefusal("issued Barge block identity is malformed")
     pool_cap = block.get("pool_cap_bytes")
-    if type(pool_cap) is not int or not 0 < pool_cap <= BARGE_CAP_BYTES:
+    if type(pool_cap) is not int or not 0 < pool_cap <= BARGE_POOL_VALIDATOR_MAX_BYTES:
         raise GateRefusal("issued Barge block pool budget is missing or out of range")
     max_seconds = block.get("max_seconds")
     if type(max_seconds) is not int or not 60 <= max_seconds <= PROSPECTIVE_MAX_SECONDS:
@@ -4691,7 +4693,7 @@ def self_test() -> int:
                    beyond_cap, head=BARGE_RECIPE_HEAD, wrapper_hash=host["wrapper_sha256"],
                    oxide_hash=full_host["oxide_hash"], audit_hash=full_host["audit_hash"],
                    ledger_hash=full_host["ledger_hash"])
-    exact_pool = dict(issued_block, pool_cap_bytes=BARGE_CAP_BYTES)
+    exact_pool = dict(issued_block, pool_cap_bytes=BARGE_POOL_VALIDATOR_MAX_BYTES)
     exact_pool_bound = expect_ok("pool cap at the approved grant accepted",
                                  validate_barge_block, exact_pool,
                                  head=BARGE_RECIPE_HEAD, wrapper_hash=host["wrapper_sha256"],
@@ -4700,12 +4702,22 @@ def self_test() -> int:
                                  ledger_hash=full_host["ledger_hash"])
     if exact_pool_bound != issued_block["max_seconds"]:
         failures.append("pool cap at the approved grant did not return the block bound")
+    if issued_block["pool_cap_bytes"] != 256 * 1024 * 1024:
+        failures.append("the current private pool issuance is not 256 MiB")
+    expect_ok("the current 256 MiB pool passes early validation", parse_block_head, issued_block)
+    expect_refusal("early pool check preserves its prior ceiling", parse_block_head,
+                   dict(issued_block, pool_cap_bytes=BARGE_POOL_VALIDATOR_MAX_BYTES + 1))
+    expanded_pool = dict(issued_block, pool_cap_bytes=BARGE_CAP_BYTES)
+    expect_refusal("aggregate grant does not expand pool policy", validate_barge_block,
+                   expanded_pool, head=BARGE_RECIPE_HEAD, wrapper_hash=host["wrapper_sha256"],
+                   oxide_hash=full_host["oxide_hash"], audit_hash=full_host["audit_hash"],
+                   ledger_hash=full_host["ledger_hash"])
     no_pool = dict(issued_block, pool_cap_bytes=None)
     expect_refusal("missing pool cap", validate_barge_block, no_pool,
                    head=BARGE_RECIPE_HEAD, wrapper_hash=host["wrapper_sha256"],
                    oxide_hash=full_host["oxide_hash"], audit_hash=full_host["audit_hash"],
                    ledger_hash=full_host["ledger_hash"])
-    big_pool = dict(issued_block, pool_cap_bytes=BARGE_CAP_BYTES + 1)
+    big_pool = dict(issued_block, pool_cap_bytes=BARGE_POOL_VALIDATOR_MAX_BYTES + 1)
     expect_refusal("pool cap above scratch", validate_barge_block, big_pool,
                    head=BARGE_RECIPE_HEAD, wrapper_hash=host["wrapper_sha256"],
                    oxide_hash=full_host["oxide_hash"], audit_hash=full_host["audit_hash"],
