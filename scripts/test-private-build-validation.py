@@ -1253,11 +1253,18 @@ def verify_inventory(before: list, after: list, phase: str = "unspecified",
 # Source archives (read-only Git, exact tree and mode binding)
 # ---------------------------------------------------------------------------
 
-def git_output(repo: Path, *args: str) -> bytes:
+def git_output(repo: Path, *args: str, deadline_ns: int | None = None) -> bytes:
     env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1",
            "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_OPTIONAL_LOCKS": "0"}
-    result = subprocess.run(["/usr/bin/git", "-C", str(repo), *args], env=env,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    timeout = None if deadline_ns is None else (deadline_ns - now_ns()) / 1_000_000_000
+    if timeout is not None and timeout <= 0:
+        raise GateRefusal("Git deadline exhausted before launch")
+    try:
+        result = subprocess.run(["/usr/bin/git", "-C", str(repo), *args], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                                timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise GateRefusal("Git deadline exhausted") from None
     if result.returncode != 0 or len(result.stdout) > 64 * 1024 * 1024:
         raise GateRefusal(f"read-only git {args[0]} failed or exceeded its bound")
     return result.stdout
@@ -1323,17 +1330,19 @@ def stage_audit_inputs(root: Path, manifest: dict) -> None:
         private_write(root, destination, data)
 
 
-def stage_git_tree(repo: Path, root: Path, commit: str, expected_tree: str) -> dict:
+def stage_git_tree(repo: Path, root: Path, commit: str, expected_tree: str, *, deadline_ns: int | None = None) -> dict:
     """Stage one bounded Git archive into an empty private root and verify it."""
     if any(root.iterdir()):
         raise GateRefusal("source archive destination is not empty")
-    data = git_output(repo, "archive", "--format=tar", commit)
+    data = git_output(repo, "archive", "--format=tar", commit, deadline_ns=deadline_ns)
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
         members = archive.getmembers()
         if len(members) > 50000:
             raise GateRefusal("source archive contains too many members")
         deferred = []
         for member in members:
+            if deadline_ns is not None and now_ns() >= deadline_ns:
+                raise GateRefusal("source archive deadline exhausted")
             relative = Path(member.name.rstrip("/"))
             if (relative.is_absolute() or not relative.parts
                     or any(p in ("", ".", "..") for p in relative.parts)):
@@ -1355,20 +1364,24 @@ def stage_git_tree(repo: Path, root: Path, commit: str, expected_tree: str) -> d
             else:
                 raise GateRefusal("unsupported source archive member")
         for relative, target in deferred:
+            if deadline_ns is not None and now_ns() >= deadline_ns:
+                raise GateRefusal("source archive deadline exhausted")
             private_dir(root, relative.parent)
             os.symlink(target, root / relative)
-    return extract_git_tree(repo, root, commit, expected_tree)
+    return extract_git_tree(repo, root, commit, expected_tree, deadline_ns=deadline_ns)
 
 
-def extract_git_tree(repo: Path, root: Path, commit: str, expected_tree: str) -> dict:
+def extract_git_tree(repo: Path, root: Path, commit: str, expected_tree: str, *, deadline_ns: int | None = None) -> dict:
     """Materialize and verify every archived file and mode against the tree."""
-    tree = git_output(repo, "rev-parse", commit + "^{tree}").decode("ascii").strip()
-    resolved = git_output(repo, "rev-parse", commit + "^{commit}").decode("ascii").strip()
+    tree = git_output(repo, "rev-parse", commit + "^{tree}", deadline_ns=deadline_ns).decode("ascii").strip()
+    resolved = git_output(repo, "rev-parse", commit + "^{commit}", deadline_ns=deadline_ns).decode("ascii").strip()
     if tree != expected_tree or resolved != commit:
         raise GateRefusal("source commit or tree mismatch")
-    records = git_output(repo, "ls-tree", "-rz", "--full-tree", commit).split(b"\0")
+    records = git_output(repo, "ls-tree", "-rz", "--full-tree", commit, deadline_ns=deadline_ns).split(b"\0")
     expected = {}
     for record in records:
+        if deadline_ns is not None and now_ns() >= deadline_ns:
+            raise GateRefusal("source verification deadline exhausted")
         if not record:
             continue
         header, raw = record.split(b"\t", 1)
@@ -1400,14 +1413,19 @@ def extract_git_tree(repo: Path, root: Path, commit: str, expected_tree: str) ->
                         + b"\0" + content).hexdigest() != blob:
             raise GateRefusal("source bytes differ from the Git tree")
         expected[name] = sha256_bytes(content)
-    actual = {p.relative_to(root).as_posix() for p in root.rglob("*")
-              if p.is_file() or p.is_symlink()}
+    actual, actual_dirs = set(), set()
+    for path in root.rglob("*"):
+        if deadline_ns is not None and now_ns() >= deadline_ns:
+            raise GateRefusal("source membership deadline exhausted")
+        relative = path.relative_to(root).as_posix()
+        if path.is_file() or path.is_symlink():
+            actual.add(relative)
+        if path.is_dir() and not path.is_symlink():
+            actual_dirs.add(relative)
     if actual != set(expected):
         raise GateRefusal("source archive membership mismatch")
     expected_dirs = {parent.as_posix() for name in expected
                      for parent in Path(name).parents if parent != Path(".")}
-    actual_dirs = {p.relative_to(root).as_posix() for p in root.rglob("*")
-                   if p.is_dir() and not p.is_symlink()}
     if actual_dirs != expected_dirs:
         raise GateRefusal("source archive directory mismatch")
     return expected
@@ -3720,11 +3738,11 @@ def diagnostic(options: dict) -> int:
     return 0
 
 
-def extract_commit_identity(repo: Path, commit: str) -> tuple:
+def extract_commit_identity(repo: Path, commit: str, *, deadline_ns: int | None = None) -> tuple:
     if not isinstance(commit, str) or not HEX40.fullmatch(commit):
         raise GateRefusal(f"source head must be 40 hex: {commit!r}")
-    tree = git_output(repo, "rev-parse", commit + "^{tree}").decode("ascii").strip()
-    resolved = git_output(repo, "rev-parse", commit + "^{commit}").decode("ascii").strip()
+    tree = git_output(repo, "rev-parse", commit + "^{tree}", deadline_ns=deadline_ns).decode("ascii").strip()
+    resolved = git_output(repo, "rev-parse", commit + "^{commit}", deadline_ns=deadline_ns).decode("ascii").strip()
     if resolved != commit or not HEX40.fullmatch(tree):
         raise GateRefusal(f"source commit identity unavailable: {commit}")
     return commit, tree

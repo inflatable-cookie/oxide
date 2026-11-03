@@ -163,6 +163,13 @@ def _consume(options, *, execute=None):
     expected = options['digests']
     docs = {name: _document(paths[name], expected[name]) for name in
             ('gate', 'candidate', 'qualification', 'issuance', 'guard', 'case_guard', 'live_before', 'live_after')}
+    issuance = docs['issuance']
+    require(type(issuance.get('expires_ns')) is int
+            and type(issuance.get('max_seconds')) is int and issuance['max_seconds'] > 0,
+            'issuance deadline is invalid')
+    effective_deadline = min(deadline_ns, issuance['expires_ns'],
+                             started_ns + issuance['max_seconds'] * 1_000_000_000)
+    require(provider.now_ns() < effective_deadline, 'issuance or runtime allowance expired')
     require(isinstance(docs['live_before'], list) and docs['live_before']
             and docs['live_before'] == docs['live_after'], 'empty or changed live inventory')
     guard = docs['guard']
@@ -186,7 +193,7 @@ def _consume(options, *, execute=None):
         pool=producer_root / 'scratch/pool', registry_probe=producer_root / f'registry-probe-{probe_id}',
         cache_probe=producer_root / 'home/Library/Caches/oxide/build-pool')
     repo = provider.repo_guard(options['product_repo'])
-    head, tree = provider.extract_commit_identity(repo, options['product_head'])
+    head, tree = provider.extract_commit_identity(repo, options['product_head'], deadline_ns=effective_deadline)
     verify_documents(docs['gate'], docs['candidate'], docs['qualification'], docs['issuance'],
                      expected, head, tree)
     issuance = docs['issuance']
@@ -225,11 +232,6 @@ def _consume(options, *, execute=None):
             and type(issuance.get('pool_cap_bytes')) is int
             and 0 < issuance['pool_cap_bytes'] <= provider.OXIDE_CAP_BYTES
             and type(issuance.get('expires_ns')) is int, 'issuance bounds invalid')
-    effective_deadline = min(deadline_ns, issuance['expires_ns'],
-                             started_ns + issuance['max_seconds'] * 1_000_000_000)
-    require(provider.now_ns() < effective_deadline, 'issuance or runtime allowance expired')
-    require(deadline_ns == effective_deadline,
-            'outer supervisor deadline exceeds issuance or invocation allowance')
     retained = [Path(value) for value in issuance['retained_roots']]
     require(retained and len(retained) == len(set(retained))
             and all(path.is_absolute() and path != scratch and not scratch.is_relative_to(path)
@@ -258,7 +260,7 @@ def _consume(options, *, execute=None):
         return execute(SELECTORS)
     allowance = provider.Allowance(issuance['max_seconds'], effective_deadline,
                                    None, started_ns=started_ns)
-    allowance.require(1, 'capture preparation')
+    allowance.require(32, 'capture preparation')
     active_receipt = provider.canonical_file(evidence / 'receipt.json')
     active_digest = provider.sha256_file(active_receipt)
     guard_live = _document(active_receipt, active_digest)
@@ -277,7 +279,7 @@ def _consume(options, *, execute=None):
             'retained bytes and outer guard exceed an engine aggregate cap')
     before = provider.live_inventory(provider.LIVE_ACCOUNT_ROOT, effective_deadline)
     retained_before = provider.retained_snapshot(retained, provider.SCRATCH_ROOT, effective_deadline)
-    allowance.require(1, 'capture claim')
+    allowance.require(32, 'capture claim')
     # Claim after the read-only checks, immediately before staging effects.
     provider.claim_issued_token(Path(paths['issuance']), expected['issuance'], run_id)
     try:
@@ -320,7 +322,7 @@ def _execute_guarded(issuance, candidate, repo, head, tree, scratch, evidence, d
         require(stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid()
                 and not st.st_mode & 0o077, 'suite root is not owner-only')
     source = provider.private_dir(root, Path('source'))
-    files = provider.stage_git_tree(repo, source, head, tree)
+    files = provider.stage_git_tree(repo, source, head, tree, deadline_ns=deadline_ns)
     require(files.get('Cargo.lock') == issuance['product_lock_sha256']
             and files.get('rust-toolchain.toml') == issuance['product_toolchain_sha256'],
             'staged lock or toolchain differs')
@@ -346,7 +348,7 @@ def _execute_guarded(issuance, candidate, repo, head, tree, scratch, evidence, d
                              and not path.is_relative_to(scratch) for path in retained),
             'retained roots overlap the active scratch root')
     for index, selector in enumerate(SELECTORS):
-        allowance.require(1, selector)
+        allowance.require(31, selector)
         before = provider.live_inventory(provider.LIVE_ACCOUNT_ROOT, deadline_ns)
         retained_before = provider.retained_snapshot(retained, provider.SCRATCH_ROOT, deadline_ns)
         command = [tools['effigy']['path'], *selector.split()]

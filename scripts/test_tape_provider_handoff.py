@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import importlib.util
 from pathlib import Path
 import sys
+import subprocess
 import unittest
 from unittest import mock
 
@@ -130,6 +131,36 @@ class CandidateTest(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(provider.GateRefusal):
                 check(changed)
 
+    def test_git_deadline_timeout_refuses(self):
+        result = SimpleNamespace(returncode=0, stdout=b'ok')
+        with mock.patch.object(provider, 'now_ns', return_value=1_000_000_000), \
+             mock.patch.object(provider.subprocess, 'run', return_value=result) as run:
+            self.assertEqual(provider.git_output(Path('/repo'), 'status', deadline_ns=3_000_000_000), b'ok')
+            self.assertEqual(run.call_args.kwargs['timeout'], 2)
+            with self.assertRaises(provider.GateRefusal):
+                provider.git_output(Path('/repo'), 'status', deadline_ns=1_000_000_000)
+            run.side_effect = subprocess.TimeoutExpired('git', 2)
+            with self.assertRaisesRegex(provider.GateRefusal, 'deadline exhausted'):
+                provider.git_output(Path('/repo'), 'status', deadline_ns=3_000_000_000)
+
+    def test_real_allowance_and_effective_deadline_boundaries(self):
+        billion = 1_000_000_000
+        with mock.patch.object(provider, 'now_ns', return_value=10 * billion):
+            allowance = provider.Allowance(60, 50 * billion, None, started_ns=10 * billion)
+            self.assertEqual(allowance.remaining_seconds(), 40)
+        with mock.patch.object(provider, 'now_ns', return_value=19 * billion):
+            allowance.require(31, 'selector')
+        with mock.patch.object(provider, 'now_ns', return_value=20 * billion):
+            with self.assertRaises(provider.GateRefusal):
+                allowance.require(31, 'selector')
+        with mock.patch.object(provider, 'now_ns', return_value=70 * billion):
+            with self.assertRaises(provider.GateRefusal):
+                allowance.require(1, 'maximum')
+        with mock.patch.object(provider, 'now_ns', return_value=50 * billion - 1):
+            self.assertEqual(allowance.remaining_seconds(), 0)
+        with mock.patch.object(provider, 'now_ns', return_value=50 * billion):
+            self.assertEqual(allowance.remaining_seconds(), 0)
+
     def test_guarded_body_routes_all_selectors_and_rejects_changed_inventory(self):
         docs, _ = sample()
         issue = docs['issuance']
@@ -137,8 +168,8 @@ class CandidateTest(unittest.TestCase):
         root = scratch / 'capture-covering'
         issue.update(product_lock_sha256='lock', product_toolchain_sha256='toolchain',
                      test_validation_tmp=str(root / 'tmp'))
-        allowance = mock.Mock()
-        allowance.remaining_seconds.return_value = 275
+        with mock.patch.object(provider, 'now_ns', return_value=1):
+            allowance = provider.Allowance(600, 275_000_000_001, None, started_ns=1)
         child = mock.Mock(return_value=({'closed': True}, '', []))
         seed = mock.Mock()
         stage = mock.Mock(return_value={'Cargo.lock': 'lock', 'rust-toolchain.toml': 'toolchain'})
@@ -156,6 +187,7 @@ class CandidateTest(unittest.TestCase):
                     (Path, 'read_bytes', {'return_value': b'lock'}),
                     (consumer.os, 'lstat', {'return_value': mode}),
                     (consumer.os, 'symlink', {}),
+                    (provider, 'now_ns', {'return_value': 1}),
                     (provider, 'private_dir', {'side_effect': directory}),
                     (provider, 'private_write', {}),
                     (provider, 'stage_git_tree', {'new': stage}),
@@ -182,13 +214,28 @@ class CandidateTest(unittest.TestCase):
         self.assertTrue(all(call.kwargs['limit_seconds'] == 275 for call in child.call_args_list))
         seed.assert_called_once()
         self.assertEqual(seed.call_args.kwargs['deadline_ns'], 123456)
-        stage.assert_called_once_with(Path('/repo'), root / 'source', 'head', 'tree')
+        stage.assert_called_once_with(Path('/repo'), root / 'source', 'head', 'tree', deadline_ns=123456)
         self.assertEqual(receipt_check.call_count, 4)
+        self.assertEqual(receipt_check.call_args.args[2], Path(issue['test_internal_root']))
         self.assertEqual(retained.call_count, 8)
         child.reset_mock()
         with self.assertRaisesRegex(provider.GateRefusal, 'inventory changed'):
             run_with_snapshots([['before'], ['after']])
         self.assertEqual(child.call_count, 1)
+        child.reset_mock()
+        stage.return_value = {'Cargo.lock': 'changed', 'rust-toolchain.toml': 'toolchain'}
+        with self.assertRaisesRegex(provider.GateRefusal, 'staged lock or toolchain'):
+            run_with_snapshots([])
+        child.assert_not_called()
+        stage.return_value = {'Cargo.lock': 'lock', 'rust-toolchain.toml': 'toolchain'}
+        def reject_suite(receipt, command, expected_scratch):
+            if command[-2:] == ['test', 'rust']:
+                self.assertEqual(expected_scratch, Path(issue['test_internal_root']))
+                raise provider.GateRefusal('wrong suite receipt scratch')
+        receipt_check.side_effect = reject_suite
+        with self.assertRaisesRegex(provider.GateRefusal, 'wrong suite receipt scratch'):
+            run_with_snapshots([['same']] * 8)
+        self.assertEqual(child.call_count, 4)
 
     def test_actual_consumer_reaches_only_named_mock_child(self):
         docs, digests = sample()
@@ -241,9 +288,7 @@ class CandidateTest(unittest.TestCase):
                 consumer._consume(options, execute=child)
             child.assert_not_called()
             docs['issuance']['expires_ns'] = 999
-            with self.assertRaisesRegex(provider.GateRefusal, 'outer supervisor deadline'):
-                consumer._consume(options, execute=child)
-            child.assert_not_called()
+            self.assertEqual(consumer._consume(options, execute=child), 'mock-only')
 
 
 if __name__ == '__main__':

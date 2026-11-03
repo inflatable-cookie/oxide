@@ -1768,7 +1768,9 @@ guard, single-use claim, source/tool verification, offline dependency setup,
 live inventory and Barge selector/cap checks remain independently required.
 No positive execution or admission field may be synthesized from the returned
 number. The component imports the shared provider from its own directory, so
-both staged source files must be independently hash-bound. The thin tape entry accepts only
+both staged source files must be independently hash-bound. The earlier reviewed Barge
+fact-only pair remains bound to its original hashes; the Oxide deadline-aware
+provider change does not migrate or requalify that pair. The thin tape entry accepts only
 `--input <path> --sha256 <planner-digest>` under the shared supervisor. The
 input's `paths` and `digests` bind the producer gate and candidate receipts,
 outer and status-case guard receipts, both live inventories, independent
@@ -1793,11 +1795,13 @@ which lie beyond the capture harness prefix. It does not change the reached
 of the exact source to be covered by the later checks.
 
 For a capture run the planner supplies `TAPE_CAPTURE_LIMIT_SECONDS` before
-Effigy admission. It must be no greater than the issued remaining allowance
-and must leave the guard deadline no later than the issuance expiry or the
-invocation start plus its maximum. The consumer checks the live guard deadline
-and refuses if it exceeds either bound; a missing limit refuses. Admission
-waits do not rewrite an expiry or resurrect a claim. A post-claim refusal burns
+Effigy admission. A missing limit refuses. The consumer uses the minimum of
+the live guard deadline, the independently issued expiry and the invocation
+start plus its maximum. Git subprocesses use the remaining deadline as their
+timeout and archive members are checked against it. The allowance must leave
+at least 32 seconds before the claim and 31 seconds before each nested guard;
+a spent issuance refuses. Admission waits do not rewrite an expiry or resurrect
+a claim. A post-claim refusal burns
 the one-use issuance. The guard must adopt an owner-only, canonical root below
 `/Volumes/Builds/scratch/oxide-validation`; the Rust suite temporary directory
 is that root's `capture-covering/tmp`. Its separately approved internal fixture
