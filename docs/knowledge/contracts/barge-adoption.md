@@ -1373,6 +1373,65 @@ identify a writer, lower the oracle, repair the baseline, skip bootstrap
 or weaken one-use claims. Honest missing runtime evidence at this head
 remains missing and blocks qualification.
 
+**Candidate-input qualification route (oxide#254; operator decision
+`d9aec625-ecc1-4dcf-a0be-737f85d9eca0` v2, 2026-11-03, "Approve proposed
+validation route").** The same provider gains a `--candidate` mode that
+binds the RETAINED debug artifact instead of building one. The planner
+binds every input at dispatch: the origin root
+(`/Volumes/Builds/scratch/barge/replacement-runtime.0xj2w99b`), the
+artifact digest `c6137a1a1fe1027dd2e90e9c5ee3bd95f2db0472b8edb3bfb4c04f0af29256e1`
+and its 20513160 bytes, the retained nested guard receipt
+(`evidence/bootstrap/receipt.json`, command-bound, closed, status 0,
+certain empty census, scratch naming that root) and build log digests, the
+retained `Cargo.lock`/`rust-toolchain.toml` digests (which must equal the
+pinned `3de2413` commit's own bytes, so the staged source reproduces the
+build source), and the audited host-tools document. Origin, bindings and
+retained nested closure are validated BEFORE any staging; the artifact is
+then copied only inside the fresh guard-owned task root, rehashed, and
+symlinked as `bin/oxide`. Nothing under the origin is written; there is no
+automatic rebuild, install, cleanup or repair. The ruling explicitly
+allows the pinned Rust 1.97.1 toolchain and the named Apple
+linker/assembler tools (`cc`, `c++`, `clang`, `gcc`, `ld`, `as`, `ar`,
+`ranlib`) as audited HOST inputs for this route: the planner-bound
+host-tools document names each resolved canonical path plus its live
+content hash and size; absent stays absent; a changed, unlisted or
+documented-but-not-live binding refuses; a private binding stays allowed.
+They are not private bindings and the hashes do not confine their writes;
+ambient Cargo configuration refusals, the explicit environment allowlist
+and the pre-launch packet-retained refusal (oxide#253 rule, now
+`evidence/candidate-provenance.json`) are unchanged. No other inherited
+tool, environment or config trust exception follows. The route takes its
+own fresh live-inventory baseline around the private status gate and the
+retained-root quiescence snapshot; any inode/content delta, ambiguous
+closure, missing root accounting or cap breach refuses, including
+identical-content inode replacement. The origin session's failed
+isolation stays historical and unrepaired; a fresh baseline never erases
+it, and unrelated host activity is not presumed to excuse a delta. The
+wrapper-consumable issued documents and the debug receipt are NOT derived
+in this route: the accepted wrapper binds a debug receipt to an in-root
+cargo build (fixed argv, supervisor receipt naming the private root),
+which a retained candidate cannot honestly fill, so capture-side handoff
+integration stays on the capture tasks' own route and both modes'
+fail-closed controls stay intact. The gate receipt stays honest
+(`qualification` always unqualified; retained review judges). Final
+capture wire/schema limitations, X-S2/O3, production pins/features and
+live-data restrictions are unchanged. Prospective accounting under
+`d9aec625` v2: ONE cumulative 1200-second continuation charged to BOTH
+capture blocks — the existing 309 seconds plus at most 891 new seconds,
+with 20 seconds reserved now for the source checks (spent conservatively
+in both blocks, no refund, at most 1180 seconds unallocated before actual
+preparation/runtime); the preceding 309-second ledger and every earlier
+reservation stay history with no clock reset or refund. Prospective
+aggregate scratch caps remain Barge 3 GiB and Oxide 8 GiB and refuse when
+retained bytes leave no space. At most ONE Queue-routed candidate
+isolation qualification and then at most ONE safe covering batch per
+capture task at its exact approved head, each with the qualified guard
+(`fcfda2b0…` unchanged) and fresh one-use claims; no automatic retry,
+native image or bootstrap. Source approval grants no native credit. The
+selector `proof:private-build-validation:candidate` (heavy) carries the
+fixed unbound declaration and refuses before any effect until the planner
+amends the command with every bound argument.
+
 **Integration and removal plan for the obsolete local scaffold.** The #240
 local route (`scripts/tape-isolation-check.py` sequence/bootstrap/preflight/
 cover actions and the `proof:tape-prune:*` launch selectors at `657023bd`)
