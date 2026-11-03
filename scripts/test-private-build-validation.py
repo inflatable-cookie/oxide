@@ -1452,8 +1452,8 @@ class Allowance:
 
     def __init__(self, max_seconds: int, deadline_ns: int | None, state_dir: Path | None,
                  started_ns: int | None = None):
-        if type(max_seconds) is not int or max_seconds < 60:
-            raise GateRefusal("the allowance needs an explicit bounded maximum")
+        if type(max_seconds) is not int or max_seconds <= 30:
+            raise GateRefusal("the allowance needs a maximum above the supervisor floor")
         self.max_seconds = max_seconds
         self.deadline_ns = deadline_ns
         self.state_dir = state_dir
@@ -4162,6 +4162,14 @@ def self_test() -> int:
                           sample_receipt, 210_000_000_000, 150, 1200)
         if bound != 110_000_000_000:
             failures.append("effective outer deadline did not use the smaller guard")
+        floor_bound = expect_ok("31-second issued outer limit", bind_outer_deadline,
+                                dict(sample_receipt, limit_s=31), 210_000_000_000, 31, 1200)
+        if floor_bound != 41_000_000_000:
+            failures.append("the minimum valid outer limit was not accepted")
+        expect_ok("31-second issued allowance", Allowance, 31, floor_bound, None,
+                  started_ns=10_000_000_000)
+        expect_refusal("30-second issued allowance", Allowance, 30, floor_bound, None,
+                       started_ns=10_000_000_000)
         expect_refusal("outer floor refuses", bind_outer_deadline,
                        dict(sample_receipt, limit_s=30), 210_000_000_000, 150, 1200)
         expect_refusal("outer above issuance refuses", bind_outer_deadline,
