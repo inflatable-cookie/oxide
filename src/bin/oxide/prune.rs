@@ -2041,12 +2041,24 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
         Err(reason) => return Err(reason),
     };
     drop(authority);
-    let fresh = build_preview(
+    // A failed fresh preview after exact intent replay is a partial
+    // completion: those roots already changed. Mapping the error through
+    // `?` would print "no output root was changed" and exit 2.
+    let fresh = match build_preview(
         &registry,
         &evaluated,
         fresh_list.as_ref(),
         evaluated.complete,
-    )?;
+    ) {
+        Ok(fresh) => fresh,
+        Err(reason) if !completed_roots.is_empty() => {
+            return Ok(partial(
+                &completed_roots,
+                &format!("the fresh preview failed ({reason}), so every other root is kept"),
+            ));
+        }
+        Err(reason) => return Err(reason),
+    };
     if !fresh.coverage.complete {
         let reason = "the fresh authority snapshot is incomplete, so every remaining root is kept";
         return Ok(if completed_roots.is_empty() {
