@@ -969,7 +969,7 @@ def validate_barge_audit(audit, *, private, host: dict, deadline_ns: int | None 
 def validate_barge_ledger(ledger, *, private_root: Path, scratch: Path,
                           historic: Path = BARGE_HISTORIC_LEDGER,
                           scratch_glob: str = "041-pr.*",
-                          required_roots=None) -> list:
+                          required_roots=None, deadline_ns: int | None = None) -> list:
     if not isinstance(ledger, dict) or ledger.get("schema") != SCHEMA_BARGE_LEDGER \
             or ledger.get("task") != BARGE_TASK:
         raise GateRefusal("task private-root ledger missing")
@@ -3181,7 +3181,7 @@ def diagnostic(options: dict) -> int:
     # accepted launcher rules with live digests.
     allowance.begin("documents")
     ledger_doc = read_json_bound(ledger_path, ledger_digest)
-    ledger_roots = validate_barge_ledger(ledger_doc, private_root=barge_root, scratch=BARGE_SCRATCH)
+    ledger_roots = validate_barge_ledger(ledger_doc, private_root=barge_root, scratch=BARGE_SCRATCH, deadline_ns=deadline_ns)
     allowance.finish("documents")
 
     # Candidate origin validation (oxide#254): retained-artifact bindings and
