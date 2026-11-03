@@ -6072,6 +6072,24 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
 ## Pruning owned output roots (oxide#129)
 
+**Bounded-batch qualification (oxide#256, 2026-11-03).** Source `afa28a9d`
+passed the pure dispatcher controls, the uncounted diagnostic and the counted
+author and distinct reviewer sessions: all 22 native cases completed, with
+closed guards, certain empty censuses, no fault or deadline, and the owned
+images ordinarily detached. Review `6599808998` and the retained
+`planner-storage-reclamation-20261103/256-*` packets bind the evidence. The
+reached proof script (`91442176…`), qualified guard (`fcfda2b0…`), Rust source,
+lock and toolchain are unchanged at merged `6dcf0140`. The receipt-matched
+installation `20261103T092325Z-6dcf01405018.json` records binary `4e5d52c4…`
+with unchanged control-state 9 and registration 2.
+
+The first fresh preview on that installation selected 322 of 569 eligible
+roots in 262,088 bytes; 247 were deferred. Authority coverage was complete,
+while byte accounting was incomplete for 107 selected roots. These are distinct:
+measurement completeness does not select or authorize roots, and the observed
+byte totals promise no physical reclaim. Real deletion still requires the
+exact plan and all fresh product checks below.
+
 `oxide outputs prune` is the explicit, one-shot removal of owned output roots whose checkout is positively gone. It is not part of any automatic admission or cleanup path, it owns no timer, hook or mode switch, and a normal build never prunes. The owner inventory context (52 roots, 42 GB logical, 36 checkout-gone, 21.5 GiB, 16 live) is not an allowlist, a proof, or an expected reclaimed figure: logical and allocated bytes are separate observations with coverage, source and time, and hard links or shared extents mean neither is guaranteed physical reclaim.
 
 - **Host automation (Tom, 2026-10-26).** Oxide itself still owns no timer. On Tom's machine a host job outside Oxide (`com.tom.scratch-reaper`, daily at 04:30) runs `oxide outputs prune --dry-run` into a plan file. When the preview names at least one candidate, it runs exactly one real `--plan FILE --plan-sha256 <that preview's SHA>`. It never passes an operator list, records any non-zero exit, and never retries; legacy roots that need an operator list stay for an explicit operator run. The first live run on 2026-10-26 (installed `069b7fa6`) deleted 114 roots and kept 276. When more eligible roots exist than one preview can name, that job still runs one bounded batch; the next authorized dry-run selects the next prefix of what remains.
