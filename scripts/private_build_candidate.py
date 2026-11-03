@@ -151,7 +151,7 @@ def _text(path, expected):
     return data.decode('utf-8', errors='strict')
 
 
-def consume(options, *, execute=None):
+def _consume(options, *, execute=None):
     """Guard, verify and execute the four fixed selectors under one claim.
 
     `execute` is solely a test seam; production callers use the real shared
@@ -225,8 +225,11 @@ def consume(options, *, execute=None):
             and type(issuance.get('pool_cap_bytes')) is int
             and 0 < issuance['pool_cap_bytes'] <= provider.OXIDE_CAP_BYTES
             and type(issuance.get('expires_ns')) is int, 'issuance bounds invalid')
-    require(provider.now_ns() < deadline_ns and issuance['expires_ns'] <= deadline_ns
-            and provider.now_ns() < issuance['expires_ns'], 'issuance expired or exceeds guard')
+    effective_deadline = min(deadline_ns, issuance['expires_ns'],
+                             started_ns + issuance['max_seconds'] * 1_000_000_000)
+    require(provider.now_ns() < effective_deadline, 'issuance or runtime allowance expired')
+    require(deadline_ns == effective_deadline,
+            'outer supervisor deadline exceeds issuance or invocation allowance')
     retained = [Path(value) for value in issuance['retained_roots']]
     require(retained and len(retained) == len(set(retained))
             and all(path.is_absolute() and path != scratch and not scratch.is_relative_to(path)
@@ -250,13 +253,12 @@ def consume(options, *, execute=None):
     require(checked_origin == origin, 'retained origin facts changed')
     require(any(candidate_path == path or candidate_path.is_relative_to(path) for path in retained),
             'candidate copy is not in the retained-root ledger')
-    # The provider's durable exclusive companion claim is the one-use control.
-    provider.claim_issued_token(Path(paths['issuance']), expected['issuance'], run_id)
     if execute is not None:
+        provider.claim_issued_token(Path(paths['issuance']), expected['issuance'], run_id)
         return execute(SELECTORS)
-    allowance = provider.Allowance(issuance['max_seconds'], min(deadline_ns, issuance['expires_ns']),
+    allowance = provider.Allowance(issuance['max_seconds'], effective_deadline,
                                    None, started_ns=started_ns)
-    allowance.require(300, 'capture preparation')
+    allowance.require(1, 'capture preparation')
     active_receipt = provider.canonical_file(evidence / 'receipt.json')
     active_digest = provider.sha256_file(active_receipt)
     guard_live = _document(active_receipt, active_digest)
@@ -268,21 +270,29 @@ def consume(options, *, execute=None):
     require(set(oxide_retained).isdisjoint(barge_retained)
             and set(oxide_retained + barge_retained) == set(retained),
             'retained roots do not match the qualified engine allocation')
-    oxide_outside = provider.allocated_bytes(oxide_retained, provider.OXIDE_CAP_BYTES, deadline_ns)
-    barge_outside = provider.allocated_bytes(barge_retained, provider.BARGE_CAP_BYTES, deadline_ns)
+    oxide_outside = provider.allocated_bytes(oxide_retained, provider.OXIDE_CAP_BYTES, effective_deadline)
+    barge_outside = provider.allocated_bytes(barge_retained, provider.BARGE_CAP_BYTES, effective_deadline)
     require(oxide_outside + guard_budget <= provider.OXIDE_CAP_BYTES
             and barge_outside <= provider.BARGE_CAP_BYTES,
             'retained bytes and outer guard exceed an engine aggregate cap')
-    before = provider.live_inventory(provider.LIVE_ACCOUNT_ROOT, deadline_ns)
-    retained_before = provider.retained_snapshot(retained, provider.SCRATCH_ROOT, deadline_ns)
+    before = provider.live_inventory(provider.LIVE_ACCOUNT_ROOT, effective_deadline)
+    retained_before = provider.retained_snapshot(retained, provider.SCRATCH_ROOT, effective_deadline)
+    allowance.require(1, 'capture claim')
+    # Claim after the read-only checks, immediately before staging effects.
+    provider.claim_issued_token(Path(paths['issuance']), expected['issuance'], run_id)
     try:
         return _execute_guarded(issuance, candidate_path, repo, head, tree, scratch, evidence,
-                                min(deadline_ns, issuance['expires_ns']), allowance)
+                                effective_deadline, allowance)
     finally:
-        after = provider.live_inventory(provider.LIVE_ACCOUNT_ROOT, deadline_ns)
+        after = provider.live_inventory(provider.LIVE_ACCOUNT_ROOT, effective_deadline)
         provider.verify_inventory(before, after, 'capture-covering', evidence)
-        require(retained_before == provider.retained_snapshot(retained, provider.SCRATCH_ROOT, deadline_ns),
+        require(retained_before == provider.retained_snapshot(retained, provider.SCRATCH_ROOT, effective_deadline),
                 'retained roots changed during covering')
+
+
+def consume(options):
+    """Run the fixed Oxide covering path; callers cannot supply an executor."""
+    return _consume(options)
 
 
 def _execute_guarded(issuance, candidate, repo, head, tree, scratch, evidence, deadline_ns, allowance):
@@ -292,14 +302,29 @@ def _execute_guarded(issuance, candidate, repo, head, tree, scratch, evidence, d
             and cache_source.is_dir() and cache_source.stat().st_uid == os.geteuid(),
             'offline cache source is not the qualified owner directory')
     root = provider.private_dir(scratch, Path('capture-covering'))
+    for name in ('home', 'tmp', 'scratch', 'bin'):
+        provider.private_dir(root, Path(name))
+    internal = Path(issuance['test_internal_root'])
+    validation_tmp = Path(issuance['test_validation_tmp'])
+    require(internal.is_absolute() and internal.is_relative_to(Path('/private/tmp'))
+            and internal != Path('/private/tmp') and internal.resolve(strict=True) == internal
+            and validation_tmp.is_absolute()
+            and validation_tmp.is_relative_to(Path('/Volumes/Builds/scratch/oxide-validation'))
+            and validation_tmp != Path('/Volumes/Builds/scratch/oxide-validation')
+            and validation_tmp.resolve(strict=True) == validation_tmp
+            and scratch.resolve(strict=True) == scratch
+            and validation_tmp.is_relative_to(scratch) and validation_tmp != scratch,
+            'covering suite roots are outside their approved locations')
+    for directory in (scratch, internal, validation_tmp):
+        st = os.lstat(directory)
+        require(stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid()
+                and not st.st_mode & 0o077, 'suite root is not owner-only')
     source = provider.private_dir(root, Path('source'))
     files = provider.stage_git_tree(repo, source, head, tree)
     require(files.get('Cargo.lock') == issuance['product_lock_sha256']
             and files.get('rust-toolchain.toml') == issuance['product_toolchain_sha256'],
             'staged lock or toolchain differs')
     cache = provider.private_dir(root, Path('cache'))
-    for name in ('home', 'tmp', 'scratch', 'bin'):
-        provider.private_dir(root, Path(name))
     provider.private_write(root, Path('config.toml'), b'')
     sys.path.insert(0, str(source / 'scripts'))
     try:
@@ -320,21 +345,8 @@ def _execute_guarded(issuance, candidate, repo, head, tree, scratch, evidence, d
     require(retained and all(path != scratch and not scratch.is_relative_to(path)
                              and not path.is_relative_to(scratch) for path in retained),
             'retained roots overlap the active scratch root')
-    internal = Path(issuance['test_internal_root'])
-    validation_tmp = Path(issuance['test_validation_tmp'])
-    require(internal.is_absolute() and internal.is_relative_to(Path('/private/tmp'))
-            and internal != Path('/private/tmp') and internal.resolve(strict=True) == internal
-            and validation_tmp.is_absolute()
-            and validation_tmp.is_relative_to(Path('/Volumes/Builds/scratch/oxide-validation'))
-            and validation_tmp != Path('/Volumes/Builds/scratch/oxide-validation')
-            and validation_tmp.resolve(strict=True) == validation_tmp,
-            'covering suite roots are outside their approved locations')
-    for directory in (internal, validation_tmp):
-        st = os.lstat(directory)
-        require(stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid()
-                and not st.st_mode & 0o077, 'suite root is not owner-only')
     for index, selector in enumerate(SELECTORS):
-        allowance.require(300, selector)
+        allowance.require(1, selector)
         before = provider.live_inventory(provider.LIVE_ACCOUNT_ROOT, deadline_ns)
         retained_before = provider.retained_snapshot(retained, provider.SCRATCH_ROOT, deadline_ns)
         command = [tools['effigy']['path'], *selector.split()]
@@ -348,7 +360,7 @@ def _execute_guarded(issuance, candidate, repo, head, tree, scratch, evidence, d
         try:
             receipt, _, _ = provider.run_supervised(supervisor=Path(tools['supervisor']['path']),
                 python=Path(sys.executable), command=command, cwd=source, env=child_env,
-                limit_seconds=300, scratch_mib=issuance['scratch_mib'], evidence=child_evidence,
+                limit_seconds=min(300, allowance.remaining_seconds()), scratch_mib=issuance['scratch_mib'], evidence=child_evidence,
                 allowance=allowance, phase=f'capture-{index}')
             provider.validate_supervisor_receipt(receipt, command, child_scratch)
         finally:

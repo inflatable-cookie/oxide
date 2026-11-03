@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Mock-only controls for the canonical capture candidate consumer."""
 import copy
+from contextlib import ExitStack
+from types import SimpleNamespace
 import importlib.util
 from pathlib import Path
 import sys
@@ -85,7 +87,7 @@ def sample():
         'selectors': list(consumer.SELECTORS), 'max_seconds': 600, 'planner_reference': 'issued',
         'one_use_id': 'b' * 64, 'consumer_sha256': 'consumer', 'provider_sha256': 'provider',
         'tools': tools, 'rustup_home': '/rustup', 'scratch_mib': 512, 'pool_cap_bytes': 1,
-        'expires_ns': 900, 'retained_roots': ['/old'], 'offline_cache_source': '/old/cache',
+        'expires_ns': 1100, 'retained_roots': ['/old'], 'offline_cache_source': '/old/cache',
         'oxide_retained_roots': [], 'barge_retained_roots': ['/old'],
         'admission_env': qualification['admission_env'],
         'admission_audit': qualification['admission_audit'],
@@ -128,6 +130,66 @@ class CandidateTest(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(provider.GateRefusal):
                 check(changed)
 
+    def test_guarded_body_routes_all_selectors_and_rejects_changed_inventory(self):
+        docs, _ = sample()
+        issue = docs['issuance']
+        scratch = Path('/Volumes/Builds/scratch/oxide-validation/guard')
+        root = scratch / 'capture-covering'
+        issue.update(product_lock_sha256='lock', product_toolchain_sha256='toolchain',
+                     test_validation_tmp=str(root / 'tmp'))
+        allowance = mock.Mock()
+        allowance.remaining_seconds.return_value = 275
+        child = mock.Mock(return_value=({'closed': True}, '', []))
+        seed = mock.Mock()
+        stage = mock.Mock(return_value={'Cargo.lock': 'lock', 'rust-toolchain.toml': 'toolchain'})
+        receipt_check = mock.Mock()
+        retained = mock.Mock(return_value=['stable'])
+        mode = SimpleNamespace(st_uid=__import__('os').geteuid(), st_mode=0o40700)
+        def directory(base, relative):
+            return base / relative
+        def run_with_snapshots(snapshots):
+            with ExitStack() as stack:
+                for obj, name, kw in (
+                    (Path, 'resolve', {'new': lambda self, **_: self}),
+                    (Path, 'is_dir', {'return_value': True}),
+                    (Path, 'stat', {'return_value': mode}),
+                    (Path, 'read_bytes', {'return_value': b'lock'}),
+                    (consumer.os, 'lstat', {'return_value': mode}),
+                    (consumer.os, 'symlink', {}),
+                    (provider, 'private_dir', {'side_effect': directory}),
+                    (provider, 'private_write', {}),
+                    (provider, 'stage_git_tree', {'new': stage}),
+                    (provider, 'child_environment', {'return_value': {'TMPDIR': str(root / 'tmp')}}),
+                    (provider, 'live_inventory', {'side_effect': snapshots}),
+                    (provider, 'retained_snapshot', {'new': retained}),
+                    (provider, 'verify_inventory', {'side_effect': lambda a, b, *_: consumer.require(a == b, 'inventory changed')}),
+                    (provider, 'run_supervised', {'new': child}),
+                    (provider, 'validate_supervisor_receipt', {'new': receipt_check}),
+                ):
+                    stack.enter_context(mock.patch.object(obj, name, **kw))
+                stack.enter_context(mock.patch.dict(sys.modules, {'offline_seed': SimpleNamespace(seed_cargo_home=seed)}))
+                return consumer._execute_guarded(issue, Path('/candidate'), Path('/repo'),
+                    'head', 'tree', scratch, Path('/evidence'), 123456, allowance)
+        self.assertEqual(run_with_snapshots([['same']] * 8), 0)
+        self.assertEqual([call.kwargs['command'][1:] for call in child.call_args_list],
+                         [selector.split() for selector in consumer.SELECTORS])
+        for call in child.call_args_list[:3]:
+            self.assertEqual(call.kwargs['env']['TMPDIR'], str(root / 'tmp'))
+        suite = child.call_args_list[-1].kwargs
+        self.assertEqual(suite['env']['OXIDE_TEST_INTERNAL_ROOT'], issue['test_internal_root'])
+        self.assertEqual(suite['env']['TMPDIR'], str(root / 'tmp'))
+        self.assertEqual(suite['allowance'], allowance)
+        self.assertTrue(all(call.kwargs['limit_seconds'] == 275 for call in child.call_args_list))
+        seed.assert_called_once()
+        self.assertEqual(seed.call_args.kwargs['deadline_ns'], 123456)
+        stage.assert_called_once_with(Path('/repo'), root / 'source', 'head', 'tree')
+        self.assertEqual(receipt_check.call_count, 4)
+        self.assertEqual(retained.call_count, 8)
+        child.reset_mock()
+        with self.assertRaisesRegex(provider.GateRefusal, 'inventory changed'):
+            run_with_snapshots([['before'], ['after']])
+        self.assertEqual(child.call_count, 1)
+
     def test_actual_consumer_reaches_only_named_mock_child(self):
         docs, digests = sample()
         options = {'paths': {**{key: key for key in docs}, 'case_log': 'case_log'}, 'digests': digests,
@@ -154,29 +216,33 @@ class CandidateTest(unittest.TestCase):
              mock.patch.object(provider, 'now_ns', return_value=1), \
              mock.patch.object(Path, 'resolve', lambda self, **_: self), \
              mock.patch.object(consumer.os, 'access', return_value=True):
-            self.assertEqual(consumer.consume(options, execute=child), 'mock-only')
+            self.assertEqual(consumer._consume(options, execute=child), 'mock-only')
             child.assert_called_once_with(consumer.SELECTORS)
             verify_probe.assert_called_once()
             claim.assert_called_once()
             child.reset_mock()
             claim.side_effect = provider.GateRefusal('replayed')
             with self.assertRaises(provider.GateRefusal):
-                consumer.consume(options, execute=child)
+                consumer._consume(options, execute=child)
             child.assert_not_called()
             claim.side_effect = None
             docs['issuance']['tools']['rustc']['sha256'] = 'wrong'
             with self.assertRaises(provider.GateRefusal):
-                consumer.consume(options, execute=child)
+                consumer._consume(options, execute=child)
             child.assert_not_called()
             docs['issuance']['tools']['rustc']['sha256'] = 'rustc'
             docs['candidate']['origin']['root'] = '/different'
             with self.assertRaises(provider.GateRefusal):
-                consumer.consume(options, execute=child)
+                consumer._consume(options, execute=child)
             child.assert_not_called()
             docs['candidate']['origin']['root'] = '/old'
             docs['issuance']['expires_ns'] = 1
             with self.assertRaises(provider.GateRefusal):
-                consumer.consume(options, execute=child)
+                consumer._consume(options, execute=child)
+            child.assert_not_called()
+            docs['issuance']['expires_ns'] = 999
+            with self.assertRaisesRegex(provider.GateRefusal, 'outer supervisor deadline'):
+                consumer._consume(options, execute=child)
             child.assert_not_called()
 
 

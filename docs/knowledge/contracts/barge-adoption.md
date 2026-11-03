@@ -1780,6 +1780,30 @@ Issuance binds that judgment, exact selectors, candidate, component/provider
 and tool digests, private roots, limits and a fresh one-use claim. Missing,
 changed, expired, unguarded or spent inputs refuse before product execution.
 
+The retained private debug front door was compiled from commit
+`3de241325dd286ae44a5759fa6825b05a81c7b4e`; the compile and test selectors
+operate on the separately bound, staged PR head and tree. The candidate remains
+unqualified until its actual retained qualification. Its identity is not the
+installed release binary. Host-tool hashes bind executable identity, not a
+filesystem confinement guarantee.
+
+The 256 batching change updates preview selection and real-run authorization,
+which lie beyond the capture harness prefix. It does not change the reached
+`evaluate` source-site or cfg map. Its production and test changes remain part
+of the exact source to be covered by the later checks.
+
+For a capture run the planner supplies `TAPE_CAPTURE_LIMIT_SECONDS` before
+Effigy admission. It must be no greater than the issued remaining allowance
+and must leave the guard deadline no later than the issuance expiry or the
+invocation start plus its maximum. The consumer checks the live guard deadline
+and refuses if it exceeds either bound; a missing limit refuses. Admission
+waits do not rewrite an expiry or resurrect a claim. A post-claim refusal burns
+the one-use issuance. The guard must adopt an owner-only, canonical root below
+`/Volumes/Builds/scratch/oxide-validation`; the Rust suite temporary directory
+is that root's `capture-covering/tmp`. Its separately approved internal fixture
+root is still used by the nested suite guard. These bounds do not confine host
+tools' filesystem writes.
+
 After the existing provider's guard and exclusive claim, the consumer stages
 the exact product Git tree and uses the existing offline seeder on its bound
 lock into a private Cargo home. It runs the four named covering selectors
