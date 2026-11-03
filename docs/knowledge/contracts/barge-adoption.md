@@ -1113,176 +1113,29 @@ alone is insufficient.
   Oxide controls; extra variables or a different PATH refuse. The child
   must check its controls and resolved state and pool before entering the
   engine. This proves no production account-home equivalence. The isolated
-  wrapper route for covering checks is task-scoped by decision cf2c3cf4:
-  bootstrap this task's debug Oxide through `proof:tape-prune:bootstrap`,
-  then run the covering selectors with its private fixture HOME, pool and
-  scratch. Before bootstrap and after each execution, compare bounded no-follow
-  inventories of the complete live Oxide account state; any change or unknown
-  fails the run. The installed release binary remains unchanged, and this
-  authority is not a general Cargo fallback. Decision 696fa6e9
-  records the identical-content `pools.json` inode replacement as a failed
-  isolation gate, with no repair or attribution assumption. A later replacement
-  from inode 2072777179 to 2072840885 also retained identical bytes and failed
-  its gate. Decision 86249e2c requires no repair and a fresh live inventory
-  immediately before each new dry preflight or run; any change still fails. Before another
-  focused run, actual config, state/registry, cache and pool destinations must
-  bind private scratch and an effect-free preflight must produce a zero-delta
-  live-state inventory. The test-only path preflight calls the existing config
-  functions without opening a pool; its debug cfg must match the wrapper.
-  The earlier `proof:tape-prune:preflight-build` selector ran
-  `oxide test --no-run`, which enters `Store::open_or_create` and may create
-  or register a pool before the resolver executable runs. It could not
-  establish its own pre-registration confinement. The new task-local launcher
-  is unexecuted source: it compares a private git-archive extraction to the
-  current clean task commit/tree and records per-file, lockfile, toolchain,
-  Python, debug binary and exported harness hashes. It supplies only explicit
-  private HOME, config, state-derived home, pool, scratch, cargo home and temp
-  controls; the existing debug home control is `1`. Its build command is a
-  bounded offline debug bootstrap, and its artifact lookup uses Cargo's actual
-  emitted executable path and digest. Each action takes fresh bounded no-follow
-  live inventories before and after its supervised command and stops on any
-  change or unreadable observation. A reviewed budget ledger must account for
-  all retained roots and prior covering seconds; the code checks those supplied
-  roots but cannot prove that the supplied list is complete. The config-only
-  preflight and the subsequent focused harness executions use the same bound
-  executable; a changed source or digest refuses. The monitored context has a
-  retained bootstrap-target sibling and a work subtree: bootstrap monitors the
-  whole context, while later actions monitor work and count the retained target
-  in the aggregate budget. The source archive, private Cargo cache, home, pool
-  and all later output remain inside work. This is not evidence that a test or
-  build subprocess cannot write outside the monitored subtree. The launcher
-  binds a private copy of the Northstar skill for the docs selector and exposes
-  the named covering selectors through task-local wrapper selectors. Nested
-  Effigy admission and every test-built executable still need source review.
-  The covering Rust suite alone accepts a separately pre-created, owner-only
-  internal temporary root for its already-approved boot-Data fixtures; its
-  nested supervisor adopts that root, while TMPDIR and ordinary task inputs
-  stay in Builds work. No other selector uses the exception, and neither root
-  is automatically removed by this launcher. The route is not qualified by
-  these declarations. A source audit must still
-  establish every subprocess's environment, executable, path and destination,
-  and the owner must verify the ledger and actual remaining budget before any
-  invocation. The earlier failed inode packets remain failures, with no repair
-  or attribution assumption. The `OXIDE_POOL` source branch skips
-  `config::remember_pool`, but the saved packet cannot identify a writer and is
-  not evidence of isolation. The task's prospective debug-bootstrap bound is 300 seconds
-  and 1024 MiB monitored scratch (the earlier 512 MiB bound remains historical);
-  this does not qualify a route or increase the aggregate 6 GiB or 1200-second
-  covering limits. The proposed schema requires each writer descriptor target
-  to include its path, parent and object device/inode, and descriptor number;
-  the containing writer supplies process identity. A regular-file entry needs
-  a digest; an unreadable file uses the explicit refusal variant. `oxide_tree`
-  carries the staged Git tree identity separately from the commit. Volume
-  observations and volume obligations name the same declared window identity;
-  numeric file devices and string volume devices retain distinct variants.
-  This remains a proposal for the retained reviewer and B-S1/X-S2
-  reconciliation, not an accepted shape.
-  For this task only, the planner amended
-  the private Builds scratch cap prospectively from 2 GiB to 3 GiB, counting
-  earlier and current roots and preserving their evidence; the cumulative
-  1200 s wall, reserve and account inventory gates remain unchanged. At the
-  amendment the measured roots were 29 MiB, 329 MiB and 1525 MiB; the
-  historical 2 GiB limit remains bound to the earlier runs. The planner then
-  extended the task's aggregate limit prospectively to 4 GiB at a measured
-  3041 MiB baseline, preserving all earlier evidence and the historical 2 GiB
-  and 3 GiB limits. Tom subsequently approved a prospective 6 GiB ceiling for
-  the fresh isolated route at a measured 3468 MiB retained-root baseline (Queue
-  decision 1fb64e41); every prior and future root still counts. The historical
-  limits, 1200 s cumulative wall, reserve and inventory gates remain unchanged.
-  Preserve the earlier contaminated sessions and the operator's live-state
-  disposition separately in Queue.
-- **Private launcher context for a future authorized run.** Nothing in these
-  instructions authorizes a bootstrap or a live inventory. After the source
-  and isolation gates are approved, prepare a fresh `mktemp -d` child of
-  `/Volumes/Builds/scratch/oxide` with mode 0700, and use its canonical path
-  as `TAPE_RUN_ROOT`. Create owner-only directories `work/source`, `work/home`,
-  `work/cargo-home`, `work/scratch/tmp`, `work/bin`, and `bootstrap-target`
-  inside it. Create `work/config.toml` as a regular, empty, single-link 0600
-  file. Extract `git archive --format=tar HEAD` from the clean task checkout
-  into `work/source`, preserving executable bits and without links or extra
-  files. Set `TAPE_REPOSITORY` to the canonical task checkout, not the archive.
-  The launcher independently compares every staged file and executable bit
-  to the clean queue branch's archive, commit and tree; an unqualified archive
-  cannot attest itself. Do not run it with a dirty checkout or a different head.
+  validation handoff is the shared provider described below. Local tape
+  selectors refuse: only a planner-bound, independently qualified shared
+  packet and exact-head route can authorize a later execution. The previous
+  task-local sequence and its input schemas are retired, not qualified.
+  The previous `pools.json` inode replacements, including 2072777179 to
+  2072840885 with identical bytes, remain failed isolation gates; the writer
+  is unknown and no repair occurred. The later shared diagnostic #252 also
+  failed its registry identity gate, and #253 owns its source/provenance audit.
+  Neither failure grants proof credit.
 
-  Populate `work/cargo-home` with the already available offline dependency
-  cache using real owner-only directories and regular files, without symlinks,
-  Cargo config files or downloads. Copy the existing Northstar skill tree into
-  `work/home/.agents/skills/northstar` with the same private, no-link rules;
-  set `TAPE_NORTHSTAR_DIR` to its canonical original for the launcher's
-  content comparison. Set `RUSTUP_HOME` to the existing canonical Rustup
-  home and `TAPE_TOOLCHAIN_BIN` to its installed `toolchains/1.97.1-*/bin`
-  directory. Set `TAPE_EFFIGY` to the canonical existing Effigy executable.
-  For `cover-test` only, `TAPE_TEST_INTERNAL_ROOT` names a fresh empty,
-  owner-only child of `/private/tmp`, as allowed by the existing boot-Data
-  suite exception; no other action uses that exception. The launcher supplies
-  HOME, config, pool, scratch, TMP and the scrubbed subprocess environment.
+  The capture manifest remains a proposal: descriptor targets require path,
+  parent and object identity, and descriptor number; file entries need a
+  digest or explicit unreadable refusal. `oxide_tree` names the source tree;
+  volume obligations bind their declared window. Retained review and Barge
+  reconciliation are still needed before either side treats the shape as
+  accepted. The original caps and capture semantics remain unchanged.
 
-  Create `budget.json` in the run root as a single-link 0600 JSON file with
-  `task` equal to `d41de092-b0b0-495d-b159-8c4d1730d6b4`, a nonempty
-  `history_reference`, `covering_seconds_charged: 1200`, and `retained_roots`
-  containing the new run root and every earlier non-overlapping owned Builds
-  root. Obtain the reference, actual cumulative covering charges and exact
-  root list from retained Queue records and packets; verify them against that
-  history before use. The 3468 MiB historical baseline is a lower bound, not
-  a complete inventory or permission to assume zero elapsed time. Missing or
-  uncertain history refuses the run; the launcher cannot authenticate a
-  caller-supplied ledger by itself. Keep receipts and failed packets.
-
-  The 1200 is the planner's conservative admission charge, not a measured
-  elapsed time. The separate proposed block is at most another 1200 seconds,
-  so the charged total cannot exceed 2400; neither original history nor the
-  6 GiB aggregate is reset. Prepare `history-discovery.json` with task ID,
-  complete verified retained-root list and evidence digests, and a separate
-  `block-authorization.json` binding that file, `budget.json`, the exact run
-  root, source commit/tree, full canonical launcher binding, planner reference,
-  1200-second original admission charge, 1200-second prospective maximum and
-  a unique 64-hex one-use ID. The context binding digest is SHA-256 of the
-  launcher's `binding` JSON encoded with sorted keys and compact separators.
-  `TAPE_BLOCK_APPROVAL_SHA256` must be the planner-bound authorization digest;
-  an environment value or an owner-created JSON document alone does not prove
-  planner authorization. The caller must receive that binding from Queue after
-  independent source/discovery review. The block binds an affirmative retained
-  root quiescence admission. Each action records a bounded no-follow metadata
-  inventory and size for the other roots before and after, refusing changes or
-  unreadable entries. Equal snapshots do not rule out transient growth or
-  prove a continuous peak; a separate quiescence mechanism remains required.
-  An incomplete discovery packet refuses.
-
-  The candidate entry `proof:tape-prune:sequence` wraps the whole ordered
-  bootstrap, harness build, path preflight, focused checks and covering checks
-  in the existing shared supervisor under one `CLOCK_UPTIME_RAW` deadline. The
-  child reads the supervisor's own absolute deadline on that same system clock;
-  the parent alone measures its own elapsed time and writes the block result.
-  An interruption without a result remains unknown, and the one-use marker is
-  kept. It reserves
-  300 seconds before each action and retains one-use markers on interruption;
-  individual action selectors refuse outside this sequence. An action's own
-  300-second limit and scratch bound remain. The sequence stops when the
-  remaining block cannot admit an action; it does not grant a new block. The
-  preflight is the test-only resolver, while `preflight-build` itself runs the
-  debug front door and may open the pool before that resolver; source/env
-  analysis and each before/after inventory are not yet a positive dry proof
-  of all build/admission descendants. A current-head planner binding, qualified
-  quiescence and a source-proven actual dry gate remain prerequisites. This
-  recipe and this candidate source are not executable admission or evidence.
-  Source trace: `config::Facts::from_env` calls `proof_controls` and, with the
-  existing debug control set to `1`, `resolve_home` returns the supplied HOME
-  before account lookup. `Facts::state_dir` supplies the parent of
-  `config::known_pools`'s `pools.json`; `config_file` honors the explicit
-  OXIDE_CONFIG and settings honors OXIDE_POOL. `cli::classify` sends `check`
-  and `test` through the modelled leased path, and `main.rs` sets Cargo's
-  target to the checkout target. The launcher constructs a fresh environment
-  with those private controls and without inherited XDG values. That source
-  path explains the intended routing; it does not prove that every compiler,
-  build script, admission helper or test descendant preserves it. The
-  test-only resolver's cfg equivalence to the debug binary, the pre-registration
-  build route, live inventory equality, independently authenticated block
-  binding, continuous quiescence of retained roots and nested supervisor
-  custody remain runtime/admission premises. A Boolean quiescence field is
-  only a required planner input, not measurement of other roots. An interrupted
-  launch before its durable one-use marker and cross-context uniqueness also
-  require planner-side custody; the local file alone is not a global authority.
+  Historical private Builds limits of 2, 3, 4 and 6 GiB, the 1200-second
+  covering allowance, retained files and failed packets remain history. The
+  6 GiB session reported 5591.8 MiB retained and an approximately 552 MiB
+  whole-block clamp; that point observation is not a current reservation or
+  peak. The later 3 GiB Barge / 8 GiB Oxide grants are prospective only.
+  The 300 s / 1024 MiB debug bootstrap cap remains a maximum, not a fit claim.
 - **Harness composition.** The harness crate re-roots the actual library and
   binary modules and aliases itself as `oxide_storage`, sharing one tape.
   Library observations must come from their actual leaf sites; a fixture diff
@@ -1460,6 +1313,294 @@ final disagreement (currently `REF-ORPHAN-MARKED`, `RCP-V1`,
 current source in the comparison report or recorded as blocking, and O3 stays
 held while any blocking row stands. `D-1`/`D-2` (Q-E) and `D-3` (Q-D) keep
 their existing operator decision points.
+
+## Shared private-build validation gate (oxide#248)
+
+The capture tasks' private debug-build validation shares one common
+canonical provider in this repository: `scripts/test-private-build-validation.py`
+(oxide#248, project-owner decision `a451b488`). It owns the common admission
+prerequisites for Oxide #240/PR230 and Barge #041/PR41 so neither product
+worker re-implements the gate. The capture Rust source itself is unchanged;
+this apparatus authorizes nothing by existing and grants no cleanup, deletion
+or deployment authority.
+
+**Artifact interface.** The provider prepares and validates exactly the
+runtime documents the two reviewed wrappers consume — no new competing
+schema:
+
+- `barge.validation-source-audit/1`, `barge.private-roots/1` and
+  `barge.validation-block/1` (the accepted Barge launcher shapes, pinned to
+  the source-approved cap revision at
+  `60c2c793e0743ebb389dd433cec53251d00a0b87`, retained review run
+  `9c36470a-54ab-44a8-9e15-28ce1789e9c4`), built from private source
+  copies staged under the prepared task root, with component analyses bound
+  to the audited source sites and host executable digests measured live;
+- provider-emitted Oxide compatibility proposals: `budget.json`,
+  `history-discovery.json` and `block-authorization.json`. These remain
+  unissued inputs owned by the provider; the removed local launcher does not
+  consume or independently approve their shape;
+- one gate receipt, `oxide.private-build-validation/1`, whose qualification
+  state is always `unqualified` — receipt judgment is retained Queue review,
+  never this tool.
+
+Documents are deterministic (sorted keys, compact separators, trailing
+newline, no timestamps, no live sizes). Barge discovery preserves individually
+attributed loose historical logs as exact file entries, never their shared
+scratch parent. A file entry is opened without following links and its owner,
+identity, metadata and content are observed in each retained snapshot; a
+missing, unreadable or replaced file refuses. Neither the snapshot nor its
+allocation count establishes historical peak or continuous quiescence.
+
+For preparation the planner supplies `OXIDE_CORRECTED_DISCOVERY_PACKET` as
+the canonical path, under Oxide scratch, of the exact compact JSON bytes from
+PR 230 comment 6583995069 (SHA-256
+`1c60e2374b76e9004ac99f27bcb0297623cabddb6d2422e29cbc26cd040bb54a`,
+no trailing newline). The provider checks the digest and consumes every
+attributed candidate, including the six task roots, individual evidence files
+and attributed review/planner directories; it also accounts for the packet,
+review export and actual audit-input files. The review 6584174560 and packet
+retain unknown mixed attribution and other gaps; unresolved candidates are
+counted conservatively without asserting ownership. The proposal remains
+`complete: false` and does not authorize execution. No unrelated scratch root
+or shared pool is swept, and no prior point-in-time size is a present peak.
+
+**Execution model.** Preparation and the diagnostic use separate Barge
+phase roots, with the qualified supervisor adopting and sampling the entire
+active root, including its evidence and exports. The diagnostic verifies a
+closed preparation receipt and charges its wall time and a conservative 120 s
+pure-check reservation against both prospective blocks. **Source-bound
+cross-checkout preparation** (operator decision `af038a7e` v2; planner
+relative-path correction): the authorized continuation prepares at one Queue
+checkout and executes at the eventual merged-source proof-only checkout, so
+the diagnostic no longer compares script paths — the recorded preparation
+path may be relative (`scripts/test-private-build-validation.py`), and a
+path comparison could pass in the diagnostic's own cwd without any byte
+evidence, or error on an absolute path at a checkout that no longer exists.
+Preparation instead writes a deterministic `source-binding.json`
+(`oxide.private-build-validation.source-binding/1`) beside the packet
+manifest, positively binding the whole guard-recorded command verbatim, the
+preparation script's actual SHA-256 (computed in the preparation process,
+where its recorded path is meaningful), the qualified supervisor bytes
+(`fcfda2b0…`) and the packet manifest digest; it prints that binding's
+digest for the planner to bind. The diagnostic requires the planner-bound
+`--expect-source-binding` digest, re-reads the binding and the manifest from
+the retained packet (whose directory it locates only from the recorded
+command, never by resolving the recorded script path), verifies its own
+running script bytes against the bound digest, re-checks every manifest
+binding (run identity, packet, roots, heads, audit-input digest, unissued
+state and each named packet document digest), and refuses a changed script
+or guard, an edited command token, mismatched heads/roots/options, a
+malformed or missing binding or manifest, an edited manifest or packet
+document, or an unclosed preparation. Identical reviewed bytes at a
+different checkout are accepted; an absolute basename, an environment
+assertion or a removed check would not be a source binding. It consumes each
+planner-issued companion token once, under the relevant task root's guard;
+the exclusive persistent claim is retained even after refusal. A direct
+entry requires a matching live supervisor parent, command and receipt, not
+just exported environment variables. Parent-command and receipt mismatches name
+the failed predicate without printing the command or environment. The process
+reader compares the parent and child interpreter images using the kernel
+for both. It treats the kernel size probe as an allocation estimate, retries
+a bounded `ENOMEM`, and requires one exact matching returned row; errors and
+returned sizes are bounded refusal
+diagnostics, never evidence that an unknown process is absent. Root discovery
+and block proposals are unissued; a planner must resolve their unknowns and bind actual inputs before
+execution. A closed runner receipt and matching live inventories still require
+independent judgment; the diagnostic itself never grants qualification.
+
+The Barge bootstrap builds pinned Oxide `3de2413`; the independent Oxide
+product head is a separate input bound to the Oxide block. The global
+allowance includes setup, bootstrap, status and exports. The diagnostic
+brackets the retained inactive roots and account inventory, with inode and
+content equality; uncertainty refuses. The supervisor samples scratch usage,
+so a sample maximum is evidence, not an instantaneous peak measurement.
+
+**Host admission.** `EFFIGY_ADMISSION_HOOK` and `QUEUE_ADMISSION_SOCKET` are
+preserved exactly as the independent audit binds them; an unset hook is not
+host admission. The audited Effigy must be the direct executable, never an
+unbound shebang shim. The bootstrap's host admission is the gate task's own
+heavy Effigy admission through the audited hook, with the audited pair
+preserved in every child environment; no second admission seam exists and no
+Git-verified source archive is ever edited.
+
+**Resource clamps (operator decision `af038a7e` v2; review 6584174560).**
+Whole-block scratch is a measured clamp of each prospective aggregate grant
+minus retained bytes — Barge 3 GiB and Oxide 8 GiB of Builds scratch. The
+prospective grants do not renew or raise any earlier session: the historical
+2 GiB / 6 GiB runs and their evidence (Oxide's reported 5591.8 MiB retained
+total, about 552 MiB effective against the 6 GiB grant) keep their original
+bounds and stand as historical measurement only. The effective figure is
+measured at runtime, disclosed in the receipt, never silently raised, and
+never a claim that a phase fits: an impossible fit is an exact measured
+shortfall and refuses.
+
+**Selectors.** `proof:private-build-validation:test` (pure mocked
+counterfactuals covering every gate/refusal control: missing/unissued/duplicate
+block, exhausted time/disk, cross-process id/deadline mismatch, wrong
+source/digest/child env, absent admission hook/socket/runtime binding,
+unknown/incomplete/non-quiescent roots, empty/malformed inventory,
+same-content inode replacement, failed closure, real-tree accounting and
+clamp arithmetic (historical and prospective grants), exact/over-cap
+acceptance and refusal, packet/schema conformance, supervisor-context
+binding, and the cross-checkout source binding: identical reviewed bytes at
+a different checkout accepted; changed script/guard bytes, an edited command
+or manifest or packet document, mismatched heads/roots/options and a
+missing or malformed binding refused);
+`proof:private-build-validation:plan` (effect-free);
+`proof:private-build-validation:diagnostic` (heavy, whole command under the
+qualified supervisor). The diagnostic declaration carries no issued binding
+and refuses before any effect until the planner amends the command with the
+bound inputs. The exact command template the planner binds at issue:
+
+    OXIDE_TASK_SCRATCH_ROOT=<guarded-barge-root> python3 scripts/bounded-test.py --limit 1200 --scratch-budget-mib <reviewed-mib-at-most-512> -- \
+      python3 scripts/test-private-build-validation.py --diagnostic \
+      --oxide-repo <canonical oxide checkout> --oxide-head 3de241325dd286ae44a5759fa6825b05a81c7b4e \
+      --oxide-product-head <40-hex independently approved Oxide product head> \
+      --barge-repo <canonical barge checkout> --barge-head <40-hex> \
+      --barge-root /Volumes/Builds/scratch/barge/<prepared root> \
+      --oxide-root /Volumes/Builds/scratch/oxide/<prepared root> \
+      --expect-audit <sha256> --expect-ledger <sha256> \
+      --expect-budget <sha256> --expect-history <sha256> --expect-oxide-binding <sha256> \
+      --preparation-receipt <closed guard receipt> --expect-preparation <sha256> \
+      --expect-source-binding <sha256> \
+      [--planner-reference <string>]
+
+Preparation is a separate guarded document phase with a fresh adopted Barge
+root. The planner binds `--prepare --packet-dir <path inside preparation root>`
+plus the same repository, head and planned task-root arguments shown above.
+The Oxide task root must already exist before preparation. Retain the audit
+input manifest through diagnostic execution. Its `--audit-inputs <manifest>
+--expect-audit-inputs <sha256>` names bounded
+source copies, each with `source`, private relative `destination` and `sha256`;
+the diagnostic recopies and rechecks those same bytes from the retained phase.
+Each audit component source is bounded to 64 MiB for both construction and
+validation, matching the per-file staging limit; documents retain their 8 MiB limit.
+Admission executables and runtime files use the 256 MiB host-artifact digest
+bound and must still match their canonical paths and audited digests.
+An inventory mismatch still refuses isolation. Its bounded refusal identifies
+the phase, total changed rows and up to eight hashed paths with change kinds;
+it does not expose inventory values or establish which actor made a change.
+Comparison keys rows by unique path, independent of traversal order. On a
+mismatch the guarded private evidence directory retains the actual before and
+after rows and difference summary, capped at 8 MiB; excess refuses without
+claiming that the evidence was saved. Duplicate paths also refuse.
+The same digest-bound manifest requires `retained_roots`, a nonempty list of
+at most 64 canonical, owned, non-group-writable task-private directories under
+the Barge or Oxide scratch subtree. It must name entire prior preparation and
+future-runtime roots, including partial archives, not just receipt files.
+The guard validates the list before any tree walk or packet write and counts
+the named shared history against both grants. Before copying, it emits one
+bounded stdout observation of the Barge and Oxide retained bytes, effective
+preparation clamp and chosen guard budget; those are current observations,
+not a historical peak. Bases, aliases, escapes, missing roots and
+active/future-root overlaps refuse. The planner still verifies
+attribution, completeness and quiescence; a list alone does not establish them.
+It preserves that phase's receipt and packet, resolves every unknown, reviews
+the source audit and then issues the documents and companion tokens. The
+preparation manifest binds each unissued document digest; audit component
+entries name the source pairs rather than their accompanying analysis text. The
+preparation root is retained and counted before the diagnostic. All command
+and environment bindings are fixed before dispatch; changing the source needs
+new source review. The displayed diagnostic scratch budget is a planner-bound
+clamp, and the repository selector's 512 MiB default refuses if it does not
+fit the measured remainders.
+
+with the issued documents and their digests in the environment
+(`BARGE_VALIDATION_BLOCK[+_SHA256]`, `BARGE_VALIDATION_SOURCE_AUDIT[+_SHA256]`,
+`BARGE_VALIDATION_ROOT_LEDGER[+_SHA256]`, `BARGE_VALIDATION_EFFIGY`,
+`BARGE_VALIDATION_GIT`, `BARGE_VALIDATION_SUPERVISOR`, `BARGE_PINNED_RUSTC`,
+`TAPE_BLOCK_APPROVAL_SHA256`, `EFFIGY_ADMISSION_HOOK`,
+`QUEUE_ADMISSION_SOCKET`, `CARGO_HOME`, `RUSTUP_TOOLCHAIN`, and optionally
+`RUSTUP_HOME`). The Barge phase root must be the outer guard's adopted scratch
+root, including its evidence; the short Oxide claim phase's guard adopts the
+Oxide root. The planner binds the appropriate measured
+whole-root caps and includes the preparation root in the retained ledger.
+Before the diagnostic the planner creates the canonical owner-only Oxide root
+and places `budget.json`, `history-discovery.json`, and the issued
+`block-authorization.json` directly there; the last has an owner-only
+`block-authorization.json.token` companion. In the guarded Barge root the
+planner places the reviewed source-audit template, the root ledger, and the
+issued Barge block template, plus its `<block-name>.token` companion. Each
+token contains its block-template digest and a newline. Both the Barge block
+template's `oxide_sha256` and `audit_sha256` and the audit template's
+`oxide_sha256` must be JSON null. Its `authorization_reference` starts with
+`derived-artifact-v1:` followed by the external issue reference: this
+explicitly authorizes the provider to fill only those fields from the one
+supervised bootstrap and the resulting canonical audit digest. The provider
+writes the resulting complete wrapper-compatible audit and block to the Barge
+root's `issued/` directory, records the template and derived digests, and the
+wrapper receives the derived bytes and digests. No second build, issuer or
+pre-run binary digest is assumed. The planner reviews the template and this
+specific derivation before issuing; the provider cannot extend its bounds.
+A fixed exclusive hard-link claim burns each token across runs; a partial
+claim is never retried. `CARGO_HOME` identifies
+the invoking offline seed; `RUSTUP_HOME` falls back to the invoking
+`HOME/.rustup` before HOME is replaced, and `RUSTUP_TOOLCHAIN` is pinned.
+The audited admission hook, socket, direct Effigy, Git, supervisor, rustc and
+child PATH must all match the issued audit. The planner supplies and reviews
+source component copies, host provenance, the complete root ledger and both
+issued blocks; proposed documents alone are not an admission packet.
+`planner_reference` must be confirmed by the planner at binding (the
+proposal carries the brief-v11 string; the held brief is now v12).
+
+**Status and the approved continuation (oxide#249; operator decision
+`af038a7e` v2, 2026-11-02).** The gate's source landed source-only as
+#248/PR234 (merged `1854c581`); it grants no qualification. The first
+proofExecution, Queue execution `0feea5af` at `67eea662`, failed after its
+debug bootstrap: the guard closed with exit 2, no fault or deadline, and a
+certain empty census, on the post-bootstrap live-inventory bracket (receipt
+`/Volumes/Builds/scratch/barge/248-retained-runtime.pz0dqxo7/supervisor-evidence.09j75k94/receipt.json`,
+SHA-256 `9dee671b093f1e3a2f9cabe6f48c5f45abf5b5ac31cb8c02377da7cb24c976e0`);
+the single original bootstrap grant is spent, the compared inventories were
+not persisted, and no qualification or acceptance is claimed. That failure
+packet and the earlier preparation packet (`248-retained-prepare.i0okptqk`,
+whose receipt names a relative script path) are historical evidence: old
+packets, receipts and manifests are untouched and carry no binding under the
+source-bound route, and consumed claims are never re-opened. The ruling
+approves ONE further shared Queue diagnostic and at most ONE additional
+300 s private debug bootstrap, inside the SAME at-most-749 s remaining to
+each block (1200 s minus 451 s already charged, including the failed run's
+58 s). The Barge cap revision's safe checks deduct a further 4 s,
+conservatively charged to both blocks, leaving at most 745 s before the
+continuation's own checks and preparation, with the prospective 3 GiB / 8 GiB
+caps above. Preparation for that
+continuation may run at one Queue checkout and the diagnostic at the
+eventual merged-source proof-only checkout under the source-bound
+`--expect-source-binding` route. No new clock, reset, refund, cleanup,
+install, production redirect, live shared-pool/output read or additional
+runtime is granted; any inode/content delta, unknown custody or exceeded
+bound still refuses, and the retained reviewer judges the actual receipt
+before the planner releases the gate. Both capture tasks remain manually
+held pending the actual new proof-only qualification and its required
+covering evidence; merged source-only #248 and the failed native `0feea5af`
+are distinct facts and neither is a qualification.
+
+**Capture handoff.** The obsolete #240 local sequence, its local admission
+schemas and its launch machinery are removed. The shared provider owns the
+preparation inputs, source binding, one-use claim, effective clamp and guarded
+execution. The local `proof:tape-prune:*` execution entries fail closed: they
+do not accept a token, launch a child or attest a packet. Only the planner may
+bind the independently qualified shared-provider receipt and the exact-head
+selector/export command for the capture task. The shared diagnostic #252 failed
+its live registry-identity gate, so no executable packet is qualified. #253
+independently audits the remaining source and provenance. Source integration
+alone never permits the diagnostic, a fixture, native work or a merge.
+
+**Premise dispositions (HIGH, proof-apparatus authoring).** (1) Private
+HOME/CARGO_HOME with the invoking `RUSTUP_HOME` captured before replacement,
+pinned 1.97.1, `RUSTUP_AUTO_INSTALL=0`, offline lock from the extracted
+archive, seeded by the shared bounded seeder from the invoking CARGO_HOME —
+never a download. (2) `OXIDE_TEST_HOME_FROM_ENV=1` on every product child.
+(3) The child environment is an explicit allowlist that drops inherited
+`OXIDE_*`, `XDG_*`, `CARGO_*`, `SCCACHE_*` values and passes only the audited
+admission pair plus the declared controls. (4)–(5) No automatic adoption and
+no Cargo external argv are involved. (6) No image, attach or detach. (7)
+`RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS` are not inherited (the allowlist
+drops them; the bootstrap is a plain offline debug build). (8) The gate's own
+scratch lives under the supervisor's adopted root; task roots live under the
+task scratch bases with the gate's own accounting. (9) Fixture temp in the
+self-test uses a `mktemp` template under `OXIDE_TASK_SCRATCH_ROOT` or the
+temp directory, resolved canonically.
 
 ## Failure and race matrix
 

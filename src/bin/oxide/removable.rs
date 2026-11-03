@@ -641,6 +641,15 @@ pub(crate) fn read_registration(control: &Path) -> Result<Option<Registration>, 
     let Some(directory) = store::open_control_directory(control)? else {
         return Ok(None);
     };
+    read_registration_at(&directory)
+}
+
+/// Read the registration under an already-verified control directory
+/// descriptor, so a caller that pinned that directory witnesses the document
+/// of exactly the pinned control (oxide#235). The read is charged to the
+/// prune authority budget through [`crate::prune::authority_read`] whenever
+/// a window is active.
+pub(crate) fn read_registration_at(directory: &File) -> Result<Option<Registration>, String> {
     let name = CString::new(REGISTRATION).map_err(|error| error.to_string())?;
     // SAFETY: `name` is a live CString with initialized bytes through its
     // terminator, and `directory` owns a live descriptor that anchors this

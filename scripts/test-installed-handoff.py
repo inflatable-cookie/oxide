@@ -25,6 +25,35 @@ replacement between hashing and the last check; skipped commands; and a
 command that reaches final release after effects with newer state, which must
 never execute anything.
 
+The trace layout binds two independent supervisor identities to their own
+real sources and never equates them: the exported `OXIDE_PROOF_RUN_ID`
+(session token) must equal the guard receipt's `run_id`, and the scratch
+marker's `run_id` must equal that receipt's `scratch_marker.run_id` (the
+monitor generates the two tokens independently). The diagnostic attributes
+raw trace evidence per instrumented command and fails when the instrument
+did not fire; missing ends stay unknown and trace totals and times are
+observations, never acceptance gates.
+
+The oxide#243 partition extends the instrument into the post-open tail of
+`Store::open_or_create`: `sticky-exclusion`, `backup-exclude` (with its
+nested real `tmutil` children `backup-addexclusion` and
+`backup-isexcluded`), `remember-pool` and `ensure-control`. Each phase wraps
+exactly one existing step; statements, order, results and branches are
+unchanged and release builds stay silent. One creation-path command can
+emit at most 38 events (19 paired phases; `remember-pool` is unreachable
+for these commands' `OXIDE_POOL` sources), inside the unchanged 64-event
+cap, which the parser now also pins: a file with more event lines cannot be
+product output. The per-command summary carries each phase's actual
+duration, the measured `store-open`-end-to-`store`-end span with its
+explicit residual, and honest states (measured / unknown / not-applicable /
+absent) for the plan; a traced command whose trace shows `store-open` and
+`workspace` paired completed the reached creation path, and every applicable
+planned phase must then be paired there — a clean 17/17 collection with
+absent reached-path instrumentation is insufficient and exits 1. This is a
+partition of observations, not a latency fix or a product verdict: no cause
+is concluded and no timing is an acceptance gate. Papercut 18fc63cf stays
+open.
+
 HIGH premise dispositions (see the case bodies and helpers below):
 1. _stage_subject captures invoking rustup and Cargo cache before a private HOME;
    fixture children use private HOME/CARGO_HOME, the pinned toolchain, no auto
@@ -72,6 +101,12 @@ import tempfile
 import time
 
 MIB = 1024 * 1024
+RECEIPT_MAX_BYTES = 64 * 1024
+TRACE_READ_BYTES = 64 * 1024
+# The product caps one trace at 64 emitted events; more event lines cannot
+# be product output. One creation-path command reaches at most 38 events
+# (19 paired phases), so the cap does not grow.
+TRACE_EVENT_CAP = 64
 NOTICE = "oxide: handing off to the installed binary (state is newer than this one).\n"
 REFUSAL = "oxide: oxide was upgraded during this command; re-run.\n"
 # Control-state versions and the fences in the documents this proof plants.
@@ -188,13 +223,43 @@ def bounded_output(value):
     return data[:2048].decode("utf-8", "replace")
 
 
+def read_receipt(evidence: str, owner_uid: int):
+    """One bounded no-follow snapshot of the guard's published receipt at
+    `<evidence>/receipt.json`. The monitor replaces that path atomically
+    (`receipt.json.tmp` + rename) at each phase, so one open descriptor always
+    reads exactly one whole publication; a snapshot whose identity changed
+    between lstat and open, a symlink, a foreign owner, an oversized file, or
+    a truncated or malformed document refuses. There is no retry: any refused
+    receipt disables the trace."""
+    path = os.path.join(evidence, "receipt.json")
+    info = os.lstat(path)
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != owner_uid
+            or info.st_size > RECEIPT_MAX_BYTES):
+        return None
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+            return None
+        raw = handle.read(RECEIPT_MAX_BYTES + 1)
+    if len(raw) > RECEIPT_MAX_BYTES:
+        return None
+    return json.loads(raw)
+
+
 def trace_layout(env, evidence, run_id):
-    """Refuse anything except the owned supervisor and this private fixture."""
+    """Refuse anything except the owned supervisor and this private fixture.
+    The two supervisor identities bind to their own sources and are never
+    equated: the exported session token equals the guard receipt's `run_id`,
+    the marker token equals the receipt's `scratch_marker.run_id`, the
+    receipt names this verified root, scratch and evidence, and the marker's
+    canonical root, UID, device and inode match the opened descriptor."""
     try:
         scratch = env["OXIDE_TASK_SCRATCH_ROOT"]
         fixture_root = env["OXIDE_SCRATCH_ROOT"]
         home = env["HOME"]
         root = os.path.dirname(scratch)
+        marker_path = os.path.join(root, ".oxide-scratch.json")
         paths = (scratch, evidence, fixture_root, home, root)
         if any(not os.path.isabs(p) or os.path.realpath(p) != p for p in paths):
             return False
@@ -205,7 +270,6 @@ def trace_layout(env, evidence, run_id):
                 or env.get("OXIDE_POOL") != os.path.join(os.path.dirname(home), "pool")):
             return False
         info = os.lstat(root)
-        marker_path = os.path.join(root, ".oxide-scratch.json")
         marker_info = os.lstat(marker_path)
         if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077
                 or not stat.S_ISREG(marker_info.st_mode) or marker_info.st_uid != info.st_uid
@@ -220,14 +284,289 @@ def trace_layout(env, evidence, run_id):
         if len(raw) > 4096:
             return False
         marker = json.loads(raw)
-        return (isinstance(run_id, str) and re.fullmatch(r"[0-9a-f]{32}", run_id) is not None
-                and marker.get("run_id") == run_id and marker.get("root") == root
-                and marker.get("owner_uid") == info.st_uid and marker.get("device") == info.st_dev
-                and marker.get("inode") == info.st_ino and marker.get("version") == 1
-                and marker.get("outcome") == "running" and marker.get("closure") == "none"
-                and marker.get("concluded_unix", False) is None)
+        session = run_id
+        marker_run = marker.get("run_id")
+        if (not isinstance(session, str) or re.fullmatch(r"[0-9a-f]{32}", session) is None
+                or not isinstance(marker_run, str)
+                or re.fullmatch(r"[0-9a-f]{32}", marker_run) is None
+                or marker.get("root") != root
+                or marker.get("owner_uid") != info.st_uid
+                or marker.get("device") != info.st_dev
+                or marker.get("inode") != info.st_ino
+                or marker.get("version") != 1
+                or marker.get("outcome") != "running" or marker.get("closure") != "none"
+                or marker.get("concluded_unix", False) is not None):
+            return False
+        receipt = read_receipt(evidence, info.st_uid)
+        scratch_marker = receipt.get("scratch_marker") if isinstance(receipt, dict) else None
+        return (isinstance(scratch_marker, dict)
+                and receipt.get("run_id") == session
+                and receipt.get("root") == root
+                and receipt.get("scratch") == scratch
+                and receipt.get("evidence") == evidence
+                and isinstance(receipt.get("phase"), str) and bool(receipt["phase"])
+                and scratch_marker.get("run_id") == marker_run
+                and scratch_marker.get("path") == marker_path)
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return False
+
+
+def parse_trace_events(path: str) -> dict:
+    """Bounded read of one product trace file: `<name> start|end <nanos>`
+    lines from the debug-only phase instrument. A refused, unreadable,
+    oversized, empty, malformed or over-cap file never counts as evidence:
+    the product caps one trace at 64 events, so more event lines cannot be
+    product output. Paired phases carry their actual durations from the
+    product's single monotonic clock; a start without a matching end stays an
+    unknown end and never receives an invented one."""
+    record = {"state": "missing", "bytes": None, "events": 0, "first": None,
+              "last": None, "phases": {}, "unpaired": [], "pairs": [],
+              "first_start_ns": None, "last_end_ns": None, "window_ns": None}
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(TRACE_READ_BYTES + 1)
+    except OSError:
+        record["state"] = "unreadable"
+        return record
+    record["bytes"] = len(raw)
+    if len(raw) > TRACE_READ_BYTES:
+        record["state"] = "oversized"
+        return record
+    if not raw:
+        record["state"] = "empty"
+        return record
+    events = []
+    for line in raw.decode("ascii", "replace").splitlines():
+        parts = line.split(" ")
+        if len(parts) != 3 or parts[1] not in ("start", "end") or not parts[2].isdigit():
+            record["state"] = "malformed"
+            return record
+        events.append((parts[0], parts[1], int(parts[2])))
+    if len(events) > TRACE_EVENT_CAP:
+        record["state"] = "over-cap"
+        record["events"] = len(events)
+        return record
+    phases: dict = {}
+    pending: dict = {}
+    pairs = []
+    for name, kind, nanos in events:
+        counts = phases.setdefault(name, {"starts": 0, "ends": 0})
+        counts["starts" if kind == "start" else "ends"] += 1
+        record["events"] += 1
+        record["last"] = name
+        if record["first"] is None:
+            record["first"] = name
+        if kind == "start":
+            pending.setdefault(name, []).append(nanos)
+            if record["first_start_ns"] is None:
+                record["first_start_ns"] = nanos
+        elif pending.get(name):
+            start = pending[name].pop(0)
+            pairs.append({"name": name, "start_ns": start, "end_ns": nanos,
+                          "duration_ns": nanos - start})
+            if record["last_end_ns"] is None or nanos > record["last_end_ns"]:
+                record["last_end_ns"] = nanos
+    record["state"] = "evidence"
+    record["phases"] = phases
+    record["unpaired"] = sorted(name for name, counts in phases.items()
+                                if counts["starts"] != counts["ends"])
+    record["pairs"] = pairs
+    if record["first_start_ns"] is not None and record["last_end_ns"] is not None:
+        record["window_ns"] = record["last_end_ns"] - record["first_start_ns"]
+    return record
+
+
+def measured_union_ns(pairs):
+    """Total time covered by the paired phase intervals, as their union, so a
+    nested phase inside its parent is never counted twice."""
+    covered_end, total = None, 0
+    for start, end in sorted((pair["start_ns"], pair["end_ns"]) for pair in pairs):
+        if covered_end is None or start > covered_end:
+            total += end - start
+            covered_end = end
+        elif end > covered_end:
+            total += end - covered_end
+            covered_end = end
+    return total
+
+
+# The post-open tail partition (oxide#243): the debug-only phase names
+# `Store::open_or_create` wraps around its steps after `store-open` returns.
+# `remember-pool` is instrumented too, but this proof's fixture commands take
+# their pool from `OXIDE_POOL` (an Environment source), so that branch cannot
+# be reached and its absence is expected, never missing evidence. On a
+# non-macOS host the two real `tmutil` children are likewise not applicable.
+STORE_TAIL_PLAN = ("sticky-exclusion", "backup-exclude", "backup-addexclusion",
+                   "backup-isexcluded", "remember-pool", "ensure-control")
+
+
+def store_tail_states(parsed):
+    """The honest per-phase state of the post-open tail in one parsed trace.
+    A trace that itself shows `store-open` and `workspace` paired completed
+    the reached creation path, and every applicable planned phase must then be
+    paired there; anything less is a problem, never a pass by counts. States:
+    measured (paired, with its duration), unknown (unpaired start, no end
+    invented), not-applicable (branch or platform cannot reach it), absent
+    (otherwise unreached or missing). Durations and states are observations;
+    this derives no product verdict and no cause."""
+    phases = parsed["phases"]
+    durations: dict = {}
+    for pair in parsed["pairs"]:
+        durations.setdefault(pair["name"], []).append(pair["duration_ns"])
+
+    def paired(name):
+        counts = phases.get(name)
+        return bool(counts) and counts["starts"] == counts["ends"] == 1
+
+    macos = sys.platform == "darwin"
+    completed = paired("store-open") and paired("workspace")
+    required = []
+    if completed:
+        required = ["sticky-exclusion", "backup-exclude", "ensure-control"]
+        if macos:
+            required += ["backup-addexclusion", "backup-isexcluded"]
+    states = {}
+    for name in STORE_TAIL_PLAN:
+        counts = phases.get(name)
+        if counts and counts["starts"] != counts["ends"]:
+            states[name] = {"state": "unknown", "duration_ns": None}
+        elif counts:
+            states[name] = {"state": "measured",
+                            "duration_ns": (durations.get(name) or [None])[0]}
+        elif (name == "remember-pool"
+              or name in ("backup-addexclusion", "backup-isexcluded") and not macos):
+            states[name] = {"state": "not-applicable", "duration_ns": None}
+        else:
+            states[name] = {"state": "absent", "duration_ns": None}
+    return {"completed": completed, "required": required, "phases": states}
+
+
+def store_tail_span(parsed):
+    """The measured region this partition explains: the paired `store-open`
+    end to the paired `store` end, with the union of paired tail intervals
+    inside it and the explicit residual no phase names. A missing bracket
+    keeps the span unknown with its precise coverage reason."""
+    open_pair = next((pair for pair in parsed["pairs"] if pair["name"] == "store-open"), None)
+    store_pair = next((pair for pair in parsed["pairs"] if pair["name"] == "store"), None)
+    if open_pair is None or store_pair is None:
+        return {"span_ns": None, "measured_union_ns": None, "residual_ns": None,
+                "reason": "store-open or store is not paired in this trace"}
+    span = store_pair["end_ns"] - open_pair["end_ns"]
+    tail_pairs = [pair for pair in parsed["pairs"]
+                  if pair["name"] in STORE_TAIL_PLAN
+                  and pair["start_ns"] >= open_pair["end_ns"]
+                  and pair["end_ns"] <= store_pair["end_ns"]]
+    union = measured_union_ns(tail_pairs)
+    return {"span_ns": span, "measured_union_ns": union,
+            "residual_ns": max(0, span - union), "reason": None}
+
+
+def attribute_traces(commands, *, evidence=None, session=None) -> dict:
+    """Bind every traced command to its own raw trace evidence and to the
+    guard receipt's two identities. A refused layout or absent raw evidence
+    is an insufficient-instrumentation outcome, never a successful
+    attribution beside passing cases. An unpaired start stays an unknown end;
+    totals, durations and spans are observations, never acceptance gates and
+    never a product verdict. A traced command whose evidence shows the
+    reached creation path completed (`store-open` and `workspace` paired)
+    must carry every applicable planned post-open tail phase paired; a clean
+    collection with absent reached-path instrumentation is insufficient."""
+    evidence = os.environ.get("OXIDE_PROOF_EVIDENCE", "") if evidence is None else evidence
+    session = os.environ.get("OXIDE_PROOF_RUN_ID", "") if session is None else session
+    receipt = None
+    if evidence and os.path.isdir(evidence):
+        try:
+            receipt = read_receipt(evidence, os.geteuid())
+        except (OSError, ValueError):
+            receipt = None
+    receipt_run = receipt.get("run_id") if isinstance(receipt, dict) else None
+    marker_run = None
+    if isinstance(receipt, dict) and isinstance(receipt.get("scratch_marker"), dict):
+        marker_run = receipt["scratch_marker"].get("run_id")
+    rows, problems = [], []
+    traced = [command for command in commands if isinstance(command.get("trace"), dict)]
+    if not traced:
+        problems.append("no instrumented commands were recorded")
+    if receipt_run != session:
+        problems.append(f"guard receipt run_id {receipt_run!r} does not bind the "
+                        f"exported OXIDE_PROOF_RUN_ID {session!r}")
+    for command in traced:
+        trace = command["trace"]
+        case = command.get("case")
+        row = {"case": case, "allocation": trace.get("state"),
+               "file": trace.get("file"), "run": trace.get("run"), "bytes": None,
+               "events": 0, "first": None, "last": None, "phases": {}, "unpaired": [],
+               "evidence": None, "durations": [], "first_start_ns": None,
+               "last_end_ns": None, "window_ns": None, "measured_union_ns": None,
+               "residual_ns": None, "store_tail": None}
+        if trace.get("state") == "allocated" and trace.get("file"):
+            parsed = parse_trace_events(os.path.join(evidence, trace["file"]))
+            row["bytes"] = parsed["bytes"]
+            row["events"] = parsed["events"]
+            row["first"], row["last"] = parsed["first"], parsed["last"]
+            row["phases"], row["unpaired"] = parsed["phases"], parsed["unpaired"]
+            row["evidence"] = parsed["state"]
+            row["durations"] = parsed["pairs"]
+            row["first_start_ns"] = parsed["first_start_ns"]
+            row["last_end_ns"] = parsed["last_end_ns"]
+            row["window_ns"] = parsed["window_ns"]
+            if parsed["state"] == "evidence":
+                row["measured_union_ns"] = measured_union_ns(parsed["pairs"])
+                if row["window_ns"] is not None:
+                    row["residual_ns"] = max(0, row["window_ns"] - row["measured_union_ns"])
+                tail_states = store_tail_states(parsed)
+                span = store_tail_span(parsed)
+                row["store_tail"] = dict(span, **{"completed": tail_states["completed"],
+                                                  "required": tail_states["required"],
+                                                  "phases": tail_states["phases"]})
+                if not tail_states["completed"]:
+                    problems.append(f"{case}: trace does not show the completed "
+                                    f"creation path; no reached-path requirement holds")
+                for name in tail_states["required"]:
+                    state = tail_states["phases"][name]["state"]
+                    if state == "absent":
+                        problems.append(f"{case}: required reached-path phase {name} "
+                                        f"is absent from the trace")
+                    elif state == "unknown":
+                        problems.append(f"{case}: required reached-path phase {name} "
+                                        f"has an unpaired start (unknown end)")
+            if trace.get("run") != session:
+                problems.append(f"{case}: trace allocation names run "
+                                f"{trace.get('run')!r}, not the exported session token")
+            if parsed["state"] != "evidence":
+                problems.append(f"{case}: no raw trace evidence ({parsed['state']})")
+        else:
+            problems.append(f"{case}: trace not allocated ({trace.get('state')})")
+        rows.append(row)
+    spans = [row["store_tail"]["span_ns"] for row in rows
+             if isinstance(row.get("store_tail"), dict) and row["store_tail"]["span_ns"] is not None]
+    observations = {}
+    for name in STORE_TAIL_PLAN:
+        values = [row["store_tail"]["phases"][name]["duration_ns"] for row in rows
+                  if isinstance(row.get("store_tail"), dict)
+                  and row["store_tail"]["phases"][name]["duration_ns"] is not None]
+        observations[name] = ({"measured": len(values), "min_ns": min(values),
+                               "max_ns": max(values)} if values
+                              else {"measured": 0, "min_ns": None, "max_ns": None})
+    return {"source": {"session": session, "receipt_run": receipt_run,
+                       "marker_run": marker_run, "evidence": evidence},
+            "expected_traced": len(rows),
+            "allocated": sum(1 for row in rows if row["allocation"] == "allocated"),
+            "with_evidence": sum(1 for row in rows if row["evidence"] == "evidence"),
+            "unknown_ends": sum(1 for row in rows if row["unpaired"]),
+            "completed_creation_paths": sum(1 for row in rows
+                                            if isinstance(row.get("store_tail"), dict)
+                                            and row["store_tail"]["completed"]),
+            "commands": rows,
+            "store_tail_spans": {"commands": len(spans), "min_ns": min(spans) if spans else None,
+                                 "max_ns": max(spans) if spans else None},
+            "tail_phase_observations": observations,
+            "problems": problems[:8],
+            "problems_omitted": max(0, len(problems) - 8),
+            "outside": ("each command's window is its own first start to last end; earlier "
+                        "and later steps stay outside it, unpaired starts keep unknown ends, "
+                        "and residual_ns is the window time no paired phase covers"),
+            "sufficient": not problems}
 
 
 def observed_run(argv, *, limit, _runner=None, _remaining=None, _merged_log=None, _fixture=None, _trace=False, **kwargs):
@@ -1190,12 +1529,18 @@ def empty_outcome():
     return {"qualified": False, "states": {name: "unexecuted" for name in CASE_PLAN}, "reached": [], "completed": [], "failed": [],
             "active": None, "groups_completed": [], "unexecuted_groups": [],
             "aborted": None, "case_times": {}, "commands": [], "commands_omitted": 0,
-            "last_command": None, "phase": None, "phases": [],
+            "last_command": None, "phase": None, "phases": [], "trace_attribution": None,
             "start_ns": time.monotonic_ns(), "end_ns": None}
 
 
 def diagnostic_exit(outcome):
-    """A clean collection is still unqualified; incomplete evidence is failure."""
+    """A clean collection is still unqualified; incomplete evidence is failure,
+    and so is an insufficient trace-attribution result: a collection whose
+    instrumented commands were all refused or produced no raw trace evidence
+    never passes beside passing case oracles."""
+    attribution = outcome.get("trace_attribution")
+    instrumented = (isinstance(attribution, dict) and attribution.get("sufficient") is True
+                    and not attribution.get("problems"))
     clean = (outcome["qualified"] is False and not outcome["failed"]
              and outcome["aborted"] is None and outcome["active"] is None
              and not outcome["unexecuted_groups"]
@@ -1203,7 +1548,7 @@ def diagnostic_exit(outcome):
              and outcome["reached"] == list(CASE_PLAN)
              and outcome["completed"] == list(CASE_PLAN)
              and outcome["states"] == {name: "completed" for name in CASE_PLAN})
-    return 0 if clean else 1
+    return 0 if clean and instrumented else 1
 
 
 def self_check():
@@ -1300,7 +1645,11 @@ def self_check():
     clean["reached"] = list(CASE_PLAN)
     clean["completed"] = list(CASE_PLAN)
     clean["states"] = {name: "completed" for name in CASE_PLAN}
+    clean["trace_attribution"] = {"sufficient": True, "problems": []}
     assert diagnostic_exit(clean) == 0 and clean["qualified"] is False
+    clean["trace_attribution"] = {"sufficient": False, "problems": ["layout refused"]}
+    assert diagnostic_exit(clean) == 1, "insufficient instrumentation fails a clean collection"
+    clean["trace_attribution"] = {"sufficient": True, "problems": []}
     clean["states"][CASE_PLAN[-1]] = "unexecuted"
     assert diagnostic_exit(clean) == 1
     clean["states"][CASE_PLAN[-1]] = "completed"
@@ -1347,6 +1696,9 @@ def self_check():
         else:
             os.environ["OXIDE_TASK_SCRATCH_ROOT"] = old_scratch
     # Synthetic supervisor layout: no product child or live account is read.
+    # The qualified schema carries two independent tokens: the receipt's
+    # session `run_id` and the marker's own `run_id`, bound to each other
+    # through `scratch_marker.run_id` only.
     with tempfile.TemporaryDirectory(prefix="handoff-layout.", dir=os.environ["TMPDIR"]) as root:
         scratch = os.path.join(root, "scratch")
         evidence = os.path.join(root, "evidence")
@@ -1355,20 +1707,232 @@ def self_check():
         os.makedirs(home, mode=0o700)
         os.mkdir(evidence, 0o700)
         info = os.stat(root)
-        marker = {"run_id": "a" * 32, "root": root, "owner_uid": info.st_uid,
-                  "device": info.st_dev, "inode": info.st_ino, "version": 1,
-                  "outcome": "running", "closure": "none", "concluded_unix": None}
-        write(os.path.join(root, ".oxide-scratch.json"), json.dumps(marker), 0o600)
+        session, marker_run = "9f13c2a47b8d0e5623ab4cd6ef901257", "5d8a02be71c49f3ea6d80b29c5147f36"
+        marker_path = os.path.join(root, ".oxide-scratch.json")
+        marker = {"version": 1, "run_id": marker_run, "root": root, "owner_uid": info.st_uid,
+                  "device": info.st_dev, "inode": info.st_ino, "created_unix": 1700000000.0,
+                  "concluded_unix": None, "outcome": "running", "closure": "none",
+                  "kept_reason": "none", "nested_scope": "exclusive"}
+        write(marker_path, json.dumps(marker), 0o600)
+        receipt = {"run_id": session, "command": ["python3", "proof"], "limit_s": 600.0,
+                   "root": root, "scratch": scratch, "evidence": evidence,
+                   "scratch_owned": True, "start_ns": 1, "abort_threshold": 1,
+                   "phase": "started: incomplete", "leader": None, "custodian": [],
+                   "outcome": None, "census": None, "census_rounds": 0, "survivors": [],
+                   "scratch_marker": {"path": marker_path, "state": "written",
+                                      "run_id": marker_run, "reason": None}}
+        receipt_path = os.path.join(evidence, "receipt.json")
+        write(receipt_path, json.dumps(receipt), 0o644)
         env = {"HOME": home, "OXIDE_POOL": os.path.join(os.path.dirname(home), "pool"),
                "OXIDE_TASK_SCRATCH_ROOT": scratch, "OXIDE_SCRATCH_ROOT": fixture_root,
                "OXIDE_TEST_HOME_FROM_ENV": "1"}
-        assert trace_layout(env, evidence, "a" * 32)
-        assert not trace_layout(env, evidence, "b" * 32)
-        assert not trace_layout(env, root, "a" * 32)
-        assert not trace_layout({}, evidence, "a" * 32)
-        marker["outcome"] = "closed"
-        write(os.path.join(root, ".oxide-scratch.json"), json.dumps(marker), 0o600)
-        assert not trace_layout(env, evidence, "a" * 32)
+        assert trace_layout(env, evidence, session), "two distinct valid tokens enable"
+        assert not trace_layout(env, evidence, marker_run), "session slot refuses the marker token"
+        assert not trace_layout(env, evidence, "a" * 32), "a third token refuses"
+        assert not trace_layout(env, root, session), "a wrong evidence argument refuses"
+        assert not trace_layout({}, evidence, session), "a missing environment refuses"
+
+        def broken(**changes):
+            document = json.loads(json.dumps(receipt))
+            document.update(changes)
+            write(receipt_path, json.dumps(document), 0o644)
+            enabled = trace_layout(env, evidence, session)
+            write(receipt_path, json.dumps(receipt), 0o644)
+            return enabled
+
+        assert not broken(run_id=marker_run), "swapped receipt session token refuses"
+        assert not broken(scratch_marker={"path": marker_path, "state": "written",
+                                          "run_id": session, "reason": None}), \
+            "marker bound to the wrong token refuses"
+        assert not broken(root=os.path.join(root, "other")), "wrong receipt root refuses"
+        assert not broken(scratch=os.path.join(root, "scratch2")), "wrong receipt scratch refuses"
+        assert not broken(evidence=os.path.join(root, "evidence2")), "wrong receipt evidence refuses"
+        assert not broken(phase=None), "an unpublished receipt refuses"
+        assert not broken(scratch_marker={"path": os.path.join(root, "elsewhere"),
+                                          "state": "written", "run_id": marker_run,
+                                          "reason": None}), "wrong marker path refuses"
+        os.unlink(receipt_path)
+        assert not trace_layout(env, evidence, session), "a missing receipt refuses"
+        write(receipt_path, "{not json", 0o644)
+        assert not trace_layout(env, evidence, session), "a malformed receipt refuses"
+        write(receipt_path, "x" * (RECEIPT_MAX_BYTES + 1), 0o644)
+        assert not trace_layout(env, evidence, session), "an oversized receipt refuses"
+        link = os.path.join(evidence, "receipt-link")
+        os.symlink(receipt_path, link)
+        os.replace(link, receipt_path)
+        assert not trace_layout(env, evidence, session), "a symlinked receipt refuses"
+        os.unlink(receipt_path)
+        write(receipt_path, json.dumps(receipt), 0o644)
+        for field, value in (("device", info.st_dev + 1), ("inode", info.st_ino + 1),
+                             ("owner_uid", info.st_uid + 1), ("root", os.path.join(root, "r")),
+                             ("run_id", "short"), ("version", 2), ("outcome", "closed")):
+            stale = dict(marker, **{field: value})
+            write(marker_path, json.dumps(stale), 0o600)
+            assert not trace_layout(env, evidence, session), f"marker {field} mismatch refuses"
+            write(marker_path, json.dumps(marker), 0o600)
+
+    # Trace attribution parses raw phase evidence and demands it (pure).
+    # Discriminators: the pre-243 unpartitioned output, a missing applicable
+    # phase, an unpaired nested phase, an absent-instrument collection, and
+    # the unchanged 64-event cap.
+    with tempfile.TemporaryDirectory(prefix="handoff-attribution.", dir=os.environ["TMPDIR"]) as root:
+        evidence = os.path.join(root, "evidence")
+        os.mkdir(evidence, 0o700)
+        session, marker_run = "9f13c2a47b8d0e5623ab4cd6ef901257", "5d8a02be71c49f3ea6d80b29c5147f36"
+        write(os.path.join(evidence, "receipt.json"), json.dumps(
+            {"run_id": session, "phase": "started: incomplete", "root": root,
+             "scratch": os.path.join(root, "scratch"), "evidence": evidence,
+             "scratch_marker": {"path": os.path.join(root, ".oxide-scratch.json"),
+                                "state": "written", "run_id": marker_run, "reason": None}}), 0o644)
+        # One complete creation-path command under the post-open tail
+        # partition (oxide#243): 18 paired phases, 36 events, `remember-pool`
+        # honestly absent because these commands' pools are `OXIDE_POOL`.
+        # Times are illustrative; the product's own trace carries its clock.
+        write(os.path.join(evidence, "handoff-trace.full"),
+              "invocation start 0\nstore start 10\n"
+              "scratch-evaluate start 20\nscratch-evaluate end 120\n"
+              "scratch-create start 130\nscratch-init start 200\nscratch-init end 900\n"
+              "scratch-create end 910\nscratch-repair start 920\nscratch-repair end 1000\n"
+              "store-open start 1010\nstore-open end 2000\n"
+              "sticky-exclusion start 2010\nsticky-exclusion end 2100\n"
+              "backup-exclude start 2110\n"
+              "backup-addexclusion start 2120\nbackup-addexclusion end 6120\n"
+              "backup-isexcluded start 6130\nbackup-isexcluded end 8130\n"
+              "backup-exclude end 8140\n"
+              "ensure-control start 8150\nensure-control end 8200\n"
+              "store end 8210\n"
+              "workspace start 8220\nworkspace end 8320\n"
+              "removable start 8330\nremovable end 8350\n"
+              "incremental-key start 8360\nincremental-key end 8400\n"
+              "key start 8410\nkey end 8460\n"
+              "summary-clock start 8470\nsummary-clock end 8480\n"
+              "summary start 8490\nsummary end 8500\n"
+              "invocation end 8510\n", 0o600)
+        # The pre-243 output: the same command shape with no tail phases.
+        # Its store-open/workspace pair completes the creation path, so the
+        # applicable planned phases are missing: insufficient, never a pass.
+        write(os.path.join(evidence, "handoff-trace.old"),
+              "invocation start 0\nstore start 10\n"
+              "scratch-evaluate start 20\nscratch-evaluate end 120\n"
+              "scratch-create start 130\nscratch-create end 810\n"
+              "scratch-repair start 820\nscratch-repair end 900\n"
+              "store-open start 910\nstore-open end 1100\n"
+              "store end 11000100\n"
+              "workspace start 11000110\nworkspace end 11000200\n"
+              "removable start 11000210\nremovable end 11000230\n"
+              "incremental-key start 11000240\nincremental-key end 11000300\n"
+              "key start 11000310\nkey end 11000400\n"
+              "summary-clock start 11000410\nsummary-clock end 11000420\n"
+              "summary start 11000430\nsummary end 11000450\n"
+              "invocation end 11000460\n", 0o600)
+        # The full trace without `ensure-control`: one missing applicable
+        # phase must be named, not silently absorbed.
+        full_text = open(os.path.join(evidence, "handoff-trace.full"), encoding="ascii").read()
+        write(os.path.join(evidence, "handoff-trace.tailmissing"),
+              full_text.replace("ensure-control start 8150\nensure-control end 8200\n", ""), 0o600)
+        # The full trace with the nested `tmutil addexclusion` child's end
+        # missing: an unpaired start stays an unknown end and fails the
+        # reached-path requirement.
+        write(os.path.join(evidence, "handoff-trace.tailunknown"),
+              full_text.replace("backup-addexclusion end 6120\n", ""), 0o600)
+        write(os.path.join(evidence, "handoff-trace.b"), "invocation start 7\n", 0o600)
+        write(os.path.join(evidence, "handoff-trace.c"), "", 0o600)
+        write(os.path.join(evidence, "handoff-trace.cap"),
+              "".join(f"phase{i} start {i}\n" for i in range(65)), 0o600)
+        full_row = {"case": "full", "trace": {"state": "allocated", "file": "handoff-trace.full", "run": session}}
+        rows = [
+            full_row,
+            {"case": "old-unpartitioned", "trace": {"state": "allocated", "file": "handoff-trace.old", "run": session}},
+            {"case": "tail-missing", "trace": {"state": "allocated", "file": "handoff-trace.tailmissing", "run": session}},
+            {"case": "tail-unknown", "trace": {"state": "allocated", "file": "handoff-trace.tailunknown", "run": session}},
+            {"case": "unknown-end", "trace": {"state": "allocated", "file": "handoff-trace.b", "run": session}},
+            {"case": "empty", "trace": {"state": "allocated", "file": "handoff-trace.c", "run": session}},
+            {"case": "refused", "trace": {"state": "layout refused"}},
+        ]
+        attribution = attribute_traces(rows, evidence=evidence, session=session)
+        assert attribution["expected_traced"] == 7 and attribution["allocated"] == 6
+        assert attribution["with_evidence"] == 5 and attribution["unknown_ends"] == 2
+        assert attribution["completed_creation_paths"] == 4
+        assert attribution["source"]["marker_run"] == marker_run
+        assert not attribution["sufficient"], "insufficient instrumentation never passes"
+        tail_required = ["sticky-exclusion", "backup-exclude", "ensure-control"]
+        if sys.platform == "darwin":
+            tail_required += ["backup-addexclusion", "backup-isexcluded"]
+        expected_all = (
+            [f"old-unpartitioned: required reached-path phase {name} is absent from the trace"
+             for name in tail_required]
+            + ["tail-missing: required reached-path phase ensure-control is absent from the trace",
+               "tail-unknown: required reached-path phase backup-addexclusion has an unpaired start (unknown end)",
+               "unknown-end: trace does not show the completed creation path; no reached-path requirement holds",
+               "empty: no raw trace evidence (empty)",
+               "refused: trace not allocated (layout refused)"])
+        assert attribution["problems"] == expected_all[:8]
+        assert attribution["problems_omitted"] == max(0, len(expected_all) - 8), \
+            "the bounded problem list stays honest"
+        # The complete command: paired tail phases with their actual
+        # durations, the honest not-applicable label, the measured
+        # store-open-to-store span and its explicit residual.
+        full = attribution["commands"][0]
+        assert full["evidence"] == "evidence" and full["events"] == 36
+        assert full["store_tail"]["completed"] is True
+        assert full["store_tail"]["required"] == tail_required
+        assert full["store_tail"]["span_ns"] == 6210
+        assert full["store_tail"]["measured_union_ns"] == 6170
+        assert full["store_tail"]["residual_ns"] == 40
+        assert full["store_tail"]["reason"] is None
+        phases = full["store_tail"]["phases"]
+        assert phases["sticky-exclusion"] == {"state": "measured", "duration_ns": 90}
+        assert phases["backup-exclude"] == {"state": "measured", "duration_ns": 6030}
+        assert phases["backup-addexclusion"] == {"state": "measured", "duration_ns": 4000}
+        assert phases["backup-isexcluded"] == {"state": "measured", "duration_ns": 2000}
+        assert phases["remember-pool"] == {"state": "not-applicable", "duration_ns": None}
+        assert phases["ensure-control"] == {"state": "measured", "duration_ns": 50}
+        assert full["window_ns"] == 8510 and full["residual_ns"] == 0
+        assert attribution["store_tail_spans"] == {"commands": 4, "min_ns": 6210,
+                                                   "max_ns": 10999000}
+        assert attribution["tail_phase_observations"]["backup-addexclusion"] == \
+            {"measured": 2, "min_ns": 4000, "max_ns": 4000}
+        assert attribution["tail_phase_observations"]["remember-pool"] == \
+            {"measured": 0, "min_ns": None, "max_ns": None}
+        old = attribution["commands"][1]
+        assert old["store_tail"]["completed"] is True
+        assert old["store_tail"]["phases"]["sticky-exclusion"] == \
+            {"state": "absent", "duration_ns": None}
+        assert old["store_tail"]["span_ns"] == 11000100 - 1100
+        assert old["store_tail"]["residual_ns"] == old["store_tail"]["span_ns"]
+        unknown = attribution["commands"][4]
+        assert unknown["evidence"] == "evidence" and unknown["unpaired"] == ["invocation"]
+        assert unknown["store_tail"]["completed"] is False
+        assert unknown["store_tail"]["span_ns"] is None
+        assert "store-open or store is not paired in this trace" in unknown["store_tail"]["reason"]
+        over = parse_trace_events(os.path.join(evidence, "handoff-trace.cap"))
+        assert over["state"] == "over-cap" and over["events"] == 65
+        assert not attribute_traces([dict(full_row, trace=dict(full_row["trace"], file="handoff-trace.cap"))],
+                                    evidence=evidence, session=session)["sufficient"], \
+            "an over-cap file cannot be product evidence"
+        # A collection where every trace is the pre-243 output: the new
+        # events are absent everywhere, so the instrument did not fire.
+        absent_collection = attribute_traces(
+            [{"case": f"old-{index}", "trace": {"state": "allocated", "file": "handoff-trace.old", "run": session}}
+             for index in range(3)], evidence=evidence, session=session)
+        assert not absent_collection["sufficient"]
+        assert absent_collection["with_evidence"] == 3
+        assert absent_collection["problems_omitted"] > 0, "problems stay bounded"
+        good = attribute_traces([full_row], evidence=evidence, session=session)
+        assert good["sufficient"] and not good["problems"], "complete reached-path evidence suffices"
+        assert not attribute_traces([], evidence=evidence, session=session)["sufficient"]
+        assert not attribute_traces([full_row], evidence=evidence, session=marker_run)["sufficient"], \
+            "a session slot with the marker token fails the receipt binding"
+        assert not attribute_traces([full_row], evidence=os.path.join(root, "absent"),
+                                    session=session)["sufficient"], "a missing guard receipt fails"
+        write(os.path.join(evidence, "handoff-trace.d"), "store middle 9\n", 0o600)
+        malformed = parse_trace_events(os.path.join(evidence, "handoff-trace.d"))
+        assert malformed["state"] == "malformed" and malformed["events"] == 0
+        assert parse_trace_events(os.path.join(root, "absent"))["state"] == "unreadable"
+        still_good = attribute_traces([full_row], evidence=evidence, session=session)
+        assert still_good["sufficient"]  # the malformed file is not among these rows
+        tail_only = store_tail_states(parse_trace_events(os.path.join(evidence, "handoff-trace.full")))
+        assert tail_only["completed"] and tail_only["required"] == tail_required
     check_source_versions()
     print("installed-handoff apparatus self-check passed")
     return 0
@@ -1421,6 +1985,7 @@ def main() -> int:
             # Each group launches product children, so a failure after launch
             # is conservatively an unknown writer outcome.
             collect(GROUPS, lambda body: body(root, binary), outcome, lambda: True)
+            outcome["trace_attribution"] = attribute_traces(outcome["commands"])
             return diagnostic_exit(outcome)
         for _, body in GROUPS:
             body(root, binary)
@@ -1442,6 +2007,12 @@ def main() -> int:
             outcome["end_ns"] = time.monotonic_ns()
             if outcome["phase"] is not None:
                 outcome["phases"][-1]["end_ns"] = outcome["end_ns"]
+            if outcome.get("trace_attribution") is None:
+                try:
+                    outcome["trace_attribution"] = attribute_traces(outcome["commands"])
+                except BaseException as error:  # never masks the original failure
+                    outcome["trace_attribution"] = {"sufficient": False,
+                                                    "problems": [f"attribution failed: {type(error).__name__}"]}
             publish_diagnostic(outcome)
 
 if __name__ == "__main__":

@@ -1401,7 +1401,9 @@ pub fn exclude_from_backup(pool: &Path) -> Backup {
         .arg("addexclusion")
         .arg(pool)
         .stdin(std::process::Stdio::null());
-    let added = crate::budget::output(&mut command);
+    let added = crate::handoff_trace::phase("backup-addexclusion", || {
+        crate::budget::output(&mut command)
+    });
     match added {
         Ok(output) if output.status.success() => backup_state(pool),
         Ok(output) => Backup::NotExcluded(format!(
@@ -1422,7 +1424,8 @@ pub fn backup_state(pool: &Path) -> Backup {
         .arg("isexcluded")
         .arg(pool)
         .stdin(std::process::Stdio::null());
-    let checked = crate::budget::output(&mut command);
+    let checked =
+        crate::handoff_trace::phase("backup-isexcluded", || crate::budget::output(&mut command));
     match checked {
         Ok(output) if output.status.success() => {
             let text = String::from_utf8_lossy(&output.stdout);

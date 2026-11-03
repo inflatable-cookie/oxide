@@ -642,6 +642,34 @@ run = "python3 scripts/test-prune-authority.py --self-check"
 [tasks."proof:prune-authority:plan"]
 run = "python3 scripts/test-prune-authority.py --plan"
 
+# oxide#235 fresh per-row custody witnesses (frozen design oxide#229, brief v4):
+# one fixed script as the whole command of the QUALIFIED candidate runner at its
+# fixed path (planner decision 9575afc9; candidate SHA-256 c5782431…, consumed
+# only through this narrow new-proof route), under heavy admission. 360 s wall,
+# 512 MiB monitored scratch including staging/cleanup, at most one owned 128 MiB
+# image. Selected-volume scratch placement, no --root-parent. The counted run is
+# fail-fast; the diagnostic is the uncounted keep-going twin and is never a
+# native PASS. Each native run needs separate owner activation.
+[tasks."rust:prune-fresh-custody"]
+admission = "heavy"
+run = "python3 scripts/bounded-test-candidate.py --limit 360 --scratch-budget-mib 512 -- python3 scripts/test-prune-fresh-custody.py"
+
+# Uncounted keep-going diagnostic; it never grants native PASS credit.
+[tasks."rust:prune-fresh-custody:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test-candidate.py --limit 360 --scratch-budget-mib 512 -- python3 scripts/test-prune-fresh-custody.py --diagnostic"
+
+# Pure apparatus check: case tables, counterfactual oracles, bounds, the scale
+# arithmetic, source-literal pins and the exact selector text. No scratch,
+# child, image or pool.
+[tasks."proof:prune-fresh-custody:test"]
+run = "python3 scripts/test-prune-fresh-custody.py --self-check"
+
+# Effect-free: prints the case table, bounds, runner pins, the scale oracle and
+# the nine premise dispositions.
+[tasks."proof:prune-fresh-custody:plan"]
+run = "python3 scripts/test-prune-fresh-custody.py --plan"
+
 # oxide#135 focused checked-out-absence proof: one fixed script under the
 # qualified shared supervisor. A checkout path outside /Volumes may be proved
 # absent with missing ancestors only from a no-follow descriptor walk whose held
@@ -1314,11 +1342,17 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # children: child-created session/group membership and identity binding,
 # a session leader's EPERM-refused setpgid/setsid escapes, exclusive unreaped
 # custody with SIGCHLD SIG_DFL (a SIG_IGN demo shows kernel auto-reap),
-# WNOHANG collecting nothing while live, ECHILD on a second wait, bounded
-# kill/killpg-0 zombie persistence with the same (PID, start) identity, the
-# prospective cooperative stop (bounded killpg TERM escalating to KILL only
-# under positive held custody, then positive reap), model refusal after
-# settled custody with no syscall, and vacuous kill(0,0)/killpg(0,0) probes.
+# consuming WNOHANG live probes that collect nothing while live (a positive
+# probe settles collected truth; oxide#244 corrected the retired helper whose
+# collecting WNOHANG poll marked consumed children held-exited and failed
+# oxide#242's diagnostics with ESRCH/ECHILD), exit observed WITHOUT collecting
+# through the non-consuming kinfo_proc zombie flag with the single consuming
+# wait being the positive reap, ECHILD on a second wait, c06's live probe
+# positively staged by a hold/release lifecycle, bounded kill/killpg-0 zombie
+# persistence with the same (PID, start) identity, the prospective cooperative
+# stop (bounded killpg TERM escalating to KILL only under positive held
+# custody, then positive reap), model refusal after settled custody with no
+# syscall, and vacuous kill(0,0)/killpg(0,0) probes.
 # Parent-death, owner-unresponsive and descendant-group-escape cases are
 # HELD source/pure-only. No Cargo, toolchain, image, mount, live pool or
 # account read; the nested receipt binds the supervisor and marker tokens
@@ -1403,60 +1437,52 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-scratch-pool.py"
 
-# F6-O2 X-S1 (oxide#240, barge-adoption.md): the prune capture harness's
-# pure selectors. `proof:tape-prune:test` runs the embedded self-check of the
-# `tape_prune_eval` in-crate harness — the pure tape checks (deterministic
-# serialization, epoch/occurrence bookkeeping, the fixed caps' explicit
-# truncation, the unbound-read note) plus the BASE, EFFECT-1, EFFECT-2,
-# REGISTRY-MISSING and UNSETTLED-INTENT unit fixtures, plus a fresh BASE
-# disconnected-sink counterfactual, each with one waited child. `proof:tape-prune:self-check`
-# runs only the pure checks. The launcher binds both to its private context,
-# including the pool and owner-only TMPDIR. They are not a benchmark, native proof or full QA; the
-# counted diagnostic at a source-approved head remains X-S2's Queue proof.
-[tasks."proof:tape-prune:isolation-test"]
-run = "python3 scripts/test_tape_isolation.py"
+# Shared private-build validation admission/preparation gate (oxide#248): the
+# common canonical provider for the capture tasks' private validation
+# prerequisites (Oxide #240/PR230 and Barge #041/PR41). It binds actual
+# sources/heads/trees/locks/toolchains/binaries/manifests/helpers, keeps the
+# attributable task-private root discovery ledgers, validates the
+# planner-issued one-use execution blocks and receipts, and runs — only under
+# the qualified supervisor — the single 300 s debug-Oxide bootstrap, the
+# inventory-bracketed private status dry gate and the retained-root quiescence
+# snapshots, exporting the wrapper-consumable artifacts and the measured
+# remaining allowance. Whole-block scratch is a measured clamp of each grant
+# minus retained bytes (about 552 MiB on Oxide's 6 GiB grant at the reported
+# 5591.8 MiB retained total), disclosed and never silently raised.
+# `proof:private-build-validation:test` is the pure mocked counterfactual
+# apparatus (effect-free, fixtures under a fresh temp template);
+# `proof:private-build-validation:plan` is effect-free.
+# `proof:private-build-validation:diagnostic` is the planner's ONE
+# proofExecution: this fixed declaration carries no issued binding and the
+# script refuses before any effect until the planner amends the command with
+# the bound roots, document digests, planner reference and issued blocks
+# (details and the exact command template: docs/knowledge/contracts/
+# barge-adoption.md, "Shared private-build validation gate"). Its task-root
+# accounting requires the adopted whole task root and separately guarded
+# Oxide claim root; retained-root walks set the measured clamps.
+[tasks."proof:private-build-validation:test"]
+run = "python3 scripts/test-private-build-validation.py --self-test"
 
-# Source-only candidate; planner binding and runtime isolation gates remain.
-[tasks."proof:tape-prune:sequence"]
+[tasks."proof:private-build-validation:plan"]
+run = "python3 scripts/test-private-build-validation.py --plan"
+
+[tasks."proof:private-build-validation:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/tape-isolation-check.py sequence"
+run = "python3 scripts/bounded-test.py --limit 1200 --scratch-budget-mib 512 -- python3 scripts/test-private-build-validation.py --diagnostic"
+
+# X-S1 has no task-local admission provider. Each local execution selector
+# refuses; Queue must bind the qualified shared provider and exact-head route.
+[tasks."proof:tape-prune:handoff-test"]
+run = "python3 scripts/test_tape_provider_handoff.py"
 
 [tasks."proof:tape-prune:test"]
-admission = "heavy"
-run = "python3 scripts/tape-isolation-check.py test"
+run = "python3 scripts/tape-provider-handoff.py"
 
 [tasks."proof:tape-prune:self-check"]
-admission = "heavy"
-run = "python3 scripts/tape-isolation-check.py self-check"
-
-[tasks."proof:tape-prune:bootstrap"]
-admission = "heavy"
-run = "python3 scripts/tape-isolation-check.py bootstrap"
+run = "python3 scripts/tape-provider-handoff.py"
 
 [tasks."proof:tape-prune:preflight-build"]
-admission = "heavy"
-run = "python3 scripts/tape-isolation-check.py preflight-build"
+run = "python3 scripts/tape-provider-handoff.py"
 
-[tasks."proof:tape-prune:path-preflight"]
-admission = "heavy"
-run = "python3 scripts/tape-isolation-check.py preflight"
-
-[tasks."proof:tape-prune:cover-compile"]
-admission = "heavy"
-run = "python3 scripts/tape-isolation-check.py cover-compile"
-
-[tasks."proof:tape-prune:cover-release"]
-admission = "heavy"
-run = "python3 scripts/tape-isolation-check.py cover-release"
-
-[tasks."proof:tape-prune:cover-format"]
-admission = "heavy"
-run = "python3 scripts/tape-isolation-check.py cover-format"
-
-[tasks."proof:tape-prune:cover-test"]
-admission = "heavy"
-run = "python3 scripts/tape-isolation-check.py cover-test"
-
-[tasks."proof:tape-prune:cover-docs"]
-admission = "heavy"
-run = "python3 scripts/tape-isolation-check.py cover-docs"
+[tasks."proof:tape-prune:bootstrap"]
+run = "python3 scripts/tape-provider-handoff.py"

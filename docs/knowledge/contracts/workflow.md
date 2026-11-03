@@ -1811,6 +1811,94 @@ necessary.
     end is unknown. Release builds do not emit this trace. Trace records are
     observations, not timing or closure gates; a missing trace cannot establish
     a duration. No new diagnostic has yet attributed the historical gap.
+  - **Instrument finding (oxide#239).** The first diagnostic of that
+    instrument (`/Volumes/Builds/scratch/oxide/oxide-proof.tj837y2a/evidence`,
+    diagnostic receipt SHA-256 `a44391d1540063f72da10a0d6c5723076cc3407007ef0b9d1c5bc1d6ccd37939`,
+    guard receipt SHA-256 `c47eca0216d73291d935c4af55c1017ab7ed3cf2dba77f460c9e328c8d723161`)
+    completed 17/17 cases with the guard closed, no fault and no deadline
+    (417 s of 600 s, 71.6 MiB of 128 MiB), but every one of the 31 instrumented
+    commands recorded `layout refused` and no trace file existed: both
+    validators required `marker.run_id == OXIDE_PROOF_RUN_ID`, while the guard
+    receipt's `run_id` is the supervisor session token and the scratch
+    marker's `run_id` is the monitor's independent marker token. The
+    historical 11–13 s outside-summary gap therefore stays unattributed; that
+    packet keeps its failed uncounted outcome with no evidence rewrite.
+  - **Two-token binding (oxide#239).** The trace layout now binds each token
+    to its own source and never equates them: the exported `OXIDE_PROOF_RUN_ID`
+    (session token) must equal the guard's published `receipt.json` `run_id`,
+    read as one bounded no-follow regular-file snapshot with a 64 KiB cap
+    that refuses missing, symlinked, foreign-owned, oversized, malformed or
+    cross-run documents and accounts for the monitor's atomic replace by
+    refusing a snapshot whose file identity changed between `lstat` and
+    `open`; the marker's `run_id` must equal that receipt's
+    `scratch_marker.run_id` and the receipt must name the verified root,
+    scratch and evidence paths and a published phase, while the marker's
+    canonical root, UID, device and inode still bind to the already verified
+    private descriptor topology. The supervisor's token generation is
+    unchanged. Activation stays debug-only, opt-in, bounded at 64 events and
+    silent in ordinary and release code.
+  - **Trace attribution (oxide#239).** The fixed diagnostic now records a
+    separate bounded trace-attribution result — expected instrumented
+    commands, per-command allocation and raw phase evidence with starts, ends
+    and unpaired starts as unknown ends, and the guard receipt's two
+    identities — and requires actual nonempty raw phase evidence from every
+    reached creation-path command: layout refusals or absent traces are an
+    insufficient-instrumentation outcome (diagnostic exit 1), never a
+    successful attribution beside passing cases. Missing ends stay unknown;
+    no timing is invented and no requirement reproduces the historical gap;
+    trace totals and time comparisons are observations, not performance
+    acceptance thresholds. Native and kernel custody remain real and are
+    never inferred from trace or command success.
+  - **Verified 239 observation boundary.** The passing 239 diagnostic packet
+    (`/Volumes/Builds/scratch/oxide/oxide-proof.direkfwy/evidence`, receipt
+    SHA-256 `27744de3ecbb52c34abdab361887d18972f1ea83caf9b3419d234a4e332a8347`,
+    guard receipt SHA-256
+    `45250b772d2466c9864613d6fa9aaef492d4ccdfd05daa592867d733db17f2bf`,
+    17/17 cases, 31/31 commands with nonempty paired traces, worker 447 s of
+    600 s and 106.8 MiB of 128 MiB) measured each instrumented command at
+    11.44–14.75 s wall with only 4–15 ms outside the trace window and
+    `scratch-create` at 53–677 ms; the `store` phase closed about 11.07–11.14 s
+    after `store-open` in every one of the 31 traces. That fixes only the
+    region: the uninstrumented tail of `Store::open_or_create` after
+    `Self::open_at` returned carried the remaining time. It is not proof of
+    which step costs it, and it is not a latency fix; `tmutil` is not
+    concluded as the cause from that packet. The prior 231 uninstrumented
+    `tj837y2a` failure stays historical with no trace credit.
+  - **Post-open tail partition (oxide#243, observation only).** The same
+    guarded `handoff_trace::phase` instrument now partitions that measured
+    tail, wrapping exactly one existing step each and changing no statement,
+    order, result or branch: `sticky-exclusion` (`config::has_sticky_exclusion`),
+    `backup-exclude` (the conditional `config::exclude_from_backup` call)
+    with its nested real `tmutil` children `backup-addexclusion` and
+    `backup-isexcluded` (the `budget::output` calls, so every caller of
+    `backup_state` measures its own child), `remember-pool` (the conditional
+    `config::remember_pool` call) and `ensure-control` (`Store::ensure_control`).
+    Activation, the two-token binding, the no-follow receipt snapshot and the
+    trace destination are unchanged; the 64-event cap does not grow: one
+    creation-path command reaches at most 38 events (19 paired phases;
+    `remember-pool` is unreachable for the proof's `OXIDE_POOL` commands).
+    The parser refuses a file with more than 64 event lines as not product
+    output. The attributable per-command summary gains each paired phase's
+    actual duration, the measured `store-open`-end-to-`store`-end span with
+    its explicit residual (window time no paired phase covers, union-counted
+    so nested phases never count twice), and honest per-phase states
+    (measured / unknown / not-applicable / absent) for the plan. A trace that
+    itself shows `store-open` and `workspace` paired completed the reached
+    creation path, and every applicable planned phase must then be paired
+    there: a clean 17/17 collection whose reached-path instrumentation is
+    absent is insufficient and exits 1, and the pure self-check discriminates
+    the pre-243 unpartitioned output, a missing applicable phase, an unpaired
+    nested phase and an all-old-events collection. This is a partition of
+    observations, not a product verdict: no cause is concluded, no step is
+    optimized or skipped, no timing is an acceptance gate, and papercut
+    18fc63cf stays open. The one declared
+    `effigy rust:installed-handoff:diagnostic` runs through Queue at this
+    head after retained exact-head source approval, under the qualified
+    `fcfda2b0…` supervisor bytes unchanged; author and reviewer run no
+    native themselves and the same retained reviewer judges its one receipt
+    (Tom `c8991f99`). Its native attribution can establish a measured
+    responsible phase or an honest remaining unknown with the precise
+    coverage reason; until then no result is claimed here.
   - **Discriminator.** A debug-only, opt-in phase trace on the creation path
     (the `release_trace::phase` pattern, not that trace, which covers only the
     release closeout) in one uncounted diagnostic would split the gap. That
@@ -6001,8 +6089,8 @@ The stable, read-only interface other tools use to find the registered Builds dr
 - **Nonces and keys.** Every root creation or recreation draws a fresh random 128-bit lowercase-hex nonce. The output destination key includes the nonce, root, volume UUID and recipe; legacy `outputs-1` keys stay distinct and no recreated root claims a warm legacy root. An existing root keeps its marker's nonce.
 - **Registry and overflow.** Rows are keyed by checkout, placement member and root; revision advances before every changed receipt, selection or root effect, and the registry is read as one bounded whole snapshot (8192 files, 64 MiB, 10 s). The live registry is capped at 4096 rows and 4 MiB. Before a cap-exceeding unindexed selection the registry records sticky incompleteness durably; that write failing refuses adoption before its effect, and prune then keeps every root with an explicit reason. The incomplete flag is never cleared by this tranche.
 - **Recorded root identity and generation (oxide#218).** A registry row records the root's own immutable creation generation, read from its owner marker when the row is written, never the receipt's committed selection generation: `transition_at` keys a selection to the marker's creation generation (oxide#152), and the marker is rewritten only by the version-1 to version-2 upgrade, which preserves it. Rows written before oxide#152 recorded the commit generation, which advances with every transition, so a long-lived root's row could say generation 2 or 3 while its marker still says 1. That one superseded shape is reconciled at observation, and only from the recorded marker digest: when the recorded digest equals the live marker's exact bytes the document — including its own nonce, volume and creation generation — is the recorded one, so the differing field is a superseded selection observation and never a claim about a re-created root. A recorded generation OLDER than the marker's (nothing writes one), a row without a recorded digest (no pin), a changed marker, a different nonce or kind, a different volume and a changed inode all still classify Unknown and keep the root. A migration's intermediate receipt writes also never rewrite a whole-target row with the root/2 marker that replaced its legacy one: a row is refreshed only from a placement that records the marker's own nonce and creation generation, so a superseded placement keeps the row's recorded history instead of writing the successor digest with an empty nonce. Within one (checkout, root) group the evaluated representative is the first LIVE reference in member order — selected, pending, reserved or already owned by an intent — because only the selected subset is the checkout's current authority; an inactive history row (a legacy `target` reference left by a profile migration) is never the representative while a live reference exists, so it cannot make the snapshot incomplete for a contradiction the group does not have. A group with no live reference keeps its first member exactly as before. This changes no other identity gate, the whole-batch incomplete-snapshot rule for a genuine contradiction, unknown writer custody, or the operator-list requirement for a row without a version-2 identity; a dry run still mutates nothing. Evidence: the six owner-marker/registry contradictions found after oxide#216 are three inactive legacy `target` rows left by profile migrations (no nonce, successor digest) and three pre-#152 whole-target rows recording commit generations 2, 2 and 3 against creation generation 1, with recorded device, inode, nonce and marker digest matching the live roots; the first class keeps its recorded history and is simply never the representative, the second is reconciled by the rule above, and no live registry, root or operator list was touched. A future live prune still needs a fresh complete preview, its exact plan SHA and a separate operator go. At the 2026-11-01 live scale (512 roots, 1177 rows) that preview is not yet achievable within the snapshot's fixed 64 MiB input budget: with the identity contradiction gone, full eligibility runs for every root and re-reads the pool state documents per root (the removable pool's ~95 KB `state.json` and the internal ~5 KB one, up to twice each in `checkout_custody` and `active_holders`), which the earlier identity reason masked — the identity gate is not the cause and this is a separate ruling, because widening the budget or reading one state document per snapshot changes the custody-freshness contract.
-- **Post-218 snapshot refusal (oxide#220, diagnosis only; no code change).** The read-only preview on installed `9d2aa46` (preview `b1549017…`, revision 11349, 0.554 s) kept every root for "the snapshot exceeded its input or time budget" on the removable pool's writer-record read. The time cap is excluded: the whole command ran 0.554 s against the ten-second deadline. The byte budget is the mechanism. `authority_read` charges each read of a state document to the one shared 64 MiB snapshot budget and caches nothing. For each absent-checkout row that reaches custody, `checkout_custody` reads the internal `state.json` twice (the admission fence's load and its own load) and the removable one once (sibling state); `active_holders` then reads the internal one again and the removable one again. That is three internal and two removable reads per row, about 205 KB at the documented ~5 KB and ~95 KB sizes, so roughly 320 such rows exhaust 64 MiB. The exhausting read returns the budget message even when its own read succeeded. An earlier I/O error cannot be the origin: every error on that path is recorded before it can latch, so the first recorded error is the exhausting read. The crossing row and the cumulative byte figure were not observed. `kept_roots: 512` is the preview's `MAX_CANDIDATES` truncation in `build_preview`, not a count. A fix that changes how custody state is read or budgeted changes deletion-gating custody and needs an Elevated brief plus a freshness ruling. A dedupe inside one row only trims about half the bytes and may not clear the live scale.
-- **Fresh custody reads (oxide#229; frozen design, not implemented).** Tom’s 2026-11-01 ruling on the proposed contract was “Allow this design subject to independent review”: parsed pool state may be reused across preview rows only under both per-row admission locks with a pinned open-file identity and unchanged metadata witnessing the same atomically replaced document; changed or uncertain witnesses require a newly charged bounded read or batch refusal, dynamic process custody is rechecked per row and effect-time proofs stay fresh. This ruling authorizes neither implementation nor a live preview. The current per-row reads are deliberately not replaced by a snapshot-wide claim that writers stayed closed. A candidate design retains at most one parsed state and its open file descriptor per pool for one authority window. At *each* custody decision it takes both existing admission locks in internal-then-removable order, without creating a missing lock or fencing state, and verifies the registered pairing, control directories and lock identities through no-follow descriptors. It then checks each state pathname against the still-open descriptor: same device and inode, regular private file, owner, mode, link/size and high-resolution change metadata, with pre/post checks surrounding any actual read. The descriptor remains open across rows so an unlinked inode cannot be recycled into a false match. A changed witness requires a fresh bounded read and complete parse under the locks, charged to the same aggregate budget; an uncertain identity, unsupported metadata, changed control or lock, missing required input, invalid parse, failed lock or read, or budget/deadline exhaustion refuses the whole authority batch. A known absent, unregistered sibling is usable only with a positive no-follow absence and registration witness repeated under the internal lock on each row; ambiguous absence is unknown. A registered sibling without provable state and lock is unknown, never empty. Use non-blocking acquisition in that order: if the second lock is busy, release the first and refuse this snapshot rather than wait while holding it. Release both immediately after that row's custody decision, before path traversal or report construction. Acquisitions and checks are bounded by the existing snapshot deadline; no lock acquisition may outlive the window.
+- **Post-218 snapshot refusal (oxide#220, diagnosis only; no code change).** The read-only preview on installed `9d2aa46` (preview `b1549017…`, revision 11349, 0.554 s) kept every root for "the snapshot exceeded its input or time budget" on the removable pool's writer-record read. The time cap is excluded: the whole command ran 0.554 s against the ten-second deadline. The byte budget is the mechanism. `authority_read` charges each read of a state document to the one shared 64 MiB snapshot budget and caches nothing. For each absent-checkout row that reaches custody, `checkout_custody` reads the internal `state.json` twice (the admission fence's load and its own load) and the removable one once (sibling state); `active_holders` then reads the internal one again and the removable one again. That is three internal and two removable reads per row, about 205 KB at the documented ~5 KB and ~95 KB sizes, so roughly 320 such rows exhaust 64 MiB. The exhausting read returns the budget message even when its own read succeeded. An earlier I/O error cannot be the origin: every error on that path is recorded before it can latch, so the first recorded error is the exhausting read. The crossing row and the cumulative byte figure were not observed. `kept_roots: 512` is the preview's `MAX_CANDIDATES` truncation in `build_preview`, not a count. A fix that changes how custody state is read or budgeted changes deletion-gating custody and needs an Elevated brief plus a freshness ruling. A dedupe inside one row only trims about half the bytes and may not clear the live scale. That brief and ruling are the fresh custody reads above, implemented by oxide#235: the witnessed route reads each state document once per authority window, so the per-row re-read exhaustion no longer applies to prune.
+- **Fresh custody reads (oxide#229; implemented by oxide#235, diagnostic and counted qualification accepted).** Tom’s 2026-11-01 ruling on the proposed contract was “Allow this design subject to independent review”: parsed pool state may be reused across preview rows only under both per-row admission locks with a pinned open-file identity and unchanged metadata witnessing the same atomically replaced document; changed or uncertain witnesses require a newly charged bounded read or batch refusal, dynamic process custody is rechecked per row and effect-time proofs stay fresh. This ruling authorizes neither implementation nor a live preview. The current per-row reads are deliberately not replaced by a snapshot-wide claim that writers stayed closed. A candidate design retains at most one parsed state and its open file descriptor per pool for one authority window. At *each* custody decision it takes both existing admission locks in internal-then-removable order, without creating a missing lock or fencing state, and verifies the registered pairing, control directories and lock identities through no-follow descriptors. It then checks each state pathname against the still-open descriptor: same device and inode, regular private file, owner, mode, link/size and high-resolution change metadata, with pre/post checks surrounding any actual read. The descriptor remains open across rows so an unlinked inode cannot be recycled into a false match. A changed witness requires a fresh bounded read and complete parse under the locks, charged to the same aggregate budget; an uncertain identity, unsupported metadata, changed control or lock, missing required input, invalid parse, failed lock or read, or budget/deadline exhaustion refuses the whole authority batch. A known absent, unregistered sibling is usable only with a positive no-follow absence and registration witness repeated under the internal lock on each row; ambiguous absence is unknown. A registered sibling without provable state and lock is unknown, never empty. Use non-blocking acquisition in that order: if the second lock is busy, release the first and refuse this snapshot rather than wait while holding it. Release both immediately after that row's custody decision, before path traversal or report construction. Acquisitions and checks are bounded by the existing snapshot deadline; no lock acquisition may outlive the window.
 
   The current front-door `Store::save` and library `persist_control_state` use atomic rename under admission; removable registration and mode changes also take internal admission. The current internal `checkout_custody` takes internal admission, whose fence can write, while its sibling read does not itself take the removable lock. These observations do not establish the whole premise. This design is conditional on a source audit and qualification proving that every supported cooperative writer, including released predecessors and the library, serializes state changes on those same lock identities and replaces the state atomically, rather than changing its inode in place. Metadata comparison is an additional tamper detector, not an ABA-proof substitute for that invariant. If any supported writer can mutate in place, if file identity or change metadata cannot be trusted on a supported filesystem, or if stable lock and directory identity cannot be proved, this reuse rule is unavailable and the batch refuses; timestamps, a pathname, a digest of an old read, and the output registry revision alone cannot witness freshness. No arbitrary same-user writer or external process is newly fenced by this proposal. A registry revision witnesses registry publication, not pool-state freshness; root, receipt, reference, nonce, generation, class and marker checks remain independent and retain their existing rules.
 
@@ -6012,7 +6100,27 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
   **Design freeze (2026-11-01).** The project planner froze this conditional contract after independent exact-head review `6565393855` of `0868684c826ac02e589b01a7e1a2cf125d27cf6d`, which verified Tom's native ruling above. The writer/lock/filesystem and no-effect dry-run premises still require the specified source audit before implementation. A failed premise requires redesign, not weaker witnesses or a larger budget. The freeze supplies no native credit, live-preview permission, operator-list approval or deletion authority.
 
-  **Minimum future proof.** Before authoring, independently review this design and obtain planner freeze; verify all lock/state-writer premises, the no-effect dry-run lock route, lock ordering and bounded acquisition against actual supported predecessors. If any premise fails, redesign rather than silently weakening it. A separate HIGH-complexity, Elevated implementation brief must include the proof-authoring premise checklist, source changes and focused regressions, `effigy rust:compile`, `effigy rust:compile-release`, `effigy rust:format`, `effigy test rust`, `effigy docs:check` when applicable, and an owner-activated uncounted keep-going diagnostic followed by counted author and distinct independent reviewer native runs at the final published source. The proposed focused selectors are `effigy rust:prune-fresh-custody:diagnostic` and `effigy rust:prune-fresh-custody`, each invoking one fixed script under the then-qualified shared supervisor and Effigy heavy admission, with a fixed 360 s wall-clock limit and 512 MiB monitored scratch, with at most one owned 128 MiB image; this is a proposed bound, not measured fit or authority to execute. The proof must stage its own isolated controls and assert actual read bytes, locks, witnesses and complete output, not merely count calls. Counterfactuals must show that removing each witness admits a changed state or writer: unchanged reuse; replacements between rows in either pool, including admission immediately before and after the check; lock/control/path replacement, missing or unreadable sibling and invalid, oversized or partial documents; in-place-change and inode-reuse attempts; lost/unknown writers and dynamic liveness changes; changed registry revision, root/ref/nonce/class/marker, receipt and binding; large valid input and cumulative repeated-change exhaustion; and >512 keeps with incomplete coverage. Exercise preview, fresh real-run revalidation, barrier/binding recheck and publication compare-and-set, with full-tree and exact symlink-target nonmutation oracles for refusals. Measure wall time and scratch and retain failures without native credit; a diagnostic is uncounted. Existing native receipts, live-preview authority and Barge adoption gates do not transfer.
+  **Proof fixture observations.** The focused proof uses the existing supervised, private-control debug gate to pause after one row without holding its admission locks, bounded by the original authority deadline; a second debug-only observation reports the actual aggregate authority bytes, including a budget-exhausted partial reread. The fixture also stages large valid state documents and changed real-run inputs; a separate debug-only bounded pause at the pre-intent publication comparison exercises binding custody and two revision changes. The accepted diagnostic below measures their fit for that exact source and fixture. Neither hook exists in release builds. The image indication is published before attachment and the qualified guard alone receives the detach request after child custody is closed. The hooks add no production authority; their native evidence is scoped to the receipt below.
+
+  **Diagnostic history (oxide#235).** The one Queue-routed uncounted diagnostic at `ea2832af` failed: baseline and absent-custody completed, then dynamic-writer read `removable/managed/state.json`, although the product uses `removable/oxide-managed/state.json`; six dependent cases were skipped. The supervisor closed with command status 1, no fault or deadline, 408.3 MiB peak of 512 MiB, 305.6 GiB minimum host free, and a successful post-census detach. The case receipt was `qualified: false`; this is no native qualification credit. The retained log SHA-256 is `1501d251bbcfc619658d656504c1c762b988f79a41fceaf42a564d6ec42ae118`; the Queue proof execution `2d9b42ab-6036-45aa-b72d-86177eb62f4e` owns the evidence locations and guard receipt. The corrected fixture derives the same shared managed-control name as the product and checks both existing private lock/state pairs before its cases; that correction itself is not native evidence.
+
+  **Second diagnostic (oxide#235).** The Queue-routed uncounted diagnostic `27b37717-c65b-4ad3-805a-b3aa45210740` at `c4837ca` completed six cases, then failed the large-state fixture and skipped two dependent cases. Two individually valid 30 MiB documents exhausted the 64 MiB aggregate: readiness reads the internal document before the witnessed internal and removable reads, and the charged counter reached 67,108,864 bytes. The preview kept all three roots with incomplete coverage. The guard closed with command status 1, no fault or deadline, 468.2 MiB peak of 512 MiB, 305.1 GiB minimum host free, and detached the image successfully. The receipt remains `qualified: false` and gives no native credit; log SHA-256 `db345a34693a90890be4b19aa4a2087e864fccc2cbb074041acd79ad62c91fb6` and the Queue proof execution bind the evidence. The corrected source keeps that symmetric refusal as a control and uses 2 MiB internal and 31 MiB removable documents for a separate complete baseline and replacement-exhaustion check. This is not a promise that arbitrary large documents complete or new native evidence.
+
+  **Accepted diagnostic and deployment boundary (oxide#235).** At source `c47328cc371627be243908b44e9ab096630db446`, Queue execution `3c86a13c-75b8-4527-8007-1ac85a702dc0` completed all nine cases with no error. Retained evidence review `6579534504` accepted the exact source and receipts. The symmetric large-state control and replacement reread both exhausted at 67,108,864 charged bytes and kept the batch; the asymmetric baseline completed at 36,711,600 bytes. The 709-root case used 2,319,235 authority bytes in 0.56 s with the 512-kept reporting cap; its per-row reread counterfactual would charge 180,165,408 bytes. The private effect deleted three fixture roots, and the immediate reproof refused. The guard closed with a certain empty census, no survivors, fault or deadline, and a successful post-census detach: 39.85 s of 360 s, 462,209,024 bytes (440.8 MiB) of 512 MiB peak, and 304.4 GiB minimum sampled host free.
+
+  The original diagnostic remains intentionally exit 1 / `qualified: false`, with no counted qualification credit. Its log `/Volumes/Builds/scratch/oxide/proof-235-executor.8nVgfZ/diagnostic.log` has SHA-256 `df0518147ba1831ffa0da3392590fd32475c004f6ee05f6eeebd74e82c16fefd`. Under `/Volumes/Builds/scratch/oxide/oxide-proof.hpo8ba5f/evidence`, the case receipt is `6dc9d5d841927dd81100321d4a5eeaf8593c150ab64a863225dfd3083fc46fe7`, the guard receipt `6de172c8d43c242715cb406589edc2a082e5ae26290dbcdeea483c52fe7ace90`, and provenance `55b363a74b8b232ea89cf479659e4d3284e6203f4f24ff37e4a6f60cbc90731d`. They bind tree `7450c3185c8cbb143d4ad4d3803c1388f540a911`, proof script `b2c10f9cb616ddea068f882984be5a0f07de14e7075aa8851b3003f70c546266`, manifest `fceb535abdd77af83c5e9aeb80112c01444f2d2225e40108bfe5e3278e09d50b`, qualified candidate `c5782431…` and unchanged ordinary default `fcfda2b0…`. The two failed packets above remain historical and receive no credit.
+
+  Attributed planner decision `2eee0c9a-8cea-4743-b547-4040a0863baf`, under Tom's `c8991f99` delegation, accepts the reviewed source for merge while retaining one counted qualification as a release gate before installation or live consumer activation. That separate Queue proof-only execution uses the exact merged source commit, selector `effigy rust:prune-fresh-custody`, and the same 360 s / 512 MiB / one owned 128 MiB image bounds. Counted mode prints `qualified: null`, requires all nine cases completed and `error: null`, and exits zero only after the proof's completion checks; it does not write the diagnostic case file or emit `qualified: true`. Judge the original stdout payload and qualified guard/custody receipts rather than inventing a field or modifying a receipt. The installed binary and ordinary runner routes remain unchanged until that gate is accepted. The read-only operator-list packet still requires its separate planner activation, exact live deletion requires Tom's go, and the legacy 91 roots and full released-predecessor enumeration remain explicit residuals. This evidence establishes neither universal ABA safety nor completion for arbitrary large inputs.
+
+  **Accepted counted qualification (oxide#247).** Queue execution `90ef29a8-ec34-4114-9e5c-1e2a423dc95e` ran `effigy rust:prune-fresh-custody` once at the same immutable `c47328cc` source. Retained receipt review `46ab2d27-1768-4869-86f8-714013f7f0dd` accepted the pass: all nine distinct cases completed, `error: null`, counted `qualified: null`, child exit zero, closed guard with a certain empty joined census, no survivors, fault or deadline, and a positively reaped successful image detach. The counted scale case took 0.42 s; authority-byte and effect/refusal oracles matched the accepted diagnostic. The whole guard took about 39.8 s of 360 s, peaked at 461,479,936 of 536,870,912 monitored bytes, and sampled a minimum 317,477,711,872 host-free bytes (295.7 GiB) in 154 readings with a 0.2603 s maximum gap. Source, tree, script, manifest, lockfile and both runner pins matched the five declared inputs.
+
+  Original evidence is retained under `/Volumes/Builds/scratch/oxide/oxide-proof.lyjda1y9/evidence`: `receipt.json` SHA-256 `e0a15fdb87282adbf0e10e7d2d6bd4e1280584eeb1a8094702ebd4a1e5961d13`, `stdout.log` `3c7b379efa8f08290ca54205cf4e46ebb0f8eb35bc7a26d9ab846f1cf6ae6d40`, provenance `57c48b3e7905bf040657462174dc2fa6e590c4e14c54acf894131f5aef230568`, image custody `344754ce8fcc313b2e44c19d6a708178f65c4d88451c32392e1184ab7a54ae31`, and detach request `d5b9ca79f33cf313892bbe89ecaf1e01ab93f28b8b473566831498853f4cf903`. The reviewer and planner independently rehashed the artifacts; the executor narrative omitted one `d` from the guard hash, and that transcription error is preserved rather than repairing a receipt. The counted case payload is the original stdout JSON, not a new diagnostic case file. External selector logs in `/Volumes/Builds/scratch/oxide/qualification-645fa4ff.7SUBrw` are separately disclosed outside the monitored root.
+
+  Attributed planner decision `41e602eb-7df6-496f-bb8f-c6c53261b4b2` accepts this counted qualification and the ordinary receipt-matched reviewed-main Oxide reinstall under standing authority. The executable source is unchanged from the qualified head; later knowledge edits do not extend its native claim. Ordinary default `fcfda2b0…` and fixed candidate `c5782431…` remain unchanged. Installation supplies no live preview, registry census, cleanup, repair, deletion or operator-list authority. The later read-only packet remains a separate planner activation and exact live deletion still needs Tom's scoped go. The full released-predecessor enumeration and legacy 91-root residuals remain explicit; no universal ABA or arbitrary-size completion claim follows.
+
+  **Minimum future proof.** Before authoring, independently review this design and obtain planner freeze; verify all lock/state-writer premises, the no-effect dry-run lock route, lock ordering and bounded acquisition against actual supported predecessors. If any premise fails, redesign rather than silently weakening it. A separate HIGH-complexity, Elevated implementation brief must include the proof-authoring premise checklist, source changes and focused regressions, `effigy rust:compile`, `effigy rust:compile-release`, `effigy rust:format`, `effigy test rust`, `effigy docs:check` when applicable, and the single Queue-routed uncounted diagnostic at the exact source, judged by the retained reviewer. Tom's later decision `c8991f99` supersedes the former separate counted author/reviewer chain: further qualification is a planner-owned release gate, carried by one ordinary proof-only execution and one retained receipt reviewer. The proposed focused selectors are `effigy rust:prune-fresh-custody:diagnostic` and `effigy rust:prune-fresh-custody`, each invoking one fixed script under the then-qualified shared supervisor and Effigy heavy admission, with a fixed 360 s wall-clock limit and 512 MiB monitored scratch, with at most one owned 128 MiB image; the accepted diagnostic above measures fit at its exact source, while every later execution still needs its own Queue admission. The proof must stage its own isolated controls and assert actual read bytes, locks, witnesses and complete output, not merely count calls. Counterfactuals must show that removing each witness admits a changed state or writer: unchanged reuse; replacements between rows in either pool, including admission immediately before and after the check; lock/control/path replacement, missing or unreadable sibling and invalid, oversized or partial documents; in-place-change and inode-reuse attempts; lost/unknown writers and dynamic liveness changes; changed registry revision, root/ref/nonce/class/marker, receipt and binding; large valid input and cumulative repeated-change exhaustion; and >512 keeps with incomplete coverage. Exercise preview, fresh real-run revalidation, barrier/binding recheck and publication compare-and-set, with full-tree and exact symlink-target nonmutation oracles for refusals. Measure wall time and scratch and retain failures without native credit; a diagnostic is uncounted. Existing native receipts, live-preview authority and Barge adoption gates do not transfer.
+
+  **Implementation (oxide#235).** The current-source premise audit found that the front door's `Store::save` and the library's `fence_managed_control` replaces the document atomically by temporary-file rename while holding that control's `admission.lock` (registration and mode changes take the internal admission lock the same way), these current paths do not mutate the document in place, and supported operations preserve the lock and control directory identities. Released-predecessor coverage remains a separate audit residual; no version, fence or budget was widened. The landed seam is a per-window `CustodyWitness` in the state reader: at most one parsed state and one still-open state descriptor per pool for one prune authority window, created on the window's first custody decision and dropped with it, so nothing crosses windows. Each row takes both existing admission locks internal-first, NON-BLOCKING, without creating a missing lock and without admission fencing, through the verified no-follow control descriptor; the registration witness is re-read under the internal lock on every row (charged to the shared budget like every other snapshot input); the state pathname is then witnessed against the pinned descriptor — device, inode, regular private owner-only file, link count, size and high-resolution change metadata — with pre- and post-checks around any actual read, and a changed witness forces one fresh bounded read and full parse under the locks. A known absent, unregistered sibling is used only with a positive no-follow absence plus registration witness repeated per row (a removable control directory without a registration document is ambiguous and refuses); a registered sibling without proved control, lock or state is unknown and refuses the batch. A busy second lock releases the first and refuses the snapshot; changed control or lock identity, unsupported metadata, missing input, invalid or oversized parse, failed lock or read, and deadline or budget exhaustion all refuse the whole batch. Both locks are released before any path traversal or report construction. The verdict and holder texts are computed by one shared classifier (`custody_verdict`, `holder_lines`) so the retained unlocked `checkout_custody` route — still used by transitions and cleans — and the witnessed route classify records identically, including boot closure recomputed per row. All four prune custody sites use the witnessed route (snapshot eligibility, the receiptless custody reason, the intent-time under-barrier recheck inside its own fresh window, and the resolve-intent settlement, which runs one one-shot witness outside any window), so a prune preview no longer takes the fence-writing admission gate at all. Focused unit regressions cover unchanged reuse and re-read on replacement, replaced lock and control identity, missing-lock refusal without creation, busy internal and removable locks with first-lock release, unprovable and ambiguous sibling states, in-place changes including a same-size, same-inode re-read, hard links, symlinks, oversized and vanished documents, per-row lost-writer and boot-closure recomputation, holder-line parity, and the whole-snapshot refusal classification.
 - **Status.** Default `oxide status` reads only the bounded recorded `outputs/prune-observations.json` (`oxide.outputs.prune-observations/1`, at most 256 KiB and 512 roots) in the pool section. It performs no root walk, replay, lock or reconciliation. Coverage, source and time are explicit; a partial observation never becomes a global orphan total. `--measure` does not scan output roots for prune.
 - **Nonce reservation.** A building command reserves its future root's nonce after automatic adoption and before `planned_destination`/`SlotKey::resolve_in`, under the checkout's binding lock (released before the slot wait) and the internal publication lock: the receipt's `target` placement records `reserved` (transaction ID, fresh random nonce, root, kind, volume UUID, generation) and the registry a pending row with the same transaction and nonce, in one write-ahead publication. An existing root keys its marker nonce; a future root keys only its reserved nonce, never a missing root's old one. Starters for the identical future root share one uncancelled reservation; the commit that creates the root consumes it. Binding validates the exact surviving reservation (receipt, keyed nonce, registry row with no cancellation) before Cargo and refuses a cancelled, replaced or absent one with no automatic retry. `oxide outputs cancel-reservation` (and `detach`, and a starter that needs a different future root) cancels only under the checkout's binding with every writer clear, the reserved root absent and no prune intent: the registry first records the cancellation (authority invalidated, revision advanced), then the receipt commits without it, then the abandoned row is removed; an interrupted cancellation is finished only for its exact recorded transaction. A cancelled nonce is never reused. `oxide outputs plan` stays read-only. The pre-lease reservation applies binding's P4 precondition exactly, so a command that binding will refuse for it changes no authority — no `reserved` field, no generation, no updated timestamp, no link text (oxide#133 case14). A requested profile member whose committed root is missing under its owned member link (binding's `Dangling` state) also reserves nothing — its receipt bytes, registry bytes, revision, digest, generation and timestamps are unchanged — and the explicit `oxide outputs adopt` that refusal names then recovers in one command with a fresh nonce that supersedes the old committed row, which the next build uses (oxide#152). That precondition is per REQUESTED member and only for a profile-layout receipt: a requested member whose committed placement is external while this command's fresh selection is not. A member the receipt does not place, a whole-target receipt, and any command whose fresh selection is still external keep their reservation — a whole-target local fallback and a new member beside a committed external sibling both need it for `reservation_matches`. The ordering nit closed by oxide#133 is recorded here: in a profile checkout a command name whose profile outputs Oxide does not model is refused in the declaration step, BEFORE `reserve`, so it publishes no reservation at all. The remaining deferred nit is narrower: an `exec` that declares no member is still refused by `planned_destination`, i.e. after the reservation, and moving that refusal ahead of `reserve` (so it too changes nothing) is not part of oxide#144.
 - **Overflow.** When a reservation would exceed the live row cap, the registry durably records sticky incompleteness and the reservation is retried once with an explicit overflow tag (registry identity, transaction, nonce, revision as provenance) and no registry row. Binding validates that exact tag against the same sticky-incomplete registry and the overflow cancellation journal; an unrelated revision advance never refuses it. Prune keeps the whole batch while the registry is incomplete, and the flag is never cleared by this tranche.
@@ -6441,7 +6549,7 @@ Approved design direction (Tom, 2026-10-20). Not implemented. It applies to buil
   [foundation qualification](#qualification-result) record; a heavy-project benefit
   reading remains a separate stage.
 
-### Foreign churn in the supervisor census (design investigation)
+### Foreign churn in the supervisor census
 
 A PID is not an identity: the census identifies an occupant by `(pid, start)`.
 A successful safe reread showing no row or a different start proves only that
@@ -6482,8 +6590,8 @@ census thread, the final and named certain-empty census messages, pipe EOF and
 identity-bound custody remain independent closure requirements; no proposed
 classification grants signal authority. Zombie terminal treatment retains its
 existing allowlist and full paired-read requirements, not a generic exiting
-shortcut. These observations are a design investigation, not an implemented or
-qualified change.
+shortcut. These observations record the original design investigation; the later oxide#233
+candidate below remains unqualified.
 
 **Recommendation: no-go on either papercut shortcut.** A foreign parent's
 session does not bind its child's session: a child may enter the supervised
@@ -6526,8 +6634,170 @@ absence. This remains a design subject to independent exact-head review.
 `78364942c8dec9253d557cfc63a7775fe9284848`, runner SHA-256
 `fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b`,
 suite SHA-256 `c95d46aa0e590285c3c412294ffb215c0d45b19ba804f2243f0d2ebd62158d7b`,
-and this section before this amendment. It is a design, not implemented or
-qualified behavior. The following fixes the open choices in the candidate above.
+and this section before this amendment. It records the frozen design; the
+subsequent oxide#233 candidate is not yet qualified. The following fixes the open choices in the candidate above.
+
+**Candidate implementation (oxide#233).** The branch implements same-round
+replacement accounting using the ledger, shared read budget and fixed phase
+clock described below. The receipt and census message carry bounded
+`replacement_work` evidence, while the uncapped ledger determines obligations;
+a late publication refuses certainty. The original snapshot/confirmation/final
+zombie witnesses and the exact named and final census, EOF, joined-thread and
+fault gates remain independent. The qualification suite currently contains
+406 pure cases and 59 real cases by its loader: the two new real cases label
+synthetic replacement observations alongside the actual kernel snapshot. They
+are not kernel PID reuse, and no signal authority follows. The 382 pure / 57
+real #197 claims remain historical at their own bytes.
+
+**Failed diagnostic and fixture attribution correction.** The one Queue-activated
+uncounted diagnostic at `e6ed727` recorded 464 cases, 460 completed and four
+failed: both labelled synthetic replacement cases and the one- and twelve-held
+zombie witnesses. Its candidate guard closed with status 1, no fault or deadline,
+and monitored scratch peaked at 68,931,584 of 536,870,912 bytes. The failed
+packet is preserved: `cases.json` SHA-256
+`2c7d557182e3cef2ed84b9323a4611149678c66bc73bc7c879521037b5f050ab`,
+`topology.json` `7fee338b62238f8af34594f8cfac0d0e7b7ff8d1f91d1f039b2c60afeb258e85`,
+and guard receipt `3d918de9af3a6672f5c95203397a7b7190f60fb925446c9610a1497f9689bf1e`
+under `/Volumes/Builds/scratch/oxide/oxide-supervisor-qualify.l1rp7zy1` and
+`/Volumes/Builds/scratch/oxide/oxide-proof.rz6m7o9t/evidence`. Its four nested
+receipts show more than 1,100 snapshot identities and 40 or more ESRCH rows:
+the unchanged 20-row work/diagnostic prefixes omitted the named replacement or
+held zombies, and no terminal witness fit in the shared diagnostics budget.
+The counts and closure do not by themselves attribute an owned identity.
+
+The corrected candidate adds an opt-in, test-only projection of at most twelve
+fixture-named exact identities from the completed round ledger and its actual
+terminal witness records. Missing or unmatched identities remain `unobserved`;
+no ambient row substitutes for the named identity. The projection consumes no
+kernel read and changes no classification, certainty, cap, signal or closure
+decision. The two synthetic fixtures and the held-zombie cases assert that
+projection; the old clipped rows, omission counts and negative controls remain.
+The independent source and proof judgment and any fresh exact-head proof route
+remain with the same retained Queue reviewer and owner; this correction supplies
+no native qualification and does not reset the failed session.
+
+**Corrected-head diagnostic and nested-record schema.** The separately activated
+uncounted Queue diagnostic at `535ebbcb` exercised 465/465 cases successfully,
+including all four previously failing fixture cases. The candidate guard closed
+with status 0, no fault or deadline, and peak monitored scratch of 67.8 MiB.
+The diagnostic still failed: 11/12 checks passed, with `nested-cases` rejecting
+the two synthetic cases' `replacement_fixture` field as unmodelled. The packet
+at `/Volumes/Builds/scratch/oxide/oxide-supervisor-qualify.lli9efki` and
+`/Volumes/Builds/scratch/oxide/oxide-proof.ukf8izwb/evidence` is retained;
+`cases.json` SHA-256 `b22135446fdb9fe6bc94bdbd0a1d2165125308ca74d2a65d03b3c381931aa89f`,
+`topology.json` `6fd46774800df97d70593a93211e5c3541d53792fd962bed4742f95af3e3dc9e`,
+and guard receipt `6d12aad516bde8dedaae50eb2daedb7d98d0b0bf4d5735a56d17cc426321b4bc`.
+This is an uncounted failed diagnostic, never qualification credit. The next
+source correction permits that field only for the two named synthetic cases;
+the independent cases oracle still checks its exact contents and no-signal
+condition, and all nested-root and receipt checks remain in force. Pure controls
+also reject this field on other cases, malformed values, missing evidence,
+outside-root paths and unknown fields. No native run or allowance reset follows
+from this source correction; any further proof needs the Queue owner and the same
+retained reviewer's exact-head judgment.
+
+**Qualified default and isolated candidate (safe landing).** The ordinary
+`scripts/bounded-test.py` is restored byte-for-byte to the deployed qualified
+`fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b` source.
+The unchanged oxide#233 candidate `c578243126a2470cde0dfd19530254b3ec61b4ea5bb1fa43c6bbd2d41853c2b7`
+resides at `scripts/bounded-test-candidate.py` and is used only by the existing
+qualification bootstrap, suite, preflight and pure tests. Those routes bind
+both fixed paths and hashes, refuse absent, changed or swapped bytes, and never
+fall back to the ordinary runner. Ordinary selectors, wrappers and consumer
+imports retain their existing default paths and pins. Promotion of this candidate
+is a separate release step after actual qualification and is not authorized here.
+
+Queue diagnostic `0e148446` at source `8b4c2e0`, independently judged by the
+same retained reviewer (review `6567647646`, verdict `v10-fresh-diagnostic-8b4c2e06`),
+completed 465/465 cases and 12/12 checks with zero problems; the candidate guard
+closed status 0 with no fault or deadline, 419.38 s worker wall, 71,045,120 bytes
+peak monitored scratch and 288.3 GiB minimum sampled free. Intentional exit 1 and
+`qualified: false` remain: this is uncounted evidence, not a counted qualification,
+promotion or consumer proof. Its retained `cases.json` SHA-256
+`2a9983f387703ca1654401ba4fcecf3d16bbae47712d70677e618ae9f57f34c9` and
+`topology.json` `4b32f4a1b64b2d50fc3b5b70735ba806fc6cd3dd58abbf20b3f2b30903b23b9e`
+are in `/Volumes/Builds/scratch/oxide/oxide-supervisor-qualify.iy_vrps8`; the
+nested guard receipt SHA-256
+`bfaa86c19b82f5ee0acb3ad6d1e50816f3efd05b8128c7d4fce65198d003f97d` is in
+`/Volumes/Builds/scratch/oxide/oxide-proof.eziis49o/evidence`. The reviewer
+assessed the pre-existing fixture-thread traceback separately (verdict
+`v11-traceback-assessment`); that assessment does not migrate evidence to this
+relocated source head. The earlier failed packets remain unchanged. The retained
+reviewer must judge this routing revision; any changed-head diagnostic is separately
+owner-activated under its fixed limits and cannot qualify deployment by itself.
+
+The relocated source at `0ddc30650dbdb26ec5dd875d9cc9926e6f082b61` was then
+tested by Queue proof-only diagnostic `41eef47b`. Its retained reviewer accepted
+465/465 cases (406 pure and 59 real), 12/12 checks and zero problems, with the
+candidate closed at status 0, no fault or deadline, 421.7 s worker wall,
+69,967,872 bytes peak monitored scratch and 300.5 GiB minimum sampled free.
+The guard receipt SHA-256 is
+`01482d23938e1f614999cb3dee543d9b9aefe573aeff275ebb0d26b9d6687f1d`, retained
+at `/Volumes/Builds/scratch/oxide/oxide-proof.kh7tju10/evidence/receipt.json`;
+the matching `cases.json` SHA-256 is
+`ea3099ff2b0bcf29850f90b3c36e5f4ac4d91bef9a159d0fc7d078d158f7582b` in
+`/Volumes/Builds/scratch/oxide/oxide-supervisor-qualify.jveh3rik`.
+The twelve printed check rows were captured by Queue rather than retained as
+a separate disk receipt; the reviewer re-derived their inputs from the kept
+artifacts. Intentional exit 1 and `qualified: false` remain: this establishes
+the relocated diagnostic route, not counted qualification or consumer promotion.
+The default qualified runner remains `fcfda2b0`; retained nested fault fixtures
+and all historical failures stay unchanged.
+
+**Counted candidate qualification.** The counted selector
+`effigy proof:supervisor:qualify` ran once at the same `0ddc306` source in
+execution `a7c3c9da`. Its actual receipt schema emits `result: "pass"` and
+`problems: []`; counted mode does not emit a top-level `qualified` property.
+Only diagnostic mode adds `qualified: false`. A future qualification brief
+must use that actual schema, together with the source, case, custody and
+resource oracles, rather than demand a nonexistent `qualified: true` field.
+The exact manifest is bound by the fifth independently verified Queue input
+and clean source commit; the printed `sha256` object binds the candidate,
+qualified default, suite and bootstrap.
+
+Planner release-gate acceptance `9575afc9-4a46-4302-8f33-c660977454cd`
+accepts this counted evidence for the isolated `c5782431` bytes. All 465
+outcomes passed, with no problems, candidate closed at status 0, no fault or
+deadline, a certain empty deciding census and no survivors. Worker wall was
+417.07 s, peak monitored scratch 71,032,832 bytes and minimum sampled free
+304.9 GiB. Nested fault fixtures and the bootstrap base remain retained;
+both startup sweeps removed nothing. The original combined log at
+`/Volumes/Builds/scratch/oxide/qualification.BRF2xdS5/qualification.log` has
+SHA-256 `56010506433b3eff6ba49bd62991e893942d7da856e236ae36a3496446ee80b9`;
+its 166,100 bytes were outside guarded accounting. The matching guard receipt
+at `/Volumes/Builds/scratch/oxide/oxide-proof.dgi2n6oi/evidence/receipt.json`
+has SHA-256 `c2764ebcf79a41598a32ea5630198a9abeb02d467c251a1360d8cae785de6323`.
+No receipt, missing field or reviewer finding was rewritten by the acceptance.
+It qualifies only these bytes within the declared cooperative macOS scope;
+it supplies no stronger group-lifetime or historical-survivor closure claim.
+The ordinary default remains `fcfda2b0`. Using the qualified candidate's fixed
+path in a new proof needs its own scoped consumer disposition and pin audit;
+qualification alone performs no global promotion or consumer repin.
+
+The proof-authoring premise sweep for the new cases follows their executable
+route: `Real.replacement_fixture` calls `Real.guardian` with `fixture("pass")`;
+that fixture is Python-only and makes no Oxide, Cargo or rustup call. Therefore
+private HOME/rustup and lock generation, Oxide account-home override, inherited
+Oxide configuration and automatic adoption, Cargo external argv, and compiler
+flags are not applicable to these case bodies. They create no image, so the
+owned-image attachment premise is not applicable. `Real.setUp`, `nested_root`
+and `Real.guardian` place their `tempfile.mkdtemp` case directory and nested
+supervisor evidence inside the qualification-owned root; no shell `mktemp` is
+called. Existing suite cases and the enclosing bootstrap retain their own
+premises, bounds and custody rules. This source sweep is not a native diagnostic.
+
+These candidate bytes have the counted qualification and attributed planner
+acceptance recorded above. Main's `fcfda2b0…` runner remains the deployed
+default route; no prior receipt migrates. Under Tom's task-specific
+ruling `c8991f99`, the single retained Queue reviewer judges the exact published
+source and, after source approval, one separately activated source-immutable
+uncounted diagnostic. Qualification and active-consumer safety are distinct
+planner-owned release gates; the later counted execution is a separate
+qualification disposition, not an additional reviewer native. The 600 s outer /
+560 s candidate / 530 s suite bounds,
+512 MiB monitored scratch and host custody remain unchanged. The persistent
+same-identity non-zombie ESRCH (`37529b20`) and recycled-identity report
+(`631e4462`) gain no retrospective closure or signal authority.
 
 The project planner froze this bounded design on 2026-11-01 after independent
 exact-head review `6565343955` of `ecd2129b771b74e7a29ff6f38687cad88e9418ca`.
@@ -6632,8 +6902,9 @@ a same-session different-group survivor and no-signal control. The separate
 persistent same non-zombie identity with getsid ESRCH (`37529b20`) remains
 unknown/UNCLOSED; related recycled-identity paper `631e4462` and historical
 packets gain no closure or credit. This slice is HIGH/ELEVATED because it changes
-writer closure; its independent reviewer must run the distinct native session.
-The existing qualification bounds and activation order below remain fixed.
+writer closure. The original design's separate reviewer-native requirement was
+superseded for oxide#233 by Tom's task-specific ruling `c8991f99`; the fixed
+qualification bounds remain unchanged.
 
 | Interleaving / counterexample | Required disposition |
 | --- | --- |
@@ -6676,17 +6947,17 @@ fixtures and test-only controlled seams to exercise replacement attribution and
 closure end to end, alongside actual same-session different-group survivor,
 foreign churn, EOF veto, join and no-signal controls; do not depend on forcing
 kernel PID reuse or a quiet host. Distinguish simulated interleavings from real
-kernel observations in receipts. Run the pure selector and covering checks once,
-then an owner-activated uncounted keep-going diagnostic, counted author and
-distinct independent reviewer native qualifications at the exact published
-head, under the then-approved 600 s outer / 560 s candidate / 530 s suite and
-512 MiB bounds, reserve watchdog and custody rules. Any changed bounds require
-an explicit brief amendment, not a reset. This changes writer-closure decisions,
-so future implementation is Elevated; retain the independent reviewer native.
-No native is authorized by this design.
+kernel observations in receipts. Run the covering selectors, then the one Queue-activated uncounted keep-going
+diagnostic at the exact published head after retained-reviewer source approval,
+under the 600 s outer / 560 s candidate / 530 s suite and 512 MiB bounds,
+reserve watchdog and custody rules. Tom's task-specific ruling `c8991f99`
+supersedes the original separate author and reviewer native sessions for this
+task; further qualification is a planner-owned release gate. Any changed bounds
+require an explicit brief amendment, not a reset. This changes writer-closure
+decisions and is Elevated. No native is authorized by this design alone.
 
-The candidate runner remains unqualified until that chain and exact-head review
-pass. Inventory direct consumers in `effigy.toml` and all hash checks at the
+The candidate runner remains unqualified until the applicable qualification
+requirements are met. Inventory direct consumers in `effigy.toml` and all hash checks at the
 implementation head; update each applicable pin only under its own approved
 scope, with new consumer evidence where required. At this source head explicit
 `fcfda2b0…` checks occur in `test-command-budgets.py`,
