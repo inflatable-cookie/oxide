@@ -1243,6 +1243,12 @@ alone is insufficient.
   | [`inventory.rs`](../../../src/inventory.rs), `inventory_directory`, `inventory_with`, `Walker`, `probe_filesystem_free`; [`volume.rs`](../../../src/volume.rs), binding/open/verification | Existing root, iterator, metadata, deadline and filesystem-free results feed the same accounting and refusal branches. Test rows record returned results, not a second inventory or a recomputed policy; volume descriptor and parent fields stay unproven where the original operation supplies none. |
   | [`tape.rs`](../../../src/bin/oxide/tape.rs), [`tape_harness.rs`](../../../src/bin/oxide/tape_harness.rs), [`src/tape.rs`](../../../src/tape.rs), [`lib.rs`](../../../src/lib.rs) | The tape and harness are test-only; the library-side module is `cfg(all(test, unix))`. The re-rooted harness resolves the real modules into one sink. Production release compile-away remains an execution obligation, not a consequence inferred from this table. |
 
+  In main's `custody_verdict`, the production `lost.unclosed.as_deref()`
+  filter is assigned to `unclosed` before the same `if let Some(why)` branch.
+  This reshaping preserves the one `closed_by_boot` call, short circuit and
+  returned custody value; only the test arm records that actual call result.
+  This is a source equivalence claim, still requiring release compilation.
+
   Initializer-only `prepare_new_pool`, `verify_scratch_initializer` and
   `refuse_occupied_init_directory` are reached by initialization, not by
   `Pool::open_inner`. `HoldingSweep` and its actual unlink traversal belong to
