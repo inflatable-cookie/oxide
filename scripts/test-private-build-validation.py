@@ -618,7 +618,7 @@ def allocated_bytes(paths: list, cap: int, deadline_ns: int | None = None) -> in
 # Environment: audited admission binding and the scrubbed child environment
 # ---------------------------------------------------------------------------
 
-def audited_admission(inherited: dict, audit: dict) -> dict:
+def audited_admission(inherited: dict, audit: dict, *, deadline_ns: int | None = None) -> dict:
     """Preserve only the independently audited host admission route.
 
     An unset or unequaled hook is not host admission; the executables and
@@ -641,7 +641,7 @@ def audited_admission(inherited: dict, audit: dict) -> dict:
             if (not path.is_absolute() or path.is_symlink()
                     or path.resolve(strict=True) != path or not path.is_file()
                     or not isinstance(item["sha256"], str) or not HEX64.fullmatch(item["sha256"])
-                    or sha256_file(path, cap=MAX_ADMISSION_ARTIFACT_BYTES) != item["sha256"]):
+                    or sha256_file(path, cap=MAX_ADMISSION_ARTIFACT_BYTES, deadline_ns=deadline_ns) != item["sha256"]):
                 raise GateRefusal(f"{name} is missing or changed on this host")
     return {"EFFIGY_ADMISSION_HOOK": hook, "QUEUE_ADMISSION_SOCKET": socket}
 
@@ -898,15 +898,15 @@ def validate_barge_block(block, *, head, wrapper_hash, oxide_hash, audit_hash,
 
 
 def live_audit_host(*, effigy: Path, git_tool: Path, rustc_tool: Path,
-                    python: Path, wrapper_hash: str, oxide_hash: str) -> dict:
+                    python: Path, wrapper_hash: str, oxide_hash: str, deadline_ns: int | None = None) -> dict:
     cap = 256 * 1024 * 1024
-    return {"effigy_sha256": sha256_file(effigy, cap=cap),
-            "git_sha256": sha256_file(git_tool, cap=cap),
-            "rustc_sha256": sha256_file(rustc_tool, cap=cap),
+    return {"effigy_sha256": sha256_file(effigy, cap=cap, deadline_ns=deadline_ns),
+            "git_sha256": sha256_file(git_tool, cap=cap, deadline_ns=deadline_ns),
+            "rustc_sha256": sha256_file(rustc_tool, cap=cap, deadline_ns=deadline_ns),
             "supervisor_sha256": SUPERVISOR_SHA256,
             "wrapper_sha256": wrapper_hash, "oxide_sha256": oxide_hash,
-            "cargo_sha256": sha256_file((rustc_tool.parent / "cargo").resolve(strict=True), cap=cap),
-            "python_sha256": sha256_file(python, cap=cap)}
+            "cargo_sha256": sha256_file((rustc_tool.parent / "cargo").resolve(strict=True), cap=cap, deadline_ns=deadline_ns),
+            "python_sha256": sha256_file(python, cap=cap, deadline_ns=deadline_ns)}
 
 
 def bind_barge_documents(block_template: dict, audit_template: dict, oxide_hash: str) -> tuple:
@@ -927,7 +927,7 @@ def bind_barge_documents(block_template: dict, audit_template: dict, oxide_hash:
     return block, audit
 
 
-def validate_barge_audit(audit, *, private, host: dict) -> None:
+def validate_barge_audit(audit, *, private, host: dict, deadline_ns: int | None = None) -> None:
     if not isinstance(audit, dict) or audit.get("schema") != SCHEMA_BARGE_AUDIT:
         raise GateRefusal("source audit missing")
     if not isinstance(audit.get("review_reference"), str) or not audit["review_reference"].strip():
@@ -962,7 +962,7 @@ def validate_barge_audit(audit, *, private, host: dict) -> None:
                     or not isinstance(item["lines"], str) or not item["lines"].strip()):
                 raise GateRefusal(f"{name}: invalid source identity")
             if (path.is_symlink() or path.resolve(strict=True) != path
-                    or not path.is_file() or sha256_file(path, cap=MAX_AUDIT_SOURCE_BYTES) != expected):
+                    or not path.is_file() or sha256_file(path, cap=MAX_AUDIT_SOURCE_BYTES, deadline_ns=deadline_ns) != expected):
                 raise GateRefusal(f"{name}: source changed or unreadable")
 
 
@@ -986,7 +986,7 @@ def validate_barge_ledger(ledger, *, private_root: Path, scratch: Path,
         if (not path.is_absolute() or not path.is_relative_to(scratch) or path.is_symlink()
                 or path.resolve(strict=True) != path or not path.is_file()
                 or not isinstance(item["sha256"], str) or not HEX64.fullmatch(item["sha256"])
-                or sha256_file(path) != item["sha256"]):
+                or sha256_file(path, deadline_ns=deadline_ns) != item["sha256"]):
             raise GateRefusal("root-discovery evidence is missing or changed")
     roots = ledger.get("roots")
     if not isinstance(roots, list) or not roots or any(not isinstance(p, str) for p in roots):
@@ -1135,7 +1135,7 @@ def validate_preparation_binding(*, binding, prep_command: list, prep_run_id,
                                  current_script_sha256: str, barge_root: Path,
                                  oxide_root: Path, barge_head: str, oxide_head: str,
                                  oxide_product_head: str,
-                                 audit_inputs_sha256: str) -> dict:
+                                 audit_inputs_sha256: str, deadline_ns: int | None = None) -> dict:
     """Bind the preparation's actual bytes, guard, command and packet manifest.
 
     The recorded script path is never resolved here: it may be relative (the
@@ -1192,7 +1192,7 @@ def validate_preparation_binding(*, binding, prep_command: list, prep_run_id,
             raise GateRefusal("preparation packet manifest document binding is malformed")
     for name, digest in sorted(documents.items()):
         try:
-            if sha256_file(canonical_file(packet_dir / name)) != digest:
+            if sha256_file(canonical_file(packet_dir / name), deadline_ns=deadline_ns) != digest:
                 raise GateRefusal(f"preparation packet document changed: {name}")
         except OSError as error:
             raise GateRefusal(f"preparation packet document {name} is missing or unreadable: "
@@ -2091,11 +2091,11 @@ def live_account_reachability(values: list, *, account_root: Path) -> dict:
             "values": hits}
 
 
-def tool_identity(path: Path, cap: int) -> dict:
+def tool_identity(path: Path, cap: int, *, deadline_ns: int | None = None) -> dict:
     """A bounded live identity for one allowed build executable."""
     try:
         info = path.stat()
-        digest = sha256_file(path, cap=cap)
+        digest = sha256_file(path, cap=cap, deadline_ns=deadline_ns)
     except OSError as error:
         raise GateRefusal(f"provenance tool unreadable: {path}: {error}") from None
     return {"path": str(path), "bytes": info.st_size, "sha256": digest}
@@ -2436,7 +2436,7 @@ def validate_host_tools_document(document: dict, *, rustc_tool: Path,
             "tools": sorted(names) or None}
 
 
-def reconcile_host_tools(ambient: dict, document: dict) -> tuple:
+def reconcile_host_tools(ambient: dict, document: dict, *, deadline_ns: int | None = None) -> tuple:
     """Adjudicate the PATH-tool scan into the candidate route's final findings.
 
     Takes the merged pre-launch ambient dict (its `path_executables` scan and
@@ -2470,7 +2470,7 @@ def reconcile_host_tools(ambient: dict, document: dict) -> tuple:
             resolved = Path(entry.get("resolved_path") or entry.get("path", ""))
             binding = bound.get(name)
             try:
-                live_sha256 = sha256_file(resolved, cap=MAX_ADMISSION_ARTIFACT_BYTES)
+                live_sha256 = sha256_file(resolved, cap=MAX_ADMISSION_ARTIFACT_BYTES, deadline_ns=deadline_ns)
                 live_bytes = resolved.stat().st_size
             except (OSError, GateRefusal) as error:
                 recorded["state"] = "unreadable"
@@ -2619,7 +2619,7 @@ def validate_candidate_origin(*, origin_root: Path, options: dict, ledger_roots:
 
 
 def copy_candidate_artifact(source: Path, fresh_root: Path, expected_sha256: str,
-                            expected_bytes: int) -> dict:
+                            expected_bytes: int, *, deadline_ns: int | None = None) -> dict:
     """Copy the retained candidate into the fresh guard-owned root, rehash it.
 
     The source must be the planner-digest-bound regular executable file
@@ -2660,6 +2660,7 @@ def copy_candidate_artifact(source: Path, fresh_root: Path, expected_sha256: str
             digest = hashlib.sha256()
             copied = 0
             while True:
+                deadline_check(deadline_ns)
                 block = os.read(source_fd, 1024 * 1024)
                 if not block:
                     break
@@ -2687,7 +2688,7 @@ def copy_candidate_artifact(source: Path, fresh_root: Path, expected_sha256: str
                 os.close(out)
             except OSError:
                 pass
-    copy_digest = sha256_file(destination, cap=MAX_ADMISSION_ARTIFACT_BYTES)
+    copy_digest = sha256_file(destination, cap=MAX_ADMISSION_ARTIFACT_BYTES, deadline_ns=deadline_ns)
     if copy_digest != expected_sha256:
         raise GateRefusal("candidate copy digest differs from the retained candidate")
     copy_stat = os.lstat(destination)
@@ -2869,8 +2870,9 @@ def bootstrap_artifact_facts(log_text: str, *, oxide_source: Path,
                 violations.append(f"artifact-escaped:{str(staged)[:512]}")
             else:
                 try:
-                    digest = sha256_file(staged, cap=256 * 1024 * 1024)
+                    digest = sha256_file(staged, cap=256 * 1024 * 1024, deadline_ns=deadline_ns)
                 except GateRefusal as error:
+                    deadline_check(deadline_ns)
                     kind = ("artifact-oversize:" if "exceeds the document bound"
                             in str(error) else "artifact-missing:")
                     violations.append(kind + raw)
@@ -2979,7 +2981,7 @@ def refuse_bootstrap_launch(inputs: dict, ambient: dict, allowance: dict) -> Non
 
 
 def resolve_bootstrap_artifact(log_text: str, inputs: dict, *, guard: dict,
-                               ambient: dict, allowance: dict) -> dict:
+                               ambient: dict, allowance: dict, deadline_ns: int | None = None) -> dict:
     """Resolve the artifact, retain provenance first, refuse on any finding.
 
     On the success path nothing is written here: the diagnostic completes the
@@ -2988,7 +2990,7 @@ def resolve_bootstrap_artifact(log_text: str, inputs: dict, *, guard: dict,
     validation failure keeps the attributable bootstrap evidence.
     """
     facts = bootstrap_artifact_facts(log_text, oxide_source=inputs["cwd"],
-                                     private_root=inputs["private_root"])
+                                     private_root=inputs["private_root"], deadline_ns=deadline_ns)
     if facts["violations"]:
         document = build_bootstrap_provenance(
             inputs, guard=guard,
@@ -3001,14 +3003,14 @@ def resolve_bootstrap_artifact(log_text: str, inputs: dict, *, guard: dict,
 
 def bootstrap_guard_facts(receipt: dict, *, receipt_path: Path, log_path: Path,
                           limit_seconds: int, scratch_mib: int,
-                          expected_argv: list) -> dict:
+                          expected_argv: list, deadline_ns: int | None = None) -> dict:
     """The bounded reference to the nested guard receipt and build log."""
     census = receipt.get("census", {})
     outcome = receipt.get("outcome", {})
     return {
         "state": "closed",
         "receipt_path": str(receipt_path),
-        "receipt_sha256": sha256_file(receipt_path, cap=MAX_DOC_BYTES),
+        "receipt_sha256": sha256_file(receipt_path, cap=MAX_DOC_BYTES, deadline_ns=deadline_ns),
         "run_id": receipt.get("run_id"),
         "limit_s": receipt.get("limit_s"),
         "start_ns": receipt.get("start_ns"),
@@ -3022,7 +3024,7 @@ def bootstrap_guard_facts(receipt: dict, *, receipt_path: Path, log_path: Path,
         "outcome": {key: outcome.get(key) for key in
                     ("closure", "status", "fault", "deadline", "launched")},
         "log_path": str(log_path),
-        "log_sha256": sha256_file(log_path, cap=32 * 1024 * 1024),
+        "log_sha256": sha256_file(log_path, cap=32 * 1024 * 1024, deadline_ns=deadline_ns),
     }
 
 
@@ -3134,7 +3136,7 @@ def diagnostic(options: dict) -> int:
         raise GateRefusal("qualified supervisor bytes are not the pinned qualified version")
     inherited = dict(os.environ)
     audit_doc = read_json_bound(audit_path, audit_digest)
-    admission_env = audited_admission(inherited, audit_doc)
+    admission_env = audited_admission(inherited, audit_doc, deadline_ns=deadline_ns)
     invoking_cargo_home = os.environ.get("CARGO_HOME", "")
     if mode != "candidate" and (not invoking_cargo_home or not Path(invoking_cargo_home).is_dir()):
         raise GateRefusal("invoking CARGO_HOME is required as the offline seed source")
@@ -3162,7 +3164,7 @@ def diagnostic(options: dict) -> int:
         current_script_sha256=current_script_sha256,
         barge_root=barge_root, oxide_root=oxide_root, barge_head=barge_head,
         oxide_head=oxide_head, oxide_product_head=prep_options["oxide_product_head"],
-        audit_inputs_sha256=prep_options["expect_audit_inputs"])
+        audit_inputs_sha256=prep_options["expect_audit_inputs"], deadline_ns=deadline_ns)
     deadline_check(deadline_ns)
     # Fixed companion claims survive fresh evidence directories and burn on uncertainty.
     claim = {"gate_id": run_id,
@@ -3294,13 +3296,13 @@ def diagnostic(options: dict) -> int:
                                                           options["expect_candidate"])
         validate_barge_audit(audit_doc, private=barge_root, host=live_audit_host(
             effigy=effigy, git_tool=git_tool, rustc_tool=rustc_tool, python=python,
-            wrapper_hash=wrapper_hash, oxide_hash=options["expect_candidate"]))
+            wrapper_hash=wrapper_hash, oxide_hash=options["expect_candidate"], deadline_ns=deadline_ns), deadline_ns=deadline_ns)
     else:
         block_doc, audit_preview = bind_barge_documents(block_template, audit_doc, "0" * 64)
         issued_audit_digest = sha256_bytes(canonical_json(audit_doc))
         validate_barge_audit(audit_preview, private=barge_root, host=live_audit_host(
             effigy=effigy, git_tool=git_tool, rustc_tool=rustc_tool, python=python,
-            wrapper_hash=wrapper_hash, oxide_hash="0" * 64))
+            wrapper_hash=wrapper_hash, oxide_hash="0" * 64, deadline_ns=deadline_ns), deadline_ns=deadline_ns)
     if audit_doc.get("child_path") != str(barge_root / "bin") + os.pathsep + inherited.get("PATH", ""):
         raise GateRefusal("audited child PATH does not match the effective environment")
     if block_doc.get("barge_tree") != barge_tree:
@@ -3329,7 +3331,7 @@ def diagnostic(options: dict) -> int:
         # origin tree is never written and no offline seed runs.
         copy_facts = copy_candidate_artifact(
             Path(origin_facts["artifact"]["path"]), barge_root,
-            options["expect_candidate"], options["candidate_bytes"])
+            options["expect_candidate"], options["candidate_bytes"], deadline_ns=deadline_ns)
         os.symlink(copy_facts["path"], barge_root / "bin/oxide")
     else:
         sys.path.insert(0, str(oxide_source / "scripts"))
@@ -3373,19 +3375,19 @@ def diagnostic(options: dict) -> int:
             ambient_cargo_config_scan(oxide_source, private_root=barge_root,
                                       cargo_home=Path(env["CARGO_HOME"]), deadline_ns=deadline_ns),
             env["PATH"], private_root=barge_root, cwd=oxide_source, deadline_ns=deadline_ns)
-        host_observation, candidate_findings = reconcile_host_tools(ambient, host_tools_doc)
+        host_observation, candidate_findings = reconcile_host_tools(ambient, host_tools_doc, deadline_ns=deadline_ns)
         ambient = dict(ambient)
         ambient["host_tool_bindings"] = host_observation
         # The adjudicated findings REPLACE the raw scan verdicts: a bound
         # audited host input no longer carries its ambient-executable refusal.
         ambient["violations"] = candidate_findings
         candidate_tools = {
-            "python": tool_identity(python, 256 * 1024 * 1024),
-            "supervisor": tool_identity(supervisor_tool, 512 * 1024),
-            "rustc": tool_identity(rustc_tool, 256 * 1024 * 1024),
-            "cargo": tool_identity(cargo_tool, 256 * 1024 * 1024),
-            "effigy": tool_identity(effigy, 256 * 1024 * 1024),
-            "git": tool_identity(git_tool, 64 * 1024 * 1024),
+            "python": tool_identity(python, 256 * 1024 * 1024, deadline_ns=deadline_ns),
+            "supervisor": tool_identity(supervisor_tool, 512 * 1024, deadline_ns=deadline_ns),
+            "rustc": tool_identity(rustc_tool, 256 * 1024 * 1024, deadline_ns=deadline_ns),
+            "cargo": tool_identity(cargo_tool, 256 * 1024 * 1024, deadline_ns=deadline_ns),
+            "effigy": tool_identity(effigy, 256 * 1024 * 1024, deadline_ns=deadline_ns),
+            "git": tool_identity(git_tool, 64 * 1024 * 1024, deadline_ns=deadline_ns),
         }
         provenance_inputs = {
             "run_id": run_id, "private_root": barge_root,
@@ -3466,12 +3468,12 @@ def diagnostic(options: dict) -> int:
             "argv": list(BARGE_BOOTSTRAP_ARGV), "cwd": oxide_source, "env": env,
             "inherited_keys": sorted(os.environ),
             "tools": {
-                "python": tool_identity(python, 256 * 1024 * 1024),
-                "supervisor": tool_identity(supervisor_tool, 512 * 1024),
-                "rustc": tool_identity(rustc_tool, 256 * 1024 * 1024),
-                "cargo": tool_identity(cargo_tool, 256 * 1024 * 1024),
-                "effigy": tool_identity(effigy, 256 * 1024 * 1024),
-                "git": tool_identity(git_tool, 64 * 1024 * 1024),
+                "python": tool_identity(python, 256 * 1024 * 1024, deadline_ns=deadline_ns),
+                "supervisor": tool_identity(supervisor_tool, 512 * 1024, deadline_ns=deadline_ns),
+                "rustc": tool_identity(rustc_tool, 256 * 1024 * 1024, deadline_ns=deadline_ns),
+                "cargo": tool_identity(cargo_tool, 256 * 1024 * 1024, deadline_ns=deadline_ns),
+                "effigy": tool_identity(effigy, 256 * 1024 * 1024, deadline_ns=deadline_ns),
+                "git": tool_identity(git_tool, 64 * 1024 * 1024, deadline_ns=deadline_ns),
             },
             "sources": {
                 "oxide_pin_commit": OXIDE_PIN_COMMIT, "oxide_pin_tree": oxide_tree,
@@ -3504,10 +3506,10 @@ def diagnostic(options: dict) -> int:
             receipt_path=bootstrap_evidence / "receipt.json",
             log_path=bootstrap_evidence.parent / "bootstrap-stdout.log",
             limit_seconds=bootstrap_receipt["limit_s"], scratch_mib=bootstrap_mib,
-            expected_argv=list(BARGE_BOOTSTRAP_ARGV))
+            expected_argv=list(BARGE_BOOTSTRAP_ARGV), deadline_ns=deadline_ns)
         facts = resolve_bootstrap_artifact(bootstrap_log, provenance_inputs,
                                            guard=guard_facts, ambient=ambient,
-                                           allowance=allowance.document())
+                                           allowance=allowance.document(), deadline_ns=deadline_ns)
         staged = Path(facts["artifact"]["resolved_path"])
         oxide_hash = facts["artifact"]["sha256"]
         os.symlink(staged, barge_root / "bin/oxide")
@@ -3531,8 +3533,8 @@ def diagnostic(options: dict) -> int:
         block_doc, issued_audit = bind_barge_documents(block_template, audit_doc, oxide_hash)
         validate_barge_audit(issued_audit, private=barge_root, host=live_audit_host(
             effigy=effigy, git_tool=git_tool, rustc_tool=rustc_tool, python=python,
-            wrapper_hash=wrapper_hash, oxide_hash=oxide_hash))
-        audited_admission(inherited, issued_audit)
+            wrapper_hash=wrapper_hash, oxide_hash=oxide_hash, deadline_ns=deadline_ns), deadline_ns=deadline_ns)
+        audited_admission(inherited, issued_audit, deadline_ns=deadline_ns)
         issued_audit_bytes = canonical_json(issued_audit)
         issued_block_bytes = canonical_json(block_doc)
         issued_dir = private_dir(barge_root, Path("issued"))
@@ -3610,8 +3612,8 @@ def diagnostic(options: dict) -> int:
                 "commit": OXIDE_PIN_COMMIT, "tree": oxide_tree,
                 "lock_sha256": oxide_files["Cargo.lock"],
                 "toolchain_sha256": oxide_files["rust-toolchain.toml"],
-                "rustc_sha256": sha256_file(rustc_tool, cap=256 * 1024 * 1024),
-                "cargo_sha256": sha256_file(cargo_tool, cap=256 * 1024 * 1024),
+                "rustc_sha256": sha256_file(rustc_tool, cap=256 * 1024 * 1024, deadline_ns=deadline_ns),
+                "cargo_sha256": sha256_file(cargo_tool, cap=256 * 1024 * 1024, deadline_ns=deadline_ns),
                 "oxide_sha256": oxide_hash,
                 "files": oxide_files,
             },
@@ -3638,16 +3640,16 @@ def diagnostic(options: dict) -> int:
             "exit_code": 0,
             "artifact_sha256": oxide_hash,
             "source_tree": oxide_tree,
-            "rustc_sha256": sha256_file(rustc_tool, cap=256 * 1024 * 1024),
+            "rustc_sha256": sha256_file(rustc_tool, cap=256 * 1024 * 1024, deadline_ns=deadline_ns),
             "cwd": str(oxide_source),
             "lock_sha256": oxide_files["Cargo.lock"],
             "toolchain_sha256": oxide_files["rust-toolchain.toml"],
-            "cargo_sha256": sha256_file((rustc_tool.parent / "cargo").resolve(strict=True), cap=256 * 1024 * 1024),
+            "cargo_sha256": sha256_file((rustc_tool.parent / "cargo").resolve(strict=True), cap=256 * 1024 * 1024, deadline_ns=deadline_ns),
             "environment": {key: env[key] for key in BUILD_ENV_KEYS},
             "log_path": str(bootstrap_evidence.parent / "bootstrap-stdout.log"),
-            "log_sha256": sha256_file(bootstrap_evidence.parent / "bootstrap-stdout.log"),
+            "log_sha256": sha256_file(bootstrap_evidence.parent / "bootstrap-stdout.log", deadline_ns=deadline_ns),
             "supervisor_receipt_path": str(bootstrap_evidence / "receipt.json"),
-            "supervisor_receipt_sha256": sha256_file(bootstrap_evidence / "receipt.json"),
+            "supervisor_receipt_sha256": sha256_file(bootstrap_evidence / "receipt.json", deadline_ns=deadline_ns),
             "live_before_path": str(live_before_export),
             "live_before_sha256": sha256_bytes(live_before_doc),
             "live_after_path": str(live_after_export),
@@ -3657,7 +3659,7 @@ def diagnostic(options: dict) -> int:
             "commit": OXIDE_PIN_COMMIT, "tree": oxide_tree,
             "lock_sha256": oxide_files["Cargo.lock"],
             "toolchain_sha256": oxide_files["rust-toolchain.toml"],
-            "rustc_sha256": sha256_file(rustc_tool, cap=256 * 1024 * 1024),
+            "rustc_sha256": sha256_file(rustc_tool, cap=256 * 1024 * 1024, deadline_ns=deadline_ns),
             "oxide_sha256": oxide_hash,
             "files": oxide_files,
         }, build=build_doc)
@@ -3755,11 +3757,11 @@ def diagnostic(options: dict) -> int:
         gate_id=run_id,
         blocks={"barge_block_sha256": block_digest, "oxide_block_sha256": approval},
         allowance=published_allowance,
-        bindings={"effigy": sha256_file(effigy, cap=256 * 1024 * 1024), "oxide": oxide_hash,
-                  "rustc": sha256_file(rustc_tool, cap=256 * 1024 * 1024), "git": sha256_file(git_tool, cap=256 * 1024 * 1024),
+        bindings={"effigy": sha256_file(effigy, cap=256 * 1024 * 1024, deadline_ns=deadline_ns), "oxide": oxide_hash,
+                  "rustc": sha256_file(rustc_tool, cap=256 * 1024 * 1024, deadline_ns=deadline_ns), "git": sha256_file(git_tool, cap=256 * 1024 * 1024, deadline_ns=deadline_ns),
                   "supervisor": SUPERVISOR_SHA256, "wrapper": wrapper_hash},
         commands=commands,
-        observations={"oxide_claim_receipt_sha256": sha256_file(oxide_claim_evidence / "receipt.json"),
+        observations={"oxide_claim_receipt_sha256": sha256_file(oxide_claim_evidence / "receipt.json", deadline_ns=deadline_ns),
                       "live_inventory_sha256": sha256_bytes(live_before_doc),
                       "retained_snapshot_sha256": sha256_bytes(canonical_json(retained_after)),
                       "barge_aggregate_bytes": barge_outside + barge_monitored,
@@ -4200,6 +4202,10 @@ def self_test() -> int:
             failures.append("expired staging launched Git")
         expect_refusal("final inventory respects deadline", live_inventory,
                        private_root, 99)
+    (private_root / "deadline-digest").write_bytes(b"digest")
+    with patch(__name__ + ".now_ns", return_value=100):
+        expect_refusal("expired final digest refuses", sha256_file, private_root / "deadline-digest",
+                       deadline_ns=99)
     # Time can elapse after a caller's initial sample; never launch at <=30s.
     allowance_stub = Mock()
     allowance_stub.remaining_seconds.return_value = 30
