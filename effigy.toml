@@ -1469,3 +1469,17 @@ run = "python3 scripts/test-private-build-validation.py --plan"
 [tasks."proof:private-build-validation:diagnostic"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 1200 --scratch-budget-mib 512 -- python3 scripts/test-private-build-validation.py --diagnostic"
+
+# Candidate route (oxide#254, operator decision d9aec625): the same guarded
+# provider binding the RETAINED debug artifact from the spent replacement
+# diagnostic instead of building one. This fixed declaration carries no issued
+# binding and refuses before any effect until the planner amends the command
+# with the diagnostic arguments plus the candidate origin root, digests, byte
+# size, retained guard receipt and build log, and the audited host-tools
+# document. No new bootstrap, install, cleanup or wrapper-consumable
+# derivation runs; the named linker/assembler tools and the pinned 1.97.1
+# toolchain are audited host inputs whose hashes bind admission identity and
+# never confine their writes. Not a benchmark or an alias for full QA.
+[tasks."proof:private-build-validation:candidate"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 1200 --scratch-budget-mib 512 -- python3 scripts/test-private-build-validation.py --candidate"
