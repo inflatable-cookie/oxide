@@ -1442,10 +1442,14 @@ unknown/incomplete/non-quiescent roots, empty/malformed inventory,
 same-content inode replacement, failed closure, real-tree accounting and
 clamp arithmetic (historical and prospective grants), exact/over-cap
 acceptance and refusal, packet/schema conformance, supervisor-context
-binding, and the cross-checkout source binding: identical reviewed bytes at
+binding, the cross-checkout source binding: identical reviewed bytes at
 a different checkout accepted; changed script/guard bytes, an edited command
 or manifest or packet document, mismatched heads/roots/options and a
-missing or malformed binding refused);
+missing or malformed binding refused; and bootstrap provenance (oxide#253):
+a successful bootstrap packet survives a later real inventory refusal;
+missing, malformed and escaped artifacts refuse with the packet retained;
+ambient or planted Cargo configuration without a private content binding
+refuses before launch);
 `proof:private-build-validation:plan` (effect-free);
 `proof:private-build-validation:diagnostic` (heavy, whole command under the
 qualified supervisor). The diagnostic declaration carries no issued binding
@@ -1575,16 +1579,198 @@ held pending the actual new proof-only qualification and its required
 covering evidence; merged source-only #248 and the failed native `0feea5af`
 are distinct facts and neither is a qualification.
 
-**Capture handoff.** The obsolete #240 local sequence, its local admission
-schemas and its launch machinery are removed. The shared provider owns the
-preparation inputs, source binding, one-use claim, effective clamp and guarded
-execution. The local `proof:tape-prune:*` execution entries fail closed: they
-do not accept a token, launch a child or attest a packet. Only the planner may
-bind the independently qualified shared-provider receipt and the exact-head
-selector/export command for the capture task. The shared diagnostic #252 failed
-its live registry-identity gate, so no executable packet is qualified. #253
-independently audits the remaining source and provenance. Source integration
-alone never permits the diagnostic, a fixture, native work or a merge.
+**Bootstrap provenance and the spent replacement diagnostic (oxide#253).**
+The #249 continuation ran once as shared-gate task `7eeabf3a` / executor
+`912ec96f` at source `c0255171`. Full `CLOCK_UPTIME_RAW` 156.045200042 s,
+charged 157 s, remaining 370 s per block. Outer guard closed, status 2, no
+fault or deadline, certain empty census. Nested debug bootstrap closed,
+status 0. The compared inventories were persisted this time
+(`/Volumes/Builds/scratch/barge/replacement-runtime.0xj2w99b/supervisor-evidence.1g94y4v2/live-inventory-bootstrap.json`,
+SHA-256 `1c88b191eaf52a9f2363ac4c3021785b75a45beadba1cb1d89f1736a92b5eed3`;
+guard receipt SHA-256
+`08a7c12435ff7d4598253c38d48a54395981928fa7c541e376b949d05137ac4a`).
+`./state/pools.json` inode `2074628791` → `2074629593` with equal content
+hash `c76baa06454558963eb87c05b13274d41f465eb21c4710d13c11f8b25637f493`,
+plus the parent `./state` mtime change. That proves the isolation bracket
+failed. It does not identify a writer: overlap, current private-home
+emptiness, and source-only absence arguments do not name an actor. Planner
+analysis
+`/Volumes/Builds/scratch/oxide/planner-041-240-owner-disposition-20261102/replacement-diagnostic-issue.r6p9orys/planner-isolation-failure.json`
+(SHA-256 `45974f1bde2346fb51c448cc79d33e7ea9fb5fe0332484ff6f3d4d41413a84f7`)
+records the same limit. Operator `2df45ce0`'s one replacement diagnostic
+and one additional bootstrap are spent. No further native, bootstrap,
+preparation, status or inventory run is authorized from this gate.
+
+Recorded during that run, not reconstructed: argv was the fixed
+`cargo build --offline --locked --bin oxide --message-format=json`; the
+nested receipt named that command, limit 299 s, root
+`/Volumes/Builds/scratch/barge/replacement-runtime.0xj2w99b`; stderr
+recorded cwd as that root's `oxide-source` (`Finished dev` for
+`oxide-storage`); the JSON log named exactly one `oxide` bin artifact at
+`oxide-source/target/debug/oxide` whose `src_path` was
+`oxide-source/src/bin/oxide/main.rs`; that file's digest is
+`c6137a1a1fe1027dd2e90e9c5ee3bd95f2db0472b8edb3bfb4c04f0af29256e1`
+(20513160 bytes); `bin/oxide` is a symlink to it. The artifact is evidence
+only: it is not executed, relocated, installed or qualified by existing.
+
+Reconstructed from the retained tree and current source, and labelled as
+such: `bin/cargo` and `bin/effigy` are symlinks to the invoking rustup
+1.97.1 cargo and the audited Effigy; private `HOME` is empty;
+`$CARGO_HOME/config.toml` and every `.cargo/config.toml` on the cwd
+ancestor chain to `/` are absent; the offline seed populated
+`cache/registry` and `cache/git` from the invoking CARGO_HOME; `RUSTC` is
+the pinned 1.97.1 rustc. Child PATH is private `bin` plus the inherited
+suffix. Named linker and assembler tools (`cc`, `c++`, `clang`, `gcc`,
+`ld`, `as`, `ar`, `ranlib`) whose first usable PATH match is not a
+private binding use the existing pre-launch refusal. A private binding
+is an executable regular file inside the private root, or a symlink
+whose resolved target is an executable regular file inside the private
+root. A dangling symlink, a non-executable file, and a symlink to a
+host `cc` are not private bindings: execvp continues or runs the host
+tool, and the scan refuses the ambient match. An unreadable Cargo
+config path is a violation, not absence. Proc-macro and build-script
+crates compile to `target/` under the private root and inherit the same
+child PATH; `rustc` itself is bound. Unnamed further host spawns those
+crates may perform cannot be bound without executing the bootstrap, so
+they are not invented as privately proven. The scrubbed child
+environment (`HOME`, `CARGO_HOME`, `TMPDIR`, `OXIDE_CONFIG`,
+`OXIDE_POOL`, and the rest of the allowlist) redirects processes that
+honor those variables. It does not confine a build-script, proc-macro,
+linker, or other child that opens an absolute path such as
+`~/Library/Application Support/oxide`. The spent run used the inherited
+PATH suffix and closed status 0; that is historical reconstruction, not
+a forward authorization to skip the refusal. Registry resolution is the
+seeded private cache (offline, locked). Account-home for live inventory
+is `~/Library/Application Support/oxide`, independent of the scrubbed
+`HOME`; `OXIDE_TEST_HOME_FROM_ENV=1` is on the product child allowlist.
+A cargo build of `--bin oxide` is not itself a product invocation.
+
+Unexcluded candidate writer classes for the `pools.json` inode
+replacement (none is identified as the writer): cargo and rustc (bound
+host binaries that can open any path); build-scripts executed by cargo;
+proc-macro crates executed by rustc; PATH-resolved linker and assembler
+tools if they ran; the nested supervisor, python, and the gate process;
+concurrent host processes overlapping the live account; macOS services
+touching `~/Library/Application Support/oxide`. The built `oxide`
+binary is not a candidate: it was not executed.
+
+The source gap this task closes: the spent diagnostic retained the
+inventory mismatch and the nested receipt, but dropped the attributable
+bootstrap inputs (allowlist env, cwd, argv, tool identities, source+lock
+bindings, ambient Cargo scan, guard receipt reference, artifact
+path/digest) before the isolation refusal. The existing bootstrap call site
+now writes `evidence/bootstrap-provenance.json` inside the monitored root
+after a successful nested closure and before `verify_inventory`, and on
+pre-launch ambient/planted Cargo-config refusal or artifact
+missing/malformed/escaped/ambiguous findings. The packet is internal
+bounded evidence (`bootstrap-provenance`, 256 KiB cap), not a public schema
+or wrapper hook. It records the audited allowlist values actually passed
+and inherited key names; it never records inherited secret values. An
+ambient or planted Cargo configuration, a `$CARGO_HOME/config.toml`
+outside the private root, an unreadable config path, or a PATH-resolved
+named linker/assembler whose first usable match is not an executable
+regular file inside the private root, still uses the existing bounded
+refusal.
+
+Next minimal evidence requirement: an operator-authorized runtime whose
+private `bin` binds the named linker and assembler tools (or a recorded
+operator exception for a specific host tool), then a nested bootstrap
+closure with the provenance packet retained, then the isolation bracket.
+The writer of `pools.json` remains unknown until that packet plus the
+nested log and inventories name one. The provenance packet lets that
+route assess the bootstrap path when isolation refuses; it does not
+identify a writer, lower the oracle, repair the baseline, skip bootstrap
+or weaken one-use claims. Honest missing runtime evidence at this head
+remains missing and blocks qualification.
+
+**Candidate-input qualification route (oxide#254; operator decision
+`d9aec625-ecc1-4dcf-a0be-737f85d9eca0` v2, 2026-11-03, "Approve proposed
+validation route").** The same provider gains a `--candidate` mode that
+binds the RETAINED debug artifact instead of building one. The planner
+binds every input at dispatch: the origin root
+(`/Volumes/Builds/scratch/barge/replacement-runtime.0xj2w99b`), the
+artifact digest `c6137a1a1fe1027dd2e90e9c5ee3bd95f2db0472b8edb3bfb4c04f0af29256e1`
+and its 20513160 bytes, the retained nested guard receipt
+(`evidence/bootstrap/receipt.json`, command-bound, closed, status 0,
+certain empty census, scratch naming that root) and build log digests, the
+retained `Cargo.lock`/`rust-toolchain.toml` digests (which must equal the
+pinned `3de2413` commit's own bytes, so the staged source reproduces the
+build source), and the audited host-tools document. Origin, bindings and
+retained nested closure are validated BEFORE any staging; the artifact is
+then copied only inside the fresh guard-owned task root, rehashed, and
+symlinked as `bin/oxide`. Nothing under the origin is written; there is no
+automatic rebuild, install, cleanup or repair. The ruling explicitly
+allows the pinned Rust 1.97.1 toolchain and the named Apple
+linker/assembler tools (`cc`, `c++`, `clang`, `gcc`, `ld`, `as`, `ar`,
+`ranlib`) as audited HOST inputs for this route: the planner-bound
+host-tools document names each resolved canonical path plus its live
+content hash and size; absent stays absent; a changed, unlisted or
+documented-but-not-live binding refuses; a private binding stays allowed.
+They are not private bindings and the hashes do not confine their writes;
+ambient Cargo configuration refusals, the explicit environment allowlist
+and the pre-launch packet-retained refusal (oxide#253 rule, now
+`evidence/candidate-provenance.json`) are unchanged. No other inherited
+tool, environment or config trust exception follows. The route takes its
+own fresh live-inventory baseline around the private status gate and the
+retained-root quiescence snapshot; any inode/content delta, ambiguous
+closure, missing root accounting or cap breach refuses, including
+identical-content inode replacement. The origin session's failed
+isolation stays historical and unrepaired; a fresh baseline never erases
+it, and unrelated host activity is not presumed to excuse a delta. The
+wrapper-consumable issued documents and the debug receipt are NOT derived
+in this route: the accepted wrapper binds a debug receipt to an in-root
+cargo build (fixed argv, supervisor receipt naming the private root),
+which a retained candidate cannot honestly fill, so capture-side handoff
+integration stays on the capture tasks' own route and both modes'
+fail-closed controls stay intact. The gate receipt stays honest
+(`qualification` always unqualified; retained review judges). Final
+capture wire/schema limitations, X-S2/O3, production pins/features and
+live-data restrictions are unchanged. Prospective accounting under
+`d9aec625` v2: ONE cumulative 1200-second continuation charged to BOTH
+capture blocks. Earlier provider and owner evidence reservations total 30 s;
+two consumer source-check reservations add 20 s, leaving at most 1150 s
+unallocated before actual preparation/runtime. These are conservative
+reservations, not measured runtime; the earlier 309-second ledger and every
+historical charge remain with no reset or refund. Prospective
+aggregate scratch caps remain Barge 3 GiB and Oxide 8 GiB and refuse when
+retained bytes leave no space. At most ONE Queue-routed candidate
+isolation qualification and then at most ONE safe covering batch per
+capture task at its exact approved head, each with the qualified guard
+(`fcfda2b0…` unchanged) and fresh one-use claims; no automatic retry,
+native image or bootstrap. Source approval grants no native credit. The
+selector `proof:private-build-validation:candidate` (heavy) carries the
+fixed unbound declaration and refuses before any effect until the planner
+amends the command with every bound argument.
+
+**Capture handoff.** The obsolete #240 local sequence and admission schemas
+are removed. `scripts/private_build_candidate.py` is the source-owned
+candidate consumer: Barge may stage and hash this exact component alongside
+`scripts/test-private-build-validation.py` and invoke its `consume(options)`;
+it must not copy the verification policy. The thin tape entry accepts only
+`--input <path> --sha256 <planner-digest>` under the shared supervisor. The
+input's `paths` and `digests` bind the producer gate and candidate receipts,
+outer and status-case guard receipts, both live inventories, independent
+qualification and fresh issuance. The input also names the product checkout
+and exact head. Qualification is a separate planner-bound positive judgment
+over those artifacts, product head/tree and retained roots; the producer's
+candidate receipt remains `unqualified` with `build.state = not-built`.
+Issuance binds that judgment, exact selectors, candidate, component/provider
+and tool digests, private roots, limits and a fresh one-use claim. Missing,
+changed, expired, unguarded or spent inputs refuse before product execution.
+
+After the existing provider's guard and exclusive claim, the consumer stages
+the exact product Git tree and uses the existing offline seeder on its bound
+lock into a private Cargo home. It runs the four named covering selectors
+under the shared supervisor, preserving the approved suite's validation-temp
+and internal roots and bracketing the work with live and retained inventories.
+Equal retained snapshots are not continuous-peak proof. Host-tool hashes bind
+identity, not writes. `proof:tape-prune:cover` is the guarded entry; the
+unbound declaration refuses. This new source component and the producer's
+separate case/guard outputs require exact-head retained review, a real positive
+qualification and planner-issued inputs before use. The shared diagnostic #252
+failed its live registry-identity gate; #253 independently owns source and
+provenance audit. Neither source integration nor the candidate receipt grants
+runtime, native, parity or merge credit.
 
 **Premise dispositions (HIGH, proof-apparatus authoring).** (1) Private
 HOME/CARGO_HOME with the invoking `RUSTUP_HOME` captured before replacement,

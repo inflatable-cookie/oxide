@@ -26,10 +26,14 @@ verify the outer supervisor context and every issued binding, claim the
 blocks, materialize the prepared roots, re-derive every binding live, bracket
 the live account state with bounded identity+content inventories, run ONE
 debug-Oxide bootstrap (exact argv, nested qualified supervisor, at most 300 s
-of the one global allowance), run the inventory-bracketed private status dry
-gate, re-snapshot every retained root, and export the wrapper-consumable
-artifacts plus the remaining measured allowance. Any unknown refuses without
-repair, retry or attribution.
+of the one global allowance), retain a bounded attributable bootstrap
+provenance packet BEFORE the inventory assertion can refuse (oxide#253: the
+actual passed allowlist environment, cwd, argv, tool identities, source+lock
+bindings, ambient-Cargo-configuration scan, nested guard receipt reference and
+the resolved artifact; refusals keep the packet), run the inventory-bracketed
+private status dry gate, re-snapshot every retained root, and export the
+wrapper-consumable artifacts plus the remaining measured allowance. Any
+unknown refuses without repair, retry or attribution.
 
 Cross-checkout preparation binding (operator `af038a7e` v2; planner
 relative-path correction): preparation may run at one Queue checkout while
@@ -42,6 +46,26 @@ command, the preparation script's actual SHA-256, the qualified supervisor
 bytes and the packet manifest digest; the diagnostic requires the
 planner-bound `--expect-source-binding` digest, re-reads both retained
 documents, and accepts only identical reviewed source bytes at any checkout.
+
+Candidate route (`--candidate`, oxide#254; operator decision `d9aec625`):
+the same guarded preparation, issuance and private status gate, but the
+private debug Oxide is the RETAINED artifact from the spent replacement
+diagnostic (`replacement-runtime.0xj2w99b/oxide-source/target/debug/oxide`,
+SHA-256 and byte size planner-bound) instead of a new bootstrap build. Its
+origin, exact source/lock/toolchain/artifact binding and the retained nested
+closure are validated from planner-digested retained documents BEFORE any
+staging; the artifact is then copied only inside the fresh guard-owned root,
+rehashed, and symlinked as `bin/oxide`. No build, install, cleanup or repair
+happens and the origin tree is never written. The named linker/assembler
+tools and the pinned 1.97.1 toolchain are audited host inputs for this route:
+planner-bound canonical paths plus content hashes, absent stays absent, and
+any changed or unlisted binding refuses; hashing binds admission identity and
+never confines a host tool's writes. The wrapper-consumable issued documents
+and debug receipt are NOT derived here: the accepted wrapper binds a debug
+receipt to an in-root bootstrap build, so a retained candidate cannot honestly
+fill it; capture-side handoff stays on the capture tasks. The prior session's
+failed isolation stays historical; this route takes its own fresh account
+inventory baseline and refuses any inode/content delta.
 
 Modes an author may run (effect-free, through Effigy selectors): `--self-test`
 (mocked counterfactuals only; fixtures under a fresh `TMPDIR` template) and
@@ -119,9 +143,27 @@ TOOLCHAIN = "1.97.1"
 
 SCHEMA_GATE_RECEIPT = "oxide.private-build-validation/1"
 SCHEMA_SOURCE_BINDING = "oxide.private-build-validation.source-binding/1"
+SCHEMA_HOST_TOOLS = "oxide.private-build-validation.host-tools/1"
+SCHEMA_CANDIDATE_RECEIPT = "oxide.private-build-validation.candidate/1"
 SCHEMA_BARGE_AUDIT = "barge.validation-source-audit/1"
 SCHEMA_BARGE_LEDGER = "barge.private-roots/1"
 SCHEMA_BARGE_BLOCK = "barge.validation-block/1"
+# Operator ruling d9aec625-ecc1-4dcf-a0be-737f85d9eca0 (2026-11-03, "Approve
+# proposed validation route"): the pinned 1.97.1 toolchain and the named
+# linker/assembler tools are audited host inputs for the candidate route only.
+# They are host tools, not private bindings; content hashes bind admission
+# identity and never confine their writes.
+CANDIDATE_RULING = "d9aec625-ecc1-4dcf-a0be-737f85d9eca0"
+# The retained candidate from the spent replacement diagnostic (oxide#252
+# build, oxide#253 failed isolation). Path relative to the planner-bound
+# origin root; the artifact itself is a regular file (bin/oxide is the
+# symlink). It is evidence, never qualified by existing.
+CANDIDATE_ORIGIN_RELATIVE = Path("oxide-source/target/debug/oxide")
+CANDIDATE_PROVENANCE_PATH = Path("evidence/candidate-provenance.json")
+MAX_CANDIDATE_PROVENANCE_BYTES = 256 * 1024
+# The retained build log is one JSON line per Cargo message, capped like the
+# guarded bootstrap output evidence.
+MAX_CANDIDATE_LOG_BYTES = 32 * 1024 * 1024
 
 # The accepted Barge launcher (`scripts/tape/admission.py` at 60c2c79, the
 # source-approved cap revision) enforces exactly these selectors and component
@@ -155,6 +197,36 @@ INVENTORY_CONTENT_CAP = 256 * 1024 * 1024
 RETAINED_ROW_CAP = 200000
 ALLOC_ENTRY_CAP = 500000
 LIVE_ACCOUNT_ROOT = Path(pwd.getpwuid(os.getuid()).pw_dir) / "Library/Application Support/oxide"
+
+# Bootstrap provenance packet (oxide#253): internal bounded evidence, written
+# inside the monitored task root BEFORE the live-inventory assertion can
+# refuse, so a real isolation failure still names the audited bootstrap path.
+# It is not a public schema and no wrapper consumes it; it widens no oracle
+# and weakens none. The packet records only the audited allowlist actually
+# passed to the child — inherited values are never recorded, only key names.
+PROVENANCE_PATH = Path("evidence/bootstrap-provenance.json")
+MAX_PROVENANCE_BYTES = 256 * 1024
+MAX_PROVENANCE_ENTRIES = 32
+MAX_PROVENANCE_CONFIG_BYTES = 1024 * 1024
+MAX_PRIVATE_STATE_BYTES = 64 * 1024
+MAX_ANCESTOR_LEVELS = 64
+# Named linker/assembler tools cargo/rustc resolve on PATH. A private
+# binding is an executable regular file inside the private root, or a
+# symlink whose resolved target is an executable regular file inside the
+# private root. A dangling symlink, a non-executable file, and a symlink
+# to a host tool are not private bindings. Absence is not a violation.
+BOOTSTRAP_PATH_TOOLS = ("cc", "c++", "clang", "gcc", "ld", "as", "ar", "ranlib")
+PRIVATE_HOME_STATE = Path("Library/Application Support/oxide/state/pools.json")
+# The complete key set child_environment may pass; the provenance builder
+# refuses any passed key outside it (a positive private binding per key).
+BOOTSTRAP_ENV_KEYS = frozenset((
+    "EFFIGY_ADMISSION_HOOK", "QUEUE_ADMISSION_SOCKET",
+    *BUILD_ENV_KEYS,
+    "PATH", "TMP", "TEMP", "OXIDE_POOL_BACKEND", "OXIDE_POOL_CAP",
+    "BARGE_PRIVATE_ROOT", "BARGE_PRIVATE_OXIDE", "BARGE_PINNED_RUSTC",
+    "BARGE_PRIVATE_WRAPPER_SHA256", "RUSTUP_AUTO_INSTALL", "RUSTUP_NO_UPDATE_CHECK",
+    "PYTHONDONTWRITEBYTECODE",
+))
 
 
 class GateRefusal(Exception):
@@ -1598,8 +1670,14 @@ USAGE = """usage:
       --expect-audit HEX64 --expect-ledger HEX64 --expect-budget HEX64 --expect-history HEX64
       --expect-oxide-binding HEX64 --preparation-receipt PATH --expect-preparation HEX64
       --expect-source-binding HEX64 [--planner-reference STRING]
+  test-private-build-validation.py --candidate <all --diagnostic arguments>
+      --candidate-origin ROOT --expect-candidate HEX64 --candidate-bytes N
+      --candidate-receipt PATH --expect-candidate-receipt HEX64
+      --candidate-log PATH --expect-candidate-log HEX64
+      --candidate-lock-sha256 HEX64 --candidate-toolchain-sha256 HEX64
+      --host-tools PATH --expect-host-tools HEX64
   prepare environment: OXIDE_CORRECTED_DISCOVERY_PACKET (exact reviewed JSON)
-  diagnostic environment: OXIDE_PROOF_DEADLINE_NS, OXIDE_PROOF_RUN_ID,
+  diagnostic/candidate environment: OXIDE_PROOF_DEADLINE_NS, OXIDE_PROOF_RUN_ID,
       OXIDE_PROOF_EVIDENCE, OXIDE_TASK_SCRATCH_ROOT (exported by the qualified
       supervisor), BARGE_VALIDATION_BLOCK[+_SHA256],
       BARGE_VALIDATION_SOURCE_AUDIT[+_SHA256], BARGE_VALIDATION_ROOT_LEDGER[+_SHA256],
@@ -1608,7 +1686,7 @@ USAGE = """usage:
 
 
 def parse_args(argv: list) -> dict:
-    modes = ("--self-test", "--plan", "--prepare", "--diagnostic", "--claim-oxide")
+    modes = ("--self-test", "--plan", "--prepare", "--diagnostic", "--candidate", "--claim-oxide")
     if not argv or argv[0] not in modes:
         raise GateRefusal("unknown or missing mode; individual actions are disabled\n" + USAGE)
     options: dict = {"mode": argv[0][2:]}
@@ -1622,6 +1700,14 @@ def parse_args(argv: list) -> dict:
                        "expect_history", "expect_oxide_binding", "preparation_receipt", "expect_preparation",
                        "expect_source_binding"),
     }.get(options["mode"], ())
+    if options["mode"] == "candidate":
+        required = ("oxide_repo", "oxide_head", "oxide_product_head", "barge_repo", "barge_head", "barge_root",
+                    "oxide_root", "expect_audit", "expect_ledger", "expect_budget",
+                    "expect_history", "expect_oxide_binding", "preparation_receipt", "expect_preparation",
+                    "expect_source_binding", "candidate_origin", "expect_candidate", "candidate_bytes",
+                    "candidate_receipt", "expect_candidate_receipt", "candidate_log",
+                    "expect_candidate_log", "candidate_lock_sha256", "candidate_toolchain_sha256",
+                    "host_tools", "expect_host_tools")
     index = 1
     while index < len(argv):
         flag = argv[index]
@@ -1632,9 +1718,19 @@ def parse_args(argv: list) -> dict:
     for flag in required:
         if flag not in options:
             raise GateRefusal(f"{options['mode']} requires --{flag.replace('_', '-')}\n" + USAGE)
-    for key in ("expect_audit", "expect_ledger", "expect_budget", "expect_history", "expect_oxide_binding", "expect_preparation", "expect_audit_inputs", "expect_source_binding", "digest"):
+    for key in ("expect_audit", "expect_ledger", "expect_budget", "expect_history", "expect_oxide_binding",
+                "expect_preparation", "expect_audit_inputs", "expect_source_binding", "digest",
+                "expect_candidate", "expect_candidate_receipt", "expect_candidate_log",
+                "candidate_lock_sha256", "candidate_toolchain_sha256", "expect_host_tools"):
         if key in options and not HEX64.fullmatch(options[key]):
             raise GateRefusal(f"--{key.replace('_', '-')} must be 64 hex")
+    if "candidate_bytes" in options:
+        try:
+            options["candidate_bytes"] = int(options["candidate_bytes"])
+        except ValueError:
+            raise GateRefusal("--candidate-bytes must be an integer byte size") from None
+        if type(options["candidate_bytes"]) is not int or options["candidate_bytes"] <= 0:
+            raise GateRefusal("--candidate-bytes must be a positive integer byte size")
     for key in ("oxide_head", "oxide_product_head", "barge_head"):
         if key in options and not HEX40.fullmatch(options[key]):
             raise GateRefusal(f"--{key.replace('_', '-')} must be 40 hex")
@@ -1922,8 +2018,973 @@ def run_status_after_sentinels(create_sentinels, run_status):
     return sentinels, run_status()
 
 
+# ---------------------------------------------------------------------------
+# Bootstrap provenance (oxide#253): bounded, attributable evidence retained
+# before the live-inventory assertion can refuse. Internal evidence only.
+# ---------------------------------------------------------------------------
+
+def live_account_reachability(values: list, *, account_root: Path) -> dict:
+    """Whether any recorded allowed value could name the live account root."""
+    prefix = str(account_root)
+    hits: list = []
+    seen: set = set()
+    for value in values:
+        raw = str(value)
+        parts = [raw]
+        if os.pathsep in raw:
+            parts.extend(raw.split(os.pathsep))
+        for text in parts:
+            if not text or text in seen:
+                continue
+            if text == prefix or text.startswith(prefix + os.sep):
+                seen.add(text)
+                if len(hits) < 4:
+                    hits.append(text[:512])
+    return {"account_root": prefix, "state": "none" if not hits else "recorded",
+            "values": hits}
+
+
+def tool_identity(path: Path, cap: int) -> dict:
+    """A bounded live identity for one allowed build executable."""
+    try:
+        info = path.stat()
+        digest = sha256_file(path, cap=cap)
+    except OSError as error:
+        raise GateRefusal(f"provenance tool unreadable: {path}: {error}") from None
+    return {"path": str(path), "bytes": info.st_size, "sha256": digest}
+
+
+def symlink_target(path: Path) -> str:
+    """The recorded no-follow target of one private bin symlink."""
+    try:
+        return os.readlink(path)
+    except OSError:
+        return "absent"
+
+
+def private_home_state_observation(private_root: Path) -> dict:
+    """Observe the private home's own account-state file (never the live one).
+
+    A product invocation under the scrubbed child environment would write the
+    private path, not the live account; recording it makes that distinction
+    decidable from retained evidence alone.
+    """
+    path = private_root / "home" / PRIVATE_HOME_STATE
+    entry = {"path": str(path)}
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        entry["exists"] = False
+        return entry
+    except OSError as error:
+        entry.update({"exists": True, "state": "unreadable",
+                      "error": error.__class__.__name__})
+        return entry
+    if not stat.S_ISREG(info.st_mode):
+        entry.update({"exists": True, "state": "not-regular"})
+        return entry
+    try:
+        entry.update({"exists": True, "bytes": info.st_size,
+                      "sha256": sha256_file(path, cap=MAX_PRIVATE_STATE_BYTES)})
+    except (OSError, GateRefusal) as error:
+        entry.update({"exists": True, "state": "unreadable",
+                      "error": error.__class__.__name__})
+    return entry
+
+
+def _observe_cargo_config(path: Path, *, inside: bool, kind: str,
+                          entries: list, violations: list) -> int:
+    """One no-follow Cargo config observation. Returns omitted count (0 or 1).
+
+    Absence (ENOENT / ENOTDIR) is recorded with no violation. Any other
+    lstat or digest error is unreadable: it is not a private binding and
+    is not recorded as absent.
+    """
+    entry = {"path": str(path), "ambient": not inside}
+
+    def retain():
+        if len(entries) < MAX_PROVENANCE_ENTRIES:
+            entries.append(entry)
+            return 0
+        return 1
+
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        entry["state"] = "absent"
+        return retain()
+    except NotADirectoryError:
+        entry["state"] = "absent"
+        return retain()
+    except OSError as error:
+        entry["state"] = "unreadable"
+        entry["error"] = error.__class__.__name__
+        violations.append("unreadable-cargo-config:" + str(path)[:512])
+        return retain()
+    if not stat.S_ISREG(info.st_mode):
+        entry["state"] = "not-regular"
+        violations.append(kind + str(path)[:512])
+        return retain()
+    try:
+        digest = sha256_file(path, cap=MAX_PROVENANCE_CONFIG_BYTES)
+    except (OSError, GateRefusal) as error:
+        entry["state"] = "unreadable"
+        entry["error"] = error.__class__.__name__
+        violations.append("unreadable-cargo-config:" + str(path)[:512])
+        return retain()
+    entry["state"] = "present"
+    entry["bytes"] = info.st_size
+    entry["sha256"] = digest
+    violations.append(kind + str(path)[:512])
+    return retain()
+
+
+def ambient_cargo_config_scan(start: Path, *, private_root: Path,
+                              cargo_home: Path | None = None) -> dict:
+    """Observe Cargo configuration on the build cwd's ancestor chain and CARGO_HOME.
+
+    Cargo discovers `.cargo/config.toml` from the working directory upward and
+    then `$CARGO_HOME/config.toml`. A configuration above the private root, or
+    a CARGO_HOME outside it, would be silently inherited ambient policy with no
+    positive private binding. A present file inside the private tree is planted
+    policy whose content this gate does not bind. Either finding refuses
+    BEFORE the launch; the recorded observation is retained in the provenance
+    packet. Absence is recorded. An unreadable path is a violation, not
+    absence. PATH-resolved linker and assembler tools are a separate scan.
+    """
+    chain: list = []
+    node = Path(start).resolve(strict=True)
+    complete = False
+    while len(chain) < MAX_ANCESTOR_LEVELS:
+        chain.append(node)
+        parent = node.parent
+        if parent == node:
+            complete = True
+            break
+        node = parent
+    entries: list = []
+    violations: list = []
+    inside_levels = 0
+    omitted_entries = 0
+    for node in chain:
+        inside = node == private_root or node.is_relative_to(private_root)
+        if inside:
+            inside_levels += 1
+        kind = "ambient-cargo-config:" if not inside else "planted-cargo-config:"
+        for name in (".cargo/config.toml", ".cargo/config"):
+            omitted_entries += _observe_cargo_config(
+                node / name, inside=inside, kind=kind,
+                entries=entries, violations=violations)
+    if cargo_home is not None:
+        home = Path(cargo_home)
+        inside = home == private_root or home.is_relative_to(private_root)
+        kind = "ambient-cargo-config:" if not inside else "planted-cargo-home-config:"
+        for name in ("config.toml", "config"):
+            omitted_entries += _observe_cargo_config(
+                home / name, inside=inside, kind=kind,
+                entries=entries, violations=violations)
+    return {"scan_root": str(Path(start).resolve(strict=True)), "levels": len(chain),
+            "chain_complete": complete, "inside_private_levels": inside_levels,
+            "cargo_home": None if cargo_home is None else str(cargo_home),
+            "entries": entries, "omitted_entries": omitted_entries,
+            "violations": violations}
+
+
+def _path_inside_private(path: Path, private_root: Path) -> bool:
+    try:
+        return path == private_root or path.is_relative_to(private_root)
+    except ValueError:
+        return False
+
+
+def _usable_regular_file(path: Path) -> bool:
+    """True when path is an executable regular file (follows a final symlink)."""
+    try:
+        info = path.stat()
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and os.access(path, os.X_OK)
+
+
+def _classify_path_slot(candidate: Path, info: os.stat_result,
+                        *, private_root: Path) -> dict | None:
+    """Classify one PATH slot, or None so the search continues.
+
+    A usable binding is an executable regular file. A symlink is usable
+    only when its resolved target is an executable regular file. Private
+    requires that usable file to sit inside the private root. A dangling
+    symlink or non-executable slot is skipped (execvp continues). A
+    symlink to a host executable is ambient, not private.
+    """
+    if stat.S_ISLNK(info.st_mode):
+        try:
+            raw_target = os.readlink(candidate)
+        except OSError as error:
+            return {"state": "unreadable", "path": str(candidate)[:512],
+                    "error": error.__class__.__name__}
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            return None
+        if not _usable_regular_file(resolved):
+            return None
+        entry = {"path": str(candidate)[:512],
+                 "resolved_path": str(resolved)[:512],
+                 "symlink_target": str(raw_target)[:512]}
+        entry["state"] = ("private" if _path_inside_private(resolved, private_root)
+                          else "ambient")
+        return entry
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    if not os.access(candidate, os.X_OK):
+        return None
+    return {"path": str(candidate)[:512],
+            "state": ("private" if _path_inside_private(candidate, private_root)
+                      else "ambient")}
+
+
+def path_executable_scan(path_value: str, *, private_root: Path,
+                         cwd: Path | None = None) -> dict:
+    """Resolve named linker/assembler tools on the child PATH.
+
+    A private binding is an executable regular file inside the private
+    root, or a symlink whose resolved target is an executable regular
+    file inside the private root. A first-match usable slot outside the
+    private root, or an unreadable slot, is an ambient executable path:
+    the existing pre-launch refusal records it. A dangling symlink or
+    non-executable file is skipped so a later host match can refuse.
+    Absence is recorded and is not a violation. An empty PATH component
+    is the child cwd (POSIX). Proc-macro and build-script crates compile
+    to ``target/`` under the private root and inherit this PATH; unnamed
+    further host spawns cannot be bound without executing the bootstrap.
+    """
+    components = str(path_value).split(os.pathsep)
+    entries: list = []
+    violations: list = []
+    omitted_entries = 0
+    for name in BOOTSTRAP_PATH_TOOLS:
+        entry = {"name": name, "state": "absent"}
+        for component in components:
+            if component == "":
+                if cwd is None:
+                    continue
+                candidate = Path(cwd) / name
+            else:
+                candidate = Path(component) / name
+            try:
+                info = candidate.lstat()
+            except FileNotFoundError:
+                continue
+            except NotADirectoryError:
+                continue
+            except OSError as error:
+                entry = {"name": name, "path": str(candidate)[:512],
+                         "state": "unreadable", "error": error.__class__.__name__}
+                violations.append("unreadable-executable:" + name + ":"
+                                  + str(candidate)[:512])
+                break
+            classified = _classify_path_slot(candidate, info,
+                                             private_root=private_root)
+            if classified is None:
+                continue
+            entry = {"name": name, **classified}
+            if classified["state"] == "ambient":
+                violations.append("ambient-executable:" + name + ":"
+                                  + classified["path"])
+            elif classified["state"] == "unreadable":
+                violations.append("unreadable-executable:" + name + ":"
+                                  + classified["path"])
+            break
+        if len(entries) < MAX_PROVENANCE_ENTRIES:
+            entries.append(entry)
+        else:
+            omitted_entries += 1
+    return {"entries": entries, "omitted_entries": omitted_entries,
+            "violations": violations}
+
+
+def attach_path_executables(ambient: dict, path_value: str,
+                            *, private_root: Path,
+                            cwd: Path | None = None) -> dict:
+    """Merge the PATH-tool scan into the pre-launch ambient findings."""
+    scan = path_executable_scan(path_value, private_root=private_root, cwd=cwd)
+    bound = dict(ambient)
+    bound["path_executables"] = scan
+    bound["violations"] = list(ambient.get("violations", [])) + list(scan["violations"])
+    return bound
+
+
+# ---------------------------------------------------------------------------
+# Candidate route (oxide#254): retained-artifact bindings and audited host tools
+# ---------------------------------------------------------------------------
+
+def validate_host_tools_document(document: dict, *, rustc_tool: Path,
+                                 cargo_tool: Path) -> dict:
+    """Validate the planner-issued audited host-input bindings.
+
+    The document is the reviewed input operator ruling d9aec625 authorizes for
+    the candidate route: the pinned 1.97.1 rustc/cargo pair and any subset of
+    the named linker/assembler tools that actually resolves on the child PATH.
+    Every binding names one canonical executable regular file plus its live
+    content hash and byte size; the live files must still match. Absent tools
+    are omitted (absence is never listed). These are audited HOST inputs, not
+    private bindings, and the hashes do not confine the tools' writes.
+    """
+    if (not isinstance(document, dict) or document.get("schema") != SCHEMA_HOST_TOOLS
+            or document.get("route") != "candidate"
+            or document.get("ruling") != CANDIDATE_RULING
+            or set(document) != {"schema", "route", "ruling", "toolchain", "tools"}):
+        raise GateRefusal("host-tools document is not the candidate-route ruling binding")
+    toolchain = document.get("toolchain")
+    if not isinstance(toolchain, dict) or set(toolchain) != {"rustc", "cargo"}:
+        raise GateRefusal("host-tools document must bind the pinned toolchain pair")
+    for name, live in (("rustc", rustc_tool), ("cargo", cargo_tool)):
+        entry = toolchain[name]
+        if not isinstance(entry, dict) or set(entry) != {"path", "sha256", "bytes"}:
+            raise GateRefusal(f"host-tools toolchain {name} binding is malformed")
+        path = Path(entry["path"])
+        if (not path.is_absolute() or path.is_symlink() or path.resolve(strict=True) != path
+                or path != live or not path.is_file()):
+            raise GateRefusal(f"host-tools toolchain {name} does not bind the live executable")
+        info = path.stat()
+        if (type(entry["bytes"]) is not int or entry["bytes"] <= 0
+                or entry["bytes"] != info.st_size
+                or not isinstance(entry["sha256"], str) or not HEX64.fullmatch(entry["sha256"])
+                or sha256_file(path, cap=256 * 1024 * 1024) != entry["sha256"]):
+            raise GateRefusal(f"host-tools toolchain {name} digest or size changed")
+    tools = document.get("tools")
+    if not isinstance(tools, list):
+        raise GateRefusal("host-tools tool list is missing")
+    names: list = []
+    for entry in tools:
+        if not isinstance(entry, dict) or set(entry) != {"name", "path", "sha256", "bytes"}:
+            raise GateRefusal("host-tools entry is malformed")
+        name = entry["name"]
+        if not isinstance(name, str) or name not in BOOTSTRAP_PATH_TOOLS:
+            raise GateRefusal(f"host-tools entry names an unlisted tool: {name!r}")
+        if name in names:
+            raise GateRefusal(f"host-tools entry duplicates {name}")
+        names.append(name)
+        path = Path(entry["path"])
+        if (not path.is_absolute() or path.is_symlink() or path.resolve(strict=True) != path
+                or not path.is_file()):
+            raise GateRefusal(f"host-tools {name} binding is not a canonical file")
+        info = path.stat()
+        if (type(entry["bytes"]) is not int or entry["bytes"] <= 0
+                or entry["bytes"] > MAX_ADMISSION_ARTIFACT_BYTES or entry["bytes"] != info.st_size
+                or not isinstance(entry["sha256"], str) or not HEX64.fullmatch(entry["sha256"])
+                or sha256_file(path, cap=MAX_ADMISSION_ARTIFACT_BYTES) != entry["sha256"]):
+            raise GateRefusal(f"host-tools {name} digest or size changed")
+        if not os.access(path, os.X_OK):
+            raise GateRefusal(f"host-tools {name} binding is not executable")
+    return {"schema": SCHEMA_HOST_TOOLS, "ruling": CANDIDATE_RULING,
+            "toolchain": {"rustc": str(rustc_tool), "cargo": str(cargo_tool)},
+            "tools": sorted(names) or None}
+
+
+def reconcile_host_tools(ambient: dict, document: dict) -> tuple:
+    """Adjudicate the PATH-tool scan into the candidate route's final findings.
+
+    Takes the merged pre-launch ambient dict (its `path_executables` scan and
+    its raw `violations`) and the audited host-input bindings. Returns
+    (observation, final_violations): the raw scan's `ambient-executable:`
+    findings are REPLACED by this document's verdict — a first-match usable
+    slot outside the private root is accepted only when the document binds
+    exactly that resolved path with exactly that live content hash and size;
+    a documented tool that is absent, changed or resolved elsewhere refuses,
+    and a live ambient match with no documented binding refuses. Every other
+    raw finding (ambient or planted Cargo configuration, unreadable
+    executables) is carried through unchanged, so an unreadable slot still
+    refuses and a private binding stays allowed: the private-tool requirement
+    is replaced only for the reviewed host bindings, never disabled globally.
+    Absent and undocumented stays absent.
+    """
+    if (not isinstance(document, dict) or document.get("schema") != SCHEMA_HOST_TOOLS):
+        raise GateRefusal("host-tools document is required for the candidate route")
+    scan = ambient.get("path_executables", {}) if isinstance(ambient, dict) else {}
+    bound: dict = {}
+    for entry in document.get("tools", []):
+        if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+            bound[entry["name"]] = entry
+    observation: list = []
+    adjudicated: list = []
+    for entry in scan.get("entries", []):
+        name = entry.get("name")
+        state = entry.get("state")
+        recorded = {"name": name, "state": state}
+        if state == "ambient":
+            resolved = Path(entry.get("resolved_path") or entry.get("path", ""))
+            binding = bound.get(name)
+            try:
+                live_sha256 = sha256_file(resolved, cap=MAX_ADMISSION_ARTIFACT_BYTES)
+                live_bytes = resolved.stat().st_size
+            except (OSError, GateRefusal) as error:
+                recorded["state"] = "unreadable"
+                recorded["error"] = error.__class__.__name__
+                adjudicated.append("unreadable-host-tool:" + name)
+            else:
+                if (binding is None or Path(binding["path"]) != resolved
+                        or binding["sha256"] != live_sha256 or binding["bytes"] != live_bytes):
+                    recorded["bound"] = bool(binding)
+                    adjudicated.append("unbound-ambient-executable:" + name + ":"
+                                       + str(resolved)[:512])
+                else:
+                    recorded.update({"resolved_path": str(resolved), "sha256": live_sha256,
+                                     "bytes": live_bytes,
+                                     "note": "audited host input; not private; hash binds "
+                                             "admission identity and does not confine writes"})
+        elif state == "private":
+            recorded["resolved_path"] = entry.get("resolved_path") or entry.get("path")
+        # A scan-unreadable slot already carries its own raw
+        # `unreadable-executable:` finding, kept below; no second verdict.
+        if len(observation) < MAX_PROVENANCE_ENTRIES:
+            observation.append(recorded)
+    documented_names = set(bound)
+    live_names = {entry.get("name") for entry in scan.get("entries", [])
+                  if entry.get("state") == "ambient"}
+    stale = sorted(documented_names - live_names)
+    if stale:
+        adjudicated.append("documented-host-tool-not-live:" + ",".join(stale[:8]))
+    # The candidate route's violations: every raw finding except the
+    # ambient-executable ones this document adjudicates, then the verdicts.
+    violations = [finding for finding in ambient.get("violations", [])
+                  if isinstance(finding, str)
+                  and not finding.startswith("ambient-executable:")] + adjudicated
+    return observation, violations
+
+
+def validate_candidate_issuance(block: dict, audit: dict, candidate_sha256: str) -> str:
+    """The candidate route takes complete issued documents, not derivations.
+
+    The derivation rule (`derived-artifact-v1:` plus JSON-null artifact and
+    audit digests) authorizes filling those fields from one supervised
+    bootstrap build. The candidate route runs no build, so its issued block
+    and audit must already name the retained candidate digest and the audit
+    digest; anything deferred, null, or derivation-referenced refuses.
+    """
+    if (not isinstance(block, dict) or not isinstance(audit, dict)
+            or not isinstance(candidate_sha256, str) or not HEX64.fullmatch(candidate_sha256)):
+        raise GateRefusal("candidate issuance inputs are malformed")
+    for name, document in (("block", block), ("audit", audit)):
+        if document.get("oxide_sha256") != candidate_sha256:
+            raise GateRefusal(f"candidate {name} does not name the retained candidate digest")
+    reference = block.get("authorization_reference")
+    if (not isinstance(reference, str) or not reference.strip()
+            or reference.startswith("derived-artifact-v1:")):
+        raise GateRefusal("candidate route requires a non-derivation authorization reference")
+    return sha256_bytes(canonical_json(audit))
+
+
+def validate_candidate_origin(*, origin_root: Path, options: dict, ledger_roots: list,
+                              pinned_lock_sha256: str,
+                              pinned_toolchain_sha256: str) -> dict:
+    """Validate the retained candidate's origin, bindings and nested closure.
+
+    Reads only: the origin root must be a canonical directory under Barge
+    scratch, distinct from every active root and covered by the retained-root
+    ledger; the retained nested guard receipt must prove the fixed offline
+    build closed with a certain empty census in THIS root; the retained build
+    log must name exactly one pinned-main artifact resolving to the canonical
+    retained path inside the origin root; and the artifact, lock and
+    toolchain bytes must equal the planner bindings, which must equal the
+    pinned commit's own bytes. Nothing under the origin is written; a
+    mismatch refuses before any staging.
+    """
+    try:
+        origin_root.resolve(strict=True)
+    except OSError as error:
+        raise GateRefusal(f"candidate origin root is unavailable: {error}") from None
+    if (origin_root.resolve(strict=True) != origin_root or origin_root.is_symlink()
+            or not origin_root.is_dir()):
+        raise GateRefusal("candidate origin root must be a canonical directory")
+    covered = any(origin_root == root or origin_root.is_relative_to(root) for root in ledger_roots)
+    if not covered:
+        raise GateRefusal("candidate origin root is not covered by the retained-root ledger")
+    expected_lock = options["candidate_lock_sha256"]
+    expected_toolchain = options["candidate_toolchain_sha256"]
+    if expected_lock != pinned_lock_sha256 or expected_toolchain != pinned_toolchain_sha256:
+        raise GateRefusal("candidate lock or toolchain binding differs from the pinned source")
+    receipt_path = Path(options["candidate_receipt"])
+    receipt = read_json_bound(receipt_path, options["expect_candidate_receipt"])
+    validate_supervisor_receipt(receipt, list(BARGE_BOOTSTRAP_ARGV), origin_root)
+    log_path = Path(options["candidate_log"])
+    try:
+        log_stat = os.lstat(log_path)
+    except OSError as error:
+        raise GateRefusal(f"retained build log is unavailable: {error}") from None
+    if not stat.S_ISREG(log_stat.st_mode) or log_stat.st_size > MAX_CANDIDATE_LOG_BYTES:
+        raise GateRefusal("retained build log is not a bounded regular file")
+    if sha256_file(log_path, cap=MAX_CANDIDATE_LOG_BYTES) != options["expect_candidate_log"]:
+        raise GateRefusal("retained build log does not match its bound digest")
+    log_text = log_path.read_text(encoding="utf-8", errors="strict")
+    facts = bootstrap_artifact_facts(log_text, oxide_source=origin_root / "oxide-source",
+                                     private_root=origin_root)
+    if facts["violations"]:
+        raise GateRefusal(artifact_refusal_message(facts))
+    artifact = facts["artifact"]
+    canonical_artifact = origin_root / CANDIDATE_ORIGIN_RELATIVE
+    if Path(artifact["resolved_path"]) != canonical_artifact:
+        raise GateRefusal("retained build log does not name the canonical retained artifact path")
+    if artifact["sha256"] != options["expect_candidate"]:
+        raise GateRefusal("retained artifact digest differs from the bound candidate digest")
+    if type(options["candidate_bytes"]) is not int or options["candidate_bytes"] <= 0 \
+            or artifact["bytes"] != options["candidate_bytes"]:
+        raise GateRefusal("retained artifact size differs from the bound candidate size")
+    origin_lock = origin_root / "oxide-source/Cargo.lock"
+    origin_toolchain = origin_root / "oxide-source/rust-toolchain.toml"
+    try:
+        if sha256_file(origin_lock, cap=MAX_DOC_BYTES) != expected_lock:
+            raise GateRefusal("origin Cargo.lock differs from the bound candidate source")
+        if sha256_file(origin_toolchain, cap=MAX_DOC_BYTES) != expected_toolchain:
+            raise GateRefusal("origin rust-toolchain.toml differs from the bound candidate source")
+    except GateRefusal:
+        raise
+    except OSError as error:
+        raise GateRefusal(f"origin source binding is unreadable: {error}") from None
+    census = receipt.get("census", {})
+    outcome = receipt.get("outcome", {})
+    return {
+        "root": str(origin_root),
+        "artifact": {"path": str(canonical_artifact), "sha256": artifact["sha256"],
+                     "bytes": artifact["bytes"]},
+        "lock_sha256": expected_lock, "toolchain_sha256": expected_toolchain,
+        "guard": {"run_id": receipt.get("run_id"), "limit_s": receipt.get("limit_s"),
+                  "start_ns": receipt.get("start_ns"), "published_ns": receipt.get("published_ns"),
+                  "closure": outcome.get("closure"), "status": outcome.get("status"),
+                  "census_certain": census.get("certain"), "census_members": census.get("members"),
+                  "census_uncertain": census.get("uncertain"),
+                  "argv_matches": receipt.get("command") == list(BARGE_BOOTSTRAP_ARGV),
+                  "receipt_path": str(receipt_path),
+                  "receipt_sha256": options["expect_candidate_receipt"],
+                  "log_path": str(log_path), "log_sha256": options["expect_candidate_log"]},
+        "note": "retained evidence from the spent replacement diagnostic; the artifact is "
+                "not qualified by existing and that session's failed isolation stays "
+                "historical and unrepaired",
+    }
+
+
+def copy_candidate_artifact(source: Path, fresh_root: Path, expected_sha256: str,
+                            expected_bytes: int) -> dict:
+    """Copy the retained candidate into the fresh guard-owned root, rehash it.
+
+    The source must be the planner-digest-bound regular executable file
+    validated by validate_candidate_origin; the copy is created owner-only,
+    owner-executable (0o700, so `bin/oxide` can actually exec it) and
+    exclusive, rehashed in full, mode-checked, and both endpoint identities
+    are re-checked after the transfer so a same-name swap, truncation or
+    in-place change during the copy refuses. The origin tree is never
+    written.
+    """
+    try:
+        before = os.lstat(source)
+    except OSError as error:
+        raise GateRefusal(f"candidate source vanished before the copy: {error}") from None
+    if not stat.S_ISREG(before.st_mode):
+        raise GateRefusal("candidate source is not a regular file (symlink swap refused)")
+    if not os.access(source, os.X_OK):
+        raise GateRefusal("candidate origin artifact is not executable")
+    relative = Path("candidate") / CANDIDATE_ORIGIN_RELATIVE.name
+    try:
+        candidate_dir = private_dir(fresh_root, Path("candidate"))
+        destination = fresh_root / relative
+        fd = os.open(candidate_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except GateRefusal:
+        raise
+    except OSError as error:
+        raise GateRefusal(f"candidate copy destination is unavailable: {error}") from None
+    out = None
+    try:
+        out = os.open(relative.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                      0o700, dir_fd=fd)
+        source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            opened = os.fstat(source_fd)
+            if (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != \
+                    (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns):
+                raise GateRefusal("candidate source changed identity before the copy")
+            digest = hashlib.sha256()
+            copied = 0
+            while True:
+                block = os.read(source_fd, 1024 * 1024)
+                if not block:
+                    break
+                copied += len(block)
+                if copied > MAX_ADMISSION_ARTIFACT_BYTES:
+                    raise GateRefusal("candidate source exceeds the artifact bound mid-copy")
+                view = memoryview(block)
+                while view:
+                    written = os.write(out, view)
+                    view = view[written:]
+            after = os.fstat(source_fd)
+            if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != \
+                    (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns):
+                raise GateRefusal("candidate source changed identity during the copy")
+        finally:
+            os.close(source_fd)
+    except FileExistsError:
+        raise GateRefusal("candidate copy destination already exists") from None
+    except OSError as error:
+        raise GateRefusal(f"candidate copy failed: {error}") from None
+    finally:
+        os.close(fd)
+        if out is not None:
+            try:
+                os.close(out)
+            except OSError:
+                pass
+    copy_digest = sha256_file(destination, cap=MAX_ADMISSION_ARTIFACT_BYTES)
+    if copy_digest != expected_sha256:
+        raise GateRefusal("candidate copy digest differs from the retained candidate")
+    copy_stat = os.lstat(destination)
+    if copy_stat.st_size != expected_bytes:
+        raise GateRefusal("candidate copy size differs from the retained candidate")
+    if not stat.S_IMODE(copy_stat.st_mode) & 0o100 or copy_stat.st_mode & 0o077:
+        raise GateRefusal("candidate copy is not an owner-only executable")
+    try:
+        final = os.lstat(source)
+    except OSError as error:
+        raise GateRefusal(f"candidate source vanished after the copy: {error}") from None
+    if (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns) != \
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns):
+        raise GateRefusal("candidate source changed identity after the copy")
+    return {"origin_path": str(source), "origin_identity": [before.st_dev, before.st_ino],
+            "origin_mode": stat.S_IMODE(before.st_mode),
+            "path": str(destination), "bytes": copy_stat.st_size,
+            "sha256": copy_digest, "mode": stat.S_IMODE(copy_stat.st_mode)}
+
+
+def build_candidate_provenance(inputs: dict, *, origin: dict, guard: dict, artifact: dict,
+                               ambient: dict, allowance: dict, written_ns: int) -> dict:
+    """Assemble the bounded candidate provenance document (internal evidence).
+
+    Mirrors the bootstrap provenance packet's rule (oxide#253): gathered from
+    the audited allowlist actually passed, retained inside the monitored root
+    BEFORE the status gate can refuse, bounded in bytes, and never recording
+    inherited secret values. The audited host inputs are recorded with their
+    bound digests and labelled as host tools, never as private bindings.
+    """
+    private_root = Path(inputs["private_root"])
+    cwd = Path(inputs["cwd"])
+    if not (cwd == private_root or cwd.is_relative_to(private_root)):
+        raise GateRefusal(f"provenance cwd is not under the private root: {cwd}")
+    env = inputs["env"]
+    if not isinstance(env, dict) or set(env) - BOOTSTRAP_ENV_KEYS:
+        raise GateRefusal("provenance environment carries keys outside the "
+                          "audited allowlist: " +
+                          ",".join(sorted(set(env) - BOOTSTRAP_ENV_KEYS)[:8]))
+    inherited_names = list(inputs["inherited_keys"])
+    reachability = live_account_reachability(
+        [env[key] for key in sorted(env)] + [str(cwd)],
+        account_root=inputs["account_root"])
+    return {
+        "kind": "candidate-provenance",
+        "written_ns": written_ns,
+        "gate_run_id": inputs["run_id"],
+        "ruling": CANDIDATE_RULING,
+        "origin": origin,
+        "command": {
+            "argv": list(inputs["argv"]),
+            "argv_sha256": sha256_bytes(canonical_json(list(inputs["argv"]))),
+            "cwd": str(cwd),
+        },
+        "child_environment": {
+            "allowed_keys": sorted(env),
+            "values": {key: env[key] for key in sorted(env)},
+            "inherited_key_names": inherited_names[:MAX_PROVENANCE_ENTRIES],
+            "inherited_key_count": len(inherited_names),
+            "live_account_reachability": reachability,
+        },
+        "admission": {"hook": env.get("EFFIGY_ADMISSION_HOOK", ""),
+                      "socket": env.get("QUEUE_ADMISSION_SOCKET", "")},
+        "tools": inputs["tools"],
+        "audited_host_tools": inputs["host_tools"],
+        "bin_symlinks": {
+            "cargo": symlink_target(private_root / "bin/cargo"),
+            "effigy": symlink_target(private_root / "bin/effigy"),
+            "oxide": symlink_target(private_root / "bin/oxide"),
+        },
+        "sources": inputs["sources"],
+        "ambient": ambient,
+        "bounds": {"limit_seconds": inputs["limit_seconds"],
+                   "scratch_mib": inputs["scratch_mib"],
+                   "pool_cap_bytes": inputs["pool_cap_bytes"]},
+        "guard": guard,
+        "artifact": artifact,
+        "allowance": allowance,
+        "private_home_state": private_home_state_observation(private_root),
+    }
+
+
+def write_candidate_provenance(private_root: Path, document: dict) -> Path:
+    """Retain the candidate packet before any later refusal (oxide#253 rule)."""
+    data = canonical_json(document)
+    if len(data) > MAX_CANDIDATE_PROVENANCE_BYTES:
+        raise GateRefusal(f"candidate provenance packet exceeds its "
+                          f"{MAX_CANDIDATE_PROVENANCE_BYTES}-byte bound; nothing retained")
+    return private_write(private_root, CANDIDATE_PROVENANCE_PATH, data)
+
+
+def refuse_candidate_launch(inputs: dict, ambient: dict, origin: dict, allowance: dict) -> None:
+    """Refuse before the status gate when the pre-launch scan recorded a finding.
+
+    Covers ambient or planted Cargo configuration, an unreadable config path,
+    and a PATH-resolved named tool without an exact audited host-input binding
+    (or without a private binding). The candidate packet is retained first.
+    """
+    if not ambient["violations"]:
+        return
+    document = build_candidate_provenance(
+        inputs, origin=origin, guard={"state": "not-launched"},
+        artifact={"state": "not-launched"},
+        ambient=ambient, allowance=allowance, written_ns=now_ns())
+    write_candidate_provenance(inputs["private_root"], document)
+    raise GateRefusal("ambient configuration or executable path lacks a private "
+                      "or audited host binding: " + ambient["violations"][0])
+
+
+def artifact_refusal_message(facts: dict) -> str:
+    """The bounded refusal text for the recorded artifact findings."""
+    for kind in facts["violations"]:
+        if kind.startswith("artifact-count:"):
+            return "the bootstrap log does not name exactly one oxide artifact"
+        if kind.startswith("artifact-escaped:"):
+            return "bootstrap artifact escaped the private root: " + kind.split(":", 1)[1]
+        if kind.startswith("artifact-missing:"):
+            return "bootstrap artifact is missing or unreadable: " + kind.split(":", 1)[1]
+        if kind.startswith("artifact-oversize:"):
+            return "bootstrap artifact exceeds the digest bound: " + kind.split(":", 1)[1]
+    return "bootstrap artifact could not be resolved"
+
+
+def bootstrap_artifact_facts(log_text: str, *, oxide_source: Path,
+                             private_root: Path) -> dict:
+    """Resolve the bootstrap artifact from the build log with bounded findings.
+
+    The accepted single-artifact rule is unchanged: exactly one
+    compiler-artifact message for the pinned `src/bin/oxide/main.rs`, a `bin`
+    target, an executable path inside the private root. Malformed log lines
+    are counted and retained — never silently accepted, never a crash.
+    """
+    main_rs = str(oxide_source / "src/bin/oxide/main.rs")
+    candidates: list = []
+    oxid_entries: list = []
+    candidate_count = 0
+    malformed_lines = 0
+    truncated = False
+    for line in log_text.splitlines():
+        try:
+            item = json.loads(line)
+        except (ValueError, UnicodeDecodeError):
+            malformed_lines += 1
+            continue
+        if not isinstance(item, dict):
+            malformed_lines += 1
+            continue
+        target = item.get("target", {})
+        if (item.get("reason") == "compiler-artifact" and isinstance(target, dict)
+                and target.get("name") == "oxide" and "bin" in target.get("kind", [])
+                and item.get("executable")):
+            entry = {"src_path": str(target.get("src_path", "")),
+                     "path": str(item["executable"])[:512]}
+            if len(oxid_entries) < 4:
+                oxid_entries.append(entry)
+            if entry["src_path"] == main_rs:
+                candidate_count += 1
+                if len(candidates) < MAX_PROVENANCE_ENTRIES:
+                    candidates.append(entry)
+                else:
+                    truncated = True
+    violations: list = []
+    if candidate_count != 1:
+        violations.append(f"artifact-count:{candidate_count}")
+        if candidate_count == 0 and oxid_entries:
+            violations.append("artifact-src-path-mismatch")
+    if truncated:
+        violations.append("artifact-candidates-truncated")
+    artifact = None
+    if candidate_count == 1:
+        raw = candidates[0]["path"]
+        try:
+            staged = Path(raw).resolve(strict=True)
+        except OSError:
+            violations.append(f"artifact-missing:{raw}")
+        else:
+            if not staged.is_relative_to(private_root):
+                violations.append(f"artifact-escaped:{str(staged)[:512]}")
+            else:
+                try:
+                    digest = sha256_file(staged, cap=256 * 1024 * 1024)
+                except GateRefusal as error:
+                    kind = ("artifact-oversize:" if "exceeds the document bound"
+                            in str(error) else "artifact-missing:")
+                    violations.append(kind + raw)
+                except OSError:
+                    violations.append(f"artifact-missing:{raw}")
+                else:
+                    artifact = {"path": raw, "resolved_path": str(staged),
+                                "bytes": staged.stat().st_size,
+                                "sha256": digest, "src_path": main_rs}
+    return {"main_rs_binding": main_rs, "candidates": candidates,
+            "candidate_count": candidate_count, "oxide_bin_entries": oxid_entries,
+            "malformed_lines": malformed_lines, "violations": violations,
+            "artifact": artifact}
+
+
+def build_bootstrap_provenance(inputs: dict, *, guard: dict, artifact: dict,
+                               ambient: dict, allowance: dict,
+                               written_ns: int) -> dict:
+    """Assemble the bounded bootstrap provenance document (internal evidence).
+
+    Records only what was actually passed to the child: the scrubbed
+    allowlist environment and its exact key set, exact argv, cwd, resolved
+    tool identities, source and lock bindings, the ambient-configuration
+    scan, the nested guard receipt reference and the resolved artifact.
+    Pre-scrub inherited environment VALUES are never recorded; only their
+    key names document the scrub. Construction facts (argv, allowlist,
+    private cwd) refuse on drift; live findings are recorded and judged at
+    the call site.
+    """
+    private_root = Path(inputs["private_root"])
+    cwd = Path(inputs["cwd"])
+    if not (cwd == private_root or cwd.is_relative_to(private_root)):
+        raise GateRefusal(f"provenance cwd is not under the private root: {cwd}")
+    if list(inputs["argv"]) != list(BARGE_BOOTSTRAP_ARGV):
+        raise GateRefusal("provenance argv is not the fixed bootstrap argv")
+    env = inputs["env"]
+    if not isinstance(env, dict) or set(env) - BOOTSTRAP_ENV_KEYS:
+        raise GateRefusal("provenance environment carries keys outside the "
+                          "audited allowlist: " +
+                          ",".join(sorted(set(env) - BOOTSTRAP_ENV_KEYS)[:8]))
+    inherited_names = list(inputs["inherited_keys"])
+    reachability = live_account_reachability(
+        [env[key] for key in sorted(env)] + [str(cwd)],
+        account_root=inputs["account_root"])
+    return {
+        "kind": "bootstrap-provenance",
+        "written_ns": written_ns,
+        "gate_run_id": inputs["run_id"],
+        "command": {
+            "argv": list(inputs["argv"]),
+            "argv_sha256": sha256_bytes(canonical_json(list(inputs["argv"]))),
+            "cwd": str(cwd),
+        },
+        "child_environment": {
+            "allowed_keys": sorted(env),
+            "values": {key: env[key] for key in sorted(env)},
+            "inherited_key_names": inherited_names[:MAX_PROVENANCE_ENTRIES],
+            "inherited_key_count": len(inherited_names),
+            "live_account_reachability": reachability,
+        },
+        "admission": {"hook": env.get("EFFIGY_ADMISSION_HOOK", ""),
+                      "socket": env.get("QUEUE_ADMISSION_SOCKET", "")},
+        "tools": inputs["tools"],
+        "bin_symlinks": {
+            "cargo": symlink_target(private_root / "bin/cargo"),
+            "effigy": symlink_target(private_root / "bin/effigy"),
+            "oxide": symlink_target(private_root / "bin/oxide"),
+        },
+        "sources": inputs["sources"],
+        "seed": inputs["seed"],
+        "ambient": ambient,
+        "bounds": {"limit_seconds": inputs["limit_seconds"],
+                   "scratch_mib": inputs["scratch_mib"],
+                   "pool_cap_bytes": inputs["pool_cap_bytes"]},
+        "guard": guard,
+        "artifact": artifact,
+        "allowance": allowance,
+        "private_home_state": private_home_state_observation(private_root),
+    }
+
+
+def write_bootstrap_provenance(private_root: Path, document: dict) -> Path:
+    """Retain the packet inside the monitored root before any later refusal."""
+    data = canonical_json(document)
+    if len(data) > MAX_PROVENANCE_BYTES:
+        raise GateRefusal(f"provenance packet exceeds its "
+                          f"{MAX_PROVENANCE_BYTES}-byte bound; nothing retained")
+    return private_write(private_root, PROVENANCE_PATH, data)
+
+
+def refuse_bootstrap_launch(inputs: dict, ambient: dict, allowance: dict) -> None:
+    """Refuse before the launch when the ambient scan recorded a finding.
+
+    Covers ambient or planted Cargo configuration, an unreadable config
+    path, and a PATH-resolved named linker/assembler without a private
+    PATH-slot binding. The packet is retained first.
+    """
+    if not ambient["violations"]:
+        return
+    document = build_bootstrap_provenance(
+        inputs, guard={"state": "not-launched"}, artifact={"state": "not-built"},
+        ambient=ambient, allowance=allowance, written_ns=now_ns())
+    write_bootstrap_provenance(inputs["private_root"], document)
+    raise GateRefusal("ambient configuration or executable path lacks a "
+                      "private binding: " + ambient["violations"][0])
+
+
+def resolve_bootstrap_artifact(log_text: str, inputs: dict, *, guard: dict,
+                               ambient: dict, allowance: dict) -> dict:
+    """Resolve the artifact, retain provenance first, refuse on any finding.
+
+    On the success path nothing is written here: the diagnostic completes the
+    packet once, after the guarded closure, still before the inventory
+    assertion. On any artifact finding the packet is retained first so a real
+    validation failure keeps the attributable bootstrap evidence.
+    """
+    facts = bootstrap_artifact_facts(log_text, oxide_source=inputs["cwd"],
+                                     private_root=inputs["private_root"])
+    if facts["violations"]:
+        document = build_bootstrap_provenance(
+            inputs, guard=guard,
+            artifact={"state": "unresolved", "findings": facts},
+            ambient=ambient, allowance=allowance, written_ns=now_ns())
+        write_bootstrap_provenance(inputs["private_root"], document)
+        raise GateRefusal(artifact_refusal_message(facts))
+    return facts
+
+
+def bootstrap_guard_facts(receipt: dict, *, receipt_path: Path, log_path: Path,
+                          limit_seconds: int, scratch_mib: int,
+                          expected_argv: list) -> dict:
+    """The bounded reference to the nested guard receipt and build log."""
+    census = receipt.get("census", {})
+    outcome = receipt.get("outcome", {})
+    return {
+        "state": "closed",
+        "receipt_path": str(receipt_path),
+        "receipt_sha256": sha256_file(receipt_path, cap=MAX_DOC_BYTES),
+        "run_id": receipt.get("run_id"),
+        "limit_s": receipt.get("limit_s"),
+        "start_ns": receipt.get("start_ns"),
+        "published_ns": receipt.get("published_ns"),
+        "limit_seconds": limit_seconds,
+        "scratch_mib": scratch_mib,
+        "argv_matches_command": receipt.get("command") == list(expected_argv),
+        "census_certain": census.get("certain"),
+        "census_members": census.get("members"),
+        "census_uncertain": census.get("uncertain"),
+        "outcome": {key: outcome.get(key) for key in
+                    ("closure", "status", "fault", "deadline", "launched")},
+        "log_path": str(log_path),
+        "log_sha256": sha256_file(log_path, cap=32 * 1024 * 1024),
+    }
+
+
 def diagnostic(options: dict) -> int:
-    """The planner's one proofExecution: refuse before any effect on any gap."""
+    """The planner's one proofExecution: refuse before any effect on any gap.
+
+    `--diagnostic` runs the fixed supervised bootstrap and derives the issued
+    documents from the built artifact. `--candidate` (oxide#254, operator
+    ruling d9aec625) runs the same guarded preparation, issuance, accounting,
+    private status gate and isolation brackets, but binds the retained debug
+    artifact from the spent replacement diagnostic instead of building: its
+    origin, source/lock/toolchain/artifact binding and retained nested closure
+    are validated before any staging, the artifact is copied only inside the
+    fresh guard-owned root and rehashed, the named linker/assembler tools and
+    the pinned toolchain are audited host inputs under the planner-bound
+    host-tools document, and no wrapper-consumable derivation happens.
+    """
+    mode = "candidate" if options["mode"] == "candidate" else "bootstrap"
     python = Path(sys.executable).resolve(strict=True)
     evidence, run_id, deadline_ns, adopted_scratch = supervisor_context()
     allowance_dir = evidence / "private-build-validation.allowance"
@@ -1942,6 +3003,10 @@ def diagnostic(options: dict) -> int:
         raise GateRefusal("the outer supervisor must monitor the complete Barge task root and evidence")
     if oxide_head != OXIDE_PIN_COMMIT:
         raise GateRefusal("Oxide block head must equal the source built by the bootstrap")
+    if mode == "candidate" and options["candidate_origin"]:
+        origin_root = root_guard(options["candidate_origin"], BARGE_SCRATCH)
+        if origin_root in (barge_root, oxide_root):
+            raise GateRefusal("candidate origin root must be distinct from the active task roots")
 
     # Issued documents first: nothing is created before every binding checks.
     block_path, block_digest = env_document("BARGE_VALIDATION_BLOCK",
@@ -1987,7 +3052,7 @@ def diagnostic(options: dict) -> int:
     audit_doc = read_json_bound(audit_path, audit_digest)
     admission_env = audited_admission(inherited, audit_doc)
     invoking_cargo_home = os.environ.get("CARGO_HOME", "")
-    if not invoking_cargo_home or not Path(invoking_cargo_home).is_dir():
+    if mode != "candidate" and (not invoking_cargo_home or not Path(invoking_cargo_home).is_dir()):
         raise GateRefusal("invoking CARGO_HOME is required as the offline seed source")
 
     # Charge preparation's complete supervised wall time plus the conservative
@@ -2052,14 +3117,35 @@ def diagnostic(options: dict) -> int:
     # accepted launcher rules with live digests.
     allowance.begin("documents")
     ledger_doc = read_json_bound(ledger_path, ledger_digest)
-    validate_barge_ledger(ledger_doc, private_root=barge_root, scratch=BARGE_SCRATCH)
+    ledger_roots = validate_barge_ledger(ledger_doc, private_root=barge_root, scratch=BARGE_SCRATCH)
     allowance.finish("documents")
+
+    # Candidate origin validation (oxide#254): retained-artifact bindings and
+    # nested closure are proven from planner-digested documents BEFORE any
+    # staging; the host-tools document binds the audited host inputs of
+    # operator ruling d9aec625 against their live executables.
+    if mode == "candidate":
+        allowance.begin("candidate-origin")
+        pinned_lock_sha256 = sha256_bytes(git_output(oxide_repo, "show", OXIDE_PIN_COMMIT + ":Cargo.lock"))
+        pinned_toolchain_sha256 = sha256_bytes(git_output(
+            oxide_repo, "show", OXIDE_PIN_COMMIT + ":rust-toolchain.toml"))
+        cargo_tool = (rustc_tool.parent / "cargo").resolve(strict=True)
+        host_tools_doc = read_json_bound(canonical_file(Path(options["host_tools"])),
+                                         options["expect_host_tools"])
+        validate_host_tools_document(host_tools_doc, rustc_tool=rustc_tool, cargo_tool=cargo_tool)
+        origin_facts = validate_candidate_origin(
+            origin_root=origin_root, options=options, ledger_roots=ledger_roots,
+            pinned_lock_sha256=pinned_lock_sha256,
+            pinned_toolchain_sha256=pinned_toolchain_sha256)
+        if origin_root == prep_scratch or origin_root in prep_scratch.parents \
+                or prep_scratch in origin_root.parents:
+            raise GateRefusal("candidate origin root overlaps the preparation phase root")
+        allowance.finish("candidate-origin")
 
     # Aggregate accounting before any child: the caps must fit what remains.
     # Both effective figures are measured clamps, disclosed in the receipt;
     # neither is a claim that a phase fits, and neither is silently raised.
     allowance.begin("account")
-    ledger_roots = [Path(p) for p in ledger_doc["roots"]]
     barge_outside = allocated_bytes([p for p in ledger_roots if p != barge_root],
                                     BARGE_CAP_BYTES, deadline_ns)
     if prep_scratch not in ledger_roots:
@@ -2137,30 +3223,61 @@ def diagnostic(options: dict) -> int:
                                 for entry in audit_inputs["inputs"]]}
     stage_audit_inputs(barge_root, staged_inputs)
     block_template = read_json_bound(block_path, block_digest)
-    block_doc, audit_preview = bind_barge_documents(block_template, audit_doc, "0" * 64)
-    validate_barge_audit(audit_preview, private=barge_root, host=live_audit_host(
-        effigy=effigy, git_tool=git_tool, rustc_tool=rustc_tool, python=python,
-        wrapper_hash=wrapper_hash, oxide_hash="0" * 64))
+    if mode == "candidate":
+        # The candidate route takes COMPLETE issued documents: the retained
+        # candidate digest is planner-bound before any staging, so nothing is
+        # derived here and a derivation-style issuance refuses.
+        block_doc = block_template
+        issued_audit_digest = validate_candidate_issuance(block_doc, audit_doc,
+                                                          options["expect_candidate"])
+        validate_barge_audit(audit_doc, private=barge_root, host=live_audit_host(
+            effigy=effigy, git_tool=git_tool, rustc_tool=rustc_tool, python=python,
+            wrapper_hash=wrapper_hash, oxide_hash=options["expect_candidate"]))
+    else:
+        block_doc, audit_preview = bind_barge_documents(block_template, audit_doc, "0" * 64)
+        issued_audit_digest = sha256_bytes(canonical_json(audit_doc))
+        validate_barge_audit(audit_preview, private=barge_root, host=live_audit_host(
+            effigy=effigy, git_tool=git_tool, rustc_tool=rustc_tool, python=python,
+            wrapper_hash=wrapper_hash, oxide_hash="0" * 64))
     if audit_doc.get("child_path") != str(barge_root / "bin") + os.pathsep + inherited.get("PATH", ""):
         raise GateRefusal("audited child PATH does not match the effective environment")
     if block_doc.get("barge_tree") != barge_tree:
         raise GateRefusal("issued Barge tree does not match the built archive")
-    validate_barge_block(block_doc, head=barge_head, wrapper_hash=wrapper_hash,
-                         oxide_hash="0" * 64,
-                         audit_hash=sha256_bytes(canonical_json(audit_preview)),
-                         ledger_hash=ledger_digest)
+    if mode == "candidate":
+        max_seconds = validate_barge_block(block_doc, head=barge_head, wrapper_hash=wrapper_hash,
+                                           oxide_hash=options["expect_candidate"],
+                                           audit_hash=issued_audit_digest,
+                                           ledger_hash=ledger_digest)
+        if oxide_files["Cargo.lock"] != origin_facts["lock_sha256"] \
+                or oxide_files["rust-toolchain.toml"] != origin_facts["toolchain_sha256"]:
+            raise GateRefusal("staged source does not reproduce the candidate's "
+                              "source/lock/toolchain binding")
+    else:
+        max_seconds = validate_barge_block(block_doc, head=barge_head, wrapper_hash=wrapper_hash,
+                                           oxide_hash="0" * 64,
+                                           audit_hash=sha256_bytes(canonical_json(audit_preview)),
+                                           ledger_hash=ledger_digest)
     for name in ("home", "cache", "tmp", "scratch", "bin"):
         private_dir(barge_root, Path(name))
     private_write(barge_root, Path("config.toml"), b"")
     cache_root = private_dir(barge_root, Path("cache"))
-    sys.path.insert(0, str(oxide_source / "scripts"))
-    try:
-        from offline_seed import seed_cargo_home  # type: ignore
-        seed_cargo_home(Path(invoking_cargo_home), cache_root,
-                        (oxide_source / "Cargo.lock").read_bytes(),
-                        deadline_ns=deadline_ns)
-    finally:
-        sys.path.pop(0)
+    if mode == "candidate":
+        # No build: the retained artifact is copied into this fresh
+        # guard-owned root, rehashed and symlinked as the private oxide. The
+        # origin tree is never written and no offline seed runs.
+        copy_facts = copy_candidate_artifact(
+            Path(origin_facts["artifact"]["path"]), barge_root,
+            options["expect_candidate"], options["candidate_bytes"])
+        os.symlink(copy_facts["path"], barge_root / "bin/oxide")
+    else:
+        sys.path.insert(0, str(oxide_source / "scripts"))
+        try:
+            from offline_seed import seed_cargo_home  # type: ignore
+            seed_cargo_home(Path(invoking_cargo_home), cache_root,
+                            (oxide_source / "Cargo.lock").read_bytes(),
+                            deadline_ns=deadline_ns)
+        finally:
+            sys.path.pop(0)
     allowance.finish("setup")
 
 
@@ -2168,70 +3285,202 @@ def diagnostic(options: dict) -> int:
 
     # The single debug bootstrap: exact argv under the nested qualified
     # supervisor, inside the 300 s window and the measured, clamped budget.
-    allowance.begin_bootstrap()
-    bootstrap_mib = min(barge_effective_mib, oxide_caps["effective_whole_block_mib"],
-                        BOOTSTRAP_MAX_MIB)
-    bootstrap_limit = max(1, min(BOOTSTRAP_MAX_SECONDS,
-                                 (allowance.bootstrap_deadline_ns() - now_ns()) // 1_000_000_000))
-    bootstrap_evidence = private_dir(barge_root, Path("evidence/bootstrap"))
-    env = child_environment(dict(os.environ), private=barge_root,
-                            oxide=barge_root / "bin/oxide", rustc=rustc_tool,
-                            wrapper_hash=wrapper_hash,
-                            pool_cap=block_doc["pool_cap_bytes"],
-                            admission_env=admission_env)
-    os.symlink(rustc_tool.parent / "cargo", barge_root / "bin/cargo")
-    os.symlink(effigy, barge_root / "bin/effigy")
-    bootstrap_receipt, bootstrap_log, bootstrap_argv = run_supervised(
-        supervisor=supervisor_tool, python=python,
-        command=list(BARGE_BOOTSTRAP_ARGV), cwd=oxide_source, env=env,
-        limit_seconds=bootstrap_limit, scratch_mib=bootstrap_mib,
-        evidence=bootstrap_evidence, allowance=allowance, phase="bootstrap")
-    validate_supervisor_receipt(bootstrap_receipt, list(BARGE_BOOTSTRAP_ARGV), barge_root)
-    artifacts = []
-    for line in bootstrap_log.splitlines():
+    # Before any launch the bounded provenance inputs are gathered and any
+    # ambient Cargo configuration or PATH-resolved host tool without a
+    # private binding refuses with its finding retained (oxide#253); after
+    # the guarded closure the completed packet is retained BEFORE the
+    # inventory assertion can refuse.
+    if mode == "candidate":
+        # Candidate derivation (oxide#254): no build. The copy already
+        # happened inside the guarded setup; the same scrubbed allowlist
+        # environment is built, the pre-launch scans must clear with exact
+        # audited host-input bindings (ruling d9aec625) or private bindings,
+        # and the candidate packet is retained before the status gate can
+        # refuse. The audited host inputs are host tools, never private
+        # bindings, and their hashes do not confine their writes.
+        allowance.require(60, "private-status")
+        allowance.begin("candidate-derivation")
+        os.symlink(rustc_tool.parent / "cargo", barge_root / "bin/cargo")
+        os.symlink(effigy, barge_root / "bin/effigy")
+        env = child_environment(dict(os.environ), private=barge_root,
+                                oxide=barge_root / "bin/oxide", rustc=rustc_tool,
+                                wrapper_hash=wrapper_hash,
+                                pool_cap=block_doc["pool_cap_bytes"],
+                                admission_env=admission_env)
+        ambient = attach_path_executables(
+            ambient_cargo_config_scan(oxide_source, private_root=barge_root,
+                                      cargo_home=Path(env["CARGO_HOME"])),
+            env["PATH"], private_root=barge_root, cwd=oxide_source)
+        host_observation, candidate_findings = reconcile_host_tools(ambient, host_tools_doc)
+        ambient = dict(ambient)
+        ambient["host_tool_bindings"] = host_observation
+        # The adjudicated findings REPLACE the raw scan verdicts: a bound
+        # audited host input no longer carries its ambient-executable refusal.
+        ambient["violations"] = candidate_findings
+        candidate_tools = {
+            "python": tool_identity(python, 256 * 1024 * 1024),
+            "supervisor": tool_identity(supervisor_tool, 512 * 1024),
+            "rustc": tool_identity(rustc_tool, 256 * 1024 * 1024),
+            "cargo": tool_identity(cargo_tool, 256 * 1024 * 1024),
+            "effigy": tool_identity(effigy, 256 * 1024 * 1024),
+            "git": tool_identity(git_tool, 64 * 1024 * 1024),
+        }
+        provenance_inputs = {
+            "run_id": run_id, "private_root": barge_root,
+            "account_root": LIVE_ACCOUNT_ROOT,
+            "argv": [str(effigy), STATUS_SELECTOR], "cwd": barge_source, "env": env,
+            "inherited_keys": sorted(os.environ),
+            "tools": candidate_tools,
+            "host_tools": host_observation,
+            "sources": {
+                "oxide_pin_commit": OXIDE_PIN_COMMIT, "oxide_pin_tree": oxide_tree,
+                "oxide_source": str(oxide_source), "oxide_staged_files": len(oxide_files),
+                "lock_sha256": oxide_files["Cargo.lock"],
+                "toolchain_sha256": oxide_files["rust-toolchain.toml"],
+                "barge_head": barge_head, "barge_tree": barge_tree,
+                "barge_source": str(barge_source), "barge_staged_files": len(barge_files),
+                "wrapper_sha256": wrapper_hash,
+                "block_sha256": block_digest, "issued_audit_sha256": audit_digest,
+                "issued_audit_document_sha256": issued_audit_digest,
+                "issued_ledger_sha256": ledger_digest, "oxide_block_sha256": approval,
+                "audit_inputs_sha256": prep_options["expect_audit_inputs"],
+                "host_tools_document_sha256": options["expect_host_tools"],
+                "candidate_sha256": options["expect_candidate"],
+                "candidate_bytes": options["candidate_bytes"],
+                "origin": origin_facts,
+            },
+            "limit_seconds": min(300, allowance.remaining_seconds()),
+            "scratch_mib": min(barge_effective_mib, oxide_caps["effective_whole_block_mib"], 512),
+            "pool_cap_bytes": block_doc["pool_cap_bytes"],
+        }
+        refuse_candidate_launch(provenance_inputs, ambient, origin_facts,
+                                allowance.document())
+        write_candidate_provenance(barge_root, build_candidate_provenance(
+            provenance_inputs, origin=origin_facts, guard={"state": "pre-launch"},
+            artifact={"state": "copied", **copy_facts},
+            ambient=ambient, allowance=allowance.document(), written_ns=now_ns()))
+        oxide_hash = options["expect_candidate"]
+        env.update({"BARGE_VALIDATION_SOURCE_AUDIT": str(audit_path),
+                    "BARGE_VALIDATION_SOURCE_AUDIT_SHA256": audit_digest,
+                    "BARGE_VALIDATION_BLOCK": str(block_path),
+                    "BARGE_VALIDATION_BLOCK_SHA256": block_digest,
+                    "BARGE_VALIDATION_ROOT_LEDGER": str(ledger_path),
+                    "BARGE_VALIDATION_ROOT_LEDGER_SHA256": ledger_digest})
+        allowance.finish("candidate-derivation")
+        live_after_derivation = live_inventory(LIVE_ACCOUNT_ROOT, deadline_ns)
+        verify_inventory(live_before, live_after_derivation, "candidate-derivation", evidence)
+    else:
+        # The single debug bootstrap: exact argv under the nested qualified
+        # supervisor, inside the 300 s window and the measured, clamped budget.
+        # Before any launch the bounded provenance inputs are gathered and any
+        # ambient Cargo configuration or PATH-resolved host tool without a
+        # private binding refuses with its finding retained (oxide#253); after
+        # the guarded closure the completed packet is retained BEFORE the
+        # inventory assertion can refuse.
+        allowance.begin_bootstrap()
+        bootstrap_mib = min(barge_effective_mib, oxide_caps["effective_whole_block_mib"],
+                            BOOTSTRAP_MAX_MIB)
+        bootstrap_limit = max(1, min(BOOTSTRAP_MAX_SECONDS,
+                                     (allowance.bootstrap_deadline_ns() - now_ns()) // 1_000_000_000))
+        bootstrap_evidence = private_dir(barge_root, Path("evidence/bootstrap"))
+        env = child_environment(dict(os.environ), private=barge_root,
+                                oxide=barge_root / "bin/oxide", rustc=rustc_tool,
+                                wrapper_hash=wrapper_hash,
+                                pool_cap=block_doc["pool_cap_bytes"],
+                                admission_env=admission_env)
+        os.symlink(rustc_tool.parent / "cargo", barge_root / "bin/cargo")
+        os.symlink(effigy, barge_root / "bin/effigy")
         try:
-            item = json.loads(line)
-        except (ValueError, UnicodeDecodeError):
-            continue
-        target = item.get("target", {})
-        if (item.get("reason") == "compiler-artifact" and target.get("name") == "oxide"
-                and "bin" in target.get("kind", [])
-                and target.get("src_path") == str(oxide_source / "src/bin/oxide/main.rs")
-                and item.get("executable")):
-            artifacts.append(Path(item["executable"]))
-    if len(artifacts) != 1:
-        raise GateRefusal("the bootstrap log does not name exactly one oxide artifact")
-    staged = artifacts[0].resolve(strict=True)
-    if not staged.is_relative_to(barge_root):
-        raise GateRefusal("bootstrap artifact escaped the private root")
-    oxide_hash = sha256_file(staged, cap=256 * 1024 * 1024)
-    os.symlink(staged, barge_root / "bin/oxide")
-    allowance.finish_bootstrap()
+            cargo_tool = (rustc_tool.parent / "cargo").resolve(strict=True)
+        except OSError as error:
+            raise GateRefusal(f"bootstrap cargo is unresolved: {error}") from None
+        ambient = attach_path_executables(
+            ambient_cargo_config_scan(oxide_source, private_root=barge_root,
+                                      cargo_home=Path(env["CARGO_HOME"])),
+            env["PATH"], private_root=barge_root, cwd=oxide_source)
+        provenance_inputs = {
+            "run_id": run_id, "private_root": barge_root,
+            "account_root": LIVE_ACCOUNT_ROOT,
+            "argv": list(BARGE_BOOTSTRAP_ARGV), "cwd": oxide_source, "env": env,
+            "inherited_keys": sorted(os.environ),
+            "tools": {
+                "python": tool_identity(python, 256 * 1024 * 1024),
+                "supervisor": tool_identity(supervisor_tool, 512 * 1024),
+                "rustc": tool_identity(rustc_tool, 256 * 1024 * 1024),
+                "cargo": tool_identity(cargo_tool, 256 * 1024 * 1024),
+                "effigy": tool_identity(effigy, 256 * 1024 * 1024),
+                "git": tool_identity(git_tool, 64 * 1024 * 1024),
+            },
+            "sources": {
+                "oxide_pin_commit": OXIDE_PIN_COMMIT, "oxide_pin_tree": oxide_tree,
+                "oxide_source": str(oxide_source), "oxide_staged_files": len(oxide_files),
+                "lock_sha256": oxide_files["Cargo.lock"],
+                "toolchain_sha256": oxide_files["rust-toolchain.toml"],
+                "barge_head": barge_head, "barge_tree": barge_tree,
+                "barge_source": str(barge_source), "barge_staged_files": len(barge_files),
+                "wrapper_sha256": wrapper_hash,
+                "block_sha256": block_digest, "issued_audit_sha256": audit_digest,
+                "issued_ledger_sha256": ledger_digest, "oxide_block_sha256": approval,
+                "audit_inputs_sha256": prep_options["expect_audit_inputs"],
+            },
+            "seed": {"source_cargo_home": invoking_cargo_home,
+                     "cache_root": str(cache_root)},
+            "limit_seconds": bootstrap_limit, "scratch_mib": bootstrap_mib,
+            "pool_cap_bytes": block_doc["pool_cap_bytes"],
+        }
+        refuse_bootstrap_launch(provenance_inputs, ambient, allowance.document())
+        bootstrap_receipt, bootstrap_log, bootstrap_argv = run_supervised(
+            supervisor=supervisor_tool, python=python,
+            command=list(BARGE_BOOTSTRAP_ARGV), cwd=oxide_source, env=env,
+            limit_seconds=bootstrap_limit, scratch_mib=bootstrap_mib,
+            evidence=bootstrap_evidence, allowance=allowance, phase="bootstrap")
+        validate_supervisor_receipt(bootstrap_receipt, list(BARGE_BOOTSTRAP_ARGV), barge_root)
+        guard_facts = bootstrap_guard_facts(
+            bootstrap_receipt,
+            receipt_path=bootstrap_evidence / "receipt.json",
+            log_path=bootstrap_evidence.parent / "bootstrap-stdout.log",
+            limit_seconds=bootstrap_limit, scratch_mib=bootstrap_mib,
+            expected_argv=list(BARGE_BOOTSTRAP_ARGV))
+        facts = resolve_bootstrap_artifact(bootstrap_log, provenance_inputs,
+                                           guard=guard_facts, ambient=ambient,
+                                           allowance=allowance.document())
+        staged = Path(facts["artifact"]["resolved_path"])
+        oxide_hash = facts["artifact"]["sha256"]
+        os.symlink(staged, barge_root / "bin/oxide")
+        allowance.finish_bootstrap()
+        write_bootstrap_provenance(barge_root, build_bootstrap_provenance(
+            provenance_inputs, guard=guard_facts,
+            artifact={"state": "resolved", "main_rs_binding": facts["main_rs_binding"],
+                      "path": facts["artifact"]["path"],
+                      "resolved_path": facts["artifact"]["resolved_path"],
+                      "bytes": facts["artifact"]["bytes"], "sha256": oxide_hash,
+                      "symlinked_to": str(barge_root / "bin/oxide")},
+            ambient=ambient, allowance=allowance.document(), written_ns=now_ns()))
 
-    # Live isolation bracket: the bootstrap must have changed nothing.
-    live_after_bootstrap = live_inventory(LIVE_ACCOUNT_ROOT, deadline_ns)
-    verify_inventory(live_before, live_after_bootstrap, "bootstrap", evidence)
+        # Live isolation bracket: the bootstrap must have changed nothing.
+        live_after_bootstrap = live_inventory(LIVE_ACCOUNT_ROOT, deadline_ns)
+        verify_inventory(live_before, live_after_bootstrap, "bootstrap", evidence)
 
-    # The external, one-use templates authorize this exact derivation only.
-    # The accepted wrapper receives complete, immutable schema documents;
-    # no guessed binary digest is needed before the single bootstrap.
-    block_doc, issued_audit = bind_barge_documents(block_template, audit_doc, oxide_hash)
-    validate_barge_audit(issued_audit, private=barge_root, host=live_audit_host(
-        effigy=effigy, git_tool=git_tool, rustc_tool=rustc_tool, python=python,
-        wrapper_hash=wrapper_hash, oxide_hash=oxide_hash))
-    audited_admission(inherited, issued_audit)
-    issued_audit_bytes = canonical_json(issued_audit)
-    issued_block_bytes = canonical_json(block_doc)
-    issued_dir = private_dir(barge_root, Path("issued"))
-    issued_audit_path = private_write(issued_dir, Path("source-audit.json"), issued_audit_bytes)
-    issued_block_path = private_write(issued_dir, Path("validation-block.json"), issued_block_bytes)
-    issued_audit_digest = sha256_bytes(issued_audit_bytes)
-    env.update({"BARGE_VALIDATION_SOURCE_AUDIT": str(issued_audit_path),
-                "BARGE_VALIDATION_SOURCE_AUDIT_SHA256": issued_audit_digest,
-                "BARGE_VALIDATION_BLOCK": str(issued_block_path),
-                "BARGE_VALIDATION_BLOCK_SHA256": sha256_bytes(issued_block_bytes),
-                "BARGE_VALIDATION_ROOT_LEDGER": str(ledger_path),
-                "BARGE_VALIDATION_ROOT_LEDGER_SHA256": ledger_digest})
+        # The external, one-use templates authorize this exact derivation only.
+        # The accepted wrapper receives complete, immutable schema documents;
+        # no guessed binary digest is needed before the single bootstrap.
+        block_doc, issued_audit = bind_barge_documents(block_template, audit_doc, oxide_hash)
+        validate_barge_audit(issued_audit, private=barge_root, host=live_audit_host(
+            effigy=effigy, git_tool=git_tool, rustc_tool=rustc_tool, python=python,
+            wrapper_hash=wrapper_hash, oxide_hash=oxide_hash))
+        audited_admission(inherited, issued_audit)
+        issued_audit_bytes = canonical_json(issued_audit)
+        issued_block_bytes = canonical_json(block_doc)
+        issued_dir = private_dir(barge_root, Path("issued"))
+        issued_audit_path = private_write(issued_dir, Path("source-audit.json"), issued_audit_bytes)
+        issued_block_path = private_write(issued_dir, Path("validation-block.json"), issued_block_bytes)
+        issued_audit_digest = sha256_bytes(issued_audit_bytes)
+        env.update({"BARGE_VALIDATION_SOURCE_AUDIT": str(issued_audit_path),
+                    "BARGE_VALIDATION_SOURCE_AUDIT_SHA256": issued_audit_digest,
+                    "BARGE_VALIDATION_BLOCK": str(issued_block_path),
+                    "BARGE_VALIDATION_BLOCK_SHA256": sha256_bytes(issued_block_bytes),
+                    "BARGE_VALIDATION_ROOT_LEDGER": str(ledger_path),
+                    "BARGE_VALIDATION_ROOT_LEDGER_SHA256": ledger_digest})
 
     # The dry gate: the real private status through the same child route.
     allowance.require(60, "private-status")
@@ -2266,79 +3515,178 @@ def diagnostic(options: dict) -> int:
     if retained_before != retained_after:
         raise GateRefusal("retained roots changed during the gate; quiescence unproven")
 
-    # Full block validation now that the built oxide digest exists.
-    max_seconds = validate_barge_block(block_doc, head=barge_head, wrapper_hash=wrapper_hash,
-                                       oxide_hash=oxide_hash, audit_hash=issued_audit_digest,
-                                       ledger_hash=ledger_digest)
+    # Full block validation now that the built oxide digest exists. The
+    # candidate route already validated the complete issuance against the
+    # planner-bound candidate digest during setup, before the copy.
+    if mode == "bootstrap":
+        max_seconds = validate_barge_block(block_doc, head=barge_head, wrapper_hash=wrapper_hash,
+                                           oxide_hash=oxide_hash, audit_hash=issued_audit_digest,
+                                           ledger_hash=ledger_digest)
 
     # Exports: the wrapper-consumable debug receipt and the measured
-    # remaining allowance, then the honest gate receipt.
+    # remaining allowance, then the honest gate receipt. The candidate route
+    # exports the honest candidate receipt instead: no wrapper-consumable
+    # debug receipt exists because the accepted wrapper binds one to an
+    # in-root bootstrap build, which the candidate route intentionally does
+    # not run.
     exports_dir = private_dir(barge_root, Path("exports"))
     live_before_doc = canonical_json(live_before)
     live_after_doc = canonical_json(final_live)
-    build_doc = {
-        "command": list(BARGE_BOOTSTRAP_ARGV),
-        "exit_code": 0,
-        "artifact_sha256": oxide_hash,
-        "source_tree": oxide_tree,
-        "rustc_sha256": sha256_file(rustc_tool, cap=256 * 1024 * 1024),
-        "cwd": str(oxide_source),
-        "lock_sha256": oxide_files["Cargo.lock"],
-        "toolchain_sha256": oxide_files["rust-toolchain.toml"],
-        "cargo_sha256": sha256_file((rustc_tool.parent / "cargo").resolve(strict=True), cap=256 * 1024 * 1024),
-        "environment": {key: env[key] for key in BUILD_ENV_KEYS},
-        "log_path": str(bootstrap_evidence.parent / "bootstrap-stdout.log"),
-        "log_sha256": sha256_file(bootstrap_evidence.parent / "bootstrap-stdout.log"),
-        "supervisor_receipt_path": str(bootstrap_evidence / "receipt.json"),
-        "supervisor_receipt_sha256": sha256_file(bootstrap_evidence / "receipt.json"),
-        "live_before_path": str(private_write(exports_dir, Path("live-before.json"),
-                                              live_before_doc)),
-        "live_before_sha256": sha256_bytes(live_before_doc),
-        "live_after_path": str(private_write(exports_dir, Path("live-after.json"), live_after_doc)),
-        "live_after_sha256": sha256_bytes(live_after_doc),
-    }
-    debug_receipt = build_debug_receipt(binding={
-        "commit": OXIDE_PIN_COMMIT, "tree": oxide_tree,
-        "lock_sha256": oxide_files["Cargo.lock"],
-        "toolchain_sha256": oxide_files["rust-toolchain.toml"],
-        "rustc_sha256": sha256_file(rustc_tool, cap=256 * 1024 * 1024),
-        "oxide_sha256": oxide_hash,
-        "files": oxide_files,
-    }, build=build_doc)
+    live_before_export = private_write(exports_dir, Path("live-before.json"), live_before_doc)
+    live_after_export = private_write(exports_dir, Path("live-after.json"), live_after_doc)
+    if mode == "candidate":
+        candidate_doc = {
+            "schema": SCHEMA_CANDIDATE_RECEIPT,
+            "mode": "candidate",
+            "qualification": "unqualified",
+            "ruling": CANDIDATE_RULING,
+            "origin": origin_facts,
+            "copy": copy_facts,
+            "binding": {
+                "commit": OXIDE_PIN_COMMIT, "tree": oxide_tree,
+                "lock_sha256": oxide_files["Cargo.lock"],
+                "toolchain_sha256": oxide_files["rust-toolchain.toml"],
+                "rustc_sha256": sha256_file(rustc_tool, cap=256 * 1024 * 1024),
+                "cargo_sha256": sha256_file(cargo_tool, cap=256 * 1024 * 1024),
+                "oxide_sha256": oxide_hash,
+                "files": oxide_files,
+            },
+            "toolchain_note": "the pinned toolchain and named linker/assembler tools are "
+                              "audited host inputs (operator ruling " + CANDIDATE_RULING + "); "
+                              "content hashes bind admission identity and never confine "
+                              "their writes",
+            "build": {"state": "not-built",
+                      "note": "no bootstrap in the candidate route; the accepted wrapper "
+                              "binds a debug receipt to an in-root cargo build, so no "
+                              "wrapper-consumable debug receipt is derived here and "
+                              "capture-side handoff stays on the capture tasks"},
+            "live_inventory": {"before_sha256": sha256_bytes(live_before_doc),
+                               "after_sha256": sha256_bytes(live_after_doc)},
+            "status_phase": STATUS_SELECTOR,
+            "bounds": {"max_seconds": max_seconds,
+                       "pool_cap_bytes": block_doc["pool_cap_bytes"],
+                       "scratch_cap_bytes": block_doc["scratch_cap_bytes"]},
+        }
+        debug_receipt = candidate_doc
+    else:
+        build_doc = {
+            "command": list(BARGE_BOOTSTRAP_ARGV),
+            "exit_code": 0,
+            "artifact_sha256": oxide_hash,
+            "source_tree": oxide_tree,
+            "rustc_sha256": sha256_file(rustc_tool, cap=256 * 1024 * 1024),
+            "cwd": str(oxide_source),
+            "lock_sha256": oxide_files["Cargo.lock"],
+            "toolchain_sha256": oxide_files["rust-toolchain.toml"],
+            "cargo_sha256": sha256_file((rustc_tool.parent / "cargo").resolve(strict=True), cap=256 * 1024 * 1024),
+            "environment": {key: env[key] for key in BUILD_ENV_KEYS},
+            "log_path": str(bootstrap_evidence.parent / "bootstrap-stdout.log"),
+            "log_sha256": sha256_file(bootstrap_evidence.parent / "bootstrap-stdout.log"),
+            "supervisor_receipt_path": str(bootstrap_evidence / "receipt.json"),
+            "supervisor_receipt_sha256": sha256_file(bootstrap_evidence / "receipt.json"),
+            "live_before_path": str(live_before_export),
+            "live_before_sha256": sha256_bytes(live_before_doc),
+            "live_after_path": str(live_after_export),
+            "live_after_sha256": sha256_bytes(live_after_doc),
+        }
+        debug_receipt = build_debug_receipt(binding={
+            "commit": OXIDE_PIN_COMMIT, "tree": oxide_tree,
+            "lock_sha256": oxide_files["Cargo.lock"],
+            "toolchain_sha256": oxide_files["rust-toolchain.toml"],
+            "rustc_sha256": sha256_file(rustc_tool, cap=256 * 1024 * 1024),
+            "oxide_sha256": oxide_hash,
+            "files": oxide_files,
+        }, build=build_doc)
     debug_bytes = canonical_json(debug_receipt)
     allowance.require(10, "publication")
     publication_start = now_ns()
     published_allowance = allowance.document()
     published_allowance["remaining_seconds"] = max(0, published_allowance["remaining_seconds"] - 10)
     published_allowance["publication_reserve_seconds"] = 10
+    receipt_name = ("candidate-oxide-receipt.json" if mode == "candidate"
+                    else "debug-oxide-receipt.json")
     exports = {
-        "debug_receipt": str(private_write(exports_dir, Path("debug-oxide-receipt.json"),
-                                           debug_bytes)),
-        "debug_receipt_sha256": sha256_bytes(debug_bytes),
+        f"{'candidate_receipt' if mode == 'candidate' else 'debug_receipt'}":
+            str(private_write(exports_dir, Path(receipt_name), debug_bytes)),
+        f"{'candidate_receipt' if mode == 'candidate' else 'debug_receipt'}_sha256":
+            sha256_bytes(debug_bytes),
         "remaining_allowance": published_allowance,
-        "issued_barge_block": str(issued_block_path),
-        "issued_barge_block_sha256": sha256_bytes(issued_block_bytes),
-        "issued_barge_audit": str(issued_audit_path),
-        "issued_barge_audit_sha256": issued_audit_digest,
         "authorized_barge_max_seconds": max_seconds,
         "pure_checks_conservative_charge_seconds": 120,
         "preparation_seconds": prep_seconds,
         "preparation_receipt_sha256": options["expect_preparation"],
         "preparation_source_binding_sha256": options["expect_source_binding"],
         "preparation_packet_dir": str(packet_dir),
+        "live_before_path": str(live_before_export),
+        "live_before_sha256": sha256_bytes(live_before_doc),
+        "live_after_path": str(live_after_export),
+        "live_after_sha256": sha256_bytes(live_after_doc),
     }
+    if mode == "candidate":
+        exports.update({
+            "candidate_copy_path": copy_facts["path"],
+            "candidate_copy_sha256": copy_facts["sha256"],
+            "candidate_origin_root": origin_facts["root"],
+            "origin_guard_receipt_sha256": origin_facts["guard"]["receipt_sha256"],
+            "origin_build_log_sha256": origin_facts["guard"]["log_sha256"],
+            "host_tools_document_sha256": options["expect_host_tools"],
+            "wrapper_consumables": "not derived in the candidate route: the accepted "
+                                   "wrapper binds a debug receipt to an in-root cargo "
+                                   "build, so issued documents stay with the capture "
+                                   "tasks' own route",
+        })
+    else:
+        exports.update({
+            "issued_barge_block": str(issued_block_path),
+            "issued_barge_block_sha256": sha256_bytes(issued_block_bytes),
+            "issued_barge_audit": str(issued_audit_path),
+            "issued_barge_audit_sha256": issued_audit_digest,
+        })
     commands = [
         {"phase": "oxide-claim", "argv": claim_argv, "exit": 0},
-        {"phase": "bootstrap", "argv": bootstrap_argv, "exit": 0},
-        {"phase": STATUS_SELECTOR, "argv": status_argv, "exit": 0},
     ]
-    decisions = [
-        "host admission for the bootstrap is the gate task's own heavy Effigy "
-        "admission through the audited hook, with the audited pair preserved in "
-        "every child environment; no second admission seam and no archive edit",
-        f"the dry status gate runs the accepted Barge archive selector "
-        f"{STATUS_SELECTOR} from the extracted barge-source root",
-    ]
+    if mode == "candidate":
+        decisions = [
+            "candidate route (oxide#254): the private oxide is the retained debug "
+            "artifact from the spent replacement diagnostic, validated for origin, "
+            "source/lock/toolchain/artifact binding and retained nested closure "
+            "before staging, copied only inside this fresh guard-owned root and "
+            "rehashed; no bootstrap build ran and the origin tree was never written",
+            "operator ruling " + CANDIDATE_RULING + " authorizes the pinned 1.97.1 "
+            "toolchain and the named linker/assembler tools as audited host inputs "
+            "for this route only: planner-bound canonical paths plus live content "
+            "hashes, absent stays absent, changed or unlisted bindings refuse; they "
+            "are host tools, not private bindings, and hashing does not confine "
+            "their writes; ambient Cargo configuration and the environment allowlist "
+            "refuse unchanged",
+            "the retained failed isolation of the origin session stays historical "
+            "and unrepaired; this run took its own fresh account inventory baseline "
+            "and any inode/content delta would refuse",
+            f"the private status gate runs the accepted Barge archive selector "
+            f"{STATUS_SELECTOR} from the extracted barge-source root against the "
+            f"candidate copy",
+        ]
+    else:
+        decisions = [
+            "host admission for the bootstrap is the gate task's own heavy Effigy "
+            "admission through the audited hook, with the audited pair preserved in "
+            "every child environment; no second admission seam and no archive edit",
+            f"the dry status gate runs the accepted Barge archive selector "
+            f"{STATUS_SELECTOR} from the extracted barge-source root",
+        ]
+        commands.append({"phase": "bootstrap", "argv": bootstrap_argv, "exit": 0})
+    commands.append({"phase": STATUS_SELECTOR, "argv": status_argv, "exit": 0})
+    candidate_observations = ({
+        "route": "candidate",
+        "ruling": CANDIDATE_RULING,
+        "candidate_sha256": options["expect_candidate"],
+        "candidate_copy_sha256": copy_facts["sha256"],
+        "origin_guard_receipt_sha256": origin_facts["guard"]["receipt_sha256"],
+        "origin_build_log_sha256": origin_facts["guard"]["log_sha256"],
+        "origin_lock_sha256": origin_facts["lock_sha256"],
+        "origin_toolchain_sha256": origin_facts["toolchain_sha256"],
+        "host_tools_document_sha256": options["expect_host_tools"],
+    } if mode == "candidate" else {})
     receipt_doc = gate_receipt(
         gate_id=run_id,
         blocks={"barge_block_sha256": block_digest, "oxide_block_sha256": approval},
@@ -2361,7 +3709,8 @@ def diagnostic(options: dict) -> int:
                       "stands in review 6584174560, and no figure claims that a "
                       "phase fits",
                       "barge_root_monitored_by": "outer qualified supervisor adopted scratch; "
-                      "periodic samples do not establish an instantaneous peak"},
+                      "periodic samples do not establish an instantaneous peak",
+                      **candidate_observations},
         exports=exports, failures=[], decisions=decisions)
     private_write(allowance_dir, Path("receipt.json"), canonical_json(receipt_doc))
     if now_ns() - publication_start > 10 * 1_000_000_000:
@@ -2620,6 +3969,16 @@ REFUSAL_CASES = (
     "empty or malformed live inventory",
     "same-content inode replacement",
     "failed or uncertain child closure",
+    "missing, malformed or escaped bootstrap artifact",
+    "ambient Cargo configuration above the private root",
+    "unreadable Cargo configuration on the ancestor chain",
+    "PATH-resolved host linker or assembler without a private binding",
+    "candidate origin absent, changed, symlink-swapped or not ledger-covered",
+    "candidate origin guard receipt or build log changed or not closed",
+    "candidate lock/toolchain binding differs from the pinned source",
+    "derivation-style issuance in the candidate route",
+    "audited host input changed, unlisted, or documented but not live",
+    "candidate copy digest or size drift, or origin identity change",
 )
 
 
@@ -2636,6 +3995,9 @@ def plan(options: dict) -> int:
           f"prospective block {PROSPECTIVE_MAX_SECONDS}s")
     print(f"  schemas: {SCHEMA_GATE_RECEIPT}, {SCHEMA_BARGE_AUDIT}, "
           f"{SCHEMA_BARGE_LEDGER}, {SCHEMA_BARGE_BLOCK}")
+    print(f"  bootstrap provenance: {PROVENANCE_PATH} retained inside the "
+          f"monitored root before the isolation refusal (internal evidence, "
+          f"{MAX_PROVENANCE_BYTES}-byte bound; inherited secret values never recorded)")
     print("  refusal controls exercised by --self-test:")
     for line in REFUSAL_CASES:
         print("   -", line)
@@ -2651,9 +4013,22 @@ def plan(options: dict) -> int:
           "--preparation-receipt <path> --expect-preparation <sha256> "
           "--expect-source-binding <sha256> "
           "--planner-reference <reference>")
+    print("  candidate route (oxide#254; operator ruling " + CANDIDATE_RULING + "): the "
+          "diagnostic arguments above plus --candidate-origin <retained root> "
+          "--expect-candidate <sha256> --candidate-bytes <n> --candidate-receipt <path> "
+          "--expect-candidate-receipt <sha256> --candidate-log <path> "
+          "--expect-candidate-log <sha256> --candidate-lock-sha256 <sha256> "
+          "--candidate-toolchain-sha256 <sha256> --host-tools <path> "
+          "--expect-host-tools <sha256>")
+    print("    the retained artifact is copied only inside the fresh guard-owned root and "
+          "rehashed; no build, install, cleanup or repair runs; the named linker/assembler "
+          "tools and pinned toolchain are audited host inputs (hashing binds admission "
+          "identity and never confines their writes); the wrapper-consumable debug receipt "
+          "is not derived")
     print("  proposed selectors: proof:private-build-validation:test (pure), "
           "proof:private-build-validation:plan (effect-free), "
-          "proof:private-build-validation:diagnostic (heavy)")
+          "proof:private-build-validation:diagnostic (heavy), "
+          "proof:private-build-validation:candidate (heavy, planner-bound)")
     return 0
 
 
@@ -4043,6 +5418,883 @@ def self_test() -> int:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+    # --- bootstrap provenance (oxide#253) ----------------------------------
+    # A successful bootstrap's provenance packet survives a later real
+    # validation failure, and missing, malformed and escaped artifacts refuse
+    # with the packet retained. Mocked counterfactuals only.
+    def provenance_case(name):
+        root = fixture.root / f"provenance-{name}"
+        root.mkdir()
+        os.chmod(root, 0o700)
+        source = root / "oxide-source"
+        source.mkdir()
+        os.chmod(source, 0o700)
+        (source / "target/debug").mkdir(parents=True)
+        return root, source
+
+    def provenance_inputs_for(root, source, *, env=None, argv=None):
+        return {"run_id": "b" * 32, "private_root": root,
+                "account_root": fixture.root / "account-not-real",
+                "argv": list(BARGE_BOOTSTRAP_ARGV) if argv is None else argv,
+                "cwd": source,
+                "env": env or {"HOME": str(root / "home"),
+                               "CARGO_HOME": str(root / "cache"),
+                               "RUSTUP_TOOLCHAIN": TOOLCHAIN},
+                "inherited_keys": ["HOME", "CARGO_HOME", "MY_SECRET_TOKEN"],
+                "tools": {"python": {"path": str(sys.executable), "bytes": 1,
+                                     "sha256": "a" * 64}},
+                "sources": {"oxide_pin_commit": OXIDE_PIN_COMMIT},
+                "seed": {"source_cargo_home": "/mock/cargo-home",
+                         "cache_root": str(root / "cache")},
+                "limit_seconds": 300, "scratch_mib": 512,
+                "pool_cap_bytes": 1024 * 1024}
+
+    provenance_guard = {"state": "closed", "run_id": "c" * 32}
+    provenance_allowance = {"bootstrap_started_ns": 1,
+                            "bootstrap_max_seconds": BOOTSTRAP_MAX_SECONDS}
+
+    def artifact_line(path, source):
+        return canonical_json({"reason": "compiler-artifact",
+                               "executable": str(path),
+                               "target": {"name": "oxide", "kind": ["bin"],
+                                          "src_path": str(source / "src/bin/oxide/main.rs")}}).decode().rstrip("\n")
+
+    success_root, success_source = provenance_case("success")
+    success_artifact = success_source / "target/debug/oxide"
+    success_artifact.write_bytes(b"mock-oxide-artifact")
+    good_log = "\n".join((
+        artifact_line(success_artifact, success_source),
+        "   Compiling oxide-storage v0.1.0",
+        "not json at all",
+        "[1,2]",
+        artifact_line(success_source / "target/debug/other", fixture.root),
+        canonical_json({"reason": "build-script-executed"}).decode().rstrip("\n"),
+    )) + "\n"
+    ambient_clean = ambient_cargo_config_scan(
+        success_source, private_root=success_root,
+        cargo_home=success_root / "cache")
+    if ambient_clean["violations"] or not ambient_clean["chain_complete"] \
+            or ambient_clean["inside_private_levels"] < 2:
+        failures.append("clean ancestor scan recorded a violation or an incomplete chain")
+    success_facts = expect_ok("single artifact facts", resolve_bootstrap_artifact,
+                              good_log, provenance_inputs_for(success_root, success_source),
+                              guard=provenance_guard, ambient=ambient_clean,
+                              allowance=provenance_allowance)
+    if success_facts is not None:
+        if (success_facts["candidate_count"] != 1 or success_facts["violations"]
+                or success_facts["malformed_lines"] != 3
+                or len(success_facts["oxide_bin_entries"]) != 2):
+            failures.append(f"artifact facts mis-parsed: {success_facts}")
+        elif success_facts["artifact"]["sha256"] != sha256_bytes(b"mock-oxide-artifact"):
+            failures.append("artifact digest mismatch")
+        else:
+            document = build_bootstrap_provenance(
+                provenance_inputs_for(success_root, success_source), guard=provenance_guard,
+                artifact={"state": "resolved", "sha256": success_facts["artifact"]["sha256"],
+                          "symlinked_to": str(success_root / "bin/oxide")},
+                ambient=ambient_clean, allowance=provenance_allowance, written_ns=now_ns())
+            write_bootstrap_provenance(success_root, document)
+            before_rows = [["/x", [1, 1, 1, 1, 1], "d"]]
+            after_rows = [["/x", [1, 2, 1, 1, 1], "d"]]
+            try:
+                verify_inventory(before_rows, after_rows, "bootstrap",
+                                 success_root / "evidence")
+                failures.append("real inventory failure after provenance: expected a refusal")
+            except GateRefusal as refusal:
+                if "isolation failed" not in str(refusal):
+                    failures.append("real inventory failure after provenance: "
+                                    f"wrong diagnostic {refusal}")
+            retained = json.loads((success_root / PROVENANCE_PATH).read_bytes())
+            if (retained.get("kind") != "bootstrap-provenance"
+                    or retained.get("artifact", {}).get("sha256")
+                    != success_facts["artifact"]["sha256"]
+                    or retained.get("guard") != provenance_guard
+                    or retained.get("child_environment", {}).get(
+                        "live_account_reachability", {}).get("state") != "none"
+                    or "MY_SECRET_TOKEN" not in retained.get(
+                        "child_environment", {}).get("inherited_key_names", [])):
+                failures.append("retained provenance lost its bounded facts after refusal")
+            if b"s3cr3t-value" in (success_root / PROVENANCE_PATH).read_bytes():
+                failures.append("provenance packet recorded an inherited secret value")
+    expect_refusal("provenance argv drift refuses", build_bootstrap_provenance,
+                   provenance_inputs_for(success_root, success_source,
+                                         argv=["cargo", "build"]),
+                   guard=provenance_guard, artifact={"state": "not-built"},
+                   ambient=ambient_clean, allowance=provenance_allowance,
+                   written_ns=now_ns())
+    expect_refusal("provenance env outside the audited allowlist refuses",
+                   build_bootstrap_provenance,
+                   provenance_inputs_for(success_root, success_source,
+                                         env={"HOME": "/x", "MY_SECRET_TOKEN": "s3cr3t-value"}),
+                   guard=provenance_guard, artifact={"state": "not-built"},
+                   ambient=ambient_clean, allowance=provenance_allowance,
+                   written_ns=now_ns())
+    outside_inputs = provenance_inputs_for(success_root, success_source)
+    outside_inputs["cwd"] = fixture.root
+    expect_refusal("provenance cwd outside the private root refuses",
+                   build_bootstrap_provenance, outside_inputs,
+                   guard=provenance_guard, artifact={"state": "not-built"},
+                   ambient=ambient_clean, allowance=provenance_allowance,
+                   written_ns=now_ns())
+    reach_root = fixture.root / "account-not-real"
+    reach_root.mkdir()
+    reach_document = build_bootstrap_provenance(
+        provenance_inputs_for(success_root, success_source,
+                              env={"HOME": str(reach_root / "leak")}),
+        guard=provenance_guard, artifact={"state": "not-built"},
+        ambient=ambient_clean, allowance=provenance_allowance, written_ns=now_ns())
+    if reach_document["child_environment"]["live_account_reachability"].get("state") != "recorded" \
+            or not reach_document["child_environment"]["live_account_reachability"].get("values"):
+        failures.append("live-account reachability was not recorded")
+    path_reach = build_bootstrap_provenance(
+        provenance_inputs_for(success_root, success_source,
+                              env={"HOME": str(success_root / "home"),
+                                   "PATH": "/bin:" + str(reach_root / "tools")}),
+        guard=provenance_guard, artifact={"state": "not-built"},
+        ambient=ambient_clean, allowance=provenance_allowance, written_ns=now_ns())
+    if path_reach["child_environment"]["live_account_reachability"].get("state") != "recorded":
+        failures.append("PATH component reachability was not recorded")
+    oversized = build_bootstrap_provenance(
+        provenance_inputs_for(success_root, success_source), guard=provenance_guard,
+        artifact={"state": "not-built"}, ambient=ambient_clean,
+        allowance=provenance_allowance, written_ns=now_ns())
+    oversized["padding"] = "x" * (MAX_PROVENANCE_BYTES + 1)
+    expect_refusal("oversized provenance refuses without retention",
+                   write_bootstrap_provenance, success_root, oversized)
+    retained_path = success_root / PROVENANCE_PATH
+    if not retained_path.is_file():
+        failures.append("oversized provenance check: success packet was never retained")
+    elif b"padding" in retained_path.read_bytes():
+        failures.append("oversized provenance replaced the retained packet")
+    scrubbed = child_environment(
+        {"HOME": "/real/home", "RUSTUP_TOOLCHAIN": TOOLCHAIN,
+         "RUSTUP_HOME": "/real/rustup", "PATH": "/usr/bin:/bin",
+         "OXIDE_CONFIG": "/leak/config.toml", "MY_SECRET_TOKEN": "s3cr3t-value",
+         "EFFIGY_ADMISSION_HOOK": "/hook", "QUEUE_ADMISSION_SOCKET": "/socket"},
+        private=success_root, oxide=success_root / "bin/oxide",
+        rustc=fixture.root / "rustc", wrapper_hash="w" * 64, pool_cap=1024,
+        admission_env={"EFFIGY_ADMISSION_HOOK": "/hook",
+                       "QUEUE_ADMISSION_SOCKET": "/socket"})
+    if (set(scrubbed) - BOOTSTRAP_ENV_KEYS or "MY_SECRET_TOKEN" in scrubbed
+            or scrubbed.get("OXIDE_CONFIG") != str(success_root / "config.toml")
+            or scrubbed.get("HOME") != str(success_root / "home")):
+        failures.append("scrubbed child environment left the audited allowlist")
+
+    # Ambient Cargo configuration above the private root refuses before the
+    # launch, with the finding retained; a planted configuration refuses too.
+    (fixture.root / ".cargo").mkdir()
+    (fixture.root / ".cargo/config.toml").write_bytes(b'[alias]\nx = "y"\n')
+    ambient_root, ambient_source = provenance_case("ambient")
+    ambient_bad = ambient_cargo_config_scan(ambient_source, private_root=ambient_root)
+    if not any(v.startswith("ambient-cargo-config:") for v in ambient_bad["violations"]):
+        failures.append("ambient configuration scan missed the ancestor config")
+    expect_refusal("ambient config refuses before launch", refuse_bootstrap_launch,
+                   provenance_inputs_for(ambient_root, ambient_source),
+                   ambient_bad, {"bootstrap_started_ns": 5})
+    ambient_packet = json.loads((ambient_root / PROVENANCE_PATH).read_bytes())
+    if (ambient_packet.get("guard") != {"state": "not-launched"}
+            or ambient_packet.get("artifact") != {"state": "not-built"}
+            or not ambient_packet.get("ambient", {}).get("violations")):
+        failures.append("pre-launch refusal packet lost its findings")
+    expect_ok("clean ambient scan proceeds", refuse_bootstrap_launch,
+              provenance_inputs_for(ambient_root, ambient_source),
+              {"violations": []}, {"bootstrap_started_ns": 5})
+    planted_root, planted_source = provenance_case("planted")
+    (planted_root / ".cargo").mkdir()
+    (planted_root / ".cargo/config.toml").write_bytes(b"")
+    planted = ambient_cargo_config_scan(planted_source, private_root=planted_root)
+    kinds = {v.split(":", 1)[0] for v in planted["violations"]}
+    if kinds != {"ambient-cargo-config", "planted-cargo-config"}:
+        failures.append(f"planted configuration scan mis-recorded: {planted['violations']}")
+    cargo_home_root, cargo_home_source = provenance_case("cargo-home")
+    cache = cargo_home_root / "cache"
+    cache.mkdir()
+    (cache / "config.toml").write_bytes(b"[build]\njobs = 1\n")
+    cargo_home_scan = ambient_cargo_config_scan(
+        cargo_home_source, private_root=cargo_home_root, cargo_home=cache)
+    if not any(v.startswith("planted-cargo-home-config:") for v in cargo_home_scan["violations"]):
+        failures.append("CARGO_HOME config scan missed the private cache config")
+    outside_cache = fixture.root / "host-cargo-home"
+    outside_cache.mkdir()
+    (outside_cache / "config.toml").write_bytes(b"[build]\njobs = 2\n")
+    outside_home_scan = ambient_cargo_config_scan(
+        cargo_home_source, private_root=cargo_home_root, cargo_home=outside_cache)
+    if not any(v.startswith("ambient-cargo-config:") and "host-cargo-home" in v
+               for v in outside_home_scan["violations"]):
+        failures.append("outside CARGO_HOME config was not recorded as ambient")
+
+    # Unreadable Cargo config is a violation, never recorded as absent.
+    unread_root, unread_source = provenance_case("unreadable-config")
+    unread_dir = unread_root / ".cargo"
+    unread_dir.mkdir()
+    (unread_dir / "config.toml").write_bytes(b'[alias]\nx = "y"\n')
+    os.chmod(unread_dir, 0o600)
+    try:
+        unread_scan = ambient_cargo_config_scan(
+            unread_source, private_root=unread_root)
+        unread_entries = [entry for entry in unread_scan["entries"]
+                          if entry["path"] == str(unread_dir / "config.toml")]
+        if not unread_entries or unread_entries[0].get("state") != "unreadable":
+            failures.append("unreadable cargo config recorded as "
+                            f"{unread_entries or 'missing'}")
+        if not any(v.startswith("unreadable-cargo-config:")
+                   and str(unread_dir / "config.toml") in v
+                   for v in unread_scan["violations"]):
+            failures.append("unreadable cargo config produced no violation")
+        expect_refusal("unreadable cargo config refuses before launch",
+                       refuse_bootstrap_launch,
+                       provenance_inputs_for(unread_root, unread_source),
+                       unread_scan, {"bootstrap_started_ns": 5})
+    finally:
+        os.chmod(unread_dir, 0o700)
+
+    # PATH-resolved host tools without a private PATH-slot binding use the
+    # existing pre-launch refusal. Private-bin first match is a binding.
+    host_tools = fixture.root / "host-tools"
+    host_tools.mkdir()
+    (host_tools / "cc").write_bytes(b"fake-cc")
+    os.chmod(host_tools / "cc", 0o755)
+    path_root, path_source = provenance_case("path-ambient")
+    (path_root / "bin").mkdir()
+    ambient_path = attach_path_executables(
+        {"violations": []},
+        str(path_root / "bin") + os.pathsep + str(host_tools),
+        private_root=path_root)
+    cc_entries = [entry for entry in ambient_path["path_executables"]["entries"]
+                  if entry["name"] == "cc"]
+    if not cc_entries or cc_entries[0].get("state") != "ambient":
+        failures.append(f"host PATH cc recorded as {cc_entries or 'missing'}")
+    if not any(v.startswith("ambient-executable:cc:") for v in ambient_path["violations"]):
+        failures.append("host PATH cc produced no ambient-executable violation")
+    expect_refusal("host PATH cc refuses before launch", refuse_bootstrap_launch,
+                   provenance_inputs_for(path_root, path_source),
+                   ambient_path, {"bootstrap_started_ns": 5})
+    priv_root, priv_source = provenance_case("path-private")
+    priv_bin = priv_root / "bin"
+    priv_bin.mkdir()
+    (priv_bin / "cc").write_bytes(b"private-cc")
+    os.chmod(priv_bin / "cc", 0o755)
+    private_path = attach_path_executables(
+        {"violations": []},
+        str(priv_bin) + os.pathsep + str(host_tools),
+        private_root=priv_root)
+    priv_cc = [entry for entry in private_path["path_executables"]["entries"]
+               if entry["name"] == "cc"]
+    if not priv_cc or priv_cc[0].get("state") != "private":
+        failures.append(f"private PATH cc recorded as {priv_cc or 'missing'}")
+    if any(v.startswith("ambient-executable:cc:") for v in private_path["violations"]):
+        failures.append("private PATH cc was treated as ambient")
+    expect_ok("private PATH cc proceeds", refuse_bootstrap_launch,
+              provenance_inputs_for(priv_root, priv_source),
+              private_path, {"bootstrap_started_ns": 5})
+    inner_root, inner_source = provenance_case("path-inner-symlink")
+    inner_bin = inner_root / "bin"
+    inner_bin.mkdir()
+    inner_tools = inner_root / "tools"
+    inner_tools.mkdir()
+    (inner_tools / "cc").write_bytes(b"inner-cc")
+    os.chmod(inner_tools / "cc", 0o755)
+    os.symlink(inner_tools / "cc", inner_bin / "cc")
+    inner_path = attach_path_executables(
+        {"violations": []},
+        str(inner_bin) + os.pathsep + str(host_tools),
+        private_root=inner_root)
+    inner_cc = [entry for entry in inner_path["path_executables"]["entries"]
+                if entry["name"] == "cc"]
+    if not inner_cc or inner_cc[0].get("state") != "private":
+        failures.append(f"inner PATH cc symlink recorded as {inner_cc or 'missing'}")
+    expect_ok("inner PATH cc symlink proceeds", refuse_bootstrap_launch,
+              provenance_inputs_for(inner_root, inner_source),
+              inner_path, {"bootstrap_started_ns": 5})
+    link_root, link_source = provenance_case("path-host-symlink")
+    link_bin = link_root / "bin"
+    link_bin.mkdir()
+    os.symlink(host_tools / "cc", link_bin / "cc")
+    link_path = attach_path_executables(
+        {"violations": []},
+        str(link_bin) + os.pathsep + str(host_tools),
+        private_root=link_root)
+    link_cc = [entry for entry in link_path["path_executables"]["entries"]
+               if entry["name"] == "cc"]
+    if not link_cc or link_cc[0].get("state") != "ambient":
+        failures.append(f"host PATH cc symlink recorded as {link_cc or 'missing'}")
+    expect_refusal("host PATH cc symlink refuses before launch",
+                   refuse_bootstrap_launch,
+                   provenance_inputs_for(link_root, link_source),
+                   link_path, {"bootstrap_started_ns": 5})
+    dang_root, dang_source = provenance_case("path-dangling")
+    dang_bin = dang_root / "bin"
+    dang_bin.mkdir()
+    os.symlink("nowhere", dang_bin / "cc")
+    dang_path = attach_path_executables(
+        {"violations": []},
+        str(dang_bin) + os.pathsep + str(host_tools),
+        private_root=dang_root)
+    dang_cc = [entry for entry in dang_path["path_executables"]["entries"]
+               if entry["name"] == "cc"]
+    if not dang_cc or dang_cc[0].get("state") != "ambient":
+        failures.append(f"dangling PATH cc recorded as {dang_cc or 'missing'}")
+    expect_refusal("dangling PATH cc continues to host and refuses",
+                   refuse_bootstrap_launch,
+                   provenance_inputs_for(dang_root, dang_source),
+                   dang_path, {"bootstrap_started_ns": 5})
+    quiet_root, _quiet_source = provenance_case("path-dangling-quiet")
+    quiet_bin = quiet_root / "bin"
+    quiet_bin.mkdir()
+    os.symlink("nowhere", quiet_bin / "cc")
+    quiet_scan = path_executable_scan(str(quiet_bin), private_root=quiet_root)
+    quiet_cc = [entry for entry in quiet_scan["entries"] if entry["name"] == "cc"]
+    if not quiet_cc or quiet_cc[0].get("state") != "absent" or quiet_scan["violations"]:
+        failures.append(f"dangling PATH cc without host recorded as {quiet_cc}")
+    noexec_root, noexec_source = provenance_case("path-nonexec")
+    noexec_bin = noexec_root / "bin"
+    noexec_bin.mkdir()
+    (noexec_bin / "cc").write_bytes(b"not-exec")
+    os.chmod(noexec_bin / "cc", 0o644)
+    noexec_path = attach_path_executables(
+        {"violations": []},
+        str(noexec_bin) + os.pathsep + str(host_tools),
+        private_root=noexec_root)
+    noexec_cc = [entry for entry in noexec_path["path_executables"]["entries"]
+                 if entry["name"] == "cc"]
+    if not noexec_cc or noexec_cc[0].get("state") != "ambient":
+        failures.append(f"non-executable PATH cc recorded as {noexec_cc or 'missing'}")
+    expect_refusal("non-executable PATH cc continues to host and refuses",
+                   refuse_bootstrap_launch,
+                   provenance_inputs_for(noexec_root, noexec_source),
+                   noexec_path, {"bootstrap_started_ns": 5})
+    empty_root, empty_source = provenance_case("path-empty-component")
+    (empty_root / "cc").write_bytes(b"cwd-cc")
+    os.chmod(empty_root / "cc", 0o755)
+    empty_path = attach_path_executables(
+        {"violations": []}, os.pathsep,
+        private_root=empty_root, cwd=empty_root)
+    empty_cc = [entry for entry in empty_path["path_executables"]["entries"]
+                if entry["name"] == "cc"]
+    if not empty_cc or empty_cc[0].get("state") != "private":
+        failures.append(f"empty PATH component cwd cc recorded as {empty_cc or 'missing'}")
+    expect_ok("empty PATH component private cwd cc proceeds", refuse_bootstrap_launch,
+              provenance_inputs_for(empty_root, empty_source),
+              empty_path, {"bootstrap_started_ns": 5})
+    absent_root, absent_source = provenance_case("path-absent")
+    (absent_root / "bin").mkdir()
+    absent_path = path_executable_scan(str(absent_root / "bin"),
+                                       private_root=absent_root)
+    if absent_path["violations"]:
+        failures.append(f"absent PATH tools produced violations: {absent_path['violations']}")
+    if any(entry["state"] != "absent" for entry in absent_path["entries"]):
+        failures.append("absent PATH tools were not recorded absent")
+    unread_path_root, unread_path_source = provenance_case("path-unreadable")
+    unread_bin = unread_path_root / "bin"
+    unread_bin.mkdir()
+    (unread_bin / "cc").write_bytes(b"hidden-cc")
+    os.chmod(unread_bin, 0o600)
+    try:
+        unread_path = path_executable_scan(str(unread_bin),
+                                           private_root=unread_path_root)
+        unread_cc = [entry for entry in unread_path["entries"]
+                     if entry["name"] == "cc"]
+        if not unread_cc or unread_cc[0].get("state") != "unreadable":
+            failures.append(f"unreadable PATH cc recorded as {unread_cc or 'missing'}")
+        if not any(v.startswith("unreadable-executable:cc:")
+                   for v in unread_path["violations"]):
+            failures.append("unreadable PATH cc produced no violation")
+        expect_refusal("unreadable PATH cc refuses before launch",
+                       refuse_bootstrap_launch,
+                       provenance_inputs_for(unread_path_root, unread_path_source),
+                       attach_path_executables({"violations": []}, str(unread_bin),
+                                               private_root=unread_path_root),
+                       {"bootstrap_started_ns": 5})
+    finally:
+        os.chmod(unread_bin, 0o700)
+
+    # Candidate route (oxide#254): retained-artifact bindings, complete
+    # issuance, audited host inputs and the copy/rehash controls, all mocked.
+    cand = fixture.root / "candidate-origin"
+    cand.mkdir()
+    os.chmod(cand, 0o700)
+    cand_source = cand / "oxide-source"
+    (cand_source / "target/debug").mkdir(parents=True)
+    (cand_source / "Cargo.lock").write_bytes(b"lock-bytes")
+    (cand_source / "rust-toolchain.toml").write_bytes(b"toolchain-bytes")
+    cand_artifact = cand / CANDIDATE_ORIGIN_RELATIVE
+    cand_artifact.parent.mkdir(parents=True, exist_ok=True)
+    cand_artifact.write_bytes(b"candidate-bytes")
+    os.chmod(cand_artifact, 0o755)
+
+    def cand_log_line(path, source):
+        return json.dumps({"reason": "compiler-artifact",
+                           "target": {"name": "oxide", "kind": ["bin"],
+                                      "src_path": str(source / "src/bin/oxide/main.rs")},
+                           "executable": str(path)})
+
+    def cand_receipt_for(root):
+        return {"command": list(BARGE_BOOTSTRAP_ARGV), "run_id": "c" * 32,
+                "limit_s": 299, "start_ns": 1, "published_ns": 2,
+                "scratch": str(root),
+                "outcome": {"closure": "closed", "status": 0, "fault": None,
+                            "deadline": False, "launched": True},
+                "census": {"certain": True, "members": 0, "uncertain": 0}}
+
+    def cand_options(root, *, receipt=None, log=None, artifact_sha=None, bytes_=None,
+                     lock_sha=None, toolchain_sha=None):
+        receipt = cand_receipt_for(root) if receipt is None else receipt
+        log_text = (cand_log_line(root / CANDIDATE_ORIGIN_RELATIVE, root / "oxide-source") + "\n") \
+            if log is None else log
+        return {
+            "candidate_receipt": str(root / "receipt.json"),
+            "expect_candidate_receipt": sha256_bytes(canonical_json(receipt)),
+            "candidate_log": str(root / "log.json"),
+            "expect_candidate_log": sha256_bytes(log_text.encode()),
+            "candidate_lock_sha256": lock_sha or sha256_bytes(b"lock-bytes"),
+            "candidate_toolchain_sha256": toolchain_sha or sha256_bytes(b"toolchain-bytes"),
+            "expect_candidate": artifact_sha or sha256_bytes(b"candidate-bytes"),
+            "candidate_bytes": bytes_ or len(b"candidate-bytes"),
+        }
+
+    def cand_origin_case(name):
+        root = fixture.root / f"cand-origin-{name}"
+        root.mkdir()
+        os.chmod(root, 0o700)
+        source = root / "oxide-source"
+        (source / "target/debug").mkdir(parents=True)
+        (source / "Cargo.lock").write_bytes(b"lock-bytes")
+        (source / "rust-toolchain.toml").write_bytes(b"toolchain-bytes")
+        write_doc(root, "receipt.json", cand_receipt_for(root))
+        (root / "log.json").write_bytes(
+            (cand_log_line(root / CANDIDATE_ORIGIN_RELATIVE, source) + "\n").encode())
+        return root
+
+    write_doc(cand, "receipt.json", cand_receipt_for(cand))
+    (cand / "log.json").write_bytes(
+        (cand_log_line(cand_artifact, cand_source) + "\n").encode())
+    good_options = cand_options(cand)
+    origin_facts = expect_ok("candidate origin validates", validate_candidate_origin,
+                             origin_root=cand, options=good_options, ledger_roots=[cand],
+                             pinned_lock_sha256=good_options["candidate_lock_sha256"],
+                             pinned_toolchain_sha256=good_options["candidate_toolchain_sha256"])
+    if origin_facts is None or origin_facts["artifact"]["sha256"] != good_options["expect_candidate"]:
+        failures.append("candidate origin facts lost the artifact binding")
+    expect_refusal("candidate origin outside the ledger refuses", validate_candidate_origin,
+                   origin_root=cand, options=good_options, ledger_roots=[fixture.root / "other"],
+                   pinned_lock_sha256=good_options["candidate_lock_sha256"],
+                   pinned_toolchain_sha256=good_options["candidate_toolchain_sha256"])
+    expect_refusal("candidate lock binding off the pinned source refuses",
+                   validate_candidate_origin, origin_root=cand, options=good_options,
+                   ledger_roots=[cand], pinned_lock_sha256=sha256_bytes(b"other-lock"),
+                   pinned_toolchain_sha256=good_options["candidate_toolchain_sha256"])
+    missing_origin = cand_origin_case("missing-artifact")
+    expect_refusal("candidate origin missing artifact refuses", validate_candidate_origin,
+                   origin_root=missing_origin, options=cand_options(missing_origin),
+                   ledger_roots=[missing_origin],
+                   pinned_lock_sha256=sha256_bytes(b"lock-bytes"),
+                   pinned_toolchain_sha256=sha256_bytes(b"toolchain-bytes"))
+    swapped_origin = cand_origin_case("symlink-swapped")
+    swapped_target = swapped_origin / "elsewhere"
+    swapped_target.write_bytes(b"candidate-bytes")
+    (swapped_origin / CANDIDATE_ORIGIN_RELATIVE).symlink_to(swapped_target)
+    expect_refusal("symlink-swapped candidate refuses", validate_candidate_origin,
+                   origin_root=swapped_origin, options=cand_options(swapped_origin),
+                   ledger_roots=[swapped_origin],
+                   pinned_lock_sha256=sha256_bytes(b"lock-bytes"),
+                   pinned_toolchain_sha256=sha256_bytes(b"toolchain-bytes"))
+    changed_origin = cand_origin_case("changed-artifact")
+    (changed_origin / CANDIDATE_ORIGIN_RELATIVE).write_bytes(b"changed-bytes")
+    expect_refusal("changed candidate digest refuses", validate_candidate_origin,
+                   origin_root=changed_origin, options=cand_options(changed_origin),
+                   ledger_roots=[changed_origin],
+                   pinned_lock_sha256=sha256_bytes(b"lock-bytes"),
+                   pinned_toolchain_sha256=sha256_bytes(b"toolchain-bytes"))
+    wrong_size_origin = cand_origin_case("wrong-size")
+    expect_refusal("candidate size mismatch refuses", validate_candidate_origin,
+                   origin_root=wrong_size_origin,
+                   options=cand_options(wrong_size_origin, bytes_=7),
+                   ledger_roots=[wrong_size_origin],
+                   pinned_lock_sha256=sha256_bytes(b"lock-bytes"),
+                   pinned_toolchain_sha256=sha256_bytes(b"toolchain-bytes"))
+    zero_log_origin = cand_origin_case("zero-artifact-log")
+    expect_refusal("log without the artifact refuses", validate_candidate_origin,
+                   origin_root=zero_log_origin,
+                   options=cand_options(zero_log_origin, log="{\"reason\":\"unknown\"}"),
+                   ledger_roots=[zero_log_origin],
+                   pinned_lock_sha256=sha256_bytes(b"lock-bytes"),
+                   pinned_toolchain_sha256=sha256_bytes(b"toolchain-bytes"))
+    double_log_origin = cand_origin_case("double-artifact-log")
+    double_log = cand_log_line(double_log_origin / CANDIDATE_ORIGIN_RELATIVE,
+                               double_log_origin / "oxide-source") + "\n" + \
+        cand_log_line(double_log_origin / "oxide-source/target/debug/other",
+                      double_log_origin / "oxide-source")
+    expect_refusal("ambiguous candidate log refuses", validate_candidate_origin,
+                   origin_root=double_log_origin,
+                   options=cand_options(double_log_origin, log=double_log),
+                   ledger_roots=[double_log_origin],
+                   pinned_lock_sha256=sha256_bytes(b"lock-bytes"),
+                   pinned_toolchain_sha256=sha256_bytes(b"toolchain-bytes"))
+    foreign_log_origin = cand_origin_case("foreign-path-log")
+    foreign_log = cand_log_line(fixture.root / "outside" / "oxide",
+                                foreign_log_origin / "oxide-source")
+    expect_refusal("log naming a foreign artifact path refuses", validate_candidate_origin,
+                   origin_root=foreign_log_origin,
+                   options=cand_options(foreign_log_origin, log=foreign_log),
+                   ledger_roots=[foreign_log_origin],
+                   pinned_lock_sha256=sha256_bytes(b"lock-bytes"),
+                   pinned_toolchain_sha256=sha256_bytes(b"toolchain-bytes"))
+    wrong_receipt_origin = cand_origin_case("wrong-receipt")
+    wrong_receipt = cand_receipt_for(wrong_receipt_origin)
+    wrong_receipt["outcome"]["closure"] = "UNCLOSED"
+    write_doc(wrong_receipt_origin, "receipt.json", wrong_receipt)
+    expect_refusal("unclosed candidate guard refuses", validate_candidate_origin,
+                   origin_root=wrong_receipt_origin,
+                   options=cand_options(wrong_receipt_origin, receipt=wrong_receipt),
+                   ledger_roots=[wrong_receipt_origin],
+                   pinned_lock_sha256=sha256_bytes(b"lock-bytes"),
+                   pinned_toolchain_sha256=sha256_bytes(b"toolchain-bytes"))
+    drifted_receipt_origin = cand_origin_case("drifted-receipt")
+    write_doc(drifted_receipt_origin, "receipt.json", cand_receipt_for(drifted_receipt_origin))
+    drifted_options = cand_options(drifted_receipt_origin)
+    drifted_options["expect_candidate_receipt"] = sha256_bytes(b"not-the-receipt")
+    expect_refusal("changed retained guard receipt refuses", validate_candidate_origin,
+                   origin_root=drifted_receipt_origin, options=drifted_options,
+                   ledger_roots=[drifted_receipt_origin],
+                   pinned_lock_sha256=sha256_bytes(b"lock-bytes"),
+                   pinned_toolchain_sha256=sha256_bytes(b"toolchain-bytes"))
+    drifted_log_origin = cand_origin_case("drifted-log")
+    (drifted_log_origin / "log.json").write_bytes(b"changed log")
+    drifted_log_options = cand_options(drifted_log_origin)
+    expect_refusal("changed retained build log refuses", validate_candidate_origin,
+                   origin_root=drifted_log_origin, options=drifted_log_options,
+                   ledger_roots=[drifted_log_origin],
+                   pinned_lock_sha256=sha256_bytes(b"lock-bytes"),
+                   pinned_toolchain_sha256=sha256_bytes(b"toolchain-bytes"))
+    wrong_lock_origin = cand_origin_case("wrong-lock")
+    (wrong_lock_origin / "oxide-source/Cargo.lock").write_bytes(b"different-lock")
+    expect_refusal("origin lock drift refuses", validate_candidate_origin,
+                   origin_root=wrong_lock_origin, options=cand_options(wrong_lock_origin),
+                   ledger_roots=[wrong_lock_origin],
+                   pinned_lock_sha256=sha256_bytes(b"lock-bytes"),
+                   pinned_toolchain_sha256=sha256_bytes(b"toolchain-bytes"))
+    symlink_origin = fixture.root / "cand-origin-symlink"
+    symlink_origin.symlink_to(cand)
+    expect_refusal("symlinked origin root refuses", validate_candidate_origin,
+                   origin_root=symlink_origin, options=good_options, ledger_roots=[cand],
+                   pinned_lock_sha256=good_options["candidate_lock_sha256"],
+                   pinned_toolchain_sha256=good_options["candidate_toolchain_sha256"])
+
+    # Candidate copy: rehash, exclusive create, owner-executable mode and
+    # identity re-checks.
+    copy_root = fixture.root / "candidate-copy-root"
+    copy_root.mkdir()
+    os.chmod(copy_root, 0o700)
+    copy_facts = expect_ok("candidate copy rehashes", copy_candidate_artifact,
+                           cand_artifact, copy_root, good_options["expect_candidate"],
+                           good_options["candidate_bytes"])
+    if copy_facts is None or (copy_root / "candidate/oxide").read_bytes() != b"candidate-bytes":
+        failures.append("candidate copy lost the artifact bytes")
+    if copy_facts is not None and copy_facts["sha256"] != good_options["expect_candidate"]:
+        failures.append("candidate copy digest mismatch was not recorded")
+    copied_path = copy_root / "candidate/oxide"
+    if not copied_path.is_file() or not os.access(copied_path, os.X_OK) \
+            or copied_path.stat().st_mode & 0o077:
+        failures.append("candidate copy is not an owner-only executable")
+    if copy_facts is not None and copy_facts.get("mode") != stat.S_IMODE(copied_path.stat().st_mode):
+        failures.append("candidate copy mode fact disagrees with the file")
+    noexec_origin = cand_origin_case("noexec-origin")
+    (noexec_origin / CANDIDATE_ORIGIN_RELATIVE).write_bytes(b"candidate-bytes")
+    os.chmod(noexec_origin / CANDIDATE_ORIGIN_RELATIVE, 0o644)
+    expect_refusal("non-executable origin artifact refuses the copy", copy_candidate_artifact,
+                   noexec_origin / CANDIDATE_ORIGIN_RELATIVE, fixture.root / "copy-root-noexec",
+                   sha256_bytes(b"candidate-bytes"), len(b"candidate-bytes"))
+    expect_refusal("second candidate copy refuses", copy_candidate_artifact,
+                   cand_artifact, copy_root, good_options["expect_candidate"],
+                   good_options["candidate_bytes"])
+    expect_refusal("symlinked candidate source refuses the copy", copy_candidate_artifact,
+                   swapped_origin / CANDIDATE_ORIGIN_RELATIVE, fixture.root / "copy-root-2",
+                   sha256_bytes(b"candidate-bytes"), len(b"candidate-bytes"))
+    expect_refusal("candidate copy digest drift refuses", copy_candidate_artifact,
+                   cand_artifact, fixture.root / "copy-root-3",
+                   sha256_bytes(b"other-bytes"), len(b"candidate-bytes"))
+
+    # Complete issuance only: derivation-style documents refuse.
+    cand_digest = good_options["expect_candidate"]
+    complete_audit = {"schema": SCHEMA_BARGE_AUDIT, "review_reference": "review",
+                      "oxide_sha256": cand_digest}
+    complete_block = {"schema": SCHEMA_BARGE_BLOCK, "oxide_sha256": cand_digest,
+                      "audit_sha256": sha256_bytes(canonical_json(complete_audit)),
+                      "authorization_reference": "candidate-route-v1:issue-ref"}
+    expect_ok("complete candidate issuance binds", validate_candidate_issuance,
+              complete_block, complete_audit, cand_digest)
+    derived_block = dict(complete_block, authorization_reference="derived-artifact-v1:issue")
+    expect_refusal("derivation reference refuses in the candidate route",
+                   validate_candidate_issuance, derived_block, complete_audit, cand_digest)
+    expect_refusal("null candidate digest in the audit refuses",
+                   validate_candidate_issuance, complete_block,
+                   dict(complete_audit, oxide_sha256=None), cand_digest)
+    expect_refusal("block digest mismatch refuses", validate_candidate_issuance,
+                   dict(complete_block, oxide_sha256=sha256_bytes(b"other")),
+                   complete_audit, cand_digest)
+
+    # Audited host inputs: planner-bound canonical paths plus live digests.
+    fake_rustc = fixture.root / "fake-rustc"
+    fake_cargo = fixture.root / "fake-cargo"
+    fake_rustc.write_bytes(b"fake-rustc-bytes")
+    fake_cargo.write_bytes(b"fake-cargo-bytes")
+    os.chmod(fake_rustc, 0o755)
+    os.chmod(fake_cargo, 0o755)
+    not_executable = fixture.root / "not-executable"
+    not_executable.write_bytes(b"not-executable-bytes")
+    host_cc_path = host_tools / "cc"
+    host_tool_binding_cc = {"name": "cc", "path": str(host_cc_path),
+                            "sha256": sha256_file(host_cc_path, cap=MAX_ADMISSION_ARTIFACT_BYTES),
+                            "bytes": host_cc_path.stat().st_size}
+
+    def toolchain_binding(path):
+        info = path.stat()
+        return {"path": str(path), "sha256": sha256_file(path, cap=256 * 1024 * 1024),
+                "bytes": info.st_size}
+
+    def host_tools_document(tools):
+        return {"schema": SCHEMA_HOST_TOOLS, "route": "candidate", "ruling": CANDIDATE_RULING,
+                "toolchain": {"rustc": toolchain_binding(fake_rustc),
+                              "cargo": toolchain_binding(fake_cargo)},
+                "tools": tools}
+
+    expect_ok("host-tools document validates", validate_host_tools_document,
+              host_tools_document([host_tool_binding_cc]),
+              rustc_tool=fake_rustc, cargo_tool=fake_cargo)
+    expect_refusal("host-tools schema drift refuses", validate_host_tools_document,
+                   dict(host_tools_document([]), schema="other/1"),
+                   rustc_tool=fake_rustc, cargo_tool=fake_cargo)
+    expect_refusal("host-tools ruling drift refuses", validate_host_tools_document,
+                   dict(host_tools_document([]), ruling="other"),
+                   rustc_tool=fake_rustc, cargo_tool=fake_cargo)
+    expect_refusal("unlisted host tool name refuses", validate_host_tools_document,
+                   host_tools_document([dict(host_tool_binding_cc, name="make")]),
+                   rustc_tool=fake_rustc, cargo_tool=fake_cargo)
+    expect_refusal("duplicate host tool refuses", validate_host_tools_document,
+                   host_tools_document([host_tool_binding_cc, host_tool_binding_cc]),
+                   rustc_tool=fake_rustc, cargo_tool=fake_cargo)
+    expect_refusal("changed host tool digest refuses", validate_host_tools_document,
+                   host_tools_document([dict(host_tool_binding_cc, sha256=sha256_bytes(b"stale"))]),
+                   rustc_tool=fake_rustc, cargo_tool=fake_cargo)
+    expect_refusal("changed host tool size refuses", validate_host_tools_document,
+                   host_tools_document([dict(host_tool_binding_cc, bytes=1)]),
+                   rustc_tool=fake_rustc, cargo_tool=fake_cargo)
+    expect_refusal("non-executable host tool binding refuses", validate_host_tools_document,
+                   host_tools_document([dict(host_tool_binding_cc, path=str(not_executable),
+                                             sha256=sha256_file(not_executable, cap=MAX_ADMISSION_ARTIFACT_BYTES),
+                                             bytes=not_executable.stat().st_size)]),
+                   rustc_tool=fake_rustc, cargo_tool=fake_cargo)
+    expect_refusal("toolchain digest drift refuses", validate_host_tools_document,
+                   dict(host_tools_document([]),
+                        toolchain={"rustc": dict(toolchain_binding(fake_rustc), sha256=sha256_bytes(b"stale")),
+                                   "cargo": toolchain_binding(fake_cargo)}),
+                   rustc_tool=fake_rustc, cargo_tool=fake_cargo)
+    expect_refusal("toolchain path drift refuses", validate_host_tools_document,
+                   dict(host_tools_document([]),
+                        toolchain={"rustc": toolchain_binding(fake_cargo),
+                                   "cargo": toolchain_binding(fake_cargo)}),
+                   rustc_tool=fake_rustc, cargo_tool=fake_cargo)
+
+    host_doc_match = host_tools_document([host_tool_binding_cc])
+    reconciled, reconciled_violations = expect_ok(
+        "bound host tool reconciles", reconcile_host_tools, ambient_path,
+        host_doc_match)
+    if reconciled_violations:
+        failures.append(f"bound host tool left violations: {reconciled_violations}")
+    cc_observation = [entry for entry in (reconciled or []) if entry.get("name") == "cc"]
+    if not cc_observation or cc_observation[0].get("state") != "ambient" or \
+            "not private" not in cc_observation[0].get("note", ""):
+        failures.append("audited host tool was not recorded as a host input")
+    _, unbound_violations = expect_ok(
+        "unbound host tool refuses", reconcile_host_tools,
+        ambient_path, host_tools_document([]))
+    if not any(v.startswith("unbound-ambient-executable:cc:") for v in unbound_violations):
+        failures.append("unbound ambient host tool produced no violation")
+    _, stale_violations = expect_ok(
+        "changed host tool binding refuses", reconcile_host_tools,
+        ambient_path,
+        host_tools_document([dict(host_tool_binding_cc, sha256=sha256_bytes(b"stale"))]))
+    if not any(v.startswith("unbound-ambient-executable:cc:") for v in stale_violations):
+        failures.append("changed host tool binding produced no violation")
+    _, stale_doc_violations = expect_ok(
+        "documented absent host tool refuses", reconcile_host_tools,
+        {"path_executables": {"entries": [{"name": "cc", "state": "absent"}],
+                              "violations": []}, "violations": []},
+        host_tools_document([host_tool_binding_cc]))
+    if not any(v.startswith("documented-host-tool-not-live:cc") for v in stale_doc_violations):
+        failures.append("documented but absent host tool produced no violation")
+    priv_reconciled, priv_reconciled_violations = expect_ok(
+        "private binding stays allowed", reconcile_host_tools,
+        private_path, host_tools_document([]))
+    if priv_reconciled_violations:
+        failures.append(f"private binding was not allowed: {priv_reconciled_violations}")
+    expect_refusal("host-tools document missing for reconcile refuses",
+                   reconcile_host_tools, ambient_path, {"schema": "other"})
+
+    # Composition regression (review 6598012622, host_tool_prelaunch_composition):
+    # scan -> adjudication -> pre-launch control must compose: a matching
+    # host-tools document leaves NO violation, the raw ambient-executable
+    # findings are replaced rather than accumulated, and unrelated findings
+    # survive unchanged into the same final list.
+    composed_root, composed_source = provenance_case("candidate-composed")
+    (composed_root / "bin").mkdir()
+    composed_ambient = attach_path_executables(
+        {"violations": []},
+        str(composed_root / "bin") + os.pathsep + str(host_tools),
+        private_root=composed_root)
+    raw_ambient_findings = list(composed_ambient["violations"])
+    if not any(v.startswith("ambient-executable:cc:") for v in raw_ambient_findings):
+        failures.append("composition fixture lost the raw ambient-executable finding")
+    composed_observation, composed_violations = expect_ok(
+        "matching document clears the composed findings", reconcile_host_tools,
+        composed_ambient, host_doc_match)
+    if composed_violations:
+        failures.append(f"composed matching document left violations: {composed_violations}")
+    with_config = dict(composed_ambient,
+                       violations=["ambient-cargo-config:found"] + raw_ambient_findings)
+    _, config_violations = expect_ok(
+        "unrelated findings survive adjudication", reconcile_host_tools,
+        with_config, host_doc_match)
+    if config_violations != ["ambient-cargo-config:found"]:
+        failures.append(f"candidate composition changed unrelated findings: {config_violations}")
+
+    # Candidate provenance packet: retained before a refusal, bounded.
+    def candidate_inputs_for(root, source):
+        return {"run_id": "d" * 32, "private_root": root,
+                "account_root": fixture.root / "account-not-real",
+                "argv": ["/effigy", STATUS_SELECTOR], "cwd": source,
+                "env": {"HOME": str(root / "home"), "RUSTUP_TOOLCHAIN": TOOLCHAIN},
+                "inherited_keys": ["HOME", "PATH"], "tools": {}, "host_tools": [],
+                "sources": {}, "limit_seconds": 10, "scratch_mib": 64,
+                "pool_cap_bytes": 1024}
+
+    packet_root, packet_source = provenance_case("candidate-packet")
+    candidate_document = expect_ok("candidate provenance builds", build_candidate_provenance,
+                                   candidate_inputs_for(packet_root, packet_source),
+                                   origin={"root": str(cand)}, guard={"state": "pre-launch"},
+                                   artifact={"state": "copied"}, ambient={"violations": []},
+                                   allowance={"clock": "CLOCK_UPTIME_RAW"}, written_ns=now_ns())
+    if candidate_document is None or candidate_document.get("kind") != "candidate-provenance" \
+            or candidate_document.get("ruling") != CANDIDATE_RULING:
+        failures.append("candidate provenance packet lost its kind or ruling")
+    expect_ok("candidate provenance retained", write_candidate_provenance,
+              packet_root, candidate_document)
+    if not (packet_root / CANDIDATE_PROVENANCE_PATH).is_file():
+        failures.append("candidate provenance packet was not retained")
+    padded_candidate = dict(candidate_document, padding="x" * (MAX_CANDIDATE_PROVENANCE_BYTES + 1))
+    expect_refusal("oversized candidate provenance refuses without retention",
+                   write_candidate_provenance, packet_root, padded_candidate)
+    refuse_root, refuse_source = provenance_case("candidate-refuse")
+    expect_refusal("candidate pre-launch finding refuses with packet retained",
+                   refuse_candidate_launch, candidate_inputs_for(refuse_root, refuse_source),
+                   {"violations": ["ambient-cargo-config:found"], "host_tool_bindings": []},
+                   {"root": str(cand)}, {"clock": "CLOCK_UPTIME_RAW"})
+    if not (refuse_root / CANDIDATE_PROVENANCE_PATH).is_file():
+        failures.append("candidate refusal lost its retained packet")
+    refused_packet = json.loads((refuse_root / CANDIDATE_PROVENANCE_PATH).read_bytes())
+    if refused_packet.get("guard") != {"state": "not-launched"}:
+        failures.append("candidate refusal packet lost its not-launched guard state")
+    clean_root, clean_source = provenance_case("candidate-clean")
+    expect_ok("clean candidate scan proceeds", refuse_candidate_launch,
+              candidate_inputs_for(clean_root, clean_source),
+              {"violations": [], "host_tool_bindings": []},
+              {"root": str(cand)}, {"clock": "CLOCK_UPTIME_RAW"})
+    gate_root, gate_source = provenance_case("candidate-clean-gate")
+    gate_ambient = dict(composed_ambient, host_tool_bindings=composed_observation,
+                        violations=composed_violations)
+    expect_ok("matching host tools pass the pre-launch control", refuse_candidate_launch,
+              candidate_inputs_for(gate_root, gate_source), gate_ambient,
+              {"root": str(cand)}, {"clock": "CLOCK_UPTIME_RAW"})
+
+    # Candidate argument binding: every planner-bound digest is required.
+    expect_refusal("candidate without the origin refuses", parse_args,
+                   ["--candidate", "--oxide-repo", "/r"])
+    expect_refusal("candidate with a non-hex digest refuses", parse_args,
+                   ["--candidate", "--oxide-repo", "/r", "--oxide-head", "a" * 40,
+                    "--oxide-product-head", "b" * 40, "--barge-repo", "/b", "--barge-head", "c" * 40,
+                    "--barge-root", "/Volumes/Builds/scratch/barge/x", "--oxide-root", "/Volumes/Builds/scratch/oxide/x",
+                    "--expect-audit", "d" * 64, "--expect-ledger", "e" * 64, "--expect-budget", "f" * 64,
+                    "--expect-history", "0" * 64, "--expect-oxide-binding", "1" * 64,
+                    "--preparation-receipt", "/p", "--expect-preparation", "2" * 64,
+                    "--expect-source-binding", "3" * 64, "--candidate-origin", "/o",
+                    "--expect-candidate", "short", "--candidate-bytes", "5",
+                    "--candidate-receipt", "/cr", "--expect-candidate-receipt", "4" * 64,
+                    "--candidate-log", "/cl", "--expect-candidate-log", "5" * 64,
+                    "--candidate-lock-sha256", "6" * 64, "--candidate-toolchain-sha256", "7" * 64,
+                    "--host-tools", "/ht", "--expect-host-tools", "8" * 64])
+    expect_refusal("candidate with a non-integer size refuses", parse_args,
+                   ["--candidate", "--oxide-repo", "/r", "--oxide-head", "a" * 40,
+                    "--oxide-product-head", "b" * 40, "--barge-repo", "/b", "--barge-head", "c" * 40,
+                    "--barge-root", "/Volumes/Builds/scratch/barge/x", "--oxide-root", "/Volumes/Builds/scratch/oxide/x",
+                    "--expect-audit", "d" * 64, "--expect-ledger", "e" * 64, "--expect-budget", "f" * 64,
+                    "--expect-history", "0" * 64, "--expect-oxide-binding", "1" * 64,
+                    "--preparation-receipt", "/p", "--expect-preparation", "2" * 64,
+                    "--expect-source-binding", "3" * 64, "--candidate-origin", "/o",
+                    "--expect-candidate", "9" * 64, "--candidate-bytes", "many",
+                    "--candidate-receipt", "/cr", "--expect-candidate-receipt", "4" * 64,
+                    "--candidate-log", "/cl", "--expect-candidate-log", "5" * 64,
+                    "--candidate-lock-sha256", "6" * 64, "--candidate-toolchain-sha256", "7" * 64,
+                    "--host-tools", "/ht", "--expect-host-tools", "8" * 64])
+
+    # Artifact refusal controls: each uses its own private root so log paths
+    # and the provenance cwd/src binding agree, and each retains the packet.
+    def artifact_refusal_case(name, root, source, log_text, expected):
+        try:
+            resolve_bootstrap_artifact(log_text,
+                                       provenance_inputs_for(root, source),
+                                       guard=provenance_guard,
+                                       ambient={"violations": []},
+                                       allowance=provenance_allowance)
+        except GateRefusal as refusal:
+            if expected not in str(refusal):
+                failures.append(f"{name}: wrong refusal {refusal}")
+        else:
+            failures.append(f"{name}: expected a refusal, got success")
+            return None
+        packet = json.loads((root / PROVENANCE_PATH).read_bytes())
+        if packet.get("artifact", {}).get("state") != "unresolved" \
+                or not packet.get("artifact", {}).get("findings", {}).get("violations"):
+            failures.append(f"{name}: refusal packet lost the artifact findings")
+        return packet
+
+    missing_root, missing_source = provenance_case("missing-holder")
+    artifact_refusal_case(
+        "missing artifact", missing_root, missing_source,
+        artifact_line(missing_source / "target/debug/gone", missing_source),
+        "missing or unreadable")
+    escaped_file = fixture.root / "escaped-oxide"
+    escaped_file.write_bytes(b"x")
+    escaped_root, escaped_source = provenance_case("escaped-holder")
+    artifact_refusal_case(
+        "escaped artifact", escaped_root, escaped_source,
+        artifact_line(escaped_file, escaped_source),
+        "escaped the private root")
+    double_root, double_source = provenance_case("double-holder")
+    first = double_source / "target/debug/one"
+    first.write_bytes(b"1")
+    second = double_source / "target/debug/two"
+    second.write_bytes(b"2")
+    artifact_refusal_case(
+        "ambiguous artifact", double_root, double_source,
+        artifact_line(first, double_source) + "\n" + artifact_line(second, double_source),
+        "the bootstrap log does not name exactly one oxide artifact")
+    mismatch_root, mismatch_source = provenance_case("mismatch-holder")
+    mismatch_packet = artifact_refusal_case(
+        "artifact src-path mismatch", mismatch_root, mismatch_source,
+        artifact_line(mismatch_source / "target/debug/other", fixture.root),
+        "the bootstrap log does not name exactly one oxide artifact")
+    if mismatch_packet is not None and "artifact-src-path-mismatch" not in \
+            mismatch_packet["artifact"]["findings"]["violations"]:
+        failures.append("src-path mismatch diagnosis was not retained")
+    malformed_root, malformed_source = provenance_case("malformed-holder")
+    malformed_packet = artifact_refusal_case(
+        "malformed bootstrap log", malformed_root, malformed_source,
+        "not json\n[1,2]\n",
+        "the bootstrap log does not name exactly one oxide artifact")
+    if malformed_packet is not None and \
+            malformed_packet["artifact"]["findings"].get("malformed_lines") != 2:
+        failures.append("malformed log line count was not retained")
 
     fixture.close()
     if failures:

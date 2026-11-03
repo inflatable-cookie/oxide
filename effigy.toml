@@ -1475,6 +1475,12 @@ run = "python3 scripts/bounded-test.py --limit 1200 --scratch-budget-mib 512 -- 
 [tasks."proof:tape-prune:handoff-test"]
 run = "python3 scripts/test_tape_provider_handoff.py"
 
+# Requires a separately qualified planner-bound input; the guard still refuses
+# missing or mismatched inputs before a product child can be launched.
+[tasks."proof:tape-prune:cover"]
+admission = "heavy"
+run = 'python3 scripts/bounded-test.py --limit 1200 --scratch-budget-mib 512 -- python3 scripts/tape-provider-handoff.py --input "$TAPE_CAPTURE_INPUT" --sha256 "$TAPE_CAPTURE_INPUT_SHA256"'
+
 [tasks."proof:tape-prune:test"]
 run = "python3 scripts/tape-provider-handoff.py"
 
@@ -1486,3 +1492,17 @@ run = "python3 scripts/tape-provider-handoff.py"
 
 [tasks."proof:tape-prune:bootstrap"]
 run = "python3 scripts/tape-provider-handoff.py"
+
+# Candidate route (oxide#254, operator decision d9aec625): the same guarded
+# provider binding the RETAINED debug artifact from the spent replacement
+# diagnostic instead of building one. This fixed declaration carries no issued
+# binding and refuses before any effect until the planner amends the command
+# with the diagnostic arguments plus the candidate origin root, digests, byte
+# size, retained guard receipt and build log, and the audited host-tools
+# document. No new bootstrap, install, cleanup or wrapper-consumable
+# derivation runs; the named linker/assembler tools and the pinned 1.97.1
+# toolchain are audited host inputs whose hashes bind admission identity and
+# never confine their writes. Not a benchmark or an alias for full QA.
+[tasks."proof:private-build-validation:candidate"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 1200 --scratch-budget-mib 512 -- python3 scripts/test-private-build-validation.py --candidate"
