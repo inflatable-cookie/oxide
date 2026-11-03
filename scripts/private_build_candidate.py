@@ -360,9 +360,11 @@ def _execute_guarded(issuance, candidate, repo, head, tree, scratch, evidence, d
                              TMPDIR=str(validation_tmp), TMP=str(validation_tmp), TEMP=str(validation_tmp))
             child_scratch = internal
         try:
+            remaining = allowance.remaining_seconds()
+            require(remaining >= 31, 'authorized block exhausted before selector launch')
             receipt, _, _ = provider.run_supervised(supervisor=Path(tools['supervisor']['path']),
                 python=Path(sys.executable), command=command, cwd=source, env=child_env,
-                limit_seconds=min(300, allowance.remaining_seconds()), scratch_mib=issuance['scratch_mib'], evidence=child_evidence,
+                limit_seconds=min(300, remaining), scratch_mib=issuance['scratch_mib'], evidence=child_evidence,
                 allowance=allowance, phase=f'capture-{index}')
             provider.validate_supervisor_receipt(receipt, command, child_scratch)
         finally:

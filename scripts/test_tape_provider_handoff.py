@@ -178,7 +178,14 @@ class CandidateTest(unittest.TestCase):
         mode = SimpleNamespace(st_uid=__import__('os').geteuid(), st_mode=0o40700)
         def directory(base, relative):
             return base / relative
-        def run_with_snapshots(snapshots):
+        def run_with_snapshots(snapshots, advance=False):
+            clock = [1]
+            pending = iter(snapshots)
+            def inventory(*_):
+                value = next(pending)
+                if advance:
+                    clock[0] = 246_000_000_001
+                return value
             with ExitStack() as stack:
                 for obj, name, kw in (
                     (Path, 'resolve', {'new': lambda self, **_: self}),
@@ -187,12 +194,12 @@ class CandidateTest(unittest.TestCase):
                     (Path, 'read_bytes', {'return_value': b'lock'}),
                     (consumer.os, 'lstat', {'return_value': mode}),
                     (consumer.os, 'symlink', {}),
-                    (provider, 'now_ns', {'return_value': 1}),
+                    (provider, 'now_ns', {'side_effect': lambda: clock[0]}),
                     (provider, 'private_dir', {'side_effect': directory}),
                     (provider, 'private_write', {}),
                     (provider, 'stage_git_tree', {'new': stage}),
-                    (provider, 'child_environment', {'return_value': {'TMPDIR': str(root / 'tmp')}}),
-                    (provider, 'live_inventory', {'side_effect': snapshots}),
+                    (provider, 'child_environment', {'return_value': {'TMPDIR': '/base-tmp', 'TMP': '/base-tmp', 'TEMP': '/base-tmp', 'OXIDE_TASK_SCRATCH_ROOT': str(root)}}),
+                    (provider, 'live_inventory', {'side_effect': inventory}),
                     (provider, 'retained_snapshot', {'new': retained}),
                     (provider, 'verify_inventory', {'side_effect': lambda a, b, *_: consumer.require(a == b, 'inventory changed')}),
                     (provider, 'run_supervised', {'new': child}),
@@ -206,10 +213,13 @@ class CandidateTest(unittest.TestCase):
         self.assertEqual([call.kwargs['command'][1:] for call in child.call_args_list],
                          [selector.split() for selector in consumer.SELECTORS])
         for call in child.call_args_list[:3]:
-            self.assertEqual(call.kwargs['env']['TMPDIR'], str(root / 'tmp'))
+            self.assertEqual(call.kwargs['env']['TMPDIR'], '/base-tmp')
+            self.assertEqual(call.kwargs['env']['OXIDE_TASK_SCRATCH_ROOT'], str(root))
         suite = child.call_args_list[-1].kwargs
         self.assertEqual(suite['env']['OXIDE_TEST_INTERNAL_ROOT'], issue['test_internal_root'])
-        self.assertEqual(suite['env']['TMPDIR'], str(root / 'tmp'))
+        for name in ('TMPDIR', 'TMP', 'TEMP'):
+            self.assertEqual(suite['env'][name], str(root / 'tmp'))
+        self.assertEqual(suite['env']['OXIDE_TASK_SCRATCH_ROOT'], issue['test_internal_root'])
         self.assertEqual(suite['allowance'], allowance)
         self.assertTrue(all(call.kwargs['limit_seconds'] == 275 for call in child.call_args_list))
         seed.assert_called_once()
@@ -219,6 +229,9 @@ class CandidateTest(unittest.TestCase):
         self.assertEqual(receipt_check.call_args.args[2], Path(issue['test_internal_root']))
         self.assertEqual(retained.call_count, 8)
         child.reset_mock()
+        with self.assertRaisesRegex(provider.GateRefusal, 'selector launch'):
+            run_with_snapshots([['same'], ['same']], advance=True)
+        child.assert_not_called()
         with self.assertRaisesRegex(provider.GateRefusal, 'inventory changed'):
             run_with_snapshots([['before'], ['after']])
         self.assertEqual(child.call_count, 1)
@@ -227,7 +240,31 @@ class CandidateTest(unittest.TestCase):
         with self.assertRaisesRegex(provider.GateRefusal, 'staged lock or toolchain'):
             run_with_snapshots([])
         child.assert_not_called()
+        stage.return_value = {'Cargo.lock': 'lock', 'rust-toolchain.toml': 'changed'}
+        with self.assertRaisesRegex(provider.GateRefusal, 'staged lock or toolchain'):
+            run_with_snapshots([])
+        child.assert_not_called()
         stage.return_value = {'Cargo.lock': 'lock', 'rust-toolchain.toml': 'toolchain'}
+        original_tmp, original_internal = issue['test_validation_tmp'], issue['test_internal_root']
+        for bad_tmp in ('/outside', '/Volumes/Builds/scratch/oxide-validation',
+                        '/Volumes/Builds/scratch/oxide-validation/other/tmp'):
+            issue['test_validation_tmp'] = bad_tmp
+            with self.subTest(bad_tmp=bad_tmp), self.assertRaises(provider.GateRefusal):
+                run_with_snapshots([])
+        issue['test_validation_tmp'] = original_tmp
+        issue['test_internal_root'] = '/other/internal'
+        with self.assertRaises(provider.GateRefusal):
+            run_with_snapshots([])
+        issue['test_internal_root'] = original_internal
+        mode.st_mode = 0o40755
+        with self.assertRaises(provider.GateRefusal):
+            run_with_snapshots([])
+        mode.st_mode = 0o40700
+        mode.st_uid += 1
+        with self.assertRaises(provider.GateRefusal):
+            run_with_snapshots([])
+        mode.st_uid -= 1
+        child.assert_not_called()
         def reject_suite(receipt, command, expected_scratch):
             if command[-2:] == ['test', 'rust']:
                 self.assertEqual(expected_scratch, Path(issue['test_internal_root']))
