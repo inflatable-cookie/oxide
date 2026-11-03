@@ -69,6 +69,8 @@ const MAX_OBSERVATIONS_BYTES: usize = 256 * 1024;
 const MAX_OBSERVATION_ROOTS: usize = 512;
 const MAX_PLAN_BYTES: usize = 256 * 1024;
 const MAX_CANDIDATES: usize = 512;
+/// Kept diagnostic for an eligible root this bounded preview did not select.
+const DEFERRED_KEEP_REASON: &str = "eligible remainder deferred to a later prune batch";
 const MAX_OPERATOR_LIST_BYTES: usize = 256 * 1024;
 const MAX_TEXT_BYTES: usize = 1024;
 const DELETE_BATCH: u64 = 512;
@@ -314,7 +316,7 @@ struct Coverage {
     observed_ms: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Candidate {
     checkout_id: String,
@@ -2021,7 +2023,7 @@ fn dry_run(operator_list: Option<&Path>) -> Result<u8, String> {
     }
     let evaluated = evaluate(&store, &control, &registry, list.as_ref(), &mut authority)?;
     drop(authority);
-    let preview = build_preview(&registry, &evaluated, list.as_ref(), evaluated.complete);
+    let preview = build_preview(&registry, &evaluated, list.as_ref(), evaluated.complete)?;
     preview.validate()?;
     let bytes = serde_json::to_vec(&preview).map_err(|error| error.to_string())?;
     if bytes.len() > MAX_PLAN_BYTES {
@@ -2037,10 +2039,21 @@ fn dry_run(operator_list: Option<&Path>) -> Result<u8, String> {
         .and_then(|()| std::io::stdout().flush())
         .map_err(|error| format!("cannot write the prune preview: {error}"))?;
     eprintln!();
-    eprintln!(
-        "oxide: prune preview SHA-256 {sha} ({} candidate root(s), {} kept); nothing was changed. Write these exact bytes to a file and re-run with --plan FILE --plan-sha256 {sha}",
-        preview.totals.candidates, preview.totals.kept
-    );
+    let deferred = preview
+        .coverage
+        .candidate_roots
+        .saturating_sub(preview.totals.candidates);
+    if deferred > 0 {
+        eprintln!(
+            "oxide: prune preview SHA-256 {sha} ({} candidate root(s) of {} eligible, {deferred} deferred to a later batch, {} kept); nothing was changed. Write these exact bytes to a file and re-run with --plan FILE --plan-sha256 {sha}",
+            preview.totals.candidates, preview.coverage.candidate_roots, preview.totals.kept
+        );
+    } else {
+        eprintln!(
+            "oxide: prune preview SHA-256 {sha} ({} candidate root(s), {} kept); nothing was changed. Write these exact bytes to a file and re-run with --plan FILE --plan-sha256 {sha}",
+            preview.totals.candidates, preview.totals.kept
+        );
+    }
     Ok(0)
 }
 
@@ -2209,12 +2222,24 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
         Err(reason) => return Err(reason),
     };
     drop(authority);
-    let fresh = build_preview(
+    // A failed fresh preview after exact intent replay is a partial
+    // completion: those roots already changed. Mapping the error through
+    // `?` would print "no output root was changed" and exit 2.
+    let fresh = match build_preview(
         &registry,
         &evaluated,
         fresh_list.as_ref(),
         evaluated.complete,
-    );
+    ) {
+        Ok(fresh) => fresh,
+        Err(reason) if !completed_roots.is_empty() => {
+            return Ok(partial(
+                &completed_roots,
+                &format!("the fresh preview failed ({reason}), so every other root is kept"),
+            ));
+        }
+        Err(reason) => return Err(reason),
+    };
     if !fresh.coverage.complete {
         let reason = "the fresh authority snapshot is incomplete, so every remaining root is kept";
         return Ok(if completed_roots.is_empty() {
@@ -2223,13 +2248,16 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
             partial(&completed_roots, reason)
         });
     }
-    let plan_set: Vec<&Candidate> = preview
-        .candidates
+    let eligible: Vec<Candidate> = evaluated
         .iter()
-        .filter(|candidate| !completed_roots.contains(&candidate.root))
+        .filter_map(|entry| entry.candidate.clone())
         .collect();
-    let fresh_set: Vec<&Candidate> = fresh.candidates.iter().collect();
-    if !same_candidates(&plan_set, &fresh_set) {
+    let Some(authorized) = authorize_plan(
+        &preview.candidates,
+        &fresh.candidates,
+        &eligible,
+        &completed_roots,
+    ) else {
         let kept = kept_note(&fresh);
         if !completed_roots.is_empty() {
             return Ok(partial(
@@ -2242,8 +2270,8 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
         return Ok(refused(&format!(
             "the eligible root set changed since the preview ({kept}); no output root was changed"
         )));
-    }
-    if fresh.candidates.is_empty() {
+    };
+    if authorized.is_empty() {
         if completed_roots.is_empty() {
             eprintln!("oxide: no eligible roots; nothing was deleted");
         } else {
@@ -2262,7 +2290,7 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
     // A per-root refusal before its intent keeps that root unchanged and
     // the batch continues; only a journaled intent stops it.
     let mut refusals: Vec<(PathBuf, String)> = Vec::new();
-    for candidate in &fresh.candidates {
+    for candidate in authorized {
         // The real run's own ancestry witness is the baseline every later
         // proof is compared with. A candidate without one is never pruned.
         let Some(evidence) = evidence_for(&evaluated, candidate) else {
@@ -2365,7 +2393,7 @@ fn evidence_for<'a>(
         .and_then(|entry| entry.evidence.as_ref())
 }
 
-/// Whether the plan's eligible root set is exactly the fresh snapshot's.
+/// Whether two candidates are the same root identity.
 ///
 /// The checkout, member, root, nonce, inode and marker digest are the root's
 /// immutable identity. The device is not: macOS renumbers a mounted volume's
@@ -2373,20 +2401,55 @@ fn evidence_for<'a>(
 /// same unchanged roots. The fresh snapshot's own device is the one every later
 /// step of this run binds (`RootSession::open`), and a renumbered inode, a
 /// changed marker or a different volume still refuses the plan.
+fn same_identity(left: &Candidate, right: &Candidate) -> bool {
+    left.checkout_id == right.checkout_id
+        && left.member == right.member
+        && left.root == right.root
+        && left.nonce == right.nonce
+        && left.ino == right.ino
+        && left.marker_digest == right.marker_digest
+}
+
+/// Whether the plan's selected batch is exactly the fresh snapshot's selected
+/// batch. Length and identity must match one-to-one; order does not.
 fn same_candidates(plan: &[&Candidate], fresh: &[&Candidate]) -> bool {
-    if plan.len() != fresh.len() {
-        return false;
+    plan.len() == fresh.len()
+        && plan
+            .iter()
+            .all(|planned| fresh.iter().any(|current| same_identity(planned, current)))
+}
+
+/// The identities this real run may prune: the plan's remaining selected
+/// batch, rebound to the fresh snapshot's own candidate objects.
+///
+/// A first attempt requires the fresh bounded selection to equal the plan.
+/// After exact intent replay, remaining plan identities must still be eligible
+/// and unchanged; deferred or newly eligible roots are not backfilled into the
+/// already-authorized set.
+fn authorize_plan<'a>(
+    plan: &'a [Candidate],
+    fresh_selected: &'a [Candidate],
+    fresh_eligible: &'a [Candidate],
+    completed: &[PathBuf],
+) -> Option<Vec<&'a Candidate>> {
+    let remaining_plan: Vec<&Candidate> = plan
+        .iter()
+        .filter(|candidate| !completed.contains(&candidate.root))
+        .collect();
+    if completed.is_empty() {
+        let fresh: Vec<&Candidate> = fresh_selected.iter().collect();
+        same_candidates(&remaining_plan, &fresh).then_some(fresh)
+    } else {
+        let mut matching = Vec::with_capacity(remaining_plan.len());
+        for planned in remaining_plan {
+            matching.push(
+                fresh_eligible
+                    .iter()
+                    .find(|current| same_identity(planned, current))?,
+            );
+        }
+        Some(matching)
     }
-    plan.iter().all(|planned| {
-        fresh.iter().any(|current| {
-            planned.checkout_id == current.checkout_id
-                && planned.member == current.member
-                && planned.root == current.root
-                && planned.nonce == current.nonce
-                && planned.ino == current.ino
-                && planned.marker_digest == current.marker_digest
-        })
-    })
 }
 
 fn kept_note(preview: &Preview) -> String {
@@ -4574,12 +4637,12 @@ fn build_preview(
     evaluated: &[Evaluated],
     list: Option<&OperatorList>,
     authority_complete: bool,
-) -> Preview {
-    let candidates: Vec<Candidate> = evaluated
+) -> Result<Preview, String> {
+    let eligible: Vec<Candidate> = evaluated
         .iter()
         .filter_map(|entry| entry.candidate.clone())
         .collect();
-    let mut kept: Vec<Kept> = evaluated
+    let ineligible: Vec<Kept> = evaluated
         .iter()
         .filter_map(|entry| {
             entry.kept.as_ref().map(|reason| Kept {
@@ -4589,31 +4652,144 @@ fn build_preview(
             })
         })
         .collect();
+    let generated_ms = process::now_ms();
+    for candidate in &eligible {
+        let trial = preview_document(
+            registry,
+            list,
+            authority_complete,
+            generated_ms,
+            evaluated.len() as u64,
+            eligible.len() as u64,
+            ineligible.len() as u64,
+            std::slice::from_ref(candidate),
+            &[],
+        );
+        if preview_size(&trial)? > MAX_PLAN_BYTES {
+            return Err(format!(
+                "prune candidate {} cannot be represented in a {MAX_PLAN_BYTES}-byte preview",
+                candidate.root.display()
+            ));
+        }
+    }
+    let mut low = 0usize;
+    let mut high = eligible.len().min(MAX_CANDIDATES);
+    while low < high {
+        let mid = (low + high + 1) / 2;
+        let trial = preview_document(
+            registry,
+            list,
+            authority_complete,
+            generated_ms,
+            evaluated.len() as u64,
+            eligible.len() as u64,
+            ineligible.len() as u64,
+            &eligible[..mid],
+            &[],
+        );
+        if preview_size(&trial)? <= MAX_PLAN_BYTES {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    let selected = &eligible[..low];
+    let deferred = &eligible[low..];
+    let mut kept = Vec::new();
+    if !deferred.is_empty() {
+        kept.push(Kept {
+            checkout_id: None,
+            root: None,
+            reason: format!(
+                "{} eligible root(s) deferred to a later prune batch",
+                deferred.len()
+            ),
+        });
+    }
+    kept.extend(ineligible.iter().cloned());
+    for candidate in deferred {
+        if kept.len() >= MAX_CANDIDATES {
+            break;
+        }
+        kept.push(Kept {
+            checkout_id: Some(candidate.checkout_id.clone()),
+            root: Some(candidate.root.clone()),
+            reason: DEFERRED_KEEP_REASON.to_owned(),
+        });
+    }
     kept.truncate(MAX_CANDIDATES);
+    while !kept.is_empty() {
+        let trial = preview_document(
+            registry,
+            list,
+            authority_complete,
+            generated_ms,
+            evaluated.len() as u64,
+            eligible.len() as u64,
+            ineligible.len() as u64,
+            selected,
+            &kept,
+        );
+        if preview_size(&trial)? <= MAX_PLAN_BYTES {
+            break;
+        }
+        kept.pop();
+    }
+    Ok(preview_document(
+        registry,
+        list,
+        authority_complete,
+        generated_ms,
+        evaluated.len() as u64,
+        eligible.len() as u64,
+        ineligible.len() as u64,
+        selected,
+        &kept,
+    ))
+}
+
+fn preview_size(preview: &Preview) -> Result<usize, String> {
+    serde_json::to_vec(preview)
+        .map(|bytes| bytes.len())
+        .map_err(|error| error.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preview_document(
+    registry: &Registry,
+    list: Option<&OperatorList>,
+    authority_complete: bool,
+    generated_ms: u64,
+    roots_scanned: u64,
+    eligible_count: u64,
+    ineligible_count: u64,
+    selected: &[Candidate],
+    kept: &[Kept],
+) -> Preview {
     Preview {
         version: PREVIEW_VERSION.to_owned(),
-        generated_ms: process::now_ms(),
+        generated_ms,
         registry_revision: registry.revision,
         registry_complete: registry.complete,
         coverage: Coverage {
-            roots_scanned: evaluated.len() as u64,
+            roots_scanned,
             registry_roots: registry.rows.len() as u64,
-            candidate_roots: candidates.len() as u64,
-            kept_roots: kept.len() as u64,
+            candidate_roots: eligible_count,
+            kept_roots: ineligible_count,
             complete: authority_complete,
             source: "internal output registry".to_owned(),
-            observed_ms: process::now_ms(),
+            observed_ms: generated_ms,
         },
         operator_list_sha256: list.map(|list| list.sha256.clone()),
         totals: Totals {
-            candidates: candidates.len() as u64,
-            kept: kept.len() as u64,
-            logical_bytes: candidates.iter().map(|root| root.logical_bytes).sum(),
-            allocated_bytes: candidates.iter().map(|root| root.allocated_bytes).sum(),
-            accounting_complete: candidates.iter().all(|root| root.accounting_complete),
+            candidates: selected.len() as u64,
+            kept: ineligible_count,
+            logical_bytes: selected.iter().map(|root| root.logical_bytes).sum(),
+            allocated_bytes: selected.iter().map(|root| root.allocated_bytes).sum(),
+            accounting_complete: selected.iter().all(|root| root.accounting_complete),
         },
-        candidates,
-        kept,
+        candidates: selected.to_vec(),
+        kept: kept.to_vec(),
     }
 }
 
@@ -8922,7 +9098,7 @@ mod tests {
             intents: Vec::new(),
             cancelled_overflow: Vec::new(),
         };
-        let preview = build_preview(&registry, &[], None, registry.complete);
+        let preview = build_preview(&registry, &[], None, registry.complete).unwrap();
         let first = serde_json::to_vec(&preview).unwrap();
         let second = serde_json::to_vec(&preview).unwrap();
         assert_eq!(first, second);
@@ -8932,6 +9108,296 @@ mod tests {
             sha256_hex(&first),
             sha256_hex(&serde_json::to_vec(&changed).unwrap())
         );
+    }
+
+    fn empty_registry() -> Registry {
+        Registry {
+            version: REGISTRY_VERSION.to_owned(),
+            schema: REGISTRY_SCHEMA,
+            revision: 7,
+            complete: true,
+            incomplete: None,
+            created_by: "a".repeat(32),
+            rows: Vec::new(),
+            intents: Vec::new(),
+            cancelled_overflow: Vec::new(),
+        }
+    }
+
+    fn synthetic_entry(index: usize, pad: usize, kept: Option<&str>) -> Evaluated {
+        let mut row = row_for(Path::new("/"));
+        row.checkout_id = format!("{index:064x}");
+        row.checkout = PathBuf::from(format!("/c/{index}"));
+        row.receipt = PathBuf::from(format!("/e/{index}"));
+        row.member = "t".to_owned();
+        row.root = PathBuf::from(format!("/r/{index}{}", "x".repeat(pad)));
+        row.root_ino = Some(index as u64);
+        if let Some(reason) = kept {
+            Evaluated {
+                row,
+                candidate: None,
+                kept: Some(reason.to_owned()),
+                legacy: false,
+                evidence: None,
+            }
+        } else {
+            let mut candidate = candidate_of(&row);
+            candidate.ino = index as u64;
+            Evaluated {
+                row,
+                candidate: Some(candidate),
+                kept: None,
+                legacy: false,
+                evidence: None,
+            }
+        }
+    }
+
+    fn eligible_entries(count: usize, pad: usize) -> Vec<Evaluated> {
+        (0..count)
+            .map(|index| synthetic_entry(index, pad, None))
+            .collect()
+    }
+
+    fn preview_of(evaluated: &[Evaluated]) -> Preview {
+        build_preview(&empty_registry(), evaluated, None, true).unwrap()
+    }
+
+    fn eligible_candidates(evaluated: &[Evaluated]) -> Vec<Candidate> {
+        evaluated
+            .iter()
+            .filter_map(|entry| entry.candidate.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_preview_under_the_cap_keeps_every_eligible_root() {
+        let mut evaluated = eligible_entries(3, 0);
+        evaluated.push(synthetic_entry(
+            3,
+            0,
+            Some("the checkout is present, so its root is kept"),
+        ));
+        let preview = preview_of(&evaluated);
+        preview.validate().unwrap();
+        assert_eq!(preview.candidates.len(), 3);
+        assert_eq!(preview.coverage.candidate_roots, 3);
+        assert_eq!(preview.coverage.kept_roots, 1);
+        assert_eq!(preview.totals.candidates, 3);
+        assert_eq!(preview.totals.kept, 1);
+        assert!(preview.coverage.complete);
+        assert_eq!(
+            preview.candidates[0].root,
+            evaluated[0].candidate.as_ref().unwrap().root
+        );
+        assert!(preview
+            .kept
+            .iter()
+            .any(|kept| kept.reason.contains("checkout is present")));
+        let bytes = serde_json::to_vec(&preview).unwrap();
+        assert!(bytes.len() <= MAX_PLAN_BYTES);
+    }
+
+    #[test]
+    fn a_preview_selects_a_bounded_prefix_when_eligible_roots_exceed_512() {
+        let mut evaluated = eligible_entries(MAX_CANDIDATES + 1, 0);
+        evaluated.push(synthetic_entry(900, 0, Some("a foreign file is present")));
+        evaluated.push(synthetic_entry(
+            901,
+            0,
+            Some("an active writer still holds this checkout"),
+        ));
+        evaluated.push(synthetic_entry(
+            902,
+            0,
+            Some("checkout absence is unknown (no volume facts)"),
+        ));
+        let preview = preview_of(&evaluated);
+        preview.validate().unwrap();
+        let bytes = serde_json::to_vec(&preview).unwrap();
+        assert!(bytes.len() <= MAX_PLAN_BYTES, "{}", bytes.len());
+        assert!(preview.candidates.len() <= MAX_CANDIDATES);
+        assert!(!preview.candidates.is_empty());
+        assert_eq!(
+            preview.coverage.candidate_roots,
+            (MAX_CANDIDATES + 1) as u64
+        );
+        assert_eq!(preview.coverage.kept_roots, 3);
+        assert_eq!(preview.totals.candidates, preview.candidates.len() as u64);
+        assert_eq!(preview.totals.kept, 3);
+        let deferred = preview.coverage.candidate_roots - preview.totals.candidates;
+        assert!(deferred > 0);
+        assert!(preview.coverage.complete);
+        let eligible = eligible_candidates(&evaluated);
+        assert_eq!(
+            preview.candidates,
+            eligible[..preview.candidates.len()].to_vec()
+        );
+        assert!(preview.kept.iter().any(|kept| kept
+            .reason
+            .contains("eligible root(s) deferred to a later prune batch")));
+        assert!(preview
+            .kept
+            .iter()
+            .any(|kept| kept.reason.contains("foreign file")));
+        assert!(preview
+            .kept
+            .iter()
+            .any(|kept| kept.reason.contains("active writer")));
+        assert!(preview
+            .kept
+            .iter()
+            .any(|kept| kept.reason.contains("absence is unknown")));
+        assert!(preview.candidates.iter().all(|candidate| candidate
+            .root
+            .as_os_str()
+            .to_string_lossy()
+            .starts_with("/r/")));
+    }
+
+    #[test]
+    fn a_preview_fits_byte_pressure_below_the_root_cap() {
+        let evaluated = eligible_entries(250, 1000);
+        assert!(evaluated.len() < MAX_CANDIDATES);
+        let preview = preview_of(&evaluated);
+        preview.validate().unwrap();
+        let bytes = serde_json::to_vec(&preview).unwrap();
+        assert!(bytes.len() <= MAX_PLAN_BYTES, "{}", bytes.len());
+        assert!(preview.candidates.len() < evaluated.len());
+        assert!(!preview.candidates.is_empty());
+        assert_eq!(preview.coverage.candidate_roots, 250);
+        assert_eq!(preview.totals.candidates, preview.candidates.len() as u64);
+        assert!(preview.coverage.candidate_roots > preview.totals.candidates);
+        let eligible = eligible_candidates(&evaluated);
+        assert_eq!(
+            preview.candidates,
+            eligible[..preview.candidates.len()].to_vec()
+        );
+        assert!(
+            evaluated[0]
+                .candidate
+                .as_ref()
+                .unwrap()
+                .root
+                .as_os_str()
+                .len()
+                > 900
+        );
+    }
+
+    #[test]
+    fn a_preview_refuses_an_unrepresentable_candidate() {
+        let evaluated = eligible_entries(1, MAX_PLAN_BYTES);
+        let error = build_preview(&empty_registry(), &evaluated, None, true).unwrap_err();
+        assert!(error.contains("cannot be represented in a"), "{error}");
+        assert!(
+            error.contains(
+                &evaluated[0]
+                    .candidate
+                    .as_ref()
+                    .unwrap()
+                    .root
+                    .display()
+                    .to_string()
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_preview_batch_is_stable_and_progresses_across_batches() {
+        let evaluated = eligible_entries(MAX_CANDIDATES + 1, 0);
+        let first = preview_of(&evaluated);
+        let again = preview_of(&evaluated);
+        assert_eq!(first.candidates, again.candidates);
+        assert_eq!(
+            first.coverage.candidate_roots,
+            again.coverage.candidate_roots
+        );
+        let eligible = eligible_candidates(&evaluated);
+        let authorized = authorize_plan(&first.candidates, &again.candidates, &eligible, &[]);
+        assert_eq!(
+            authorized.unwrap().into_iter().cloned().collect::<Vec<_>>(),
+            first.candidates
+        );
+        let remainder: Vec<Evaluated> = eligible_entries(MAX_CANDIDATES + 1, 0)
+            .into_iter()
+            .filter(|entry| {
+                entry.candidate.as_ref().is_some_and(|candidate| {
+                    !first
+                        .candidates
+                        .iter()
+                        .any(|selected| same_identity(selected, candidate))
+                })
+            })
+            .collect();
+        assert!(!remainder.is_empty());
+        let second = preview_of(&remainder);
+        second.validate().unwrap();
+        assert!(!second.candidates.is_empty());
+        assert!(second.candidates.iter().all(|candidate| {
+            !first
+                .candidates
+                .iter()
+                .any(|selected| same_identity(selected, candidate))
+        }));
+        assert_eq!(
+            first.candidates.len() + second.candidates.len(),
+            eligible.len()
+        );
+    }
+
+    #[test]
+    fn a_preview_plan_rejects_changed_or_extra_identities() {
+        let evaluated = eligible_entries(MAX_CANDIDATES + 1, 0);
+        let plan = preview_of(&evaluated);
+        let eligible = eligible_candidates(&evaluated);
+        let mut changed = eligible.clone();
+        changed[0].nonce = Some("d".repeat(32));
+        let mut changed_entries = eligible_entries(MAX_CANDIDATES + 1, 0);
+        changed_entries[0].candidate = Some(changed[0].clone());
+        let fresh = preview_of(&changed_entries);
+        assert!(authorize_plan(&plan.candidates, &fresh.candidates, &changed, &[]).is_none());
+        let mut extra = eligible_entries(MAX_CANDIDATES + 1, 0);
+        extra.insert(0, synthetic_entry(2000, 0, None));
+        let extra_preview = preview_of(&extra);
+        let extra_eligible = eligible_candidates(&extra);
+        assert!(authorize_plan(
+            &plan.candidates,
+            &extra_preview.candidates,
+            &extra_eligible,
+            &[]
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_preview_plan_does_not_backfill_after_replay() {
+        let evaluated = eligible_entries(MAX_CANDIDATES + 1, 0);
+        let plan = preview_of(&evaluated);
+        let completed = vec![plan.candidates[0].root.clone()];
+        let remainder: Vec<Evaluated> = eligible_entries(MAX_CANDIDATES + 1, 0)
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .candidate
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.root != completed[0])
+            })
+            .collect();
+        let fresh = preview_of(&remainder);
+        let eligible = eligible_candidates(&remainder);
+        let authorized =
+            authorize_plan(&plan.candidates, &fresh.candidates, &eligible, &completed).unwrap();
+        assert_eq!(authorized.len(), plan.candidates.len() - 1);
+        assert!(authorized.iter().all(|candidate| plan
+            .candidates
+            .iter()
+            .any(|planned| same_identity(planned, candidate))));
+        let deferred = &eligible_candidates(&evaluated)[plan.candidates.len()];
+        assert!(authorized
+            .iter()
+            .all(|candidate| !same_identity(candidate, deferred)));
     }
 
     #[test]
@@ -9476,6 +9942,7 @@ mod tests {
         assert!(!evaluated.complete);
         assert!(
             !build_preview(&registry, &evaluated, None, evaluated.complete)
+                .unwrap()
                 .coverage
                 .complete
         );
