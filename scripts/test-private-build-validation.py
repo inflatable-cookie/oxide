@@ -86,6 +86,7 @@ import hashlib
 import io
 import struct
 import json
+import math
 import os
 import pwd
 from pathlib import Path
@@ -2041,6 +2042,10 @@ def bind_outer_deadline(receipt: dict, supervisor_deadline: int, issued_remainin
                         oxide_max: int) -> int:
     """Bind the qualified outer limit to both issued wall authorities."""
     limit, started = receipt.get("limit_s"), receipt.get("start_ns")
+    # The qualified guard serializes --limit as a float. Preserve the receipt;
+    # accept only an exact integral finite value for integer wall arithmetic.
+    if type(limit) is float and math.isfinite(limit) and limit.is_integer():
+        limit = int(limit)
     if (type(limit) is not int or type(started) is not int
             or type(supervisor_deadline) is not int or type(issued_remaining) is not int
             or type(oxide_max) is not int or limit <= 30
@@ -4178,6 +4183,43 @@ def self_test() -> int:
                        dict(sample_receipt, limit_s=151), 210_000_000_000, 150, 1200)
         expect_refusal("outer above oxide authority refuses", bind_outer_deadline,
                        sample_receipt, 210_000_000_000, 150, 99)
+        # Exercise the actual guard's JSON number, not a recast integer fixture.
+        numeric_receipt = json.loads('{"limit_s": 990.0, "start_ns": 10000000000}')
+        raw_receipt = dict(numeric_receipt)
+        float_bound = expect_ok("guard float limit", bind_outer_deadline,
+                                numeric_receipt, 2_000_000_000_000, 990, 1200)
+        int_bound = expect_ok("equivalent integer limit", bind_outer_deadline,
+                              dict(numeric_receipt, limit_s=990), 2_000_000_000_000, 990, 1200)
+        if float_bound != int_bound or float_bound != 1_000_000_000_000:
+            failures.append("integral guard float changed the wall deadline")
+        if numeric_receipt != raw_receipt or type(numeric_receipt['limit_s']) is not float:
+            failures.append("guard receipt was mutated")
+        numeric_token = Mock()
+        def bind_numeric_then_claim(receipt):
+            bind_outer_deadline(receipt, 2_000_000_000_000, 990, 1200)
+            numeric_token()
+        invalid_limits = (990.5, float('nan'), float('inf'), float('-inf'),
+                          True, False, '990', None, 30.0, 991.0, 1201.0)
+        for bad in invalid_limits:
+            expect_refusal(f"invalid guard limit {bad!r} before claim", bind_numeric_then_claim,
+                           dict(numeric_receipt, limit_s=bad))
+        expect_refusal("missing guard limit before claim", bind_numeric_then_claim,
+                       {"start_ns": numeric_receipt['start_ns']})
+        if numeric_token.called:
+            failures.append("invalid numeric guard value reached the token")
+        expect_refusal("expired guard float refuses", bind_outer_deadline,
+                       numeric_receipt, 11_000_000_000, 990, 1200)
+        expect_refusal("float limit above oxide authority", bind_outer_deadline,
+                       numeric_receipt, 2_000_000_000_000, 990, 989)
+        expect_refusal("float issued allowance remains invalid", bind_outer_deadline,
+                       numeric_receipt, 2_000_000_000_000, 990.0, 1200)
+        expect_refusal("float supervisor deadline remains invalid", bind_outer_deadline,
+                       numeric_receipt, 2_000_000_000_000.0, 990, 1200)
+        expect_refusal("float oxide authority remains invalid", bind_outer_deadline,
+                       numeric_receipt, 2_000_000_000_000, 990, 1200.0)
+        expect_refusal("float guard start remains invalid", bind_outer_deadline,
+                       dict(numeric_receipt, start_ns=10_000_000_000.0),
+                       2_000_000_000_000, 990, 1200)
         token = Mock()
         def bind_then_claim(receipt):
             bind_outer_deadline(receipt, 210_000_000_000, 150, 1200)
