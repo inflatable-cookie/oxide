@@ -172,6 +172,11 @@ MAX_PROVENANCE_ENTRIES = 32
 MAX_PROVENANCE_CONFIG_BYTES = 1024 * 1024
 MAX_PRIVATE_STATE_BYTES = 64 * 1024
 MAX_ANCESTOR_LEVELS = 64
+# Named linker/assembler tools cargo/rustc resolve on PATH. A first-match
+# slot inside the private root is a positive private binding; a first-match
+# slot outside it, or an unreadable slot, uses the existing pre-launch
+# refusal. Absence is recorded and is not a violation.
+BOOTSTRAP_PATH_TOOLS = ("cc", "c++", "clang", "gcc", "ld", "as", "ar", "ranlib")
 PRIVATE_HOME_STATE = Path("Library/Application Support/oxide/state/pools.json")
 # The complete key set child_environment may pass; the provenance builder
 # refuses any passed key outside it (a positive private binding per key).
@@ -2021,24 +2026,49 @@ def private_home_state_observation(private_root: Path) -> dict:
 
 def _observe_cargo_config(path: Path, *, inside: bool, kind: str,
                           entries: list, violations: list) -> int:
-    """One no-follow Cargo config observation. Returns omitted count (0 or 1)."""
+    """One no-follow Cargo config observation. Returns omitted count (0 or 1).
+
+    Absence (ENOENT / ENOTDIR) is recorded with no violation. Any other
+    lstat or digest error is unreadable: it is not a private binding and
+    is not recorded as absent.
+    """
     entry = {"path": str(path), "ambient": not inside}
+
+    def retain():
+        if len(entries) < MAX_PROVENANCE_ENTRIES:
+            entries.append(entry)
+            return 0
+        return 1
+
     try:
         info = path.lstat()
-    except OSError:
+    except FileNotFoundError:
         entry["state"] = "absent"
-    else:
-        if not stat.S_ISREG(info.st_mode):
-            entry["state"] = "not-regular"
-        else:
-            entry["state"] = "present"
-            entry["bytes"] = info.st_size
-            entry["sha256"] = sha256_file(path, cap=MAX_PROVENANCE_CONFIG_BYTES)
+        return retain()
+    except NotADirectoryError:
+        entry["state"] = "absent"
+        return retain()
+    except OSError as error:
+        entry["state"] = "unreadable"
+        entry["error"] = error.__class__.__name__
+        violations.append("unreadable-cargo-config:" + str(path)[:512])
+        return retain()
+    if not stat.S_ISREG(info.st_mode):
+        entry["state"] = "not-regular"
         violations.append(kind + str(path)[:512])
-    if len(entries) < MAX_PROVENANCE_ENTRIES:
-        entries.append(entry)
-        return 0
-    return 1
+        return retain()
+    try:
+        digest = sha256_file(path, cap=MAX_PROVENANCE_CONFIG_BYTES)
+    except (OSError, GateRefusal) as error:
+        entry["state"] = "unreadable"
+        entry["error"] = error.__class__.__name__
+        violations.append("unreadable-cargo-config:" + str(path)[:512])
+        return retain()
+    entry["state"] = "present"
+    entry["bytes"] = info.st_size
+    entry["sha256"] = digest
+    violations.append(kind + str(path)[:512])
+    return retain()
 
 
 def ambient_cargo_config_scan(start: Path, *, private_root: Path,
@@ -2051,8 +2081,8 @@ def ambient_cargo_config_scan(start: Path, *, private_root: Path,
     positive private binding. A present file inside the private tree is planted
     policy whose content this gate does not bind. Either finding refuses
     BEFORE the launch; the recorded observation is retained in the provenance
-    packet. Absence is recorded; it is not a proof that Cargo cannot see a
-    host linker or other PATH-resolved tool.
+    packet. Absence is recorded. An unreadable path is a violation, not
+    absence. PATH-resolved linker and assembler tools are a separate scan.
     """
     chain: list = []
     node = Path(start).resolve(strict=True)
@@ -2090,6 +2120,75 @@ def ambient_cargo_config_scan(start: Path, *, private_root: Path,
             "cargo_home": None if cargo_home is None else str(cargo_home),
             "entries": entries, "omitted_entries": omitted_entries,
             "violations": violations}
+
+
+def path_executable_scan(path_value: str, *, private_root: Path) -> dict:
+    """Resolve named linker/assembler tools on the child PATH.
+
+    A first-match PATH slot inside the private root is a positive private
+    binding (the same pattern as ``bin/cargo``, including a symlink). A
+    first-match slot outside the private root, or an unreadable slot that
+    cannot prove a binding, is an ambient executable path: the existing
+    pre-launch refusal records it. Absence is recorded and is not a
+    violation. Proc-macro and build-script crates compile to ``target/``
+    under the private root and inherit this PATH; unnamed further host
+    spawns cannot be bound without executing the bootstrap.
+    """
+    components = [part for part in str(path_value).split(os.pathsep)]
+    entries: list = []
+    violations: list = []
+    omitted_entries = 0
+    for name in BOOTSTRAP_PATH_TOOLS:
+        entry = {"name": name, "state": "absent"}
+        for component in components:
+            if component == "":
+                continue
+            candidate = Path(component) / name
+            try:
+                info = candidate.lstat()
+            except FileNotFoundError:
+                continue
+            except NotADirectoryError:
+                continue
+            except OSError as error:
+                entry = {"name": name, "path": str(candidate)[:512],
+                         "state": "unreadable", "error": error.__class__.__name__}
+                violations.append("unreadable-executable:" + name + ":"
+                                  + str(candidate)[:512])
+                break
+            if not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
+                continue
+            inside = False
+            try:
+                inside = (candidate == private_root
+                          or candidate.is_relative_to(private_root))
+            except ValueError:
+                inside = False
+            if inside:
+                entry = {"name": name, "path": str(candidate)[:512],
+                         "state": "private"}
+            else:
+                entry = {"name": name, "path": str(candidate)[:512],
+                         "state": "ambient"}
+                violations.append("ambient-executable:" + name + ":"
+                                  + str(candidate)[:512])
+            break
+        if len(entries) < MAX_PROVENANCE_ENTRIES:
+            entries.append(entry)
+        else:
+            omitted_entries += 1
+    return {"entries": entries, "omitted_entries": omitted_entries,
+            "violations": violations}
+
+
+def attach_path_executables(ambient: dict, path_value: str,
+                            *, private_root: Path) -> dict:
+    """Merge the PATH-tool scan into the pre-launch ambient findings."""
+    scan = path_executable_scan(path_value, private_root=private_root)
+    bound = dict(ambient)
+    bound["path_executables"] = scan
+    bound["violations"] = list(ambient.get("violations", [])) + list(scan["violations"])
+    return bound
 
 
 def artifact_refusal_message(facts: dict) -> str:
@@ -2246,15 +2345,20 @@ def write_bootstrap_provenance(private_root: Path, document: dict) -> Path:
 
 
 def refuse_bootstrap_launch(inputs: dict, ambient: dict, allowance: dict) -> None:
-    """Refuse before the launch when the ambient scan recorded a finding."""
+    """Refuse before the launch when the ambient scan recorded a finding.
+
+    Covers ambient or planted Cargo configuration, an unreadable config
+    path, and a PATH-resolved named linker/assembler without a private
+    PATH-slot binding. The packet is retained first.
+    """
     if not ambient["violations"]:
         return
     document = build_bootstrap_provenance(
         inputs, guard={"state": "not-launched"}, artifact={"state": "not-built"},
         ambient=ambient, allowance=allowance, written_ns=now_ns())
     write_bootstrap_provenance(inputs["private_root"], document)
-    raise GateRefusal("ambient Cargo configuration lacks a private binding: "
-                      + ambient["violations"][0])
+    raise GateRefusal("ambient configuration or executable path lacks a "
+                      "private binding: " + ambient["violations"][0])
 
 
 def resolve_bootstrap_artifact(log_text: str, inputs: dict, *, guard: dict,
@@ -2552,9 +2656,10 @@ def diagnostic(options: dict) -> int:
     # The single debug bootstrap: exact argv under the nested qualified
     # supervisor, inside the 300 s window and the measured, clamped budget.
     # Before any launch the bounded provenance inputs are gathered and any
-    # ambient Cargo configuration above the private root refuses with its
-    # finding retained (oxide#253); after the guarded closure the completed
-    # packet is retained BEFORE the inventory assertion can refuse.
+    # ambient Cargo configuration or PATH-resolved host tool without a
+    # private binding refuses with its finding retained (oxide#253); after
+    # the guarded closure the completed packet is retained BEFORE the
+    # inventory assertion can refuse.
     allowance.begin_bootstrap()
     bootstrap_mib = min(barge_effective_mib, oxide_caps["effective_whole_block_mib"],
                         BOOTSTRAP_MAX_MIB)
@@ -2572,8 +2677,10 @@ def diagnostic(options: dict) -> int:
         cargo_tool = (rustc_tool.parent / "cargo").resolve(strict=True)
     except OSError as error:
         raise GateRefusal(f"bootstrap cargo is unresolved: {error}") from None
-    ambient = ambient_cargo_config_scan(oxide_source, private_root=barge_root,
-                                        cargo_home=Path(env["CARGO_HOME"]))
+    ambient = attach_path_executables(
+        ambient_cargo_config_scan(oxide_source, private_root=barge_root,
+                                 cargo_home=Path(env["CARGO_HOME"])),
+        env["PATH"], private_root=barge_root)
     provenance_inputs = {
         "run_id": run_id, "private_root": barge_root,
         "account_root": LIVE_ACCOUNT_ROOT,
@@ -3047,6 +3154,8 @@ REFUSAL_CASES = (
     "failed or uncertain child closure",
     "missing, malformed or escaped bootstrap artifact",
     "ambient Cargo configuration above the private root",
+    "unreadable Cargo configuration on the ancestor chain",
+    "PATH-resolved host linker or assembler without a private binding",
 )
 
 
@@ -4678,6 +4787,117 @@ def self_test() -> int:
     if not any(v.startswith("ambient-cargo-config:") and "host-cargo-home" in v
                for v in outside_home_scan["violations"]):
         failures.append("outside CARGO_HOME config was not recorded as ambient")
+
+    # Unreadable Cargo config is a violation, never recorded as absent.
+    unread_root, unread_source = provenance_case("unreadable-config")
+    unread_dir = unread_root / ".cargo"
+    unread_dir.mkdir()
+    (unread_dir / "config.toml").write_bytes(b'[alias]\nx = "y"\n')
+    os.chmod(unread_dir, 0o600)
+    try:
+        unread_scan = ambient_cargo_config_scan(
+            unread_source, private_root=unread_root)
+        unread_entries = [entry for entry in unread_scan["entries"]
+                          if entry["path"] == str(unread_dir / "config.toml")]
+        if not unread_entries or unread_entries[0].get("state") != "unreadable":
+            failures.append("unreadable cargo config recorded as "
+                            f"{unread_entries or 'missing'}")
+        if not any(v.startswith("unreadable-cargo-config:")
+                   and str(unread_dir / "config.toml") in v
+                   for v in unread_scan["violations"]):
+            failures.append("unreadable cargo config produced no violation")
+        expect_refusal("unreadable cargo config refuses before launch",
+                       refuse_bootstrap_launch,
+                       provenance_inputs_for(unread_root, unread_source),
+                       unread_scan, {"bootstrap_started_ns": 5})
+    finally:
+        os.chmod(unread_dir, 0o700)
+
+    # PATH-resolved host tools without a private PATH-slot binding use the
+    # existing pre-launch refusal. Private-bin first match is a binding.
+    host_tools = fixture.root / "host-tools"
+    host_tools.mkdir()
+    (host_tools / "cc").write_bytes(b"fake-cc")
+    os.chmod(host_tools / "cc", 0o755)
+    path_root, path_source = provenance_case("path-ambient")
+    (path_root / "bin").mkdir()
+    ambient_path = attach_path_executables(
+        {"violations": []},
+        str(path_root / "bin") + os.pathsep + str(host_tools),
+        private_root=path_root)
+    cc_entries = [entry for entry in ambient_path["path_executables"]["entries"]
+                  if entry["name"] == "cc"]
+    if not cc_entries or cc_entries[0].get("state") != "ambient":
+        failures.append(f"host PATH cc recorded as {cc_entries or 'missing'}")
+    if not any(v.startswith("ambient-executable:cc:") for v in ambient_path["violations"]):
+        failures.append("host PATH cc produced no ambient-executable violation")
+    expect_refusal("host PATH cc refuses before launch", refuse_bootstrap_launch,
+                   provenance_inputs_for(path_root, path_source),
+                   ambient_path, {"bootstrap_started_ns": 5})
+    priv_root, priv_source = provenance_case("path-private")
+    priv_bin = priv_root / "bin"
+    priv_bin.mkdir()
+    (priv_bin / "cc").write_bytes(b"private-cc")
+    os.chmod(priv_bin / "cc", 0o755)
+    private_path = attach_path_executables(
+        {"violations": []},
+        str(priv_bin) + os.pathsep + str(host_tools),
+        private_root=priv_root)
+    priv_cc = [entry for entry in private_path["path_executables"]["entries"]
+               if entry["name"] == "cc"]
+    if not priv_cc or priv_cc[0].get("state") != "private":
+        failures.append(f"private PATH cc recorded as {priv_cc or 'missing'}")
+    if any(v.startswith("ambient-executable:cc:") for v in private_path["violations"]):
+        failures.append("private PATH cc was treated as ambient")
+    expect_ok("private PATH cc proceeds", refuse_bootstrap_launch,
+              provenance_inputs_for(priv_root, priv_source),
+              private_path, {"bootstrap_started_ns": 5})
+    link_root, link_source = provenance_case("path-symlink")
+    link_bin = link_root / "bin"
+    link_bin.mkdir()
+    os.symlink(host_tools / "cc", link_bin / "cc")
+    link_path = attach_path_executables(
+        {"violations": []},
+        str(link_bin) + os.pathsep + str(host_tools),
+        private_root=link_root)
+    link_cc = [entry for entry in link_path["path_executables"]["entries"]
+               if entry["name"] == "cc"]
+    if not link_cc or link_cc[0].get("state") != "private":
+        failures.append(f"private PATH cc symlink recorded as {link_cc or 'missing'}")
+    expect_ok("private PATH cc symlink proceeds", refuse_bootstrap_launch,
+              provenance_inputs_for(link_root, link_source),
+              link_path, {"bootstrap_started_ns": 5})
+    absent_root, absent_source = provenance_case("path-absent")
+    (absent_root / "bin").mkdir()
+    absent_path = path_executable_scan(str(absent_root / "bin"),
+                                       private_root=absent_root)
+    if absent_path["violations"]:
+        failures.append(f"absent PATH tools produced violations: {absent_path['violations']}")
+    if any(entry["state"] != "absent" for entry in absent_path["entries"]):
+        failures.append("absent PATH tools were not recorded absent")
+    unread_path_root, unread_path_source = provenance_case("path-unreadable")
+    unread_bin = unread_path_root / "bin"
+    unread_bin.mkdir()
+    (unread_bin / "cc").write_bytes(b"hidden-cc")
+    os.chmod(unread_bin, 0o600)
+    try:
+        unread_path = path_executable_scan(str(unread_bin),
+                                           private_root=unread_path_root)
+        unread_cc = [entry for entry in unread_path["entries"]
+                     if entry["name"] == "cc"]
+        if not unread_cc or unread_cc[0].get("state") != "unreadable":
+            failures.append(f"unreadable PATH cc recorded as {unread_cc or 'missing'}")
+        if not any(v.startswith("unreadable-executable:cc:")
+                   for v in unread_path["violations"]):
+            failures.append("unreadable PATH cc produced no violation")
+        expect_refusal("unreadable PATH cc refuses before launch",
+                       refuse_bootstrap_launch,
+                       provenance_inputs_for(unread_path_root, unread_path_source),
+                       attach_path_executables({"violations": []}, str(unread_bin),
+                                               private_root=unread_path_root),
+                       {"bootstrap_started_ns": 5})
+    finally:
+        os.chmod(unread_bin, 0o700)
 
     # Artifact refusal controls: each uses its own private root so log paths
     # and the provenance cwd/src binding agree, and each retains the packet.

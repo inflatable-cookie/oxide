@@ -1310,10 +1310,19 @@ such: `bin/cargo` and `bin/effigy` are symlinks to the invoking rustup
 ancestor chain to `/` are absent; the offline seed populated
 `cache/registry` and `cache/git` from the invoking CARGO_HOME; `RUSTC` is
 the pinned 1.97.1 rustc. Child PATH is private `bin` plus the inherited
-suffix, so `cc`/`ld` and build-script tools resolve through host PATH with
-no positive private binding. That is a recorded limit, not a private-proven
-conclusion, and it is not a new refusal: the spent run used that PATH and
-closed status 0. Registry resolution is the seeded private cache (offline,
+suffix. Named linker and assembler tools (`cc`, `c++`, `clang`, `gcc`,
+`ld`, `as`, `ar`, `ranlib`) whose first PATH match sits outside the
+private root lack a positive private binding and use the existing
+pre-launch refusal; a first-match slot inside private `bin` (including a
+symlink, the same pattern as `bin/cargo`) is a private binding of that
+PATH slot. An unreadable Cargo config path is a violation, not absence.
+Proc-macro and build-script crates compile to `target/` under the private
+root and inherit the same child PATH; `rustc` itself is bound. Unnamed
+further host spawns those crates may perform cannot be bound without
+executing the bootstrap, so they are not invented as privately proven.
+The spent run used the inherited PATH suffix and closed status 0; that is
+historical reconstruction, not a forward authorization to skip the
+refusal. Registry resolution is the seeded private cache (offline,
 locked). Account-home for live inventory is
 `~/Library/Application Support/oxide`, independent of the scrubbed `HOME`;
 `OXIDE_TEST_HOME_FROM_ENV=1` is on the product child allowlist. A cargo
@@ -1331,16 +1340,21 @@ missing/malformed/escaped/ambiguous findings. The packet is internal
 bounded evidence (`bootstrap-provenance`, 256 KiB cap), not a public schema
 or wrapper hook. It records the audited allowlist values actually passed
 and inherited key names; it never records inherited secret values. An
-ambient or planted Cargo configuration, or a `$CARGO_HOME/config.toml`
-outside the private root, still uses the existing bounded refusal. A host
-linker on inherited PATH is recorded as unbound, not invented as private.
+ambient or planted Cargo configuration, a `$CARGO_HOME/config.toml`
+outside the private root, an unreadable config path, or a PATH-resolved
+named linker/assembler whose first match lacks a private PATH-slot
+binding, still uses the existing bounded refusal.
 
-Next runtime still needs a separately concrete operator-authorized route
-after this source work. The provenance packet lets that route assess the
-bootstrap path when isolation refuses; it does not identify a writer, lower
-the oracle, repair the baseline, skip bootstrap or weaken one-use claims.
-Honest missing runtime evidence at this head remains missing and blocks
-qualification.
+Next minimal evidence requirement: an operator-authorized runtime whose
+private `bin` binds the named linker and assembler tools (or a recorded
+operator exception for a specific host tool), then a nested bootstrap
+closure with the provenance packet retained, then the isolation bracket.
+The writer of `pools.json` remains unknown until that packet plus the
+nested log and inventories name one. The provenance packet lets that
+route assess the bootstrap path when isolation refuses; it does not
+identify a writer, lower the oracle, repair the baseline, skip bootstrap
+or weaken one-use claims. Honest missing runtime evidence at this head
+remains missing and blocks qualification.
 
 **Integration and removal plan for the obsolete local scaffold.** The #240
 local route (`scripts/tape-isolation-check.py` sequence/bootstrap/preflight/
