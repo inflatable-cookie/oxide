@@ -1311,22 +1311,38 @@ ancestor chain to `/` are absent; the offline seed populated
 `cache/registry` and `cache/git` from the invoking CARGO_HOME; `RUSTC` is
 the pinned 1.97.1 rustc. Child PATH is private `bin` plus the inherited
 suffix. Named linker and assembler tools (`cc`, `c++`, `clang`, `gcc`,
-`ld`, `as`, `ar`, `ranlib`) whose first PATH match sits outside the
-private root lack a positive private binding and use the existing
-pre-launch refusal; a first-match slot inside private `bin` (including a
-symlink, the same pattern as `bin/cargo`) is a private binding of that
-PATH slot. An unreadable Cargo config path is a violation, not absence.
-Proc-macro and build-script crates compile to `target/` under the private
-root and inherit the same child PATH; `rustc` itself is bound. Unnamed
-further host spawns those crates may perform cannot be bound without
-executing the bootstrap, so they are not invented as privately proven.
-The spent run used the inherited PATH suffix and closed status 0; that is
-historical reconstruction, not a forward authorization to skip the
-refusal. Registry resolution is the seeded private cache (offline,
-locked). Account-home for live inventory is
-`~/Library/Application Support/oxide`, independent of the scrubbed `HOME`;
-`OXIDE_TEST_HOME_FROM_ENV=1` is on the product child allowlist. A cargo
-build of `--bin oxide` is not itself a product invocation.
+`ld`, `as`, `ar`, `ranlib`) whose first usable PATH match is not a
+private binding use the existing pre-launch refusal. A private binding
+is an executable regular file inside the private root, or a symlink
+whose resolved target is an executable regular file inside the private
+root. A dangling symlink, a non-executable file, and a symlink to a
+host `cc` are not private bindings: execvp continues or runs the host
+tool, and the scan refuses the ambient match. An unreadable Cargo
+config path is a violation, not absence. Proc-macro and build-script
+crates compile to `target/` under the private root and inherit the same
+child PATH; `rustc` itself is bound. Unnamed further host spawns those
+crates may perform cannot be bound without executing the bootstrap, so
+they are not invented as privately proven. The scrubbed child
+environment (`HOME`, `CARGO_HOME`, `TMPDIR`, `OXIDE_CONFIG`,
+`OXIDE_POOL`, and the rest of the allowlist) redirects processes that
+honor those variables. It does not confine a build-script, proc-macro,
+linker, or other child that opens an absolute path such as
+`~/Library/Application Support/oxide`. The spent run used the inherited
+PATH suffix and closed status 0; that is historical reconstruction, not
+a forward authorization to skip the refusal. Registry resolution is the
+seeded private cache (offline, locked). Account-home for live inventory
+is `~/Library/Application Support/oxide`, independent of the scrubbed
+`HOME`; `OXIDE_TEST_HOME_FROM_ENV=1` is on the product child allowlist.
+A cargo build of `--bin oxide` is not itself a product invocation.
+
+Unexcluded candidate writer classes for the `pools.json` inode
+replacement (none is identified as the writer): cargo and rustc (bound
+host binaries that can open any path); build-scripts executed by cargo;
+proc-macro crates executed by rustc; PATH-resolved linker and assembler
+tools if they ran; the nested supervisor, python, and the gate process;
+concurrent host processes overlapping the live account; macOS services
+touching `~/Library/Application Support/oxide`. The built `oxide`
+binary is not a candidate: it was not executed.
 
 The source gap this task closes: the spent diagnostic retained the
 inventory mismatch and the nested receipt, but dropped the attributable
@@ -1342,8 +1358,9 @@ or wrapper hook. It records the audited allowlist values actually passed
 and inherited key names; it never records inherited secret values. An
 ambient or planted Cargo configuration, a `$CARGO_HOME/config.toml`
 outside the private root, an unreadable config path, or a PATH-resolved
-named linker/assembler whose first match lacks a private PATH-slot
-binding, still uses the existing bounded refusal.
+named linker/assembler whose first usable match is not an executable
+regular file inside the private root, still uses the existing bounded
+refusal.
 
 Next minimal evidence requirement: an operator-authorized runtime whose
 private `bin` binds the named linker and assembler tools (or a recorded

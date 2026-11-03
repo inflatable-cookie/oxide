@@ -172,10 +172,11 @@ MAX_PROVENANCE_ENTRIES = 32
 MAX_PROVENANCE_CONFIG_BYTES = 1024 * 1024
 MAX_PRIVATE_STATE_BYTES = 64 * 1024
 MAX_ANCESTOR_LEVELS = 64
-# Named linker/assembler tools cargo/rustc resolve on PATH. A first-match
-# slot inside the private root is a positive private binding; a first-match
-# slot outside it, or an unreadable slot, uses the existing pre-launch
-# refusal. Absence is recorded and is not a violation.
+# Named linker/assembler tools cargo/rustc resolve on PATH. A private
+# binding is an executable regular file inside the private root, or a
+# symlink whose resolved target is an executable regular file inside the
+# private root. A dangling symlink, a non-executable file, and a symlink
+# to a host tool are not private bindings. Absence is not a violation.
 BOOTSTRAP_PATH_TOOLS = ("cc", "c++", "clang", "gcc", "ld", "as", "ar", "ranlib")
 PRIVATE_HOME_STATE = Path("Library/Application Support/oxide/state/pools.json")
 # The complete key set child_environment may pass; the provenance builder
@@ -2010,8 +2011,12 @@ def private_home_state_observation(private_root: Path) -> dict:
     entry = {"path": str(path)}
     try:
         info = path.lstat()
-    except OSError:
+    except FileNotFoundError:
         entry["exists"] = False
+        return entry
+    except OSError as error:
+        entry.update({"exists": True, "state": "unreadable",
+                      "error": error.__class__.__name__})
         return entry
     if not stat.S_ISREG(info.st_mode):
         entry.update({"exists": True, "state": "not-regular"})
@@ -2019,8 +2024,9 @@ def private_home_state_observation(private_root: Path) -> dict:
     try:
         entry.update({"exists": True, "bytes": info.st_size,
                       "sha256": sha256_file(path, cap=MAX_PRIVATE_STATE_BYTES)})
-    except OSError as error:
-        raise GateRefusal(f"private home state unreadable: {path}: {error}") from None
+    except (OSError, GateRefusal) as error:
+        entry.update({"exists": True, "state": "unreadable",
+                      "error": error.__class__.__name__})
     return entry
 
 
@@ -2122,19 +2128,75 @@ def ambient_cargo_config_scan(start: Path, *, private_root: Path,
             "violations": violations}
 
 
-def path_executable_scan(path_value: str, *, private_root: Path) -> dict:
+def _path_inside_private(path: Path, private_root: Path) -> bool:
+    try:
+        return path == private_root or path.is_relative_to(private_root)
+    except ValueError:
+        return False
+
+
+def _usable_regular_file(path: Path) -> bool:
+    """True when path is an executable regular file (follows a final symlink)."""
+    try:
+        info = path.stat()
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and os.access(path, os.X_OK)
+
+
+def _classify_path_slot(candidate: Path, info: os.stat_result,
+                        *, private_root: Path) -> dict | None:
+    """Classify one PATH slot, or None so the search continues.
+
+    A usable binding is an executable regular file. A symlink is usable
+    only when its resolved target is an executable regular file. Private
+    requires that usable file to sit inside the private root. A dangling
+    symlink or non-executable slot is skipped (execvp continues). A
+    symlink to a host executable is ambient, not private.
+    """
+    if stat.S_ISLNK(info.st_mode):
+        try:
+            raw_target = os.readlink(candidate)
+        except OSError as error:
+            return {"state": "unreadable", "path": str(candidate)[:512],
+                    "error": error.__class__.__name__}
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            return None
+        if not _usable_regular_file(resolved):
+            return None
+        entry = {"path": str(candidate)[:512],
+                 "resolved_path": str(resolved)[:512],
+                 "symlink_target": str(raw_target)[:512]}
+        entry["state"] = ("private" if _path_inside_private(resolved, private_root)
+                          else "ambient")
+        return entry
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    if not os.access(candidate, os.X_OK):
+        return None
+    return {"path": str(candidate)[:512],
+            "state": ("private" if _path_inside_private(candidate, private_root)
+                      else "ambient")}
+
+
+def path_executable_scan(path_value: str, *, private_root: Path,
+                         cwd: Path | None = None) -> dict:
     """Resolve named linker/assembler tools on the child PATH.
 
-    A first-match PATH slot inside the private root is a positive private
-    binding (the same pattern as ``bin/cargo``, including a symlink). A
-    first-match slot outside the private root, or an unreadable slot that
-    cannot prove a binding, is an ambient executable path: the existing
-    pre-launch refusal records it. Absence is recorded and is not a
-    violation. Proc-macro and build-script crates compile to ``target/``
-    under the private root and inherit this PATH; unnamed further host
-    spawns cannot be bound without executing the bootstrap.
+    A private binding is an executable regular file inside the private
+    root, or a symlink whose resolved target is an executable regular
+    file inside the private root. A first-match usable slot outside the
+    private root, or an unreadable slot, is an ambient executable path:
+    the existing pre-launch refusal records it. A dangling symlink or
+    non-executable file is skipped so a later host match can refuse.
+    Absence is recorded and is not a violation. An empty PATH component
+    is the child cwd (POSIX). Proc-macro and build-script crates compile
+    to ``target/`` under the private root and inherit this PATH; unnamed
+    further host spawns cannot be bound without executing the bootstrap.
     """
-    components = [part for part in str(path_value).split(os.pathsep)]
+    components = str(path_value).split(os.pathsep)
     entries: list = []
     violations: list = []
     omitted_entries = 0
@@ -2142,8 +2204,11 @@ def path_executable_scan(path_value: str, *, private_root: Path) -> dict:
         entry = {"name": name, "state": "absent"}
         for component in components:
             if component == "":
-                continue
-            candidate = Path(component) / name
+                if cwd is None:
+                    continue
+                candidate = Path(cwd) / name
+            else:
+                candidate = Path(component) / name
             try:
                 info = candidate.lstat()
             except FileNotFoundError:
@@ -2156,22 +2221,17 @@ def path_executable_scan(path_value: str, *, private_root: Path) -> dict:
                 violations.append("unreadable-executable:" + name + ":"
                                   + str(candidate)[:512])
                 break
-            if not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
+            classified = _classify_path_slot(candidate, info,
+                                             private_root=private_root)
+            if classified is None:
                 continue
-            inside = False
-            try:
-                inside = (candidate == private_root
-                          or candidate.is_relative_to(private_root))
-            except ValueError:
-                inside = False
-            if inside:
-                entry = {"name": name, "path": str(candidate)[:512],
-                         "state": "private"}
-            else:
-                entry = {"name": name, "path": str(candidate)[:512],
-                         "state": "ambient"}
+            entry = {"name": name, **classified}
+            if classified["state"] == "ambient":
                 violations.append("ambient-executable:" + name + ":"
-                                  + str(candidate)[:512])
+                                  + classified["path"])
+            elif classified["state"] == "unreadable":
+                violations.append("unreadable-executable:" + name + ":"
+                                  + classified["path"])
             break
         if len(entries) < MAX_PROVENANCE_ENTRIES:
             entries.append(entry)
@@ -2182,9 +2242,10 @@ def path_executable_scan(path_value: str, *, private_root: Path) -> dict:
 
 
 def attach_path_executables(ambient: dict, path_value: str,
-                            *, private_root: Path) -> dict:
+                            *, private_root: Path,
+                            cwd: Path | None = None) -> dict:
     """Merge the PATH-tool scan into the pre-launch ambient findings."""
-    scan = path_executable_scan(path_value, private_root=private_root)
+    scan = path_executable_scan(path_value, private_root=private_root, cwd=cwd)
     bound = dict(ambient)
     bound["path_executables"] = scan
     bound["violations"] = list(ambient.get("violations", [])) + list(scan["violations"])
@@ -2200,6 +2261,8 @@ def artifact_refusal_message(facts: dict) -> str:
             return "bootstrap artifact escaped the private root: " + kind.split(":", 1)[1]
         if kind.startswith("artifact-missing:"):
             return "bootstrap artifact is missing or unreadable: " + kind.split(":", 1)[1]
+        if kind.startswith("artifact-oversize:"):
+            return "bootstrap artifact exceeds the digest bound: " + kind.split(":", 1)[1]
     return "bootstrap artifact could not be resolved"
 
 
@@ -2259,10 +2322,18 @@ def bootstrap_artifact_facts(log_text: str, *, oxide_source: Path,
             if not staged.is_relative_to(private_root):
                 violations.append(f"artifact-escaped:{str(staged)[:512]}")
             else:
-                artifact = {"path": raw, "resolved_path": str(staged),
-                            "bytes": staged.stat().st_size,
-                            "sha256": sha256_file(staged, cap=256 * 1024 * 1024),
-                            "src_path": main_rs}
+                try:
+                    digest = sha256_file(staged, cap=256 * 1024 * 1024)
+                except GateRefusal as error:
+                    kind = ("artifact-oversize:" if "exceeds the document bound"
+                            in str(error) else "artifact-missing:")
+                    violations.append(kind + raw)
+                except OSError:
+                    violations.append(f"artifact-missing:{raw}")
+                else:
+                    artifact = {"path": raw, "resolved_path": str(staged),
+                                "bytes": staged.stat().st_size,
+                                "sha256": digest, "src_path": main_rs}
     return {"main_rs_binding": main_rs, "candidates": candidates,
             "candidate_count": candidate_count, "oxide_bin_entries": oxid_entries,
             "malformed_lines": malformed_lines, "violations": violations,
@@ -2680,7 +2751,7 @@ def diagnostic(options: dict) -> int:
     ambient = attach_path_executables(
         ambient_cargo_config_scan(oxide_source, private_root=barge_root,
                                  cargo_home=Path(env["CARGO_HOME"])),
-        env["PATH"], private_root=barge_root)
+        env["PATH"], private_root=barge_root, cwd=oxide_source)
     provenance_inputs = {
         "run_id": run_id, "private_root": barge_root,
         "account_root": LIVE_ACCOUNT_ROOT,
@@ -4852,7 +4923,26 @@ def self_test() -> int:
     expect_ok("private PATH cc proceeds", refuse_bootstrap_launch,
               provenance_inputs_for(priv_root, priv_source),
               private_path, {"bootstrap_started_ns": 5})
-    link_root, link_source = provenance_case("path-symlink")
+    inner_root, inner_source = provenance_case("path-inner-symlink")
+    inner_bin = inner_root / "bin"
+    inner_bin.mkdir()
+    inner_tools = inner_root / "tools"
+    inner_tools.mkdir()
+    (inner_tools / "cc").write_bytes(b"inner-cc")
+    os.chmod(inner_tools / "cc", 0o755)
+    os.symlink(inner_tools / "cc", inner_bin / "cc")
+    inner_path = attach_path_executables(
+        {"violations": []},
+        str(inner_bin) + os.pathsep + str(host_tools),
+        private_root=inner_root)
+    inner_cc = [entry for entry in inner_path["path_executables"]["entries"]
+                if entry["name"] == "cc"]
+    if not inner_cc or inner_cc[0].get("state") != "private":
+        failures.append(f"inner PATH cc symlink recorded as {inner_cc or 'missing'}")
+    expect_ok("inner PATH cc symlink proceeds", refuse_bootstrap_launch,
+              provenance_inputs_for(inner_root, inner_source),
+              inner_path, {"bootstrap_started_ns": 5})
+    link_root, link_source = provenance_case("path-host-symlink")
     link_bin = link_root / "bin"
     link_bin.mkdir()
     os.symlink(host_tools / "cc", link_bin / "cc")
@@ -4862,11 +4952,66 @@ def self_test() -> int:
         private_root=link_root)
     link_cc = [entry for entry in link_path["path_executables"]["entries"]
                if entry["name"] == "cc"]
-    if not link_cc or link_cc[0].get("state") != "private":
-        failures.append(f"private PATH cc symlink recorded as {link_cc or 'missing'}")
-    expect_ok("private PATH cc symlink proceeds", refuse_bootstrap_launch,
-              provenance_inputs_for(link_root, link_source),
-              link_path, {"bootstrap_started_ns": 5})
+    if not link_cc or link_cc[0].get("state") != "ambient":
+        failures.append(f"host PATH cc symlink recorded as {link_cc or 'missing'}")
+    expect_refusal("host PATH cc symlink refuses before launch",
+                   refuse_bootstrap_launch,
+                   provenance_inputs_for(link_root, link_source),
+                   link_path, {"bootstrap_started_ns": 5})
+    dang_root, dang_source = provenance_case("path-dangling")
+    dang_bin = dang_root / "bin"
+    dang_bin.mkdir()
+    os.symlink("nowhere", dang_bin / "cc")
+    dang_path = attach_path_executables(
+        {"violations": []},
+        str(dang_bin) + os.pathsep + str(host_tools),
+        private_root=dang_root)
+    dang_cc = [entry for entry in dang_path["path_executables"]["entries"]
+               if entry["name"] == "cc"]
+    if not dang_cc or dang_cc[0].get("state") != "ambient":
+        failures.append(f"dangling PATH cc recorded as {dang_cc or 'missing'}")
+    expect_refusal("dangling PATH cc continues to host and refuses",
+                   refuse_bootstrap_launch,
+                   provenance_inputs_for(dang_root, dang_source),
+                   dang_path, {"bootstrap_started_ns": 5})
+    quiet_root, _quiet_source = provenance_case("path-dangling-quiet")
+    quiet_bin = quiet_root / "bin"
+    quiet_bin.mkdir()
+    os.symlink("nowhere", quiet_bin / "cc")
+    quiet_scan = path_executable_scan(str(quiet_bin), private_root=quiet_root)
+    quiet_cc = [entry for entry in quiet_scan["entries"] if entry["name"] == "cc"]
+    if not quiet_cc or quiet_cc[0].get("state") != "absent" or quiet_scan["violations"]:
+        failures.append(f"dangling PATH cc without host recorded as {quiet_cc}")
+    noexec_root, noexec_source = provenance_case("path-nonexec")
+    noexec_bin = noexec_root / "bin"
+    noexec_bin.mkdir()
+    (noexec_bin / "cc").write_bytes(b"not-exec")
+    os.chmod(noexec_bin / "cc", 0o644)
+    noexec_path = attach_path_executables(
+        {"violations": []},
+        str(noexec_bin) + os.pathsep + str(host_tools),
+        private_root=noexec_root)
+    noexec_cc = [entry for entry in noexec_path["path_executables"]["entries"]
+                 if entry["name"] == "cc"]
+    if not noexec_cc or noexec_cc[0].get("state") != "ambient":
+        failures.append(f"non-executable PATH cc recorded as {noexec_cc or 'missing'}")
+    expect_refusal("non-executable PATH cc continues to host and refuses",
+                   refuse_bootstrap_launch,
+                   provenance_inputs_for(noexec_root, noexec_source),
+                   noexec_path, {"bootstrap_started_ns": 5})
+    empty_root, empty_source = provenance_case("path-empty-component")
+    (empty_root / "cc").write_bytes(b"cwd-cc")
+    os.chmod(empty_root / "cc", 0o755)
+    empty_path = attach_path_executables(
+        {"violations": []}, os.pathsep,
+        private_root=empty_root, cwd=empty_root)
+    empty_cc = [entry for entry in empty_path["path_executables"]["entries"]
+                if entry["name"] == "cc"]
+    if not empty_cc or empty_cc[0].get("state") != "private":
+        failures.append(f"empty PATH component cwd cc recorded as {empty_cc or 'missing'}")
+    expect_ok("empty PATH component private cwd cc proceeds", refuse_bootstrap_launch,
+              provenance_inputs_for(empty_root, empty_source),
+              empty_path, {"bootstrap_started_ns": 5})
     absent_root, absent_source = provenance_case("path-absent")
     (absent_root / "bin").mkdir()
     absent_path = path_executable_scan(str(absent_root / "bin"),
