@@ -1134,7 +1134,8 @@ alone is insufficient.
   covering allowance, retained files and failed packets remain history. The
   6 GiB session reported 5591.8 MiB retained and an approximately 552 MiB
   whole-block clamp; that point observation is not a current reservation or
-  peak. The later 3 GiB Barge / 8 GiB Oxide grants are prospective only.
+  peak. The later 3 GiB Barge / 8 GiB Oxide grants were prospective; the
+  current Barge ceiling is 4 GiB, with Oxide unchanged at 8 GiB.
   The 300 s / 1024 MiB debug bootstrap cap remains a maximum, not a fit claim.
 - **Harness composition.** The harness crate re-roots the actual library and
   binary modules and aliases itself as `oxide_storage`, sharing one tape.
@@ -1437,9 +1438,10 @@ most 512 MiB. The increase adds no cleanup or runtime authorization and does
 not repin Barge's retained fact-only component.
 
 **Resource clamps (operator decision `af038a7e` v2; review 6584174560).**
-Whole-block scratch is a measured clamp of each prospective aggregate grant
-minus retained bytes — Barge 3 GiB and Oxide 8 GiB of Builds scratch. The
-prospective grants do not renew or raise any earlier session: the historical
+Whole-block scratch is a measured clamp of the applicable aggregate grant
+minus retained bytes. Decision `af038a7e` v2 granted Barge 3 GiB and Oxide
+8 GiB; the subsequent prospective Barge ceiling is 4 GiB, as stated above.
+These grants do not renew or raise any earlier session: the historical
 2 GiB / 6 GiB runs and their evidence (Oxide's reported 5591.8 MiB retained
 total, about 552 MiB effective against the 6 GiB grant) keep their original
 bounds and stand as historical measurement only. The effective figure is
