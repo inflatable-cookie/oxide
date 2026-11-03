@@ -2382,26 +2382,32 @@ def validate_host_tools_document(document: dict, *, rustc_tool: Path,
             "tools": sorted(names) or None}
 
 
-def reconcile_host_tools(scan: dict, document: dict) -> tuple:
-    """Reconcile the PATH-tool scan against the audited host-input bindings.
+def reconcile_host_tools(ambient: dict, document: dict) -> tuple:
+    """Adjudicate the PATH-tool scan into the candidate route's final findings.
 
-    Returns (observation, violations). A first-match usable slot outside the
-    private root is accepted only when the document binds exactly that resolved
-    path with exactly that live content hash and size; a documented tool that is
-    absent, changed or resolved elsewhere refuses, and a live ambient match with
-    no documented binding refuses. A private binding stays allowed (the
-    private-tool requirement is replaced only for the reviewed host bindings,
-    never disabled globally). Absent and undocumented stays absent. Unreadable
-    slots keep the scan's violation.
+    Takes the merged pre-launch ambient dict (its `path_executables` scan and
+    its raw `violations`) and the audited host-input bindings. Returns
+    (observation, final_violations): the raw scan's `ambient-executable:`
+    findings are REPLACED by this document's verdict — a first-match usable
+    slot outside the private root is accepted only when the document binds
+    exactly that resolved path with exactly that live content hash and size;
+    a documented tool that is absent, changed or resolved elsewhere refuses,
+    and a live ambient match with no documented binding refuses. Every other
+    raw finding (ambient or planted Cargo configuration, unreadable
+    executables) is carried through unchanged, so an unreadable slot still
+    refuses and a private binding stays allowed: the private-tool requirement
+    is replaced only for the reviewed host bindings, never disabled globally.
+    Absent and undocumented stays absent.
     """
     if (not isinstance(document, dict) or document.get("schema") != SCHEMA_HOST_TOOLS):
         raise GateRefusal("host-tools document is required for the candidate route")
+    scan = ambient.get("path_executables", {}) if isinstance(ambient, dict) else {}
     bound: dict = {}
     for entry in document.get("tools", []):
         if isinstance(entry, dict) and isinstance(entry.get("name"), str):
             bound[entry["name"]] = entry
     observation: list = []
-    violations: list = []
+    adjudicated: list = []
     for entry in scan.get("entries", []):
         name = entry.get("name")
         state = entry.get("state")
@@ -2415,13 +2421,13 @@ def reconcile_host_tools(scan: dict, document: dict) -> tuple:
             except (OSError, GateRefusal) as error:
                 recorded["state"] = "unreadable"
                 recorded["error"] = error.__class__.__name__
-                violations.append("unreadable-host-tool:" + name)
+                adjudicated.append("unreadable-host-tool:" + name)
             else:
                 if (binding is None or Path(binding["path"]) != resolved
                         or binding["sha256"] != live_sha256 or binding["bytes"] != live_bytes):
                     recorded["bound"] = bool(binding)
-                    violations.append("unbound-ambient-executable:" + name + ":"
-                                      + str(resolved)[:512])
+                    adjudicated.append("unbound-ambient-executable:" + name + ":"
+                                       + str(resolved)[:512])
                 else:
                     recorded.update({"resolved_path": str(resolved), "sha256": live_sha256,
                                      "bytes": live_bytes,
@@ -2429,8 +2435,8 @@ def reconcile_host_tools(scan: dict, document: dict) -> tuple:
                                              "admission identity and does not confine writes"})
         elif state == "private":
             recorded["resolved_path"] = entry.get("resolved_path") or entry.get("path")
-        elif state == "unreadable":
-            violations.append("unreadable-host-tool:" + name)
+        # A scan-unreadable slot already carries its own raw
+        # `unreadable-executable:` finding, kept below; no second verdict.
         if len(observation) < MAX_PROVENANCE_ENTRIES:
             observation.append(recorded)
     documented_names = set(bound)
@@ -2438,7 +2444,12 @@ def reconcile_host_tools(scan: dict, document: dict) -> tuple:
                   if entry.get("state") == "ambient"}
     stale = sorted(documented_names - live_names)
     if stale:
-        violations.append("documented-host-tool-not-live:" + ",".join(stale[:8]))
+        adjudicated.append("documented-host-tool-not-live:" + ",".join(stale[:8]))
+    # The candidate route's violations: every raw finding except the
+    # ambient-executable ones this document adjudicates, then the verdicts.
+    violations = [finding for finding in ambient.get("violations", [])
+                  if isinstance(finding, str)
+                  and not finding.startswith("ambient-executable:")] + adjudicated
     return observation, violations
 
 
@@ -2556,11 +2567,13 @@ def copy_candidate_artifact(source: Path, fresh_root: Path, expected_sha256: str
                             expected_bytes: int) -> dict:
     """Copy the retained candidate into the fresh guard-owned root, rehash it.
 
-    The source must be the planner-digest-bound regular file validated by
-    validate_candidate_origin; the copy is created owner-only and exclusive,
-    rehashed in full, and both endpoint identities are re-checked after the
-    transfer so a same-name swap, truncation or in-place change during the
-    copy refuses. The origin tree is never written.
+    The source must be the planner-digest-bound regular executable file
+    validated by validate_candidate_origin; the copy is created owner-only,
+    owner-executable (0o700, so `bin/oxide` can actually exec it) and
+    exclusive, rehashed in full, mode-checked, and both endpoint identities
+    are re-checked after the transfer so a same-name swap, truncation or
+    in-place change during the copy refuses. The origin tree is never
+    written.
     """
     try:
         before = os.lstat(source)
@@ -2568,6 +2581,8 @@ def copy_candidate_artifact(source: Path, fresh_root: Path, expected_sha256: str
         raise GateRefusal(f"candidate source vanished before the copy: {error}") from None
     if not stat.S_ISREG(before.st_mode):
         raise GateRefusal("candidate source is not a regular file (symlink swap refused)")
+    if not os.access(source, os.X_OK):
+        raise GateRefusal("candidate origin artifact is not executable")
     relative = Path("candidate") / CANDIDATE_ORIGIN_RELATIVE.name
     try:
         candidate_dir = private_dir(fresh_root, Path("candidate"))
@@ -2580,7 +2595,7 @@ def copy_candidate_artifact(source: Path, fresh_root: Path, expected_sha256: str
     out = None
     try:
         out = os.open(relative.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                      0o600, dir_fd=fd)
+                      0o700, dir_fd=fd)
         source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
         try:
             opened = os.fstat(source_fd)
@@ -2623,6 +2638,8 @@ def copy_candidate_artifact(source: Path, fresh_root: Path, expected_sha256: str
     copy_stat = os.lstat(destination)
     if copy_stat.st_size != expected_bytes:
         raise GateRefusal("candidate copy size differs from the retained candidate")
+    if not stat.S_IMODE(copy_stat.st_mode) & 0o100 or copy_stat.st_mode & 0o077:
+        raise GateRefusal("candidate copy is not an owner-only executable")
     try:
         final = os.lstat(source)
     except OSError as error:
@@ -2631,7 +2648,9 @@ def copy_candidate_artifact(source: Path, fresh_root: Path, expected_sha256: str
             (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns):
         raise GateRefusal("candidate source changed identity after the copy")
     return {"origin_path": str(source), "origin_identity": [before.st_dev, before.st_ino],
-            "path": str(destination), "bytes": copy_stat.st_size, "sha256": copy_digest}
+            "origin_mode": stat.S_IMODE(before.st_mode),
+            "path": str(destination), "bytes": copy_stat.st_size,
+            "sha256": copy_digest, "mode": stat.S_IMODE(copy_stat.st_mode)}
 
 
 def build_candidate_provenance(inputs: dict, *, origin: dict, guard: dict, artifact: dict,
@@ -3292,11 +3311,12 @@ def diagnostic(options: dict) -> int:
             ambient_cargo_config_scan(oxide_source, private_root=barge_root,
                                       cargo_home=Path(env["CARGO_HOME"])),
             env["PATH"], private_root=barge_root, cwd=oxide_source)
-        host_observation, host_violations = reconcile_host_tools(
-            ambient["path_executables"], host_tools_doc)
+        host_observation, candidate_findings = reconcile_host_tools(ambient, host_tools_doc)
         ambient = dict(ambient)
         ambient["host_tool_bindings"] = host_observation
-        ambient["violations"] = list(ambient["violations"]) + host_violations
+        # The adjudicated findings REPLACE the raw scan verdicts: a bound
+        # audited host input no longer carries its ambient-executable refusal.
+        ambient["violations"] = candidate_findings
         candidate_tools = {
             "python": tool_identity(python, 256 * 1024 * 1024),
             "supervisor": tool_identity(supervisor_tool, 512 * 1024),
@@ -5801,6 +5821,7 @@ def self_test() -> int:
     cand_artifact = cand / CANDIDATE_ORIGIN_RELATIVE
     cand_artifact.parent.mkdir(parents=True, exist_ok=True)
     cand_artifact.write_bytes(b"candidate-bytes")
+    os.chmod(cand_artifact, 0o755)
 
     def cand_log_line(path, source):
         return json.dumps({"reason": "compiler-artifact",
@@ -5960,7 +5981,8 @@ def self_test() -> int:
                    pinned_lock_sha256=good_options["candidate_lock_sha256"],
                    pinned_toolchain_sha256=good_options["candidate_toolchain_sha256"])
 
-    # Candidate copy: rehash, exclusive create and identity re-checks.
+    # Candidate copy: rehash, exclusive create, owner-executable mode and
+    # identity re-checks.
     copy_root = fixture.root / "candidate-copy-root"
     copy_root.mkdir()
     os.chmod(copy_root, 0o700)
@@ -5971,6 +5993,18 @@ def self_test() -> int:
         failures.append("candidate copy lost the artifact bytes")
     if copy_facts is not None and copy_facts["sha256"] != good_options["expect_candidate"]:
         failures.append("candidate copy digest mismatch was not recorded")
+    copied_path = copy_root / "candidate/oxide"
+    if not copied_path.is_file() or not os.access(copied_path, os.X_OK) \
+            or copied_path.stat().st_mode & 0o077:
+        failures.append("candidate copy is not an owner-only executable")
+    if copy_facts is not None and copy_facts.get("mode") != stat.S_IMODE(copied_path.stat().st_mode):
+        failures.append("candidate copy mode fact disagrees with the file")
+    noexec_origin = cand_origin_case("noexec-origin")
+    (noexec_origin / CANDIDATE_ORIGIN_RELATIVE).write_bytes(b"candidate-bytes")
+    os.chmod(noexec_origin / CANDIDATE_ORIGIN_RELATIVE, 0o644)
+    expect_refusal("non-executable origin artifact refuses the copy", copy_candidate_artifact,
+                   noexec_origin / CANDIDATE_ORIGIN_RELATIVE, fixture.root / "copy-root-noexec",
+                   sha256_bytes(b"candidate-bytes"), len(b"candidate-bytes"))
     expect_refusal("second candidate copy refuses", copy_candidate_artifact,
                    cand_artifact, copy_root, good_options["expect_candidate"],
                    good_options["candidate_bytes"])
@@ -6064,38 +6098,66 @@ def self_test() -> int:
 
     host_doc_match = host_tools_document([host_tool_binding_cc])
     reconciled, reconciled_violations = expect_ok(
-        "bound host tool reconciles", reconcile_host_tools, ambient_path["path_executables"],
+        "bound host tool reconciles", reconcile_host_tools, ambient_path,
         host_doc_match)
     if reconciled_violations:
-        failures.append(f"bound host tool produced violations: {reconciled_violations}")
+        failures.append(f"bound host tool left violations: {reconciled_violations}")
     cc_observation = [entry for entry in (reconciled or []) if entry.get("name") == "cc"]
     if not cc_observation or cc_observation[0].get("state") != "ambient" or \
             "not private" not in cc_observation[0].get("note", ""):
         failures.append("audited host tool was not recorded as a host input")
     _, unbound_violations = expect_ok(
         "unbound host tool refuses", reconcile_host_tools,
-        ambient_path["path_executables"], host_tools_document([]))
+        ambient_path, host_tools_document([]))
     if not any(v.startswith("unbound-ambient-executable:cc:") for v in unbound_violations):
         failures.append("unbound ambient host tool produced no violation")
     _, stale_violations = expect_ok(
         "changed host tool binding refuses", reconcile_host_tools,
-        ambient_path["path_executables"],
+        ambient_path,
         host_tools_document([dict(host_tool_binding_cc, sha256=sha256_bytes(b"stale"))]))
     if not any(v.startswith("unbound-ambient-executable:cc:") for v in stale_violations):
         failures.append("changed host tool binding produced no violation")
     _, stale_doc_violations = expect_ok(
         "documented absent host tool refuses", reconcile_host_tools,
-        {"entries": [{"name": "cc", "state": "absent"}], "violations": []},
+        {"path_executables": {"entries": [{"name": "cc", "state": "absent"}],
+                              "violations": []}, "violations": []},
         host_tools_document([host_tool_binding_cc]))
     if not any(v.startswith("documented-host-tool-not-live:cc") for v in stale_doc_violations):
         failures.append("documented but absent host tool produced no violation")
     priv_reconciled, priv_reconciled_violations = expect_ok(
         "private binding stays allowed", reconcile_host_tools,
-        private_path["path_executables"], host_tools_document([]))
+        private_path, host_tools_document([]))
     if priv_reconciled_violations:
         failures.append(f"private binding was not allowed: {priv_reconciled_violations}")
     expect_refusal("host-tools document missing for reconcile refuses",
-                   reconcile_host_tools, ambient_path["path_executables"], {"schema": "other"})
+                   reconcile_host_tools, ambient_path, {"schema": "other"})
+
+    # Composition regression (review 6598012622, host_tool_prelaunch_composition):
+    # scan -> adjudication -> pre-launch control must compose: a matching
+    # host-tools document leaves NO violation, the raw ambient-executable
+    # findings are replaced rather than accumulated, and unrelated findings
+    # survive unchanged into the same final list.
+    composed_root, composed_source = provenance_case("candidate-composed")
+    (composed_root / "bin").mkdir()
+    composed_ambient = attach_path_executables(
+        {"violations": []},
+        str(composed_root / "bin") + os.pathsep + str(host_tools),
+        private_root=composed_root)
+    raw_ambient_findings = list(composed_ambient["violations"])
+    if not any(v.startswith("ambient-executable:cc:") for v in raw_ambient_findings):
+        failures.append("composition fixture lost the raw ambient-executable finding")
+    composed_observation, composed_violations = expect_ok(
+        "matching document clears the composed findings", reconcile_host_tools,
+        composed_ambient, host_doc_match)
+    if composed_violations:
+        failures.append(f"composed matching document left violations: {composed_violations}")
+    with_config = dict(composed_ambient,
+                       violations=["ambient-cargo-config:found"] + raw_ambient_findings)
+    _, config_violations = expect_ok(
+        "unrelated findings survive adjudication", reconcile_host_tools,
+        with_config, host_doc_match)
+    if config_violations != ["ambient-cargo-config:found"]:
+        failures.append(f"candidate composition changed unrelated findings: {config_violations}")
 
     # Candidate provenance packet: retained before a refusal, bounded.
     def candidate_inputs_for(root, source):
@@ -6137,6 +6199,12 @@ def self_test() -> int:
     expect_ok("clean candidate scan proceeds", refuse_candidate_launch,
               candidate_inputs_for(clean_root, clean_source),
               {"violations": [], "host_tool_bindings": []},
+              {"root": str(cand)}, {"clock": "CLOCK_UPTIME_RAW"})
+    gate_root, gate_source = provenance_case("candidate-clean-gate")
+    gate_ambient = dict(composed_ambient, host_tool_bindings=composed_observation,
+                        violations=composed_violations)
+    expect_ok("matching host tools pass the pre-launch control", refuse_candidate_launch,
+              candidate_inputs_for(gate_root, gate_source), gate_ambient,
               {"root": str(cand)}, {"clock": "CLOCK_UPTIME_RAW"})
 
     # Candidate argument binding: every planner-bound digest is required.
