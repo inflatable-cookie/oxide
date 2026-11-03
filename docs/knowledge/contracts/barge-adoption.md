@@ -1429,6 +1429,13 @@ heavy Effigy admission through the audited hook, with the audited pair
 preserved in every child environment; no second admission seam exists and no
 Git-verified source archive is ever edited.
 
+The current prospective private-validation ceiling is **4 GiB for Barge** and
+8 GiB for Oxide. The preceding 3 GiB Barge grant and its packets remain
+historical. Each run still clamps its budget to the aggregate ceiling minus
+retained bytes; the private pool remains 256 MiB and the native guard is at
+most 512 MiB. The increase adds no cleanup or runtime authorization and does
+not repin Barge's retained fact-only component.
+
 **Resource clamps (operator decision `af038a7e` v2; review 6584174560).**
 Whole-block scratch is a measured clamp of each prospective aggregate grant
 minus retained bytes — Barge 3 GiB and Oxide 8 GiB of Builds scratch. The
@@ -1749,8 +1756,9 @@ two consumer source-check reservations add 20 s, leaving at most 1150 s
 unallocated before actual preparation/runtime. These are conservative
 reservations, not measured runtime; the earlier 309-second ledger and every
 historical charge remain with no reset or refund. Prospective
-aggregate scratch caps remain Barge 3 GiB and Oxide 8 GiB and refuse when
-retained bytes leave no space. At most ONE Queue-routed candidate
+aggregate scratch caps for that ruling were Barge 3 GiB and Oxide 8 GiB and
+refused when retained bytes left no space. The later prospective Barge 4 GiB
+correction is recorded above and does not rewrite those historical packets. At most ONE Queue-routed candidate
 isolation qualification and then at most ONE safe covering batch per
 capture task at its exact approved head, each with the qualified guard
 (`fcfda2b0…` unchanged) and fresh one-use claims; no automatic retry,
