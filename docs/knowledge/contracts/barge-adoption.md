@@ -1758,7 +1758,17 @@ provider's `GateRefusal`; the caller must first read and hash the actual
 documents and must independently enforce its own fixed selector contract,
 guard, claim, paths and limits. Oxide's `verify_documents` and `consume`
 add its fixed selectors and guarded execution; Barge must not copy that fact
-policy or treat the fact function alone as admission. The thin tape entry accepts only
+policy or treat the fact function alone as admission. In particular, Barge's
+`candidate_runtime` caller must pass the producer gate, candidate and separate
+qualification documents, the actual byte digests (`gate`, `candidate`,
+`guard`, `case_guard`, `case_log`, `live_before`, `live_after`) and Barge's
+bound product head/tree. It must replace its expected `verify_candidate`
+boolean-result interface with this integer-returning fact call; its existing
+guard, single-use claim, source/tool verification, offline dependency setup,
+live inventory and Barge selector/cap checks remain independently required.
+No positive execution or admission field may be synthesized from the returned
+number. The component imports the shared provider from its own directory, so
+both staged source files must be independently hash-bound. The thin tape entry accepts only
 `--input <path> --sha256 <planner-digest>` under the shared supervisor. The
 input's `paths` and `digests` bind the producer gate and candidate receipts,
 outer and status-case guard receipts, both live inventories, independent
