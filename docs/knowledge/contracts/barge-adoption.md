@@ -1511,7 +1511,16 @@ preparation manifest binds each unissued document digest; audit component
 entries name the source pairs rather than their accompanying analysis text. The
 preparation root is retained and counted before the diagnostic. All command
 and environment bindings are fixed before dispatch; changing the source needs
-new source review. The displayed diagnostic scratch budget is a planner-bound
+new source review. The candidate diagnostic binds its qualified outer guard to the separately
+issued remaining allocation after the preparation charge: the actual guard
+limit must exceed 30 seconds and may not exceed either issued authority. Its
+effective deadline is the earliest of the guard deadline and the issued wall
+bounds; bounded source staging, input walks and final inventories use it. Each
+nested guard samples the remaining time again immediately before launch and
+refuses at 30 seconds or less. Historical 1200-second packets retain their
+original limits; this check does not create a new allowance.
+
+The displayed diagnostic scratch budget is a planner-bound
 clamp, and the repository selector's 512 MiB default refuses if it does not
 fit the measured remainders.
 
