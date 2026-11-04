@@ -1530,3 +1530,8 @@ run = "python3 scripts/bounded-test.py --limit 1200 --scratch-budget-mib 512 -- 
 [tasks."rust:profile-reservation:test"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- oxide test --bin oxide --locked profile_reservation -- --test-threads=1"
+
+# Uncounted embedded cases only; same qualified guard and fixed suite bounds.
+[tasks."proof:tape-prune:embedded-diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- oxide test --test tape_prune_eval --locked -- --diagnostic"

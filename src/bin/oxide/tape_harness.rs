@@ -179,7 +179,7 @@ impl Case {
         })
     }
 
-    /// STATIC cases forbid every effect; the EFFECT cases declare theirs.
+    /// Historical EFFECT names remain stable; attempts never imply completion.
     fn static_case(self) -> bool {
         matches!(
             self,
@@ -991,7 +991,7 @@ fn build_fixture(root: &Path, spec: &FixtureSpec) -> Result<FixturePaths, String
     }
 
     // The control state: fully fenced version 9, or the unfenced successor
-    // document the EFFECT-2 case upgrades.
+    // document the EFFECT-2 read-only case must leave unchanged.
     let state = if spec.fenced_state {
         serde_json::json!({
             "version": 9,
@@ -2371,34 +2371,11 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
         .unwrap_or_default();
 
     if matches!(case, Case::Base | Case::Effect1 | Case::Effect2) {
-        let expected: &[(&str, &str, &str, &str)] = match case {
-            Case::Base => &[],
-            Case::Effect1 => &[(
-                "lock-create",
-                "admission",
-                "create",
-                "scratch/pool/oxide-managed/admission.lock",
-            )],
-            Case::Effect2 => &[(
-                "fence",
-                "managed-control",
-                "save",
-                "scratch/pool/oxide-managed/state.json",
-            )],
-            _ => unreachable!(),
-        };
-        let transient_count = if case == Case::Effect2 { 2 } else { 0 };
-        let completed_effects = doc
-            .effects
-            .iter()
-            .filter(|effect| {
-                effect.get("attempted").and_then(|value| value.as_bool()) == Some(false)
-            })
-            .count();
         check(
-            completed_effects == expected.len() + transient_count
-                && diff_effects.len() == expected.len(),
-            "completed transient and persistent effects match their declared counts",
+            doc.effects.iter().all(|effect| {
+                effect.get("attempted").and_then(|value| value.as_bool()) == Some(true)
+            }) && diff_effects.is_empty(),
+            "read-only evaluation has no completed effects or persistent fixture diff",
         )?;
         check(
             doc.effects.iter().any(|effect| {
@@ -2407,49 +2384,10 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
             }),
             "the O_CREAT pool-lock open remains an explicitly uncertain attempt",
         )?;
-        if case == Case::Effect2 {
-            for (kind, site, attempted) in [
-                ("create", "managed-admission-open", true),
-                ("create", "managed-control-temp", false),
-                ("save", "managed-control-temp", false),
-            ] {
-                check(
-                    doc.effects
-                        .iter()
-                        .filter(|effect| {
-                            effect.get("kind").and_then(|value| value.as_str()) == Some(kind)
-                                && effect.get("site").and_then(|value| value.as_str()) == Some(site)
-                                && effect.get("attempted").and_then(|value| value.as_bool())
-                                    == Some(attempted)
-                        })
-                        .count()
-                        == 1,
-                    "the reached temporary or uncertain effect occurs exactly once",
-                )?;
-            }
-        }
-        for (taped, site, diff, rel) in expected {
-            check(
-                doc.effects.iter().any(|effect| {
-                    effect.get("kind").and_then(|v| v.as_str()) == Some(*taped)
-                        && effect.get("site").and_then(|v| v.as_str()) == Some(*site)
-                        && effect.get("attempted").and_then(|v| v.as_bool()) == Some(false)
-                        && effect.get("path").and_then(|v| v.as_str()) == root.join(rel).to_str()
-                }),
-                "declared effect appears on tape",
-            )?;
-            check(
-                diff_effects.iter().any(|effect| {
-                    effect.get("kind").and_then(|v| v.as_str()) == Some(*diff)
-                        && effect.get("path").and_then(|v| v.as_str()) == Some(*rel)
-                }),
-                "declared effect appears in fixture diff",
-            )?;
-        }
     }
 
     match case {
-        Case::Base => {
+        Case::Base | Case::Effect2 => {
             check(
                 outcome_state(&doc) == "completed",
                 &format!("BASE completes: {}", outcome_reason(&doc)),
@@ -2561,42 +2499,28 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
             )?;
         }
         Case::Effect1 => {
+            // The evaluator completes with a conservative batch refusal, not
+            // a chain error: every root carries the missing-lock reason.
+            let result = doc.outcome.get("result");
+            let entries = result
+                .and_then(|result| result.get("entries"))
+                .and_then(|entries| entries.as_array());
             check(
-                doc.effects.iter().any(|effect| {
-                    effect.get("kind").and_then(|k| k.as_str()) == Some("lock-create")
-                }),
-                "the absent admission lock's real create is an effect row",
-            )?;
-            let created_lock = diff_effects.iter().any(|effect| {
-                effect.get("path").and_then(|p| p.as_str())
-                    == Some("scratch/pool/oxide-managed/admission.lock")
-                    && effect.get("kind").and_then(|k| k.as_str()) == Some("create")
-            });
-            check(
-                created_lock,
-                "the fixture diff positively shows the lock create",
+                outcome_state(&doc) == "completed"
+                    && result.and_then(|result| result.get("complete"))
+                        .and_then(|value| value.as_bool()) == Some(false)
+                    && entries.is_some_and(|entries| entries.len() == 3 && entries.iter().all(|entry| {
+                        entry.get("candidate").is_some_and(|value| value.is_null())
+                            && entry.get("kept").and_then(|value| value.as_str()).is_some_and(|reason| {
+                                reason.contains("writer custody could not be witnessed (the internal pool's admission lock is missing)")
+                            })
+                    })),
+                "the missing admission lock refuses custody for the whole incomplete batch",
             )?;
             check(
-                !doc.effects.iter().any(|effect| {
-                    effect
-                        .get("kind")
-                        .and_then(|k| k.as_str())
-                        .map_or(false, |k| k == "save" || k == "fence")
-                }),
-                "an already-fenced control is not rewritten",
+                !paths.control.join("admission.lock").exists(),
+                "the missing admission lock remains absent",
             )?;
-        }
-        Case::Effect2 => {
-            let state_changed = diff_effects.iter().any(|effect| {
-                effect.get("path").and_then(|p| p.as_str())
-                    == Some("scratch/pool/oxide-managed/state.json")
-            });
-            check(state_changed, "the missing fences are durably saved")?;
-            let lock_untouched = !diff_effects.iter().any(|effect| {
-                effect.get("path").and_then(|p| p.as_str())
-                    == Some("scratch/pool/oxide-managed/admission.lock")
-            });
-            check(lock_untouched, "the present lock is not recreated")?;
         }
         Case::RegistryMissing => {
             check(
@@ -2658,7 +2582,7 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
     Ok(())
 }
 
-fn self_check(pure_only: bool) -> Result<(), String> {
+fn self_check(pure_only: bool, diagnostic: bool) -> Result<(), String> {
     let base = std::env::temp_dir();
     let dir = base.join(format!(
         "tape-prune-self-check-{}-{}",
@@ -2680,7 +2604,7 @@ fn self_check(pure_only: bool) -> Result<(), String> {
         effect_reconciliation_check(&dir).map_err(|failure| failure.what)?;
         volume_window_reconciliation_check(&dir).map_err(|failure| failure.what)?;
         if !pure_only {
-            let external = fixture_volume(&dir).is_some();
+            let mut failures = Vec::new();
             for case in [
                 Case::RegistryMissing,
                 Case::UnsettledIntent,
@@ -2688,10 +2612,35 @@ fn self_check(pure_only: bool) -> Result<(), String> {
                 Case::Effect1,
                 Case::Effect2,
             ] {
-                fixture_case(&dir, case, false).map_err(|failure| failure.what)?;
+                let result = fixture_case(&dir, case, false);
+                println!(
+                    "oxide: embedded {}: {}",
+                    case.name(),
+                    if result.is_ok() { "passed" } else { "failed" }
+                );
+                if let Err(failure) = result {
+                    if !diagnostic {
+                        return Err(failure.what);
+                    }
+                    failures.push(format!("{}: {}", case.name(), failure.what));
+                }
             }
-            fixture_case(&dir, Case::Base, true).map_err(|failure| failure.what)?;
-            let _ = external;
+            let result = fixture_case(&dir, Case::Base, true);
+            println!(
+                "oxide: embedded BASE disconnected: {}",
+                if result.is_ok() { "passed" } else { "failed" }
+            );
+            if let Err(failure) = result {
+                failures.push(format!("BASE disconnected: {}", failure.what));
+            }
+            if diagnostic {
+                return Err(format!(
+                    "uncounted diagnostic; qualified=false; failures={failures:?}"
+                ));
+            }
+            if !failures.is_empty() {
+                return Err(failures.join("; "));
+            }
         }
         Ok(())
     })();
@@ -2709,7 +2658,7 @@ fn self_check(pure_only: bool) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: tape_prune_eval [--self-check] [--fixture-root <dir> --manifest <path> --transcript-out <path> --case <CASE>]".to_owned()
+    "usage: tape_prune_eval [--self-check | --diagnostic] [--fixture-root <dir> --manifest <path> --transcript-out <path> --case <CASE>]".to_owned()
 }
 
 fn main() {
@@ -2725,7 +2674,7 @@ fn main() {
         }
     }
     if args.is_empty() {
-        let code = match self_check(false) {
+        let code = match self_check(false, false) {
             Ok(()) => 0,
             Err(reason) => {
                 eprintln!("oxide: prune capture harness: {reason}");
@@ -2767,8 +2716,15 @@ fn main() {
                 }
             }
         }
+        Some("--diagnostic") if args.len() == 1 => {
+            let reason = self_check(false, true)
+                .err()
+                .unwrap_or_else(|| "diagnostic unexpectedly passed".to_owned());
+            eprintln!("oxide: prune capture harness: {reason}");
+            std::process::exit(1);
+        }
         Some("--self-check") => {
-            let code = match self_check(true) {
+            let code = match self_check(true, false) {
                 Ok(()) => 0,
                 Err(reason) => {
                     eprintln!("oxide: prune capture harness: {reason}");

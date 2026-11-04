@@ -868,8 +868,8 @@ always recorded.
 | WRT-RETIRED-CLEAN | retired record, no lost fact, no holders | skipped → custody clear → may proceed to candidate | retired without lost fact classified unknown → kept | EXPLAIN-OR-BLOCK |
 | FENCE-MISSING | outputs control fence absent | `require_ready` refusal (not initialized), nothing written | control unknown → every covered root kept | MATCH-KEPT |
 | FENCE-UNKNOWN | unknown fence version/owner | keep/refuse batch | keep every covered root | MATCH |
-| EFFECT-1 | `admission.lock` absent (DYNAMIC) | real lock create + fence saves recorded as effects, custody then evaluated | `shared_if_present` observes nothing; no effect | declared effects exactly; per-engine record |
-| EFFECT-2 | admission state missing accounting fences (DYNAMIC) | real fence saves recorded as effects; evaluation proceeds | custody parse unaffected → proceeds | MATCH on fates + declared Oxide effects |
+| EFFECT-1 | `admission.lock` absent (DYNAMIC) | missing existing lock refuses custody; incomplete batch, every root kept; no completed effect | `shared_if_present` observes nothing; no effect | specific refusal and no completed effect; per-engine record |
+| EFFECT-2 | admission state missing accounting fences (DYNAMIC) | read-only custody parses the old state without upgrading fences; evaluation proceeds | custody parse unaffected → proceeds | MATCH on fates; no completed fence save |
 | DECL-MISSING | area not declared | unaffected (candidate) | command refusal: no release policy | SCOPE (declared refusal; no per-root parity) |
 | DECL-POLICY-NONE | area declared `prune: none` | candidate | kept by policy | CONFIG (configuration difference, no parity claim) |
 | LEG-UNLISTED | R-C unlisted (BASE) | kept: legacy, operator list required | kept: D-3 partition | MATCH |
@@ -904,12 +904,14 @@ never parity. Each names its realization and oracle.
    self-test rejects same-pid/different-start reuse. ID-DEVICE-LIVE and
    VOL-REMOVED-DURING bind the changed mount/device/UUID epoch; a same-UUID
    remount must reconcile as a declared remount, never as a fresh identity.
-6. **Absent admission lock and missing fence cause real create/save
-   attempts.** EFFECT-1/EFFECT-2 record them as effect rows and a per-engine
-   record; they are never hidden by a mock, repaired between engines, or read
-   as attempted write parity. Pending holding or eviction reconciliation
-   reached through `ledger_view` is recorded the same way and is a stop, not a
-   read.
+6. **Missing admission inputs stay read-only.** EFFECT-1 must record the
+   missing internal admission lock's custody refusal on every kept row in an
+   incomplete batch, with no candidate, completed effect or persistent diff.
+   EFFECT-2 keeps its existing lock and old accounting state unchanged and
+   follows BASE evaluation. The pool-lock `O_CREAT` open remains an uncertain
+   attempt, never completed creation or write parity. Pending holding or
+   eviction reconciliation reached through `ledger_view` is still a stop,
+   not a read. These two cases provide no positive completed-write coverage.
 7. **Second reads under changed epochs.** Barge's marker reread under its
    second root-id lock and Oxide's ancestry revalidation must each appear as a
    distinct bound occurrence whose outcome equals the first and the manifest;
@@ -1331,10 +1333,20 @@ alone is insufficient.
   carries the four admission fences, `outputs_init` ready, the pool lock and
   the admission lock. BASE expects no confirmed effect and an empty fixture
   diff, but the real pool-lock `O_CREAT` open remains an uncertain attempt,
-  so its transcript is insufficient for parity. The EFFECT cases also record
-  actual temporary operations and uncertain attempts, alongside the final
-  admission-lock creation or fence save; fixture diffs corroborate only the
-  surviving changes. These source assertions have not been executed.
+  so its transcript is insufficient for parity. The historical EFFECT names do not promise writes: EFFECT-1 requires the
+  specific missing-lock custody refusal and an incomplete whole-batch keep;
+  EFFECT-2 uses the same outcome assertions as BASE and leaves the old fences
+  unchanged. Both forbid any completed effect or persistent fixture diff.
+  `PoolWitness::take_admission` opens only an existing lock; `read_state`
+  parses through a read-only descriptor and never invokes the fence writers.
+  This path offers no real positive lock-create/fence-save coverage. Pure
+  effect bookkeeping and reconciliation controls remain, but supply no
+  engine-write or parity credit. Completeness acceptance is unchanged.
+  `--diagnostic` keeps going through all five embedded cases and the
+  disconnected BASE control, reports each result, retains its fixture root,
+  and always exits nonzero with `qualified=false`; the no-argument suite
+  remains fail-fast. The fixed `proof:tape-prune:embedded-diagnostic` selector
+  runs only that harness under the qualified guard at 600 s / 512 MiB.
 - **Validation and export.** The final executable and its build route must be
   identified from the reviewed source and recorded with its digest, lock and
   toolchain before X-S2 consumes it. The final head still needs its covering
