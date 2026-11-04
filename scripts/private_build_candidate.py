@@ -230,7 +230,7 @@ def _consume(options, *, execute=None):
             == issuance['candidate_sha256'] and os.access(candidate_path, os.X_OK), 'candidate binary changed')
     require(type(issuance.get('scratch_mib')) is int and 1 <= issuance['scratch_mib'] <= 512
             and type(issuance.get('pool_cap_bytes')) is int
-            and 0 < issuance['pool_cap_bytes'] <= provider.OXIDE_CAP_BYTES
+            and 0 < issuance['pool_cap_bytes'] <= provider.OXIDE_POOL_VALIDATOR_MAX_BYTES
             and type(issuance.get('expires_ns')) is int, 'issuance bounds invalid')
     retained = [Path(value) for value in issuance['retained_roots']]
     require(retained and len(retained) == len(set(retained))

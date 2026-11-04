@@ -326,6 +326,16 @@ class CandidateTest(unittest.TestCase):
             child.assert_not_called()
             docs['issuance']['expires_ns'] = 999
             self.assertEqual(consumer._consume(options, execute=child), 'mock-only')
+            child.reset_mock()
+            docs['issuance']['pool_cap_bytes'] = 8 * 1024 * 1024 * 1024
+            self.assertEqual(consumer._consume(options, execute=child), 'mock-only')
+            child.reset_mock()
+            for invalid_pool in (8 * 1024 * 1024 * 1024 + 1, 9 * 1024 * 1024 * 1024,
+                                 True, float(256 * 1024 * 1024), None, 0):
+                docs['issuance']['pool_cap_bytes'] = invalid_pool
+                with self.assertRaises(provider.GateRefusal):
+                    consumer._consume(options, execute=child)
+                child.assert_not_called()
 
 
 if __name__ == '__main__':

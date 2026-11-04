@@ -1134,8 +1134,8 @@ alone is insufficient.
   covering allowance, retained files and failed packets remain history. The
   6 GiB session reported 5591.8 MiB retained and an approximately 552 MiB
   whole-block clamp; that point observation is not a current reservation or
-  peak. The later 3 GiB Barge / 8 GiB Oxide grants were prospective; the
-  current Barge ceiling is 4 GiB, with Oxide unchanged at 8 GiB.
+  peak. The later 3 GiB and 4 GiB Barge / 8 GiB Oxide grants were
+  prospective at the time; current ceilings are 5 GiB Barge / 9 GiB Oxide.
   The 300 s / 1024 MiB debug bootstrap cap remains a maximum, not a fit claim.
 - **Harness composition.** The harness crate re-roots the actual library and
   binary modules and aliases itself as `oxide_storage`, sharing one tape.
@@ -1430,17 +1430,18 @@ heavy Effigy admission through the audited hook, with the audited pair
 preserved in every child environment; no second admission seam exists and no
 Git-verified source archive is ever edited.
 
-The current prospective private-validation ceiling is **4 GiB for Barge** and
-8 GiB for Oxide. The preceding 3 GiB Barge grant and its packets remain
-historical. Each run still clamps its budget to the aggregate ceiling minus
-retained bytes; the private pool remains 256 MiB and the native guard is at
+The current prospective private-validation ceiling is **5 GiB for Barge** and
+9 GiB for Oxide. The preceding 3 GiB and 4 GiB Barge / 8 GiB Oxide grants
+and their packets remain historical. Each run still clamps its budget to the
+aggregate ceiling minus retained bytes; the private pool remains 256 MiB and the native guard is at
 most 512 MiB. The increase adds no cleanup or runtime authorization and does
 not repin Barge's retained fact-only component.
 
 **Resource clamps (operator decision `af038a7e` v2; review 6584174560).**
 Whole-block scratch is a measured clamp of the applicable aggregate grant
 minus retained bytes. Decision `af038a7e` v2 granted Barge 3 GiB and Oxide
-8 GiB; the subsequent prospective Barge ceiling is 4 GiB, as stated above.
+8 GiB; the subsequent 4 GiB Barge / 8 GiB Oxide grant is historical. The
+current prospective ceilings are 5 GiB Barge / 9 GiB Oxide, as stated above.
 These grants do not renew or raise any earlier session: the historical
 2 GiB / 6 GiB runs and their evidence (Oxide's reported 5591.8 MiB retained
 total, about 552 MiB effective against the 6 GiB grant) keep their original
@@ -1759,9 +1760,9 @@ unallocated before actual preparation/runtime. These are conservative
 reservations, not measured runtime; the earlier 309-second ledger and every
 historical charge remain with no reset or refund. Prospective
 aggregate scratch caps for that ruling were Barge 3 GiB and Oxide 8 GiB and
-refused when retained bytes left no space. The later prospective Barge 4 GiB
-correction is recorded above and does not rewrite those historical packets. At most ONE Queue-routed candidate
-isolation qualification and then at most ONE safe covering batch per
+refused when retained bytes left no space. The later Barge 4 GiB / Oxide 8 GiB
+correction and current 5 GiB / 9 GiB ceilings are recorded above and do not
+rewrite those historical packets. At most ONE Queue-routed candidate isolation qualification and then at most ONE safe covering batch per
 capture task at its exact approved head, each with the qualified guard
 (`fcfda2b0…` unchanged) and fresh one-use claims; no automatic retry,
 native image or bootstrap. Source approval grants no native credit. The

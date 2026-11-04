@@ -116,13 +116,14 @@ OXIDE_TASK = "d41de092-b0b0-495d-b159-8c4d1730d6b4"
 BARGE_SCRATCH = Path("/Volumes/Builds/scratch/barge")
 OXIDE_SCRATCH = Path("/Volumes/Builds/scratch/oxide")
 SCRATCH_ROOT = Path("/Volumes/Builds/scratch")
-BARGE_CAP_BYTES = 4 * 1024 * 1024 * 1024
+BARGE_CAP_BYTES = 5 * 1024 * 1024 * 1024
 # Preserve the existing pool-validator ceiling; current issuance uses 256 MiB.
 BARGE_POOL_VALIDATOR_MAX_BYTES = 3 * 1024 * 1024 * 1024
-OXIDE_CAP_BYTES = 8 * 1024 * 1024 * 1024
-# Prospective aggregate Builds scratch grants (operator decision af038a7e v2,
-# 2026-11-02); the earlier 2 GiB / 6 GiB sessions and their evidence keep
-# their original historical bounds and are never silently raised.
+OXIDE_CAP_BYTES = 9 * 1024 * 1024 * 1024
+# Keep the consumer pool limit independent of the aggregate grant.
+OXIDE_POOL_VALIDATOR_MAX_BYTES = 8 * 1024 * 1024 * 1024
+# Historical aggregate Builds scratch grants (operator decision af038a7e v2,
+# 2026-11-02); earlier sessions and their evidence keep their original bounds.
 HISTORIC_BARGE_CAP_BYTES = 2 * 1024 * 1024 * 1024
 HISTORIC_OXIDE_CAP_BYTES = 6 * 1024 * 1024 * 1024
 PROSPECTIVE_MAX_SECONDS = 1200
@@ -916,7 +917,7 @@ def validate_barge_block(block, *, head, wrapper_hash, oxide_hash, audit_hash,
     if block["max_seconds"] > PROSPECTIVE_MAX_SECONDS:
         raise GateRefusal("block exceeds the one authorized prospective maximum")
     if type(block["scratch_cap_bytes"]) is not int or block["scratch_cap_bytes"] != BARGE_CAP_BYTES:
-        raise GateRefusal("private scratch cap must be the approved 4 GiB")
+        raise GateRefusal("private scratch cap must be the approved 5 GiB")
     if type(block["pool_cap_bytes"]) is not int or not 0 < block["pool_cap_bytes"] <= BARGE_POOL_VALIDATOR_MAX_BYTES:
         raise GateRefusal("private pool budget is missing or exceeds scratch cap")
     selectors = block["selectors"]
@@ -4787,9 +4788,10 @@ def self_test() -> int:
                    historic_cap, head=BARGE_RECIPE_HEAD, wrapper_hash=host["wrapper_sha256"],
                    oxide_hash=full_host["oxide_hash"], audit_hash=full_host["audit_hash"],
                    ledger_hash=full_host["ledger_hash"])
-    if BARGE_CAP_BYTES != 4 * 1024 * 1024 * 1024 or issued_block["scratch_cap_bytes"] != BARGE_CAP_BYTES:
-        failures.append("new block does not bind the exact 4 GiB Barge cap")
-    for label, cap in (("prior 3 GiB", 3 * 1024 * 1024 * 1024),
+    if BARGE_CAP_BYTES != 5 * 1024 * 1024 * 1024 or issued_block["scratch_cap_bytes"] != BARGE_CAP_BYTES:
+        failures.append("new block does not bind the exact 5 GiB Barge cap")
+    for label, cap in (("prior 4 GiB", 4 * 1024 * 1024 * 1024),
+                       ("prior 3 GiB", 3 * 1024 * 1024 * 1024),
                        ("float cap", float(BARGE_CAP_BYTES)), ("boolean cap", True),
                        ("missing cap value", None), ("zero cap", 0)):
         expect_refusal(label + " is not a valid new issuance", validate_barge_block,
@@ -5417,13 +5419,28 @@ def self_test() -> int:
                    complete_diagnostic[:binding_flag + 1] + ["nothex"])
 
     # --- clamp arithmetic (review 6584174560 finding 2; af038a7e v2 grants) -
+    # The current Oxide aggregate grant is separate from the historical pool ceiling.
+    if OXIDE_CAP_BYTES != 9 * 1024 * 1024 * 1024:
+        failures.append("the current Oxide aggregate grant is not exactly 9 GiB")
+    if OXIDE_POOL_VALIDATOR_MAX_BYTES != 8 * 1024 * 1024 * 1024:
+        failures.append("the Oxide consumer pool ceiling changed")
+    if BARGE_POOL_VALIDATOR_MAX_BYTES != 3 * 1024 * 1024 * 1024:
+        failures.append("the Barge pool ceiling changed")
+    if clamp_mib(OXIDE_CAP_BYTES, OXIDE_CAP_BYTES - 256 * 1024 * 1024,
+                 BOOTSTRAP_MAX_MIB) != 256:
+        failures.append("Oxide cap clamp did not use aggregate minus retained bytes")
+    expect_refusal("clamp at the prospective Oxide grant", clamp_mib,
+                   OXIDE_CAP_BYTES, OXIDE_CAP_BYTES, BOOTSTRAP_MAX_MIB)
+    expect_refusal("clamp over the prospective Oxide grant", clamp_mib,
+                   OXIDE_CAP_BYTES, OXIDE_CAP_BYTES + 1, BOOTSTRAP_MAX_MIB)
+
     historic_retained = 5591 * 1024 * 1024 + 838_860
     expect_ok("historical 552 MiB clamp at the reported retained total", clamp_mib,
               HISTORIC_OXIDE_CAP_BYTES, historic_retained, BOOTSTRAP_MAX_MIB)
     if clamp_mib(HISTORIC_OXIDE_CAP_BYTES, historic_retained, BOOTSTRAP_MAX_MIB) != 552:
         failures.append("the historical 6 GiB clamp figure moved")
     if clamp_mib(OXIDE_CAP_BYTES, historic_retained, BOOTSTRAP_MAX_MIB) != BOOTSTRAP_MAX_MIB:
-        failures.append("the prospective 8 GiB grant must still clamp to the per-run bootstrap cap")
+        failures.append("the prospective 9 GiB grant must still clamp to the per-run bootstrap cap")
     if clamp_mib(BARGE_CAP_BYTES, 2 * 1024 * 1024 * 1024 + 512 * 1024 * 1024,
                  BOOTSTRAP_MAX_MIB) != BOOTSTRAP_MAX_MIB:
         failures.append("the prospective Barge grant did not clamp to its measured remainder")
