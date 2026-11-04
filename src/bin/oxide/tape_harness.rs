@@ -653,13 +653,47 @@ fn fixture_facts(root: &Path) -> config::Facts {
     }
 }
 
+/// The guard/wrapper supplies TMPDIR within the selected volume's owned
+/// scratch namespace. Re-derive and validate that namespace without reading
+/// host pool configuration (engine children have only fixture configuration).
+fn fixture_namespace() -> Result<PathBuf, String> {
+    use std::os::unix::fs::MetadataExt;
+    let temp = std::env::temp_dir();
+    let parts: Vec<_> = temp.components().collect();
+    if parts.len() < 5
+        || !temp.starts_with("/Volumes")
+        || parts[3].as_os_str() != "scratch"
+        || !matches!(
+            parts[4].as_os_str().to_str(),
+            Some("oxide" | "oxide-validation")
+        )
+    {
+        return Err("TMPDIR is outside selected-volume scratch namespaces".to_owned());
+    }
+    let namespace: PathBuf = parts[..5].iter().collect();
+    if std::fs::canonicalize(&namespace).map_err(|e| e.to_string())? != namespace {
+        return Err("scratch namespace is not canonical".to_owned());
+    }
+    let boot = std::fs::metadata("/").map_err(|e| e.to_string())?.dev();
+    for ancestor in namespace.ancestors().take(3) {
+        let meta = std::fs::symlink_metadata(ancestor).map_err(|e| e.to_string())?;
+        if !meta.is_dir()
+            || meta.uid() != unsafe { libc::getuid() }
+            || meta.mode() & 0o022 != 0
+            || meta.dev() == boot
+        {
+            return Err("unsafe selected-volume scratch namespace".to_owned());
+        }
+    }
+    Ok(namespace)
+}
+
 /// Check every existing component without following a symlink. The root must
 /// be the canonical owner-only fixture; missing suffixes remain under its held
 /// namespace and are created only by the fixture owner.
 fn validate_fixture_path(root: &Path, path: &Path) -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    if !(root.starts_with("/Volumes/Builds/scratch/oxide/")
-        || root.starts_with("/Volumes/Builds/scratch/oxide-validation/"))
+    if !root.starts_with(fixture_namespace()?)
         || std::fs::canonicalize(root).map_err(|e| e.to_string())? != root
     {
         return Err("fixture root is not canonical task scratch".to_owned());
@@ -1375,15 +1409,16 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
     // The covering Rust recipe supplies a fresh child of this sibling as
     // TMPDIR. Exercise the real guard on that owned root when it does so;
     // never create an independent fixture outside the caller's temp root.
-    if temp.starts_with("/Volumes/Builds/scratch/oxide-validation/") {
+    if temp.starts_with(fixture_namespace().map_err(|what| CheckFailure { what })?) {
         check(
             validate_fixture_path(temp, &temp.join("new-entry")).is_ok(),
             "canonical private validation sibling is accepted",
         )?;
     }
-    let lookalike = Path::new("/Volumes/Builds/scratch/oxide-validation-x/not-a-fixture");
+    let namespace = fixture_namespace().map_err(|what| CheckFailure { what })?;
+    let lookalike = namespace.with_extension("lookalike").join("not-a-fixture");
     check(
-        validate_fixture_path(lookalike, lookalike).is_err(),
+        validate_fixture_path(&lookalike, &lookalike).is_err(),
         "validation sibling lookalike is refused",
     )?;
     let insecure = temp.join("insecure-validation-root");
@@ -2320,6 +2355,7 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
         .env_clear()
         .envs(envs)
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("TMPDIR", std::env::temp_dir())
         .output()
         .map_err(|error| CheckFailure {
             what: format!("cannot run the engine child: {error}"),

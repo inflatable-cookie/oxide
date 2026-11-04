@@ -2080,3 +2080,14 @@ policy kind), G4 (the waiver's status).
 | `rollout_and_rollback` | Rollout order and rollback table |
 | `finite_slices` | Slice table and dependency column |
 | `docs_current` | Index entries; Q-021 in questions; no current-truth claims changed |
+
+The embedded harness derives its allowed scratch namespace from the qualified
+launcher's TMPDIR: `<selected-volume>/scratch/oxide` or `oxide-validation`.
+It rechecks canonical paths, directory ownership, non-writable shared ancestors,
+non-boot placement and private fixture components; engine children receive only
+that TMPDIR plus their fixture configuration. A namespace lookalike or escape
+is refused. This replaces the historical host-specific `/Volumes/Builds` gate.
+Planner ruling c4de881a (2026-11-04) permits this test-only correction and one
+replacement 600 s / 512 MiB uncounted diagnostic; the failed pre-case diagnostic
+remains charged and retained, and the counted suite stays gated on the corrected
+diagnostic's case results.
