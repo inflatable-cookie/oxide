@@ -1204,12 +1204,6 @@ fn note_reservation(
     let member = member.as_str();
     let reserved = receipt.reserved();
     let current_id = reserved.map(|reserved| reserved.id.as_str());
-    let selected_root = receipt
-        .current()
-        .map(|selected| selected.root().to_path_buf());
-    let proposed_root = receipt
-        .prepared_ref()
-        .map(|prepared| prepared.to.root().to_path_buf());
     for row in registry
         .rows
         .iter_mut()
@@ -1223,7 +1217,14 @@ fn note_reservation(
         }
         // Consumed: the commit (or the prepared transition) now references
         // the reserved root itself.
-        if Some(&row.root) == selected_root.as_ref() || Some(&row.root) == proposed_root.as_ref() {
+        if receipt.links().iter().any(|placement| {
+            placement
+                .selected_ref()
+                .is_some_and(|selected| selected.root() == row.root)
+                || placement
+                    .prepared_ref()
+                    .is_some_and(|prepared| prepared.to.root() == row.root)
+        }) {
             row.reservation = None;
             continue;
         }
@@ -11791,7 +11792,7 @@ mod tests {
     /// a begun cancellation refuses, and finishing the cancellation clears
     /// only its journal entry. A complete registry refuses an overflow tag.
     #[test]
-    fn overflow_reservations_bind_by_tag_and_cancel_without_a_row() {
+    fn profile_reservation_overflow_binds_by_tag_and_cancels_without_a_row() {
         let fixture = Fixture::new();
         let control = ready_control(&fixture, Vec::new(), Vec::new());
         let mut registry = ready_registry(&control).unwrap();

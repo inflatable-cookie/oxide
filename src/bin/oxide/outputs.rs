@@ -17028,6 +17028,135 @@ mod tests {
         assert!(refused.contains("cancellation journal"), "{refused}");
     }
 
+    /// The first sorted member can retain an older root while a later member
+    /// commits the root-level reservation. Exercise actual replay/publication.
+    #[test]
+    fn profile_reservation_mixed_roots_finish_and_replay() {
+        for (old_member, new_member) in [
+            ("aarch64-apple-darwin/release", "debug"),
+            ("debug", "release"),
+            ("release", "debug"),
+            (MEMBER, MEMBER),
+        ] {
+            let fixture = Fixture::new();
+            let context = fixture.context();
+            let mut receipt = if new_member == MEMBER {
+                fixture.receipt()
+            } else {
+                Receipt::first_with(&fixture.checkout, &context.checkout_id, LayoutKind::Profile)
+            };
+            receipt.state = ReceiptState::Committed;
+            receipt.generation = 1;
+            let old = RootSpec::Local {
+                root: fixture.root.join("older-root"),
+            }
+            .selected(1)
+            .with_nonce(Some("a".repeat(32)));
+            receipt.place_member(old_member).selected = Some(old.clone());
+            receipt.place_member(new_member).selected = Some(old.clone());
+            receipt.roots.push(old);
+            let future = fixture.local();
+            let reserved = publish_reservation(&fixture, &mut receipt, future.root());
+            let selected = future.selected(2).with_nonce(Some(reserved.nonce.clone()));
+            ensure_root_with(&context, &future, 2, Some(&reserved.nonce)).unwrap();
+            ensure_member_directory(future.root(), new_member).unwrap();
+            let link = link_path(&fixture.checkout, new_member);
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            symlink(member_destination(future.root(), new_member), &link).unwrap();
+            receipt.state = ReceiptState::Prepared;
+            receipt.place_member(new_member).prepared = Some(Prepared {
+                generation: 2,
+                to: selected.clone(),
+                link,
+            });
+            write_receipt(&fixture.control, &receipt).unwrap();
+            let committed = replay(&context, receipt).unwrap();
+            assert!(committed.reserved().is_none());
+            assert_eq!(committed.selected_for(new_member), Some(&selected));
+            assert_eq!(
+                read_marker(future.root()).unwrap().nonce.as_deref(),
+                Some(reserved.nonce.as_str())
+            );
+            assert!(crate::prune::validate_reservation(&fixture.control, &reserved).is_err());
+            let rows = crate::prune::test_rows(&fixture.control).unwrap();
+            assert!(rows
+                .iter()
+                .any(|(root, selected, pending, _)| root == future.root()
+                    && *selected
+                    && !*pending));
+            let before = authority_tree(&fixture.control);
+            let replayed = replay(&context, committed.clone()).unwrap();
+            assert_eq!(replayed, committed);
+            assert_eq!(authority_tree(&fixture.control), before);
+            let stored = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored, committed);
+        }
+    }
+
+    #[test]
+    fn profile_reservation_prepared_reference_consumes_pending_row() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let mut receipt =
+            Receipt::first_with(&fixture.checkout, &context.checkout_id, LayoutKind::Profile);
+        receipt.state = ReceiptState::Committed;
+        receipt.generation = 1;
+        receipt
+            .place_member("aarch64-apple-darwin/release")
+            .selected = Some(
+            RootSpec::Local {
+                root: fixture.root.join("old-root"),
+            }
+            .selected(1),
+        );
+        let future = fixture.local();
+        let reserved = publish_reservation(&fixture, &mut receipt, future.root());
+        receipt.state = ReceiptState::Prepared;
+        receipt.place_member("debug").prepared = Some(Prepared {
+            generation: 2,
+            to: future.selected(2).with_nonce(Some(reserved.nonce.clone())),
+            link: link_path(&fixture.checkout, "debug"),
+        });
+        *receipt.reserved_mut() = None;
+        write_receipt(&fixture.control, &receipt).unwrap();
+        assert!(crate::prune::validate_reservation(&fixture.control, &reserved).is_err());
+        let rows = crate::prune::test_rows(&fixture.control).unwrap();
+        assert!(rows
+            .iter()
+            .any(|(root, selected, pending, _)| root == future.root() && !*selected && *pending));
+    }
+
+    #[test]
+    fn profile_reservation_drop_history_and_cancellation_controls() {
+        let fixture = Fixture::new();
+        let mut receipt = fixture.receipt();
+        let future = fixture.local();
+        let reserved = publish_reservation(&fixture, &mut receipt, future.root());
+        // History alone must never excuse a genuinely dropped reservation.
+        receipt
+            .roots
+            .push(future.selected(1).with_nonce(Some(reserved.nonce.clone())));
+        *receipt.reserved_mut() = None;
+        let before = authority_tree(&fixture.control);
+        let error = write_receipt(&fixture.control, &receipt).unwrap_err();
+        assert!(
+            error.contains("without its cancellation journal"),
+            "{error}"
+        );
+        assert_eq!(authority_tree(&fixture.control), before);
+        crate::prune::validate_reservation(&fixture.control, &reserved).unwrap();
+        // Cancellation in progress still prevents republication.
+        crate::prune::begin_cancel(&fixture.control, &receipt.checkout_id, &reserved).unwrap();
+        *receipt.reserved_mut() = Some(reserved);
+        let before = authority_tree(&fixture.control);
+        assert!(write_receipt(&fixture.control, &receipt)
+            .unwrap_err()
+            .contains("being cancelled"));
+        assert_eq!(authority_tree(&fixture.control), before);
+    }
+
     /// The future-root shape this seam can build without a registered volume:
     /// the checkout's own local root, held by a durable reservation on the same
     /// fixture receipt the existing reservation test uses. The only variable
