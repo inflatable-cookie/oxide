@@ -869,7 +869,7 @@ always recorded.
 | FENCE-MISSING | outputs control fence absent | `require_ready` refusal (not initialized), nothing written | control unknown → every covered root kept | MATCH-KEPT |
 | FENCE-UNKNOWN | unknown fence version/owner | keep/refuse batch | keep every covered root | MATCH |
 | EFFECT-1 | `admission.lock` absent (DYNAMIC) | missing existing lock refuses custody; incomplete batch, every root kept; no completed effect | `shared_if_present` observes nothing; no effect | specific refusal and no completed effect; per-engine record |
-| EFFECT-2 | admission state missing accounting fences (DYNAMIC) | read-only custody parses the old state without upgrading fences; evaluation proceeds | custody parse unaffected → proceeds | MATCH on fates; no completed fence save |
+| EFFECT-2 | admission state missing accounting fences (DYNAMIC) | pool open fences old managed state before read-only custody; evaluation proceeds | custody parse unaffected → proceeds | MATCH on fates + declared Oxide effects |
 | DECL-MISSING | area not declared | unaffected (candidate) | command refusal: no release policy | SCOPE (declared refusal; no per-root parity) |
 | DECL-POLICY-NONE | area declared `prune: none` | candidate | kept by policy | CONFIG (configuration difference, no parity claim) |
 | LEG-UNLISTED | R-C unlisted (BASE) | kept: legacy, operator list required | kept: D-3 partition | MATCH |
@@ -907,11 +907,11 @@ never parity. Each names its realization and oracle.
 6. **Missing admission inputs stay read-only.** EFFECT-1 must record the
    missing internal admission lock's custody refusal on every kept row in an
    incomplete batch, with no candidate, completed effect or persistent diff.
-   EFFECT-2 keeps its existing lock and old accounting state unchanged and
-   follows BASE evaluation. The pool-lock `O_CREAT` open remains an uncertain
+   EFFECT-2 preserves positive fence-save coverage through the real locked pool
+   open, including completed temporary create/save and final state rename. The pool-lock `O_CREAT` open remains an uncertain
    attempt, never completed creation or write parity. Pending holding or
    eviction reconciliation reached through `ledger_view` is still a stop,
-   not a read. These two cases provide no positive completed-write coverage.
+   not a read. Missing-lock custody provides no positive lock-create coverage.
 7. **Second reads under changed epochs.** Barge's marker reread under its
    second root-id lock and Oxide's ancestry revalidation must each appear as a
    distinct bound occurrence whose outcome equals the first and the manifest;
@@ -1335,13 +1335,14 @@ alone is insufficient.
   diff, but the real pool-lock `O_CREAT` open remains an uncertain attempt,
   so its transcript is insufficient for parity. The historical EFFECT names do not promise writes: EFFECT-1 requires the
   specific missing-lock custody refusal and an incomplete whole-batch keep;
-  EFFECT-2 uses the same outcome assertions as BASE and leaves the old fences
-  unchanged. Both forbid any completed effect or persistent fixture diff.
-  `PoolWitness::take_admission` opens only an existing lock; `read_state`
-  parses through a read-only descriptor and never invokes the fence writers.
-  This path offers no real positive lock-create/fence-save coverage. Pure
-  effect bookkeeping and reconciliation controls remain, but supply no
-  engine-write or parity credit. Completeness acceptance is unchanged.
+  EFFECT-2 retains its declared completed transient create/save and persistent
+  fence-save assertions, plus the surviving state diff and unchanged existing
+  lock. `PoolWitness::take_admission` opens only an existing lock and `read_state`
+  is read-only, so there is no positive lock-create coverage on that custody
+  route. However, earlier `Store::open_at` calls library `ledger_view`, whose
+  locked `Pool::open_inner` reaches `fence_managed_control`: EFFECT-2's old
+  state triggers the real managed fence write before custody. Pure effect
+  bookkeeping/reconciliation controls and all completeness/parity limits stay.
   `--diagnostic` keeps going through all five embedded cases and the
   disconnected BASE control, reports each result, retains its fixture root,
   and always exits nonzero with `qualified=false`; the no-argument suite
@@ -2097,3 +2098,10 @@ unchanged child environment allowlist and one further 600 s / 512 MiB diagnostic
 Diagnostic fixtures live under the existing guard evidence directory, preserving
 containment and guard cleanup/custody. Both earlier failed sessions stay charged;
 their logs/receipts remain, but their scratch was removed after clean closure.
+
+Planner ruling 7f28a33a (2026-11-04) permits restoring the original EFFECT-2
+positive-effect checks after the retained diagnostic exposed its real pool-open
+fence write, while keeping EFFECT-1's specific refusal. One additional bounded
+uncounted diagnostic is authorized; all earlier runs remain charged. Production
+and guard behavior are unchanged; the counted suite still follows a clean
+all-case diagnostic.

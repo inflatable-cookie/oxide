@@ -1028,7 +1028,7 @@ fn build_fixture(root: &Path, spec: &FixtureSpec) -> Result<FixturePaths, String
     }
 
     // The control state: fully fenced version 9, or the unfenced successor
-    // document the EFFECT-2 read-only case must leave unchanged.
+    // document the EFFECT-2 pool-open path upgrades.
     let state = if spec.fenced_state {
         serde_json::json!({
             "version": 9,
@@ -2410,11 +2410,29 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
         .unwrap_or_default();
 
     if matches!(case, Case::Base | Case::Effect1 | Case::Effect2) {
+        let expected: &[(&str, &str, &str, &str)] = match case {
+            Case::Base => &[],
+            Case::Effect1 => &[],
+            Case::Effect2 => &[(
+                "fence",
+                "managed-control",
+                "save",
+                "scratch/pool/oxide-managed/state.json",
+            )],
+            _ => unreachable!(),
+        };
+        let transient_count = if case == Case::Effect2 { 2 } else { 0 };
+        let completed_effects = doc
+            .effects
+            .iter()
+            .filter(|effect| {
+                effect.get("attempted").and_then(|value| value.as_bool()) == Some(false)
+            })
+            .count();
         check(
-            doc.effects.iter().all(|effect| {
-                effect.get("attempted").and_then(|value| value.as_bool()) == Some(true)
-            }) && diff_effects.is_empty(),
-            "read-only evaluation has no completed effects or persistent fixture diff",
+            completed_effects == expected.len() + transient_count
+                && diff_effects.len() == expected.len(),
+            "completed transient and persistent effects match their declared counts",
         )?;
         check(
             doc.effects.iter().any(|effect| {
@@ -2423,10 +2441,49 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
             }),
             "the O_CREAT pool-lock open remains an explicitly uncertain attempt",
         )?;
+        if case == Case::Effect2 {
+            for (kind, site, attempted) in [
+                ("create", "managed-admission-open", true),
+                ("create", "managed-control-temp", false),
+                ("save", "managed-control-temp", false),
+            ] {
+                check(
+                    doc.effects
+                        .iter()
+                        .filter(|effect| {
+                            effect.get("kind").and_then(|value| value.as_str()) == Some(kind)
+                                && effect.get("site").and_then(|value| value.as_str()) == Some(site)
+                                && effect.get("attempted").and_then(|value| value.as_bool())
+                                    == Some(attempted)
+                        })
+                        .count()
+                        == 1,
+                    "the reached temporary or uncertain effect occurs exactly once",
+                )?;
+            }
+        }
+        for (taped, site, diff, rel) in expected {
+            check(
+                doc.effects.iter().any(|effect| {
+                    effect.get("kind").and_then(|v| v.as_str()) == Some(*taped)
+                        && effect.get("site").and_then(|v| v.as_str()) == Some(*site)
+                        && effect.get("attempted").and_then(|v| v.as_bool()) == Some(false)
+                        && effect.get("path").and_then(|v| v.as_str()) == root.join(rel).to_str()
+                }),
+                "declared effect appears on tape",
+            )?;
+            check(
+                diff_effects.iter().any(|effect| {
+                    effect.get("kind").and_then(|v| v.as_str()) == Some(*diff)
+                        && effect.get("path").and_then(|v| v.as_str()) == Some(*rel)
+                }),
+                "declared effect appears in fixture diff",
+            )?;
+        }
     }
 
     match case {
-        Case::Base | Case::Effect2 => {
+        Case::Base => {
             check(
                 outcome_state(&doc) == "completed",
                 &format!("BASE completes: {}", outcome_reason(&doc)),
@@ -2538,6 +2595,11 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
             )?;
         }
         Case::Effect1 => {
+            check(
+                doc.effects.iter().all(|effect| effect.get("attempted").and_then(|v| v.as_bool()) == Some(true))
+                    && diff_effects.is_empty(),
+                "missing-lock custody has no completed effect or fixture diff",
+            )?;
             // The evaluator completes with a conservative batch refusal, not
             // a chain error: every root carries the missing-lock reason.
             let result = doc.outcome.get("result");
@@ -2560,6 +2622,18 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
                 !paths.control.join("admission.lock").exists(),
                 "the missing admission lock remains absent",
             )?;
+        }
+        Case::Effect2 => {
+            let state_changed = diff_effects.iter().any(|effect| {
+                effect.get("path").and_then(|p| p.as_str())
+                    == Some("scratch/pool/oxide-managed/state.json")
+            });
+            check(state_changed, "the missing fences are durably saved")?;
+            let lock_untouched = !diff_effects.iter().any(|effect| {
+                effect.get("path").and_then(|p| p.as_str())
+                    == Some("scratch/pool/oxide-managed/admission.lock")
+            });
+            check(lock_untouched, "the present lock is not recreated")?;
         }
         Case::RegistryMissing => {
             check(
