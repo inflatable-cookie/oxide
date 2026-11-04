@@ -3406,6 +3406,7 @@ impl Pool {
             return None;
         }
         let id = slot.id;
+        let incarnation = slot.incarnation;
         let last_lease_id = slot.last_lease_id.clone();
         let path = self.recorded_slot_root(id).ok()??;
         let sizes = self.inventory_slot(&path).ok()?;
