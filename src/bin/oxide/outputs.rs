@@ -8209,8 +8209,18 @@ fn read_receipt_with(
         return Ok(None);
     };
     let mut bytes = Vec::new();
+    #[cfg(not(test))]
     crate::prune::authority_read(file.take(MAX_RECEIPT_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    #[cfg(test)]
+    crate::prune::authority_read_observed(
+        &file,
+        &path,
+        "outputs::read_receipt_with",
+        MAX_RECEIPT_BYTES,
+        &mut bytes,
+    )
+    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     if bytes.len() as u64 > MAX_RECEIPT_BYTES {
         return Err(format!(
             "{} exceeds its {MAX_RECEIPT_BYTES}-byte limit",
@@ -8292,14 +8302,59 @@ pub(crate) fn read_receipt_for_prune(
     read_receipt_with(LegacyReceiptReading::Read, control, checkout, checkout_id)
 }
 
+#[cfg(test)]
+fn observed_marker_open(site: &str, path: &Path) -> std::io::Result<File> {
+    let result = File::open(path);
+    let saved_errno = crate::tape::observer_errno();
+    let outcome = match &result {
+        Ok(_) => crate::tape::TapeOutcome::Facts { facts: "opened; descriptor identity pending".to_owned() },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => crate::tape::TapeOutcome::Absent,
+        Err(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+    };
+    crate::tape::read_row(site, path, outcome, 0);
+    crate::tape::restore_observer_errno(saved_errno);
+    result
+}
+
+#[cfg(test)]
+fn observed_marker_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
+    use std::os::unix::fs::MetadataExt;
+    let result = fs::symlink_metadata(path);
+    let saved_errno = crate::tape::observer_errno();
+    match &result {
+        Ok(metadata) => crate::tape::read_row_dev("outputs:marker:lstat", path,
+            metadata.dev(), metadata.ino(),
+            crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
+        Err(error) => crate::tape::read_row("outputs:marker:lstat", path,
+            if error.kind() == std::io::ErrorKind::NotFound { crate::tape::TapeOutcome::Absent }
+            else { crate::tape::TapeOutcome::Refusal { reason: error.to_string() } }, 0),
+    }
+    crate::tape::restore_observer_errno(saved_errno);
+    result
+}
+
 /// The SHA-256 of the exact marker bytes, for the recorded root identity.
 pub(crate) fn marker_digest(root: &Path) -> Result<String, String> {
     let path = root.join(MARKER);
+    #[cfg(not(test))]
     let file =
         File::open(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    #[cfg(test)]
+    let file = observed_marker_open("outputs:marker-digest:open", &path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let mut bytes = Vec::new();
+    #[cfg(not(test))]
     crate::prune::authority_read(file.take(MAX_MARKER_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    #[cfg(test)]
+    crate::prune::authority_read_observed(
+        &file,
+        &path,
+        "outputs::marker_digest",
+        MAX_MARKER_BYTES,
+        &mut bytes,
+    )
+    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     if bytes.len() as u64 > MAX_MARKER_BYTES {
         return Err(format!("{} exceeds its byte limit", path.display()));
     }
@@ -8527,7 +8582,11 @@ pub(crate) fn receipt_is_pruning(receipt: &Receipt) -> bool {
 
 fn read_marker(root: &Path) -> Result<Marker, String> {
     let path = root.join(MARKER);
+    #[cfg(not(test))]
     let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| format!("{} has no readable owner marker ({error})", root.display()))?;
+    #[cfg(test)]
+    let metadata = observed_marker_metadata(&path)
         .map_err(|error| format!("{} has no readable owner marker ({error})", root.display()))?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(format!("{} is not an owner marker file", path.display()));
@@ -8535,11 +8594,25 @@ fn read_marker(root: &Path) -> Result<Marker, String> {
     if metadata.len() > MAX_MARKER_BYTES {
         return Err(format!("{} exceeds its byte limit", path.display()));
     }
+    #[cfg(not(test))]
     let file =
         File::open(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    #[cfg(test)]
+    let file = observed_marker_open("outputs:read-marker:open", &path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let mut bytes = Vec::new();
+    #[cfg(not(test))]
     crate::prune::authority_read(file.take(MAX_MARKER_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    #[cfg(test)]
+    crate::prune::authority_read_observed(
+        &file,
+        &path,
+        "outputs::read_marker",
+        MAX_MARKER_BYTES,
+        &mut bytes,
+    )
+    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     if bytes.len() as u64 > MAX_MARKER_BYTES {
         return Err(format!("{} exceeds its byte limit", path.display()));
     }

@@ -262,7 +262,14 @@ fn boot_session() -> Option<u64> {
             return injected;
         }
     }
-    process::boot_ms()
+    let boot = process::boot_ms();
+    #[cfg(test)]
+    if let Some(value) = boot {
+        crate::tape::clock_row("boot-session-ms", value);
+    } else {
+        crate::tape::clock_unproven("boot-session-ms");
+    }
+    boot
 }
 
 /// Whether the record's holder started before the current boot session, so a
@@ -1078,8 +1085,18 @@ pub fn recorded_last_use(control: &Path) -> Result<Option<LastUse>, String> {
     let path = control.join("state.json");
     let file = private_file(&path, false)?.ok_or("no Oxide control state")?;
     let mut bytes = Vec::new();
+    #[cfg(not(test))]
     crate::prune::authority_read(file.take(MAX_STATE_BYTES + 1), &mut bytes)
         .map_err(|error| error.to_string())?;
+    #[cfg(test)]
+    crate::prune::authority_read_observed(
+        &file,
+        &path,
+        "store::recorded_last_use",
+        MAX_STATE_BYTES,
+        &mut bytes,
+    )
+    .map_err(|error| error.to_string())?;
     let state: State = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     Ok(state
         .records
@@ -1102,8 +1119,18 @@ pub fn recorded_lost(control: &Path) -> Result<Vec<(String, Option<PathBuf>, Str
         return Ok(Vec::new());
     };
     let mut bytes = Vec::new();
+    #[cfg(not(test))]
     crate::prune::authority_read(file.take(MAX_STATE_BYTES + 1), &mut bytes)
         .map_err(|error| error.to_string())?;
+    #[cfg(test)]
+    crate::prune::authority_read_observed(
+        &file,
+        &path,
+        "store::recorded_lost",
+        MAX_STATE_BYTES,
+        &mut bytes,
+    )
+    .map_err(|error| error.to_string())?;
     let state: State = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     let boot = boot_session();
     Ok(state
@@ -1134,8 +1161,18 @@ fn holders(control: &Path, checkout: &Path, cleans: bool) -> Result<Vec<String>,
         return Ok(Vec::new());
     };
     let mut bytes = Vec::new();
+    #[cfg(not(test))]
     crate::prune::authority_read(file.take(MAX_STATE_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read Oxide state: {error}"))?;
+    #[cfg(test)]
+    crate::prune::authority_read_observed(
+        &file,
+        &path,
+        "store::active_holders",
+        MAX_STATE_BYTES,
+        &mut bytes,
+    )
+    .map_err(|error| format!("cannot read Oxide state: {error}"))?;
     if bytes.len() as u64 > MAX_STATE_BYTES {
         return Err("Oxide state exceeds its byte limit".to_owned());
     }
@@ -1153,6 +1190,23 @@ fn holder_lines(state: &State, checkout: &Path, cleans: bool) -> Vec<String> {
         if record.checkout.as_deref() != Some(checkout) || !record.active() {
             continue;
         }
+        #[cfg(test)]
+        if let Some(holder) = &record.holder {
+            crate::tape::recorded_holder("store:active-holders", record.id, holder.pid, holder.started_ms);
+        }
+        #[cfg(test)]
+        crate::tape::classify_row(
+            "custody:holder",
+            &format!("record={}|checkout={}", record.id, checkout.display()),
+            &format!(
+                "pid={:?}|command={:?}",
+                record.holder.as_ref().map(|holder| holder.pid),
+                record
+                    .holder
+                    .as_ref()
+                    .and_then(|holder| holder.command.as_deref()),
+            ),
+        );
         let name = record
             .holder
             .as_ref()
@@ -1193,16 +1247,50 @@ fn custody_verdict(
             if record.checkout.as_deref() != Some(checkout) || Some(record.id) == *exempt {
                 continue;
             }
+            #[cfg(test)]
+            if let Some(holder) = &record.holder {
+                crate::tape::recorded_holder(
+                    "store:checkout-custody",
+                    record.id,
+                    holder.pid,
+                    holder.started_ms,
+                );
+            }
+            #[cfg(test)]
+            crate::tape::classify_row(
+                "custody:record",
+                &format!("pool={pool}|id={}|phase={:?}", record.id, record.phase),
+                &format!(
+                    "holder={:?}|lost={:?}|group={:?}",
+                    record.holder.as_ref().map(|holder| holder.pid),
+                    record.lost.as_ref().map(|lost| lost.slot_id.clone()),
+                    record.process_group,
+                ),
+            );
             if record.phase == Phase::Retired {
                 if let Some(lost) = record.lost.as_ref() {
                     // A restart closed a quarantined record whose holder
                     // predates this boot session; its slot is released and
                     // deleted whole at the next admission.
-                    if let Some(why) = lost
+                    #[cfg(not(test))]
+                    let unclosed = lost
                         .unclosed
                         .as_deref()
-                        .filter(|_| !closed_by_boot(record, boot))
-                    {
+                        .filter(|_| !closed_by_boot(record, boot));
+                    #[cfg(test)]
+                    let unclosed = lost
+                        .unclosed
+                        .as_deref()
+                        .filter(|_| {
+                            let closed = closed_by_boot(record, boot);
+                            crate::tape::classify_row(
+                                "boot-classify:closed-by-boot",
+                                &format!("record={}", record.id),
+                                &format!("boot={boot:?}|closed={closed}"),
+                            );
+                            !closed
+                        });
+                    if let Some(why) = unclosed {
                         return CheckoutCustody::Unknown(format!(
                             "slot {} in the {pool} pool is lost with writers that were never confirmed closed ({why})",
                             lost.slot_id
@@ -2040,14 +2128,40 @@ impl Store {
             crate::scratch_io::evaluate(settings, false)?;
         }
         match config::inspect(&settings.pool) {
-            Found::Absent => Ok(None),
-            Found::LegacyImage => Err(legacy_refusal()),
+            Found::Absent => {
+                #[cfg(test)]
+                crate::tape::pool_row(
+                    "store:open-existing",
+                    &settings.pool,
+                    crate::tape::TapeOutcome::Absent,
+                );
+                Ok(None)
+            }
+            Found::LegacyImage => {
+                #[cfg(test)]
+                crate::tape::pool_row(
+                    "store:open-existing",
+                    &settings.pool,
+                    crate::tape::TapeOutcome::Refusal {
+                        reason: "legacy image pool".to_owned(),
+                    },
+                );
+                Err(legacy_refusal())
+            }
             Found::Directory | Found::Unknown => {
                 if let Some(uuid) = crate::scratch_io::evaluate(settings, false)? {
                     if repair {
                         crate::scratch_io::repair(settings, &uuid)?;
                     }
                 }
+                #[cfg(test)]
+                crate::tape::pool_row(
+                    "store:open-existing:inspect",
+                    &settings.pool,
+                    crate::tape::TapeOutcome::Facts {
+                        facts: "directory pool".to_owned(),
+                    },
+                );
                 Self::open_at(&settings.pool, settings).map(Some)
             }
         }
@@ -2147,6 +2261,14 @@ impl Store {
             fs::canonicalize(path).map_err(|error| format!("cannot open the pool: {error}"))?;
         let view =
             ledger_view(&pool).map_err(|error| lease_error("cannot open the pool", &error))?;
+        #[cfg(test)]
+        crate::tape::pool_row(
+            "pool:ledger-view",
+            &pool,
+            crate::tape::TapeOutcome::Facts {
+                facts: format!("backend={}|cap={}", view.backend, view.cap_bytes),
+            },
+        );
         let backend = Backend::recorded(&view.backend)?;
         if backend != Backend::DirectoryBudget {
             return Err(format!(
@@ -2511,6 +2633,12 @@ impl Store {
             // this slot's writer: the number may belong to an unrelated
             // process now, so only a group of the current session is checked.
             let boot_closed = closed_by_boot(record, boot);
+            #[cfg(test)]
+            crate::tape::classify_row(
+                "boot-classify:closed-by-boot",
+                &format!("record={}", record.id),
+                &format!("boot={boot:?}|closed={boot_closed}"),
+            );
             if !boot_closed
                 && record
                     .process_group
@@ -2612,6 +2740,21 @@ impl Store {
     /// has begun. Read without a lock; callers that mutate recheck it under
     /// admission.
     pub fn outputs_initialization(&self) -> Result<Option<OutputsInit>, String> {
+        #[cfg(test)]
+        {
+            let state = self.load()?;
+            crate::tape::classify_row(
+                "outputs-initialization",
+                &self.owner_control().display().to_string(),
+                match &state.outputs_init {
+                    Some(OutputsInit::Ready { .. }) => "ready",
+                    Some(OutputsInit::Initializing { .. }) => "initializing",
+                    None => "absent",
+                },
+            );
+            Ok(state.outputs_init)
+        }
+        #[cfg(not(test))]
         Ok(self.load()?.outputs_init)
     }
 
@@ -3042,7 +3185,17 @@ impl Store {
         let sibling = self.sibling.as_ref()?;
         let file = private_file(&sibling.control.join("state.json"), false).ok()??;
         let mut bytes = Vec::new();
+        #[cfg(not(test))]
         crate::prune::authority_read(file.take(MAX_STATE_BYTES + 1), &mut bytes).ok()?;
+        #[cfg(test)]
+        crate::prune::authority_read_observed(
+            &file,
+            &sibling.control.join("state.json"),
+            "store::sibling_state",
+            MAX_STATE_BYTES,
+            &mut bytes,
+        )
+        .ok()?;
         serde_json::from_slice::<State>(&bytes).ok()
     }
 
@@ -3081,8 +3234,18 @@ impl Store {
             return Ok(None);
         };
         let mut bytes = Vec::new();
+        #[cfg(not(test))]
         crate::prune::authority_read(file.take(MAX_STATE_BYTES + 1), &mut bytes)
             .map_err(|error| format!("the other pool's record state is unreadable: {error}"))?;
+        #[cfg(test)]
+        crate::prune::authority_read_observed(
+            &file,
+            &path,
+            "store::sibling_state_checked",
+            MAX_STATE_BYTES,
+            &mut bytes,
+        )
+        .map_err(|error| format!("the other pool's record state is unreadable: {error}"))?;
         if bytes.len() as u64 > MAX_STATE_BYTES {
             return Err("the other pool's record state exceeds its byte limit".to_owned());
         }
@@ -3136,6 +3299,16 @@ impl Store {
     pub fn checkout_custody(&self, checkout: &Path, own: u64) -> Result<CheckoutCustody, String> {
         let _sibling = self.sibling_admission()?;
         let _admission = self.admission()?;
+        #[cfg(test)]
+        crate::tape::classify_row(
+            "custody:entry",
+            &format!(
+                "checkout={}|control={}",
+                checkout.display(),
+                self.control.display()
+            ),
+            "enter",
+        );
         let own_state = if self.control.exists() {
             Some(self.load()?)
         } else {
@@ -3172,6 +3345,14 @@ impl Store {
         let file = private_file(&sibling.control.join("admission.lock"), true)?
             .ok_or("the internal admission lock is missing")?;
         crate::budget::lock(&file, "internal admission")?;
+        #[cfg(test)]
+        crate::tape::lock_row(
+            "admission-lock:sibling",
+            &sibling.control.join("admission.lock"),
+            crate::tape::TapeOutcome::Facts {
+                facts: "locked".to_owned(),
+            },
+        );
         Ok(Some(file))
     }
 
@@ -5036,7 +5217,17 @@ impl Store {
     fn trusted_origin(&self, record: &Record) -> Option<Built> {
         let file = private_file(&self.origin_path(record.id), false).ok()??;
         let mut bytes = Vec::new();
+        #[cfg(not(test))]
         crate::prune::authority_read(file.take(MAX_ORIGIN_BYTES + 1), &mut bytes).ok()?;
+        #[cfg(test)]
+        crate::prune::authority_read_observed(
+            &file,
+            &self.origin_path(record.id),
+            "store::trusted_origin",
+            MAX_ORIGIN_BYTES,
+            &mut bytes,
+        )
+        .ok()?;
         if bytes.len() as u64 > MAX_ORIGIN_BYTES {
             return None;
         }
@@ -5202,6 +5393,14 @@ impl Store {
     fn admission(&self) -> Result<File, String> {
         let lock = lock_admission(&self.control)?;
         self.fence_admission_state()?;
+        #[cfg(test)]
+        crate::tape::lock_row(
+            "admission-lock:this",
+            &self.control.join("admission.lock"),
+            crate::tape::TapeOutcome::Facts {
+                facts: "locked".to_owned(),
+            },
+        );
         Ok(lock)
     }
 
@@ -5223,6 +5422,8 @@ impl Store {
     /// Make the recorded-accounting fence durable. Nothing is written when it
     /// is already set.
     fn fence_recorded_accounting(&self) -> Result<(), String> {
+        #[cfg(test)]
+        let _tape_fence_kind = crate::tape::effect_kind_override("fence@recorded-accounting");
         let mut state = self.load()?;
         if state.recorded_accounting.as_deref() != Some(RECORDED_ACCOUNTING_FENCE) {
             state.recorded_accounting = Some(RECORDED_ACCOUNTING_FENCE.to_owned());
@@ -5234,6 +5435,8 @@ impl Store {
     /// Make the current control fences durable when they are not already
     /// there. Returns without writing for an already-fenced control.
     fn fence_admission_state(&self) -> Result<(), String> {
+        #[cfg(test)]
+        let _tape_fence_kind = crate::tape::effect_kind_override("fence@admission-fences");
         let mut state = self.load()?;
         let mut changed = false;
         if state.recorded_accounting.as_deref() != Some(RECORDED_ACCOUNTING_FENCE) {
@@ -5301,8 +5504,18 @@ impl Store {
             return Ok(State::default());
         };
         let mut bytes = Vec::new();
+        #[cfg(not(test))]
         crate::prune::authority_read(file.take(MAX_STATE_BYTES + 1), &mut bytes)
             .map_err(|error| format!("cannot read Oxide state: {error}"))?;
+        #[cfg(test)]
+        crate::prune::authority_read_observed(
+            &file,
+            &self.control.join("state.json"),
+            "store::load",
+            MAX_STATE_BYTES,
+            &mut bytes,
+        )
+        .map_err(|error| format!("cannot read Oxide state: {error}"))?;
         // The shared parser is the fence's acceptance test too
         // (`oxide_storage::lease::control::parse_state`), so the two writers
         // cannot disagree about what a valid control document is.
@@ -5362,6 +5575,9 @@ impl Store {
         }
         // Only the admission-lock holder writes, so one temp name suffices.
         let temp = self.control.join("state.json.tmp");
+        #[cfg(test)]
+        let tape_state_path = self.control.join("state.json");
+        #[cfg(not(test))]
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
@@ -5370,12 +5586,47 @@ impl Store {
             .custom_flags(libc::O_NOFOLLOW)
             .open(&temp)
             .map_err(|error| format!("cannot write Oxide state: {error}"))?;
+        #[cfg(test)]
+        let mut file = {
+            let result = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&temp);
+            crate::tape::effect_row("attempt@control-state-temp-open", &temp);
+            result.map_err(|error| format!("cannot write Oxide state: {error}"))?
+        };
+        #[cfg(not(test))]
         file.write_all(&bytes)
             .and_then(|()| file.sync_all())
             .map_err(|error| format!("cannot write Oxide state: {error}"))?;
+        #[cfg(test)]
+        {
+            let write = file.write_all(&bytes);
+            crate::tape::effect_row(if write.is_ok() { "save@control-state-temp" }
+                else { "attempt-save@control-state-temp" }, &temp);
+            write.and_then(|()| file.sync_all())
+                .map_err(|error| format!("cannot write Oxide state: {error}"))?;
+        }
+        #[cfg(not(test))]
         fs::rename(&temp, self.control.join("state.json"))
             .and_then(|()| File::open(&self.control)?.sync_all())
-            .map_err(|error| format!("cannot replace Oxide state: {error}"))
+            .map_err(|error| format!("cannot replace Oxide state: {error}"))?;
+        #[cfg(test)]
+        {
+            let renamed = fs::rename(&temp, self.control.join("state.json"));
+            if renamed.is_err() {
+                crate::tape::effect_row("attempt-rename@control-state", &tape_state_path);
+            }
+            renamed.map_err(|error| format!("cannot replace Oxide state: {error}"))?;
+            crate::tape::effect_row("save@control-state", &tape_state_path);
+            File::open(&self.control)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| format!("cannot replace Oxide state: {error}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -5465,7 +5716,30 @@ fn ensure_private_dir(path: &Path) -> Result<(), String> {
 
 /// Open an existing owner-only control directory without following its final
 /// path component. The descriptor is suitable for relative control-file I/O.
+#[cfg(test)]
+mod control_directory_fs {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+
+    pub(super) fn symlink_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
+        let result = std::fs::symlink_metadata(path);
+        let saved_errno = crate::tape::observer_errno();
+        match &result {
+            Ok(metadata) => crate::tape::read_row_dev("control-directory:named", path,
+                metadata.dev(), metadata.ino(),
+                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
+            Err(error) => crate::tape::read_row("control-directory:named", path,
+                if error.kind() == std::io::ErrorKind::NotFound { crate::tape::TapeOutcome::Absent }
+                else { crate::tape::TapeOutcome::Refusal { reason: error.to_string() } }, 0),
+        }
+        crate::tape::restore_observer_errno(saved_errno);
+        result
+    }
+}
+
 pub(crate) fn open_control_directory(path: &Path) -> Result<Option<File>, String> {
+    #[cfg(test)]
+    use self::control_directory_fs as fs;
     let named = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -5479,14 +5753,43 @@ pub(crate) fn open_control_directory(path: &Path) -> Result<Option<File>, String
             path.display()
         ));
     }
+    #[cfg(not(test))]
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
         .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    #[cfg(test)]
+    let directory = {
+        let result = OpenOptions::new().read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path);
+        let saved_errno = crate::tape::observer_errno();
+        let outcome = match &result {
+            Ok(_) => crate::tape::TapeOutcome::Facts { facts: "opened; descriptor identity pending".to_owned() },
+            Err(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+        };
+        crate::tape::read_row("control-directory:open", path, outcome, 0);
+        crate::tape::restore_observer_errno(saved_errno);
+        result.map_err(|error| format!("cannot open {}: {error}", path.display()))?
+    };
+    #[cfg(not(test))]
     let opened = directory
         .metadata()
         .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    #[cfg(test)]
+    let opened = {
+        let result = directory.metadata();
+        let saved_errno = crate::tape::observer_errno();
+        match &result {
+            Ok(metadata) => crate::tape::read_row_dev("control-directory:held", path,
+                metadata.dev(), metadata.ino(),
+                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
+            Err(error) => crate::tape::read_row("control-directory:held", path,
+                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, 0),
+        }
+        crate::tape::restore_observer_errno(saved_errno);
+        result.map_err(|error| format!("cannot inspect {}: {error}", path.display()))?
+    };
     if !opened.is_dir()
         || opened.uid() != uid
         || opened.mode() & 0o077 != 0
@@ -6089,6 +6392,8 @@ fn open_admission_file(control: &Path, create: bool) -> Result<Option<File>, Str
     // followed, and creation is exclusive so no second file is ever written.
     let mut fd = -1;
     let mut last = None;
+    #[cfg(test)]
+    let mut tape_created = false;
     for _ in 0..3 {
         if create {
             // SAFETY: `name` is a live CString with initialized bytes through
@@ -6107,10 +6412,23 @@ fn open_admission_file(control: &Path, create: bool) -> Result<Option<File>, Str
                 )
             };
             if fd >= 0 {
+                #[cfg(test)]
+                {
+                    tape_created = true;
+                }
                 break;
             }
             let create_error = std::io::Error::last_os_error();
             if create_error.kind() != std::io::ErrorKind::AlreadyExists {
+                #[cfg(test)]
+                crate::tape::read_row(
+                    "admission-lock:open",
+                    &control.join("admission.lock"),
+                    crate::tape::TapeOutcome::Refusal {
+                        reason: create_error.to_string(),
+                    },
+                    0,
+                );
                 return Err(format!(
                     "cannot create admission lock in {}: {create_error}",
                     control.display()
@@ -6142,6 +6460,13 @@ fn open_admission_file(control: &Path, create: bool) -> Result<Option<File>, Str
         // the lock, so `create == false` must distinguish the two precisely.
         let error = last.unwrap_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT));
         if error.kind() == std::io::ErrorKind::NotFound {
+            #[cfg(test)]
+            crate::tape::read_row(
+                "admission-lock:open",
+                &control.join("admission.lock"),
+                crate::tape::TapeOutcome::Absent,
+                0,
+            );
             return Ok(None);
         }
         return Err(if create {
@@ -6162,6 +6487,17 @@ fn open_admission_file(control: &Path, create: bool) -> Result<Option<File>, Str
     // SAFETY: `fd` is a newly opened descriptor owned by this function.
     let file = unsafe { File::from_raw_fd(fd) };
     let metadata = file.metadata().map_err(|error| error.to_string())?;
+    #[cfg(test)]
+    {
+        let path = control.join("admission.lock");
+        if tape_created {
+            crate::tape::effect_row("lock-create@admission", &path);
+        }
+        crate::tape::read_row_dev(
+            "admission-lock:open", &path, metadata.dev(), metadata.ino(),
+            crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0,
+        );
+    }
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
     if !metadata.is_file() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
@@ -6210,6 +6546,14 @@ fn lock_admission_inner(control: &Path, release_pool: Option<&Path>) -> Result<F
     } else {
         crate::budget::lock(&file, "admission")?;
     }
+    #[cfg(test)]
+    crate::tape::lock_row(
+        "admission-lock:acquire",
+        &control.join("admission.lock"),
+        crate::tape::TapeOutcome::Facts {
+            facts: "locked".to_owned(),
+        },
+    );
     Ok(file)
 }
 
@@ -6347,8 +6691,18 @@ fn read_observations(control: &Path) -> Result<Option<Observations>, String> {
         return Ok(None);
     };
     let mut bytes = Vec::new();
+    #[cfg(not(test))]
     crate::prune::authority_read(file.take(MAX_OBSERVATIONS_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read recorded observations: {error}"))?;
+    #[cfg(test)]
+    crate::prune::authority_read_observed(
+        &file,
+        &path,
+        "store::read_observations",
+        MAX_OBSERVATIONS_BYTES,
+        &mut bytes,
+    )
+    .map_err(|error| format!("cannot read recorded observations: {error}"))?;
     if bytes.len() as u64 > MAX_OBSERVATIONS_BYTES {
         return Err("recorded observations exceed their byte limit".to_owned());
     }
@@ -6574,11 +6928,72 @@ pub(crate) fn private_file(path: &Path, create: bool) -> Result<Option<File>, St
         options.create(true).mode(0o600);
     }
     let file = match options.open(path) {
+        #[cfg(not(test))]
         Ok(file) => file,
-        Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("cannot open {}: {error}", path.display())),
+        #[cfg(test)]
+        Ok(file) => {
+            let saved_errno = crate::tape::observer_errno();
+            crate::tape::read_row("private-file:open", path,
+                crate::tape::TapeOutcome::Facts { facts: "opened; descriptor identity unproven".to_owned() }, 0);
+            crate::tape::restore_observer_errno(saved_errno);
+            file
+        }
+        Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(test)]
+            let saved_errno = crate::tape::observer_errno();
+            #[cfg(test)]
+            crate::tape::read_row(
+                "private-file:open",
+                path,
+                crate::tape::TapeOutcome::Absent,
+                0,
+            );
+            #[cfg(test)]
+            crate::tape::restore_observer_errno(saved_errno);
+            return Ok(None);
+        }
+        Err(error) => {
+            #[cfg(test)]
+            let saved_errno = crate::tape::observer_errno();
+            #[cfg(test)]
+            if create {
+                crate::tape::effect_row("attempt@private-file-create", path);
+            }
+            #[cfg(test)]
+            crate::tape::read_row(
+                "private-file:open",
+                path,
+                crate::tape::TapeOutcome::Refusal {
+                    reason: error.to_string(),
+                },
+                0,
+            );
+            #[cfg(test)]
+            crate::tape::restore_observer_errno(saved_errno);
+            return Err(format!("cannot open {}: {error}", path.display()));
+        }
     };
+    // O_CREAT without O_EXCL cannot prove whether the file existed.
+    #[cfg(test)]
+    if create {
+        crate::tape::effect_row("attempt@private-file-create", path);
+    }
+    #[cfg(not(test))]
     let metadata = file.metadata().map_err(|error| error.to_string())?;
+    #[cfg(test)]
+    let metadata = {
+        let result = file.metadata();
+        let saved_errno = crate::tape::observer_errno();
+        match &result {
+            Ok(metadata) => crate::tape::read_row_dev(
+                "private-file:metadata", path, metadata.dev(), metadata.ino(),
+                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
+            Err(error) => crate::tape::read_row("private-file:metadata", path,
+                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, 0),
+        }
+        crate::tape::restore_observer_errno(saved_errno);
+        result.map_err(|error| error.to_string())?
+    };
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
     if !metadata.is_file() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {

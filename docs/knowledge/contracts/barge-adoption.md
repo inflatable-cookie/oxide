@@ -19,6 +19,11 @@ evidence; landing this checkpoint does not satisfy that prerequisite. A native
 diagnostic at a future implementation head is not a missing proof of this
 design checkpoint.
 
+Oxide's test-only capture apparatus uses a single re-rooted test crate for
+binary and library leaves. The shared capture contract below remains the
+acceptance authority; this composition alone is not parity evidence. O3
+remains held on equivalent-input D8 evidence.
+
 The text below is the pre-freeze proposal. Its "proposed design" and "changes
 no code" statements describe the 2026-11-01 proposal only and are kept as dated
 evidence. Where a later slice lands, its own note in this file is the current
@@ -705,6 +710,20 @@ the same manifest fact; missing an applicable obligation is insufficient. Static
 source-site inventory and review of all direct read paths are required alongside
 transcript reconciliation: a transcript alone cannot detect an untaped read.
 
+#### Manifest field proposal
+
+[`oxide-capture-manifest.schema.json`](oxide-capture-manifest.schema.json)
+and [`manifest-example.json`](capture-examples/manifest-example.json) propose
+one machine-readable representation for the semantic contract below. They
+are unaccepted until the retained reviewer judges the shape. Examples are
+illustrative, with placeholder identities and digests; they are not evidence.
+The Barge proposal's `barge.volume_uuid`, `namespace`, `area`, optional
+`named_roots` and `volume_mount`, and its optional `fixture.volume` are
+represented. The authoritative aggregate 32 MiB fixture-byte limit and
+cross-field, identity, source-binding and refusal obligations are semantic
+checks in addition to JSON Schema. An invalid or unbound manifest can never
+establish parity. X-S2 must reconcile the reviewed shape with B-S1 before use.
+
 #### Serialized schemas and caps
 
 One manifest and two transcripts per case window, JSON, deterministic field
@@ -997,6 +1016,329 @@ authorizes a real run, a pin change or a production behaviour change.
   Stopping criteria: pure selectors green, the report renders for a synthetic
   unit fixture, no fixture, pool or image touched outside pure mode.
 
+#### Oxide test-only capture apparatus
+
+Tom decision `c6e3e9c8` v2 (2026-11-04) separates capture delivery from
+private launcher qualification. The separately activated capture-only Effigy
+selectors `rust:compile:cargo`, `rust:compile-release:cargo`,
+`rust:format:cargo`, and `rust:test-600:cargo` cover the build and the existing
+unit and embedded tape harness through Cargo. The suite retains its qualified
+600-second / 512 MiB guard and dual-root recipe. These checks do not establish
+private launcher isolation, global live-state invariance or current export
+production; those remain unproven and separately gated, as does X-S2 adoption.
+Historical private receipts and failures retain their original meanings.
+Ordinary Rust selectors continue to use Oxide.
+
+For the planner-activated Oxide direct batch, a fresh owned 9 GiB outer Cargo
+root holds `HOME`, `CARGO_HOME` and `CARGO_TARGET_DIR`; `CARGO_NET_OFFLINE=true`,
+Rust 1.97.1 and the existing `5cbf42e1` lock-only offline seeder bind the
+inputs. The suite wrapper inherits those Cargo paths, while creating and
+validating its own internal 512 MiB fixture root and sibling temporary root;
+the four inherited root/evidence controls must be absent before it starts.
+The outer qualified guard enforces the independent batch and Cargo-output
+bounds. A plain outer command obtains real heavy Effigy admission separately
+for each of the four Cargo selectors, with no outer heavy reservation; only
+bounded 45-second / 256 MiB offline seeding and pre-effect metadata precede
+them. No Cargo or compiler starts before its selector's admission grant.
+This is the prospective recipe, not evidence that a batch ran or that the
+private launcher or global live-state checks passed.
+
+The harness is under review against the shared capture contract. A passing
+release-profile compile is needed to establish compile-away; a source claim
+alone is insufficient.
+
+- **Files.** `src/bin/oxide/tape.rs` (the binary tape engine: the
+  `oxide.capture.transcript/1` document, epochs assigned at the leaf,
+  per-key occurrence bookkeeping under the fixed 64 cap, the 8192 read-row
+  and 8 MiB document caps with explicit `truncation` flags, effect rows,
+  clock rows, an additive bounded `classifications` array, and the
+  additive bounded pre/post `fixture_capture` with its diff),
+  `src/tape.rs` (the separate sink used only by library unit tests), and `src/bin/oxide/tape_harness.rs` (the `[[test]]`
+  `tape_prune_eval` target, `harness = false`). Recorder statements sit in
+  `prune.rs` (authority scope and budget, `authority_read` core/bind,
+  `read_registry`, `read_bounded`, the no-follow absence walk start,
+  `fstatat`/`openat`/revalidation component rows keyed to observed parent
+  identities, `HeldFacts`, the recorded-volume and boot-Data judges,
+  `observe_row_root`/`observe_root_in` binding, entry, root-directory and
+  marker rows, `judge_recorded_root`/`judge_root_identity`,
+  `account_candidates`), `store.rs` (`private_file` opens and creates,
+  `load`/`holders` authority binds, `save` as `save@control-state` effects,
+  `outputs_initialization`, `checkout_custody` entry/record/verdict
+  classifications, admission lock rows, the fence effect-kind overrides,
+  `open_existing_mode`/`open_at`/`ledger_view` pool rows, `boot_session`
+  and `closed_by_boot`), `outputs.rs` (`read_receipt_with`,
+  `marker_digest`), `removable.rs` (`coordinate`, the registration open and
+  read), `scratch_io.rs` (`read_document` open/meta/bytes rows, the volume
+  binding), and — library-side — `src/volume.rs` (`Binding::open_in`
+  parent/mount/observe/verify rows), `src/inventory.rs` (walk start and
+  root identity) and `src/lease/pool.rs` + `src/lease/mod.rs`
+  (`ledger_view`, the pool lock, reconcile entry classification,
+  `save@ledger` and `fence@managed-control` effects).
+- **Descriptor-read inventory.** The test-only descriptor wrapper currently
+  covers `prune::read_registry`, `prune::read_bounded`, the root marker read,
+  `store::recorded_last_use`, `recorded_lost`, `active_holders`,
+  `sibling_state`, `sibling_state_checked`, `trusted_origin`, `load`, and
+  `read_observations`, `outputs::read_receipt_with`, `marker_digest` and
+  `read_marker`, and `removable::read_registration`. The non-test read
+  statements remain in their original cfg branches. Parent identities are
+  not established by a later path lookup: where the operation did not bind a
+  parent, the descriptor row carries an explicit unproven note. Decision
+  86249e2c permits one test-only fstat on the held descriptor for identity
+  observation only; its failure does not change the real read or policy. This
+  inventory is not proof that every direct read in the contract is taped.
+  Only `prune::read_bounded` uses the approved additional held-descriptor
+  fstat. Other authority-read sites preserve the actual read outcome while
+  marking descriptor and parent identity unproven. The tape does not issue
+  later path or descriptor syscalls to manufacture identities; it uses the
+  existing metadata result for the removable registration, admission lock and
+  volume path verification, and existing `fstatat`/`fstat` outcomes for the
+  revalidation walk. Sites without those facts remain insufficient. The
+  authority deadline is not reconstructed from wall time; its monotonic binding
+  remains unproven until captured from the actual decision input.
+- **Schema coordination.** The proposed shared manifest carries Barge's
+  `barge.volume_uuid`, `namespace`, `area`, optional `named_roots` and
+  `volume_mount`. Barge's small consumption surface ignores the remaining
+  envelope; Oxide's proposal additionally requires the window, source,
+  fixture, dynamic, mandatory-observation, expected-effect and expected
+  fields. The minimal Barge fixture alone is therefore not a complete shared
+  manifest. Retained review of one common shape remains required before either
+  harness treats it as an accepted interface. Effect rows use one fixed
+  kind (`create`, `save`, `fence`, `reconcile`, `lock-create`, `rename` or
+  `unlink`), with a separate source site and an explicit attempted flag;
+  attempted creation is not a successful effect. The actual pool-lock open
+  uses `O_CREAT` without `O_EXCL` even with a prepared lock. A prior pathname
+  metadata observation does not prove what that later open did, so the tape
+  reports an uncertain create attempt and marks the observation insufficient;
+  BASE can have zero confirmed fixture changes without earning parity. The
+  managed-fence path also creates and writes a randomly named temporary file
+  before its rename: the recorder names those actual temporal effects, and a
+  final fixture diff only corroborates the persistent replacement. The shared
+  manifest's exact predeclared path rule cannot predict that random name; this
+  remains an explicit reconciliation gap, never an invented path or a match.
+  The all-kinds manifest example exercises the proposed vocabulary.
+- **Preflight observation.** The tape window begins before fixture configuration
+  resolution because that resolution reads config and pool state. Actual config
+  and private-file read bytes or errors are recorded without a second read;
+  descriptor and parent identities remain explicitly unproven where the real
+  operation did not observe them. The absolute monotonic origin/end and the
+  authority deadline remain unproven, not a synthetic zero or wall clock.
+  Authority begin, complete and read checks, and accounting's start,
+  per-candidate and completion checks, record the actual `Instant` each
+  policy branch already consumed as an offset from the tape's own monotonic
+  start; a short-circuited branch does not invent a sample. These offsets are
+  not the unknown absolute origin or deadline.
+  Fixture snapshot read errors or the 32 MiB byte bound mark the snapshot
+  truncated; a pre/post diff cannot replace effect observations. Refused
+  transcripts identify `source` as `apparatus` for pre-entry validation or
+  `engine` for the actual prune chain; truncation preserves that distinction.
+- **Fixture configuration.** Preparation uses `config::Facts` with injected
+  platform-directory inputs; the evaluator child uses the existing debug-only
+  `OXIDE_TEST_HOME_FROM_ENV=1` control and explicit fixture paths. Its
+  environment accepts only the fixture HOME, fixed system PATH and those
+  Oxide controls; extra variables or a different PATH refuse. The child
+  must check its controls and resolved state and pool before entering the
+  engine. This proves no production account-home equivalence. The isolated
+  validation handoff is the shared provider described below. Local tape
+  selectors refuse: only a planner-bound, independently qualified shared
+  packet and exact-head route can authorize a later execution. The previous
+  task-local sequence and its input schemas are retired, not qualified.
+  The previous `pools.json` inode replacements, including 2072777179 to
+  2072840885 with identical bytes, remain failed isolation gates; the writer
+  is unknown and no repair occurred. The later shared diagnostic #252 also
+  failed its registry identity gate, and #253 owns its source/provenance audit.
+  Neither failure grants proof credit.
+
+  The capture manifest remains a proposal: descriptor targets require path,
+  parent and object identity, and descriptor number; file entries need a
+  digest or explicit unreadable refusal. `oxide_tree` names the source tree;
+  volume obligations bind their declared window. Retained review and Barge
+  reconciliation are still needed before either side treats the shape as
+  accepted. The original caps and capture semantics remain unchanged.
+
+  Historical private Builds limits of 2, 3, 4 and 6 GiB, the 1200-second
+  covering allowance, retained files and failed packets remain history. The
+  6 GiB session reported 5591.8 MiB retained and an approximately 552 MiB
+  whole-block clamp; that point observation is not a current reservation or
+  peak. The later 3 GiB and 4 GiB Barge / 8 GiB Oxide grants were
+  prospective at the time; current ceilings are 5 GiB Barge / 9 GiB Oxide.
+  The 300 s / 1024 MiB debug bootstrap cap remains a maximum, not a fit claim.
+- **Harness composition.** The harness crate re-roots the actual library and
+  binary modules and aliases itself as `oxide_storage`, sharing one tape.
+  Library observations must come from their actual leaf sites; a fixture diff
+  cannot replace them. The harness's negative control reruns the actual BASE
+  engine in a fresh fixture and diverts the reached pool-lock observation to a
+  separate bounded test sink. Its transcript explicitly says insufficient;
+  the ordinary BASE run must contain the same library site on the shared tape.
+  This source regression has not yet been executed. `HoldingSweep` belongs to the release command, while
+  `paired_store` calls `removable::coordinate`, which only reads registration
+  and constructs the sibling store.
+  Narrow `cfg(test)`/`cfg(not(test))` splits are permitted at individual
+  observation sites: the non-test statement remains verbatim, while the test
+  branch calls the real operation once and records its returned value or error.
+  Descriptor reads must bind the held descriptor, not a later path lookup.
+- **Source map for this correction.** `config::config_file` and `inspect`
+  preserve their non-test metadata, canonicalization and read statements;
+  their test arms execute each corresponding operation once, record its real
+  result, preserve errno and retain the original branch order and short circuit.
+  `lease::canonical_existing_dir`, `fence_managed_control`, the private-file
+  reader and `pool::lock_pool_inner` keep their non-test calls verbatim and
+  observe actual test-arm results; parent identity is unproven where no held
+  parent was observed. Pool entry names are recorded from the actual iterator,
+  and each existing listed-entry metadata result is taped without a second read.
+  At `pool::refuse_foreign_pool_entries` and
+  `pool::validate_lease_payload_entries`, test-only local `fs` bindings wrap
+  the same real `read_dir` call and its original iterator: open success/error,
+  each returned entry/error and observed end are recorded without a second
+  syscall. The payload wrapper also records the real metadata calls. Non-test
+  loop statements stay verbatim, and parent identity is unproven because the
+  iterator does not expose a bound parent. Inventory's actual directory-open,
+  returned names, type/metadata results, guard samples, root verification and
+  filesystem-free result are likewise observed without replaying those calls.
+  This is a source claim, not an executed inventory. The engine fixture is a fresh
+  re-exec with `env_clear`; `test_fs` injection and race hooks start as empty
+  thread-local cells, and `volume::verified_facts` starts `None`. The harness
+  does not arm those adapters. Fault-injection debug environment hooks are
+  absent from that child environment; the existing test-home control is set.
+  This documents those reachable seams, not a complete cfg
+  audit or proof that another subprocess kept the same environment.
+  `lease::persist_private_file` and
+  `persist_control_state` retain the non-test write/sync/rename statements;
+  test arms record temp creation, actual write result, cleanup when it succeeds
+  and the final replacement separately, including a write before later sync
+  failure. `store::save` similarly distinguishes an uncertain create/truncate,
+  write result and final rename. `store::private_file` and
+  `store::open_control_directory` record the actual open and held-descriptor
+  metadata result separately. `scratch_io::read_document` records actual
+  open, metadata and read errors rather than a generic refusal;
+  `removable::read_registration` records `openat` and held metadata, and
+  `outputs` records marker open/lstat results alongside the authority read.
+  The source adds component names to tape identities, binds proposed volume
+  facts to the manifest's named window, and checks mandatory identities,
+  extra/unbound reads and exact declared-effect multisets after the engine
+  returns. A fixture diff checks persistent observed changes only; it cannot
+  account for vanished temporary effects. Actual parsed holder records have a
+  separate 512-row bound; their stored wall-clock starts are never promoted to
+  kernel process-start identities, and missing kernel starts and UIDs remain
+  explicit. Process identities and external allowance identities that the
+  row/schema cannot bind remain insufficient;
+  these checks are not a cross-engine oracle or parity verdict. Note storage
+  and the distinct-key table are bounded and mark truncation.
+  Descriptor-relative recovery
+  records the actual `stat_at` result without fabricating its parent, and its
+  reached chmod and put-back sites note the real success or failure as an
+  unbound effect; a descriptor-only result without a path is insufficient. In
+  `open_verified_step` the observer runs only after the restoration guard is
+  armed, preserving its custody ordering. These changes are source-only;
+  the statement map below identifies the pool-open recovery and error paths.
+  Subprocess environment closure needs the separate executable and inventory
+  gates and cannot be inferred from a transcript or fixture diff.
+- **Prefix reachability and effect boundaries.** `Pool::open` calls
+  `open_inner(root, false, true, true)`: canonical root and directory
+  enumeration precede the lock, managed-control fence, config, backend
+  opening and ledger read; holding reconciliation then precedes evicting
+  reconciliation. A prepared fence can avoid a fence write, but the lock's
+  `O_CREAT` is still an attempted effect. A pending reconciliation can write
+  and must not be treated as a static read. `prepare_new_pool`,
+  `verify_scratch_initializer` and `refuse_occupied_init_directory` are
+  initializer paths; `open_inner` does not call them. `holding_names` is used
+  by initialization and the holding-deletion traversal, not the open prefix;
+  the evaluator does not call that deleter. These are call-site distinctions,
+  not a claim that arbitrary pending reconciliation is effect-free.
+  The separate `cfg(not(test))` statements in `config`, `store`, `scratch_io`,
+  `outputs`, `removable`, `inventory`, `lease`, `lease::pool`, `owned_delete`
+  and `volume` are the production side of the equivalence review. The test
+  arms must be checked operation by operation against those statements,
+  including error conversion, errno, short circuit, ownership and descriptor
+  lifetime. A source map and candidate hooks are present; their complete
+  equivalence and transitive coverage have not been independently established.
+  The following statement map is for the actual chain, including error exits;
+  links name the source containing both the non-test statement and its test
+  observation. It does not assert that an unbound row meets an identity
+  obligation or that a failed write succeeded.
+
+  | Source and reached statements | Production/test relationship and outcome |
+  | --- | --- |
+  | [`prune.rs`](../../../src/bin/oxide/prune.rs), `tape_entry::run_chain`, `paired_store`, `require_ready`, `evaluate` | The test entry calls the real chain in that order. Authority clocks and bounded reads have one real call in each cfg arm; read error, cap, missing registry, unsettled state and evaluation result retain the real branch. `dry_run`, preview rendering and deletion entrypoints are not called. |
+  | [`config.rs`](../../../src/bin/oxide/config.rs), `config_file`, `read_config`, `inspect` | Metadata, canonicalization and actual file read retain the non-test statements; test arms record the corresponding result or error before the same propagation/short circuit. |
+  | [`store.rs`](../../../src/bin/oxide/store.rs), `private_file`, `open_control_directory`, `holders`, `save`, `open_admission_file`, `lock_admission_inner` | The original non-test opens, descriptor metadata, state write/sync/rename and lock statements remain in their cfg arms. Test arms record the one real result; rename failure is an attempt and successful state replacement is recorded before directory sync. The `O_CREAT` cases remain attempts when creation is not proven. Holder wall starts do not establish kernel starts. |
+  | [`scratch_io.rs`](../../../src/bin/oxide/scratch_io.rs), `read_document`; [`outputs.rs`](../../../src/bin/oxide/outputs.rs), `read_receipt_with`, `marker_digest`, `read_marker`; [`removable.rs`](../../../src/bin/oxide/removable.rs), `read_registration`, `coordinate` | Test arms observe the actual open, metadata, bounded read, marker and registration results; non-test statements and their error returns remain. `coordinate` selects the paired store; it does not invoke a holding deleter. |
+  | [`lease/mod.rs`](../../../src/lease/mod.rs), `canonical_existing_dir`, `read_private_file_bounded`, `fence_managed_control`, `persist_private_file`, `persist_control_state`, `random_hex` | Non-test calls retain canonicalization, bounded read, entropy, create/write/sync/rename and cleanup order. The test branch records real create/write, failed rename/cleanup attempts, successful cleanup and the replacement before the directory sync. The managed admission open is an attempt, not a claimed new lock. A failed sync is propagated even if the replacement was already recorded. |
+  | [`lease/pool.rs`](../../../src/lease/pool.rs), `Pool::open_inner`, `lock_pool_inner`, `read_config`, `read_ledger`, `open_budget_payload`, `open_volume_payload`, `refuse_foreign_pool_entries`, `validate_lease_payload_entries` | Root canonicalization and listing precede the real lock and fence; config and ledger use the private-file reader. Backend probes, listing results/errors, lock open/metadata/flock and actual held metadata are taped at the corresponding operations. Unsupported backing, bad metadata, listing and lock errors keep their original returns. The non-test directory iterators and syscall statements remain, with test-only wrappers calling each original iterator once. |
+  | [`lease/pool.rs`](../../../src/lease/pool.rs), `reconcile_holding`, `reconcile_evicting`, `reconcile_slot_capture`, `record_slot_capture`, `persist_revised`, `persist`, `hold_slot_tree_with_phase` | A stale or adopted holding row changes the ledger only through `persist_revised` → `persist` → `persist_private_file`; a pending eviction can record intent, restore captures, create a holding directory, rename a tree and persist a revised ledger. Create and rename results are taped where attempted; failed checks retain/block the record. Successful rename is taped before subsequent verification and sync; a containment rename is separately recorded. A prepared pool with no pending rows does not take these recovery branches. |
+  | [`owned_delete.rs`](../../../src/owned_delete.rs), `observe_entry`, `open_verified_step`, `restore_root_capture`, `put_back`; [`lease/pool.rs`](../../../src/lease/pool.rs), `rollback_captures` | Recovery uses the real held-descriptor metadata and no-follow operations. Where chmod or rename has no observed path binding, the actual success/failure is an explicit unbound effect, not an invented pathname. The mode restoration guard is armed before the test observer runs. The outside-lock `delete_holding_children` and `holding_names` deleter path is not called by `open_inner` or the evaluator. |
+  | [`inventory.rs`](../../../src/inventory.rs), `inventory_directory`, `inventory_with`, `Walker`, `probe_filesystem_free`; [`volume.rs`](../../../src/volume.rs), binding/open/verification | Existing root, iterator, metadata, deadline and filesystem-free results feed the same accounting and refusal branches. Test rows record returned results, not a second inventory or a recomputed policy; volume descriptor and parent fields stay unproven where the original operation supplies none. |
+  | [`tape.rs`](../../../src/bin/oxide/tape.rs), [`tape_harness.rs`](../../../src/bin/oxide/tape_harness.rs), [`src/tape.rs`](../../../src/tape.rs), [`lib.rs`](../../../src/lib.rs) | The tape and harness are test-only; the library-side module is `cfg(all(test, unix))`. The re-rooted harness resolves the real modules into one sink. Production release compile-away remains an execution obligation, not a consequence inferred from this table. |
+
+  In main's `custody_verdict`, the production `lost.unclosed.as_deref()`
+  filter is assigned to `unclosed` before the same `if let Some(why)` branch.
+  This reshaping preserves the one `closed_by_boot` call, short circuit and
+  returned custody value; only the test arm records that actual call result.
+  This is a source equivalence claim, still requiring release compilation.
+
+  Initializer-only `prepare_new_pool`, `verify_scratch_initializer` and
+  `refuse_occupied_init_directory` are reached by initialization, not by
+  `Pool::open_inner`. `HoldingSweep` and its actual unlink traversal belong to
+  release, not the `run_chain` call graph. A recovery rollback can still do
+  descriptor-only chmod or rename, so it is not classified as a no-op.
+  In the pending-eviction path, `recorded_root_is_untracked` observes each
+  actually reached original/private `symlink_metadata` in its original
+  short-circuit order; `require_slot_parent` observes the two device reads;
+  `holding_device` observes its real metadata result before the existing
+  fallback; holding moves and slot accounting record their own metadata
+  results. Errors remain errors or the same original conservative fallback.
+- **The entry.** `prune::tape_entry::run_chain` (cfg(test)) follows the
+  `dry_run` prefix exactly — `AuthorityScope::begin`, `paired_store`, the
+  optional `read_operator_list`, `require_ready`, the unfinished-intent
+  refusal through `unsettled`, then `evaluate` — and exports every actual
+  `Evaluation` entry (root identity, candidate or kept reason, legacy flag)
+  and the completeness flag, or the actual pre-evaluate refusal with the
+  engine's exit code (2 registry/fence refusal, 3 unsettled, 1 chain
+  error). It never calls `dry_run`, never renders a preview, never
+  redirects stdout. The static source-site inventory is the list above;
+  the descriptor-bound read sites and their failure paths still require
+  source and execution review. An unbound or unknown observation is never
+  parity, and over-cap occurrences explicitly mark truncation.
+- **The harness.** Argv contract exactly
+  `--fixture-root --manifest --transcript-out --case`; exit 0 when the
+  transcript is written (any engine outcome), 2 on harness failure. No
+  arguments (the `oxide test` route) runs the embedded unit fixture end to
+  end: the pure tape checks (deterministic field order, epoch and
+  occurrence bookkeeping, both caps' explicit truncation, the unbound
+  authority-read note, effect/clock/classification rows) plus the BASE,
+  EFFECT-1 (absent admission lock), EFFECT-2 (missing accounting fences),
+  REGISTRY-MISSING and UNSETTLED-INTENT unit fixtures, each a fresh
+  exclusively owned fixture and one engine child (this executable
+  re-invoked with a scrubbed environment: private HOME plus
+  `OXIDE_TEST_HOME_FROM_ENV=1`, private `OXIDE_CONFIG`, `OXIDE_POOL`,
+  `OXIDE_POOL_CAP`, `OXIDE_SCRATCH_ROOT` only when the fixture sits under
+  `/Volumes`), every child waited and reaped. `--self-check` runs only the
+  pure checks.
+- **Honest fixture limits.** The engine's `Binding::open` accepts exactly
+  `/Volumes/<name>`, so an external root binds only when the fixture's own
+  `oxide-outputs` sits at a dedicated mount root. On a shared volume's
+  scratch (or the internal fallback) the embedded BASE is expected to record
+  an incomplete batch with every root kept and the engine's own reason; the
+  strong BASE surface (present checkout kept, positively absent checkout's
+  root an actual candidate, unlisted legacy root kept, complete snapshot)
+  requires a fixture that is its own attached proof volume. A prepared fixture
+  carries the four admission fences, `outputs_init` ready, the pool lock and
+  the admission lock. BASE expects no confirmed effect and an empty fixture
+  diff, but the real pool-lock `O_CREAT` open remains an uncertain attempt,
+  so its transcript is insufficient for parity. The EFFECT cases also record
+  actual temporary operations and uncertain attempts, alongside the final
+  admission-lock creation or fence save; fixture diffs corroborate only the
+  surviving changes. These source assertions have not been executed.
+- **Validation and export.** The final executable and its build route must be
+  identified from the reviewed source and recorded with its digest, lock and
+  toolchain before X-S2 consumes it. The final head still needs its covering
+  compile, release compile, format, Rust suite, docs and focused selectors.
+  No earlier fixture run supplies that evidence. The fixed nine-premise
+  checklist remains mandatory for future execution: private HOME/rustup,
+  account control, environment scrubbing, no unintended adoption, Cargo argv,
+  image custody if applicable, frozen compiler flags, temporary placement and
+  explicit macOS mktemp templates. These are conditions to verify, not proof
+  that the current apparatus satisfies them.
+
 Deliverable note for O3: an `EXPLAIN-OR-BLOCK` case that demonstrates a real
 final disagreement (currently `REF-ORPHAN-MARKED`, `RCP-V1`,
 `WRT-RETIRED-CLEAN`) is not folded into a match. Each is either explained from
@@ -1025,10 +1367,10 @@ schema:
   `9c36470a-54ab-44a8-9e15-28ce1789e9c4`), built from private source
   copies staged under the prepared task root, with component analyses bound
   to the audited source sites and host executable digests measured live;
-- the accepted Oxide #240 launcher shapes: `budget.json`,
-  `history-discovery.json` and the eleven-field `block-authorization.json`,
-  whose `binding_sha256`, `ledger_sha256`, `history_sha256` and `one_use_id`
-  stay null in proposals and are planner-bound at issue;
+- provider-emitted Oxide compatibility proposals: `budget.json`,
+  `history-discovery.json` and `block-authorization.json`. These remain
+  unissued inputs owned by the provider; the removed local launcher does not
+  consume or independently approve their shape;
 - one gate receipt, `oxide.private-build-validation/1`, whose qualification
   state is always `unqualified` — receipt judgment is retained Queue review,
   never this tool.
@@ -1113,10 +1455,24 @@ heavy Effigy admission through the audited hook, with the audited pair
 preserved in every child environment; no second admission seam exists and no
 Git-verified source archive is ever edited.
 
+The explicit audit manifest accepts at most 128 retained-root names; the earlier
+64-name limit is historical. Each name still passes the existing containment,
+identity and metadata checks, and per-walk entry, depth and deadline bounds are
+unchanged. No retained root may be omitted to fit this name budget.
+
+The current prospective private-validation ceiling is **5 GiB for Barge** and
+9 GiB for Oxide. The preceding 3 GiB and 4 GiB Barge / 8 GiB Oxide grants
+and their packets remain historical. Each run still clamps its budget to the
+aggregate ceiling minus retained bytes; the private pool remains 256 MiB and the native guard is at
+most 512 MiB. The increase adds no cleanup or runtime authorization and does
+not repin Barge's retained fact-only component.
+
 **Resource clamps (operator decision `af038a7e` v2; review 6584174560).**
-Whole-block scratch is a measured clamp of each prospective aggregate grant
-minus retained bytes — Barge 3 GiB and Oxide 8 GiB of Builds scratch. The
-prospective grants do not renew or raise any earlier session: the historical
+Whole-block scratch is a measured clamp of the applicable aggregate grant
+minus retained bytes. Decision `af038a7e` v2 granted Barge 3 GiB and Oxide
+8 GiB; the subsequent 4 GiB Barge / 8 GiB Oxide grant is historical. The
+current prospective ceilings are 5 GiB Barge / 9 GiB Oxide, as stated above.
+These grants do not renew or raise any earlier session: the historical
 2 GiB / 6 GiB runs and their evidence (Oxide's reported 5591.8 MiB retained
 total, about 552 MiB effective against the 6 GiB grant) keep their original
 bounds and stand as historical measurement only. The effective figure is
@@ -1195,7 +1551,18 @@ preparation manifest binds each unissued document digest; audit component
 entries name the source pairs rather than their accompanying analysis text. The
 preparation root is retained and counted before the diagnostic. All command
 and environment bindings are fixed before dispatch; changing the source needs
-new source review. The displayed diagnostic scratch budget is a planner-bound
+new source review. The candidate diagnostic binds its qualified outer guard to the separately
+issued remaining allocation after the preparation charge: the actual guard
+limit must exceed 30 seconds and may not exceed either issued authority. The
+qualified guard serializes its limit as a JSON number such as `990.0`; the gate
+accepts a finite integral float as that exact integer without changing the receipt.
+Its effective deadline is the earliest of the guard deadline and the issued wall
+bounds; bounded source staging, input walks and final inventories use it. Each
+nested guard samples the remaining time again immediately before launch and
+refuses at 30 seconds or less. Historical 1200-second packets retain their
+original limits; this check does not create a new allowance.
+
+The displayed diagnostic scratch budget is a planner-bound
 clamp, and the repository selector's 512 MiB default refuses if it does not
 fit the measured remainders.
 
@@ -1417,14 +1784,15 @@ fail-closed controls stay intact. The gate receipt stays honest
 capture wire/schema limitations, X-S2/O3, production pins/features and
 live-data restrictions are unchanged. Prospective accounting under
 `d9aec625` v2: ONE cumulative 1200-second continuation charged to BOTH
-capture blocks — the existing 309 seconds plus at most 891 new seconds,
-with 20 seconds reserved now for the source checks (spent conservatively
-in both blocks, no refund, at most 1180 seconds unallocated before actual
-preparation/runtime); the preceding 309-second ledger and every earlier
-reservation stay history with no clock reset or refund. Prospective
-aggregate scratch caps remain Barge 3 GiB and Oxide 8 GiB and refuse when
-retained bytes leave no space. At most ONE Queue-routed candidate
-isolation qualification and then at most ONE safe covering batch per
+capture blocks. Earlier provider and owner evidence reservations total 30 s;
+two consumer source-check reservations add 20 s, leaving at most 1150 s
+unallocated before actual preparation/runtime. These are conservative
+reservations, not measured runtime; the earlier 309-second ledger and every
+historical charge remain with no reset or refund. Prospective
+aggregate scratch caps for that ruling were Barge 3 GiB and Oxide 8 GiB and
+refused when retained bytes left no space. The later Barge 4 GiB / Oxide 8 GiB
+correction and current 5 GiB / 9 GiB ceilings are recorded above and do not
+rewrite those historical packets. At most ONE Queue-routed candidate isolation qualification and then at most ONE safe covering batch per
 capture task at its exact approved head, each with the qualified guard
 (`fcfda2b0…` unchanged) and fresh one-use claims; no automatic retry,
 native image or bootstrap. Source approval grants no native credit. The
@@ -1432,21 +1800,85 @@ selector `proof:private-build-validation:candidate` (heavy) carries the
 fixed unbound declaration and refuses before any effect until the planner
 amends the command with every bound argument.
 
-**Integration and removal plan for the obsolete local scaffold.** The #240
-local route (`scripts/tape-isolation-check.py` sequence/bootstrap/preflight/
-cover actions and the `proof:tape-prune:*` launch selectors at `657023bd`)
-is NOT source-approved and must not be executed or relied on. In ONE later
-correction, after this provider is independently reviewed and the planner
-binds its first execution, the #240 author (whose branch is not edited from
-here) delegates to the shared artifacts: consume this gate's exports (the
-issued Oxide block, `budget.json`, `history-discovery.json` and the debug
-receipt) instead of the local packet builders, route the covering execution
-through the shared diagnostic's exported remaining allowance, retire the
-local sequence/launch selectors, and keep the accepted cfg(test) capture
-source and its harness untouched. Until then the local scaffold stays
-unexecuted, and its review's confirmed ideas (CLOCK_UPTIME_RAW deadline,
-budget clamp arithmetic shape, retained inventory before/after equality)
-re-enter only through this provider's own reviewed source.
+The shared provider accepts `OXIDE_PRIVATE_BUILD_PROGRESS=1` for bounded
+stage begin/end timestamps on its existing stderr during preparation and the
+candidate diagnostic. These fixed-name observations identify the last entered
+operation; they do not grant admission, alter deadlines or establish a pass.
+With the switch unset the provider emits no progress records.
+
+**Capture handoff.** The obsolete #240 local sequence and admission schemas
+are removed. `scripts/private_build_candidate.py` is the source-owned
+candidate consumer: Barge may stage and hash this exact component alongside
+`scripts/test-private-build-validation.py` and invoke
+`verify_candidate_facts(gate, candidate, qualification, digests, product_head,
+product_tree)`. It returns the producer's remaining seconds or raises the
+provider's `GateRefusal`; the caller must first read and hash the actual
+documents and must independently enforce its own fixed selector contract,
+guard, claim, paths and limits. Oxide's `verify_documents` and `consume`
+add its fixed selectors and guarded execution; Barge must not copy that fact
+policy or treat the fact function alone as admission. In particular, Barge's
+`candidate_runtime` caller must pass the producer gate, candidate and separate
+qualification documents, the actual byte digests (`gate`, `candidate`,
+`guard`, `case_guard`, `case_log`, `live_before`, `live_after`) and Barge's
+bound product head/tree. It must replace its expected `verify_candidate`
+boolean-result interface with this integer-returning fact call; its existing
+guard, single-use claim, source/tool verification, offline dependency setup,
+live inventory and Barge selector/cap checks remain independently required.
+No positive execution or admission field may be synthesized from the returned
+number. The component imports the shared provider from its own directory, so
+both staged source files must be independently hash-bound. The earlier reviewed Barge
+fact-only pair remains bound to its original hashes; the Oxide deadline-aware
+provider change does not migrate or requalify that pair. The thin tape entry accepts only
+`--input <path> --sha256 <planner-digest>` under the shared supervisor. The
+input's `paths` and `digests` bind the producer gate and candidate receipts,
+outer and status-case guard receipts, both live inventories, independent
+qualification and fresh issuance. The input also names the product checkout
+and exact head. Qualification is a separate planner-bound positive judgment
+over those artifacts, product head/tree and retained roots; the producer's
+candidate receipt remains `unqualified` with `build.state = not-built`.
+Issuance binds that judgment, exact selectors, candidate, component/provider
+and tool digests, private roots, limits and a fresh one-use claim. Missing,
+changed, expired, unguarded or spent inputs refuse before product execution.
+
+The retained private debug front door was compiled from commit
+`3de241325dd286ae44a5759fa6825b05a81c7b4e`; the compile and test selectors
+operate on the separately bound, staged PR head and tree. The candidate remains
+unqualified until its actual retained qualification. Its identity is not the
+installed release binary. Host-tool hashes bind executable identity, not a
+filesystem confinement guarantee.
+
+The 256 batching change updates preview selection and real-run authorization,
+which lie beyond the capture harness prefix. It does not change the reached
+`evaluate` source-site or cfg map. Its production and test changes remain part
+of the exact source to be covered by the later checks.
+
+For a capture run the planner supplies `TAPE_CAPTURE_LIMIT_SECONDS` before
+Effigy admission. A missing limit refuses. The consumer uses the minimum of
+the live guard deadline, the independently issued expiry and the invocation
+start plus its maximum. Git subprocesses use the remaining deadline as their
+timeout and archive members are checked against it. The allowance must leave
+at least 32 seconds before the claim and 31 seconds before each nested guard;
+a spent issuance refuses. Admission waits do not rewrite an expiry or resurrect
+a claim. A post-claim refusal burns
+the one-use issuance. The guard must adopt an owner-only, canonical root below
+`/Volumes/Builds/scratch/oxide-validation`; the Rust suite temporary directory
+is that root's `capture-covering/tmp`. Its separately approved internal fixture
+root is still used by the nested suite guard. These bounds do not confine host
+tools' filesystem writes.
+
+After the existing provider's guard and exclusive claim, the consumer stages
+the exact product Git tree and uses the existing offline seeder on its bound
+lock into a private Cargo home. It runs the four named covering selectors
+under the shared supervisor, preserving the approved suite's validation-temp
+and internal roots and bracketing the work with live and retained inventories.
+Equal retained snapshots are not continuous-peak proof. Host-tool hashes bind
+identity, not writes. `proof:tape-prune:cover` is the guarded entry; the
+unbound declaration refuses. This new source component and the producer's
+separate case/guard outputs require exact-head retained review, a real positive
+qualification and planner-issued inputs before use. The shared diagnostic #252
+failed its live registry-identity gate; #253 independently owns source and
+provenance audit. Neither source integration nor the candidate receipt grants
+runtime, native, parity or merge credit.
 
 **Premise dispositions (HIGH, proof-apparatus authoring).** (1) Private
 HOME/CARGO_HOME with the invoking `RUSTUP_HOME` captured before replacement,

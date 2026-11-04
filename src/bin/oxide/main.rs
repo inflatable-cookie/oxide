@@ -49,6 +49,11 @@ mod version;
 mod watchdog;
 mod wrapper;
 
+/// The binary observation tape for the prune capture harness (X-S1); see
+/// `src/bin/oxide/tape.rs` and `docs/knowledge/contracts/barge-adoption.md`.
+#[cfg(test)]
+mod tape;
+
 use cli::{Class, Invocation, Profile, LEGACY_PROFILE_ENVIRONMENT};
 use freshness::{Gate, Refusal};
 use identity::{RunPick, SlotKey};

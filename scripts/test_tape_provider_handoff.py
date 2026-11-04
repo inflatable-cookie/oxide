@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""Mock-only controls for the canonical capture candidate consumer."""
+import copy
+from contextlib import ExitStack
+from types import SimpleNamespace
+import importlib.util
+from pathlib import Path
+import sys
+import subprocess
+import unittest
+from unittest import mock
+
+sys.dont_write_bytecode = True
+import private_build_candidate as consumer
+
+spec = importlib.util.spec_from_file_location('tape_handoff', Path(__file__).with_name('tape-provider-handoff.py'))
+handoff = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(handoff)
+provider = consumer.provider
+
+
+def sample():
+    digests = {name: (str(index) * 64) for index, name in enumerate(
+        ('gate', 'candidate', 'qualification', 'issuance', 'guard', 'case_guard', 'live_before', 'live_after'), 1)}
+    digests['live_after'] = digests['live_before']
+    digests['case_log'] = '9' * 64
+    artifact = 'a' * 64
+    origin = {'root': '/old', 'artifact': {'sha256': artifact, 'bytes': 10},
+              'lock_sha256': 'lock', 'toolchain_sha256': 'toolchain',
+              'guard': {'closure': 'closed', 'status': 0, 'census_certain': True,
+                        'census_members': 0, 'census_uncertain': 0,
+                        'receipt_sha256': 'origin-guard', 'log_sha256': 'origin-log',
+                        'receipt_path': '/origin-receipt', 'log_path': '/origin-log'}}
+    candidate = {'schema': provider.SCHEMA_CANDIDATE_RECEIPT, 'mode': 'candidate',
+                 'qualification': 'unqualified', 'ruling': provider.CANDIDATE_RULING,
+                 'status_phase': provider.STATUS_SELECTOR, 'build': {'state': 'not-built'},
+                 'origin': origin, 'copy': {'path': '/old/candidate', 'sha256': artifact},
+                 'binding': {'commit': provider.OXIDE_PIN_COMMIT, 'lock_sha256': 'lock',
+                             'toolchain_sha256': 'toolchain', 'oxide_sha256': artifact,
+                             'rustc_sha256': 'rustc', 'cargo_sha256': 'cargo'},
+                 'live_inventory': {'before_sha256': digests['live_before'],
+                                    'after_sha256': digests['live_after']}}
+    guard_command = ['python', 'test-private-build-validation.py', '--candidate']
+    case_command = ['effigy', provider.STATUS_SELECTOR]
+    allowance = {'remaining_seconds': 1000}
+    gate = {'schema': provider.SCHEMA_GATE_RECEIPT, 'qualification': {'state': 'unqualified'},
+            'failures': [], 'blocks': {'oxide_block_sha256': 'prior-block'},
+            'bindings': {'effigy': 'effigy', 'git': 'git'}, 'allowance': allowance,
+            'commands': [{'phase': provider.STATUS_SELECTOR, 'exit': 0,
+                          'argv': ['python', 'bounded-test.py', '--', *case_command]}],
+            'exports': {'candidate_receipt_sha256': digests['candidate'],
+                        'candidate_copy_path': '/old/candidate', 'candidate_copy_sha256': artifact,
+                        'candidate_origin_root': '/old', 'origin_guard_receipt_sha256': 'origin-guard',
+                        'origin_build_log_sha256': 'origin-log',
+                        'live_before_sha256': digests['live_before'],
+                        'live_after_sha256': digests['live_after'],
+                        'remaining_allowance': allowance}}
+    def guard(command):
+        return {'command': command, 'scratch': '/old',
+                'outcome': {'closure': 'closed', 'status': 0, 'fault': None,
+                            'deadline': False, 'launched': True},
+                'census': {'certain': True, 'members': 0, 'uncertain': 0}}
+    qualification = {'schema': consumer.QUALIFICATION_SCHEMA, 'state': 'qualified',
+        'review_reference': 'planner-review', 'gate_sha256': digests['gate'],
+        'candidate_sha256': digests['candidate'], 'guard_sha256': digests['guard'],
+        'case_guard_sha256': digests['case_guard'], 'guard_command': guard_command,
+        'case_log_sha256': digests['case_log'], 'status_probe_id': 'fixture',
+        'guard_scratch': '/old', 'case_command': case_command, 'case_scratch': '/old',
+        'product_head': '1' * 40, 'product_tree': '2' * 40,
+        'producer_oxide_block_sha256': 'prior-block',
+        'retained_roots': ['/old'],
+        'oxide_retained_roots': [], 'barge_retained_roots': ['/old'],
+        'offline_cache_source': '/old/cache',
+        'admission_env': {'EFFIGY_ADMISSION_HOOK': '/hook', 'QUEUE_ADMISSION_SOCKET': '/socket'},
+        'admission_audit': {'example': 'audit'},
+        'test_internal_root': '/private/tmp/fixture',
+        'test_validation_tmp': '/Volumes/Builds/scratch/oxide-validation/fixture',
+        'live_before_sha256': digests['live_before'], 'live_after_sha256': digests['live_after']}
+    tools = {name: {'path': '/tools/' + name, 'sha256': name} for name in
+             ('effigy', 'rustc', 'cargo', 'supervisor', 'python', 'git')}
+    tools['supervisor']['sha256'] = provider.SUPERVISOR_SHA256
+    tools['python']['path'] = sys.executable
+    tools['git']['path'] = '/usr/bin/git'
+    tools['rustc']['path'] = '/rustup/toolchains/1.97.1-test/bin/rustc'
+    tools['cargo']['path'] = '/rustup/toolchains/1.97.1-test/bin/cargo'
+    issuance = {'schema': consumer.ISSUANCE_SCHEMA, 'qualification_sha256': digests['qualification'],
+        'product_head': '1' * 40, 'product_tree': '2' * 40, 'candidate_sha256': artifact,
+        'selectors': list(consumer.SELECTORS), 'max_seconds': 600, 'planner_reference': 'issued',
+        'one_use_id': 'b' * 64, 'consumer_sha256': 'consumer', 'provider_sha256': 'provider',
+        'tools': tools, 'rustup_home': '/rustup', 'scratch_mib': 512, 'pool_cap_bytes': 1,
+        'expires_ns': 1100, 'retained_roots': ['/old'], 'offline_cache_source': '/old/cache',
+        'oxide_retained_roots': [], 'barge_retained_roots': ['/old'],
+        'admission_env': qualification['admission_env'],
+        'admission_audit': qualification['admission_audit'],
+        'test_internal_root': qualification['test_internal_root'],
+        'test_validation_tmp': qualification['test_validation_tmp']}
+    docs = {'gate': gate, 'candidate': candidate, 'qualification': qualification, 'issuance': issuance,
+            'guard': guard(guard_command), 'case_guard': guard(case_command),
+            'live_before': [['state/pools.json']], 'live_after': [['state/pools.json']]}
+    return docs, digests
+
+
+class CandidateTest(unittest.TestCase):
+    def test_missing_and_unguarded_entry_refuse(self):
+        with mock.patch.object(handoff.consumer.provider, 'supervisor_context', side_effect=provider.GateRefusal('unguarded')):
+            with self.assertRaisesRegex(SystemExit, 'missing'):
+                handoff.handoff([])
+            with self.assertRaises(provider.GateRefusal):
+                handoff.handoff(['--input', '/input', '--sha256', 'a' * 64])
+
+    def test_valid_bound_documents_and_refusals(self):
+        docs, digests = sample()
+        def check(d):
+            return consumer.verify_documents(d['gate'], d['candidate'], d['qualification'],
+                                             d['issuance'], digests, '1' * 40, '2' * 40)
+        self.assertEqual(check(docs), 1000)
+        self.assertEqual(consumer.verify_candidate_facts(docs['gate'], docs['candidate'],
+                         docs['qualification'], digests, '1' * 40, '2' * 40), 1000)
+        for name, section, key, value in (
+            ('unqualified', 'qualification', 'state', 'unqualified'),
+            ('bootstrap confusion', 'candidate', 'mode', 'bootstrap'),
+            ('wrong head', 'issuance', 'product_head', '3' * 40),
+            ('depleted', 'issuance', 'max_seconds', 0),
+            ('changed receipt', 'qualification', 'candidate_sha256', 'different'),
+            ('wrong producer ruling', 'candidate', 'ruling', 'other'),
+            ('missing qualification', 'qualification', 'review_reference', ''),
+            ('foreign selector contract', 'issuance', 'selectors', ['barge:test']),
+        ):
+            changed = copy.deepcopy(docs)
+            changed[section][key] = value
+            with self.subTest(name=name), self.assertRaises(provider.GateRefusal):
+                check(changed)
+
+    def test_git_deadline_timeout_refuses(self):
+        result = SimpleNamespace(returncode=0, stdout=b'ok')
+        with mock.patch.object(provider, 'now_ns', return_value=1_000_000_000), \
+             mock.patch.object(provider.subprocess, 'run', return_value=result) as run:
+            self.assertEqual(provider.git_output(Path('/repo'), 'status', deadline_ns=3_000_000_000), b'ok')
+            self.assertEqual(run.call_args.kwargs['timeout'], 2)
+            with self.assertRaises(provider.GateRefusal):
+                provider.git_output(Path('/repo'), 'status', deadline_ns=1_000_000_000)
+            run.side_effect = subprocess.TimeoutExpired('git', 2)
+            with self.assertRaisesRegex(provider.GateRefusal, 'deadline exhausted'):
+                provider.git_output(Path('/repo'), 'status', deadline_ns=3_000_000_000)
+
+    def test_real_allowance_and_effective_deadline_boundaries(self):
+        billion = 1_000_000_000
+        with mock.patch.object(provider, 'now_ns', return_value=10 * billion):
+            allowance = provider.Allowance(60, 50 * billion, None, started_ns=10 * billion)
+            self.assertEqual(allowance.remaining_seconds(), 40)
+        with mock.patch.object(provider, 'now_ns', return_value=19 * billion):
+            allowance.require(31, 'selector')
+        with mock.patch.object(provider, 'now_ns', return_value=20 * billion):
+            with self.assertRaises(provider.GateRefusal):
+                allowance.require(31, 'selector')
+        with mock.patch.object(provider, 'now_ns', return_value=70 * billion):
+            with self.assertRaises(provider.GateRefusal):
+                allowance.require(1, 'maximum')
+        with mock.patch.object(provider, 'now_ns', return_value=50 * billion - 1):
+            self.assertEqual(allowance.remaining_seconds(), 0)
+        with mock.patch.object(provider, 'now_ns', return_value=50 * billion):
+            self.assertEqual(allowance.remaining_seconds(), 0)
+
+    def test_guarded_body_routes_all_selectors_and_rejects_changed_inventory(self):
+        docs, _ = sample()
+        issue = docs['issuance']
+        scratch = Path('/Volumes/Builds/scratch/oxide-validation/guard')
+        root = scratch / 'capture-covering'
+        issue.update(product_lock_sha256='lock', product_toolchain_sha256='toolchain',
+                     test_validation_tmp=str(root / 'tmp'))
+        with mock.patch.object(provider, 'now_ns', return_value=1):
+            allowance = provider.Allowance(600, 275_000_000_001, None, started_ns=1)
+        child = mock.Mock(return_value=({'closed': True}, '', []))
+        seed = mock.Mock()
+        stage = mock.Mock(return_value={'Cargo.lock': 'lock', 'rust-toolchain.toml': 'toolchain'})
+        receipt_check = mock.Mock()
+        retained = mock.Mock(return_value=['stable'])
+        mode = SimpleNamespace(st_uid=__import__('os').geteuid(), st_mode=0o40700)
+        def directory(base, relative):
+            return base / relative
+        def run_with_snapshots(snapshots, advance=False):
+            clock = [1]
+            pending = iter(snapshots)
+            def inventory(*_):
+                value = next(pending)
+                if advance:
+                    clock[0] = 246_000_000_001
+                return value
+            with ExitStack() as stack:
+                for obj, name, kw in (
+                    (Path, 'resolve', {'new': lambda self, **_: self}),
+                    (Path, 'is_dir', {'return_value': True}),
+                    (Path, 'stat', {'return_value': mode}),
+                    (Path, 'read_bytes', {'return_value': b'lock'}),
+                    (consumer.os, 'lstat', {'return_value': mode}),
+                    (consumer.os, 'symlink', {}),
+                    (provider, 'now_ns', {'side_effect': lambda: clock[0]}),
+                    (provider, 'private_dir', {'side_effect': directory}),
+                    (provider, 'private_write', {}),
+                    (provider, 'stage_git_tree', {'new': stage}),
+                    (provider, 'child_environment', {'return_value': {'TMPDIR': '/base-tmp', 'TMP': '/base-tmp', 'TEMP': '/base-tmp', 'OXIDE_TASK_SCRATCH_ROOT': str(root)}}),
+                    (provider, 'live_inventory', {'side_effect': inventory}),
+                    (provider, 'retained_snapshot', {'new': retained}),
+                    (provider, 'verify_inventory', {'side_effect': lambda a, b, *_: consumer.require(a == b, 'inventory changed')}),
+                    (provider, 'run_supervised', {'new': child}),
+                    (provider, 'validate_supervisor_receipt', {'new': receipt_check}),
+                ):
+                    stack.enter_context(mock.patch.object(obj, name, **kw))
+                stack.enter_context(mock.patch.dict(sys.modules, {'offline_seed': SimpleNamespace(seed_cargo_home=seed)}))
+                return consumer._execute_guarded(issue, Path('/candidate'), Path('/repo'),
+                    'head', 'tree', scratch, Path('/evidence'), 123456, allowance)
+        self.assertEqual(run_with_snapshots([['same']] * 8), 0)
+        self.assertEqual([call.kwargs['command'][1:] for call in child.call_args_list],
+                         [selector.split() for selector in consumer.SELECTORS])
+        for call in child.call_args_list[:3]:
+            self.assertEqual(call.kwargs['env']['TMPDIR'], '/base-tmp')
+            self.assertEqual(call.kwargs['env']['OXIDE_TASK_SCRATCH_ROOT'], str(root))
+        suite = child.call_args_list[-1].kwargs
+        self.assertEqual(suite['env']['OXIDE_TEST_INTERNAL_ROOT'], issue['test_internal_root'])
+        for name in ('TMPDIR', 'TMP', 'TEMP'):
+            self.assertEqual(suite['env'][name], str(root / 'tmp'))
+        self.assertEqual(suite['env']['OXIDE_TASK_SCRATCH_ROOT'], issue['test_internal_root'])
+        self.assertEqual(suite['allowance'], allowance)
+        self.assertTrue(all(call.kwargs['limit_seconds'] == 275 for call in child.call_args_list))
+        seed.assert_called_once()
+        self.assertEqual(seed.call_args.kwargs['deadline_ns'], 123456)
+        stage.assert_called_once_with(Path('/repo'), root / 'source', 'head', 'tree', deadline_ns=123456)
+        self.assertEqual(receipt_check.call_count, 4)
+        self.assertEqual(receipt_check.call_args.args[2], Path(issue['test_internal_root']))
+        self.assertEqual(retained.call_count, 8)
+        child.reset_mock()
+        with self.assertRaisesRegex(provider.GateRefusal, 'selector launch'):
+            run_with_snapshots([['same'], ['same']], advance=True)
+        child.assert_not_called()
+        with self.assertRaisesRegex(provider.GateRefusal, 'inventory changed'):
+            run_with_snapshots([['before'], ['after']])
+        self.assertEqual(child.call_count, 1)
+        child.reset_mock()
+        stage.return_value = {'Cargo.lock': 'changed', 'rust-toolchain.toml': 'toolchain'}
+        with self.assertRaisesRegex(provider.GateRefusal, 'staged lock or toolchain'):
+            run_with_snapshots([])
+        child.assert_not_called()
+        stage.return_value = {'Cargo.lock': 'lock', 'rust-toolchain.toml': 'changed'}
+        with self.assertRaisesRegex(provider.GateRefusal, 'staged lock or toolchain'):
+            run_with_snapshots([])
+        child.assert_not_called()
+        stage.return_value = {'Cargo.lock': 'lock', 'rust-toolchain.toml': 'toolchain'}
+        original_tmp, original_internal = issue['test_validation_tmp'], issue['test_internal_root']
+        for bad_tmp in ('/outside', '/Volumes/Builds/scratch/oxide-validation',
+                        '/Volumes/Builds/scratch/oxide-validation/other/tmp'):
+            issue['test_validation_tmp'] = bad_tmp
+            with self.subTest(bad_tmp=bad_tmp), self.assertRaises(provider.GateRefusal):
+                run_with_snapshots([])
+        issue['test_validation_tmp'] = original_tmp
+        issue['test_internal_root'] = '/other/internal'
+        with self.assertRaises(provider.GateRefusal):
+            run_with_snapshots([])
+        issue['test_internal_root'] = original_internal
+        mode.st_mode = 0o40755
+        with self.assertRaises(provider.GateRefusal):
+            run_with_snapshots([])
+        mode.st_mode = 0o40700
+        mode.st_uid += 1
+        with self.assertRaises(provider.GateRefusal):
+            run_with_snapshots([])
+        mode.st_uid -= 1
+        child.assert_not_called()
+        def reject_suite(receipt, command, expected_scratch):
+            if command[-2:] == ['test', 'rust']:
+                self.assertEqual(expected_scratch, Path(issue['test_internal_root']))
+                raise provider.GateRefusal('wrong suite receipt scratch')
+        receipt_check.side_effect = reject_suite
+        with self.assertRaisesRegex(provider.GateRefusal, 'wrong suite receipt scratch'):
+            run_with_snapshots([['same']] * 8)
+        self.assertEqual(child.call_count, 4)
+
+    def test_actual_consumer_reaches_only_named_mock_child(self):
+        docs, digests = sample()
+        options = {'paths': {**{key: key for key in docs}, 'case_log': 'case_log'}, 'digests': digests,
+                   'product_repo': '/repo', 'product_head': '1' * 40}
+        tool_hashes = {value['path']: value['sha256'] for value in docs['issuance']['tools'].values()}
+        def sha(path, **_):
+            if path == Path(consumer.__file__): return 'consumer'
+            if path == consumer._provider_path: return 'provider'
+            if str(path) == '/old/candidate': return 'a' * 64
+            return tool_hashes[str(path)]
+        child = mock.Mock(return_value='mock-only')
+        with mock.patch.object(consumer, '_document', side_effect=lambda path, _: docs[path]), \
+             mock.patch.object(consumer, '_text', return_value='mock-status'), \
+             mock.patch.object(provider, 'verify_probe') as verify_probe, \
+             mock.patch.object(provider, 'supervisor_context', return_value=(Path('/evidence'), 'run', 1000, Path('/scratch'))), \
+             mock.patch.object(provider, 'repo_guard', return_value=Path('/repo')), \
+             mock.patch.object(provider, 'extract_commit_identity', return_value=('1' * 40, '2' * 40)), \
+             mock.patch.object(provider, 'canonical_file', side_effect=lambda p: p), \
+             mock.patch.object(provider, 'direct_effigy', side_effect=lambda p: p), \
+             mock.patch.object(provider, 'audited_admission', return_value=docs['issuance']['admission_env']), \
+             mock.patch.object(provider, 'sha256_file', side_effect=sha), \
+             mock.patch.object(provider, 'validate_candidate_origin', return_value=docs['candidate']['origin']), \
+             mock.patch.object(provider, 'claim_issued_token') as claim, \
+             mock.patch.object(provider, 'now_ns', return_value=1), \
+             mock.patch.object(Path, 'resolve', lambda self, **_: self), \
+             mock.patch.object(consumer.os, 'access', return_value=True):
+            self.assertEqual(consumer._consume(options, execute=child), 'mock-only')
+            child.assert_called_once_with(consumer.SELECTORS)
+            verify_probe.assert_called_once()
+            claim.assert_called_once()
+            child.reset_mock()
+            claim.side_effect = provider.GateRefusal('replayed')
+            with self.assertRaises(provider.GateRefusal):
+                consumer._consume(options, execute=child)
+            child.assert_not_called()
+            claim.side_effect = None
+            docs['issuance']['tools']['rustc']['sha256'] = 'wrong'
+            with self.assertRaises(provider.GateRefusal):
+                consumer._consume(options, execute=child)
+            child.assert_not_called()
+            docs['issuance']['tools']['rustc']['sha256'] = 'rustc'
+            docs['candidate']['origin']['root'] = '/different'
+            with self.assertRaises(provider.GateRefusal):
+                consumer._consume(options, execute=child)
+            child.assert_not_called()
+            docs['candidate']['origin']['root'] = '/old'
+            docs['issuance']['expires_ns'] = 1
+            with self.assertRaises(provider.GateRefusal):
+                consumer._consume(options, execute=child)
+            child.assert_not_called()
+            docs['issuance']['expires_ns'] = 999
+            self.assertEqual(consumer._consume(options, execute=child), 'mock-only')
+            child.reset_mock()
+            docs['issuance']['pool_cap_bytes'] = 8 * 1024 * 1024 * 1024
+            self.assertEqual(consumer._consume(options, execute=child), 'mock-only')
+            child.reset_mock()
+            for invalid_pool in (8 * 1024 * 1024 * 1024 + 1, 9 * 1024 * 1024 * 1024,
+                                 True, float(256 * 1024 * 1024), None, 0):
+                docs['issuance']['pool_cap_bytes'] = invalid_pool
+                with self.assertRaises(provider.GateRefusal):
+                    consumer._consume(options, execute=child)
+                child.assert_not_called()
+
+
+if __name__ == '__main__':
+    unittest.main()

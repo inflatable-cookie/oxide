@@ -10,6 +10,9 @@ named selector.
 
     python3 scripts/rust-test-600.py    # effigy rust:test-600
 
+The capture-only `--capture-cargo` choice selects the same fixed test arguments
+with Cargo; the default remains Oxide. No other command can be supplied.
+
 Fixed bounds, never overridable from the command line: the shared supervisor
 (`scripts/bounded-test.py`, the qualified source bytes) gets `--limit 600
 --scratch-budget-mib 512` and the whole command `oxide test --workspace
@@ -65,6 +68,7 @@ REPO = os.path.dirname(HERE)
 LIMIT_S = 600
 SCRATCH_BUDGET_MIB = 512
 COMMAND = ("oxide", "test", "--workspace", "--all-targets", "--locked")
+CAPTURE_COMMAND = ("cargo", "test", "--workspace", "--all-targets", "--locked")
 INTERNAL_PARENT = "/private/tmp"
 VALIDATION_PREFIX = "run."
 INTERNAL_PREFIX = "oxide-internal."
@@ -98,12 +102,14 @@ class Refused(Exception):
 
 
 def parse(argv):
-    options = {"self_check": False, "plan": False}
+    options = {"self_check": False, "plan": False, "capture_cargo": False}
     for argument in argv:
         if argument == "--self-check":
             options["self_check"] = True
         elif argument == "--plan":
             options["plan"] = True
+        elif argument == "--capture-cargo":
+            options["capture_cargo"] = True
         else:
             raise Refused(f"unknown argument {argument}; this selector's bounds are fixed")
     if options["self_check"] and options["plan"]:
@@ -121,13 +127,13 @@ def refuse_inherited(env):
                           "creates and owns its roots")
 
 
-def supervisor_argv():
+def supervisor_argv(capture_cargo=False):
     """The whole command the shared supervisor runs, with this selector's fixed
     bounds. Nothing here overrides them."""
     return [sys.executable, os.path.join(HERE, "bounded-test.py"),
             "--limit", str(LIMIT_S),
             "--scratch-budget-mib", str(SCRATCH_BUDGET_MIB),
-            "--", *COMMAND]
+            "--", *(CAPTURE_COMMAND if capture_cargo else COMMAND)]
 
 
 def supervisor_environment(env, roots):
@@ -296,10 +302,10 @@ def cleanup(roots, code):
     return "removed"
 
 
-def plan_lines():
+def plan_lines(capture_cargo=False):
     return [
         f"rust:test-600 plan (oxide#224): {LIMIT_S} s limit, {SCRATCH_BUDGET_MIB} MiB monitored scratch",
-        "command: " + " ".join(supervisor_argv()),
+        "command: " + " ".join(supervisor_argv(capture_cargo)),
         f"internal root: one {INTERNAL_PREFIX}* owner-only directory under {INTERNAL_PARENT},",
         "  exported as OXIDE_TASK_SCRATCH_ROOT and OXIDE_TEST_INTERNAL_ROOT",
         "validation temp: one run.* owner-only directory under the selected volume's",
@@ -312,7 +318,7 @@ def plan_lines():
     ]
 
 
-def run(env, probe=None, runner=None):
+def run(env, probe=None, runner=None, capture_cargo=False):
     """Prepare this run's roots, run the shared supervisor once, then dispose of
     the roots truthfully. Returns the supervisor's exit status."""
     probe = probe if probe is not None else BOUNDED.DefaultProbe()
@@ -329,7 +335,7 @@ def run(env, probe=None, runner=None):
     child = supervisor_environment(env, roots)
     code = 1
     try:
-        code = runner(supervisor_argv(), child)
+        code = runner(supervisor_argv(capture_cargo), child)
     finally:
         disposition = cleanup(roots, code)
         if disposition == "kept":
@@ -383,6 +389,9 @@ def self_check():
     check("parse accepts the two effect-free modes",
           parse(["--self-check"])["self_check"] and parse(["--plan"])["plan"])
     check("parse refuses both modes together", refused(parse, ["--self-check", "--plan"]))
+    check("capture mode requires its exact flag", parse(["--capture-cargo"])["capture_cargo"]
+          and not parse([])["capture_cargo"]
+          and refused(parse, ["--capture-cargo", "--arbitrary"]))
 
     for name in INHERITED:
         check(f"an inherited {name} refuses", refused(refuse_inherited, {name: "/somewhere"}))
@@ -400,6 +409,31 @@ def self_check():
           argv[argv.index("--limit") + 1] == "600"
           and argv[argv.index("--scratch-budget-mib") + 1] == "512"
           and tuple(argv[argv.index("--") + 1:]) == COMMAND)
+    capture_argv = supervisor_argv(parse(["--capture-cargo"])["capture_cargo"])
+    check("capture choice changes only the fixed suite command",
+          capture_argv[:-len(CAPTURE_COMMAND)] == argv[:-len(COMMAND)]
+          and tuple(capture_argv[capture_argv.index("--") + 1:])
+          == ("cargo", "test", "--workspace", "--all-targets", "--locked")
+          and COMMAND == ("oxide", "test", "--workspace", "--all-targets", "--locked"))
+
+    # Check the actual fixed Effigy declarations without Cargo or a child.
+    with open(os.path.join(REPO, "effigy.toml"), encoding="utf-8") as config:
+        config_text = config.read()
+    expected_selectors = {
+        "rust:compile:cargo": "cargo check --workspace --all-targets --locked",
+        "rust:compile-release:cargo": "RUSTFLAGS='-D warnings' cargo check --release --workspace --bins --locked",
+        "rust:format:cargo": "cargo fmt --all -- --check",
+        "rust:test-600:cargo": "python3 scripts/rust-test-600.py --capture-cargo",
+    }
+    check("capture selectors bind fixed commands under heavy admission",
+          all(config_text.count(f'[tasks."{name}"]\nadmission = "heavy"\nrun = "{command}"\n') == 1
+              for name, command in expected_selectors.items()))
+    check("ordinary Rust selectors retain the Oxide backend",
+          all(line in config_text.splitlines() for line in (
+              '"rust:compile" = "oxide check --workspace --all-targets --locked"',
+              "\"rust:compile-release\" = \"RUSTFLAGS='-D warnings' oxide check --release --workspace --bins --locked\"",
+              '"rust:format" = "oxide fmt --all -- --check"',
+              'run = "python3 scripts/rust-test-600.py"')))
 
     base = tempfile.mkdtemp(prefix="rust-test-600-self-check.")
     try:
@@ -511,10 +545,10 @@ def main(argv):
         if options["self_check"]:
             return self_check()
         if options["plan"]:
-            for line in plan_lines():
+            for line in plan_lines(options["capture_cargo"]):
                 print(line)
             return 0
-        return run(os.environ)
+        return run(os.environ, capture_cargo=options["capture_cargo"])
     except Refused as refusal:
         print(f"rust-test-600: refused: {refusal}", file=sys.stderr)
         return 2

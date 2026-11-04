@@ -720,11 +720,23 @@ impl Drop for StepModeGuard {
 fn restore_mode_through(dir: BorrowedFd<'_>, mode: u32) -> Result<(), String> {
     let bits = (mode & 0o7777) as libc::mode_t;
     // SAFETY: `dir` is a live descriptor for the verified directory.
+    #[cfg(not(test))]
     if unsafe { libc::fchmod(dir.as_raw_fd(), bits) } != 0 {
         return Err(format!(
             "the step directory's recorded mode cannot be restored ({})",
             io::Error::last_os_error()
         ));
+    }
+    #[cfg(test)]
+    {
+        let status = unsafe { libc::fchmod(dir.as_raw_fd(), bits) };
+        crate::tape::unbound_effect("restore-step-mode:fchmod", status == 0);
+        if status != 0 {
+            return Err(format!(
+                "the step directory's recorded mode cannot be restored ({})",
+                io::Error::last_os_error()
+            ));
+        }
     }
     if unsafe { libc::fsync(dir.as_raw_fd()) } != 0 {
         return Err(format!(
@@ -757,11 +769,23 @@ pub fn open_verified_step(
     }
     let bits = ((mode & 0o7777) | 0o700) as libc::mode_t;
     // SAFETY: `held` is a live descriptor for the verified directory.
+    #[cfg(not(test))]
     if unsafe { libc::fchmod(held.as_raw_fd(), bits) } != 0 {
         return Err(format!(
             "the directory cannot be given access for the step ({})",
             io::Error::last_os_error()
         ));
+    }
+    #[cfg(test)]
+    {
+        let status = unsafe { libc::fchmod(held.as_raw_fd(), bits) };
+        if status != 0 {
+            crate::tape::unbound_effect("open-verified-step:fchmod", false);
+            return Err(format!(
+                "the directory cannot be given access for the step ({})",
+                io::Error::last_os_error()
+            ));
+        }
     }
     // Armed from this instant, before anything else can fail.
     let mut guard = StepModeGuard {
@@ -769,6 +793,8 @@ pub fn open_verified_step(
         mode,
         armed: true,
     };
+    #[cfg(test)]
+    crate::tape::unbound_effect("open-verified-step:fchmod", true);
     #[cfg(test)]
     crate::test_fs::run_after_step_chmod();
     let fault = {
@@ -839,11 +865,23 @@ pub fn restore_captured_mode(
     }
     let bits = (mode & 0o7777) as libc::mode_t;
     // SAFETY: `held` is a live descriptor for the verified directory.
+    #[cfg(not(test))]
     if unsafe { libc::fchmod(held.as_raw_fd(), bits) } != 0 {
         return Err(format!(
             "the captured directory's recorded mode cannot be restored ({})",
             io::Error::last_os_error()
         ));
+    }
+    #[cfg(test)]
+    {
+        let status = unsafe { libc::fchmod(held.as_raw_fd(), bits) };
+        crate::tape::unbound_effect("restore-captured-mode:fchmod", status == 0);
+        if status != 0 {
+            return Err(format!(
+                "the captured directory's recorded mode cannot be restored ({})",
+                io::Error::last_os_error()
+            ));
+        }
     }
     if unsafe { libc::fsync(held.as_raw_fd()) } != 0 {
         return Err(format!(
@@ -1137,11 +1175,23 @@ pub fn restore_root_capture(
             }
         }
         // SAFETY: `held` is a live descriptor for the captured directory.
+        #[cfg(not(test))]
         if unsafe { libc::fchmod(held.as_raw_fd(), plan.mode_bits()) } != 0 {
             return Err(format!(
                 "the captured root's recorded mode cannot be restored ({})",
                 io::Error::last_os_error()
             ));
+        }
+        #[cfg(test)]
+        {
+            let status = unsafe { libc::fchmod(held.as_raw_fd(), plan.mode_bits()) };
+            crate::tape::unbound_effect("restore-root-capture:fchmod", status == 0);
+            if status != 0 {
+                return Err(format!(
+                    "the captured root's recorded mode cannot be restored ({})",
+                    io::Error::last_os_error()
+                ));
+            }
         }
         if unsafe { libc::fsync(held.as_raw_fd()) } != 0 {
             return Err(format!(
@@ -1150,8 +1200,15 @@ pub fn restore_root_capture(
             ));
         }
     }
+    #[cfg(not(test))]
     rename_exclusive(parent, &private, name)
         .map_err(|error| format!("the captured root cannot be put back ({error})"))?;
+    #[cfg(test)]
+    {
+        let result = rename_exclusive(parent, &private, name);
+        crate::tape::unbound_effect("restore-root-capture:rename", result.is_ok());
+        result.map_err(|error| format!("the captured root cannot be put back ({error})"))?;
+    }
     sync_directory(parent).map_err(|error| format!("the put-back cannot be synced ({error})"))?;
     match name_holds(parent, name, plan)? {
         Some(true) => Ok(()),
@@ -1204,7 +1261,14 @@ pub fn verify_captured(
 /// that took that name again makes this fail; the caller then leaves the
 /// private name in place and reports both.
 pub fn put_back(dir: BorrowedFd<'_>, capture: &Capture) -> io::Result<()> {
-    rename_exclusive(dir, &capture.private, &capture.original)
+    #[cfg(not(test))]
+    { rename_exclusive(dir, &capture.private, &capture.original) }
+    #[cfg(test)]
+    {
+        let result = rename_exclusive(dir, &capture.private, &capture.original);
+        crate::tape::unbound_effect("put-back:rename", result.is_ok());
+        result
+    }
 }
 
 /// Remove the captured regular file or link by its private name only.
@@ -1677,6 +1741,20 @@ fn stat_at(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<libc::stat> {
             libc::AT_SYMLINK_NOFOLLOW,
         )
     };
+    #[cfg(test)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let saved_errno = crate::tape::observer_errno();
+        let outcome = if status == 0 {
+            crate::tape::TapeOutcome::Opened { dev: stat_device(&stat), ino: stat_ino(&stat) }
+        } else {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::NotFound { crate::tape::TapeOutcome::Absent }
+            else { crate::tape::TapeOutcome::Refusal { reason: error.to_string() } }
+        };
+        crate::tape::component_without_parent("owned-delete:stat-at", std::ffi::OsStr::from_bytes(name.to_bytes()), outcome);
+        crate::tape::restore_observer_errno(saved_errno);
+    }
     if status != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -1798,8 +1876,24 @@ pub fn names_of(dir: BorrowedFd<'_>) -> io::Result<Vec<OsString>> {
 pub fn descriptor_identity(fd: BorrowedFd<'_>) -> io::Result<(u64, u64)> {
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: `fd` is live for the call.
+    #[cfg(not(test))]
     if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
         return Err(io::Error::last_os_error());
+    }
+    #[cfg(test)]
+    {
+        let status = unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) };
+        let saved_errno = crate::tape::observer_errno();
+        let outcome = if status == 0 {
+            crate::tape::TapeOutcome::Opened { dev: stat_device(&stat), ino: stat_ino(&stat) }
+        } else {
+            crate::tape::TapeOutcome::Refusal { reason: io::Error::last_os_error().to_string() }
+        };
+        crate::tape::descriptor_row("owned-delete:descriptor-identity", fd.as_raw_fd(), outcome);
+        crate::tape::restore_observer_errno(saved_errno);
+        if status != 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     Ok((
         stat_device(&stat),

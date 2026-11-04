@@ -94,6 +94,23 @@ default = false
 [tasks."rust:test-600"]
 run = "python3 scripts/rust-test-600.py"
 
+# Capture-only direct Cargo covering, separately activated after source review.
+[tasks."rust:compile:cargo"]
+admission = "heavy"
+run = "cargo check --workspace --all-targets --locked"
+
+[tasks."rust:compile-release:cargo"]
+admission = "heavy"
+run = "RUSTFLAGS='-D warnings' cargo check --release --workspace --bins --locked"
+
+[tasks."rust:format:cargo"]
+admission = "heavy"
+run = "cargo fmt --all -- --check"
+
+[tasks."rust:test-600:cargo"]
+admission = "heavy"
+run = "python3 scripts/rust-test-600.py --capture-cargo"
+
 [tasks."proof:rust-test-600:test"]
 run = "python3 scripts/rust-test-600.py --self-check"
 
@@ -1469,6 +1486,29 @@ run = "python3 scripts/test-private-build-validation.py --plan"
 [tasks."proof:private-build-validation:diagnostic"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 1200 --scratch-budget-mib 512 -- python3 scripts/test-private-build-validation.py --diagnostic"
+
+# X-S1 has no task-local admission provider. Each local execution selector
+# refuses; Queue must bind the qualified shared provider and exact-head route.
+[tasks."proof:tape-prune:handoff-test"]
+run = "python3 scripts/test_tape_provider_handoff.py"
+
+# Requires a separately qualified planner-bound input; the guard still refuses
+# missing or mismatched inputs before a product child can be launched.
+[tasks."proof:tape-prune:cover"]
+admission = "heavy"
+run = 'python3 scripts/bounded-test.py --limit "${TAPE_CAPTURE_LIMIT_SECONDS:-0}" --scratch-budget-mib 512 -- python3 scripts/tape-provider-handoff.py --input "$TAPE_CAPTURE_INPUT" --sha256 "$TAPE_CAPTURE_INPUT_SHA256"'
+
+[tasks."proof:tape-prune:test"]
+run = "python3 scripts/tape-provider-handoff.py"
+
+[tasks."proof:tape-prune:self-check"]
+run = "python3 scripts/tape-provider-handoff.py"
+
+[tasks."proof:tape-prune:preflight-build"]
+run = "python3 scripts/tape-provider-handoff.py"
+
+[tasks."proof:tape-prune:bootstrap"]
+run = "python3 scripts/tape-provider-handoff.py"
 
 # Candidate route (oxide#254, operator decision d9aec625): the same guarded
 # provider binding the RETAINED debug artifact from the spent replacement

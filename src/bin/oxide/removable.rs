@@ -663,17 +663,56 @@ pub(crate) fn read_registration_at(directory: &File) -> Result<Option<Registrati
     };
     if fd < 0 {
         let error = std::io::Error::last_os_error();
+        #[cfg(test)]
+        let saved_errno = crate::tape::observer_errno();
+        #[cfg(test)]
+        crate::tape::read_row(
+            "removable:registration-open",
+            &control.join(REGISTRATION),
+            if error.kind() == std::io::ErrorKind::NotFound {
+                crate::tape::TapeOutcome::Absent
+            } else {
+                crate::tape::TapeOutcome::Refusal {
+                    reason: error.to_string(),
+                }
+            },
+            0,
+        );
+        #[cfg(test)]
+        crate::tape::restore_observer_errno(saved_errno);
         return if error.kind() == std::io::ErrorKind::NotFound {
             Ok(None)
         } else {
             Err(format!("cannot read the removable registration: {error}"))
         };
     }
+    #[cfg(test)]
+    {
+        let saved_errno = crate::tape::observer_errno();
+        crate::tape::read_row("removable:registration-open", &control.join(REGISTRATION),
+            crate::tape::TapeOutcome::Facts { facts: "opened; descriptor identity pending".to_owned() }, 0);
+        crate::tape::restore_observer_errno(saved_errno);
+    }
     // SAFETY: `fd` is a newly opened descriptor owned by this function.
     let file = unsafe { File::from_raw_fd(fd) };
+    #[cfg(not(test))]
     let metadata = file
         .metadata()
         .map_err(|error| format!("cannot read the removable registration: {error}"))?;
+    #[cfg(test)]
+    let metadata = {
+        let result = file.metadata();
+        let saved_errno = crate::tape::observer_errno();
+        match &result {
+            Ok(metadata) => crate::tape::read_row_dev("removable:registration-held", &control.join(REGISTRATION),
+                metadata.dev(), metadata.ino(),
+                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
+            Err(error) => crate::tape::read_row("removable:registration-held", &control.join(REGISTRATION),
+                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, 0),
+        }
+        crate::tape::restore_observer_errno(saved_errno);
+        result.map_err(|error| format!("cannot read the removable registration: {error}"))?
+    };
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
     if !metadata.is_file()
@@ -684,8 +723,18 @@ pub(crate) fn read_registration_at(directory: &File) -> Result<Option<Registrati
         return Err("the removable registration is not a small owner-only regular file".to_owned());
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    #[cfg(not(test))]
     crate::prune::authority_read(file.take(MAX_REGISTRATION_BYTES + 1), &mut bytes)
         .map_err(|error| format!("cannot read the removable registration: {error}"))?;
+    #[cfg(test)]
+    crate::prune::authority_read_observed(
+        &file,
+        &control.join(REGISTRATION),
+        "removable::read_registration",
+        MAX_REGISTRATION_BYTES,
+        &mut bytes,
+    )
+    .map_err(|error| format!("cannot read the removable registration: {error}"))?;
     if bytes.len() as u64 > MAX_REGISTRATION_BYTES {
         return Err("the removable registration exceeds its byte limit".to_owned());
     }
@@ -996,9 +1045,21 @@ pub fn coordinate(internal: Option<Store>) -> Result<Option<Store>, String> {
         return Ok(None);
     };
     if registration(&internal)?.is_none() {
+        #[cfg(test)]
+        crate::tape::classify_row(
+            "removable:coordinate",
+            &internal.control().display().to_string(),
+            "no-registration; internal pool only",
+        );
         return Ok(Some(internal));
     }
     let control = removable_control(internal.control());
+    #[cfg(test)]
+    crate::tape::classify_row(
+        "removable:coordinate",
+        &internal.control().display().to_string(),
+        &format!("sibling-control={}", control.display()),
+    );
     Ok(Some(internal.with_sibling(&control, false)))
 }
 

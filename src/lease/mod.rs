@@ -857,8 +857,25 @@ fn canonical_existing_dir(path: &Path, owner_only: bool) -> Result<PathBuf, Leas
     if path.as_os_str().as_bytes().len() > MAX_PATH_BYTES {
         return Err(LeaseError::InvalidInput("path is too long"));
     }
+    #[cfg(not(test))]
     let metadata =
         fs::symlink_metadata(path).map_err(|_| LeaseError::UnsafePath("path missing"))?;
+    #[cfg(test)]
+    let metadata = {
+        use std::os::unix::fs::MetadataExt;
+        let result = fs::symlink_metadata(path);
+        let saved_errno = crate::tape::observer_errno();
+        match &result {
+            Ok(metadata) => crate::tape::read_row_dev("lease:canonical-dir:metadata", path,
+                metadata.dev(), metadata.ino(),
+                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
+            Err(error) => crate::tape::read_row("lease:canonical-dir:metadata", path,
+                if error.kind() == std::io::ErrorKind::NotFound { crate::tape::TapeOutcome::Absent }
+                else { crate::tape::TapeOutcome::Refusal { reason: error.to_string() } }, 0),
+        }
+        crate::tape::restore_observer_errno(saved_errno);
+        result.map_err(|_| LeaseError::UnsafePath("path missing"))?
+    };
     if metadata.file_type().is_symlink() {
         return Err(LeaseError::UnsafePath("symlinks are refused"));
     }
@@ -875,7 +892,20 @@ fn canonical_existing_dir(path: &Path, owner_only: bool) -> Result<PathBuf, Leas
             ));
         }
     }
+    #[cfg(not(test))]
     let canonical = fs::canonicalize(path).map_err(io_error)?;
+    #[cfg(test)]
+    let canonical = {
+        let result = fs::canonicalize(path);
+        let saved_errno = crate::tape::observer_errno();
+        let outcome = match &result {
+            Ok(canonical) => crate::tape::TapeOutcome::Facts { facts: canonical.display().to_string() },
+            Err(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+        };
+        crate::tape::read_row("lease:canonical-dir:canonicalize", path, outcome, 0);
+        crate::tape::restore_observer_errno(saved_errno);
+        result.map_err(io_error)?
+    };
     if canonical != path {
         return Err(LeaseError::UnsafePath(
             "path must be supplied in canonical form",
@@ -932,16 +962,57 @@ fn persist_private_file(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
     let temp_path = parent.join(temp_name);
     let mut options = OpenOptions::new();
     options.write(true).create_new(true).mode(0o600);
+    #[cfg(not(test))]
     let mut file = options.open(&temp_path).map_err(io_error)?;
+    #[cfg(test)]
+    let mut file = {
+        let result = options.open(&temp_path);
+        crate::tape::effect_row(if result.is_ok() { "create@pool-private-temp" }
+            else { "attempt@pool-private-temp" }, &temp_path);
+        result.map_err(io_error)?
+    };
+    #[cfg(not(test))]
     if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
         let _ = fs::remove_file(&temp_path);
         return Err(io_error(error));
     }
+    #[cfg(test)]
+    {
+        let write = file.write_all(bytes);
+        let saved_errno = crate::tape::observer_errno();
+        crate::tape::effect_row(if write.is_ok() { "save@pool-private-temp" }
+            else { "attempt-save@pool-private-temp" }, &temp_path);
+        crate::tape::restore_observer_errno(saved_errno);
+        if let Err(error) = write.and_then(|()| file.sync_all()) {
+            let removed = fs::remove_file(&temp_path);
+            crate::tape::effect_row(if removed.is_ok() { "unlink@pool-private-temp" }
+                else { "attempt-unlink@pool-private-temp" }, &temp_path);
+            return Err(io_error(error));
+        }
+    }
     drop(file);
+    #[cfg(not(test))]
     if let Err(error) = fs::rename(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
         return Err(io_error(error));
     }
+    #[cfg(test)]
+    if let Err(error) = fs::rename(&temp_path, path) {
+        crate::tape::effect_row("attempt-rename@pool-private-file", path);
+        let removed = fs::remove_file(&temp_path);
+        crate::tape::effect_row(if removed.is_ok() { "unlink@pool-private-temp" }
+            else { "attempt-unlink@pool-private-temp" }, &temp_path);
+        return Err(io_error(error));
+    }
+    #[cfg(test)]
+    crate::tape::effect_row(
+        if path.file_name().is_some_and(|name| name == LEDGER_NAME) {
+            "save@ledger"
+        } else {
+            "save@pool-config"
+        },
+        path,
+    );
     // oxide#196: an injected failure after the replacement but before the
     // parent-directory sync leaves the new ledger visible while the write
     // errors, so callers must classify the commit boundary conservatively.
@@ -961,7 +1032,28 @@ fn read_private_file(path: &Path) -> Result<Vec<u8>, LeaseError> {
 }
 
 fn read_private_file_bounded(path: &Path, max: u64) -> Result<Vec<u8>, LeaseError> {
+    #[cfg(not(test))]
     let metadata = fs::symlink_metadata(path).map_err(io_error)?;
+    #[cfg(test)]
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            use std::os::unix::fs::MetadataExt;
+            let saved_errno = crate::tape::observer_errno();
+            crate::tape::read_row_dev(
+                "lease:private-file:metadata", path, metadata.dev(), metadata.ino(),
+                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, max,
+            );
+            crate::tape::restore_observer_errno(saved_errno);
+            metadata
+        }
+        Err(error) => {
+            let saved_errno = crate::tape::observer_errno();
+            crate::tape::read_row("lease:private-file:metadata", path,
+                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, max);
+            crate::tape::restore_observer_errno(saved_errno);
+            return Err(io_error(error));
+        }
+    };
     if metadata.file_type().is_symlink()
         || !metadata.file_type().is_file()
         || metadata.permissions().mode() & 0o077 != 0
@@ -970,11 +1062,42 @@ fn read_private_file_bounded(path: &Path, max: u64) -> Result<Vec<u8>, LeaseErro
     {
         return Err(LeaseError::UnknownAccounting);
     }
+    #[cfg(not(test))]
     let file = File::open(path).map_err(io_error)?;
+    #[cfg(test)]
+    let file = match File::open(path) {
+        Ok(file) => {
+            let saved_errno = crate::tape::observer_errno();
+            crate::tape::read_row("lease:private-file:open", path,
+                crate::tape::TapeOutcome::Facts { facts: "opened; descriptor identity unproven".to_owned() }, max);
+            crate::tape::restore_observer_errno(saved_errno);
+            file
+        }
+        Err(error) => {
+            let saved_errno = crate::tape::observer_errno();
+            crate::tape::read_row("lease:private-file:open", path,
+                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, max);
+            crate::tape::restore_observer_errno(saved_errno);
+            return Err(io_error(error));
+        }
+    };
     let mut bytes = Vec::new();
+    #[cfg(not(test))]
     file.take(max + 1)
         .read_to_end(&mut bytes)
         .map_err(io_error)?;
+    #[cfg(test)]
+    {
+        let result = file.take(max + 1).read_to_end(&mut bytes);
+        let saved_errno = crate::tape::observer_errno();
+        let outcome = match &result {
+            Ok(_) => crate::tape::TapeOutcome::Digest { digest: crate::tape::sha256_hex(&bytes) },
+            Err(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+        };
+        crate::tape::read_row("lease:private-file:bytes", path, outcome, max);
+        crate::tape::restore_observer_errno(saved_errno);
+        result.map_err(io_error)?;
+    }
     if bytes.len() as u64 > max {
         return Err(LeaseError::LedgerExhausted);
     }
@@ -1023,10 +1146,31 @@ pub(crate) fn fence_managed_control(pool: &Path) -> Result<(), LeaseError> {
     // Only an absent control state means "a library fixture with nothing to
     // fence". Any other metadata failure is a refusal: a state this binary
     // cannot inspect must never let recovery run unfenced.
+    #[cfg(not(test))]
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(io_error(error)),
+    };
+    #[cfg(test)]
+    let metadata = {
+        use std::os::unix::fs::MetadataExt;
+        let result = fs::symlink_metadata(&path);
+        let saved_errno = crate::tape::observer_errno();
+        match &result {
+            Ok(metadata) => crate::tape::read_row_dev("lease:fence:state-metadata", &path,
+                metadata.dev(), metadata.ino(),
+                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
+            Err(error) => crate::tape::read_row("lease:fence:state-metadata", &path,
+                if error.kind() == std::io::ErrorKind::NotFound { crate::tape::TapeOutcome::Absent }
+                else { crate::tape::TapeOutcome::Refusal { reason: error.to_string() } }, 0),
+        }
+        crate::tape::restore_observer_errno(saved_errno);
+        match result {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(io_error(error)),
+        }
     };
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
@@ -1077,8 +1221,31 @@ fn open_control_admission(control: &Path) -> Result<File, LeaseError> {
         .create(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW);
+    #[cfg(not(test))]
     let file = options.open(&path).map_err(io_error)?;
+    #[cfg(test)]
+    let file = {
+        let result = options.open(&path);
+        crate::tape::effect_row("attempt@managed-admission-open", &path);
+        result.map_err(io_error)?
+    };
+    #[cfg(not(test))]
     let metadata = file.metadata().map_err(io_error)?;
+    #[cfg(test)]
+    let metadata = {
+        use std::os::unix::fs::MetadataExt;
+        let result = file.metadata();
+        let saved_errno = crate::tape::observer_errno();
+        match &result {
+            Ok(metadata) => crate::tape::read_row_dev("lease:admission:metadata", &path,
+                metadata.dev(), metadata.ino(),
+                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
+            Err(error) => crate::tape::read_row("lease:admission:metadata", &path,
+                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, 0),
+        }
+        crate::tape::restore_observer_errno(saved_errno);
+        result.map_err(io_error)?
+    };
     if !metadata.is_file()
         || metadata.uid() != current_uid()
         || metadata.permissions().mode() & 0o077 != 0
@@ -1087,12 +1254,31 @@ fn open_control_admission(control: &Path) -> Result<File, LeaseError> {
             "control admission lock must be a private regular file",
         ));
     }
+    #[cfg(not(test))]
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let error = std::io::Error::last_os_error();
         if error.kind() == std::io::ErrorKind::WouldBlock {
             return Err(LeaseError::UnknownAccounting);
         }
         return Err(io_error(error));
+    }
+    #[cfg(test)]
+    {
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let saved_errno = crate::tape::observer_errno();
+        let error = (result != 0).then(std::io::Error::last_os_error);
+        let outcome = match &error {
+            Some(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+            None => crate::tape::TapeOutcome::Facts { facts: "locked".to_owned() },
+        };
+        crate::tape::lock_row("lease:admission:flock", &path, outcome);
+        crate::tape::restore_observer_errno(saved_errno);
+        if let Some(error) = error {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(LeaseError::UnknownAccounting);
+            }
+            return Err(io_error(error));
+        }
     }
     Ok(file)
 }
@@ -1106,16 +1292,50 @@ fn persist_control_state(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
     let temp_path = parent.join(temp_name);
     let mut options = OpenOptions::new();
     options.write(true).create_new(true).mode(0o600);
+    #[cfg(not(test))]
     let mut file = options.open(&temp_path).map_err(io_error)?;
+    #[cfg(test)]
+    let mut file = {
+        let result = options.open(&temp_path);
+        crate::tape::effect_row(if result.is_ok() { "create@managed-control-temp" }
+            else { "attempt@managed-control-temp" }, &temp_path);
+        result.map_err(io_error)?
+    };
+    #[cfg(not(test))]
     if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
         let _ = fs::remove_file(&temp_path);
         return Err(io_error(error));
     }
+    #[cfg(test)]
+    {
+        let write = file.write_all(bytes);
+        let saved_errno = crate::tape::observer_errno();
+        crate::tape::effect_row(if write.is_ok() { "save@managed-control-temp" }
+            else { "attempt-save@managed-control-temp" }, &temp_path);
+        crate::tape::restore_observer_errno(saved_errno);
+        if let Err(error) = write.and_then(|()| file.sync_all()) {
+            let removed = fs::remove_file(&temp_path);
+            crate::tape::effect_row(if removed.is_ok() { "unlink@managed-control-temp" }
+                else { "attempt-unlink@managed-control-temp" }, &temp_path);
+            return Err(io_error(error));
+        }
+    }
     drop(file);
+    #[cfg(not(test))]
     if let Err(error) = fs::rename(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
         return Err(io_error(error));
     }
+    #[cfg(test)]
+    if let Err(error) = fs::rename(&temp_path, path) {
+        crate::tape::effect_row("attempt-rename@managed-control", path);
+        let removed = fs::remove_file(&temp_path);
+        crate::tape::effect_row(if removed.is_ok() { "unlink@managed-control-temp" }
+            else { "attempt-unlink@managed-control-temp" }, &temp_path);
+        return Err(io_error(error));
+    }
+    #[cfg(test)]
+    crate::tape::effect_row("fence@managed-control", path);
     // oxide#196: an injected failure after the replacement but before the
     // parent-directory sync leaves the new ledger visible while the write
     // errors, so callers must classify the commit boundary conservatively.
@@ -1132,9 +1352,22 @@ fn persist_control_state(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
 
 fn random_hex(bytes: usize) -> Result<String, LeaseError> {
     let mut value = vec![0_u8; bytes];
+    #[cfg(not(test))]
     File::open("/dev/urandom")
         .and_then(|mut file| file.read_exact(&mut value))
         .map_err(io_error)?;
+    #[cfg(test)]
+    {
+        let result = File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut value));
+        let saved_errno = crate::tape::observer_errno();
+        let outcome = match &result {
+            Ok(()) => crate::tape::TapeOutcome::Digest { digest: crate::tape::sha256_hex(&value) },
+            Err(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+        };
+        crate::tape::read_row("lease:random-hex:entropy", Path::new("/dev/urandom"), outcome, bytes as u64);
+        crate::tape::restore_observer_errno(saved_errno);
+        result.map_err(io_error)?;
+    }
     let mut result = String::with_capacity(bytes * 2);
     for byte in value {
         use std::fmt::Write as _;
