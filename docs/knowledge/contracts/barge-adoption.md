@@ -2091,3 +2091,9 @@ Planner ruling c4de881a (2026-11-04) permits this test-only correction and one
 replacement 600 s / 512 MiB uncounted diagnostic; the failed pre-case diagnostic
 remains charged and retained, and the counted suite stays gated on the corrected
 diagnostic's case results.
+
+Planner ruling 0f894fd8 (2026-11-04) permits forwarding TMPDIR in the otherwise
+unchanged child environment allowlist and one further 600 s / 512 MiB diagnostic.
+Diagnostic fixtures live under the existing guard evidence directory, preserving
+containment and guard cleanup/custody. Both earlier failed sessions stay charged;
+their logs/receipts remain, but their scratch was removed after clean closure.

@@ -675,10 +675,12 @@ fn fixture_namespace() -> Result<PathBuf, String> {
         return Err("scratch namespace is not canonical".to_owned());
     }
     let boot = std::fs::metadata("/").map_err(|e| e.to_string())?.dev();
+    // SAFETY: getuid takes no arguments and has no caller preconditions.
+    let uid = unsafe { libc::getuid() };
     for ancestor in namespace.ancestors().take(3) {
         let meta = std::fs::symlink_metadata(ancestor).map_err(|e| e.to_string())?;
         if !meta.is_dir()
-            || meta.uid() != unsafe { libc::getuid() }
+            || meta.uid() != uid
             || meta.mode() & 0o022 != 0
             || meta.dev() == boot
         {
@@ -751,6 +753,7 @@ fn validate_engine_environment(root: &Path) -> Result<(), String> {
         if !matches!(
             name.as_ref(),
             "HOME"
+                | "TMPDIR"
                 | "PATH"
                 | "OXIDE_TEST_HOME_FROM_ENV"
                 | "OXIDE_CONFIG"
@@ -2619,7 +2622,14 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
 }
 
 fn self_check(pure_only: bool, diagnostic: bool) -> Result<(), String> {
-    let base = std::env::temp_dir();
+    let base = if diagnostic {
+        PathBuf::from(
+            std::env::var_os("OXIDE_PROOF_EVIDENCE")
+                .ok_or("diagnostic requires the guard evidence directory")?,
+        )
+    } else {
+        std::env::temp_dir()
+    };
     let dir = base.join(format!(
         "tape-prune-self-check-{}-{}",
         std::process::id(),
