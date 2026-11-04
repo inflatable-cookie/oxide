@@ -192,9 +192,9 @@ fn unexpected(place: &'static str, entry: &str) -> LeaseError {
 /// The scan of a refusal for incomplete accounting.
 fn incomplete<T: std::fmt::Debug>(result: Result<T, LeaseError>) -> AccountingScan {
     match result {
-        Err(LeaseError::AccountingIncomplete(scan)) => {
+        Err(LeaseError::AccountingIncomplete(scan, context)) => {
             assert_eq!(
-                LeaseError::AccountingIncomplete(scan.clone()).reason(),
+                LeaseError::AccountingIncomplete(scan.clone(), context).reason(),
                 "unknown_accounting"
             );
             *scan
@@ -2205,7 +2205,7 @@ fn entry_bound_refuses_reuse_and_allocation_with_its_cause_then_pool_bounds_admi
         assert_eq!(scan.coverage, AccountingCoverage::Partial);
         assert_eq!(gap_kinds(&scan), vec![AccountingGapKind::EntryLimit]);
         assert_eq!((scan.entries_visited, scan.max_entries), (20, 20));
-        let message = LeaseError::AccountingIncomplete(Box::new(scan)).to_string();
+        let message = LeaseError::AccountingIncomplete(Box::new(scan), None).to_string();
         assert!(message.contains("partial, entry_limit x1, 20 entries in"));
         assert!(message.contains("(bounds 20 entries, depth 64, 60000 ms)"));
         // Each slot under the bound but the pool over it: a slot under the
@@ -6210,7 +6210,7 @@ fn an_unjournaled_inaccessible_eviction_is_a_conservative_refusal() {
         );
         if unrelated {
             assert!(
-                matches!(result, Err(LeaseError::AccountingIncomplete(_))),
+                matches!(result, Err(LeaseError::AccountingIncomplete(..))),
                 "{result:?}"
             );
         } else {
@@ -8044,4 +8044,121 @@ fn scratch_initializer_accepts_only_this_invocations_prepared_leaf() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("init requires an empty pool directory"));
+}
+
+#[test]
+fn accounting_context_rendering_is_bounded_and_preserves_scan_and_category() {
+    use super::{AccountingContext, AccountingWalk};
+    let scan = AccountingScan {
+        coverage: AccountingCoverage::Partial,
+        gaps: Vec::new(),
+        vanished: 0,
+        entries_visited: 0,
+        elapsed_ms: 0,
+        max_entries: 1,
+        max_depth: 1,
+        max_elapsed_ms: 1,
+    };
+    let encoded = serde_json::to_value(&scan).expect("scan json");
+    let prefix = format!("owned accounting is incomplete: {scan}");
+    for walk in [
+        AccountingWalk::MatchingReuse,
+        AccountingWalk::PoolScope,
+        AccountingWalk::NonTargetSlotRoot,
+    ] {
+        for removable in [false, true] {
+            for slot in [None, Some((u64::MAX, u64::MAX))] {
+                let context = AccountingContext {
+                    walk,
+                    removable,
+                    slot,
+                };
+                let error = LeaseError::AccountingIncomplete(Box::new(scan.clone()), Some(context));
+                let text = error.to_string();
+                let suffix = text.strip_prefix(&prefix).expect("legacy prefix and scan");
+                assert!(suffix.is_ascii() && suffix.len() <= 128, "{suffix}");
+                assert!(!suffix.contains('/') && !suffix.contains('\\'));
+                assert_eq!(error.reason(), "unknown_accounting");
+                assert_eq!(error.exit_code(), 3);
+            }
+        }
+    }
+    assert_eq!(
+        LeaseError::AccountingIncomplete(Box::new(scan.clone()), None).to_string(),
+        prefix
+    );
+    assert_eq!(serde_json::to_value(scan).unwrap(), encoded);
+    assert_eq!(
+        LeaseError::UnknownAccounting.to_string(),
+        "owned accounting is unknown or a foreign entry is present"
+    );
+}
+
+#[test]
+fn required_walk_refusals_name_only_their_known_origin_and_preserve_ledger() {
+    let fx = Fixture::new("refusal-context");
+    let (pool, id, slot, workspace) = released_idle_slot(&fx, "context", 64 * 1024 * 1024);
+    let project = fx.path().join("context-project");
+    fill(&slot, 10);
+    let before = fs::read(pool.join("ledger.json")).expect("ledger before");
+    let error = with_accounting_limits(2, 64, 60_000, || {
+        lease_injected(request(&pool, &project, &workspace, "reuse"))
+    })
+    .expect_err("matching walk must refuse");
+    assert!(
+        error.to_string().contains(&format!(
+            " [phase=matching_reuse backing=directory slot={id} incarnation=1]"
+        )),
+        "{error}"
+    );
+    assert_eq!(fs::read(pool.join("ledger.json")).unwrap(), before);
+
+    // A scope bound refuses before selecting any slot.
+    let fresh = fx.dir("fresh-project");
+    let error = with_accounting_limits(1, 64, 60_000, || {
+        lease_injected(request(&pool, &fresh, &workspace, "scope"))
+    })
+    .expect_err("scope walk must refuse");
+    assert!(
+        error
+            .to_string()
+            .ends_with(" [phase=pool_scope backing=directory]"),
+        "{error}"
+    );
+    assert_eq!(fs::read(pool.join("ledger.json")).unwrap(), before);
+
+    // A non-target partial slot keeps its positive charge and cannot be evicted.
+    super::pool::drop_record_for_test(&pool, id).unwrap();
+    let (_admitted, charges) = with_accounting_limits(5, 64, 60_000, || {
+        super::pool::lease_with_charges_injected(request(&pool, &fresh, &workspace, "partial"))
+    })
+    .expect("partial peer admits");
+    assert!(charges
+        .iter()
+        .any(|(charged, bytes)| *charged == id && *bytes > 0));
+    assert!(slot.exists());
+}
+
+#[test]
+fn unreadable_non_target_root_refuses_with_its_identity_without_charging() {
+    let fx = Fixture::new("root-context");
+    let (pool, id, slot, workspace) = released_idle_slot(&fx, "root", 64 * 1024 * 1024);
+    super::pool::drop_record_for_test(&pool, id).unwrap();
+    let before = fs::read(pool.join("ledger.json")).unwrap();
+    let fresh = fx.dir("fresh");
+    let result = crate::inventory::guard_faults::with_fault(
+        &slot,
+        crate::inventory::BoundaryPoint::BeforeGuard,
+        crate::inventory::guard_faults::Fault::Fail(libc::EACCES),
+        || super::pool::lease_with_charges_injected(request(&pool, &fresh, &workspace, "root")),
+    );
+    let error = result.expect_err("unreadable root must refuse");
+    assert!(
+        error.to_string().ends_with(&format!(
+            " [phase=non_target_slot_root backing=directory slot={id} incarnation=1]"
+        )),
+        "{error}"
+    );
+    assert_eq!(fs::read(pool.join("ledger.json")).unwrap(), before);
+    assert!(slot.exists());
 }
