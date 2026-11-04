@@ -2529,8 +2529,8 @@ impl Pool {
             Err(LeaseError::AccountingIncomplete(scan, context)) if self.is_removable() => {
                 self.admit_unknown_removable(&scan, plan)
                     .map_err(|error| match error {
-                        LeaseError::AccountingIncomplete(scan, _) => {
-                            LeaseError::AccountingIncomplete(scan, context)
+                        LeaseError::AccountingIncomplete(scan, origin) => {
+                            LeaseError::AccountingIncomplete(scan, origin.or(context))
                         }
                         other => other,
                     })?;
@@ -7487,6 +7487,42 @@ mod removable_pool_path_tests {
                 .is_some(),
             "the idle record was dropped"
         );
+    }
+
+    #[test]
+    fn removable_fallback_refusal_preserves_scope_context() {
+        let fixture = Fixture::new("fallback-context");
+        let mut pool = fixture.pool(Some(RESERVE));
+        pool.limits.max_entries = 1;
+        let project = fixture.root.join("project");
+        let workspace = fixture.root.join("workspace");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        let request = LeaseRequest {
+            pool: fixture.root.join("pool"),
+            project,
+            workspace,
+            profile: Profile::Dev,
+            holder: "fixture".to_owned(),
+            budget_bytes: None,
+            reserve_bytes: Some(RESERVE),
+            layout: None,
+            replace_slot: None,
+            class: AdmissionClass::Normal,
+            victims: VictimPolicy::Any,
+            slice: None,
+        };
+        verified_facts::with(facts(FLOOR - GIB), || {
+            let error = pool.lease(&request).expect_err("below floor refuses");
+            assert!(
+                error
+                    .to_string()
+                    .ends_with(" [phase=pool_scope backing=removable]"),
+                "{error}"
+            );
+            assert_eq!(error.exit_code(), 3);
+        });
+        assert!(pool.ledger.slots.is_empty());
     }
 
     #[test]
