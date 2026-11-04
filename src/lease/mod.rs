@@ -199,6 +199,42 @@ pub struct UnmeasuredSlot {
     pub dir: Option<String>,
 }
 
+/// Static origin of a required accounting walk; never inferred from a scan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccountingWalk {
+    MatchingReuse,
+    PoolScope,
+    NonTargetSlotRoot,
+}
+
+/// Already-held refusal facts. This diagnostic has no serialized form.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AccountingContext {
+    pub walk: AccountingWalk,
+    pub removable: bool,
+    pub slot: Option<(u64, u64)>,
+}
+
+impl std::fmt::Display for AccountingContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let phase = match self.walk {
+            AccountingWalk::MatchingReuse => "matching_reuse",
+            AccountingWalk::PoolScope => "pool_scope",
+            AccountingWalk::NonTargetSlotRoot => "non_target_slot_root",
+        };
+        let backing = if self.removable {
+            "removable"
+        } else {
+            "directory"
+        };
+        write!(formatter, " [phase={phase} backing={backing}")?;
+        if let Some((id, incarnation)) = self.slot {
+            write!(formatter, " slot={id} incarnation={incarnation}")?;
+        }
+        write!(formatter, "]")
+    }
+}
+
 /// Why a command refused. Mapped to a small exit set by [`LeaseError::exit_code`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LeaseError {
@@ -215,7 +251,7 @@ pub enum LeaseError {
     },
     /// A bounded accounting walk that admission, reuse or eviction needed
     /// did not complete. Same reason and exit code as `UnknownAccounting`.
-    AccountingIncomplete(Box<AccountingScan>),
+    AccountingIncomplete(Box<AccountingScan>, Option<AccountingContext>),
     /// Capacity could not admit this admission because the slots a partial
     /// walk left unmeasured are charged conservatively and are never evicted on
     /// that charge (oxide#186). A bounded capacity refusal: exit code 3, the
@@ -280,7 +316,7 @@ impl LeaseError {
             Self::Full
             | Self::UnknownAccounting
             | Self::UnexpectedEntry { .. }
-            | Self::AccountingIncomplete(_)
+            | Self::AccountingIncomplete(..)
             | Self::CapacityCharged { .. }
             | Self::OneUseBudget { .. }
             | Self::LedgerExhausted => 3,
@@ -297,7 +333,7 @@ impl LeaseError {
             Self::Full => "full",
             Self::UnknownAccounting
             | Self::UnexpectedEntry { .. }
-            | Self::AccountingIncomplete(_) => "unknown_accounting",
+            | Self::AccountingIncomplete(..) => "unknown_accounting",
             Self::CapacityCharged { .. } => "full",
             Self::OneUseBudget { .. } => "one_use_budget",
             Self::UnsafePath(_) => "unsafe_path",
@@ -338,8 +374,12 @@ impl std::fmt::Display for LeaseError {
                     "one-use workspace slots are full: the member union could not be measured within the {limit}-byte slice bound and no safely evictable idle one-use slot is left"
                 ),
             },
-            Self::AccountingIncomplete(scan) => {
-                write!(formatter, "owned accounting is incomplete: {scan}")
+            Self::AccountingIncomplete(scan, context) => {
+                write!(formatter, "owned accounting is incomplete: {scan}")?;
+                if let Some(context) = context {
+                    write!(formatter, "{context}")?;
+                }
+                Ok(())
             }
             Self::CapacityCharged {
                 measured,

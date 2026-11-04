@@ -818,7 +818,13 @@ names the gap kinds (`entry_limit`, `depth_limit`, `elapsed_deadline`,
 `mount_boundary`, `unreadable_entry`, `missing_metadata`,
 `unsupported_metadata`, `root_missing`, `root_not_directory`,
 `root_unreadable`, `root_symlink`) with counts, entries visited, elapsed
-milliseconds and the bounds used. No path or name is printed. An incomplete
+milliseconds and the bounds used. Required walk refusals append only the
+already-known static phase (`matching_reuse`, `pool_scope`, or
+`non_target_slot_root`), backing kind and, when validated, numeric slot ID and
+incarnation. The ASCII suffix is at most 128 bytes; an unattributed error has
+no suffix. No path or name is printed. This context adds no reads or gates;
+scan/status serialization, conservative peer charges and removable bound-gap
+reserve/floor decisions are unchanged. An incomplete
 walk's bytes are never used for admission and never make a slot an eviction
 candidate; `status` shows them as a lower bound. A measured zero stays
 distinct from unknown.

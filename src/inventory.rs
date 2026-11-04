@@ -343,7 +343,7 @@ pub(crate) enum MetadataSource {
 /// thread-local and exist only in test builds; no product environment hook
 /// exists for them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BoundaryPoint {
+pub(crate) enum BoundaryPoint {
     /// The enumerated regular-file or directory read.
     Entry,
     /// Before the pathname sample taken before the directory is read.
@@ -1960,7 +1960,7 @@ pub mod walk_observer {
 /// test replace, rename, remove or fail one observed directory between its
 /// classification, its read and its second sample without a race.
 #[cfg(test)]
-mod guard_faults {
+pub(crate) mod guard_faults {
     use super::BoundaryPoint;
     use std::cell::RefCell;
     use std::fs;
@@ -1968,7 +1968,7 @@ mod guard_faults {
     use std::path::{Path, PathBuf};
 
     #[derive(Clone, Debug)]
-    pub(super) enum Fault {
+    pub(crate) enum Fault {
         Remove,
         ReplaceWithSymlink(PathBuf),
         ReplaceWithFile,
@@ -1991,7 +1991,7 @@ mod guard_faults {
     /// Arm one boundary mutation for `path` and run `body`. The mutation fires
     /// at most once, at `point`, and the thread's armed state is restored even
     /// if `body` unwinds.
-    pub(super) fn with_fault<T>(
+    pub(crate) fn with_fault<T>(
         path: &Path,
         point: BoundaryPoint,
         fault: Fault,

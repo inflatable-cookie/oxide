@@ -12,15 +12,15 @@ use super::slice::MemberSet;
 use super::{
     canonical_existing_dir, current_uid, ensure_private_dir, io_error, is_finder_metadata,
     is_tolerated_metadata_file, open_verified_directory, persist_private_file, random_hex,
-    read_private_file, unexpected_entry, unlink_at, AccountingCoverage, AccountingGap,
-    AccountingGapKind, AccountingScan, HeldEvictionFailure, LeaseEnvironment, LeaseError,
-    LeaseGrant, Leased, LedgerSlot, LedgerView, MeasuredPool, PassiveSnapshot, PoolStatus, Profile,
-    RecordedFact, RecordedVolume, ReleaseReceipt, ReuseMeasurement, SlotOccupancy, SlotStatus,
-    UnmeasuredSlot, ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES,
-    CAPACITY_POLICY_VERSION, CONFIG_NAME, LEASE_VERSION, LEDGER_NAME,
-    LEGACY_CAPACITY_POLICY_VERSION, LEGACY_MAX_SLOTS, LOCK_NAME, MAX_HOLDER_BYTES,
-    MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS, PREVIOUS_CAPACITY_POLICY_VERSION,
-    RAISED_CAPACITY_POLICY_VERSION, SLOTS_NAME,
+    read_private_file, unexpected_entry, unlink_at, AccountingContext, AccountingCoverage,
+    AccountingGap, AccountingGapKind, AccountingScan, AccountingWalk, HeldEvictionFailure,
+    LeaseEnvironment, LeaseError, LeaseGrant, Leased, LedgerSlot, LedgerView, MeasuredPool,
+    PassiveSnapshot, PoolStatus, Profile, RecordedFact, RecordedVolume, ReleaseReceipt,
+    ReuseMeasurement, SlotOccupancy, SlotStatus, UnmeasuredSlot, ACCOUNTING_MAX_DEPTH,
+    ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES, CAPACITY_POLICY_VERSION, CONFIG_NAME,
+    LEASE_VERSION, LEDGER_NAME, LEGACY_CAPACITY_POLICY_VERSION, LEGACY_MAX_SLOTS, LOCK_NAME,
+    MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS,
+    PREVIOUS_CAPACITY_POLICY_VERSION, RAISED_CAPACITY_POLICY_VERSION, SLOTS_NAME,
 };
 use super::{BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1};
 use crate::inventory::{
@@ -1992,7 +1992,11 @@ impl Pool {
         let (slot_path, _identity) =
             self.validate_idle_slot_scope(idle, incarnation, &project, request.profile)?;
         // Compatible reuse needs this slot's own walk complete.
-        let _unique = inventory_sizes(&slot_path).require_complete()?;
+        let _unique = inventory_sizes(&slot_path).require_complete(Some(AccountingContext {
+            walk: AccountingWalk::MatchingReuse,
+            removable: self.is_removable(),
+            slot: Some((idle, incarnation)),
+        }))?;
         let dir = self.slot(idle).and_then(|slot| slot.dir.clone());
         // The idle-rank sequence must have headroom before any grant
         // transition; exhaustion refuses without changing the pool.
@@ -2522,8 +2526,14 @@ impl Pool {
                     }
                 }
             }
-            Err(LeaseError::AccountingIncomplete(scan)) if self.is_removable() => {
-                self.admit_unknown_removable(&scan, plan)?;
+            Err(LeaseError::AccountingIncomplete(scan, context)) if self.is_removable() => {
+                self.admit_unknown_removable(&scan, plan)
+                    .map_err(|error| match error {
+                        LeaseError::AccountingIncomplete(scan, _) => {
+                            LeaseError::AccountingIncomplete(scan, context)
+                        }
+                        other => other,
+                    })?;
             }
             Err(error) => return Err(error),
         }
@@ -2943,7 +2953,7 @@ impl Pool {
                     }
                 }
                 UnknownRemovableStep::Refuse(scan) => {
-                    return Err(LeaseError::AccountingIncomplete(Box::new(scan)))
+                    return Err(LeaseError::AccountingIncomplete(Box::new(scan), None))
                 }
             }
         }
@@ -3001,11 +3011,11 @@ impl Pool {
     fn pressure_known_or_bounded_removable(&mut self) -> Result<(), LeaseError> {
         match self.pressure() {
             Ok(_) => Ok(()),
-            Err(LeaseError::AccountingIncomplete(scan)) if self.is_removable() => {
+            Err(LeaseError::AccountingIncomplete(scan, context)) if self.is_removable() => {
                 if bound_gaps_only(&scan) {
                     Ok(())
                 } else {
-                    Err(LeaseError::AccountingIncomplete(scan))
+                    Err(LeaseError::AccountingIncomplete(scan, context))
                 }
             }
             Err(error) => Err(error),
@@ -3029,7 +3039,11 @@ impl Pool {
         // neither the slot ceiling nor the project cap.
         let mut total = self
             .pool_scope()
-            .require_complete()?
+            .require_complete(Some(AccountingContext {
+                walk: AccountingWalk::PoolScope,
+                removable: self.is_removable(),
+                slot: None,
+            }))?
             .saturating_add(self.holding_bytes());
         let mut pending: Vec<(u64, RecordedSize)> = Vec::new();
         for index in 0..self.ledger.slots.len() {
@@ -3086,6 +3100,7 @@ impl Pool {
             return Ok(largest.max(recorded));
         }
         let id = slot.id;
+        let incarnation = slot.incarnation;
         let last_lease_id = slot.last_lease_id.clone();
         let idle = slot.state == SlotPersistState::Idle && slot.lease_id.is_none();
         let current = idle
@@ -3138,7 +3153,14 @@ impl Pool {
         let Some(observed) = sizes.unique else {
             // The walk could not open or classify the slot root itself. That is
             // a root-identity failure, never a size this admission may charge.
-            return Err(LeaseError::AccountingIncomplete(Box::new(sizes.scan)));
+            return Err(LeaseError::AccountingIncomplete(
+                Box::new(sizes.scan),
+                Some(AccountingContext {
+                    walk: AccountingWalk::NonTargetSlotRoot,
+                    removable: self.is_removable(),
+                    slot: Some((id, incarnation)),
+                }),
+            ));
         };
         if sizes.scan.coverage != AccountingCoverage::Complete {
             // A partial walk of another slot, idle or held, on either backend,
@@ -3384,11 +3406,10 @@ impl Pool {
             return None;
         }
         let id = slot.id;
-        let incarnation = slot.incarnation;
         let last_lease_id = slot.last_lease_id.clone();
         let path = self.recorded_slot_root(id).ok()??;
         let sizes = self.inventory_slot(&path).ok()?;
-        let unique = sizes.require_complete().ok()?;
+        let unique = sizes.require_complete(None).ok()?;
         // Conditional publication: the generation this figure measured must
         // still be the one about to become idle.
         let slot = self.ledger.slots.get(index)?;
@@ -4578,12 +4599,13 @@ struct Sizes {
 impl Sizes {
     /// Unique allocated bytes of a complete walk. A partial, late or
     /// unknown walk refuses with its scan; its bytes are never used.
-    fn require_complete(&self) -> Result<u64, LeaseError> {
+    fn require_complete(&self, context: Option<AccountingContext>) -> Result<u64, LeaseError> {
         match (self.scan.coverage, self.unique) {
             (AccountingCoverage::Complete, Some(unique)) => Ok(unique),
-            _ => Err(LeaseError::AccountingIncomplete(Box::new(
-                self.scan.clone(),
-            ))),
+            _ => Err(LeaseError::AccountingIncomplete(
+                Box::new(self.scan.clone()),
+                context,
+            )),
         }
     }
 }
@@ -4656,10 +4678,16 @@ fn unknown_removable_step(
     idle_available: bool,
 ) -> Result<UnknownRemovableStep, LeaseError> {
     if !bound_gaps_only(scan) {
-        return Err(LeaseError::AccountingIncomplete(Box::new(scan.clone())));
+        return Err(LeaseError::AccountingIncomplete(
+            Box::new(scan.clone()),
+            None,
+        ));
     }
     let (Some(available), Some(reserve)) = (available, reserve) else {
-        return Err(LeaseError::AccountingIncomplete(Box::new(scan.clone())));
+        return Err(LeaseError::AccountingIncomplete(
+            Box::new(scan.clone()),
+            None,
+        ));
     };
     // Recovering space comes first: while any eligible idle whole slot
     // remains, free space at or below the reserve — and any free space below
@@ -6953,7 +6981,7 @@ mod unknown_removable_tests {
         ] {
             assert!(matches!(
                 unknown_removable_step(&original, available, reserve, FLOOR, true),
-                Err(LeaseError::AccountingIncomplete(_))
+                Err(LeaseError::AccountingIncomplete(..))
             ));
         }
     }
@@ -6976,7 +7004,7 @@ mod unknown_removable_tests {
             assert!(!bound_gaps_only(&refusing), "{refusing:?}");
             assert!(matches!(
                 unknown_removable_step(&refusing, Some(RESERVE + 1), Some(RESERVE), FLOOR, true),
-                Err(LeaseError::AccountingIncomplete(_))
+                Err(LeaseError::AccountingIncomplete(..))
             ));
         }
         assert!(bound_gaps_only(&bounds(&[AccountingGapKind::EntryLimit])));
@@ -7279,7 +7307,7 @@ mod removable_pool_path_tests {
         verified_facts::with(facts(FLOOR - GIB), || {
             let scan = bounds_scan();
             match pool.admit_unknown_removable(&scan, &VictimPlan::any()) {
-                Err(LeaseError::AccountingIncomplete(original)) => {
+                Err(LeaseError::AccountingIncomplete(original, _)) => {
                     assert_eq!(*original, scan, "the original scan was not preserved")
                 }
                 other => panic!("below the floor with nothing to prune must refuse: {other:?}"),
@@ -7400,7 +7428,7 @@ mod removable_pool_path_tests {
         with_accounting_limits(1, 64, 60_000, || {
             let refused = lease_injected(request.clone());
             assert!(
-                matches!(refused, Err(LeaseError::AccountingIncomplete(_))),
+                matches!(refused, Err(LeaseError::AccountingIncomplete(..))),
                 "an internal incompleteness must refuse: {refused:?}"
             );
         });
@@ -7512,7 +7540,7 @@ mod removable_pool_path_tests {
             // from it: the one-victim decision refuses with the incomplete scan.
             let outcome = pool.pressure();
             assert!(
-                matches!(outcome, Err(LeaseError::AccountingIncomplete(_))),
+                matches!(outcome, Err(LeaseError::AccountingIncomplete(..))),
                 "byte pressure on an unknown removable figure must refuse: {outcome:?}"
             );
         });
