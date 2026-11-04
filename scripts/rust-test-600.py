@@ -416,10 +416,9 @@ def self_check():
           == ("cargo", "test", "--workspace", "--all-targets", "--locked")
           and COMMAND == ("oxide", "test", "--workspace", "--all-targets", "--locked"))
 
-    # Check the actual Effigy declarations without executing Cargo or a child.
-    import tomllib
-    with open(os.path.join(REPO, "effigy.toml"), "rb") as config:
-        tasks = tomllib.load(config)["tasks"]
+    # Check the actual fixed Effigy declarations without Cargo or a child.
+    with open(os.path.join(REPO, "effigy.toml"), encoding="utf-8") as config:
+        config_text = config.read()
     expected_selectors = {
         "rust:compile:cargo": "cargo check --workspace --all-targets --locked",
         "rust:compile-release:cargo": "RUSTFLAGS='-D warnings' cargo check --release --workspace --bins --locked",
@@ -427,13 +426,14 @@ def self_check():
         "rust:test-600:cargo": "python3 scripts/rust-test-600.py --capture-cargo",
     }
     check("capture selectors bind fixed commands under heavy admission",
-          all(tasks.get(name) == {"admission": "heavy", "run": command}
+          all(config_text.count(f'[tasks."{name}"]\nadmission = "heavy"\nrun = "{command}"\n') == 1
               for name, command in expected_selectors.items()))
     check("ordinary Rust selectors retain the Oxide backend",
-          tasks.get("rust:compile") == "oxide check --workspace --all-targets --locked"
-          and tasks.get("rust:compile-release") == "RUSTFLAGS='-D warnings' oxide check --release --workspace --bins --locked"
-          and tasks.get("rust:format") == "oxide fmt --all -- --check"
-          and tasks.get("rust:test-600", {}).get("run") == "python3 scripts/rust-test-600.py")
+          all(line in config_text.splitlines() for line in (
+              '"rust:compile" = "oxide check --workspace --all-targets --locked"',
+              "\"rust:compile-release\" = \"RUSTFLAGS='-D warnings' oxide check --release --workspace --bins --locked\"",
+              '"rust:format" = "oxide fmt --all -- --check"',
+              'run = "python3 scripts/rust-test-600.py"')))
 
     base = tempfile.mkdtemp(prefix="rust-test-600-self-check.")
     try:
