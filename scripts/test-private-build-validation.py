@@ -1311,10 +1311,13 @@ def git_output(repo: Path, *args: str, deadline_ns: int | None = None) -> bytes:
     return result.stdout
 
 
+AUDIT_RETAINED_ROOT_NAME_LIMIT = 128
+
+
 def audit_retained_roots(manifest: dict) -> list:
     """Validate explicit task-private roots before any retained-tree walk."""
     roots = manifest.get("retained_roots") if isinstance(manifest, dict) else None
-    if not isinstance(roots, list) or not roots or len(roots) > 64:
+    if not isinstance(roots, list) or not roots or len(roots) > AUDIT_RETAINED_ROOT_NAME_LIMIT:
         raise GateRefusal("audit manifest needs a bounded retained-root list")
     paths = []
     for value in roots:
@@ -4529,6 +4532,30 @@ def self_test() -> int:
         expect_refusal("aliased retained root refused", audit_retained_roots, {"retained_roots": [str(alias)]})
         expect_refusal("duplicate retained root refused", audit_retained_roots,
                        {"retained_roots": [str(prior_partial), str(prior_partial)]})
+        # Exercise the actual validator with mocked metadata; no retained tree is walked.
+        named = [str(case_base / f"named-{index}") for index in range(129)]
+        owned_info = Mock(st_uid=os.geteuid(), st_mode=stat.S_IFDIR | 0o700)
+        with patch(__name__ + ".os.lstat", return_value=owned_info) as metadata, \
+             patch.object(Path, "resolve", lambda self, strict=False: self):
+            for count in (64, 65, AUDIT_RETAINED_ROOT_NAME_LIMIT):
+                actual = expect_ok(f"{count} distinct retained roots accepted", audit_retained_roots,
+                                   {"retained_roots": named[:count]})
+                if actual != list(map(Path, named[:count])):
+                    failures.append(f"{count} retained roots did not preserve all paths")
+            metadata.reset_mock()
+            expect_refusal("129 retained roots refused", audit_retained_roots,
+                           {"retained_roots": named})
+            if metadata.called:
+                failures.append("oversized retained-root list traversed metadata")
+            metadata.return_value = Mock(st_uid=os.geteuid() + 1, st_mode=stat.S_IFDIR | 0o700)
+            expect_refusal("foreign retained root refused", audit_retained_roots,
+                           {"retained_roots": named[:1]})
+            metadata.return_value = Mock(st_uid=os.geteuid(), st_mode=stat.S_IFDIR | 0o722)
+            expect_refusal("writable retained root refused", audit_retained_roots,
+                           {"retained_roots": named[:1]})
+            metadata.side_effect = PermissionError("unreadable")
+            expect_refusal("unreadable retained root refused", audit_retained_roots,
+                           {"retained_roots": named[:1]})
     unsafe_manifest = write_doc(oxide_scratch, "unsafe-audit-inputs.json", {"inputs": [{
         "source": str(input_file), "destination": "effigy-source/admission.rs",
         "sha256": sha256_file(input_file)}], "retained_roots": [str(case_base)]})

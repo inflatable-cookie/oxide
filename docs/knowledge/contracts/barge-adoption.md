@@ -1430,6 +1430,11 @@ heavy Effigy admission through the audited hook, with the audited pair
 preserved in every child environment; no second admission seam exists and no
 Git-verified source archive is ever edited.
 
+The explicit audit manifest accepts at most 128 retained-root names; the earlier
+64-name limit is historical. Each name still passes the existing containment,
+identity and metadata checks, and per-walk entry, depth and deadline bounds are
+unchanged. No retained root may be omitted to fit this name budget.
+
 The current prospective private-validation ceiling is **5 GiB for Barge** and
 9 GiB for Oxide. The preceding 3 GiB and 4 GiB Barge / 8 GiB Oxide grants
 and their packets remain historical. Each run still clamps its budget to the
