@@ -1769,6 +1769,12 @@ selector `proof:private-build-validation:candidate` (heavy) carries the
 fixed unbound declaration and refuses before any effect until the planner
 amends the command with every bound argument.
 
+The shared provider accepts `OXIDE_PRIVATE_BUILD_PROGRESS=1` for bounded
+stage begin/end timestamps on its existing stderr during preparation and the
+candidate diagnostic. These fixed-name observations identify the last entered
+operation; they do not grant admission, alter deadlines or establish a pass.
+With the switch unset the provider emits no progress records.
+
 **Capture handoff.** The obsolete #240 local sequence and admission schemas
 are removed. `scripts/private_build_candidate.py` is the source-owned
 candidate consumer: Barge may stage and hash this exact component alongside

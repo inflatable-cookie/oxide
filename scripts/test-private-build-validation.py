@@ -240,6 +240,37 @@ def now_ns() -> int:
     return time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
 
 
+# Optional fixed-vocabulary observations only; no path, input or verdict data.
+_PROGRESS_STAGES = frozenset({
+    "prepare", "prepare-bind", "prepare-input", "prepare-discover",
+    "prepare-barge-bytes", "prepare-oxide-bytes", "prepare-shared-barge",
+    "prepare-shared-oxide", "prepare-audit-stage", "prepare-source-stage", "prepare-packet",
+    "candidate", "candidate-bind", "candidate-documents", "candidate-origin",
+    "candidate-account", "candidate-retained-before", "candidate-live-before",
+    "candidate-claims", "candidate-setup", "candidate-status", "candidate-final-live",
+    "candidate-final-retained", "candidate-export",
+})
+_PROGRESS_LIMIT = 64
+_progress_count = 0
+
+
+def progress(stage: str, event: str) -> None:
+    """Emit bounded optional timing observations, never an admission decision."""
+    global _progress_count
+    if (os.environ.get("OXIDE_PRIVATE_BUILD_PROGRESS") != "1"
+            or stage not in _PROGRESS_STAGES or event not in ("begin", "end")
+            or _progress_count >= _PROGRESS_LIMIT):
+        return
+    try:
+        line = f"private-build-progress {stage} {event} {now_ns()}\n".encode("ascii")
+        if len(line) <= 128:
+            _progress_count += 1
+            os.write(2, line)
+    except (OSError, OverflowError, ValueError):
+        # Diagnostics are best-effort and never alter an engine or guard result.
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Primitives: digests, canonical private paths, canonical documents
 # ---------------------------------------------------------------------------
@@ -3049,9 +3080,12 @@ def diagnostic(options: dict) -> int:
     the pinned toolchain are audited host inputs under the planner-bound
     host-tools document, and no wrapper-consumable derivation happens.
     """
+    progress("candidate", "begin")
     mode = "candidate" if options["mode"] == "candidate" else "bootstrap"
     python = Path(sys.executable).resolve(strict=True)
+    progress("candidate-bind", "begin")
     evidence, run_id, deadline_ns, adopted_scratch = supervisor_context()
+    progress("candidate-bind", "end")
     allowance_dir = evidence / "private-build-validation.allowance"
     barge_root = root_guard(options["barge_root"], BARGE_SCRATCH)
     oxide_root = root_guard(options["oxide_root"], OXIDE_SCRATCH)
@@ -3072,6 +3106,7 @@ def diagnostic(options: dict) -> int:
             raise GateRefusal("candidate origin root must be distinct from the active task roots")
 
     # Issued documents first: nothing is created before every binding checks.
+    progress("candidate-documents", "begin")
     block_path, block_digest = env_document("BARGE_VALIDATION_BLOCK",
                                             "BARGE_VALIDATION_BLOCK_SHA256", BARGE_SCRATCH)
     audit_path, audit_digest = env_document("BARGE_VALIDATION_SOURCE_AUDIT",
@@ -3132,6 +3167,7 @@ def diagnostic(options: dict) -> int:
                          planner_reference=options.get("planner_reference",
                                                        OXIDE_PLANNER_REFERENCE))
 
+    progress("candidate-documents", "end")
     # Live executable bindings (read-only facts; any drift refuses).
     effigy = direct_effigy(Path(os.environ.get("BARGE_VALIDATION_EFFIGY", "")))
     git_tool = Path(os.environ.get("BARGE_VALIDATION_GIT", "")).resolve(strict=True)
@@ -3191,6 +3227,7 @@ def diagnostic(options: dict) -> int:
     ledger_roots = validate_barge_ledger(ledger_doc, private_root=barge_root, scratch=BARGE_SCRATCH, deadline_ns=deadline_ns)
     allowance.finish("documents")
 
+    progress("candidate-origin", "begin")
     # Candidate origin validation (oxide#254): retained-artifact bindings and
     # nested closure are proven from planner-digested documents BEFORE any
     # staging; the host-tools document binds the audited host inputs of
@@ -3213,9 +3250,11 @@ def diagnostic(options: dict) -> int:
             raise GateRefusal("candidate origin root overlaps the preparation phase root")
         allowance.finish("candidate-origin")
 
+    progress("candidate-origin", "end")
     # Aggregate accounting before any child: the caps must fit what remains.
     # Both effective figures are measured clamps, disclosed in the receipt;
     # neither is a claim that a phase fits, and neither is silently raised.
+    progress("candidate-account", "begin")
     allowance.begin("account")
     barge_outside = allocated_bytes([p for p in ledger_roots if p != barge_root],
                                     BARGE_CAP_BYTES, deadline_ns)
@@ -3243,14 +3282,20 @@ def diagnostic(options: dict) -> int:
         raise GateRefusal("retained Oxide evidence leaves no whole-block scratch budget")
     if supervisor_receipt.get("owned_bytes", {}).get("budget", 0) > oxide_caps["effective_whole_block_mib"] * 1024 * 1024:
         raise GateRefusal("outer supervisor budget exceeds the measured Oxide remainder")
+    progress("candidate-account", "end")
+    progress("candidate-retained-before", "begin")
     retained_before = retained_snapshot(inactive_roots(ledger_roots, oxide_budget_roots,
                                                         barge_root, oxide_root), SCRATCH_ROOT,
                                         deadline_ns)
+    progress("candidate-retained-before", "end")
+    progress("candidate-live-before", "begin")
     live_before = live_inventory(LIVE_ACCOUNT_ROOT, deadline_ns)
+    progress("candidate-live-before", "end")
     allowance.finish("account")
 
     # Burn each issued token under its own task root's guard. The outer guard
     # continues to monitor the Barge root while the short Oxide guard runs.
+    progress("candidate-claims", "begin")
     allowance.require(10, "oxide-token")
     claim["tokens"] = [claim_issued_token(block_path, block_digest, run_id)]
     oxide_claim_evidence = oxide_root / "claim-evidence"
@@ -3268,8 +3313,10 @@ def diagnostic(options: dict) -> int:
     private_dir(evidence, Path("private-build-validation.allowance"))
     allowance.state_dir = allowance_dir
     private_write(allowance_dir, Path("claim.json"), canonical_json(claim))
+    progress("candidate-claims", "end")
 
     # Materialize the prepared roots; the archives are verified byte-exactly.
+    progress("candidate-setup", "begin")
     allowance.begin("setup")
     for root in (barge_root, oxide_root):
         st = os.lstat(root)
@@ -3350,6 +3397,7 @@ def diagnostic(options: dict) -> int:
         finally:
             sys.path.pop(0)
     allowance.finish("setup")
+    progress("candidate-setup", "end")
 
 
 
@@ -3556,6 +3604,7 @@ def diagnostic(options: dict) -> int:
                     "BARGE_VALIDATION_ROOT_LEDGER_SHA256": ledger_digest})
 
     # The dry gate: the real private status through the same child route.
+    progress("candidate-status", "begin")
     allowance.require(60, "private-status")
     gate_limit = min(300, allowance.remaining_seconds())
     gate_mib = min(barge_effective_mib, oxide_caps["effective_whole_block_mib"], 512)
@@ -3580,11 +3629,16 @@ def diagnostic(options: dict) -> int:
                  pool=barge_root / "scratch/pool", registry_probe=registry_probe,
                  cache_probe=cache_probe)
 
+    progress("candidate-status", "end")
     # Final isolation bracket and retained-root quiescence observation.
+    progress("candidate-final-live", "begin")
     final_live = live_inventory(LIVE_ACCOUNT_ROOT, deadline_ns)
     verify_inventory(live_before, final_live, "private-status", evidence)
+    progress("candidate-final-live", "end")
+    progress("candidate-final-retained", "begin")
     retained_after = retained_snapshot(inactive_roots(ledger_roots, oxide_budget_roots,
                                                         barge_root, oxide_root), SCRATCH_ROOT, deadline_ns)
+    progress("candidate-final-retained", "end")
     if retained_before != retained_after:
         raise GateRefusal("retained roots changed during the gate; quiescence unproven")
 
@@ -3602,6 +3656,7 @@ def diagnostic(options: dict) -> int:
     # debug receipt exists because the accepted wrapper binds one to an
     # in-root bootstrap build, which the candidate route intentionally does
     # not run.
+    progress("candidate-export", "begin")
     exports_dir = private_dir(barge_root, Path("exports"))
     live_before_doc = canonical_json(live_before)
     live_after_doc = canonical_json(final_live)
@@ -3788,8 +3843,10 @@ def diagnostic(options: dict) -> int:
     private_write(allowance_dir, Path("receipt.json"), canonical_json(receipt_doc))
     if now_ns() - publication_start > 10 * 1_000_000_000:
         raise GateRefusal("publication reserve exhausted; exported allowance is unusable")
+    progress("candidate-export", "end")
     print("private-build-validation gate completed; receipt "
           f"{allowance_dir / 'receipt.json'}")
+    progress("candidate", "end")
     return 0
 
 
@@ -3814,6 +3871,7 @@ def prepare(options: dict) -> int:
     The blocks it emits are UNISSUED proposals: their identity, authorization
     and digest commitments stay null for the planner to bind.
     """
+    progress("prepare", "begin")
     packet_dir = Path(options["packet_dir"])
     if not packet_dir.is_absolute() or packet_dir.exists():
         raise GateRefusal("--packet-dir must be a fresh absolute directory")
@@ -3828,7 +3886,9 @@ def prepare(options: dict) -> int:
     oxide_product_head = options["oxide_product_head"]
     # Preparation is a supervised whole command: every walk and marker below
     # is inside the qualified supervisor's coverage and bound to its identity.
+    progress("prepare-bind", "begin")
     evidence_dir, run_id, deadline_ns, adopted_scratch = supervisor_context()
+    progress("prepare-bind", "end")
     guard_command = json.loads((evidence_dir / "receipt.json").read_bytes()).get("command")
     if (not isinstance(guard_command, list) or len(guard_command) < 3
             or not all(isinstance(part, str) for part in guard_command)
@@ -3838,6 +3898,7 @@ def prepare(options: dict) -> int:
             or not evidence_dir.is_relative_to(adopted_scratch)
             or not packet_dir.is_relative_to(adopted_scratch)):
         raise GateRefusal("preparation needs a distinct guarded Barge phase root")
+    progress("prepare-input", "begin")
     audit_manifest_path = canonical_file(Path(options["audit_inputs"]))
     audit_manifest = read_json_bound(audit_manifest_path, options["expect_audit_inputs"])
     explicit_retained = audit_retained_roots(audit_manifest)
@@ -3857,19 +3918,30 @@ def prepare(options: dict) -> int:
             input_paths.append(path)
     barge_extra = [str(barge_root), str(adopted_scratch)] + [str(p) for p in input_paths if p.is_relative_to(BARGE_SCRATCH)]
     oxide_extra = [str(oxide_root)] + [str(p) for p in input_paths if p.is_relative_to(OXIDE_SCRATCH)]
+    progress("prepare-input", "end")
+    progress("prepare-discover", "begin")
     barge_roots, barge_evidence = discover_barge_roots(barge_extra)
     oxide_packet = Path(os.environ.get("OXIDE_CORRECTED_DISCOVERY_PACKET", ""))
     oxide_roots, oxide_evidence, oxide_unknown = discover_oxide_roots(oxide_extra, oxide_packet)
+    progress("prepare-discover", "end")
+    progress("prepare-barge-bytes", "begin")
     barge_retained = allocated_bytes([p for p in barge_roots
                                       if p not in (barge_root, adopted_scratch)],
                                      BARGE_CAP_BYTES, deadline_ns)
+    progress("prepare-barge-bytes", "end")
+    progress("prepare-oxide-bytes", "begin")
     oxide_retained = allocated_bytes(oxide_roots, OXIDE_CAP_BYTES, deadline_ns)
+    progress("prepare-oxide-bytes", "end")
     # The explicitly supplied roots are shared preparation history. Count them
     # against both grants, without counting either tree twice within a grant.
+    progress("prepare-shared-barge", "begin")
     barge_retained += allocated_bytes([p for p in explicit_retained if p.is_relative_to(OXIDE_SCRATCH)],
                                       BARGE_CAP_BYTES, deadline_ns)
+    progress("prepare-shared-barge", "end")
+    progress("prepare-shared-oxide", "begin")
     oxide_retained += allocated_bytes([p for p in explicit_retained if p.is_relative_to(BARGE_SCRATCH)],
                                       OXIDE_CAP_BYTES, deadline_ns)
+    progress("prepare-shared-oxide", "end")
     prep_budget = json.loads((evidence_dir / "receipt.json").read_bytes()).get("owned_bytes", {}).get("budget")
     allowed_mib = min(clamp_mib(BARGE_CAP_BYTES, barge_retained, BOOTSTRAP_MAX_MIB),
                       clamp_mib(OXIDE_CAP_BYTES, oxide_retained, BOOTSTRAP_MAX_MIB))
@@ -3889,17 +3961,22 @@ def prepare(options: dict) -> int:
     barge_source = private_dir(adopted_scratch, Path("barge-source"))
     audit_inputs = read_json_bound(canonical_file(Path(options["audit_inputs"])),
                                    options["expect_audit_inputs"])
+    progress("prepare-audit-stage", "begin")
     stage_audit_inputs(adopted_scratch, audit_inputs)
+    progress("prepare-audit-stage", "end")
+    progress("prepare-source-stage", "begin")
     _, oxide_tree = extract_commit_identity(oxide_repo, OXIDE_PIN_COMMIT)
     if oxide_tree != OXIDE_PIN_TREE:
         raise GateRefusal("pinned Oxide tree mismatch")
     oxide_files = stage_git_tree(oxide_repo, oxide_source, OXIDE_PIN_COMMIT, oxide_tree)
     barge_tree = extract_commit_identity(barge_repo, barge_head)[1]
     barge_files = stage_git_tree(barge_repo, barge_source, barge_head, barge_tree)
+    progress("prepare-source-stage", "end")
     wrapper_hash = barge_files.get("scripts/tape/private-wrapper.py")
     if not wrapper_hash:
         raise GateRefusal("Barge archive does not carry the private wrapper")
 
+    progress("prepare-packet", "begin")
     host = {
         "effigy_sha256": None,
         "rustc_sha256": None,
@@ -3977,7 +4054,9 @@ def prepare(options: dict) -> int:
         print(f"  {name} sha256={sha256_file(packet_dir / name)}")
     print(f"  source-binding.json sha256="
           f"{sha256_file(packet_dir / 'source-binding.json')}")
+    progress("prepare-packet", "end")
     print("the packet carries no issued block; planner binding and review come first")
+    progress("prepare", "end")
     return 0
 
 
@@ -4165,6 +4244,40 @@ def self_test() -> int:
 
     # The issued remainder bounds the qualified outer guard before any claim.
     from unittest.mock import Mock, patch
+    # Exercise the actual prepare entry through a mocked guard refusal: the
+    # last record must identify the entered operation, not claim it completed.
+    mock_options = {"packet_dir": str(fixture.root / "not-created"),
+                    "barge_root": str(fixture.root / "b"), "oxide_root": str(fixture.root / "o"),
+                    "barge_repo": str(fixture.root / "br"), "oxide_repo": str(fixture.root / "or"),
+                    "barge_head": "a" * 40, "oxide_head": OXIDE_PIN_COMMIT,
+                    "oxide_product_head": "b" * 40}
+    with patch.dict(os.environ, {"OXIDE_PRIVATE_BUILD_PROGRESS": "1"}), \
+         patch(__name__ + "._progress_count", 0), \
+         patch(__name__ + ".now_ns", return_value=123), \
+         patch(__name__ + ".os.write") as writes, \
+         patch(__name__ + ".root_guard", side_effect=lambda path, _: Path(path)), \
+         patch(__name__ + ".repo_guard", side_effect=lambda path: Path(path)), \
+         patch(__name__ + ".supervisor_context", side_effect=GateRefusal("mock guard refusal")):
+        expect_refusal("progress actual prepare refusal", prepare, mock_options)
+        rows = [call.args[1] for call in writes.call_args_list]
+        if rows != [b"private-build-progress prepare begin 123\n",
+                    b"private-build-progress prepare-bind begin 123\n"]:
+            failures.append("prepare progress did not retain last entered guard stage")
+    with patch.dict(os.environ, {}, clear=True), patch(__name__ + ".os.write") as writes:
+        progress("prepare", "begin")
+        if writes.called:
+            failures.append("progress was not quiet by default")
+    with patch.dict(os.environ, {"OXIDE_PRIVATE_BUILD_PROGRESS": "1"}), \
+         patch(__name__ + "._progress_count", 0), \
+         patch(__name__ + ".now_ns", return_value=123), \
+         patch(__name__ + ".os.write") as writes:
+        progress("not-a-stage", "begin")
+        progress("prepare", "not-an-event")
+        for _ in range(70):
+            progress("prepare", "begin")
+        if (writes.call_count != _PROGRESS_LIMIT or
+                any(call.args[0] != 2 or len(call.args[1]) > 128 for call in writes.call_args_list)):
+            failures.append("progress vocabulary or output bound failed")
     with patch(__name__ + ".now_ns", return_value=11_000_000_000):
         sample_receipt = {"limit_s": 100, "start_ns": 10_000_000_000}
         bound = expect_ok("smaller issued outer limit", bind_outer_deadline,
