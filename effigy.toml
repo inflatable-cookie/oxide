@@ -1523,3 +1523,10 @@ run = "python3 scripts/tape-provider-handoff.py"
 [tasks."proof:private-build-validation:candidate"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 1200 --scratch-budget-mib 512 -- python3 scripts/test-private-build-validation.py --candidate"
+
+# oxide#277: owned receipt/registry regressions only, existing libtest keep-going
+# behavior (no --fail-fast). Same command for uncounted diagnostic and counted
+# occurrences; the invocation envelope records which occurrence it is.
+[tasks."rust:profile-reservation:test"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- oxide test --bin oxide --locked profile_reservation -- --test-threads=1"

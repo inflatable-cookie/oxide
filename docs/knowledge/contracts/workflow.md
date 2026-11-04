@@ -5636,7 +5636,12 @@ author and reviewer native remain unactivated.
   per owned member and `real <member>` for a real directory, so a linked and a
   real member never share a warm slot; legacy whole-target keys stay exactly
   `outputs-2`. Adding a member to a root preserves the root's nonce; a
-  reservation is root-level and may not be cancelled while another member's
+  reservation is root-level: registry publication recognizes consumption by
+  any actual selected or prepared placement, including a later sorted member
+  while the first member keeps an older root (oxide#277). Root history alone
+  never excuses a missing cancellation journal. The existing root identity
+  and nonce checks remain at binding and commit. A reservation may not be
+  cancelled while another member's
   consumer owns it. A slot KEYED for a future root binds only the exact
   uncancelled reservation it named (receipt, keyed nonce and registry row): a
   cancelled, replaced or absent one refuses inside binding before the prepared
