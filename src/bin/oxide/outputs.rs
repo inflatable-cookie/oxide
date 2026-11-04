@@ -8307,9 +8307,15 @@ fn observed_marker_open(site: &str, path: &Path) -> std::io::Result<File> {
     let result = File::open(path);
     let saved_errno = crate::tape::observer_errno();
     let outcome = match &result {
-        Ok(_) => crate::tape::TapeOutcome::Facts { facts: "opened; descriptor identity pending".to_owned() },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => crate::tape::TapeOutcome::Absent,
-        Err(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+        Ok(_) => crate::tape::TapeOutcome::Facts {
+            facts: "opened; descriptor identity pending".to_owned(),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::tape::TapeOutcome::Absent
+        }
+        Err(error) => crate::tape::TapeOutcome::Refusal {
+            reason: error.to_string(),
+        },
     };
     crate::tape::read_row(site, path, outcome, 0);
     crate::tape::restore_observer_errno(saved_errno);
@@ -8322,12 +8328,29 @@ fn observed_marker_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
     let result = fs::symlink_metadata(path);
     let saved_errno = crate::tape::observer_errno();
     match &result {
-        Ok(metadata) => crate::tape::read_row_dev("outputs:marker:lstat", path,
-            metadata.dev(), metadata.ino(),
-            crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
-        Err(error) => crate::tape::read_row("outputs:marker:lstat", path,
-            if error.kind() == std::io::ErrorKind::NotFound { crate::tape::TapeOutcome::Absent }
-            else { crate::tape::TapeOutcome::Refusal { reason: error.to_string() } }, 0),
+        Ok(metadata) => crate::tape::read_row_dev(
+            "outputs:marker:lstat",
+            path,
+            metadata.dev(),
+            metadata.ino(),
+            crate::tape::TapeOutcome::Opened {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            },
+            0,
+        ),
+        Err(error) => crate::tape::read_row(
+            "outputs:marker:lstat",
+            path,
+            if error.kind() == std::io::ErrorKind::NotFound {
+                crate::tape::TapeOutcome::Absent
+            } else {
+                crate::tape::TapeOutcome::Refusal {
+                    reason: error.to_string(),
+                }
+            },
+            0,
+        ),
     }
     crate::tape::restore_observer_errno(saved_errno);
     result

@@ -1192,7 +1192,12 @@ fn holder_lines(state: &State, checkout: &Path, cleans: bool) -> Vec<String> {
         }
         #[cfg(test)]
         if let Some(holder) = &record.holder {
-            crate::tape::recorded_holder("store:active-holders", record.id, holder.pid, holder.started_ms);
+            crate::tape::recorded_holder(
+                "store:active-holders",
+                record.id,
+                holder.pid,
+                holder.started_ms,
+            );
         }
         #[cfg(test)]
         crate::tape::classify_row(
@@ -1278,18 +1283,15 @@ fn custody_verdict(
                         .as_deref()
                         .filter(|_| !closed_by_boot(record, boot));
                     #[cfg(test)]
-                    let unclosed = lost
-                        .unclosed
-                        .as_deref()
-                        .filter(|_| {
-                            let closed = closed_by_boot(record, boot);
-                            crate::tape::classify_row(
-                                "boot-classify:closed-by-boot",
-                                &format!("record={}", record.id),
-                                &format!("boot={boot:?}|closed={closed}"),
-                            );
-                            !closed
-                        });
+                    let unclosed = lost.unclosed.as_deref().filter(|_| {
+                        let closed = closed_by_boot(record, boot);
+                        crate::tape::classify_row(
+                            "boot-classify:closed-by-boot",
+                            &format!("record={}", record.id),
+                            &format!("boot={boot:?}|closed={closed}"),
+                        );
+                        !closed
+                    });
                     if let Some(why) = unclosed {
                         return CheckoutCustody::Unknown(format!(
                             "slot {} in the {pool} pool is lost with writers that were never confirmed closed ({why})",
@@ -5605,9 +5607,16 @@ impl Store {
         #[cfg(test)]
         {
             let write = file.write_all(&bytes);
-            crate::tape::effect_row(if write.is_ok() { "save@control-state-temp" }
-                else { "attempt-save@control-state-temp" }, &temp);
-            write.and_then(|()| file.sync_all())
+            crate::tape::effect_row(
+                if write.is_ok() {
+                    "save@control-state-temp"
+                } else {
+                    "attempt-save@control-state-temp"
+                },
+                &temp,
+            );
+            write
+                .and_then(|()| file.sync_all())
                 .map_err(|error| format!("cannot write Oxide state: {error}"))?;
         }
         #[cfg(not(test))]
@@ -5725,12 +5734,29 @@ mod control_directory_fs {
         let result = std::fs::symlink_metadata(path);
         let saved_errno = crate::tape::observer_errno();
         match &result {
-            Ok(metadata) => crate::tape::read_row_dev("control-directory:named", path,
-                metadata.dev(), metadata.ino(),
-                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
-            Err(error) => crate::tape::read_row("control-directory:named", path,
-                if error.kind() == std::io::ErrorKind::NotFound { crate::tape::TapeOutcome::Absent }
-                else { crate::tape::TapeOutcome::Refusal { reason: error.to_string() } }, 0),
+            Ok(metadata) => crate::tape::read_row_dev(
+                "control-directory:named",
+                path,
+                metadata.dev(),
+                metadata.ino(),
+                crate::tape::TapeOutcome::Opened {
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                },
+                0,
+            ),
+            Err(error) => crate::tape::read_row(
+                "control-directory:named",
+                path,
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    crate::tape::TapeOutcome::Absent
+                } else {
+                    crate::tape::TapeOutcome::Refusal {
+                        reason: error.to_string(),
+                    }
+                },
+                0,
+            ),
         }
         crate::tape::restore_observer_errno(saved_errno);
         result
@@ -5761,12 +5787,18 @@ pub(crate) fn open_control_directory(path: &Path) -> Result<Option<File>, String
         .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
     #[cfg(test)]
     let directory = {
-        let result = OpenOptions::new().read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path);
+        let result = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path);
         let saved_errno = crate::tape::observer_errno();
         let outcome = match &result {
-            Ok(_) => crate::tape::TapeOutcome::Facts { facts: "opened; descriptor identity pending".to_owned() },
-            Err(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+            Ok(_) => crate::tape::TapeOutcome::Facts {
+                facts: "opened; descriptor identity pending".to_owned(),
+            },
+            Err(error) => crate::tape::TapeOutcome::Refusal {
+                reason: error.to_string(),
+            },
         };
         crate::tape::read_row("control-directory:open", path, outcome, 0);
         crate::tape::restore_observer_errno(saved_errno);
@@ -5781,11 +5813,25 @@ pub(crate) fn open_control_directory(path: &Path) -> Result<Option<File>, String
         let result = directory.metadata();
         let saved_errno = crate::tape::observer_errno();
         match &result {
-            Ok(metadata) => crate::tape::read_row_dev("control-directory:held", path,
-                metadata.dev(), metadata.ino(),
-                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
-            Err(error) => crate::tape::read_row("control-directory:held", path,
-                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, 0),
+            Ok(metadata) => crate::tape::read_row_dev(
+                "control-directory:held",
+                path,
+                metadata.dev(),
+                metadata.ino(),
+                crate::tape::TapeOutcome::Opened {
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                },
+                0,
+            ),
+            Err(error) => crate::tape::read_row(
+                "control-directory:held",
+                path,
+                crate::tape::TapeOutcome::Refusal {
+                    reason: error.to_string(),
+                },
+                0,
+            ),
         }
         crate::tape::restore_observer_errno(saved_errno);
         result.map_err(|error| format!("cannot inspect {}: {error}", path.display()))?
@@ -6210,7 +6256,12 @@ impl CustodyWitness {
         // The registration witness is re-read under the internal admission
         // lock on every row; inside a prune authority window the read is
         // charged to the shared budget like every other snapshot input.
-        let registered = crate::removable::read_registration_at(&self.internal.dir)?.is_some();
+        let registered = crate::removable::read_registration_at(
+            &self.internal.dir,
+            #[cfg(test)]
+            &self.internal.control,
+        )?
+        .is_some();
         let removable_admission = if registered {
             let sibling = self.pinned_sibling()?;
             Some(sibling.take_admission(deadline, "removable")?)
@@ -6494,8 +6545,15 @@ fn open_admission_file(control: &Path, create: bool) -> Result<Option<File>, Str
             crate::tape::effect_row("lock-create@admission", &path);
         }
         crate::tape::read_row_dev(
-            "admission-lock:open", &path, metadata.dev(), metadata.ino(),
-            crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0,
+            "admission-lock:open",
+            &path,
+            metadata.dev(),
+            metadata.ino(),
+            crate::tape::TapeOutcome::Opened {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            },
+            0,
         );
     }
     // SAFETY: getuid has no preconditions.
@@ -6933,8 +6991,14 @@ pub(crate) fn private_file(path: &Path, create: bool) -> Result<Option<File>, St
         #[cfg(test)]
         Ok(file) => {
             let saved_errno = crate::tape::observer_errno();
-            crate::tape::read_row("private-file:open", path,
-                crate::tape::TapeOutcome::Facts { facts: "opened; descriptor identity unproven".to_owned() }, 0);
+            crate::tape::read_row(
+                "private-file:open",
+                path,
+                crate::tape::TapeOutcome::Facts {
+                    facts: "opened; descriptor identity unproven".to_owned(),
+                },
+                0,
+            );
             crate::tape::restore_observer_errno(saved_errno);
             file
         }
@@ -6986,10 +7050,24 @@ pub(crate) fn private_file(path: &Path, create: bool) -> Result<Option<File>, St
         let saved_errno = crate::tape::observer_errno();
         match &result {
             Ok(metadata) => crate::tape::read_row_dev(
-                "private-file:metadata", path, metadata.dev(), metadata.ino(),
-                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
-            Err(error) => crate::tape::read_row("private-file:metadata", path,
-                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, 0),
+                "private-file:metadata",
+                path,
+                metadata.dev(),
+                metadata.ino(),
+                crate::tape::TapeOutcome::Opened {
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                },
+                0,
+            ),
+            Err(error) => crate::tape::read_row(
+                "private-file:metadata",
+                path,
+                crate::tape::TapeOutcome::Refusal {
+                    reason: error.to_string(),
+                },
+                0,
+            ),
         }
         crate::tape::restore_observer_errno(saved_errno);
         result.map_err(|error| error.to_string())?

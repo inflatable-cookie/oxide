@@ -24,6 +24,13 @@ binary and library leaves. The shared capture contract below remains the
 acceptance authority; this composition alone is not parity evidence. O3
 remains held on equivalent-input D8 evidence.
 
+The stable-build repair keeps the production authority-budget assignments
+inside supported cfg blocks, passes each registration reader's existing control
+path only to test recording, and gives the test chain a mutable authority scope.
+It changes no policy or descriptor operation. The earlier failed Cargo check
+and retained receipts remain historical; this repair supplies no private-launcher,
+export or parity qualification.
+
 The text below is the pre-freeze proposal. Its "proposed design" and "changes
 no code" statements describe the 2026-11-01 proposal only and are kept as dated
 evidence. Where a later slice lands, its own note in this file is the current

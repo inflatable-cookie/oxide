@@ -641,7 +641,11 @@ pub(crate) fn read_registration(control: &Path) -> Result<Option<Registration>, 
     let Some(directory) = store::open_control_directory(control)? else {
         return Ok(None);
     };
-    read_registration_at(&directory)
+    read_registration_at(
+        &directory,
+        #[cfg(test)]
+        control,
+    )
 }
 
 /// Read the registration under an already-verified control directory
@@ -649,7 +653,10 @@ pub(crate) fn read_registration(control: &Path) -> Result<Option<Registration>, 
 /// of exactly the pinned control (oxide#235). The read is charged to the
 /// prune authority budget through [`crate::prune::authority_read`] whenever
 /// a window is active.
-pub(crate) fn read_registration_at(directory: &File) -> Result<Option<Registration>, String> {
+pub(crate) fn read_registration_at(
+    directory: &File,
+    #[cfg(test)] control: &Path,
+) -> Result<Option<Registration>, String> {
     let name = CString::new(REGISTRATION).map_err(|error| error.to_string())?;
     // SAFETY: `name` is a live CString with initialized bytes through its
     // terminator, and `directory` owns a live descriptor that anchors this
@@ -689,8 +696,14 @@ pub(crate) fn read_registration_at(directory: &File) -> Result<Option<Registrati
     #[cfg(test)]
     {
         let saved_errno = crate::tape::observer_errno();
-        crate::tape::read_row("removable:registration-open", &control.join(REGISTRATION),
-            crate::tape::TapeOutcome::Facts { facts: "opened; descriptor identity pending".to_owned() }, 0);
+        crate::tape::read_row(
+            "removable:registration-open",
+            &control.join(REGISTRATION),
+            crate::tape::TapeOutcome::Facts {
+                facts: "opened; descriptor identity pending".to_owned(),
+            },
+            0,
+        );
         crate::tape::restore_observer_errno(saved_errno);
     }
     // SAFETY: `fd` is a newly opened descriptor owned by this function.
@@ -704,11 +717,25 @@ pub(crate) fn read_registration_at(directory: &File) -> Result<Option<Registrati
         let result = file.metadata();
         let saved_errno = crate::tape::observer_errno();
         match &result {
-            Ok(metadata) => crate::tape::read_row_dev("removable:registration-held", &control.join(REGISTRATION),
-                metadata.dev(), metadata.ino(),
-                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
-            Err(error) => crate::tape::read_row("removable:registration-held", &control.join(REGISTRATION),
-                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, 0),
+            Ok(metadata) => crate::tape::read_row_dev(
+                "removable:registration-held",
+                &control.join(REGISTRATION),
+                metadata.dev(),
+                metadata.ino(),
+                crate::tape::TapeOutcome::Opened {
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                },
+                0,
+            ),
+            Err(error) => crate::tape::read_row(
+                "removable:registration-held",
+                &control.join(REGISTRATION),
+                crate::tape::TapeOutcome::Refusal {
+                    reason: error.to_string(),
+                },
+                0,
+            ),
         }
         crate::tape::restore_observer_errno(saved_errno);
         result.map_err(|error| format!("cannot read the removable registration: {error}"))?

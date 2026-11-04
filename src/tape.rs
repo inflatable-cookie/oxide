@@ -22,7 +22,10 @@ use std::path::Path;
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub(crate) const MAX_ROWS: usize = 8192;
@@ -148,7 +151,10 @@ pub(crate) fn read_row_dev(
     cap: u64,
 ) {
     with_state(|state| {
-        let identity = format!("file:{}|parent=unproven|dev={dev}/ino={ino}", path.display());
+        let identity = format!(
+            "file:{}|parent=unproven|dev={dev}/ino={ino}",
+            path.display()
+        );
         push_record(state, kind, identity, &outcome, cap);
     });
 }
@@ -178,14 +184,26 @@ pub(crate) fn component_without_parent(kind: &str, name: &std::ffi::OsStr, outco
 /// The standalone library sink has no harness window origin.
 pub(crate) fn monotonic_observed(site: &str, _instant: std::time::Instant) {
     let saved_errno = observer_errno();
-    classify_row("clock-origin-unproven", site, "instant sampled; standalone sink has no window");
+    classify_row(
+        "clock-origin-unproven",
+        site,
+        "instant sampled; standalone sink has no window",
+    );
     restore_observer_errno(saved_errno);
 }
 
 /// A descriptor result without a guessed process or path binding.
 pub(crate) fn descriptor_row(site: &str, fd: i32, outcome: TapeOutcome) {
     let saved_errno = observer_errno();
-    with_state(|state| push_record(state, site, format!("descriptor:{fd}|identity=unproven"), &outcome, 0));
+    with_state(|state| {
+        push_record(
+            state,
+            site,
+            format!("descriptor:{fd}|identity=unproven"),
+            &outcome,
+            0,
+        )
+    });
     restore_observer_errno(saved_errno);
 }
 
@@ -242,7 +260,11 @@ pub(crate) fn classify_row(kind: &str, identity: &str, value: &str) {
 /// Record the actual result of an unbound descriptor effect without inventing a path.
 pub(crate) fn unbound_effect(site: &str, succeeded: bool) {
     let saved_errno = observer_errno();
-    classify_row("unbound-effect", site, if succeeded { "succeeded" } else { "failed" });
+    classify_row(
+        "unbound-effect",
+        site,
+        if succeeded { "succeeded" } else { "failed" },
+    );
     restore_observer_errno(saved_errno);
 }
 

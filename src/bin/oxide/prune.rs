@@ -1712,11 +1712,13 @@ impl AuthorityScope {
                 return Err("nested authority snapshot".to_owned());
             }
             #[cfg(not(test))]
-            *active = Some(AuthorityBudget {
-                deadline: Instant::now() + SNAPSHOT_TIME,
-                remaining: SNAPSHOT_MAX_BYTES,
-                failed: false,
-            });
+            {
+                *active = Some(AuthorityBudget {
+                    deadline: Instant::now() + SNAPSHOT_TIME,
+                    remaining: SNAPSHOT_MAX_BYTES,
+                    failed: false,
+                });
+            }
             #[cfg(test)]
             {
                 let started = Instant::now();
@@ -1737,7 +1739,9 @@ impl AuthorityScope {
         AUTHORITY.with(|cell| {
             cell.borrow().as_ref().is_some_and(|budget| {
                 #[cfg(not(test))]
-                { !budget.failed && budget.remaining > 0 && Instant::now() <= budget.deadline }
+                {
+                    !budget.failed && budget.remaining > 0 && Instant::now() <= budget.deadline
+                }
                 #[cfg(test)]
                 {
                     if budget.failed || budget.remaining == 0 {
@@ -2565,12 +2569,29 @@ fn read_bounded(path: &Path, limit: usize, what: &str) -> Result<Vec<u8>, String
         let result = fs::symlink_metadata(path);
         let saved_errno = crate::tape::observer_errno();
         match &result {
-            Ok(metadata) => crate::tape::read_row_without_parent("read-bounded:lstat", path,
-                metadata.dev(), metadata.ino(),
-                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, limit as u64),
-            Err(error) => crate::tape::read_row("read-bounded:lstat", path,
-                if error.kind() == std::io::ErrorKind::NotFound { crate::tape::TapeOutcome::Absent }
-                else { crate::tape::TapeOutcome::Refusal { reason: error.to_string() } }, limit as u64),
+            Ok(metadata) => crate::tape::read_row_without_parent(
+                "read-bounded:lstat",
+                path,
+                metadata.dev(),
+                metadata.ino(),
+                crate::tape::TapeOutcome::Opened {
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                },
+                limit as u64,
+            ),
+            Err(error) => crate::tape::read_row(
+                "read-bounded:lstat",
+                path,
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    crate::tape::TapeOutcome::Absent
+                } else {
+                    crate::tape::TapeOutcome::Refusal {
+                        reason: error.to_string(),
+                    }
+                },
+                limit as u64,
+            ),
         }
         crate::tape::restore_observer_errno(saved_errno);
         result.map_err(|error| format!("cannot open the {what} {}: {error}", path.display()))?
@@ -2592,8 +2613,12 @@ fn read_bounded(path: &Path, limit: usize, what: &str) -> Result<Vec<u8>, String
         let result = File::open(path);
         let saved_errno = crate::tape::observer_errno();
         let outcome = match &result {
-            Ok(_) => crate::tape::TapeOutcome::Facts { facts: "opened; descriptor identity pending".to_owned() },
-            Err(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+            Ok(_) => crate::tape::TapeOutcome::Facts {
+                facts: "opened; descriptor identity pending".to_owned(),
+            },
+            Err(error) => crate::tape::TapeOutcome::Refusal {
+                reason: error.to_string(),
+            },
         };
         crate::tape::read_row("read-bounded:open", path, outcome, limit as u64);
         crate::tape::restore_observer_errno(saved_errno);
@@ -3383,17 +3408,22 @@ fn revalidate_chain(descriptors: &[OwnedFd], observed: &[ObservedEntry]) -> Resu
             Ok(opened) => opened,
             Err(error) => {
                 crate::tape::component_without_parent(
-                    "absence-walk:revalidate-descriptor", &entry.name,
-                    crate::tape::TapeOutcome::Refusal { reason: error.clone() },
+                    "absence-walk:revalidate-descriptor",
+                    &entry.name,
+                    crate::tape::TapeOutcome::Refusal {
+                        reason: error.clone(),
+                    },
                 );
                 return Err(error);
             }
         };
         #[cfg(test)]
         crate::tape::component_without_parent(
-            "absence-walk:revalidate-descriptor", &entry.name,
+            "absence-walk:revalidate-descriptor",
+            &entry.name,
             crate::tape::TapeOutcome::Opened {
-                dev: u64::try_from(opened.st_dev).unwrap_or(u64::MAX), ino: opened.st_ino,
+                dev: u64::try_from(opened.st_dev).unwrap_or(u64::MAX),
+                ino: opened.st_ino,
             },
         );
         if !entry.matches(&opened) {
@@ -3424,17 +3454,22 @@ fn revalidate_chain(descriptors: &[OwnedFd], observed: &[ObservedEntry]) -> Resu
             {
                 let error = std::io::Error::last_os_error();
                 crate::tape::component_without_parent(
-                    "absence-walk:revalidate-name", &entry.name,
-                    crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+                    "absence-walk:revalidate-name",
+                    &entry.name,
+                    crate::tape::TapeOutcome::Refusal {
+                        reason: error.to_string(),
+                    },
                 );
                 return Err(error.to_string());
             }
         }
         #[cfg(test)]
         crate::tape::component_without_parent(
-            "absence-walk:revalidate-name", &entry.name,
+            "absence-walk:revalidate-name",
+            &entry.name,
             crate::tape::TapeOutcome::Opened {
-                dev: u64::try_from(stat.st_dev).unwrap_or(u64::MAX), ino: stat.st_ino,
+                dev: u64::try_from(stat.st_dev).unwrap_or(u64::MAX),
+                ino: stat.st_ino,
             },
         );
         if !entry.matches(&stat) {
@@ -3499,7 +3534,11 @@ fn walk_checkout(
             };
             #[cfg(test)]
             {
-                if let Some((pdev, pino)) = Some(if index == 0 { (start_dev, start_ino) } else { (observed[index - 1].dev, observed[index - 1].ino) }) {
+                if let Some((pdev, pino)) = Some(if index == 0 {
+                    (start_dev, start_ino)
+                } else {
+                    (observed[index - 1].dev, observed[index - 1].ino)
+                }) {
                     crate::tape::component_row(
                         "absence-walk:fstatat",
                         pdev,
@@ -3508,7 +3547,9 @@ fn walk_checkout(
                         if error.kind() == std::io::ErrorKind::NotFound {
                             crate::tape::TapeOutcome::Absent
                         } else {
-                            crate::tape::TapeOutcome::Refusal { reason: error.to_string() }
+                            crate::tape::TapeOutcome::Refusal {
+                                reason: error.to_string(),
+                            }
                         },
                     );
                 }
@@ -3534,7 +3575,11 @@ fn walk_checkout(
         if index == leaf {
             #[cfg(test)]
             {
-                if let Some((pdev, pino)) = Some(if index == 0 { (start_dev, start_ino) } else { (observed[index - 1].dev, observed[index - 1].ino) }) {
+                if let Some((pdev, pino)) = Some(if index == 0 {
+                    (start_dev, start_ino)
+                } else {
+                    (observed[index - 1].dev, observed[index - 1].ino)
+                }) {
                     crate::tape::component_row(
                         "absence-walk:fstatat",
                         pdev,
@@ -3574,8 +3619,13 @@ fn walk_checkout(
                     (observed[index - 1].dev, observed[index - 1].ino)
                 };
                 crate::tape::component_row(
-                    "absence-walk:openat", pdev, pino, name.as_os_str(),
-                    crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+                    "absence-walk:openat",
+                    pdev,
+                    pino,
+                    name.as_os_str(),
+                    crate::tape::TapeOutcome::Refusal {
+                        reason: error.to_string(),
+                    },
                 );
                 return Ok(Walk::Unknown(error.to_string()));
             }
@@ -3585,7 +3635,11 @@ fn walk_checkout(
         let opened_stat = fstat_fd(&opened)?;
         #[cfg(test)]
         {
-            if let Some((pdev, pino)) = Some(if index == 0 { (start_dev, start_ino) } else { (observed[index - 1].dev, observed[index - 1].ino) }) {
+            if let Some((pdev, pino)) = Some(if index == 0 {
+                (start_dev, start_ino)
+            } else {
+                (observed[index - 1].dev, observed[index - 1].ino)
+            }) {
                 crate::tape::component_row(
                     "absence-walk:openat",
                     pdev,
@@ -4264,11 +4318,14 @@ fn observe_root_in(binding: &Binding, row: &Row) -> Result<RootState, String> {
         let error = std::io::Error::last_os_error();
         #[cfg(test)]
         crate::tape::component_without_parent(
-            "root-observe:entry", name,
+            "root-observe:entry",
+            name,
             if error.kind() == std::io::ErrorKind::NotFound {
                 crate::tape::TapeOutcome::Absent
             } else {
-                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }
+                crate::tape::TapeOutcome::Refusal {
+                    reason: error.to_string(),
+                }
             },
         );
         return Ok(if error.kind() == std::io::ErrorKind::NotFound {
@@ -4279,9 +4336,11 @@ fn observe_root_in(binding: &Binding, row: &Row) -> Result<RootState, String> {
     }
     #[cfg(test)]
     crate::tape::component_without_parent(
-        "root-observe:entry", name,
+        "root-observe:entry",
+        name,
         crate::tape::TapeOutcome::Opened {
-            dev: u64::try_from(stat.st_dev).unwrap_or(u64::MAX), ino: stat.st_ino,
+            dev: u64::try_from(stat.st_dev).unwrap_or(u64::MAX),
+            ino: stat.st_ino,
         },
     );
     if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
@@ -4548,15 +4607,29 @@ fn account_candidates(evaluated: &mut [Evaluated], control: &Path) {
             let saved_errno = crate::tape::observer_errno();
             match result {
                 Ok(report) => {
-                    crate::tape::read_row("accounting-walk", &candidate.root,
-                        crate::tape::TapeOutcome::Facts { facts: format!("entries={} complete={}",
-                            report.entries_visited, report.coverage.complete) }, remaining);
+                    crate::tape::read_row(
+                        "accounting-walk",
+                        &candidate.root,
+                        crate::tape::TapeOutcome::Facts {
+                            facts: format!(
+                                "entries={} complete={}",
+                                report.entries_visited, report.coverage.complete
+                            ),
+                        },
+                        remaining,
+                    );
                     crate::tape::restore_observer_errno(saved_errno);
                     report
                 }
                 Err(error) => {
-                    crate::tape::read_row("accounting-walk", &candidate.root,
-                        crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, remaining);
+                    crate::tape::read_row(
+                        "accounting-walk",
+                        &candidate.root,
+                        crate::tape::TapeOutcome::Refusal {
+                            reason: error.to_string(),
+                        },
+                        remaining,
+                    );
                     crate::tape::restore_observer_errno(saved_errno);
                     break;
                 }
@@ -4566,7 +4639,9 @@ fn account_candidates(evaluated: &mut [Evaluated], control: &Path) {
         candidate.logical_bytes = report.total.logical_bytes_by_name;
         candidate.allocated_bytes = report.total.allocated_bytes;
         #[cfg(not(test))]
-        candidate.accounting_complete = report.coverage.complete && Instant::now() <= deadline;
+        {
+            candidate.accounting_complete = report.coverage.complete && Instant::now() <= deadline;
+        }
         #[cfg(test)]
         {
             candidate.accounting_complete = if report.coverage.complete {
@@ -8211,7 +8286,7 @@ pub(crate) mod tape_entry {
     /// The actual decision chain, in `dry_run`'s exact order, exporting its
     /// real result. Nothing here feeds anything back into the engine.
     pub(crate) fn run_chain(operator_list: Option<&Path>) -> Result<ChainOutcome, String> {
-        let authority = AuthorityScope::begin()?;
+        let mut authority = AuthorityScope::begin()?;
         let store = paired_store()?;
         let control = store.owner_control().to_path_buf();
         let list = match operator_list {
@@ -8244,7 +8319,7 @@ pub(crate) mod tape_entry {
                 unsettled: true,
             }));
         }
-        let evaluated = evaluate(&store, &control, &registry, list.as_ref(), &authority)?;
+        let evaluated = evaluate(&store, &control, &registry, list.as_ref(), &mut authority)?;
         drop(authority);
         Ok(ChainOutcome::Evaluated {
             result: export_evaluation(&evaluated),

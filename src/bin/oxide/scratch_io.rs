@@ -34,8 +34,14 @@ fn read_document(path: &Path, limit: u64) -> ReadDocument {
         #[cfg(test)]
         Ok(file) => {
             let saved_errno = crate::tape::observer_errno();
-            crate::tape::read_row("scratch-io:read-document:open", path,
-                crate::tape::TapeOutcome::Facts { facts: "opened; descriptor identity pending".to_owned() }, limit);
+            crate::tape::read_row(
+                "scratch-io:read-document:open",
+                path,
+                crate::tape::TapeOutcome::Facts {
+                    facts: "opened; descriptor identity pending".to_owned(),
+                },
+                limit,
+            );
             crate::tape::restore_observer_errno(saved_errno);
             file
         }
@@ -69,8 +75,14 @@ fn read_document(path: &Path, limit: u64) -> ReadDocument {
         #[cfg(test)]
         Err(error) => {
             let saved_errno = crate::tape::observer_errno();
-            crate::tape::read_row("scratch-io:read-document", path,
-                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, limit);
+            crate::tape::read_row(
+                "scratch-io:read-document",
+                path,
+                crate::tape::TapeOutcome::Refusal {
+                    reason: error.to_string(),
+                },
+                limit,
+            );
             crate::tape::restore_observer_errno(saved_errno);
             return ReadDocument::Invalid;
         }
@@ -84,14 +96,35 @@ fn read_document(path: &Path, limit: u64) -> ReadDocument {
         let result = file.metadata();
         let saved_errno = crate::tape::observer_errno();
         match &result {
-            Ok(meta) => crate::tape::read_row_dev("scratch-io:read-document:meta", path,
-                meta.dev(), meta.ino(), crate::tape::TapeOutcome::Facts { facts: format!(
-                    "file={}|uid={}|mode={}|size={}", meta.is_file(), meta.uid(), meta.mode(), meta.len()) }, limit),
-            Err(error) => crate::tape::read_row("scratch-io:read-document:meta", path,
-                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, limit),
+            Ok(meta) => crate::tape::read_row_dev(
+                "scratch-io:read-document:meta",
+                path,
+                meta.dev(),
+                meta.ino(),
+                crate::tape::TapeOutcome::Facts {
+                    facts: format!(
+                        "file={}|uid={}|mode={}|size={}",
+                        meta.is_file(),
+                        meta.uid(),
+                        meta.mode(),
+                        meta.len()
+                    ),
+                },
+                limit,
+            ),
+            Err(error) => crate::tape::read_row(
+                "scratch-io:read-document:meta",
+                path,
+                crate::tape::TapeOutcome::Refusal {
+                    reason: error.to_string(),
+                },
+                limit,
+            ),
         }
         crate::tape::restore_observer_errno(saved_errno);
-        let Ok(meta) = result else { return ReadDocument::Invalid; };
+        let Ok(meta) = result else {
+            return ReadDocument::Invalid;
+        };
         meta
     };
     if !meta.is_file()
@@ -112,9 +145,15 @@ fn read_document(path: &Path, limit: u64) -> ReadDocument {
         let saved_errno = crate::tape::observer_errno();
         let invalid = result.is_err() || bytes.len() as u64 > limit;
         let outcome = match &result {
-            Err(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
-            Ok(_) if invalid => crate::tape::TapeOutcome::Refusal { reason: "over its byte limit".to_owned() },
-            Ok(_) => crate::tape::TapeOutcome::Digest { digest: crate::tape::sha256_hex(&bytes) },
+            Err(error) => crate::tape::TapeOutcome::Refusal {
+                reason: error.to_string(),
+            },
+            Ok(_) if invalid => crate::tape::TapeOutcome::Refusal {
+                reason: "over its byte limit".to_owned(),
+            },
+            Ok(_) => crate::tape::TapeOutcome::Digest {
+                digest: crate::tape::sha256_hex(&bytes),
+            },
         };
         crate::tape::read_row("scratch-io:read-document:bytes", path, outcome, limit);
         crate::tape::restore_observer_errno(saved_errno);

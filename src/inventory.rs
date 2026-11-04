@@ -407,11 +407,29 @@ fn enumerated_directory_metadata(
 fn observe_metadata_result(site: &str, path: &Path, result: &std::io::Result<fs::Metadata>) {
     let saved_errno = crate::tape::observer_errno();
     match result {
-        Ok(metadata) => crate::tape::read_row_dev(site, path, metadata.dev(), metadata.ino(),
-            crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
-        Err(error) => crate::tape::read_row(site, path,
-            if error.kind() == std::io::ErrorKind::NotFound { crate::tape::TapeOutcome::Absent }
-            else { crate::tape::TapeOutcome::Refusal { reason: error.to_string() } }, 0),
+        Ok(metadata) => crate::tape::read_row_dev(
+            site,
+            path,
+            metadata.dev(),
+            metadata.ino(),
+            crate::tape::TapeOutcome::Opened {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            },
+            0,
+        ),
+        Err(error) => crate::tape::read_row(
+            site,
+            path,
+            if error.kind() == std::io::ErrorKind::NotFound {
+                crate::tape::TapeOutcome::Absent
+            } else {
+                crate::tape::TapeOutcome::Refusal {
+                    reason: error.to_string(),
+                }
+            },
+            0,
+        ),
     }
     crate::tape::restore_observer_errno(saved_errno);
 }
@@ -529,18 +547,22 @@ fn inventory_with(
         let result = fs::canonicalize(root);
         let saved_errno = crate::tape::observer_errno();
         let outcome = match &result {
-            Ok(path) => crate::tape::TapeOutcome::Facts { facts: path.display().to_string() },
-            Err(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+            Ok(path) => crate::tape::TapeOutcome::Facts {
+                facts: path.display().to_string(),
+            },
+            Err(error) => crate::tape::TapeOutcome::Refusal {
+                reason: error.to_string(),
+            },
         };
         crate::tape::read_row("inventory:root-canonicalize", root, outcome, 0);
         crate::tape::restore_observer_errno(saved_errno);
         result.map_err(|error| match error.kind() {
-        std::io::ErrorKind::NotFound => InventoryError::RootMissing(root.to_path_buf()),
-        _ => InventoryError::RootUnreadable {
-            root: root.to_path_buf(),
-            reason: error.to_string(),
-        },
-    })?
+            std::io::ErrorKind::NotFound => InventoryError::RootMissing(root.to_path_buf()),
+            _ => InventoryError::RootUnreadable {
+                root: root.to_path_buf(),
+                reason: error.to_string(),
+            },
+        })?
     };
     #[cfg(not(test))]
     let root_metadata = fs::metadata(&canonical).map_err(|error| {
@@ -558,24 +580,41 @@ fn inventory_with(
         let result = fs::metadata(&canonical);
         let saved_errno = crate::tape::observer_errno();
         match &result {
-            Ok(metadata) => crate::tape::read_row_dev("accounting-walk:root", &canonical,
-                metadata.dev(), metadata.ino(),
-                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, limits.max_entries),
-            Err(error) => crate::tape::read_row("accounting-walk:root", &canonical,
-                if error.kind() == std::io::ErrorKind::NotFound { crate::tape::TapeOutcome::Absent }
-                else { crate::tape::TapeOutcome::Refusal { reason: error.to_string() } }, limits.max_entries),
+            Ok(metadata) => crate::tape::read_row_dev(
+                "accounting-walk:root",
+                &canonical,
+                metadata.dev(),
+                metadata.ino(),
+                crate::tape::TapeOutcome::Opened {
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                },
+                limits.max_entries,
+            ),
+            Err(error) => crate::tape::read_row(
+                "accounting-walk:root",
+                &canonical,
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    crate::tape::TapeOutcome::Absent
+                } else {
+                    crate::tape::TapeOutcome::Refusal {
+                        reason: error.to_string(),
+                    }
+                },
+                limits.max_entries,
+            ),
         }
         crate::tape::restore_observer_errno(saved_errno);
         result.map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            InventoryError::RootMissing(canonical.clone())
-        } else {
-            InventoryError::RootUnreadable {
-                root: canonical.clone(),
-                reason: error.to_string(),
+            if error.kind() == std::io::ErrorKind::NotFound {
+                InventoryError::RootMissing(canonical.clone())
+            } else {
+                InventoryError::RootUnreadable {
+                    root: canonical.clone(),
+                    reason: error.to_string(),
+                }
             }
-        }
-    })?
+        })?
     };
     if !root_metadata.is_dir() {
         return Err(InventoryError::RootNotDirectory(canonical));
@@ -960,8 +999,12 @@ impl<'a> Walker<'a> {
             {
                 let saved_errno = crate::tape::observer_errno();
                 let outcome = match &read_dir {
-                    Ok(_) => crate::tape::TapeOutcome::Facts { facts: "directory opened; identity unproven".to_owned() },
-                    Err(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+                    Ok(_) => crate::tape::TapeOutcome::Facts {
+                        facts: "directory opened; identity unproven".to_owned(),
+                    },
+                    Err(error) => crate::tape::TapeOutcome::Refusal {
+                        reason: error.to_string(),
+                    },
                 };
                 crate::tape::read_row("inventory:read-dir-open", &directory, outcome, 0);
                 crate::tape::restore_observer_errno(saved_errno);
@@ -1006,10 +1049,21 @@ impl<'a> Walker<'a> {
                 {
                     let saved_errno = crate::tape::observer_errno();
                     match &entry {
-                        Ok(entry) => crate::tape::component_without_parent("inventory:entry-name", &entry.file_name(),
-                            crate::tape::TapeOutcome::Facts { facts: "enumerated".to_owned() }),
-                        Err(error) => crate::tape::read_row("inventory:entry-error", &directory,
-                            crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, 0),
+                        Ok(entry) => crate::tape::component_without_parent(
+                            "inventory:entry-name",
+                            &entry.file_name(),
+                            crate::tape::TapeOutcome::Facts {
+                                facts: "enumerated".to_owned(),
+                            },
+                        ),
+                        Err(error) => crate::tape::read_row(
+                            "inventory:entry-error",
+                            &directory,
+                            crate::tape::TapeOutcome::Refusal {
+                                reason: error.to_string(),
+                            },
+                            0,
+                        ),
                     }
                     crate::tape::restore_observer_errno(saved_errno);
                 }
@@ -1031,9 +1085,17 @@ impl<'a> Walker<'a> {
                 {
                     let saved_errno = crate::tape::observer_errno();
                     let outcome = match &file_type_result {
-                        Ok(kind) => crate::tape::TapeOutcome::Facts { facts: format!("file={} directory={} symlink={}",
-                            kind.is_file(), kind.is_dir(), kind.is_symlink()) },
-                        Err(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+                        Ok(kind) => crate::tape::TapeOutcome::Facts {
+                            facts: format!(
+                                "file={} directory={} symlink={}",
+                                kind.is_file(),
+                                kind.is_dir(),
+                                kind.is_symlink()
+                            ),
+                        },
+                        Err(error) => crate::tape::TapeOutcome::Refusal {
+                            reason: error.to_string(),
+                        },
                     };
                     crate::tape::read_row("inventory:entry-type", &path, outcome, 0);
                     crate::tape::restore_observer_errno(saved_errno);
@@ -1109,8 +1171,14 @@ impl<'a> Walker<'a> {
             #[cfg(test)]
             {
                 let saved_errno = crate::tape::observer_errno();
-                crate::tape::read_row("inventory:read-dir-end", &directory,
-                    crate::tape::TapeOutcome::Facts { facts: "end of directory".to_owned() }, 0);
+                crate::tape::read_row(
+                    "inventory:read-dir-end",
+                    &directory,
+                    crate::tape::TapeOutcome::Facts {
+                        facts: "end of directory".to_owned(),
+                    },
+                    0,
+                );
                 crate::tape::restore_observer_errno(saved_errno);
             }
             // A second sample of the same pathname after enumeration. A
@@ -1285,15 +1353,15 @@ impl<'a> Walker<'a> {
             let result = fs::symlink_metadata(self.root);
             observe_metadata_result("inventory:verify-root", self.root, &result);
             result.map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                InventoryError::RootMissing(self.root.to_path_buf())
-            } else {
-                InventoryError::RootUnreadable {
-                    root: self.root.to_path_buf(),
-                    reason: error.to_string(),
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    InventoryError::RootMissing(self.root.to_path_buf())
+                } else {
+                    InventoryError::RootUnreadable {
+                        root: self.root.to_path_buf(),
+                        reason: error.to_string(),
+                    }
                 }
-            }
-        })?
+            })?
         };
         if !metadata.is_dir() {
             return Err(InventoryError::RootNotDirectory(self.root.to_path_buf()));
@@ -1585,8 +1653,14 @@ fn probe_filesystem_free(root: &Path, device: u64) -> FilesystemFree {
     #[cfg(test)]
     if status != 0 {
         let saved_errno = crate::tape::observer_errno();
-        crate::tape::read_row("inventory:statvfs", root,
-            crate::tape::TapeOutcome::Refusal { reason: std::io::Error::last_os_error().to_string() }, 0);
+        crate::tape::read_row(
+            "inventory:statvfs",
+            root,
+            crate::tape::TapeOutcome::Refusal {
+                reason: std::io::Error::last_os_error().to_string(),
+            },
+            0,
+        );
         crate::tape::restore_observer_errno(saved_errno);
     }
     if status != 0 {
@@ -1599,10 +1673,17 @@ fn probe_filesystem_free(root: &Path, device: u64) -> FilesystemFree {
     #[cfg(test)]
     {
         let saved_errno = crate::tape::observer_errno();
-        crate::tape::read_row("inventory:statvfs", root,
-            crate::tape::TapeOutcome::Facts { facts: format!(
-                "device={device} fragment={} blocks={} free={} available={}",
-                stat.f_frsize, stat.f_blocks, stat.f_bfree, stat.f_bavail) }, 0);
+        crate::tape::read_row(
+            "inventory:statvfs",
+            root,
+            crate::tape::TapeOutcome::Facts {
+                facts: format!(
+                    "device={device} fragment={} blocks={} free={} available={}",
+                    stat.f_frsize, stat.f_blocks, stat.f_bfree, stat.f_bavail
+                ),
+            },
+            0,
+        );
         crate::tape::restore_observer_errno(saved_errno);
     }
     let block_size = u64::from(stat.f_frsize);
