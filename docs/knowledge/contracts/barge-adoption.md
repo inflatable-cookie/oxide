@@ -1018,6 +1018,17 @@ authorizes a real run, a pin change or a production behaviour change.
 
 #### Oxide test-only capture apparatus
 
+Tom decision `c6e3e9c8` v2 (2026-11-04) separates capture delivery from
+private launcher qualification. The separately activated capture-only Effigy
+selectors `rust:compile:cargo`, `rust:compile-release:cargo`,
+`rust:format:cargo`, and `rust:test-600:cargo` cover the build and the existing
+unit and embedded tape harness through Cargo. The suite retains its qualified
+600-second / 512 MiB guard and dual-root recipe. These checks do not establish
+private launcher isolation, global live-state invariance or current export
+production; those remain unproven and separately gated, as does X-S2 adoption.
+Historical private receipts and failures retain their original meanings.
+Ordinary Rust selectors continue to use Oxide.
+
 The harness is under review against the shared capture contract. A passing
 release-profile compile is needed to establish compile-away; a source claim
 alone is insufficient.

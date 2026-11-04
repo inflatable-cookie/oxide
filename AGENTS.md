@@ -19,6 +19,7 @@ Tom's 2026-10-10 blanket approval in [vision](docs/knowledge/vision.md#authority
 ## Validate
 
 Tom approved risk-proportionate verification on 2026-10-20 ([vision](docs/knowledge/vision.md#validation-policy)). Every product brief names its tier, covering Effigy selectors, wall-clock limit and scratch-disk budget.
+Tom decision `c6e3e9c8` v2 (2026-11-04) permits the named capture-only Cargo selectors `rust:compile:cargo`, `rust:compile-release:cargo`, `rust:format:cargo` and `rust:test-600:cargo` for direct capture covering. They establish build and embedded-harness behavior, not private launcher isolation or current export production. Ordinary Rust selectors remain through Oxide. The direct checks require separate planner activation and the existing guard, root and host safeguards.
 Every native-proof authoring or correction brief declares HIGH complexity, applies the fixed [premise checklist](docs/knowledge/contracts/workflow.md#proof-authoring-premise-checklist), and requires an uncounted keep-going diagnostic before its counted native ([policy](docs/knowledge/vision.md#validation-policy)). A source sweep alone does not satisfy that gate.
 
 - **Standard, the default:** the author runs covering compile, format when applicable, unit/regression tests, docs checks when docs change, and the focused native proof. An independent reviewer reviews the exact published source, regressions and the author's evidence. The reviewer does not repeat the native proof or covering selectors; missing or inadequate evidence is reported honestly.

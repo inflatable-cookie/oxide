@@ -94,6 +94,23 @@ default = false
 [tasks."rust:test-600"]
 run = "python3 scripts/rust-test-600.py"
 
+# Capture-only direct Cargo covering, separately activated after source review.
+[tasks."rust:compile:cargo"]
+admission = "heavy"
+run = "cargo check --workspace --all-targets --locked"
+
+[tasks."rust:compile-release:cargo"]
+admission = "heavy"
+run = "RUSTFLAGS='-D warnings' cargo check --release --workspace --bins --locked"
+
+[tasks."rust:format:cargo"]
+admission = "heavy"
+run = "cargo fmt --all -- --check"
+
+[tasks."rust:test-600:cargo"]
+admission = "heavy"
+run = "python3 scripts/rust-test-600.py --capture-cargo"
+
 [tasks."proof:rust-test-600:test"]
 run = "python3 scripts/rust-test-600.py --self-check"
 

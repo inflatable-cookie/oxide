@@ -302,6 +302,15 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
 
 Tom, 2026-10-20: risk-proportionate verification. AGENTS.md "Validate" holds
 the operating rules.
+
+Tom decision `c6e3e9c8` v2 (2026-11-04) separates capture delivery from
+private launcher qualification for the bounded O2 capture tasks. Their named
+capture-only Cargo selectors cover build and embedded harness behavior; they
+do not qualify launcher isolation, global live-state invariance or current
+export production. Ordinary Rust selectors continue to use Oxide. Direct
+covering requires the separately activated, qualified-guard route in the
+[barge adoption contract](contracts/barge-adoption.md#oxide-test-only-capture-apparatus).
+
 - **Standard tier:** author checks and native proof, plus an independent source
   review.
 - **Elevated tier,** for deletion or recycling, crash recovery or writer
