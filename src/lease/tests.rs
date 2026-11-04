@@ -8098,7 +8098,7 @@ fn accounting_context_rendering_is_bounded_and_preserves_scan_and_category() {
 fn required_walk_refusals_name_only_their_known_origin_and_preserve_ledger() {
     let fx = Fixture::new("refusal-context");
     let (pool, id, slot, workspace) = released_idle_slot(&fx, "context", 64 * 1024 * 1024);
-    let project = fx.dir("context-project");
+    let project = fx.path().join("context-project");
     fill(&slot, 10);
     let before = fs::read(pool.join("ledger.json")).expect("ledger before");
     let error = with_accounting_limits(2, 64, 60_000, || {
