@@ -1029,6 +1029,20 @@ production; those remain unproven and separately gated, as does X-S2 adoption.
 Historical private receipts and failures retain their original meanings.
 Ordinary Rust selectors continue to use Oxide.
 
+For the planner-activated Oxide direct batch, a fresh owned 9 GiB outer Cargo
+root holds `HOME`, `CARGO_HOME` and `CARGO_TARGET_DIR`; `CARGO_NET_OFFLINE=true`,
+Rust 1.97.1 and the existing `5cbf42e1` lock-only offline seeder bind the
+inputs. The suite wrapper inherits those Cargo paths, while creating and
+validating its own internal 512 MiB fixture root and sibling temporary root;
+the four inherited root/evidence controls must be absent before it starts.
+The outer qualified guard enforces the independent batch and Cargo-output
+bounds. A plain outer command obtains real heavy Effigy admission separately
+for each of the four Cargo selectors, with no outer heavy reservation; only
+bounded 45-second / 256 MiB offline seeding and pre-effect metadata precede
+them. No Cargo or compiler starts before its selector's admission grant.
+This is the prospective recipe, not evidence that a batch ran or that the
+private launcher or global live-state checks passed.
+
 The harness is under review against the shared capture contract. A passing
 release-profile compile is needed to establish compile-away; a source claim
 alone is insufficient.
