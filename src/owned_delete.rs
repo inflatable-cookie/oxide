@@ -1262,7 +1262,9 @@ pub fn verify_captured(
 /// private name in place and reports both.
 pub fn put_back(dir: BorrowedFd<'_>, capture: &Capture) -> io::Result<()> {
     #[cfg(not(test))]
-    { rename_exclusive(dir, &capture.private, &capture.original) }
+    {
+        rename_exclusive(dir, &capture.private, &capture.original)
+    }
     #[cfg(test)]
     {
         let result = rename_exclusive(dir, &capture.private, &capture.original);
@@ -1746,13 +1748,25 @@ fn stat_at(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<libc::stat> {
         use std::os::unix::ffi::OsStrExt;
         let saved_errno = crate::tape::observer_errno();
         let outcome = if status == 0 {
-            crate::tape::TapeOutcome::Opened { dev: stat_device(&stat), ino: stat_ino(&stat) }
+            crate::tape::TapeOutcome::Opened {
+                dev: stat_device(&stat),
+                ino: stat_ino(&stat),
+            }
         } else {
             let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::NotFound { crate::tape::TapeOutcome::Absent }
-            else { crate::tape::TapeOutcome::Refusal { reason: error.to_string() } }
+            if error.kind() == io::ErrorKind::NotFound {
+                crate::tape::TapeOutcome::Absent
+            } else {
+                crate::tape::TapeOutcome::Refusal {
+                    reason: error.to_string(),
+                }
+            }
         };
-        crate::tape::component_without_parent("owned-delete:stat-at", std::ffi::OsStr::from_bytes(name.to_bytes()), outcome);
+        crate::tape::component_without_parent(
+            "owned-delete:stat-at",
+            std::ffi::OsStr::from_bytes(name.to_bytes()),
+            outcome,
+        );
         crate::tape::restore_observer_errno(saved_errno);
     }
     if status != 0 {
@@ -1885,9 +1899,14 @@ pub fn descriptor_identity(fd: BorrowedFd<'_>) -> io::Result<(u64, u64)> {
         let status = unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) };
         let saved_errno = crate::tape::observer_errno();
         let outcome = if status == 0 {
-            crate::tape::TapeOutcome::Opened { dev: stat_device(&stat), ino: stat_ino(&stat) }
+            crate::tape::TapeOutcome::Opened {
+                dev: stat_device(&stat),
+                ino: stat_ino(&stat),
+            }
         } else {
-            crate::tape::TapeOutcome::Refusal { reason: io::Error::last_os_error().to_string() }
+            crate::tape::TapeOutcome::Refusal {
+                reason: io::Error::last_os_error().to_string(),
+            }
         };
         crate::tape::descriptor_row("owned-delete:descriptor-identity", fd.as_raw_fd(), outcome);
         crate::tape::restore_observer_errno(saved_errno);

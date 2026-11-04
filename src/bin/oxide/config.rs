@@ -978,8 +978,15 @@ fn read_config(path: &Path) -> Result<FileConfig, String> {
             use std::os::unix::fs::MetadataExt;
             let saved_errno = crate::prune::tape_errno();
             crate::tape::read_row_dev(
-                "config:read-config:metadata", path, metadata.dev(), metadata.ino(),
-                crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, MAX_CONFIG_BYTES,
+                "config:read-config:metadata",
+                path,
+                metadata.dev(),
+                metadata.ino(),
+                crate::tape::TapeOutcome::Opened {
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                },
+                MAX_CONFIG_BYTES,
             );
             crate::prune::tape_restore_errno(saved_errno);
             metadata
@@ -987,8 +994,12 @@ fn read_config(path: &Path) -> Result<FileConfig, String> {
         Err(error) => {
             let saved_errno = crate::prune::tape_errno();
             crate::tape::read_row(
-                "config:read-config:metadata", path,
-                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, MAX_CONFIG_BYTES,
+                "config:read-config:metadata",
+                path,
+                crate::tape::TapeOutcome::Refusal {
+                    reason: error.to_string(),
+                },
+                MAX_CONFIG_BYTES,
             );
             crate::prune::tape_restore_errno(saved_errno);
             return Err(named(error.to_string()));
@@ -1004,11 +1015,16 @@ fn read_config(path: &Path) -> Result<FileConfig, String> {
         .map_err(|error| named(error.to_string()))?;
     #[cfg(test)]
     {
-        let result = fs::File::open(path).and_then(|file| file.take(MAX_CONFIG_BYTES).read_to_string(&mut text));
+        let result = fs::File::open(path)
+            .and_then(|file| file.take(MAX_CONFIG_BYTES).read_to_string(&mut text));
         let saved_errno = crate::prune::tape_errno();
         let outcome = match &result {
-            Ok(_) => crate::tape::TapeOutcome::Digest { digest: crate::tape::sha256_hex(text.as_bytes()) },
-            Err(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+            Ok(_) => crate::tape::TapeOutcome::Digest {
+                digest: crate::tape::sha256_hex(text.as_bytes()),
+            },
+            Err(error) => crate::tape::TapeOutcome::Refusal {
+                reason: error.to_string(),
+            },
         };
         crate::tape::read_row("config:read-config", path, outcome, MAX_CONFIG_BYTES);
         crate::prune::tape_restore_errno(saved_errno);
@@ -1223,16 +1239,42 @@ pub enum Found {
 }
 
 #[cfg(test)]
-fn inspect_metadata_observed(site: &str, path: &Path, follow: bool) -> std::io::Result<fs::Metadata> {
+fn inspect_metadata_observed(
+    site: &str,
+    path: &Path,
+    follow: bool,
+) -> std::io::Result<fs::Metadata> {
     use std::os::unix::fs::MetadataExt;
-    let result = if follow { fs::metadata(path) } else { fs::symlink_metadata(path) };
+    let result = if follow {
+        fs::metadata(path)
+    } else {
+        fs::symlink_metadata(path)
+    };
     let saved_errno = crate::prune::tape_errno();
     match &result {
-        Ok(metadata) => crate::tape::read_row_dev(site, path, metadata.dev(), metadata.ino(),
-            crate::tape::TapeOutcome::Opened { dev: metadata.dev(), ino: metadata.ino() }, 0),
-        Err(error) => crate::tape::read_row(site, path,
-            if error.kind() == std::io::ErrorKind::NotFound { crate::tape::TapeOutcome::Absent }
-            else { crate::tape::TapeOutcome::Refusal { reason: error.to_string() } }, 0),
+        Ok(metadata) => crate::tape::read_row_dev(
+            site,
+            path,
+            metadata.dev(),
+            metadata.ino(),
+            crate::tape::TapeOutcome::Opened {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            },
+            0,
+        ),
+        Err(error) => crate::tape::read_row(
+            site,
+            path,
+            if error.kind() == std::io::ErrorKind::NotFound {
+                crate::tape::TapeOutcome::Absent
+            } else {
+                crate::tape::TapeOutcome::Refusal {
+                    reason: error.to_string(),
+                }
+            },
+            0,
+        ),
     }
     crate::prune::tape_restore_errno(saved_errno);
     result
@@ -1261,12 +1303,18 @@ pub fn inspect(path: &Path) -> Found {
         let result = fs::canonicalize(path);
         let saved_errno = crate::prune::tape_errno();
         let outcome = match &result {
-            Ok(resolved) => crate::tape::TapeOutcome::Facts { facts: resolved.display().to_string() },
-            Err(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+            Ok(resolved) => crate::tape::TapeOutcome::Facts {
+                facts: resolved.display().to_string(),
+            },
+            Err(error) => crate::tape::TapeOutcome::Refusal {
+                reason: error.to_string(),
+            },
         };
         crate::tape::read_row("config:inspect:canonicalize", path, outcome, 0);
         crate::prune::tape_restore_errno(saved_errno);
-        let Ok(resolved) = result else { return Found::Unknown; };
+        let Ok(resolved) = result else {
+            return Found::Unknown;
+        };
         resolved
     };
     #[cfg(not(test))]
@@ -1275,7 +1323,8 @@ pub fn inspect(path: &Path) -> Found {
     }
     #[cfg(test)]
     if !inspect_metadata_observed("config:inspect:resolved", &resolved, true)
-        .is_ok_and(|metadata| metadata.is_dir()) {
+        .is_ok_and(|metadata| metadata.is_dir())
+    {
         return Found::Unknown;
     }
     let path = resolved.as_path();
@@ -1286,8 +1335,14 @@ pub fn inspect(path: &Path) -> Found {
         return Found::LegacyImage;
     }
     #[cfg(test)]
-    if inspect_metadata_observed("config:inspect:image", &path.join("image.sparseimage"), false).is_ok()
-        || inspect_metadata_observed("config:inspect:receipt", &path.join("receipt.json"), false).is_ok()
+    if inspect_metadata_observed(
+        "config:inspect:image",
+        &path.join("image.sparseimage"),
+        false,
+    )
+    .is_ok()
+        || inspect_metadata_observed("config:inspect:receipt", &path.join("receipt.json"), false)
+            .is_ok()
     {
         return Found::LegacyImage;
     }
@@ -1311,12 +1366,18 @@ pub fn inspect(path: &Path) -> Found {
         let result = fs::read(&config);
         let saved_errno = crate::prune::tape_errno();
         let outcome = match &result {
-            Ok(bytes) => crate::tape::TapeOutcome::Digest { digest: crate::tape::sha256_hex(bytes) },
-            Err(error) => crate::tape::TapeOutcome::Refusal { reason: error.to_string() },
+            Ok(bytes) => crate::tape::TapeOutcome::Digest {
+                digest: crate::tape::sha256_hex(bytes),
+            },
+            Err(error) => crate::tape::TapeOutcome::Refusal {
+                reason: error.to_string(),
+            },
         };
         crate::tape::read_row("config:inspect:bytes", &config, outcome, MAX_CONFIG_BYTES);
         crate::prune::tape_restore_errno(saved_errno);
-        let Ok(bytes) = result else { return Found::Unknown; };
+        let Ok(bytes) = result else {
+            return Found::Unknown;
+        };
         bytes
     };
     let backend = serde_json::from_slice::<serde_json::Value>(&bytes)

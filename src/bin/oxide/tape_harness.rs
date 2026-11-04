@@ -550,8 +550,15 @@ fn validate_manifest_envelope(doc: &serde_json::Value) -> Result<(), String> {
             return Err(format!("missing field in {pointer}"));
         }
     }
-    let window = doc.pointer("/window/identity").and_then(|v| v.as_str()).ok_or("missing window identity")?;
-    for volume in doc.pointer("/dynamic/volumes").and_then(|v| v.as_array()).ok_or("missing volumes")? {
+    let window = doc
+        .pointer("/window/identity")
+        .and_then(|v| v.as_str())
+        .ok_or("missing window identity")?;
+    for volume in doc
+        .pointer("/dynamic/volumes")
+        .and_then(|v| v.as_array())
+        .ok_or("missing volumes")?
+    {
         if volume.get("window_identity").and_then(|v| v.as_str()) != Some(window) {
             return Err("volume belongs to a different window".to_owned());
         }
@@ -594,10 +601,21 @@ fn validate_manifest_envelope(doc: &serde_json::Value) -> Result<(), String> {
             return Err("incomplete mandatory observation".to_owned());
         }
     }
-    for entry in doc.pointer("/fixture/entries").and_then(|v| v.as_array()).ok_or("missing entries")? {
-        let rel = entry.get("rel").and_then(|v| v.as_str()).ok_or("missing fixture relative path")?;
-        if rel.split('/').any(|part| part.is_empty() || part == "." || part == "..")
-            || !Path::new(rel).components().all(|part| matches!(part, std::path::Component::Normal(_)))
+    for entry in doc
+        .pointer("/fixture/entries")
+        .and_then(|v| v.as_array())
+        .ok_or("missing entries")?
+    {
+        let rel = entry
+            .get("rel")
+            .and_then(|v| v.as_str())
+            .ok_or("missing fixture relative path")?;
+        if rel
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+            || !Path::new(rel)
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
         {
             return Err("fixture relative path is not a plain relative path".to_owned());
         }
@@ -698,8 +716,13 @@ fn validate_engine_environment(root: &Path) -> Result<(), String> {
         let name = name.to_string_lossy();
         if !matches!(
             name.as_ref(),
-            "HOME" | "PATH" | "OXIDE_TEST_HOME_FROM_ENV" | "OXIDE_CONFIG"
-                | "OXIDE_POOL" | "OXIDE_POOL_CAP" | "OXIDE_SCRATCH_ROOT"
+            "HOME"
+                | "PATH"
+                | "OXIDE_TEST_HOME_FROM_ENV"
+                | "OXIDE_CONFIG"
+                | "OXIDE_POOL"
+                | "OXIDE_POOL_CAP"
+                | "OXIDE_SCRATCH_ROOT"
         ) {
             return Err(format!("unexpected environment control {name}"));
         }
@@ -1187,13 +1210,23 @@ fn run_case(
         {
             return Err("fixture identity differs from manifest".to_owned());
         }
-        for effect in doc["expected_effects"].as_array().ok_or("invalid effects")? {
-            let text = effect.get("path").and_then(|value| value.as_str()).ok_or("missing effect path")?;
+        for effect in doc["expected_effects"]
+            .as_array()
+            .ok_or("invalid effects")?
+        {
+            let text = effect
+                .get("path")
+                .and_then(|value| value.as_str())
+                .ok_or("missing effect path")?;
             let path = Path::new(text);
-            let relative = path.strip_prefix(fixture_root).map_err(|_| "effect path escapes fixture")?;
+            let relative = path
+                .strip_prefix(fixture_root)
+                .map_err(|_| "effect path escapes fixture")?;
             if relative.as_os_str().is_empty()
                 || text.split('/').any(|part| part == "." || part == "..")
-                || !relative.components().all(|part| matches!(part, std::path::Component::Normal(_)))
+                || !relative
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
             {
                 return Err("effect path is not strictly inside the fixture".to_owned());
             }
@@ -1343,19 +1376,29 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
     // TMPDIR. Exercise the real guard on that owned root when it does so;
     // never create an independent fixture outside the caller's temp root.
     if temp.starts_with("/Volumes/Builds/scratch/oxide-validation/") {
-        check(validate_fixture_path(temp, &temp.join("new-entry")).is_ok(),
-            "canonical private validation sibling is accepted")?;
+        check(
+            validate_fixture_path(temp, &temp.join("new-entry")).is_ok(),
+            "canonical private validation sibling is accepted",
+        )?;
     }
     let lookalike = Path::new("/Volumes/Builds/scratch/oxide-validation-x/not-a-fixture");
-    check(validate_fixture_path(lookalike, lookalike).is_err(),
-        "validation sibling lookalike is refused")?;
+    check(
+        validate_fixture_path(lookalike, lookalike).is_err(),
+        "validation sibling lookalike is refused",
+    )?;
     let insecure = temp.join("insecure-validation-root");
     write_private_dir(&insecure).map_err(|what| CheckFailure { what })?;
-    std::fs::set_permissions(&insecure, std::fs::Permissions::from_mode(0o755))
-        .map_err(|error| CheckFailure { what: error.to_string() })?;
+    std::fs::set_permissions(&insecure, std::fs::Permissions::from_mode(0o755)).map_err(
+        |error| CheckFailure {
+            what: error.to_string(),
+        },
+    )?;
     let refused = validate_fixture_path(&insecure, &insecure).is_err();
-    std::fs::set_permissions(&insecure, std::fs::Permissions::from_mode(0o700))
-        .map_err(|error| CheckFailure { what: error.to_string() })?;
+    std::fs::set_permissions(&insecure, std::fs::Permissions::from_mode(0o700)).map_err(
+        |error| CheckFailure {
+            what: error.to_string(),
+        },
+    )?;
     check(refused, "non-owner-only fixture root is refused")?;
     let private_state = fixture_facts(temp)
         .state_dir()
@@ -1372,12 +1415,22 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
     write_private_dir(&capture_root).map_err(|what| CheckFailure { what })?;
     let oversized = capture_root.join("oversized");
     write_private_file(&oversized, b"").map_err(|what| CheckFailure { what })?;
-    std::fs::OpenOptions::new().write(true).open(&oversized)
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&oversized)
         .and_then(|file| file.set_len(32 * 1024 * 1024 + 1))
-        .map_err(|error| CheckFailure { what: error.to_string() })?;
+        .map_err(|error| CheckFailure {
+            what: error.to_string(),
+        })?;
     let capture = tape::capture_fixture(&capture_root);
-    check(capture.truncated && capture.post.iter().any(|entry| entry.rel == "oversized" && entry.bytes_sha256.is_none()),
-        "a fixture exceeding the byte cap is explicitly truncated")?;
+    check(
+        capture.truncated
+            && capture
+                .post
+                .iter()
+                .any(|entry| entry.rel == "oversized" && entry.bytes_sha256.is_none()),
+        "a fixture exceeding the byte cap is explicitly truncated",
+    )?;
     let link = temp.join("escape-link");
     std::os::unix::fs::symlink("/", &link).map_err(|error| CheckFailure {
         what: error.to_string(),
@@ -1401,46 +1454,97 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
     )?;
     let effect_example: serde_json::Value = serde_json::from_str(include_str!(
         "../../../docs/knowledge/contracts/capture-examples/manifest-effects-all-kinds.json"
-    )).map_err(|error| CheckFailure { what: error.to_string() })?;
-    check(validate_manifest_envelope(&effect_example).is_ok(), "all fixed effect kinds are accepted")?;
+    ))
+    .map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    check(
+        validate_manifest_envelope(&effect_example).is_ok(),
+        "all fixed effect kinds are accepted",
+    )?;
     let mut invalid_effect = effect_example.clone();
     invalid_effect["expected_effects"][0]["kind"] = "attempt".into();
-    check(validate_manifest_envelope(&invalid_effect).is_err(), "attempt is not an effect kind")?;
+    check(
+        validate_manifest_envelope(&invalid_effect).is_err(),
+        "attempt is not an effect kind",
+    )?;
     let mut missing_effect_site = effect_example.clone();
-    missing_effect_site["expected_effects"][0].as_object_mut().expect("effect object").remove("site");
-    check(validate_manifest_envelope(&missing_effect_site).is_err(), "effect source site is required")?;
+    missing_effect_site["expected_effects"][0]
+        .as_object_mut()
+        .expect("effect object")
+        .remove("site");
+    check(
+        validate_manifest_envelope(&missing_effect_site).is_err(),
+        "effect source site is required",
+    )?;
     let mut missing_attempt = effect_example.clone();
-    missing_attempt["expected_effects"][0].as_object_mut().expect("effect object").remove("attempted");
-    check(validate_manifest_envelope(&missing_attempt).is_err(), "effect attempt status is required")?;
+    missing_attempt["expected_effects"][0]
+        .as_object_mut()
+        .expect("effect object")
+        .remove("attempted");
+    check(
+        validate_manifest_envelope(&missing_attempt).is_err(),
+        "effect attempt status is required",
+    )?;
     let mut missing_tree = example.clone();
-    missing_tree["source"].as_object_mut().expect("source object").remove("oxide_tree");
-    check(validate_manifest_envelope(&missing_tree).is_err(), "source tree is required")?;
+    missing_tree["source"]
+        .as_object_mut()
+        .expect("source object")
+        .remove("oxide_tree");
+    check(
+        validate_manifest_envelope(&missing_tree).is_err(),
+        "source tree is required",
+    )?;
     let mut escaped_entry = example.clone();
     escaped_entry["fixture"]["entries"][0]["rel"] = "../outside".into();
-    check(validate_manifest_envelope(&escaped_entry).is_err(), "fixture entry traversal refuses")?;
+    check(
+        validate_manifest_envelope(&escaped_entry).is_err(),
+        "fixture entry traversal refuses",
+    )?;
     let mut incomplete_unreadable = example.clone();
-    incomplete_unreadable["fixture"]["entries"][2].as_object_mut().expect("entry").remove("reason");
-    check(validate_manifest_envelope(&incomplete_unreadable).is_err(),
-        "an unreadable entry requires its actual reason")?;
+    incomplete_unreadable["fixture"]["entries"][2]
+        .as_object_mut()
+        .expect("entry")
+        .remove("reason");
+    check(
+        validate_manifest_envelope(&incomplete_unreadable).is_err(),
+        "an unreadable entry requires its actual reason",
+    )?;
     let mut incomplete_directory = example.clone();
-    incomplete_directory["fixture"]["entries"][3].as_object_mut().expect("entry").remove("inode");
-    check(validate_manifest_envelope(&incomplete_directory).is_err(),
-        "a directory entry requires its observed inode")?;
+    incomplete_directory["fixture"]["entries"][3]
+        .as_object_mut()
+        .expect("entry")
+        .remove("inode");
+    check(
+        validate_manifest_envelope(&incomplete_directory).is_err(),
+        "a directory entry requires its observed inode",
+    )?;
     let mut unreadable_file = example.clone();
     unreadable_file["fixture"]["entries"][0]["bytes_sha256"] = serde_json::Value::Null;
-    check(validate_manifest_envelope(&unreadable_file).is_err(),
-        "a present file needs a digest; unreadable files use the refusal variant")?;
+    check(
+        validate_manifest_envelope(&unreadable_file).is_err(),
+        "a present file needs a digest; unreadable files use the refusal variant",
+    )?;
     let mut volume_obligation = example.clone();
     volume_obligation["mandatory_observations"][0]["identity"] = serde_json::json!({
         "volume_uuid": "example-uuid", "mount": "/example", "device": "/dev/example",
         "window_identity": "example-only"
     });
-    check(validate_manifest_envelope(&volume_obligation).is_ok(), "complete volume identity is accepted")?;
+    check(
+        validate_manifest_envelope(&volume_obligation).is_ok(),
+        "complete volume identity is accepted",
+    )?;
     volume_obligation["mandatory_observations"][0]["identity"]["device"] = 1.into();
-    check(validate_manifest_envelope(&volume_obligation).is_err(), "volume device requires its string identity")?;
+    check(
+        validate_manifest_envelope(&volume_obligation).is_err(),
+        "volume device requires its string identity",
+    )?;
     let mut stale_volume = example.clone();
     stale_volume["dynamic"]["volumes"][0]["window_identity"] = "other-window".into();
-    check(validate_manifest_envelope(&stale_volume).is_err(), "stale volume window refuses")?;
+    check(
+        validate_manifest_envelope(&stale_volume).is_err(),
+        "stale volume window refuses",
+    )?;
     let mut invalid_digest = example.clone();
     invalid_digest["source"]["cargo_lock_sha256"] = "not-a-digest".into();
     check(
@@ -1452,10 +1556,18 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
         {"path": "/fixture/file", "parent_device": 1, "parent_inode": 2,
          "device": 1, "inode": 3, "fd": 4}
     ]);
-    check(validate_manifest_envelope(&descriptor).is_ok(), "complete descriptor target is accepted")?;
+    check(
+        validate_manifest_envelope(&descriptor).is_ok(),
+        "complete descriptor target is accepted",
+    )?;
     descriptor["dynamic"]["writers"][0]["descriptor_targets"][0]
-        .as_object_mut().expect("descriptor target").remove("inode");
-    check(validate_manifest_envelope(&descriptor).is_err(), "descriptor target requires object identity")?;
+        .as_object_mut()
+        .expect("descriptor target")
+        .remove("inode");
+    check(
+        validate_manifest_envelope(&descriptor).is_err(),
+        "descriptor target requires object identity",
+    )?;
     let mut invalid_identity = example.clone();
     invalid_identity["mandatory_observations"][0]["identity"] = serde_json::json!({"pid": 42});
     check(
@@ -1599,7 +1711,8 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
     check(
         observed_bytes == b"original"
             && descriptor_doc.reads.iter().any(|row| {
-                row.get("kind").and_then(|v| v.as_str()) == Some("authority-read@prune::read_bounded")
+                row.get("kind").and_then(|v| v.as_str())
+                    == Some("authority-read@prune::read_bounded")
                     && row.pointer("/identity/ino").and_then(|v| v.as_u64())
                         == Some(observed_identity)
                     && row
@@ -1708,7 +1821,9 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
         "the outcome is the engine's own completed document",
     )?;
     check(
-        doc.notes.iter().any(|note| note.contains("parent identity unproven")),
+        doc.notes
+            .iter()
+            .any(|note| note.contains("parent identity unproven")),
         "the missing parent remains explicitly unproven",
     )?;
     Ok(())
@@ -1799,16 +1914,33 @@ fn volume_window_reconciliation_check(temp: &Path) -> Result<(), CheckFailure> {
         }}]
     });
     tape::begin("oxide", "VOLUME-WINDOW", "manifest", "pure");
-    tape::volume_row("volume-site", Path::new("/mount"), Some("volume"), Some("/dev/example"),
-        tape::TapeOutcome::Facts { facts: "observed".to_owned() });
+    tape::volume_row(
+        "volume-site",
+        Path::new("/mount"),
+        Some("volume"),
+        Some("/dev/example"),
+        tape::TapeOutcome::Facts {
+            facts: "observed".to_owned(),
+        },
+    );
     tape::check_manifest_obligations(&manifest, temp);
     let path = temp.join("volume-window.json");
-    tape::finish_and_write(&path, TapeEngineOutcome::Completed {
-        result: serde_json::json!({"complete": false, "entries": []}),
-    }, None).map_err(|what| CheckFailure { what })?;
+    tape::finish_and_write(
+        &path,
+        TapeEngineOutcome::Completed {
+            result: serde_json::json!({"complete": false, "entries": []}),
+        },
+        None,
+    )
+    .map_err(|what| CheckFailure { what })?;
     let doc = read_transcript(&path).map_err(|what| CheckFailure { what })?;
-    check(!doc.notes.iter().any(|note| note.contains("mandatory observation missing")
-        || note.contains("extra or unbound observation")), "a volume identity binds within its declared window")
+    check(
+        !doc.notes.iter().any(|note| {
+            note.contains("mandatory observation missing")
+                || note.contains("extra or unbound observation")
+        }),
+        "a volume identity binds within its declared window",
+    )
 }
 
 fn effect_reconciliation_check(temp: &Path) -> Result<(), CheckFailure> {
@@ -1819,14 +1951,27 @@ fn effect_reconciliation_check(temp: &Path) -> Result<(), CheckFailure> {
     tape::effect_row("save@unexpected", Path::new("/fixture/other"));
     tape::check_manifest_effects(&manifest);
     let transcript = temp.join("effect-missing-extra.json");
-    tape::finish_and_write(&transcript, TapeEngineOutcome::Completed {
-        result: serde_json::json!({"complete": false, "entries": []}),
-    }, None).map_err(|what| CheckFailure { what })?;
+    tape::finish_and_write(
+        &transcript,
+        TapeEngineOutcome::Completed {
+            result: serde_json::json!({"complete": false, "entries": []}),
+        },
+        None,
+    )
+    .map_err(|what| CheckFailure { what })?;
     let doc = read_transcript(&transcript).map_err(|what| CheckFailure { what })?;
-    check(doc.notes.iter().any(|note| note.contains("missing declared effect")),
-        "a missing declared effect is explicit")?;
-    check(doc.notes.iter().any(|note| note.contains("extra observed effect")),
-        "an extra observed effect is explicit")
+    check(
+        doc.notes
+            .iter()
+            .any(|note| note.contains("missing declared effect")),
+        "a missing declared effect is explicit",
+    )?;
+    check(
+        doc.notes
+            .iter()
+            .any(|note| note.contains("extra observed effect")),
+        "an extra observed effect is explicit",
+    )
 }
 
 fn obligation_reconciliation_check(temp: &Path) -> Result<(), CheckFailure> {
@@ -1839,30 +1984,65 @@ fn obligation_reconciliation_check(temp: &Path) -> Result<(), CheckFailure> {
             "identity": {"component": "entry", "parent_device": 1, "parent_inode": 2}}]
     });
     tape::begin("oxide", "OBLIGATION-PRESENT", "manifest", "pure");
-    tape::component_row("component-site", 1, 2, std::ffi::OsStr::new("entry"),
-        tape::TapeOutcome::Opened { dev: 3, ino: 4 });
+    tape::component_row(
+        "component-site",
+        1,
+        2,
+        std::ffi::OsStr::new("entry"),
+        tape::TapeOutcome::Opened { dev: 3, ino: 4 },
+    );
     tape::check_manifest_obligations(&manifest, temp);
     let present_path = temp.join("obligation-present.json");
-    tape::finish_and_write(&present_path, TapeEngineOutcome::Completed {
-        result: serde_json::json!({"complete": false, "entries": []}),
-    }, None).map_err(|what| CheckFailure { what })?;
+    tape::finish_and_write(
+        &present_path,
+        TapeEngineOutcome::Completed {
+            result: serde_json::json!({"complete": false, "entries": []}),
+        },
+        None,
+    )
+    .map_err(|what| CheckFailure { what })?;
     let present = read_transcript(&present_path).map_err(|what| CheckFailure { what })?;
-    check(!present.notes.iter().any(|note| note.contains("mandatory observation missing")
-        || note.contains("extra or unbound observation")), "a fully bound component satisfies its obligation")?;
+    check(
+        !present.notes.iter().any(|note| {
+            note.contains("mandatory observation missing")
+                || note.contains("extra or unbound observation")
+        }),
+        "a fully bound component satisfies its obligation",
+    )?;
 
     tape::begin("oxide", "OBLIGATION-MISSING-EXTRA", "manifest", "pure");
-    tape::component_row("unexpected-site", 7, 8, std::ffi::OsStr::new("other"),
-        tape::TapeOutcome::Opened { dev: 9, ino: 10 });
+    tape::component_row(
+        "unexpected-site",
+        7,
+        8,
+        std::ffi::OsStr::new("other"),
+        tape::TapeOutcome::Opened { dev: 9, ino: 10 },
+    );
     tape::check_manifest_obligations(&manifest, temp);
     let missing_path = temp.join("obligation-missing-extra.json");
-    tape::finish_and_write(&missing_path, TapeEngineOutcome::Completed {
-        result: serde_json::json!({"complete": false, "entries": []}),
-    }, None).map_err(|what| CheckFailure { what })?;
+    tape::finish_and_write(
+        &missing_path,
+        TapeEngineOutcome::Completed {
+            result: serde_json::json!({"complete": false, "entries": []}),
+        },
+        None,
+    )
+    .map_err(|what| CheckFailure { what })?;
     let missing = read_transcript(&missing_path).map_err(|what| CheckFailure { what })?;
-    check(missing.notes.iter().any(|note| note.contains("mandatory observation missing")),
-        "a missing mandatory component is insufficient")?;
-    check(missing.notes.iter().any(|note| note.contains("extra or unbound observation")),
-        "an extra component is insufficient")
+    check(
+        missing
+            .notes
+            .iter()
+            .any(|note| note.contains("mandatory observation missing")),
+        "a missing mandatory component is insufficient",
+    )?;
+    check(
+        missing
+            .notes
+            .iter()
+            .any(|note| note.contains("extra or unbound observation")),
+        "an extra component is insufficient",
+    )
 }
 
 fn recorded_holder_cap_check(temp: &Path) -> Result<(), CheckFailure> {
@@ -1871,31 +2051,60 @@ fn recorded_holder_cap_check(temp: &Path) -> Result<(), CheckFailure> {
         tape::recorded_holder("pure-holder", id as u64, id as u32, 42);
     }
     let path = temp.join("holder-cap.json");
-    tape::finish_and_write(&path, TapeEngineOutcome::Completed {
-        result: serde_json::json!({"complete": false, "entries": []}),
-    }, None).map_err(|what| CheckFailure { what })?;
+    tape::finish_and_write(
+        &path,
+        TapeEngineOutcome::Completed {
+            result: serde_json::json!({"complete": false, "entries": []}),
+        },
+        None,
+    )
+    .map_err(|what| CheckFailure { what })?;
     let doc = read_transcript(&path).map_err(|what| CheckFailure { what })?;
-    check(doc.truncation.get("process_rows_truncated").and_then(|v| v.as_bool()) == Some(true),
-        "recorded holder cap is explicit")?;
-    check(doc.recorded_holders.len() == tape::MAX_PROCESS_ROWS,
-        "recorded holder rows remain bounded")?;
-    check(doc.recorded_holders[0]["kernel_start"].is_null() && doc.recorded_holders[0]["uid"].is_null(),
-        "recorded wall start is not a kernel identity")
+    check(
+        doc.truncation
+            .get("process_rows_truncated")
+            .and_then(|v| v.as_bool())
+            == Some(true),
+        "recorded holder cap is explicit",
+    )?;
+    check(
+        doc.recorded_holders.len() == tape::MAX_PROCESS_ROWS,
+        "recorded holder rows remain bounded",
+    )?;
+    check(
+        doc.recorded_holders[0]["kernel_start"].is_null()
+            && doc.recorded_holders[0]["uid"].is_null(),
+        "recorded wall start is not a kernel identity",
+    )
 }
 
 fn unique_key_cap_check(temp: &Path) -> Result<(), CheckFailure> {
     tape::begin("oxide", "UNIQUE-KEY-CAP", "manifest", "pure");
     for index in 0..=tape::MAX_READ_ROWS * 2 {
-        tape::read_row("unique-key-cap", &temp.join(index.to_string()),
-            tape::TapeOutcome::Absent, 0);
+        tape::read_row(
+            "unique-key-cap",
+            &temp.join(index.to_string()),
+            tape::TapeOutcome::Absent,
+            0,
+        );
     }
     let transcript = temp.join("unique-key-cap.json");
-    tape::finish_and_write(&transcript, TapeEngineOutcome::Completed {
-        result: serde_json::json!({"complete": false, "entries": []}),
-    }, None).map_err(|what| CheckFailure { what })?;
+    tape::finish_and_write(
+        &transcript,
+        TapeEngineOutcome::Completed {
+            result: serde_json::json!({"complete": false, "entries": []}),
+        },
+        None,
+    )
+    .map_err(|what| CheckFailure { what })?;
     let doc = read_transcript(&transcript).map_err(|what| CheckFailure { what })?;
-    check(doc.truncation.get("occurrences_truncated").and_then(|v| v.as_bool()) == Some(true),
-        "the bounded distinct-key table reports truncation")
+    check(
+        doc.truncation
+            .get("occurrences_truncated")
+            .and_then(|v| v.as_bool())
+            == Some(true),
+        "the bounded distinct-key table reports truncation",
+    )
 }
 
 fn effect_attempt_check(temp: &Path) -> Result<(), CheckFailure> {
@@ -1904,28 +2113,56 @@ fn effect_attempt_check(temp: &Path) -> Result<(), CheckFailure> {
         let _fence = tape::effect_kind_override("fence@expected");
         tape::effect_row("attempt@temporary-open", Path::new("/fixture/temp"));
         tape::effect_row("attempt-save@temporary-write", Path::new("/fixture/temp"));
-        tape::effect_row("attempt-rename@temporary-move", Path::new("/fixture/destination"));
-        tape::effect_row("attempt-unlink@temporary-cleanup", Path::new("/fixture/temp"));
+        tape::effect_row(
+            "attempt-rename@temporary-move",
+            Path::new("/fixture/destination"),
+        );
+        tape::effect_row(
+            "attempt-unlink@temporary-cleanup",
+            Path::new("/fixture/temp"),
+        );
         tape::effect_row("save@control-state", Path::new("/fixture/state"));
     }
     let transcript = temp.join("effect-attempt.json");
-    tape::finish_and_write(&transcript, TapeEngineOutcome::Completed {
-        result: serde_json::json!({"complete": false, "entries": []}),
-    }, None).map_err(|what| CheckFailure { what })?;
+    tape::finish_and_write(
+        &transcript,
+        TapeEngineOutcome::Completed {
+            result: serde_json::json!({"complete": false, "entries": []}),
+        },
+        None,
+    )
+    .map_err(|what| CheckFailure { what })?;
     let doc = read_transcript(&transcript).map_err(|what| CheckFailure { what })?;
-    check(doc.effects.len() == 5, "all attempted and completed effects are retained")?;
-    check(doc.effects[0]["kind"] == "create" && doc.effects[0]["attempted"] == true,
-        "uncertain create stays an attempt")?;
-    check(doc.effects[1]["kind"] == "save" && doc.effects[1]["attempted"] == true,
-        "failed write stays an attempt")?;
-    check(doc.effects[2]["kind"] == "rename" && doc.effects[2]["attempted"] == true,
-        "failed rename stays an attempt")?;
-    check(doc.effects[3]["kind"] == "unlink" && doc.effects[3]["attempted"] == true,
-        "failed cleanup stays an attempt")?;
-    check(doc.effects[4]["kind"] == "fence" && doc.effects[4]["site"] == "expected",
-        "temporary attempts do not consume the final fence override")?;
-    check(doc.notes.iter().any(|note| note.contains("attempted effect") && note.contains("insufficient")),
-        "attempts cannot be silently treated as parity")
+    check(
+        doc.effects.len() == 5,
+        "all attempted and completed effects are retained",
+    )?;
+    check(
+        doc.effects[0]["kind"] == "create" && doc.effects[0]["attempted"] == true,
+        "uncertain create stays an attempt",
+    )?;
+    check(
+        doc.effects[1]["kind"] == "save" && doc.effects[1]["attempted"] == true,
+        "failed write stays an attempt",
+    )?;
+    check(
+        doc.effects[2]["kind"] == "rename" && doc.effects[2]["attempted"] == true,
+        "failed rename stays an attempt",
+    )?;
+    check(
+        doc.effects[3]["kind"] == "unlink" && doc.effects[3]["attempted"] == true,
+        "failed cleanup stays an attempt",
+    )?;
+    check(
+        doc.effects[4]["kind"] == "fence" && doc.effects[4]["site"] == "expected",
+        "temporary attempts do not consume the final fence override",
+    )?;
+    check(
+        doc.notes
+            .iter()
+            .any(|note| note.contains("attempted effect") && note.contains("insufficient")),
+        "attempts cannot be silently treated as parity",
+    )
 }
 
 fn config_inspect_absence_check(temp: &Path) -> Result<(), CheckFailure> {
@@ -1938,11 +2175,20 @@ fn config_inspect_absence_check(temp: &Path) -> Result<(), CheckFailure> {
     let transcript = temp.join("config-inspect-absent.json");
     tape::finish_and_write(&transcript, result, None).map_err(|what| CheckFailure { what })?;
     let doc = read_transcript(&transcript).map_err(|what| CheckFailure { what })?;
-    check(found == config::Found::Absent, "the actual missing pool is absent")?;
-    check(doc.reads.iter().any(|row| {
-        row.get("kind").and_then(|value| value.as_str()) == Some("config:inspect:initial")
-            && row.pointer("/outcome/type").and_then(|value| value.as_str()) == Some("absent")
-    }), "the actual missing metadata result is taped")
+    check(
+        found == config::Found::Absent,
+        "the actual missing pool is absent",
+    )?;
+    check(
+        doc.reads.iter().any(|row| {
+            row.get("kind").and_then(|value| value.as_str()) == Some("config:inspect:initial")
+                && row
+                    .pointer("/outcome/type")
+                    .and_then(|value| value.as_str())
+                    == Some("absent")
+        }),
+        "the actual missing metadata result is taped",
+    )
 }
 
 fn unbound_authority_note_check(temp: &Path) -> Result<(), CheckFailure> {
@@ -1973,13 +2219,19 @@ fn unbound_authority_note_check(temp: &Path) -> Result<(), CheckFailure> {
     check(
         doc.reads.iter().any(|row| {
             row.get("kind").and_then(|k| k.as_str()) == Some("authority-read@pure::site")
-                && row.pointer("/identity/dev").is_some_and(|value| value.is_null())
-                && row.pointer("/identity/parent_dev").is_some_and(|value| value.is_null())
+                && row
+                    .pointer("/identity/dev")
+                    .is_some_and(|value| value.is_null())
+                && row
+                    .pointer("/identity/parent_dev")
+                    .is_some_and(|value| value.is_null())
         }),
         "an unobserved descriptor and parent are not invented",
     )?;
     check(
-        doc.notes.iter().any(|note| note.contains("identity unproven")),
+        doc.notes
+            .iter()
+            .any(|note| note.contains("identity unproven")),
         "an unobserved identity explicitly prevents proof",
     )
 }
@@ -1999,8 +2251,11 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
         registry: !matches!(case, Case::RegistryMissing),
         intent: matches!(case, Case::UnsettledIntent),
     };
-    let root = temp.join(format!("fixture-{}{}", case.name().to_lowercase(),
-        if disconnected { "-disconnected" } else { "" }));
+    let root = temp.join(format!(
+        "fixture-{}{}",
+        case.name().to_lowercase(),
+        if disconnected { "-disconnected" } else { "" }
+    ));
     let paths = build_fixture(&root, &spec).map_err(|error| CheckFailure { what: error })?;
     // Schema-example data is a unit-test envelope, not source or fixture
     // qualification evidence. X-S2 supplies observed manifest facts.
@@ -2096,11 +2351,17 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
         doc.manifest_sha256 == manifest_sha,
         "the transcript binds the manifest digest",
     )?;
-    check(doc.clocks.iter().any(|clock| {
-        clock.get("kind").and_then(|value| value.as_str())
-            == Some("authority:begin:window-offset-ns")
-            && clock.get("value").and_then(|value| value.as_u64()).is_some()
-    }), "the actual authority start has a monotonic offset from this window")?;
+    check(
+        doc.clocks.iter().any(|clock| {
+            clock.get("kind").and_then(|value| value.as_str())
+                == Some("authority:begin:window-offset-ns")
+                && clock
+                    .get("value")
+                    .and_then(|value| value.as_u64())
+                    .is_some()
+        }),
+        "the actual authority start has a monotonic offset from this window",
+    )?;
     let diff_effects: Vec<serde_json::Value> = doc
         .fixture_capture
         .as_ref()
@@ -2127,28 +2388,44 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
             _ => unreachable!(),
         };
         let transient_count = if case == Case::Effect2 { 2 } else { 0 };
-        let completed_effects = doc.effects.iter().filter(|effect| {
-            effect.get("attempted").and_then(|value| value.as_bool()) == Some(false)
-        }).count();
+        let completed_effects = doc
+            .effects
+            .iter()
+            .filter(|effect| {
+                effect.get("attempted").and_then(|value| value.as_bool()) == Some(false)
+            })
+            .count();
         check(
-            completed_effects == expected.len() + transient_count && diff_effects.len() == expected.len(),
+            completed_effects == expected.len() + transient_count
+                && diff_effects.len() == expected.len(),
             "completed transient and persistent effects match their declared counts",
         )?;
-        check(doc.effects.iter().any(|effect| {
-            effect.get("site").and_then(|value| value.as_str()) == Some("pool-lock-open")
-                && effect.get("attempted").and_then(|value| value.as_bool()) == Some(true)
-        }), "the O_CREAT pool-lock open remains an explicitly uncertain attempt")?;
+        check(
+            doc.effects.iter().any(|effect| {
+                effect.get("site").and_then(|value| value.as_str()) == Some("pool-lock-open")
+                    && effect.get("attempted").and_then(|value| value.as_bool()) == Some(true)
+            }),
+            "the O_CREAT pool-lock open remains an explicitly uncertain attempt",
+        )?;
         if case == Case::Effect2 {
             for (kind, site, attempted) in [
                 ("create", "managed-admission-open", true),
                 ("create", "managed-control-temp", false),
                 ("save", "managed-control-temp", false),
             ] {
-                check(doc.effects.iter().filter(|effect| {
-                    effect.get("kind").and_then(|value| value.as_str()) == Some(kind)
-                        && effect.get("site").and_then(|value| value.as_str()) == Some(site)
-                        && effect.get("attempted").and_then(|value| value.as_bool()) == Some(attempted)
-                }).count() == 1, "the reached temporary or uncertain effect occurs exactly once")?;
+                check(
+                    doc.effects
+                        .iter()
+                        .filter(|effect| {
+                            effect.get("kind").and_then(|value| value.as_str()) == Some(kind)
+                                && effect.get("site").and_then(|value| value.as_str()) == Some(site)
+                                && effect.get("attempted").and_then(|value| value.as_bool())
+                                    == Some(attempted)
+                        })
+                        .count()
+                        == 1,
+                    "the reached temporary or uncertain effect occurs exactly once",
+                )?;
             }
         }
         for (taped, site, diff, rel) in expected {
@@ -2247,15 +2524,20 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
                 "the reached library pool lock distinguishes the connected sink",
             )?;
             if disconnected {
-                check(doc.notes.iter().any(|note| note.contains("counterfactual: pool lock")
-                    && note.contains("insufficient")),
-                    "the actual disconnected engine run is explicitly insufficient")?;
+                check(
+                    doc.notes.iter().any(|note| {
+                        note.contains("counterfactual: pool lock") && note.contains("insufficient")
+                    }),
+                    "the actual disconnected engine run is explicitly insufficient",
+                )?;
             }
-            check(has_read(&doc.reads, "pool:entries:read-dir-open")
-                && has_read(&doc.reads, "pool:entries:end")
-                && has_read(&doc.reads, "pool:payload-entries:read-dir-open")
-                && has_read(&doc.reads, "pool:payload-entries:end"),
-                "the actual pool and payload enumeration opens and ends reach the tape")?;
+            check(
+                has_read(&doc.reads, "pool:entries:read-dir-open")
+                    && has_read(&doc.reads, "pool:entries:end")
+                    && has_read(&doc.reads, "pool:payload-entries:read-dir-open")
+                    && has_read(&doc.reads, "pool:payload-entries:end"),
+                "the actual pool and payload enumeration opens and ends reach the tape",
+            )?;
             check(
                 doc.effects.iter().all(|effect| effect.get("attempted").and_then(|v| v.as_bool()) == Some(true))
                     && diff_effects.is_empty(),
@@ -2299,9 +2581,7 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
                     effect
                         .get("kind")
                         .and_then(|k| k.as_str())
-                        .map_or(false, |k| {
-                            k == "save" || k == "fence"
-                        })
+                        .map_or(false, |k| k == "save" || k == "fence")
                 }),
                 "an already-fenced control is not rewritten",
             )?;
@@ -2339,10 +2619,14 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
                 exit == 2,
                 "the registry refusal carries the engine's exit code",
             )?;
-            check(doc.outcome.get("source").and_then(|v| v.as_str()) == Some("engine"),
-                "the registry refusal is attributed to the engine")?;
             check(
-                doc.effects.iter().all(|effect| effect.get("attempted").and_then(|v| v.as_bool()) == Some(true))
+                doc.outcome.get("source").and_then(|v| v.as_str()) == Some("engine"),
+                "the registry refusal is attributed to the engine",
+            )?;
+            check(
+                doc.effects
+                    .iter()
+                    .all(|effect| effect.get("attempted").and_then(|v| v.as_bool()) == Some(true))
                     && diff_effects.is_empty(),
                 "a pre-evaluate refusal has no confirmed effect; attempts remain insufficient",
             )?;
@@ -2363,7 +2647,9 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
                 .unwrap_or(0);
             check(exit == 3, "the unsettled refusal carries exit 3")?;
             check(
-                doc.effects.iter().all(|effect| effect.get("attempted").and_then(|v| v.as_bool()) == Some(true))
+                doc.effects
+                    .iter()
+                    .all(|effect| effect.get("attempted").and_then(|v| v.as_bool()) == Some(true))
                     && diff_effects.is_empty(),
                 "the unsettled refusal has no confirmed effect; attempts remain insufficient",
             )?;
@@ -2428,7 +2714,9 @@ fn usage() -> String {
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let disconnected = args.first().is_some_and(|arg| arg == "--counterfactual-disconnected");
+    let disconnected = args
+        .first()
+        .is_some_and(|arg| arg == "--counterfactual-disconnected");
     if disconnected {
         args.remove(0);
         if args.first().map(String::as_str) != Some("--fixture-root") {
@@ -2519,7 +2807,13 @@ fn main() {
             let parsed = parse();
             let code = match parsed {
                 Ok((fixture_root, manifest, transcript_out, case)) => {
-                    match run_case(&fixture_root, &manifest, &transcript_out, &case, disconnected) {
+                    match run_case(
+                        &fixture_root,
+                        &manifest,
+                        &transcript_out,
+                        &case,
+                        disconnected,
+                    ) {
                         Ok(()) => {
                             println!(
                                 "oxide: prune capture harness wrote {} for {}",

@@ -292,21 +292,33 @@ impl Binding {
         let parent_fd = open_dir(None, parent)?;
         #[cfg(test)]
         crate::tape::read_row(
-            "volume:open-parent", parent,
-            crate::tape::TapeOutcome::Facts { facts: "opened; identity unproven".to_owned() }, 0,
+            "volume:open-parent",
+            parent,
+            crate::tape::TapeOutcome::Facts {
+                facts: "opened; identity unproven".to_owned(),
+            },
+            0,
         );
         let fd = open_dir(Some(parent_fd.as_fd_ref()), Path::new(name)).map_err(|error| {
             #[cfg(test)]
             crate::tape::read_row(
-                "volume:open-mount", &mount_point,
-                crate::tape::TapeOutcome::Refusal { reason: error.to_string() }, 0,
+                "volume:open-mount",
+                &mount_point,
+                crate::tape::TapeOutcome::Refusal {
+                    reason: error.to_string(),
+                },
+                0,
             );
             format!("{} is not available: {error}", mount_point.display())
         })?;
         #[cfg(test)]
         crate::tape::read_row(
-            "volume:open-mount", &mount_point,
-            crate::tape::TapeOutcome::Facts { facts: "opened; identity unproven".to_owned() }, 0,
+            "volume:open-mount",
+            &mount_point,
+            crate::tape::TapeOutcome::Facts {
+                facts: "opened; identity unproven".to_owned(),
+            },
+            0,
         );
         let facts = observe(fd.as_fd())?;
         #[cfg(test)]
@@ -410,13 +422,15 @@ impl Binding {
             .map_err(|error| format!("{} is gone: {error}", self.mount_point.display()))?;
         #[cfg(test)]
         crate::tape::read_row_dev(
-            "volume:verify:path", &self.mount_point,
+            "volume:verify:path",
+            &self.mount_point,
             std::os::unix::fs::MetadataExt::dev(&by_path),
             std::os::unix::fs::MetadataExt::ino(&by_path),
             crate::tape::TapeOutcome::Opened {
                 dev: std::os::unix::fs::MetadataExt::dev(&by_path),
                 ino: std::os::unix::fs::MetadataExt::ino(&by_path),
-            }, 0,
+            },
+            0,
         );
         if by_path.file_type().is_symlink()
             || std::os::unix::fs::MetadataExt::dev(&by_path) != facts.dev

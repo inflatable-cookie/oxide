@@ -131,8 +131,14 @@ pub(crate) struct TapeClassifyRow {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case", tag = "state")]
 pub(crate) enum TapeEngineOutcome {
-    Completed { result: serde_json::Value },
-    Refused { reason: String, exit_code: u8, source: &'static str },
+    Completed {
+        result: serde_json::Value,
+    },
+    Refused {
+        reason: String,
+        exit_code: u8,
+        source: &'static str,
+    },
 }
 
 /// A holder as recorded in the parsed control file. Its userspace wall start
@@ -296,8 +302,11 @@ fn file_identity_matches(row: &TapeReadRow, identity: &serde_json::Value) -> boo
         && identity.get("parent_inode").and_then(|v| v.as_u64()) == i.parent_ino
         && identity.get("device").and_then(|v| v.as_u64()) == i.dev
         && identity.get("inode").and_then(|v| v.as_u64()) == i.ino
-        && i.path.is_some() && i.parent_dev.is_some() && i.parent_ino.is_some()
-        && i.dev.is_some() && i.ino.is_some()
+        && i.path.is_some()
+        && i.parent_dev.is_some()
+        && i.parent_ino.is_some()
+        && i.dev.is_some()
+        && i.ino.is_some()
 }
 
 fn identity_matches(row: &TapeReadRow, identity: &serde_json::Value, window: Option<&str>) -> bool {
@@ -306,16 +315,20 @@ fn identity_matches(row: &TapeReadRow, identity: &serde_json::Value, window: Opt
     }
     if let Some(name) = identity.get("component").and_then(|v| v.as_str()) {
         return row.identity.component.as_deref() == Some(name)
-            && row.identity.parent_dev.is_some() && row.identity.parent_ino.is_some()
+            && row.identity.parent_dev.is_some()
+            && row.identity.parent_ino.is_some()
             && identity.get("parent_device").and_then(|v| v.as_u64()) == row.identity.parent_dev
             && identity.get("parent_inode").and_then(|v| v.as_u64()) == row.identity.parent_ino;
     }
     if let Some(uuid) = identity.get("volume_uuid").and_then(|v| v.as_str()) {
         return row.identity.uuid.as_deref() == Some(uuid)
-            && identity.get("mount").and_then(|v| v.as_str()) == row.identity.mount_point.as_deref()
+            && identity.get("mount").and_then(|v| v.as_str())
+                == row.identity.mount_point.as_deref()
             && identity.get("device").and_then(|v| v.as_str()) == row.identity.device.as_deref()
-            && row.identity.mount_point.is_some() && row.identity.device.is_some()
-            && window.is_some() && identity.get("window_identity").and_then(|v| v.as_str()) == window;
+            && row.identity.mount_point.is_some()
+            && row.identity.device.is_some()
+            && window.is_some()
+            && identity.get("window_identity").and_then(|v| v.as_str()) == window;
     }
     // A PID alone or a process-start identity not present on this row cannot
     // be upgraded into a match by parsing the display key.
@@ -325,75 +338,153 @@ fn identity_matches(row: &TapeReadRow, identity: &serde_json::Value, window: Opt
 pub(crate) fn check_manifest_obligations(manifest: &serde_json::Value, root: &Path) {
     with_state(|state| {
         let mut issues = std::collections::BTreeSet::new();
-        if let Some(obligations) = manifest.get("mandatory_observations").and_then(|v| v.as_array()) {
+        if let Some(obligations) = manifest
+            .get("mandatory_observations")
+            .and_then(|v| v.as_array())
+        {
             for obligation in obligations {
                 if obligation.get("engine").and_then(|v| v.as_str()) != Some("oxide") {
                     continue;
                 }
-                let site = obligation.get("site").and_then(|v| v.as_str()).unwrap_or("");
+                let site = obligation
+                    .get("site")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let identity = &obligation["identity"];
-                if !state.reads.iter().any(|row| row.kind == site && identity_matches(row, identity, manifest.pointer("/window/identity").and_then(|v| v.as_str()))) {
-                    issues.insert(format!("mandatory observation missing or identity unproven at {site}"));
+                if !state.reads.iter().any(|row| {
+                    row.kind == site
+                        && identity_matches(
+                            row,
+                            identity,
+                            manifest
+                                .pointer("/window/identity")
+                                .and_then(|v| v.as_str()),
+                        )
+                }) {
+                    issues.insert(format!(
+                        "mandatory observation missing or identity unproven at {site}"
+                    ));
                 }
             }
         }
-        let entries = manifest.pointer("/fixture/entries").and_then(|v| v.as_array());
+        let entries = manifest
+            .pointer("/fixture/entries")
+            .and_then(|v| v.as_array());
         for row in &state.reads {
             let bound_file = row.identity.path.as_deref().is_some_and(|path| {
-                let fixture_match = entries.is_some_and(|entries| entries.iter().any(|entry| {
-                    let Some(rel) = entry.get("rel").and_then(|v| v.as_str()) else { return false; };
-                    let relative = Path::new(rel);
-                    if !relative.components().all(|part| matches!(part, std::path::Component::Normal(_))) {
-                        return false;
-                    }
-                    root.join(relative) == Path::new(path)
-                        && entry.get("parent_device").and_then(|v| v.as_u64()) == row.identity.parent_dev
-                        && entry.get("parent_inode").and_then(|v| v.as_u64()) == row.identity.parent_ino
-                        && row.identity.parent_dev.is_some() && row.identity.parent_ino.is_some()
-                        && match &row.outcome {
-                            TapeOutcome::Absent => entry.get("kind").and_then(|v| v.as_str()) == Some("absent"),
-                            TapeOutcome::Refusal { reason } => entry.get("kind").and_then(|v| v.as_str()) == Some("unreadable")
-                                && entry.get("reason").and_then(|v| v.as_str()) == Some(reason.as_str()),
-                            outcome => entry.get("device").and_then(|v| v.as_u64()) == row.identity.dev
-                                && entry.get("inode").and_then(|v| v.as_u64()) == row.identity.ino
-                                && row.identity.dev.is_some() && row.identity.ino.is_some()
-                                && match outcome {
-                                    TapeOutcome::Digest { digest } => entry.get("bytes_sha256").and_then(|v| v.as_str()) == Some(digest.as_str()),
-                                    _ => true,
-                                },
+                let fixture_match = entries.is_some_and(|entries| {
+                    entries.iter().any(|entry| {
+                        let Some(rel) = entry.get("rel").and_then(|v| v.as_str()) else {
+                            return false;
+                        };
+                        let relative = Path::new(rel);
+                        if !relative
+                            .components()
+                            .all(|part| matches!(part, std::path::Component::Normal(_)))
+                        {
+                            return false;
                         }
-                }));
+                        root.join(relative) == Path::new(path)
+                            && entry.get("parent_device").and_then(|v| v.as_u64())
+                                == row.identity.parent_dev
+                            && entry.get("parent_inode").and_then(|v| v.as_u64())
+                                == row.identity.parent_ino
+                            && row.identity.parent_dev.is_some()
+                            && row.identity.parent_ino.is_some()
+                            && match &row.outcome {
+                                TapeOutcome::Absent => {
+                                    entry.get("kind").and_then(|v| v.as_str()) == Some("absent")
+                                }
+                                TapeOutcome::Refusal { reason } => {
+                                    entry.get("kind").and_then(|v| v.as_str()) == Some("unreadable")
+                                        && entry.get("reason").and_then(|v| v.as_str())
+                                            == Some(reason.as_str())
+                                }
+                                outcome => {
+                                    entry.get("device").and_then(|v| v.as_u64()) == row.identity.dev
+                                        && entry.get("inode").and_then(|v| v.as_u64())
+                                            == row.identity.ino
+                                        && row.identity.dev.is_some()
+                                        && row.identity.ino.is_some()
+                                        && match outcome {
+                                            TapeOutcome::Digest { digest } => {
+                                                entry.get("bytes_sha256").and_then(|v| v.as_str())
+                                                    == Some(digest.as_str())
+                                            }
+                                            _ => true,
+                                        }
+                                }
+                            }
+                    })
+                });
                 // The proposed allowance carries a path/class but no observed
                 // parent or object identity; it cannot establish a binding.
                 fixture_match
             });
             let bound_component = row.identity.component.as_deref().is_some_and(|name| {
-                row.identity.parent_dev.is_some() && row.identity.parent_ino.is_some()
-                    && entries.is_some_and(|items| items.iter().any(|entry| {
-                        let rel = entry.get("rel").and_then(|value| value.as_str()).map(Path::new);
-                        rel.is_some_and(|path| path.components().all(|part| matches!(part, std::path::Component::Normal(_))))
-                            && rel.and_then(Path::file_name).and_then(|value| value.to_str()) == Some(name)
-                            && entry.get("parent_device").and_then(|v| v.as_u64()) == row.identity.parent_dev
-                            && entry.get("parent_inode").and_then(|v| v.as_u64()) == row.identity.parent_ino
-                            && match &row.outcome {
-                                TapeOutcome::Absent => entry.get("kind").and_then(|v| v.as_str()) == Some("absent"),
-                                TapeOutcome::Refusal { reason } => entry.get("kind").and_then(|v| v.as_str()) == Some("unreadable")
-                                    && entry.get("reason").and_then(|v| v.as_str()) == Some(reason.as_str()),
-                                TapeOutcome::Opened { dev, ino } => entry.get("device").and_then(|v| v.as_u64()) == Some(*dev)
-                                    && entry.get("inode").and_then(|v| v.as_u64()) == Some(*ino),
-                                _ => !matches!(entry.get("kind").and_then(|v| v.as_str()), Some("absent" | "unreadable")),
-                            }
-                    }))
+                row.identity.parent_dev.is_some()
+                    && row.identity.parent_ino.is_some()
+                    && entries.is_some_and(|items| {
+                        items.iter().any(|entry| {
+                            let rel = entry
+                                .get("rel")
+                                .and_then(|value| value.as_str())
+                                .map(Path::new);
+                            rel.is_some_and(|path| {
+                                path.components()
+                                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+                            }) && rel
+                                .and_then(Path::file_name)
+                                .and_then(|value| value.to_str())
+                                == Some(name)
+                                && entry.get("parent_device").and_then(|v| v.as_u64())
+                                    == row.identity.parent_dev
+                                && entry.get("parent_inode").and_then(|v| v.as_u64())
+                                    == row.identity.parent_ino
+                                && match &row.outcome {
+                                    TapeOutcome::Absent => {
+                                        entry.get("kind").and_then(|v| v.as_str()) == Some("absent")
+                                    }
+                                    TapeOutcome::Refusal { reason } => {
+                                        entry.get("kind").and_then(|v| v.as_str())
+                                            == Some("unreadable")
+                                            && entry.get("reason").and_then(|v| v.as_str())
+                                                == Some(reason.as_str())
+                                    }
+                                    TapeOutcome::Opened { dev, ino } => {
+                                        entry.get("device").and_then(|v| v.as_u64()) == Some(*dev)
+                                            && entry.get("inode").and_then(|v| v.as_u64())
+                                                == Some(*ino)
+                                    }
+                                    _ => !matches!(
+                                        entry.get("kind").and_then(|v| v.as_str()),
+                                        Some("absent" | "unreadable")
+                                    ),
+                                }
+                        })
+                    })
             });
-            let bound_volume = manifest.pointer("/dynamic/volumes").and_then(|v| v.as_array())
-                .is_some_and(|volumes| volumes.iter().any(|volume| {
-                    let window = manifest.pointer("/window/identity").and_then(|v| v.as_str());
-                    row.identity.uuid.is_some() && row.identity.mount_point.is_some() && row.identity.device.is_some()
-                        && volume.get("uuid").and_then(|v| v.as_str()) == row.identity.uuid.as_deref()
-                        && volume.get("mount").and_then(|v| v.as_str()) == row.identity.mount_point.as_deref()
-                        && volume.get("device").and_then(|v| v.as_str()) == row.identity.device.as_deref()
-                        && window.is_some() && volume.get("window_identity").and_then(|v| v.as_str()) == window
-                }));
+            let bound_volume = manifest
+                .pointer("/dynamic/volumes")
+                .and_then(|v| v.as_array())
+                .is_some_and(|volumes| {
+                    volumes.iter().any(|volume| {
+                        let window = manifest
+                            .pointer("/window/identity")
+                            .and_then(|v| v.as_str());
+                        row.identity.uuid.is_some()
+                            && row.identity.mount_point.is_some()
+                            && row.identity.device.is_some()
+                            && volume.get("uuid").and_then(|v| v.as_str())
+                                == row.identity.uuid.as_deref()
+                            && volume.get("mount").and_then(|v| v.as_str())
+                                == row.identity.mount_point.as_deref()
+                            && volume.get("device").and_then(|v| v.as_str())
+                                == row.identity.device.as_deref()
+                            && window.is_some()
+                            && volume.get("window_identity").and_then(|v| v.as_str()) == window
+                    })
+                });
             if !bound_file && !bound_component && !bound_volume {
                 issues.insert(format!("extra or unbound observation at {}", row.kind));
             }
@@ -409,31 +500,58 @@ pub(crate) fn check_manifest_obligations(manifest: &serde_json::Value, root: &Pa
 pub(crate) fn check_manifest_effects(manifest: &serde_json::Value) {
     with_state(|state| {
         let mut declared = std::collections::BTreeMap::new();
-        if let Some(rows) = manifest.get("expected_effects").and_then(|value| value.as_array()) {
+        if let Some(rows) = manifest
+            .get("expected_effects")
+            .and_then(|value| value.as_array())
+        {
             for row in rows {
-                let key = (row.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
-                    row.get("site").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
-                    row.get("path").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
-                    row.get("attempted").and_then(|v| v.as_bool()).unwrap_or(true));
+                let key = (
+                    row.get("kind")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned(),
+                    row.get("site")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned(),
+                    row.get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned(),
+                    row.get("attempted")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true),
+                );
                 *declared.entry(key).or_insert(0usize) += 1;
             }
         }
         let mut actual = std::collections::BTreeMap::new();
         for row in &state.effects {
-            let key = (row.kind.clone(), row.site.clone(), row.path.clone(), row.attempted);
+            let key = (
+                row.kind.clone(),
+                row.site.clone(),
+                row.path.clone(),
+                row.attempted,
+            );
             *actual.entry(key).or_insert(0usize) += 1;
         }
         let mut issues = Vec::new();
         for (key, count) in &declared {
             let observed = actual.get(key).copied().unwrap_or(0);
             if observed < *count {
-                issues.push(format!("missing declared effect {} at {}: {}", key.0, key.1, key.2));
+                issues.push(format!(
+                    "missing declared effect {} at {}: {}",
+                    key.0, key.1, key.2
+                ));
             }
         }
         for (key, count) in &actual {
             let expected = declared.get(key).copied().unwrap_or(0);
             if *count > expected {
-                issues.push(format!("extra observed effect {} at {}: {}", key.0, key.1, key.2));
+                issues.push(format!(
+                    "extra observed effect {} at {}: {}",
+                    key.0, key.1, key.2
+                ));
             }
         }
         for issue in issues {
@@ -447,22 +565,34 @@ pub(crate) fn check_manifest_effects(manifest: &serde_json::Value) {
 pub(crate) fn check_fixture_diff(root: &Path, capture: &TapeFixtureCapture) {
     with_state(|state| {
         if capture.truncated {
-            push_note(state, "fixture capture truncated; effect agreement insufficient".to_owned());
+            push_note(
+                state,
+                "fixture capture truncated; effect agreement insufficient".to_owned(),
+            );
         }
         let mut issues = Vec::new();
         for diff in &capture.diff_effects {
             let path = root.join(&diff.path);
             let matched = state.effects.iter().any(|effect| {
-                !effect.attempted && Path::new(&effect.path) == path.as_path()
+                !effect.attempted
+                    && Path::new(&effect.path) == path.as_path()
                     && match diff.kind.as_str() {
-                        "create" => matches!(effect.kind.as_str(), "create" | "lock-create" | "rename"),
-                        "save" => matches!(effect.kind.as_str(), "save" | "fence" | "reconcile" | "rename"),
+                        "create" => {
+                            matches!(effect.kind.as_str(), "create" | "lock-create" | "rename")
+                        }
+                        "save" => matches!(
+                            effect.kind.as_str(),
+                            "save" | "fence" | "reconcile" | "rename"
+                        ),
                         "unlink" => matches!(effect.kind.as_str(), "unlink" | "rename"),
                         _ => false,
                     }
             });
             if !matched {
-                issues.push(format!("fixture change lacks a matching observed effect: {}", diff.path));
+                issues.push(format!(
+                    "fixture change lacks a matching observed effect: {}",
+                    diff.path
+                ));
             }
         }
         for issue in issues {
@@ -483,8 +613,10 @@ pub(crate) fn finish_and_write(
         let state = taken.ok_or_else(|| "the observation tape was not active".to_owned())?;
         let mut notes = state.notes.clone();
         if state.disconnected_pool_lock {
-            notes.push(format!("counterfactual diverted pool-lock observations: {}",
-                state.disconnected_lock_observations.len()));
+            notes.push(format!(
+                "counterfactual diverted pool-lock observations: {}",
+                state.disconnected_lock_observations.len()
+            ));
         }
         notes.push("absolute monotonic window origin and end unproven".to_owned());
         if state.pending_authority.is_some() {
@@ -530,7 +662,9 @@ pub(crate) fn finish_and_write(
                 TapeEngineOutcome::Completed { .. } => TapeEngineOutcome::Completed {
                     result: serde_json::json!({"truncated": true}),
                 },
-                TapeEngineOutcome::Refused { exit_code, source, .. } => TapeEngineOutcome::Refused {
+                TapeEngineOutcome::Refused {
+                    exit_code, source, ..
+                } => TapeEngineOutcome::Refused {
                     reason: "refusal detail exceeded the document cap".to_owned(),
                     exit_code,
                     source,
@@ -650,7 +784,10 @@ fn file_identity(path: &Path, outcome: &TapeOutcome) -> TapeIdentity {
 pub(crate) fn read_row(kind: &str, path: &Path, outcome: TapeOutcome, cap: u64) {
     with_state(|state| {
         let identity = file_identity(path, &outcome);
-        push_note(state, format!("object or parent identity unproven at {kind}"));
+        push_note(
+            state,
+            format!("object or parent identity unproven at {kind}"),
+        );
         let key = format!("{kind}|{}", identity_key(&identity));
         let (occurrence, counted) = occurrence(state, &key);
         let epoch = next_epoch(state);
@@ -735,14 +872,35 @@ pub(crate) fn component_without_parent(kind: &str, name: &std::ffi::OsStr, outco
         };
         let key = format!("component:parent=unproven|name={name:?}|dev={dev:?}/ino={ino:?}");
         let identity = TapeIdentity {
-            path: None, component: name.to_str().map(str::to_owned), parent_dev: None, parent_ino: None, dev, ino,
-            uuid: None, mount_point: None, device: None, key: key.clone(),
+            path: None,
+            component: name.to_str().map(str::to_owned),
+            parent_dev: None,
+            parent_ino: None,
+            dev,
+            ino,
+            uuid: None,
+            mount_point: None,
+            device: None,
+            key: key.clone(),
         };
-        push_note(state, format!("component parent identity unproven at {kind}"));
+        push_note(
+            state,
+            format!("component parent identity unproven at {kind}"),
+        );
         let (occurrence, counted) = occurrence(state, &format!("{kind}|{key}"));
         let epoch = next_epoch(state);
         if counted {
-            push_read(state, TapeReadRow { kind: kind.to_owned(), identity, outcome, cap: 0, epoch, occurrence });
+            push_read(
+                state,
+                TapeReadRow {
+                    kind: kind.to_owned(),
+                    identity,
+                    outcome,
+                    cap: 0,
+                    epoch,
+                    occurrence,
+                },
+            );
         }
     });
 }
@@ -815,12 +973,18 @@ pub(crate) fn effect_row(kind: &str, path: &Path) {
     with_state(|state| {
         let epoch = next_epoch(state);
         let kind = if kind == "save@control-state" {
-            state.pending_effect_kind.take().unwrap_or_else(|| kind.to_owned())
+            state
+                .pending_effect_kind
+                .take()
+                .unwrap_or_else(|| kind.to_owned())
         } else {
             kind.to_owned()
         };
         let (verb, site) = kind.split_once('@').unwrap_or((&kind, "unknown"));
-        let attempted = matches!(verb, "attempt" | "attempt-save" | "attempt-rename" | "attempt-unlink");
+        let attempted = matches!(
+            verb,
+            "attempt" | "attempt-save" | "attempt-rename" | "attempt-unlink"
+        );
         let verb = match verb {
             "attempt" => "create",
             "attempt-save" => "save",
@@ -828,7 +992,10 @@ pub(crate) fn effect_row(kind: &str, path: &Path) {
             "attempt-unlink" => "unlink",
             _ => verb,
         };
-        if !matches!(verb, "create" | "save" | "fence" | "reconcile" | "lock-create" | "rename" | "unlink") {
+        if !matches!(
+            verb,
+            "create" | "save" | "fence" | "reconcile" | "lock-create" | "rename" | "unlink"
+        ) {
             push_note(state, format!("unknown effect kind at {kind}"));
             return;
         }
@@ -837,11 +1004,17 @@ pub(crate) fn effect_row(kind: &str, path: &Path) {
             return;
         }
         let Some(path_text) = path.to_str() else {
-            push_note(state, format!("effect path at {site} is not UTF-8; identity unproven; insufficient"));
+            push_note(
+                state,
+                format!("effect path at {site} is not UTF-8; identity unproven; insufficient"),
+            );
             return;
         };
         if attempted {
-            push_note(state, format!("attempted effect at {site} remains insufficient"));
+            push_note(
+                state,
+                format!("attempted effect at {site} remains insufficient"),
+            );
         }
         state.effects.push(TapeEffectRow {
             kind: verb.to_owned(),
@@ -903,7 +1076,10 @@ pub(crate) fn monotonic_observed(kind: &str, observed: Instant) {
                 });
                 charge_document(state, 48);
             }
-            None => push_note(state, format!("monotonic reading before window at {kind}; insufficient")),
+            None => push_note(
+                state,
+                format!("monotonic reading before window at {kind}; insufficient"),
+            ),
         }
     });
     restore_observer_errno(saved_errno);
@@ -923,10 +1099,18 @@ pub(crate) fn recorded_holder(site: &str, record_id: u64, pid: u32, recorded_sta
         }
         let epoch = next_epoch(state);
         state.recorded_holders.push(TapeRecordedHolder {
-            site: site.to_owned(), record_id, pid, recorded_start_ms,
-            kernel_start: None, uid: None, epoch,
+            site: site.to_owned(),
+            record_id,
+            pid,
+            recorded_start_ms,
+            kernel_start: None,
+            uid: None,
+            epoch,
         });
-        push_note(state, format!("recorded holder at {site} has no kernel start or UID; insufficient"));
+        push_note(
+            state,
+            format!("recorded holder at {site} has no kernel start or UID; insufficient"),
+        );
         charge_document(state, 96);
     });
     restore_observer_errno(saved_errno);
@@ -988,14 +1172,18 @@ pub(crate) fn authority_core(bytes: &[u8], cap: u64, budget_failed: bool, refuse
 pub(crate) fn authority_bind(site: &str, path: &Path, cap: u64) {
     with_state(|state| {
         let Some(pending) = state.pending_authority.take() else {
-            push_note(state, format!(
-                "authority-bind at {site} found no pending read; the read stays unbound"
-            ));
+            push_note(
+                state,
+                format!("authority-bind at {site} found no pending read; the read stays unbound"),
+            );
             return;
         };
         let outcome = pending.outcome;
         let identity = file_identity(path, &outcome);
-        push_note(state, format!("descriptor and parent identity unproven at {site}"));
+        push_note(
+            state,
+            format!("descriptor and parent identity unproven at {site}"),
+        );
         let key = format!("{site}|{}", identity.key);
         let (occurrence, counted) = occurrence(state, &key);
         let epoch = next_epoch(state);
@@ -1084,9 +1272,10 @@ pub(crate) fn authority_bind_descriptor(
 pub(crate) fn authority_unbound(site: &str, reason: &str) {
     with_state(|state| {
         state.pending_authority = None;
-        push_note(state, format!(
-            "descriptor identity unavailable at {site}: {reason}"
-        ));
+        push_note(
+            state,
+            format!("descriptor identity unavailable at {site}: {reason}"),
+        );
     });
 }
 
@@ -1105,16 +1294,35 @@ pub(crate) fn descriptor_row(site: &str, fd: i32, outcome: TapeOutcome) {
             _ => (None, None),
         };
         let identity = TapeIdentity {
-            path: None, component: None, parent_dev: None, parent_ino: None, dev, ino,
-            uuid: None, mount_point: None, device: None,
+            path: None,
+            component: None,
+            parent_dev: None,
+            parent_ino: None,
+            dev,
+            ino,
+            uuid: None,
+            mount_point: None,
+            device: None,
             key: format!("descriptor:{fd}|process-start=unproven|dev={dev:?}|ino={ino:?}"),
         };
-        push_note(state, format!("descriptor path, parent and process-start unproven at {site}"));
+        push_note(
+            state,
+            format!("descriptor path, parent and process-start unproven at {site}"),
+        );
         let (occurrence, counted) = occurrence(state, &format!("{site}|{}", identity.key));
         let epoch = next_epoch(state);
         if counted {
-            push_read(state, TapeReadRow { kind: site.to_owned(), identity, outcome,
-                cap: 0, epoch, occurrence });
+            push_read(
+                state,
+                TapeReadRow {
+                    kind: site.to_owned(),
+                    identity,
+                    outcome,
+                    cap: 0,
+                    epoch,
+                    occurrence,
+                },
+            );
         }
     });
     restore_observer_errno(saved_errno);
@@ -1125,16 +1333,22 @@ pub(crate) fn lock_row(kind: &str, path: &Path, outcome: TapeOutcome) {
     let disconnected = with_state(|state| {
         if kind == "pool:lock" && state.disconnected_pool_lock {
             if state.disconnected_lock_observations.len() < MAX_READ_ROWS {
-                state.disconnected_lock_observations.push((path.to_path_buf(), outcome.clone()));
+                state
+                    .disconnected_lock_observations
+                    .push((path.to_path_buf(), outcome.clone()));
             } else {
                 state.truncation.read_rows_truncated = true;
             }
-            push_note(state, "counterfactual: pool lock routed away from shared tape; insufficient".to_owned());
+            push_note(
+                state,
+                "counterfactual: pool lock routed away from shared tape; insufficient".to_owned(),
+            );
             true
         } else {
             false
         }
-    }).unwrap_or(false);
+    })
+    .unwrap_or(false);
     if !disconnected {
         read_row(kind, path, outcome, 0);
     }
@@ -1150,7 +1364,10 @@ pub(crate) fn disconnect_pool_lock_for_counterfactual() {
 /// budget state every read charges against.
 pub(crate) fn budget_begin(allowance_bytes: u64) {
     with_state(|state| {
-        push_note(state, "authority monotonic deadline identity unproven".to_owned());
+        push_note(
+            state,
+            "authority monotonic deadline identity unproven".to_owned(),
+        );
     });
     classify_row(
         "authority-budget",
@@ -1172,7 +1389,10 @@ pub(crate) fn budget_end(failed: bool, remaining: u64) {
 /// Never issue a second path or descriptor syscall to fill that gap.
 pub(crate) fn fd_dev_ino(_fd: std::os::fd::BorrowedFd<'_>) -> Option<(u64, u64)> {
     with_state(|state| {
-        push_note(state, "descriptor identity unproven at observation site".to_owned());
+        push_note(
+            state,
+            "descriptor identity unproven at observation site".to_owned(),
+        );
     });
     None
 }
@@ -1266,8 +1486,10 @@ fn walk_fixture(
         let bytes_sha256 = if meta.is_file() {
             use std::io::Read;
             let mut bytes = Vec::new();
-            let read = std::fs::File::open(&path)
-                .and_then(|file| file.take(remaining.saturating_add(1)).read_to_end(&mut bytes));
+            let read = std::fs::File::open(&path).and_then(|file| {
+                file.take(remaining.saturating_add(1))
+                    .read_to_end(&mut bytes)
+            });
             match read {
                 Ok(_) if bytes.len() as u64 <= *remaining => {
                     *remaining -= bytes.len() as u64;
@@ -1342,8 +1564,8 @@ pub(crate) fn diff_fixture(
                 if changed {
                     effects.push(TapeEffectRow {
                         kind: "save".to_owned(),
-                site: "fixture-diff".to_owned(),
-                attempted: false,
+                        site: "fixture-diff".to_owned(),
+                        attempted: false,
                         path: entry.rel.clone(),
                         epoch: 0,
                     });
