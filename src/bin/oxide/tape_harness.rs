@@ -679,11 +679,7 @@ fn fixture_namespace() -> Result<PathBuf, String> {
     let uid = unsafe { libc::getuid() };
     for ancestor in namespace.ancestors().take(3) {
         let meta = std::fs::symlink_metadata(ancestor).map_err(|e| e.to_string())?;
-        if !meta.is_dir()
-            || meta.uid() != uid
-            || meta.mode() & 0o022 != 0
-            || meta.dev() == boot
-        {
+        if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o022 != 0 || meta.dev() == boot {
             return Err("unsafe selected-volume scratch namespace".to_owned());
         }
     }
