@@ -2376,6 +2376,81 @@ mod tests {
         }
     }
 
+    fn matching_fixture_signature(metadata: &fs::Metadata) -> serde_json::Value {
+        if metadata.is_dir() {
+            serde_json::json!([metadata.dev(), metadata.ino(), metadata.mode()])
+        } else {
+            serde_json::json!([
+                metadata.dev(),
+                metadata.ino(),
+                metadata.mode(),
+                metadata.size(),
+                metadata.blocks(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+                metadata.ctime(),
+                metadata.ctime_nsec()
+            ])
+        }
+    }
+
+    // Verify only the frozen intended names/identities. An unexpected directory
+    // is rejected before descent, never traversed or adopted into expectations.
+    // This is a non-atomic fixture oracle, not product containment authority.
+    fn matching_fixture_matches(
+        root: &Path,
+        expected: &serde_json::Value,
+    ) -> std::io::Result<bool> {
+        if matching_fixture_signature(&fs::symlink_metadata(root)?) != expected["root"] {
+            return Ok(false);
+        }
+        let Some(nodes) = expected["nodes"].as_object() else {
+            return Ok(false);
+        };
+        if nodes.len() > 80_000 {
+            return Ok(false);
+        }
+        let mut seen = 0usize;
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory)? {
+                let path = entry?.path();
+                let relative = path.strip_prefix(root).expect("enumerated fixture child");
+                let Some(name) = relative.to_str() else {
+                    return Ok(false);
+                };
+                let Some(signature) = nodes.get(name) else {
+                    return Ok(false);
+                };
+                let metadata = fs::symlink_metadata(&path)?;
+                if matching_fixture_signature(&metadata) != *signature {
+                    return Ok(false);
+                }
+                seen += 1;
+                if seen > nodes.len() {
+                    return Ok(false);
+                }
+                if metadata.is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
+        Ok(seen == nodes.len())
+    }
+
+    #[test]
+    fn matching_fixture_rejects_unplanned_name() {
+        let fixture = Fixture::new("fixed-name-oracle");
+        let file = fixture.file("planned", 1);
+        let expected = serde_json::json!({
+            "root": matching_fixture_signature(&fs::symlink_metadata(fixture.path()).unwrap()),
+            "nodes": {"planned": matching_fixture_signature(&fs::symlink_metadata(file).unwrap())}
+        });
+        assert!(matching_fixture_matches(fixture.path(), &expected).unwrap());
+        fixture.file("unplanned", 1);
+        assert!(!matching_fixture_matches(fixture.path(), &expected).unwrap());
+    }
+
     // Invoked only by the bounded #280 driver with its fresh, owned fixture.
     // No pool, account API, Cargo child or fixture deletion occurs in this test.
     #[test]
@@ -2384,7 +2459,17 @@ mod tests {
         let base = PathBuf::from(std::env::var("OXIDE_TEST_MATCHING_COST_ROOT")?);
         let base = fs::canonicalize(base)?;
         let scratch = fs::canonicalize(std::env::var("OXIDE_TASK_SCRATCH_ROOT")?)?;
-        assert!(base.starts_with(&scratch) && base != scratch);
+        let evidence = fs::canonicalize(std::env::var("OXIDE_PROOF_EVIDENCE")?)?;
+        assert_eq!(scratch.parent(), evidence.parent());
+        assert_ne!(scratch, evidence);
+        assert_eq!(base.parent(), Some(evidence.as_path()));
+        assert!(base
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("matching-cost-")));
+        let owner = fs::symlink_metadata(&base)?;
+        assert!(owner.is_dir() && owner.mode() & 0o077 == 0);
+        assert_eq!(owner.uid(), fs::metadata(&evidence)?.uid());
         let root = fs::canonicalize(base.join("tree"))?;
         assert!(root.starts_with(&base) && root != base);
         let expected: serde_json::Value =
@@ -2403,6 +2488,16 @@ mod tests {
         };
         // Same walker and order as inventory_directory's single-root path.
         // Split phase observations add no product clock or acceptance path.
+        check(
+            "unplanned extra rejected",
+            !matching_fixture_matches(&base.join("negative"), &expected["negative"])?,
+        );
+        let intact = matching_fixture_matches(&root, &expected)?;
+        check("fixed tree before", intact);
+        assert!(
+            intact,
+            "fixture identity/name uncertainty before measurement"
+        );
         let metadata = fs::metadata(&root)?;
         let started = Instant::now();
         let mut walker = Walker::new(&root, metadata.dev(), metadata.ino(), limits, started, &[]);
@@ -2416,6 +2511,12 @@ mod tests {
         let finish_started = Instant::now();
         let report = walker.finish(free);
         let finish_ms = finish_started.elapsed().as_secs_f64() * 1000.0;
+        let intact = matching_fixture_matches(&root, &expected)?;
+        check("fixed tree after split walk", intact);
+        assert!(
+            intact,
+            "fixture identity/name uncertainty after measurement"
+        );
         check("complete", report.coverage.complete);
         check(
             "entries",
@@ -2452,6 +2553,12 @@ mod tests {
         let public_started = Instant::now();
         let public = inventory_directory(&root, limits)?;
         let public_ms = public_started.elapsed().as_secs_f64() * 1000.0;
+        let intact = matching_fixture_matches(&root, &expected)?;
+        check("fixed tree after public walk", intact);
+        assert!(
+            intact,
+            "fixture identity/name uncertainty after public walk"
+        );
         check("public complete", public.coverage.complete);
         check("public totals", public.total == report.total);
         check(
@@ -2491,6 +2598,12 @@ mod tests {
         check(
             "deadline refusal",
             !deadline.coverage.complete && gap(&deadline, GapKind::ElapsedDeadline) == 1,
+        );
+        let intact = matching_fixture_matches(&root, &expected)?;
+        check("fixed tree after bound controls", intact);
+        assert!(
+            intact,
+            "fixture identity/name uncertainty after bound controls"
         );
         let passed = checks.iter().all(|row| row["passed"] == true);
         let receipt = serde_json::json!({

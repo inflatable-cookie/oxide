@@ -12,8 +12,10 @@ Premises, traced through main/fixture and its sole Oxide child:
    unconverted-checkout oracle; fixture inventory calls no adoption code.
 5. No external Cargo subcommand or fake tool. 6. No image or mount operations.
 7. Both flag encodings frozen empty for the ordinary managed compilation.
-8. Fixture, test temp and observation writes are under the qualified selected-
-   volume scratch. Compiler output remains ordinary Oxide-managed storage.
+8. Fixture and observations stay in a fresh 0700 child of current evidence.
+   Guard sample_owned uses tree_bytes(ctx[root]), including evidence; cleanup
+   rmtree targets only ctx[scratch]. Scratch/evidence are canonical siblings.
+   Child TMPDIR stays in fresh scratch; compiler output is ordinary managed.
 9. Python mkdtemp uses explicit dir, no macOS mktemp default or fixed /tmp.
 
 No payload is read, pool walked, or production code changed. Fresh-created
@@ -60,16 +62,33 @@ def main():
         raise SystemExit("qualified guard mismatch")
     scratch = Path(os.environ["OXIDE_TASK_SCRATCH_ROOT"])
     evidence = Path(os.environ["OXIDE_PROOF_EVIDENCE"])
-    if not scratch.is_dir() or scratch.resolve() != scratch or not evidence.is_dir():
+    if (not scratch.is_dir() or scratch.resolve() != scratch or
+            not evidence.is_dir() or evidence.resolve() != evidence or
+            evidence.parent != scratch.parent or evidence == scratch):
         raise SystemExit("missing canonical supervisor scratch/evidence")
     if not str(scratch).startswith("/Volumes/Stash/scratch/oxide/"):
         raise SystemExit("not selected Stash scratch")
     os.environ["OXIDE_PROOF_DEADLINE_NS"]  # refuse unsupervised invocation
-    base = Path(tempfile.mkdtemp(prefix="matching-cost-", dir=scratch))
+    base = Path(tempfile.mkdtemp(prefix="matching-cost-", dir=evidence))
+    child_temp = Path(tempfile.mkdtemp(prefix="matching-temp-", dir=scratch))
+    if stat.S_IMODE(base.lstat().st_mode) != 0o700 or base.lstat().st_uid != os.getuid():
+        raise SystemExit("fixture must be private and owned")
     tree = base / "tree"
     tree.mkdir()
     started = time.monotonic()
     counts = dict(entries=0, files=0, logical=0, allocated=0, directories=0)
+    nodes = {}
+
+    def signature(path):
+        meta = path.lstat()
+        identity = [meta.st_dev, meta.st_ino, meta.st_mode]
+        if stat.S_ISDIR(meta.st_mode):
+            return identity
+        return identity + [meta.st_size, meta.st_blocks,
+                           meta.st_mtime_ns // 10**9, meta.st_mtime_ns % 10**9,
+                           meta.st_ctime_ns // 10**9, meta.st_ctime_ns % 10**9]
+
+    root_identity = signature(tree)
 
     def directory(relative):
         path = tree / relative
@@ -79,7 +98,21 @@ def main():
             path.mkdir()
             counts["directories"] += 1
             counts["entries"] += 1
+            nodes[str(path.relative_to(tree))] = signature(path)
         return path
+
+    def record_file(leaf):
+        metadata = leaf.lstat()
+        key = (metadata.st_dev, metadata.st_ino)
+        if key not in inodes:
+            counts["allocated"] += metadata.st_blocks * 512
+            inodes.add(key)
+        counts["files"] += 1
+        counts["entries"] += 1
+        counts["logical"] += metadata.st_size
+        nodes[str(leaf.relative_to(tree))] = signature(leaf)
+
+    inodes = set()
 
     def files(relative, number):
         parent = directory(relative)
@@ -87,11 +120,7 @@ def main():
             leaf = parent / f"oxide_fixture_unit_{index:04x}-0123456789abcdef.o"
             with leaf.open("xb") as output:
                 output.write(b"x")
-            metadata = leaf.lstat()
-            counts["allocated"] += metadata.st_blocks * 512
-            counts["files"] += 1
-            counts["entries"] += 1
-            counts["logical"] += 1
+            record_file(leaf)
 
     files("debug/deps", 16000)
     for unit in range(160):
@@ -102,17 +131,39 @@ def main():
     # One long-name/deeper path and a genuine cross-category hardlink oracle.
     files("debug/" + "/".join(["representative_name_0123456789"] * 12) + "/deps", 1)
     original = tree / "debug/deps/oxide_fixture_unit_0000-0123456789abcdef.o"
-    os.link(original, tree / "debug/.fingerprint/shared-hardlink")
-    counts["entries"] += 1
-    counts["files"] += 1
-    counts["logical"] += 1
-    if counts["entries"] > 80000:
-        raise SystemExit("fixture exceeds entry limit")
-    (base / "expected.json").write_text(json.dumps(counts))
+    alias = tree / "debug/.fingerprint/shared-hardlink"
+    original_identity = signature(original)[:3]
+    os.link(original, alias)
+    if signature(original)[:3] != original_identity:
+        raise SystemExit("hardlink creation changed original identity")
+    # Deliberate link creation changes ctime; record that known operation,
+    # never enumerate additions and adopt them into the expected manifest.
+    nodes[str(original.relative_to(tree))] = signature(original)
+    record_file(alias)
+    for relative in [".DS_Store", "debug/.DS_Store"]:
+        leaf = tree / relative
+        with leaf.open("xb") as output:
+            output.write(b"oxide-280-deliberately-created-metadata\n")
+        record_file(leaf)
+    if counts["entries"] != 60822 or counts["entries"] > 80000:
+        raise SystemExit("fixture exceeds fixed layout")
+    # Independent tiny negative control: freeze intended set BEFORE adding
+    # the deliberately unplanned name. No oracle counts are adjusted for it.
+    negative = base / "negative"
+    negative.mkdir(mode=0o700)
+    planned = negative / "planned"
+    with planned.open("xb") as output:
+        output.write(b"planned")
+    negative_manifest = dict(root=signature(negative), nodes={"planned": signature(planned)})
+    with (negative / "unplanned").open("xb") as output:
+        output.write(b"must fail the fixed-name oracle")
+    counts.update(nodes=nodes, root=root_identity, negative=negative_manifest)
+    with (base / "expected.json").open("x") as output:
+        json.dump(counts, output)
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("OXIDE_", "XDG_")) or key in
            ("OXIDE_TASK_SCRATCH_ROOT", "OXIDE_PROOF_EVIDENCE", "OXIDE_PROOF_DEADLINE_NS")}
-    env.update(TMPDIR=str(base), TMP=str(base), TEMP=str(base),
+    env.update(TMPDIR=str(child_temp), TMP=str(child_temp), TEMP=str(child_temp),
                RUSTUP_TOOLCHAIN="1.97.1", RUSTUP_AUTO_INSTALL="0",
                CARGO_NET_OFFLINE="true", RUSTFLAGS="", CARGO_ENCODED_RUSTFLAGS="",
                OXIDE_TEST_MATCHING_COST_ROOT=str(base))
@@ -126,7 +177,9 @@ def main():
     observations = base / "observations.json"
     result = json.loads(observations.read_text()) if observations.exists() else None
     receipt = dict(qualified=False, diagnostic=diagnostic, command=COMMAND,
-                   child_exit=child.returncode, fixture=str(base), counts=counts,
+                   child_exit=child.returncode, fixture=str(base), retained_in_evidence=True,
+                   counts={key: value for key, value in counts.items() if key not in ("nodes", "negative")},
+                   expected_sha256=hashlib.sha256((base / "expected.json").read_bytes()).hexdigest(),
                    wall_seconds=time.monotonic() - started,
                    observations=result,
                    source_sha256={str(path): hashlib.sha256((repo / path).read_bytes()).hexdigest()
