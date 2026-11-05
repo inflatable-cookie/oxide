@@ -1535,3 +1535,11 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- o
 [tasks."proof:tape-prune:embedded-diagnostic"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- oxide test --test tape_prune_eval --locked -- --diagnostic"
+
+[tasks."proof:store-fixtures:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/diagnose-store-fixtures.py"
+
+[tasks."proof:store-fixtures:controls"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- oxide test --bin oxide --locked store::tests::fixture_description_control -- --exact --nocapture"

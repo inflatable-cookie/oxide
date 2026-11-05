@@ -7210,6 +7210,90 @@ fn lease_error(context: &str, error: &LeaseError) -> String {
 pub(crate) mod tests {
     use super::*;
 
+    /// Isolate only fixtures whose oracle requires a just-closed flock to be
+    /// free. Parallel runner process creation can inherit an open description
+    /// until exec, even when the parent has already dropped its File.
+    pub(super) fn fixture_child(test: &str) -> bool {
+        if std::env::var("OXIDE_STORE_FIXTURE_CHILD").as_deref() == Ok(test) {
+            return false;
+        }
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("OXIDE_STORE_FIXTURE_CHILD", test)
+            .status()
+            .expect("fixture child");
+        assert!(result.success(), "fixture child failed: {test}: {result}");
+        true
+    }
+
+    #[test]
+    fn fixture_description_control() {
+        use std::os::fd::AsRawFd;
+        if fixture_child("store::tests::fixture_description_control") {
+            return;
+        }
+        let (root, store, key) = seed_fixture();
+        store.save(&State::default()).unwrap();
+        let admission = lock_admission(&store.control).unwrap();
+        let inherited = admission.try_clone().unwrap();
+        let meta = inherited.metadata().unwrap();
+        eprintln!(
+            "278-owned-admission pid={} original_fd={} inherited_fd={} dev={} ino={}",
+            std::process::id(),
+            admission.as_raw_fd(),
+            inherited.as_raw_fd(),
+            meta.dev(),
+            meta.ino()
+        );
+        assert_eq!(admission.metadata().unwrap().ino(), meta.ino());
+        drop(admission);
+        let mut witness = CustodyWitness::open(&store.control).unwrap();
+        let reason = witness.decide(None, &key.checkout, true).unwrap_err();
+        assert!(reason.contains("admission lock is busy"), "{reason}");
+        drop(inherited);
+        assert_eq!(
+            witness.decide(None, &key.checkout, true).unwrap().verdict,
+            CheckoutCustody::Clear
+        );
+
+        let held = lease(&store, &key, None).unwrap();
+        let old_slot = held.slot_id.clone();
+        let inherited = held._lock.try_clone().unwrap();
+        let meta = inherited.metadata().unwrap();
+        eprintln!(
+            "278-owned-record pid={} original_fd={} inherited_fd={} dev={} ino={} slot={old_slot}",
+            std::process::id(),
+            held._lock.as_raw_fd(),
+            inherited.as_raw_fd(),
+            meta.dev(),
+            meta.ino()
+        );
+        drop(held);
+        // A held record is conservatively unavailable. A new slot is Fresh,
+        // which must not be mistaken for Unknown on reuse of the old slot.
+        let other = lease(&store, &key, None).unwrap();
+        eprintln!(
+            "278-held-record old_slot={old_slot} new_slot={} prior={:?}",
+            other.slot_id, other.prior
+        );
+        assert_ne!(other.slot_id, old_slot);
+        assert!(!other.reused && matches!(other.prior, Prior::Fresh));
+        assert_eq!(
+            store
+                .ledger()
+                .unwrap()
+                .slots
+                .iter()
+                .find(|slot| slot.slot_id == old_slot)
+                .unwrap()
+                .state,
+            SlotOccupancy::Held
+        );
+        store.release(other, None).unwrap();
+        drop(inherited);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn release_admission_notice_and_budget_are_bounded_and_truthful() {
         let (root, _store, _key) = class_fixture("release-admission-notice");
@@ -9513,6 +9597,11 @@ pub(crate) mod tests {
 
     #[test]
     fn seed_crash_states_remain_untrusted_and_unrecorded_spawn_stays_held() {
+        if super::tests::fixture_child(
+            "store::tests::seed_crash_states_remain_untrusted_and_unrecorded_spawn_stays_held",
+        ) {
+            return;
+        }
         for point in ["before-origin", "intent", "partial", "complete", "running"] {
             let (root, store, key) = seed_fixture();
             let held = lease(&store, &key, None).expect("fresh lease");
@@ -9532,8 +9621,17 @@ pub(crate) mod tests {
                 store.mark_spawning(&held).unwrap();
                 store.mark_running(&held, i32::MAX).unwrap();
             }
+            let old_slot = held.slot_id.clone();
+            let old_dir = held.build_dir.clone();
             drop(held);
             let reacquired = lease(&store, &key, None).expect("recoverable lease");
+            eprintln!("278-seed point={point} old_slot={old_slot} old_dir={} new_slot={} new_dir={} reused={} prior={:?} ledger={:?}", old_dir.display(), reacquired.slot_id, reacquired.build_dir.display(), reacquired.reused, reacquired.prior, store.ledger().unwrap());
+            assert_eq!(
+                reacquired.slot_id, old_slot,
+                "{point}: reused slot identity"
+            );
+            assert_eq!(reacquired.build_dir, old_dir, "{point}: reused directory");
+            assert!(reacquired.reused, "{point}: the original slot is reused");
             assert!(matches!(reacquired.prior, Prior::Unknown), "{point}");
             store.discard(reacquired).unwrap();
             let cold = lease(&store, &key, None).expect("cold lease");
@@ -13455,18 +13553,55 @@ mod fresh_custody_tests {
         fixture.root.join("gone/checkout")
     }
 
+    fn observe_lock(fixture: &CustodyFixture, label: &str) {
+        use std::os::fd::AsRawFd;
+        let lock = File::open(fixture.control.join("admission.lock")).unwrap();
+        let identity = lock.metadata().unwrap();
+        let mut descriptors = Vec::new();
+        for fd in 0..4096 {
+            // SAFETY: fstat writes only the initialized stat buffer; an invalid
+            // descriptor returns an error. No descriptor is closed or changed.
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: fstat accepts any integer fd and writes at most this
+            // live stat object's size; errors leave the observation unused.
+            if unsafe { libc::fstat(fd, &mut stat) } == 0
+                && stat.st_dev as u64 == identity.dev()
+                && stat.st_ino == identity.ino()
+            {
+                descriptors.push(fd);
+            }
+        }
+        eprintln!("278-lock {label} pid={} path={} dev={} ino={} observation_fd={} matching_fds={descriptors:?}",
+            std::process::id(), fixture.control.display(), identity.dev(), identity.ino(), lock.as_raw_fd());
+    }
+
     /// One parsed state is reused across rows, and a replacement between rows
     /// is re-read under the locks: the same document is still clear, a
     /// document replaced by a running writer is seen by the next row, and a
     /// document replaced back is clear again.
     #[test]
     fn rows_reuse_one_parsed_state_and_reread_a_replaced_document() {
+        if super::tests::fixture_child("store::fresh_custody_tests::rows_reuse_one_parsed_state_and_reread_a_replaced_document") {
+            return;
+        }
         let fixture = CustodyFixture::new("reuse");
         fixture.prime();
         let checkout = checkout(&fixture);
+        observe_lock(&fixture, "before-witness");
         let mut witness = CustodyWitness::open(&fixture.control).unwrap();
         assert_eq!(
-            witness.decide(None, &checkout, true).unwrap().verdict,
+            {
+                observe_lock(&fixture, "before-row");
+                let result = witness.decide(None, &checkout, true);
+                eprintln!(
+                    "278-row result={:?}",
+                    result.as_ref().map(|row| &row.verdict)
+                );
+                observe_lock(&fixture, "after-row");
+                result
+            }
+            .unwrap()
+            .verdict,
             CheckoutCustody::Clear
         );
         fixture.replace_state(&State {
@@ -13474,13 +13609,35 @@ mod fresh_custody_tests {
             ..State::default()
         });
         assert_eq!(
-            witness.decide(None, &checkout, true).unwrap().verdict,
+            {
+                observe_lock(&fixture, "before-row");
+                let result = witness.decide(None, &checkout, true);
+                eprintln!(
+                    "278-row result={:?}",
+                    result.as_ref().map(|row| &row.verdict)
+                );
+                observe_lock(&fixture, "after-row");
+                result
+            }
+            .unwrap()
+            .verdict,
             CheckoutCustody::Writers,
             "a replacement between rows must be witnessed and re-read"
         );
         fixture.replace_state(&State::default());
         assert_eq!(
-            witness.decide(None, &checkout, true).unwrap().verdict,
+            {
+                observe_lock(&fixture, "before-row");
+                let result = witness.decide(None, &checkout, true);
+                eprintln!(
+                    "278-row result={:?}",
+                    result.as_ref().map(|row| &row.verdict)
+                );
+                observe_lock(&fixture, "after-row");
+                result
+            }
+            .unwrap()
+            .verdict,
             CheckoutCustody::Clear
         );
     }
@@ -13816,13 +13973,37 @@ mod fresh_custody_tests {
     /// row instead of reading a stranger's document or reporting empty.
     #[test]
     fn a_disappeared_state_refuses() {
+        if super::tests::fixture_child("store::fresh_custody_tests::a_disappeared_state_refuses") {
+            return;
+        }
         let fixture = CustodyFixture::new("vanished");
         fixture.prime();
         let checkout = checkout(&fixture);
+        observe_lock(&fixture, "before-witness");
         let mut witness = CustodyWitness::open(&fixture.control).unwrap();
-        witness.decide(None, &checkout, true).unwrap();
+        {
+            observe_lock(&fixture, "before-row");
+            let result = witness.decide(None, &checkout, true);
+            eprintln!(
+                "278-row result={:?}",
+                result.as_ref().map(|row| &row.verdict)
+            );
+            observe_lock(&fixture, "after-row");
+            result
+        }
+        .unwrap();
         fs::remove_file(fixture.control.join("state.json")).unwrap();
-        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        let reason = {
+            observe_lock(&fixture, "before-row");
+            let result = witness.decide(None, &checkout, true);
+            eprintln!(
+                "278-row result={:?}",
+                result.as_ref().map(|row| &row.verdict)
+            );
+            observe_lock(&fixture, "after-row");
+            result
+        }
+        .unwrap_err();
         assert!(reason.contains("missing"), "{reason}");
     }
 

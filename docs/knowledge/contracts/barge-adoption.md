@@ -2117,3 +2117,32 @@ ordinary-suite or counted embedded-harness evidence. Planner ruling 3c8bff6f
 (2026-11-05) requires preserving both suite roots and publishing the actual
 failure for retained review/disposition; no retry or `store.rs` correction is
 authorized by this task.
+
+#### Ordinary fixture isolation
+
+The three store fixtures that require an immediately free, just-closed flock
+run in individual exact-test child processes: the fresh-custody replacement
+and disappearing-state tests, and the seed-crash trust test. Other tests keep
+their existing parallel execution. Process creation in a parallel test can
+inherit an open file description until exec; closing the parent's descriptor
+alone does not release that description's flock. The fixture child runs only
+after exec, before it opens its own fixture locks. There is no production lock
+change, retry, sleep or weakened refusal.
+
+The cfg(test) `fixture_description_control` owns a duplicate admission-lock
+descriptor and requires the real custody reader to report busy after the first
+descriptor closes, then clear after the duplicate closes. Its record-lock
+control requires a held old slot to stay held while a different new slot is
+`Fresh`. The seed-crash fixture separately requires reacquisition of its exact
+original slot and directory, `reused=true` and `Prior::Unknown`, before discard
+and cold allocation. Descriptor/device/inode and actual slot/Prior observations
+are printed by the scoped fixtures. These controls demonstrate the mechanism;
+they do not identify an uncaptured historical holder.
+
+The amended owner disposition (brief v2, 2026-11-05) permits this cfg(test)-only
+repair and changed-input validation on the same PR, prospectively superseding
+the earlier no-retry/no-store-test-correction rulings. Historical Builds
+transcripts are unavailable provenance, not required current review inputs;
+no reconstruction or attribution from unchanged source is claimed. Current
+review uses immutable source and checksum-verified retained Stash evidence.
+All earlier failures and limits remain historical and spent.
