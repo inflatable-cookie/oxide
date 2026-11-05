@@ -1272,6 +1272,11 @@ evidence does not carry forward to the migrated recipe.
 
 ### Recorded per-slot accounting (oxide#146: implemented, native held)
 
+The [proposed Normal warm-reuse contract](warm-reuse-admission.md) separates
+grant-time root/custody checks from recursive measurement. It is design only:
+the matching-slot complete-walk requirement described here remains implemented,
+and OneUse, new-slot pressure, release accounting and deletion are unchanged.
+
 Tom's 2026-10-25 ruling, "We need a much faster way to do the accounting
 too" (Queue decision `8c6b8319-b20e-4a78-b987-c09dee69886c`), approves a
 different policy from the exact-cache proposal below. The sections below are

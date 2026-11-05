@@ -14,6 +14,7 @@ Oxide aims to make Rust development easy and light: predictable storage, less bu
 - [Storage inventory (read-only)](knowledge/contracts/storage-inventory.md)
 - [Scoped matching-slot trace kit (preparation only; execution held)](knowledge/contracts/matching-slot-trace.md)
 - [Local lease library (standalone CLI retired)](knowledge/contracts/local-lease.md)
+- [Normal warm-reuse admission without a recursive size scan (proposed)](knowledge/contracts/warm-reuse-admission.md)
 - [Nested Oxide lease joining and borrowed host permits (proposed design)](knowledge/contracts/nested-lease.md)
 - [Idle exec sessions and run-slot custody (proposed design)](knowledge/contracts/idle-exec-sessions.md)
 - [Rust toolchain and quality](knowledge/rust-toolchain-and-quality.md)
