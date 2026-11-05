@@ -46,6 +46,79 @@ COMMAND = ["oxide", "test", "--lib", "--locked", "--offline",
            "--ignored", "--exact", "--nocapture", "--test-threads=1"]
 
 
+def stat_signature(meta):
+    identity = [meta.st_dev, meta.st_ino, meta.st_mode]
+    if stat.S_ISDIR(meta.st_mode):
+        return identity
+    return identity + [meta.st_size, meta.st_blocks,
+                       meta.st_mtime_ns // 10**9, meta.st_mtime_ns % 10**9,
+                       meta.st_ctime_ns // 10**9, meta.st_ctime_ns % 10**9]
+
+
+
+def require_path_signature(path, expected, emit):
+    try:
+        observed = stat_signature(path.lstat())
+    except OSError as error:
+        emit(dict(phase="path", path=str(path), expected=expected, error=type(error).__name__))
+        raise
+    emit(dict(phase="path", path=str(path), expected=expected, observed=observed))
+    if observed != expected:
+        raise RuntimeError("creation pathname differs from descriptor: " + str(path))
+
+
+def create_file(path, payload, emit):
+    with path.open("xb") as output:
+        output.write(payload)
+        output.flush()
+        metadata = os.fstat(output.fileno())  # sole source of counts AND signature
+        emit(dict(phase="descriptor", path=str(path), signature=stat_signature(metadata)))
+    require_path_signature(path, stat_signature(metadata), emit)
+    return metadata
+
+
+def provenance_controls():
+    # Pure deterministic seams: no fixture writes, deletion, native child or
+    # payload reads. Mutation at the former second read cannot be adopted;
+    # the next fixed-identity recheck must still refuse it.
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+    original = SimpleNamespace(st_dev=1, st_ino=2, st_mode=stat.S_IFREG | 0o600,
+                               st_size=1, st_blocks=8, st_mtime_ns=10, st_ctime_ns=20)
+    replacement = SimpleNamespace(**{**vars(original), "st_ino": 3, "st_size": 9})
+    outcomes = []
+    for name, observations in [
+        ("replace_before_former_first_read", [replacement]),
+        ("replace_before_former_second_read", [original, replacement]),
+        ("disappear_after_close", [FileNotFoundError("injected missing creation")]),
+    ]:
+        path = MagicMock()
+        path.lstat.side_effect = observations
+        events = []
+        with patch.object(os, "fstat", return_value=original) as sampled:
+            try:
+                metadata = create_file(path, b"x", events.append)
+                assert name == "replace_before_former_second_read"
+                assert metadata is original and path.lstat.call_count == 1
+                require_path_signature(path, stat_signature(metadata), events.append)
+            except (RuntimeError, FileNotFoundError):
+                pass
+            else:
+                raise AssertionError("mutation was adopted: " + name)
+            assert sampled.call_count == 1
+        assert events[0]["signature"] == stat_signature(original)
+        assert path.open.call_args.args == ("xb",)
+        assert path.open.return_value.__enter__.return_value.flush.call_count == 1
+        outcomes.append(dict(name=name, passed=True))
+    # Nonmutation control makes each refusal test non-vacuous.
+    path = MagicMock()
+    path.lstat.return_value = original
+    with patch.object(os, "fstat", return_value=original) as sampled:
+        assert create_file(path, b"x", lambda event: None) is original
+        assert sampled.call_count == 1 and path.lstat.call_count == 1
+    return outcomes + [dict(name="unchanged_creation_accepted", passed=True)]
+
+
 def main():
     if sys.argv[1:] not in ([], ["--diagnostic"], ["--self-check"]):
         raise SystemExit("usage: test-matching-slot-cost.py [--diagnostic | --self-check]")
@@ -57,11 +130,12 @@ def main():
     if not isinstance(own_metadata.st_blocks, int):
         raise SystemExit("allocated-block metadata unavailable")
     if sys.argv[1:] == ["--self-check"]:
+        controls = provenance_controls()
         print(json.dumps(dict(python=sys.version, metadata_api="Path.lstat",
                               scale="smaller-fixture", permissions="files0400/directories0500",
                               permission_apis=all(hasattr(os, key) for key in ["fchmod", "fstat", "O_NOFOLLOW", "O_DIRECTORY"]),
                               file_names=7172, entries=7350,
-                              max_depth=14, passed=True)))
+                              max_depth=14, provenance_controls=controls, passed=True)))
         return 0
     diagnostic = bool(sys.argv[1:])
     repo = Path(__file__).resolve().parent.parent
@@ -85,14 +159,18 @@ def main():
     started = time.monotonic()
     counts = dict(entries=0, files=0, logical=0, allocated=0, directories=0)
     nodes = {}
+    creation_log = (base / "creation-metadata.jsonl").open("x")
+    creation_events = 0
 
-    def stat_signature(meta):
-        identity = [meta.st_dev, meta.st_ino, meta.st_mode]
-        if stat.S_ISDIR(meta.st_mode):
-            return identity
-        return identity + [meta.st_size, meta.st_blocks,
-                           meta.st_mtime_ns // 10**9, meta.st_mtime_ns % 10**9,
-                           meta.st_ctime_ns // 10**9, meta.st_ctime_ns % 10**9]
+    def emit(event):
+        nonlocal creation_events
+        encoded = json.dumps(event) + "\n"
+        if creation_events >= 32000 or len(encoded.encode()) > 4096:
+            raise RuntimeError("creation metadata evidence bound")
+        creation_events += 1
+        creation_log.write(encoded)
+        creation_log.flush()
+
 
     def signature(path):
         return stat_signature(path.lstat())
@@ -110,8 +188,7 @@ def main():
             nodes[str(path.relative_to(tree))] = signature(path)
         return path
 
-    def record_file(leaf):
-        metadata = leaf.lstat()
+    def record_file(leaf, metadata):
         key = (metadata.st_dev, metadata.st_ino)
         if key not in inodes:
             counts["allocated"] += metadata.st_blocks * 512
@@ -119,7 +196,7 @@ def main():
         counts["files"] += 1
         counts["entries"] += 1
         counts["logical"] += metadata.st_size
-        nodes[str(leaf.relative_to(tree))] = signature(leaf)
+        nodes[str(leaf.relative_to(tree))] = stat_signature(metadata)
 
     inodes = set()
 
@@ -127,9 +204,7 @@ def main():
         parent = directory(relative)
         for index in range(number):
             leaf = parent / f"oxide_fixture_unit_{index:04x}-0123456789abcdef.o"
-            with leaf.open("xb") as output:
-                output.write(b"x")
-            record_file(leaf)
+            record_file(leaf, create_file(leaf, b"x", emit))
 
     # Create the two exclusive metadata controls before bulk population, not
     # after a long creation window. An existing name still refuses; this does
@@ -137,9 +212,7 @@ def main():
     for relative in [".DS_Store", "debug/.DS_Store"]:
         directory(str(Path(relative).parent))
         leaf = tree / relative
-        with leaf.open("xb") as output:
-            output.write(b"oxide-280-deliberately-created-metadata\n")
-        record_file(leaf)
+        record_file(leaf, create_file(leaf, b"oxide-280-deliberately-created-metadata\n", emit))
 
     files("debug/deps", 2048)
     for unit in range(32):
@@ -152,15 +225,22 @@ def main():
     original = tree / "debug/deps/oxide_fixture_unit_0000-0123456789abcdef.o"
     alias = tree / "debug/.fingerprint/shared-hardlink"
     original_before = nodes[str(original.relative_to(tree))]
-    if signature(original) != original_before:
-        raise SystemExit("original changed before deliberate hardlink")
-    os.link(original, alias)
-    if signature(original)[:7] != original_before[:7]:
-        raise SystemExit("hardlink creation changed original identity or bytes")
-    # Deliberate link creation changes ctime; record that known operation,
-    # never enumerate additions and adopt them into the expected manifest.
-    nodes[str(original.relative_to(tree))] = signature(original)
-    record_file(alias)
+    fd = os.open(original, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        if stat_signature(os.fstat(fd)) != original_before:
+            raise RuntimeError("original changed before deliberate hardlink")
+        os.link(original, alias, follow_symlinks=False)
+        linked_metadata = os.fstat(fd)
+        if stat_signature(linked_metadata)[:7] != original_before[:7]:
+            raise RuntimeError("hardlink changed original identity or bytes")
+    finally:
+        os.close(fd)
+    linked_signature = stat_signature(linked_metadata)
+    emit(dict(phase="deliberate-link", path=str(alias), signature=linked_signature))
+    require_path_signature(original, linked_signature, emit)
+    require_path_signature(alias, linked_signature, emit)
+    nodes[str(original.relative_to(tree))] = linked_signature
+    record_file(alias, linked_metadata)
     if counts["entries"] != 7350 or counts["files"] != 7172 or counts["files"] > 8192:
         raise SystemExit("fixture exceeds fixed layout")
     # Validate every creation record before any permission transition. Never
@@ -168,8 +248,7 @@ def main():
     if signature(tree) != root_identity:
         raise SystemExit("root changed before permission protection")
     for name, expected in nodes.items():
-        if signature(tree / name) != expected:
-            raise SystemExit("creation changed before permission protection: " + name)
+        require_path_signature(tree / name, expected, emit)
 
     # Operate through a no-follow descriptor and verify the creation identity
     # again after open. chmod changes only our known mode/ctime; preserve all
@@ -211,8 +290,7 @@ def main():
         nodes[name] = protect(tree / name, nodes[name], 0o500)
     root_identity = protect(tree, root_identity, 0o500)
     for name, expected in nodes.items():
-        if signature(tree / name) != expected:
-            raise SystemExit("creation changed before manifest freeze: " + name)
+        require_path_signature(tree / name, expected, emit)
     if signature(tree) != root_identity:
         raise SystemExit("root changed before manifest freeze")
 
@@ -221,14 +299,13 @@ def main():
     negative = base / "negative"
     negative.mkdir(mode=0o700)
     planned = negative / "planned"
-    with planned.open("xb") as output:
-        output.write(b"planned")
-    negative_manifest = dict(root=signature(negative), nodes={"planned": signature(planned)})
-    with (negative / "unplanned").open("xb") as output:
-        output.write(b"must fail the fixed-name oracle")
+    planned_metadata = create_file(planned, b"planned", emit)
+    negative_manifest = dict(root=signature(negative), nodes={"planned": stat_signature(planned_metadata)})
+    create_file(negative / "unplanned", b"must fail the fixed-name oracle", emit)
     counts.update(nodes=nodes, root=root_identity, negative=negative_manifest)
     with (base / "expected.json").open("x") as output:
         json.dump(counts, output)
+    creation_log.close()
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("OXIDE_", "XDG_")) or key in
            ("OXIDE_TASK_SCRATCH_ROOT", "OXIDE_PROOF_EVIDENCE", "OXIDE_PROOF_DEADLINE_NS")}
