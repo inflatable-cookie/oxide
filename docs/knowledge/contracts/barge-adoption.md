@@ -52,19 +52,18 @@ owned by [workflow](workflow.md#pruning-owned-output-roots-oxide129) and
 
 ## Controlled decision comparison
 
-Earlier actual-engine calibration receipts (oxide#279) passed at source
-`f12d65686b11fbc166e3afc3168142155b2c1f79`: one uncounted replacement
-`rust:release-comparison:diagnostic`, followed by one counted
-`rust:release-comparison`. Both run actual Oxide `prune::evaluate` and the
-unchanged feature-off pinned Barge `release::plan`, never copied policy.
-Independent review identified that the selected case also created the checkout,
-changing the candidate's absence premise. Those receipts therefore do not
-cover the required selected-but-absent control or establish task acceptance.
+The corrected selected-but-absent comparison (oxide#279) ran once at source
+`359c35a250f46329b4697353557c6d74adf407d5`, under separately approved
+uncounted activation `4510e9d8d7a3175423d941fdc138ba289d8b1a3c7d5f1018fcc6122a64e2ea73`.
+Actual Oxide `prune::evaluate` and unchanged feature-off pinned Barge
+`release::plan` disagree in the selected case. The strict no-offer assertion
+failed (exit 101; two cases passed, one failed); no policy or expectation was
+changed and no counted rerun was authorised.
 
 | Case | Oxide | Barge |
 | --- | --- | --- |
 | Unselected v2 root, absent checkout, closed writers | Complete; candidate | Complete references; candidate; positive checkout absence |
-| Selected root, present checkout | Complete; kept because checkout is present | Complete references; kept by current registry/receipt/marker references |
+| Selected root, absent checkout | Complete; candidate; fails the no-offer control | Complete references; kept by current registry/receipt/marker references |
 | Required state contains malformed JSON (`{`) | Incomplete authority; whole batch kept for unknown writer custody | Incomplete references; kept for unknown pool/checkout custody |
 
 One case specification maps each logical root to two physical fixture roots:
@@ -74,13 +73,22 @@ completeness and reasons, and retains global refusal separately from per-root
 keeps/candidates. Assertions require the candidate in both engines and each
 control's intended gate, rejecting clock/policy masking. The corrected selected
 case keeps its checkout positively absent and changes only registry/receipt
-selection. It retains the no-offer expectation for both engines. No native
-occurrence at this corrected premise is authorised by the spent allowances;
-its actual outcomes and counted acceptance remain missing. Source inspection
-suggests a possible difference: Oxide validates the committed selection and
-then continues to checkout absence and custody, whereas Barge retains current
-references. This is a prediction, not an executed outcome or permission to
-change either engine.
+selection. It retains the no-offer expectation for both engines. The actual
+disagreement is consistent with the source: Oxide validates the committed
+selection and then continues to checkout absence and custody, whereas Barge
+retains current references. This is an observed bounded fixture result, not
+permission to change either engine or waive acceptance.
+
+Corrected evidence: `/Volumes/Stash/scratch/oxide/oxide-proof.9hzvh3zc/evidence`;
+receipt SHA-256
+`f9a56974c09780b09f7c798976517bc2af04eaf8b12c6faf96249bad3c574a21`.
+The guard closed without fault/deadline and positively reaped/verified ordinary
+post-census detach. Time to publication was 28.47 s of the 300 s bound, sampled
+owned peak 8.1 MiB/512 MiB, minimum reserve 3030.2 GiB. Actual input bytes,
+all three engine reports, the failed assertion and raw logs remain retained.
+Reviewer answer `72d5ad7a602518240bf7497e49995c0727905c42e533a3591b48133b13957e05`
+confirms this does not satisfy selected-control acceptance or authorise a
+counted run. Any outcome or acceptance-scope change needs the applicable ruling.
 
 One fresh 128 MiB APFS image per occurrence supplies real kernel-verified
 mount/device/UUID facts to both engines. Its backing/evidence remain under
@@ -103,7 +111,9 @@ digest derivation, matching the production root/2 format. The request clock
 is actual post-setup time; unchanged `ReleaseOnReference` has no minimum
 age/cooldown but requires known activity no later than that clock.
 
-Successful evidence under `/Volumes/Stash/scratch/oxide/`:
+Historical selected-present evidence at
+`f12d65686b11fbc166e3afc3168142155b2c1f79`, under
+`/Volumes/Stash/scratch/oxide/`:
 
 - `oxide-proof._ad3hi_s/evidence`: uncounted diagnostic, 3/3 cases, exit 0,
   37.72 s to receipt publication, minimum reserve 3044.6 GiB, sampled owned
@@ -119,6 +129,9 @@ children and verified ordinary post-census detach. Backings and evidence are
 retained. Sampling is not a quota. The case reports retain actual fixture
 input bytes, adapter facts and both engine results; ordinary logs bind source,
 pin, exits and guard outcomes.
+Independent review identified that this older selected case also created the
+checkout, changing the candidate's absence premise. Its 3/3 receipts do not
+cover the required selected-but-absent control or establish task acceptance.
 
 **Preserved limits and failed history.** Feature-off Barge's `MountPoint`
 constructor is private and its synthetic testkit is crate-private.
