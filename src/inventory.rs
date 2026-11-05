@@ -2376,6 +2376,141 @@ mod tests {
         }
     }
 
+    // Invoked only by the bounded #280 driver with its fresh, owned fixture.
+    // No pool, account API, Cargo child or fixture deletion occurs in this test.
+    #[test]
+    #[ignore = "requires the bounded matching-slot-cost driver"]
+    fn matching_slot_cost_fixture() -> Result<(), Box<dyn std::error::Error>> {
+        let base = PathBuf::from(std::env::var("OXIDE_TEST_MATCHING_COST_ROOT")?);
+        let base = fs::canonicalize(base)?;
+        let scratch = fs::canonicalize(std::env::var("OXIDE_TASK_SCRATCH_ROOT")?)?;
+        assert!(base.starts_with(&scratch) && base != scratch);
+        let root = fs::canonicalize(base.join("tree"))?;
+        assert!(root.starts_with(&base) && root != base);
+        let expected: serde_json::Value =
+            serde_json::from_slice(&fs::read(base.join("expected.json"))?)?;
+        let diagnostic = std::env::var_os("OXIDE_TEST_MATCHING_COST_DIAGNOSTIC").is_some();
+        let mut checks = Vec::new();
+        let mut check = |name: &str, passed: bool| {
+            checks.push(serde_json::json!({"name": name, "passed": passed}));
+            assert!(diagnostic || passed, "{name}");
+        };
+        let limits = InventoryLimits {
+            max_entries: 2_000_000,
+            max_depth: 64,
+            max_output_bytes: 64,
+            max_elapsed_ms: 60_000,
+        };
+        // Same walker and order as inventory_directory's single-root path.
+        // Split phase observations add no product clock or acceptance path.
+        let metadata = fs::metadata(&root)?;
+        let started = Instant::now();
+        let mut walker = Walker::new(&root, metadata.dev(), metadata.ino(), limits, started, &[]);
+        let (outcome, sources) = crate::test_fs::observe_metadata_sources(|| walker.run());
+        outcome?;
+        let walk_ms = started.elapsed().as_secs_f64() * 1000.0;
+        walker.verify_root()?;
+        let capacity_started = Instant::now();
+        let free = probe_filesystem_free(&root, metadata.dev());
+        let capacity_ms = capacity_started.elapsed().as_secs_f64() * 1000.0;
+        let finish_started = Instant::now();
+        let report = walker.finish(free);
+        let finish_ms = finish_started.elapsed().as_secs_f64() * 1000.0;
+        check("complete", report.coverage.complete);
+        check(
+            "entries",
+            Some(report.entries_visited) == expected["entries"].as_u64(),
+        );
+        check(
+            "files",
+            Some(report.total.files) == expected["files"].as_u64(),
+        );
+        check(
+            "logical",
+            Some(report.total.logical_bytes_by_name) == expected["logical"].as_u64(),
+        );
+        check(
+            "allocation union",
+            Some(report.total.allocated_bytes) == expected["allocated"].as_u64(),
+        );
+        check(
+            "hardlink union",
+            report.total.distinct_files + 1 == report.total.files,
+        );
+        check(
+            "one metadata selection per file/directory",
+            sources.len() as u64 == report.total.files + report.total.directories,
+        );
+        check(
+            "all entries use existing relative metadata",
+            sources
+                .iter()
+                .all(|source| *source == MetadataSource::EntryRelative),
+        );
+        // A second, explicitly warm traversal checks the split-phase result
+        // against the real public entry point, not against a new fast path.
+        let public_started = Instant::now();
+        let public = inventory_directory(&root, limits)?;
+        let public_ms = public_started.elapsed().as_secs_f64() * 1000.0;
+        check("public complete", public.coverage.complete);
+        check("public totals", public.total == report.total);
+        check(
+            "public entries",
+            public.entries_visited == report.entries_visited,
+        );
+        // Bound counterfactuals use the same tree and must remain partial.
+        let entry = inventory_directory(
+            &root,
+            InventoryLimits {
+                max_entries: 1,
+                ..limits
+            },
+        )?;
+        check(
+            "entry refusal",
+            !entry.coverage.complete && gap(&entry, GapKind::EntryLimit) == 1,
+        );
+        let depth = inventory_directory(
+            &root,
+            InventoryLimits {
+                max_depth: 0,
+                ..limits
+            },
+        )?;
+        check(
+            "depth refusal",
+            !depth.coverage.complete && gap(&depth, GapKind::DepthLimit) > 0,
+        );
+        let deadline = inventory_directory(
+            &root,
+            InventoryLimits {
+                max_elapsed_ms: 0,
+                ..limits
+            },
+        )?;
+        check(
+            "deadline refusal",
+            !deadline.coverage.complete && gap(&deadline, GapKind::ElapsedDeadline) == 1,
+        );
+        let passed = checks.iter().all(|row| row["passed"] == true);
+        let receipt = serde_json::json!({
+            "qualified": false, "diagnostic": diagnostic, "passed": passed,
+            "checks": checks, "walk_ms": walk_ms, "capacity_ms": capacity_ms,
+            "finish_ms": finish_ms, "warm_public_ms": public_ms,
+            "metadata_selections": sources.len(), "report": report,
+            "limits": "source selection counts are not syscall counts; fresh-created then warm tree, not cold-volume attribution"
+        });
+        fs::write(
+            base.join("observations.json"),
+            serde_json::to_vec_pretty(&receipt)?,
+        )?;
+        assert!(
+            passed,
+            "matching-slot fixture oracles failed; see observations.json"
+        );
+        Ok(())
+    }
+
     fn category(report: &InventoryReport, wanted: Category) -> Accounting {
         report
             .categories

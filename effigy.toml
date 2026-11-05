@@ -1548,3 +1548,16 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- o
 [tasks."proof:store-fixtures:process-diagnostic"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/diagnose-store-fixtures.py --process-control"
+
+# #280: one fresh owned Cargo-shaped fixture; observations, never a throughput gate.
+[tasks."proof:matching-slot-cost:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-matching-slot-cost.py --diagnostic"
+
+[tasks."proof:matching-slot-cost"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-matching-slot-cost.py"
+
+[tasks."rust:matching-slot-cost:lib"]
+admission = "heavy"
+run = "oxide test --lib --locked inventory -- --test-threads=1"
