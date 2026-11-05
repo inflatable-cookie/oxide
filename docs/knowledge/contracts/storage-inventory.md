@@ -464,6 +464,14 @@ activated operator participation. The privileged tracer is outside the
 ordinary guard's closure promise; reported process/thread labels are never
 converted into a verified PID or historical holder. Existing missing counted
 evidence, merge hold and admission-unrestored status remain unchanged.
+Review6668209287 found that the original preparation did not bind genuine
+admission/catalog and did not stop after identity change. The corrected kit
+requires the retained authenticated author environment, unchanged inherited
+Nucleus hook, no stale admission marker and the exact checkout/catalog before
+launch. Tom starts only the separate collector. The probe now stops on its
+first changed/missing identity, retaining descriptor/refusal rows without
+further creation or polling. Pure injected controls cover these cases; actual
+execution remains held. This does not explain or prevent prior disappearance.
 
 ## Output and exit semantics
 
