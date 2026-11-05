@@ -122,6 +122,16 @@ def main():
                 output.write(b"x")
             record_file(leaf)
 
+    # Create the two exclusive metadata controls before bulk population, not
+    # after a long creation window. An existing name still refuses; this does
+    # not fence unknown writers or make a conflicting file ours.
+    for relative in [".DS_Store", "debug/.DS_Store"]:
+        directory(str(Path(relative).parent))
+        leaf = tree / relative
+        with leaf.open("xb") as output:
+            output.write(b"oxide-280-deliberately-created-metadata\n")
+        record_file(leaf)
+
     files("debug/deps", 16000)
     for unit in range(160):
         files(f"debug/incremental/fixture_{unit:04x}-0123456789abcdef/s-session/working", 160)
@@ -140,11 +150,6 @@ def main():
     # never enumerate additions and adopt them into the expected manifest.
     nodes[str(original.relative_to(tree))] = signature(original)
     record_file(alias)
-    for relative in [".DS_Store", "debug/.DS_Store"]:
-        leaf = tree / relative
-        with leaf.open("xb") as output:
-            output.write(b"oxide-280-deliberately-created-metadata\n")
-        record_file(leaf)
     if counts["entries"] != 60822 or counts["entries"] > 80000:
         raise SystemExit("fixture exceeds fixed layout")
     # Independent tiny negative control: freeze intended set BEFORE adding

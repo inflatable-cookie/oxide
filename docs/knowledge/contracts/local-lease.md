@@ -868,7 +868,11 @@ but its contribution to this refusal has not been isolated. The bounded private
 investigation produced timings and source-selection counts, then failed four
 exact-tree checks after two unexplained `.DS_Store` files appeared; its guard
 ended with cleanup uncertainty and exit 125. The inventory diagnosis preserves
-the packet and limits. No counted proof followed the inadequate diagnostic.
+the packets and limits. The later evidence-retained fixture diagnostic refused
+an already-present metadata name before inventory ran and independently ended
+with a stale-reading guard fault and `UNCLOSED`. Its metadata-creation ordering
+correction has not received another native occurrence. No counted proof
+followed either inadequate diagnostic.
 Admission remains **unrestored**; this precise-impediment outcome grants no
 installation or Effigy QA readiness and no performance qualification credit.
 

@@ -241,10 +241,51 @@ diagnostic failed on Python 3.9.6's unsupported
 at `/Volumes/Stash/scratch/oxide/oxide-proof.mg2hh512/evidence/receipt.json`.
 The corrected driver checks its `Path.lstat()` API before effects. Both spent
 occurrences remain failed and charged; no counted occurrence followed.
-Planner disposition `8f6ab30f` permits review of this precise impediment only:
-no further native attempt, cleanup or acceptance-count change. Admission is
-**unrestored**, with no installation or Effigy QA readiness. No accounting-only
-fast path is implemented, and historical causation remains **UNKNOWN**.
+Planner disposition `8f6ab30f` initially permitted review of that precise
+impediment only. The later owner reopening authorized the bounded fixture
+correction below, without converting either earlier failure into a pass.
+
+**Evidence-retained fixture correction.** The corrected private driver places
+its fresh 0700 fixture directly inside the current guard's evidence directory.
+The unchanged `fcfda2b0` guard samples `tree_bytes(ctx["root"])`, including
+evidence, and its ordinary shutdown removes only `ctx["scratch"]`. The driver
+and ignored test require canonical sibling scratch/evidence paths and a
+private owned fixture directly under this evidence path; no outside-root or
+arbitrary fixture-path authority is added. Retention is deliberate and remains
+within the 512 MiB monitored total, not a resolution of old cleanup uncertainty.
+
+Expected names, directory identities and file identity/mode/size/allocation/
+mtime/ctime observations come only from deliberate creation. The two metadata
+controls are exclusively created with known bytes, and ordinary inventory
+counts them as regular files. The fixed main layout is 60,822 entries, including
+60,004 file names and 818 directories. The oracle compares the intended name
+set and metadata before and after measured calls and after bound controls;
+unexpected names or changes fail rather than being adopted. A separate tiny
+negative control freezes one intended name, adds an unplanned entry, and must
+be rejected by the same oracle. Its focused unit regression passed.
+
+The owner-activated diagnostic at `46dacd3e` **failed before the inventory
+child**: exclusive creation found `tree/.DS_Store` already present after bulk
+population and raised `FileExistsError`; nothing overwrote or adopted it.
+Its origin remains **UNKNOWN**. Independently, the guard latched
+`scratch readings stale: none in 10 s`, recorded `UNCLOSED`, child status 1,
+no deadline, and returned 125. Its receipt is
+`/Volumes/Stash/scratch/oxide/oxide-proof.q436kq0i/evidence/receipt.json`,
+SHA-256 `eb9ee35eb3bee17b88185adc864f3cbe181eb04bf3b1350daa4794d07a6184b3`.
+Sampled peak was 152,424,448 bytes against 512 MiB; minimum sampled free space
+was 3,241,596,981,248 bytes. The partial population and all evidence remain
+kept. This packet measures neither inventory performance nor the cause of
+the stale reading; it supplies no new complete-tree or native credit.
+
+The driver now creates the two exclusive controls before bulk population,
+reducing that creation window while still refusing an existing name. This
+ordering correction has only an interpreter/API check, not a fresh native
+occurrence. It does not fence unknown writers or repair the guard fault.
+The required passing diagnostic and counted fixture occurrence remain
+**missing**. No automatic replacement or cleanup follows a failed occurrence.
+Admission is **unrestored**, with no installation or Effigy QA readiness.
+No accounting-only fast path is implemented, and historical causation remains
+**UNKNOWN**. Earlier roots and conclusions remain unchanged.
 
 ## Output and exit semantics
 
