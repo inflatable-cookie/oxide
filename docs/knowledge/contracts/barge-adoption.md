@@ -62,6 +62,40 @@ writer-closure decision or deletion path. Focused regressions cover selected
 present roots, nonrepresentative profile selection, contradictory/malformed
 references, sibling identity disagreement and genuinely released fixtures.
 The selected-plus-absent comparison remains strict and uses an absent checkout.
+At corrected executable source `9331d3ca519e1972fcca91ac93c410046cd3c87c`,
+the newly authorised uncounted diagnostic and subsequent counted comparison
+each passed all three cases (exit 0):
+
+| Case | Oxide | Barge |
+| --- | --- | --- |
+| Unselected v2 root, absent checkout, closed writers | Complete; candidate | Complete references; candidate; positive checkout absence |
+| Selected root, absent checkout | Complete; kept because a current selection references the root | Complete references; kept by current registry/receipt/marker references |
+| Required state contains malformed JSON (`{`) | Incomplete authority; whole batch kept for unknown writer custody | Incomplete references; kept for unknown pool/checkout custody |
+
+Both controls exercised their intended gates, with checkout absence retained
+and no unrelated policy predicate masking the selection or unknown-state result.
+The four focused selection regressions passed. Changed-input Effigy compile,
+release compile, format and docs checks passed; the single ordinary
+`rust:test-600` suite reported 1055 passed, zero failed and five ignored.
+
+New evidence under `/Volumes/Stash/scratch/oxide/`:
+
+- `oxide-proof.1o4csics/evidence`: uncounted diagnostic, 35.19 s to receipt
+  publication, minimum reserve 3020.5 GiB; receipt SHA-256
+  `7444bb80076346a00ec4e178461f310acfa6a64bee03c86b0870f066aadd2a6b`.
+- `oxide-proof.hct6slxh/evidence`: counted comparison, 8.82 s to publication,
+  minimum reserve 3020.7 GiB; receipt SHA-256
+  `04fb1c649fe421f0e31b92fd5af6c0a289c39b0ad912029a2d3c7db88f519734`.
+
+Each used its own 128 MiB image under the unchanged qualified guard,
+300 s/512 MiB bounds and sampled owned peak 8.1 MiB. Both guards closed with
+status zero, no fault or deadline, positively reaped their ordinary detach
+children and verified no remaining attachment of their backing. Backings,
+actual input bytes, case reports, raw and covering logs and `AUTHOR-SHA256SUMS`
+are retained. Sampling is an observation, not a quota. Final publication
+changes only Markdown after that executable source; review still binds the
+exact published head.
+
 The historical results below describe the pre-alignment executable source.
 
 The corrected selected-but-absent comparison (oxide#279) ran once at source
@@ -89,7 +123,7 @@ selection. It retains the no-offer expectation for both engines. The actual
 disagreement is consistent with the source: Oxide validates the committed
 selection and then continues to checkout absence and custody, whereas Barge
 retains current references. This is an observed bounded fixture result, not
-permission to change either engine or waive acceptance.
+permission to change either engine or waive acceptance at that source.
 
 Corrected evidence: `/Volumes/Stash/scratch/oxide/oxide-proof.9hzvh3zc/evidence`;
 receipt SHA-256
@@ -102,14 +136,14 @@ Reviewer answer `72d5ad7a602518240bf7497e49995c0727905c42e533a3591b48133b13957e0
 confirms this does not satisfy selected-control acceptance or authorise a
 counted run.
 
-**Approved policy, implementation pending.** Tom answered **"Current selection
+**Operator policy and scoped alignment.** Tom answered **"Current selection
 protects"** in operator decision `dc1d6924-f196-4cde-8f2e-4c51c87ba65e`
 (2026-11-05; question
 `f500bff1884023e154b71a88773d059b8a9c09538f9774daa3cbdf083a7a17e6`).
 A current selection must protect the root even when its checkout is positively
 absent. This resolves the intended semantics; the measured Oxide discrepancy
-above remains uncorrected. The subsequent Queue brief v5 scopes only the conservative
-Oxide exclusion and fresh changed-input validation. The original ruling alone
+above remains historical. The subsequent Queue brief v5 scopes only the
+conservative Oxide exclusion and fresh changed-input validation recorded above. The original ruling alone
 grants no implementation, native rerun, counted acceptance, merge or adoption
 authority, and the alignment does not change the historical receipts.
 
