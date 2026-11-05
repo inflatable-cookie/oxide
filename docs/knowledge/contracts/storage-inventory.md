@@ -203,14 +203,48 @@ source (`library/std/src/sys/fs/unix.rs`, `DirEntry::metadata`) selects
 entry-relative read with another descriptor-relative implementation is not
 an established remedy. This source fact is not a syscall timing measurement.
 
-No representative fixture comparison was executed and no cold-volume or
-historical-tree cost attribution is available. The remaining measurement gap
-is the contribution of in-walk classification/report bookkeeping versus
-required metadata, enumeration and pathname identity samples. A fixture must
-measure those separately while preserving depth/name shapes, allocation and
-hardlink union, all boundaries, races and incomplete-result refusals; a warm
-tiny-tree result cannot establish historical causation or ordinary-build
-readiness. No accounting-only fast path is implemented by this diagnosis.
+The private investigation at `1dac1848` used a fresh, generated Cargo-shaped
+tree: 60,002 declared file names (one cross-category hardlink), 818 directories,
+depth up to 14, hashed object-style names and a deeper long-name branch. This
+was not copied from the unavailable historical tree and did not preserve that
+tree's unknown depth/name distribution or cold-volume state. An ignored
+library test uses the existing walker and metadata-source observer, splits
+traversal/capacity/report timings, then compares its totals with a second,
+explicitly warm public-entry walk. No product code or acceptance path changes.
+
+The replacement uncounted diagnostic **failed**: four exact-tree oracles
+disagreed with the generated manifest. Both walks observed 60,822 entries and
+60,004 file names, versus 60,820 entries and 60,002 names declared; allocation
+was 245,780,480 versus 245,764,096 bytes. The retained tree subsequently named
+two additional `.DS_Store` files, at its root and `debug/`. Those names explain
+the discrepancy but their origin is **unknown**; their payloads were not read.
+The ten other checks passed, including one entry-metadata source selection per
+observed file/directory, complete matching public totals, hardlink union, and
+partial entry/depth/deadline counterfactuals. These are not substitute PASS
+evidence for the failed exact-tree checks.
+
+Observed timings were 5,976.8 ms traversal, 0.0085 ms capacity probe, 4.37 ms
+report construction and 6,204.6 ms warm public walk. These failed-packet
+observations do not isolate in-walk classification from required metadata,
+enumeration or pathname samples, and do not establish a remedy or historical
+cause. Source-selection counts are not syscall counts. The qualified guard
+sampled a 245,829,632-byte peak against 512 MiB and minimum free space
+3,242,000,936,960 bytes. Its receipt records closed child status 1 without a
+deadline/fault, but ends `cleanup_partial_or_unknown`; Effigy exited 125.
+Closure is not successful cleanup or qualification.
+
+The packet remains at
+`/Volumes/Stash/scratch/oxide/oxide-proof.if_xhj5b/evidence/` (`receipt.json`,
+`matching-cost.json`, `matching-cost-child.log`). The earlier `98b4bbb6`
+diagnostic failed on Python 3.9.6's unsupported
+`Path.stat(follow_symlinks=False)` before inventory ran; its receipt remains
+at `/Volumes/Stash/scratch/oxide/oxide-proof.mg2hh512/evidence/receipt.json`.
+The corrected driver checks its `Path.lstat()` API before effects. Both spent
+occurrences remain failed and charged; no counted occurrence followed.
+Planner disposition `8f6ab30f` permits review of this precise impediment only:
+no further native attempt, cleanup or acceptance-count change. Admission is
+**unrestored**, with no installation or Effigy QA readiness. No accounting-only
+fast path is implemented, and historical causation remains **UNKNOWN**.
 
 ## Output and exit semantics
 

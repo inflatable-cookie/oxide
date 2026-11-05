@@ -864,8 +864,13 @@ deadline gap has been demonstrated. The existing
 entry-relative metadata path and both required directory samples remain
 necessary under the current contract. The accounting caller does discard
 report detail, described in the [inventory diagnosis](storage-inventory.md#accounting-report-cost-diagnosis-oxide280),
-but its contribution to this refusal has not been measured. There is no
-performance correction or qualification credit from this source inspection.
+but its contribution to this refusal has not been isolated. The bounded private
+investigation produced timings and source-selection counts, then failed four
+exact-tree checks after two unexplained `.DS_Store` files appeared; its guard
+ended with cleanup uncertainty and exit 125. The inventory diagnosis preserves
+the packet and limits. No counted proof followed the inadequate diagnostic.
+Admission remains **unrestored**; this precise-impediment outcome grants no
+installation or Effigy QA readiness and no performance qualification credit.
 
 **Enumerated paths that vanish (oxide#113).** If a non-root path enumerated by
 the same walk returns `NotFound` at deferred `read_dir`, `file_type` or
