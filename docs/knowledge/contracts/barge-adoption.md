@@ -88,7 +88,17 @@ owned peak 8.1 MiB/512 MiB, minimum reserve 3030.2 GiB. Actual input bytes,
 all three engine reports, the failed assertion and raw logs remain retained.
 Reviewer answer `72d5ad7a602518240bf7497e49995c0727905c42e533a3591b48133b13957e05`
 confirms this does not satisfy selected-control acceptance or authorise a
-counted run. Any outcome or acceptance-scope change needs the applicable ruling.
+counted run.
+
+**Approved policy, implementation pending.** Tom answered **"Current selection
+protects"** in operator decision `dc1d6924-f196-4cde-8f2e-4c51c87ba65e`
+(2026-11-05; question
+`f500bff1884023e154b71a88773d059b8a9c09538f9774daa3cbdf083a7a17e6`).
+A current selection must protect the root even when its checkout is positively
+absent. This resolves the intended semantics; the measured Oxide discrepancy
+above remains uncorrected. Alignment requires a separately scoped approved
+brief. This ruling grants no implementation, native rerun, counted acceptance,
+merge or adoption authority, and does not change the historical receipts.
 
 One fresh 128 MiB APFS image per occurrence supplies real kernel-verified
 mount/device/UUID facts to both engines. Its backing/evidence remain under
