@@ -115,9 +115,20 @@ fn comparison_records(account: &ComparisonAccount, row: &mut Row, spec: Comparis
     )
     .unwrap();
     if !spec.state_known {
-        fs::remove_file(control.join("state.json")).unwrap();
+        // A present malformed required state is unknown to BOTH real readers:
+        // Oxide PoolWitness::read_state -> parse_state and Barge
+        // PoolCustody::read_pool -> parse_state reject invalid JSON. Missing
+        // state has different meanings and is retained only as earlier evidence.
+        fs::write(control.join("state.json"), b"{").unwrap();
     }
     store
+}
+
+fn comparison_marker(row: &Row) -> serde_json::Value {
+    let mut marker = root_marker(row);
+    // Match the production root/2 writer before recording the marker digest.
+    marker["checkout_volume_uuid"] = serde_json::json!(row.checkout_volume_uuid);
+    marker
 }
 
 fn release_comparison_case(spec: ComparisonCase) {
@@ -212,7 +223,7 @@ fn release_comparison_case(spec: ComparisonCase) {
     row.checkout_volume_uuid = Some(uuid.clone());
     row.volume_uuid = Some(uuid);
     row.root = oxide_root.clone();
-    write_root_marker(&oxide_root, &root_marker(&row));
+    write_root_marker(&oxide_root, &comparison_marker(&row));
     let identity = observe_fixture_root(&row);
     row.root_dev = Some(identity.dev);
     row.root_ino = Some(identity.ino);
@@ -223,7 +234,7 @@ fn release_comparison_case(spec: ComparisonCase) {
     // All other synthetic checkout/reference/custody facts come from spec.
     let mut mapped = row.clone();
     mapped.root = barge_root.path.clone();
-    write_root_marker(&mapped.root, &root_marker(&mapped));
+    write_root_marker(&mapped.root, &comparison_marker(&mapped));
     // Account directory exists for Barge StatePaths; records owns its own child.
     let reference_account = ComparisonAccount(account.0.join("references"));
     let _barge_store = comparison_records(&reference_account, &mut mapped, spec);

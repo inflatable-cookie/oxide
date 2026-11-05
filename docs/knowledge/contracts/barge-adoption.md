@@ -98,7 +98,7 @@ created by its ordinary area API. Checkout, selection and missing-state facts
 are shared; Barge's empty descriptor observation and the empty lease ledgers
 are explicitly synthetic. Mount facts are verified normally by both engines.
 The selected control has a present checkout and matching current reference;
-the unknown control omits required pool state. This is decision calibration,
+the original unknown control omitted pool state (corrected below). This is decision calibration,
 not a claim that a selected-but-absent checkout has identical policy.
 
 `rust:release-comparison:diagnostic` and `rust:release-comparison` use the
@@ -162,6 +162,19 @@ correction or native occurrence is authorised by these observations. Planner
 answer `0fda4cf211ef52ba45e3eee06f1d4d6e34e6d50a55997a350b74efc2d93b97dd`
 requires preservation and the source trace; candidate acceptance and
 unknown-control evidence remain missing.
+
+Planner continuation `562fafa54ae0be9b606e378a7eb5d7c4537295d3312ab162ca9c59a6da20e719`
+subsequently authorises the comparison-local marker correction and one shared
+unknown premise, with one replacement diagnostic before the still-gated counted
+occurrence. Both mapped markers now carry the row's checkout UUID before any
+digest is derived. The third case uses identical malformed JSON (`{`) in each
+engine's required `oxide-managed/state.json`, retaining an otherwise valid
+fixture. Oxide's `PoolWitness::read_state` passes these bytes to its actual
+state parser and refuses the authority batch; Barge's `PoolCustody::read_pool`
+passes them to `parse_state`, records pool-wide unknown, and
+`OxideSnapshot::references_for` makes the reference set incomplete. This traces
+a shared required fact without assuming that absence has equivalent meaning.
+The historical missing-state results above remain distinct.
 
 These observations supply no O2 input equivalence, D8/CF coverage or live qualification. The
 parent/descriptor binding gaps here and in Barge's
