@@ -341,6 +341,34 @@ check is authorized. The required counted evidence remains missing. All earlier
 failures, UNCLOSED resources and charges remain history; admission and live
 readiness remain unrestored, with historical causation **UNKNOWN**.
 
+Planner direction `601c3852` next authorized a test-only cooperative permissions
+correction and one changed-input diagnostic. The driver at `46a1fbef` verifies
+creation records before changing modes; no-follow descriptors re-verify each
+identity before `fchmod`, process hardlink inodes once, and retain the deliberate
+mode/ctime transition for every linked name. Intended measurement modes are
+0400 regular files and 0500 directories, deepest-first with the root last;
+writable bookkeeping and the negative control remain outside that tree.
+Final path records must match before the manifest freezes. These permissions
+are cooperative interference protection, not writer-closure or attribution
+evidence. The Python API check passed, but execution did not reach this logic.
+
+The authorized diagnostic failed during its **initial creation-record recheck**:
+`lstat(tree/.DS_Store)` raised `FileNotFoundError` at driver line 171, before any
+permission transition, frozen manifest or inventory/compiler child. The file
+was not recreated, overwritten or adopted. Its disappearance's origin remains
+**UNKNOWN**, and the permissions correction's effectiveness remains unproven.
+The guard closed with command status 1, no fault/deadline, and Effigy returned
+1. Receipt
+`/Volumes/Stash/scratch/oxide/oxide-proof.38vxo94q/evidence/receipt.json`
+has SHA-256 `81e689573ce759ea1f90391699213bdd1990d91c753317adc1bf3111dcd6926e`.
+Sampled peak was 21,704,704 bytes of 512 MiB; minimum sampled free space was
+3,233,181,110,272 bytes. There are no new measurement or named-oracle results,
+permission-protection credit or counted evidence. Retained reviewer disposition
+`d0737bea` requires returning the missing creation identity and packet for
+planner disposition without automatic repetition, recreation or attribution.
+All prior failures, resources and charges remain preserved; admission and live
+readiness are still unrestored.
+
 ## Output and exit semantics
 
 Human output is concise: root, coverage, visited counts, a per-category table

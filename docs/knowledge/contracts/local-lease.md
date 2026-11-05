@@ -879,6 +879,9 @@ After the owner repaired that route, the authorized diagnostic closed but
 failed its fixed-tree precondition before measurement. A later metadata-only
 observation found both deliberate metadata files had different inodes and
 sizes; their replacement's origin remains unknown. No counted proof followed.
+The next cooperative permissions correction also stopped before measurement:
+a creation identity was missing before any permission change could run.
+That correction's effectiveness and the disappearance's cause remain unknown.
 Admission remains **unrestored**; this precise-impediment outcome grants no
 installation or Effigy QA readiness and no performance qualification credit.
 
