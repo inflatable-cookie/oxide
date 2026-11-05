@@ -251,6 +251,9 @@ fn release_comparison_case(spec: ComparisonCase) {
         })
         .collect::<Vec<_>>();
     // Setup is complete before either actual engine call.
+    // ReleaseOnReference has no age/cooldown waiver: the ordinary policy still
+    // requires known activity at or before this actual post-setup clock.
+    let now_ms = barge::state::now_ms();
     let oxide = evaluate_test(&oxide_store, oxide_store.owner_control(), &registry, None);
     let barge = barge::release::plan(
         &state,
@@ -263,7 +266,7 @@ fn release_comparison_case(spec: ComparisonCase) {
             namespace: "oxide",
             area: "outputs",
             volume_uuid: &record.volume_uuid,
-            now_ms: 1000,
+            now_ms,
             bounds: barge::release::ReleaseBounds::design(),
             named_roots: &[],
         },
@@ -280,7 +283,7 @@ fn release_comparison_case(spec: ComparisonCase) {
         Ok(result) => serde_json::to_value(result).unwrap(),
         Err(reason) => serde_json::json!({"global_refusal": reason.to_string()}),
     };
-    let report = serde_json::json!({"case": spec.name, "logical_root": spec.name,
+    let report = serde_json::json!({"case": spec.name, "logical_root": spec.name, "now_ms": now_ms,
         "mapping": {"oxide": oxide_root, "barge": barge_root.path},
         "fixture_inputs": inputs,
         "synthetic": {"selected": spec.selected, "checkout_present": spec.selected,
@@ -302,6 +305,48 @@ fn release_comparison_case(spec: ComparisonCase) {
         "union must include the Barge root"
     );
     let expected = !spec.selected && spec.state_known;
+    let barge_row = &barge.plan.rows.rows[0];
+    assert!(
+        barge_row.idle.age_seconds.is_some(),
+        "clock/policy masked the case: {report}"
+    );
+    assert_ne!(barge_row.blocked_by.as_deref(), Some("policy"), "{report}");
+    if spec.selected {
+        assert_eq!(
+            barge_row.blocked_by.as_deref(),
+            Some("references"),
+            "{report}"
+        );
+        assert!(
+            barge_row
+                .references
+                .iter()
+                .any(|reference| reference.current),
+            "{report}"
+        );
+        assert!(
+            oxide[0]
+                .kept
+                .as_deref()
+                .unwrap_or_default()
+                .contains("checkout is present"),
+            "{report}"
+        );
+    } else if !spec.state_known {
+        assert!(
+            !oxide.complete,
+            "unknown custody must refuse the Oxide batch: {report}"
+        );
+        assert!(
+            !barge_row.references_complete,
+            "unknown custody gate was not reached: {report}"
+        );
+        assert_eq!(
+            barge_row.blocked_by.as_deref(),
+            Some("references"),
+            "{report}"
+        );
+    }
     assert_eq!(oxide[0].candidate.is_some(), expected, "{report}");
     assert_eq!(barge.plan.rows.rows[0].eligible, expected, "{report}");
     if expected {

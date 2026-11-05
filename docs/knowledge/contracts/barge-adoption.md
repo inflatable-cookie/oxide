@@ -108,13 +108,26 @@ attachment and requests only guard-owned post-census detach. The Rust cases
 retain actual input bytes and both engine results in guard evidence; global
 refusals remain distinct from per-root keeps. No effect/deletion verb runs.
 
-None of the three cases was exercised: unselected v2 candidate with an absent
-checkout and closed writers; the same identity selected; or a missing/unknown
-required custody or admission fact. Both engines' case outcomes, the uncounted
-diagnostic and the counted native remain missing; both native allowances are
-unspent. No kernel-verification run or fixture engine call was attempted.
-This source-level limit
-supplies no O2 input equivalence, D8/CF coverage or live qualification. The
+The first uncounted diagnostic at `7d36faaa` exercised all three cases:
+Oxide offered the unselected v2 root with absent checkout/closed writers, kept
+the selected root with present checkout, and refused the whole missing-state
+batch as incomplete. Barge kept all three at its policy gate: the fixture's
+`now_ms=1000` predated actual root activity. Thus the candidate assertion failed
+and both Barge controls were masked, despite two libtest passes. Exit 101,
+closed guard, no fault/deadline; post-census detach succeeded. Evidence remains
+at `/Volumes/Stash/scratch/oxide/oxide-proof.xypmxi9_/evidence` (300 s/512 MiB;
+8.1 MiB sampled owned peak, 3059.8 GiB minimum reserve). This occurrence is
+spent and supplies no counted credit.
+
+Planner amendment `3842b045764b1011819a168cccfe969f20fadaf0df01b1abd2b27c75af7ca2ee`
+permits only a test-clock correction and one replacement uncounted diagnostic.
+The request now uses actual post-setup time; the unchanged
+`ReleaseOnReference` policy has no minimum age/cooldown but still requires
+known activity no later than the request. Explicit assertions reject policy
+masking and require current-reference and unknown-custody control evidence.
+Counted execution stays gated on adequate diagnostic evidence.
+
+These observations supply no O2 input equivalence, D8/CF coverage or live qualification. The
 parent/descriptor binding gaps here and in Barge's
 `oxide-capture-parent-identity.md` remain unproven; oxide#241 and oxide#222
 remain held, with no delegation or adoption authorised.
