@@ -163,3 +163,8 @@ print(json.dumps(dict(final_total_passed=len(checks), execution='PURE MOCKS ONLY
 
 check('private ordinary guard receipt umask', 'os.umask(0o077)' in Path(kit.__file__).read_text())
 print(json.dumps(dict(final_total_passed=len(checks), execution='PURE MOCKS ONLY')))
+
+from types import SimpleNamespace
+fake = SimpleNamespace(Kinfo=SimpleNamespace(one=lambda pid: (_ for _ in ()).throw(OSError('injected'))))
+check('observable PID kept with unreadable start identity', kit.identity(fake,321) == dict(pid=321,state='unreadable',row=None))
+print(json.dumps(dict(final_total_passed=len(checks), execution='PURE MOCKS ONLY')))

@@ -150,9 +150,9 @@ def reader(session):
 def identity(module, pid):
     try:
         row = module.Kinfo.one(pid)
-        return dict(state='observed' if row else 'absent', row=row)
+        return dict(pid=pid, state='observed' if row else 'absent', row=row)
     except (OSError, ValueError):
-        return dict(state='unreadable', row=None)
+        return dict(pid=pid, state='unreadable', row=None)
 
 
 def owned_token(token, prefix):
