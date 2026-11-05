@@ -50,6 +50,34 @@ owned by [workflow](workflow.md#pruning-owned-output-roots-oxide129) and
 [local lease](local-lease.md). The authority boundary is in
 [vision](../vision.md#storage) and [architecture](../architecture.md#storage-invariants).
 
+## Controlled decision comparison: interface limit
+
+The three-case fixture comparison (oxide#279) cannot reach Barge's release
+candidate through the approved feature-off dependency at
+`4af9360bd09629e970c143080ca159de8eef2562`. `release::plan` requires
+`MountRoot` and `AbsenceVolume`/`VolumeLocator`; their successful mount answers
+contain `os::MountPoint`. That type's `path` is private and its only constructor,
+`new`, is `pub(crate)` (`crates/barge/src/os/facts.rs`). Barge's synthetic
+constructors live in its `cfg(test)` crate-private `testkit`, unavailable to
+Oxide's in-crate tests. The public macOS implementation constructs the marker
+only after real mount verification; a fresh owned fixture directory is not a
+mount root.
+
+Planner answer `467200af1401ab13a531a88246f59b8395c71abeccb2e23b06951ef8d38620f5`
+(2026-11-05) confirms no identified safe public fixture route under this scope.
+A real verified mount requires an explicit planner amendment to the fixture
+premise. Do not forge the marker, enable features, change the pin or public
+surface, or substitute empty refusal comparisons.
+
+None of the three cases was exercised: unselected v2 candidate with an absent
+checkout and closed writers; the same identity selected; or a missing/unknown
+required custody or admission fact. Both engines' case outcomes, the uncounted
+diagnostic and the counted native remain missing. This source-level limit
+supplies no O2 input equivalence, D8/CF coverage or live qualification. The
+parent/descriptor binding gaps here and in Barge's
+`oxide-capture-parent-identity.md` remain unproven; oxide#241 and oxide#222
+remain held, with no delegation or adoption authorised.
+
 ## Sources and pins
 
 - Barge `main` at `ce1aef1`: the contracts above, and the code under
