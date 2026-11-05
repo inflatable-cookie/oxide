@@ -829,6 +829,44 @@ walk's bytes are never used for admission and never make a slot an eviction
 candidate; `status` shows them as a lower bound. A measured zero stays
 distinct from unknown.
 
+### Matching-reuse deadline diagnosis (oxide#280)
+
+The retained Effigy milestone at `80960289a0dbfdbaa6b2b06c6e803cd6cb76f180`
+refused before its compiler/tests: `matching_reuse`, removable slot 1,
+incarnation 1, `elapsed_deadline x1`, 61,624 entries in 60,006 ms against
+2,000,000 entries / depth 64 / 60,000 ms. The verified 361-byte stderr has
+SHA-256 `b3e4ec97a921a187688f5321523a362046a3f88468808b506bae898953360c4d`.
+This establishes an elapsed-bound refusal, not entry exhaustion, corruption,
+a slow syscall, host load or a storage-device cause. Historical causation is
+**UNKNOWN**; the failed milestone remains failed.
+
+Source inspection of installed `3fd61913` and `941087f5` found identical
+`src/lease/pool.rs` and `src/inventory.rs` between those commits.
+`reuse_idle` validates the slot scope, calls `inventory_sizes` once, and
+requires complete coverage before `take_idle`. That walk is not a redundant
+repeat of a current record: matching reuse explicitly requires a fresh walk.
+`recorded_total` uses current idle records for the separate capacity decision;
+it publishes newly completed idle observations after generation rechecks.
+`measure_for_release` likewise requires completion and the same slot,
+incarnation and lease generation before returning a closing record. Taking
+the slot clears its record. None of these publications permits skipping the
+matching walk.
+
+The walker retains one start/deadline, checks between filesystem operations
+and after the second directory sample, and latches the first deadline gap.
+Partial bytes cannot pass `Sizes::require_complete`. Its final root
+verification, filesystem-capacity probe and report construction run after
+traversal; they do not themselves set `elapsed_deadline`. Consequently the
+reported elapsed milliseconds are not a breakdown of traversal costs.
+
+No redundant filesystem read whose removal would prevent this traversal
+deadline gap has been demonstrated. The existing
+entry-relative metadata path and both required directory samples remain
+necessary under the current contract. The accounting caller does discard
+report detail, described in the [inventory diagnosis](storage-inventory.md#accounting-report-cost-diagnosis-oxide280),
+but its contribution to this refusal has not been measured. There is no
+performance correction or qualification credit from this source inspection.
+
 **Enumerated paths that vanish (oxide#113).** If a non-root path enumerated by
 the same walk returns `NotFound` at deferred `read_dir`, `file_type` or
 no-follow metadata, the walk increments a separate `vanished` count rather

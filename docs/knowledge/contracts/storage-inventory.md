@@ -178,6 +178,40 @@ default an absent count to zero. Older strict readers may reject a report that
 contains a nonzero `vanished` field. This diagnostic is not persisted in the
 pool ledger or configuration.
 
+### Accounting report cost diagnosis (oxide#280)
+
+`inventory_sizes_with` consumes only coverage/gaps, logical bytes by name,
+unique allocated bytes, visited entries, elapsed milliseconds and vanished
+count. It discards category breakdowns, hardlink-overlap detail, dominant
+category, filesystem free-space results, notes and policy hints. Setting
+`max_output_bytes` to 64 does not avoid constructing those fields: it limits
+rendering, not traversal or report construction.
+
+There is demonstrable unused report work, but no demonstrated link to the
+[matching-reuse refusal](local-lease.md#matching-reuse-deadline-diagnosis-oxide280).
+The filesystem-capacity probe runs after `Walker::run` and `verify_root`;
+`finish` samples elapsed time before aggregating inode/category totals and
+building notes/policy. Removing that final work alone cannot prevent the
+walker's earlier deadline gap. Classification of each relative path and
+category-bit maintenance do occur during traversal; their cost remains
+unmeasured. Global `(device, inode)` allocation union work is required even
+when category detail is unused.
+
+At the inspected 1.97.1 toolchain, the locally installed Rust standard-library
+source (`library/std/src/sys/fs/unix.rs`, `DirEntry::metadata`) selects
+`dirfd` plus `fstatat(AT_SYMLINK_NOFOLLOW)` on Apple. Thus replacing the existing
+entry-relative read with another descriptor-relative implementation is not
+an established remedy. This source fact is not a syscall timing measurement.
+
+No representative fixture comparison was executed and no cold-volume or
+historical-tree cost attribution is available. The remaining measurement gap
+is the contribution of in-walk classification/report bookkeeping versus
+required metadata, enumeration and pathname identity samples. A fixture must
+measure those separately while preserving depth/name shapes, allocation and
+hardlink union, all boundaries, races and incomplete-result refusals; a warm
+tiny-tree result cannot establish historical causation or ordinary-build
+readiness. No accounting-only fast path is implemented by this diagnosis.
+
 ## Output and exit semantics
 
 Human output is concise: root, coverage, visited counts, a per-category table
