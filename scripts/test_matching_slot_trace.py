@@ -3,6 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 from unittest.mock import patch
+from contextlib import ExitStack
 
 spec = importlib.util.spec_from_file_location('trace280_tested', Path(__file__).with_name('matching-slot-trace.py'))
 kit = importlib.util.module_from_spec(spec)
@@ -143,13 +144,16 @@ for exit_status in (0, None):
 # Probe/guard result is independent from a successful tracer launcher status.
 records = []
 ready = dict(root=P+'/runs/oxide-proof.a', evidence=P+'/runs/oxide-proof.a/evidence')
-with patch.object(kit, 'private_file', side_effect=lambda p,*args: json.dumps(
+with patch.object(kit, 'launch_context', return_value=Path('/reviewed/checkout')), \
+     patch.dict(kit.os.environ, {'NUCLEUS_RUN_ID':'test-run'}), \
+     patch.object(kit, 'private_file', side_effect=lambda p,*args: json.dumps(
         {'phase':'unclosed','outcome':{'closure':'UNCLOSED','status':1}} if p.name=='receipt.json' else ready).encode()), \
      patch.object(kit, 'validate_ready'), patch.object(Path,'exists',return_value=True), \
      patch.object(kit,'write_once',side_effect=lambda p,v: records.append((p.name,v))), \
      patch.object(kit.subprocess,'Popen') as route:
     route.return_value.wait.return_value = 125
-    check('probe route failure preserved', kit.operator_start(Path(P),{},'a'*32,'digest') == 125)
+    check('probe route failure preserved', kit.operator_start(Path(P),{'effigy':'/reviewed/effigy'},'a'*32,'digest') == 125)
+    check('Effigy launch uses bound executable/cwd', route.call_args.args[0] == ['/reviewed/effigy',kit.TASK] and route.call_args.kwargs['cwd']==Path('/reviewed/checkout'))
     result = [v for n,v in records if n=='probe-route-exit.json'][0]
     check('guard UNCLOSED kept separately', result['guard_receipt']['outcome']['closure']=='UNCLOSED')
     check('tracer not inferred from probe', result['tracer_closure'].startswith('independent'))
@@ -168,3 +172,104 @@ from types import SimpleNamespace
 fake = SimpleNamespace(Kinfo=SimpleNamespace(one=lambda pid: (_ for _ in ()).throw(OSError('injected'))))
 check('observable PID kept with unreadable start identity', kit.identity(fake,321) == dict(pid=321,state='unreadable',row=None))
 print(json.dumps(dict(final_total_passed=len(checks), execution='PURE MOCKS ONLY')))
+
+
+# Retained-worker admission validation: no credential export, no actual hook.
+from unittest.mock import mock_open
+import stat
+worker = dict(NUCLEUS_TASK_ID=kit.TASK_ID, NUCLEUS_RUN_ID='mock-run',
+              NUCLEUS_RUN_TOKEN='mock-token', QUEUE_ADMISSION_SOCKET='/mock/socket',
+              EFFIGY_ADMISSION_HOOK='ELECTRON_RUN_AS_NODE=1 /mock/node /mock/queue-effigy-admission-hook.mjs')
+with patch.dict(kit.os.environ, worker, clear=True), \
+     patch.object(kit.os, 'access', return_value=True), \
+     patch.object(Path, 'lstat', return_value=SimpleNamespace(st_mode=stat.S_IFSOCK|0o600, st_uid=kit.os.getuid())), \
+     patch('builtins.open', mock_open(read_data=b'mock supported hook')):
+    context = kit.worker_context()
+    check('context records hashes not credentials/settings', 'mock-token' not in json.dumps(context) and '/mock/' not in json.dumps(context))
+    for key in ('EFFIGY_ADMISSION_HOOK', 'NUCLEUS_RUN_TOKEN', 'QUEUE_ADMISSION_SOCKET', 'NUCLEUS_TASK_ID'):
+        changed = dict(worker); del changed[key]
+        with patch.dict(kit.os.environ, changed, clear=True):
+            try: kit.worker_context()
+            except ValueError: check('missing worker context refuses '+key, True)
+            else: raise AssertionError('missing context accepted')
+
+c = dict(admission_context={'trusted':True}, checkout='/reviewed/checkout', checkout_identity={},
+         hashes={'matching-slot-trace.py':kit.sha(b'kit')}, catalog_sha256=kit.sha(b'catalog'),
+         effigy='/reviewed/effigy', effigy_identity={})
+with patch.object(kit,'worker_context',return_value={'trusted':True}), \
+     patch.object(kit,'safe_path',side_effect=lambda p:p), patch.object(kit,'fact',return_value={}), \
+     patch.object(Path,'cwd',return_value=Path(c['checkout'])), \
+     patch.object(Path,'read_bytes',side_effect=lambda:b'catalog') as read, \
+     patch.object(kit.shutil,'which',return_value=c['effigy']), \
+     patch.dict(kit.os.environ,{},clear=True):
+    read.side_effect = [b'catalog', b'kit']
+    check('bound checkout and catalog accepted', kit.launch_context(c)==Path(c['checkout']))
+    for marker in ('', 'old-run'):
+        with patch.dict(kit.os.environ,{'EFFIGY_ADMITTED':marker}):
+            try: kit.launch_context(c)
+            except ValueError: check('stale admission refuses before read '+repr(marker), True)
+            else: raise AssertionError('stale admitted accepted')
+    with patch.object(Path,'cwd',return_value=Path('/wrong/catalog')):
+        try: kit.launch_context(c)
+        except ValueError: check('wrong cwd refuses before launch',True)
+        else: raise AssertionError('wrong cwd accepted')
+    read.side_effect = [b'changed catalog']
+    try: kit.launch_context(c)
+    except ValueError: check('changed catalog refused',True)
+    else: raise AssertionError('wrong catalog accepted')
+    with patch.object(kit,'worker_context',return_value={'trusted':False}):
+        try: kit.launch_context(c)
+        except ValueError: check('changed inherited hook context refused',True)
+        else: raise AssertionError('changed hook accepted')
+    try: kit.launch_context(c,admitted=True)
+    except ValueError: check('direct guarded mode lacks Effigy marker refuses',True)
+    else: raise AssertionError('direct guard accepted')
+
+# Exercise the actual tiny probe through injected interfaces only: first
+# mismatch/missing path must unwind before another create/read. No file effects.
+m = SimpleNamespace(st_dev=1,st_ino=2,st_mode=stat.S_IFREG|0o600,st_size=40,
+                    st_blocks=8,st_mtime_ns=10,st_ctime_ns=10)
+changed = SimpleNamespace(**dict(vars(m),st_ino=3))
+for label, observations, expected_creates, expected_reads, fails in (
+        ('post-close replacement',[changed],1,1,True),
+        ('post-close disappearance',[FileNotFoundError()],1,1,True),
+        ('subsequent change',[m,m,m,changed],3,4,True),
+        ('subsequent disappearance',[m,m,m,FileNotFoundError()],3,4,True),
+        ('late change',[m]*42+[changed],3,43,True),
+        ('unchanged',[m]*300,3,None,False)):
+    records=[]; clock=Clock()
+    g=SimpleNamespace(now_ns=lambda:clock.tick()*100_000_000)
+    env=dict(OXIDE_TASK_SCRATCH_ROOT=P+'/runs/oxide-proof.a/scratch',
+             OXIDE_PROOF_EVIDENCE=P+'/runs/oxide-proof.a/evidence',
+             OXIDE_PROOF_DEADLINE_NS='300000000000',OXIDE_PROOF_RUN_ID='mock-run')
+    def exists(path): return path.name=='gate.json'
+    with ExitStack() as stack:
+        for mock in [patch.dict(kit.os.environ,env,clear=True),
+                     patch.object(kit,'reader',return_value=g),
+                     patch.object(kit,'identity',return_value={'state':'observed'}),
+                     patch.object(kit,'safe_path',side_effect=lambda p:p),
+                     patch.object(kit,'fact',return_value={}),
+                     patch.object(kit,'write_once',side_effect=lambda p,v:records.append((p.name,v))),
+                     patch.object(kit,'private_file',return_value=b'{}'),
+                     patch.object(kit,'gate_valid',return_value=True),
+                     patch.object(Path,'exists',exists), patch.object(Path,'mkdir'),
+                     patch.object(kit.os,'fdopen'), patch.object(kit.os,'fstat',return_value=m),
+                     patch.object(kit.time,'sleep'), patch.object(kit.signal,'signal'),
+                     patch.object(kit.signal,'setitimer'),
+                     patch.object(kit.subprocess,'Popen',side_effect=AssertionError('launch forbidden'))]:
+            stack.enter_context(mock)
+        reads=stack.enter_context(patch.object(Path,'lstat',side_effect=observations))
+        creates=stack.enter_context(patch.object(kit.os,'open',return_value=99))
+        refused=False
+        try: result=kit.probe(Path(P),{},'a'*32,'digest')
+        except (ValueError,FileNotFoundError): refused=True
+        check(label+' refusal matches',refused==fails)
+        check(label+' no additional creation',creates.call_count==expected_creates)
+        check(label+' no additional read',expected_reads is None or reads.call_count==expected_reads)
+        receipt=records[-1][1]
+        check(label+' descriptor rows retained',any(r.get('phase')=='creation-descriptor' for r in receipt['rows']))
+        if fails:
+            check(label+' bounded refusal retained',records[-1][0]=='trace-probe-refusal.json' and any(r.get('changed') or r.get('error') for r in receipt['rows']))
+        else:
+            check('nonmutation finishes normally',result==0 and records[-1][0]=='trace-probe-receipt.json')
+print(json.dumps(dict(final_total_passed=len(checks), execution='PURE MOCKS ONLY; no admission/guard/probe/trace')))

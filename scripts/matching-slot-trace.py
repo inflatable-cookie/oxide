@@ -23,6 +23,8 @@ from pathlib import Path
 import plistlib
 import re
 import secrets
+import shlex
+import shutil
 import selectors
 import signal
 import stat
@@ -245,7 +247,59 @@ def gate_valid(gate, ready, digest, now):
             gate.get('challenge') == str(Path(ready['session']) / ('challenge-' + ready['nonce'])))
 
 
+TASK_ID = 'b2c68e24-53b8-4f24-b4ee-ec18cb74a999'
+
+
+def worker_context():
+    """Require inherited owner-supplied context; never reconstruct/export it."""
+    def inherited(name):
+        return os.environ.get('NUCLEUS_' + name) or os.environ.get('NORTHSTAR_' + name)
+    if inherited('TASK_ID') != TASK_ID or not inherited('RUN_ID') or not inherited('RUN_TOKEN'):
+        raise ValueError('retained authenticated Nucleus worker required')
+    hook = os.environ.get('EFFIGY_ADMISSION_HOOK', '')
+    argv = shlex.split(hook)
+    if (len(argv) != 3 or argv[0] != 'ELECTRON_RUN_AS_NODE=1' or
+            not Path(argv[1]).is_absolute() or not os.access(argv[1], os.X_OK) or
+            not Path(argv[2]).is_absolute() or Path(argv[2]).name != 'queue-effigy-admission-hook.mjs'):
+        raise ValueError('inherited supported Nucleus hook required')
+    socket = os.environ.get('QUEUE_ADMISSION_SOCKET', '')
+    m = Path(socket).lstat() if socket else None
+    if m is None or not stat.S_ISSOCK(m.st_mode) or m.st_uid != os.getuid():
+        raise ValueError('owned Nucleus admission socket required')
+    # Store hashes only, never hook settings, run tokens or credentials.
+    with open(argv[2], 'rb') as source:
+        data = source.read(2 * 1024 * 1024 + 1)
+    if len(data) > 2 * 1024 * 1024:
+        raise ValueError('hook source bound')
+    return dict(hook_sha256=sha(hook.encode()), hook_source_sha256=sha(data),
+                socket_sha256=sha(socket.encode()), task=TASK_ID)
+
+
+def launch_context(c, admitted=False):
+    # EFFIGY_ADMITTED is advisory, never independent proof of a grant. Reject
+    # any inherited marker before Effigy so its real hook cannot be skipped.
+    marker = os.environ.get('EFFIGY_ADMITTED')
+    if (not admitted and 'EFFIGY_ADMITTED' in os.environ) or (admitted and not marker):
+        raise ValueError('stale admission at entry or absent Effigy child marker')
+    if worker_context() != c['admission_context']:
+        raise ValueError('Nucleus admission context changed')
+    repo = Path(c['checkout'])
+    if Path.cwd() != repo or fact(safe_path(repo)) != c['checkout_identity']:
+        raise ValueError('wrong checkout cwd/identity')
+    if sha((repo / 'effigy.toml').read_bytes()) != c['catalog_sha256']:
+        raise ValueError('reviewed catalog changed')
+    for name, digest in c['hashes'].items():
+        if sha((repo / 'scripts' / name).read_bytes()) != digest:
+            raise ValueError('checkout executable source changed')
+    if str(Path(shutil.which('effigy') or '').resolve()) != c['effigy'] or fact(Path(c['effigy'])) != c['effigy_identity']:
+        raise ValueError('Effigy executable changed')
+    return repo
+
+
 def prepare():
+    if 'EFFIGY_ADMITTED' in os.environ:
+        raise ValueError('stale admission during preparation')
+    context = worker_context()
     volume()
     safe_path(PARENT)
     if PARENT.stat().st_dev != Path('/Volumes/Stash').stat().st_dev:
@@ -272,7 +326,11 @@ def prepare():
         with os.fdopen(fd, 'wb') as out:
             out.write(data)
     c = dict(session=str(session), nonce=nonce, identity=fact(session), volume_uuid=UUID,
-             source_head=head, interpreter=str(Path(sys.executable).resolve()), directories={n: fact(session / n) for n in ('kit', 'runs')},
+             source_head=head, checkout=str(repo), checkout_identity=fact(repo),
+             catalog_sha256=sha((repo / 'effigy.toml').read_bytes()), admission_context=context,
+             effigy=str(Path(shutil.which('effigy')).resolve()),
+             effigy_identity=fact(Path(shutil.which('effigy')).resolve()),
+             interpreter=str(Path(sys.executable).resolve()), directories={n: fact(session / n) for n in ('kit', 'runs')},
              hashes={n: sha(data) for n, data in sources.items()}, phase='PREPARED; EXECUTION HELD')
     write_once(session / 'session.json', c)
     digest = sha((session / 'session.json').read_bytes())
@@ -294,13 +352,23 @@ Do not run these activation commands during preparation or review.
 After reviewer acceptance, the planner must separately activate this ONE occurrence.
 All code below runs as your ordinary user. Never run Python, shell, or kit with sudo.
 
-Terminal A, after activation, starts normal real heavy admission:
+Retained Nucleus author environment ONLY, after separate activation. This is
+NOT a command for Tom's terminal. The retained author starts the nonprivileged
+route with its original inherited authenticated Nucleus hook/context, unchanged.
+Absent hook, inherited EFFIGY_ADMITTED (even empty), wrong task/context or cwd,
+changed hook/catalog/executable sources are refusals BEFORE launch/guard effects.
+Do not copy/export/unset/replace hook settings or admission markers to pass.
+Exact checkout/catalog SHA256: {repo} / {c['catalog_sha256']}
+Inherited hook SHA256 (settings not copied): {context['hook_sha256']}
+cd '{repo}'
+
 '{python}' '{kit}' --operator-start {args}
 Admission may wait before any trace clock starts. Leave it foreground; do not retry.
 Wait for `GUARD READY` naming actual root/evidence and the120s ready window.
-No probe files exist yet. Terminal A must remain open.
+No probe files exist yet. The retained author keeps the command foreground and reports GUARD READY to Tom.
+Tom does not start heavy admission or the probe.
 
-Terminal B, only after that ready message, authenticate interactively:
+Tom's terminal, only after the author's GUARD READY message, authenticate interactively:
 /usr/bin/sudo -v
 Then immediately (within the ready window) start the unprivileged collector:
 '{python}' '{kit}' --operator-collect {args}
@@ -315,17 +383,17 @@ Probe also arms its own20s SIGALRM (no other process signalled); blocked kernel
 operations may delay delivery, and that uncertainty is not hidden. The unchanged
 300s guard remains the independent outer bound. Trace has30s timeout plus5s observation margin. No second trace or probe attempt.
 
-Abort: press Ctrl-C in Terminal B (your terminal/sudo owns privileged cancellation).
+Abort: press Ctrl-C in Tom's collector terminal (your terminal/sudo owns privileged cancellation).
 Kit never signals the tracer or another process. The probe alarms only itself.
 It writes the session abort indication and stops probe
 work cooperatively. If sudo/job has not exited by35s, collector retains UNKNOWN,
 prints its exact observable PID/start and stays foreground awaiting you. Press
-Ctrl-C in B to request normal sudo interruption and wait for its exit. If it
-still does not exit, leave both terminals open and return the UNKNOWN receipt,
+Ctrl-C in Tom's collector terminal to request normal sudo interruption and wait for its exit. If it
+still does not exit, leave the author command and collector terminal open and return the UNKNOWN receipt,
 PID/start to the planner; do not use a pattern kill, detach, disown or another
 root command. Root fs_usage descendants may not be independently observable;
 a sudo wait status is recorded at that level, never invented root closure.
-Terminal A separately waits for real guard completion; tracer exit is NOT probe
+The retained author separately waits for real guard completion; tracer exit is NOT probe
 closure and probe exit is NOT tracer closure. No cleanup of retained resources.
 
 View ONLY bounded receipts (never a raw trace):
@@ -339,8 +407,10 @@ ambiguity are INCONCLUSIVE, not proof no actor exists. fs_usage TOD microseconds
 collector monotonic arrival and kernel PID/start identity tokens have different
 bases; never order them as one causal clock. Process suffix is a reported THREAD
 ID per local fs_usage manpage, not a verified PID. No historical holder claim.
-Execution is observational only; mutation is recorded without recreation or
-adoption. No cost fixture, installation, live readiness, QA or merge follows.
+Probe STOPS at the first changed/missing identity or creation refusal, before
+any further creation or probe read; bounded refusal/descriptor rows are retained.
+The independent fixed30s tracer may finish its existing window. No recreation,
+adoption or second attempt. No cost fixture, installation, live readiness, QA or merge follows.
 '''
     fd = os.open(session / 'OPERATOR.md', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, 'w') as out:
@@ -365,10 +435,12 @@ def validate_ready(session, nonce, digest, ready):
 
 def operator_start(session, c, nonce, digest):
     # Explicit operator mode only. No override of admission or guard settings.
-    write_once(session / 'launch.json', dict(nonce=nonce, manifest=digest))
+    repo = launch_context(c)
+    run = os.environ.get('NUCLEUS_RUN_ID') or os.environ['NORTHSTAR_RUN_ID']
+    write_once(session / 'launch.json', dict(nonce=nonce, manifest=digest, worker_run=run))
     env = dict(os.environ, OXIDE_TRACE280_SESSION=str(session), OXIDE_TRACE280_NONCE=nonce,
                OXIDE_TRACE280_MANIFEST=digest)
-    route = subprocess.Popen(['effigy', TASK], env=env)
+    route = subprocess.Popen([c['effigy'], TASK], cwd=repo, env=env)
     while True:
         try:
             code = route.wait()
@@ -392,9 +464,13 @@ def operator_start(session, c, nonce, digest):
 
 
 def guarded_operator(session, c, nonce, digest):
-    if json.loads(private_file(session / 'launch.json')) != dict(nonce=nonce, manifest=digest):
+    launch_context(c, admitted=True)
+    run = os.environ.get('NUCLEUS_RUN_ID') or os.environ['NORTHSTAR_RUN_ID']
+    if json.loads(private_file(session / 'launch.json')) != dict(nonce=nonce, manifest=digest, worker_run=run):
         raise ValueError('wrong launch binding')
-    write_once(session / 'guard-entered.json', dict(nonce=nonce, manifest=digest))
+    write_once(session / 'guard-entered.json', dict(nonce=nonce, manifest=digest,
+               effigy_admitted=os.environ['EFFIGY_ADMITTED'], worker_run=run,
+               admission_evidence='normal inherited hook; marker advisory only'))
     kit = session / 'kit'
     env = {k: v for k, v in os.environ.items() if not k.startswith(('OXIDE_', 'XDG_'))}
     argv = [sys.executable, str(kit / 'bounded-test.py'), '--limit', '300',
@@ -402,6 +478,23 @@ def guarded_operator(session, c, nonce, digest):
             sys.executable, str(kit / 'matching-slot-trace.py'), '--probe', str(session), nonce, digest]
     os.umask(0o077)  # private future guard receipts; process-local, no host setting
     os.execve(sys.executable, argv, env)
+
+
+def signature(m):
+    return [m.st_dev, m.st_ino, m.st_mode, m.st_size, m.st_blocks,
+            m.st_mtime_ns, m.st_ctime_ns]
+
+
+def observe(path, name, original, rows, phase):
+    try:
+        observed = signature(path.lstat())
+    except OSError as error:
+        rows.append(dict(name=name, phase=phase, expected=original, error=type(error).__name__))
+        raise
+    rows.append(dict(name=name, phase=phase, expected=original, observed=observed,
+                     changed=observed != original))
+    if observed != original:
+        raise ValueError('probe creation identity changed; stop')
 
 
 def probe(session, c, nonce, digest):
@@ -461,15 +554,13 @@ def probe(session, c, nonce, digest):
                         out.write(b'O' * 40)
                         out.flush()
                         m = os.fstat(out.fileno())
-                        expected[name] = [m.st_dev, m.st_ino, m.st_mode, m.st_size, m.st_blocks,
-                                          m.st_mtime_ns, m.st_ctime_ns]
+                        expected[name] = signature(m)
                         rows.append(dict(name=name, phase='creation-descriptor', expected=expected[name]))
                     # immediate metadata observation, no payload read/adoption
-                    m = path.lstat()
-                    rows.append(dict(name=name, phase='post-close', expected=expected[name],
-                                     observed=[m.st_dev,m.st_ino,m.st_mode,m.st_size,m.st_blocks,m.st_mtime_ns,m.st_ctime_ns]))
+                    observe(path, name, expected[name], rows, 'post-close')
             except (OSError, ValueError) as error:
                 rows.append(dict(phase='creation_refusal', error=type(error).__name__))
+                raise
             outcome = 'metadata_observations_only; no attribution or qualification'
             while g.now_ns() < stop and len(rows) < 256:
                 if (session / 'abort.json').exists():
@@ -478,12 +569,7 @@ def probe(session, c, nonce, digest):
                 for name, original in expected.items():
                     if g.now_ns() >= stop:
                         break
-                    try:
-                        m = (tree / name).lstat()
-                        observed = [m.st_dev,m.st_ino,m.st_mode,m.st_size,m.st_blocks,m.st_mtime_ns,m.st_ctime_ns]
-                        rows.append(dict(name=name, expected=original, observed=observed, changed=observed != original))
-                    except OSError as error:
-                        rows.append(dict(name=name, expected=original, error=type(error).__name__))
+                    observe(tree / name, name, original, rows, 'poll')
                 time.sleep(.25)
         if alarm_installed:
             signal.setitimer(signal.ITIMER_REAL, 0)
@@ -491,7 +577,7 @@ def probe(session, c, nonce, digest):
             alarm_installed = False
         # bounded metadata only; reduce rows to fit a single small receipt
         write_once(evidence / 'trace-probe-receipt.json', dict(outcome=outcome, ready=ready,
-                   rows=rows[:40], observed_rows=len(rows), omitted_rows=max(0,len(rows)-40),
+                   rows=rows if len(rows) <= 40 else rows[:38] + rows[-2:], observed_rows=len(rows), omitted_rows=max(0,len(rows)-40),
                    closure='not claimed here; qualified guard owns closure'))
         return 0 if accepted else 1
     except Exception as error:
@@ -499,7 +585,7 @@ def probe(session, c, nonce, digest):
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, prior_alarm)
         write_once(evidence / 'trace-probe-refusal.json', dict(error=type(error).__name__,
-                   rows=rows[:40], observed_rows=len(rows), omitted_rows=max(0,len(rows)-40),
+                   rows=rows if len(rows) <= 40 else rows[:38] + rows[-2:], observed_rows=len(rows), omitted_rows=max(0,len(rows)-40),
                    effects='unknown if already activated; retained, never retried',
                    closure='guard verdict only'))
         raise
