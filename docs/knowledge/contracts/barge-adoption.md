@@ -52,11 +52,14 @@ owned by [workflow](workflow.md#pruning-owned-output-roots-oxide129) and
 
 ## Controlled decision comparison
 
-The three actual-engine calibration cases (oxide#279) passed at source
+Earlier actual-engine calibration receipts (oxide#279) passed at source
 `f12d65686b11fbc166e3afc3168142155b2c1f79`: one uncounted replacement
 `rust:release-comparison:diagnostic`, followed by one counted
 `rust:release-comparison`. Both run actual Oxide `prune::evaluate` and the
 unchanged feature-off pinned Barge `release::plan`, never copied policy.
+Independent review identified that the selected case also created the checkout,
+changing the candidate's absence premise. Those receipts therefore do not
+cover the required selected-but-absent control or establish task acceptance.
 
 | Case | Oxide | Barge |
 | --- | --- | --- |
@@ -69,8 +72,15 @@ Oxide's canonical `<mount>/oxide-outputs/<root>` and a root created through
 Barge's area API. Every case reports the union of both roots, actual
 completeness and reasons, and retains global refusal separately from per-root
 keeps/candidates. Assertions require the candidate in both engines and each
-control's intended gate, rejecting clock/policy masking. The selected case
-includes a present checkout; it does not compare selected-but-absent policy.
+control's intended gate, rejecting clock/policy masking. The corrected selected
+case keeps its checkout positively absent and changes only registry/receipt
+selection. It retains the no-offer expectation for both engines. No native
+occurrence at this corrected premise is authorised by the spent allowances;
+its actual outcomes and counted acceptance remain missing. Source inspection
+suggests a possible difference: Oxide validates the committed selection and
+then continues to checkout absence and custody, whereas Barge retains current
+references. This is a prediction, not an executed outcome or permission to
+change either engine.
 
 One fresh 128 MiB APFS image per occurrence supplies real kernel-verified
 mount/device/UUID facts to both engines. Its backing/evidence remain under

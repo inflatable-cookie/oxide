@@ -153,9 +153,10 @@ fn release_comparison_case(spec: ComparisonCase) {
     std::env::set_var("HOME", &home);
     std::env::set_var("OXIDE_TEST_HOME_FROM_ENV", "1");
     let checkout = base.join("checkout");
-    if spec.selected {
-        comparison_private_dir(&checkout);
-    }
+    // Selection is the sole changed premise of the selected control. Its
+    // checkout stays positively absent, just like the candidate's checkout.
+    assert!(matches!(fs::symlink_metadata(&checkout), Err(error)
+        if error.kind() == std::io::ErrorKind::NotFound));
     let account = ComparisonAccount(base.join("barge-account"));
     comparison_private_dir(&account.0);
     let state =
@@ -297,7 +298,7 @@ fn release_comparison_case(spec: ComparisonCase) {
     let report = serde_json::json!({"case": spec.name, "logical_root": spec.name, "now_ms": now_ms,
         "mapping": {"oxide": oxide_root, "barge": barge_root.path},
         "fixture_inputs": inputs,
-        "synthetic": {"selected": spec.selected, "checkout_present": spec.selected,
+        "synthetic": {"selected": spec.selected, "checkout_present": false,
             "state_known": spec.state_known, "barge_open_descriptors": [], "ledger_slots": []},
         "oxide": oxide_value, "barge": barge_value});
     let evidence = PathBuf::from(std::env::var_os("OXIDE_PROOF_EVIDENCE").unwrap());
@@ -333,14 +334,6 @@ fn release_comparison_case(spec: ComparisonCase) {
                 .references
                 .iter()
                 .any(|reference| reference.current),
-            "{report}"
-        );
-        assert!(
-            oxide[0]
-                .kept
-                .as_deref()
-                .unwrap_or_default()
-                .contains("checkout is present"),
             "{report}"
         );
     } else if !spec.state_known {
