@@ -52,8 +52,8 @@ owned by [workflow](workflow.md#pruning-owned-output-roots-oxide129) and
 
 ## Controlled decision comparison: interface limit
 
-The three-case fixture comparison (oxide#279) cannot reach Barge's release
-candidate through the approved feature-off dependency at
+The original synthetic-mount premise for the three-case fixture comparison
+(oxide#279) cannot reach Barge's release candidate through the feature-off pin
 `4af9360bd09629e970c143080ca159de8eef2562`. `release::plan` requires
 `MountRoot` and `AbsenceVolume`/`VolumeLocator`; their successful mount answers
 contain `os::MountPoint`. That type's `path` is private and its only constructor,
@@ -65,14 +65,36 @@ mount root.
 
 Planner answer `467200af1401ab13a531a88246f59b8395c71abeccb2e23b06951ef8d38620f5`
 (2026-11-05) confirms no identified safe public fixture route under this scope.
-A real verified mount requires an explicit planner amendment to the fixture
-premise. Do not forge the marker, enable features, change the pin or public
-surface, or substitute empty refusal comparisons.
+Brief v3 subsequently authorised Barge's existing public kernel-verification
+route on the already mounted Stash volume
+(`8A660440-C919-45C6-A3F1-3365B9BD2006`), with fictional account, registry and
+area data wholly inside private scratch. This resolves the Barge construction
+premise without adding a synthetic constructor or changing the pin/features.
+
+Oxide has a separate layout boundary: `prune::evaluate` calls
+`observe_row_root(row: &Row) -> Result<RootState, String>`, which takes
+`row.root.parent().parent()` as the mount and opens it with
+`Binding::open(mount, Some(uuid))` (`src/bin/oxide/prune.rs`).
+`Binding::open` calls `mount_name`, requiring exactly `/Volumes/<name>`
+(`src/volume.rs`). Thus a private scratch root such as
+`<fixture>/oxide-outputs/<root>` attempts to bind `<fixture>` as a mount and
+refuses. The accepted real layout would instead enter
+`/Volumes/Stash/oxide-outputs`, outside the authorised fixture prefix.
+The existing test-only `binding_for_test` helper does not replace that call.
+
+Planner answer
+`1f470a0b8c67fef02994f666193969a933dc621c57a0b33956c14cc595b35f97`
+(2026-11-05) confirms no identified permitted seam around this binding path.
+A dedicated owned fixture volume needs a separate explicit planner amendment.
+Do not enter the live output namespace, forge bindings, substitute aliases,
+change production readers or weaken the candidate expectation.
 
 None of the three cases was exercised: unselected v2 candidate with an absent
 checkout and closed writers; the same identity selected; or a missing/unknown
 required custody or admission fact. Both engines' case outcomes, the uncounted
-diagnostic and the counted native remain missing. This source-level limit
+diagnostic and the counted native remain missing; both native allowances are
+unspent. No kernel-verification run or fixture engine call was attempted.
+This source-level limit
 supplies no O2 input equivalence, D8/CF coverage or live qualification. The
 parent/descriptor binding gaps here and in Barge's
 `oxide-capture-parent-identity.md` remain unproven; oxide#241 and oxide#222
