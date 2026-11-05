@@ -2592,7 +2592,9 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
         }
         Case::Effect1 => {
             check(
-                doc.effects.iter().all(|effect| effect.get("attempted").and_then(|v| v.as_bool()) == Some(true))
+                doc.effects
+                    .iter()
+                    .all(|effect| effect.get("attempted").and_then(|v| v.as_bool()) == Some(true))
                     && diff_effects.is_empty(),
                 "missing-lock custody has no completed effect or fixture diff",
             )?;
