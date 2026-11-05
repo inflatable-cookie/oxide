@@ -2162,3 +2162,10 @@ transcripts are unavailable provenance, not required current review inputs;
 no reconstruction or attribution from unchanged source is claimed. Current
 review uses immutable source and checksum-verified retained Stash evidence.
 All earlier failures and limits remain historical and spent.
+
+Planner ruling 4c207fce (2026-11-05) permits one replacement 300 s / 512 MiB
+process diagnostic after the new control incorrectly expected `Writers` for
+pre-Cargo `Acquiring`. The real `Clear` custody verdict is distinct from the
+still-held record's availability. That failed run remains charged; the owned
+child's positive reap and observed descriptors remain evidence, not a pass.
+Original custody/seed oracles, CLOEXEC and historical uncertainty are preserved.
