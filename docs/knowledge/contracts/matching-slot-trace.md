@@ -8,20 +8,20 @@ unknown. All earlier failed/UNCLOSED evidence and charges stay historical.
 
 The fixed [kit](../../../scripts/matching-slot-trace.py) and
 [pure controls](../../../scripts/test_matching_slot_trace.py) were staged from
-pushed source `4b9c4842738fd6b15cfea2acc82d306e15e86ef7`. No/default/self-check
+pushed source `1385d6516a3a5f38784ba9b736688a6fa2ec5c7a`. No/default/self-check
 or prepare mode launches privileged/native work. The manual heavy selector is
 not a queue proof execution or automatic dispatch; it is held for separately
 activated operator use only. The existing guard is byte-identical and reused
 as a supervisor and, only in later operator modes, as the known-PID identity
 reader. No thread-to-process census or new signal authority is added.
 
-Session identity: device **16777245**, inode **57686444**, UID **501**, mode
-**0700**. `kit/` inode **57686445**, `runs/` inode **57686446**, same device/UID/mode.
+Session identity: device **16777245**, inode **57846900**, UID **501**, mode
+**0700**. `kit/` inode **57846902**, `runs/` inode **57846903**, same device/UID/mode.
 Stash UUID was read from single-volume metadata and device identity was checked
 against `/Volumes/Stash`; no pool, old fixture or account payload was scanned.
 Staged sources are owner-only executable/readable; control documents are0600.
 
-Pure Effigy controls passed **51** checks, including privacy/redaction, strict
+Pure Effigy controls passed **52** checks, including privacy/redaction, strict
 formats and thread-not-PID semantics, incremental/overlong/partial/capped
 streams, warning/drop indications, wrong/stale session gates, path escape and
 replacement, fresh/expired gate decisions, mocked nullable wait status and
@@ -61,28 +61,30 @@ parents. Preparation itself creates no .DS_Store/probe files, guard or trace.
 
 The following is a review copy, not an activation request. The byte-identical
 operator copy is `OPERATOR.md` inside the exact session path below; its hash is
-`6f1e37be23f8494286b9c201e73cc1ef7e6b3b2b439de01cd45f982b7633ea8f`.
+`666741f2bae3cbc03048e7ef650a3011ad460d691194fb83180ab814dda589d1`.
 Test-source SHA256 is
-`de6329b546ca4588bea56348428be43cbdf2ceab9ac9a411e4fa39bb1327582a`.
+`aab3a2f13d0aaa564b0c8e6cbbc91824ba987de72bdf99db4fb0bc5bd43a280d`.
+
+The first unused preparation directory (`trace280-55121f9d9800ea9318126949a96ea286-0e9n98pi`) remains retained and unactivated. It is superseded by the exact session below after the ordinary guard-launch receipt umask was made process-local077. No host setting or guard byte changed. Only this final session may be proposed for later activation.
 
 ```text
 # Oxide280: HELD pending exact-head review AND separate planner activation
 
-Session: /Volumes/Stash/scratch/oxide/trace280-55121f9d9800ea9318126949a96ea286-0e9n98pi
-Nonce: 55121f9d9800ea9318126949a96ea286
-Session manifest SHA256: a246cba0c38ff23417a6bd1af2766ca973e9a914174c363f5f7b639dbe9b73aa
-Source head: 4b9c4842738fd6b15cfea2acc82d306e15e86ef7
-Kit SHA256: e54bb9f668e96fe64a9648575fea9810d5babab6f3ae8efec6c02f1377b49d24
+Session: /Volumes/Stash/scratch/oxide/trace280-e8b13b426ebc79fcd87c62070622b1ab-ghticnxu
+Nonce: e8b13b426ebc79fcd87c62070622b1ab
+Session manifest SHA256: 76a8e2e24ec23dd47976e34116c461d69448ed3cc89275d174b9cc7c2e4e8674
+Source head: 1385d6516a3a5f38784ba9b736688a6fa2ec5c7a
+Kit SHA256: 7589db75f37e384ef509178da0ab0a395aa1240513d8006aeb9ad3b28f94048a
 Guard SHA256: fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b
 Stash UUID: 8A660440-C919-45C6-A3F1-3365B9BD2006
-Root-parent (later guard allocates one fresh child): /Volumes/Stash/scratch/oxide/trace280-55121f9d9800ea9318126949a96ea286-0e9n98pi/runs
+Root-parent (later guard allocates one fresh child): /Volumes/Stash/scratch/oxide/trace280-e8b13b426ebc79fcd87c62070622b1ab-ghticnxu/runs
 
 Do not run these activation commands during preparation or review.
 After reviewer acceptance, the planner must separately activate this ONE occurrence.
 All code below runs as your ordinary user. Never run Python, shell, or kit with sudo.
 
 Terminal A, after activation, starts normal real heavy admission:
-'/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9' '/Volumes/Stash/scratch/oxide/trace280-55121f9d9800ea9318126949a96ea286-0e9n98pi/kit/matching-slot-trace.py' --operator-start '/Volumes/Stash/scratch/oxide/trace280-55121f9d9800ea9318126949a96ea286-0e9n98pi' '55121f9d9800ea9318126949a96ea286' 'a246cba0c38ff23417a6bd1af2766ca973e9a914174c363f5f7b639dbe9b73aa'
+'/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9' '/Volumes/Stash/scratch/oxide/trace280-e8b13b426ebc79fcd87c62070622b1ab-ghticnxu/kit/matching-slot-trace.py' --operator-start '/Volumes/Stash/scratch/oxide/trace280-e8b13b426ebc79fcd87c62070622b1ab-ghticnxu' 'e8b13b426ebc79fcd87c62070622b1ab' '76a8e2e24ec23dd47976e34116c461d69448ed3cc89275d174b9cc7c2e4e8674'
 Admission may wait before any trace clock starts. Leave it foreground; do not retry.
 Wait for `GUARD READY` naming actual root/evidence and the120s ready window.
 No probe files exist yet. Terminal A must remain open.
@@ -90,7 +92,7 @@ No probe files exist yet. Terminal A must remain open.
 Terminal B, only after that ready message, authenticate interactively:
 /usr/bin/sudo -v
 Then immediately (within the ready window) start the unprivileged collector:
-'/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9' '/Volumes/Stash/scratch/oxide/trace280-55121f9d9800ea9318126949a96ea286-0e9n98pi/kit/matching-slot-trace.py' --operator-collect '/Volumes/Stash/scratch/oxide/trace280-55121f9d9800ea9318126949a96ea286-0e9n98pi' '55121f9d9800ea9318126949a96ea286' 'a246cba0c38ff23417a6bd1af2766ca973e9a914174c363f5f7b639dbe9b73aa'
+'/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9' '/Volumes/Stash/scratch/oxide/trace280-e8b13b426ebc79fcd87c62070622b1ab-ghticnxu/kit/matching-slot-trace.py' --operator-collect '/Volumes/Stash/scratch/oxide/trace280-e8b13b426ebc79fcd87c62070622b1ab-ghticnxu' 'e8b13b426ebc79fcd87c62070622b1ab' '76a8e2e24ec23dd47976e34116c461d69448ed3cc89275d174b9cc7c2e4e8674'
 The collector launches ONLY this privileged command, once:
 /usr/bin/sudo -n /usr/bin/fs_usage -w -f filesys -t 30
 No raw trace reaches your terminal or any file. Do not pipe fs_usage yourself.
@@ -116,7 +118,7 @@ Terminal A separately waits for real guard completion; tracer exit is NOT probe
 closure and probe exit is NOT tracer closure. No cleanup of retained resources.
 
 View ONLY bounded receipts (never a raw trace):
-'/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9' '/Volumes/Stash/scratch/oxide/trace280-55121f9d9800ea9318126949a96ea286-0e9n98pi/kit/matching-slot-trace.py' --receipts '/Volumes/Stash/scratch/oxide/trace280-55121f9d9800ea9318126949a96ea286-0e9n98pi' '55121f9d9800ea9318126949a96ea286' 'a246cba0c38ff23417a6bd1af2766ca973e9a914174c363f5f7b639dbe9b73aa'
+'/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9' '/Volumes/Stash/scratch/oxide/trace280-e8b13b426ebc79fcd87c62070622b1ab-ghticnxu/kit/matching-slot-trace.py' --receipts '/Volumes/Stash/scratch/oxide/trace280-e8b13b426ebc79fcd87c62070622b1ab-ghticnxu' 'e8b13b426ebc79fcd87c62070622b1ab' '76a8e2e24ec23dd47976e34116c461d69448ed3cc89275d174b9cc7c2e4e8674'
 
 Privacy/limits: only structurally parsed ASCII metadata events naming this exact
 fresh session prefix are retained (512KiB cap,4096B line bound). Other paths on

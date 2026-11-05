@@ -413,6 +413,7 @@ def probe(session, c, nonce, digest):
         raise ValueError('actual guard layout outside session')
     alarm_installed = False
     prior_alarm = None
+    rows = []
     try:
         deadline = int(os.environ['OXIDE_PROOF_DEADLINE_NS'])
         me = identity(g, os.getpid())
@@ -498,6 +499,7 @@ def probe(session, c, nonce, digest):
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, prior_alarm)
         write_once(evidence / 'trace-probe-refusal.json', dict(error=type(error).__name__,
+                   rows=rows[:40], observed_rows=len(rows), omitted_rows=max(0,len(rows)-40),
                    effects='unknown if already activated; retained, never retried',
                    closure='guard verdict only'))
         raise
