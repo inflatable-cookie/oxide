@@ -2129,15 +2129,30 @@ alone does not release that description's flock. The fixture child runs only
 after exec, before it opens its own fixture locks. There is no production lock
 change, retry, sleep or weakened refusal.
 
-The cfg(test) `fixture_description_control` owns a duplicate admission-lock
-descriptor and requires the real custody reader to report busy after the first
-descriptor closes, then clear after the duplicate closes. Its record-lock
-control requires a held old slot to stay held while a different new slot is
-`Fresh`. The seed-crash fixture separately requires reacquisition of its exact
-original slot and directory, `reused=true` and `Prior::Unknown`, before discard
-and cold allocation. Descriptor/device/inode and actual slot/Prior observations
-are printed by the scoped fixtures. These controls demonstrate the mechanism;
-they do not identify an uncaptured historical holder.
+The cfg(test) `fixture_description_control` runs in its own exact-test process
+and forks one owned child. That child reports its actual PID/PPID, both inherited
+lock descriptor numbers, device/inode and unchanged CLOEXEC flags. Until exec it
+uses only fixed async-signal-safe operations; two bounded gates let the parent
+observe the real custody refusal while the child holds admission, and writers
+plus a different `Fresh` slot while the child retains the record lock alone.
+The child then executes one fixed system command. The parent positively reaps
+that exact direct child before asserting old-slot recovery as `Unknown` and a
+clear released fixture. A caught oracle panic closes the gate and reaps before
+resuming; a child is never treated as closed merely because the parent dropped
+its descriptors. The qualified guard supplies the outer bound and custody.
+
+This demonstrates a process/descriptor hazard that targeted after-exec fixture
+isolation avoids; historical causation remains **UNKNOWN**. The former same-process
+`try_clone` control and the old slot-1/slot-2 observation alone did not establish
+process inheritance. The seed-crash fixture still requires its exact original
+slot/directory, `reused=true` and `Prior::Unknown`, before discard and cold
+allocation. No original trust or custody oracle is relaxed.
+
+The green ordinary suite at `4f3cd6c9` reached all embedded cases. Its
+`cold_seed_default_off` target reports **2 passed, 2 ignored**; the earlier PR
+statement that no tests were ignored was incorrect. The ignored-test policy is
+unchanged. Brief v3 authorizes one changed-input process-control diagnostic and,
+after it passes, one new final-head suite. All preceding evidence is preserved.
 
 The amended owner disposition (brief v2, 2026-11-05) permits this cfg(test)-only
 repair and changed-input validation on the same PR, prospectively superseding

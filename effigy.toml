@@ -1543,3 +1543,8 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 [tasks."proof:store-fixtures:controls"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- oxide test --bin oxide --locked store::tests::fixture_description_control -- --exact --nocapture"
+
+# Brief v3: one changed-input uncounted owned-process mechanism diagnostic.
+[tasks."proof:store-fixtures:process-diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/diagnose-store-fixtures.py --process-control"
