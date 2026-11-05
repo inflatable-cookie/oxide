@@ -167,6 +167,15 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
 - **Barge owns drive management** (approved, staged): volume registration and selection, placement and fallback, owned roots, pruning and scratch move to the separate Barge product ([inflatable-cookie/barge](https://github.com/inflatable-cookie/barge)), which Oxide will use as a library. Oxide keeps Cargo, slots, leases, recipes, freshness and `exec`. Until each part moves, Oxide's current implementation stays authoritative.
 - **Pools are budget-only:** a soft admission budget, whole-idle-slot eviction
   and the host-reserve watchdog, with no OS-enforced cap.
+- **Warm reuse redesign** (Tom, 2026-11-05, decision
+  `e3dccedb-0046-4003-a9a0-f4d44517cc44`, "Design warm reuse without a full
+  scan"): design normal matching-slot reuse without a mandatory recursive size
+  scan. Preserve root identity, ownership, leases, writer custody and backing
+  safeguards; allocation, eviction and OneUse slice rules stay outside this
+  change. Independent design review must resolve the descendant checks the
+  scan currently supplies, including mount boundaries and identity changes,
+  before implementation is briefed. This approves design only: the current
+  reuse gate remains implemented, and no runtime or QA readiness is established.
 - **Internal pool:** `~/Dev/oxide`, with a 100 GB budget. Config follows
   Longhorn's storage-location policy, through Longhorn's own resolver.
 - **The Builds drive** is the preferred pool:
