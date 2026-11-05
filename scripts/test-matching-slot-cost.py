@@ -19,7 +19,8 @@ Premises, traced through main/fixture and its sole Oxide child:
 9. Python mkdtemp uses explicit dir, no macOS mktemp default or fixed /tmp.
 
 No payload is read, pool walked, or production code changed. Fresh-created
-60,000-file Cargo shapes differ from the unavailable historical tree. A warm
+smaller-fixture Cargo shapes (7,172 file names) differ from the unavailable
+historical tree. A warm
 second walk is a result cross-check, not a cold-device benchmark. Source
 selection counts do not count syscalls. No universal throughput acceptance.
 --diagnostic keeps going across independent oracle failures in the test, always
@@ -54,7 +55,9 @@ def main():
     if not isinstance(own_metadata.st_blocks, int):
         raise SystemExit("allocated-block metadata unavailable")
     if sys.argv[1:] == ["--self-check"]:
-        print(json.dumps(dict(python=sys.version, metadata_api="Path.lstat", passed=True)))
+        print(json.dumps(dict(python=sys.version, metadata_api="Path.lstat",
+                              scale="smaller-fixture", file_names=7172, entries=7350,
+                              max_depth=14, passed=True)))
         return 0
     diagnostic = bool(sys.argv[1:])
     repo = Path(__file__).resolve().parent.parent
@@ -132,12 +135,12 @@ def main():
             output.write(b"oxide-280-deliberately-created-metadata\n")
         record_file(leaf)
 
-    files("debug/deps", 16000)
-    for unit in range(160):
-        files(f"debug/incremental/fixture_{unit:04x}-0123456789abcdef/s-session/working", 160)
-        files(f"debug/.fingerprint/fixture_{unit:04x}-0123456789abcdef", 40)
-    for unit in range(80):
-        files(f"debug/build/fixture_{unit:04x}-0123456789abcdef/out", 150)
+    files("debug/deps", 2048)
+    for unit in range(32):
+        files(f"debug/incremental/fixture_{unit:04x}-0123456789abcdef/s-session/working", 96)
+        files(f"debug/.fingerprint/fixture_{unit:04x}-0123456789abcdef", 16)
+    for unit in range(16):
+        files(f"debug/build/fixture_{unit:04x}-0123456789abcdef/out", 96)
     # One long-name/deeper path and a genuine cross-category hardlink oracle.
     files("debug/" + "/".join(["representative_name_0123456789"] * 12) + "/deps", 1)
     original = tree / "debug/deps/oxide_fixture_unit_0000-0123456789abcdef.o"
@@ -150,7 +153,7 @@ def main():
     # never enumerate additions and adopt them into the expected manifest.
     nodes[str(original.relative_to(tree))] = signature(original)
     record_file(alias)
-    if counts["entries"] != 60822 or counts["entries"] > 80000:
+    if counts["entries"] != 7350 or counts["files"] != 7172 or counts["files"] > 8192:
         raise SystemExit("fixture exceeds fixed layout")
     # Independent tiny negative control: freeze intended set BEFORE adding
     # the deliberately unplanned name. No oracle counts are adjusted for it.
@@ -181,7 +184,7 @@ def main():
         child = subprocess.run(COMMAND, cwd=repo, env=env, stdout=output, stderr=subprocess.STDOUT)
     observations = base / "observations.json"
     result = json.loads(observations.read_text()) if observations.exists() else None
-    receipt = dict(qualified=False, diagnostic=diagnostic, command=COMMAND,
+    receipt = dict(qualified=False, diagnostic=diagnostic, scale="smaller-fixture", command=COMMAND,
                    child_exit=child.returncode, fixture=str(base), retained_in_evidence=True,
                    counts={key: value for key, value in counts.items() if key not in ("nodes", "negative")},
                    expected_sha256=hashlib.sha256((base / "expected.json").read_bytes()).hexdigest(),
