@@ -23,6 +23,8 @@ smaller-fixture Cargo shapes (7,172 file names) differ from the unavailable
 historical tree. A warm
 second walk is a result cross-check, not a cold-device benchmark. Source
 selection counts do not count syscalls. No universal throughput acceptance.
+Measurement files0400/directories0500 protect against cooperative interference;
+creation identities are rechecked before freezing. This is not writer closure.
 --diagnostic keeps going across independent oracle failures in the test, always
 returns 1 and qualified:false. Infrastructure failures abort and retain their
 actual exit/log, without a replacement run. The shared guard alone supervises
@@ -56,7 +58,9 @@ def main():
         raise SystemExit("allocated-block metadata unavailable")
     if sys.argv[1:] == ["--self-check"]:
         print(json.dumps(dict(python=sys.version, metadata_api="Path.lstat",
-                              scale="smaller-fixture", file_names=7172, entries=7350,
+                              scale="smaller-fixture", permissions="files0400/directories0500",
+                              permission_apis=all(hasattr(os, key) for key in ["fchmod", "fstat", "O_NOFOLLOW", "O_DIRECTORY"]),
+                              file_names=7172, entries=7350,
                               max_depth=14, passed=True)))
         return 0
     diagnostic = bool(sys.argv[1:])
@@ -82,14 +86,16 @@ def main():
     counts = dict(entries=0, files=0, logical=0, allocated=0, directories=0)
     nodes = {}
 
-    def signature(path):
-        meta = path.lstat()
+    def stat_signature(meta):
         identity = [meta.st_dev, meta.st_ino, meta.st_mode]
         if stat.S_ISDIR(meta.st_mode):
             return identity
         return identity + [meta.st_size, meta.st_blocks,
                            meta.st_mtime_ns // 10**9, meta.st_mtime_ns % 10**9,
                            meta.st_ctime_ns // 10**9, meta.st_ctime_ns % 10**9]
+
+    def signature(path):
+        return stat_signature(path.lstat())
 
     root_identity = signature(tree)
 
@@ -145,16 +151,71 @@ def main():
     files("debug/" + "/".join(["representative_name_0123456789"] * 12) + "/deps", 1)
     original = tree / "debug/deps/oxide_fixture_unit_0000-0123456789abcdef.o"
     alias = tree / "debug/.fingerprint/shared-hardlink"
-    original_identity = signature(original)[:3]
+    original_before = nodes[str(original.relative_to(tree))]
+    if signature(original) != original_before:
+        raise SystemExit("original changed before deliberate hardlink")
     os.link(original, alias)
-    if signature(original)[:3] != original_identity:
-        raise SystemExit("hardlink creation changed original identity")
+    if signature(original)[:7] != original_before[:7]:
+        raise SystemExit("hardlink creation changed original identity or bytes")
     # Deliberate link creation changes ctime; record that known operation,
     # never enumerate additions and adopt them into the expected manifest.
     nodes[str(original.relative_to(tree))] = signature(original)
     record_file(alias)
     if counts["entries"] != 7350 or counts["files"] != 7172 or counts["files"] > 8192:
         raise SystemExit("fixture exceeds fixed layout")
+    # Validate every creation record before any permission transition. Never
+    # overwrite, adopt, or chmod a path already replaced by another writer.
+    if signature(tree) != root_identity:
+        raise SystemExit("root changed before permission protection")
+    for name, expected in nodes.items():
+        if signature(tree / name) != expected:
+            raise SystemExit("creation changed before permission protection: " + name)
+
+    # Operate through a no-follow descriptor and verify the creation identity
+    # again after open. chmod changes only our known mode/ctime; preserve all
+    # other recorded fields. A hardlink inode is changed once and both names'
+    # expected records receive that SAME deliberate operation's result.
+    groups = {}
+    for name, expected in nodes.items():
+        if stat.S_ISREG(expected[2]):
+            groups.setdefault(tuple(expected[:2]), []).append(name)
+
+    def protect(path, expected, mode):
+        flags = os.O_RDONLY | os.O_NOFOLLOW
+        if stat.S_ISDIR(expected[2]):
+            flags |= os.O_DIRECTORY
+        fd = os.open(path, flags)
+        try:
+            if stat_signature(os.fstat(fd)) != expected:
+                raise SystemExit("creation identity changed at permission open")
+            os.fchmod(fd, mode)
+            after = stat_signature(os.fstat(fd))
+            wanted = list(expected)
+            wanted[2] = stat.S_IFMT(expected[2]) | mode
+            if after[:7] != wanted[:7]:
+                raise SystemExit("permission change altered identity or bytes")
+            return after
+        finally:
+            os.close(fd)
+
+    for names in groups.values():
+        before = nodes[names[0]]
+        after = protect(tree / names[0], before, 0o400)
+        for name in names:
+            nodes[name] = after
+    # Deepest-first, with the root last. Bookkeeping and the negative control
+    # remain writable siblings outside this tree. Permissions are cooperative
+    # interference protection, NOT writer closure or attribution.
+    directories = [name for name, row in nodes.items() if stat.S_ISDIR(row[2])]
+    for name in sorted(directories, key=lambda name: name.count("/"), reverse=True):
+        nodes[name] = protect(tree / name, nodes[name], 0o500)
+    root_identity = protect(tree, root_identity, 0o500)
+    for name, expected in nodes.items():
+        if signature(tree / name) != expected:
+            raise SystemExit("creation changed before manifest freeze: " + name)
+    if signature(tree) != root_identity:
+        raise SystemExit("root changed before manifest freeze")
+
     # Independent tiny negative control: freeze intended set BEFORE adding
     # the deliberately unplanned name. No oracle counts are adjusted for it.
     negative = base / "negative"
@@ -185,7 +246,7 @@ def main():
     observations = base / "observations.json"
     result = json.loads(observations.read_text()) if observations.exists() else None
     receipt = dict(qualified=False, diagnostic=diagnostic, scale="smaller-fixture", command=COMMAND,
-                   child_exit=child.returncode, fixture=str(base), retained_in_evidence=True,
+                   child_exit=child.returncode, fixture=str(base), retained_in_evidence=True, permissions="files0400/directories0500",
                    counts={key: value for key, value in counts.items() if key not in ("nodes", "negative")},
                    expected_sha256=hashlib.sha256((base / "expected.json").read_bytes()).hexdigest(),
                    wall_seconds=time.monotonic() - started,
