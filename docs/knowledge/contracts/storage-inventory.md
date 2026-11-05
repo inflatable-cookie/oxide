@@ -254,8 +254,10 @@ private owned fixture directly under this evidence path; no outside-root or
 arbitrary fixture-path authority is added. Retention is deliberate and remains
 within the 512 MiB monitored total, not a resolution of old cleanup uncertainty.
 
-Expected names, directory identities and file identity/mode/size/allocation/
-mtime/ctime observations come only from deliberate creation. The two metadata
+The fixture intends names, directory identities and file identity/mode/size/
+allocation/mtime/ctime observations to describe deliberate creation; the later
+source-only audit below identifies a gap in binding file observations to the
+creation descriptor. The two metadata
 controls are exclusively created with known bytes, and ordinary inventory
 counts them as regular files. The fixed main layout is 60,822 entries, including
 60,004 file names and 818 directories. The oracle compares the intended name
@@ -368,6 +370,52 @@ permission-protection credit or counted evidence. Retained reviewer disposition
 planner disposition without automatic repetition, recreation or attribution.
 All prior failures, resources and charges remain preserved; admission and live
 readiness are still unrestored.
+
+### Source-only creation audit (oxide#280)
+
+The retained `46a1fbef` driver and the audited source at `805dffc1` have the
+same SHA-256,
+`95e3295629d31e1671815df645028449564be8279a916c6f49d435e9732f1caa`.
+The audit used the retained packet, source and local Python 3.9 library source;
+it did not inspect a fixture tree, execute the driver or change permissions.
+
+For each metadata control, driver lines 137–142 construct `tree / relative`,
+open it with `"xb"`, write inside a context manager, leave that context, then
+call `record_file`. Python's `Path.open` delegates to ordinary `io.open`, not
+an automatically deleting temporary-file wrapper. The context closes and
+flushes the ordinary file. `record_file` then makes **two pathname reads**:
+line 114 supplies byte counts and its inode-union key, while line 122 calls
+`signature`, which calls `Path.lstat` again for the expected signature. Neither
+read is an `fstat` of the exclusive-create descriptor.
+
+This is a source-proven **creation-provenance gap** in the test driver. A
+replacement after close could be recorded as though it were the created inode;
+a replacement between the two metadata reads could also make counts and the
+expected signature describe different observations. The records are not
+positively bound to the exclusive-open inode. This defect does not itself
+establish why the later `NotFound` happened, and it is not a product accounting
+defect or a measured runtime cost mechanism.
+
+The traceback at line 171 implies both earlier `record_file` pathname reads
+returned for the root metadata name. The same relative string `.DS_Store` is
+used to reconstruct `tree / name` at that recheck. `tree` is an absolute path
+under the canonical evidence base, is not reassigned, and no `chdir`, unlink,
+rename or removal occurs in the driver before the exception. The permission
+logic and child launch are later and were not reached. The unchanged guard's
+ordinary cleanup targets the sibling scratch directory after leader settlement,
+not this evidence tree. No driver-directed disappearance or divergent pathname
+has therefore been demonstrated. A previously successful pathname observation
+followed by `NotFound` remains unexplained; the audit identifies no actor or
+filesystem mechanism.
+
+The retained packet has source, guard receipt and a transcribed error in the
+author envelope, but no creation-descriptor metadata receipt or syscall trace.
+It cannot distinguish original-inode loss from an earlier replacement already
+adopted by the post-close reads, or assign the later lookup failure's origin.
+Retained reviewer disposition `3b705a55` confirms this distinction and returns
+the unresolved failure and missing proof to the planner. No executable repair,
+native attempt, permission workaround, guard change or counted run followed
+this source-only audit.
 
 ## Output and exit semantics
 

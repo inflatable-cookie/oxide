@@ -882,6 +882,11 @@ sizes; their replacement's origin remains unknown. No counted proof followed.
 The next cooperative permissions correction also stopped before measurement:
 a creation identity was missing before any permission change could run.
 That correction's effectiveness and the disappearance's cause remain unknown.
+The source-only audit also found that the fixture's expected metadata is read
+twice by pathname after closing the creation descriptor, so creation provenance
+is not pinned. That test-driver defect does not explain the later missing path;
+the [inventory audit](storage-inventory.md#source-only-creation-audit-oxide280)
+records the distinction and evidence limit. No runtime remedy is established.
 Admission remains **unrestored**; this precise-impediment outcome grants no
 installation or Effigy QA readiness and no performance qualification credit.
 
