@@ -238,13 +238,46 @@ class Filter:
         self.buffer.clear()
 
 
+GATE_CLOCK = 'CLOCK_UPTIME_RAW'
+
+
+def gate_record(ready, digest, challenge, guard):
+    # The qualified reader's system clock is shared across both processes.
+    # Python3.9 macOS monotonic origins are not a cross-process contract.
+    return dict(session=ready['session'], nonce=ready['nonce'], run=ready['run'],
+                probe=ready['probe'], ready_sha256=digest, clock=GATE_CLOCK,
+                issued_uptime_ns=guard.now_ns(), challenge=str(challenge))
+
+
+def gate_decision(gate, ready, digest, now):
+    decision = dict(accepted=False, reason='gate_not_object', clock=GATE_CLOCK,
+                    observed_uptime_ns=now, issued_uptime_ns=None, age_ns=None)
+    if not isinstance(gate, dict):
+        return decision
+    for field, expected in [('nonce', ready['nonce']), ('session', ready['session']),
+                            ('ready_sha256', digest), ('run', ready['run']),
+                            ('probe', ready['probe']),
+                            ('challenge', str(Path(ready['session']) / ('challenge-' + ready['nonce']))),
+                            ('clock', GATE_CLOCK)]:
+        if gate.get(field) != expected:
+            decision['reason'] = 'gate_' + field + '_mismatch'
+            return decision
+    issued = gate.get('issued_uptime_ns')
+    if type(issued) is not int or type(now) is not int:
+        decision['reason'] = 'gate_clock_value_invalid'
+        return decision
+    decision.update(issued_uptime_ns=issued, age_ns=now - issued)
+    if now < issued:
+        decision['reason'] = 'gate_timestamp_future'
+    elif now - issued > 3_000_000_000:
+        decision['reason'] = 'gate_expired'
+    else:
+        decision.update(accepted=True, reason='gate_accepted')
+    return decision
+
+
 def gate_valid(gate, ready, digest, now):
-    return (gate.get('nonce') == ready['nonce'] and gate.get('session') == ready['session'] and
-            gate.get('ready_sha256') == digest and gate.get('run') == ready['run'] and
-            gate.get('probe') == ready['probe'] and
-            type(gate.get('issued_mono_ns')) is int and
-            0 <= now - gate['issued_mono_ns'] <= 3_000_000_000 and
-            gate.get('challenge') == str(Path(ready['session']) / ('challenge-' + ready['nonce'])))
+    return gate_decision(gate, ready, digest, now)['accepted']
 
 
 TASK_ID = 'b2c68e24-53b8-4f24-b4ee-ec18cb74a999'
@@ -507,6 +540,7 @@ def probe(session, c, nonce, digest):
     alarm_installed = False
     prior_alarm = None
     rows = []
+    readiness = dict(accepted=False, reason='readiness_not_established', clock=GATE_CLOCK)
     try:
         deadline = int(os.environ['OXIDE_PROOF_DEADLINE_NS'])
         me = identity(g, os.getpid())
@@ -520,17 +554,26 @@ def probe(session, c, nonce, digest):
         print('GUARD READY ' + json.dumps(ready) + '; gate wait <=120s', flush=True)
         until = min(g.now_ns() + 120_000_000_000, deadline - 30_000_000_000)
         accepted = False
+        readiness['reason'] = 'readiness_wait_expired'
         while g.now_ns() < until:
             if (session / 'abort.json').exists():
+                readiness['reason'] = 'operator_abort_before_gate'
                 break
             if (session / 'gate.json').exists():
-                gate = json.loads(private_file(session / 'gate.json'))
-                accepted = gate_valid(gate, ready, ready_digest, time.monotonic_ns())
+                try:
+                    gate = json.loads(private_file(session / 'gate.json'))
+                    readiness = gate_decision(gate, ready, ready_digest, g.now_ns())
+                except (OSError, ValueError) as error:
+                    readiness.update(reason='gate_unreadable', error=type(error).__name__)
+                accepted = readiness['accepted']
                 break
             time.sleep(.1)
         rows = []
         outcome = 'readiness_refused_no_probe_files'
-        if accepted and deadline - g.now_ns() >= 50_000_000_000:
+        if accepted and deadline - g.now_ns() < 50_000_000_000:
+            accepted = False
+            readiness.update(accepted=False, reason='guard_shutdown_margin_insufficient')
+        if accepted:
             stop = min(g.now_ns() + 20_000_000_000, deadline - 30_000_000_000)
             def observation_alarm(_number, _frame):
                 raise TimeoutError('probe20s observation window ended')
@@ -576,7 +619,7 @@ def probe(session, c, nonce, digest):
             signal.signal(signal.SIGALRM, prior_alarm)
             alarm_installed = False
         # bounded metadata only; reduce rows to fit a single small receipt
-        write_once(evidence / 'trace-probe-receipt.json', dict(outcome=outcome, ready=ready,
+        write_once(evidence / 'trace-probe-receipt.json', dict(outcome=outcome, ready=ready, readiness=readiness,
                    rows=rows if len(rows) <= 40 else rows[:38] + rows[-2:], observed_rows=len(rows), omitted_rows=max(0,len(rows)-40),
                    closure='not claimed here; qualified guard owns closure'))
         return 0 if accepted else 1
@@ -584,7 +627,7 @@ def probe(session, c, nonce, digest):
         if alarm_installed:
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, prior_alarm)
-        write_once(evidence / 'trace-probe-refusal.json', dict(error=type(error).__name__,
+        write_once(evidence / 'trace-probe-refusal.json', dict(error=type(error).__name__, readiness=readiness,
                    rows=rows if len(rows) <= 40 else rows[:38] + rows[-2:], observed_rows=len(rows), omitted_rows=max(0,len(rows)-40),
                    effects='unknown if already activated; retained, never retried',
                    closure='guard verdict only'))
@@ -667,9 +710,7 @@ def collect(session, c, nonce, digest):
                     for event in parser.feed(chunk):
                         if (not gate and not aborted and elapsed <= 5 and event['operation'] in META and
                                 str(challenge) in event['owned_paths'] and probe_live(g, ready)):
-                            write_once(session / 'gate.json', dict(session=str(session), nonce=nonce,
-                                run=ready['run'], probe=ready['probe'], ready_sha256=sha(ready_raw),
-                                issued_mono_ns=time.monotonic_ns(), challenge=str(challenge)))
+                            write_once(session / 'gate.json', gate_record(ready, sha(ready_raw), challenge, g))
                             gate = True
             except KeyboardInterrupt:
                 # Terminal/sudo, not this kit, owns any privileged cancellation.

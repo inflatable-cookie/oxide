@@ -1,10 +1,53 @@
-# Scoped filesystem trace preparation (oxide#280)
+# Scoped filesystem trace investigation (oxide#280)
 
-**PREPARATION ONLY. Execution and merge remain held.** Operator decision
-`594bb959-c984-480b-8d37-8210a7abdeae` v2 authorized this kit and concrete
-control-plane staging, not a trace, probe, cost fixture or qualification.
-Admission is unrestored; historical cause and full-scale/live readiness remain
-unknown. All earlier failed/UNCLOSED evidence and charges stay historical.
+**SOURCE-ONLY CORRECTION. Execution and merge remain held.** Planner ruling
+`74aa602a` authorizes the clock correction and pure controls below, without
+restaging or another trace/probe/cost occurrence. The one activated occurrence
+at `6c4f2466` was inconclusive; its staged bytes, timestamps, receipts, resources
+and charges remain unchanged. Admission is unrestored; historical cause,
+full-scale/live readiness and the original counted cost proof remain unresolved.
+
+## Shared clock correction
+
+Gate issuance and comparison now both use the unchanged qualified guard's
+`now_ns()` reader: integer `CLOCK_UPTIME_RAW` nanoseconds. Python3.9 macOS
+`monotonic_ns()` has no shared-process-origin contract suitable for this gate.
+The new gate explicitly names its clock and `issued_uptime_ns`; the freshness
+window remains inclusive zero through3,000,000,000ns. Future or older timestamps,
+wrong clock, malformed values and session/run/identity/hash/path mismatches
+refuse. Old `issued_mono_ns` records are never converted, adopted or rewritten.
+Collector-local elapsed observation timing remains local; guard deadlines,
+120s readiness allowance,20s probe bound and shutdown margins are unchanged.
+
+Probe receipts now retain a bounded `readiness` decision: accepted/reason,
+clock and, for a valid clock comparison, issued/observed uptime and age.
+Malformed/unreadable gates, abort before gate, readiness timeout and inadequate
+guard shutdown margin have explicit refusal reasons. An accepted gate with
+insufficient remaining guard time returns refusal before probe effects.
+
+`effigy proof:matching-slot-trace:check` passed **123 pure checks** at this
+correction. Injected differing process clock origins have no effect on the
+shared-clock decision; exact3s, expired/future/wrong-clock/malformed gates and
+persisted rejection reasons are covered. Existing stop-on-first-change,
+privacy/bounds, custody, admission-context and nonmutation controls remain.
+No actual clock/probe/trace experiment or restaging validates this correction.
+
+The previous occurrence's gate was published, but its probe reported
+`readiness_refused_no_probe_files`, zero rows, author/Effigy exit1. Its guard
+closed status1 without fault/deadline. The collector exceeded30+5s observation
+margin, retained UNKNOWN/operator handoff, then recorded sudo wait0 while
+privileged descendant closure stayed unproven. The original gate contains
+`issued_mono_ns=3681133083`; the contemporaneous comparison value and rejection
+reason were not recorded. The clock-contract defect is source-proven, but its
+causal role in that refusal remains **unknown**. No actor attribution or trace,
+probe, cost, runtime-admission or closure credit follows this correction.
+
+Same retained reviewer must judge the changed source and pure evidence.
+The session and exact commands below are **historical, already used** and bind
+older executable bytes. They are not staging or activation for this correction.
+No further execution, cleanup, install or consumer QA is authorized.
+
+## Historical preparation packet (already used; do not execute)
 
 The fixed [kit](../../../scripts/matching-slot-trace.py) and
 [pure controls](../../../scripts/test_matching_slot_trace.py) were staged from
@@ -21,7 +64,7 @@ Stash UUID was read from single-volume metadata and device identity was checked
 against `/Volumes/Stash`; no pool, old fixture or account payload was scanned.
 Staged sources are owner-only executable/readable; control documents are0600.
 
-Pure Effigy controls passed **96** checks, including privacy/redaction, strict
+Historical preparation controls passed **96** checks, including privacy/redaction, strict
 formats and thread-not-PID semantics, incremental/overlong/partial/capped
 streams, warning/drop indications, wrong/stale session gates, path escape and
 replacement, fresh/expired gate decisions, mocked nullable wait status and
@@ -79,7 +122,7 @@ parents. Preparation itself creates no .DS_Store/probe files, guard or trace.
 
 ## Review copy of staged operator instructions
 
-The following is a review copy, not an activation request. The byte-identical
+The following is the preserved historical review copy, not an activation request. The byte-identical
 operator copy is `OPERATOR.md` inside the exact session path below; its hash is
 `7947a4c1132ea31af4cc654b45c137604d2de11ba3962fbf0afe15cf0df103a9`.
 Test-source SHA256 is
@@ -89,9 +132,8 @@ The session manifest also binds the exact checkout/catalog and hashes of the
 inherited supported admission context, without copying settings or credentials.
 
 Four earlier preparation directories with nonce prefixes55121f9d,e8b13b42,
-c32ffbbd,ba8f4aaf remain retained and never activated. Only the exact corrected
-session below may be proposed for later activation. Nothing was executed in
-any preparation. Review6668209287 is addressed by this source and restaging;
+c32ffbbd,ba8f4aaf remain retained and never activated. The session below was subsequently used for the one inconclusive occurrence.
+Earlier unused sessions remain retained; no new session is prepared here. Review6668209287 is addressed by this source and restaging;
 actual admission and trace/probe/counted evidence remain missing and held.
 
 ```text

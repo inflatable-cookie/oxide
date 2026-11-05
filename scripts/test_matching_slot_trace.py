@@ -56,12 +56,12 @@ with patch.object(kit.subprocess, 'Popen', side_effect=AssertionError('process l
     check('no unrelated trace stored', b'secret' not in b''.join(sink))
 
     ready = dict(session=P, nonce='a'*32, run='run-a', probe={'pid': 1, 'start': 2})
-    gate = dict(**ready, ready_sha256='digest', issued_mono_ns=100,
+    gate = dict(**ready, ready_sha256='digest', clock=kit.GATE_CLOCK, issued_uptime_ns=100,
                 challenge=P + '/challenge-' + 'a'*32)
     check('fresh gate', kit.gate_valid(gate, ready, 'digest', 101))
     for field, value in [('nonce', 'b'*32), ('session', P+'-other'), ('run','old-run'),
                          ('probe', {'pid':1,'start':3}), ('ready_sha256','old'),
-                         ('challenge', '/outside'), ('issued_mono_ns',1010)]:
+                         ('challenge', '/outside'), ('issued_uptime_ns',1010)]:
         wrong = dict(gate, **{field:value})
         check('wrong/stale gate refused: ' + field, not kit.gate_valid(wrong, ready, 'digest', 101))
     check('expired gate refused', not kit.gate_valid(gate, ready, 'digest', 3_000_000_101))
@@ -236,7 +236,9 @@ for label, observations, expected_creates, expected_reads, fails in (
         ('subsequent change',[m,m,m,changed],3,4,True),
         ('subsequent disappearance',[m,m,m,FileNotFoundError()],3,4,True),
         ('late change',[m]*42+[changed],3,43,True),
-        ('unchanged',[m]*300,3,None,False)):
+        ('unchanged',[m]*300,3,None,False),
+        ('expired readiness',[],0,0,False),
+        ('wrong clock readiness',[],0,0,False)):
     records=[]; clock=Clock()
     g=SimpleNamespace(now_ns=lambda:clock.tick()*100_000_000)
     env=dict(OXIDE_TASK_SCRATCH_ROOT=P+'/runs/oxide-proof.a/scratch',
@@ -251,7 +253,10 @@ for label, observations, expected_creates, expected_reads, fails in (
                      patch.object(kit,'fact',return_value={}),
                      patch.object(kit,'write_once',side_effect=lambda p,v:records.append((p.name,v))),
                      patch.object(kit,'private_file',return_value=b'{}'),
-                     patch.object(kit,'gate_valid',return_value=True),
+                     patch.object(kit,'gate_decision',return_value={'accepted':expected_creates>0,
+                                  'reason':'gate_expired' if label=='expired readiness' else
+                                  'gate_clock_mismatch' if label=='wrong clock readiness' else 'gate_accepted',
+                                  'clock':kit.GATE_CLOCK}),
                      patch.object(Path,'exists',exists), patch.object(Path,'mkdir'),
                      patch.object(kit.os,'fdopen'), patch.object(kit.os,'fstat',return_value=m),
                      patch.object(kit.time,'sleep'), patch.object(kit.signal,'signal'),
@@ -267,9 +272,42 @@ for label, observations, expected_creates, expected_reads, fails in (
         check(label+' no additional creation',creates.call_count==expected_creates)
         check(label+' no additional read',expected_reads is None or reads.call_count==expected_reads)
         receipt=records[-1][1]
-        check(label+' descriptor rows retained',any(r.get('phase')=='creation-descriptor' for r in receipt['rows']))
+        check(label+' descriptor facts match effects',any(r.get('phase')=='creation-descriptor' for r in receipt['rows'])==(expected_creates>0))
         if fails:
             check(label+' bounded refusal retained',records[-1][0]=='trace-probe-refusal.json' and any(r.get('changed') or r.get('error') for r in receipt['rows']))
-        else:
+        elif expected_creates:
             check('nonmutation finishes normally',result==0 and records[-1][0]=='trace-probe-receipt.json')
+        else:
+            check(label+' reason persisted without effects',result==1 and receipt['readiness']['reason'] in ('gate_expired','gate_clock_mismatch') and receipt['rows']==[])
 print(json.dumps(dict(final_total_passed=len(checks), execution='PURE MOCKS ONLY; no admission/guard/probe/trace')))
+
+
+# Cross-process freshness uses only injected qualified shared uptime, even
+# when Python monotonic clocks have unrelated origins. No real clock read.
+ready=dict(session=P,nonce='a'*32,run='mock-run',probe={'pid':1,'start':2})
+challenge=Path(P)/('challenge-'+ready['nonce'])
+for collector_origin,probe_origin in [(0,90_000_000_000),(90_000_000_000,0)]:
+    shared=SimpleNamespace(now_ns=lambda:100_000_000_000)
+    with patch.object(kit.time,'monotonic_ns',return_value=collector_origin) as local:
+        gate=kit.gate_record(ready,'digest',challenge,shared)
+        check('collector does not read process-origin clock '+str(collector_origin),local.call_count==0)
+    with patch.object(kit.time,'monotonic_ns',return_value=probe_origin) as local:
+        d=kit.gate_decision(gate,ready,'digest',101_000_000_000)
+        check('differing clock origins still fresh '+str(probe_origin),d['accepted'] and d['age_ns']==1_000_000_000 and local.call_count==0)
+    check('shared3s exact boundary accepted '+str(collector_origin),kit.gate_valid(gate,ready,'digest',103_000_000_000))
+    d=kit.gate_decision(gate,ready,'digest',103_000_000_001)
+    check('shared3s unchanged rejection '+str(collector_origin),d['reason']=='gate_expired' and not d['accepted'] and d['age_ns']==3_000_000_001)
+    d=kit.gate_decision(gate,ready,'digest',99_999_999_999)
+    check('future clock explicitly refused '+str(collector_origin),d['reason']=='gate_timestamp_future' and not d['accepted'])
+for field,value,reason in [('clock','process-local','gate_clock_mismatch'),
+                           ('issued_uptime_ns',True,'gate_clock_value_invalid'),
+                           ('nonce','wrong','gate_nonce_mismatch'),
+                           ('ready_sha256','wrong','gate_ready_sha256_mismatch')]:
+    d=kit.gate_decision(dict(gate,**{field:value}),ready,'digest',101_000_000_000)
+    check('explicit rejection reason '+field,not d['accepted'] and d['reason']==reason)
+old=dict(gate);del old['clock'];del old['issued_uptime_ns'];old['issued_mono_ns']=3681133083
+check('old timestamps neither adopted nor reinterpreted',kit.gate_decision(old,ready,'digest',101_000_000_000)['reason']=='gate_clock_mismatch' and old['issued_mono_ns']==3681133083)
+check('malformed gate rejection recorded',kit.gate_decision(None,ready,'digest',101_000_000_000)['reason']=='gate_not_object')
+source=Path(kit.__file__).read_text()
+check('actual probe compares qualified clock and records reason', 'gate_decision(gate, ready, ready_digest, g.now_ns())' in source and 'readiness=readiness' in source and 'time.monotonic_ns()' not in source)
+print(json.dumps(dict(final_total_passed=len(checks), execution='PURE MOCKS ONLY; no restaging/admission/guard/probe/trace')))

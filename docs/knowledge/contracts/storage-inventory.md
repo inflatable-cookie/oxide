@@ -472,6 +472,18 @@ launch. Tom starts only the separate collector. The probe now stops on its
 first changed/missing identity, retaining descriptor/refusal rows without
 further creation or polling. Pure injected controls cover these cases; actual
 execution remains held. This does not explain or prevent prior disappearance.
+The subsequent single activated trace at `6c4f2466` refused probe readiness
+before creating probe files and remained inconclusive. The guard closed
+status1 without fault/deadline; collector UNKNOWN/handoff and later sudo wait0
+provide no independent privileged descendant closure. Planner `74aa602a`
+authorizes only a source clock correction: gate issuance/comparison now share
+the unchanged guard's `CLOCK_UPTIME_RAW`, retaining the3s freshness limit and
+all deadlines. Pure controls cover differing process-local clock origins and
+explicit rejection receipts. Old timestamps and staged bytes stay historical;
+no restage or retry is authorized. The old comparison/rejection reason was not
+recorded, so the source defect does not establish the cause of that refusal.
+The original passing cost diagnostic/count and admission readiness stay missing.
+
 
 ## Output and exit semantics
 
