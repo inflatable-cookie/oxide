@@ -1564,3 +1564,17 @@ run = "oxide test --lib --locked inventory -- --test-threads=1"
 
 [tasks."proof:matching-slot-cost:check"]
 run = "python3 scripts/test-matching-slot-cost.py --self-check"
+
+# #280 PREPARATION ONLY: pure inputs/mocked interfaces, no root/native effects.
+[tasks."proof:matching-slot-trace:check"]
+run = "python3 scripts/matching-slot-trace.py --self-check"
+
+# Manual operator route HELD pending exact-head review + separate activation.
+# No automatic execution/queue proof declaration. Default/prep never invokes it.
+[tasks."proof:matching-slot-trace:operator"]
+admission = "heavy"
+run = "python3 scripts/matching-slot-trace.py --guarded-operator"
+
+# Explicit control-plane staging only: no guard/probe/trace/admission.
+[tasks."proof:matching-slot-trace:prepare"]
+run = "python3 scripts/matching-slot-trace.py --prepare"
