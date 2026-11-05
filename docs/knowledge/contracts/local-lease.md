@@ -887,6 +887,10 @@ twice by pathname after closing the creation descriptor, so creation provenance
 is not pinned. That test-driver defect does not explain the later missing path;
 the [inventory audit](storage-inventory.md#source-only-creation-audit-oxide280)
 records the distinction and evidence limit. No runtime remedy is established.
+The authorized descriptor-based correction then captured creation metadata and
+a matching post-close pathname, but the later lookup still failed before
+measurement. Creation provenance is now bound for that failed occurrence;
+its disappearance remains unexplained and no counted proof followed.
 Admission remains **unrestored**; this precise-impediment outcome grants no
 installation or Effigy QA readiness and no performance qualification credit.
 

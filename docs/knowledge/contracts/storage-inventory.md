@@ -417,6 +417,44 @@ the unresolved failure and missing proof to the planner. No executable repair,
 native attempt, permission workaround, guard change or counted run followed
 this source-only audit.
 
+Planner direction `b7e82fd7` subsequently authorized the demonstrated provenance
+correction. Driver `d5ee533f` flushes known creation writes, takes **one fstat
+of that creation descriptor**, and uses that same metadata for byte counts,
+inode union and expected signature. After close it compares the pathname with
+the descriptor-derived signature and refuses missing or differing observations.
+The deliberate hardlink is likewise checked through a verified descriptor;
+pathname reads do not supply its count/signature. Bounded JSONL evidence keeps
+descriptor observations and subsequent path comparisons inside current evidence
+(at most 32,000 rows of 4,096 encoded bytes, within the monitored total).
+
+Four pure, mocked-metadata regression controls passed through Effigy: replacement
+at each former pathname-read window is not adopted and is refused, disappearance
+after close is refused, and unchanged creation is accepted. These controls do
+not explain or prevent the historical filesystem observation changes.
+
+The one authorized changed-input diagnostic again failed before permission
+transitions, manifest freeze or inventory/compiler launch: its initial creation
+recheck at driver line 251 found `tree/.DS_Store` missing. This time retained
+evidence binds the observed creation: device 16777245, inode 53566551, size 40,
+mode 33188 and 8 allocated blocks came from the flushed descriptor, and the
+immediate post-close pathname observation matched. A later row records
+`FileNotFoundError` against that same expected identity. The known provenance
+gap is closed for this occurrence; the later failed lookup's cause and actor
+remain **UNKNOWN**. No replacement was adopted or missing file recreated.
+
+Evidence is at `/Volumes/Stash/scratch/oxide/oxide-proof.i5iy6kat/evidence/`:
+`matching-cost-5r_3li7l/creation-metadata.jsonl` is 4,969,746 bytes, SHA-256
+`6445fb8cb0888b93a9f2051e4046c8a43b4ead60ce15c3af996563ab270aa80b`;
+`receipt.json` SHA-256 is
+`f6e31d39f05a1c987c526071bca8eeaa4c0c4109830fd8b48c397f77700688c8`.
+The guard closed, status 1, no fault/deadline, Effigy 1; sampled peak was
+29,290,496 bytes of 512 MiB, minimum free 3,236,120,662,016 bytes. No permission
+effectiveness, inventory timing, passing diagnostic or counted proof resulted.
+Retained reviewer disposition `ec481075` returns this descriptor-bound
+disappearance for planner disposition, without another workaround or attempt.
+All prior evidence, failures and charges remain preserved; admission and
+historical/full-scale/live readiness remain unresolved.
+
 ## Output and exit semantics
 
 Human output is concise: root, coverage, visited counts, a per-category table
