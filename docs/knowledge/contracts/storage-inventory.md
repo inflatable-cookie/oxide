@@ -309,6 +309,38 @@ before execution. The passing diagnostic and original counted occurrence
 remain missing; admission, full-scale behavior and historical cause remain
 unresolved. All prior failures and kept resources remain unchanged.
 
+The Nucleus owner subsequently confirmed its supported compatibility-link
+repair and authorized one diagnostic through the repaired normal heavy route,
+without a hook change by this author. At `4576f67e` (executable source
+`513c6350`) admission succeeded, but the test failed
+`fixture identity/name uncertainty before measurement` and exited 101.
+The guard closed with command status 1, no fault or deadline, and Effigy
+returned 1. Positive closure did not make the failed fixture a passing
+diagnostic; no counted occurrence followed. No inventory timing was produced.
+
+This occurrence's packet is at
+`/Volumes/Stash/scratch/oxide/oxide-proof.7t3oonbe/evidence/`
+(`receipt.json`, `matching-cost.json`, `matching-cost-child.log`). Guard receipt
+SHA-256 is `8a59589b141e900f60db5a784eea75b5ab33bd646eaf4a07f8706a440c3fc950`;
+sampled peak was 30,683,136 bytes of 512 MiB and minimum sampled free space was
+3,236,558,389,248 bytes. The generated manifest declared 7,350 entries and
+7,172 file names, but the fixed-tree precondition refused before measurement.
+
+A post-failure, metadata-only observation of this occurrence found two changed
+files: `.DS_Store` inode 52177443 became 52185485, and `debug/.DS_Store` inode
+52177445 became 52181764. Both deliberately created 40-byte files were then
+6,148 bytes with changed timestamps and allocation. No names were missing,
+the root identity matched, and no other manifest mismatch was observed.
+The observation is not atomic, does not read payloads or update the oracle,
+and does not establish who or what replaced the files. Its recorded result is
+`post-failure-metadata-observation.json` in that evidence directory, SHA-256
+`64edef91054bafdb6ccd7575c26c9c6e44cbcdc057164f832814d85c86d64d51`.
+Retained reviewer disposition `e7b2dd0b` requires returning this unexplained
+replacement for planner disposition: no additional attempt or weaker identity
+check is authorized. The required counted evidence remains missing. All earlier
+failures, UNCLOSED resources and charges remain history; admission and live
+readiness remain unrestored, with historical causation **UNKNOWN**.
+
 ## Output and exit semantics
 
 Human output is concise: root, coverage, visited counts, a per-category table

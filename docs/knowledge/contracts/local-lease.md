@@ -875,6 +875,10 @@ correction has not received another native occurrence. No counted proof
 followed either inadequate diagnostic.
 The smaller-fixture continuation was then refused before admission by a
 missing Nucleus runtime in Effigy's hook; it produced no new walk or proof.
+After the owner repaired that route, the authorized diagnostic closed but
+failed its fixed-tree precondition before measurement. A later metadata-only
+observation found both deliberate metadata files had different inodes and
+sizes; their replacement's origin remains unknown. No counted proof followed.
 Admission remains **unrestored**; this precise-impediment outcome grants no
 installation or Effigy QA readiness and no performance qualification credit.
 
