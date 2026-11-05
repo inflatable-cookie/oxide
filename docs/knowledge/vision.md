@@ -174,8 +174,13 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   safeguards; allocation, eviction and OneUse slice rules stay outside this
   change. Independent design review must resolve the descendant checks the
   scan currently supplies, including mount boundaries and identity changes,
-  before implementation is briefed. This approves design only: the current
-  reuse gate remains implemented, and no runtime or QA readiness is established.
+  before implementation is briefed. Tom's subsequent decision
+  `23f2fa22-2a1c-4834-b74f-88ce008b4328` v2, "Implement reviewed warm reuse,"
+  authorizes the independently reviewed Normal-only policy: Cargo may encounter
+  descendant symlinks or nested mounts without a pregrant scan. Oxide remains a
+  cooperative root-bound lease, not a descendant sandbox. Implementation and
+  targeted verification proceed through the scoped Queue brief and independent
+  review; the ruling itself establishes no runtime or QA readiness.
 - **Internal pool:** `~/Dev/oxide`, with a 100 GB budget. Config follows
   Longhorn's storage-location policy, through Longhorn's own resolver.
 - **The Builds drive** is the preferred pool:
