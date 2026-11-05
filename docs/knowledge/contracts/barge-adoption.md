@@ -50,136 +50,99 @@ owned by [workflow](workflow.md#pruning-owned-output-roots-oxide129) and
 [local lease](local-lease.md). The authority boundary is in
 [vision](../vision.md#storage) and [architecture](../architecture.md#storage-invariants).
 
-## Controlled decision comparison: interface limit
+## Controlled decision comparison
 
-The original synthetic-mount premise for the three-case fixture comparison
-(oxide#279) cannot reach Barge's release candidate through the feature-off pin
-`4af9360bd09629e970c143080ca159de8eef2562`. `release::plan` requires
-`MountRoot` and `AbsenceVolume`/`VolumeLocator`; their successful mount answers
-contain `os::MountPoint`. That type's `path` is private and its only constructor,
-`new`, is `pub(crate)` (`crates/barge/src/os/facts.rs`). Barge's synthetic
-constructors live in its `cfg(test)` crate-private `testkit`, unavailable to
-Oxide's in-crate tests. The public macOS implementation constructs the marker
-only after real mount verification; a fresh owned fixture directory is not a
-mount root.
+The three actual-engine calibration cases (oxide#279) passed at source
+`f12d65686b11fbc166e3afc3168142155b2c1f79`: one uncounted replacement
+`rust:release-comparison:diagnostic`, followed by one counted
+`rust:release-comparison`. Both run actual Oxide `prune::evaluate` and the
+unchanged feature-off pinned Barge `release::plan`, never copied policy.
 
-Planner answer `467200af1401ab13a531a88246f59b8395c71abeccb2e23b06951ef8d38620f5`
-(2026-11-05) confirms no identified safe public fixture route under this scope.
-Brief v3 subsequently authorised Barge's existing public kernel-verification
-route on the already mounted Stash volume
-(`8A660440-C919-45C6-A3F1-3365B9BD2006`), with fictional account, registry and
-area data wholly inside private scratch. This resolves the Barge construction
-premise without adding a synthetic constructor or changing the pin/features.
+| Case | Oxide | Barge |
+| --- | --- | --- |
+| Unselected v2 root, absent checkout, closed writers | Complete; candidate | Complete references; candidate; positive checkout absence |
+| Selected root, present checkout | Complete; kept because checkout is present | Complete references; kept by current registry/receipt/marker references |
+| Required state contains malformed JSON (`{`) | Incomplete authority; whole batch kept for unknown writer custody | Incomplete references; kept for unknown pool/checkout custody |
 
-Oxide has a separate layout boundary: `prune::evaluate` calls
-`observe_row_root(row: &Row) -> Result<RootState, String>`, which takes
-`row.root.parent().parent()` as the mount and opens it with
-`Binding::open(mount, Some(uuid))` (`src/bin/oxide/prune.rs`).
-`Binding::open` calls `mount_name`, requiring exactly `/Volumes/<name>`
-(`src/volume.rs`). Thus a private scratch root such as
-`<fixture>/oxide-outputs/<root>` attempts to bind `<fixture>` as a mount and
-refuses. The accepted real layout would instead enter
-`/Volumes/Stash/oxide-outputs`, outside the authorised fixture prefix.
-The existing test-only `binding_for_test` helper does not replace that call.
+One case specification maps each logical root to two physical fixture roots:
+Oxide's canonical `<mount>/oxide-outputs/<root>` and a root created through
+Barge's area API. Every case reports the union of both roots, actual
+completeness and reasons, and retains global refusal separately from per-root
+keeps/candidates. Assertions require the candidate in both engines and each
+control's intended gate, rejecting clock/policy masking. The selected case
+includes a present checkout; it does not compare selected-but-absent policy.
 
-Planner answer
-`1f470a0b8c67fef02994f666193969a933dc621c57a0b33956c14cc595b35f97`
-(2026-11-05) confirms no identified permitted seam around this binding path.
-A dedicated owned fixture volume needs a separate explicit planner amendment.
-Do not enter the live output namespace, forge bindings, substitute aliases,
-change production readers or weaken the candidate expectation.
+One fresh 128 MiB APFS image per occurrence supplies real kernel-verified
+mount/device/UUID facts to both engines. Its backing/evidence remain under
+Stash's qualified guard root. `scripts/test-release-comparison.py` reuses the
+owned-image kit: custody indication before attachment, `-nobrowse -owners on`,
+raw attach retention and guard-only post-census detach. No deletion verb runs.
+The guard remains byte-identical `fcfda2b0…`; each occurrence has 300 s and
+512 MiB bounds. Barge's empty descriptor observation/self identity and the
+empty lease ledgers are explicitly synthetic. Account, registry, receipt,
+marker and control files are fictional and fixture-owned. Compilation uses
+ordinary managed storage; no internal fixture root is needed.
 
-Brief v4 authorises that bounded premise correction: one fresh owned 128 MiB
-APFS image per occurrence, backed in Stash guard evidence. The test-only
-`release_comparison_*` cases use actual Oxide `evaluate` and pinned feature-off
-Barge `release::plan`. One case specification maps each logical root to an
-Oxide root in the image's canonical `oxide-outputs` layout and a Barge root
-created by its ordinary area API. Checkout, selection and missing-state facts
-are shared; Barge's empty descriptor observation and the empty lease ledgers
-are explicitly synthetic. Mount facts are verified normally by both engines.
-The selected control has a present checkout and matching current reference;
-the original unknown control omitted pool state (corrected below). This is decision calibration,
-not a claim that a selected-but-absent checkout has identical policy.
+The shared unknown premise is source-traced: Oxide's
+`PoolWitness::read_state` passes the required state bytes to its actual parser
+and refuses the authority batch on invalid JSON. Barge's
+`PoolCustody::read_pool` passes the same bytes to `parse_state`, records
+pool-wide unknown, and `OxideSnapshot::references_for` makes references
+incomplete. The comparison-local markers carry `checkout_volume_uuid` before
+digest derivation, matching the production root/2 format. The request clock
+is actual post-setup time; unchanged `ReleaseOnReference` has no minimum
+age/cooldown but requires known activity no later than that clock.
 
-`rust:release-comparison:diagnostic` and `rust:release-comparison` use the
-unchanged qualified guard (`fcfda2b0…`), 300 s and 512 MiB each. The short
-driver reuses the owned-image attachment kit, publishes image custody before
-attachment and requests only guard-owned post-census detach. The Rust cases
-retain actual input bytes and both engine results in guard evidence; global
-refusals remain distinct from per-root keeps. No effect/deletion verb runs.
+Successful evidence under `/Volumes/Stash/scratch/oxide/`:
 
-The first uncounted diagnostic at `7d36faaa` exercised all three cases:
-Oxide offered the unselected v2 root with absent checkout/closed writers, kept
-the selected root with present checkout, and refused the whole missing-state
-batch as incomplete. Barge kept all three at its policy gate: the fixture's
-`now_ms=1000` predated actual root activity. Thus the candidate assertion failed
-and both Barge controls were masked, despite two libtest passes. Exit 101,
-closed guard, no fault/deadline; post-census detach succeeded. Evidence remains
-at `/Volumes/Stash/scratch/oxide/oxide-proof.xypmxi9_/evidence` (300 s/512 MiB;
-8.1 MiB sampled owned peak, 3059.8 GiB minimum reserve). This occurrence is
-spent and supplies no counted credit.
+- `oxide-proof._ad3hi_s/evidence`: uncounted diagnostic, 3/3 cases, exit 0,
+  37.72 s to receipt publication, minimum reserve 3044.6 GiB, sampled owned
+  peak 8.1 MiB; receipt SHA-256
+  `955a106ebc77a6ccd5e3868f9a906a5ce7c7e9a6bf215d7ea61189bbdb632c6f`.
+- `oxide-proof.t402z4xm/evidence`: counted comparison, 3/3 cases, exit 0,
+  8.39 s to publication, minimum reserve 3043.7 GiB, sampled peak 8.1 MiB;
+  receipt SHA-256
+  `727ff9468cf116d7234061564d0d0d0b73cfa7a8de595d17c335ec3c02f6f8c7`.
 
-Planner amendment `3842b045764b1011819a168cccfe969f20fadaf0df01b1abd2b27c75af7ca2ee`
-permits only a test-clock correction and one replacement uncounted diagnostic.
-The request now uses actual post-setup time; the unchanged
-`ReleaseOnReference` policy has no minimum age/cooldown but still requires
-known activity no later than the request. Explicit assertions reject policy
-masking and require current-reference and unknown-custody control evidence.
-Counted execution stays gated on adequate diagnostic evidence.
+Both guards closed with no fault or deadline, positively reaped their detach
+children and verified ordinary post-census detach. Backings and evidence are
+retained. Sampling is not a quota. The case reports retain actual fixture
+input bytes, adapter facts and both engine results; ordinary logs bind source,
+pin, exits and guard outcomes.
 
-The replacement at `5254a9ec` removed policy masking, but failed the candidate
-and unknown-gate checks (exit 101). Oxide again offered the positive root,
-kept the present selected checkout and refused the missing-state batch.
-Barge kept the selected root at its current-reference gate, but kept the
-positive and missing-state roots at `absence`: two records disagree about
-the checkout volume. Both engines reported one mapped root in every case.
-Evidence: `/Volumes/Stash/scratch/oxide/oxide-proof.scz62jay/evidence`;
-23.65 s to receipt publication, closed/no fault/no deadline, ordinary guard
-detach succeeded, sampled owned peak 8.1 MiB/512 MiB and minimum reserve
-3060.1 GiB. The first occurrence took 66.36 s to publication. Neither is a
-counted PASS; both diagnostic allowances are spent and counted remains unrun.
+**Preserved limits and failed history.** Feature-off Barge's `MountPoint`
+constructor is private and its synthetic testkit is crate-private.
+Oxide's `observe_row_root` derives the mount from the root's grandparent and
+`Binding::open` accepts exactly `/Volumes/<name>`; nested private scratch
+cannot satisfy that layout. Brief v3 authorised real Stash verification but
+could not solve Oxide's layout. Brief v4 authorised the dedicated owned image;
+no synthetic constructor, forged binding, alias or live output namespace was
+used.
 
-The conflict is a fixture inconsistency, not an established engine-policy
-difference: `release_comparison_case` assigns the real checkout UUID to the
-registry row, then writes both physical markers with prune tests'
-`root_marker`, which omits `checkout_volume_uuid`. The retained replacement
-candidate registry says `0FD012E1-01B5-4E52-B7F5-E4FF7B2477A4`; its marker
-has no checkout-volume field. Barge's `reference::OxideSnapshot::references_for`
-constructs absence requests from each claim; `release::prove_references`
-refuses `Some(UUID)` versus `None` for the same path. Oxide's actual `Marker`
-format supports the field and its production root writer records it. The
-smallest supported candidate correction is comparison-local marker
-construction carrying the row's checkout UUID before digest derivation, for
-both mapped roots; no product or dependency change is needed.
+The first uncounted occurrence at `7d36faaa` failed because `now_ms=1000`
+predated real activity, masking all Barge gates (`oxide-proof.xypmxi9_/evidence`,
+exit 101, 66.36 s). The clock-corrected replacement at `5254a9ec` exposed a
+fixture inconsistency: the registry recorded the actual checkout UUID while
+prune tests' `root_marker` omitted it. Barge correctly refused conflicting
+`Some(UUID)`/`None` absence claims (`oxide-proof.scz62jay/evidence`, exit 101,
+23.65 s). Both guards closed and detached ordinarily; neither failure earns
+counted credit. These packets and their original limits remain historical.
 
-The missing-state gate remains unproven too. Barge's `pool_custody::classify`
-allows absent control state with an empty ledger, whereas Oxide requires a
-state witness. This source difference is not evidence of the unmasked final
-decision: Barge stopped at the fixture's volume conflict. A planner disposition
-must also settle a genuinely shared unknown fact (for example malformed
-required state) or retain this as a documented difference. No further fixture
-correction or native occurrence is authorised by these observations. Planner
-answer `0fda4cf211ef52ba45e3eee06f1d4d6e34e6d50a55997a350b74efc2d93b97dd`
-requires preservation and the source trace; candidate acceptance and
-unknown-control evidence remain missing.
+The historical missing-state control also stays distinct: Barge permits an
+absent state beside an empty ledger, while Oxide requires a state witness.
+Its final Barge decision was masked by the volume conflict, so no unmasked
+missing-state parity is claimed. Planner continuation
+`562fafa54ae0be9b606e378a7eb5d7c4537295d3312ab162ca9c59a6da20e719`
+authorised only comparison-local marker repair, a source-traced shared unknown
+fact and one replacement diagnostic, with counted execution gated on adequate
+results. That correction did not change either policy.
 
-Planner continuation `562fafa54ae0be9b606e378a7eb5d7c4537295d3312ab162ca9c59a6da20e719`
-subsequently authorises the comparison-local marker correction and one shared
-unknown premise, with one replacement diagnostic before the still-gated counted
-occurrence. Both mapped markers now carry the row's checkout UUID before any
-digest is derived. The third case uses identical malformed JSON (`{`) in each
-engine's required `oxide-managed/state.json`, retaining an otherwise valid
-fixture. Oxide's `PoolWitness::read_state` passes these bytes to its actual
-state parser and refuses the authority batch; Barge's `PoolCustody::read_pool`
-passes them to `parse_state`, records pool-wide unknown, and
-`OxideSnapshot::references_for` makes the reference set incomplete. This traces
-a shared required fact without assuming that absence has equivalent meaning.
-The historical missing-state results above remain distinct.
-
-These observations supply no O2 input equivalence, D8/CF coverage or live qualification. The
-parent/descriptor binding gaps here and in Barge's
+This is bounded decision calibration, not identical consumed observations,
+full O2/D8/CF parity, live qualification, adoption or delegation. The mandatory
+parent/descriptor gaps here and in Barge's
 `oxide-capture-parent-identity.md` remain unproven; oxide#241 and oxide#222
-remain held, with no delegation or adoption authorised.
+remain held. A shared specification and retained input bytes do not close
+those gaps.
 
 ## Sources and pins
 
