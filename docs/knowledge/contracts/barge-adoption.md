@@ -2133,8 +2133,9 @@ The cfg(test) `fixture_description_control` runs in its own exact-test process
 and forks one owned child. That child reports its actual PID/PPID, both inherited
 lock descriptor numbers, device/inode and unchanged CLOEXEC flags. Until exec it
 uses only fixed async-signal-safe operations; two bounded gates let the parent
-observe the real custody refusal while the child holds admission, and writers
-plus a different `Fresh` slot while the child retains the record lock alone.
+observe the real custody refusal while the child holds admission, then clear
+custody for the pre-Cargo `Acquiring` phase but a different `Fresh` slot while
+the child retains the record lock alone.
 The child then executes one fixed system command. The parent positively reaps
 that exact direct child before asserting old-slot recovery as `Unknown` and a
 clear released fixture. A caught oracle panic closes the gate and reaps before

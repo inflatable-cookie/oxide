@@ -7368,9 +7368,12 @@ pub(crate) mod tests {
             let mut ack = [0];
             channel.read_exact(&mut ack).unwrap();
             assert_eq!(ack, [1]);
+            // Acquiring has not started Cargo: custody is clear once the
+            // admission lock closes, while slot reuse still needs its own
+            // record lock. The following allocation checks that distinction.
             assert_eq!(
                 witness.decide(None, &key.checkout, true).unwrap().verdict,
-                CheckoutCustody::Writers
+                CheckoutCustody::Clear
             );
             let other = lease(&store, &key, None).unwrap();
             eprintln!(
