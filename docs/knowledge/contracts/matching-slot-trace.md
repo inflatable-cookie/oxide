@@ -1,10 +1,35 @@
 # Scoped filesystem trace investigation (oxide#280)
 
-**SOURCE-ONLY DIAGNOSIS. Execution and merge remain held.** Planner ruling
-`bb13e6d9` authorizes diagnosis using retained evidence and pure controls. No
-runtime kit repair, restaging or another trace/probe/cost occurrence follows.
-All historical failures, omitted observations, closure uncertainty and charges
-remain unchanged. Admission is unrestored; the cost diagnostic/count is missing.
+**SOURCE-ONLY ALARM CORRECTION. Execution and merge remain held.** Planner
+ruling `658b48d4` authorizes correction of the demonstrated alarm race and pure
+boundary controls. No restaging, trace/probe/cost occurrence or privileged action
+follows. All historical failures, omitted observations, closure uncertainty and
+charges remain unchanged. Admission is unrestored; the cost proof is missing.
+
+## Cooperative stop correction
+
+The probe now checks a19s cooperative stop, leaving1s before its unchanged20s
+hard self-alarm. Each polling sleep is the smaller of250ms and the positive
+remaining cooperative time. At/past the stop, no sleep or next metadata read is
+started. Cancellation/restoration follows the normal completion path. A blocked
+or delayed call can still cross the hard alarm; that remains a `TimeoutError`
+refusal, never normal completion. OS scheduling and blocked calls are not given
+new guarantees by the1s margin. No deadline is enlarged or reset.
+
+The existing observation helper still raises on the first changed/missing
+identity; no additional creation, read or sleep follows that refusal. Shared
+clock gate freshness, guard300s/512MiB bounds and shutdown margin, actual root
+bindings, strict path parser, row caps and separate tracer custody are unchanged.
+The hard20s alarm,120s readiness allowance and tracer30s+5s margin are unchanged.
+This corrects only the private probe's normal cooperative completion boundary.
+
+`effigy proof:matching-slot-trace:check` passed **152 pure checks**. Virtual-time
+controls exercise alarm delivery enabled/disabled, a100ms final sleep, exact and
+past cooperative boundaries, a delayed read reaching the hard20s alarm and an
+identity change just before the cooperative stop. A hard timeout retains its
+failed-read row and refusal. Existing admission, privacy, strict full/trimmed
+path, identity and custody controls remain. No actual execution validates the
+corrected bytes. Historical timeouts and unknown causation remain historical.
 
 ## Timeout and filtering diagnosis
 
@@ -14,11 +39,11 @@ omitting203. Retained identities match; the receipt records `TimeoutError`.
 The guard closed status1 without fault/deadline. Collector UNKNOWN/handoff and
 later sudo wait0 do not establish privileged descendant closure.
 
-The probe sets its cooperative stop to20s, arms a20s self-alarm that raises
+The executed probe at `8398f805` sets its cooperative stop to20s, arms a20s self-alarm that raises
 `TimeoutError`, and unconditionally sleeps250ms after each polling round. That
 sleep can cross the alarm boundary before the next stop check. The outer
 exception handler then writes a refusal even when retained metadata matches.
-New pure controls run the actual probe function with virtual time and injected
+The diagnosis at `17bf616c` added pure controls of that probe function with virtual time and injected
 signal delivery: the same unchanged metadata reaches20s and returns0 without
 alarm delivery, but becomes a preserved `TimeoutError` refusal when the alarm
 fires during the final sleep. This establishes a classification race in source.
@@ -49,11 +74,10 @@ and incomplete sampling remain unresolved alternatives. Final counters include
 798,971 unparsed lines and71 utility-warning/drop indications, so zero matching
 file events is not absence evidence. No additional host/global trace was read.
 
-Smallest unexecuted design proposals for planner/reviewer disposition:
+Disposition of the original design proposals:
 
-- Finish cooperative observation before the unchanged hard20s safety alarm,
-  bound sleeps by remaining time, and distinguish normal window completion
-  from a delivered timeout. Preserve actual refusals and all deadlines.
+- The cooperative-stop correction above implements the alarm-race proposal
+  in source only, preserving hard timeouts as failures and all deadlines.
 - Consider a short exclusive child basename inside the already fresh bound
   guard evidence root, avoiding a repeated32-byte nonce there. A `p/` layout
   would give126/132/133-byte paths under this historical root, without suffix
@@ -61,11 +85,12 @@ Smallest unexecuted design proposals for planner/reviewer disposition:
   limitation; it needs separately scoped source/preparation review and actual
   format evidence before any execution. No fixed display limit is inferred.
 
-`effigy proof:matching-slot-trace:check` passed **140 pure checks**, including
-both timer-delivery outcomes and full/trimmed exact path controls. The runtime
-kit and qualified guard are unchanged from the executed bytes. No production
-algorithm, policy, supervisor, acceptance rule or actual receipt is corrected.
-Return these findings to the same reviewer; neither proposal grants a retry.
+The diagnosis at `17bf616c` passed **140 pure checks**, including both original
+timer-delivery outcomes and full/trimmed path controls, with the runtime kit then
+unchanged. Those results stay bound to their source. The correction above adds
+boundary controls; no production algorithm, policy, supervisor, acceptance rule
+or historical receipt changes. The same reviewer judges the correction; no
+proposal or passing pure control grants a retry.
 
 ## Shared clock correction
 

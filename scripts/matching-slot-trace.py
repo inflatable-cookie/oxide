@@ -574,7 +574,9 @@ def probe(session, c, nonce, digest):
             accepted = False
             readiness.update(accepted=False, reason='guard_shutdown_margin_insufficient')
         if accepted:
-            stop = min(g.now_ns() + 20_000_000_000, deadline - 30_000_000_000)
+            # Reserve1s for cooperative completion/cancellation before the
+            # unchanged20s hard self-alarm; blocked calls can still time out.
+            stop = min(g.now_ns() + 19_000_000_000, deadline - 30_000_000_000)
             def observation_alarm(_number, _frame):
                 raise TimeoutError('probe20s observation window ended')
             prior_alarm = signal.signal(signal.SIGALRM, observation_alarm)
@@ -613,7 +615,10 @@ def probe(session, c, nonce, digest):
                     if g.now_ns() >= stop:
                         break
                     observe(tree / name, name, original, rows, 'poll')
-                time.sleep(.25)
+                remaining = stop - g.now_ns()
+                if remaining <= 0:
+                    break
+                time.sleep(min(.25, remaining / 1_000_000_000))
         if alarm_installed:
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, prior_alarm)

@@ -14,6 +14,7 @@ checks = []
 
 def check(name, value):
     if not value:
+        print('FAILED PURE CHECK: '+name, flush=True)
         raise AssertionError(name)
     checks.append(name)
 
@@ -90,7 +91,7 @@ source = Path(kit.__file__).read_text()
 check('no kit kill or detach', all(x not in source for x in ['.kill(', 'killpg(', 'start_new_session=', 'os.setsid(', 'os.system(']))
 check('independent outcomes not conflated', 'privileged_closure' in source and 'guard_receipt' in source and 'not independently proven' in source)
 check('unknown timeout and handoff retained', 'trace-window.json' in source and "elapsed > 35" in source and "while child.poll() is None" in source)
-check('probe20s and no reset', '20_000_000_000' in source and '120_000_000_000' in source and "deadline - 30_000_000_000" in source)
+check('probe20s and no reset', 'signal.setitimer(signal.ITIMER_REAL, 20)' in source and '120_000_000_000' in source and "deadline - 30_000_000_000" in source)
 print(json.dumps(dict(passed=len(checks), checks=checks, execution='PURE MOCKS ONLY; no native/trace/probe credit'), indent=2))
 
 # Actual collector timeout/unknown-wait branch with mocked processes, clocks,
@@ -313,26 +314,35 @@ check('actual probe compares qualified clock and records reason', 'gate_decision
 print(json.dumps(dict(final_total_passed=len(checks), execution='PURE MOCKS ONLY; no restaging/admission/guard/probe/trace')))
 
 
-# Diagnosis only: execute the existing probe with a virtual20s window and
+# Exercise the corrected probe with virtual cooperative/hard boundaries and
 # injected signal delivery. No real clock, alarm, process or fixture is used.
-def diagnose_window(deliver_alarm):
-    clock={'ns':100_000_000_000,'alarm':None,'handler':None,'creates':0}
+def diagnose_window(deliver_alarm, poll_target_ns=None, mutate=False):
+    clock={'ns':100_000_000_000,'alarm':None,'handler':None,'creates':0,
+           'reads':0,'sleeps':[],'armed_seconds':[],'error_type':None}
     records=[]
     def handler(_sig,callback):
         prior=clock['handler'];clock['handler']=callback;return prior
     def timer(_which,seconds):
+        clock['armed_seconds'].append(seconds)
         clock['alarm']=clock['ns']+int(seconds*1_000_000_000) if seconds else None
-    def sleep(seconds):
-        clock['ns']+=int(seconds*1_000_000_000)
+    def advance(ns):
+        clock['ns']=ns
         if deliver_alarm and clock['alarm'] is not None and clock['ns']>=clock['alarm']:
             clock['handler'](kit.signal.SIGALRM,None)
+    def sleep(seconds):
+        clock['sleeps'].append(seconds)
+        advance(clock['ns']+int(seconds*1_000_000_000))
     def metadata(index):
         return SimpleNamespace(st_dev=1,st_ino=index,st_mode=stat.S_IFREG|0o600,st_size=40,
                                st_blocks=8,st_mtime_ns=10,st_ctime_ns=10)
     def create(*args):
         clock['creates']+=1;return clock['creates']
     def lstat(path):
-        return metadata(3 if path.name=='ordinary-control' else 2 if path.parent.name=='debug' else 1)
+        clock['reads']+=1
+        if clock['reads']==4 and poll_target_ns is not None:
+            advance(100_000_000_000+poll_target_ns)
+        index=3 if path.name=='ordinary-control' else 2 if path.parent.name=='debug' else 1
+        return metadata(99 if mutate and clock['reads']==4 else index)
     env=dict(OXIDE_TASK_SCRATCH_ROOT=P+'/runs/oxide-proof.a/scratch',
              OXIDE_PROOF_EVIDENCE=P+'/runs/oxide-proof.a/evidence',
              OXIDE_PROOF_DEADLINE_NS='300000000000',OXIDE_PROOF_RUN_ID='mock-run')
@@ -354,19 +364,32 @@ def diagnose_window(deliver_alarm):
             stack.enter_context(mock)
         error=None;code=None
         try:code=kit.probe(Path(P),{},'a'*32,'digest')
-        except TimeoutError as exc:error=str(exc)
+        except (TimeoutError,ValueError) as exc:
+            error=str(exc);clock['error_type']=type(exc).__name__
     return clock,records[-1],error,code
 
 for delivery in (False,True):
     clock,(name,receipt),error,code=diagnose_window(delivery)
-    check('healthy metadata reaches20s '+str(delivery),clock['ns']==120_000_000_000 and clock['creates']==3)
+    check('cooperative completion19s '+str(delivery),clock['ns']==119_000_000_000 and clock['creates']==3)
     check('retained metadata unchanged '+str(delivery),not any(r.get('changed') or r.get('error') for r in receipt['rows']))
-    if delivery:
-        check('normal-window alarm becomes refusal',name=='trace-probe-refusal.json' and receipt['error']=='TimeoutError' and code is None)
-        check('source alarm message identifies20s window',error=='probe20s observation window ended')
-        check('alarm diagnosis preserves omitted count',receipt['omitted_rows']==receipt['observed_rows']-40 and receipt['omitted_rows']>0)
-    else:
-        check('same window without delivered alarm returns0',name=='trace-probe-receipt.json' and code==0 and error is None)
+    check('hard20s alarm unchanged and cancelled '+str(delivery),clock['armed_seconds']==[20,0] and clock['alarm'] is None)
+    check('normal completion succeeds before alarm '+str(delivery),name=='trace-probe-receipt.json' and code==0 and error is None)
+
+clock,(name,receipt),error,code=diagnose_window(True,18_900_000_000)
+check('last sleep clipped to100ms',clock['sleeps']==[.1] and clock['ns']==119_000_000_000)
+check('late poll completes before hard deadline',code==0 and error is None and clock['armed_seconds']==[20,0])
+for target in (19_000_000_000,19_050_000_000):
+    clock,(name,receipt),error,code=diagnose_window(True,target)
+    check('no sleep or extra read at/past cooperative stop '+str(target),clock['sleeps']==[] and clock['reads']==4)
+    check('cooperative stop does not wait for alarm '+str(target),code==0 and error is None and clock['ns']<120_000_000_000)
+clock,(name,receipt),error,code=diagnose_window(True,20_000_000_000)
+check('hard deadline still refuses delayed metadata',clock['error_type']=='TimeoutError' and name=='trace-probe-refusal.json' and code is None)
+check('hard timeout never reclassified as success',receipt['error']=='TimeoutError' and error=='probe20s observation window ended')
+check('hard timeout retains metadata and omitted accounting',receipt['observed_rows']==7 and receipt['omitted_rows']==0 and clock['armed_seconds']==[20,0] and any(r.get('phase')=='poll' and r.get('error')=='TimeoutError' for r in receipt['rows']))
+clock,(name,receipt),error,code=diagnose_window(True,18_900_000_000,mutate=True)
+check('identity change near stop refuses immediately',clock['error_type']=='ValueError' and name=='trace-probe-refusal.json' and code is None)
+check('identity change permits no subsequent read/sleep',clock['reads']==4 and clock['sleeps']==[] and clock['creates']==3)
+check('identity refusal facts preserved',any(r.get('changed') for r in receipt['rows']) and clock['armed_seconds']==[20,0])
 
 # The exact historical path shapes are supported when complete. Simulated
 # left-trimmed renderings deliberately remain untrusted, not recovered/adopted.
@@ -379,4 +402,4 @@ for name in ('.DS_Store','debug/.DS_Store','ordinary-control'):
     for rendered in (full[-160:],'/'+full[-159:]):
         event,kind=kit.parse_line(line(rendered,'lstat64','Python.123'),retained_prefix)
         check('simulated lost prefix not attributed '+name+str(rendered.startswith('/')),event is None and kind in ('unparsed','discarded'))
-print(json.dumps(dict(final_total_passed=len(checks), execution='DIAGNOSIS PURE MOCKS ONLY; production kit unchanged; no native/trace/probe')))
+print(json.dumps(dict(final_total_passed=len(checks), execution='ALARM CORRECTION PURE MOCKS ONLY; no native/trace/probe')))

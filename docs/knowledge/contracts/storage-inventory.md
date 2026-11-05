@@ -496,6 +496,14 @@ verified actors. No raw rejected trace exists to settle the missing-path cause.
 [Full findings and unexecuted narrow proposals](matching-slot-trace.md#timeout-and-filtering-diagnosis)
 preserve all omitted rows, incomplete coverage and closure uncertainty. No kit
 repair, restaging, native/probe/trace/cost retry or readiness follows diagnosis.
+Planner `658b48d4` subsequently authorized the alarm correction in source only:
+the probe now cooperatively stops at19s and clips each sleep to positive time
+remaining before that stop, retaining the unchanged20s hard alarm. A delayed
+call reaching the hard alarm remains a refusal; identity change still stops
+subsequent reads/sleeps immediately. Pure boundary regressions cover both
+outcomes. Path filtering, guard limits, historical failures and unknown cause
+are unchanged. No restage or actual trace/probe/cost execution is activated.
+
 
 
 
