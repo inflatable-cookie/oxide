@@ -28,6 +28,7 @@ processes, deadlines, reserve and cleanup. This script never deletes fixtures.
 import hashlib
 import json
 import os
+import stat
 from pathlib import Path
 import subprocess
 import sys
@@ -41,8 +42,18 @@ COMMAND = ["oxide", "test", "--lib", "--locked", "--offline",
 
 
 def main():
-    if sys.argv[1:] not in ([], ["--diagnostic"]):
-        raise SystemExit("usage: test-matching-slot-cost.py [--diagnostic]")
+    if sys.argv[1:] not in ([], ["--diagnostic"], ["--self-check"]):
+        raise SystemExit("usage: test-matching-slot-cost.py [--diagnostic | --self-check]")
+    # Exercise the exact no-follow API before creating any fixture or child.
+    # Path.stat(follow_symlinks=...) is unavailable on the host's Python 3.9.6.
+    own_metadata = Path(__file__).lstat()
+    if sys.version_info < (3, 8) or not stat.S_ISREG(own_metadata.st_mode):
+        raise SystemExit("requires Python >=3.8 and an ordinary driver file")
+    if not isinstance(own_metadata.st_blocks, int):
+        raise SystemExit("allocated-block metadata unavailable")
+    if sys.argv[1:] == ["--self-check"]:
+        print(json.dumps(dict(python=sys.version, metadata_api="Path.lstat", passed=True)))
+        return 0
     diagnostic = bool(sys.argv[1:])
     repo = Path(__file__).resolve().parent.parent
     if hashlib.sha256((repo / "scripts/bounded-test.py").read_bytes()).hexdigest() != RUNNER_HASH:
@@ -76,7 +87,7 @@ def main():
             leaf = parent / f"oxide_fixture_unit_{index:04x}-0123456789abcdef.o"
             with leaf.open("xb") as output:
                 output.write(b"x")
-            metadata = leaf.stat(follow_symlinks=False)
+            metadata = leaf.lstat()
             counts["allocated"] += metadata.st_blocks * 512
             counts["files"] += 1
             counts["entries"] += 1

@@ -1561,3 +1561,6 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 [tasks."rust:matching-slot-cost:lib"]
 admission = "heavy"
 run = "oxide test --lib --locked inventory -- --test-threads=1"
+
+[tasks."proof:matching-slot-cost:check"]
+run = "python3 scripts/test-matching-slot-cost.py --self-check"
