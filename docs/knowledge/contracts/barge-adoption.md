@@ -2105,3 +2105,15 @@ fence write, while keeping EFFECT-1's specific refusal. One additional bounded
 uncounted diagnostic is authorized; all earlier runs remain charged. Production
 and guard behavior are unchanged; the counted suite still follows a clean
 all-case diagnostic.
+
+The retained embedded diagnostic at `9807864b` exercised all five cases and the
+disconnected BASE control with no case failures; its exit 1 and `qualified=false`
+are intentional and give no qualification/parity credit. The following Rust
+changes only wrap those same expressions. The ordinary suite at `87ce6a6d`
+passed 354 library tests but failed three of 673 binary tests (two fresh-custody
+fixtures reported a busy admission lock; the seed-crash fixture failed at
+`before-origin`). Cargo stopped before the embedded harness, so this is no green
+ordinary-suite or counted embedded-harness evidence. Planner ruling 3c8bff6f
+(2026-11-05) requires preserving both suite roots and publishing the actual
+failure for retained review/disposition; no retry or `store.rs` correction is
+authorized by this task.
