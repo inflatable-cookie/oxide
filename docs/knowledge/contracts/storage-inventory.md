@@ -287,6 +287,28 @@ Admission is **unrestored**, with no installation or Effigy QA readiness.
 No accounting-only fast path is implemented, and historical causation remains
 **UNKNOWN**. Earlier roots and conclusions remain unchanged.
 
+**Smaller-fixture continuation.** Planner direction `49467784` subsequently
+authorized one replacement diagnostic using at most 8,192 file names under
+the same guard and bounds. The current driver generates 7,172 file names and
+7,350 total entries (178 directories), retaining the depth-14 branch, all Cargo
+categories, the hardlink, explicit metadata controls and fixed-manifest
+negative control. This is a smaller-fixture investigation, not full-scale
+evidence, a guard change or a resolution of historical/live admission behavior.
+
+At source `513c6350`, the attempted `proof:matching-slot-cost:diagnostic`
+did not launch: Effigy admission run `agq2zrwlkixtivaagxdjjzhr3u` failed closed
+because its hook exited 127 before admission. The hook's Nucleus version
+`0.0.0-f97727980c2d2e12193d503d1818ff7db834fd82-c96693691f67b1c7aea6a26b498dfc06b5810e30e28084bfcad5fe0017144246`
+had no `runtime/node` at its configured path under
+`/Users/tom/.local/share/nucleus/versions/`. No guard, fixture or inventory child
+ran. The driver interpreter/API check passed, but there is no smaller-fixture
+measurement or diagnostic credit. Retained reviewer disposition `d35c74b5`
+requires planner-owned environment repair/disposition; the author does not
+unset or replace the hook. A repaired route still needs planner confirmation
+before execution. The passing diagnostic and original counted occurrence
+remain missing; admission, full-scale behavior and historical cause remain
+unresolved. All prior failures and kept resources remain unchanged.
+
 ## Output and exit semantics
 
 Human output is concise: root, coverage, visited counts, a per-category table

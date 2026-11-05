@@ -873,6 +873,8 @@ an already-present metadata name before inventory ran and independently ended
 with a stale-reading guard fault and `UNCLOSED`. Its metadata-creation ordering
 correction has not received another native occurrence. No counted proof
 followed either inadequate diagnostic.
+The smaller-fixture continuation was then refused before admission by a
+missing Nucleus runtime in Effigy's hook; it produced no new walk or proof.
 Admission remains **unrestored**; this precise-impediment outcome grants no
 installation or Effigy QA readiness and no performance qualification credit.
 
