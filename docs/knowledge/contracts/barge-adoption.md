@@ -127,6 +127,42 @@ known activity no later than the request. Explicit assertions reject policy
 masking and require current-reference and unknown-custody control evidence.
 Counted execution stays gated on adequate diagnostic evidence.
 
+The replacement at `5254a9ec` removed policy masking, but failed the candidate
+and unknown-gate checks (exit 101). Oxide again offered the positive root,
+kept the present selected checkout and refused the missing-state batch.
+Barge kept the selected root at its current-reference gate, but kept the
+positive and missing-state roots at `absence`: two records disagree about
+the checkout volume. Both engines reported one mapped root in every case.
+Evidence: `/Volumes/Stash/scratch/oxide/oxide-proof.scz62jay/evidence`;
+23.65 s to receipt publication, closed/no fault/no deadline, ordinary guard
+detach succeeded, sampled owned peak 8.1 MiB/512 MiB and minimum reserve
+3060.1 GiB. The first occurrence took 66.36 s to publication. Neither is a
+counted PASS; both diagnostic allowances are spent and counted remains unrun.
+
+The conflict is a fixture inconsistency, not an established engine-policy
+difference: `release_comparison_case` assigns the real checkout UUID to the
+registry row, then writes both physical markers with prune tests'
+`root_marker`, which omits `checkout_volume_uuid`. The retained replacement
+candidate registry says `0FD012E1-01B5-4E52-B7F5-E4FF7B2477A4`; its marker
+has no checkout-volume field. Barge's `reference::OxideSnapshot::references_for`
+constructs absence requests from each claim; `release::prove_references`
+refuses `Some(UUID)` versus `None` for the same path. Oxide's actual `Marker`
+format supports the field and its production root writer records it. The
+smallest supported candidate correction is comparison-local marker
+construction carrying the row's checkout UUID before digest derivation, for
+both mapped roots; no product or dependency change is needed.
+
+The missing-state gate remains unproven too. Barge's `pool_custody::classify`
+allows absent control state with an empty ledger, whereas Oxide requires a
+state witness. This source difference is not evidence of the unmasked final
+decision: Barge stopped at the fixture's volume conflict. A planner disposition
+must also settle a genuinely shared unknown fact (for example malformed
+required state) or retain this as a documented difference. No further fixture
+correction or native occurrence is authorised by these observations. Planner
+answer `0fda4cf211ef52ba45e3eee06f1d4d6e34e6d50a55997a350b74efc2d93b97dd`
+requires preservation and the source trace; candidate acceptance and
+unknown-control evidence remain missing.
+
 These observations supply no O2 input equivalence, D8/CF coverage or live qualification. The
 parent/descriptor binding gaps here and in Barge's
 `oxide-capture-parent-identity.md` remain unproven; oxide#241 and oxide#222
