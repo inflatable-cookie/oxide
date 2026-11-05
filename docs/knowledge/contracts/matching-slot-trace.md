@@ -8,20 +8,20 @@ unknown. All earlier failed/UNCLOSED evidence and charges stay historical.
 
 The fixed [kit](../../../scripts/matching-slot-trace.py) and
 [pure controls](../../../scripts/test_matching_slot_trace.py) were staged from
-pushed source `02fb9d08c4a25bb8bf21e9cd045d558c23772409`. No/default/self-check
+pushed source `42d2ddd748cf79c7a01c237089cb60d3697ffe30`. No/default/self-check
 or prepare mode launches privileged/native work. The manual heavy selector is
 not a queue proof execution or automatic dispatch; it is held for separately
 activated operator use only. The existing guard is byte-identical and reused
 as a supervisor and, only in later operator modes, as the known-PID identity
 reader. No thread-to-process census or new signal authority is added.
 
-Session identity: device **16777245**, inode **57931488**, UID **501**, mode
-**0700**. `kit/` inode **57931489**, `runs/` inode **57931490**, same device/UID/mode.
+Session identity: device **16777245**, inode **57995228**, UID **501**, mode
+**0700**. `kit/` inode **57995229**, `runs/` inode **57995230**, same device/UID/mode.
 Stash UUID was read from single-volume metadata and device identity was checked
 against `/Volumes/Stash`; no pool, old fixture or account payload was scanned.
 Staged sources are owner-only executable/readable; control documents are0600.
 
-Pure Effigy controls passed **52** checks, including privacy/redaction, strict
+Pure Effigy controls passed **53** checks, including privacy/redaction, strict
 formats and thread-not-PID semantics, incremental/overlong/partial/capped
 streams, warning/drop indications, wrong/stale session gates, path escape and
 replacement, fresh/expired gate decisions, mocked nullable wait status and
@@ -61,30 +61,30 @@ parents. Preparation itself creates no .DS_Store/probe files, guard or trace.
 
 The following is a review copy, not an activation request. The byte-identical
 operator copy is `OPERATOR.md` inside the exact session path below; its hash is
-`23d00d4f6248f3edbf20365be1f6d89c026d8849f2c7e5729d01e5cb406dd5ad`.
+`4ed3304a739ce1c6a9d13c6e8d9b281641c4b6ffec4bcdfdec71e635e512742a`.
 Test-source SHA256 is
-`aab3a2f13d0aaa564b0c8e6cbbc91824ba987de72bdf99db4fb0bc5bd43a280d`.
+`abcacf204633e46c5bf8d133380fdaf0573c217c1209103e24896907a9704fa9`.
 
-Two unused preparation directories (`trace280-55121f9d9800ea9318126949a96ea286-0e9n98pi` and `trace280-e8b13b426ebc79fcd87c62070622b1ab-ghticnxu`) remain retained and never activated. They were superseded while source was tightened for private guard receipts and timeout/refusal observation retention. Only the exact final session below may be proposed for later activation. No root, trace or probe was launched in any preparation.
+Three earlier preparation directories with nonce prefixes55121f9d,e8b13b42,c32ffbbd remain retained and never activated. They were superseded while private receipts, timeout observation retention and observable-PID uncertainty handling were tightened. Only the exact final session below may be proposed for later activation. No root, trace or probe was launched in any preparation.
 
 ```text
 # Oxide280: HELD pending exact-head review AND separate planner activation
 
-Session: /Volumes/Stash/scratch/oxide/trace280-c32ffbbd5fdb4adc9786fbc61429b1e8-a4_jh879
-Nonce: c32ffbbd5fdb4adc9786fbc61429b1e8
-Session manifest SHA256: 459e19ab803b7a08cd7c019cee354f314d35eb8962f5adb2e1818844bdc2c838
-Source head: 02fb9d08c4a25bb8bf21e9cd045d558c23772409
-Kit SHA256: 573020c41f18ba731e2dec2a200ba16963897477a5eddc734478cc52aa3d5e6e
+Session: /Volumes/Stash/scratch/oxide/trace280-ba8f4aaf9dfb29705225bf90249ab793-oveln6h9
+Nonce: ba8f4aaf9dfb29705225bf90249ab793
+Session manifest SHA256: ba32d815b97ef2f93eccab6b24e813c3549c58d881a024f5af6d4cf57e3d41ea
+Source head: 42d2ddd748cf79c7a01c237089cb60d3697ffe30
+Kit SHA256: 87e4b115015cf29183742d51b6e9badb236f843efdda85e527f30a8dcbcb761c
 Guard SHA256: fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b
 Stash UUID: 8A660440-C919-45C6-A3F1-3365B9BD2006
-Root-parent (later guard allocates one fresh child): /Volumes/Stash/scratch/oxide/trace280-c32ffbbd5fdb4adc9786fbc61429b1e8-a4_jh879/runs
+Root-parent (later guard allocates one fresh child): /Volumes/Stash/scratch/oxide/trace280-ba8f4aaf9dfb29705225bf90249ab793-oveln6h9/runs
 
 Do not run these activation commands during preparation or review.
 After reviewer acceptance, the planner must separately activate this ONE occurrence.
 All code below runs as your ordinary user. Never run Python, shell, or kit with sudo.
 
 Terminal A, after activation, starts normal real heavy admission:
-'/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9' '/Volumes/Stash/scratch/oxide/trace280-c32ffbbd5fdb4adc9786fbc61429b1e8-a4_jh879/kit/matching-slot-trace.py' --operator-start '/Volumes/Stash/scratch/oxide/trace280-c32ffbbd5fdb4adc9786fbc61429b1e8-a4_jh879' 'c32ffbbd5fdb4adc9786fbc61429b1e8' '459e19ab803b7a08cd7c019cee354f314d35eb8962f5adb2e1818844bdc2c838'
+'/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9' '/Volumes/Stash/scratch/oxide/trace280-ba8f4aaf9dfb29705225bf90249ab793-oveln6h9/kit/matching-slot-trace.py' --operator-start '/Volumes/Stash/scratch/oxide/trace280-ba8f4aaf9dfb29705225bf90249ab793-oveln6h9' 'ba8f4aaf9dfb29705225bf90249ab793' 'ba32d815b97ef2f93eccab6b24e813c3549c58d881a024f5af6d4cf57e3d41ea'
 Admission may wait before any trace clock starts. Leave it foreground; do not retry.
 Wait for `GUARD READY` naming actual root/evidence and the120s ready window.
 No probe files exist yet. Terminal A must remain open.
@@ -92,7 +92,7 @@ No probe files exist yet. Terminal A must remain open.
 Terminal B, only after that ready message, authenticate interactively:
 /usr/bin/sudo -v
 Then immediately (within the ready window) start the unprivileged collector:
-'/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9' '/Volumes/Stash/scratch/oxide/trace280-c32ffbbd5fdb4adc9786fbc61429b1e8-a4_jh879/kit/matching-slot-trace.py' --operator-collect '/Volumes/Stash/scratch/oxide/trace280-c32ffbbd5fdb4adc9786fbc61429b1e8-a4_jh879' 'c32ffbbd5fdb4adc9786fbc61429b1e8' '459e19ab803b7a08cd7c019cee354f314d35eb8962f5adb2e1818844bdc2c838'
+'/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9' '/Volumes/Stash/scratch/oxide/trace280-ba8f4aaf9dfb29705225bf90249ab793-oveln6h9/kit/matching-slot-trace.py' --operator-collect '/Volumes/Stash/scratch/oxide/trace280-ba8f4aaf9dfb29705225bf90249ab793-oveln6h9' 'ba8f4aaf9dfb29705225bf90249ab793' 'ba32d815b97ef2f93eccab6b24e813c3549c58d881a024f5af6d4cf57e3d41ea'
 The collector launches ONLY this privileged command, once:
 /usr/bin/sudo -n /usr/bin/fs_usage -w -f filesys -t 30
 No raw trace reaches your terminal or any file. Do not pipe fs_usage yourself.
@@ -118,7 +118,7 @@ Terminal A separately waits for real guard completion; tracer exit is NOT probe
 closure and probe exit is NOT tracer closure. No cleanup of retained resources.
 
 View ONLY bounded receipts (never a raw trace):
-'/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9' '/Volumes/Stash/scratch/oxide/trace280-c32ffbbd5fdb4adc9786fbc61429b1e8-a4_jh879/kit/matching-slot-trace.py' --receipts '/Volumes/Stash/scratch/oxide/trace280-c32ffbbd5fdb4adc9786fbc61429b1e8-a4_jh879' 'c32ffbbd5fdb4adc9786fbc61429b1e8' '459e19ab803b7a08cd7c019cee354f314d35eb8962f5adb2e1818844bdc2c838'
+'/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9' '/Volumes/Stash/scratch/oxide/trace280-ba8f4aaf9dfb29705225bf90249ab793-oveln6h9/kit/matching-slot-trace.py' --receipts '/Volumes/Stash/scratch/oxide/trace280-ba8f4aaf9dfb29705225bf90249ab793-oveln6h9' 'ba8f4aaf9dfb29705225bf90249ab793' 'ba32d815b97ef2f93eccab6b24e813c3549c58d881a024f5af6d4cf57e3d41ea'
 
 Privacy/limits: only structurally parsed ASCII metadata events naming this exact
 fresh session prefix are retained (512KiB cap,4096B line bound). Other paths on
