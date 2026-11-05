@@ -1549,32 +1549,15 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- o
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/diagnose-store-fixtures.py --process-control"
 
-# #280: one fresh owned Cargo-shaped fixture; observations, never a throughput gate.
-[tasks."proof:matching-slot-cost:diagnostic"]
+# #280 Normal-only unmeasured reuse. Source covering; native proof is owner-gated.
+[tasks."rust:warm-reuse"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-matching-slot-cost.py --diagnostic"
+run = "oxide test --lib --bin oxide --locked warm_reuse -- --test-threads=1"
 
-[tasks."proof:matching-slot-cost"]
+[tasks."proof:warm-reuse:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-matching-slot-cost.py"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-warm-reuse.py --diagnostic"
 
-[tasks."rust:matching-slot-cost:lib"]
+[tasks."proof:warm-reuse"]
 admission = "heavy"
-run = "oxide test --lib --locked inventory -- --test-threads=1"
-
-[tasks."proof:matching-slot-cost:check"]
-run = "python3 scripts/test-matching-slot-cost.py --self-check"
-
-# #280 PREPARATION ONLY: pure inputs/mocked interfaces, no root/native effects.
-[tasks."proof:matching-slot-trace:check"]
-run = "python3 scripts/matching-slot-trace.py --self-check"
-
-# Manual operator route HELD pending exact-head review + separate activation.
-# No automatic execution/queue proof declaration. Default/prep never invokes it.
-[tasks."proof:matching-slot-trace:operator"]
-admission = "heavy"
-run = "python3 scripts/matching-slot-trace.py --guarded-operator"
-
-# Explicit control-plane staging only: no guard/probe/trace/admission.
-[tasks."proof:matching-slot-trace:prepare"]
-run = "python3 scripts/matching-slot-trace.py --prepare"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-warm-reuse.py"

@@ -1,18 +1,19 @@
-# Normal warm-reuse admission (proposed)
+# Normal warm-reuse admission
 
-**Design only; unimplemented.** Tom's decision
-`e3dccedb-0046-4003-a9a0-f4d44517cc44` v2 (2026-11-05), “Design warm reuse
-without a full scan,” authorizes this direction and independent design review.
-The [ruling recorded in vision at `c4def456`](https://github.com/inflatable-cookie/oxide/blob/c4def456/docs/knowledge/vision.md)
-preserves root identity, ownership, leases, writer custody and backing safeguards;
-allocation, eviction and OneUse slice rules stay outside this change.
-Implementation, validation, installation and QA require later scoped authority.
+**Implemented source; Elevated runtime correctness proof pending.** Tom's
+`e3dccedb-0046-4003-a9a0-f4d44517cc44` v2 approved the design (2026-11-05),
+independently reviewed at `cbc57b55`. Decision
+`23f2fa22-2a1c-4834-b74f-88ce008b4328` v2 then authorized this Normal-only
+implementation and targeted covering. Root identity, ownership, leases,
+writer custody and backing safeguards remain authoritative. Native execution,
+merge, installation and consumer QA remain separately gated.
 
-## Recommendation and policy boundary
+## Implemented policy boundary
 
-Admit a compatible **Normal** idle slot from its verified root and exclusive
-lease state, without recursively measuring its contents. Apply the same rule
-to `directory-budget-v1` internal and `apfs-volume-v1` removable pools. Report
+A compatible **Normal** idle slot is admitted from its verified root and
+exclusive lease state, without recursively measuring its contents. The same
+rule applies to `directory-budget-v1` internal and `apfs-volume-v1` removable
+pools. The result reports
 **slot size unknown** for that acquisition.
 
 This deliberately removes a descendant-completeness precondition. It is a
@@ -22,31 +23,29 @@ cause remains unknown. A scan's size does not decide capacity on this branch,
 but the scan also detects some descendant faults. Those facts need separate
 treatment below.
 
-The proposed contract is a cooperative, root-bound lease, **not descendant
+The contract is a cooperative, root-bound lease, **not descendant
 filesystem containment for Cargo**. A build may encounter an existing symlink
 or nested mount without Oxide detecting it first. Root validation does not
 prove otherwise. The current inventory is also not a write fence: its
 pathname samples cannot exclude transient replacement, and a completed scan
-does not establish lasting immutability. This proposal grants no ownership of
+does not establish lasting immutability. This behavior grants no ownership of
 another tree, mount or writer. It must not be described as a sandbox.
 
 ## Source baseline and consumers
 
-Locations below refer to executable baseline
-`e8c08f6d9e223d94d3c44486907aceb0226ba715`; no executable behavior changes here.
+The design was traced against `e8c08f6d`; the implementation separates the
+Normal branch as follows. Symbols identify the owning current source.
 
-| Source location | Current behavior and proposed boundary |
+| Source location | Current behavior |
 | --- | --- |
-| [`Pool::lease_inner`, pool.rs:1834–1990](../../../src/lease/pool.rs) | Checks holder exclusion and resolves membership/victims. OneUse restores its slice before reuse. Normal candidate reuse returns before new-slot `allocate` and pressure decisions. |
-| [`Pool::reuse_idle`, pool.rs:2005](../../../src/lease/pool.rs) | Validates scope, requires the target inventory complete, then checks policy/rank headroom and takes the slot. Only Normal should bypass its walk. |
-| [`Pool::validate_idle_slot_scope` / `validate_slot_tree`, pool.rs:3579–3640](../../../src/lease/pool.rs) | Checks generation, idle state, project/profile, canonical owned root and parent, and device. Returns root device/inode; reuse currently discards that identity. |
-| [`ReuseMeasurement` / `Leased`, mod.rs:696–709](../../../src/lease/mod.rs) | Complete acquisition observation: slot, incarnation, directory and unique allocated bytes. `Option::None` already represents no measurement. Keep the type for measured routes. |
-| [`Store::attempt`, store.rs:4644–4767](../../../src/bin/oxide/store.rs) | Passes the measurement into `Lease.measured` and, only when present, writes the diagnostic `LeaseReuse` sidecar. Neither publication nor its failure decides admission. |
-| [`run_invocation_inner` / `print_summary`, main.rs:1033 / 1723](../../../src/bin/oxide/main.rs) | Carries that measurement to the result line; warm plus `None` already renders “slot size unknown.” No summary walk. |
-| [`take_idle`, pool.rs:2457; `measure_for_release`, :3424](../../../src/lease/pool.rs) | Taking clears `SlotRecord.recorded`; `release_or_recover` (:2636) conditionally publishes a complete closed observation. Preserve both transitions. |
-| [`recorded_total` / `slot_figure`, pool.rs:3057 / 3103](../../../src/lease/pool.rs) | Ledger idle observations feed pool pressure, with existing generation checks and fallback walks. `largest_recorded_slot` (:3214) / `conservative_charge` (:3230) also use them for incomplete charges; `hold_slot_tree_with_phase` (:5129) carries their charge into holding until deletion settles. These remain separate from Normal reuse. |
-| [`snapshot_of`, pool.rs:4094; `ledger_slot`, :5597](../../../src/lease/pool.rs) | Export recorded totals, coverage and per-generation record facts for passive library/status consumers; they do not measure or grant. |
-| [`Store::report`, store.rs:3857–3968; `recorded_size`, :6788](../../../src/bin/oxide/store.rs) | Default status prefers a current ledger record, otherwise the diagnostic sidecar matched by store/slot/incarnation/directory, labelled with source and age. Explicit measured status remains a bounded audit. |
+| [`Pool::lease_inner`, `reuse_normal_idle`, `normal_reuse_scope`](../../../src/lease/pool.rs) | Normal candidate returns before new-slot `allocate`/pressure, with two root/parent samples and no inventory. OneUse still calls measured `reuse_idle` after restore. |
+| [`validate_idle_slot_scope`, `validate_slot_tree`, `require_slot_parent`](../../../src/lease/pool.rs) | Check generation, idle state, project/profile, canonical owned root/parent, allowed layout and device. |
+| [`ReuseMeasurement` / `Leased`](../../../src/lease/mod.rs) | Complete OneUse target observation. Normal acquisition returns `None`; release accounting is independent. |
+| [`Store::attempt`, `Lease.measured`](../../../src/bin/oxide/store.rs) | Only a present measurement writes a diagnostic `LeaseReuse` sidecar. Failure to publish does not decide admission. |
+| [`run_invocation_inner`, `print_summary`, `leased_size`](../../../src/bin/oxide/main.rs) | Carry the acquisition observation to the result. Warm plus `None` renders “slot size unknown”; no reporting walk. |
+| [`take_idle`, `release_or_recover`, `measure_for_release`](../../../src/lease/pool.rs) | Taking clears `SlotRecord.recorded`; release/recovery conditionally publishes a complete closed observation. |
+| [`recorded_total`, `slot_figure`, `largest_recorded_slot`, `conservative_charge`, `hold_slot_tree_with_phase`](../../../src/lease/pool.rs) | Recorded idle observations feed pressure, incomplete charges and holding charges with existing safeguards. No new capacity calculation on Normal reuse. |
+| [`snapshot_of`, `ledger_slot`](../../../src/lease/pool.rs); [`Store::report`, `recorded_size`](../../../src/bin/oxide/store.rs) | Passive/status consumers show current ledger records or separately sourced historical sidecar observations with age and generation matching. Explicit measured status remains a bounded audit. |
 
 ## Required before Cargo writes
 
@@ -56,19 +55,20 @@ requested project/profile and exact slot/incarnation, with no active lease.
 Held, uncertain, incompatible, quarantined and unresolved generations gain no
 new reuse route; same-holder replay keeps its existing semantics.
 
-Retain `Pool::open_inner` (pool.rs:1571), `open_budget_payload` (:4203),
-`open_volume_payload` (:4245), `require_slot_parent` (:4670) and
-`canonical_existing_dir` (mod.rs:895): canonical real directories, caller UID,
+`Pool::open_inner`, `open_budget_payload`, `open_volume_payload`,
+`require_slot_parent` (pool.rs) and `canonical_existing_dir` (mod.rs) retain
+canonical real directories, caller UID,
 owner-only mode, allowed recorded path/layout, valid ledger/config/fences and
 the expected backing device. Internal payload stays on its pool device;
 removable payload keeps its registered mount/UUID binding and descriptor/path
-agreement through `volume::Binding` (volume.rs:281, :391, :463).
+agreement through `volume::Binding::{open, verify, dir_at}`.
 
-Replace the removed walk's **root** boundary samples with bounded metadata
-rechecks, not a replacement traversal. Sample the slot and its validated parent
-device/inode at scope validation; revalidate their path, kind, UID, mode,
-device and identity immediately before the durable `Idle → Held` commit under
-the same pool lock. A missing, unreadable, replaced or mismatched sample refuses
+The removed walk's **root** boundary samples are replaced by bounded metadata
+rechecks. `normal_reuse_scope` samples slot and parent device/inode, canonical
+paths, kind, UID, mode and backing device; `reuse_normal_idle` repeats it and
+requires the same identities immediately before `take_idle` under the same
+pool lock. Removable binding verification and payload descriptor/path identity
+are rechecked as well. A missing, unreadable, replaced or mismatched sample refuses
 before grant. Keep policy/rank exhaustion refusals and persist the exclusive
 lease before returning it. These are point-in-time checks, not a fence against
 a same-UID actor changing paths after the last sample. There is no persistent
@@ -85,7 +85,7 @@ observes the selected backing; it does not protect a different nested mount.
 The [inventory contract](storage-inventory.md)
 owns the current no-follow walk and its limitations.
 
-| Fact currently observed recursively | Proposed Normal grant policy |
+| Fact previously required recursively | Normal grant policy |
 | --- | --- |
 | Descendant device/mount boundary | No recursive pregrant assertion. An unobserved nested mount can be reached by Cargo. Retain inventory's refusal to descend across devices and deletion's independent device checks; no new authority over that mount's target. |
 | Symlink/no-follow semantics | Root and parent symlinks still refuse. Descendant symlinks are not inspected for grant; Cargo retains its ordinary path behavior. Inventory counts links without following them; deletion keeps its own no-follow rules. |
@@ -93,27 +93,27 @@ owns the current no-follow walk and its limitations.
 | Descendant directory identity change or concurrent mutation | No pregrant claim about descendant stability. Cargo handles its own reads/invalidation; independent writers still require the existing custody/refusal/recovery rules. An inventory scan cannot establish writer closure. |
 | Entry/depth/deadline limits | No walk and no completeness claim on this branch. All measured routes retain their cumulative bounds and partial/refusal semantics. |
 
-This is the safety choice for independent review: accept Normal reuse without
+The reviewed policy accepts Normal reuse without
 certifying descendant accessibility or device uniformity, within the existing
 cooperative Cargo boundary. The [architecture](../architecture.md#storage-invariants)
 requires compatible inputs, path identity, exclusive ownership and conservative
-recovery; it does not establish a Cargo descendant sandbox. If descendant
-device uniformity **before any Cargo write** is required, this recommendation
-conflicts with that requirement: finite root checks cannot prove it, and an
-earlier complete walk cannot keep it true. That would need a separately
-designed enforcement boundary, not a stale size record or an invented fence.
+recovery; it does not establish a Cargo descendant sandbox. A future requirement
+for descendant device uniformity **before any Cargo write** would need a
+different contract: finite root checks cannot prove it, and an earlier complete
+walk cannot keep it true. It would need a separately designed enforcement
+boundary.
 
-## Narrow implementation and reporting
+## Class separation and reporting
 
-Separate the two call sites explicitly: keep OneUse's restore, membership,
-slice union/budgets and complete target walk; give only the Normal candidate
-branch a scope-checked, unmeasured transition. Share the final checked ledger
-transition if useful, not a globally weakened `reuse_idle`. Normal new-slot
+The two call sites are separate: OneUse keeps its restore, membership,
+slice union/budgets and complete target walk; only the Normal candidate
+branch uses `reuse_normal_idle`. The common final `take_idle` transition is
+unchanged; measured `reuse_idle` is not globally weakened. Normal new-slot
 restore, pressure, reserve/hard floor, victim selection and deletion remain
 unchanged. Release measurement still runs and publishes only complete results;
 an incomplete release leaves the slot unrecorded as today.
 
-Return `Leased.measured = None` on this Normal path. Do not write a new
+Normal returns `Leased.measured = None` on this Normal path. Do not write a new
 `LeaseReuse` observation, perform a reporting walk, substitute a stale ledger
 figure or introduce a conservative charge where no capacity decision occurs.
 Existing status records retain their observation source/age and generation
@@ -139,19 +139,40 @@ Use direct correctness cases, not another timing benchmark or actor search:
   scan. Recorded status remains explicitly historical. Reserve refusal,
   watchdog stop/removal, group closure and release ordering remain effective.
 
-Future implementation should be **HIGH complexity, Elevated verification**:
-the changed admission permits subsequent writes on removable media. No change
-to deletion or writer-closure decisions is proposed. Cover with
-`effigy rust:compile`, `rust:compile-release`, `rust:format`, `docs:check` and
-a focused Effigy library/front-door regression selector using the ordinary
-Oxide-backed test route. Propose a small fixed warm-reuse correctness selector
-and its uncounted diagnostic under the unchanged qualified shared guard,
-normal heavy admission, 300 s and 512 MiB, followed only when adequate by the
-counted author and distinct independent reviewer occurrences. A future brief
-must name those selectors and safe backend fixtures; existing removable proof
-tooling is not presumed qualified. This design activates none of them.
+The implementation is **HIGH complexity, Elevated verification** because
+changed admission permits subsequent writes on removable media. Deletion and
+writer-closure decisions are unchanged. Covering selectors are
+`effigy rust:compile`, `rust:compile-release`, `rust:format`, `rust:warm-reuse`
+and `docs:check`. The focused selector runs library/front-door regressions
+through ordinary Oxide. Existing unchanged accounting, volume and watchdog
+rules remain owned by their contracts; the new tests do not qualify a mount.
 
-The published investigation apparatus and failed/inconclusive evidence remain
-unchanged. The original adequate cost diagnostic and counted proof are still
-missing, with no waiver or PASS. Design acceptance establishes neither product
-readiness nor permission to merge that apparatus, install or run Effigy QA.
+`proof:warm-reuse:diagnostic` and `proof:warm-reuse` prepare the exact commands:
+
+```text
+python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-warm-reuse.py --diagnostic
+python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-warm-reuse.py
+```
+
+Both are heavy selectors under the unchanged qualified guard
+`fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b`.
+The fixed driver runs the ignored library correctness case and a front-door
+case through ordinary offline/locked Oxide; it uses fresh evidence fixtures
+and scratch temp, with compiler output in ordinary managed storage. Thirty-one
+independent library case rows and the front-door receipt cover actual lease
+engine/filesystem effects; removable verification and device/UID/kind fault
+projections are explicitly synthetic. No image, real account, private HOME,
+metadata-actor probe or live pool is used. Guard closure remains a separate
+receipt; child success cannot establish it. The driver's nine premises are
+listed in its module docstring. Diagnostic mode retains independent failures
+and always returns nonzero with `qualified: false`; infrastructure failure
+stops dependent work. There is no automatic retry or new supervisor.
+
+Source/readiness review precedes planner activation of one immutable uncounted
+diagnostic, then (only when adequate) one author and one distinct independent
+reviewer correctness occurrence. None has run at this implementation head.
+Historical cost diagnostics/counts remain failed or missing, with no waiver or
+PASS, and the last privileged trace's descendant closure remains unproven.
+Superseded investigation tooling is removed from the landing diff; its
+published commits and evidence remain history. Source implementation alone
+permits neither merge, installation nor Effigy QA.

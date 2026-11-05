@@ -1735,15 +1735,7 @@ fn print_summary(
             "run" | "test" | "exec" => "build+execute",
             _ => "build",
         };
-        let size = match measured {
-            Some(measured) => format!(
-                "slot {} was {} MiB when leased",
-                measured.slot_id,
-                measured.unique_allocated_bytes / MIB
-            ),
-            None if !warm => "new slot".to_owned(),
-            None => "slot size unknown".to_owned(),
-        };
+        let size = leased_size(measured, warm);
         let pool = format!(
             "{size}, {} MiB budget, pool total: see oxide status",
             store.command_budget() / MIB
@@ -1765,6 +1757,19 @@ fn print_summary(
         started.elapsed().as_secs_f64()
     );
     });
+}
+
+/// An acquisition without a walk has no fresh size, even on warm reuse.
+fn leased_size(measured: Option<&ReuseMeasurement>, warm: bool) -> String {
+    match measured {
+        Some(measured) => format!(
+            "slot {} was {} MiB when leased",
+            measured.slot_id,
+            measured.unique_allocated_bytes / MIB
+        ),
+        None if !warm => "new slot".to_owned(),
+        None => "slot size unknown".to_owned(),
+    }
 }
 
 /// What one `oxide status` run asks for (oxide#128). `Recorded` is the
@@ -3225,7 +3230,9 @@ mod tests {
     /// A recorded size says it is recorded, with its age and source, and a
     /// missing, unreadable or differently generated fact never claims a size.
     #[test]
-    fn recorded_sizes_are_honest() {
+    fn warm_reuse_sizes_and_historical_observations_are_honest() {
+        assert_eq!(leased_size(None, true), "slot size unknown");
+        assert_eq!(leased_size(None, false), "new slot");
         use store::{ObservationSource, RecordedAge, SlotSize};
         let recorded = SlotSize::Recorded {
             allocated_bytes: 12 * 1024 * 1024,

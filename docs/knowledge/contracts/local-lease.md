@@ -829,70 +829,19 @@ walk's bytes are never used for admission and never make a slot an eviction
 candidate; `status` shows them as a lower bound. A measured zero stays
 distinct from unknown.
 
-### Matching-reuse deadline diagnosis (oxide#280)
+### Normal warm reuse (oxide#280)
 
-The retained Effigy milestone at `80960289a0dbfdbaa6b2b06c6e803cd6cb76f180`
-refused before its compiler/tests: `matching_reuse`, removable slot 1,
-incarnation 1, `elapsed_deadline x1`, 61,624 entries in 60,006 ms against
-2,000,000 entries / depth 64 / 60,000 ms. The verified 361-byte stderr has
-SHA-256 `b3e4ec97a921a187688f5321523a362046a3f88468808b506bae898953360c4d`.
-This establishes an elapsed-bound refusal, not entry exhaustion, corruption,
-a slow syscall, host load or a storage-device cause. Historical causation is
-**UNKNOWN**; the failed milestone remains failed.
+[Normal warm-reuse admission](warm-reuse-admission.md) now takes a compatible
+idle slot without a recursive target size walk. Root/parent identity, backing,
+lease exclusion and writer custody remain checked; descendant completeness is
+not a pregrant assertion. No fresh size is reported. OneUse still measures its
+target; new-slot pressure, release accounting and deletion are unchanged.
 
-Source inspection of installed `3fd61913` and `941087f5` found identical
-`src/lease/pool.rs` and `src/inventory.rs` between those commits.
-`reuse_idle` validates the slot scope, calls `inventory_sizes` once, and
-requires complete coverage before `take_idle`. That walk is not a redundant
-repeat of a current record: matching reuse explicitly requires a fresh walk.
-`recorded_total` uses current idle records for the separate capacity decision;
-it publishes newly completed idle observations after generation rechecks.
-`measure_for_release` likewise requires completion and the same slot,
-incarnation and lease generation before returning a closing record. Taking
-the slot clears its record. None of these publications permits skipping the
-matching walk.
-
-The walker retains one start/deadline, checks between filesystem operations
-and after the second directory sample, and latches the first deadline gap.
-Partial bytes cannot pass `Sizes::require_complete`. Its final root
-verification, filesystem-capacity probe and report construction run after
-traversal; they do not themselves set `elapsed_deadline`. Consequently the
-reported elapsed milliseconds are not a breakdown of traversal costs.
-
-No redundant filesystem read whose removal would prevent this traversal
-deadline gap has been demonstrated. The existing
-entry-relative metadata path and both required directory samples remain
-necessary under the current contract. The accounting caller does discard
-report detail, described in the [inventory diagnosis](storage-inventory.md#accounting-report-cost-diagnosis-oxide280),
-but its contribution to this refusal has not been isolated. The bounded private
-investigation produced timings and source-selection counts, then failed four
-exact-tree checks after two unexplained `.DS_Store` files appeared; its guard
-ended with cleanup uncertainty and exit 125. The inventory diagnosis preserves
-the packets and limits. The later evidence-retained fixture diagnostic refused
-an already-present metadata name before inventory ran and independently ended
-with a stale-reading guard fault and `UNCLOSED`. Its metadata-creation ordering
-correction has not received another native occurrence. No counted proof
-followed either inadequate diagnostic.
-The smaller-fixture continuation was then refused before admission by a
-missing Nucleus runtime in Effigy's hook; it produced no new walk or proof.
-After the owner repaired that route, the authorized diagnostic closed but
-failed its fixed-tree precondition before measurement. A later metadata-only
-observation found both deliberate metadata files had different inodes and
-sizes; their replacement's origin remains unknown. No counted proof followed.
-The next cooperative permissions correction also stopped before measurement:
-a creation identity was missing before any permission change could run.
-That correction's effectiveness and the disappearance's cause remain unknown.
-The source-only audit also found that the fixture's expected metadata is read
-twice by pathname after closing the creation descriptor, so creation provenance
-is not pinned. That test-driver defect does not explain the later missing path;
-the [inventory audit](storage-inventory.md#source-only-creation-audit-oxide280)
-records the distinction and evidence limit. No runtime remedy is established.
-The authorized descriptor-based correction then captured creation metadata and
-a matching post-close pathname, but the later lookup still failed before
-measurement. Creation provenance is now bound for that failed occurrence;
-its disappearance remains unexplained and no counted proof followed.
-Admission remains **unrestored**; this precise-impediment outcome grants no
-installation or Effigy QA readiness and no performance qualification credit.
+The historical matching-reuse refusal reached 61,624 entries / 60,006 ms.
+Its cause and the investigation's metadata actor remain unknown; the failed
+cost diagnostics and inconclusive trace confer no runtime proof. Published
+investigation commits/evidence remain preserved. The new direct correctness
+proof is separately gated; source implementation alone is not qualification.
 
 **Enumerated paths that vanish (oxide#113).** If a non-root path enumerated by
 the same walk returns `NotFound` at deferred `read_dir`, `file_type` or
@@ -1026,8 +975,8 @@ already makes, in
 `<pool>/oxide-managed/status-observations.json` (schema
 `oxide.status-observations/1`, ≤512 KiB, 256 retained recent facts, each
 bound to store ID, slot ID, incarnation, exact recorded directory, wall-clock
-time, allocated bytes, source and measuring lease). There are two sources: the
-reuse walk (`lease-reuse`, with its measured figure) and an admission walk that
+time, allocated bytes, source and measuring lease). There are two sources: a OneUse target reuse walk (`lease-reuse`, with its
+measured figure; older Normal reuse observations remain historical) and an admission walk that
 stopped partial (`admission-walk-incomplete`, which carries **no** figure — its
 `allocated_bytes` is written as 0 and read by nothing, and it reads as
 `not measured (walk incomplete)`; oxide#186). The sidecar is an
@@ -1272,10 +1221,10 @@ evidence does not carry forward to the migrated recipe.
 
 ### Recorded per-slot accounting (oxide#146: implemented, native held)
 
-The [proposed Normal warm-reuse contract](warm-reuse-admission.md) separates
-grant-time root/custody checks from recursive measurement. It is design only:
-the matching-slot complete-walk requirement described here remains implemented,
-and OneUse, new-slot pressure, release accounting and deletion are unchanged.
+The [Normal warm-reuse contract](warm-reuse-admission.md) separates grant-time
+root/custody checks from recursive measurement. Normal compatible reuse has no
+size walk; OneUse, new-slot pressure, release accounting and deletion keep their
+existing measured rules.
 
 Tom's 2026-10-25 ruling, "We need a much faster way to do the accounting
 too" (Queue decision `8c6b8319-b20e-4a78-b987-c09dee69886c`), approves a
@@ -1309,8 +1258,8 @@ the full-walk audit.
 is trusted at admission, so an entry that only a fresh walk would find
 unreadable no longer blocks a new-slot admission; the whole-idle-slot deletion
 then either succeeds or fails honestly and leaves a recorded `Evicting` slot
-for reconciliation. Reuse of that same idle slot still walks it and still
-refuses. (2) `pool_scope()` needed its own walker: `extra_depth` only raises
+for reconciliation. OneUse reuse of that same idle slot still walks it and refuses; Normal
+compatible reuse verifies its root without a descendant walk. (2) `pool_scope()` needed its own walker: `extra_depth` only raises
 `max_depth` and files at the bound are still counted, so any depth bound would
 either descend into legacy `slots/<id>` roots or report a `DepthLimit` gap at
 labelled `slots/<folder>/<profile>-<id>` roots. (3) The 5 s

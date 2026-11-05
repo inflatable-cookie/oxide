@@ -1953,14 +1953,7 @@ impl Pool {
             });
         }
         if let Some((idle, incarnation)) = candidate {
-            // A normal warm reuse measures nothing (design §6.3): the #110
-            // target-only walk below is its only measurement.
-            return self
-                .reuse_idle(idle, incarnation, project, workspace, request)
-                .map(|leased| Leased {
-                    slice: None,
-                    ..leased
-                });
+            return self.reuse_normal_idle(idle, incarnation, project, workspace, request);
         }
         // Restore runs before every new-slot admission, normal included
         // (design §6.3). An empty member set costs no walk and no write.
@@ -2001,7 +1994,76 @@ impl Pool {
             .map(|slot| (slot.id, slot.incarnation))
     }
 
-    /// Take an idle compatible slot after validating its own scope.
+    /// Normal reuse verifies only its root and parent, never descendants.
+    /// These two samples are point-in-time identity checks, not a write fence.
+    fn reuse_normal_idle(
+        &mut self,
+        idle: u64,
+        incarnation: u64,
+        project: PathBuf,
+        workspace: PathBuf,
+        request: &LeaseRequest,
+    ) -> Result<Leased, LeaseError> {
+        let before = self.normal_reuse_scope(idle, incarnation, &project, request.profile)?;
+        self.ensure_capacity_policy()?;
+        self.next_rank()?;
+        #[cfg(test)]
+        warm_reuse_tests::before_commit(self);
+        let after = self.normal_reuse_scope(idle, incarnation, &project, request.profile)?;
+        if before != after {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        let grant = self.take_idle(idle, incarnation, project, workspace, request)?;
+        Ok(Leased {
+            grant,
+            measured: None,
+            admission_note: None,
+            slice: None,
+            unmeasured: Vec::new(),
+            holding: Vec::new(),
+        })
+    }
+
+    fn normal_reuse_scope(
+        &self,
+        id: u64,
+        incarnation: u64,
+        project: &Path,
+        profile: Profile,
+    ) -> Result<(PathBuf, (u64, u64), (u64, u64)), LeaseError> {
+        self.backing.verify_volume()?;
+        let (path, root) = self.validate_idle_slot_scope(id, incarnation, project, profile)?;
+        let parent = path.parent().ok_or(LeaseError::UnknownAccounting)?;
+        canonical_existing_dir(parent, true)?;
+        let parent = fs::symlink_metadata(parent).map_err(io_error)?;
+        let payload = fs::symlink_metadata(self.backing.payload_root()).map_err(io_error)?;
+        let facts = (parent.dev(), parent.uid(), parent.mode());
+        #[cfg(test)]
+        let facts = warm_reuse_tests::parent_facts(facts);
+        if facts.2 & u32::from(libc::S_IFMT) != u32::from(libc::S_IFDIR)
+            || facts.1 != current_uid()
+            || facts.2 & 0o077 != 0
+            || facts.0 != root.0
+            || payload.dev() != root.0
+        {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        if let Payload::Volume { fd, .. } = &self.backing {
+            let held = fs::File::from(fd.try_clone().map_err(io_error)?)
+                .metadata()
+                .map_err(io_error)?;
+            if (held.dev(), held.ino()) != (payload.dev(), payload.ino()) {
+                return Err(LeaseError::BackingMismatch);
+            }
+        } else if fs::symlink_metadata(&self.root).map_err(io_error)?.dev() != root.0 {
+            // A budget payload must remain on its control pool's device,
+            // including a change after Pool::open but before this sample.
+            return Err(LeaseError::BackingMismatch);
+        }
+        Ok((path, root, (parent.dev(), parent.ino())))
+    }
+
+    /// OneUse retains its complete target measurement after slice restore.
     fn reuse_idle(
         &mut self,
         idle: u64,
@@ -7935,6 +7997,8 @@ mod removable_pool_path_tests {
         // A count replacement on the internal pool must refuse before deletion
         // when its own figure is incomplete.
         request.replace_slot = Some(idle.slot_id.parse().expect("slot id"));
+        request.project = fixture.root.join("new-project");
+        fs::create_dir(&request.project).expect("new project");
         with_accounting_limits(1, 64, 60_000, || {
             let refused = lease_injected(request.clone());
             assert!(
@@ -8959,3 +9023,6 @@ mod one_use_slice_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod warm_reuse_tests;
