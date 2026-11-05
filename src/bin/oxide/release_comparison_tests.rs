@@ -325,6 +325,11 @@ fn release_comparison_case(spec: ComparisonCase) {
     assert_ne!(barge_row.blocked_by.as_deref(), Some("policy"), "{report}");
     if spec.selected {
         assert_eq!(
+            oxide[0].kept.as_deref(),
+            Some(CURRENT_SELECTION_KEEP),
+            "{report}"
+        );
+        assert_eq!(
             barge_row.blocked_by.as_deref(),
             Some("references"),
             "{report}"

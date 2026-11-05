@@ -52,6 +52,18 @@ owned by [workflow](workflow.md#pruning-owned-output-roots-oxide129) and
 
 ## Controlled decision comparison
 
+The current-selection alignment in Oxide implements Tom's ruling under the
+separately scoped Queue brief v5. A final exclusion removes validated current
+selections from preview candidates and locked revalidation after the original
+snapshot, identity and all-member reference checks. It checks every relevant
+profile member, preserves whole-batch refusals and leaves released roots on
+their existing candidate path. It changes no Barge reader, format, barrier,
+writer-closure decision or deletion path. Focused regressions cover selected
+present roots, nonrepresentative profile selection, contradictory/malformed
+references, sibling identity disagreement and genuinely released fixtures.
+The selected-plus-absent comparison remains strict and uses an absent checkout.
+The historical results below describe the pre-alignment executable source.
+
 The corrected selected-but-absent comparison (oxide#279) ran once at source
 `359c35a250f46329b4697353557c6d74adf407d5`, under separately approved
 uncounted activation `4510e9d8d7a3175423d941fdc138ba289d8b1a3c7d5f1018fcc6122a64e2ea73`.
@@ -96,9 +108,10 @@ protects"** in operator decision `dc1d6924-f196-4cde-8f2e-4c51c87ba65e`
 `f500bff1884023e154b71a88773d059b8a9c09538f9774daa3cbdf083a7a17e6`).
 A current selection must protect the root even when its checkout is positively
 absent. This resolves the intended semantics; the measured Oxide discrepancy
-above remains uncorrected. Alignment requires a separately scoped approved
-brief. This ruling grants no implementation, native rerun, counted acceptance,
-merge or adoption authority, and does not change the historical receipts.
+above remains uncorrected. The subsequent Queue brief v5 scopes only the conservative
+Oxide exclusion and fresh changed-input validation. The original ruling alone
+grants no implementation, native rerun, counted acceptance, merge or adoption
+authority, and the alignment does not change the historical receipts.
 
 One fresh 128 MiB APFS image per occurrence supplies real kernel-verified
 mount/device/UUID facts to both engines. Its backing/evidence remain under
