@@ -1,11 +1,71 @@
 # Scoped filesystem trace investigation (oxide#280)
 
-**SOURCE-ONLY CORRECTION. Execution and merge remain held.** Planner ruling
-`74aa602a` authorizes the clock correction and pure controls below, without
-restaging or another trace/probe/cost occurrence. The one activated occurrence
-at `6c4f2466` was inconclusive; its staged bytes, timestamps, receipts, resources
-and charges remain unchanged. Admission is unrestored; historical cause,
-full-scale/live readiness and the original counted cost proof remain unresolved.
+**SOURCE-ONLY DIAGNOSIS. Execution and merge remain held.** Planner ruling
+`bb13e6d9` authorizes diagnosis using retained evidence and pure controls. No
+runtime kit repair, restaging or another trace/probe/cost occurrence follows.
+All historical failures, omitted observations, closure uncertainty and charges
+remain unchanged. Admission is unrestored; the cost diagnostic/count is missing.
+
+## Timeout and filtering diagnosis
+
+The replacement at `8398f805` accepted the shared-clock gate (age34,957,750ns),
+created three40-byte controls and recorded243 observations, retaining40 and
+omitting203. Retained identities match; the receipt records `TimeoutError`.
+The guard closed status1 without fault/deadline. Collector UNKNOWN/handoff and
+later sudo wait0 do not establish privileged descendant closure.
+
+The probe sets its cooperative stop to20s, arms a20s self-alarm that raises
+`TimeoutError`, and unconditionally sleeps250ms after each polling round. That
+sleep can cross the alarm boundary before the next stop check. The outer
+exception handler then writes a refusal even when retained metadata matches.
+New pure controls run the actual probe function with virtual time and injected
+signal delivery: the same unchanged metadata reaches20s and returns0 without
+alarm delivery, but becomes a preserved `TimeoutError` refusal when the alarm
+fires during the final sleep. This establishes a classification race in source.
+It does not identify which instruction raised the historical exception: its
+receipt has only the exception class, not a message, traceback or signal fact.
+The retained matching rows also say nothing about the203 omitted rows.
+
+Filtering accepts all three complete exact path shapes in pure controls,
+including their dots, underscores and169/175/176-byte lengths. The parser has
+no160-byte path cap. Retained filtered evidence contains719 events/279,449B:
+639 name the122-byte challenge, and the longest retained pathname is159 bytes,
+the probe directory itself. None names any of the three exact file paths.
+Operations are669 `lstat64`,25 `stat64`,24 `getattrlist` and one `mkdir`.
+Reported labels are695 `Python` and24 `Finder`; every retained `Finder` event
+is an attribute query of a directory. These are process-label/operation facts,
+not verified actor identities or evidence of file mutation. No thread suffix
+is interpreted as a PID. No mutation is established, and none is ruled out.
+
+The installed `/usr/share/man/man1/fs_usage.1` documents wider formatting with
+`-w` and default left-side pathname trimming. It does not establish a concrete
+wide-mode160-byte limit here. Pure controls show that simulated left-trimmed
+versions losing the session prefix are rejected/unparsed or discarded, while
+complete paths match. This preserves privacy and identity; the parser must not
+adopt a filename suffix as an owned path. Raw discarded output was deliberately
+never retained, so these facts support a trimming hypothesis but do not prove
+why the three paths are absent. Unsupported format/operation, utility drops,
+and incomplete sampling remain unresolved alternatives. Final counters include
+798,971 unparsed lines and71 utility-warning/drop indications, so zero matching
+file events is not absence evidence. No additional host/global trace was read.
+
+Smallest unexecuted design proposals for planner/reviewer disposition:
+
+- Finish cooperative observation before the unchanged hard20s safety alarm,
+  bound sleeps by remaining time, and distinguish normal window completion
+  from a delivered timeout. Preserve actual refusals and all deadlines.
+- Consider a short exclusive child basename inside the already fresh bound
+  guard evidence root, avoiding a repeated32-byte nonce there. A `p/` layout
+  would give126/132/133-byte paths under this historical root, without suffix
+  matching or new root authority. This only removes one candidate display
+  limitation; it needs separately scoped source/preparation review and actual
+  format evidence before any execution. No fixed display limit is inferred.
+
+`effigy proof:matching-slot-trace:check` passed **140 pure checks**, including
+both timer-delivery outcomes and full/trimmed exact path controls. The runtime
+kit and qualified guard are unchanged from the executed bytes. No production
+algorithm, policy, supervisor, acceptance rule or actual receipt is corrected.
+Return these findings to the same reviewer; neither proposal grants a retry.
 
 ## Shared clock correction
 

@@ -483,6 +483,20 @@ explicit rejection receipts. Old timestamps and staged bytes stay historical;
 no restage or retry is authorized. The old comparison/rejection reason was not
 recorded, so the source defect does not establish the cause of that refusal.
 The original passing cost diagnostic/count and admission readiness stay missing.
+Planner `bb13e6d9` then authorized source-only timeout/filter diagnosis.
+Pure virtual-time controls establish that the probe's250ms sleep ignores
+remaining time and can cross its20s alarm and classify unchanged retained metadata as
+`TimeoutError`; the historical receipt lacks message/stack/signal provenance,
+so this is a source-proven race, not a proven historical cause. Complete exact
+file paths parse in pure controls; simulated left-trimmed paths lose the owned
+prefix and must remain rejected. The longest retained path is159 bytes versus
+169–176-byte probe file paths, supporting but not proving display trimming.
+Retained `Finder` labels are directory attribute queries, not file mutations or
+verified actors. No raw rejected trace exists to settle the missing-path cause.
+[Full findings and unexecuted narrow proposals](matching-slot-trace.md#timeout-and-filtering-diagnosis)
+preserve all omitted rows, incomplete coverage and closure uncertainty. No kit
+repair, restaging, native/probe/trace/cost retry or readiness follows diagnosis.
+
 
 
 ## Output and exit semantics

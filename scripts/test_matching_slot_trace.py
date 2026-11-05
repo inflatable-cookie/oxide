@@ -311,3 +311,72 @@ check('malformed gate rejection recorded',kit.gate_decision(None,ready,'digest',
 source=Path(kit.__file__).read_text()
 check('actual probe compares qualified clock and records reason', 'gate_decision(gate, ready, ready_digest, g.now_ns())' in source and 'readiness=readiness' in source and 'time.monotonic_ns()' not in source)
 print(json.dumps(dict(final_total_passed=len(checks), execution='PURE MOCKS ONLY; no restaging/admission/guard/probe/trace')))
+
+
+# Diagnosis only: execute the existing probe with a virtual20s window and
+# injected signal delivery. No real clock, alarm, process or fixture is used.
+def diagnose_window(deliver_alarm):
+    clock={'ns':100_000_000_000,'alarm':None,'handler':None,'creates':0}
+    records=[]
+    def handler(_sig,callback):
+        prior=clock['handler'];clock['handler']=callback;return prior
+    def timer(_which,seconds):
+        clock['alarm']=clock['ns']+int(seconds*1_000_000_000) if seconds else None
+    def sleep(seconds):
+        clock['ns']+=int(seconds*1_000_000_000)
+        if deliver_alarm and clock['alarm'] is not None and clock['ns']>=clock['alarm']:
+            clock['handler'](kit.signal.SIGALRM,None)
+    def metadata(index):
+        return SimpleNamespace(st_dev=1,st_ino=index,st_mode=stat.S_IFREG|0o600,st_size=40,
+                               st_blocks=8,st_mtime_ns=10,st_ctime_ns=10)
+    def create(*args):
+        clock['creates']+=1;return clock['creates']
+    def lstat(path):
+        return metadata(3 if path.name=='ordinary-control' else 2 if path.parent.name=='debug' else 1)
+    env=dict(OXIDE_TASK_SCRATCH_ROOT=P+'/runs/oxide-proof.a/scratch',
+             OXIDE_PROOF_EVIDENCE=P+'/runs/oxide-proof.a/evidence',
+             OXIDE_PROOF_DEADLINE_NS='300000000000',OXIDE_PROOF_RUN_ID='mock-run')
+    with ExitStack() as stack:
+        for mock in [patch.dict(kit.os.environ,env,clear=True),
+                     patch.object(kit,'reader',return_value=SimpleNamespace(now_ns=lambda:clock['ns'])),
+                     patch.object(kit,'identity',return_value={'state':'observed'}),
+                     patch.object(kit,'safe_path',side_effect=lambda p:p),patch.object(kit,'fact',return_value={}),
+                     patch.object(kit,'write_once',side_effect=lambda p,v:records.append((p.name,v))),
+                     patch.object(kit,'private_file',return_value=b'{}'),
+                     patch.object(kit,'gate_decision',return_value={'accepted':True,'reason':'gate_accepted'}),
+                     patch.object(Path,'exists',lambda p:p.name=='gate.json'),patch.object(Path,'mkdir'),
+                     patch.object(Path,'lstat',lstat),patch.object(kit.os,'open',side_effect=create),
+                     patch.object(kit.os,'fdopen'),patch.object(kit.os,'fstat',side_effect=lambda fd:metadata(clock['creates'])),
+                     patch.object(kit.time,'sleep',side_effect=sleep),
+                     patch.object(kit.signal,'signal',side_effect=handler),patch.object(kit.signal,'setitimer',side_effect=timer),
+                     patch.object(kit.subprocess,'Popen',side_effect=AssertionError('process forbidden')),
+                     patch.object(kit.subprocess,'run',side_effect=AssertionError('process forbidden'))]:
+            stack.enter_context(mock)
+        error=None;code=None
+        try:code=kit.probe(Path(P),{},'a'*32,'digest')
+        except TimeoutError as exc:error=str(exc)
+    return clock,records[-1],error,code
+
+for delivery in (False,True):
+    clock,(name,receipt),error,code=diagnose_window(delivery)
+    check('healthy metadata reaches20s '+str(delivery),clock['ns']==120_000_000_000 and clock['creates']==3)
+    check('retained metadata unchanged '+str(delivery),not any(r.get('changed') or r.get('error') for r in receipt['rows']))
+    if delivery:
+        check('normal-window alarm becomes refusal',name=='trace-probe-refusal.json' and receipt['error']=='TimeoutError' and code is None)
+        check('source alarm message identifies20s window',error=='probe20s observation window ended')
+        check('alarm diagnosis preserves omitted count',receipt['omitted_rows']==receipt['observed_rows']-40 and receipt['omitted_rows']>0)
+    else:
+        check('same window without delivered alarm returns0',name=='trace-probe-receipt.json' and code==0 and error is None)
+
+# The exact historical path shapes are supported when complete. Simulated
+# left-trimmed renderings deliberately remain untrusted, not recovered/adopted.
+retained_prefix='/Volumes/Stash/scratch/oxide/trace280-b921217fe7fc700ea87d46e8d484d798-ppeypurg'
+base=retained_prefix+'/runs/oxide-proof.ah458c9s/evidence/trace-probe-b921217fe7fc700ea87d46e8d484d798/'
+for name in ('.DS_Store','debug/.DS_Store','ordinary-control'):
+    full=base+name
+    event,kind=kit.parse_line(line(full,'lstat64','Python.123'),retained_prefix)
+    check('full exact path accepted '+name,kind=='matching' and event['owned_paths']==[full])
+    for rendered in (full[-160:],'/'+full[-159:]):
+        event,kind=kit.parse_line(line(rendered,'lstat64','Python.123'),retained_prefix)
+        check('simulated lost prefix not attributed '+name+str(rendered.startswith('/')),event is None and kind in ('unparsed','discarded'))
+print(json.dumps(dict(final_total_passed=len(checks), execution='DIAGNOSIS PURE MOCKS ONLY; production kit unchanged; no native/trace/probe')))
