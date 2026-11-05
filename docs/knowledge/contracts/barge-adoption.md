@@ -89,6 +89,25 @@ A dedicated owned fixture volume needs a separate explicit planner amendment.
 Do not enter the live output namespace, forge bindings, substitute aliases,
 change production readers or weaken the candidate expectation.
 
+Brief v4 authorises that bounded premise correction: one fresh owned 128 MiB
+APFS image per occurrence, backed in Stash guard evidence. The test-only
+`release_comparison_*` cases use actual Oxide `evaluate` and pinned feature-off
+Barge `release::plan`. One case specification maps each logical root to an
+Oxide root in the image's canonical `oxide-outputs` layout and a Barge root
+created by its ordinary area API. Checkout, selection and missing-state facts
+are shared; Barge's empty descriptor observation and the empty lease ledgers
+are explicitly synthetic. Mount facts are verified normally by both engines.
+The selected control has a present checkout and matching current reference;
+the unknown control omits required pool state. This is decision calibration,
+not a claim that a selected-but-absent checkout has identical policy.
+
+`rust:release-comparison:diagnostic` and `rust:release-comparison` use the
+unchanged qualified guard (`fcfda2b0…`), 300 s and 512 MiB each. The short
+driver reuses the owned-image attachment kit, publishes image custody before
+attachment and requests only guard-owned post-census detach. The Rust cases
+retain actual input bytes and both engine results in guard evidence; global
+refusals remain distinct from per-root keeps. No effect/deletion verb runs.
+
 None of the three cases was exercised: unselected v2 candidate with an absent
 checkout and closed writers; the same identity selected; or a missing/unknown
 required custody or admission fact. Both engines' case outcomes, the uncounted

@@ -1531,6 +1531,15 @@ run = "python3 scripts/bounded-test.py --limit 1200 --scratch-budget-mib 512 -- 
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- oxide test --bin oxide --locked profile_reservation -- --test-threads=1"
 
+# oxide#279: same three keep-going libtest cases; diagnostic precedes counted.
+[tasks."rust:release-comparison"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-release-comparison.py"
+
+[tasks."rust:release-comparison:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-release-comparison.py --diagnostic"
+
 # Uncounted embedded cases only; same qualified guard and fixed suite bounds.
 [tasks."proof:tape-prune:embedded-diagnostic"]
 admission = "heavy"

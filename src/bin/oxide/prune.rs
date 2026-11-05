@@ -8332,6 +8332,8 @@ pub(crate) mod tape_entry {
 mod tests {
     use super::*;
 
+    include!("release_comparison_tests.rs");
+
     /// The pinned Barge reference reader must preserve every live registry flag.
     /// This compares only the in-memory reference predicates, not release plans,
     /// filesystem capture, writer custody, or parity of the two evaluators.
