@@ -688,7 +688,7 @@ fn held_oversized_compatible_slot_keeps_same_holder_replay_and_other_holder_busy
 }
 
 #[test]
-fn partial_accounting_and_unsafe_slot_root_refuse_compatible_reuse() {
+fn warm_reuse_ignores_descendant_depth_but_refuses_unsafe_root() {
     let fx = Fixture::new("recycle-unsafe");
     let pool = fx.dir("pool");
     create_injected(&pool, 8 * 1024 * 1024).expect("init");
@@ -707,23 +707,18 @@ fn partial_accounting_and_unsafe_slot_root_refuse_compatible_reuse() {
         fs::create_dir(&nested).expect("nested fixture directory");
     }
     release_injected(&pool, &partial.lease_id).expect("release partial candidate");
-    // The old depth bound (24) stops this slot's walk: reuse refuses.
-    let refused = with_accounting_limits(50_000, 24, 5_000, || {
+    // Normal reuse has no descendant walk, even beyond the supplied bound.
+    let warm = with_accounting_limits(50_000, 24, 5_000, || {
         lease_injected(request(
             &pool,
             &partial_project,
             &workspace,
             "partial-retry",
         ))
-    });
-    let scan = incomplete(refused);
-    assert_eq!(scan.coverage, AccountingCoverage::Partial);
-    assert_eq!(gap_kinds(&scan), vec![AccountingGapKind::DepthLimit]);
-    assert!(pool
-        .join("payload")
-        .join("slots")
-        .join(&partial.slot_id)
-        .exists());
+    })
+    .expect("normal reuse ignores descendant depth");
+    assert_eq!(warm.slot_id, partial.slot_id);
+    release_injected(&pool, &warm.lease_id).expect("release warm");
     // The pool bounds cover it: the same slot generation is reused.
     let reused = lease_injected(request(
         &pool,
@@ -2182,7 +2177,7 @@ fn unexpected_entry_names_are_escaped_and_bounded() {
 }
 
 #[test]
-fn entry_bound_refuses_reuse_and_allocation_with_its_cause_then_pool_bounds_admit() {
+fn warm_reuse_ignores_entry_bound_while_status_and_pressure_keep_it() {
     let fx = Fixture::new("entry-bound");
     let pool = fx.dir("pool");
     managed::init_budget_pool(&pool, 64 * 1024 * 1024).expect("init budget pool");
@@ -2200,16 +2195,10 @@ fn entry_bound_refuses_reuse_and_allocation_with_its_cause_then_pool_bounds_admi
     }
     let before = managed::status(&pool).expect("status");
     with_accounting_limits(20, 64, 60_000, || {
-        // A single slot over the bound: its reuse walk stops at the bound.
-        let scan = incomplete(managed::lease(request(&pool, &big, &workspace, "reuse")));
-        assert_eq!(scan.coverage, AccountingCoverage::Partial);
-        assert_eq!(gap_kinds(&scan), vec![AccountingGapKind::EntryLimit]);
-        assert_eq!((scan.entries_visited, scan.max_entries), (20, 20));
-        let message = LeaseError::AccountingIncomplete(Box::new(scan), None).to_string();
-        assert!(message.contains("partial, entry_limit x1, 20 entries in"));
-        assert!(message.contains("(bounds 20 entries, depth 64, 60000 ms)"));
-        // Each slot under the bound but the pool over it: a slot under the
-        // bound is still reused, and a new slot's admission walk refuses.
+        let warm = managed::lease(request(&pool, &big, &workspace, "reuse")).expect("normal reuse");
+        assert_eq!(warm.slot_id, slots[0].slot_id);
+        managed::release(&pool, &warm.lease_id).expect("release big");
+        // Neither Normal candidate needs descendant accounting.
         let warm = managed::lease(request(&pool, &small_a, &workspace, "warm")).expect("warm");
         assert!(warm.reused_slot);
         assert_eq!(warm.slot_id, slots[1].slot_id);
@@ -2258,7 +2247,7 @@ fn entry_bound_refuses_reuse_and_allocation_with_its_cause_then_pool_bounds_admi
 }
 
 #[test]
-fn elapsed_deadline_refuses_with_its_cause() {
+fn warm_reuse_skips_deadline_but_new_slot_keeps_scope_refusal() {
     let fx = Fixture::new("elapsed-bound");
     let pool = fx.dir("pool");
     managed::init_budget_pool(&pool, 64 * 1024 * 1024).expect("init budget pool");
@@ -2267,8 +2256,9 @@ fn elapsed_deadline_refuses_with_its_cause() {
     let grant = managed::lease(request(&pool, &project, &workspace, "a")).expect("lease");
     managed::release(&pool, &grant.lease_id).expect("release");
     with_accounting_limits(2_000_000, 64, 0, || {
-        let scan = incomplete(managed::lease(request(&pool, &project, &workspace, "b")));
-        assert_eq!(gap_kinds(&scan), vec![AccountingGapKind::ElapsedDeadline]);
+        let warm =
+            managed::lease(request(&pool, &project, &workspace, "b")).expect("normal warm reuse");
+        managed::release(&pool, &warm.lease_id).expect("release warm");
         let scan = incomplete(managed::lease(request(
             &pool,
             &fx.dir("other"),
@@ -2285,7 +2275,7 @@ fn elapsed_deadline_refuses_with_its_cause() {
 }
 
 #[test]
-fn unreadable_slot_entry_refuses_reuse_admission_and_eviction() {
+fn warm_reuse_skips_unreadable_descendants_and_preserves_recorded_eviction() {
     let fx = Fixture::new("unreadable");
     let pool = fx.dir("pool");
     managed::init_budget_pool(&pool, 1024).expect("init tiny budget pool");
@@ -2301,18 +2291,23 @@ fn unreadable_slot_entry_refuses_reuse_admission_and_eviction() {
     fs::create_dir(&locked).expect("locked dir");
     managed::release(&pool, &grant.lease_id).expect("release");
     let denied = crate::test_fs::InjectedErrorGuard::read_dir(&locked);
-    let reuse = managed::lease(request(&pool, &project, &workspace, "b"));
+    let reuse = managed::lease(request(&pool, &project, &workspace, "b")).expect("normal reuse");
+    assert_eq!(denied.hits(), 0);
+    drop(denied);
+    managed::release(&pool, &reuse.lease_id).expect("release refreshes record");
+    let denied = crate::test_fs::InjectedErrorGuard::read_dir(&locked);
     // Over the tiny budget the recorded idle slot is byte pressure. The
     // accepted stale-idle policy trusts a current record, so a new-slot
     // admission does not re-walk that slot: it evicts the whole idle slot it
     // owns instead of refusing on an entry only a fresh walk would notice.
     let admit = lease_after_publishing(&pool, request(&pool, &fx.dir("other"), &workspace, "c"));
     let status = managed::status(&pool);
-    assert!(denied.hits() >= 1, "permission injection was not reached");
+    assert_eq!(
+        denied.hits(),
+        0,
+        "neither reuse nor recorded pressure walks descendants"
+    );
     drop(denied);
-    let scan = incomplete(reuse);
-    assert_eq!(scan.coverage, AccountingCoverage::Partial);
-    assert_eq!(gap_kinds(&scan), vec![AccountingGapKind::UnreadableEntry]);
     let admitted = admit.expect("the trusted record admits and the idle slot is evicted whole");
     assert_ne!(admitted.slot_id, grant.slot_id);
     assert!(!grant.env.cargo_build_build_dir.exists());
@@ -2626,12 +2621,11 @@ fn ledger_view_is_status_membership_without_walks() {
     );
 }
 
-/// Reuse walks only its target slot and returns that walk; a held replay
-/// walks and measures nothing; a new slot keeps the whole-payload admission
-/// walk and has no measurement.
+/// Normal reuse and held replay measure nothing; new-slot pressure remains
+/// independently accounted.
 #[cfg(debug_assertions)]
 #[test]
-fn reuse_walks_only_its_slot_and_returns_that_measurement() {
+fn warm_reuse_returns_no_measurement_or_walk() {
     let fx = Fixture::new("measured");
     let pool = fx.dir("pool");
     create_injected(&pool, 64 * 1024 * 1024).expect("init");
@@ -2656,29 +2650,13 @@ fn reuse_walks_only_its_slot_and_returns_that_measurement() {
     let unrelated = lease_injected(request(&pool, &other, &workspace, "b")).expect("other");
     fill(&unrelated.env.cargo_build_build_dir, 300);
     release_injected(&pool, &unrelated.lease_id).expect("release other");
-    let expected = status_injected(&pool)
-        .expect("status")
-        .slots
-        .iter()
-        .find(|slot| slot.slot_id == first.grant.slot_id)
-        .and_then(|slot| slot.unique_allocated_bytes)
-        .expect("target size");
-
     let (reused, reuse_walks) = walked(&pool, || {
         managed::lease_measured(request(&pool, &target, &workspace, "c"))
     });
     let reused = reused.expect("reuse");
     assert!(reused.grant.reused_slot);
-    assert_eq!(reuse_walks, vec![format!("slots/{}", first.grant.slot_id)]);
-    assert_eq!(
-        reused.measured,
-        Some(super::ReuseMeasurement {
-            slot_id: first.grant.slot_id.clone(),
-            incarnation: first.grant.incarnation.clone(),
-            unique_allocated_bytes: expected,
-            dir: None,
-        })
-    );
+    assert!(reuse_walks.is_empty(), "{reuse_walks:?}");
+    assert_eq!(reused.measured, None);
 
     let (replay, replay_walks) = walked(&pool, || {
         managed::lease_measured(request(&pool, &target, &workspace, "c"))
@@ -4429,11 +4407,10 @@ fn measure_matches_status_for_a_settled_pool() {
     );
 }
 
-/// Reuse's measurement carries the exact recorded slot directory, so a
-/// recorded observation binds to that directory and not to an assumed
-/// `slots/<id>` path.
+/// Normal reuse preserves the recorded slot directory without publishing
+/// a measurement or guessing a legacy `slots/<id>` path.
 #[test]
-fn reuse_measurement_names_the_recorded_slot_directory() {
+fn warm_reuse_keeps_the_recorded_slot_directory_without_a_measurement() {
     let fx = Fixture::new("reuse-dir");
     let pool = fx.dir("pool");
     create_injected(&pool, 8 * 1024 * 1024).expect("init");
@@ -4448,13 +4425,12 @@ fn reuse_measurement_names_the_recorded_slot_directory() {
     let leased = lease_injected(first).expect("new slot");
     release_injected(&pool, &leased.lease_id).expect("release");
     let reused = managed::lease_measured(request(&pool, &project, &workspace, "b")).expect("reuse");
-    let measured = reused.measured.expect("reuse measures its slot");
-    assert_eq!(measured.slot_id, leased.slot_id);
-    assert_eq!(
-        measured.dir.as_deref(),
-        Some("project-aaaa/quick-1"),
-        "the measurement names the recorded directory"
-    );
+    assert!(reused.measured.is_none());
+    assert!(reused
+        .grant
+        .env
+        .cargo_build_build_dir
+        .ends_with("project-aaaa/quick-1/build"));
 }
 
 /// One measurement has one cumulative elapsed deadline: every walk
@@ -8095,23 +8071,17 @@ fn accounting_context_rendering_is_bounded_and_preserves_scan_and_category() {
 }
 
 #[test]
-fn required_walk_refusals_name_only_their_known_origin_and_preserve_ledger() {
+fn warm_reuse_skips_matching_walk_but_preserves_required_scope_refusals() {
     let fx = Fixture::new("refusal-context");
     let (pool, id, slot, workspace) = released_idle_slot(&fx, "context", 64 * 1024 * 1024);
     let project = fx.path().join("context-project");
     fill(&slot, 10);
-    let before = fs::read(pool.join("ledger.json")).expect("ledger before");
-    let error = with_accounting_limits(2, 64, 60_000, || {
+    let warm = with_accounting_limits(2, 64, 60_000, || {
         lease_injected(request(&pool, &project, &workspace, "reuse"))
     })
-    .expect_err("matching walk must refuse");
-    assert!(
-        error.to_string().contains(&format!(
-            " [phase=matching_reuse backing=directory slot={id} incarnation=1]"
-        )),
-        "{error}"
-    );
-    assert_eq!(fs::read(pool.join("ledger.json")).unwrap(), before);
+    .expect("normal candidate skips inventory");
+    release_injected(&pool, &warm.lease_id).unwrap();
+    let before = fs::read(pool.join("ledger.json")).expect("ledger before");
 
     // A scope bound refuses before selecting any slot.
     let fresh = fx.dir("fresh-project");

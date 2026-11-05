@@ -689,9 +689,9 @@ impl From<&SlotStatus> for LedgerSlot {
     }
 }
 
-/// The complete walk reuse made of exactly this slot generation, under the
-/// pool lock, before this lease took it. Nothing measures a new slot or a
-/// held same-holder replay, and nothing remeasures after release.
+/// The complete target walk OneUse reuse made under the pool lock before
+/// taking this generation. Normal warm reuse, new slots and held same-holder
+/// replay have no acquisition measurement; release accounting is separate.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReuseMeasurement {
     pub slot_id: String,

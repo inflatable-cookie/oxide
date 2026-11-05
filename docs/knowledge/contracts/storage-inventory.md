@@ -178,6 +178,18 @@ default an absent count to zero. Older strict readers may reject a report that
 contains a nonzero `vanished` field. This diagnostic is not persisted in the
 pool ledger or configuration.
 
+### Matching-reuse investigation (oxide#280)
+
+The historical matching-reuse walk refused at 61,624 entries / 60,006 ms;
+its cause remains unknown. Private cost diagnostics did not establish a
+production cost remedy, and the metadata trace was inconclusive. Failed
+fixtures, omitted observations, privileged-descendant closure uncertainty and
+all published evidence remain history; no cost proof or actor attribution is
+claimed. Superseded investigation tooling is removed from the landing source,
+with its published commits preserved. The [Normal warm-reuse contract](warm-reuse-admission.md)
+changes admission policy instead; inventory semantics and measured routes stay
+unchanged.
+
 ## Output and exit semantics
 
 Human output is concise: root, coverage, visited counts, a per-category table

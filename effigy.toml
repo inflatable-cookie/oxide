@@ -1561,3 +1561,16 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- o
 [tasks."proof:store-fixtures:process-diagnostic"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/diagnose-store-fixtures.py --process-control"
+
+# #280 Normal-only unmeasured reuse. Source covering; native proof is owner-gated.
+[tasks."rust:warm-reuse"]
+admission = "heavy"
+run = "oxide test --lib --bin oxide --locked warm_reuse -- --test-threads=1"
+
+[tasks."proof:warm-reuse:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-warm-reuse.py --diagnostic"
+
+[tasks."proof:warm-reuse"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-warm-reuse.py"

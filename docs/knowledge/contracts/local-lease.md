@@ -829,6 +829,20 @@ walk's bytes are never used for admission and never make a slot an eviction
 candidate; `status` shows them as a lower bound. A measured zero stays
 distinct from unknown.
 
+### Normal warm reuse (oxide#280)
+
+[Normal warm-reuse admission](warm-reuse-admission.md) now takes a compatible
+idle slot without a recursive target size walk. Root/parent identity, backing,
+lease exclusion and writer custody remain checked; descendant completeness is
+not a pregrant assertion. No fresh size is reported. OneUse still measures its
+target; new-slot pressure, release accounting and deletion are unchanged.
+
+The historical matching-reuse refusal reached 61,624 entries / 60,006 ms.
+Its cause and the investigation's metadata actor remain unknown; the failed
+cost diagnostics and inconclusive trace confer no runtime proof. Published
+investigation commits/evidence remain preserved. The new direct correctness
+proof is separately gated; source implementation alone is not qualification.
+
 **Enumerated paths that vanish (oxide#113).** If a non-root path enumerated by
 the same walk returns `NotFound` at deferred `read_dir`, `file_type` or
 no-follow metadata, the walk increments a separate `vanished` count rather
@@ -961,8 +975,8 @@ already makes, in
 `<pool>/oxide-managed/status-observations.json` (schema
 `oxide.status-observations/1`, ≤512 KiB, 256 retained recent facts, each
 bound to store ID, slot ID, incarnation, exact recorded directory, wall-clock
-time, allocated bytes, source and measuring lease). There are two sources: the
-reuse walk (`lease-reuse`, with its measured figure) and an admission walk that
+time, allocated bytes, source and measuring lease). There are two sources: a OneUse target reuse walk (`lease-reuse`, with its
+measured figure; older Normal reuse observations remain historical) and an admission walk that
 stopped partial (`admission-walk-incomplete`, which carries **no** figure — its
 `allocated_bytes` is written as 0 and read by nothing, and it reads as
 `not measured (walk incomplete)`; oxide#186). The sidecar is an
@@ -1207,6 +1221,11 @@ evidence does not carry forward to the migrated recipe.
 
 ### Recorded per-slot accounting (oxide#146: implemented, native held)
 
+The [Normal warm-reuse contract](warm-reuse-admission.md) separates grant-time
+root/custody checks from recursive measurement. Normal compatible reuse has no
+size walk; OneUse, new-slot pressure, release accounting and deletion keep their
+existing measured rules.
+
 Tom's 2026-10-25 ruling, "We need a much faster way to do the accounting
 too" (Queue decision `8c6b8319-b20e-4a78-b987-c09dee69886c`), approves a
 different policy from the exact-cache proposal below. The sections below are
@@ -1239,8 +1258,8 @@ the full-walk audit.
 is trusted at admission, so an entry that only a fresh walk would find
 unreadable no longer blocks a new-slot admission; the whole-idle-slot deletion
 then either succeeds or fails honestly and leaves a recorded `Evicting` slot
-for reconciliation. Reuse of that same idle slot still walks it and still
-refuses. (2) `pool_scope()` needed its own walker: `extra_depth` only raises
+for reconciliation. OneUse reuse of that same idle slot still walks it and refuses; Normal
+compatible reuse verifies its root without a descendant walk. (2) `pool_scope()` needed its own walker: `extra_depth` only raises
 `max_depth` and files at the bound are still counted, so any depth bound would
 either descend into legacy `slots/<id>` roots or report a `DepthLimit` gap at
 labelled `slots/<folder>/<profile>-<id>` roots. (3) The 5 s

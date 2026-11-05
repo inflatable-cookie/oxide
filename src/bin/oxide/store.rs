@@ -11281,6 +11281,39 @@ pub(crate) mod tests {
         outcome
     }
 
+    #[test]
+    fn warm_reuse_has_no_measurement_sidecar() {
+        let (root, store, key) = class_fixture("warm-reuse-size");
+        let first = lease(&store, &key, None).unwrap();
+        let slot = first.slot_id.clone();
+        store.release(first, None).unwrap();
+        assert!(read_observations(&store.control).unwrap().is_none());
+        let warm = lease(&store, &key, None).unwrap();
+        assert_eq!(warm.slot_id, slot);
+        assert!(warm.reused);
+        assert!(warm.measured.is_none());
+        assert_eq!(
+            crate::leased_size(warm.measured.as_ref(), warm.reused),
+            "slot size unknown"
+        );
+        assert!(read_observations(&store.control).unwrap().is_none());
+        let ledger = store.ledger().unwrap();
+        assert!(ledger.slots.iter().any(|row| row.slot_id == slot
+            && row.state == SlotOccupancy::Held
+            && row.recorded.is_none()));
+        store.release(warm, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        if std::env::var_os("OXIDE_WARM_REUSE_FIXTURE").is_some() {
+            let evidence =
+                PathBuf::from(std::env::var_os("OXIDE_PROOF_EVIDENCE").expect("proof evidence"));
+            fs::write(
+                evidence.join("warm-reuse-frontdoor.json"),
+                b"{\"passed\":true}\n",
+            )
+            .unwrap();
+        }
+    }
+
     fn class_state_bytes(store: &Store) -> Vec<u8> {
         fs::read(store.control.join("state.json")).unwrap()
     }
