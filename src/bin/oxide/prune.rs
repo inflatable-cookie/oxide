@@ -2989,6 +2989,22 @@ fn evaluate(
             complete: false,
         });
     }
+    // Apply the monotonic exclusion only AFTER the original snapshot, root
+    // identity and all-member reference checks. A selection cannot hide a
+    // whole-batch refusal (including unknown custody on an absent checkout).
+    for entry in &mut evaluated {
+        if entry.candidate.is_some()
+            || entry.kept.as_deref() == Some("the checkout is present, so its root is kept")
+        {
+            if let Some(Ok(receipt)) = receipts.get(&entry.row.checkout_id) {
+                if current_selection_references(receipt, &entry.row.root) {
+                    entry.candidate = None;
+                    entry.evidence = None;
+                    entry.kept = Some(CURRENT_SELECTION_KEEP.to_owned());
+                }
+            }
+        }
+    }
     // Diagnostics do not consume authority time or input budget.
     AUTHORITY.with(|cell| *cell.borrow_mut() = None);
     account_candidates(&mut evaluated, control);
@@ -3007,6 +3023,19 @@ fn evaluate_test(
 ) -> Result<Evaluation, String> {
     let mut authority = AuthorityScope::begin()?;
     evaluate(store, control, registry, list, &mut authority)
+}
+
+const CURRENT_SELECTION_KEEP: &str = "a current selection still references this root";
+
+/// Final exclusion after the caller has validated the receipt, registry group
+/// and the identity required by its ordinary path. All profile members count.
+fn current_selection_references(receipt: &Receipt, root: &Path) -> bool {
+    receipt.selects()
+        && receipt.links().iter().any(|placement| {
+            placement
+                .selected_ref()
+                .is_some_and(|selected| selected.root() == root)
+        })
 }
 
 /// The eligibility predicates for one row. `Ok(None)` means every predicate
@@ -3068,28 +3097,54 @@ fn eligibility(
     // longer references it as current (a released root: relinked away or
     // detached, kept in history). A registry selection the receipt does not
     // make is a contradiction and keeps the root.
-    match receipt.current() {
-        Some(selected) if selected.root() == row.root => {
-            if !receipt.selects() {
-                return Ok(Some(
-                    "the checkout's receipt is not committed for this root".to_owned(),
-                ));
-            }
-            if selected.nonce() != row.nonce.as_deref()
-                || selected.generation() != row.generation
-                || selected.kind() != row.root_kind
-            {
-                return Err(
-                    "the registry row does not match the checkout's committed receipt".to_owned(),
-                );
-            }
+    for placement in receipt.links() {
+        let Some(selected) = placement
+            .selected_ref()
+            .filter(|selected| selected.root() == row.root)
+        else {
+            continue;
+        };
+        if !receipt.selects() {
+            return Ok(Some(
+                "the checkout's receipt is not committed for this root".to_owned(),
+            ));
         }
-        _ if row.selected => {
+        // Each profile member has its own authority. The representative can
+        // be inactive history, or another member can select a different root.
+        let owners: Vec<&Row> = registry
+            .rows
+            .iter()
+            .filter(|owner| {
+                owner.checkout_id == row.checkout_id
+                    && owner.root == row.root
+                    && owner.member == placement.member()
+                    && owner.selected
+            })
+            .collect();
+        if owners.len() != 1 {
             return Err(
-                "the registry selects this root but the checkout's receipt does not".to_owned(),
-            )
+                "a receipt reference is missing or contradictory in the registry".to_owned(),
+            );
         }
-        _ => {}
+        let owner = owners[0];
+        if selected.nonce() != owner.nonce.as_deref()
+            || selected.generation() != owner.generation
+            || selected.kind() != owner.root_kind
+            || selected.volume_uuid() != owner.volume_uuid.as_deref()
+        {
+            return Err(
+                "the registry row does not match the checkout's committed receipt".to_owned(),
+            );
+        }
+    }
+    if row.selected
+        && !receipt
+            .selected_for(&row.member)
+            .is_some_and(|selected| selected.root() == row.root)
+    {
+        return Err(
+            "the registry selects this root but the checkout's receipt does not".to_owned(),
+        );
     }
     if receipt.prepared_ref().is_some() {
         return Ok(Some("the checkout has a prepared transition".to_owned()));
@@ -6315,6 +6370,12 @@ fn recheck_candidate(
     if !authority.complete() {
         return Err("the locked authority recheck exceeded its input or time budget".to_owned());
     }
+    // The same final exclusion as the preview, after all original rechecks.
+    let group = verified_group(&registry, candidate)?;
+    verify_group_against_receipt(&receipt, &candidate.root, &group)?;
+    if current_selection_references(&receipt, &candidate.root) {
+        return Err(CURRENT_SELECTION_KEEP.to_owned());
+    }
     Ok(registry.revision)
 }
 
@@ -8332,6 +8393,9 @@ pub(crate) mod tape_entry {
 mod tests {
     use super::*;
 
+    include!("release_comparison_tests.rs");
+    include!("selection_protection_tests.rs");
+
     /// The pinned Barge reference reader must preserve every live registry flag.
     /// This compares only the in-memory reference predicates, not release plans,
     /// filesystem capture, writer custody, or parity of the two evaluators.
@@ -10037,7 +10101,8 @@ mod tests {
         // The recipe's internal root: a selected-volume fixture path is a
         // /Volumes mount spelling, where the recorded-volume rule applies first.
         let fixture = Fixture::at_internal_root();
-        let present = legacy_snapshot_row(&fixture, &"a".repeat(64));
+        let mut present = legacy_snapshot_row(&fixture, &"a".repeat(64));
+        present.selected = false;
         fs::create_dir_all(&present.checkout).unwrap();
         fs::create_dir(fixture.root.join("real")).unwrap();
         std::os::unix::fs::symlink(
@@ -10046,18 +10111,14 @@ mod tests {
         )
         .unwrap();
         let mut linked = legacy_snapshot_row(&fixture, &"b".repeat(64));
+        linked.selected = false;
         linked.checkout = fixture.root.join("linked-parent").join("child");
         let control = ready_control(&fixture, vec![present.clone(), linked.clone()], Vec::new());
         for row in [&present, &linked] {
             publish_snapshot_receipt(
                 &control,
                 row,
-                &snapshot_receipt(
-                    row,
-                    "oxide.outputs.transition/1",
-                    "committed",
-                    Some(&row.root),
-                ),
+                &snapshot_receipt(row, "oxide.outputs.transition/1", "detached", None),
             );
         }
         let list = OperatorList {
@@ -10715,13 +10776,14 @@ mod tests {
         fs::write(
             &receipt_path,
             serde_json::to_vec_pretty(&serde_json::json!({
-                "version": "oxide.outputs.transition/2",
+                "version": "oxide.outputs.transition/3",
+                "layout": "profile",
                 "checkout": debug.checkout.to_string_lossy(),
                 "checkout_id": debug.checkout_id,
                 "generation": 1,
                 "state": "committed",
                 "links": [{
-                    "member": "target",
+                    "member": "debug",
                     "selected": {
                         "kind": "local",
                         "root": debug.root.to_string_lossy(),

@@ -235,6 +235,9 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   settings stay as they are.
 - **Leftover output roots** of checkouts that no longer exist are removed
   only by an explicit `oxide outputs prune`, never automatically.
+- Tom's 2026-11-05 selected-root protection ruling and its conservative
+  alignment boundary are owned by the
+  [controlled decision comparison](contracts/barge-adoption.md#controlled-decision-comparison).
 - **Sharing builds:** slots share warm builds across worktrees, up to 12 per
   project, with least-recently-used idle slots evicted under the byte budget.
 - **Cold slots:** the chosen direction instead of sccache is seeding a cold
