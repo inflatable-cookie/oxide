@@ -868,8 +868,8 @@ always recorded.
 | WRT-RETIRED-CLEAN | retired record, no lost fact, no holders | skipped → custody clear → may proceed to candidate | retired without lost fact classified unknown → kept | EXPLAIN-OR-BLOCK |
 | FENCE-MISSING | outputs control fence absent | `require_ready` refusal (not initialized), nothing written | control unknown → every covered root kept | MATCH-KEPT |
 | FENCE-UNKNOWN | unknown fence version/owner | keep/refuse batch | keep every covered root | MATCH |
-| EFFECT-1 | `admission.lock` absent (DYNAMIC) | real lock create + fence saves recorded as effects, custody then evaluated | `shared_if_present` observes nothing; no effect | declared effects exactly; per-engine record |
-| EFFECT-2 | admission state missing accounting fences (DYNAMIC) | real fence saves recorded as effects; evaluation proceeds | custody parse unaffected → proceeds | MATCH on fates + declared Oxide effects |
+| EFFECT-1 | `admission.lock` absent (DYNAMIC) | missing existing lock refuses custody; incomplete batch, every root kept; no completed effect | `shared_if_present` observes nothing; no effect | specific refusal and no completed effect; per-engine record |
+| EFFECT-2 | admission state missing accounting fences (DYNAMIC) | pool open fences old managed state before read-only custody; evaluation proceeds | custody parse unaffected → proceeds | MATCH on fates + declared Oxide effects |
 | DECL-MISSING | area not declared | unaffected (candidate) | command refusal: no release policy | SCOPE (declared refusal; no per-root parity) |
 | DECL-POLICY-NONE | area declared `prune: none` | candidate | kept by policy | CONFIG (configuration difference, no parity claim) |
 | LEG-UNLISTED | R-C unlisted (BASE) | kept: legacy, operator list required | kept: D-3 partition | MATCH |
@@ -904,12 +904,14 @@ never parity. Each names its realization and oracle.
    self-test rejects same-pid/different-start reuse. ID-DEVICE-LIVE and
    VOL-REMOVED-DURING bind the changed mount/device/UUID epoch; a same-UUID
    remount must reconcile as a declared remount, never as a fresh identity.
-6. **Absent admission lock and missing fence cause real create/save
-   attempts.** EFFECT-1/EFFECT-2 record them as effect rows and a per-engine
-   record; they are never hidden by a mock, repaired between engines, or read
-   as attempted write parity. Pending holding or eviction reconciliation
-   reached through `ledger_view` is recorded the same way and is a stop, not a
-   read.
+6. **Missing admission inputs stay read-only.** EFFECT-1 must record the
+   missing internal admission lock's custody refusal on every kept row in an
+   incomplete batch, with no candidate, completed effect or persistent diff.
+   EFFECT-2 preserves positive fence-save coverage through the real locked pool
+   open, including completed temporary create/save and final state rename. The pool-lock `O_CREAT` open remains an uncertain
+   attempt, never completed creation or write parity. Pending holding or
+   eviction reconciliation reached through `ledger_view` is still a stop,
+   not a read. Missing-lock custody provides no positive lock-create coverage.
 7. **Second reads under changed epochs.** Barge's marker reread under its
    second root-id lock and Oxide's ancestry revalidation must each appear as a
    distinct bound occurrence whose outcome equals the first and the manifest;
@@ -1331,10 +1333,21 @@ alone is insufficient.
   carries the four admission fences, `outputs_init` ready, the pool lock and
   the admission lock. BASE expects no confirmed effect and an empty fixture
   diff, but the real pool-lock `O_CREAT` open remains an uncertain attempt,
-  so its transcript is insufficient for parity. The EFFECT cases also record
-  actual temporary operations and uncertain attempts, alongside the final
-  admission-lock creation or fence save; fixture diffs corroborate only the
-  surviving changes. These source assertions have not been executed.
+  so its transcript is insufficient for parity. The historical EFFECT names do not promise writes: EFFECT-1 requires the
+  specific missing-lock custody refusal and an incomplete whole-batch keep;
+  EFFECT-2 retains its declared completed transient create/save and persistent
+  fence-save assertions, plus the surviving state diff and unchanged existing
+  lock. `PoolWitness::take_admission` opens only an existing lock and `read_state`
+  is read-only, so there is no positive lock-create coverage on that custody
+  route. However, earlier `Store::open_at` calls library `ledger_view`, whose
+  locked `Pool::open_inner` reaches `fence_managed_control`: EFFECT-2's old
+  state triggers the real managed fence write before custody. Pure effect
+  bookkeeping/reconciliation controls and all completeness/parity limits stay.
+  `--diagnostic` keeps going through all five embedded cases and the
+  disconnected BASE control, reports each result, retains its fixture root,
+  and always exits nonzero with `qualified=false`; the no-argument suite
+  remains fail-fast. The fixed `proof:tape-prune:embedded-diagnostic` selector
+  runs only that harness under the qualified guard at 600 s / 512 MiB.
 - **Validation and export.** The final executable and its build route must be
   identified from the reviewed source and recorded with its digest, lock and
   toolchain before X-S2 consumes it. The final head still needs its covering
@@ -2068,3 +2081,91 @@ policy kind), G4 (the waiver's status).
 | `rollout_and_rollback` | Rollout order and rollback table |
 | `finite_slices` | Slice table and dependency column |
 | `docs_current` | Index entries; Q-021 in questions; no current-truth claims changed |
+
+The embedded harness derives its allowed scratch namespace from the qualified
+launcher's TMPDIR: `<selected-volume>/scratch/oxide` or `oxide-validation`.
+It rechecks canonical paths, directory ownership, non-writable shared ancestors,
+non-boot placement and private fixture components; engine children receive only
+that TMPDIR plus their fixture configuration. A namespace lookalike or escape
+is refused. This replaces the historical host-specific `/Volumes/Builds` gate.
+Planner ruling c4de881a (2026-11-04) permits this test-only correction and one
+replacement 600 s / 512 MiB uncounted diagnostic; the failed pre-case diagnostic
+remains charged and retained, and the counted suite stays gated on the corrected
+diagnostic's case results.
+
+Planner ruling 0f894fd8 (2026-11-04) permits forwarding TMPDIR in the otherwise
+unchanged child environment allowlist and one further 600 s / 512 MiB diagnostic.
+Diagnostic fixtures live under the existing guard evidence directory, preserving
+containment and guard cleanup/custody. Both earlier failed sessions stay charged;
+their logs/receipts remain, but their scratch was removed after clean closure.
+
+Planner ruling 7f28a33a (2026-11-04) permits restoring the original EFFECT-2
+positive-effect checks after the retained diagnostic exposed its real pool-open
+fence write, while keeping EFFECT-1's specific refusal. One additional bounded
+uncounted diagnostic is authorized; all earlier runs remain charged. Production
+and guard behavior are unchanged; the counted suite still follows a clean
+all-case diagnostic.
+
+The retained embedded diagnostic at `9807864b` exercised all five cases and the
+disconnected BASE control with no case failures; its exit 1 and `qualified=false`
+are intentional and give no qualification/parity credit. The following Rust
+changes only wrap those same expressions. The ordinary suite at `87ce6a6d`
+passed 354 library tests but failed three of 673 binary tests (two fresh-custody
+fixtures reported a busy admission lock; the seed-crash fixture failed at
+`before-origin`). Cargo stopped before the embedded harness, so this is no green
+ordinary-suite or counted embedded-harness evidence. Planner ruling 3c8bff6f
+(2026-11-05) requires preserving both suite roots and publishing the actual
+failure for retained review/disposition; no retry or `store.rs` correction is
+authorized by this task.
+
+#### Ordinary fixture isolation
+
+The three store fixtures that require an immediately free, just-closed flock
+run in individual exact-test child processes: the fresh-custody replacement
+and disappearing-state tests, and the seed-crash trust test. Other tests keep
+their existing parallel execution. Process creation in a parallel test can
+inherit an open file description until exec; closing the parent's descriptor
+alone does not release that description's flock. The fixture child runs only
+after exec, before it opens its own fixture locks. There is no production lock
+change, retry, sleep or weakened refusal.
+
+The cfg(test) `fixture_description_control` runs in its own exact-test process
+and forks one owned child. That child reports its actual PID/PPID, both inherited
+lock descriptor numbers, device/inode and unchanged CLOEXEC flags. Until exec it
+uses only fixed async-signal-safe operations; two bounded gates let the parent
+observe the real custody refusal while the child holds admission, then clear
+custody for the pre-Cargo `Acquiring` phase but a different `Fresh` slot while
+the child retains the record lock alone.
+The child then executes one fixed system command. The parent positively reaps
+that exact direct child before asserting old-slot recovery as `Unknown` and a
+clear released fixture. A caught oracle panic closes the gate and reaps before
+resuming; a child is never treated as closed merely because the parent dropped
+its descriptors. The qualified guard supplies the outer bound and custody.
+
+This demonstrates a process/descriptor hazard that targeted after-exec fixture
+isolation avoids; historical causation remains **UNKNOWN**. The former same-process
+`try_clone` control and the old slot-1/slot-2 observation alone did not establish
+process inheritance. The seed-crash fixture still requires its exact original
+slot/directory, `reused=true` and `Prior::Unknown`, before discard and cold
+allocation. No original trust or custody oracle is relaxed.
+
+The green ordinary suite at `4f3cd6c9` reached all embedded cases. Its
+`cold_seed_default_off` target reports **2 passed, 2 ignored**; the earlier PR
+statement that no tests were ignored was incorrect. The ignored-test policy is
+unchanged. Brief v3 authorizes one changed-input process-control diagnostic and,
+after it passes, one new final-head suite. All preceding evidence is preserved.
+
+The amended owner disposition (brief v2, 2026-11-05) permits this cfg(test)-only
+repair and changed-input validation on the same PR, prospectively superseding
+the earlier no-retry/no-store-test-correction rulings. Historical Builds
+transcripts are unavailable provenance, not required current review inputs;
+no reconstruction or attribution from unchanged source is claimed. Current
+review uses immutable source and checksum-verified retained Stash evidence.
+All earlier failures and limits remain historical and spent.
+
+Planner ruling 4c207fce (2026-11-05) permits one replacement 300 s / 512 MiB
+process diagnostic after the new control incorrectly expected `Writers` for
+pre-Cargo `Acquiring`. The real `Clear` custody verdict is distinct from the
+still-held record's availability. That failed run remains charged; the owned
+child's positive reap and observed descriptors remain evidence, not a pass.
+Original custody/seed oracles, CLOEXEC and historical uncertainty are preserved.

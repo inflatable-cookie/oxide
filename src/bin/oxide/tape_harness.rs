@@ -179,7 +179,7 @@ impl Case {
         })
     }
 
-    /// STATIC cases forbid every effect; the EFFECT cases declare theirs.
+    /// Historical EFFECT names remain stable; attempts never imply completion.
     fn static_case(self) -> bool {
         matches!(
             self,
@@ -653,13 +653,45 @@ fn fixture_facts(root: &Path) -> config::Facts {
     }
 }
 
+/// The guard/wrapper supplies TMPDIR within the selected volume's owned
+/// scratch namespace. Re-derive and validate that namespace without reading
+/// host pool configuration (engine children have only fixture configuration).
+fn fixture_namespace() -> Result<PathBuf, String> {
+    use std::os::unix::fs::MetadataExt;
+    let temp = std::env::temp_dir();
+    let parts: Vec<_> = temp.components().collect();
+    if parts.len() < 5
+        || !temp.starts_with("/Volumes")
+        || parts[3].as_os_str() != "scratch"
+        || !matches!(
+            parts[4].as_os_str().to_str(),
+            Some("oxide" | "oxide-validation")
+        )
+    {
+        return Err("TMPDIR is outside selected-volume scratch namespaces".to_owned());
+    }
+    let namespace: PathBuf = parts[..5].iter().collect();
+    if std::fs::canonicalize(&namespace).map_err(|e| e.to_string())? != namespace {
+        return Err("scratch namespace is not canonical".to_owned());
+    }
+    let boot = std::fs::metadata("/").map_err(|e| e.to_string())?.dev();
+    // SAFETY: getuid takes no arguments and has no caller preconditions.
+    let uid = unsafe { libc::getuid() };
+    for ancestor in namespace.ancestors().take(3) {
+        let meta = std::fs::symlink_metadata(ancestor).map_err(|e| e.to_string())?;
+        if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o022 != 0 || meta.dev() == boot {
+            return Err("unsafe selected-volume scratch namespace".to_owned());
+        }
+    }
+    Ok(namespace)
+}
+
 /// Check every existing component without following a symlink. The root must
 /// be the canonical owner-only fixture; missing suffixes remain under its held
 /// namespace and are created only by the fixture owner.
 fn validate_fixture_path(root: &Path, path: &Path) -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    if !(root.starts_with("/Volumes/Builds/scratch/oxide/")
-        || root.starts_with("/Volumes/Builds/scratch/oxide-validation/"))
+    if !root.starts_with(fixture_namespace()?)
         || std::fs::canonicalize(root).map_err(|e| e.to_string())? != root
     {
         return Err("fixture root is not canonical task scratch".to_owned());
@@ -717,6 +749,7 @@ fn validate_engine_environment(root: &Path) -> Result<(), String> {
         if !matches!(
             name.as_ref(),
             "HOME"
+                | "TMPDIR"
                 | "PATH"
                 | "OXIDE_TEST_HOME_FROM_ENV"
                 | "OXIDE_CONFIG"
@@ -991,7 +1024,7 @@ fn build_fixture(root: &Path, spec: &FixtureSpec) -> Result<FixturePaths, String
     }
 
     // The control state: fully fenced version 9, or the unfenced successor
-    // document the EFFECT-2 case upgrades.
+    // document the EFFECT-2 pool-open path upgrades.
     let state = if spec.fenced_state {
         serde_json::json!({
             "version": 9,
@@ -1375,15 +1408,16 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
     // The covering Rust recipe supplies a fresh child of this sibling as
     // TMPDIR. Exercise the real guard on that owned root when it does so;
     // never create an independent fixture outside the caller's temp root.
-    if temp.starts_with("/Volumes/Builds/scratch/oxide-validation/") {
+    if temp.starts_with(fixture_namespace().map_err(|what| CheckFailure { what })?) {
         check(
             validate_fixture_path(temp, &temp.join("new-entry")).is_ok(),
             "canonical private validation sibling is accepted",
         )?;
     }
-    let lookalike = Path::new("/Volumes/Builds/scratch/oxide-validation-x/not-a-fixture");
+    let namespace = fixture_namespace().map_err(|what| CheckFailure { what })?;
+    let lookalike = namespace.with_extension("lookalike").join("not-a-fixture");
     check(
-        validate_fixture_path(lookalike, lookalike).is_err(),
+        validate_fixture_path(&lookalike, &lookalike).is_err(),
         "validation sibling lookalike is refused",
     )?;
     let insecure = temp.join("insecure-validation-root");
@@ -2320,6 +2354,7 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
         .env_clear()
         .envs(envs)
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("TMPDIR", std::env::temp_dir())
         .output()
         .map_err(|error| CheckFailure {
             what: format!("cannot run the engine child: {error}"),
@@ -2373,12 +2408,7 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
     if matches!(case, Case::Base | Case::Effect1 | Case::Effect2) {
         let expected: &[(&str, &str, &str, &str)] = match case {
             Case::Base => &[],
-            Case::Effect1 => &[(
-                "lock-create",
-                "admission",
-                "create",
-                "scratch/pool/oxide-managed/admission.lock",
-            )],
+            Case::Effect1 => &[],
             Case::Effect2 => &[(
                 "fence",
                 "managed-control",
@@ -2562,28 +2592,33 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
         }
         Case::Effect1 => {
             check(
-                doc.effects.iter().any(|effect| {
-                    effect.get("kind").and_then(|k| k.as_str()) == Some("lock-create")
-                }),
-                "the absent admission lock's real create is an effect row",
+                doc.effects
+                    .iter()
+                    .all(|effect| effect.get("attempted").and_then(|v| v.as_bool()) == Some(true))
+                    && diff_effects.is_empty(),
+                "missing-lock custody has no completed effect or fixture diff",
             )?;
-            let created_lock = diff_effects.iter().any(|effect| {
-                effect.get("path").and_then(|p| p.as_str())
-                    == Some("scratch/pool/oxide-managed/admission.lock")
-                    && effect.get("kind").and_then(|k| k.as_str()) == Some("create")
-            });
+            // The evaluator completes with a conservative batch refusal, not
+            // a chain error: every root carries the missing-lock reason.
+            let result = doc.outcome.get("result");
+            let entries = result
+                .and_then(|result| result.get("entries"))
+                .and_then(|entries| entries.as_array());
             check(
-                created_lock,
-                "the fixture diff positively shows the lock create",
+                outcome_state(&doc) == "completed"
+                    && result.and_then(|result| result.get("complete"))
+                        .and_then(|value| value.as_bool()) == Some(false)
+                    && entries.is_some_and(|entries| entries.len() == 3 && entries.iter().all(|entry| {
+                        entry.get("candidate").is_some_and(|value| value.is_null())
+                            && entry.get("kept").and_then(|value| value.as_str()).is_some_and(|reason| {
+                                reason.contains("writer custody could not be witnessed (the internal pool's admission lock is missing)")
+                            })
+                    })),
+                "the missing admission lock refuses custody for the whole incomplete batch",
             )?;
             check(
-                !doc.effects.iter().any(|effect| {
-                    effect
-                        .get("kind")
-                        .and_then(|k| k.as_str())
-                        .map_or(false, |k| k == "save" || k == "fence")
-                }),
-                "an already-fenced control is not rewritten",
+                !paths.control.join("admission.lock").exists(),
+                "the missing admission lock remains absent",
             )?;
         }
         Case::Effect2 => {
@@ -2658,8 +2693,15 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
     Ok(())
 }
 
-fn self_check(pure_only: bool) -> Result<(), String> {
-    let base = std::env::temp_dir();
+fn self_check(pure_only: bool, diagnostic: bool) -> Result<(), String> {
+    let base = if diagnostic {
+        PathBuf::from(
+            std::env::var_os("OXIDE_PROOF_EVIDENCE")
+                .ok_or("diagnostic requires the guard evidence directory")?,
+        )
+    } else {
+        std::env::temp_dir()
+    };
     let dir = base.join(format!(
         "tape-prune-self-check-{}-{}",
         std::process::id(),
@@ -2680,7 +2722,7 @@ fn self_check(pure_only: bool) -> Result<(), String> {
         effect_reconciliation_check(&dir).map_err(|failure| failure.what)?;
         volume_window_reconciliation_check(&dir).map_err(|failure| failure.what)?;
         if !pure_only {
-            let external = fixture_volume(&dir).is_some();
+            let mut failures = Vec::new();
             for case in [
                 Case::RegistryMissing,
                 Case::UnsettledIntent,
@@ -2688,10 +2730,35 @@ fn self_check(pure_only: bool) -> Result<(), String> {
                 Case::Effect1,
                 Case::Effect2,
             ] {
-                fixture_case(&dir, case, false).map_err(|failure| failure.what)?;
+                let result = fixture_case(&dir, case, false);
+                println!(
+                    "oxide: embedded {}: {}",
+                    case.name(),
+                    if result.is_ok() { "passed" } else { "failed" }
+                );
+                if let Err(failure) = result {
+                    if !diagnostic {
+                        return Err(failure.what);
+                    }
+                    failures.push(format!("{}: {}", case.name(), failure.what));
+                }
             }
-            fixture_case(&dir, Case::Base, true).map_err(|failure| failure.what)?;
-            let _ = external;
+            let result = fixture_case(&dir, Case::Base, true);
+            println!(
+                "oxide: embedded BASE disconnected: {}",
+                if result.is_ok() { "passed" } else { "failed" }
+            );
+            if let Err(failure) = result {
+                failures.push(format!("BASE disconnected: {}", failure.what));
+            }
+            if diagnostic {
+                return Err(format!(
+                    "uncounted diagnostic; qualified=false; failures={failures:?}"
+                ));
+            }
+            if !failures.is_empty() {
+                return Err(failures.join("; "));
+            }
         }
         Ok(())
     })();
@@ -2709,7 +2776,7 @@ fn self_check(pure_only: bool) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: tape_prune_eval [--self-check] [--fixture-root <dir> --manifest <path> --transcript-out <path> --case <CASE>]".to_owned()
+    "usage: tape_prune_eval [--self-check | --diagnostic] [--fixture-root <dir> --manifest <path> --transcript-out <path> --case <CASE>]".to_owned()
 }
 
 fn main() {
@@ -2725,7 +2792,7 @@ fn main() {
         }
     }
     if args.is_empty() {
-        let code = match self_check(false) {
+        let code = match self_check(false, false) {
             Ok(()) => 0,
             Err(reason) => {
                 eprintln!("oxide: prune capture harness: {reason}");
@@ -2767,8 +2834,15 @@ fn main() {
                 }
             }
         }
+        Some("--diagnostic") if args.len() == 1 => {
+            let reason = self_check(false, true)
+                .err()
+                .unwrap_or_else(|| "diagnostic unexpectedly passed".to_owned());
+            eprintln!("oxide: prune capture harness: {reason}");
+            std::process::exit(1);
+        }
         Some("--self-check") => {
-            let code = match self_check(true) {
+            let code = match self_check(true, false) {
                 Ok(()) => 0,
                 Err(reason) => {
                     eprintln!("oxide: prune capture harness: {reason}");

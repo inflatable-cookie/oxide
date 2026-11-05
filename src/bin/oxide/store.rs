@@ -7210,6 +7210,232 @@ fn lease_error(context: &str, error: &LeaseError) -> String {
 pub(crate) mod tests {
     use super::*;
 
+    /// Isolate only fixtures whose oracle requires a just-closed flock to be
+    /// free. Parallel runner process creation can inherit an open description
+    /// until exec, even when the parent has already dropped its File.
+    pub(super) fn fixture_child(test: &str) -> bool {
+        if std::env::var("OXIDE_STORE_FIXTURE_CHILD").as_deref() == Ok(test) {
+            return false;
+        }
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("OXIDE_STORE_FIXTURE_CHILD", test)
+            .status()
+            .expect("fixture child");
+        assert!(result.success(), "fixture child failed: {test}: {result}");
+        true
+    }
+
+    #[test]
+    fn fixture_description_control() {
+        use std::os::fd::AsRawFd;
+        if fixture_child("store::tests::fixture_description_control") {
+            return;
+        }
+        let (root, store, key) = seed_fixture();
+        store.save(&State::default()).unwrap();
+        use std::os::unix::net::UnixStream;
+        let held = lease(&store, &key, None).unwrap();
+        let old_slot = held.slot_id.clone();
+        let admission = lock_admission(&store.control).unwrap();
+        let admission_meta = admission.metadata().unwrap();
+        let record_meta = held._lock.metadata().unwrap();
+        let admission_fd = admission.as_raw_fd();
+        let record_fd = held._lock.as_raw_fd();
+        let (mut channel, child_channel) = UnixStream::pair().unwrap();
+        channel
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        channel
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let parent_channel_fd = channel.as_raw_fd();
+        let child_channel_fd = child_channel.as_raw_fd();
+        let parent_pid = std::process::id();
+        let mut witness = CustodyWitness::open(&store.control).unwrap();
+        // SAFETY: the fixture runs in an isolated exact-test process. The
+        // child branch below uses only fixed-size initialized stack buffers
+        // and async-signal-safe syscalls until exec/_exit, never Rust teardown.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "cannot fork the owned fixture child");
+        if pid == 0 {
+            // SAFETY: every fd was live at fork; only the child's own copies
+            // are read/closed. fstat writes complete stat objects on success.
+            // write/read use valid stack buffers of their stated sizes. poll
+            // bounds each gate to 5 s. No allocation, locks, callbacks, Rust
+            // destructors or non-signal-safe operations occur before exec.
+            unsafe {
+                libc::close(parent_channel_fd);
+                let mut a: libc::stat = std::mem::zeroed();
+                let mut r: libc::stat = std::mem::zeroed();
+                let af = libc::fcntl(admission_fd, libc::F_GETFD);
+                let rf = libc::fcntl(record_fd, libc::F_GETFD);
+                if libc::fstat(admission_fd, &mut a) != 0
+                    || libc::fstat(record_fd, &mut r) != 0
+                    || af < 0
+                    || rf < 0
+                {
+                    libc::_exit(120);
+                }
+                let facts = [
+                    libc::getpid() as u64,
+                    libc::getppid() as u64,
+                    admission_fd as u64,
+                    a.st_dev as u64,
+                    a.st_ino,
+                    af as u64,
+                    record_fd as u64,
+                    r.st_dev as u64,
+                    r.st_ino,
+                    rf as u64,
+                ];
+                if libc::write(
+                    child_channel_fd,
+                    facts.as_ptr().cast(),
+                    std::mem::size_of_val(&facts),
+                ) != std::mem::size_of_val(&facts) as isize
+                {
+                    libc::_exit(121);
+                }
+                let mut poll = libc::pollfd {
+                    fd: child_channel_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let mut gate = 0_u8;
+                if libc::poll(&mut poll, 1, 5000) != 1
+                    || libc::read(child_channel_fd, (&mut gate as *mut u8).cast(), 1) != 1
+                    || gate != 1
+                {
+                    libc::_exit(122);
+                }
+                // Release admission only; retain the actual inherited record
+                // description through the second observation window.
+                if libc::close(admission_fd) != 0
+                    || libc::write(child_channel_fd, (&gate as *const u8).cast(), 1) != 1
+                {
+                    libc::_exit(123);
+                }
+                if libc::poll(&mut poll, 1, 5000) != 1
+                    || libc::read(child_channel_fd, (&mut gate as *mut u8).cast(), 1) != 1
+                    || gate != 2
+                {
+                    libc::_exit(124);
+                }
+                // Both lock descriptors keep their original CLOEXEC flags.
+                // This fixed exec closes the still-held record description.
+                libc::execl(
+                    b"/usr/bin/true\0".as_ptr().cast(),
+                    b"true\0".as_ptr().cast(),
+                    std::ptr::null::<libc::c_char>(),
+                );
+                libc::_exit(125);
+            }
+        }
+        drop(child_channel);
+        drop(admission);
+        drop(held);
+        // A failed oracle still closes the gate and reaps this exact child
+        // before its panic resumes. The shared guard owns the outer bound.
+        let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut bytes = [0_u8; 80];
+            channel.read_exact(&mut bytes).unwrap();
+            let facts: Vec<u64> = bytes
+                .chunks_exact(8)
+                .map(|part| u64::from_ne_bytes(part.try_into().unwrap()))
+                .collect();
+            eprintln!("278-process parent={parent_pid} child={pid} child_facts={facts:?}");
+            assert_eq!(facts[0], pid as u64);
+            assert_eq!(facts[1], u64::from(parent_pid));
+            assert_eq!(
+                &facts[2..5],
+                &[
+                    admission_fd as u64,
+                    admission_meta.dev(),
+                    admission_meta.ino()
+                ]
+            );
+            assert_eq!(
+                &facts[6..9],
+                &[record_fd as u64, record_meta.dev(), record_meta.ino()]
+            );
+            assert_ne!(facts[5] & libc::FD_CLOEXEC as u64, 0);
+            assert_ne!(facts[9] & libc::FD_CLOEXEC as u64, 0);
+            let reason = witness.decide(None, &key.checkout, true).unwrap_err();
+            eprintln!("278-process admission-held: {reason}");
+            assert!(reason.contains("admission lock is busy"), "{reason}");
+            channel.write_all(&[1]).unwrap();
+            let mut ack = [0];
+            channel.read_exact(&mut ack).unwrap();
+            assert_eq!(ack, [1]);
+            // Acquiring has not started Cargo: custody is clear once the
+            // admission lock closes, while slot reuse still needs its own
+            // record lock. The following allocation checks that distinction.
+            assert_eq!(
+                witness.decide(None, &key.checkout, true).unwrap().verdict,
+                CheckoutCustody::Clear
+            );
+            let other = lease(&store, &key, None).unwrap();
+            eprintln!(
+                "278-process record-held old_slot={old_slot} new_slot={} prior={:?}",
+                other.slot_id, other.prior
+            );
+            assert_ne!(other.slot_id, old_slot);
+            assert!(!other.reused && matches!(other.prior, Prior::Fresh));
+            assert_eq!(
+                store
+                    .ledger()
+                    .unwrap()
+                    .slots
+                    .iter()
+                    .find(|slot| slot.slot_id == old_slot)
+                    .unwrap()
+                    .state,
+                SlotOccupancy::Held
+            );
+            channel.write_all(&[2]).unwrap();
+            other
+        }));
+        drop(channel);
+        let mut child_status = 0;
+        loop {
+            // SAFETY: pid is this process's unreaped direct child; status is
+            // a live output slot. EINTR repeats only this custody wait.
+            let reaped = unsafe { libc::waitpid(pid, &mut child_status, 0) };
+            if reaped == pid {
+                break;
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::Interrupted,
+                "cannot reap owned child {pid}"
+            );
+        }
+        eprintln!("278-process child={pid} positively_reaped=true status={child_status}");
+        let other = match observed {
+            Ok(other) => other,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        assert_eq!(
+            child_status, 0,
+            "owned child did not exec and exit successfully"
+        );
+        let recovered = lease(&store, &key, None).unwrap();
+        eprintln!(
+            "278-process after-child-closure old_slot={old_slot} recovered_slot={} prior={:?}",
+            recovered.slot_id, recovered.prior
+        );
+        assert_eq!(recovered.slot_id, old_slot);
+        assert!(recovered.reused && matches!(recovered.prior, Prior::Unknown));
+        store.release(recovered, None).unwrap();
+        store.release(other, None).unwrap();
+        assert_eq!(
+            witness.decide(None, &key.checkout, true).unwrap().verdict,
+            CheckoutCustody::Clear
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn release_admission_notice_and_budget_are_bounded_and_truthful() {
         let (root, _store, _key) = class_fixture("release-admission-notice");
@@ -9513,6 +9739,11 @@ pub(crate) mod tests {
 
     #[test]
     fn seed_crash_states_remain_untrusted_and_unrecorded_spawn_stays_held() {
+        if super::tests::fixture_child(
+            "store::tests::seed_crash_states_remain_untrusted_and_unrecorded_spawn_stays_held",
+        ) {
+            return;
+        }
         for point in ["before-origin", "intent", "partial", "complete", "running"] {
             let (root, store, key) = seed_fixture();
             let held = lease(&store, &key, None).expect("fresh lease");
@@ -9532,8 +9763,17 @@ pub(crate) mod tests {
                 store.mark_spawning(&held).unwrap();
                 store.mark_running(&held, i32::MAX).unwrap();
             }
+            let old_slot = held.slot_id.clone();
+            let old_dir = held.build_dir.clone();
             drop(held);
             let reacquired = lease(&store, &key, None).expect("recoverable lease");
+            eprintln!("278-seed point={point} old_slot={old_slot} old_dir={} new_slot={} new_dir={} reused={} prior={:?} ledger={:?}", old_dir.display(), reacquired.slot_id, reacquired.build_dir.display(), reacquired.reused, reacquired.prior, store.ledger().unwrap());
+            assert_eq!(
+                reacquired.slot_id, old_slot,
+                "{point}: reused slot identity"
+            );
+            assert_eq!(reacquired.build_dir, old_dir, "{point}: reused directory");
+            assert!(reacquired.reused, "{point}: the original slot is reused");
             assert!(matches!(reacquired.prior, Prior::Unknown), "{point}");
             store.discard(reacquired).unwrap();
             let cold = lease(&store, &key, None).expect("cold lease");
@@ -13455,18 +13695,55 @@ mod fresh_custody_tests {
         fixture.root.join("gone/checkout")
     }
 
+    fn observe_lock(fixture: &CustodyFixture, label: &str) {
+        use std::os::fd::AsRawFd;
+        let lock = File::open(fixture.control.join("admission.lock")).unwrap();
+        let identity = lock.metadata().unwrap();
+        let mut descriptors = Vec::new();
+        for fd in 0..4096 {
+            // SAFETY: fstat writes only the initialized stat buffer; an invalid
+            // descriptor returns an error. No descriptor is closed or changed.
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: fstat accepts any integer fd and writes at most this
+            // live stat object's size; errors leave the observation unused.
+            if unsafe { libc::fstat(fd, &mut stat) } == 0
+                && stat.st_dev as u64 == identity.dev()
+                && stat.st_ino == identity.ino()
+            {
+                descriptors.push(fd);
+            }
+        }
+        eprintln!("278-lock {label} pid={} path={} dev={} ino={} observation_fd={} matching_fds={descriptors:?}",
+            std::process::id(), fixture.control.display(), identity.dev(), identity.ino(), lock.as_raw_fd());
+    }
+
     /// One parsed state is reused across rows, and a replacement between rows
     /// is re-read under the locks: the same document is still clear, a
     /// document replaced by a running writer is seen by the next row, and a
     /// document replaced back is clear again.
     #[test]
     fn rows_reuse_one_parsed_state_and_reread_a_replaced_document() {
+        if super::tests::fixture_child("store::fresh_custody_tests::rows_reuse_one_parsed_state_and_reread_a_replaced_document") {
+            return;
+        }
         let fixture = CustodyFixture::new("reuse");
         fixture.prime();
         let checkout = checkout(&fixture);
+        observe_lock(&fixture, "before-witness");
         let mut witness = CustodyWitness::open(&fixture.control).unwrap();
         assert_eq!(
-            witness.decide(None, &checkout, true).unwrap().verdict,
+            {
+                observe_lock(&fixture, "before-row");
+                let result = witness.decide(None, &checkout, true);
+                eprintln!(
+                    "278-row result={:?}",
+                    result.as_ref().map(|row| &row.verdict)
+                );
+                observe_lock(&fixture, "after-row");
+                result
+            }
+            .unwrap()
+            .verdict,
             CheckoutCustody::Clear
         );
         fixture.replace_state(&State {
@@ -13474,13 +13751,35 @@ mod fresh_custody_tests {
             ..State::default()
         });
         assert_eq!(
-            witness.decide(None, &checkout, true).unwrap().verdict,
+            {
+                observe_lock(&fixture, "before-row");
+                let result = witness.decide(None, &checkout, true);
+                eprintln!(
+                    "278-row result={:?}",
+                    result.as_ref().map(|row| &row.verdict)
+                );
+                observe_lock(&fixture, "after-row");
+                result
+            }
+            .unwrap()
+            .verdict,
             CheckoutCustody::Writers,
             "a replacement between rows must be witnessed and re-read"
         );
         fixture.replace_state(&State::default());
         assert_eq!(
-            witness.decide(None, &checkout, true).unwrap().verdict,
+            {
+                observe_lock(&fixture, "before-row");
+                let result = witness.decide(None, &checkout, true);
+                eprintln!(
+                    "278-row result={:?}",
+                    result.as_ref().map(|row| &row.verdict)
+                );
+                observe_lock(&fixture, "after-row");
+                result
+            }
+            .unwrap()
+            .verdict,
             CheckoutCustody::Clear
         );
     }
@@ -13816,13 +14115,37 @@ mod fresh_custody_tests {
     /// row instead of reading a stranger's document or reporting empty.
     #[test]
     fn a_disappeared_state_refuses() {
+        if super::tests::fixture_child("store::fresh_custody_tests::a_disappeared_state_refuses") {
+            return;
+        }
         let fixture = CustodyFixture::new("vanished");
         fixture.prime();
         let checkout = checkout(&fixture);
+        observe_lock(&fixture, "before-witness");
         let mut witness = CustodyWitness::open(&fixture.control).unwrap();
-        witness.decide(None, &checkout, true).unwrap();
+        {
+            observe_lock(&fixture, "before-row");
+            let result = witness.decide(None, &checkout, true);
+            eprintln!(
+                "278-row result={:?}",
+                result.as_ref().map(|row| &row.verdict)
+            );
+            observe_lock(&fixture, "after-row");
+            result
+        }
+        .unwrap();
         fs::remove_file(fixture.control.join("state.json")).unwrap();
-        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        let reason = {
+            observe_lock(&fixture, "before-row");
+            let result = witness.decide(None, &checkout, true);
+            eprintln!(
+                "278-row result={:?}",
+                result.as_ref().map(|row| &row.verdict)
+            );
+            observe_lock(&fixture, "after-row");
+            result
+        }
+        .unwrap_err();
         assert!(reason.contains("missing"), "{reason}");
     }
 
