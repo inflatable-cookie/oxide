@@ -400,6 +400,7 @@ def guarded_operator(session, c, nonce, digest):
     argv = [sys.executable, str(kit / 'bounded-test.py'), '--limit', '300',
             '--scratch-budget-mib', '512', '--root-parent', str(session / 'runs'), '--',
             sys.executable, str(kit / 'matching-slot-trace.py'), '--probe', str(session), nonce, digest]
+    os.umask(0o077)  # private future guard receipts; process-local, no host setting
     os.execve(sys.executable, argv, env)
 
 

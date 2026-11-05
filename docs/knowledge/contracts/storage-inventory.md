@@ -455,6 +455,16 @@ disappearance for planner disposition, without another workaround or attempt.
 All prior evidence, failures and charges remain preserved; admission and
 historical/full-scale/live readiness remain unresolved.
 
+Operator decision `594bb959` v2 later authorized a
+[fixed filesystem trace kit and concrete control-plane preparation](matching-slot-trace.md).
+This is preparation only: no trace, sudo, probe/guard/native or cost occurrence
+has run under that phase. The same retained independent reviewer must judge
+the current source, staged commands and pure controls before any separately
+activated operator participation. The privileged tracer is outside the
+ordinary guard's closure promise; reported process/thread labels are never
+converted into a verified PID or historical holder. Existing missing counted
+evidence, merge hold and admission-unrestored status remain unchanged.
+
 ## Output and exit semantics
 
 Human output is concise: root, coverage, visited counts, a per-category table

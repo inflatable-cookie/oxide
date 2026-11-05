@@ -160,3 +160,6 @@ check('inherited stream past margin stays UNKNOWN', kit.trace_window(36, 0, True
 check('unknown wait past margin stays UNKNOWN', kit.trace_window(36, None) == 'handoff_unknown')
 check('normal wait within window separate outcome', kit.trace_window(20, 0) == 'observe')
 print(json.dumps(dict(final_total_passed=len(checks), execution='PURE MOCKS ONLY')))
+
+check('private ordinary guard receipt umask', 'os.umask(0o077)' in Path(kit.__file__).read_text())
+print(json.dumps(dict(final_total_passed=len(checks), execution='PURE MOCKS ONLY')))
