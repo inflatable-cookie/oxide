@@ -2077,7 +2077,7 @@ fn volume_window_reconciliation_check(temp: &Path) -> Result<(), CheckFailure> {
     let manifest = serde_json::json!({
         "window": {"identity": "current"}, "fixture": {"entries": []},
         "dynamic": {"volumes": [{"uuid": "volume", "mount": "/mount", "device": "/dev/example", "window_identity": "current"}]},
-        "mandatory_observations": [{"engine": "oxide", "site": "volume-site", "identity": {
+        "mandatory_observations": [{"engine": "oxide", "site": "volume-site", "parent_required": false, "identity": {
             "volume_uuid": "volume", "mount": "/mount", "device": "/dev/example", "window_identity": "current"
         }}]
     });
@@ -2149,6 +2149,7 @@ fn obligation_reconciliation_check(temp: &Path) -> Result<(), CheckFailure> {
             "parent_device": 1, "parent_inode": 2, "device": 3, "inode": 4}]},
         "dynamic": {"volumes": [], "external_allowances": []},
         "mandatory_observations": [{"engine": "oxide", "site": "component-site",
+            "parent_required": false,
             "identity": {"component": "entry", "parent_device": 1, "parent_inode": 2}}]
     });
     tape::begin("oxide", "OBLIGATION-PRESENT", "manifest", "pure");

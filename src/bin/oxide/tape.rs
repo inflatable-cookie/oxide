@@ -419,10 +419,13 @@ pub(crate) fn check_manifest_obligations(manifest: &serde_json::Value, root: &Pa
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let identity = &obligation["identity"];
-                let parent_required = obligation
-                    .get("parent_required")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                let parent_required = match obligation.get("parent_required") {
+                    Some(serde_json::Value::Bool(value)) => *value,
+                    _ => {
+                        issues.insert(format!("obligation missing parent_required at {site}"));
+                        continue;
+                    }
+                };
                 if !state.reads.iter().any(|row| {
                     row.kind == site
                         && identity_matches(
@@ -1443,7 +1446,8 @@ pub(crate) fn fd_dev_ino(fd: std::os::fd::BorrowedFd<'_>) -> Option<(u64, u64)> 
 fn live_held_fstat(fd: std::os::fd::BorrowedFd<'_>) -> Option<(u64, u64)> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let raw = fd.as_raw_fd();
-    let duped = unsafe { libc::dup(raw) };
+    // SAFETY: F_DUPFD_CLOEXEC returns a new private descriptor or -1.
+    let duped = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };
     let observe = if duped >= 0 {
         classify_row("observe:dup", "held-fd", "ok");
         // SAFETY: `duped` is a newly owned descriptor.
@@ -1466,13 +1470,10 @@ fn live_held_fstat(fd: std::os::fd::BorrowedFd<'_>) -> Option<(u64, u64)> {
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: the descriptor is live for the call.
     let status = unsafe { libc::fstat(observe_raw, &mut stat) };
+    let fstat_error = (status != 0).then(std::io::Error::last_os_error);
     drop(observe);
-    if status != 0 {
-        classify_row(
-            "observe:fstat",
-            "held-fd",
-            &format!("error:{}", std::io::Error::last_os_error()),
-        );
+    if let Some(error) = fstat_error {
+        classify_row("observe:fstat", "held-fd", &format!("error:{error}"));
         with_state(|state| {
             push_note(
                 state,

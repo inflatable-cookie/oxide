@@ -191,19 +191,163 @@ fn schema_name(
     Ok(())
 }
 
-fn parse_identity(value: &serde_json::Value) -> Result<(), ParseError> {
-    let identity = as_object(value, "identity")?;
+fn parse_err(message: impl Into<String>) -> ParseError {
+    ParseError {
+        message: message.into(),
+    }
+}
+
+fn optional_string(value: &serde_json::Value, what: &str) -> Result<(), ParseError> {
+    if value.is_null() || value.is_string() {
+        Ok(())
+    } else {
+        Err(parse_err(format!("{what} is not a string or null")))
+    }
+}
+
+fn optional_u64(value: &serde_json::Value, what: &str) -> Result<(), ParseError> {
+    if value.is_null() || value.is_u64() {
+        Ok(())
+    } else {
+        Err(parse_err(format!("{what} is not a u64 or null")))
+    }
+}
+
+fn optional_u32(value: &serde_json::Value, what: &str) -> Result<(), ParseError> {
+    if value.is_null() {
+        return Ok(());
+    }
+    if value.as_u64().is_some_and(|n| n <= u64::from(u32::MAX)) {
+        Ok(())
+    } else {
+        Err(parse_err(format!("{what} is not a u32 or null")))
+    }
+}
+
+fn optional_i32(value: &serde_json::Value, what: &str) -> Result<(), ParseError> {
+    if value.is_null() {
+        return Ok(());
+    }
+    if value
+        .as_i64()
+        .is_some_and(|n| n >= i64::from(i32::MIN) && n <= i64::from(i32::MAX))
+    {
+        Ok(())
+    } else {
+        Err(parse_err(format!("{what} is not an i32 or null")))
+    }
+}
+
+fn require_u64(value: Option<&serde_json::Value>, what: &str) -> Result<u64, ParseError> {
+    value
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| parse_err(format!("{what} is not a u64")))
+}
+
+fn type_check_identity(
+    identity: &serde_json::Map<String, serde_json::Value>,
+    require_provenance: bool,
+) -> Result<(), ParseError> {
     deny_unknown(identity, IDENTITY_FIELDS, "identity")?;
-    require_keys(identity, &["parent_source", "own_source"], "identity")?;
-    Provenance::parse(identity.get("parent_source")).map_err(|message| ParseError { message })?;
-    Provenance::parse(identity.get("own_source")).map_err(|message| ParseError { message })?;
-    if let Some(device) = identity.get("device") {
-        if !device.is_null() && !device.is_u64() && !device.is_string() {
-            return Err(ParseError {
-                message: "identity device is not a number, string, or null".to_owned(),
-            });
+    if require_provenance {
+        require_keys(identity, &["parent_source", "own_source"], "identity")?;
+    }
+    if let Some(value) = identity.get("parent_source") {
+        Provenance::parse(Some(value)).map_err(parse_err)?;
+    }
+    if let Some(value) = identity.get("own_source") {
+        Provenance::parse(Some(value)).map_err(parse_err)?;
+    }
+    for (key, value) in identity {
+        match key.as_str() {
+            "path" | "component" | "volume_uuid" | "mount" | "volume_device"
+            | "window_identity" => optional_string(value, key)?,
+            "parent_device" | "parent_inode" | "device" | "inode" | "start" => {
+                optional_u64(value, key)?;
+            }
+            "pid" | "uid" => optional_u32(value, key)?,
+            "fd" => optional_i32(value, key)?,
+            "parent_source" | "own_source" => {}
+            _ => {}
         }
     }
+    Ok(())
+}
+
+fn parse_identity(value: &serde_json::Value) -> Result<(), ParseError> {
+    let identity = as_object(value, "identity")?;
+    type_check_identity(identity, true)
+}
+
+fn parse_outcome(value: &serde_json::Value) -> Result<(), ParseError> {
+    let outcome = as_object(value, "outcome")?;
+    let ty = outcome
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| parse_err("outcome missing type"))?;
+    match ty {
+        "digest" => {
+            deny_unknown(outcome, &["type", "digest"], "outcome")?;
+            let digest = outcome
+                .get("digest")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| parse_err("outcome digest is not a SHA-256"))?;
+            if digest.len() != 64 || digest.chars().any(|c| !c.is_ascii_hexdigit()) {
+                return Err(parse_err("outcome digest is not a SHA-256"));
+            }
+        }
+        "opened" => {
+            deny_unknown(outcome, &["type", "dev", "ino"], "outcome")?;
+            require_u64(outcome.get("dev"), "outcome dev")?;
+            require_u64(outcome.get("ino"), "outcome ino")?;
+        }
+        "absent" => deny_unknown(outcome, &["type"], "outcome")?,
+        "refusal" => {
+            deny_unknown(outcome, &["type", "reason"], "outcome")?;
+            if !outcome
+                .get("reason")
+                .is_some_and(serde_json::Value::is_string)
+            {
+                return Err(parse_err("outcome reason is not a string"));
+            }
+        }
+        "facts" => {
+            deny_unknown(outcome, &["type", "facts"], "outcome")?;
+            if !outcome
+                .get("facts")
+                .is_some_and(serde_json::Value::is_string)
+            {
+                return Err(parse_err("outcome facts is not a string"));
+            }
+        }
+        other => return Err(parse_err(format!("unknown outcome type {other}"))),
+    }
+    Ok(())
+}
+
+fn parse_effect(effect: &serde_json::Map<String, serde_json::Value>) -> Result<(), ParseError> {
+    deny_unknown(effect, EFFECT_FIELDS, "effect")?;
+    require_keys(effect, EFFECT_FIELDS, "effect")?;
+    let kind = effect
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !EFFECT_KINDS.contains(&kind) {
+        return Err(parse_err(format!("unknown effect kind {kind}")));
+    }
+    if !effect.get("site").is_some_and(serde_json::Value::is_string) {
+        return Err(parse_err("effect site is not a string"));
+    }
+    if !effect
+        .get("attempted")
+        .is_some_and(serde_json::Value::is_boolean)
+    {
+        return Err(parse_err("effect attempted is not a boolean"));
+    }
+    if !effect.get("path").is_some_and(serde_json::Value::is_string) {
+        return Err(parse_err("effect path is not a string"));
+    }
+    require_u64(effect.get("epoch"), "effect epoch")?;
     Ok(())
 }
 
@@ -257,7 +401,10 @@ pub(crate) fn parse_transcript(bytes: &[u8]) -> Result<serde_json::Value, ParseE
             });
         }
         parse_identity(&row["identity"])?;
-        let occurrence = row.get("occurrence").and_then(|v| v.as_u64()).unwrap_or(0);
+        parse_outcome(&row["outcome"])?;
+        require_u64(row.get("cap"), "read row cap")?;
+        require_u64(row.get("epoch"), "read row epoch")?;
+        let occurrence = require_u64(row.get("occurrence"), "read row occurrence")?;
         if occurrence == 0 || occurrence > MAX_OCCURRENCES_PER_KEY {
             return Err(ParseError {
                 message: "read row occurrence is outside 1..=64".to_owned(),
@@ -271,15 +418,7 @@ pub(crate) fn parse_transcript(bytes: &[u8]) -> Result<serde_json::Value, ParseE
             message: "effects is not an array".to_owned(),
         })?;
     for effect in effects {
-        let effect = as_object(effect, "effect")?;
-        deny_unknown(effect, EFFECT_FIELDS, "effect")?;
-        require_keys(effect, EFFECT_FIELDS, "effect")?;
-        let kind = effect.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-        if !EFFECT_KINDS.contains(&kind) {
-            return Err(ParseError {
-                message: format!("unknown effect kind {kind}"),
-            });
-        }
+        parse_effect(as_object(effect, "effect")?)?;
     }
     if let Some(holders) = map.get("recorded_holders").and_then(|v| v.as_array()) {
         if holders.len() > MAX_PROCESS_ROWS {
@@ -373,7 +512,7 @@ pub(crate) fn parse_manifest(bytes: &[u8]) -> Result<serde_json::Value, ParseErr
             });
         }
         let identity = as_object(&obligation["identity"], "obligation identity")?;
-        deny_unknown(identity, IDENTITY_FIELDS, "obligation identity")?;
+        type_check_identity(identity, false)?;
     }
     let effects = map
         .get("expected_effects")
@@ -396,23 +535,73 @@ fn parent_source_of(row: &serde_json::Value) -> Provenance {
     Provenance::parse(row.pointer("/identity/parent_source")).unwrap_or(Provenance::None)
 }
 
+fn identity_part(value: Option<&serde_json::Value>) -> String {
+    match value {
+        None | Some(serde_json::Value::Null) => "none".to_owned(),
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Number(number)) => number.to_string(),
+        Some(other) => other.to_string(),
+    }
+}
+
 fn identity_key(row: &serde_json::Value) -> String {
     format!(
         "{}|{}|{}|{}|{}",
         row.get("site").and_then(|v| v.as_str()).unwrap_or(""),
-        row.pointer("/identity/path")
-            .and_then(|v| v.as_str())
-            .unwrap_or(""),
-        row.pointer("/identity/component")
-            .and_then(|v| v.as_str())
-            .unwrap_or(""),
-        row.pointer("/identity/parent_device")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        row.pointer("/identity/parent_inode")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
+        identity_part(row.pointer("/identity/path")),
+        identity_part(row.pointer("/identity/component")),
+        identity_part(row.pointer("/identity/parent_device")),
+        identity_part(row.pointer("/identity/parent_inode")),
     )
+}
+
+fn identity_fields_match(
+    obligation_identity: &serde_json::Value,
+    row_identity: &serde_json::Value,
+) -> bool {
+    let Some(want) = obligation_identity.as_object() else {
+        return false;
+    };
+    let Some(got) = row_identity.as_object() else {
+        return false;
+    };
+    for (key, expected) in want {
+        if key == "parent_source" || key == "own_source" {
+            continue;
+        }
+        match got.get(key) {
+            Some(actual) if actual == expected => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn effect_bag(effects: &[serde_json::Value]) -> Vec<(String, String, String)> {
+    let mut bag: Vec<(String, String, String)> = effects
+        .iter()
+        .map(|effect| {
+            (
+                effect
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                effect
+                    .get("site")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                effect
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+            )
+        })
+        .collect();
+    bag.sort();
+    bag
 }
 
 /// Completeness against an optional manifest. Never inferred from structure.
@@ -484,22 +673,31 @@ pub(crate) fn assess_completeness(
                     .get("site")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let parent_required = obligation
-                    .get("parent_required")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let matched = reads.iter().any(|row| {
-                    row.get("site").and_then(|v| v.as_str()) == Some(site)
-                        || row.get("kind").and_then(|v| v.as_str()) == Some(site)
-                });
-                if !matched {
+                let parent_required = match obligation.get("parent_required") {
+                    Some(serde_json::Value::Bool(value)) => *value,
+                    _ => {
+                        issues.push(format!("obligation missing parent_required at {site}"));
+                        continue;
+                    }
+                };
+                let at_site: Vec<&serde_json::Value> = reads
+                    .iter()
+                    .filter(|row| row.get("site").and_then(|v| v.as_str()) == Some(site))
+                    .collect();
+                if at_site.is_empty() {
                     issues.push(format!("missing obligation at {site}"));
                     continue;
                 }
+                let identity_matched = at_site
+                    .iter()
+                    .any(|row| identity_fields_match(&obligation["identity"], &row["identity"]));
+                if !identity_matched {
+                    issues.push(format!("wrong identity at {site}"));
+                    continue;
+                }
                 if parent_required {
-                    let discharged = reads.iter().any(|row| {
-                        (row.get("site").and_then(|v| v.as_str()) == Some(site)
-                            || row.get("kind").and_then(|v| v.as_str()) == Some(site))
+                    let discharged = at_site.iter().any(|row| {
+                        identity_fields_match(&obligation["identity"], &row["identity"])
                             && parent_source_of(row) == Provenance::Handle
                             && K1_PREMISE_QUALIFIED
                     });
@@ -517,10 +715,16 @@ pub(crate) fn assess_completeness(
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_default();
-            if declared.len() != observed.len() {
+            let want = effect_bag(declared);
+            let got = effect_bag(&observed);
+            if want.len() != got.len() {
                 issues.push("omitted or extra effects".to_owned());
+            } else if want != got {
+                issues.push("substituted effects".to_owned());
             }
         }
+    } else {
+        issues.push("no manifest".to_owned());
     }
     Completeness { issues }
 }
@@ -538,7 +742,7 @@ struct Vector {
 }
 
 enum VectorKind {
-    ValidTranscript { parent_required: bool },
+    ValidTranscript,
     InvalidTranscript,
     ValidManifest,
     InvalidManifest,
@@ -551,9 +755,7 @@ const VECTORS: &[Vector] = &[
             "../../../docs/knowledge/contracts/capture-vectors/valid/path-only-unproven.json"
         ),
         digest: "d119a519c5fe050607117c43aaee32a7d9d474a965bcc0e7dae3b54a94c80563",
-        kind: VectorKind::ValidTranscript {
-            parent_required: true,
-        },
+        kind: VectorKind::ValidTranscript,
     },
     Vector {
         name: "valid/handle-parent.json",
@@ -561,17 +763,13 @@ const VECTORS: &[Vector] = &[
             "../../../docs/knowledge/contracts/capture-vectors/valid/handle-parent.json"
         ),
         digest: "1eeef64d45322210b4501775f36aa9dd2e120404d5357fc942b471a72ad05a3b",
-        kind: VectorKind::ValidTranscript {
-            parent_required: true,
-        },
+        kind: VectorKind::ValidTranscript,
     },
     Vector {
         name: "valid/absent.json",
         bytes: include_bytes!("../../../docs/knowledge/contracts/capture-vectors/valid/absent.json"),
         digest: "27c1d50d7317d4d1ec01c4eacf3af853eb65976076e9cbe56ff8e99c53ef30c5",
-        kind: VectorKind::ValidTranscript {
-            parent_required: false,
-        },
+        kind: VectorKind::ValidTranscript,
     },
     Vector {
         name: "valid/refused.json",
@@ -579,9 +777,7 @@ const VECTORS: &[Vector] = &[
             "../../../docs/knowledge/contracts/capture-vectors/valid/refused.json"
         ),
         digest: "0e7530bd79edec6aad1499617b15f35e4622d120e1229fffa771480c62462fc6",
-        kind: VectorKind::ValidTranscript {
-            parent_required: false,
-        },
+        kind: VectorKind::ValidTranscript,
     },
     Vector {
         name: "valid/truncated.json",
@@ -589,9 +785,7 @@ const VECTORS: &[Vector] = &[
             "../../../docs/knowledge/contracts/capture-vectors/valid/truncated.json"
         ),
         digest: "6c277878701a630394a9c2b9d6799672bda406ea21e34fd73bf62a74d0a85282",
-        kind: VectorKind::ValidTranscript {
-            parent_required: false,
-        },
+        kind: VectorKind::ValidTranscript,
     },
     Vector {
         name: "invalid/unknown-version.json",
@@ -631,9 +825,7 @@ const VECTORS: &[Vector] = &[
             "../../../docs/knowledge/contracts/capture-vectors/invalid/collision.json"
         ),
         digest: "586b01537500d475945f27956d9e62957256fcf004ccc0e40f928490e7a60683",
-        kind: VectorKind::ValidTranscript {
-            parent_required: false,
-        },
+        kind: VectorKind::ValidTranscript,
     },
     Vector {
         name: "invalid/source-mismatch.json",
@@ -641,9 +833,7 @@ const VECTORS: &[Vector] = &[
             "../../../docs/knowledge/contracts/capture-vectors/invalid/source-mismatch.json"
         ),
         digest: "0c947a92549ca49ce13e89a2070034d36c7a8d91e4e233e790cfeb60e78f1b17",
-        kind: VectorKind::ValidTranscript {
-            parent_required: false,
-        },
+        kind: VectorKind::ValidTranscript,
     },
     Vector {
         name: "invalid/unknown-effect.json",
@@ -652,6 +842,78 @@ const VECTORS: &[Vector] = &[
         ),
         digest: "d608c47662440ff1778b167fab4e6668c2eaeb3cc75653da1e6ea69fcd2878cb",
         kind: VectorKind::InvalidTranscript,
+    },
+    Vector {
+        name: "invalid/string-device.json",
+        bytes: include_bytes!(
+            "../../../docs/knowledge/contracts/capture-vectors/invalid/string-device.json"
+        ),
+        digest: "bc96a18bb1be86b6c3b1b704f579736667b44b9482af4df7c4a41f41d184f11d",
+        kind: VectorKind::InvalidTranscript,
+    },
+    Vector {
+        name: "invalid/string-parent-inode.json",
+        bytes: include_bytes!(
+            "../../../docs/knowledge/contracts/capture-vectors/invalid/string-parent-inode.json"
+        ),
+        digest: "efd944bf6a6f762e72fe631bb037c0a2c8a91910f523aff505d709afd84928dd",
+        kind: VectorKind::InvalidTranscript,
+    },
+    Vector {
+        name: "invalid/occurrence-zero.json",
+        bytes: include_bytes!(
+            "../../../docs/knowledge/contracts/capture-vectors/invalid/occurrence-zero.json"
+        ),
+        digest: "9064a508b7c35bcf284ce82cbfa040b272a7003a80e8688618e6781066ffe010",
+        kind: VectorKind::InvalidTranscript,
+    },
+    Vector {
+        name: "invalid/wrong-parent.json",
+        bytes: include_bytes!(
+            "../../../docs/knowledge/contracts/capture-vectors/invalid/wrong-parent.json"
+        ),
+        digest: "78e0c54f28ba6fb7e36ea639cca2295c61ae8915f9928a262f5c8816731be858",
+        kind: VectorKind::ValidTranscript,
+    },
+    Vector {
+        name: "invalid/wrong-inode.json",
+        bytes: include_bytes!(
+            "../../../docs/knowledge/contracts/capture-vectors/invalid/wrong-inode.json"
+        ),
+        digest: "c466a002728c7cde344b8e6a15a1fbf1fe96a36fc2fbf65a2498b183d2b70ae7",
+        kind: VectorKind::ValidTranscript,
+    },
+    Vector {
+        name: "invalid/omitted-obligation.json",
+        bytes: include_bytes!(
+            "../../../docs/knowledge/contracts/capture-vectors/invalid/omitted-obligation.json"
+        ),
+        digest: "f393749cd739660f100a80bb30bc13266627c3dedef35e7e7b27b4be7c1553e0",
+        kind: VectorKind::ValidTranscript,
+    },
+    Vector {
+        name: "invalid/extra-effect.json",
+        bytes: include_bytes!(
+            "../../../docs/knowledge/contracts/capture-vectors/invalid/extra-effect.json"
+        ),
+        digest: "16d01f5db93dea43de7267697989c09b6b4f66d9fd84b4ac56230b90f874f555",
+        kind: VectorKind::ValidTranscript,
+    },
+    Vector {
+        name: "invalid/substituted-effect.json",
+        bytes: include_bytes!(
+            "../../../docs/knowledge/contracts/capture-vectors/invalid/substituted-effect.json"
+        ),
+        digest: "da294866f4b9490890688e67456496614a6fadd0c3841f139bf34d98abf4cd5c",
+        kind: VectorKind::ValidTranscript,
+    },
+    Vector {
+        name: "invalid/omitted-effect.json",
+        bytes: include_bytes!(
+            "../../../docs/knowledge/contracts/capture-vectors/invalid/omitted-effect.json"
+        ),
+        digest: "41c6223d939f4dcb4dac7f514b16ac4662189acf3b9b37d797f1f0c71c5c3d56",
+        kind: VectorKind::ValidTranscript,
     },
     Vector {
         name: "manifest/valid-parent-required.json",
@@ -679,7 +941,24 @@ const VECTORS: &[Vector] = &[
     },
 ];
 
-fn vector_manifest(parent_required: bool, case: &str) -> serde_json::Value {
+fn vector_manifest(
+    case: &str,
+    site: &str,
+    parent_required: bool,
+    identity: serde_json::Value,
+    obligations: bool,
+    expected_effects: serde_json::Value,
+) -> serde_json::Value {
+    let mandatory_observations = if obligations {
+        serde_json::json!([{
+            "engine": "oxide",
+            "site": site,
+            "parent_required": parent_required,
+            "identity": identity
+        }])
+    } else {
+        serde_json::json!([])
+    };
     serde_json::json!({
         "schema": MANIFEST_SCHEMA,
         "case": case,
@@ -701,22 +980,249 @@ fn vector_manifest(parent_required: bool, case: &str) -> serde_json::Value {
         },
         "fixture": {"root": "/fixture", "device": 1, "inode": 2, "mode": 448, "entries": [], "roots": []},
         "dynamic": {"volumes": [], "writers": [], "external_allowances": []},
-        "mandatory_observations": [{
-            "engine": "oxide",
-            "site": "prune::read_registry",
-            "parent_required": parent_required,
-            "identity": {"path": "/fixture/registry", "parent_device": 1, "parent_inode": 2, "device": 3, "inode": 4}
-        }],
-        "expected_effects": [],
+        "mandatory_observations": mandatory_observations,
+        "expected_effects": expected_effects,
         "expected": {"classification": "MATCH", "roots": []},
         "barge": {"volume_uuid": "0", "namespace": "oxide", "area": "outputs"}
     })
+}
+
+fn completeness_fixture(name: &str, transcript_case: &str) -> serde_json::Value {
+    match name {
+        "valid/path-only-unproven.json" => vector_manifest(
+            transcript_case,
+            "prune::read_registry",
+            true,
+            serde_json::json!({"path": "/fixture/registry", "device": 3, "inode": 4}),
+            true,
+            serde_json::json!([]),
+        ),
+        "valid/handle-parent.json" => vector_manifest(
+            transcript_case,
+            "root-observe:entry",
+            true,
+            serde_json::json!({
+                "component": "oxide-ra",
+                "parent_device": 1,
+                "parent_inode": 2,
+                "device": 3,
+                "inode": 4
+            }),
+            true,
+            serde_json::json!([]),
+        ),
+        "valid/absent.json" => vector_manifest(
+            transcript_case,
+            "config:inspect:initial",
+            false,
+            serde_json::json!({"path": "/fixture/missing"}),
+            true,
+            serde_json::json!([]),
+        ),
+        "valid/refused.json" => vector_manifest(
+            transcript_case,
+            "prune::read_registry",
+            false,
+            serde_json::json!({"path": "/fixture/registry"}),
+            true,
+            serde_json::json!([]),
+        ),
+        "valid/truncated.json" => vector_manifest(
+            transcript_case,
+            "pure:read",
+            false,
+            serde_json::json!({"path": "/pure/object", "device": 3, "inode": 4}),
+            true,
+            serde_json::json!([]),
+        ),
+        "invalid/collision.json" => vector_manifest(
+            transcript_case,
+            "pure:read",
+            false,
+            serde_json::json!({"path": "/pure/object", "device": 3, "inode": 4}),
+            true,
+            serde_json::json!([]),
+        ),
+        "invalid/source-mismatch.json" => vector_manifest(
+            "OTHER-CASE",
+            "prune::read_registry",
+            false,
+            serde_json::json!({"path": "/fixture/registry"}),
+            false,
+            serde_json::json!([]),
+        ),
+        "invalid/wrong-parent.json" => vector_manifest(
+            transcript_case,
+            "root-observe:entry",
+            false,
+            serde_json::json!({
+                "component": "oxide-ra",
+                "parent_device": 1,
+                "parent_inode": 2,
+                "device": 3,
+                "inode": 4
+            }),
+            true,
+            serde_json::json!([]),
+        ),
+        "invalid/wrong-inode.json" => vector_manifest(
+            transcript_case,
+            "prune::read_registry",
+            false,
+            serde_json::json!({"path": "/fixture/registry", "device": 3, "inode": 99}),
+            true,
+            serde_json::json!([]),
+        ),
+        "invalid/omitted-obligation.json" => vector_manifest(
+            transcript_case,
+            "prune::read_registry",
+            false,
+            serde_json::json!({"path": "/fixture/registry"}),
+            true,
+            serde_json::json!([]),
+        ),
+        "invalid/extra-effect.json" => vector_manifest(
+            transcript_case,
+            "prune::read_registry",
+            false,
+            serde_json::json!({"path": "/fixture/registry"}),
+            false,
+            serde_json::json!([]),
+        ),
+        "invalid/omitted-effect.json" => vector_manifest(
+            transcript_case,
+            "prune::read_registry",
+            false,
+            serde_json::json!({"path": "/fixture/registry"}),
+            false,
+            serde_json::json!([{
+                "kind": "save",
+                "site": "ledger",
+                "path": "/fixture/ledger"
+            }]),
+        ),
+        "invalid/substituted-effect.json" => vector_manifest(
+            transcript_case,
+            "prune::read_registry",
+            false,
+            serde_json::json!({"path": "/fixture/registry"}),
+            false,
+            serde_json::json!([{
+                "kind": "unlink",
+                "site": "other",
+                "path": "/fixture/other"
+            }]),
+        ),
+        _ => vector_manifest(
+            transcript_case,
+            "prune::read_registry",
+            false,
+            serde_json::json!({"path": "/fixture/registry"}),
+            true,
+            serde_json::json!([]),
+        ),
+    }
+}
+
+fn expected_issues(name: &str) -> &'static [&'static str] {
+    match name {
+        "valid/path-only-unproven.json" => &[
+            "parent_required unproven at prune::read_registry: handle parent still needs qualified K1",
+        ],
+        "valid/handle-parent.json" => &[
+            "parent_required unproven at root-observe:entry: handle parent still needs qualified K1",
+        ],
+        "valid/absent.json" | "valid/refused.json" => &[],
+        "valid/truncated.json" => &["truncated: read_rows_truncated"],
+        "invalid/collision.json" => {
+            &["collision at pure:read|/pure/object|none|none|none occurrence 1"]
+        }
+        "invalid/source-mismatch.json" => &["source/run case mismatch"],
+        "invalid/wrong-parent.json" => &["wrong identity at root-observe:entry"],
+        "invalid/wrong-inode.json" => &["wrong identity at prune::read_registry"],
+        "invalid/omitted-obligation.json" => &["missing obligation at prune::read_registry"],
+        "invalid/extra-effect.json" | "invalid/omitted-effect.json" => {
+            &["omitted or extra effects"]
+        }
+        "invalid/substituted-effect.json" => &["substituted effects"],
+        _ => &[],
+    }
+}
+
+fn path_only_bytes() -> &'static [u8] {
+    VECTORS
+        .iter()
+        .find(|vector| vector.name == "valid/path-only-unproven.json")
+        .expect("path-only vector")
+        .bytes
+}
+
+fn cap_checks() -> Result<usize, String> {
+    let mut checked = 0usize;
+    let oversize = vec![b'x'; MAX_DOCUMENT_BYTES + 1];
+    if parse_transcript(&oversize).is_ok() {
+        return Err("8 MiB+1 document must fail parse".to_owned());
+    }
+    checked += 1;
+
+    let mut occurrence = serde_json::from_slice::<serde_json::Value>(path_only_bytes())
+        .map_err(|error| error.to_string())?;
+    occurrence["reads"][0]["occurrence"] = serde_json::json!(65);
+    let bytes = serde_json::to_vec(&occurrence).map_err(|error| error.to_string())?;
+    if parse_transcript(&bytes).is_ok() {
+        return Err("occurrence 65 must fail parse".to_owned());
+    }
+    checked += 1;
+
+    let mut reads = serde_json::from_slice::<serde_json::Value>(path_only_bytes())
+        .map_err(|error| error.to_string())?;
+    let row = reads["reads"][0].clone();
+    reads["reads"] = serde_json::Value::Array(vec![row; MAX_READ_ROWS + 1]);
+    let bytes = serde_json::to_vec(&reads).map_err(|error| error.to_string())?;
+    if parse_transcript(&bytes).is_ok() {
+        return Err("8193 reads must fail parse".to_owned());
+    }
+    checked += 1;
+
+    let mut holders = serde_json::from_slice::<serde_json::Value>(path_only_bytes())
+        .map_err(|error| error.to_string())?;
+    holders["recorded_holders"] =
+        serde_json::Value::Array(vec![serde_json::json!({"pid": 1}); MAX_PROCESS_ROWS + 1]);
+    let bytes = serde_json::to_vec(&holders).map_err(|error| error.to_string())?;
+    if parse_transcript(&bytes).is_ok() {
+        return Err("513 process rows must fail parse".to_owned());
+    }
+    checked += 1;
+
+    let parsed = parse_transcript(path_only_bytes()).map_err(|error| error.message)?;
+    let without = assess_completeness(&parsed, None);
+    if !without.issues.iter().any(|issue| issue == "no manifest") || without.ok() {
+        return Err("assess_completeness without a manifest must issue no manifest".to_owned());
+    }
+    checked += 1;
+
+    let mut missing = completeness_fixture("valid/path-only-unproven.json", "VECTOR-PATH-ONLY");
+    missing["mandatory_observations"][0]
+        .as_object_mut()
+        .ok_or("path-only fixture obligation is not an object")?
+        .remove("parent_required");
+    let missing_issues = assess_completeness(&parsed, Some(&missing));
+    if !missing_issues
+        .issues
+        .iter()
+        .any(|issue| issue.contains("missing parent_required"))
+    {
+        return Err("missing parent_required must be an issue, not false".to_owned());
+    }
+    checked += 1;
+    Ok(checked)
 }
 
 /// Pure parser, completeness and hashed-vector checks. Invoked from the
 /// harness `--self-check` so the `harness = false` target actually runs them.
 pub(crate) fn run_self_checks() -> Result<(), String> {
     let mut failed = Vec::new();
+    let mut checked = 0usize;
     for vector in VECTORS {
         let digest = sha256_hex(vector.bytes);
         if digest != vector.digest {
@@ -727,7 +1233,7 @@ pub(crate) fn run_self_checks() -> Result<(), String> {
             continue;
         }
         match vector.kind {
-            VectorKind::ValidTranscript { parent_required } => {
+            VectorKind::ValidTranscript => {
                 let parsed = match parse_transcript(vector.bytes) {
                     Ok(doc) => doc,
                     Err(error) => {
@@ -739,93 +1245,49 @@ pub(crate) fn run_self_checks() -> Result<(), String> {
                     .get("case")
                     .and_then(|v| v.as_str())
                     .unwrap_or("VECTOR");
-                let manifest = if vector.name.ends_with("source-mismatch.json") {
-                    vector_manifest(parent_required, "OTHER-CASE")
-                } else if vector.name.contains("handle-parent") {
-                    let mut manifest = vector_manifest(true, case);
-                    manifest["mandatory_observations"][0]["site"] = "root-observe:entry".into();
-                    manifest
-                } else {
-                    vector_manifest(parent_required, case)
-                };
+                let manifest = completeness_fixture(vector.name, case);
                 let completeness = assess_completeness(&parsed, Some(&manifest));
-                let expect_incomplete = parent_required
-                    || vector.name.contains("truncated")
-                    || vector.name.contains("collision")
-                    || vector.name.contains("source-mismatch");
-                if expect_incomplete {
-                    if completeness.ok() {
-                        failed.push(format!(
-                            "{} parser-positive was treated as complete",
-                            vector.name
-                        ));
-                    }
-                } else if !completeness.ok()
-                    && !vector.name.contains("absent")
-                    && !vector.name.contains("refused")
-                {
-                    // absent/refused rows are structure-valid; completeness
-                    // depends on the accompanying obligation.
+                let expected: Vec<String> = expected_issues(vector.name)
+                    .iter()
+                    .map(|issue| (*issue).to_owned())
+                    .collect();
+                if completeness.issues != expected {
+                    failed.push(format!(
+                        "{} issues {:?} != {:?}",
+                        vector.name, completeness.issues, expected
+                    ));
                 }
-                if vector.name.contains("path-only")
-                    && !completeness
-                        .issues
-                        .iter()
-                        .any(|issue| issue.contains("parent_required unproven"))
-                {
-                    failed.push("path-only parent_required must fail completeness".to_owned());
+                if vector.name.contains("handle-parent") && K1_PREMISE_QUALIFIED {
+                    failed.push("K1_PREMISE_QUALIFIED must stay false on this landing".to_owned());
                 }
-                if vector.name.contains("handle-parent") {
-                    if completeness.ok() {
-                        failed.push("handle parent must remain unproven without K1".to_owned());
-                    }
-                    if K1_PREMISE_QUALIFIED {
-                        failed.push(
-                            "K1_PREMISE_QUALIFIED must stay false on this landing".to_owned(),
-                        );
-                    }
-                }
-                if vector.name.contains("collision")
-                    && !completeness
-                        .issues
-                        .iter()
-                        .any(|issue| issue.contains("collision"))
-                {
-                    failed.push("collision vector must name the collision".to_owned());
-                }
-                if vector.name.contains("source-mismatch")
-                    && !completeness
-                        .issues
-                        .iter()
-                        .any(|issue| issue.contains("case mismatch"))
-                {
-                    failed.push("source-mismatch vector must fail completeness".to_owned());
-                }
-                if vector.name.contains("truncated")
-                    && !completeness
-                        .issues
-                        .iter()
-                        .any(|issue| issue.contains("truncated"))
-                {
-                    failed.push("truncated vector must fail completeness".to_owned());
-                }
+                checked += 1;
             }
             VectorKind::InvalidTranscript => {
                 if parse_transcript(vector.bytes).is_ok() {
                     failed.push(format!("{} should fail parse", vector.name));
+                } else {
+                    checked += 1;
                 }
             }
             VectorKind::ValidManifest => {
                 if let Err(error) = parse_manifest(vector.bytes) {
                     failed.push(format!("{} parse: {}", vector.name, error.message));
+                } else {
+                    checked += 1;
                 }
             }
             VectorKind::InvalidManifest => {
                 if parse_manifest(vector.bytes).is_ok() {
                     failed.push(format!("{} should fail parse", vector.name));
+                } else {
+                    checked += 1;
                 }
             }
         }
+    }
+    match cap_checks() {
+        Ok(extra) => checked += extra,
+        Err(error) => failed.push(error),
     }
     if PROVENANCE.len() != 4 {
         failed.push("provenance vocabulary drifted".to_owned());
@@ -841,6 +1303,7 @@ pub(crate) fn run_self_checks() -> Result<(), String> {
         }
     }
     if failed.is_empty() {
+        println!("oxide: capture-wire: {checked} vector checks passed");
         Ok(())
     } else {
         Err(failed.join("; "))
