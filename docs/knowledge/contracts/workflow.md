@@ -1578,6 +1578,49 @@ Tom ruled on 2026-10-25 that every Rust project in `~/Dev/projects` moves fully 
   - one cold run and one warm repeat are timed, as observations.
   - Anything that changes a test result stays on `cargo` and is reported as a dogfood finding.
 
+### Writing briefs in adopting repositories
+
+Planners writing briefs in an adopted (or adopting) repository follow this
+standing guidance (Tom, 2026-10-22, decisions 3b041cf4 and 89797220;
+Tom, 2026-10-25: every Rust project moves fully to Oxide). It is carried
+here from the Northstar brief skill so this contract owns it; the mechanics
+above stay the reference, and this list links to them rather than
+restating them.
+
+- Move fully to Oxide: ordinary build, check, clippy, test, nextest and
+  format routes call `oxide` with the same arguments, as do metadata,
+  locate-project, fetch, update, install, package, publish, tree, fmt, deny
+  and audit. There are no per-selector `:cargo` escapes. Changing an entry
+  point authorizes no actual publish, install, release or secret use.
+- A brief in a repository still on plain Cargo also runs `oxide init` at its
+  existing package or workspace, adopting that workspace rather than adding a
+  root crate. This is standing approval: never ask the operator per
+  repository. The task still gets its normal checks and review.
+- Keep toolchain pins: `cargo +<toolchain>` becomes
+  `RUSTUP_TOOLCHAIN=<toolchain> oxide` or a `rust-toolchain` file. Tests
+  that find sibling binaries through `current_exe` use
+  `env!("CARGO_BIN_EXE_<name>")` first, or read
+  `$CARGO_TARGET_DIR/<profile>`, because Oxide runs test executables from
+  the slot and uplifts final binaries to `target/`.
+- A tool or driver that runs Cargo itself runs under `oxide exec --` with
+  its command intact (see [`oxide exec`](#oxide-exec-cargo-wrapping-tools)).
+  Change the route, never the product or fixture semantics it drives. A
+  driver or fixture whose target is throwaway keeps it inside the temp root
+  it removes.
+- A proof whose subject is Cargo's own target layout, or that must build
+  with no shared intermediate state, is a named proof exception: it still
+  runs under `oxide exec`, sets its own build directory under the drive's
+  `scratch/<project>/` or the proof's `OXIDE_TASK_SCRATCH_ROOT` (never
+  `/var/folders`, `~` or a drive root), removes only that directory
+  afterwards, and is listed by proof name with its preserved intent in the
+  project's guidance.
+- Stays on Cargo: CI and release workflows, container and VM guest builds,
+  product code that runs Cargo as part of its own behaviour, and test
+  fixtures.
+- The only escape is explicit: `EFFIGY_OXIDE_ESCAPE=cargo`, or running
+  Cargo by hand while Oxide is broken (see **Selectors** above for the
+  machine-wide fallback). Nothing falls back silently.
+
 ## Dogfooding in Oxide's repository
 
 Approved by Tom on 2026-10-19 ([vision](../vision.md#product-workflow-direction)).
