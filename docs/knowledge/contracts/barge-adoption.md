@@ -1223,7 +1223,9 @@ continuous identity. The transcript must retain unproven wherever the required
 lifetime, process or object binding is missing.
 
 Candidate sites are limited to capture-chain operations with a declared
-`parent_required` obligation for the named leaf. For each, the existing
+`parent_required` obligation for the named leaf. The brief directs the shared
+wire/adapter work to introduce this flag; the existing manifest proposal does
+not yet define it. For each, the existing
 unproven note reports missing evidence; it does not discharge that obligation.
 Even a held-parent observation discharges it only with the independently
 qualified numeric-identity and lifetime premise, a matching component and
@@ -1236,6 +1238,33 @@ result, or complete input coverage.
 | `store::private_file(path, false)` (`src/bin/oxide/store.rs`), used by `prune::read_registry` and `outputs::read_receipt_with` | Parent of the non-create private-file open, including absent or refused child. The open is read/write with `O_NOFOLLOW`, even with `create=false`; those flags and its metadata and error checks must remain. Create callers are excluded and must keep their existing behavior. |
 | `config::inspect` (`src/bin/oxide/config.rs`) | Parent of each reached initial, resolved, image, receipt and config metadata or bytes operation, if its case declares it mandatory. Their follow/no-follow choices and canonicalization are distinct; this proposal does not make them one observation. |
 | `scratch_io::read_document` (`src/bin/oxide/scratch_io.rs`) | Parent of the no-follow document open, including absence or refusal. The existing child metadata is not an observation of its parent; the bytes still need binding to the opened child. |
+
+The eleven literal non-create `private_file` calls are `store::recorded_last_use`,
+`recorded_lost`, `holders`, `sibling_state`, `checked_sibling_state`,
+`trusted_origin`, `load`, `read_observations`, `prune::read_registry`,
+`prune::status_lines`, and `outputs::read_receipt_with`. The descriptor-read
+inventory below identifies all except `prune::status_lines` as capture-chain
+sites (with `holders` recorded through `active_holders`). Several also serve
+ordinary product operations. Additionally `store::probe_lock` passes a
+variable `create` to `private_file`, including potentially false; it is a lock
+path and excluded. A function-level change to `private_file` would reach all
+of these, including that lock path. The candidate instead requires explicit
+per-caller routing for the inventoried capture sites; `status_lines`,
+`probe_lock`, and create callers retain the current path open. That routing
+still affects every production use of each selected caller, not only capture
+runs, and must preserve its budget and refusal policy.
+
+`config::read_config` is called by `config::settings` after `config_file`
+selects an existing file; settings resolution serves ordinary product commands
+as well as the capture chain. A seam in that function reaches every such call.
+Likewise a seam in `config::inspect` reaches its product callers in
+`store.rs` (lines 1992, 2132, 2177 and 2199), `adopt.rs` (lines 556 and 605),
+and `main.rs` (line 2800), as well as capture. These would be production I/O
+changes for those commands, not capture-only instrumentation. Neither change
+may alter read budgets or refusal policy; the compatibility and Route B gates
+below apply to their full reach. `scratch_io::read_document` also has callers
+outside capture; a function-level change would reach all of them and requires
+the same full-reach review.
 
 These are candidates for a per-site design and counterfactual review, not an
 assertion that a single helper is compatible everywhere. `adopt::read_bounded`
