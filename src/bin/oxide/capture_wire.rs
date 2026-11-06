@@ -74,6 +74,15 @@ const IDENTITY_FIELDS: &[&str] = &[
 ];
 
 const EFFECT_FIELDS: &[&str] = &["kind", "site", "attempted", "path", "epoch"];
+const HOLDER_FIELDS: &[&str] = &[
+    "site",
+    "record_id",
+    "pid",
+    "recorded_start_ms",
+    "kernel_start",
+    "uid",
+    "epoch",
+];
 const EFFECT_KINDS: &[&str] = &[
     "create",
     "save",
@@ -230,11 +239,13 @@ fn optional_i32(value: &serde_json::Value, what: &str) -> Result<(), ParseError>
     }
     if value
         .as_i64()
-        .is_some_and(|n| n >= i64::from(i32::MIN) && n <= i64::from(i32::MAX))
+        .is_some_and(|n| n >= 0 && n <= i64::from(i32::MAX))
     {
         Ok(())
     } else {
-        Err(parse_err(format!("{what} is not an i32 or null")))
+        Err(parse_err(format!(
+            "{what} is not a non-negative i32 or null"
+        )))
     }
 }
 
@@ -258,10 +269,15 @@ fn type_check_identity(
     if let Some(value) = identity.get("own_source") {
         Provenance::parse(Some(value)).map_err(parse_err)?;
     }
+    let volume_shape = !require_provenance
+        && identity
+            .get("volume_uuid")
+            .is_some_and(serde_json::Value::is_string);
     for (key, value) in identity {
         match key.as_str() {
             "path" | "component" | "volume_uuid" | "mount" | "volume_device"
             | "window_identity" => optional_string(value, key)?,
+            "device" if volume_shape => optional_string(value, key)?,
             "parent_device" | "parent_inode" | "device" | "inode" | "start" => {
                 optional_u64(value, key)?;
             }
@@ -351,6 +367,39 @@ fn parse_effect(effect: &serde_json::Map<String, serde_json::Value>) -> Result<(
     Ok(())
 }
 
+fn parse_holder(holder: &serde_json::Map<String, serde_json::Value>) -> Result<(), ParseError> {
+    deny_unknown(holder, HOLDER_FIELDS, "recorded holder")?;
+    require_keys(
+        holder,
+        &["site", "record_id", "pid", "recorded_start_ms", "epoch"],
+        "recorded holder",
+    )?;
+    let site = holder
+        .get("site")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if site.is_empty() {
+        return Err(parse_err("recorded holder missing site"));
+    }
+    require_u64(holder.get("record_id"), "recorded holder record_id")?;
+    let pid = holder.get("pid").and_then(serde_json::Value::as_u64);
+    if !pid.is_some_and(|n| n <= u64::from(u32::MAX)) {
+        return Err(parse_err("recorded holder pid is not a u32"));
+    }
+    require_u64(
+        holder.get("recorded_start_ms"),
+        "recorded holder recorded_start_ms",
+    )?;
+    require_u64(holder.get("epoch"), "recorded holder epoch")?;
+    if let Some(value) = holder.get("kernel_start") {
+        optional_u64(value, "recorded holder kernel_start")?;
+    }
+    if let Some(value) = holder.get("uid") {
+        optional_u32(value, "recorded holder uid")?;
+    }
+    Ok(())
+}
+
 /// Strict transcript parse. Success is structure only.
 pub(crate) fn parse_transcript(bytes: &[u8]) -> Result<serde_json::Value, ParseError> {
     if bytes.len() > MAX_DOCUMENT_BYTES {
@@ -420,11 +469,17 @@ pub(crate) fn parse_transcript(bytes: &[u8]) -> Result<serde_json::Value, ParseE
     for effect in effects {
         parse_effect(as_object(effect, "effect")?)?;
     }
-    if let Some(holders) = map.get("recorded_holders").and_then(|v| v.as_array()) {
+    if let Some(value) = map.get("recorded_holders") {
+        let holders = value.as_array().ok_or_else(|| ParseError {
+            message: "recorded_holders is not an array".to_owned(),
+        })?;
         if holders.len() > MAX_PROCESS_ROWS {
             return Err(ParseError {
                 message: "process rows exceed the 512-row cap".to_owned(),
             });
+        }
+        for holder in holders {
+            parse_holder(as_object(holder, "recorded holder")?)?;
         }
     }
     Ok(doc)
@@ -558,6 +613,7 @@ fn identity_key(row: &serde_json::Value) -> String {
 fn identity_fields_match(
     obligation_identity: &serde_json::Value,
     row_identity: &serde_json::Value,
+    window: Option<&str>,
 ) -> bool {
     let Some(want) = obligation_identity.as_object() else {
         return false;
@@ -565,11 +621,25 @@ fn identity_fields_match(
     let Some(got) = row_identity.as_object() else {
         return false;
     };
+    let volume = want
+        .get("volume_uuid")
+        .is_some_and(serde_json::Value::is_string);
     for (key, expected) in want {
         if key == "parent_source" || key == "own_source" {
             continue;
         }
-        match got.get(key) {
+        if key == "window_identity" {
+            match expected.as_str() {
+                Some(want_window) if Some(want_window) == window => continue,
+                _ => return false,
+            }
+        }
+        let row_key = if volume && key == "device" {
+            "volume_device"
+        } else {
+            key.as_str()
+        };
+        match got.get(row_key) {
             Some(actual) if actual == expected => {}
             _ => return false,
         }
@@ -663,6 +733,9 @@ pub(crate) fn assess_completeness(
             .get("mandatory_observations")
             .and_then(|v| v.as_array())
         {
+            let window = manifest
+                .pointer("/window/identity")
+                .and_then(serde_json::Value::as_str);
             for obligation in obligations {
                 if obligation.get("engine").and_then(|v| v.as_str())
                     != transcript.get("engine").and_then(|v| v.as_str())
@@ -688,16 +761,16 @@ pub(crate) fn assess_completeness(
                     issues.push(format!("missing obligation at {site}"));
                     continue;
                 }
-                let identity_matched = at_site
-                    .iter()
-                    .any(|row| identity_fields_match(&obligation["identity"], &row["identity"]));
+                let identity_matched = at_site.iter().any(|row| {
+                    identity_fields_match(&obligation["identity"], &row["identity"], window)
+                });
                 if !identity_matched {
                     issues.push(format!("wrong identity at {site}"));
                     continue;
                 }
                 if parent_required {
                     let discharged = at_site.iter().any(|row| {
-                        identity_fields_match(&obligation["identity"], &row["identity"])
+                        identity_fields_match(&obligation["identity"], &row["identity"], window)
                             && parent_source_of(row) == Provenance::Handle
                             && K1_PREMISE_QUALIFIED
                     });
@@ -785,6 +858,12 @@ const VECTORS: &[Vector] = &[
             "../../../docs/knowledge/contracts/capture-vectors/valid/truncated.json"
         ),
         digest: "6c277878701a630394a9c2b9d6799672bda406ea21e34fd73bf62a74d0a85282",
+        kind: VectorKind::ValidTranscript,
+    },
+    Vector {
+        name: "valid/volume.json",
+        bytes: include_bytes!("../../../docs/knowledge/contracts/capture-vectors/valid/volume.json"),
+        digest: "a5211e825a77ab7898246825ecd893e8c5687de77854fd6558ba34307df16077",
         kind: VectorKind::ValidTranscript,
     },
     Vector {
@@ -916,11 +995,35 @@ const VECTORS: &[Vector] = &[
         kind: VectorKind::ValidTranscript,
     },
     Vector {
+        name: "invalid/string-holder-pid.json",
+        bytes: include_bytes!(
+            "../../../docs/knowledge/contracts/capture-vectors/invalid/string-holder-pid.json"
+        ),
+        digest: "1d694c59286eeef310a94f732a3e106f0149583634d1f754627628c33d7ea836",
+        kind: VectorKind::InvalidTranscript,
+    },
+    Vector {
+        name: "invalid/negative-fd.json",
+        bytes: include_bytes!(
+            "../../../docs/knowledge/contracts/capture-vectors/invalid/negative-fd.json"
+        ),
+        digest: "858c351163d68f5ccc618a829c35fe66d141e56994a96d6ddc76a00549662ea3",
+        kind: VectorKind::InvalidTranscript,
+    },
+    Vector {
         name: "manifest/valid-parent-required.json",
         bytes: include_bytes!(
             "../../../docs/knowledge/contracts/capture-vectors/manifest/valid-parent-required.json"
         ),
         digest: "ee622767bfef80d78cb5025235faa8da380c10a01f7325067f1c19b094a5641a",
+        kind: VectorKind::ValidManifest,
+    },
+    Vector {
+        name: "manifest/valid-volume-identity.json",
+        bytes: include_bytes!(
+            "../../../docs/knowledge/contracts/capture-vectors/manifest/valid-volume-identity.json"
+        ),
+        digest: "63a2baa98243a341b526743d8766b89b509aa4aaaf9b224df2ddd032233d9f84",
         kind: VectorKind::ValidManifest,
     },
     Vector {
@@ -1035,6 +1138,19 @@ fn completeness_fixture(name: &str, transcript_case: &str) -> serde_json::Value 
             true,
             serde_json::json!([]),
         ),
+        "valid/volume.json" => vector_manifest(
+            transcript_case,
+            "volume-site",
+            false,
+            serde_json::json!({
+                "volume_uuid": "volume",
+                "mount": "/mount",
+                "device": "/dev/example",
+                "window_identity": "vector"
+            }),
+            true,
+            serde_json::json!([]),
+        ),
         "invalid/collision.json" => vector_manifest(
             transcript_case,
             "pure:read",
@@ -1132,7 +1248,7 @@ fn expected_issues(name: &str) -> &'static [&'static str] {
         "valid/handle-parent.json" => &[
             "parent_required unproven at root-observe:entry: handle parent still needs qualified K1",
         ],
-        "valid/absent.json" | "valid/refused.json" => &[],
+        "valid/absent.json" | "valid/refused.json" | "valid/volume.json" => &[],
         "valid/truncated.json" => &["truncated: read_rows_truncated"],
         "invalid/collision.json" => {
             &["collision at pure:read|/pure/object|none|none|none occurrence 1"]
@@ -1159,9 +1275,20 @@ fn path_only_bytes() -> &'static [u8] {
 
 fn cap_checks() -> Result<usize, String> {
     let mut checked = 0usize;
-    let oversize = vec![b'x'; MAX_DOCUMENT_BYTES + 1];
-    if parse_transcript(&oversize).is_ok() {
-        return Err("8 MiB+1 document must fail parse".to_owned());
+    let mut oversize = serde_json::from_slice::<serde_json::Value>(path_only_bytes())
+        .map_err(|error| error.to_string())?;
+    oversize["notes"] = serde_json::json!(["x".repeat(MAX_DOCUMENT_BYTES)]);
+    let bytes = serde_json::to_vec(&oversize).map_err(|error| error.to_string())?;
+    if bytes.len() <= MAX_DOCUMENT_BYTES {
+        return Err("padded oversize transcript did not exceed 8 MiB".to_owned());
+    }
+    match parse_transcript(&bytes) {
+        Err(error) if error.message.contains("8 MiB") => {}
+        other => {
+            return Err(format!(
+                "8 MiB JSON document must fail naming the cap, got {other:?}"
+            ));
+        }
     }
     checked += 1;
 
@@ -1186,8 +1313,18 @@ fn cap_checks() -> Result<usize, String> {
 
     let mut holders = serde_json::from_slice::<serde_json::Value>(path_only_bytes())
         .map_err(|error| error.to_string())?;
-    holders["recorded_holders"] =
-        serde_json::Value::Array(vec![serde_json::json!({"pid": 1}); MAX_PROCESS_ROWS + 1]);
+    holders["recorded_holders"] = serde_json::Value::Array(vec![
+        serde_json::json!({
+            "site": "pure-holder",
+            "record_id": 1,
+            "pid": 1,
+            "recorded_start_ms": 1,
+            "kernel_start": null,
+            "uid": null,
+            "epoch": 1
+        });
+        MAX_PROCESS_ROWS + 1
+    ]);
     let bytes = serde_json::to_vec(&holders).map_err(|error| error.to_string())?;
     if parse_transcript(&bytes).is_ok() {
         return Err("513 process rows must fail parse".to_owned());
@@ -1213,6 +1350,27 @@ fn cap_checks() -> Result<usize, String> {
         .any(|issue| issue.contains("missing parent_required"))
     {
         return Err("missing parent_required must be an issue, not false".to_owned());
+    }
+    checked += 1;
+
+    let volume_bytes = VECTORS
+        .iter()
+        .find(|vector| vector.name == "valid/volume.json")
+        .expect("volume vector")
+        .bytes;
+    let volume = parse_transcript(volume_bytes).map_err(|error| error.message)?;
+    let mut mismatch = completeness_fixture("valid/volume.json", "VECTOR-VOLUME");
+    mismatch["mandatory_observations"][0]["identity"]["device"] = serde_json::json!("/dev/other");
+    let mismatch_issues = assess_completeness(&volume, Some(&mismatch));
+    if !mismatch_issues
+        .issues
+        .iter()
+        .any(|issue| issue == "wrong identity at volume-site")
+    {
+        return Err(format!(
+            "volume device mismatch must issue wrong identity, got {:?}",
+            mismatch_issues.issues
+        ));
     }
     checked += 1;
     Ok(checked)
