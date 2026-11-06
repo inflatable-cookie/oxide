@@ -1199,6 +1199,106 @@ authorizes a real run, a pin change or a production behaviour change.
   Stopping criteria: pure selectors green, the report renders for a synthetic
   unit fixture, no fixture, pool or image touched outside pure mode.
 
+#### Proposed private parent-descriptor seam (review checkpoint)
+
+This is a design for review, not an implemented seam or an equivalence claim.
+The existing path-only operations cannot identify the parent actually used by
+an earlier open by subsequently looking up the path. Their parent obligations
+remain unproven. The test-only adapter can independently improve observations
+of operations that already use a held directory descriptor.
+
+The smallest candidate is a private read-only helper taking a parent path and
+one final component, opening the directory once, and performing the existing
+child open relative to that held descriptor. It returns owned parent and child
+handles to the existing caller for the duration of the read. It must preserve
+that caller's child flags, metadata checks, read limit, error mapping and
+budget charging; no extra create, write, lock or retry is allowed. A test-only
+observer may fstat each live handle once, preserve errno, record success or
+failure and its additional syscall cost, and drop both with RAII. Observation
+failure cannot affect the real operation. A positive child absence or refusal
+binds the parent only if fstat on the held parent descriptor succeeded; on
+failure the parent is unproven and no parent field is recorded. A
+numeric device/inode pair after the handles close is not itself proof of
+continuous identity. The transcript must retain unproven wherever the required
+lifetime, process or object binding is missing.
+
+Candidate sites are limited to capture-chain operations with a declared
+`parent_required` obligation for the named leaf. The brief directs the shared
+wire/adapter work to introduce this flag; the existing manifest proposal does
+not yet define it. For each, the existing
+unproven note reports missing evidence; it does not discharge that obligation.
+Even a held-parent observation discharges it only with the independently
+qualified numeric-identity and lifetime premise, a matching component and
+attributable operation. It does not by itself establish the child descriptor,
+result, or complete input coverage.
+
+| Capture-chain site | Candidate obligation and limits |
+| --- | --- |
+| `config::read_config` (`src/bin/oxide/config.rs`), reached by configuration resolution | Parent of the metadata and file-read operations on the selected config. They are separate path resolutions; each needs its own attributable parent binding. `fs::metadata` and the later file open follow the leaf link today. |
+| `store::private_file(path, false)` (`src/bin/oxide/store.rs`), used by `prune::read_registry` and `outputs::read_receipt_with` | Parent of the non-create private-file open, including absent or refused child. The open is read/write with `O_NOFOLLOW`, even with `create=false`; those flags and its metadata and error checks must remain. Create callers are excluded and must keep their existing behavior. |
+| `config::inspect` (`src/bin/oxide/config.rs`) | Parent of each reached initial, resolved, image, receipt and config metadata or bytes operation, if its case declares it mandatory. Their follow/no-follow choices and canonicalization are distinct; this proposal does not make them one observation. |
+| `scratch_io::read_document` (`src/bin/oxide/scratch_io.rs`) | Parent of the no-follow document open, including absence or refusal. The existing child metadata is not an observation of its parent; the bytes still need binding to the opened child. |
+
+The eleven literal non-create `private_file` calls are `store::recorded_last_use`,
+`recorded_lost`, `holders`, `sibling_state`, `checked_sibling_state`,
+`trusted_origin`, `load`, `read_observations`, `prune::read_registry`,
+`prune::status_lines`, and `outputs::read_receipt_with`. The descriptor-read
+inventory below identifies all except `prune::status_lines` as capture-chain
+sites (with `holders` recorded through `active_holders`). Several also serve
+ordinary product operations. Additionally `store::probe_lock` passes a
+variable `create` to `private_file`, including potentially false; it is a lock
+path and excluded. A function-level change to `private_file` would reach all
+of these, including that lock path. The candidate instead requires explicit
+per-caller routing for the inventoried capture sites; `status_lines`,
+`probe_lock`, and create callers retain the current path open. That routing
+still affects every production use of each selected caller, not only capture
+runs, and must preserve its budget and refusal policy.
+
+`config::read_config` is called by `config::settings` after `config_file`
+selects an existing file; settings resolution serves ordinary product commands
+as well as the capture chain. A seam in that function reaches every such call.
+Likewise a seam in `config::inspect` reaches its product callers in
+`store.rs` (lines 1992, 2132, 2177 and 2199), `adopt.rs` (lines 556 and 605),
+and `main.rs` (line 2800), as well as capture. These would be production I/O
+changes for those commands, not capture-only instrumentation. Neither change
+may alter read budgets or refusal policy; the compatibility and Route B gates
+below apply to their full reach. `scratch_io::read_document` also has callers
+outside capture; a function-level change would reach all of them and requires
+the same full-reach review.
+
+These are candidates for a per-site design and counterfactual review, not an
+assertion that a single helper is compatible everywhere. `adopt::read_bounded`
+and its guidance and `read_for_write` callers are outside the capture chain
+and outside this proposal. In particular, the pre-write read and subsequent
+`write_block` remain unchanged. That reader's `fs::read` follows a leaf link;
+replacing it with `O_NOFOLLOW` would change its semantics.
+
+This candidate has **not** established compatibility. Opening a directory
+separately adds a descriptor, an open, a possible resource or permission
+failure, and a race boundary; anchoring the second lookup to that directory
+can read a different object if an ancestor is replaced between operations.
+A direct open can resolve a path that the proposed directory open refuses.
+Symlink traversal, trailing slashes, root and relative paths, rename, parent
+replacement, descriptor exhaustion and errors at each step need explicit
+treatment per caller. Preserve each operation's existing leaf link semantics;
+no single pinned parent may silently merge separately resolved observations.
+Enumeration and lock opens have their own semantics and are out of scope.
+
+Counterfactual review must distinguish: a parent replaced after directory open;
+a child replaced between lstat and open; a symlink at either component; a
+missing ancestor versus a missing child; `EMFILE` or `EACCES` on the extra
+open; and a post-read pathname replacement. The adapter must not make any of
+these pass by reopening a path, copying a fixture expectation, or promoting a
+closed descriptor's numeric identity. If preserving the existing externally
+observable results cannot be demonstrated, the seam is not mechanical and
+must return the exact conflict for a scope ruling. Review of this proposal is
+not activation of production I/O changes. Barge's `oxide-capture-parent-identity.md`
+Route B and `o2-tape.md` treat descriptor-relative production state-reader
+changes as a production semantics change and an operator scope question. The
+planner must reconcile that condition with the 2026-11-06 approval and
+`d2c34987` before any activation; implementation and its exact-head review
+remain separate.
+
 #### Oxide test-only capture apparatus
 
 Tom decision `c6e3e9c8` v2 (2026-11-04) separates capture delivery from
