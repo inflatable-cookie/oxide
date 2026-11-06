@@ -20,6 +20,12 @@
 //! leaves (`src/volume.rs`, `src/inventory.rs`, `src/lease/pool.rs`) resolve
 //! `crate::tape` to this same sink in the re-rooted harness crate.
 
+#[path = "capture_wire.rs"]
+pub(crate) mod capture_wire;
+use capture_wire::{Provenance, K1_PREMISE_QUALIFIED};
+
+pub(crate) use capture_wire::{assess_completeness, parse_transcript, run_self_checks};
+
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
@@ -67,31 +73,91 @@ impl TapeOutcome {
 
 /// The complete object identity of one row: absolute path, observed parent
 /// and own device/inode where the leaf saw them, or the volume's UUID, mount
-/// point and device. `key` is the canonical identity key occurrence counting
-/// binds to.
+/// point and device. Serialized names match the shared wire. `key` is
+/// occurrence bookkeeping and is not a shared-wire field.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct TapeIdentity {
     pub(crate) path: Option<String>,
     pub(crate) component: Option<String>,
+    #[serde(rename = "parent_device")]
     pub(crate) parent_dev: Option<u64>,
+    #[serde(rename = "parent_inode")]
     pub(crate) parent_ino: Option<u64>,
+    #[serde(rename = "device")]
     pub(crate) dev: Option<u64>,
+    #[serde(rename = "inode")]
     pub(crate) ino: Option<u64>,
+    pub(crate) pid: Option<u32>,
+    pub(crate) start: Option<u64>,
+    pub(crate) uid: Option<u32>,
+    pub(crate) fd: Option<i32>,
+    #[serde(rename = "volume_uuid")]
     pub(crate) uuid: Option<String>,
+    #[serde(rename = "mount")]
     pub(crate) mount_point: Option<String>,
-    pub(crate) device: Option<String>,
+    pub(crate) volume_device: Option<String>,
+    pub(crate) parent_source: Provenance,
+    pub(crate) own_source: Provenance,
+    #[serde(skip)]
     pub(crate) key: String,
 }
 
-/// One recorded read row: `{kind, identity, outcome, cap, epoch, occurrence}`.
+impl TapeIdentity {
+    fn blank(key: String) -> Self {
+        Self {
+            path: None,
+            component: None,
+            parent_dev: None,
+            parent_ino: None,
+            dev: None,
+            ino: None,
+            pid: None,
+            start: None,
+            uid: None,
+            fd: None,
+            uuid: None,
+            mount_point: None,
+            volume_device: None,
+            parent_source: Provenance::None,
+            own_source: Provenance::None,
+            key,
+        }
+    }
+}
+
+/// One recorded read row. `kind` is historical; `site` is the same value on
+/// the shared wire.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct TapeReadRow {
     pub(crate) kind: String,
+    pub(crate) site: String,
     pub(crate) identity: TapeIdentity,
     pub(crate) outcome: TapeOutcome,
     pub(crate) cap: u64,
     pub(crate) epoch: u64,
     pub(crate) occurrence: u64,
+}
+
+impl TapeReadRow {
+    fn new(
+        kind: String,
+        identity: TapeIdentity,
+        outcome: TapeOutcome,
+        cap: u64,
+        epoch: u64,
+        occurrence: u64,
+    ) -> Self {
+        let site = kind.clone();
+        Self {
+            kind,
+            site,
+            identity,
+            outcome,
+            cap,
+            epoch,
+            occurrence,
+        }
+    }
 }
 
 /// One recorded effect row: `{kind, path, epoch}`. Kinds are drawn from the
@@ -168,6 +234,7 @@ pub(crate) struct TapeTruncation {
 #[derive(Debug, Serialize)]
 pub(crate) struct TapeTranscript {
     pub(crate) version: &'static str,
+    pub(crate) schema: &'static str,
     pub(crate) engine: String,
     pub(crate) case: String,
     pub(crate) manifest_sha256: String,
@@ -324,9 +391,10 @@ fn identity_matches(row: &TapeReadRow, identity: &serde_json::Value, window: Opt
         return row.identity.uuid.as_deref() == Some(uuid)
             && identity.get("mount").and_then(|v| v.as_str())
                 == row.identity.mount_point.as_deref()
-            && identity.get("device").and_then(|v| v.as_str()) == row.identity.device.as_deref()
+            && identity.get("device").and_then(|v| v.as_str())
+                == row.identity.volume_device.as_deref()
             && row.identity.mount_point.is_some()
-            && row.identity.device.is_some()
+            && row.identity.volume_device.is_some()
             && window.is_some()
             && identity.get("window_identity").and_then(|v| v.as_str()) == window;
     }
@@ -351,6 +419,13 @@ pub(crate) fn check_manifest_obligations(manifest: &serde_json::Value, root: &Pa
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let identity = &obligation["identity"];
+                let parent_required = match obligation.get("parent_required") {
+                    Some(serde_json::Value::Bool(value)) => *value,
+                    _ => {
+                        issues.insert(format!("obligation missing parent_required at {site}"));
+                        continue;
+                    }
+                };
                 if !state.reads.iter().any(|row| {
                     row.kind == site
                         && identity_matches(
@@ -360,6 +435,9 @@ pub(crate) fn check_manifest_obligations(manifest: &serde_json::Value, root: &Pa
                                 .pointer("/window/identity")
                                 .and_then(|v| v.as_str()),
                         )
+                        && (!parent_required
+                            || (row.identity.parent_source == Provenance::Handle
+                                && K1_PREMISE_QUALIFIED))
                 }) {
                     issues.insert(format!(
                         "mandatory observation missing or identity unproven at {site}"
@@ -474,13 +552,13 @@ pub(crate) fn check_manifest_obligations(manifest: &serde_json::Value, root: &Pa
                             .and_then(|v| v.as_str());
                         row.identity.uuid.is_some()
                             && row.identity.mount_point.is_some()
-                            && row.identity.device.is_some()
+                            && row.identity.volume_device.is_some()
                             && volume.get("uuid").and_then(|v| v.as_str())
                                 == row.identity.uuid.as_deref()
                             && volume.get("mount").and_then(|v| v.as_str())
                                 == row.identity.mount_point.as_deref()
                             && volume.get("device").and_then(|v| v.as_str())
-                                == row.identity.device.as_deref()
+                                == row.identity.volume_device.as_deref()
                             && window.is_some()
                             && volume.get("window_identity").and_then(|v| v.as_str()) == window
                     })
@@ -627,6 +705,7 @@ pub(crate) fn finish_and_write(
         }
         TapeTranscript {
             version: TRANSCRIPT_VERSION,
+            schema: TRANSCRIPT_VERSION,
             engine: state.engine,
             case: state.case,
             manifest_sha256: state.manifest_sha256,
@@ -767,15 +846,11 @@ fn file_identity(path: &Path, outcome: &TapeOutcome) -> TapeIdentity {
     );
     TapeIdentity {
         path: path.to_str().map(str::to_owned),
-        component: None,
         parent_dev,
         parent_ino,
         dev,
         ino,
-        uuid: None,
-        mount_point: None,
-        device: None,
-        key,
+        ..TapeIdentity::blank(key)
     }
 }
 
@@ -791,14 +866,7 @@ pub(crate) fn read_row(kind: &str, path: &Path, outcome: TapeOutcome, cap: u64) 
         let key = format!("{kind}|{}", identity_key(&identity));
         let (occurrence, counted) = occurrence(state, &key);
         let epoch = next_epoch(state);
-        let row = TapeReadRow {
-            kind: kind.to_owned(),
-            identity,
-            outcome,
-            cap,
-            epoch,
-            occurrence,
-        };
+        let row = TapeReadRow::new(kind.to_owned(), identity, outcome, cap, epoch, occurrence);
         if counted {
             push_read(state, row);
         }
@@ -815,6 +883,18 @@ pub(crate) fn read_row_dev(
     cap: u64,
 ) {
     read_row_without_parent(kind, path, dev, ino, outcome, cap);
+}
+
+/// Own identity from a live held-descriptor fstat (`handle` provenance).
+pub(crate) fn read_row_handle(
+    kind: &str,
+    path: &Path,
+    dev: u64,
+    ino: u64,
+    outcome: TapeOutcome,
+    cap: u64,
+) {
+    read_row_owned(kind, path, dev, ino, outcome, cap, Provenance::Handle);
 }
 
 /// Record one component read of a no-follow walk: the component name bound to
@@ -835,27 +915,22 @@ pub(crate) fn component_row(
             "component:parent={parent_dev}/{parent_ino}|name={name:?}|dev={dev:?}/ino={ino:?}"
         );
         let identity = TapeIdentity {
-            path: None,
             component: name.to_str().map(str::to_owned),
             parent_dev: Some(parent_dev),
             parent_ino: Some(parent_ino),
             dev,
             ino,
-            uuid: None,
-            mount_point: None,
-            device: None,
-            key,
+            parent_source: Provenance::Handle,
+            own_source: if dev.is_some() {
+                Provenance::Extracted
+            } else {
+                Provenance::None
+            },
+            ..TapeIdentity::blank(key)
         };
         let (occurrence, counted) = occurrence(state, &format!("{kind}|{}", identity.key));
         let epoch = next_epoch(state);
-        let row = TapeReadRow {
-            kind: kind.to_owned(),
-            identity,
-            outcome,
-            cap: 0,
-            epoch,
-            occurrence,
-        };
+        let row = TapeReadRow::new(kind.to_owned(), identity, outcome, 0, epoch, occurrence);
         if counted {
             push_read(state, row);
         }
@@ -872,16 +947,15 @@ pub(crate) fn component_without_parent(kind: &str, name: &std::ffi::OsStr, outco
         };
         let key = format!("component:parent=unproven|name={name:?}|dev={dev:?}/ino={ino:?}");
         let identity = TapeIdentity {
-            path: None,
             component: name.to_str().map(str::to_owned),
-            parent_dev: None,
-            parent_ino: None,
             dev,
             ino,
-            uuid: None,
-            mount_point: None,
-            device: None,
-            key: key.clone(),
+            own_source: if dev.is_some() {
+                Provenance::Extracted
+            } else {
+                Provenance::None
+            },
+            ..TapeIdentity::blank(key.clone())
         };
         push_note(
             state,
@@ -892,14 +966,7 @@ pub(crate) fn component_without_parent(kind: &str, name: &std::ffi::OsStr, outco
         if counted {
             push_read(
                 state,
-                TapeReadRow {
-                    kind: kind.to_owned(),
-                    identity,
-                    outcome,
-                    cap: 0,
-                    epoch,
-                    occurrence,
-                },
+                TapeReadRow::new(kind.to_owned(), identity, outcome, 0, epoch, occurrence),
             );
         }
     });
@@ -927,26 +994,13 @@ pub(crate) fn volume_row(
             mount = mount.display()
         );
         let identity = TapeIdentity {
-            path: None,
-            component: None,
-            parent_dev: None,
-            parent_ino: None,
-            dev: None,
-            ino: None,
             uuid: uuid.clone(),
             mount_point: mount.to_str().map(str::to_owned),
-            device: device.map(str::to_owned),
-            key,
+            volume_device: device.map(str::to_owned),
+            ..TapeIdentity::blank(key)
         };
         let (occurrence, counted) = occurrence(state, &format!("{kind}|{}", identity.key));
-        let row = TapeReadRow {
-            kind: kind.to_owned(),
-            identity,
-            outcome,
-            cap: 0,
-            epoch,
-            occurrence,
-        };
+        let row = TapeReadRow::new(kind.to_owned(), identity, outcome, 0, epoch, occurrence);
         if counted {
             push_read(state, row);
         }
@@ -1187,14 +1241,14 @@ pub(crate) fn authority_bind(site: &str, path: &Path, cap: u64) {
         let key = format!("{site}|{}", identity.key);
         let (occurrence, counted) = occurrence(state, &key);
         let epoch = next_epoch(state);
-        let row = TapeReadRow {
-            kind: format!("authority-read@{site}"),
+        let row = TapeReadRow::new(
+            format!("authority-read@{site}"),
             identity,
             outcome,
-            cap: pending.cap.max(cap),
+            pending.cap.max(cap),
             epoch,
             occurrence,
-        };
+        );
         if counted {
             push_read(state, row);
         }
@@ -1211,6 +1265,18 @@ pub(crate) fn read_row_without_parent(
     outcome: TapeOutcome,
     cap: u64,
 ) {
+    read_row_owned(kind, path, dev, ino, outcome, cap, Provenance::Extracted);
+}
+
+fn read_row_owned(
+    kind: &str,
+    path: &Path,
+    dev: u64,
+    ino: u64,
+    outcome: TapeOutcome,
+    cap: u64,
+    own_source: Provenance,
+) {
     with_state(|state| {
         let key = format!(
             "file:{}|parent=unproven|dev={dev}/ino={ino}",
@@ -1218,15 +1284,10 @@ pub(crate) fn read_row_without_parent(
         );
         let identity = TapeIdentity {
             path: path.to_str().map(str::to_owned),
-            component: None,
-            parent_dev: None,
-            parent_ino: None,
             dev: Some(dev),
             ino: Some(ino),
-            uuid: None,
-            mount_point: None,
-            device: None,
-            key: key.clone(),
+            own_source,
+            ..TapeIdentity::blank(key.clone())
         };
         push_note(state, format!("parent identity unproven at {kind}"));
         let (occurrence, counted) = occurrence(state, &format!("{kind}|{key}"));
@@ -1234,14 +1295,7 @@ pub(crate) fn read_row_without_parent(
         if counted {
             push_read(
                 state,
-                TapeReadRow {
-                    kind: kind.to_owned(),
-                    identity,
-                    outcome,
-                    cap,
-                    epoch,
-                    occurrence,
-                },
+                TapeReadRow::new(kind.to_owned(), identity, outcome, cap, epoch, occurrence),
             );
         }
     });
@@ -1294,16 +1348,17 @@ pub(crate) fn descriptor_row(site: &str, fd: i32, outcome: TapeOutcome) {
             _ => (None, None),
         };
         let identity = TapeIdentity {
-            path: None,
-            component: None,
-            parent_dev: None,
-            parent_ino: None,
             dev,
             ino,
-            uuid: None,
-            mount_point: None,
-            device: None,
-            key: format!("descriptor:{fd}|process-start=unproven|dev={dev:?}|ino={ino:?}"),
+            fd: Some(fd),
+            own_source: if dev.is_some() {
+                Provenance::Extracted
+            } else {
+                Provenance::None
+            },
+            ..TapeIdentity::blank(format!(
+                "descriptor:{fd}|process-start=unproven|dev={dev:?}|ino={ino:?}"
+            ))
         };
         push_note(
             state,
@@ -1314,14 +1369,7 @@ pub(crate) fn descriptor_row(site: &str, fd: i32, outcome: TapeOutcome) {
         if counted {
             push_read(
                 state,
-                TapeReadRow {
-                    kind: site.to_owned(),
-                    identity,
-                    outcome,
-                    cap: 0,
-                    epoch,
-                    occurrence,
-                },
+                TapeReadRow::new(site.to_owned(), identity, outcome, 0, epoch, occurrence),
             );
         }
     });
@@ -1385,16 +1433,57 @@ pub(crate) fn budget_end(failed: bool, remaining: u64) {
     );
 }
 
-/// An observation site without a captured syscall result is insufficient.
-/// Never issue a second path or descriptor syscall to fill that gap.
-pub(crate) fn fd_dev_ino(_fd: std::os::fd::BorrowedFd<'_>) -> Option<(u64, u64)> {
-    with_state(|state| {
-        push_note(
-            state,
-            "descriptor identity unproven at observation site".to_owned(),
+/// Live fstat of an already-held descriptor. Dup is a declared extra
+/// observation: cost and error are classified, errno is restored, and Drop
+/// closes the dup. A closed numeric pair is not lifetime proof.
+pub(crate) fn fd_dev_ino(fd: std::os::fd::BorrowedFd<'_>) -> Option<(u64, u64)> {
+    let saved_errno = observer_errno();
+    let result = live_held_fstat(fd);
+    restore_observer_errno(saved_errno);
+    result
+}
+
+fn live_held_fstat(fd: std::os::fd::BorrowedFd<'_>) -> Option<(u64, u64)> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let raw = fd.as_raw_fd();
+    // SAFETY: F_DUPFD_CLOEXEC returns a new private descriptor or -1.
+    let duped = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };
+    let observe = if duped >= 0 {
+        classify_row("observe:dup", "held-fd", "ok");
+        // SAFETY: `duped` is a newly owned descriptor.
+        Some(unsafe { OwnedFd::from_raw_fd(duped) })
+    } else {
+        classify_row(
+            "observe:dup",
+            "held-fd",
+            &format!("error:{}", std::io::Error::last_os_error()),
         );
-    });
-    None
+        with_state(|state| {
+            push_note(
+                state,
+                "dup of held descriptor failed; fstat uses the live original".to_owned(),
+            );
+        });
+        None
+    };
+    let observe_raw = observe.as_ref().map(AsRawFd::as_raw_fd).unwrap_or(raw);
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: the descriptor is live for the call.
+    let status = unsafe { libc::fstat(observe_raw, &mut stat) };
+    let fstat_error = (status != 0).then(std::io::Error::last_os_error);
+    drop(observe);
+    if let Some(error) = fstat_error {
+        classify_row("observe:fstat", "held-fd", &format!("error:{error}"));
+        with_state(|state| {
+            push_note(
+                state,
+                "descriptor identity unproven at observation site".to_owned(),
+            );
+        });
+        return None;
+    }
+    classify_row("observe:fstat", "held-fd", "ok");
+    Some((u64::try_from(stat.st_dev).unwrap_or(u64::MAX), stat.st_ino))
 }
 
 /// Test-only helper: SHA-256 of bytes, lowercase hex.

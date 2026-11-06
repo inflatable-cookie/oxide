@@ -1223,9 +1223,9 @@ continuous identity. The transcript must retain unproven wherever the required
 lifetime, process or object binding is missing.
 
 Candidate sites are limited to capture-chain operations with a declared
-`parent_required` obligation for the named leaf. The brief directs the shared
-wire/adapter work to introduce this flag; the existing manifest proposal does
-not yet define it. For each, the existing
+`parent_required` obligation for the named leaf. `parent_required` is a
+required boolean on each `mandatory_observations` item in
+`oxide.capture.manifest/1` (schema, parser and adapter). For each, the existing
 unproven note reports missing evidence; it does not discharge that obligation.
 Even a held-parent observation discharges it only with the independently
 qualified numeric-identity and lifetime premise, a matching component and
@@ -1336,7 +1336,10 @@ alone is insufficient.
   and 8 MiB document caps with explicit `truncation` flags, effect rows,
   clock rows, an additive bounded `classifications` array, and the
   additive bounded pre/post `fixture_capture` with its diff),
-  `src/tape.rs` (the separate sink used only by library unit tests), and `src/bin/oxide/tape_harness.rs` (the `[[test]]`
+  `src/tape.rs` (the separate sink used only by library unit tests),
+  `src/bin/oxide/capture_wire.rs` (strict `/1` parser and completeness),
+  `docs/knowledge/contracts/capture-vectors/` (canonical hashed JSON),
+  and `src/bin/oxide/tape_harness.rs` (the `[[test]]`
   `tape_prune_eval` target, `harness = false`). Recorder statements sit in
   `prune.rs` (authority scope and budget, `authority_read` core/bind,
   `read_registry`, `read_bounded`, the no-follow absence walk start,
@@ -1369,15 +1372,21 @@ alone is insufficient.
   86249e2c permits one test-only fstat on the held descriptor for identity
   observation only; its failure does not change the real read or policy. This
   inventory is not proof that every direct read in the contract is taped.
-  Only `prune::read_bounded` uses the approved additional held-descriptor
-  fstat. Other authority-read sites preserve the actual read outcome while
-  marking descriptor and parent identity unproven. The tape does not issue
-  later path or descriptor syscalls to manufacture identities; it uses the
-  existing metadata result for the removable registration, admission lock and
-  volume path verification, and existing `fstatat`/`fstat` outcomes for the
-  revalidation walk. Sites without those facts remain insufficient. The
-  authority deadline is not reconstructed from wall time; its monotonic binding
-  remains unproven until captured from the actual decision input.
+  `tape::fd_dev_ino` now dups (`F_DUPFD_CLOEXEC`) and fstats a live held
+  descriptor (declared extra observation: `observe:dup` / `observe:fstat`
+  classifications, fstat errno captured before Drop, RAII close). Callers: `prune::read_bounded`, `absence-walk:boot-data`,
+  `root-observe:outputs-dir`, `root-observe:root-dir`. When the outputs-dir
+  fstat succeeds, `root-observe:entry` binds that parent as `handle`. Other
+  authority-read sites preserve the actual read outcome while marking
+  descriptor and parent identity unproven. The tape does not obtain a past
+  operation's parent through lexical ancestry, later pathname stat, reopen or
+  fixture expectation. Existing metadata results still decorate removable
+  registration, admission lock and volume path verification; existing
+  `fstatat`/`fstat` outcomes still decorate the revalidation walk. Sites
+  without those facts remain insufficient. The authority deadline is not
+  reconstructed from wall time; its monotonic binding remains unproven until
+  captured from the actual decision input.
+
 - **Schema coordination.** The proposed shared manifest carries Barge's
   `barge.volume_uuid`, `namespace`, `area`, optional `named_roots` and
   `volume_mount`. Barge's small consumption surface ignores the remaining
@@ -1639,6 +1648,73 @@ final disagreement (currently `REF-ORPHAN-MARKED`, `RCP-V1`,
 current source in the comparison report or recorded as blocking, and O3 stays
 held while any blocking row stands. `D-1`/`D-2` (Q-E) and `D-3` (Q-D) keep
 their existing operator decision points.
+
+#### Implemented shared capture wire (oxide#283)
+
+Test-only. Schema remains `oxide.capture.transcript/1` and
+`oxide.capture.manifest/1`. Adapter emission uses the schema identity names
+(`parent_device`, `parent_inode`, `device`, `inode`, `volume_uuid`, `mount`,
+`volume_device`), always-present `parent_source` / `own_source`
+(`handle` | `extracted` | `context` | `none`), process fields, and `site`
+alongside historical `kind` / `version`. Parser-positive is structure only
+(`src/bin/oxide/capture_wire.rs`). Completeness matches each present
+obligation identity field (not site/kind alone) and effects as a
+`(kind, site, path)` bag. `parent_required` fails for `none` / `extracted` /
+`context`; `handle` still fails while `K1_PREMISE_QUALIFIED` is false.
+Missing `parent_required` is an issue, not false. Completeness without a
+manifest is `no manifest`, never success from structure. Volume obligation
+`device` is a string mapped to the row's `volume_device`; `window_identity`
+is compared to `manifest.window.identity`, not a row key. Recorded holders
+are typed (`pid` u32; `uid` u32 or null; `kernel_start` u64 or null;
+`record_id` / `recorded_start_ms` / `epoch` u64; `site` non-empty). `fd` is
+a non-negative i32 or null. The 8 MiB document cap is proven against a
+syntactically valid transcript padded past the cap. Production I/O is
+unchanged. Route B is not activated. Live held-descriptor observation uses
+`F_DUPFD_CLOEXEC` and captures fstat errno before Drop.
+
+Canonical vectors: `docs/knowledge/contracts/capture-vectors/` (SHA256SUMS).
+Barge copies the files; there is no runtime cross-repo dependency.
+
+| Vector | SHA-256 |
+| --- | --- |
+| `valid/path-only-unproven.json` | `d119a519c5fe050607117c43aaee32a7d9d474a965bcc0e7dae3b54a94c80563` |
+| `valid/handle-parent.json` | `1eeef64d45322210b4501775f36aa9dd2e120404d5357fc942b471a72ad05a3b` |
+| `valid/absent.json` | `27c1d50d7317d4d1ec01c4eacf3af853eb65976076e9cbe56ff8e99c53ef30c5` |
+| `valid/refused.json` | `0e7530bd79edec6aad1499617b15f35e4622d120e1229fffa771480c62462fc6` |
+| `valid/truncated.json` | `6c277878701a630394a9c2b9d6799672bda406ea21e34fd73bf62a74d0a85282` |
+| `valid/volume.json` | `a5211e825a77ab7898246825ecd893e8c5687de77854fd6558ba34307df16077` |
+| `invalid/unknown-version.json` | `5a9365d81d66b4b1eaddf55c773e6434d528e4530530aadb6d9572a8bf24fd69` |
+| `invalid/unknown-field.json` | `c794624c469a4089b86a9669503415718f183888b876f8537f8d9795e0fd59fb` |
+| `invalid/missing-site.json` | `60bbe57b5546d510621684a1d7874247ba7e2bea6cdc04cfbb71a541a93485d2` |
+| `invalid/bad-provenance.json` | `d0d296b16873c798c78d0984bc848f7c57ef34df6050c09a3ec88ce75db55734` |
+| `invalid/collision.json` | `586b01537500d475945f27956d9e62957256fcf004ccc0e40f928490e7a60683` |
+| `invalid/source-mismatch.json` | `0c947a92549ca49ce13e89a2070034d36c7a8d91e4e233e790cfeb60e78f1b17` |
+| `invalid/unknown-effect.json` | `d608c47662440ff1778b167fab4e6668c2eaeb3cc75653da1e6ea69fcd2878cb` |
+| `invalid/string-device.json` | `bc96a18bb1be86b6c3b1b704f579736667b44b9482af4df7c4a41f41d184f11d` |
+| `invalid/string-parent-inode.json` | `efd944bf6a6f762e72fe631bb037c0a2c8a91910f523aff505d709afd84928dd` |
+| `invalid/occurrence-zero.json` | `9064a508b7c35bcf284ce82cbfa040b272a7003a80e8688618e6781066ffe010` |
+| `invalid/wrong-parent.json` | `78e0c54f28ba6fb7e36ea639cca2295c61ae8915f9928a262f5c8816731be858` |
+| `invalid/wrong-inode.json` | `c466a002728c7cde344b8e6a15a1fbf1fe96a36fc2fbf65a2498b183d2b70ae7` |
+| `invalid/omitted-obligation.json` | `f393749cd739660f100a80bb30bc13266627c3dedef35e7e7b27b4be7c1553e0` |
+| `invalid/extra-effect.json` | `16d01f5db93dea43de7267697989c09b6b4f66d9fd84b4ac56230b90f874f555` |
+| `invalid/substituted-effect.json` | `da294866f4b9490890688e67456496614a6fadd0c3841f139bf34d98abf4cd5c` |
+| `invalid/omitted-effect.json` | `41c6223d939f4dcb4dac7f514b16ac4662189acf3b9b37d797f1f0c71c5c3d56` |
+| `invalid/string-holder-pid.json` | `1d694c59286eeef310a94f732a3e106f0149583634d1f754627628c33d7ea836` |
+| `invalid/negative-fd.json` | `858c351163d68f5ccc618a829c35fe66d141e56994a96d6ddc76a00549662ea3` |
+| `manifest/valid-parent-required.json` | `ee622767bfef80d78cb5025235faa8da380c10a01f7325067f1c19b094a5641a` |
+| `manifest/valid-volume-identity.json` | `63a2baa98243a341b526743d8766b89b509aa4aaaf9b224df2ddd032233d9f84` |
+| `manifest/invalid-missing-parent-required.json` | `b2a8f8a02a41d6bcea5b42e11aca714f6f25e2d57d92d29dd3ac1c7f0c3603e1` |
+| `manifest/invalid-extra-field.json` | `f494fe90b091129428b37d4d56b033cb2a20ff35530af80eed290b038d30d999` |
+
+| Remaining obligation | Limit |
+| --- | --- |
+| Path-only reads (`private_file`, `read_config`, `inspect`, `read_document`, authority path binds) | Parent `none`; `parent_required` stays unproven |
+| K1 numeric identity and lifetime | Unqualified; handle parent is recorded, not discharged |
+| Route B private descriptor-relative production read | Not activated; needs full-caller compatibility review |
+| Caps 512 process / 8192 read / 8 MiB / 64 occurrences | Unchanged; known real-host overflow stays insufficient |
+| oxide#241 / #222, private producer, Barge native/live | Still held |
+
+Focused selector: `effigy rust:capture-wire` (`tape_prune_eval --self-check`).
 
 ## Shared private-build validation gate (oxide#248)
 

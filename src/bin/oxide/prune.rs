@@ -1909,26 +1909,22 @@ pub(crate) fn authority_read_observed(
     limit: u64,
     bytes: &mut Vec<u8>,
 ) -> std::io::Result<usize> {
-    use std::os::unix::fs::MetadataExt;
-    // The single test-only fstat observes this held descriptor. It never
-    // changes the evaluator result, including when the observation fails.
+    // Declared extra fstat of this held descriptor. It never changes the
+    // evaluator result, including when the observation fails.
     let before_observation = tape_errno();
-    let metadata = if site == "prune::read_bounded" {
-        Some(file.metadata())
+    let held = if site == "prune::read_bounded" {
+        crate::tape::fd_dev_ino(file.as_fd())
     } else {
         None
     };
     if site == "prune::read_bounded" {
-        if let Some(Ok(metadata)) = &metadata {
-            crate::tape::read_row_without_parent(
+        if let Some((dev, ino)) = held {
+            crate::tape::read_row_handle(
                 "read-bounded:open",
                 path,
-                metadata.dev(),
-                metadata.ino(),
-                crate::tape::TapeOutcome::Opened {
-                    dev: metadata.dev(),
-                    ino: metadata.ino(),
-                },
+                dev,
+                ino,
+                crate::tape::TapeOutcome::Opened { dev, ino },
                 limit,
             );
         }
@@ -1944,17 +1940,12 @@ pub(crate) fn authority_read_observed(
             reason: error.to_string(),
         },
     };
-    match metadata {
-        Some(Ok(metadata)) => crate::tape::authority_bind_descriptor(
-            site,
-            path,
-            metadata.dev(),
-            metadata.ino(),
-            limit,
-            outcome,
-        ),
-        Some(Err(error)) => {
-            crate::tape::authority_unbound(site, &error.to_string());
+    match held {
+        Some((dev, ino)) => {
+            crate::tape::authority_bind_descriptor(site, path, dev, ino, limit, outcome)
+        }
+        None if site == "prune::read_bounded" => {
+            crate::tape::authority_unbound(site, "held-descriptor fstat failed");
             crate::tape::read_row(&format!("authority-read@{site}"), path, outcome, limit);
         }
         None => {
@@ -3825,7 +3816,7 @@ fn boot_data_facts() -> Result<HeldFacts, String> {
     #[cfg(test)]
     {
         if let Some((dev, ino)) = crate::tape::fd_dev_ino(fd.as_fd()) {
-            crate::tape::read_row_dev(
+            crate::tape::read_row_handle(
                 "absence-walk:boot-data",
                 Path::new("/System/Volumes/Data"),
                 dev,
@@ -4342,10 +4333,11 @@ fn observe_root_in(binding: &Binding, row: &Row) -> Result<RootState, String> {
         .dir_at(binding.fd(), outputs::EXTERNAL_DIR, false)
         .map_err(|error| format!("cannot open the outputs directory: {error}"))?;
     #[cfg(test)]
-    {
+    let outputs_parent = {
         let outputs_path = binding.mount_point().join(outputs::EXTERNAL_DIR);
-        if let Some((dev, ino)) = crate::tape::fd_dev_ino(outer.as_fd()) {
-            crate::tape::read_row_dev(
+        let parent = crate::tape::fd_dev_ino(outer.as_fd());
+        if let Some((dev, ino)) = parent {
+            crate::tape::read_row_handle(
                 "root-observe:outputs-dir",
                 &outputs_path,
                 dev,
@@ -4354,7 +4346,8 @@ fn observe_root_in(binding: &Binding, row: &Row) -> Result<RootState, String> {
                 0,
             );
         }
-    }
+        parent
+    };
     let Some(name) = row.root.file_name() else {
         return Ok(RootState::Unknown("the root has no leaf name".to_owned()));
     };
@@ -4373,17 +4366,21 @@ fn observe_root_in(binding: &Binding, row: &Row) -> Result<RootState, String> {
     if status != 0 {
         let error = std::io::Error::last_os_error();
         #[cfg(test)]
-        crate::tape::component_without_parent(
-            "root-observe:entry",
-            name,
-            if error.kind() == std::io::ErrorKind::NotFound {
+        {
+            let outcome = if error.kind() == std::io::ErrorKind::NotFound {
                 crate::tape::TapeOutcome::Absent
             } else {
                 crate::tape::TapeOutcome::Refusal {
                     reason: error.to_string(),
                 }
-            },
-        );
+            };
+            match outputs_parent {
+                Some((pdev, pino)) => {
+                    crate::tape::component_row("root-observe:entry", pdev, pino, name, outcome)
+                }
+                None => crate::tape::component_without_parent("root-observe:entry", name, outcome),
+            }
+        }
         return Ok(if error.kind() == std::io::ErrorKind::NotFound {
             RootState::Absent
         } else {
@@ -4391,14 +4388,18 @@ fn observe_root_in(binding: &Binding, row: &Row) -> Result<RootState, String> {
         });
     }
     #[cfg(test)]
-    crate::tape::component_without_parent(
-        "root-observe:entry",
-        name,
-        crate::tape::TapeOutcome::Opened {
+    {
+        let outcome = crate::tape::TapeOutcome::Opened {
             dev: u64::try_from(stat.st_dev).unwrap_or(u64::MAX),
             ino: stat.st_ino,
-        },
-    );
+        };
+        match outputs_parent {
+            Some((pdev, pino)) => {
+                crate::tape::component_row("root-observe:entry", pdev, pino, name, outcome)
+            }
+            None => crate::tape::component_without_parent("root-observe:entry", name, outcome),
+        }
+    }
     if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
         return Ok(RootState::Unknown(
             "the recorded root is not a real directory".to_owned(),
@@ -4419,7 +4420,7 @@ fn observe_root_in(binding: &Binding, row: &Row) -> Result<RootState, String> {
     #[cfg(test)]
     {
         if let Some((dev, ino)) = crate::tape::fd_dev_ino(root.as_fd()) {
-            crate::tape::read_row_dev(
+            crate::tape::read_row_handle(
                 "root-observe:root-dir",
                 &row.root,
                 dev,

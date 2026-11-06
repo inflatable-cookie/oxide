@@ -1,0 +1,29 @@
+{
+  "version": "oxide.capture.transcript/1",
+  "schema": "oxide.capture.transcript/1",
+  "engine": "oxide",
+  "case": "VECTOR-OMITTED-OBLIGATION",
+  "manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "entrypoint": "vector",
+  "window_monotonic_start_ns": null,
+  "window_monotonic_end_ns": null,
+  "window_elapsed_ns": 1,
+  "outcome": {
+    "state": "completed",
+    "result": {}
+  },
+  "truncation": {
+    "read_rows_truncated": false,
+    "occurrences_truncated": false,
+    "document_truncated": false,
+    "process_rows_truncated": false,
+    "classifications_truncated": false
+  },
+  "effects": [],
+  "reads": [],
+  "clocks": [],
+  "classifications": [],
+  "recorded_holders": [],
+  "fixture_capture": null,
+  "notes": []
+}

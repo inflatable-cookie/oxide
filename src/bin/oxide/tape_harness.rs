@@ -597,6 +597,13 @@ fn validate_manifest_envelope(doc: &serde_json::Value) -> Result<(), String> {
         {
             return Err("volume obligation belongs to a different window".to_owned());
         }
+        if row
+            .get("parent_required")
+            .and_then(|v| v.as_bool())
+            .is_none()
+        {
+            return Err("obligation missing parent_required".to_owned());
+        }
         if !matches!(engine, "oxide" | "barge") || site.is_empty() || !complete {
             return Err("incomplete mandatory observation".to_owned());
         }
@@ -1400,6 +1407,124 @@ fn check(condition: bool, what: &str) -> Result<(), CheckFailure> {
     }
 }
 
+/// Live held-descriptor fstat: identity matches the open file, extra
+/// observation cost is classified, and a later path replacement does not
+/// change the recorded inode.
+fn live_held_descriptor_check(temp: &Path) -> Result<(), CheckFailure> {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::MetadataExt;
+    let path = temp.join("held-descriptor");
+    write_private_file(&path, b"held").map_err(|what| CheckFailure { what })?;
+    let file = std::fs::File::open(&path).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    let meta = file.metadata().map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    tape::begin("oxide", "LIVE-HELD", "manifest", "pure");
+    let observed = tape::fd_dev_ino(file.as_fd());
+    std::fs::rename(&path, temp.join("held-original")).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    write_private_file(&path, b"replacement").map_err(|what| CheckFailure { what })?;
+    let after_replace = tape::fd_dev_ino(file.as_fd());
+    let transcript = temp.join("live-held.json");
+    tape::finish_and_write(
+        &transcript,
+        TapeEngineOutcome::Completed {
+            result: serde_json::json!({}),
+        },
+        None,
+    )
+    .map_err(|what| CheckFailure { what })?;
+    let doc = read_transcript(&transcript).map_err(|what| CheckFailure { what })?;
+    check(
+        observed == Some((meta.dev(), meta.ino())),
+        "live fstat matches the held file",
+    )?;
+    check(
+        after_replace == observed,
+        "path replacement does not change the held descriptor identity",
+    )?;
+    check(
+        doc.classifications.iter().any(|row| {
+            row.get("kind").and_then(|v| v.as_str()) == Some("observe:fstat")
+                && row.get("value").and_then(|v| v.as_str()) == Some("ok")
+        }),
+        "extra fstat cost is classified",
+    )
+}
+
+/// Adapter emission round-trips through the shared parser; path-only
+/// parent_required stays incomplete.
+fn emitted_wire_round_trip_check(temp: &Path) -> Result<(), CheckFailure> {
+    tape::begin("oxide", "WIRE-ROUND-TRIP", "manifest", "pure");
+    tape::read_row_dev(
+        "prune::read_registry",
+        Path::new("/fixture/registry"),
+        3,
+        4,
+        tape::TapeOutcome::Digest {
+            digest: tape::sha256_hex(b"bytes"),
+        },
+        64,
+    );
+    let path = temp.join("wire-round-trip.json");
+    tape::finish_and_write(
+        &path,
+        TapeEngineOutcome::Completed {
+            result: serde_json::json!({"complete": false}),
+        },
+        None,
+    )
+    .map_err(|what| CheckFailure { what })?;
+    let bytes = std::fs::read(&path).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    let parsed = tape::parse_transcript(&bytes).map_err(|error| CheckFailure {
+        what: error.message,
+    })?;
+    check(
+        parsed.get("schema").and_then(|v| v.as_str()) == Some(tape::TRANSCRIPT_VERSION)
+            && parsed.get("version").and_then(|v| v.as_str()) == Some(tape::TRANSCRIPT_VERSION),
+        "emitted transcript names schema /1",
+    )?;
+    check(
+        parsed
+            .pointer("/reads/0/identity/parent_source")
+            .and_then(|v| v.as_str())
+            == Some("none")
+            && parsed
+                .pointer("/reads/0/identity/own_source")
+                .and_then(|v| v.as_str())
+                == Some("extracted")
+            && parsed
+                .pointer("/reads/0/identity/parent_device")
+                .is_some_and(|v| v.is_null()),
+        "path-only emission keeps parent none and unproven",
+    )?;
+    let manifest = serde_json::json!({
+        "schema": tape::MANIFEST_VERSION,
+        "case": "WIRE-ROUND-TRIP",
+        "mandatory_observations": [{
+            "engine": "oxide",
+            "site": "prune::read_registry",
+            "parent_required": true,
+            "identity": {"path": "/fixture/registry"}
+        }],
+        "expected_effects": []
+    });
+    let completeness = tape::assess_completeness(&parsed, Some(&manifest));
+    check(
+        !completeness.ok()
+            && completeness
+                .issues
+                .iter()
+                .any(|issue| issue.contains("parent_required unproven")),
+        "path-only parent_required fails completeness",
+    )
+}
+
 /// Pure recorder checks: deterministic serialization, epoch and occurrence
 /// bookkeeping, per-key occurrence cap, read-row cap, document bound and the
 /// explicit truncation markers.
@@ -1485,6 +1610,15 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
     check(
         validate_manifest_envelope(&example).is_ok(),
         "manifest example has required envelope",
+    )?;
+    let mut missing_parent_required = example.clone();
+    missing_parent_required["mandatory_observations"][0]
+        .as_object_mut()
+        .expect("obligation")
+        .remove("parent_required");
+    check(
+        validate_manifest_envelope(&missing_parent_required).is_err(),
+        "an obligation requires parent_required",
     )?;
     let effect_example: serde_json::Value = serde_json::from_str(include_str!(
         "../../../docs/knowledge/contracts/capture-examples/manifest-effects-all-kinds.json"
@@ -1747,13 +1881,13 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
             && descriptor_doc.reads.iter().any(|row| {
                 row.get("kind").and_then(|v| v.as_str())
                     == Some("authority-read@prune::read_bounded")
-                    && row.pointer("/identity/ino").and_then(|v| v.as_u64())
+                    && row.pointer("/identity/inode").and_then(|v| v.as_u64())
                         == Some(observed_identity)
                     && row
-                        .pointer("/identity/parent_dev")
+                        .pointer("/identity/parent_device")
                         .is_some_and(|v| v.is_null())
                     && row
-                        .pointer("/identity/parent_ino")
+                        .pointer("/identity/parent_inode")
                         .is_some_and(|v| v.is_null())
             }),
         "descriptor binding survives path replacement",
@@ -1943,7 +2077,7 @@ fn volume_window_reconciliation_check(temp: &Path) -> Result<(), CheckFailure> {
     let manifest = serde_json::json!({
         "window": {"identity": "current"}, "fixture": {"entries": []},
         "dynamic": {"volumes": [{"uuid": "volume", "mount": "/mount", "device": "/dev/example", "window_identity": "current"}]},
-        "mandatory_observations": [{"engine": "oxide", "site": "volume-site", "identity": {
+        "mandatory_observations": [{"engine": "oxide", "site": "volume-site", "parent_required": false, "identity": {
             "volume_uuid": "volume", "mount": "/mount", "device": "/dev/example", "window_identity": "current"
         }}]
     });
@@ -2015,6 +2149,7 @@ fn obligation_reconciliation_check(temp: &Path) -> Result<(), CheckFailure> {
             "parent_device": 1, "parent_inode": 2, "device": 3, "inode": 4}]},
         "dynamic": {"volumes": [], "external_allowances": []},
         "mandatory_observations": [{"engine": "oxide", "site": "component-site",
+            "parent_required": false,
             "identity": {"component": "entry", "parent_device": 1, "parent_inode": 2}}]
     });
     tape::begin("oxide", "OBLIGATION-PRESENT", "manifest", "pure");
@@ -2254,10 +2389,10 @@ fn unbound_authority_note_check(temp: &Path) -> Result<(), CheckFailure> {
         doc.reads.iter().any(|row| {
             row.get("kind").and_then(|k| k.as_str()) == Some("authority-read@pure::site")
                 && row
-                    .pointer("/identity/dev")
+                    .pointer("/identity/device")
                     .is_some_and(|value| value.is_null())
                 && row
-                    .pointer("/identity/parent_dev")
+                    .pointer("/identity/parent_device")
                     .is_some_and(|value| value.is_null())
         }),
         "an unobserved descriptor and parent are not invented",
@@ -2710,6 +2845,9 @@ fn self_check(pure_only: bool, diagnostic: bool) -> Result<(), String> {
     write_private_dir(&dir)
         .map_err(|error| format!("cannot create the self-check root: {error}"))?;
     let result = (|| -> Result<(), String> {
+        tape::run_self_checks().map_err(|what| format!("capture-wire: {what}"))?;
+        live_held_descriptor_check(&dir).map_err(|failure| failure.what)?;
+        emitted_wire_round_trip_check(&dir).map_err(|failure| failure.what)?;
         pure_checks(&dir).map_err(|failure| failure.what)?;
         occurrence_cap_check(&dir).map_err(|failure| failure.what)?;
         read_row_cap_check(&dir).map_err(|failure| failure.what)?;
