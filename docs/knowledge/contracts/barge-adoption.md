@@ -1199,6 +1199,54 @@ authorizes a real run, a pin change or a production behaviour change.
   Stopping criteria: pure selectors green, the report renders for a synthetic
   unit fixture, no fixture, pool or image touched outside pure mode.
 
+#### Proposed private parent-descriptor seam (review checkpoint)
+
+This is a design for review, not an implemented seam or an equivalence claim.
+The existing path-only operations cannot identify the parent actually used by
+an earlier open by subsequently looking up the path. Their parent obligations
+remain unproven. The test-only adapter can independently improve observations
+of operations that already use a held directory descriptor.
+
+The smallest candidate is a private read-only helper taking a parent path and
+one final component, opening the directory once, and performing the existing
+child open relative to that held descriptor. It returns owned parent and child
+handles to the existing caller for the duration of the read. It must preserve
+that caller's child flags, metadata checks, read limit, error mapping and
+budget charging; no extra create, write, lock or retry is allowed. A test-only
+observer may fstat each live handle once, preserve errno, record success or
+failure and its additional syscall cost, and drop both with RAII. Observation
+failure cannot affect the real operation. An absent or refused child still
+binds to the held parent only when its identity was actually observed. A
+numeric device/inode pair after the handles close is not itself proof of
+continuous identity. The transcript must retain unproven wherever the required
+lifetime, process or object binding is missing.
+
+This candidate has **not** established compatibility. In particular, opening
+a directory separately adds a descriptor, an open, a possible resource or
+permission failure, and a race boundary; anchoring the second lookup to that
+directory can read a different object if an ancestor is replaced between the
+two operations. A direct open can resolve a path that the proposed directory
+open refuses. Symlink traversal, trailing slashes, root and relative paths,
+rename, parent replacement, descriptor exhaustion and errors at each step need
+explicit treatment per caller. `read_bounded` currently performs a path lstat
+and later a separate `File::open`; a single pinned parent would also change
+what can happen between those operations. It must not silently add no-follow
+semantics or convert those two distinct observations into a single fact.
+The private-file open uses read/write and `O_NOFOLLOW`, and its create callers
+cannot be swept into a read-only seam. Enumeration and lock opens have their
+own semantics and are not covered by this candidate.
+
+Counterfactual review must distinguish: a parent replaced after directory open;
+a child replaced between lstat and open; a symlink at either component; a
+missing ancestor versus a missing child; `EMFILE` or `EACCES` on the extra
+open; and a post-read pathname replacement. The adapter must not make any of
+these pass by reopening a path, copying a fixture expectation, or promoting a
+closed descriptor's numeric identity. If preserving the existing externally
+observable results cannot be demonstrated, the seam is not mechanical and
+must return the exact conflict for a scope ruling. Review of this proposal is
+not activation of production I/O changes; a separately activated implementation
+and its exact-head review are still required.
+
 #### Oxide test-only capture apparatus
 
 Tom decision `c6e3e9c8` v2 (2026-11-04) separates capture delivery from
