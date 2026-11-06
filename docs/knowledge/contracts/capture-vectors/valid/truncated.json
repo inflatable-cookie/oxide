@@ -1,0 +1,62 @@
+{
+  "version": "oxide.capture.transcript/1",
+  "schema": "oxide.capture.transcript/1",
+  "engine": "oxide",
+  "case": "VECTOR-TRUNCATED",
+  "manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "entrypoint": "vector",
+  "window_monotonic_start_ns": null,
+  "window_monotonic_end_ns": null,
+  "window_elapsed_ns": 1,
+  "outcome": {
+    "state": "completed",
+    "result": {
+      "complete": false
+    }
+  },
+  "truncation": {
+    "read_rows_truncated": true,
+    "occurrences_truncated": false,
+    "document_truncated": false,
+    "process_rows_truncated": false,
+    "classifications_truncated": false
+  },
+  "effects": [],
+  "reads": [
+    {
+      "kind": "pure:read",
+      "site": "pure:read",
+      "identity": {
+        "path": "/pure/object",
+        "component": null,
+        "parent_device": null,
+        "parent_inode": null,
+        "device": 3,
+        "inode": 4,
+        "pid": null,
+        "start": null,
+        "uid": null,
+        "fd": null,
+        "volume_uuid": null,
+        "mount": null,
+        "volume_device": null,
+        "parent_source": "none",
+        "own_source": "extracted"
+      },
+      "outcome": {
+        "type": "digest",
+        "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "cap": 128,
+      "epoch": 1,
+      "occurrence": 1
+    }
+  ],
+  "clocks": [],
+  "classifications": [],
+  "recorded_holders": [],
+  "fixture_capture": null,
+  "notes": [
+    "read-row cap recorded truncation; known overflow remains insufficient"
+  ]
+}

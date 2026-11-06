@@ -90,6 +90,7 @@
     {
       "engine": "oxide",
       "site": "prune::read_registry",
+      "parent_required": true,
       "identity": {
         "path": "/example/fixture/registry",
         "parent_device": 1,

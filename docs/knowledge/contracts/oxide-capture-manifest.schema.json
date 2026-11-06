@@ -645,12 +645,16 @@
                 }
               }
             ]
+          },
+          "parent_required": {
+            "type": "boolean"
           }
         },
         "required": [
           "engine",
           "site",
-          "identity"
+          "identity",
+          "parent_required"
         ],
         "additionalProperties": false
       },
