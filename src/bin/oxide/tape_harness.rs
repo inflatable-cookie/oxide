@@ -1993,6 +1993,236 @@ descriptor observation"
             &format!("extra or unbound observation at {DIGEST_ROW}"),
         ),
         "a refused read is not converted into a present leaf row",
+    )?;
+
+    // 8. A failed declared observation stays unknown. The seam substitutes the
+    // `None` a failed dup/fstat returns, on a valid held file, so the unchanged
+    // read must still return its own bytes with the caller's errno and the row
+    // must bind nothing. The seam is one-shot: the same window re-run without
+    // arming it binds again.
+    let mut renamed_entry = entry.clone();
+    renamed_entry["rel"] = serde_json::json!("registry-original.json");
+    let manifest = leaf_manifest(
+        "LEAF-OBSERVATION-FAILED",
+        &root,
+        &renamed,
+        vec![renamed_entry],
+        dev,
+        ino,
+        ROW,
+    );
+    let file = std::fs::File::open(&renamed).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    prune::force_held_descriptor_observation_failure(true);
+    let (bytes, failed_doc, failed_transcript, failed_manifest_bytes) = leaf_window(
+        temp,
+        "LEAF-OBSERVATION-FAILED",
+        &renamed,
+        &file,
+        SITE,
+        64,
+        &manifest,
+        &root,
+    )?;
+    let failed_row = failed_doc
+        .get("reads")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row.get("site").and_then(|v| v.as_str()) == Some(ROW))
+        })
+        .ok_or_else(|| CheckFailure {
+            what: format!("no {ROW} row was emitted by the failed observation"),
+        })?;
+    check(
+        bytes == b"registry-bytes"
+            && failed_row
+                .pointer("/identity/device")
+                .is_some_and(|v| v.is_null())
+            && failed_row
+                .pointer("/identity/inode")
+                .is_some_and(|v| v.is_null())
+            && failed_row
+                .pointer("/identity/own_source")
+                .and_then(|v| v.as_str())
+                == Some("none")
+            && failed_row
+                .pointer("/outcome/digest")
+                .and_then(|v| v.as_str())
+                == Some(digest.as_str())
+            && notes_contain(
+                &failed_doc,
+                &format!("descriptor identity unavailable at {SITE}: held-descriptor fstat failed"),
+            )
+            && notes_contain(
+                &failed_doc,
+                &format!("extra or unbound observation at {ROW}"),
+            ),
+        &format!(
+            "a failed observation keeps the read's own bytes and records no identity: {:?}",
+            failed_doc.get("notes")
+        ),
+    )?;
+    let failed_verdict =
+        tape::capture_verdict::evaluate_limited_capture(&failed_transcript, &failed_manifest_bytes)
+            .map_err(|what| CheckFailure {
+                what: format!("canonical parse or verdict: {what}"),
+            })?;
+    check(
+        !failed_verdict.sufficient()
+            && failed_verdict.blocking.iter().any(|blocking| {
+                blocking.rule.name() == "extra-unbound-observation" && blocking.site == ROW
+            })
+            && !failed_verdict.limitations.iter().any(|limitation| {
+                limitation.rule == tape::capture_verdict::ExclusionRule::PathOnlyDirectReadParent
+            }),
+        &format!(
+            "a failed observation stays unknown and unexcluded through the limited verdict: {:?}",
+            failed_verdict.blocking_names()
+        ),
+    )?;
+    // One-shot: the seam must not leak into the next window.
+    let file = std::fs::File::open(&renamed).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    let (bytes, recovered_doc, _, _) = leaf_window(
+        temp,
+        "LEAF-OBSERVATION-RECOVERED",
+        &renamed,
+        &file,
+        SITE,
+        64,
+        &manifest,
+        &root,
+    )?;
+    check(
+        bytes == b"registry-bytes"
+            && !notes_contain(
+                &recovered_doc,
+                &format!("extra or unbound observation at {ROW}"),
+            ),
+        "the observation-failure seam is one-shot and does not leak",
+    )?;
+
+    // 9. An undeclared metadata row is not the held read descriptor. Driven
+    // through the real `outputs::read_marker_for_prune` call site, whose
+    // `outputs:marker:lstat` row carries a pathname-extracted identity, with an
+    // entry that matches that row exactly: it must stay unbound while the
+    // declared `authority-read@outputs::read_marker` row binds.
+    const MARKER_LSTAT: &str = "outputs:marker:lstat";
+    const MARKER_AUTHORITY_ROW: &str = "authority-read@outputs::read_marker";
+    let marker_root = root.join("marker-root");
+    write_private_dir(&marker_root).map_err(|what| CheckFailure { what })?;
+    let marker_path = marker_root.join(outputs::MARKER);
+    // The document is deliberately not a valid marker: this control asserts the
+    // emitted rows, so the parser's own refusal after them is irrelevant.
+    write_private_file(&marker_path, b"{}").map_err(|what| CheckFailure { what })?;
+    let marker_meta = std::fs::metadata(&marker_path).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    let marker_bytes = std::fs::read(&marker_path).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    let marker_entry = serde_json::json!({
+        "rel": outputs::MARKER,
+        "parent_device": 1,
+        "parent_inode": 2,
+        "kind": "file",
+        "bytes_sha256": tape::sha256_hex(&marker_bytes),
+        "size": marker_meta.len(),
+        "device": marker_meta.dev(),
+        "inode": marker_meta.ino(),
+        "mode": marker_meta.mode(),
+    });
+    let manifest = leaf_manifest(
+        "LEAF-UNDECLARED-METADATA",
+        &marker_root,
+        &marker_path,
+        vec![marker_entry],
+        marker_meta.dev(),
+        marker_meta.ino(),
+        MARKER_AUTHORITY_ROW,
+    );
+    let metadata_manifest_bytes = serde_json::to_vec(&manifest).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    tape::begin(
+        "oxide",
+        "LEAF-UNDECLARED-METADATA",
+        &tape::sha256_hex(&metadata_manifest_bytes),
+        "pure",
+    );
+    let _ = outputs::read_marker_for_prune(&marker_root);
+    tape::check_manifest_obligations(&manifest, &marker_root);
+    let metadata_path = temp.join("leaf-LEAF-UNDECLARED-METADATA.json");
+    tape::finish_and_write(
+        &metadata_path,
+        TapeEngineOutcome::Completed {
+            result: serde_json::json!({"complete": true, "entries": []}),
+        },
+        None,
+    )
+    .map_err(|what| CheckFailure { what })?;
+    let metadata_transcript = std::fs::read(&metadata_path).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    let metadata_doc: serde_json::Value =
+        serde_json::from_slice(&metadata_transcript).map_err(|error| CheckFailure {
+            what: error.to_string(),
+        })?;
+    let lstat_row = metadata_doc
+        .get("reads")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row.get("site").and_then(|v| v.as_str()) == Some(MARKER_LSTAT))
+        })
+        .ok_or_else(|| CheckFailure {
+            what: format!("no {MARKER_LSTAT} row was emitted"),
+        })?;
+    check(
+        lstat_row
+            .pointer("/identity/own_source")
+            .and_then(|v| v.as_str())
+            == Some("extracted")
+            && lstat_row
+                .pointer("/identity/device")
+                .and_then(|v| v.as_u64())
+                == Some(marker_meta.dev())
+            && notes_contain(
+                &metadata_doc,
+                &format!("extra or unbound observation at {MARKER_LSTAT}"),
+            )
+            && !notes_contain(
+                &metadata_doc,
+                &format!("extra or unbound observation at {MARKER_AUTHORITY_ROW}"),
+            ),
+        &format!(
+            "an otherwise matching undeclared metadata row stays unbound: {:?}",
+            metadata_doc.get("notes")
+        ),
+    )?;
+    let metadata_verdict = tape::capture_verdict::evaluate_limited_capture(
+        &metadata_transcript,
+        &metadata_manifest_bytes,
+    )
+    .map_err(|what| CheckFailure {
+        what: format!("canonical parse or verdict: {what}"),
+    })?;
+    check(
+        !metadata_verdict.sufficient()
+            && metadata_verdict.blocking.iter().any(|blocking| {
+                blocking.rule.name() == "extra-unbound-observation" && blocking.site == MARKER_LSTAT
+            })
+            && metadata_verdict.limitations.iter().any(|limitation| {
+                limitation.rule == tape::capture_verdict::ExclusionRule::PathOnlyDirectReadParent
+                    && limitation.site == MARKER_AUTHORITY_ROW
+            }),
+        &format!(
+            "the limited verdict keeps the undeclared metadata row blocking: {:?}",
+            metadata_verdict.blocking_names()
+        ),
     )
 }
 

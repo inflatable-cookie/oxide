@@ -2348,17 +2348,31 @@ absence-walk components and every `authority-read@store::*` custody read share
 `authority_read_observed` and are deliberately absent: a leaf observation must
 never stand in for a held parent or promote a deferred custody read. A failed
 observation stays unknown: no identity is manufactured and `authority_unbound`
-records why.
+records why. A one-shot `cfg(test)`-only seam
+(`prune::force_held_descriptor_observation_failure`) lets a bounded control
+report exactly the `None` a failed `dup`/`fstat` returns **without touching the
+descriptor**, so that branch can be exercised on a valid held file; it is
+consumed by the observation statement, changes nothing the read returns, and is
+absent from a release build.
 
-**The one binding rule.** `tape.rs bound_leaf` binds a present leaf row to a
-deliberately created `fixture.entries` entry only when the entry names the same
-safe relative path label (`root.join(rel) == row.path`, every component
-`Normal`), the same own `device` and `inode`, the same `bytes_sha256` for a
-digest outcome (or the same identity for an `Opened` outcome), and the manifest
-declares its window. A path label is never parent proof: the row's parent fields
-stay absent, the entry's declared parent fields are compared with nothing, and
-nothing in this rule can discharge `parent_required`. Absent and refusal
-outcomes are never converted into present rows, so they stay unbound.
+**The one binding rule, gated to the declared rows.** `tape.rs bound_leaf` binds
+a present leaf row to a deliberately created `fixture.entries` entry only when
+the entry names the same safe relative path label (`root.join(rel) == row.path`,
+every component `Normal`), the same own `device` and `inode`, the same
+`bytes_sha256` for a digest outcome (or the same identity for an `Opened`
+outcome), and the manifest declares its window. Eligibility is exact: only the
+declared path-only authority site's own `authority-read@<site>` row, or that
+site's expressly authorized associated open row (`read-bounded:open`, recorded
+from the same single fstat), may bind, and only with the `handle` provenance
+that observation records. Any other row kind — a pathname precheck such as
+`read-bounded:lstat` or `outputs:marker:lstat` with an extracted identity, an
+`outputs:read-marker:open`, a `removable:registration-held` — is not the declared
+held read descriptor, keeps its existing `extra or unbound observation` note,
+and so keeps the limited policy's conservative treatment of extra rows. A path
+label is never parent proof: the row's parent fields stay absent, the entry's
+declared parent fields are compared with nothing, and nothing in this rule can
+discharge `parent_required`. Absent and refusal outcomes are never converted
+into present rows, so they stay unbound.
 
 **The parent obligation gets its own line.** When a row matches an obligation's
 identity and `parent_required` is not discharged, the recorder now reports
@@ -2412,15 +2426,26 @@ label and a traversal label each stay unbound with the identity unchanged; a
 shared-helper site outside the declared set emits no own identity and an
 explicit `descriptor identity unavailable` note; a kernel-refused read keeps its
 identity but is not converted into a present row; and every window asserts the
-caller's `errno` sentinel survives the observation and the unchanged read. A
-deliberate mutation (`bound_leaf` accepting any label) failed that check by name
-before the change was reverted, so the control is not vacuous. Two new pure
-policy controls pin the note mapping: a schema-shaped parent-naming obligation
-over a parent-free leaf yields the limitation and only
+caller's `errno` sentinel survives the observation and the unchanged read. Two
+more controls answer the exact-head review. (a) The one-shot seam forces the
+declared observation to fail on a **valid** held file: the read still returns its
+own bytes with the caller's errno, the emitted row carries no `device`/`inode`
+and `own_source: none` plus `descriptor identity unavailable ... held-descriptor
+fstat failed`, no manifest entry binds it, the canonical parser and limited
+verdict keep it blocking (`extra-unbound-observation`) with no limitation, and
+the next unarmed window binds again — so the seam neither leaks nor changes what
+the read returned. (b) Through the real `outputs::read_marker_for_prune` call
+site, an entry that matches the `outputs:marker:lstat` row exactly leaves that
+extracted metadata row unbound (`extra or unbound observation`), while the
+declared `authority-read@outputs::read_marker` row binds and keeps its
+limitation; the limited verdict stays insufficient. Two deliberate mutations —
+`bound_leaf` accepting any label, and `bound_leaf` dropping the declared-kind and
+`handle`-provenance gate while the seam became a no-op — each failed the
+corresponding control by name before being reverted, so neither control is
+vacuous. Two pure policy controls pin the note mapping: a schema-shaped
+parent-naming obligation over a parent-free leaf yields the limitation and only
 `strict-issue-unexplained`, and the parent sentence is explained at the site that
-bound its leaf and blocks at the site that did not. A failed `fstat` itself is
-not injectable without an invalid descriptor; both of its branches restore errno
-and reuse the same unchanged read, and only the recorded rows differ.
+bound its leaf and blocks at the site that did not.
 
 **Unchanged.** Production readers, the `/2` wire and parser, caps,
 `K1_PREMISE_QUALIFIED`, the two reviewed exclusions, `assess_completeness`, the

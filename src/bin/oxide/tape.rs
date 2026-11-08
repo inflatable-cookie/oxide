@@ -397,6 +397,19 @@ fn observed_identity_matches(
     }
 }
 
+/// Whether this row kind is one the declared held-descriptor set may bind: the
+/// `authority-read@<site>` row of a declared path-only authority site, or that
+/// site's expressly authorized associated open row (`read-bounded:open`, which
+/// the same single fstat records). Every other kind is ineligible, so the rule
+/// can never suppress an `extra or unbound observation` note for a row that is
+/// not the declared held read descriptor.
+fn declared_leaf_row_kind(kind: &str) -> bool {
+    crate::prune::observed_path_only_row_kind(kind).is_some()
+        || crate::prune::OBSERVED_PATH_ONLY_SITES
+            .iter()
+            .any(|declared| declared.open_row == Some(kind))
+}
+
 /// The one in-window fixture binding rule for a leaf row that observed its own
 /// object and no parent (oxide#287).
 ///
@@ -405,12 +418,24 @@ fn observed_identity_matches(
 /// same observed outcome or bytes digest. A path label is never parent proof:
 /// the row's parent fields stay absent, the entry's declared parent fields are
 /// not compared with anything, and nothing here can discharge `parent_required`.
+///
+/// Eligibility is exact (`declared_leaf_row_kind`): only a declared path-only
+/// authority site's own `authority-read@<site>` row, or the one associated open
+/// row that site records from the same single fstat, may bind, and only with
+/// the `handle` provenance that observation records. A row whose identity came
+/// from a pathname precheck (`read-bounded:lstat`, `outputs:marker:lstat`) or
+/// from any other leaf (`outputs:read-marker:open`,
+/// `removable:registration-held`) is not the held read descriptor, so it keeps
+/// its existing `extra or unbound observation` note.
 fn bound_leaf(
     entries: &[serde_json::Value],
     root: &Path,
     row: &TapeReadRow,
     window: Option<&str>,
 ) -> bool {
+    if !declared_leaf_row_kind(&row.kind) {
+        return false;
+    }
     let Some(path) = row.identity.path.as_deref() else {
         return false;
     };
@@ -421,12 +446,10 @@ fn bound_leaf(
     if row.identity.parent_dev.is_some() || row.identity.parent_ino.is_some() {
         return false;
     }
-    // Only an identity the leaf itself observed can bind: a fabricated or
-    // borrowed provenance is never a leaf observation.
-    if !matches!(
-        row.identity.own_source,
-        Provenance::Handle | Provenance::Extracted
-    ) {
+    // The own identity must be the one the declared held-descriptor fstat
+    // recorded: an extracted, contextual or absent provenance is never the
+    // read descriptor's own.
+    if row.identity.own_source != Provenance::Handle {
         return false;
     }
     // The row belongs to this transcript's window and the manifest declares

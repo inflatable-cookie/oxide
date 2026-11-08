@@ -1968,6 +1968,30 @@ pub(crate) fn observed_path_only_row_kind(kind: &str) -> Option<&'static Observe
     observed_path_only_site(kind.strip_prefix("authority-read@")?)
 }
 
+/// Test-only seam for the one declared held-descriptor observation (oxide#287).
+///
+/// When armed, the next declared observation reports the failure a failed
+/// `dup`/`fstat` would report (`None`) **without touching the descriptor**, so a
+/// bounded control can prove that the observation-failure branch keeps the
+/// unchanged read's bytes, result and errno and records an unknown identity. It
+/// is one-shot, compiled only under `cfg(test)`, and reachable only from the
+/// observation statement in `authority_read_observed`; nothing in it can move a
+/// cursor, rewrite a cap or deadline, or change what `authority_read` returns.
+#[cfg(test)]
+thread_local! {
+    static OBSERVATION_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn force_held_descriptor_observation_failure(failed: bool) {
+    OBSERVATION_FAILURE.with(|slot| slot.set(failed));
+}
+
+#[cfg(test)]
+fn observation_forced_to_fail() -> bool {
+    OBSERVATION_FAILURE.with(|slot| slot.replace(false))
+}
+
 /// Test-only observation of the exact descriptor passed to authority_read.
 /// The production call below remains unchanged; the descriptor stays open
 /// until the real read result has been recorded.
@@ -1987,9 +2011,11 @@ pub(crate) fn authority_read_observed(
     // Declared extra fstat of this held descriptor. It never changes the
     // evaluator result, including when the observation fails.
     let before_observation = tape_errno();
-    let held = match declared {
-        Some(_) => crate::tape::fd_dev_ino(file.as_fd()),
-        None => None,
+    let forced_failure = declared.is_some() && observation_forced_to_fail();
+    let held = if declared.is_some() && !forced_failure {
+        crate::tape::fd_dev_ino(file.as_fd())
+    } else {
+        None
     };
     if let (Some((dev, ino)), Some(open_row)) =
         (held, declared.and_then(|declared| declared.open_row))
