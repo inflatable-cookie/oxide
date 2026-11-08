@@ -2917,8 +2917,8 @@ Effigy selectors: `proof:seed-readiness:test` (heavy, 300 s, 512 MiB, synthetic)
   Cargo, rustc, product, account, image or engine child exists in this mode.
 
 **Validation at this head.** `proof:offline-seed:test` passed 21 synthetic cases
-(seven new provenance cases). `proof:tape-prune:observation-test` passed 184
-controls, eight of them new: two for the seed-refusal report and its run
+(seven new provenance cases). `proof:tape-prune:observation-test` passed 187
+controls, eight of them new (179 recorded at oxide#292 plus eight): two for the seed-refusal report and its run
 boundary, three for the explicit seed source (an unset, a relative and an
 absolute `CARGO_HOME`), one that the plan's key list covers every published
 key, one for the plan's seed-source record, and one for a non-object `volume`. `proof:tape-prune:observation-plan` and
