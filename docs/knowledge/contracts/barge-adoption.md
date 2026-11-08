@@ -2601,33 +2601,47 @@ apparatus diagnostic, a truncation flag, a nonzero or signalled engine exit and
 an unparsable retained document as recorded observations; an absent fate is
 `absent`, never empty.
 
-**Barge custody is an owner-gated impediment, not a hidden risk.** The pinned
-no-argument route is unsafe for this observation: `crates/barge/src/testkit.rs`
-`TempDir`'s destructor calls `remove_dir_all`, there is no `keep`/`into_path`,
-and `tape_harness::embedded_exercise` drops the fixture **before** the process
-exits and before the supervisor's post-leader census. An uncertain writer or
-descendant would therefore have its fixture deleted, which the brief forbids,
-and the route also retains no manifest. The exact smallest linked Barge change
-is two statements plus one method, with no schema, argv, target, fixture-builder
-or `release::plan` change:
+**Barge custody is an owner-gated impediment, and the gate is a reviewed
+revision, not a text search.** The pinned no-argument route is unsafe for this
+observation: `crates/barge/src/testkit.rs` `TempDir`'s destructor calls
+`remove_dir_all`, there is no `keep`/`into_path`, and
+`tape_harness::embedded_exercise` performs fallible construction, the engine
+run, transcript retention and reads **before** it returns, so an error or panic
+on any of those paths drops the fixture before the process exits and before the
+supervisor's post-leader census. An uncertain writer or descendant would have
+its fixture deleted, which the brief forbids, and the route also retains no
+manifest.
+
+The required custody property is therefore **from creation through every error
+path**: the fixture directory must leave `TempDir` ownership immediately after
+creation and before any fallible step, so the guard and not the process owns
+removal; the manifest must be written inside it before the run; and the kept
+path must be printed in a bounded line. The exact smallest linked Barge change
+is two statements plus one method, with no schema, argv, target,
+fixture-builder or `release::plan` change:
 
 1. `crates/barge/src/testkit.rs`: add `TempDir::keep()` that clears the owned
    root, takes the path and forgets the destructor.
-2. `crates/barge/src/tape_harness.rs` `embedded_exercise`: write the manifest
-   bytes it already holds as `manifest.json` inside the fixture, call
-   `fixture.dir.keep()`, and print `barge.tape.exercise/1: kept fixture <path>`
-   in the same bounded form as the retained-transcript line.
+2. `crates/barge/src/tape_harness.rs` `embedded_exercise`: take the fixture out
+   of `TempDir` ownership immediately after creation and before any fallible
+   step, write the manifest bytes it already holds as `manifest.json` inside it
+   before the run, and print `barge.tape.exercise/1: kept fixture <path>`.
 
-The route **refuses before any engine** until that change is present:
-`parse_binding` requires a `barge.retention` block (linked task, both declared
-capabilities, both file digests), and `verify_barge_retention` binds the
-archived `testkit.rs` and `tape_harness.rs` digests and the three statements in
-the extracted tree before staging. A tree without them, or a run whose kept
-fixture or manifest is absent afterwards, is recorded as a gap with no fate,
-never as an empty one. **Readiness verdict: not ready for planner activation.**
-The owner-gated impediment is that linked Barge retention change; once it lands,
-the planner binds its commit, lock and the two file digests and the same command
-runs unchanged. No Barge write, dependency, pin or API change happens here.
+No byte pattern can prove a lifetime property, so this route does not pretend
+one can: the activation gate is `BARGE_CUSTODY_REVIEWED`, a reviewed Barge
+revision plus its two exact file digests, which is **None** today and is set
+only by a reviewed Oxide change that binds the reviewed Barge revision.
+`parse_binding` requires the `barge.custody` block (linked task, exact reviewed
+revision, the fixed property name), `require_reviewed_custody` refuses before
+any staging write or engine window while the gate is closed, and
+`verify_barge_custody` then re-checks the archived commit and both file digests
+against the reviewed values. Nothing in a binding can satisfy it.
+**Readiness verdict: not ready for planner activation.** The owner-gated
+impediment is that linked Barge custody change and its source review; once it
+lands, the reviewed Oxide change binds its revision and digests and the same
+command runs unchanged. A run whose kept fixture or manifest is absent or is not
+a safe artifact afterwards is recorded as a gap with no fate, never as an empty
+one. No Barge write, dependency, pin or API change happens here.
 
 **The one future command.** `effigy rust:tape-prune-observation` is
 `python3 scripts/bounded-test.py --limit 900 --scratch-budget-mib 1536 --
@@ -2674,16 +2688,26 @@ root is never read, and no path is ever picked by modification time. Unknown
 closure keeps everything, exits non-zero and claims nothing; descendant closure
 is the guard's post-leader census, not this script's conclusion.
 
-*Retained evidence.* Because cleanup deletes `<root>/scratch` on a closed run,
-the script copies the raw occurrence evidence into the guard's retained
-`<root>/evidence/<run-root-name>` subtree under the same monitored budget,
-critical bytes first: both transcripts, the emitted manifest, the observation
-and parse documents, both stage logs and stderr, both staged executables and
-both engines' captured stdout/stderr — with each retained path's bytes and
-SHA-256 recorded. Past 384 MiB per file or 768 MiB in aggregate an artifact is
-**omitted and named** in the report and a gap, never summarised into a hash and
-never replaced; a missing artifact is recorded as not written. Nothing is
-deleted from the scratch tree by this script.
+*Retained evidence, on every exit.* Because cleanup deletes `<root>/scratch` on a
+closed run, the script copies the raw occurrence evidence into the guard's
+retained `<root>/evidence/<run-root-name>` subtree under the same monitored
+budget, critical bytes first: both transcripts, the emitted manifest, the
+observation and parse documents, both stage logs and stderr, both staged
+executables and both engines' captured stdout/stderr — with each retained path's
+bytes and SHA-256 recorded. **The copy and the report run on every exit**: a
+staging, engine or parse failure still retains the evidence already produced and
+writes a bounded report whose `outcome` names the state and phase and whose
+`closure` says the guard's post-leader census, not this script, decides closure
+and may delete its own scratch afterwards. That is the difference between the
+script's unknown and actual guard closure, and the two are separate fields. Past
+384 MiB per file or 768 MiB in aggregate an artifact is **omitted and named** in
+the report and a gap, never summarised into a hash and never replaced; a missing
+artifact is recorded as not written. Every source is re-validated before it is
+read: a path that is not a real, non-symlink regular file (or directory, for a
+kept fixture) resolving inside the owned run root is recorded with its reason
+and is neither read nor copied, so an engine-reported manifest or transcript
+that links outside is refused rather than followed. Nothing is deleted from the
+scratch tree by this script.
 
 **Bounds and premises.** 900 s whole-occurrence wall clock and 1536 MiB of
 monitored scratch. The allocation is explicit and sums to the bound: 448 MiB
@@ -2719,16 +2743,20 @@ owner-only/canonical-root and escaping-report refusals, the missing manifest and
 missing transcript, a `/1` and an apparatus document, truncation, signalled and
 nonzero exits, and equal and unequal raw fates with no agreement, equivalence or
 divergence field. `effigy proof:tape-prune:observation-test` drives the real
-orchestration functions with scripted seams (96 controls: binding shape and
-digest including the Barge retention block; source/toolchain/volume/worktree
+orchestration functions with scripted seams (111 controls: binding shape and
+digest including the Barge custody block; source/toolchain/volume/worktree
 drift; derived paths; the real sibling guard topology with 0755 evidence
 accepted and 0777 or nested evidence refused; outside-root retention; engine
 classification; equal and unequal fates; gap overflow; refusal before any
-engine; a failing stage; the bound `cargo`/`RUSTC`/`PATH` staging invocation; at
-most one window per engine; one complete scripted occurrence with its retained
-evidence tree; an over-budget artifact omitted and named; and a Barge tree
-without the linked retention change refused before staging). Both are apparatus
-evidence and run no engine, compiler, fixture, image or observer campaign.
+engine; the shipped custody gate refusing before any staging write; the bound
+`cargo`/`RUSTC`/`PATH` staging invocation; at most one window per engine; one
+complete scripted occurrence with its retained evidence tree; an over-budget
+artifact omitted and named; a Barge timeout, parse failure and staging failure
+each retaining what was reached and writing a bounded failure report; a
+symlinked or outside Barge artifact refused rather than read; and the reviewed
+revision and file digests still checked once the gate is open). Both are
+apparatus evidence and run no engine, compiler, fixture, image or observer
+campaign.
 
 **Covering validation for this preparation.** `effigy rust:compile`,
 `effigy rust:compile-release`, `effigy rust:format`, `effigy rust:capture-wire`,
