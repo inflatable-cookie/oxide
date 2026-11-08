@@ -62,11 +62,19 @@ GAP_CAP = 64
 # bounded offline seeds, two engine windows, two parse passes and shutdown
 # margin, all inside the guard's limit.
 LIMIT_SECONDS = 900
-SCRATCH_MIB = 1024
+SCRATCH_MIB = 1536
 SHUTDOWN_MARGIN_SECONDS = 60
+# Raw evidence is copied out of the guard's scratch leaf (which the guard
+# deletes on a closed run) into its retained evidence subtree, under the same
+# monitored budget. Past these caps the copy is omitted and named; it is never
+# silently dropped and never replaced by a summary.
+RETENTION_CAP_BYTES = 768 * MIB
+RETENTION_FILE_CAP_BYTES = 384 * MIB
+SUPERVISOR_PATH_MARKER = "barge.tape.exercise/1: kept fixture "
 ARCHIVE_ENTRY_CAP = 20000
 ARCHIVE_BYTE_CAP = 128 * MIB
 BOUNDED_REFUSAL_MARKER = "bounded refusal (not qualification)"
+TRANSCRIPT_MARKER = "barge.tape.exercise/1: retained "
 USAGE = (
     "usage: tape-embedded-observation.py "
     "[--plan | --self-test | --observe --binding <path> --sha256 <hex>]"
@@ -170,12 +178,18 @@ BINDING_TEMPLATE = {
               "lock_sha256": "<64 lowercase hex>"},
     "barge": {"sibling": "<absolute read-only Barge checkout>",
               "commit": "<40 lowercase hex>", "tree": "<40 lowercase hex>",
-              "lock_sha256": "<64 lowercase hex>"},
+              "lock_sha256": "<64 lowercase hex>",
+              "retention": {"linked_task": "<linked Barge retention task>",
+                            "fixture_kept": True,
+                            "manifest_retained": True,
+                            "testkit_sha256": "<64 lowercase hex>",
+                            "tape_harness_sha256": "<64 lowercase hex>"}},
     "toolchain": {"rustc": "<absolute path>", "rustc_sha256": "<64 lowercase hex>",
                   "cargo": "<absolute path>", "cargo_sha256": "<64 lowercase hex>",
                   "version": BUILDER},
     "guard": {"supervisor_sha256": SUPERVISOR_SHA256,
-              "limit_seconds": LIMIT_SECONDS, "scratch_mib": SCRATCH_MIB},
+              "limit_seconds": LIMIT_SECONDS, "scratch_mib": SCRATCH_MIB,
+              "topology": "<root>/scratch and <root>/evidence, siblings"},
     "volume": {"uuid": SELECTED_VOLUME_UUID},
     "paths": {"run_root_name": "tape-observation", "report_name": REPORT_NAME},
 }
@@ -321,6 +335,18 @@ class Seams:
             json.dump(document, handle, indent=2, sort_keys=True)
             handle.write("\n")
 
+    def write_text(self, path, text):
+        with open(path, "w") as handle:
+            handle.write(text)
+
+    def copy(self, source, destination):
+        with open(source, "rb") as reader, open(destination, "xb") as writer:
+            while True:
+                block = reader.read(1 << 20)
+                if not block:
+                    break
+                writer.write(block)
+
     def extract(self, sibling, commit, destination):
         """Extract one verified commit with no write to the sibling checkout."""
         archive = subprocess.run(
@@ -400,9 +426,14 @@ def scrubbed(environ):
     }
 
 
-def staging_environment(parent, environ=None):
+def staging_environment(parent, environ=None, toolchain=None):
     """The one staging environment: private HOME, Cargo home and temp, the
-    invoking rustup home, the pinned toolchain and one frozen flag value."""
+    invoking rustup home, the pinned toolchain and one frozen flag value.
+
+    When the bound toolchain is supplied, `RUSTC` names its exact `rustc` and
+    `PATH` is the fixed system path only, so neither an inherited `cargo` nor an
+    inherited `rustc` can build the artifacts the envelope reports.
+    """
     env = scrubbed(dict(os.environ if environ is None else environ))
     home = os.path.join(parent, "home")
     cargo_home = os.path.join(parent, "cargo-home")
@@ -427,6 +458,9 @@ def staging_environment(parent, environ=None):
         "TMP": tmp,
         "TEMP": tmp,
     })
+    if toolchain:
+        env["RUSTC"] = toolchain["rustc"]
+        env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
     return env
 
 
@@ -471,6 +505,20 @@ def parse_binding(payload):
     sibling = document["barge"].get("sibling")
     if not isinstance(sibling, str) or not os.path.isabs(sibling):
         raise Obstruction("the binding's Barge sibling is not an absolute path")
+    retention = document["barge"].get("retention")
+    if not isinstance(retention, dict):
+        raise Obstruction(
+            "the binding names no Barge fixture-retention change; the pinned "
+            "no-argument route deletes its fixture before custody is known")
+    if retention.get("fixture_kept") is not True or retention.get("manifest_retained") is not True:
+        raise Obstruction(
+            "the binding's Barge retention change does not declare both a kept "
+            "fixture and a retained manifest")
+    if not safe_component(retention.get("linked_task")):
+        raise Obstruction("the binding names no linked Barge retention task")
+    for key in ("testkit_sha256", "tape_harness_sha256"):
+        if not is_hex(retention.get(key), 64):
+            raise Obstruction(f"the binding's Barge {key} is not exact")
     toolchain = document.get("toolchain")
     if not isinstance(toolchain, dict):
         raise Obstruction("the binding has no toolchain object")
@@ -517,7 +565,17 @@ def read_binding(path, expected_sha256, seams=None):
 
 
 def guard_context(seams=None, environ=None):
-    """The qualified guard's own context. Nothing runs outside it."""
+    """The qualified guard's own context and its actual default topology.
+
+    The qualified supervisor's default owned-root setup creates
+    `<root>/scratch` and `<root>/evidence` as siblings
+    (`bounded-test.py` `Monitor.setup`), and the evidence directory is created
+    with the inherited umask, so it is normally 0755 rather than owner-only.
+    This route therefore binds that exact sibling layout, requires both
+    directories to be real, canonical and not group- or other-writable, and
+    refuses an adopted scratch root or an explicit evidence directory, which
+    this route is not activated with.
+    """
     seams = seams or Seams()
     environ = dict(os.environ if environ is None else environ)
     scratch = environ.get("OXIDE_TASK_SCRATCH_ROOT")
@@ -535,18 +593,28 @@ def guard_context(seams=None, environ=None):
             raise Obstruction(f"the guard's {label} is not canonical: {path}")
         if not seams.isdir(path):
             raise Obstruction(f"the guard's {label} is not a real directory: {path}")
-        if seams.mode(path) & 0o077:
-            raise Obstruction(f"the guard's {label} is not owner-only: {path}")
-    if os.path.commonpath([os.path.realpath(scratch), os.path.realpath(evidence)]) != \
-            os.path.realpath(scratch):
-        raise Obstruction("the guard's evidence directory is outside its scratch root")
+        if seams.mode(path) & 0o022:
+            raise Obstruction(
+                f"the guard's {label} is group- or other-writable: {path}")
+    root = os.path.dirname(scratch)
+    if (os.path.basename(scratch) != "scratch"
+            or os.path.basename(evidence) != "evidence"
+            or os.path.dirname(evidence) != root):
+        raise Obstruction(
+            "the guard's scratch and evidence are not the qualified default "
+            "sibling layout <root>/scratch and <root>/evidence; an adopted "
+            "scratch root or an explicit evidence directory is not this route's "
+            "topology")
+    if not seams.isdir(root) or seams.mode(root) & 0o022:
+        raise Obstruction(f"the guard's run root {root} is not a safe directory")
     supervisor = seams.sha256(os.path.join(REPO, "scripts", "bounded-test.py"))
     if supervisor != SUPERVISOR_SHA256:
         raise Obstruction(
             f"the running supervisor bytes are {supervisor}, not the qualified "
             f"{SUPERVISOR_SHA256}")
-    return {"scratch_root": scratch, "evidence": evidence, "run_id": run_id,
-            "deadline_ns": int(deadline), "supervisor_sha256": supervisor}
+    return {"root": root, "scratch_root": scratch, "evidence": evidence,
+            "run_id": run_id, "deadline_ns": int(deadline),
+            "supervisor_sha256": supervisor}
 
 
 def derive_paths(binding, guard):
@@ -561,6 +629,8 @@ def derive_paths(binding, guard):
         "barge_run": os.path.join(run_root, "barge", "run"),
         "barge_source": os.path.join(run_root, "barge", "source"),
         "report": os.path.join(guard["evidence"], binding["paths"]["report_name"]),
+        "evidence_retained": os.path.join(guard["evidence"],
+                                          binding["paths"]["run_root_name"]),
         "guard_receipt": os.path.join(guard["evidence"], "receipt.json"),
     }
 
@@ -673,12 +743,13 @@ def artifact_from_log(text, target):
     return found
 
 
-def stage(seams, *, parent, cwd, lock_path, cargo_argv, target, label):
-    """One bounded offline staging build into the owned root, then the exact
-    reported executable and its digest. The staging tree is retained: only the
-    guard's post-leader census can conclude descendant closure."""
+def stage(seams, *, parent, cwd, lock_path, cargo_argv, target, label, toolchain):
+    """One bounded offline staging build into the owned root with the bound
+    `cargo` and `rustc`, then the exact reported executable and its digest. The
+    staging tree is retained in place: only the guard's post-leader census can
+    conclude descendant closure."""
     seams.make_dirs(parent)
-    env = staging_environment(parent)
+    env = staging_environment(parent, toolchain=toolchain)
     try:
         lock_bytes = seams.read_bytes(lock_path)
     except OSError as error:
@@ -687,7 +758,7 @@ def stage(seams, *, parent, cwd, lock_path, cargo_argv, target, label):
                       seams.deadline_ns())
     out_path = os.path.join(parent, "stage.json")
     err_path = os.path.join(parent, "stage.stderr")
-    argv = list(cargo_argv) + ["--message-format=json"]
+    argv = [toolchain["cargo"], *cargo_argv, "--message-format=json"]
     code = seams.run_logged(argv, cwd=cwd, env=env, out_path=out_path,
                             err_path=err_path,
                             timeout_s=max(1, seams.work_left() - SHUTDOWN_MARGIN_SECONDS))
@@ -706,6 +777,9 @@ def stage(seams, *, parent, cwd, lock_path, cargo_argv, target, label):
         raise Obstruction(f"{label} reported an executable outside its target root")
     return {
         "cargo_argv": argv,
+        "cargo": toolchain["cargo"],
+        "rustc": toolchain["rustc"],
+        "path": env["PATH"],
         "cwd": cwd,
         "seed": seed,
         "log": {"path": out_path, "sha256": seams.sha256(out_path)},
@@ -715,23 +789,74 @@ def stage(seams, *, parent, cwd, lock_path, cargo_argv, target, label):
     }
 
 
-def stage_oxide(seams, paths):
+def stage_oxide(seams, binding, paths):
     return stage(
         seams,
         parent=os.path.join(paths["oxide"], "stage"),
         cwd=REPO,
         lock_path=os.path.join(REPO, "Cargo.lock"),
-        cargo_argv=["cargo", "test", "--test", "tape_prune_eval", "--no-run",
+        cargo_argv=["test", "--test", "tape_prune_eval", "--no-run",
                     "--locked", "--offline"],
         target="tape_prune_eval",
         label="Oxide",
+        toolchain=binding["toolchain"],
     )
+
+
+BARGE_RETENTION_FILES = {
+    "testkit": os.path.join("crates", "barge", "src", "testkit.rs"),
+    "tape_harness": os.path.join("crates", "barge", "src", "tape_harness.rs"),
+}
+
+
+def verify_barge_retention(binding, source, seams):
+    """Refuse unless the archived Barge tree carries the bound retention change.
+
+    The pinned route's `TempDir` destructor removes the fixture before the
+    process exits, so an uncertain writer or descendant could never keep it.
+    The linked change adds `TempDir::keep`, writes the manifest `embedded_exercise`
+    already holds inside the fixture, keeps the fixture directory and prints its
+    path. Nothing is executed on a tree that does not carry it.
+    """
+    retention = binding["barge"]["retention"]
+    texts = {}
+    for name, relative in BARGE_RETENTION_FILES.items():
+        path = os.path.join(source, relative)
+        if not seams.isfile(path):
+            raise Obstruction(f"the archived Barge tree has no {relative}")
+        if seams.sha256(path) != retention[name + "_sha256"]:
+            raise Obstruction(
+                f"the archived Barge {relative} is not the bound retention change "
+                f"({retention['linked_task']})")
+        texts[name] = seams.read_text(path)
+    if "fn keep(" not in texts["testkit"]:
+        raise Obstruction(
+            "the bound Barge testkit has no `TempDir::keep`, so an uncertain "
+            f"fixture could not be kept ({retention['linked_task']})")
+    if ".dir.keep()" not in texts["tape_harness"] or "manifest.json" not in texts["tape_harness"]:
+        raise Obstruction(
+            "the bound Barge embedded_exercise neither keeps its fixture nor writes "
+            f"its manifest ({retention['linked_task']})")
+    return {"linked_task": retention["linked_task"],
+            "fixture_kept": True, "manifest_retained": True,
+            "files": {name: retention[name + "_sha256"] for name in BARGE_RETENTION_FILES}}
+
+
+def verify_toolchain_unchanged(binding, seams):
+    """The bound `cargo` and `rustc` bytes are re-read after staging, so a tool
+    that changed under the run cannot be reported as the bound one."""
+    for name in ("rustc", "cargo"):
+        if seams.sha256(binding["toolchain"][name]) != \
+                binding["toolchain"][name + "_sha256"]:
+            raise Obstruction(
+                f"the bound {name} changed while this occurrence was running")
 
 
 def stage_barge(seams, binding, paths):
     source = paths["barge_source"]
     archive = seams.extract(binding["barge"]["sibling"], binding["barge"]["commit"],
                             source)
+    retention = verify_barge_retention(binding, source, seams)
     lock_path = os.path.join(source, "Cargo.lock")
     if seams.sha256(lock_path) != binding["barge"]["lock_sha256"]:
         raise Obstruction("the archived Barge lock is not the bound lock")
@@ -740,12 +865,14 @@ def stage_barge(seams, binding, paths):
         parent=os.path.join(paths["barge"], "stage"),
         cwd=source,
         lock_path=lock_path,
-        cargo_argv=["cargo", "test", "-p", "barge", "--test", "tape_eval",
+        cargo_argv=["test", "-p", "barge", "--test", "tape_eval",
                     "--no-run", "--locked", "--offline"],
         target="tape_eval",
         label="Barge",
+        toolchain=binding["toolchain"],
     )
     staged["archive"] = archive
+    staged["retention"] = retention
     return staged
 
 
@@ -803,15 +930,27 @@ def run_barge(seams, paths, staged):
     result = seams.run_captured(
         argv, cwd=paths["barge"], env=env,
         timeout_s=max(1, seams.work_left() - SHUTDOWN_MARGIN_SECONDS))
-    marker = "barge.tape.exercise/1: retained "
     reported = None
     for line in result["stderr"].splitlines():
-        if line.startswith(marker):
-            reported = line[len(marker):].strip()
+        if line.startswith(TRANSCRIPT_MARKER):
+            reported = line[len(TRANSCRIPT_MARKER):].strip()
     retained = retained_inside(run_root, reported) if reported else None
+    kept = None
+    for line in result["stderr"].splitlines():
+        if line.startswith(SUPERVISOR_PATH_MARKER):
+            kept = line[len(SUPERVISOR_PATH_MARKER):].strip()
+    kept_fixture = retained_inside(run_root, kept) if kept else None
+    manifest = None
+    if kept_fixture:
+        candidate = os.path.join(kept_fixture, "manifest.json")
+        if seams.isfile(candidate):
+            manifest = candidate
     return {"argv": argv, "engine": result, "reported": reported,
             "retained": retained,
             "retention_refused": bool(reported) and retained is None,
+            "kept_fixture": kept_fixture,
+            "fixture_kept": bool(kept_fixture) and seams.isdir(kept_fixture),
+            "manifest": manifest,
             "fixture": run_root}
 
 
@@ -829,6 +968,85 @@ def parse_capture(seams, staged, *, root, transcript, manifest, report):
                                 timeout_s=120)
     document = read_document(seams, report) if seams.isfile(report) else None
     return {"argv": argv, "engine": result, "report": document}
+
+
+def retain(seams, paths, staged, windows, parses, gaps):
+    """Copy the raw occurrence evidence out of the guard's scratch leaf, which
+    the guard deletes on a closed run, into its retained evidence subtree.
+
+    Byte order is critical-first: transcripts, the emitted manifest, the
+    observation and parse reports, then stage logs, then the executables. An
+    artifact past the retention budget is omitted and named; a missing artifact
+    is recorded as not written. Nothing here is summarised, repaired or
+    replaced by a hash, and nothing is deleted from the scratch tree.
+    """
+    oxide, barge = windows
+    oxide_parse, barge_parse = parses
+    oxide_staged, barge_staged = staged
+    oxide_fixture = os.path.join(oxide["fixture"], "fixture-base") if oxide else None
+    artifacts = [
+        ("oxide.transcript",
+         os.path.join(oxide_fixture, "transcript.json") if oxide_fixture else None),
+        ("oxide.manifest",
+         os.path.join(oxide_fixture, "manifest.json") if oxide_fixture else None),
+        ("oxide.observation",
+         (oxide["observation"] or {}).get("path") if oxide else None),
+        ("oxide.parse",
+         ((oxide_parse or {}).get("report") or {}).get("path")),
+        ("oxide.stage.log", oxide_staged["log"]["path"]),
+        ("oxide.stage.stderr", oxide_staged["stderr"]["path"]),
+        ("barge.transcript", barge.get("retained") if barge else None),
+        ("barge.manifest", barge.get("manifest") if barge else None),
+        ("barge.parse", ((barge_parse or {}).get("report") or {}).get("path")),
+        ("barge.stage.log", barge_staged["log"]["path"]),
+        ("barge.stage.stderr", barge_staged["stderr"]["path"]),
+        ("oxide.executable", oxide_staged["executable"]["path"]),
+        ("barge.executable", barge_staged["executable"]["path"]),
+    ]
+    target = paths["evidence_retained"]
+    seams.make_root(target)
+    entries = []
+    total = 0
+    for label, source in artifacts:
+        if not source or not seams.isfile(source):
+            entries.append({"label": label, "source": source, "retained": False,
+                            "reason": "the artifact was not written"})
+            continue
+        size = seams.size(source)
+        if size > RETENTION_FILE_CAP_BYTES or total + size > RETENTION_CAP_BYTES:
+            entries.append({"label": label, "source": source, "bytes": size,
+                            "retained": False,
+                            "reason": "exceeds the retained-evidence budget; only the "
+                                      "scratch copy exists and the guard may delete it"})
+            gaps.append(f"raw evidence not retained within the budget: {label}")
+            continue
+        destination = os.path.join(target, f"{label}.{os.path.basename(source)}")
+        try:
+            seams.copy(source, destination)
+        except OSError as error:
+            entries.append({"label": label, "source": source, "bytes": size,
+                            "retained": False,
+                            "reason": f"the copy failed: {error}"})
+            gaps.append(f"raw evidence could not be retained: {label}")
+            continue
+        total += size
+        entries.append({"label": label, "source": source, "retained": True,
+                        "path": destination, "bytes": size,
+                        "sha256": seams.sha256(destination)})
+    for side, window in (("oxide", oxide), ("barge", barge)):
+        if window is None:
+            continue
+        for stream in ("stdout", "stderr"):
+            text_value = window["engine"].get(stream) or ""
+            destination = os.path.join(target, f"{side}.{stream}.txt")
+            seams.write_text(destination, text_value)
+            total += len(text_value.encode("utf-8", "replace"))
+            entries.append({"label": f"{side}.{stream}", "retained": True,
+                            "path": destination,
+                            "bytes": len(text_value.encode("utf-8", "replace")),
+                            "sha256": seams.sha256(destination)})
+    return {"root": target, "bytes": total, "entries": entries,
+            "omitted": sum(1 for entry in entries if entry["retained"] is False)}
 
 
 # ---------------------------------------------------------------------------
@@ -872,7 +1090,7 @@ def fate_of(parse):
 
 
 def build_report(*, binding, guard, paths, envelope, oxide, barge, oxide_parse,
-                 barge_parse, closure, gaps):
+                 barge_parse, retained, closure, gaps):
     """One bounded, honest report. `qualified` is false unconditionally and no
     field records agreement, equivalence or divergence."""
     bounded_gaps = list(gaps)
@@ -901,6 +1119,7 @@ def build_report(*, binding, guard, paths, envelope, oxide, barge, oxide_parse,
         },
         "paths": dict(paths),
         "envelope": envelope,
+        "retained": retained,
         "windows": {
             "oxide": {
                 "case": "BASE",
@@ -930,6 +1149,11 @@ def build_report(*, binding, guard, paths, envelope, oxide, barge, oxide_parse,
                     "reported": barge["reported"] if barge else None,
                     "inside_own_root": barge["retained"] if barge else None,
                     "retention_refused": barge["retention_refused"] if barge else None,
+                },
+                "fixture_custody": {
+                    "kept_fixture": barge["kept_fixture"] if barge else None,
+                    "fixture_kept": barge["fixture_kept"] if barge else None,
+                    "manifest": barge["manifest"] if barge else None,
                 },
                 "parse": barge_parse,
             },
@@ -987,8 +1211,10 @@ def observe(options, seams=None, environ=None):
     seams.make_root(paths["run_root"])
     seams.make_root(paths["oxide"])
     seams.make_root(paths["barge"])
-    oxide_staged = stage_oxide(seams, paths)
+    oxide_staged = stage_oxide(seams, binding, paths)
+    verify_toolchain_unchanged(binding, seams)
     barge_staged = stage_barge(seams, binding, paths)
+    verify_toolchain_unchanged(binding, seams)
     envelope["oxide"]["stage"] = oxide_staged
     envelope["barge"]["stage"] = barge_staged
 
@@ -1021,32 +1247,38 @@ def observe(options, seams=None, environ=None):
         elif oxide_parse["report"]["document"] is None:
             gaps.append("the Oxide parse report is unparsable and was not repaired")
 
+    if not barge["fixture_kept"]:
+        gaps.append(
+            "Barge did not keep its fixture directory inside this run's own root, so "
+            "an uncertain writer or descendant could not be kept; the linked Barge "
+            "retention change is required before this side can be observed")
     barge_parse = None
     if barge["retained"]:
         barge_root = paths["barge_run"]
-        manifest = os.path.join(os.path.dirname(barge["retained"]), "manifest.json")
         barge_parse = parse_capture(
             seams, oxide_staged, root=barge_root, transcript=barge["retained"],
-            manifest=manifest, report=os.path.join(barge_root, "parse.json"))
+            manifest=barge["manifest"],
+            report=os.path.join(barge_root, "parse.json"))
         if barge_parse is not None and barge_parse["report"] is not None \
                 and barge_parse["report"]["document"] is None:
             gaps.append("the Barge parse report is unparsable and was not repaired")
-        if not seams.isfile(manifest):
+        if barge["manifest"] is None:
             gaps.append(
-                "Barge's no-argument route retains no manifest document, so no strict "
-                "or limited verdict applies to that side; the exact smallest linked "
-                "Barge change is to retain the manifest bytes `embedded_exercise` "
-                "already holds beside its retained transcript")
+                "Barge retained no manifest document, so no strict or limited verdict "
+                "applies to that side; the linked retention change writes the manifest "
+                "bytes `embedded_exercise` already holds inside the kept fixture")
     elif not barge["retention_refused"]:
         gaps.append("Barge reported no retained transcript; its side has no fate")
 
+    retained = retain(seams, paths, (oxide_staged, barge_staged), (oxide, barge),
+                      (oxide_parse, barge_parse), gaps)
     closure = {"state": "guarded",
                "reason": "the qualified guard's post-leader census, not this script, "
                          "decides descendant closure; every root stays retained"}
     report = build_report(binding=binding, guard=guard, paths=paths,
                           envelope=envelope, oxide=oxide, barge=barge,
                           oxide_parse=oxide_parse, barge_parse=barge_parse,
-                          closure=closure, gaps=gaps)
+                          retained=retained, closure=closure, gaps=gaps)
     try:
         seams.write_json(paths["report"], report)
     except OSError as error:
@@ -1149,13 +1381,89 @@ def plan_document():
             "limit_seconds": LIMIT_SECONDS,
             "scratch_mib": SCRATCH_MIB,
             "shutdown_margin_seconds": SHUTDOWN_MARGIN_SECONDS,
-            "components": "two offline staging builds with debug info off, two "
-                          "private bounded offline seeds, two engine windows, two "
-                          "parse passes, transcripts and reports, and shutdown "
-                          "margin",
-            "fit": "unmeasured: this preparation runs no staging build or engine, so "
-                   "the proposal is derived from the route and the proven staging "
-                   "recipe, not measured; only a scoped amendment lowers it",
+            "allocation_scratch_mib": {
+                "oxide staging target in scratch (no debug info, incremental off)": 448,
+                "barge staging target (14-package workspace)": 192,
+                "two private seeded Cargo homes": 192,
+                "engine windows: fixtures, transcripts, observation and parse reports": 32,
+                "retained evidence copies (transcripts, manifest, logs, executables)": 416,
+                "slack": 256,
+            },
+            "allocation_seconds": {
+                "two cold sequential staging builds in scratch": 420,
+                "two engine windows": 120,
+                "two canonical parse passes": 20,
+                "retained-evidence copies": 30,
+                "two offline seeds at the seeder's own 45 s cumulative cap": 90,
+                "shutdown margin": 60,
+                "slack": 160,
+            },
+            "task_owned_measurements": {
+                "source": "this task's own covering runs at f2a97f12 (guard receipts "
+                          "retained under the Stash scratch evidence directories)",
+                "rust:capture-wire guard receipts": "300 s limit, closed, status 0, "
+                                                    "owned-byte peak 36 KiB to 3.7 MiB "
+                                                    "(the build itself dogfoods the "
+                                                    "pool, outside the guard scratch), "
+                                                    "host free minimum about 2.87 TiB",
+                "same target's own build+execute line": "18.3 s warm, quick profile",
+                "rust:compile line": "12.67 s warm workspace check",
+            },
+            "basis": "the covering figures bound the wall clock only loosely because they "
+                     "build in the pool; they are used as a warm lower bound, and the "
+                     "staging figures are explicit allowances rather than measurements",
+            "uncertainty": "the in-scratch staging trees are the largest uncertainty: "
+                           "the repository's recorded in-scratch staging peaks for the "
+                           "same oxide debug recipe are 179.3 and 182.7 MiB for a "
+                           "binary build, and this route's test-target plus two seeds "
+                           "plus retained copies are allowed roughly twice that with "
+                           "slack. The diagnostic records its own measured owned bytes "
+                           "and retained-evidence bytes in its report, so a later bound "
+                           "revision can replace the allowance with a measurement",
+        },
+        "barge_impediment": {
+            "state": "owner-gated: the ONE occurrence refuses until the linked Barge "
+                     "retention change lands",
+            "pinned_commit": "3dbee28e015fb20bfd465c52258d2a6067dea483",
+            "why": "crates/barge/src/testkit.rs TempDir::Drop removes the fixture, "
+                   "there is no keep/into_path, and embedded_exercise drops it before "
+                   "the process exits and before the guard's post-leader census, so an "
+                   "uncertain writer or descendant could never be kept; the route also "
+                   "retains no manifest",
+            "smallest_linked_change": [
+                "crates/barge/src/testkit.rs: add `TempDir::keep()` that clears the "
+                "owned root, takes the path and forgets the destructor",
+                "crates/barge/src/tape_harness.rs embedded_exercise: write the manifest "
+                "bytes it already holds as `manifest.json` inside the fixture, call "
+                "`fixture.dir.keep()`, and print `barge.tape.exercise/1: kept fixture "
+                "<path>` in the same bounded form as the retained-transcript line",
+            ],
+            "enforcement": "parse_binding requires barge.retention (linked task, both "
+                           "capabilities, both file digests) and verify_barge_retention "
+                           "binds the archived file digests and the three statements "
+                           "before any engine runs; otherwise the occurrence refuses "
+                           "with this impediment named",
+        },
+        "guard_topology": "the qualified supervisor's default owned-root layout: "
+                          "<root>/scratch and <root>/evidence as siblings, evidence "
+                          "created with the inherited umask (normally 0755), both "
+                          "canonical and not group- or other-writable; an adopted "
+                          "scratch root or an explicit evidence directory refuses",
+        "toolchain_binding": "staging runs the bound cargo by absolute path with RUSTC "
+                             "set to the bound rustc and PATH fixed to the system path, "
+                             "and both tool digests are re-read after staging, so an "
+                             "inherited cargo or rustc cannot build the reported "
+                             "artifacts",
+        "retained_evidence": {
+            "root": "<guard evidence>/<run_root_name>",
+            "budget": {"aggregate_bytes": RETENTION_CAP_BYTES,
+                       "per_file_bytes": RETENTION_FILE_CAP_BYTES},
+            "contents": "transcripts, the emitted manifest, the observation and parse "
+                        "reports, stage logs and stderr, both executables and both "
+                        "engines' captured stdout/stderr",
+            "omission": "an artifact past the budget is named and its scratch copy is "
+                        "not promised past closure; nothing is summarised into a hash "
+                        "and no missing artifact is replaced",
         },
         "awards": "nothing: no agreement, equivalence, timing, writer-closure, "
                   "export, deletion or deployment credit; a matching outcome is not "
@@ -1197,7 +1505,7 @@ class FakeSeams(Seams):
         return self.script.get("work_left", 600)
 
     def run_logged(self, argv, **kwargs):
-        self.calls.append(("run_logged", list(argv)))
+        self.calls.append(("run_logged", list(argv), dict(kwargs.get("env") or {})))
         return self.script.get("stage_exit", 0)
 
     def run_captured(self, argv, **kwargs):
@@ -1249,10 +1557,14 @@ class FakeSeams(Seams):
         return path in self.script.get("isdirs", set())
 
     def mode(self, path):
-        return 0o700
+        return self.script.get("modes", {}).get(path, 0o700)
 
     def size(self, path):
-        return 1
+        matches = [(key, value) for key, value in
+                   self.script.get("sizes", {}).items() if key in path]
+        if not matches:
+            return 1
+        return max(matches, key=lambda entry: len(entry[0]))[1]
 
     def sha256(self, path):
         self.calls.append(("sha256", path))
@@ -1267,6 +1579,12 @@ class FakeSeams(Seams):
 
     def make_dirs(self, path):
         self.calls.append(("make_dirs", path))
+
+    def copy(self, source, destination):
+        self.calls.append(("copy", source))
+
+    def write_text(self, path, text):
+        self.calls.append(("write_text", path))
 
     def write_json(self, path, document):
         self.calls.append(("write_json", path))
@@ -1296,7 +1614,7 @@ def fixture_facts():
     }
 
 
-def fixture_binding(facts):
+def fixture_binding(facts, *, retention=None):
     document = json.loads(json.dumps(BINDING_TEMPLATE))
     document["planner_reference"] = "290-fixture"
     document["oxide"] = {"commit": facts["oxide"]["commit"],
@@ -1305,7 +1623,14 @@ def fixture_binding(facts):
     document["barge"] = {"sibling": "/siblings/barge",
                          "commit": facts["barge"]["commit"],
                          "tree": facts["barge"]["tree"],
-                         "lock_sha256": facts["barge"]["lock_sha256"]}
+                         "lock_sha256": facts["barge"]["lock_sha256"],
+                         "retention": retention or {
+                             "linked_task": "barge-retention-fixture",
+                             "fixture_kept": True,
+                             "manifest_retained": True,
+                             "testkit_sha256": "a" * 64,
+                             "tape_harness_sha256": "b" * 64,
+                         }}
     document["toolchain"].update({
         "rustc": "/rust/rustc", "rustc_sha256": facts["toolchain"]["rustc_sha256"],
         "cargo": "/rust/cargo", "cargo_sha256": facts["toolchain"]["cargo_sha256"],
@@ -1313,27 +1638,33 @@ def fixture_binding(facts):
     return document
 
 
+GUARD_ROOT = "/Volumes/Stash/scratch/oxide/guard-run"
 FIXTURE_ENV = {
-    "OXIDE_TASK_SCRATCH_ROOT": "/Volumes/Stash/scratch/oxide/guard-run",
-    "OXIDE_PROOF_EVIDENCE": "/Volumes/Stash/scratch/oxide/guard-run/evidence",
+    "OXIDE_TASK_SCRATCH_ROOT": GUARD_ROOT + "/scratch",
+    "OXIDE_PROOF_EVIDENCE": GUARD_ROOT + "/evidence",
     "OXIDE_PROOF_RUN_ID": "fixture",
     "OXIDE_PROOF_DEADLINE_NS": str(10 ** 12),
 }
 
 FIXTURE_GUARD = {
-    "scratch_root": "/Volumes/Stash/scratch/oxide/guard-run",
-    "evidence": "/Volumes/Stash/scratch/oxide/guard-run/evidence",
+    "root": GUARD_ROOT,
+    "scratch_root": GUARD_ROOT + "/scratch",
+    "evidence": GUARD_ROOT + "/evidence",
     "run_id": "fixture", "deadline_ns": 10 ** 12,
     "supervisor_sha256": SUPERVISOR_SHA256,
 }
 
 
-def scripted_occurrence(binding, facts, *, barge_stderr, stage_exit=0):
+def scripted_occurrence(binding, facts, *, barge_stderr, stage_exit=0,
+                        sizes=None, extra_isfiles=()):
     """One fully scripted occurrence: no real file, child or host read."""
     run_root = os.path.join(FIXTURE_GUARD["scratch_root"], "tape-observation")
     oxide_root = os.path.join(run_root, "oxide", "fixture")
     barge_run = os.path.join(run_root, "barge", "run")
+    barge_source = os.path.join(run_root, "barge", "source")
     retained = os.path.join(barge_run, "barge-test-x.transcript.json")
+    kept_fixture = os.path.join(barge_run, "barge-test-x")
+    kept_manifest = os.path.join(kept_fixture, "manifest.json")
     transcript = os.path.join(oxide_root, "fixture-base", "transcript.json")
     manifest = os.path.join(oxide_root, "fixture-base", "manifest.json")
     observation_report = os.path.join(oxide_root, "observation.json")
@@ -1343,6 +1674,10 @@ def scripted_occurrence(binding, facts, *, barge_stderr, stage_exit=0):
                                     "deps", "tape_prune_eval-1")
     barge_executable = os.path.join(run_root, "barge", "stage", "target", "debug",
                                     "deps", "tape_eval-1")
+    oxide_log = os.path.join(run_root, "oxide", "stage", "stage.json")
+    oxide_err = os.path.join(run_root, "oxide", "stage", "stage.stderr")
+    barge_log = os.path.join(run_root, "barge", "stage", "stage.json")
+    barge_err = os.path.join(run_root, "barge", "stage", "stage.stderr")
     execution = {
         "code": 0, "signal": None, "stdout": "", "stderr": "",
         "stdout_truncated": False, "stderr_truncated": False, "timed_out": False,
@@ -1353,6 +1688,28 @@ def scripted_occurrence(binding, facts, *, barge_stderr, stage_exit=0):
                            "target": {"name": target},
                            "executable": executable})
 
+    files = {
+        "/binding.json": json.dumps(binding).encode(),
+        "Cargo.lock": b"",
+        os.path.join(barge_source, "crates", "barge", "src", "testkit.rs"): b"",
+        os.path.join(barge_source, "crates", "barge", "src",
+                     "tape_harness.rs"): b"",
+        observation_report: json.dumps(
+            {"schema": "oxide.capture.embedded-observation/1",
+             "qualified": False}).encode(),
+        oxide_parse_report: json.dumps(
+            {"schema": "oxide.capture.embedded-capture-parse/1",
+             "qualified": False,
+             "outcome": {"state": "completed"},
+             "parser": {"transcript": {"state": "parsed", "reason": None}}},
+            sort_keys=True).encode(),
+        barge_parse_report: json.dumps(
+            {"schema": "oxide.capture.embedded-capture-parse/1",
+             "qualified": False,
+             "outcome": {"state": "refused", "reason": "bounded capture refusal"},
+             "parser": {"transcript": {"state": "parsed", "reason": None}}},
+            sort_keys=True).encode(),
+    }
     return {
         "deadline_ns": 10 ** 12,
         "work_left": 600,
@@ -1382,38 +1739,37 @@ def scripted_occurrence(binding, facts, *, barge_stderr, stage_exit=0):
             "Cargo.lock": "3" * 64,
             "rustc": "7" * 64,
             "cargo": "8" * 64,
+            "testkit.rs": "a" * 64,
+            "tape_harness.rs": "b" * 64,
             "bounded-test.py": SUPERVISOR_SHA256,
         },
         "volume": facts["volume"],
         "exists": {"/siblings/barge"},
-        "isdirs": {FIXTURE_GUARD["scratch_root"], FIXTURE_GUARD["evidence"]},
+        "isdirs": {GUARD_ROOT, FIXTURE_GUARD["scratch_root"],
+                   FIXTURE_GUARD["evidence"], kept_fixture,
+                   os.path.join(run_root, "oxide"), os.path.join(run_root, "barge")},
+        "modes": {GUARD_ROOT: 0o700, FIXTURE_GUARD["scratch_root"]: 0o700,
+                  FIXTURE_GUARD["evidence"]: 0o755},
         "isfiles": {retained, transcript, manifest, observation_report,
                     oxide_parse_report, barge_parse_report,
-                    oxide_executable, barge_executable,
-                    "/rust/rustc", "/rust/cargo"},
+                    oxide_executable, barge_executable, oxide_log, barge_log,
+                    oxide_err, barge_err,
+                    kept_manifest, "/rust/rustc", "/rust/cargo",
+                    os.path.join(barge_source, "crates", "barge", "src",
+                                 "testkit.rs"),
+                    os.path.join(barge_source, "crates", "barge", "src",
+                                 "tape_harness.rs")} | set(extra_isfiles),
         "texts": {
             "oxide/stage/stage.json": artifact("tape_prune_eval", oxide_executable),
             "barge/stage/stage.json": artifact("tape_eval", barge_executable),
+            "testkit.rs": "impl TempDir {\n    pub fn keep(mut self) -> PathBuf {}\n}\n",
+            "tape_harness.rs": "fn embedded_exercise() {\n"
+                               "    let kept = fixture.dir.keep();\n"
+                               "    std::fs::write(dir.join(\"manifest.json\"), &fixture.manifest);\n"
+                               "}\n",
         },
-        "files": {
-            "/binding.json": json.dumps(binding).encode(),
-            "Cargo.lock": b"",
-            observation_report: json.dumps(
-                {"schema": "oxide.capture.embedded-observation/1",
-                 "qualified": False}).encode(),
-            oxide_parse_report: json.dumps(
-                {"schema": "oxide.capture.embedded-capture-parse/1",
-                 "qualified": False,
-                 "outcome": {"state": "completed"},
-                 "parser": {"transcript": {"state": "parsed", "reason": None}}},
-                sort_keys=True).encode(),
-            barge_parse_report: json.dumps(
-                {"schema": "oxide.capture.embedded-capture-parse/1",
-                 "qualified": False,
-                 "outcome": {"state": "refused", "reason": "bounded capture refusal"},
-                 "parser": {"transcript": {"state": "parsed", "reason": None}}},
-                sort_keys=True).encode(),
-        },
+        "files": files,
+        "sizes": sizes or {},
         "written": None,
     }
 
@@ -1449,8 +1805,17 @@ def self_test():
     check("the plan has one engine window per side",
           plan_doc["commands"]["engine_windows"].endswith("inside the guard's own group")
           and len(plan_doc["controls"]) == 2)
-    check("the plan marks fit unmeasured",
-          plan_doc["bounds"]["fit"].startswith("unmeasured"))
+    check("the plan carries an allocation and its uncertainty",
+          sum(plan_doc["bounds"]["allocation_scratch_mib"].values()) <= SCRATCH_MIB
+          and sum(plan_doc["bounds"]["allocation_seconds"].values()) <= LIMIT_SECONDS
+          and plan_doc["bounds"]["task_owned_measurements"]
+          and plan_doc["bounds"]["uncertainty"])
+    check("the plan records the Barge retention impediment",
+          plan_doc["barge_impediment"]["state"].startswith("owner-gated")
+          and len(plan_doc["barge_impediment"]["smallest_linked_change"]) == 2)
+    check("the plan records the guard topology and the toolchain binding",
+          "scratch" in plan_doc["guard_topology"]
+          and plan_doc["toolchain_binding"].startswith("staging runs the bound cargo"))
 
     # 2. Binding: malformed, missing and drifted documents refuse.
     facts = fixture_facts()
@@ -1491,6 +1856,22 @@ def self_test():
     check("the fixed binding parses",
           parse_binding(binding_bytes)["planner_reference"] == "290-fixture")
     refuses("non-JSON binding", lambda: parse_binding(b"{"), "not JSON")
+    missing_retention = fixture_binding(facts)
+    del missing_retention["barge"]["retention"]
+    refuses("a binding without the Barge retention change", lambda: parse_binding(
+        json.dumps(missing_retention).encode()), "fixture-retention change")
+    for retention, needle in (
+        ({"linked_task": "x", "fixture_kept": False, "manifest_retained": True,
+          "testkit_sha256": "a" * 64, "tape_harness_sha256": "b" * 64}, "declare both"),
+        ({"linked_task": "", "fixture_kept": True, "manifest_retained": True,
+          "testkit_sha256": "a" * 64, "tape_harness_sha256": "b" * 64},
+         "linked Barge retention task"),
+        ({"linked_task": "x", "fixture_kept": True, "manifest_retained": True,
+          "testkit_sha256": "a", "tape_harness_sha256": "b" * 64}, "not exact"),
+    ):
+        refuses("a binding with an unusable Barge retention block",
+                lambda retention=retention: parse_binding(json.dumps(
+                    fixture_binding(facts, retention=retention)).encode()), needle)
 
     # 3. Source, toolchain, volume, worktree and guard drift all refuse.
     envelope = verify_source_bindings(binding, facts, FIXTURE_GUARD)
@@ -1531,14 +1912,62 @@ def self_test():
           paths["run_root"] == os.path.join(FIXTURE_GUARD["scratch_root"],
                                             "tape-observation")
           and paths["report"] == os.path.join(FIXTURE_GUARD["evidence"],
-                                              REPORT_NAME))
+                                              REPORT_NAME)
+          and paths["evidence_retained"] == os.path.join(FIXTURE_GUARD["evidence"],
+                                                         "tape-observation"))
     refuses("a missing guard context", lambda: guard_context(
         FakeSeams({"digests": {}}),
         {"OXIDE_TASK_SCRATCH_ROOT": "", "OXIDE_PROOF_EVIDENCE": "",
          "OXIDE_PROOF_RUN_ID": "", "OXIDE_PROOF_DEADLINE_NS": ""}),
         "qualified shared supervisor")
 
-    # 5. Retention: only a path inside the caller's own root, never by mtime.
+    # 5. The guard's actual default sibling topology is the one accepted.
+    topology = FakeSeams({
+        "digests": {"bounded-test.py": SUPERVISOR_SHA256},
+        "isdirs": {GUARD_ROOT, FIXTURE_GUARD["scratch_root"],
+                   FIXTURE_GUARD["evidence"],
+                   GUARD_ROOT + "/scratch/supervisor-evidence.x"},
+        "modes": {GUARD_ROOT: 0o700, FIXTURE_GUARD["scratch_root"]: 0o700,
+                  FIXTURE_GUARD["evidence"]: 0o755,
+                  GUARD_ROOT + "/scratch/supervisor-evidence.x": 0o700},
+    })
+    context = guard_context(topology, FIXTURE_ENV)
+    check("the real sibling layout is accepted, evidence at 0755 included",
+          context["root"] == GUARD_ROOT
+          and context["evidence"] == FIXTURE_GUARD["evidence"])
+    refuses("a nested evidence directory is not this topology",
+            lambda: guard_context(topology, dict(
+                FIXTURE_ENV,
+                OXIDE_PROOF_EVIDENCE=FIXTURE_GUARD["scratch_root"])),
+            "sibling layout")
+    refuses("an adopted scratch root's evidence directory is refused",
+            lambda: guard_context(topology, dict(
+                FIXTURE_ENV,
+                OXIDE_PROOF_EVIDENCE=GUARD_ROOT + "/scratch/supervisor-evidence.x")),
+            "sibling layout")
+    writable = FakeSeams({
+        "digests": {"bounded-test.py": SUPERVISOR_SHA256},
+        "isdirs": {GUARD_ROOT, FIXTURE_GUARD["scratch_root"],
+                   FIXTURE_GUARD["evidence"]},
+        "modes": {GUARD_ROOT: 0o700, FIXTURE_GUARD["scratch_root"]: 0o777,
+                  FIXTURE_GUARD["evidence"]: 0o755},
+    })
+    refuses("a group- or other-writable scratch root is refused",
+            lambda: guard_context(writable, FIXTURE_ENV), "other-writable")
+    refuses("a non-canonical scratch root is refused",
+            lambda: guard_context(topology, dict(
+                FIXTURE_ENV, OXIDE_TASK_SCRATCH_ROOT=GUARD_ROOT + "/scratch/../scratch")),
+            "not canonical")
+    refuses("a supervisor digest mismatch is refused",
+            lambda: guard_context(FakeSeams({
+                "digests": {"bounded-test.py": "0" * 64},
+                "isdirs": {GUARD_ROOT, FIXTURE_GUARD["scratch_root"],
+                           FIXTURE_GUARD["evidence"]},
+                "modes": {GUARD_ROOT: 0o700, FIXTURE_GUARD["scratch_root"]: 0o700,
+                          FIXTURE_GUARD["evidence"]: 0o755}}), FIXTURE_ENV),
+            "not the qualified")
+
+    # 6. Retention: only a path inside the caller's own root, never by mtime.
     check("retention inside the root is accepted",
           retained_inside("/run/barge", "/run/barge/x.transcript.json")
           == "/run/barge/x.transcript.json")
@@ -1551,7 +1980,7 @@ def self_test():
     check("no reported path selects nothing",
           retained_inside("/run/barge", None) is None)
 
-    # 6. Classification keeps apparatus, refusal, raw exit and closure apart.
+    # 7. Classification keeps apparatus, refusal, raw exit and closure apart.
     check("zero exit completes", classification({"code": 0})["state"] == "completed")
     check("a raw nonzero exit is kept",
           classification({"code": 101})["state"] == "nonzero-exit")
@@ -1564,13 +1993,15 @@ def self_test():
     check("a missing window is not-run",
           classification(None)["state"] == "not-run")
 
-    # 7. Equal and unequal raw fates are both unqualified and record no claim.
+    # 8. Equal and unequal raw fates are both unqualified and record no claim.
     def report_with(barge_outcome):
         return build_report(
             binding=binding, guard=FIXTURE_GUARD, paths=paths, envelope=envelope,
             oxide=None, barge=None,
             oxide_parse={"report": {"document": {"outcome": {"state": "completed"}}}},
             barge_parse={"report": {"document": {"outcome": barge_outcome}}},
+            retained={"root": paths["evidence_retained"], "bytes": 0, "entries": [],
+                      "omitted": 0},
             closure={"state": "guarded"}, gaps=[])
     equal = report_with({"state": "completed"})
     unequal = report_with({"state": "refused", "reason": "bounded"})
@@ -1593,16 +2024,18 @@ def self_test():
     check("a broken retained document keeps its absence",
           broken["document"] is None and "unparsable" in broken)
 
-    # 8. Caps and truncation are visible, never a complete-looking document.
+    # 9. Caps and truncation are visible, never a complete-looking document.
     capped = build_report(binding=binding, guard=FIXTURE_GUARD, paths=paths,
                           envelope=envelope, oxide=None, barge=None,
                           oxide_parse=None, barge_parse=None,
+                          retained={"root": paths["evidence_retained"], "bytes": 0,
+                                    "entries": [], "omitted": 0},
                           closure={"state": "guarded"},
                           gaps=[f"g{index}" for index in range(GAP_CAP + 3)])
     check("gap overflow is counted", len(capped["gaps"]) == GAP_CAP + 1
           and "further gap(s) omitted" in capped["gaps"][-1])
 
-    # 9. Refusals happen before any engine.
+    # 10. Refusals happen before any engine.
     fake = FakeSeams({"files": {}})
     refuses("no binding refuses before any effect",
             lambda: observe({"binding": "", "sha256": ""}, fake, FIXTURE_ENV),
@@ -1631,12 +2064,16 @@ def self_test():
     check("a failing staging build ran no engine",
           not any(call[0] == "run_captured" for call in fake.calls))
 
-    # 10. A complete scripted occurrence writes one unqualified report that
-    #     keeps a nonzero engine exit and a refused retention as observations.
+    # 11. A complete scripted occurrence: bound tools, retained raw evidence,
+    #     one unqualified report, at most one window per engine.
     script = scripted_occurrence(
         binding, facts,
         barge_stderr=BOUNDED_REFUSAL_MARKER + ": x\n"
-                     "barge.tape.exercise/1: retained /elsewhere/x.transcript.json\n")
+                     "barge.tape.exercise/1: retained "
+                     + os.path.join(paths["barge_run"],
+                                    "barge-test-x.transcript.json") + "\n"
+                     "barge.tape.exercise/1: kept fixture "
+                     + os.path.join(paths["barge_run"], "barge-test-x") + "\n")
     fake = FakeSeams(script)
     code = observe({"binding": "/binding.json",
                     "sha256": sha256_bytes(binding_bytes)}, fake, FIXTURE_ENV)
@@ -1647,38 +2084,96 @@ def self_test():
           and written["fates"]["comparison"].startswith("not-claimed")
           and written["controls"][0]["case"] == "BASE"
           and written["controls"][1]["case"] == "CTL-0")
-    check("an outside-retention report is refused, not read",
-          written["windows"]["barge"]["retained_transcript"]["retention_refused"] is True
-          and written["windows"]["barge"]["retained_transcript"]["inside_own_root"] is None
-          and written["fates"]["barge"]["state"] == "absent"
-          and any("outside this run's own root" in gap for gap in written["gaps"]))
-    windows = [call[1] for call in fake.calls if call[0] == "run_captured"]
     check("each engine ran at most once",
-          sum(1 for argv in windows if "--observe-base" in argv) == 1
-          and sum(1 for argv in windows if len(argv) == 1) == 1)
+          sum(1 for call in fake.calls
+              if call[0] == "run_captured" and "--observe-base" in call[1]) == 1
+          and sum(1 for call in fake.calls
+                  if call[0] == "run_captured" and len(call[1]) == 1) == 1)
+    stages = [call for call in fake.calls if call[0] == "run_logged"]
+    check("staging runs the bound cargo, not an inherited one",
+          len(stages) == 2 and all(call[1][0] == "/rust/cargo" for call in stages))
+    check("staging directs cargo to the bound rustc and a fixed PATH",
+          all(call[2].get("RUSTC") == "/rust/rustc"
+              and call[2].get("PATH") == "/usr/bin:/bin:/usr/sbin:/sbin"
+              and call[2].get("CARGO_HOME", "").startswith(paths["run_root"])
+              for call in stages))
+    check("both engines report a retained fixture and manifest",
+          written["windows"]["barge"]["fixture_custody"]["fixture_kept"] is True
+          and written["windows"]["barge"]["fixture_custody"]["manifest"] is not None)
+    retained = written["retained"]
+    labels = {entry["label"] for entry in retained["entries"]}
+    check("raw evidence is retained in the guard's evidence subtree",
+          retained["root"] == paths["evidence_retained"]
+          and retained["omitted"] == 0
+          and {"oxide.transcript", "oxide.manifest", "oxide.observation",
+               "oxide.parse", "barge.transcript", "barge.manifest",
+               "barge.parse", "oxide.executable", "barge.executable",
+               "oxide.stdout", "barge.stderr"} <= labels)
+    check("retained copies stay inside the evidence subtree",
+          all(entry.get("path", "").startswith(paths["evidence_retained"] + "/")
+              for entry in retained["entries"] if entry["retained"]))
 
-    script = scripted_occurrence(
-        binding, facts,
-        barge_stderr=BOUNDED_REFUSAL_MARKER + ": cap exhausted\n"
-                     "barge.tape.exercise/1: retained "
-                     "/Volumes/Stash/scratch/oxide/guard-run/tape-observation/"
-                     "barge/run/barge-test-x.transcript.json\n")
-    script["barge"] = dict(script["barge"], code=2)
-    script["oxide"] = dict(script["oxide"], code=101)
-    fake = FakeSeams(script)
+    # 12. Honest retention omissions and an unsafe Barge tree refuse.
+    capped_script = scripted_occurrence(binding, facts, barge_stderr="")
+    capped_script["barge"] = dict(
+        capped_script["barge"],
+        stderr="barge.tape.exercise/1: retained "
+               + os.path.join(paths["barge_run"], "barge-test-x.transcript.json") + "\n"
+               "barge.tape.exercise/1: kept fixture "
+               + os.path.join(paths["barge_run"], "barge-test-x") + "\n")
+    capped_script["sizes"] = {"barge/stage/target": RETENTION_FILE_CAP_BYTES + 1}
+    fake = FakeSeams(capped_script)
     observe({"binding": "/binding.json", "sha256": sha256_bytes(binding_bytes)},
             fake, FIXTURE_ENV)
-    written = script["written"]
-    check("a nonzero Oxide exit is kept as an observation",
-          written["windows"]["oxide"]["classification"]["state"] == "nonzero-exit"
-          and written["windows"]["oxide"]["classification"]["exit_code"] == 101)
-    check("a reported Barge refusal has its own state",
-          written["windows"]["barge"]["classification"]["state"]
-          == "bounded-capture-refusal")
-    check("both fates are still raw and unqualified",
-          written["qualified"] is False
-          and written["fates"]["oxide"]["state"] == "observed"
-          and written["fates"]["barge"]["state"] == "observed")
+    written = capped_script["written"]
+    entries = {entry["label"]: entry for entry in written["retained"]["entries"]}
+    check("an over-budget artifact is omitted and named, never summarised",
+          entries["barge.executable"]["retained"] is False
+          and any("not retained within the budget" in gap
+                  for gap in written["gaps"])
+          and written["qualified"] is False)
+    check("the remaining raw evidence is still retained",
+          entries["oxide.transcript"]["retained"] is True
+          and entries["barge.transcript"]["retained"] is True)
+
+    # 13. The Barge retention gate refuses a tree that would delete its
+    #     fixture before custody is known.
+    barge_source = os.path.join(paths["barge_source"])
+    good = FakeSeams(scripted_occurrence(binding, facts, barge_stderr=""))
+    check("the bound Barge retention change is accepted",
+          verify_barge_retention(binding, barge_source, good)["fixture_kept"] is True)
+    bad_digest = FakeSeams({
+        "isfiles": set(good.script["isfiles"]),
+        "digests": {"testkit.rs": "c" * 64, "tape_harness.rs": "b" * 64},
+        "texts": good.script["texts"],
+    })
+    refuses("a Barge tree without the bound retention digest refuses",
+            lambda: verify_barge_retention(binding, barge_source, bad_digest),
+            "not the bound retention change")
+    no_keep = FakeSeams({
+        "isfiles": set(good.script["isfiles"]),
+        "digests": {"testkit.rs": "a" * 64, "tape_harness.rs": "b" * 64},
+        "texts": {"testkit.rs": "impl TempDir {}",
+                  "tape_harness.rs": good.script["texts"]["tape_harness.rs"]},
+    })
+    refuses("a Barge testkit without TempDir::keep refuses",
+            lambda: verify_barge_retention(binding, barge_source, no_keep),
+            "TempDir::keep")
+    no_harness = FakeSeams({
+        "isfiles": set(good.script["isfiles"]),
+        "digests": {"testkit.rs": "a" * 64, "tape_harness.rs": "b" * 64},
+        "texts": {"testkit.rs": good.script["texts"]["testkit.rs"],
+                  "tape_harness.rs": "fn embedded_exercise() {}"},
+    })
+    refuses("a Barge harness that neither keeps nor writes its manifest refuses",
+            lambda: verify_barge_retention(binding, barge_source, no_harness),
+            "keeps its fixture")
+
+    # 14. A changed bound tool during the run refuses.
+    changed_tools = FakeSeams({"digests": {"rustc": "9" * 64, "cargo": "8" * 64}})
+    refuses("a changed bound toolchain refuses",
+            lambda: verify_toolchain_unchanged(binding, changed_tools),
+            "changed while this occurrence was running")
 
     failures = [(name, detail) for name, passed, detail in checks if not passed]
     for name, passed, detail in checks:

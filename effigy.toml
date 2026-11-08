@@ -1563,13 +1563,15 @@ run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- o
 # BASE, Barge CTL-0), each run at most once, inside the qualified shared
 # supervisor and its own supervised group. The counted-shaped selector refuses
 # before any effect until the planner binds ONE occurrence through
-# TAPE_OBSERVATION_BINDING and its digest; the two proof selectors below are
-# effect-free and run no engine, fixture, compiler or staging step. The report
-# is a distinct diagnostic, `qualified` is false unconditionally, and matching
-# outcomes award nothing.
+# TAPE_OBSERVATION_BINDING and its digest, and it also refuses while the pinned
+# Barge route deletes its fixture before custody is known (the linked retention
+# change is named in the plan and refused by the binding gate). The two proof
+# selectors below are effect-free and run no engine, fixture, compiler or
+# staging step. The report is a distinct diagnostic, `qualified` is false
+# unconditionally, and matching outcomes award nothing.
 [tasks."rust:tape-prune-observation"]
 admission = "heavy"
-run = 'python3 scripts/bounded-test.py --limit 900 --scratch-budget-mib 1024 -- python3 scripts/tape-embedded-observation.py --observe --binding "$TAPE_OBSERVATION_BINDING" --sha256 "$TAPE_OBSERVATION_BINDING_SHA256"'
+run = 'python3 scripts/bounded-test.py --limit 900 --scratch-budget-mib 1536 -- python3 scripts/tape-embedded-observation.py --observe --binding "$TAPE_OBSERVATION_BINDING" --sha256 "$TAPE_OBSERVATION_BINDING_SHA256"'
 
 [tasks."proof:tape-prune:observation-test"]
 run = "python3 scripts/tape-embedded-observation.py --self-test"
