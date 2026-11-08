@@ -2427,21 +2427,30 @@ shared-helper site outside the declared set emits no own identity and an
 explicit `descriptor identity unavailable` note; a kernel-refused read keeps its
 identity but is not converted into a present row; and every window asserts the
 caller's `errno` sentinel survives the observation and the unchanged read. Two
-more controls answer the exact-head review. (a) The one-shot seam forces the
+more controls answer the exact-head reviews. (a) The one-shot seam forces the
 declared observation to fail on a **valid** held file: the read still returns its
 own bytes with the caller's errno, the emitted row carries no `device`/`inode`
 and `own_source: none` plus `descriptor identity unavailable ... held-descriptor
 fstat failed`, no manifest entry binds it, the canonical parser and limited
 verdict keep it blocking (`extra-unbound-observation`) with no limitation, and
 the next unarmed window binds again — so the seam neither leaks nor changes what
-the read returned. (b) Through the real `outputs::read_marker_for_prune` call
-site, an entry that matches the `outputs:marker:lstat` row exactly leaves that
-extracted metadata row unbound (`extra or unbound observation`), while the
-declared `authority-read@outputs::read_marker` row binds and keeps its
-limitation; the limited verdict stays insufficient. Two deliberate mutations —
-`bound_leaf` accepting any label, and `bound_leaf` dropping the declared-kind and
-`handle`-provenance gate while the seam became a no-op — each failed the
-corresponding control by name before being reverted, so neither control is
+the read returned. (a2) The same seam is armed around a read that **fails** (a
+directory descriptor): the returned raw error code, the bytes and the errno the
+caller observes are compared with an equivalent **uninstrumented** read of the
+same descriptor and must be identical, while the recorded identity stays unknown
+(refusal outcome, no `device`/`inode`), the row stays unbound, and the limited
+verdict stays insufficient with no limitation. The successful-observation
+refusal runs the same comparison, so all three states — no observation,
+observation success, observation failure — are discriminated on one error path.
+(b) Through the real `outputs::read_marker_for_prune` call site, an entry that
+matches the `outputs:marker:lstat` row exactly leaves that extracted metadata row
+unbound (`extra or unbound observation`), while the declared
+`authority-read@outputs::read_marker` row binds and keeps its limitation; the
+limited verdict stays insufficient. Four deliberate mutations —
+`bound_leaf` accepting any label; `bound_leaf` dropping the declared-kind and
+`handle`-provenance gate; the seam becoming a no-op; and the forced-failure path
+restoring the pre-observation errno instead of the read's own — each failed the
+corresponding control by name before being reverted, so none of the controls is
 vacuous. Two pure policy controls pin the note mapping: a schema-shaped
 parent-naming obligation over a parent-free leaf yields the limitation and only
 `strict-issue-unexplained`, and the parent sentence is explained at the site that

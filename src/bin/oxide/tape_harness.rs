@@ -1559,6 +1559,23 @@ fn leaf_window(
     Ok((bytes, doc, transcript, manifest_bytes))
 }
 
+/// The same production read statement with **no** observation at all: the
+/// control for the error path. Returns the error's raw OS code and the bytes the
+/// read produced, with the caller's errno sentinel set first so the comparison
+/// covers the errno the statement leaves behind.
+fn uninstrumented_read(file: std::fs::File, limit: u64) -> (Option<i32>, Vec<u8>, Option<i32>) {
+    use std::io::Read;
+    prune::tape_restore_errno(Some(libc::EPERM));
+    let mut bytes = Vec::new();
+    let result = prune::authority_read(file.take(limit + 1), &mut bytes);
+    let errno = prune::tape_errno();
+    (
+        result.err().and_then(|error| error.raw_os_error()),
+        bytes,
+        errno,
+    )
+}
+
 fn notes_contain(doc: &serde_json::Value, needle: &str) -> bool {
     doc.get("notes")
         .and_then(serde_json::Value::as_array)
@@ -1966,6 +1983,8 @@ descriptor observation"
     let mut refused_bytes = Vec::new();
     let refused =
         prune::authority_read_observed(&directory, &renamed, DIGEST_SITE, 64, &mut refused_bytes);
+    // The errno the caller observes is the read's own, never the observation's.
+    let refused_errno = prune::tape_errno();
     tape::check_manifest_obligations(&manifest, &root);
     let refusal_path = temp.join("leaf-LEAF-REFUSAL.json");
     tape::finish_and_write(
@@ -1986,6 +2005,28 @@ descriptor observation"
     check(
         refused.is_err(),
         "reading a directory is the kernel's own refusal",
+    )?;
+    // The same read with no observation at all is the control: a successful
+    // observation must not change the read's own error or errno.
+    let (direct_error, direct_bytes, direct_errno) = uninstrumented_read(
+        std::fs::File::open(&root).map_err(|error| CheckFailure {
+            what: error.to_string(),
+        })?,
+        64,
+    );
+    check(
+        direct_error.is_some()
+            && refused.as_ref().err().and_then(|error| error.raw_os_error()) == direct_error
+            && refused_bytes == direct_bytes
+            && refused_errno == direct_errno
+            && refused_errno == direct_error,
+        &format!(
+            "a successful observation leaves the read's error and errno intact: observed {:?}/{:?}, direct {:?}/{:?}",
+            refused.as_ref().err().and_then(|error| error.raw_os_error()),
+            refused_errno,
+            direct_error,
+            direct_errno
+        ),
     )?;
     check(
         notes_contain(
@@ -2103,6 +2144,135 @@ descriptor observation"
                 &format!("extra or unbound observation at {ROW}"),
             ),
         "the observation-failure seam is one-shot and does not leak",
+    )?;
+
+    // 8b. Observation failure together with a **failing** read: the caller sees
+    // the read's own error and errno, exactly as the same read with no
+    // observation, and the recorded identity stays unknown.
+    let mut failing_entry = entry.clone();
+    failing_entry["rel"] = serde_json::json!("registry-original.json");
+    let manifest = leaf_manifest(
+        "LEAF-OBSERVATION-FAILED-READ",
+        &root,
+        &renamed,
+        vec![failing_entry],
+        dev,
+        ino,
+        ROW,
+    );
+    let failing_manifest_bytes = serde_json::to_vec(&manifest).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    tape::begin(
+        "oxide",
+        "LEAF-OBSERVATION-FAILED-READ",
+        &tape::sha256_hex(&failing_manifest_bytes),
+        "pure",
+    );
+    prune::tape_restore_errno(Some(libc::EPERM));
+    prune::force_held_descriptor_observation_failure(true);
+    let mut failing_bytes = Vec::new();
+    let failing_directory = std::fs::File::open(&root).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    let failing_read =
+        prune::authority_read_observed(&failing_directory, &renamed, SITE, 64, &mut failing_bytes);
+    let failing_errno = prune::tape_errno();
+    tape::check_manifest_obligations(&manifest, &root);
+    let failing_path = temp.join("leaf-LEAF-OBSERVATION-FAILED-READ.json");
+    tape::finish_and_write(
+        &failing_path,
+        TapeEngineOutcome::Completed {
+            result: serde_json::json!({"complete": true, "entries": []}),
+        },
+        None,
+    )
+    .map_err(|what| CheckFailure { what })?;
+    let failing_transcript = std::fs::read(&failing_path).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    let failing_doc: serde_json::Value =
+        serde_json::from_slice(&failing_transcript).map_err(|error| CheckFailure {
+            what: error.to_string(),
+        })?;
+    let (control_error, control_bytes, control_errno) = uninstrumented_read(
+        std::fs::File::open(&root).map_err(|error| CheckFailure {
+            what: error.to_string(),
+        })?,
+        64,
+    );
+    let failing_error = failing_read
+        .as_ref()
+        .err()
+        .and_then(|error| error.raw_os_error());
+    check(
+        failing_error.is_some()
+            && failing_error == control_error
+            && failing_errno == control_errno
+            && failing_errno == control_error
+            && failing_bytes == control_bytes,
+        &format!(
+            "a failed observation leaves a failing read's error and errno intact: observed \
+{failing_error:?}/{failing_errno:?}, unobserved {control_error:?}/{control_errno:?}"
+        ),
+    )?;
+    let failing_row = failing_doc
+        .get("reads")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row.get("site").and_then(|v| v.as_str()) == Some(ROW))
+        })
+        .ok_or_else(|| CheckFailure {
+            what: format!("no {ROW} row was emitted by the failing read"),
+        })?;
+    check(
+        failing_row
+            .pointer("/identity/device")
+            .is_some_and(|v| v.is_null())
+            && failing_row
+                .pointer("/identity/inode")
+                .is_some_and(|v| v.is_null())
+            && failing_row
+                .pointer("/identity/own_source")
+                .and_then(|v| v.as_str())
+                == Some("none")
+            && failing_row
+                .pointer("/outcome/type")
+                .and_then(|v| v.as_str())
+                == Some("refusal")
+            && notes_contain(
+                &failing_doc,
+                &format!("descriptor identity unavailable at {SITE}: held-descriptor fstat failed"),
+            )
+            && notes_contain(
+                &failing_doc,
+                &format!("extra or unbound observation at {ROW}"),
+            ),
+        &format!(
+            "the recorded identity stays unknown on the error path: {:?}",
+            failing_doc.get("notes")
+        ),
+    )?;
+    let failing_verdict = tape::capture_verdict::evaluate_limited_capture(
+        &failing_transcript,
+        &failing_manifest_bytes,
+    )
+    .map_err(|what| CheckFailure {
+        what: format!("canonical parse or verdict: {what}"),
+    })?;
+    check(
+        !failing_verdict.sufficient()
+            && failing_verdict.blocking.iter().any(|blocking| {
+                blocking.rule.name() == "extra-unbound-observation" && blocking.site == ROW
+            })
+            && !failing_verdict.limitations.iter().any(|limitation| {
+                limitation.rule == tape::capture_verdict::ExclusionRule::PathOnlyDirectReadParent
+            }),
+        &format!(
+            "the error path stays unknown and unexcluded through the limited verdict: {:?}",
+            failing_verdict.blocking_names()
+        ),
     )?;
 
     // 9. An undeclared metadata row is not the held read descriptor. Driven
