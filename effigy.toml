@@ -1588,6 +1588,26 @@ run = "python3 scripts/tape-embedded-observation.py --plan"
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 60 --scratch-budget-mib 32 -- python3 scripts/tape-observation-volume-control.py"
 
+# Seed-only readiness for the observation's two locks (oxide#294). `:test` runs
+# the synthetic controls: fake git, seed and guard seams for the orchestration
+# (both locks, one shared deadline, clean and unknown-closure first outcomes,
+# partial records, bound-digest and tree refusals, publication failure), plus two
+# real locks through the shared seeder on tiny fixtures. It runs no Cargo, no
+# resolution, no staging, no engine and no observation. `:plan` is effect-free.
+# `:control` is the ONE prospective uncounted occurrence: it refuses before any
+# effect until a planner binds one occurrence through the two environment
+# variables, and it is not activated by this preparation.
+[tasks."proof:seed-readiness:test"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/tape-seed-readiness.py --self-test"
+
+[tasks."proof:seed-readiness:plan"]
+run = "python3 scripts/tape-seed-readiness.py --plan"
+
+[tasks."proof:seed-readiness:control"]
+admission = "heavy"
+run = 'python3 scripts/bounded-test.py --limit 180 --scratch-budget-mib 512 -- python3 scripts/tape-seed-readiness.py --control --binding "$SEED_READINESS_BINDING" --sha256 "$SEED_READINESS_BINDING_SHA256"'
+
 [tasks."proof:store-fixtures:diagnostic"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/diagnose-store-fixtures.py"

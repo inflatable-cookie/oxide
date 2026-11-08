@@ -55,6 +55,16 @@ checksum. Workspace and path packages are skipped; any other source, a
 duplicate or malformed lock entry, and a crate name, version or checksum that
 cannot be a safe path component refuses.
 
+Provenance (oxide#294): `seed_cargo_home(..., provenance=dict)` fills an
+additive `oxide.seed-provenance/1` record in place. It names the explicit
+requested host CARGO_HOME and the private destination, the identity of each
+descriptor actually opened (source, namespaces, `config.json`, database roots
+and candidates), and on refusal the first failed component, its index, the
+attempted operation, the errno name and a `kind` that is `unknown` unless the
+same operation's own stat obtained it. An errno is never read as a kind. Facts
+gathered before a refusal stay in the record. Candidate file lists stay in the
+manifest, and callers that pass no record see no change.
+
 Not claimed: this seed is offline fixture input, not source qualification. A
 caller's proof stays bound to the exact sources it ran; importing this helper
 transfers no qualification. The registry namespace is fixed; a signed or
@@ -107,7 +117,100 @@ MAX_GIT_SOURCES = 4
 
 
 class SeedRefusal(RuntimeError):
-    """The seed cannot be built safely from the lock and the host cache."""
+    """The seed cannot be built safely from the lock and the host cache.
+
+    `facts` carries what the failing operation actually established (the first
+    failed component, the attempted operation, the errno name and any identity
+    obtained before the failure). Nothing in it is inferred from the errno.
+    """
+
+    def __init__(self, message: str, facts: dict | None = None) -> None:
+        super().__init__(message)
+        self.facts = facts or {}
+
+
+PROVENANCE_SCHEMA = "oxide.seed-provenance/1"
+PROVENANCE_TEXT_CAP = 512
+
+
+def _text(value: object) -> str:
+    text = str(value)
+    return text if len(text) <= PROVENANCE_TEXT_CAP else text[:PROVENANCE_TEXT_CAP] + "..."
+
+
+def _kind(mode: int) -> str:
+    """The entry kind an operation already obtained from its own stat."""
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISREG(mode):
+        return "regular"
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    return "other"
+
+
+def _failure(parts: tuple, index: int | None, operation: str, error=None, **extra) -> dict:
+    """What one failed operation established: component, operation and errno."""
+    name = None
+    if index is not None and 0 <= index < len(parts):
+        name = parts[index]
+    code = None
+    if isinstance(error, OSError) and error.errno:
+        code = errno.errorcode.get(error.errno, str(error.errno))
+    elif isinstance(error, str):
+        code = error
+    facts = {
+        "path": _text("/".join(parts)),
+        "component": name,
+        "component_index": index,
+        "operation": operation,
+        "errno": code,
+        "kind": "unknown",
+    }
+    facts.update(extra)
+    return facts
+
+
+def _identity(fd: int) -> dict:
+    """Identity of an opened descriptor: what fstat on it actually reports."""
+    info = os.fstat(fd)
+    return {"dev": info.st_dev, "ino": info.st_ino, "kind": _kind(info.st_mode)}
+
+
+def new_provenance(requested: object, destination: object) -> dict:
+    """The seed's provenance record, filled in place as each operation opens.
+
+    `requested_source` is the explicit host CARGO_HOME the caller named; the
+    private destination is never the source. Identities appear only for the
+    descriptors the seed really opened, and a refusal keeps every fact gathered
+    before it.
+    """
+    return {
+        "schema": PROVENANCE_SCHEMA,
+        "requested_source": _text(requested),
+        "destination": _text(destination),
+        "source": None,
+        "registry": {"index_namespace": None, "cache_namespace": None, "config_json": None},
+        "git": [],
+        "refusal": None,
+    }
+
+
+def _refusal_record(error: "SeedRefusal") -> dict:
+    facts = dict(error.facts)
+    record = {
+        "message": _text(error),
+        "path": facts.get("path"),
+        "component": facts.get("component"),
+        "component_index": facts.get("component_index"),
+        "operation": facts.get("operation"),
+        "errno": facts.get("errno"),
+        "kind": facts.get("kind", "unknown"),
+    }
+    for key in ("dev", "expected_dev", "closure"):
+        if key in facts:
+            record[key] = facts[key]
+    return record
 
 
 def now_ns() -> int:
@@ -240,16 +343,26 @@ class Anchor:
     """One opened root; every read below it is descriptor-relative, no-follow."""
 
     def __init__(self, path: Path, label: str) -> None:
+        operation = "open directory without following links (O_NOFOLLOW|O_DIRECTORY)"
         try:
             self.fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        except FileNotFoundError:
-            raise SeedRefusal(f"{label} is missing: {path}")
+        except FileNotFoundError as error:
+            raise SeedRefusal(
+                f"{label} is missing: {path}",
+                _failure((label,), 0, operation, error, path=_text(path)),
+            )
         except OSError as error:
-            raise SeedRefusal(f"{label} cannot be opened without following links: {path}: {error}")
+            raise SeedRefusal(
+                f"{label} cannot be opened without following links: {path}: {error}",
+                _failure((label,), 0, operation, error, path=_text(path)),
+            )
         info = os.fstat(self.fd)
         if not stat.S_ISDIR(info.st_mode):
             os.close(self.fd)
-            raise SeedRefusal(f"{label} is not a directory: {path}")
+            raise SeedRefusal(
+                f"{label} is not a directory: {path}",
+                _failure((label,), 0, operation, None, path=_text(path), kind=_kind(info.st_mode)),
+            )
         self.label = label
         self.dev = info.st_dev
         self.identity = (info.st_dev, info.st_ino)
@@ -264,28 +377,39 @@ class Anchor:
         self.close()
 
     def open_dir(self, parts: tuple[str, ...]) -> int:
+        operation = "open directory without following links (O_NOFOLLOW|O_DIRECTORY)"
         fd = os.dup(self.fd)
-        for part in parts:
+        for index, part in enumerate(parts):
             _check_part(part, self.label)
             try:
                 child = os.open(
                     part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd
                 )
-            except FileNotFoundError:
+            except FileNotFoundError as error:
                 os.close(fd)
-                raise SeedRefusal(f"required seed directory is missing: {'/'.join(parts)}")
+                raise SeedRefusal(
+                    f"required seed directory is missing: {'/'.join(parts)}",
+                    _failure(parts, index, operation, error),
+                )
             except OSError as error:
                 os.close(fd)
                 reason = "a symlink or link loop" if error.errno == errno.ELOOP else "not a real directory"
                 raise SeedRefusal(
-                    f"seed directory is {reason}: {'/'.join(parts)}"
+                    f"seed directory is {reason}: {'/'.join(parts)}",
+                    _failure(parts, index, operation, error),
                 )
             info = os.fstat(child)
             if not stat.S_ISDIR(info.st_mode) or info.st_dev != self.dev:
                 os.close(child)
                 os.close(fd)
+                kind_facts = {
+                    "kind": _kind(info.st_mode),
+                    "dev": info.st_dev,
+                    "expected_dev": self.dev,
+                }
                 raise SeedRefusal(
-                    f"seed directory is not a real directory on the seed's device: {'/'.join(parts)}"
+                    f"seed directory is not a real directory on the seed's device: {'/'.join(parts)}",
+                    _failure(parts, index, operation, None, **kind_facts),
                 )
             os.close(fd)
             fd = child
@@ -295,31 +419,44 @@ class Anchor:
         if not parts:
             raise SeedRefusal(f"{self.label}: empty file path")
         dfd = self.open_dir(parts[:-1])
+        operation = "open file without following links (O_NOFOLLOW|O_NONBLOCK)"
+        index = len(parts) - 1
         try:
             fd = os.open(
                 _check_part(parts[-1], self.label),
                 os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
                 dir_fd=dfd,
             )
-        except FileNotFoundError:
-            raise SeedRefusal(f"required seed input is missing: {'/'.join(parts)}")
+        except FileNotFoundError as error:
+            raise SeedRefusal(
+                f"required seed input is missing: {'/'.join(parts)}",
+                _failure(parts, index, operation, error),
+            )
         except OSError as error:
             reason = (
                 "is a symlink or link loop and is refused"
                 if error.errno == errno.ELOOP
                 else f"cannot be opened without following links: {error}"
             )
-            raise SeedRefusal(f"seed input {reason}: {'/'.join(parts)}")
+            raise SeedRefusal(
+                f"seed input {reason}: {'/'.join(parts)}",
+                _failure(parts, index, operation, error),
+            )
         finally:
             os.close(dfd)
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             os.close(fd)
-            raise SeedRefusal(f"seed input is not a regular file: {'/'.join(parts)}")
+            raise SeedRefusal(
+                f"seed input is not a regular file: {'/'.join(parts)}",
+                _failure(parts, index, operation, None, kind=_kind(info.st_mode)),
+            )
         if info.st_dev != self.dev:
             os.close(fd)
             raise SeedRefusal(
-                f"seed input is not on the seed root's device: {'/'.join(parts)}"
+                f"seed input is not on the seed root's device: {'/'.join(parts)}",
+                _failure(parts, index, operation, None, kind="regular",
+                         dev=info.st_dev, expected_dev=self.dev),
             )
         return fd, info
 
@@ -385,9 +522,15 @@ def _copy_file(
     actual = digest.hexdigest()
     if expected_sha256 is not None and actual != expected_sha256:
         raise SeedRefusal(
-            f"checksum mismatch for {parts[-1]}: copied bytes {actual}, lock {expected_sha256}"
+            f"checksum mismatch for {parts[-1]}: copied bytes {actual}, lock {expected_sha256}",
+            _failure(parts, len(parts) - 1, "checksum", None, kind="regular"),
         )
-    return {"sha256": actual, "bytes": written}
+    return {
+        "sha256": actual,
+        "bytes": written,
+        "dev": before.st_dev,
+        "ino": before.st_ino,
+    }
 
 
 def _git_db_name(url: str) -> str:
@@ -429,7 +572,8 @@ def _run_git(home: Path, args: list, budget: Budget, label: str) -> tuple[int, s
         child.kill()
         child.communicate()
         raise SeedRefusal(
-            f"{label}: git did not answer within {timeout:.1f} s; that child's closure is unknown"
+            f"{label}: git did not answer within {timeout:.1f} s; that child's closure is unknown",
+            {"operation": "git (private copy)", "closure": "unknown", "component": label},
         )
     if len(out) > budget.limits.git_output_bytes or len(err) > budget.limits.git_output_bytes:
         raise SeedRefusal(f"{label}: git output exceeds the 64 KiB bound")
@@ -586,9 +730,13 @@ def _locked_git_package(table: dict) -> dict:
     }
 
 
-def _list_names(anchor: Anchor, parts: tuple[str, ...], budget: Budget, label: str) -> list[str]:
+def _list_names(
+    anchor: Anchor, parts: tuple[str, ...], budget: Budget, label: str, identity: dict | None = None
+) -> list[str]:
     dfd = anchor.open_dir(parts)
     try:
+        if identity is not None:
+            identity.update(_identity(dfd))
         names = []
         with os.scandir(dfd) as entries:
             for entry in entries:
@@ -606,6 +754,7 @@ def _walk_git(
     budget: Budget,
     depth: int,
     on_file,
+    identity: dict | None = None,
 ) -> None:
     """Walk one bare database through anchored descriptors, bounded.
 
@@ -615,11 +764,17 @@ def _walk_git(
     enumerated entry and every level beyond `limits.depth` is charged to the
     one seed budget; nothing is listed or walked unbounded.
     `on_file(host_parts, rel_parts, stat)` decides what happens to a file.
+    `identity`, when given, receives the candidate root's descriptor identity.
     """
     if depth > budget.limits.depth:
-        raise SeedRefusal(f"Git database depth exceeds {budget.limits.depth}: {'/'.join(parts)}")
+        raise SeedRefusal(
+            f"Git database depth exceeds {budget.limits.depth}: {'/'.join(parts)}",
+            _failure(parts, None, "descend (depth bound)", None),
+        )
     dfd = anchor.open_dir(parts)
     try:
+        if identity is not None and depth == 0:
+            identity.update(_identity(dfd))
         names = []
         with os.scandir(dfd) as entries:
             for entry in entries:
@@ -629,36 +784,49 @@ def _walk_git(
             _check_part(name, "git database entry")
             if not rel and name in ("config", "hooks"):
                 continue
-            if parts == ("objects", "info") and name in ("alternates", "http-alternates"):
-                raise SeedRefusal(f"Git database alternates entry refused: {'/'.join(parts + (name,))}")
-            try:
-                info = os.stat(name, dir_fd=dfd, follow_symlinks=False)
-            except FileNotFoundError:
-                raise SeedRefusal(f"Git database entry disappeared: {'/'.join(parts + (name,))}")
             child = parts + (name,)
             child_rel = rel + (name,)
+            if parts == ("objects", "info") and name in ("alternates", "http-alternates"):
+                raise SeedRefusal(
+                    f"Git database alternates entry refused: {'/'.join(child)}",
+                    _failure(parts, None, "alternates check", None, component=name),
+                )
+            try:
+                info = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            except FileNotFoundError as error:
+                raise SeedRefusal(
+                    f"Git database entry disappeared: {'/'.join(child)}",
+                    _failure(child, len(child) - 1, "stat without following links", error),
+                )
             if stat.S_ISDIR(info.st_mode):
                 if info.st_dev != anchor.dev:
                     raise SeedRefusal(
-                        f"Git database directory is not on the seed root's device: {'/'.join(child)}"
+                        f"Git database directory is not on the seed root's device: {'/'.join(child)}",
+                        _failure(child, len(child) - 1, "stat without following links", None,
+                                 kind="directory", dev=info.st_dev, expected_dev=anchor.dev),
                     )
                 _walk_git(anchor, child, child_rel, budget, depth + 1, on_file)
             elif stat.S_ISREG(info.st_mode):
                 on_file(child, child_rel, info)
             else:
                 raise SeedRefusal(
-                    f"Git database entry is a symlink or special file: {'/'.join(child)}"
+                    f"Git database entry is a symlink or special file: {'/'.join(child)}",
+                    _failure(child, len(child) - 1, "stat without following links", None,
+                             kind=_kind(info.st_mode)),
                 )
     finally:
         os.close(dfd)
 
 
-def _measure_git(anchor: Anchor, parts: tuple[str, ...], budget: Budget) -> int:
+def _measure_git(
+    anchor: Anchor, parts: tuple[str, ...], budget: Budget, identity: dict | None = None
+) -> int:
     """Admission measurement only: the regular-file bytes a candidate holds.
 
     This is not a commit or content check and never reads host Git config. A
     candidate measured over the remaining byte budget is not attempted; its
-    entries stay charged and the record names the reason.
+    entries stay charged and the record names the reason. `identity` receives
+    the candidate root's descriptor identity when it opens.
     """
     total = 0
 
@@ -666,12 +834,12 @@ def _measure_git(anchor: Anchor, parts: tuple[str, ...], budget: Budget) -> int:
         nonlocal total
         total += info.st_size
 
-    _walk_git(anchor, parts, (), budget, 0, count)
+    _walk_git(anchor, parts, (), budget, 0, count, identity=identity)
     return total
 
 
 def _seed_registry(
-    host: Anchor, cargo_home: Path, packages: list[dict], budget: Budget
+    host: Anchor, cargo_home: Path, packages: list[dict], budget: Budget, provenance: dict | None = None
 ) -> dict:
     """The lock selection from the one supported crates.io sparse namespace."""
     budget.check("registry seed")
@@ -679,17 +847,24 @@ def _seed_registry(
     index_parts = ("registry", "index", namespace)
     cache_parts = ("registry", "cache", namespace)
     # Both selected namespace directories must be real directories, checked
-    # before any descent. Other namespaces are never listed or traversed.
-    for parts, label in (
-        (index_parts, "host index namespace"),
-        (cache_parts, "host cache namespace"),
+    # before any descent. Other namespaces are never listed or traversed. The
+    # opened descriptor's identity is kept; nothing is re-probed by name.
+    for parts, key in (
+        (index_parts, "index_namespace"),
+        (cache_parts, "cache_namespace"),
     ):
-        os.close(host.open_dir(parts))
+        fd = host.open_dir(parts)
+        try:
+            identity = _identity(fd)
+        finally:
+            os.close(fd)
+        if provenance is not None:
+            provenance["registry"][key] = identity
     dest_index = cargo_home / "registry" / "index" / namespace
     dest_cache = cargo_home / "registry" / "cache" / namespace
     manifest: list[dict] = []
 
-    def record(parts: tuple[str, ...], destination: Path, checksum: str | None) -> None:
+    def record(parts: tuple[str, ...], destination: Path, checksum: str | None) -> dict:
         copied = _copy_file(host, parts, destination, budget, checksum, "registry seed file")
         manifest.append(
             {
@@ -698,8 +873,16 @@ def _seed_registry(
                 "bytes": copied["bytes"],
             }
         )
+        return copied
 
-    record(index_parts + ("config.json",), dest_index / "config.json", None)
+    config = record(index_parts + ("config.json",), dest_index / "config.json", None)
+    if provenance is not None:
+        provenance["registry"]["config_json"] = {
+            "dev": config["dev"],
+            "ino": config["ino"],
+            "bytes": config["bytes"],
+            "sha256": config["sha256"],
+        }
     for package in packages:
         rel = sparse_index_path(package["name"])
         record(index_parts + (".cache", *rel), dest_index / ".cache" / Path(*rel), None)
@@ -734,7 +917,7 @@ def verify_seed_tree(cargo_home: Path, seed: dict) -> None:
 
 
 def _seed_git(
-    host: Anchor, cargo_home: Path, git_packages: list[dict], budget: Budget
+    host: Anchor, cargo_home: Path, git_packages: list[dict], budget: Budget, provenance: dict | None = None
 ) -> list[dict]:
     """One source record per locked Git repository, in lock order (oxide#219).
 
@@ -761,14 +944,14 @@ def _seed_git(
         )
     sources: list[dict] = []
     for repository, package in repositories.items():
-        source = _seed_git_source(host, cargo_home, package, budget)
+        source = _seed_git_source(host, cargo_home, package, budget, provenance)
         source["packages"] = members[repository]
         sources.append(source)
     return sources
 
 
 def _seed_git_source(
-    host: Anchor, cargo_home: Path, package: dict, budget: Budget
+    host: Anchor, cargo_home: Path, package: dict, budget: Budget, provenance: dict | None = None
 ) -> dict:
     """Copy bare-database candidates, then verify the locked commit privately.
 
@@ -784,14 +967,25 @@ def _seed_git_source(
     """
     host_db = ("git", "db")
     candidate_re = re.compile(r"^" + re.escape(package["repository"]) + r"-[0-9a-f]{16}$")
+    # The provenance entry for this repository keeps only what was opened: the
+    # database root identity (empty when the root never opened) and one small
+    # row per candidate. Candidate file lists stay in the seed manifest.
+    git_record = None
+    if provenance is not None:
+        git_record = {"repository": package["repository"], "root": {}, "candidates": []}
+        provenance["git"].append(git_record)
     names = [
         name
-        for name in _list_names(host, host_db, budget, "host git database root")
+        for name in _list_names(
+            host, host_db, budget, "host git database root",
+            identity=None if git_record is None else git_record["root"],
+        )
         if candidate_re.match(name)
     ]
     if not 1 <= len(names) <= budget.limits.git_candidates:
         raise SeedRefusal(
-            f"expected 1 to {budget.limits.git_candidates} host {package['repository']} bare databases, found {len(names)}"
+            f"expected 1 to {budget.limits.git_candidates} host {package['repository']} bare databases, found {len(names)}",
+            {"operation": "count git candidates", "component": package["repository"]},
         )
     candidates: list[dict] = []
     home = cargo_home / "seed-home"
@@ -817,8 +1011,18 @@ def _seed_git_source(
                 "files": [],
             }
             candidates.append(record)
-            measured = _measure_git(host, parts, budget)
+            prov_candidate = {
+                "database": name,
+                "identity": {},
+                "measured_bytes": None,
+                "copied": False,
+                "commit_present": None,
+            }
+            if git_record is not None:
+                git_record["candidates"].append(prov_candidate)
+            measured = _measure_git(host, parts, budget, identity=prov_candidate["identity"])
             record["measured_bytes"] = measured
+            prov_candidate["measured_bytes"] = measured
             if budget.used + measured > budget.limits.aggregate_bytes:
                 record["skipped"] = (
                     "measured bytes would exceed the remaining 256 MiB aggregate; not attempted"
@@ -872,6 +1076,8 @@ def _seed_git_source(
                 f"git-rev-commit-{index}",
             )
             record["commit_present"] = resolved == package["rev"]
+            prov_candidate["copied"] = True
+            prov_candidate["commit_present"] = record["commit_present"]
             if not record["commit_present"]:
                 # A copied candidate that does not carry the locked commit is
                 # rejected, not a failure: its bytes stay charged and its
@@ -904,13 +1110,43 @@ def seed_cargo_home(
     *,
     limits: Limits = LIMITS,
     deadline_ns: int | None = None,
+    provenance: dict | None = None,
 ) -> dict:
     """Seed one private offline Cargo home from the lock and the host cache.
 
     Reads only the host cache named by `host_cargo_home`, never runs a network
     command, never writes to the host cache and never removes a charged byte.
     Returns the manifest the caller keeps as evidence.
+
+    `provenance`, when given, is filled in place (schema `oxide.seed-provenance/1`):
+    the explicit requested source, the private destination, the opened source
+    and namespace identities, and on refusal the failing component, operation,
+    errno and every fact gathered before it. The same record is returned as
+    `seed["provenance"]` on success. Callers that omit it see no change.
     """
+    if provenance is not None:
+        provenance.clear()
+        provenance.update(new_provenance(host_cargo_home, cargo_home))
+    try:
+        return _seed_cargo_home(
+            host_cargo_home, cargo_home, lock_bytes,
+            limits=limits, deadline_ns=deadline_ns, provenance=provenance,
+        )
+    except SeedRefusal as error:
+        if provenance is not None:
+            provenance["refusal"] = _refusal_record(error)
+        raise
+
+
+def _seed_cargo_home(
+    host_cargo_home: Path | str,
+    cargo_home: Path | str,
+    lock_bytes: bytes,
+    *,
+    limits: Limits,
+    deadline_ns: int | None,
+    provenance: dict | None,
+) -> dict:
     budget = Budget(limits, deadline_ns)
     budget.charge_manifest(len(lock_bytes), "Cargo.lock")
     try:
@@ -921,8 +1157,14 @@ def seed_cargo_home(
     destination = Path(cargo_home)
     destination.mkdir(parents=True, exist_ok=True, mode=0o700)
     with Anchor(Path(host_cargo_home), "host CARGO_HOME") as host:
-        registry = _seed_registry(host, destination, registry_packages, budget)
-        git = _seed_git(host, destination, git_packages, budget)
+        if provenance is not None:
+            provenance["source"] = {
+                "dev": host.identity[0],
+                "ino": host.identity[1],
+                "kind": "directory",
+            }
+        registry = _seed_registry(host, destination, registry_packages, budget, provenance)
+        git = _seed_git(host, destination, git_packages, budget, provenance)
     seed = {
         "lock_sha256": hashlib.sha256(lock_bytes).hexdigest(),
         "namespace": registry["namespace"],
@@ -935,6 +1177,8 @@ def seed_cargo_home(
         "limits": limits.document(),
     }
     verify_seed_tree(destination, seed)
+    if provenance is not None:
+        seed["provenance"] = provenance
     return seed
 
 
@@ -1355,6 +1599,146 @@ def self_test(root: Path | str) -> list[dict]:
     case("missing-candidate", missing)
     case("malformed-lock", malformed)
     case("symlinked-input", symlinked_input)
+    def provenance_positive(directory: Path) -> str:
+        host, rev, checksum = _fixture_host(directory)
+        cargo_home = directory / "cargo-home"
+        provenance: dict = {}
+        seed = seed_cargo_home(host, cargo_home, _lock_text(rev, checksum).encode(), deadline_ns=deadline, provenance=provenance)
+        assert provenance["schema"] == PROVENANCE_SCHEMA
+        assert provenance["requested_source"] == str(host), provenance["requested_source"]
+        assert provenance["destination"] == str(cargo_home), provenance["destination"]
+        source_info = os.stat(host)
+        assert provenance["source"] == {"dev": source_info.st_dev, "ino": source_info.st_ino, "kind": "directory"}, provenance["source"]
+        index_info = os.stat(host / "registry" / "index" / CRATES_NAMESPACE)
+        assert provenance["registry"]["index_namespace"] == {"dev": index_info.st_dev, "ino": index_info.st_ino, "kind": "directory"}
+        config_path = host / "registry" / "index" / CRATES_NAMESPACE / "config.json"
+        config_info = os.stat(config_path)
+        config = provenance["registry"]["config_json"]
+        assert (config["dev"], config["ino"]) == (config_info.st_dev, config_info.st_ino), config
+        assert config["sha256"] == hashlib.sha256(config_path.read_bytes()).hexdigest()
+        assert provenance["refusal"] is None
+        assert seed["provenance"] is provenance
+        git = provenance["git"]
+        assert len(git) == 1 and git[0]["repository"] == "seedrepo", git
+        db_info = os.stat(host / "git" / "db")
+        assert git[0]["root"] == {"dev": db_info.st_dev, "ino": db_info.st_ino, "kind": "directory"}, git[0]["root"]
+        candidate = git[0]["candidates"][0]
+        assert candidate["copied"] is True and candidate["commit_present"] is True, candidate
+        assert "files" not in candidate, "candidate file lists stay in the seed manifest, not the provenance"
+        return "explicit source, opened identities, bounded candidate rows"
+
+    def provenance_missing_namespace(directory: Path) -> str:
+        host, rev, checksum = _fixture_host(directory)
+        shutil.rmtree(host / "registry" / "index" / CRATES_NAMESPACE)
+        provenance: dict = {}
+        expect_refusal(
+            lambda: seed_cargo_home(host, directory / "cargo-home", _lock_text(rev, checksum).encode(), deadline_ns=deadline, provenance=provenance),
+            "missing",
+        )
+        refusal = provenance["refusal"]
+        assert refusal["component"] == CRATES_NAMESPACE and refusal["component_index"] == 2, refusal
+        assert refusal["errno"] == "ENOENT" and refusal["kind"] == "unknown", refusal
+        assert refusal["operation"].startswith("open directory"), refusal
+        assert provenance["source"] is not None, "the root opened before the refusal"
+        assert provenance["registry"]["index_namespace"] is None and provenance["registry"]["config_json"] is None
+        return f"first failed component {refusal['component']} at index {refusal['component_index']}: {refusal['errno']}"
+
+    def provenance_symlinked_namespace(directory: Path) -> str:
+        host, rev, checksum = _fixture_host(directory)
+        index = host / "registry" / "index" / CRATES_NAMESPACE
+        moved = directory / "moved-index"
+        index.rename(moved)
+        index.symlink_to(moved)
+        provenance: dict = {}
+        expect_refusal(
+            lambda: seed_cargo_home(host, directory / "cargo-home", _lock_text(rev, checksum).encode(), deadline_ns=deadline, provenance=provenance),
+            "seed directory is",
+        )
+        refusal = provenance["refusal"]
+        assert refusal["component"] == CRATES_NAMESPACE and refusal["component_index"] == 2, refusal
+        assert refusal["errno"] in ("ELOOP", "ENOTDIR"), refusal["errno"]
+        # A link or ENOTDIR never proves the entry kind; the seed does not guess it.
+        assert refusal["kind"] == "unknown", refusal
+        assert provenance["registry"]["index_namespace"] is None
+        return f"symlinked namespace refused at {refusal['component']} with {refusal['errno']}, kind unknown"
+
+    def provenance_symlinked_archive(directory: Path) -> str:
+        host, rev, checksum = _fixture_host(directory)
+        archive = host / "registry" / "cache" / CRATES_NAMESPACE / "seedcrate-1.2.3.crate"
+        elsewhere = directory / "elsewhere.crate"
+        archive.rename(elsewhere)
+        archive.symlink_to(elsewhere)
+        provenance: dict = {}
+        expect_refusal(
+            lambda: seed_cargo_home(host, directory / "cargo-home", _lock_text(rev, checksum).encode(), deadline_ns=deadline, provenance=provenance),
+            "symlink",
+        )
+        refusal = provenance["refusal"]
+        assert refusal["component"] == "seedcrate-1.2.3.crate" and refusal["component_index"] == 3, refusal
+        assert refusal["errno"] == "ELOOP" and refusal["kind"] == "unknown", refusal
+        # Facts gathered before the refusal survive it: the namespaces and config.
+        assert provenance["registry"]["index_namespace"] is not None
+        assert provenance["registry"]["config_json"] is not None
+        return "symlinked archive refused at its own component with ELOOP; earlier facts kept"
+
+    def provenance_missing_git_root(directory: Path) -> str:
+        host, rev, checksum = _fixture_host(directory)
+        shutil.rmtree(host / "git")
+        provenance: dict = {}
+        expect_refusal(
+            lambda: seed_cargo_home(host, directory / "cargo-home", _lock_text(rev, checksum).encode(), deadline_ns=deadline, provenance=provenance),
+            "missing",
+        )
+        refusal = provenance["refusal"]
+        assert refusal["component"] == "git" and refusal["component_index"] == 0, refusal
+        assert refusal["errno"] == "ENOENT", refusal
+        assert provenance["git"][0]["root"] == {}, "an unopened database root carries no identity"
+        assert provenance["registry"]["config_json"] is not None, "registry facts gathered first are kept"
+        return "missing git database refused at its own component; registry facts kept"
+
+    def provenance_empty_git_partial(directory: Path) -> str:
+        host, rev, checksum = _fixture_host(directory)
+        for child in (host / "git" / "db").iterdir():
+            shutil.rmtree(child)
+        provenance: dict = {}
+        expect_refusal(
+            lambda: seed_cargo_home(host, directory / "cargo-home", _lock_text(rev, checksum).encode(), deadline_ns=deadline, provenance=provenance),
+            "bare databases",
+        )
+        refusal = provenance["refusal"]
+        assert refusal["operation"] == "count git candidates", refusal
+        assert provenance["git"][0]["root"]["kind"] == "directory", "the opened database root keeps its identity"
+        assert provenance["git"][0]["candidates"] == []
+        assert provenance["registry"]["config_json"] is not None and provenance["source"] is not None
+        return "zero candidates refused after the registry and the database root were opened"
+
+    def provenance_different_device(directory: Path) -> str:
+        host, rev, checksum = _fixture_host(directory)
+        anchor = Anchor(host, "host CARGO_HOME")
+        try:
+            # Seen from the anchor, the seed's device is one the directory is not on.
+            anchor.dev = anchor.dev + 1
+            try:
+                anchor.open_dir(("registry", "index"))
+            except SeedRefusal as error:
+                facts = error.facts
+            else:
+                raise AssertionError("a directory off the seed device was accepted")
+        finally:
+            anchor.close()
+        # The first component already sits off the seed device, so it is the one named.
+        assert facts["kind"] == "directory" and facts["component"] == "registry" and facts["component_index"] == 0, facts
+        assert facts["expected_dev"] == facts["dev"] + 1, facts
+        assert facts["errno"] is None, facts
+        return "off-device directory refused at its component with both device numbers"
+
+    case("provenance-positive", provenance_positive)
+    case("provenance-missing-namespace", provenance_missing_namespace)
+    case("provenance-symlinked-namespace", provenance_symlinked_namespace)
+    case("provenance-symlinked-archive", provenance_symlinked_archive)
+    case("provenance-missing-git-root", provenance_missing_git_root)
+    case("provenance-empty-git-partial", provenance_empty_git_partial)
+    case("provenance-different-device", provenance_different_device)
     case("cap-negatives", caps)
     return records
 

@@ -2865,6 +2865,79 @@ rules, production readers, locks, errors, selection, dependencies, pins,
 toolchain, MSRV, the private-build/export provider and its qualification, the
 O2/C1/C1-prime/C2 holds, Route B, `oxide#241`/#222 and every live gate.
 
+## Seed-only readiness for the observation's two locks (oxide#294)
+
+**Status: source-prepared with synthetic covering; not activated.** No real seed,
+Cargo resolution, staging build, engine, observation, image or native diagnostic
+ran. The one prospective uncounted control needs a planner-bound occurrence and
+its own activation, and this preparation grants neither.
+
+**Explicit seed source.** The observation's seed reads one named host cache:
+`invoking_cargo_home()` now requires an absolute `CARGO_HOME` and refuses an
+unset or relative value before any staging. The implicit `~/.cargo` fallback is
+gone. Staging's own `HOME` and `CARGO_HOME` stay fresh private destinations, so
+the named source is read and never written. Each side's report entry under
+`seeds` records the seed-source role, the lock digest and the seeder's
+provenance (see [workflow](workflow.md#bounded-offline-lock-seeder)). That entry
+is published on a seed refusal too, before any stage record exists, so the
+requested source, the opened identities and the first failed component survive
+the refusal. The observation's 900 s and 1536 MiB envelope, parser, verdict and
+export rules are unchanged.
+
+**Readiness control.** `scripts/tape-seed-readiness.py` (`--plan`, `--self-test`,
+`--control`) seeds the Oxide lock and then the Barge lock from one explicit seed
+source, each into its own private destination inside the guard's owned root.
+Effigy selectors: `proof:seed-readiness:test` (heavy, 300 s, 512 MiB, synthetic),
+`proof:seed-readiness:plan` (effect-free) and `proof:seed-readiness:control`
+(heavy, 180 s, 512 MiB, refuses until a binding and its digest are supplied through
+`SEED_READINESS_BINDING` and `SEED_READINESS_BINDING_SHA256`).
+
+- **Authenticated lock bytes.** Each `Cargo.lock` is read from its bound commit
+  with read-only object queries. Its tree, its blob and its SHA-256 must all match
+  the binding before any seed. For Barge, the binding also names the reviewed
+  custody source `05b4b52` and requires its tree to equal the pinned sibling's
+  tree. The reference values are `Cargo.lock` blob `e188bee6` and SHA-256
+  `4cb40dd5…` at `d9eac3b` (tree `68f96990`). Oxide's reference digest is
+  `e7dcf464…`, bound to the commit the planner names.
+- **Shared window.** Both seeds share one absolute deadline: the guard's deadline
+  less a 30 s shutdown margin, so the shared window is 150 s of the 180 s limit.
+  Each seed keeps the seeder's own 45 s cumulative work cap and its limits. No
+  seed retries and no clock resets.
+- **Second lock gate.** The second lock runs only when the first ended cleanly
+  and the window is still open. An unknown-closure first outcome keeps the second
+  lock `not-run` with the reason named.
+- **Report.** One `oxide.capture.seed-readiness/1` document with `qualified`
+  false. Per lock: the bound identities, `completed`, `refused` or `not-run`, the
+  seeder's manifest summary (counts, bytes, the candidate `commit_present` facts
+  and one manifest digest, with no file list), its provenance or refusal, elapsed
+  time and closure. The exit is 0 only when both locks complete and the report is
+  published. A publication failure is nonzero.
+- **Premises.** The nine proof-authoring premises are applied in the script's
+  `PREMISES` table, each with its source site or a not-applicable reason. No
+  Cargo, rustc, product, account, image or engine child exists in this mode.
+
+**Validation at this head.** `proof:offline-seed:test` passed 21 synthetic cases
+(seven new provenance cases). `proof:tape-prune:observation-test` passed 184
+controls, five of them new: two for the seed-refusal report and its run
+boundary, and three for the explicit seed source (an unset, a relative and an
+absolute `CARGO_HOME`). `proof:tape-prune:observation-plan` and
+`proof:seed-readiness:plan` are effect-free and passed. `proof:seed-readiness:test`
+passed 32 controls, including two real locks through the shared seeder on tiny
+fixtures (an explicit source with a private destination, a refused second seed
+with its partial provenance, and an unchanged host tree). `docs:check` gates
+this text. No Rust input changed.
+
+**Not claimed.** A completed seed would establish current copy and verification
+facts only. It would not establish the historical cause of the oxide#293 refusal
+at `registry/index/index.crates.io-1949cf8c6b5b557f`, Cargo's sparse-index
+acceptance, a Git namespace choice, compilation, 900 s / 1536 MiB build fit, an
+observation, a comparison or a qualification. The oxide#293 occurrence stays
+spent, and no fact here reopens it.
+
+**Unchanged.** The 900 s and 1536 MiB observation envelope, the qualified
+supervisor bytes, the Barge custody gate, the parser, verdict and export rules,
+the 45 s and 256 MiB seeder bounds, locks, toolchain, pins and every live gate.
+
 ## Shared private-build validation gate (oxide#248)
 
 The capture tasks' private debug-build validation shares one common
