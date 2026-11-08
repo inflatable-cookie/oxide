@@ -25,10 +25,26 @@
 //!
 //! The exclusion set is a fixed, source-owned enumeration in this module. It
 //! is not a caller-supplied waiver list and it is never derived from the text
-//! of a strict issue: strict issues are matched against the recorder's own two
-//! fixed templates only, and any strict issue those templates do not explain
-//! is recorded as its own blocking reason. A strict insufficiency can
+//! of a strict issue: strict issues are matched against three fixed templates
+//! only (the window sentence, the recorder's parent-obligation sentence, and
+//! `wrong identity at <site>`), and any strict issue those templates do not
+//! explain is recorded as its own blocking reason. A strict insufficiency can
 //! therefore never be turned into a limited pass by a matching decision.
+//!
+//! The third template is narrow (oxide#288). `assess_completeness` keeps the
+//! full `/2` identity comparison, so a file obligation that names
+//! `parent_device`/`parent_inode` reports `wrong identity at <site>` for the
+//! parent-free leaf row a path-only reader records. That is the same parent
+//! gap the granted `path-only-direct-read-parent` limitation already excludes,
+//! so the verdict explains it only when every fact is established from the
+//! same two documents: the exact registered descriptor-observed site, its
+//! granted limitation, a recorder-bound leaf (the recorder's own
+//! parent-obligation line and no unbound sentence), a descriptor-backed
+//! parent-free row, and an exact match of every named non-parent identity key
+//! through the shared `capture_wire::path_only_identity_fields_match`. The
+//! strict issue list is retained verbatim either way; a mismatch in any other
+//! named key, a different row or leaf, an unlisted or non-observed site and
+//! every handle/component/volume/process row keep blocking.
 //!
 //! Two boundaries are deliberate and narrow. First, the manifest's
 //! `mandatory_observations` list *is* the declaration of which reads the
@@ -67,15 +83,18 @@ created `fixture.entries` entry through one rule, `bound_leaf`: a safe relative 
 row's own device and inode, the same bytes digest or observed outcome, and the declared window; a \
 path label is not parent proof and the entry's declared parent is never compared. The remaining \
 `parent_required` obligation is reported on its own line (`obligation parent_required unproven at \
-<site>`), which the limited policy explains only with a granted path-only limitation. What still \
-blocks, precisely: (1) the /2 file-form obligation identity requires `parent_device` and \
-`parent_inode` (`capture_wire.rs obligation_identity`), so the strict assessment reports `wrong \
-identity at <site>` for a parent-free leaf and that template is not one of the two reviewed \
-exclusions, so no limited verdict is sufficient; (2) no export-closure digest and receipt is \
-qualified; (3) Barge has no per-case fixture builder (see barge_support), so neither side can \
-declare the case; (4) the owner marker read (`openat` from a held root descriptor), the absence-walk \
+<site>`), which the limited policy explains only with a granted path-only limitation. The strict \
+`wrong identity at <site>` template is explained by that same granted limitation only when it \
+proves no new input (oxide#288): the exact registered descriptor-observed site, the granted \
+limitation, the recorder's own `obligation parent_required unproven at <site>` binding line with \
+no unbound sentence, a descriptor-backed parent-free row and an exact match of every named \
+non-parent key through `path_only_identity_fields_match`; anything else keeps the block, so the \
+cause is never inferred from the issue text and no other key, row or site is set aside. What still \
+blocks, precisely: (1) no export-closure digest and receipt is qualified; (2) Barge has no per-case \
+fixture builder (see barge_support), so neither side can declare the case; (3) the owner marker read \
+(`openat` from a held root descriptor), the absence-walk \
 components and every `authority-read@store::*` custody read stay handle-class or custody-class and \
-unexcludable while K1 is unqualified; (5) the pre-open observation rows \
+unexcludable while K1 is unqualified; (4) the pre-open observation rows \
 (`private-file:open`, the first `read-bounded:open` row) carry no identity by design and stay \
 unbound, because those sites are shared helpers this change must not observe";
 
@@ -552,7 +571,7 @@ const NOTE_VOCABULARY: &[(&str, NoteRule)] = &[
     // It is explained by a granted path-only limitation on that exact site and
     // by nothing else.
     (
-        "obligation parent_required unproven at ",
+        RECORDER_PARENT_OBLIGATION_PREFIX,
         NoteRule::PathOnlyParentExplained,
     ),
     (
@@ -677,12 +696,20 @@ const NOTE_VOCABULARY: &[(&str, NoteRule)] = &[
     ),
 ];
 
-/// The strict issues the review permits the limited verdict to explain. Both
-/// templates are the shared completeness module's own fixed strings; anything
-/// else is `StrictIssueUnexplained`.
+/// The strict issues the review permits the limited verdict to explain. All
+/// three templates are the shared completeness module's own fixed strings;
+/// anything else is `StrictIssueUnexplained`.
 const STRICT_WINDOW_ISSUE: &str = "window origin and end unproven";
 const STRICT_PARENT_ISSUE_PREFIX: &str = "parent_required unproven at ";
 const STRICT_PARENT_ISSUE_SUFFIX: &str = ": handle parent still needs qualified K1";
+/// The recorder's separate parent-obligation sentence (oxide#287). It is the
+/// recorder's own positive statement that `tape.rs bound_leaf` bound the leaf
+/// row to a deliberately created fixture entry and that only its parent is
+/// unproven, so the policy reads that verdict instead of re-deriving it.
+const RECORDER_PARENT_OBLIGATION_PREFIX: &str = "obligation parent_required unproven at ";
+/// The strict `/2` identity template a granted path-only limitation explains
+/// only when the parent gap is its entire cause (oxide#288).
+const STRICT_WRONG_IDENTITY_PREFIX: &str = "wrong identity at ";
 
 // ---------------------------------------------------------------------------
 // Verdict
@@ -706,6 +733,15 @@ pub(crate) struct SiteEvidence {
     pub(crate) disposition: &'static str,
 }
 
+/// One strict issue this verdict sets aside, verbatim, with the reviewed
+/// exclusion that explains it. The strict issue list itself is never rewritten.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Explanation {
+    pub(crate) issue: String,
+    pub(crate) rule: ExclusionRule,
+    pub(crate) site: String,
+}
+
 /// One limited verdict for one engine's transcript against one manifest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LimitedVerdict {
@@ -716,6 +752,7 @@ pub(crate) struct LimitedVerdict {
     pub(crate) strict: StrictResult,
     pub(crate) blocking: Vec<Blocking>,
     pub(crate) limitations: Vec<Limitation>,
+    pub(crate) explained: Vec<Explanation>,
     pub(crate) per_site: Vec<SiteEvidence>,
 }
 
@@ -749,6 +786,15 @@ impl LimitedVerdict {
                 "complete": self.strict.complete,
                 "issues": self.strict.issues,
             },
+            "explained_strict_issues": self
+                .explained
+                .iter()
+                .map(|explanation| json!({
+                    "issue": explanation.issue,
+                    "rule": explanation.rule.name(),
+                    "site": explanation.site,
+                }))
+                .collect::<Vec<_>>(),
             "blocking": self
                 .blocking
                 .iter()
@@ -849,6 +895,155 @@ fn own_identity_bound(row: &Value) -> bool {
     };
     identity.get("device").is_some_and(|value| !value.is_null())
         && identity.get("inode").is_some_and(|value| !value.is_null())
+}
+
+/// The one row shape a declared path-only reader records: its own device and
+/// inode with `handle` provenance from the declared held-descriptor
+/// observation, and no parent at all. A row that carries a parent is not this
+/// row, and a pathname precheck's extracted or contextual identity is never the
+/// read descriptor's own (oxide#287).
+fn descriptor_backed_parent_free(row: &Value) -> bool {
+    let Some(identity) = row.get("identity") else {
+        return false;
+    };
+    let descriptor = identity.get("own_source").and_then(Value::as_str) == Some("handle")
+        && identity.get("device").is_some_and(|value| !value.is_null())
+        && identity.get("inode").is_some_and(|value| !value.is_null());
+    let no_parent = identity.get("parent_source").and_then(Value::as_str) == Some("none")
+        && !identity
+            .get("parent_device")
+            .is_some_and(|value| !value.is_null())
+        && !identity
+            .get("parent_inode")
+            .is_some_and(|value| !value.is_null());
+    descriptor && no_parent
+}
+
+/// Whether the recorder stated, on its own line, that this site's leaf bound a
+/// deliberately created fixture entry and only its parent stays unproven. The
+/// recorder emits `obligation parent_required unproven at <site>` only after
+/// `tape.rs bound_leaf` succeeded, so this reads the recorder's binding verdict
+/// rather than re-deriving it.
+fn recorder_bound_the_leaf(transcript: &Value, site: &str) -> bool {
+    let note = format!("{RECORDER_PARENT_OBLIGATION_PREFIX}{site}");
+    transcript
+        .get("notes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|value| value.as_str() == Some(note.as_str()))
+}
+
+/// Why one strict `/2` `wrong identity at <site>` issue is caused by exactly
+/// the parent identity a granted path-only limitation already excludes, and by
+/// nothing else (oxide#288).
+///
+/// Every condition is established from the same two documents the verdict
+/// judged; the strict result itself is never consulted for anything but the
+/// issue string, and no strict issue is ever rewritten:
+///
+/// 1. the site is the exact registered descriptor-observed authority site
+///    (`prune.rs OBSERVED_PATH_ONLY_SITES`), so an unlisted site, the
+///    path-only-class helper rows and every handle/custody site stay out;
+/// 2. the existing eligible parent limitation was granted at that site, which
+///    already required a path-only class, `parent_required`, a bound own
+///    identity and no recorder unbound sentence;
+/// 3. the recorder bound the leaf to its fixture entry and said so on its own
+///    parent-obligation line, and it reports no unbound sentence for the site;
+/// 4. every obligation at the site whose full `/2` comparison fails names a
+///    non-empty path and at least one parent key, and has one descriptor-backed
+///    parent-free row that matches every named non-parent key exactly under the
+///    shared `path_only_identity_fields_match` rule. The strict comparison must
+///    still fail for that obligation, so the elided keys are its whole cause.
+///
+/// Anything else — a different device, inode, path or another named key, a
+/// missing row or leaf, an unbound or unstated recorder binding, a changed
+/// site or a non-descriptor row — returns `false` and leaves the issue
+/// blocking.
+#[allow(clippy::too_many_arguments)]
+fn wrong_identity_is_only_the_granted_parent_gap(
+    site: &str,
+    transcript: &Value,
+    manifest: &Value,
+    window: Option<&str>,
+    reads: &[&Value],
+    limitations: &[Limitation],
+    unbound_sites: &[String],
+) -> bool {
+    if crate::prune::observed_path_only_row_kind(site).is_none() {
+        return false;
+    }
+    if !limitations.iter().any(|limitation| {
+        limitation.rule == ExclusionRule::PathOnlyDirectReadParent && limitation.site == site
+    }) {
+        return false;
+    }
+    if unbound_sites.iter().any(|unbound| unbound == site) {
+        return false;
+    }
+    if !recorder_bound_the_leaf(transcript, site) {
+        return false;
+    }
+    let engine = transcript
+        .get("engine")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let at_site: Vec<&&Value> = reads
+        .iter()
+        .filter(|row| row.get("site").and_then(Value::as_str) == Some(site))
+        .collect();
+    let obligations_at_site: Vec<&Value> = manifest
+        .get("mandatory_observations")
+        .and_then(Value::as_array)
+        .map(|obligations| {
+            obligations
+                .iter()
+                .filter(|obligation| {
+                    obligation.get("engine").and_then(Value::as_str) == Some(engine)
+                        && obligation.get("site").and_then(Value::as_str) == Some(site)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut failing = 0usize;
+    for obligation in obligations_at_site {
+        let identity = &obligation["identity"];
+        // An obligation whose full comparison matches contributes no issue.
+        if at_site
+            .iter()
+            .any(|row| capture_wire::identity_fields_match(identity, &row["identity"], window))
+        {
+            continue;
+        }
+        if obligation.get("parent_required").and_then(Value::as_bool) != Some(true) {
+            return false;
+        }
+        let Some(want) = identity.as_object() else {
+            return false;
+        };
+        if !want
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| !path.is_empty())
+        {
+            return false;
+        }
+        let names_parent = ["parent_device", "parent_inode"]
+            .iter()
+            .any(|key| want.get(*key).is_some_and(|value| !value.is_null()));
+        if !names_parent {
+            return false;
+        }
+        let matches = at_site.iter().any(|row| {
+            descriptor_backed_parent_free(row)
+                && capture_wire::path_only_identity_fields_match(identity, &row["identity"], window)
+        });
+        if !matches {
+            return false;
+        }
+        failing += 1;
+    }
+    failing > 0
 }
 
 /// Evaluate one capture pair under the limited policy.
@@ -1575,8 +1770,16 @@ parent_required",
     }
 
     // -- strict preservation -------------------------------------------------
+    // Each reviewed template is matched against its own narrow condition; every
+    // issue a condition does not establish is recorded verbatim as unexplained.
+    let mut explained: Vec<Explanation> = Vec::new();
     for issue in &strict.issues {
         if issue == STRICT_WINDOW_ISSUE && window_null {
+            explained.push(Explanation {
+                issue: issue.clone(),
+                rule: ExclusionRule::WindowOriginEndNull,
+                site: "transcript.window".to_owned(),
+            });
             continue;
         }
         if let Some(site) = issue
@@ -1584,6 +1787,29 @@ parent_required",
             .and_then(|rest| rest.strip_suffix(STRICT_PARENT_ISSUE_SUFFIX))
         {
             if limited_sites.iter().any(|limited| limited == site) {
+                explained.push(Explanation {
+                    issue: issue.clone(),
+                    rule: ExclusionRule::PathOnlyDirectReadParent,
+                    site: site.to_owned(),
+                });
+                continue;
+            }
+        }
+        if let Some(site) = issue.strip_prefix(STRICT_WRONG_IDENTITY_PREFIX) {
+            if wrong_identity_is_only_the_granted_parent_gap(
+                site,
+                transcript,
+                manifest,
+                window,
+                &reads,
+                &limitations,
+                &unbound_sites,
+            ) {
+                explained.push(Explanation {
+                    issue: issue.clone(),
+                    rule: ExclusionRule::PathOnlyDirectReadParent,
+                    site: site.to_owned(),
+                });
                 continue;
             }
         }
@@ -1598,6 +1824,8 @@ parent_required",
     blocking.dedup();
     limitations.sort();
     limitations.dedup();
+    explained.sort();
+    explained.dedup();
     per_site.sort_by(|left, right| left.site.cmp(&right.site));
 
     LimitedVerdict {
@@ -1608,6 +1836,7 @@ parent_required",
         strict: strict_result,
         blocking,
         limitations,
+        explained,
         per_site,
     }
 }
@@ -1901,12 +2130,11 @@ const FAMILIES: &[Family] = &[
         cases: &["CTL-0", "CTL-1"],
         status: CaseStatus::Insufficient,
         reason: "the registry and receipt rows are declared path-only sites and now bind their \
-own leaf entries, but the owner marker is opened with openat from a held root descriptor \
-(handle-class, K1 unqualified) and the pre-open `private-file:open` row carries no identity by \
-design, so those rows bind nothing. The path-only rows' `parent_required` obligation stays \
-unproven and the /2 file-form obligation identity still demands a parent, so the strict `wrong \
-identity at <site>` template is left unexplained. The export gate and Barge's missing per-case \
-fixture builder hold the case regardless",
+own leaf entries; their `parent_required` obligation and the matching strict parent-free-leaf \
+identity template are explained by the granted path-only limitation (oxide#288). The owner marker \
+is opened with openat from a held root descriptor (handle-class, K1 unqualified) and the pre-open \
+`private-file:open` row carries no identity by design, so those inputs bind nothing. The export \
+gate and Barge's missing per-case fixture builder hold the case regardless",
         overrides: &[],
         cf: &[Cf::Cf1, Cf::Cf4],
         cf_absent: &[
@@ -1952,12 +2180,11 @@ fixture builder hold the case regardless",
             "CAP-1",
         ],
         status: CaseStatus::Insufficient,
-        reason: "the registry read is a declared path-only site: its row now carries the held \
+        reason: "the registry read is a declared path-only site: its row carries the held \
 descriptor's own device and inode and binds a deliberately created fixture entry, and its \
-`parent_required` obligation is reported on its own line. The case is still held because the /2 \
-file-form obligation identity requires a parent, so the strict `wrong identity at <site>` \
-template stays unexplained, and because Barge has no per-case fixture builder and no \
-export-closure receipt is qualified",
+`parent_required` obligation and strict parent-free-leaf identity template are both explained by \
+the granted path-only limitation (oxide#288). The case is still held because Barge has no per-case \
+fixture builder and no export-closure receipt is qualified",
         overrides: &[CaseOverride {
             id: "CAP-1",
             status: CaseStatus::Insufficient,
@@ -2003,10 +2230,10 @@ partial parity is claimed",
             "REF-ORPHAN-MARKED",
         ],
         status: CaseStatus::Insufficient,
-        reason: "the registry row is a declared path-only site and now binds its own fixture \
-entry; the intents this family needs are a projection over those same rows for Oxide (Barge \
-enumerates the directory, CF-1). The case is still held by the /2 file-form obligation identity \
-(parent-free leaves keep the strict `wrong identity at <site>` template unexplained), by the \
+        reason: "the registry row is a declared path-only site and binds its own fixture entry; \
+its `parent_required` obligation and strict parent-free-leaf identity template are explained by the \
+granted path-only limitation (oxide#288), and the intents this family needs are a projection over \
+those same rows for Oxide (Barge enumerates the directory, CF-1). The case is still held by the \
 export gate and by Barge's missing per-case fixture builder",
         overrides: &[CaseOverride {
             id: "REF-ORPHAN-MARKED",
@@ -2111,11 +2338,11 @@ enumeration), outputs::read_marker and prune::observe_root_in's owner-marker par
             "ABS-UUID-CONFLICT",
         ],
         status: CaseStatus::Insufficient,
-        reason: "the volume-census rows bind their own volume identity, and the registry row now \
-binds its own leaf entry. The owner marker stays handle-class (openat from the held root), so \
-the decision's marker input is unexcludable while K1 is unqualified; the /2 file-form obligation \
-identity keeps the strict parent-free-leaf template unexplained; the export gate and Barge's \
-missing per-case fixture builder hold the family too",
+        reason: "the volume-census rows bind their own volume identity, and the registry row binds \
+its own leaf entry whose `parent_required` obligation and strict parent-free-leaf identity template \
+the granted path-only limitation explains (oxide#288). The owner marker stays handle-class (openat \
+from the held root), so the decision's marker input is unexcludable while K1 is unqualified; the \
+export gate and Barge's missing per-case fixture builder hold the family too",
         overrides: &[
             CaseOverride {
                 id: "ID-INODE",
@@ -2218,8 +2445,8 @@ inputs stay insufficient",
         status: CaseStatus::Insufficient,
         reason: "the fence lives in the pool control read (`authority-read@store::load`), a \
 custody-class read no reviewed exclusion covers, and the registry row that precedes it is \
-path-only: it now binds its own leaf entry but keeps its unproven parent, whose limit the /2 \
-file-form obligation identity still reports as a strict wrong identity",
+path-only: it binds its own leaf entry, and the granted limitation explains its parent obligation \
+and the strict parent-free-leaf identity template together (oxide#288)",
         overrides: &[
             CaseOverride {
                 id: "DECL-MISSING",
@@ -2265,10 +2492,10 @@ claim exists",
         name: "legacy and operator list",
         cases: &["LEG-UNLISTED", "LEG-LISTED", "LEG-LISTED-MARKED", "LEG-RECEIPTLESS"],
         status: CaseStatus::Insufficient,
-        reason: "the operator list and the receipts are declared path-only sites and now bind \
-their own leaf entries; their `parent_required` obligations stay unproven and the /2 file-form \
-obligation identity still leaves the strict `wrong identity at <site>` template unexplained. \
-Barge's receipt enumeration (CF-1) is a second, separate requirement",
+        reason: "the operator list and the receipts are declared path-only sites and bind their \
+own leaf entries; their `parent_required` obligations and strict parent-free-leaf identity \
+templates are explained by the granted path-only limitation (oxide#288). Barge's receipt \
+enumeration (CF-1) is a second, separate requirement",
         overrides: &[CaseOverride {
             id: "LEG-LISTED",
             status: CaseStatus::Insufficient,
@@ -2543,8 +2770,10 @@ pub(crate) fn plan_document() -> Value {
         "executable_today": false,
         "execution_gate": "every case is still held: no export-closure digest and receipt is \
     qualified, Barge has no per-case fixture builder, and no first-batch decision input is complete \
-    under /2 (a parent-free leaf keeps the strict wrong-identity template unexplained; see \
-    binding_gap); this plan is readiness only and gives no comparison, parity or native credit",
+    under /2 (the oxide#288 ruling explains the strict wrong-identity template only as the parent \
+    gap a granted path-only limitation already excludes, so it adds no input, and the remaining \
+    inputs are handle-class, custody-class or identity-less; see binding_gap); this plan is \
+    readiness only and gives no comparison, parity or native credit",
         "barge_support": {
             "summary": BARGE_SUPPORT_REQUIREMENT,
             "harness": "crates/barge/tests/tape_eval.rs (harness = false) at f9f81f72",
@@ -2567,8 +2796,10 @@ pub(crate) fn plan_document() -> Value {
                 .map(|site| json!({"site": site.kind, "class": site.class.name(), "source": site.source}))
                 .collect::<Vec<_>>(),
             "closure": "the recorder observation and the entry binding are implemented \
-    (oxide#287); what remains is a /2 identity form or a reviewed exclusion for a parent-free file \
-    obligation, the export gate and Barge's per-case fixture builder, each separately authorised",
+    (oxide#287), and the strict parent-free-leaf identity template is explained only as that same \
+    granted parent gap (oxide#288). What remains is the export gate, Barge's per-case fixture \
+    builder, and the handle-class, custody-class and identity-less inputs no reviewed exclusion \
+    covers, each separately authorised",
         },
         "exclusions": [
             {
@@ -2913,8 +3144,36 @@ fn controls() -> Vec<(&'static str, fn() -> Control)> {
             recorder_bound_leaf_without_binding_is_insufficient,
         ),
         (
-            "a parent-free leaf is explained only by the strict template",
-            parent_free_leaf_is_explained_only_by_the_strict_template,
+            "the parent-only strict identity template is explained",
+            parent_only_strict_identity_is_explained,
+        ),
+        (
+            "the strict template needs the recorder's binding line",
+            parent_gap_explanation_requires_the_recorder_binding,
+        ),
+        (
+            "the strict template needs the descriptor-backed row",
+            parent_gap_explanation_requires_the_descriptor_row,
+        ),
+        (
+            "the strict template keeps every other named identity key",
+            parent_gap_explanation_keeps_other_named_keys,
+        ),
+        (
+            "a wrong leaf keeps the strict template blocking",
+            parent_gap_explanation_rejects_a_wrong_leaf,
+        ),
+        (
+            "an unlisted site keeps the strict template blocking",
+            parent_gap_explanation_rejects_an_unlisted_site,
+        ),
+        (
+            "a handle parent keeps the strict template blocking",
+            parent_gap_explanation_rejects_a_handle_parent,
+        ),
+        (
+            "the canonical parser route explains only the parent gap",
+            parent_only_explanation_through_the_canonical_parser,
         ),
         (
             "the parent obligation note is explained only at its own site",
@@ -3724,14 +3983,16 @@ fn recorder_bound_leaf_without_binding_is_insufficient() -> Control {
     control(!verdict.sufficient(), "the case is insufficient")
 }
 
-/// The `/2` file form names leaf and parent together (schema shape, from a
-/// deliberately created entry), while the recorder's row carries only the own
-/// identity its held descriptor observed. The policy compares the observed
-/// keys, grants exactly one path-only parent limitation for that leaf, and the
-/// strict `/2` identity template is the single thing it cannot explain.
-/// This is a policy-only document: the recorder emits it once a path-only site's
-/// leaf binds its entry, and the harness check drives that real shape.
-fn parent_free_leaf_is_explained_only_by_the_strict_template() -> Control {
+/// The recorder-faithful parent-only document pair (oxide#288): a file-form
+/// obligation names the parent, and the transcript carries the declared
+/// descriptor-observed leaf row (own `handle` identity, no parent) plus the
+/// recorder's own two sentences — the per-row parent note and the
+/// parent-obligation line that `tape.rs bound_leaf` produces only after it
+/// bound the leaf to a deliberately created fixture entry. These documents are
+/// **policy-only**: they are built here rather than driven through the real
+/// recorder, and `tape_harness.rs leaf_binding_check` drives the same shape end
+/// to end through the canonical parser.
+fn parent_only_documents() -> (Value, Value) {
     let mut manifest = synthetic_manifest();
     manifest["mandatory_observations"] = json!([{
         "engine": "oxide",
@@ -3745,14 +4006,35 @@ fn parent_free_leaf_is_explained_only_by_the_strict_template() -> Control {
             "inode": 4,
         },
     }]);
+    let mut row = synthetic_row(CONTROL_SITE, "none", Some(3), Some(4));
+    row["identity"]["own_source"] = json!("handle");
     let mut transcript = synthetic_transcript();
-    transcript["reads"] = json!([synthetic_row(CONTROL_SITE, "none", Some(3), Some(4))]);
+    transcript["reads"] = json!([row]);
     transcript["notes"] = json!([
         "absolute monotonic window origin and end unproven",
-        "parent identity unproven at authority-read@prune::read_registry",
-        "obligation parent_required unproven at authority-read@prune::read_registry",
+        format!("parent identity unproven at {CONTROL_SITE}"),
+        format!("obligation parent_required unproven at {CONTROL_SITE}"),
     ]);
+    (manifest, transcript)
+}
+
+fn explained_template(verdict: &LimitedVerdict) -> bool {
+    verdict.explained.iter().any(|explanation| {
+        explanation.issue == format!("{STRICT_WRONG_IDENTITY_PREFIX}{CONTROL_SITE}")
+            && explanation.rule == ExclusionRule::PathOnlyDirectReadParent
+            && explanation.site == CONTROL_SITE
+    })
+}
+
+/// The strict `/2` file form names leaf and parent together, while the declared
+/// path-only reader records the leaf's own `handle` identity and no parent. The
+/// granted limitation already excludes that parent, so the strict `wrong
+/// identity at <site>` template is explained only when its entire cause is
+/// exactly that parent gap (oxide#288). The strict issue list stays verbatim.
+fn parent_only_strict_identity_is_explained() -> Control {
+    let (manifest, transcript) = parent_only_documents();
     let verdict = evaluate_limited(&transcript, &manifest, CONTROL_DIGEST);
+    all_pass(&verdict)?;
     let limited: Vec<&Limitation> = verdict
         .limitations
         .iter()
@@ -3762,47 +4044,272 @@ fn parent_free_leaf_is_explained_only_by_the_strict_template() -> Control {
         limited.len() == 1 && limited[0].site == CONTROL_SITE,
         format!("expected one site-bound path-only limitation, got {limited:?}"),
     )?;
+    let template = format!("{STRICT_WRONG_IDENTITY_PREFIX}{CONTROL_SITE}");
     control(
-        limited[0].leaf_identity.contains("device=3")
-            && limited[0].leaf_identity.contains("inode=4"),
-        "the limitation names the leaf the descriptor observed",
+        verdict.strict.issues == vec![STRICT_WINDOW_ISSUE.to_owned(), template.clone()]
+            && !verdict.strict.complete,
+        format!(
+            "the strict issues are retained verbatim: {:?}",
+            verdict.strict.issues
+        ),
     )?;
     control(
-        !blocked_by(&verdict, BlockingRule::WrongLeafIdentity)
-            && !blocked_by(&verdict, BlockingRule::ParentRequiredUnproven)
-            && !blocked_by(&verdict, BlockingRule::RecorderObligationUnmet)
-            && !blocked_by(&verdict, BlockingRule::UnknownNote),
+        explained_template(&verdict),
         format!(
-            "the observed-key comparison and the parent note are both explained: {:?}",
+            "the parent-only strict template is not explained: {:?}",
+            verdict.explained
+        ),
+    )?;
+    let document = verdict.to_document();
+    control(
+        document["explained_strict_issues"]
+            .as_array()
+            .is_some_and(|rows| {
+                rows.iter().any(|row| {
+                    row["issue"] == json!(template)
+                        && row["rule"] == json!("path-only-direct-read-parent")
+                        && row["site"] == json!(CONTROL_SITE)
+                })
+            }),
+        "the verdict document labels the explained strict template and its rule",
+    )?;
+    control(
+        verdict.per_site.iter().any(|site| {
+            site.site == CONTROL_SITE
+                && site.bound
+                && site.parent_required
+                && site.disposition == "path-only-parent-limitation"
+        }),
+        "the site evidence records a bound leaf with the granted parent limitation",
+    )
+}
+
+/// Without the recorder's own parent-obligation line the policy has no
+/// statement that `bound_leaf` bound this leaf to a fixture entry, so the
+/// strict template keeps blocking even though the limitation is granted
+/// (oxide#288).
+fn parent_gap_explanation_requires_the_recorder_binding() -> Control {
+    let (manifest, mut transcript) = parent_only_documents();
+    transcript["notes"] = json!([
+        "absolute monotonic window origin and end unproven",
+        format!("parent identity unproven at {CONTROL_SITE}"),
+    ]);
+    let verdict = evaluate_limited(&transcript, &manifest, CONTROL_DIGEST);
+    control(
+        verdict.limitations.iter().any(|limitation| {
+            limitation.rule == ExclusionRule::PathOnlyDirectReadParent
+                && limitation.site == CONTROL_SITE
+        }),
+        "the limitation itself is still granted",
+    )?;
+    control(
+        !blocked_by(&verdict, BlockingRule::ParentRequiredUnproven),
+        "the granted limitation explains the parent sentence",
+    )?;
+    control(
+        blocked_by(&verdict, BlockingRule::StrictIssueUnexplained) && !explained_template(&verdict),
+        format!(
+            "an unstated recorder binding leaves the strict template unexplained: {:?}",
+            verdict.blocking
+        ),
+    )?;
+    control(!verdict.sufficient(), "the case stays insufficient")
+}
+
+/// A pathname precheck's extracted identity is not the declared held
+/// descriptor's own, so it never explains the strict template (oxide#288).
+fn parent_gap_explanation_requires_the_descriptor_row() -> Control {
+    let (manifest, mut transcript) = parent_only_documents();
+    transcript["reads"][0]["identity"]["own_source"] = json!("extracted");
+    let verdict = evaluate_limited(&transcript, &manifest, CONTROL_DIGEST);
+    control(
+        verdict.limitations.iter().any(|limitation| {
+            limitation.rule == ExclusionRule::PathOnlyDirectReadParent
+                && limitation.site == CONTROL_SITE
+        }),
+        "the own identity is bound, so the limitation is still granted",
+    )?;
+    control(
+        blocked_by(&verdict, BlockingRule::StrictIssueUnexplained) && !explained_template(&verdict),
+        "only the descriptor-backed row explains the strict template",
+    )?;
+    control(!verdict.sufficient(), "the case stays insufficient")
+}
+
+/// Only the two parent keys are ever elided: another named key that differs is
+/// a genuine identity mismatch and keeps the strict template blocking
+/// (oxide#288).
+fn parent_gap_explanation_keeps_other_named_keys() -> Control {
+    let (mut manifest, transcript) = parent_only_documents();
+    manifest["mandatory_observations"][0]["identity"]["component"] = json!("registry.json");
+    let verdict = evaluate_limited(&transcript, &manifest, CONTROL_DIGEST);
+    control(
+        blocked_at(&verdict, BlockingRule::WrongLeafIdentity, CONTROL_SITE),
+        format!(
+            "a mismatch in another named key is a wrong leaf identity: {:?}",
+            verdict.blocking
+        ),
+    )?;
+    control(
+        blocked_by(&verdict, BlockingRule::StrictIssueUnexplained) && !explained_template(&verdict),
+        "an additional mismatching identity key is never elided",
+    )?;
+    control(!verdict.sufficient(), "the case stays insufficient")
+}
+
+/// A different leaf device or inode is a genuine identity mismatch, not the
+/// excluded parent (oxide#288).
+fn parent_gap_explanation_rejects_a_wrong_leaf() -> Control {
+    let (manifest, mut transcript) = parent_only_documents();
+    transcript["reads"][0]["identity"]["inode"] = json!(5);
+    let verdict = evaluate_limited(&transcript, &manifest, CONTROL_DIGEST);
+    control(
+        blocked_at(&verdict, BlockingRule::WrongLeafIdentity, CONTROL_SITE)
+            && !verdict
+                .limitations
+                .iter()
+                .any(|limitation| limitation.rule == ExclusionRule::PathOnlyDirectReadParent),
+        "a different inode blocks and grants no limitation",
+    )?;
+    control(
+        blocked_by(&verdict, BlockingRule::StrictIssueUnexplained) && !explained_template(&verdict),
+        "a wrong leaf keeps the strict template unexplained",
+    )?;
+    control(!verdict.sufficient(), "the case stays insufficient")
+}
+
+/// Only the six registered descriptor-observed authority sites are eligible. A
+/// site the policy's own table does not list is blocking on its own rule and
+/// gets no parent limitation, so its strict identity template can never be
+/// explained (oxide#288). A listed path-only-class site the declared
+/// observation set does not name is blocked earlier still: its obligation is
+/// compared in full, so a parent-free row fails that comparison and no
+/// limitation is granted.
+fn parent_gap_explanation_rejects_an_unlisted_site() -> Control {
+    const SITE: &str = "authority-read@unlisted::read";
+    let mut manifest = synthetic_manifest();
+    manifest["mandatory_observations"] = json!([{
+        "engine": "oxide",
+        "site": SITE,
+        "parent_required": true,
+        "identity": {
+            "path": CONTROL_PATH,
+            "parent_device": 1,
+            "parent_inode": 2,
+            "device": 3,
+            "inode": 4,
+        },
+    }]);
+    let mut row = synthetic_row(SITE, "none", Some(3), Some(4));
+    row["identity"]["own_source"] = json!("handle");
+    let mut transcript = synthetic_transcript();
+    transcript["reads"] = json!([row]);
+    transcript["notes"] = json!([
+        "absolute monotonic window origin and end unproven",
+        format!("parent identity unproven at {SITE}"),
+        format!("obligation parent_required unproven at {SITE}"),
+    ]);
+    let verdict = evaluate_limited(&transcript, &manifest, CONTROL_DIGEST);
+    control(
+        blocked_at(&verdict, BlockingRule::UnlistedSite, SITE)
+            && !verdict
+                .limitations
+                .iter()
+                .any(|limitation| limitation.rule == ExclusionRule::PathOnlyDirectReadParent),
+        format!(
+            "an unlisted site is blocking and gets no limitation: {:?}",
+            verdict.blocking
+        ),
+    )?;
+    control(
+        blocked_by(&verdict, BlockingRule::StrictIssueUnexplained)
+            && verdict
+                .strict
+                .issues
+                .iter()
+                .any(|issue| issue == &format!("wrong identity at {SITE}")),
+        format!(
+            "an unlisted site keeps the strict template blocking: {:?}",
+            verdict.blocking
+        ),
+    )?;
+    control(
+        !verdict
+            .explained
+            .iter()
+            .any(|explanation| explanation.issue == format!("wrong identity at {SITE}")),
+        "an unlisted site is never explained",
+    )?;
+    control(!verdict.sufficient(), "the case stays insufficient")
+}
+
+/// A handle-class parent row is never excludable, so its strict identity
+/// template stays unexplained as well (oxide#288).
+fn parent_gap_explanation_rejects_a_handle_parent() -> Control {
+    let (manifest, _) = parent_only_documents();
+    let mut row = synthetic_row(CONTROL_SITE, "handle", Some(3), Some(4));
+    row["identity"]["parent_device"] = json!(7);
+    row["identity"]["parent_inode"] = json!(8);
+    let mut transcript = synthetic_transcript();
+    transcript["reads"] = json!([row]);
+    transcript["notes"] = json!(["absolute monotonic window origin and end unproven"]);
+    let verdict = evaluate_limited(&transcript, &manifest, CONTROL_DIGEST);
+    control(
+        blocked_at(
+            &verdict,
+            BlockingRule::HandleParentUnqualified,
+            CONTROL_SITE,
+        ) && !verdict
+            .limitations
+            .iter()
+            .any(|limitation| limitation.rule == ExclusionRule::PathOnlyDirectReadParent),
+        "a handle parent blocks and grants no limitation",
+    )?;
+    control(
+        blocked_by(&verdict, BlockingRule::StrictIssueUnexplained) && !explained_template(&verdict),
+        "a handle-parent row keeps the strict template unexplained",
+    )?;
+    control(!verdict.sufficient(), "the case stays insufficient")
+}
+
+/// The same parent-only pair through the canonical `/2` parser. The documents
+/// are made parser-valid and handed to the entry point a case body uses, so
+/// schema acceptance is the wire's own and the explanation still holds
+/// (oxide#288).
+fn parent_only_explanation_through_the_canonical_parser() -> Control {
+    let (manifest, mut transcript) = parent_only_documents();
+    transcript["outcome"] = json!({"state": "completed", "result": {}});
+    transcript["window_elapsed_ns"] = json!(1);
+    let manifest_bytes = serde_json::to_vec(&manifest).map_err(|error| ControlFailure {
+        what: error.to_string(),
+    })?;
+    // The entry point computes the manifest digest from these exact bytes, so
+    // the transcript must record that digest or the verdict reports drift.
+    transcript["manifest_sha256"] = json!(digest_hex(&manifest_bytes));
+    let transcript_bytes = serde_json::to_vec(&transcript).map_err(|error| ControlFailure {
+        what: error.to_string(),
+    })?;
+    let verdict =
+        evaluate_limited_capture(&transcript_bytes, &manifest_bytes).map_err(|error| {
+            ControlFailure {
+                what: format!("canonical parse: {error}"),
+            }
+        })?;
+    control(
+        explained_template(&verdict) && verdict.sufficient(),
+        format!(
+            "the canonical parser route explains only the parent gap: {:?}",
             verdict.blocking
         ),
     )?;
     control(
         verdict
-            .per_site
+            .strict
+            .issues
             .iter()
-            .any(|site| site.site == CONTROL_SITE && site.bound && site.parent_required),
-        "the site evidence records a bound leaf with an unproven parent",
-    )?;
-    control(
-        verdict.blocking_names() == vec![BlockingRule::StrictIssueUnexplained.name()],
-        format!(
-            "only the strict /2 identity template remains: {:?}",
-            verdict.blocking
-        ),
-    )?;
-    control(
-        !verdict.strict.complete
-            && verdict
-                .strict
-                .issues
-                .iter()
-                .any(|issue| issue == "wrong identity at authority-read@prune::read_registry"),
-        "the strict /2 judgement is retained verbatim and stays incomplete",
-    )?;
-    control(
-        !verdict.sufficient(),
-        "a strict identity template the exclusions do not name is never a pass",
+            .any(|issue| issue == &format!("{STRICT_WRONG_IDENTITY_PREFIX}{CONTROL_SITE}"))
+            && !verdict.strict.complete,
+        "the parser route keeps the strict issue list verbatim",
     )
 }
 
