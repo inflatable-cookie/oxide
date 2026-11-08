@@ -1689,22 +1689,31 @@ fn leaf_binding_check(temp: &Path) -> Result<(), CheckFailure> {
         limited == vec![ROW],
         &format!("the real emitted row is explained only at its own site: {limited:?}"),
     )?;
+    // oxide#288: the granted parent limitation explains the strict `/2`
+    // `wrong identity at <site>` template when its entire cause is exactly that
+    // parent gap, so this real emitted pair is sufficient under the limited
+    // policy while the strict result itself is retained verbatim.
+    let template = format!("wrong identity at {ROW}");
     check(
-        verdict.blocking_names() == vec!["strict-issue-unexplained"]
-            && !verdict.strict.complete
-            && verdict
-                .strict
-                .issues
-                .iter()
-                .any(|issue| issue == &format!("wrong identity at {ROW}")),
+        verdict.sufficient() && verdict.blocking.is_empty(),
         &format!(
-            "only the /2 file-form identity template remains unexplained: {:?}",
+            "the real emitted pair is explained by its granted parent limitation: {:?}",
             verdict.blocking
         ),
     )?;
     check(
-        !verdict.sufficient(),
-        "a real bound leaf is still not a complete /2 decision input",
+        verdict
+            .explained
+            .iter()
+            .any(|explanation| explanation.issue == template),
+        &format!(
+            "the strict parent-only identity template is explained: {:?}",
+            verdict.explained
+        ),
+    )?;
+    check(
+        !verdict.strict.complete && verdict.strict.issues.iter().any(|issue| issue == &template),
+        "the strict /2 judgement is retained verbatim and stays incomplete",
     )?;
 
     // 2. Same bytes, new inode: the identity must come from the held descriptor.

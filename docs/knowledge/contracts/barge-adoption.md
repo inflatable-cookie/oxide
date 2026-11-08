@@ -1814,7 +1814,7 @@ Remaining limits (finite):
 | Attempted or failed effects | Not completed parity |
 | Route B private descriptor-relative read | Not activated |
 | Caps 512 / 8192 / 8 MiB / 64 | Unchanged; known host overflow stays insufficient |
-| In-window fixture binding (`extra or unbound observation`: path, component and volume rules) | Engine-side only in `tape.rs`; completeness does not apply it yet. oxide#287 adds one rule for a present leaf: a safe relative path label, the row's own device and inode from a declared held-descriptor fstat, the same bytes digest or observed outcome, and the declared window (`bound_leaf`). A path label is not parent proof and the parent stays absent. **Remaining gap:** the `/2` file-form obligation identity requires `parent_device` and `parent_inode` (`capture_wire.rs obligation_identity`), so the strict assessment reports `wrong identity at <site>` for a parent-free leaf and that template is not a reviewed exclusion; see [the leaf-binding section](#leaf-binding-for-enumerated-path-only-authority-reads-oxide287-implemented) |
+| In-window fixture binding (`extra or unbound observation`: path, component and volume rules) | Engine-side only in `tape.rs`; completeness does not apply it yet. oxide#287 adds one rule for a present leaf: a safe relative path label, the row's own device and inode from a declared held-descriptor fstat, the same bytes digest or observed outcome, and the declared window (`bound_leaf`). A path label is not parent proof and the parent stays absent. **Remaining gap:** the `/2` file-form obligation identity requires `parent_device` and `parent_inode` (`capture_wire.rs obligation_identity`), so the strict assessment still reports `wrong identity at <site>` for a parent-free leaf. oxide#288 explains that one template in the limited verdict, but only as the parent gap a granted path-only limitation already excludes and only on the evidence recorded there; the strict result itself is unchanged. See [the leaf-binding section](#leaf-binding-for-enumerated-path-only-authority-reads-oxide287-implemented) and [the oxide#288 ruling](#the-strict-parent-only-identity-template-oxide288) |
 | Barge `/2` adoption and live or native use | Dependent task; no production read changed |
 
 ### Bounded comparison evidence boundary (oxide#285 design)
@@ -2156,11 +2156,15 @@ never waives a decision input's identity.
 
 The exclusion set is a source-owned enumeration, never a caller waiver list
 and never derived from warning text. The only strict issues an exclusion may
-explain are the completeness module's own two fixed templates (the window
-sentence, and `parent_required unproven at <site>: handle parent still needs
-qualified K1` for a site with a granted path-only limitation). Every other
-strict issue becomes `strict-issue-unexplained`, so the strict judgement
-survives by construction rather than by review attention.
+explain are the completeness module's own three fixed templates (the window
+sentence, `parent_required unproven at <site>: handle parent still needs
+qualified K1` for a site with a granted path-only limitation, and — since
+oxide#288 — `wrong identity at <site>` when the parent gap is its entire cause;
+see [the oxide#288 ruling](#the-strict-parent-only-identity-template-oxide288)).
+Every other strict issue becomes `strict-issue-unexplained`, so the strict
+judgement survives by construction rather than by review attention. Each
+explained issue is recorded verbatim beside the rule and site that explain it
+(`explained_strict_issues`), and the strict issue list itself is never edited.
 
 **Comparison rule.** `limited_comparison` has four states.
 `Insufficient` covers: either side's inputs insufficient, a side that did not
@@ -2173,7 +2177,7 @@ a cross-engine divergence. `Agreed` needs two sufficient sides, two complete
 batches and the declared fates. A deferred or unexecuted case is never
 agreement.
 
-**Pure controls (50, discriminating).** Each asserts an exact rule and site,
+**Pure controls (59, discriminating).** Each asserts an exact rule and site,
 not merely failure: the allowed path-only limitation with its site and leaf
 identity while the strict result stays insufficient; a handle parent blocking
 with no limitation granted; missing row; wrong leaf identity; unlisted site;
@@ -2400,11 +2404,11 @@ The strict `assess_completeness` is untouched and still applies the full rule.
 `path`+`parent_device`+`parent_inode`+`device`+`inode`
 (`capture_wire.rs obligation_identity`), so a parent-free leaf row can never
 satisfy the strict identity comparison: `assess_completeness` reports
-`wrong identity at <site>`, and that template is neither of the two reviewed
-exclusions, so the verdict records `strict-issue-unexplained` and is never
-sufficient. Closing that needs either a `/2` identity form for a parent-free
-leaf or a new reviewed exclusion; both are outside this preparation and neither
-is assumed. Together with the export gate, Barge's missing per-case fixture
+`wrong identity at <site>`. oxide#288 explains that one template in the limited
+verdict when its entire cause is exactly the parent gap a granted path-only
+limitation already excludes ([below](#the-strict-parent-only-identity-template-oxide288));
+the strict list stays verbatim and no other key, row or site becomes
+explainable. Together with the export gate, Barge's missing per-case fixture
 builder, the unexcludable handle-class marker/absence/custody rows and the
 identity-less pre-open rows (`private-file:open`, the first `read-bounded:open`
 row, whose shared helper must not be observed), the plan still reports **0
@@ -2418,8 +2422,9 @@ and `tape::check_manifest_obligations`, and then passes the **actually emitted**
 transcript through `capture_verdict::evaluate_limited_capture` (canonical `/2`
 parser → strict assessment → limited verdict). Its controls: a matching entry
 binds and yields exactly one site-bound limitation whose leaf identity is the
-observed `(device, inode)`, with `strict-issue-unexplained` as the only blocking
-reason; same bytes with a new inode after a rename/replacement leaves the
+observed `(device, inode)`, and — with the oxide#288 ruling — that real pair is
+sufficient under the limited policy while the strict result stays incomplete and
+is retained verbatim; same bytes with a new inode after a rename/replacement leaves the
 emitted identity at the held descriptor's inode and an entry describing the
 replacement object unbound; a wrong `bytes_sha256`, a different safe relative
 label and a traversal label each stay unbound with the identity unchanged; a
@@ -2460,6 +2465,80 @@ bound its leaf and blocks at the site that did not.
 `K1_PREMISE_QUALIFIED`, the two reviewed exclusions, `assess_completeness`, the
 comparison rule, pins, toolchain, MSRV, the private-build/export provider and
 its qualification, and every hold.
+
+### The strict parent-only identity template (oxide#288)
+
+**Status: prepared and pure-validated; not executed.** A test-only correction to
+the limited verdict policy under the `ba36f411` v2 preparation scope. No
+comparison ran, no fixture, engine, evaluator, image or export exists, no native
+proof is activated, and O2 (L3), O3, Route B and decision `0bcedf55` v2 are
+unchanged. `capture_verdict.rs` remains reachable only through the `cfg(test)`
+recorder path.
+
+**The inconsistency it corrects.** oxide#287 made the policy compare a declared
+path-only authority site with
+`capture_wire::path_only_identity_fields_match` (`parent_device`/`parent_inode`
+elided, every other named key compared) and grant the
+`path-only-direct-read-parent` limitation for that leaf. The unchanged strict
+checker keeps the full `/2` comparison, so the same parent-free leaf still
+reported `wrong identity at <site>`; that template was unexplained and blocked
+every such pair. The correction explains that diagnostic **only** when its
+entire cause is the parent identity the granted limitation already excludes.
+
+**The exact conditions.** All of them are established from the same manifest and
+transcript the verdict judged; the strict result is never rewritten and nothing
+is inferred from the issue text:
+
+1. the issue is exactly `wrong identity at <site>`, and the site is one of the
+   six registered descriptor-observed authority sites
+   (`prune.rs OBSERVED_PATH_ONLY_SITES`), so an unlisted site, the
+   path-only-class helper rows such as `read-bounded:lstat`, and every
+   handle/custody site stay out;
+2. the existing eligible parent limitation was already granted at that exact
+   site (path-only class, `parent_required`, bound own identity, no recorder
+   unbound sentence) — no new exclusion or waiver list is added;
+3. the recorder bound the leaf to its fixture entry and said so on its own
+   `obligation parent_required unproven at <site>` line, and it reports no
+   `extra or unbound observation` sentence for that site, so a wrong digest, an
+   outside or traversal label, or any other unbound row cannot be explained;
+4. every obligation at that site whose full `/2` comparison fails names a
+   non-empty `path` and at least one parent key, and has a descriptor-backed,
+   parent-free row (own `handle` device and inode, no parent) that matches every
+   named non-parent key exactly under that same shared
+   `path_only_identity_fields_match` rule; the strict comparison must still fail
+   for that obligation, so the elided parent keys are its whole cause.
+
+A different device, inode or path, an additional named key that differs, a
+missing row or leaf, an unbound or unstated recorder binding, an unlisted or
+non-observed site, every handle/component/volume/process row and
+source/case/fixture drift keep blocking exactly as before. Each explained issue
+is recorded verbatim with the rule and site that explain it
+(`explained_strict_issues`) beside the untouched `strict.issues` list, so the
+exclusion's semantic set can be reviewed directly.
+
+**What this does not do.** It establishes no new comparison claim or fact: it
+applies the limitation already granted to the one strict sentence that same
+gap produces. It adds no `/2` identity form, no schema or parser acceptance, no
+cap, no production reader, lock, error, selection, K1, process/holder identity,
+clock, dependency, pin, toolchain, native-proof or Barge source change. The
+plan still reports **0 runnable, 43 insufficient, 7 deferred**, and its
+per-family reasons drop only the now-explained strict template while retaining
+the export gate, Barge's per-case fixture builder, the handle-class marker and
+absence rows and the identity-less pre-open rows.
+
+**Controls (pure, in `--self-check`).** A recorder-faithful pair — parent-naming
+file obligation, descriptor-backed parent-free row, the per-row parent note and
+the recorder's own parent-obligation line — is explained: sufficient under the
+limited policy, one site-bound limitation, the strict issue list verbatim
+(including the retained `wrong identity at <site>`) and the explanation
+recorded in the document; the same pair through the canonical `/2` parser gives
+the same result. Removing the recorder's binding line, replacing the row with an
+extracted (pathname-precheck) identity, adding another mismatching named key,
+changing the leaf inode, moving the obligation to an unlisted site, or carrying
+a handle parent each leave the strict template unexplained and blocking. The
+pre-existing `tape_harness.rs leaf_binding_check` real-recorder window now
+asserts the sufficient limited result and the retained strict issue together; a
+policy-only document is labelled as such, and no control claims a native run.
 
 ## Shared private-build validation gate (oxide#248)
 
