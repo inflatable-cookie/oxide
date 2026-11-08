@@ -3204,14 +3204,16 @@ epoch change, no missing admission input, no second read under a changed
 epoch. CF-4 applies as the pure reconciler check.
 
 Barge's plan **does** read Oxide control state and ledger:
-`release::plan` → `decide_root` → `custody::take_custody_by` →
-`pool_custody::read_pool` → `read_document` of
-`<pool>/oxide-managed/state.json` and `<pool>/ledger.json`. The snapshot
-path `OxideSnapshot::read_within` → `PoolCustody::read` is the same pair.
-CTL-0's deliberate Barge input is **absence** of both files. `classify`
-treats absent state as "a pool no front-door command has recorded" and
-absent ledger as consistent with that; no records and no cleans is
-`Custody::Closed` for this checkout — the same writer-closed verdict as
+`release::plan` → `OxideSnapshot::read_within` → `PoolCustody::read` →
+`read_pool` → `read_document` of
+`<pool>/oxide-managed/state.json` and `<pool>/ledger.json`.
+`decide_root` → `custody::take_custody_by` is the deletion-unit custody
+path (holds, descriptors, marker); it does not call `PoolCustody` or read
+the Oxide pool state/ledger. CTL-0's deliberate Barge input is **absence**
+of both files. `classify` treats absent state as "a pool no front-door
+command has recorded" and absent ledger as consistent with that; no
+records and no cleans is `Custody::Closed` for this checkout — the same
+writer-closed verdict as
 Oxide's present empty-records fence plus empty ledger. They are not
 byte-identical. Present state with absent ledger is pool-wide unknown
 and would keep. `admission.lock` stays Oxide-only: Barge's reader never
@@ -3241,11 +3243,12 @@ parents); `checkout_custody` / `active_holders` (pool lock
 `read_registry`; `area::list_names`; `VolumeRoot::open_with`;
 `OxideSnapshot::read_within` / `reference::read_receipts` (enumerates
 `<pool>/oxide-managed/outputs`) / `PoolCustody::read` (`read_pool` →
-`read_document` of `oxide-managed/state.json` and `ledger.json`);
-`pending_intents`; `decide_root` → `custody::take_custody_by` →
-`pool_custody::read_pool` / `read_document` (same pair, 299 recorded
-absent); `os::prove_absence` (path-based components);
-`StateLock::shared_if_present`; `ProcessObserver` live host census.
+`read_document` of `oxide-managed/state.json` and `ledger.json`; 299
+recorded absent); `pending_intents`; `decide_root` →
+`custody::take_custody_by` (deletion-unit custody: holds, descriptors,
+marker; does not read pool state/ledger); `os::prove_absence` (path-based
+components); `StateLock::shared_if_present`; `ProcessObserver` live host
+census.
 
 ### Fact classification
 
