@@ -915,7 +915,7 @@ fn canonical_existing_dir(path: &Path, owner_only: bool) -> Result<PathBuf, Leas
                     dev: metadata.dev(),
                     ino: metadata.ino(),
                 },
-                0,
+                None,
             ),
             Err(error) => crate::tape::read_row(
                 "lease:canonical-dir:metadata",
@@ -927,7 +927,7 @@ fn canonical_existing_dir(path: &Path, owner_only: bool) -> Result<PathBuf, Leas
                         reason: error.to_string(),
                     }
                 },
-                0,
+                None,
             ),
         }
         crate::tape::restore_observer_errno(saved_errno);
@@ -963,7 +963,7 @@ fn canonical_existing_dir(path: &Path, owner_only: bool) -> Result<PathBuf, Leas
                 reason: error.to_string(),
             },
         };
-        crate::tape::read_row("lease:canonical-dir:canonicalize", path, outcome, 0);
+        crate::tape::read_row("lease:canonical-dir:canonicalize", path, outcome, None);
         crate::tape::restore_observer_errno(saved_errno);
         result.map_err(io_error)?
     };
@@ -1133,7 +1133,7 @@ fn read_private_file_bounded(path: &Path, max: u64) -> Result<Vec<u8>, LeaseErro
                     dev: metadata.dev(),
                     ino: metadata.ino(),
                 },
-                max,
+                Some(max),
             );
             crate::tape::restore_observer_errno(saved_errno);
             metadata
@@ -1146,7 +1146,7 @@ fn read_private_file_bounded(path: &Path, max: u64) -> Result<Vec<u8>, LeaseErro
                 crate::tape::TapeOutcome::Refusal {
                     reason: error.to_string(),
                 },
-                max,
+                Some(max),
             );
             crate::tape::restore_observer_errno(saved_errno);
             return Err(io_error(error));
@@ -1172,7 +1172,7 @@ fn read_private_file_bounded(path: &Path, max: u64) -> Result<Vec<u8>, LeaseErro
                 crate::tape::TapeOutcome::Facts {
                     facts: "opened; descriptor identity unproven".to_owned(),
                 },
-                max,
+                Some(max),
             );
             crate::tape::restore_observer_errno(saved_errno);
             file
@@ -1185,7 +1185,7 @@ fn read_private_file_bounded(path: &Path, max: u64) -> Result<Vec<u8>, LeaseErro
                 crate::tape::TapeOutcome::Refusal {
                     reason: error.to_string(),
                 },
-                max,
+                Some(max),
             );
             crate::tape::restore_observer_errno(saved_errno);
             return Err(io_error(error));
@@ -1208,7 +1208,7 @@ fn read_private_file_bounded(path: &Path, max: u64) -> Result<Vec<u8>, LeaseErro
                 reason: error.to_string(),
             },
         };
-        crate::tape::read_row("lease:private-file:bytes", path, outcome, max);
+        crate::tape::read_row("lease:private-file:bytes", path, outcome, Some(max));
         crate::tape::restore_observer_errno(saved_errno);
         result.map_err(io_error)?;
     }
@@ -1281,7 +1281,7 @@ pub(crate) fn fence_managed_control(pool: &Path) -> Result<(), LeaseError> {
                     dev: metadata.dev(),
                     ino: metadata.ino(),
                 },
-                0,
+                None,
             ),
             Err(error) => crate::tape::read_row(
                 "lease:fence:state-metadata",
@@ -1293,7 +1293,7 @@ pub(crate) fn fence_managed_control(pool: &Path) -> Result<(), LeaseError> {
                         reason: error.to_string(),
                     }
                 },
-                0,
+                None,
             ),
         }
         crate::tape::restore_observer_errno(saved_errno);
@@ -1377,7 +1377,7 @@ fn open_control_admission(control: &Path) -> Result<File, LeaseError> {
                     dev: metadata.dev(),
                     ino: metadata.ino(),
                 },
-                0,
+                None,
             ),
             Err(error) => crate::tape::read_row(
                 "lease:admission:metadata",
@@ -1385,7 +1385,7 @@ fn open_control_admission(control: &Path) -> Result<File, LeaseError> {
                 crate::tape::TapeOutcome::Refusal {
                     reason: error.to_string(),
                 },
-                0,
+                None,
             ),
         }
         crate::tape::restore_observer_errno(saved_errno);
@@ -1545,7 +1545,7 @@ fn random_hex(bytes: usize) -> Result<String, LeaseError> {
             "lease:random-hex:entropy",
             Path::new("/dev/urandom"),
             outcome,
-            bytes as u64,
+            Some(bytes as u64),
         );
         crate::tape::restore_observer_errno(saved_errno);
         result.map_err(io_error)?;

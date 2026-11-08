@@ -33,9 +33,11 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 /// The fixed transcript schema version (barge-adoption.md, capture contract).
-pub(crate) const TRANSCRIPT_VERSION: &str = "oxide.capture.transcript/1";
+pub(crate) const TRANSCRIPT_VERSION: &str = "oxide.capture.transcript/2";
+/// Apparatus refusal or fallback: a distinct diagnostic, never a transcript.
+pub(crate) const APPARATUS_VERSION: &str = "oxide.capture.apparatus/2";
 /// The fixed manifest schema version the harness reads and binds.
-pub(crate) const MANIFEST_VERSION: &str = "oxide.capture.manifest/1";
+pub(crate) const MANIFEST_VERSION: &str = "oxide.capture.manifest/2";
 /// Fixed caps (barge-adoption.md, serialized schemas and caps).
 pub(crate) const MAX_READ_ROWS: usize = 8192;
 pub(crate) const MAX_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
@@ -133,7 +135,8 @@ pub(crate) struct TapeReadRow {
     pub(crate) site: String,
     pub(crate) identity: TapeIdentity,
     pub(crate) outcome: TapeOutcome,
-    pub(crate) cap: u64,
+    /// `None` is "no read cap applies"; `Some(0)` is a real zero cap.
+    pub(crate) cap: Option<u64>,
     pub(crate) epoch: u64,
     pub(crate) occurrence: u64,
 }
@@ -143,7 +146,7 @@ impl TapeReadRow {
         kind: String,
         identity: TapeIdentity,
         outcome: TapeOutcome,
-        cap: u64,
+        cap: Option<u64>,
         epoch: u64,
         occurrence: u64,
     ) -> Self {
@@ -160,23 +163,27 @@ impl TapeReadRow {
     }
 }
 
-/// One recorded effect row: `{kind, path, epoch}`. Kinds are drawn from the
-/// fixed effect vocabulary (`create`, `save`, `fence`, `reconcile`,
-/// `lock-create`, `rename`, `unlink`); the source site is a separate field.
+/// One recorded effect row. Kinds are the fixed effect vocabulary plus
+/// `descriptor-effect` (a held-descriptor effect whose path is unbound, so
+/// `path` is null). `result` is what the recorder observed: `succeeded` for a
+/// completed effect, `failed` or `partial` when the leaf reported it, and
+/// `unknown` whenever the result was not observed (an attempt, a fixture diff).
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct TapeEffectRow {
     pub(crate) kind: String,
     pub(crate) site: String,
     pub(crate) attempted: bool,
-    pub(crate) path: String,
+    pub(crate) path: Option<String>,
     pub(crate) epoch: u64,
+    pub(crate) result: &'static str,
 }
 
 /// One recorded clock row, bound to the declared window.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct TapeClockRow {
     pub(crate) kind: String,
-    pub(crate) value: u64,
+    /// `None` is an unobserved clock; never a zero.
+    pub(crate) value: Option<u64>,
     pub(crate) epoch: u64,
 }
 
@@ -237,7 +244,8 @@ pub(crate) struct TapeTranscript {
     pub(crate) schema: &'static str,
     pub(crate) engine: String,
     pub(crate) case: String,
-    pub(crate) manifest_sha256: String,
+    /// `None` when no manifest bytes were bound (an explicit null).
+    pub(crate) manifest_sha256: Option<String>,
     pub(crate) entrypoint: String,
     pub(crate) window_monotonic_start_ns: Option<u64>,
     pub(crate) window_monotonic_end_ns: Option<u64>,
@@ -264,10 +272,10 @@ pub(crate) struct TapeFixtureEntry {
     pub(crate) rel: String,
     pub(crate) kind: String,
     pub(crate) size: u64,
-    pub(crate) dev: u64,
-    pub(crate) ino: u64,
-    pub(crate) parent_dev: Option<u64>,
-    pub(crate) parent_ino: Option<u64>,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) parent_device: Option<u64>,
+    pub(crate) parent_inode: Option<u64>,
     pub(crate) mode: u32,
     pub(crate) bytes_sha256: Option<String>,
 }
@@ -359,50 +367,16 @@ pub(crate) fn active() -> bool {
     TAPE.with(|cell| cell.borrow().is_some())
 }
 
-/// Evaluate manifest observation obligations without changing the engine's
-/// result. Only fields actually represented by the tape can establish a match;
-/// absent parent, process, component or volume identity remains insufficient.
-fn file_identity_matches(row: &TapeReadRow, identity: &serde_json::Value) -> bool {
-    let i = &row.identity;
-    identity.get("path").and_then(|v| v.as_str()) == i.path.as_deref()
-        && identity.get("parent_device").and_then(|v| v.as_u64()) == i.parent_dev
-        && identity.get("parent_inode").and_then(|v| v.as_u64()) == i.parent_ino
-        && identity.get("device").and_then(|v| v.as_u64()) == i.dev
-        && identity.get("inode").and_then(|v| v.as_u64()) == i.ino
-        && i.path.is_some()
-        && i.parent_dev.is_some()
-        && i.parent_ino.is_some()
-        && i.dev.is_some()
-        && i.ino.is_some()
-}
-
+/// The one identity rule, shared with the completeness judgement in
+/// `capture_wire`: a row matches only when every named key equals its value.
 fn identity_matches(row: &TapeReadRow, identity: &serde_json::Value, window: Option<&str>) -> bool {
-    if identity.get("path").is_some() {
-        return file_identity_matches(row, identity);
-    }
-    if let Some(name) = identity.get("component").and_then(|v| v.as_str()) {
-        return row.identity.component.as_deref() == Some(name)
-            && row.identity.parent_dev.is_some()
-            && row.identity.parent_ino.is_some()
-            && identity.get("parent_device").and_then(|v| v.as_u64()) == row.identity.parent_dev
-            && identity.get("parent_inode").and_then(|v| v.as_u64()) == row.identity.parent_ino;
-    }
-    if let Some(uuid) = identity.get("volume_uuid").and_then(|v| v.as_str()) {
-        return row.identity.uuid.as_deref() == Some(uuid)
-            && identity.get("mount").and_then(|v| v.as_str())
-                == row.identity.mount_point.as_deref()
-            && identity.get("device").and_then(|v| v.as_str())
-                == row.identity.volume_device.as_deref()
-            && row.identity.mount_point.is_some()
-            && row.identity.volume_device.is_some()
-            && window.is_some()
-            && identity.get("window_identity").and_then(|v| v.as_str()) == window;
-    }
-    // A PID alone or a process-start identity not present on this row cannot
-    // be upgraded into a match by parsing the display key.
-    false
+    let row_identity = serde_json::to_value(&row.identity).unwrap_or(serde_json::Value::Null);
+    capture_wire::identity_fields_match(identity, &row_identity, window)
 }
 
+/// Evaluate manifest observation obligations without changing the engine's
+/// result. Absent parent, process, component or volume identity remains
+/// insufficient.
 pub(crate) fn check_manifest_obligations(manifest: &serde_json::Value, root: &Path) {
     with_state(|state| {
         let mut issues = std::collections::BTreeSet::new();
@@ -573,66 +547,20 @@ pub(crate) fn check_manifest_obligations(manifest: &serde_json::Value, root: &Pa
     });
 }
 
-/// Compare exact declared and observed effect multisets. Attempts remain
-/// insufficient even if a manifest declared them.
+/// Compare declared effects with observed effects through the shared parity
+/// rule. Attempts and unsucceeded results are never completed parity.
 pub(crate) fn check_manifest_effects(manifest: &serde_json::Value) {
     with_state(|state| {
-        let mut declared = std::collections::BTreeMap::new();
-        if let Some(rows) = manifest
+        let declared = manifest
             .get("expected_effects")
             .and_then(|value| value.as_array())
-        {
-            for row in rows {
-                let key = (
-                    row.get("kind")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned(),
-                    row.get("site")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned(),
-                    row.get("path")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned(),
-                    row.get("attempted")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true),
-                );
-                *declared.entry(key).or_insert(0usize) += 1;
-            }
-        }
-        let mut actual = std::collections::BTreeMap::new();
-        for row in &state.effects {
-            let key = (
-                row.kind.clone(),
-                row.site.clone(),
-                row.path.clone(),
-                row.attempted,
-            );
-            *actual.entry(key).or_insert(0usize) += 1;
-        }
-        let mut issues = Vec::new();
-        for (key, count) in &declared {
-            let observed = actual.get(key).copied().unwrap_or(0);
-            if observed < *count {
-                issues.push(format!(
-                    "missing declared effect {} at {}: {}",
-                    key.0, key.1, key.2
-                ));
-            }
-        }
-        for (key, count) in &actual {
-            let expected = declared.get(key).copied().unwrap_or(0);
-            if *count > expected {
-                issues.push(format!(
-                    "extra observed effect {} at {}: {}",
-                    key.0, key.1, key.2
-                ));
-            }
-        }
-        for issue in issues {
+            .cloned()
+            .unwrap_or_default();
+        let observed = serde_json::to_value(&state.effects)
+            .ok()
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default();
+        for issue in capture_wire::effect_parity_issues(&declared, &observed) {
             push_note(state, issue);
         }
     });
@@ -650,10 +578,10 @@ pub(crate) fn check_fixture_diff(root: &Path, capture: &TapeFixtureCapture) {
         }
         let mut issues = Vec::new();
         for diff in &capture.diff_effects {
-            let path = root.join(&diff.path);
+            let path = root.join(diff.path.as_deref().unwrap_or(""));
             let matched = state.effects.iter().any(|effect| {
                 !effect.attempted
-                    && Path::new(&effect.path) == path.as_path()
+                    && effect.path.as_deref().map(Path::new) == Some(path.as_path())
                     && match diff.kind.as_str() {
                         "create" => {
                             matches!(effect.kind.as_str(), "create" | "lock-create" | "rename")
@@ -669,7 +597,7 @@ pub(crate) fn check_fixture_diff(root: &Path, capture: &TapeFixtureCapture) {
             if !matched {
                 issues.push(format!(
                     "fixture change lacks a matching observed effect: {}",
-                    diff.path
+                    diff.path.as_deref().unwrap_or("")
                 ));
             }
         }
@@ -708,7 +636,7 @@ pub(crate) fn finish_and_write(
             schema: TRANSCRIPT_VERSION,
             engine: state.engine,
             case: state.case,
-            manifest_sha256: state.manifest_sha256,
+            manifest_sha256: (!state.manifest_sha256.is_empty()).then_some(state.manifest_sha256),
             entrypoint: state.entrypoint,
             window_monotonic_start_ns: None,
             window_monotonic_end_ns: None,
@@ -755,6 +683,31 @@ pub(crate) fn finish_and_write(
             return Err("transcript header exceeds the document cap".to_owned());
         }
     }
+    write_document(path, &bytes)
+}
+
+/// Close the window as an apparatus refusal or fallback. The result is a
+/// distinct `oxide.capture.apparatus/2` diagnostic: the transcript parser
+/// refuses it, so it can never be read as a conforming capture.
+pub(crate) fn finish_apparatus(
+    path: &Path,
+    case: &str,
+    manifest_sha256: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let _ = TAPE.with(|cell| cell.borrow_mut().take());
+    let document = serde_json::json!({
+        "schema": APPARATUS_VERSION,
+        "version": APPARATUS_VERSION,
+        "case": case,
+        "manifest_sha256": manifest_sha256,
+        "reason": reason,
+    });
+    let bytes = serde_json::to_vec(&document).map_err(|error| error.to_string())?;
+    write_document(path, &bytes)
+}
+
+fn write_document(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
@@ -768,7 +721,7 @@ pub(crate) fn finish_and_write(
         .custom_flags(libc::O_NOFOLLOW)
         .open(&temp)
         .map_err(|error| error.to_string())?;
-    file.write_all(&bytes).map_err(|error| error.to_string())?;
+    file.write_all(bytes).map_err(|error| error.to_string())?;
     std::fs::rename(&temp, path).map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -850,13 +803,18 @@ fn file_identity(path: &Path, outcome: &TapeOutcome) -> TapeIdentity {
         parent_ino,
         dev,
         ino,
+        own_source: if dev.is_some() {
+            Provenance::Extracted
+        } else {
+            Provenance::None
+        },
         ..TapeIdentity::blank(key)
     }
 }
 
 /// Record the facts supplied by a leaf. Unknown identities remain unproven;
 /// the recorder does not make a later pathname lookup to invent a binding.
-pub(crate) fn read_row(kind: &str, path: &Path, outcome: TapeOutcome, cap: u64) {
+pub(crate) fn read_row(kind: &str, path: &Path, outcome: TapeOutcome, cap: Option<u64>) {
     with_state(|state| {
         let identity = file_identity(path, &outcome);
         push_note(
@@ -880,7 +838,7 @@ pub(crate) fn read_row_dev(
     dev: u64,
     ino: u64,
     outcome: TapeOutcome,
-    cap: u64,
+    cap: Option<u64>,
 ) {
     read_row_without_parent(kind, path, dev, ino, outcome, cap);
 }
@@ -892,7 +850,7 @@ pub(crate) fn read_row_handle(
     dev: u64,
     ino: u64,
     outcome: TapeOutcome,
-    cap: u64,
+    cap: Option<u64>,
 ) {
     read_row_owned(kind, path, dev, ino, outcome, cap, Provenance::Handle);
 }
@@ -930,7 +888,7 @@ pub(crate) fn component_row(
         };
         let (occurrence, counted) = occurrence(state, &format!("{kind}|{}", identity.key));
         let epoch = next_epoch(state);
-        let row = TapeReadRow::new(kind.to_owned(), identity, outcome, 0, epoch, occurrence);
+        let row = TapeReadRow::new(kind.to_owned(), identity, outcome, None, epoch, occurrence);
         if counted {
             push_read(state, row);
         }
@@ -966,7 +924,7 @@ pub(crate) fn component_without_parent(kind: &str, name: &std::ffi::OsStr, outco
         if counted {
             push_read(
                 state,
-                TapeReadRow::new(kind.to_owned(), identity, outcome, 0, epoch, occurrence),
+                TapeReadRow::new(kind.to_owned(), identity, outcome, None, epoch, occurrence),
             );
         }
     });
@@ -974,7 +932,7 @@ pub(crate) fn component_without_parent(kind: &str, name: &std::ffi::OsStr, outco
 
 /// Record the start object of an absence walk (the held `/` or mount root).
 pub(crate) fn walk_start_row(kind: &str, path: &Path, dev: u64, ino: u64) {
-    read_row_dev(kind, path, dev, ino, TapeOutcome::Opened { dev, ino }, 0);
+    read_row_dev(kind, path, dev, ino, TapeOutcome::Opened { dev, ino }, None);
 }
 
 /// Record one volume observation: mount point, volume UUID, device and the
@@ -1000,21 +958,37 @@ pub(crate) fn volume_row(
             ..TapeIdentity::blank(key)
         };
         let (occurrence, counted) = occurrence(state, &format!("{kind}|{}", identity.key));
-        let row = TapeReadRow::new(kind.to_owned(), identity, outcome, 0, epoch, occurrence);
+        let row = TapeReadRow::new(kind.to_owned(), identity, outcome, None, epoch, occurrence);
         if counted {
             push_read(state, row);
         }
     });
 }
 
-/// An actual effect at a descriptor-only site that cannot bind a path is
-/// explicitly insufficient; a pathname is never guessed after the operation.
+/// An effect at a descriptor-only site that cannot bind a path. Its result is
+/// the one the leaf observed (`succeeded` or `failed`); its identity stays
+/// unproven, so the row carries no path and never completes parity.
 pub(crate) fn unbound_effect(site: &str, succeeded: bool) {
     let saved_errno = observer_errno();
     with_state(|state| {
-        push_note(state, format!(
-            "descriptor-only effect at {site}: succeeded={succeeded}; identity unproven; insufficient"
-        ));
+        let epoch = next_epoch(state);
+        if state.effects.len() >= MAX_READ_ROWS {
+            state.truncation.document_truncated = true;
+        } else {
+            state.effects.push(TapeEffectRow {
+                kind: "descriptor-effect".to_owned(),
+                site: site.to_owned(),
+                attempted: false,
+                path: None,
+                epoch,
+                result: if succeeded { "succeeded" } else { "failed" },
+            });
+            charge_document(state, 96);
+        }
+        push_note(
+            state,
+            format!("descriptor-only effect at {site}: identity unproven; insufficient"),
+        );
     });
     restore_observer_errno(saved_errno);
 }
@@ -1074,8 +1048,10 @@ pub(crate) fn effect_row(kind: &str, path: &Path) {
             kind: verb.to_owned(),
             site: site.to_owned(),
             attempted,
-            path: path_text.to_owned(),
+            path: Some(path_text.to_owned()),
             epoch,
+            // An attempt's completion is never observed here.
+            result: if attempted { "unknown" } else { "succeeded" },
         });
         charge_document(state, 96);
     });
@@ -1104,7 +1080,7 @@ pub(crate) fn clock_row(kind: &str, value_ms: u64) {
         let epoch = next_epoch(state);
         state.clocks.push(TapeClockRow {
             kind: kind.to_owned(),
-            value: value_ms,
+            value: Some(value_ms),
             epoch,
         });
         charge_document(state, 48);
@@ -1125,23 +1101,44 @@ pub(crate) fn monotonic_observed(kind: &str, observed: Instant) {
                 let epoch = next_epoch(state);
                 state.clocks.push(TapeClockRow {
                     kind: kind.to_owned(),
-                    value: u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
+                    value: Some(u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)),
                     epoch,
                 });
                 charge_document(state, 48);
             }
-            None => push_note(
-                state,
-                format!("monotonic reading before window at {kind}; insufficient"),
-            ),
+            None => {
+                // A reading before the window origin is unobserved, not zero.
+                let epoch = next_epoch(state);
+                state.clocks.push(TapeClockRow {
+                    kind: kind.to_owned(),
+                    value: None,
+                    epoch,
+                });
+                push_note(
+                    state,
+                    format!("monotonic reading before window at {kind}; insufficient"),
+                );
+            }
         }
     });
     restore_observer_errno(saved_errno);
 }
 
-/// A clock the engine could not obtain remains explicitly unproven.
+/// A clock the engine could not obtain: an explicit `null` value, never zero.
 pub(crate) fn clock_unproven(kind: &str) {
-    with_state(|state| push_note(state, format!("clock unproven at {kind}")));
+    with_state(|state| {
+        if state.clocks.len() >= MAX_READ_ROWS {
+            state.truncation.document_truncated = true;
+            return;
+        }
+        let epoch = next_epoch(state);
+        state.clocks.push(TapeClockRow {
+            kind: kind.to_owned(),
+            value: None,
+            epoch,
+        });
+        charge_document(state, 48);
+    });
 }
 
 pub(crate) fn recorded_holder(site: &str, record_id: u64, pid: u32, recorded_start_ms: u64) {
@@ -1245,7 +1242,7 @@ pub(crate) fn authority_bind(site: &str, path: &Path, cap: u64) {
             format!("authority-read@{site}"),
             identity,
             outcome,
-            pending.cap.max(cap),
+            Some(pending.cap.max(cap)),
             epoch,
             occurrence,
         );
@@ -1263,7 +1260,7 @@ pub(crate) fn read_row_without_parent(
     dev: u64,
     ino: u64,
     outcome: TapeOutcome,
-    cap: u64,
+    cap: Option<u64>,
 ) {
     read_row_owned(kind, path, dev, ino, outcome, cap, Provenance::Extracted);
 }
@@ -1274,7 +1271,7 @@ fn read_row_owned(
     dev: u64,
     ino: u64,
     outcome: TapeOutcome,
-    cap: u64,
+    cap: Option<u64>,
     own_source: Provenance,
 ) {
     with_state(|state| {
@@ -1319,7 +1316,7 @@ pub(crate) fn authority_bind_descriptor(
         dev,
         ino,
         outcome,
-        cap,
+        Some(cap),
     );
 }
 
@@ -1335,7 +1332,7 @@ pub(crate) fn authority_unbound(site: &str, reason: &str) {
 
 /// Record a pool open outcome (the `Store::open_at`/`ledger_view` chain).
 pub(crate) fn pool_row(kind: &str, pool: &Path, outcome: TapeOutcome) {
-    read_row(kind, pool, outcome, 0);
+    read_row(kind, pool, outcome, None);
 }
 
 /// A held descriptor's already-observed identity, without inventing its path,
@@ -1369,7 +1366,7 @@ pub(crate) fn descriptor_row(site: &str, fd: i32, outcome: TapeOutcome) {
         if counted {
             push_read(
                 state,
-                TapeReadRow::new(site.to_owned(), identity, outcome, 0, epoch, occurrence),
+                TapeReadRow::new(site.to_owned(), identity, outcome, None, epoch, occurrence),
             );
         }
     });
@@ -1398,7 +1395,7 @@ pub(crate) fn lock_row(kind: &str, path: &Path, outcome: TapeOutcome) {
     })
     .unwrap_or(false);
     if !disconnected {
-        read_row(kind, path, outcome, 0);
+        read_row(kind, path, outcome, None);
     }
 }
 
@@ -1603,10 +1600,10 @@ fn walk_fixture(
             rel,
             kind,
             size: meta.len(),
-            dev: meta.dev(),
-            ino: meta.ino(),
-            parent_dev,
-            parent_ino,
+            device: meta.dev(),
+            inode: meta.ino(),
+            parent_device: parent_dev,
+            parent_inode: parent_ino,
             mode: meta.permissions().mode(),
             bytes_sha256,
         });
@@ -1635,16 +1632,17 @@ pub(crate) fn diff_fixture(
                 kind: "create".to_owned(),
                 site: "fixture-diff".to_owned(),
                 attempted: false,
-                path: entry.rel.clone(),
+                path: Some(entry.rel.clone()),
                 epoch: 0,
+                result: "unknown",
             }),
             Some(before) => {
                 // A directory's size moves whenever an entry is added or
                 // removed beside it; only its own identity and mode are its
                 // own effect facts. Files compare bytes and size.
                 let is_dir = entry.kind == "dir";
-                let changed = before.dev != entry.dev
-                    || before.ino != entry.ino
+                let changed = before.device != entry.device
+                    || before.inode != entry.inode
                     || before.mode != entry.mode
                     || (!is_dir
                         && (before.size != entry.size
@@ -1655,8 +1653,9 @@ pub(crate) fn diff_fixture(
                         kind: "save".to_owned(),
                         site: "fixture-diff".to_owned(),
                         attempted: false,
-                        path: entry.rel.clone(),
+                        path: Some(entry.rel.clone()),
                         epoch: 0,
+                        result: "unknown",
                     });
                 }
             }
@@ -1668,8 +1667,9 @@ pub(crate) fn diff_fixture(
                 kind: "unlink".to_owned(),
                 site: "fixture-diff".to_owned(),
                 attempted: false,
-                path: entry.rel.clone(),
+                path: Some(entry.rel.clone()),
                 epoch: 0,
+                result: "unknown",
             });
         }
     }

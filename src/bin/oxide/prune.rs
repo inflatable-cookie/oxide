@@ -1925,7 +1925,7 @@ pub(crate) fn authority_read_observed(
                 dev,
                 ino,
                 crate::tape::TapeOutcome::Opened { dev, ino },
-                limit,
+                Some(limit),
             );
         }
     }
@@ -1946,11 +1946,21 @@ pub(crate) fn authority_read_observed(
         }
         None if site == "prune::read_bounded" => {
             crate::tape::authority_unbound(site, "held-descriptor fstat failed");
-            crate::tape::read_row(&format!("authority-read@{site}"), path, outcome, limit);
+            crate::tape::read_row(
+                &format!("authority-read@{site}"),
+                path,
+                outcome,
+                Some(limit),
+            );
         }
         None => {
             crate::tape::authority_unbound(site, "no authorized descriptor observation");
-            crate::tape::read_row(&format!("authority-read@{site}"), path, outcome, limit);
+            crate::tape::read_row(
+                &format!("authority-read@{site}"),
+                path,
+                outcome,
+                Some(limit),
+            );
         }
     }
     tape_restore_errno(after_read);
@@ -2570,7 +2580,7 @@ fn read_bounded(path: &Path, limit: usize, what: &str) -> Result<Vec<u8>, String
                     dev: metadata.dev(),
                     ino: metadata.ino(),
                 },
-                limit as u64,
+                Some(limit as u64),
             ),
             Err(error) => crate::tape::read_row(
                 "read-bounded:lstat",
@@ -2582,7 +2592,7 @@ fn read_bounded(path: &Path, limit: usize, what: &str) -> Result<Vec<u8>, String
                         reason: error.to_string(),
                     }
                 },
-                limit as u64,
+                Some(limit as u64),
             ),
         }
         crate::tape::restore_observer_errno(saved_errno);
@@ -2612,7 +2622,7 @@ fn read_bounded(path: &Path, limit: usize, what: &str) -> Result<Vec<u8>, String
                 reason: error.to_string(),
             },
         };
-        crate::tape::read_row("read-bounded:open", path, outcome, limit as u64);
+        crate::tape::read_row("read-bounded:open", path, outcome, Some(limit as u64));
         crate::tape::restore_observer_errno(saved_errno);
         result.map_err(|error| format!("cannot open the {what} {}: {error}", path.display()))?
     };
@@ -3804,7 +3814,7 @@ fn boot_data_facts() -> Result<HeldFacts, String> {
             crate::tape::TapeOutcome::Refusal {
                 reason: std::io::Error::last_os_error().to_string(),
             },
-            0,
+            None,
         );
         return Err(format!(
             "the boot Data volume is unverifiable ({})",
@@ -3822,7 +3832,7 @@ fn boot_data_facts() -> Result<HeldFacts, String> {
                 dev,
                 ino,
                 crate::tape::TapeOutcome::Opened { dev, ino },
-                0,
+                None,
             );
         }
     }
@@ -4343,7 +4353,7 @@ fn observe_root_in(binding: &Binding, row: &Row) -> Result<RootState, String> {
                 dev,
                 ino,
                 crate::tape::TapeOutcome::Opened { dev, ino },
-                0,
+                None,
             );
         }
         parent
@@ -4426,7 +4436,7 @@ fn observe_root_in(binding: &Binding, row: &Row) -> Result<RootState, String> {
                 dev,
                 ino,
                 crate::tape::TapeOutcome::Opened { dev, ino },
-                0,
+                None,
             );
         }
     }
@@ -4447,7 +4457,7 @@ fn observe_root_in(binding: &Binding, row: &Row) -> Result<RootState, String> {
             crate::tape::TapeOutcome::Refusal {
                 reason: std::io::Error::last_os_error().to_string(),
             },
-            0,
+            None,
         );
         return Ok(RootState::Unknown(format!(
             "the root has no readable owner marker ({})",
@@ -4673,7 +4683,7 @@ fn account_candidates(evaluated: &mut [Evaluated], control: &Path) {
                                 report.entries_visited, report.coverage.complete
                             ),
                         },
-                        remaining,
+                        Some(remaining),
                     );
                     crate::tape::restore_observer_errno(saved_errno);
                     report
@@ -4685,7 +4695,7 @@ fn account_candidates(evaluated: &mut [Evaluated], control: &Path) {
                         crate::tape::TapeOutcome::Refusal {
                             reason: error.to_string(),
                         },
-                        remaining,
+                        Some(remaining),
                     );
                     crate::tape::restore_observer_errno(saved_errno);
                     break;

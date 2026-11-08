@@ -144,8 +144,8 @@ impl HoldingSweep {
 // Case definitions and the manifest
 // ---------------------------------------------------------------------------
 
-const MANIFEST_VERSION: &str = "oxide.capture.manifest/1";
-const TRANSCRIPT_VERSION_CHECK: &str = "oxide.capture.transcript/1";
+const MANIFEST_VERSION: &str = "oxide.capture.manifest/2";
+const TRANSCRIPT_VERSION_CHECK: &str = "oxide.capture.transcript/2";
 const ENGINE: &str = "oxide";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -456,7 +456,7 @@ fn schema_matches(value: &serde_json::Value, schema: &serde_json::Value) -> bool
 /// as evaluator inputs. Detailed reconciliation remains X-S2's oracle.
 fn validate_manifest_envelope(doc: &serde_json::Value) -> Result<(), String> {
     let schema: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../docs/knowledge/contracts/oxide-capture-manifest.schema.json"
+        "../../../docs/knowledge/contracts/oxide-capture-manifest.v2.schema.json"
     ))
     .map_err(|error| format!("manifest schema invalid: {error}"))?;
     if !schema_matches(doc, &schema) {
@@ -1281,15 +1281,7 @@ fn run_case(
     let (manifest, manifest_document) = match parsed {
         Ok(value) => value,
         Err(reason) => {
-            return tape::finish_and_write(
-                transcript_out,
-                TapeEngineOutcome::Refused {
-                    reason,
-                    exit_code: 2,
-                    source: "apparatus",
-                },
-                None,
-            )
+            return tape::finish_apparatus(transcript_out, case, &manifest_sha, &reason);
         }
     };
     let operator_list = manifest
@@ -1299,15 +1291,7 @@ fn run_case(
 
     if let Some(path) = operator_list.as_deref() {
         if let Err(reason) = validate_fixture_path(fixture_root, path) {
-            return tape::finish_and_write(
-                transcript_out,
-                TapeEngineOutcome::Refused {
-                    reason,
-                    exit_code: 2,
-                    source: "apparatus",
-                },
-                None,
-            );
+            return tape::finish_apparatus(transcript_out, case, &manifest_sha, &reason);
         }
     }
     let pre = tape::capture_fixture(fixture_root);
@@ -1351,7 +1335,7 @@ struct TranscriptDoc {
     version: String,
     engine: String,
     case: String,
-    manifest_sha256: String,
+    manifest_sha256: Option<String>,
     outcome: serde_json::Value,
     truncation: serde_json::Value,
     effects: Vec<serde_json::Value>,
@@ -1421,7 +1405,7 @@ fn live_held_descriptor_check(temp: &Path) -> Result<(), CheckFailure> {
     let meta = file.metadata().map_err(|error| CheckFailure {
         what: error.to_string(),
     })?;
-    tape::begin("oxide", "LIVE-HELD", "manifest", "pure");
+    tape::begin("oxide", "LIVE-HELD", "", "pure");
     let observed = tape::fd_dev_ino(file.as_fd());
     std::fs::rename(&path, temp.join("held-original")).map_err(|error| CheckFailure {
         what: error.to_string(),
@@ -1458,7 +1442,7 @@ fn live_held_descriptor_check(temp: &Path) -> Result<(), CheckFailure> {
 /// Adapter emission round-trips through the shared parser; path-only
 /// parent_required stays incomplete.
 fn emitted_wire_round_trip_check(temp: &Path) -> Result<(), CheckFailure> {
-    tape::begin("oxide", "WIRE-ROUND-TRIP", "manifest", "pure");
+    tape::begin("oxide", "WIRE-ROUND-TRIP", "", "pure");
     tape::read_row_dev(
         "prune::read_registry",
         Path::new("/fixture/registry"),
@@ -1467,7 +1451,7 @@ fn emitted_wire_round_trip_check(temp: &Path) -> Result<(), CheckFailure> {
         tape::TapeOutcome::Digest {
             digest: tape::sha256_hex(b"bytes"),
         },
-        64,
+        Some(64),
     );
     let path = temp.join("wire-round-trip.json");
     tape::finish_and_write(
@@ -1487,7 +1471,7 @@ fn emitted_wire_round_trip_check(temp: &Path) -> Result<(), CheckFailure> {
     check(
         parsed.get("schema").and_then(|v| v.as_str()) == Some(tape::TRANSCRIPT_VERSION)
             && parsed.get("version").and_then(|v| v.as_str()) == Some(tape::TRANSCRIPT_VERSION),
-        "emitted transcript names schema /1",
+        "emitted transcript names schema /2",
     )?;
     check(
         parsed
@@ -1528,6 +1512,243 @@ fn emitted_wire_round_trip_check(temp: &Path) -> Result<(), CheckFailure> {
 /// Pure recorder checks: deterministic serialization, epoch and occurrence
 /// bookkeeping, per-key occurrence cap, read-row cap, document bound and the
 /// explicit truncation markers.
+/// Emitted-shape regressions. Every row kind is written through the real
+/// recorder leaves; the emitted bytes must parse as `/2`, and the same bytes
+/// with one field tampered, a `/1` version, or the apparatus diagnostic must
+/// be refused. Hand-written vectors alone are not emitter conformance.
+fn emitted_shape_check(temp: &Path) -> Result<(), CheckFailure> {
+    let io = |error: std::io::Error| CheckFailure {
+        what: error.to_string(),
+    };
+    let fixture = temp.join("emitted-shape-fixture");
+    std::fs::create_dir_all(fixture.join("nested")).map_err(io)?;
+    std::fs::write(fixture.join("a.json"), b"one").map_err(io)?;
+    let pre = tape::capture_fixture(&fixture);
+    tape::begin("oxide", "EMITTED-SHAPE", "", "pure");
+    tape::read_row(
+        "config:inspect:absent",
+        Path::new("/fixture/missing"),
+        tape::TapeOutcome::Absent,
+        None,
+    );
+    tape::read_row(
+        "config:read-bounded",
+        &fixture.join("a.json"),
+        tape::TapeOutcome::Digest {
+            digest: tape::sha256_hex(b"one"),
+        },
+        Some(0),
+    );
+    tape::read_row(
+        "config:read-capped",
+        &fixture.join("a.json"),
+        tape::TapeOutcome::Digest {
+            digest: tape::sha256_hex(b"one"),
+        },
+        Some(64),
+    );
+    tape::component_row(
+        "root-observe:entry",
+        1,
+        2,
+        std::ffi::OsStr::new("oxide-ra"),
+        tape::TapeOutcome::Opened { dev: 3, ino: 4 },
+    );
+    tape::volume_row(
+        "volume-site",
+        Path::new("/mount"),
+        Some("volume"),
+        Some("/dev/example"),
+        tape::TapeOutcome::Facts {
+            facts: "mounted".to_owned(),
+        },
+    );
+    tape::descriptor_row(
+        "held:descriptor",
+        7,
+        tape::TapeOutcome::Opened { dev: 5, ino: 6 },
+    );
+    tape::recorded_holder("lock-holder", 9, 42, 77);
+    tape::classify_row("authority-budget", "allowance", "64");
+    tape::clock_row("policy-wall-ms", 1234);
+    tape::clock_unproven("boot-session-ms");
+    tape::effect_row("attempt@ledger", Path::new("/fixture/ledger"));
+    tape::effect_row("save@ledger", Path::new("/fixture/ledger"));
+    tape::unbound_effect("descriptor:fchmod", true);
+    tape::unbound_effect("descriptor:rename", false);
+    std::fs::write(fixture.join("a.json"), b"two").map_err(io)?;
+    std::fs::write(fixture.join("nested").join("b.json"), b"new").map_err(io)?;
+    let post = tape::capture_fixture(&fixture);
+    let diff_effects = tape::diff_fixture(&pre.post, &post.post);
+    let capture = TapeFixtureCapture {
+        root: post.root.clone(),
+        truncated: post.truncated || pre.truncated,
+        pre: pre.post.clone(),
+        post: post.post,
+        diff_effects,
+    };
+    let manifest = serde_json::json!({
+        "schema": tape::MANIFEST_VERSION,
+        "case": "EMITTED-SHAPE",
+        "mandatory_observations": [{
+            "engine": "oxide",
+            "site": "config:inspect:absent",
+            "parent_required": false,
+            "identity": {"path": "/fixture/missing"}
+        }],
+        "expected_effects": [{"kind": "save", "site": "ledger", "path": "/fixture/ledger"}]
+    });
+    tape::check_manifest_effects(&manifest);
+    let path = temp.join("emitted-shape.json");
+    tape::finish_and_write(
+        &path,
+        TapeEngineOutcome::Completed {
+            result: serde_json::json!({"complete": false}),
+        },
+        Some(capture),
+    )
+    .map_err(|what| CheckFailure { what })?;
+    let bytes = std::fs::read(&path).map_err(io)?;
+    let parsed = tape::parse_transcript(&bytes).map_err(|error| CheckFailure {
+        what: format!("emitted /2 transcript must parse: {}", error.message),
+    })?;
+    let at = |pointer: &str| {
+        parsed
+            .pointer(pointer)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    check(
+        at("/reads/0/cap").is_null(),
+        "an absent read cap is emitted as null",
+    )?;
+    check(
+        at("/reads/1/cap") == serde_json::json!(0),
+        "a real zero cap is emitted as 0",
+    )?;
+    check(
+        at("/reads/2/cap") == serde_json::json!(64),
+        "a real cap is emitted as its value",
+    )?;
+    check(
+        at("/reads/2/identity/fd").is_null() && at("/reads/3/identity/parent_source") == "handle",
+        "a component row keeps its handle parent and null descriptor",
+    )?;
+    check(
+        at("/reads/4/identity/volume_uuid") == "volume"
+            && at("/reads/4/identity/volume_device") == "/dev/example",
+        "a volume row keeps its UUID and device",
+    )?;
+    check(
+        at("/reads/5/identity/fd") == serde_json::json!(7)
+            && at("/reads/5/identity/own_source") == "extracted",
+        "a descriptor row keeps its fd and extracted own identity",
+    )?;
+    check(
+        at("/recorded_holders/0/kernel_start").is_null() && at("/recorded_holders/0/uid").is_null(),
+        "a recorded holder keeps its unproven kernel start and uid as null",
+    )?;
+    check(
+        at("/clocks/0/value") == serde_json::json!(1234) && at("/clocks/1/value").is_null(),
+        "an unobserved clock is null, not zero",
+    )?;
+    check(
+        at("/effects/0/result") == "unknown" && at("/effects/0/attempted") == true,
+        "an attempt is recorded as unknown, never succeeded",
+    )?;
+    check(
+        at("/effects/1/result") == "succeeded" && at("/effects/1/attempted") == false,
+        "a completed effect is recorded as succeeded",
+    )?;
+    check(
+        at("/effects/2/kind") == "descriptor-effect"
+            && at("/effects/2/path").is_null()
+            && at("/effects/2/result") == "succeeded"
+            && at("/effects/3/result") == "failed",
+        "a descriptor-only effect keeps its observed result and no path",
+    )?;
+    check(
+        at("/fixture_capture/post/0/device").is_u64()
+            && at("/fixture_capture/post/0/dev").is_null(),
+        "fixture entries use the wire identity names device and inode",
+    )?;
+    check(
+        at("/fixture_capture/diff_effects/0/result") == "unknown",
+        "a fixture diff never reports a writer result",
+    )?;
+    let completeness = tape::assess_completeness(&parsed, Some(&manifest));
+    for expected in [
+        "effect not completed at ledger (unknown)",
+        "effect identity unproven at descriptor:fchmod",
+        "effect not completed at descriptor:rename (failed)",
+        "window origin and end unproven",
+    ] {
+        check(
+            completeness.issues.iter().any(|issue| issue == expected),
+            &format!("completeness names {expected}"),
+        )?;
+    }
+    check(
+        !completeness
+            .issues
+            .iter()
+            .any(|issue| issue.contains("collision")),
+        "distinct emitted reads do not collide",
+    )?;
+
+    let mut tampered: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|error| CheckFailure {
+            what: error.to_string(),
+        })?;
+    tampered["reads"][1]["cap"] = serde_json::json!("0");
+    let tampered_bytes = serde_json::to_vec(&tampered).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    check(
+        tape::parse_transcript(&tampered_bytes).is_err(),
+        "a string cap in an emitted document is refused",
+    )?;
+    let mut missing: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|error| CheckFailure {
+            what: error.to_string(),
+        })?;
+    missing["reads"][0]
+        .as_object_mut()
+        .map(|row| row.remove("cap"));
+    let missing_bytes = serde_json::to_vec(&missing).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    check(
+        tape::parse_transcript(&missing_bytes).is_err(),
+        "an emitted read without an explicit cap is refused",
+    )?;
+    let mut historical: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|error| CheckFailure {
+            what: error.to_string(),
+        })?;
+    historical["schema"] = serde_json::json!("oxide.capture.transcript/1");
+    historical["version"] = serde_json::json!("oxide.capture.transcript/1");
+    let historical_bytes = serde_json::to_vec(&historical).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    check(
+        tape::parse_transcript(&historical_bytes)
+            .err()
+            .is_some_and(|error| error.message.contains("historical /1")),
+        "a historical /1 document is refused by name",
+    )?;
+    let apparatus = temp.join("emitted-shape-apparatus.json");
+    tape::begin("oxide", "EMITTED-SHAPE", "", "pure");
+    tape::finish_apparatus(&apparatus, "EMITTED-SHAPE", "", "manifest refused")
+        .map_err(|what| CheckFailure { what })?;
+    let apparatus_bytes = std::fs::read(&apparatus).map_err(io)?;
+    check(
+        tape::parse_transcript(&apparatus_bytes).is_err(),
+        "an apparatus diagnostic is never a conforming transcript",
+    )?;
+    Ok(())
+}
+
 fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
     use std::os::unix::fs::PermissionsExt;
     // The covering Rust recipe supplies a fresh child of this sibling as
@@ -1602,7 +1823,7 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
         what: error.to_string(),
     })?;
     let example: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../docs/knowledge/contracts/capture-examples/manifest-example.json"
+        "../../../docs/knowledge/contracts/capture-examples/v2/manifest-example.json"
     ))
     .map_err(|error| CheckFailure {
         what: error.to_string(),
@@ -1621,7 +1842,7 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
         "an obligation requires parent_required",
     )?;
     let effect_example: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../docs/knowledge/contracts/capture-examples/manifest-effects-all-kinds.json"
+        "../../../docs/knowledge/contracts/capture-examples/v2/manifest-effects-all-kinds.json"
     ))
     .map_err(|error| CheckFailure {
         what: error.to_string(),
@@ -1808,7 +2029,7 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
         check(!bytes.is_empty(), "re-rooted source is present")?;
         println!("source-map {name} sha256={}", tape::sha256_hex(bytes));
     }
-    tape::begin("oxide", "PURE-DOCUMENT-CAP", "manifest", "pure");
+    tape::begin("oxide", "PURE-DOCUMENT-CAP", "", "pure");
     let capped_path = temp.join("capped-transcript.json");
     tape::finish_and_write(
         &capped_path,
@@ -1853,7 +2074,7 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
     })?;
     write_private_file(&observed_path, b"replacement")
         .map_err(|error| CheckFailure { what: error })?;
-    tape::begin("oxide", "PURE-DESCRIPTOR", "manifest", "pure");
+    tape::begin("oxide", "PURE-DESCRIPTOR", "", "pure");
     let mut observed_bytes = Vec::new();
     prune::authority_read_observed(
         &observed_file,
@@ -1904,7 +2125,7 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
         "unobserved descriptor parent remains explicitly unproven",
     )?;
     let build = |digest: String| -> Vec<u8> {
-        tape::begin("oxide", "PURE", "manifest", "pure");
+        tape::begin("oxide", "PURE", "", "pure");
         for occurrence in 0..3 {
             tape::read_row_dev(
                 "pure:read",
@@ -1914,7 +2135,7 @@ fn pure_checks(temp: &Path) -> Result<(), CheckFailure> {
                 tape::TapeOutcome::Digest {
                     digest: format!("{digest}-{occurrence}"),
                 },
-                128,
+                Some(128),
             );
         }
         tape::effect_row("save@pure", Path::new("/pure/state.json"));
@@ -2007,7 +2228,7 @@ fn finish_pure(path: PathBuf) -> bool {
 /// The occurrence cap: the sixty-fifth occurrence of one key marks the
 /// transcript's occurrence truncation instead of dropping the row.
 fn occurrence_cap_check(temp: &Path) -> Result<(), CheckFailure> {
-    tape::begin("oxide", "PURE-CAP", "manifest", "pure");
+    tape::begin("oxide", "PURE-CAP", "", "pure");
     for _ in 0..(tape::MAX_OCCURRENCES_PER_KEY + 2) {
         tape::read_row_dev(
             "cap:read",
@@ -2017,7 +2238,7 @@ fn occurrence_cap_check(temp: &Path) -> Result<(), CheckFailure> {
             tape::TapeOutcome::Digest {
                 digest: "digest".to_owned(),
             },
-            1,
+            Some(1),
         );
     }
     let outcome = TapeEngineOutcome::Completed {
@@ -2041,7 +2262,7 @@ fn occurrence_cap_check(temp: &Path) -> Result<(), CheckFailure> {
 
 /// The read-row cap: past 8192 rows the document says so.
 fn read_row_cap_check(temp: &Path) -> Result<(), CheckFailure> {
-    tape::begin("oxide", "PURE-ROWS", "manifest", "pure");
+    tape::begin("oxide", "PURE-ROWS", "", "pure");
     for index in 0..(tape::MAX_READ_ROWS + 4) {
         let path = PathBuf::from(format!("/rows/{index}"));
         tape::read_row(
@@ -2050,7 +2271,7 @@ fn read_row_cap_check(temp: &Path) -> Result<(), CheckFailure> {
             tape::TapeOutcome::Digest {
                 digest: "d".to_owned(),
             },
-            1,
+            Some(1),
         );
     }
     let outcome = TapeEngineOutcome::Completed {
@@ -2081,7 +2302,7 @@ fn volume_window_reconciliation_check(temp: &Path) -> Result<(), CheckFailure> {
             "volume_uuid": "volume", "mount": "/mount", "device": "/dev/example", "window_identity": "current"
         }}]
     });
-    tape::begin("oxide", "VOLUME-WINDOW", "manifest", "pure");
+    tape::begin("oxide", "VOLUME-WINDOW", "", "pure");
     tape::volume_row(
         "volume-site",
         Path::new("/mount"),
@@ -2115,7 +2336,7 @@ fn effect_reconciliation_check(temp: &Path) -> Result<(), CheckFailure> {
     let manifest = serde_json::json!({"expected_effects": [
         {"kind": "fence", "site": "declared", "path": "/fixture/state", "attempted": false}
     ]});
-    tape::begin("oxide", "EFFECT-MISSING-EXTRA", "manifest", "pure");
+    tape::begin("oxide", "EFFECT-MISSING-EXTRA", "", "pure");
     tape::effect_row("save@unexpected", Path::new("/fixture/other"));
     tape::check_manifest_effects(&manifest);
     let transcript = temp.join("effect-missing-extra.json");
@@ -2131,14 +2352,14 @@ fn effect_reconciliation_check(temp: &Path) -> Result<(), CheckFailure> {
     check(
         doc.notes
             .iter()
-            .any(|note| note.contains("missing declared effect")),
-        "a missing declared effect is explicit",
+            .any(|note| note.contains("substituted effects")),
+        "a declared effect not matched by the observed one is explicit",
     )?;
     check(
         doc.notes
             .iter()
-            .any(|note| note.contains("extra observed effect")),
-        "an extra observed effect is explicit",
+            .any(|note| note.contains("substituted effects")),
+        "an unmatched observed effect is explicit",
     )
 }
 
@@ -2152,7 +2373,7 @@ fn obligation_reconciliation_check(temp: &Path) -> Result<(), CheckFailure> {
             "parent_required": false,
             "identity": {"component": "entry", "parent_device": 1, "parent_inode": 2}}]
     });
-    tape::begin("oxide", "OBLIGATION-PRESENT", "manifest", "pure");
+    tape::begin("oxide", "OBLIGATION-PRESENT", "", "pure");
     tape::component_row(
         "component-site",
         1,
@@ -2179,7 +2400,7 @@ fn obligation_reconciliation_check(temp: &Path) -> Result<(), CheckFailure> {
         "a fully bound component satisfies its obligation",
     )?;
 
-    tape::begin("oxide", "OBLIGATION-MISSING-EXTRA", "manifest", "pure");
+    tape::begin("oxide", "OBLIGATION-MISSING-EXTRA", "", "pure");
     tape::component_row(
         "unexpected-site",
         7,
@@ -2215,7 +2436,7 @@ fn obligation_reconciliation_check(temp: &Path) -> Result<(), CheckFailure> {
 }
 
 fn recorded_holder_cap_check(temp: &Path) -> Result<(), CheckFailure> {
-    tape::begin("oxide", "HOLDER-CAP", "manifest", "pure");
+    tape::begin("oxide", "HOLDER-CAP", "", "pure");
     for id in 0..=tape::MAX_PROCESS_ROWS {
         tape::recorded_holder("pure-holder", id as u64, id as u32, 42);
     }
@@ -2248,13 +2469,13 @@ fn recorded_holder_cap_check(temp: &Path) -> Result<(), CheckFailure> {
 }
 
 fn unique_key_cap_check(temp: &Path) -> Result<(), CheckFailure> {
-    tape::begin("oxide", "UNIQUE-KEY-CAP", "manifest", "pure");
+    tape::begin("oxide", "UNIQUE-KEY-CAP", "", "pure");
     for index in 0..=tape::MAX_READ_ROWS * 2 {
         tape::read_row(
             "unique-key-cap",
             &temp.join(index.to_string()),
             tape::TapeOutcome::Absent,
-            0,
+            None,
         );
     }
     let transcript = temp.join("unique-key-cap.json");
@@ -2277,7 +2498,7 @@ fn unique_key_cap_check(temp: &Path) -> Result<(), CheckFailure> {
 }
 
 fn effect_attempt_check(temp: &Path) -> Result<(), CheckFailure> {
-    tape::begin("oxide", "EFFECT-ATTEMPT", "manifest", "pure");
+    tape::begin("oxide", "EFFECT-ATTEMPT", "", "pure");
     {
         let _fence = tape::effect_kind_override("fence@expected");
         tape::effect_row("attempt@temporary-open", Path::new("/fixture/temp"));
@@ -2336,7 +2557,7 @@ fn effect_attempt_check(temp: &Path) -> Result<(), CheckFailure> {
 
 fn config_inspect_absence_check(temp: &Path) -> Result<(), CheckFailure> {
     let missing = temp.join("missing-config-inspect-pool");
-    tape::begin("oxide", "CONFIG-INSPECT-ABSENT", "manifest", "pure");
+    tape::begin("oxide", "CONFIG-INSPECT-ABSENT", "", "pure");
     let found = config::inspect(&missing);
     let result = TapeEngineOutcome::Completed {
         result: serde_json::json!({"complete": false, "entries": []}),
@@ -2361,7 +2582,7 @@ fn config_inspect_absence_check(temp: &Path) -> Result<(), CheckFailure> {
 }
 
 fn unbound_authority_note_check(temp: &Path) -> Result<(), CheckFailure> {
-    tape::begin("oxide", "PURE-UNBOUND", "manifest", "pure");
+    tape::begin("oxide", "PURE-UNBOUND", "", "pure");
     tape::authority_core(b"bytes", 64, false, false);
     let outcome = TapeEngineOutcome::Completed {
         result: serde_json::json!({"complete": false, "entries": []}),
@@ -2375,7 +2596,7 @@ fn unbound_authority_note_check(temp: &Path) -> Result<(), CheckFailure> {
             .any(|note| note.contains("without its caller binding its identity")),
         "an unbound authority read is an explicit note",
     )?;
-    tape::begin("oxide", "PURE-BOUND", "manifest", "pure");
+    tape::begin("oxide", "PURE-BOUND", "", "pure");
     tape::authority_core(b"bytes", 64, false, false);
     tape::authority_bind("pure::site", Path::new("/bound/file"), 64);
     let outcome = TapeEngineOutcome::Completed {
@@ -2429,7 +2650,7 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
     // Schema-example data is a unit-test envelope, not source or fixture
     // qualification evidence. X-S2 supplies observed manifest facts.
     let mut manifest: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../docs/knowledge/contracts/capture-examples/manifest-example.json"
+        "../../../docs/knowledge/contracts/capture-examples/v2/manifest-example.json"
     ))
     .map_err(|error| CheckFailure {
         what: error.to_string(),
@@ -2518,7 +2739,7 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
             })?,
         );
     check(
-        doc.manifest_sha256 == manifest_sha,
+        doc.manifest_sha256.as_deref() == Some(manifest_sha.as_str()),
         "the transcript binds the manifest digest",
     )?;
     check(
@@ -2848,6 +3069,7 @@ fn self_check(pure_only: bool, diagnostic: bool) -> Result<(), String> {
         tape::run_self_checks().map_err(|what| format!("capture-wire: {what}"))?;
         live_held_descriptor_check(&dir).map_err(|failure| failure.what)?;
         emitted_wire_round_trip_check(&dir).map_err(|failure| failure.what)?;
+        emitted_shape_check(&dir).map_err(|failure| failure.what)?;
         pure_checks(&dir).map_err(|failure| failure.what)?;
         occurrence_cap_check(&dir).map_err(|failure| failure.what)?;
         read_row_cap_check(&dir).map_err(|failure| failure.what)?;

@@ -986,7 +986,7 @@ fn read_config(path: &Path) -> Result<FileConfig, String> {
                     dev: metadata.dev(),
                     ino: metadata.ino(),
                 },
-                MAX_CONFIG_BYTES,
+                Some(MAX_CONFIG_BYTES),
             );
             crate::prune::tape_restore_errno(saved_errno);
             metadata
@@ -999,7 +999,7 @@ fn read_config(path: &Path) -> Result<FileConfig, String> {
                 crate::tape::TapeOutcome::Refusal {
                     reason: error.to_string(),
                 },
-                MAX_CONFIG_BYTES,
+                Some(MAX_CONFIG_BYTES),
             );
             crate::prune::tape_restore_errno(saved_errno);
             return Err(named(error.to_string()));
@@ -1026,7 +1026,7 @@ fn read_config(path: &Path) -> Result<FileConfig, String> {
                 reason: error.to_string(),
             },
         };
-        crate::tape::read_row("config:read-config", path, outcome, MAX_CONFIG_BYTES);
+        crate::tape::read_row("config:read-config", path, outcome, Some(MAX_CONFIG_BYTES));
         crate::prune::tape_restore_errno(saved_errno);
         result.map_err(|error| named(error.to_string()))?;
     }
@@ -1261,7 +1261,7 @@ fn inspect_metadata_observed(
                 dev: metadata.dev(),
                 ino: metadata.ino(),
             },
-            0,
+            None,
         ),
         Err(error) => crate::tape::read_row(
             site,
@@ -1273,7 +1273,7 @@ fn inspect_metadata_observed(
                     reason: error.to_string(),
                 }
             },
-            0,
+            None,
         ),
     }
     crate::prune::tape_restore_errno(saved_errno);
@@ -1310,7 +1310,7 @@ pub fn inspect(path: &Path) -> Found {
                 reason: error.to_string(),
             },
         };
-        crate::tape::read_row("config:inspect:canonicalize", path, outcome, 0);
+        crate::tape::read_row("config:inspect:canonicalize", path, outcome, None);
         crate::prune::tape_restore_errno(saved_errno);
         let Ok(resolved) = result else {
             return Found::Unknown;
@@ -1373,7 +1373,12 @@ pub fn inspect(path: &Path) -> Found {
                 reason: error.to_string(),
             },
         };
-        crate::tape::read_row("config:inspect:bytes", &config, outcome, MAX_CONFIG_BYTES);
+        crate::tape::read_row(
+            "config:inspect:bytes",
+            &config,
+            outcome,
+            Some(MAX_CONFIG_BYTES),
+        );
         crate::prune::tape_restore_errno(saved_errno);
         let Ok(bytes) = result else {
             return Found::Unknown;

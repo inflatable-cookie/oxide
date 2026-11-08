@@ -5743,7 +5743,7 @@ mod control_directory_fs {
                     dev: metadata.dev(),
                     ino: metadata.ino(),
                 },
-                0,
+                None,
             ),
             Err(error) => crate::tape::read_row(
                 "control-directory:named",
@@ -5755,7 +5755,7 @@ mod control_directory_fs {
                         reason: error.to_string(),
                     }
                 },
-                0,
+                None,
             ),
         }
         crate::tape::restore_observer_errno(saved_errno);
@@ -5800,7 +5800,7 @@ pub(crate) fn open_control_directory(path: &Path) -> Result<Option<File>, String
                 reason: error.to_string(),
             },
         };
-        crate::tape::read_row("control-directory:open", path, outcome, 0);
+        crate::tape::read_row("control-directory:open", path, outcome, None);
         crate::tape::restore_observer_errno(saved_errno);
         result.map_err(|error| format!("cannot open {}: {error}", path.display()))?
     };
@@ -5822,7 +5822,7 @@ pub(crate) fn open_control_directory(path: &Path) -> Result<Option<File>, String
                     dev: metadata.dev(),
                     ino: metadata.ino(),
                 },
-                0,
+                None,
             ),
             Err(error) => crate::tape::read_row(
                 "control-directory:held",
@@ -5830,7 +5830,7 @@ pub(crate) fn open_control_directory(path: &Path) -> Result<Option<File>, String
                 crate::tape::TapeOutcome::Refusal {
                     reason: error.to_string(),
                 },
-                0,
+                None,
             ),
         }
         crate::tape::restore_observer_errno(saved_errno);
@@ -6478,7 +6478,7 @@ fn open_admission_file(control: &Path, create: bool) -> Result<Option<File>, Str
                     crate::tape::TapeOutcome::Refusal {
                         reason: create_error.to_string(),
                     },
-                    0,
+                    None,
                 );
                 return Err(format!(
                     "cannot create admission lock in {}: {create_error}",
@@ -6516,7 +6516,7 @@ fn open_admission_file(control: &Path, create: bool) -> Result<Option<File>, Str
                 "admission-lock:open",
                 &control.join("admission.lock"),
                 crate::tape::TapeOutcome::Absent,
-                0,
+                None,
             );
             return Ok(None);
         }
@@ -6553,7 +6553,7 @@ fn open_admission_file(control: &Path, create: bool) -> Result<Option<File>, Str
                 dev: metadata.dev(),
                 ino: metadata.ino(),
             },
-            0,
+            None,
         );
     }
     // SAFETY: getuid has no preconditions.
@@ -6997,7 +6997,7 @@ pub(crate) fn private_file(path: &Path, create: bool) -> Result<Option<File>, St
                 crate::tape::TapeOutcome::Facts {
                     facts: "opened; descriptor identity unproven".to_owned(),
                 },
-                0,
+                None,
             );
             crate::tape::restore_observer_errno(saved_errno);
             file
@@ -7010,7 +7010,7 @@ pub(crate) fn private_file(path: &Path, create: bool) -> Result<Option<File>, St
                 "private-file:open",
                 path,
                 crate::tape::TapeOutcome::Absent,
-                0,
+                None,
             );
             #[cfg(test)]
             crate::tape::restore_observer_errno(saved_errno);
@@ -7030,7 +7030,7 @@ pub(crate) fn private_file(path: &Path, create: bool) -> Result<Option<File>, St
                 crate::tape::TapeOutcome::Refusal {
                     reason: error.to_string(),
                 },
-                0,
+                None,
             );
             #[cfg(test)]
             crate::tape::restore_observer_errno(saved_errno);
@@ -7058,7 +7058,7 @@ pub(crate) fn private_file(path: &Path, create: bool) -> Result<Option<File>, St
                     dev: metadata.dev(),
                     ino: metadata.ino(),
                 },
-                0,
+                None,
             ),
             Err(error) => crate::tape::read_row(
                 "private-file:metadata",
@@ -7066,7 +7066,7 @@ pub(crate) fn private_file(path: &Path, create: bool) -> Result<Option<File>, St
                 crate::tape::TapeOutcome::Refusal {
                     reason: error.to_string(),
                 },
-                0,
+                None,
             ),
         }
         crate::tape::restore_observer_errno(saved_errno);

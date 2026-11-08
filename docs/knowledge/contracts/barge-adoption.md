@@ -1649,9 +1649,9 @@ current source in the comparison report or recorded as blocking, and O3 stays
 held while any blocking row stands. `D-1`/`D-2` (Q-E) and `D-3` (Q-D) keep
 their existing operator decision points.
 
-#### Implemented shared capture wire (oxide#283)
+#### Implemented shared capture wire (oxide#283, superseded by `/2` below)
 
-Test-only. Schema remains `oxide.capture.transcript/1` and
+Test-only. Historical `/1` schema was `oxide.capture.transcript/1` and
 `oxide.capture.manifest/1`. Adapter emission uses the schema identity names
 (`parent_device`, `parent_inode`, `device`, `inode`, `volume_uuid`, `mount`,
 `volume_device`), always-present `parent_source` / `own_source`
@@ -1715,6 +1715,88 @@ Barge copies the files; there is no runtime cross-repo dependency.
 | oxide#241 / #222, private producer, Barge native/live | Still held |
 
 Focused selector: `effigy rust:capture-wire` (`tape_prune_eval --self-check`).
+
+#### Current shared capture wire `/2` (oxide#284)
+
+Test-only. `/2` is the current proof input for both documents. A `/1`
+transcript or manifest is refused by name (`historical /1 capture document
+… is not current proof input`) and never upgraded. The `/1` section above and
+its vectors stay as history. An apparatus refusal or fallback writes a
+distinct `oxide.capture.apparatus/2` diagnostic; the transcript parser refuses
+it, so it cannot read as a conforming capture. Parser and emitter live in
+`src/bin/oxide/capture_wire.rs` and `src/bin/oxide/tape.rs`.
+
+Shape. Every key is present; absence is an explicit `null`.
+
+- Transcript: `schema` and `version` are both `oxide.capture.transcript/2`.
+  `manifest_sha256` is `null` (no manifest bound) or lowercase SHA-256.
+  Window origin and end are `null` (unproven). `outcome` is `completed` with
+  an object `result`, or `refused` with `reason`, `exit_code` (u8) and
+  `source` `engine`. `truncation` is exactly five booleans.
+- Reads: `cap` is `null` when no cap applies, or a u64; `0` is a real zero
+  cap. Identity carries all 15 fields. Parent device and inode are both
+  present or both null; `parent_source` is `none` exactly when the parent is
+  absent; `own_source` is `none` exactly when device and inode are absent.
+  `kind` equals `site`.
+- Effects: `kind` is one of the seven writes or `descriptor-effect` (an effect
+  on a held descriptor whose path is unbound; `path` is `null`). `result` is
+  `succeeded`, `failed`, `partial` or `unknown`. An attempt is never
+  `succeeded`. Fixture-diff rows are `unknown` at epoch 0.
+- Clocks: `value` is `null` when unobserved, never zero.
+- Holders: `kernel_start` and `uid` are explicit `null` when unproven.
+- Classifications: occurrence 1..=64.
+- Fixture capture: entries use the wire names `device` and `inode`;
+  `bytes_sha256` only on `file`; `rel` is a strict relative path.
+- Epochs: at least 1 on state rows and unique across reads, effects, clocks,
+  classifications and holders.
+- Caps unchanged: 8192 rows, 8 MiB, 64 occurrences per key, 512 holders,
+  4096 fixture entries per side.
+- Manifest `/2`: strict types and source digests, `window` start not after
+  end, obligations and expected effects carry exact keys. Schema file
+  `oxide-capture-manifest.v2.schema.json`; examples under `capture-examples/v2/`.
+
+Completeness. One implementation, `capture_wire::assess_completeness`. The
+in-window engine check delegates identity matching
+(`identity_fields_match`) and effect parity (`effect_parity_issues`) to the
+same functions, so the rules cannot diverge.
+
+- Identity: every named obligation key must equal the row value; `null`
+  never matches.
+- Effects: only `attempted: false`, `succeeded`, pathed rows form completed
+  parity. Others are issues: `effect not completed at <site> (<result>)` or
+  `effect identity unproven at <site>`. An attempt matching a declared effect
+  is not parity.
+- Unproven gaps are issues: `process lifetime unproven at <site>` (holder
+  without kernel start), `clock unproven at <kind>`, `window origin and end
+  unproven`.
+- `parent_required` still fails while `K1_PREMISE_QUALIFIED` is false.
+  `Completeness` is never success from structure alone.
+
+Evidence. `docs/knowledge/contracts/capture-vectors/v2/` (`SHA256SUMS`):
+eight valid transcripts, seventeen parser refusals, eight parser-positive
+completeness failures, two valid and four invalid manifests. The emitter
+conformance regression `emitted_shape_check` in `tape_harness.rs` writes every
+row kind through the real recorder leaves, parses the bytes as `/2`, and
+refuses tampered, `/1` and apparatus variants of those same bytes. The pure
+selector is `effigy rust:capture-wire`; the regressions run there. Its
+embedded engine fixtures (`tape_prune_eval` with no arguments) are not run by
+this change.
+
+Remaining limits (finite):
+
+| Obligation | State |
+| --- | --- |
+| Path-only reads: parent `none`, `parent_required` | Unproven |
+| K1 numeric identity and lifetime | Unqualified (`K1_PREMISE_QUALIFIED` false) |
+| Recorded holders: kernel start and UID | Unproven (explicit null) |
+| Window origin and end | Unproven (explicit null) |
+| Unobserved clocks | Explicit null; completeness issue |
+| Descriptor-only effect identity | Unproven (`path` null) |
+| Writer result of a fixture diff | Unknown |
+| Attempted or failed effects | Not completed parity |
+| Route B private descriptor-relative read | Not activated |
+| Caps 512 / 8192 / 8 MiB / 64 | Unchanged; known host overflow stays insufficient |
+| Barge `/2` adoption and live or native use | Dependent task; no production read changed |
 
 ## Shared private-build validation gate (oxide#248)
 
