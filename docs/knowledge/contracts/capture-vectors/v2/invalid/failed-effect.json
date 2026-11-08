@@ -1,0 +1,68 @@
+{
+  "schema": "oxide.capture.transcript/2",
+  "version": "oxide.capture.transcript/2",
+  "engine": "oxide",
+  "case": "VECTOR-FAILED",
+  "manifest_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "entrypoint": "oxide::prune::tape_entry::run_chain",
+  "window_monotonic_start_ns": null,
+  "window_monotonic_end_ns": null,
+  "window_elapsed_ns": 1,
+  "outcome": {
+    "state": "completed",
+    "result": {}
+  },
+  "truncation": {
+    "read_rows_truncated": false,
+    "occurrences_truncated": false,
+    "document_truncated": false,
+    "process_rows_truncated": false,
+    "classifications_truncated": false
+  },
+  "effects": [
+    {
+      "kind": "save",
+      "site": "ledger",
+      "attempted": false,
+      "path": "/fixture/ledger",
+      "epoch": 2,
+      "result": "failed"
+    }
+  ],
+  "reads": [
+    {
+      "kind": "prune::read_registry",
+      "site": "prune::read_registry",
+      "identity": {
+        "path": "/fixture/registry",
+        "component": null,
+        "parent_device": null,
+        "parent_inode": null,
+        "device": null,
+        "inode": null,
+        "pid": null,
+        "start": null,
+        "uid": null,
+        "fd": null,
+        "volume_uuid": null,
+        "mount": null,
+        "volume_device": null,
+        "parent_source": "none",
+        "own_source": "none"
+      },
+      "outcome": {
+        "type": "absent"
+      },
+      "cap": null,
+      "epoch": 1,
+      "occurrence": 1
+    }
+  ],
+  "clocks": [],
+  "classifications": [],
+  "recorded_holders": [],
+  "fixture_capture": null,
+  "notes": [
+    "absolute monotonic window origin and end unproven"
+  ]
+}

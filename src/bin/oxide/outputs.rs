@@ -8317,7 +8317,7 @@ fn observed_marker_open(site: &str, path: &Path) -> std::io::Result<File> {
             reason: error.to_string(),
         },
     };
-    crate::tape::read_row(site, path, outcome, 0);
+    crate::tape::read_row(site, path, outcome, None);
     crate::tape::restore_observer_errno(saved_errno);
     result
 }
@@ -8337,7 +8337,7 @@ fn observed_marker_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
                 dev: metadata.dev(),
                 ino: metadata.ino(),
             },
-            0,
+            None,
         ),
         Err(error) => crate::tape::read_row(
             "outputs:marker:lstat",
@@ -8349,7 +8349,7 @@ fn observed_marker_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
                     reason: error.to_string(),
                 }
             },
-            0,
+            None,
         ),
     }
     crate::tape::restore_observer_errno(saved_errno);

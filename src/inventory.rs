@@ -416,7 +416,7 @@ fn observe_metadata_result(site: &str, path: &Path, result: &std::io::Result<fs:
                 dev: metadata.dev(),
                 ino: metadata.ino(),
             },
-            0,
+            None,
         ),
         Err(error) => crate::tape::read_row(
             site,
@@ -428,7 +428,7 @@ fn observe_metadata_result(site: &str, path: &Path, result: &std::io::Result<fs:
                     reason: error.to_string(),
                 }
             },
-            0,
+            None,
         ),
     }
     crate::tape::restore_observer_errno(saved_errno);
@@ -483,7 +483,7 @@ pub fn inventory_directory(
                 limits.max_elapsed_ms,
             ),
         },
-        limits.max_entries,
+        Some(limits.max_entries),
     );
     inventory_with(root, limits, &[], &[])
 }
@@ -554,7 +554,7 @@ fn inventory_with(
                 reason: error.to_string(),
             },
         };
-        crate::tape::read_row("inventory:root-canonicalize", root, outcome, 0);
+        crate::tape::read_row("inventory:root-canonicalize", root, outcome, None);
         crate::tape::restore_observer_errno(saved_errno);
         result.map_err(|error| match error.kind() {
             std::io::ErrorKind::NotFound => InventoryError::RootMissing(root.to_path_buf()),
@@ -589,7 +589,7 @@ fn inventory_with(
                     dev: metadata.dev(),
                     ino: metadata.ino(),
                 },
-                limits.max_entries,
+                Some(limits.max_entries),
             ),
             Err(error) => crate::tape::read_row(
                 "accounting-walk:root",
@@ -601,7 +601,7 @@ fn inventory_with(
                         reason: error.to_string(),
                     }
                 },
-                limits.max_entries,
+                Some(limits.max_entries),
             ),
         }
         crate::tape::restore_observer_errno(saved_errno);
@@ -1006,7 +1006,7 @@ impl<'a> Walker<'a> {
                         reason: error.to_string(),
                     },
                 };
-                crate::tape::read_row("inventory:read-dir-open", &directory, outcome, 0);
+                crate::tape::read_row("inventory:read-dir-open", &directory, outcome, None);
                 crate::tape::restore_observer_errno(saved_errno);
             }
             let entries = match read_dir {
@@ -1062,7 +1062,7 @@ impl<'a> Walker<'a> {
                             crate::tape::TapeOutcome::Refusal {
                                 reason: error.to_string(),
                             },
-                            0,
+                            None,
                         ),
                     }
                     crate::tape::restore_observer_errno(saved_errno);
@@ -1097,7 +1097,7 @@ impl<'a> Walker<'a> {
                             reason: error.to_string(),
                         },
                     };
-                    crate::tape::read_row("inventory:entry-type", &path, outcome, 0);
+                    crate::tape::read_row("inventory:entry-type", &path, outcome, None);
                     crate::tape::restore_observer_errno(saved_errno);
                 }
                 let file_type = match file_type_result {
@@ -1177,7 +1177,7 @@ impl<'a> Walker<'a> {
                     crate::tape::TapeOutcome::Facts {
                         facts: "end of directory".to_owned(),
                     },
-                    0,
+                    None,
                 );
                 crate::tape::restore_observer_errno(saved_errno);
             }
@@ -1659,7 +1659,7 @@ fn probe_filesystem_free(root: &Path, device: u64) -> FilesystemFree {
             crate::tape::TapeOutcome::Refusal {
                 reason: std::io::Error::last_os_error().to_string(),
             },
-            0,
+            None,
         );
         crate::tape::restore_observer_errno(saved_errno);
     }
@@ -1682,7 +1682,7 @@ fn probe_filesystem_free(root: &Path, device: u64) -> FilesystemFree {
                     stat.f_frsize, stat.f_blocks, stat.f_bfree, stat.f_bavail
                 ),
             },
-            0,
+            None,
         );
         crate::tape::restore_observer_errno(saved_errno);
     }

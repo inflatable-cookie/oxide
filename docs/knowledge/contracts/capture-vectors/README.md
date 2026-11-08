@@ -1,18 +1,24 @@
 # Canonical capture-wire vectors
 
-Hashed JSON fixtures for `oxide.capture.transcript/1` and
-`oxide.capture.manifest/1`. Schema and version are those strings. SHA-256
-of each file is in `SHA256SUMS` and in `src/bin/oxide/capture_wire.rs`.
+Current proof input is `v2/` (`oxide.capture.transcript/2`,
+`oxide.capture.manifest/2`). Its `SHA256SUMS` binds every file, and
+`src/bin/oxide/capture_wire.rs` binds the same digests. The contract is in
+`docs/knowledge/contracts/barge-adoption.md` under "Current shared capture
+wire `/2`".
 
-Parser-positive proves structure. Completeness is separate: path-only
-`parent_required` fails; `handle` parent still fails while K1 is unqualified.
-`invalid/` also holds parser-positive completeness failures (wrong parent,
-wrong inode, omitted obligation, omitted/extra/substituted effects,
-collision, source/run mismatch) and parse-fail vectors (string `device` on
-a file row, string `parent_inode`, occurrence 0, string holder `pid`,
-negative `fd`). Volume identity uses a string `device` on the manifest
-obligation, mapped to the row's `volume_device`; `window_identity` is
-manifest-window context. Cap overflow (8 MiB padded JSON, 8193 reads,
-occurrence 65, 513 typed process rows) is constructed in the self-check,
-not as files. Barge copies these files; there is no runtime cross-repo
-dependency.
+- `v2/valid/`: transcripts that parse and whose completeness issues are
+  exactly the expected list (unproven gaps stay issues).
+- `v2/invalid/`: parser refusals (`/1` history, apparatus diagnostic,
+  unknown or missing fields, wrong types, impossible combinations, reused
+  epochs, bad outcome or provenance) and parser-positive completeness
+  failures (`source-mismatch`, `wrong-inode`, `omitted-obligation`,
+  `omitted-effect`, `extra-effect`, `substituted-effect`,
+  `attempted-as-completed`, `partial-effect`, `failed-effect`,
+  `duplicate-observed-effect`, `duplicate-declared-effect`, `collision`).
+  Each parser refusal asserts the named refusal it must produce.
+- `v2/manifest/`: valid and invalid `/2` manifests, typed against
+  `oxide-capture-manifest.v2.schema.json`.
+
+The `/1` files at this directory's root and their `SHA256SUMS` are historical
+evidence, unchanged. They are refused as proof input. Barge copies these
+files; there is no runtime cross-repo dependency.

@@ -45,7 +45,7 @@ pub(crate) struct TapeRecord {
     pub(crate) kind: String,
     pub(crate) identity: String,
     pub(crate) outcome: String,
-    pub(crate) cap: u64,
+    pub(crate) cap: Option<u64>,
     pub(crate) epoch: u64,
     pub(crate) occurrence: u64,
 }
@@ -110,7 +110,7 @@ fn push_record(
     kind: &str,
     identity: String,
     outcome: &TapeOutcome,
-    cap: u64,
+    cap: Option<u64>,
 ) {
     if state.records.len() >= MAX_ROWS {
         state.rows_truncated = true;
@@ -134,7 +134,7 @@ fn push_record(
 
 /// Record one read row for an object at `path`, identity bound from the live
 /// tree (own and parent device/inode).
-pub(crate) fn read_row(kind: &str, path: &Path, outcome: TapeOutcome, cap: u64) {
+pub(crate) fn read_row(kind: &str, path: &Path, outcome: TapeOutcome, cap: Option<u64>) {
     with_state(|state| {
         let identity = format!("file:{}|identity=unproven", path.display());
         push_record(state, kind, identity, &outcome, cap);
@@ -148,7 +148,7 @@ pub(crate) fn read_row_dev(
     dev: u64,
     ino: u64,
     outcome: TapeOutcome,
-    cap: u64,
+    cap: Option<u64>,
 ) {
     with_state(|state| {
         let identity = format!(
@@ -169,7 +169,7 @@ pub(crate) fn component_row(
 ) {
     with_state(|state| {
         let identity = format!("component:parent={parent_dev}/{parent_ino}|name={name:?}");
-        push_record(state, kind, identity, &outcome, 0);
+        push_record(state, kind, identity, &outcome, None);
     });
 }
 
@@ -177,7 +177,7 @@ pub(crate) fn component_row(
 pub(crate) fn component_without_parent(kind: &str, name: &std::ffi::OsStr, outcome: TapeOutcome) {
     with_state(|state| {
         let identity = format!("component:parent=unproven|name={name:?}");
-        push_record(state, kind, identity, &outcome, 0);
+        push_record(state, kind, identity, &outcome, None);
     });
 }
 
@@ -201,7 +201,7 @@ pub(crate) fn descriptor_row(site: &str, fd: i32, outcome: TapeOutcome) {
             site,
             format!("descriptor:{fd}|identity=unproven"),
             &outcome,
-            0,
+            None,
         )
     });
     restore_observer_errno(saved_errno);
@@ -220,18 +220,18 @@ pub(crate) fn volume_row(
             "volume:mount={mount}|uuid={uuid:?}|device={device:?}",
             mount = mount.display()
         );
-        push_record(state, kind, identity, &outcome, 0);
+        push_record(state, kind, identity, &outcome, None);
     });
 }
 
 /// Record one lock outcome.
 pub(crate) fn lock_row(kind: &str, path: &Path, outcome: TapeOutcome) {
-    read_row(kind, path, outcome, 0);
+    read_row(kind, path, outcome, None);
 }
 
 /// Record one pool open outcome.
 pub(crate) fn pool_row(kind: &str, pool: &Path, outcome: TapeOutcome) {
-    read_row(kind, pool, outcome, 0);
+    read_row(kind, pool, outcome, None);
 }
 
 /// Record one classification observation.
@@ -250,7 +250,7 @@ pub(crate) fn classify_row(kind: &str, identity: &str, value: &str) {
             kind: format!("classify:{kind}"),
             identity: identity.to_owned(),
             outcome: value.to_owned(),
-            cap: 0,
+            cap: None,
             epoch,
             occurrence,
         });

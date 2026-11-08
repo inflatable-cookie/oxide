@@ -297,7 +297,7 @@ impl Binding {
             crate::tape::TapeOutcome::Facts {
                 facts: "opened; identity unproven".to_owned(),
             },
-            0,
+            None,
         );
         let fd = open_dir(Some(parent_fd.as_fd_ref()), Path::new(name)).map_err(|error| {
             #[cfg(test)]
@@ -307,7 +307,7 @@ impl Binding {
                 crate::tape::TapeOutcome::Refusal {
                     reason: error.to_string(),
                 },
-                0,
+                None,
             );
             format!("{} is not available: {error}", mount_point.display())
         })?;
@@ -318,7 +318,7 @@ impl Binding {
             crate::tape::TapeOutcome::Facts {
                 facts: "opened; identity unproven".to_owned(),
             },
-            0,
+            None,
         );
         let facts = observe(fd.as_fd())?;
         #[cfg(test)]
@@ -430,7 +430,7 @@ impl Binding {
                 dev: std::os::unix::fs::MetadataExt::dev(&by_path),
                 ino: std::os::unix::fs::MetadataExt::ino(&by_path),
             },
-            0,
+            None,
         );
         if by_path.file_type().is_symlink()
             || std::os::unix::fs::MetadataExt::dev(&by_path) != facts.dev

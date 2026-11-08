@@ -683,7 +683,7 @@ pub(crate) fn read_registration_at(
                     reason: error.to_string(),
                 }
             },
-            0,
+            None,
         );
         #[cfg(test)]
         crate::tape::restore_observer_errno(saved_errno);
@@ -702,7 +702,7 @@ pub(crate) fn read_registration_at(
             crate::tape::TapeOutcome::Facts {
                 facts: "opened; descriptor identity pending".to_owned(),
             },
-            0,
+            None,
         );
         crate::tape::restore_observer_errno(saved_errno);
     }
@@ -726,7 +726,7 @@ pub(crate) fn read_registration_at(
                     dev: metadata.dev(),
                     ino: metadata.ino(),
                 },
-                0,
+                None,
             ),
             Err(error) => crate::tape::read_row(
                 "removable:registration-held",
@@ -734,7 +734,7 @@ pub(crate) fn read_registration_at(
                 crate::tape::TapeOutcome::Refusal {
                     reason: error.to_string(),
                 },
-                0,
+                None,
             ),
         }
         crate::tape::restore_observer_errno(saved_errno);

@@ -4036,7 +4036,7 @@ impl Pool {
                         dev: value.dev(),
                         ino: value.ino(),
                     },
-                    0,
+                    None,
                 ),
                 Err(error) => crate::tape::read_row(
                     "pool:slot-root",
@@ -4048,7 +4048,7 @@ impl Pool {
                             reason: error.to_string(),
                         }
                     },
-                    0,
+                    None,
                 ),
             }
             crate::tape::restore_observer_errno(saved_errno);
@@ -4354,7 +4354,7 @@ fn open_volume_payload(paths: &BackingPaths, config: &PoolConfig) -> Result<Payl
                     dev: metadata.dev(),
                     ino: metadata.ino(),
                 },
-                0,
+                None,
             ),
             Err(error) => crate::tape::read_row(
                 "pool:volume:payload-held",
@@ -4362,7 +4362,7 @@ fn open_volume_payload(paths: &BackingPaths, config: &PoolConfig) -> Result<Payl
                 crate::tape::TapeOutcome::Refusal {
                     reason: error.to_string(),
                 },
-                0,
+                None,
             ),
         }
         crate::tape::restore_observer_errno(saved_errno);
@@ -5112,7 +5112,7 @@ impl Pool {
                     reason: error.to_string(),
                 },
             };
-            crate::tape::read_row("pool:holding:open", &root, outcome, 0);
+            crate::tape::read_row("pool:holding:open", &root, outcome, None);
             crate::tape::restore_observer_errno(saved_errno);
             match result {
                 Ok(file) => file,
@@ -5136,7 +5136,7 @@ impl Pool {
                         dev: metadata.dev(),
                         ino: metadata.ino(),
                     },
-                    0,
+                    None,
                 ),
                 Err(error) => crate::tape::read_row(
                     "pool:holding:held-metadata",
@@ -5144,7 +5144,7 @@ impl Pool {
                     crate::tape::TapeOutcome::Refusal {
                         reason: error.to_string(),
                     },
-                    0,
+                    None,
                 ),
             }
             crate::tape::restore_observer_errno(saved_errno);
@@ -6576,7 +6576,7 @@ fn lock_pool_inner(pool: &Path, create: bool, notice: bool) -> Result<File, Leas
                     dev: metadata.dev(),
                     ino: metadata.ino(),
                 },
-                0,
+                None,
             ),
             Err(error) => crate::tape::read_row(
                 "pool:lock:metadata-before",
@@ -6588,7 +6588,7 @@ fn lock_pool_inner(pool: &Path, create: bool, notice: bool) -> Result<File, Leas
                         reason: error.to_string(),
                     }
                 },
-                0,
+                None,
             ),
         }
         crate::tape::restore_observer_errno(saved_errno);
@@ -6638,7 +6638,7 @@ fn lock_pool_inner(pool: &Path, create: bool, notice: bool) -> Result<File, Leas
                     dev: metadata.dev(),
                     ino: metadata.ino(),
                 },
-                0,
+                None,
             ),
             Err(error) => crate::tape::read_row(
                 "pool:lock:metadata-held",
@@ -6646,7 +6646,7 @@ fn lock_pool_inner(pool: &Path, create: bool, notice: bool) -> Result<File, Leas
                 crate::tape::TapeOutcome::Refusal {
                     reason: error.to_string(),
                 },
-                0,
+                None,
             ),
         }
         crate::tape::restore_observer_errno(saved_errno);
@@ -6996,7 +6996,7 @@ fn observe_pool_metadata(site: &str, path: &Path) -> std::io::Result<fs::Metadat
                 dev: metadata.dev(),
                 ino: metadata.ino(),
             },
-            0,
+            None,
         ),
         Err(error) => crate::tape::read_row(
             site,
@@ -7008,7 +7008,7 @@ fn observe_pool_metadata(site: &str, path: &Path) -> std::io::Result<fs::Metadat
                     reason: error.to_string(),
                 }
             },
-            0,
+            None,
         ),
     }
     crate::tape::restore_observer_errno(saved_errno);
@@ -7065,7 +7065,7 @@ fn listed_control_entry(path: &Path) -> Result<Option<fs::Metadata>, LeaseError>
                     dev: metadata.dev(),
                     ino: metadata.ino(),
                 },
-                0,
+                None,
             ),
             Err(error) => crate::tape::read_row(
                 "pool:listed-entry",
@@ -7077,7 +7077,7 @@ fn listed_control_entry(path: &Path) -> Result<Option<fs::Metadata>, LeaseError>
                         reason: error.to_string(),
                     }
                 },
-                0,
+                None,
             ),
         }
         crate::tape::restore_observer_errno(saved_errno);
@@ -7111,7 +7111,7 @@ mod pool_directory_tape {
                 reason: error.to_string(),
             },
         };
-        crate::tape::read_row(&format!("{site}:read-dir-open"), path, outcome, 0);
+        crate::tape::read_row(&format!("{site}:read-dir-open"), path, outcome, None);
         let wrapped = result.map(|inner| Entries {
             inner,
             path: path.to_path_buf(),
@@ -7147,7 +7147,7 @@ mod pool_directory_tape {
                     crate::tape::TapeOutcome::Refusal {
                         reason: error.to_string(),
                     },
-                    0,
+                    None,
                 ),
                 None => crate::tape::read_row(
                     &format!("{}:end", self.site),
@@ -7155,7 +7155,7 @@ mod pool_directory_tape {
                     crate::tape::TapeOutcome::Facts {
                         facts: "end of directory".to_owned(),
                     },
-                    0,
+                    None,
                 ),
             }
             crate::tape::restore_observer_errno(saved_errno);
