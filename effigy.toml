@@ -1579,6 +1579,15 @@ run = "python3 scripts/tape-embedded-observation.py --self-test"
 [tasks."proof:tape-prune:observation-plan"]
 run = "python3 scripts/tape-embedded-observation.py --plan"
 
+# The metadata premise control for the observation volume resolver (oxide#292):
+# one nested owned directory on the selected scratch volume, resolved through the
+# real corrected helper. It runs no engine, staging, image or observation. The
+# supervisor's limit must exceed its 20 s stop reserve plus 10 s setup, so 60 s
+# leaves the 30 s work window of the 30 s / 32 MiB control.
+[tasks."proof:tape-prune:observation-volume-control"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 60 --scratch-budget-mib 32 -- python3 scripts/tape-observation-volume-control.py"
+
 [tasks."proof:store-fixtures:diagnostic"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/diagnose-store-fixtures.py"
