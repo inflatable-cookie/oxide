@@ -277,20 +277,36 @@ class Seams:
                 raise UnknownOutcome(f"{argv[0]} did not finish in its bound")
 
     def run_captured(self, argv, *, cwd, env, timeout_s):
+        """One bounded engine window. A timeout returns the output the child did
+        produce, marked `timed_out`, so partial evidence is never discarded; the
+        caller decides that an unfinished window is an unknown outcome."""
+        def bounded(raw):
+            if raw is None:
+                return "", False
+            text_value = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+            return text_value[:TEXT_CAP], len(text_value) > TEXT_CAP
+
         try:
             done = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            raise UnknownOutcome(f"{argv[0]} did not finish in its bound")
-        stdout = done.stdout.decode("utf-8", "replace")
-        stderr = done.stderr.decode("utf-8", "replace")
+        except subprocess.TimeoutExpired as expired:
+            stdout, stdout_truncated = bounded(expired.stdout)
+            stderr, stderr_truncated = bounded(expired.stderr)
+            return {
+                "code": None, "signal": None,
+                "stdout": stdout, "stdout_truncated": stdout_truncated,
+                "stderr": stderr, "stderr_truncated": stderr_truncated,
+                "timed_out": True,
+            }
+        stdout, stdout_truncated = bounded(done.stdout)
+        stderr, stderr_truncated = bounded(done.stderr)
         return {
             "code": done.returncode,
             "signal": None if done.returncode >= 0 else -done.returncode,
-            "stdout": stdout[:TEXT_CAP],
-            "stdout_truncated": len(stdout) > TEXT_CAP,
-            "stderr": stderr[:TEXT_CAP],
-            "stderr_truncated": len(stderr) > TEXT_CAP,
+            "stdout": stdout,
+            "stdout_truncated": stdout_truncated,
+            "stderr": stderr,
+            "stderr_truncated": stderr_truncated,
             "timed_out": False,
         }
 
@@ -767,12 +783,22 @@ def artifact_from_log(text, target):
     return found
 
 
-def stage(seams, *, parent, cwd, lock_path, cargo_argv, target, label, toolchain):
+def stage(seams, *, parent, cwd, lock_path, cargo_argv, target, label, toolchain,
+          artifacts):
     """One bounded offline staging build into the owned root with the bound
     `cargo` and `rustc`, then the exact reported executable and its digest. The
     staging tree is retained in place: only the guard's post-leader census can
-    conclude descendant closure."""
+    conclude descendant closure.
+
+    The stage log and stderr paths are recorded in `artifacts` *before* Cargo is
+    spawned, so a nonzero exit or a timeout still leaves them known to the
+    failure-path retention and their actual output is retained."""
     seams.make_dirs(parent)
+    out_path = os.path.join(parent, "stage.json")
+    err_path = os.path.join(parent, "stage.stderr")
+    prefix = label.lower()
+    artifacts[f"{prefix}.stage.log"] = out_path
+    artifacts[f"{prefix}.stage.stderr"] = err_path
     env = staging_environment(parent, toolchain=toolchain)
     try:
         lock_bytes = seams.read_bytes(lock_path)
@@ -780,8 +806,6 @@ def stage(seams, *, parent, cwd, lock_path, cargo_argv, target, label, toolchain
         raise Obstruction(f"the {label} lock is unreadable: {error}")
     seed = seams.seed(invoking_cargo_home(), env["CARGO_HOME"], lock_bytes,
                       seams.deadline_ns())
-    out_path = os.path.join(parent, "stage.json")
-    err_path = os.path.join(parent, "stage.stderr")
     argv = [toolchain["cargo"], *cargo_argv, "--message-format=json"]
     code = seams.run_logged(argv, cwd=cwd, env=env, out_path=out_path,
                             err_path=err_path,
@@ -799,6 +823,7 @@ def stage(seams, *, parent, cwd, lock_path, cargo_argv, target, label, toolchain
     target_root = os.path.realpath(env["CARGO_TARGET_DIR"])
     if os.path.commonpath([target_root, os.path.realpath(executable)]) != target_root:
         raise Obstruction(f"{label} reported an executable outside its target root")
+    artifacts[f"{prefix}.executable"] = executable
     return {
         "cargo_argv": argv,
         "cargo": toolchain["cargo"],
@@ -813,7 +838,7 @@ def stage(seams, *, parent, cwd, lock_path, cargo_argv, target, label, toolchain
     }
 
 
-def stage_oxide(seams, binding, paths):
+def stage_oxide(seams, binding, paths, artifacts):
     return stage(
         seams,
         parent=os.path.join(paths["oxide"], "stage"),
@@ -824,6 +849,7 @@ def stage_oxide(seams, binding, paths):
         target="tape_prune_eval",
         label="Oxide",
         toolchain=binding["toolchain"],
+        artifacts=artifacts,
     )
 
 
@@ -892,7 +918,7 @@ def verify_toolchain_unchanged(binding, seams):
                 f"the bound {name} changed while this occurrence was running")
 
 
-def stage_barge(seams, binding, paths):
+def stage_barge(seams, binding, paths, artifacts):
     source = paths["barge_source"]
     archive = seams.extract(binding["barge"]["sibling"], binding["barge"]["commit"],
                             source)
@@ -910,6 +936,7 @@ def stage_barge(seams, binding, paths):
         target="tape_eval",
         label="Barge",
         toolchain=binding["toolchain"],
+        artifacts=artifacts,
     )
     staged["archive"] = archive
     staged["retention"] = retention
@@ -1029,7 +1056,7 @@ def parse_capture(seams, staged, *, root, transcript, manifest, report):
     return {"argv": argv, "engine": result, "report": document}
 
 
-def retain(seams, paths, staged, windows, parses, gaps):
+def retain(seams, paths, stage_artifacts, windows, parses, gaps):
     """Copy the raw occurrence evidence out of the guard's scratch leaf, which
     the guard deletes on a closed run, into its retained evidence subtree.
 
@@ -1041,7 +1068,6 @@ def retain(seams, paths, staged, windows, parses, gaps):
     retention budget is omitted and named. Nothing is summarised, repaired or
     replaced by a hash, and nothing is deleted from the scratch tree.
     """
-    oxide_staged, barge_staged = staged
     oxide, barge = windows
     target = paths["evidence_retained"]
     oxide_fixture = os.path.join(paths["oxide_fixture"], "fixture-base")
@@ -1054,14 +1080,11 @@ def retain(seams, paths, staged, windows, parses, gaps):
         ("barge.manifest", (barge or {}).get("manifest")),
         ("barge.parse", os.path.join(paths["barge_run"], "parse.json")),
     ]
-    for label, staged_side in (("oxide", oxide_staged), ("barge", barge_staged)):
-        if not staged_side:
-            continue
-        artifacts.extend([
-            (f"{label}.stage.log", staged_side["log"]["path"]),
-            (f"{label}.stage.stderr", staged_side["stderr"]["path"]),
-            (f"{label}.executable", staged_side["executable"]["path"]),
-        ])
+    # Stage logs and the executable are known before or as soon as they exist,
+    # because `stage` registers them before spawning Cargo; a failed build's own
+    # output is therefore retained rather than lost with the scratch leaf.
+    for label in sorted(stage_artifacts):
+        artifacts.append((label, stage_artifacts[label]))
     try:
         seams.make_root(target)
     except Obstruction as error:
@@ -1224,6 +1247,9 @@ def build_report(*, binding, guard, paths, envelope, oxide, barge, oxide_parse,
                     "state": "in-process",
                     "note": "the Barge embedded exercise and its engine are one "
                             "process; the raw outcome is in the retained transcript",
+                    "timed_out": barge["engine"].get("timed_out") if barge else None,
+                    "exit_code": barge["engine"].get("code") if barge else None,
+                    "signal": barge["engine"].get("signal") if barge else None,
                 } if barge else None,
                 "classification": classification(
                     barge["engine"] if barge else None,
@@ -1288,21 +1314,24 @@ def observe(options, seams=None, environ=None):
     seams = seams or Seams()
     gaps = []
     reached = {"phase": "binding", "binding": None, "guard": None, "paths": None,
-               "envelope": None, "oxide_staged": None, "barge_staged": None,
-               "oxide": None, "barge": None, "oxide_parse": None, "barge_parse": None}
+               "envelope": None, "stage_artifacts": {}, "oxide": None,
+               "barge": None, "oxide_parse": None, "barge_parse": None}
 
     def finish(outcome, failure=None):
+        """Retain what was reached and publish the report. Returns whether the
+        report was published; the caller must not report success when it was
+        not, so the guard can never close a status 0 with no observation."""
         binding = reached["binding"]
         guard = reached["guard"]
         paths = reached["paths"]
         if binding is None or guard is None or paths is None:
             # Nothing was written and no owned path exists, so there is nothing
             # to retain or to report against: the refusal itself is the record.
-            return
+            return False
+        published = True
         if not seams.exists(paths["report"]):
             try:
-                retained = retain(seams, paths,
-                                  (reached["oxide_staged"], reached["barge_staged"]),
+                retained = retain(seams, paths, reached["stage_artifacts"],
                                   (reached["oxide"], reached["barge"]),
                                   (reached["oxide_parse"], reached["barge_parse"]),
                                   gaps)
@@ -1321,12 +1350,14 @@ def observe(options, seams=None, environ=None):
             try:
                 seams.write_json(paths["report"], report)
             except OSError as error:
-                say(f"observation: the report could not be written: {error}")
+                say(f"observation: the report could not be published: {error}")
+                published = False
             else:
                 say(f"observation: {outcome['state']} report {paths['report']} "
                     f"(phase {outcome['phase']}); qualified=false")
         if failure is not None:
             say(f"observation: {type(failure).__name__} at {outcome['phase']}: {failure}")
+        return published
 
     try:
         binding, _payload = read_binding(options.get("binding"),
@@ -1351,11 +1382,9 @@ def observe(options, seams=None, environ=None):
         seams.make_root(paths["barge"])
 
         reached["phase"] = "staging"
-        oxide_staged = stage_oxide(seams, binding, paths)
-        reached["oxide_staged"] = oxide_staged
+        oxide_staged = stage_oxide(seams, binding, paths, reached["stage_artifacts"])
         verify_toolchain_unchanged(binding, seams)
-        barge_staged = stage_barge(seams, binding, paths)
-        reached["barge_staged"] = barge_staged
+        barge_staged = stage_barge(seams, binding, paths, reached["stage_artifacts"])
         verify_toolchain_unchanged(binding, seams)
         envelope["oxide"]["stage"] = oxide_staged
         envelope["barge"]["stage"] = barge_staged
@@ -1363,6 +1392,10 @@ def observe(options, seams=None, environ=None):
         reached["phase"] = "oxide-window"
         oxide = run_oxide(seams, paths, oxide_staged)
         reached["oxide"] = oxide
+        if oxide["engine"]["timed_out"]:
+            gaps.append("the Oxide window did not finish in its bound; its partial "
+                        "captured output is kept and its closure is unknown")
+            raise UnknownOutcome("the Oxide window did not finish in its bound")
         if oxide["observation"] is None:
             gaps.append("Oxide wrote no observation report; only its engine exit and "
                         "output were collected")
@@ -1373,6 +1406,10 @@ def observe(options, seams=None, environ=None):
         reached["phase"] = "barge-window"
         barge = run_barge(seams, paths, barge_staged)
         reached["barge"] = barge
+        if barge["engine"]["timed_out"]:
+            gaps.append("the Barge window did not finish in its bound; its partial "
+                        "captured output is kept and its closure is unknown")
+            raise UnknownOutcome("the Barge window did not finish in its bound")
         if barge["retention_refused"]:
             gaps.append(
                 "Barge reported a retained transcript that is not a safe regular file "
@@ -1420,8 +1457,6 @@ def observe(options, seams=None, environ=None):
         elif not barge["retention_refused"]:
             gaps.append("Barge reported no retained transcript; its side has no fate")
 
-        finish({"state": "collected", "phase": "complete", "reason": None})
-        return 0
     except Obstruction as error:
         finish({"state": "refused", "phase": reached["phase"], "reason": str(error)},
                error)
@@ -1434,6 +1469,12 @@ def observe(options, seams=None, environ=None):
         finish({"state": "aborted", "phase": reached["phase"],
                 "reason": f"{type(error).__name__}: {error}"}, error)
         raise
+
+    if not finish({"state": "collected", "phase": "complete", "reason": None}):
+        raise Obstruction(
+            "the observation report could not be published; the guard must not "
+            "record a closed success")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1613,7 +1654,13 @@ def plan_document():
                              "failure propagates: a staging, engine or parse failure "
                              "still copies the evidence already produced and writes a "
                              "bounded report whose outcome names the phase and whose "
-                             "closure says the guard's census, not this script, decides",
+                             "closure says the guard's census, not this script, decides. "
+                             "Each stage log and stderr path is registered before Cargo "
+                             "is spawned, so a failed build's own output is retained; a "
+                             "timed-out engine window returns the partial output it "
+                             "produced, which is retained and recorded as unknown "
+                             "closure; and an unpublished report is a nonzero "
+                             "apparatus outcome, never a closed success",
         "artifact_safety": "every retained source is re-validated as a real, "
                            "non-symlink regular file (or directory) resolving inside "
                            "the owned run root before it is read; a symlinked or "
@@ -1765,6 +1812,8 @@ class FakeSeams(Seams):
 
     def write_json(self, path, document):
         self.calls.append(("write_json", path))
+        if self.script.get("write_fail"):
+            raise OSError("the report destination is unwritable")
         self.script["written"] = document
 
     def extract(self, sibling, commit, destination):
@@ -2373,8 +2422,11 @@ def self_test():
               and entries["barge.transcript"]["retained"] is True)
 
         # 15. Failure paths retain what was reached and write a bounded report.
-        timeout_script = scripted_occurrence(binding, facts, barge_stderr="")
-        timeout_script["raise_on"] = "barge"
+        timeout_script = scripted_occurrence(
+            binding, facts, barge_stderr="barge: partial output before the stop\n")
+        timeout_script["barge"] = dict(timeout_script["barge"], code=None,
+                                       timed_out=True,
+                                       stderr="barge: partial output before the stop\n")
         fake = FakeSeams(timeout_script)
         try:
             observe({"binding": "/binding.json",
@@ -2392,6 +2444,14 @@ def self_test():
               entries["oxide.transcript"]["retained"] is True
               and entries["oxide.executable"]["retained"] is True
               and failure["retained"]["state"] == "created")
+        check("a timed-out engine's partial output is kept, not discarded",
+              failure["windows"]["barge"]["engine"]["timed_out"] is True
+              and failure["windows"]["barge"]["outer"]["stderr"]
+              == "barge: partial output before the stop\n"
+              and entries["barge.stderr"]["retained"] is True
+              and entries["barge.stdout"]["retained"] is True
+              and any("partial captured output is kept" in gap
+                      for gap in failure["gaps"]))
         check("the failure report separates the script from guard closure",
               failure["closure"]["script"] == "does-not-conclude"
               and failure["closure"]["guard_receipt"]["closure"]
@@ -2450,6 +2510,11 @@ def self_test():
               all(entry["retained"] is False
                   for entry in failure["retained"]["entries"]
                   if entry["label"] in engine_labels))
+        entries = {entry["label"]: entry for entry in failure["retained"]["entries"]}
+        check("a failed staging build keeps its own log and stderr",
+              entries["oxide.stage.log"]["retained"] is True
+              and entries["oxide.stage.stderr"]["retained"] is True
+              and failure["outcome"]["phase"] == "staging")
 
         # 16. A symlinked or outside artifact is never read or copied.
         symlink_script = scripted_occurrence(
@@ -2487,7 +2552,27 @@ def self_test():
               and written["fates"]["barge"]["state"] == "absent"
               and entries["barge.transcript"]["retained"] is False)
 
-        # 17. A changed bound tool during the run refuses.
+        # 17. An unwritable report is an apparatus failure, never a success.
+        publish_script = scripted_occurrence(
+            binding, facts,
+            barge_stderr="barge.tape.exercise/1: retained "
+                         + os.path.join(paths["barge_run"],
+                                        "barge-test-x.transcript.json") + "\n"
+                         "barge.tape.exercise/1: kept fixture "
+                         + os.path.join(paths["barge_run"], "barge-test-x") + "\n")
+        publish_script["write_fail"] = True
+        fake = FakeSeams(publish_script)
+        refuses("an unwritable report is an apparatus failure, not a success",
+                lambda: observe({"binding": "/binding.json",
+                                 "sha256": sha256_bytes(binding_bytes)}, fake,
+                                FIXTURE_ENV),
+                "could not be published")
+        check("the failed publication still retained the reached evidence",
+              ("make_root", paths["evidence_retained"]) in fake.calls
+              and any(call[0] == "copy" for call in fake.calls)
+              and publish_script["written"] is None)
+
+        # 18. A changed bound tool during the run refuses.
         changed_tools = FakeSeams({"digests": {"rustc": "9" * 64, "cargo": "8" * 64}})
         refuses("a changed bound toolchain refuses",
                 lambda: verify_toolchain_unchanged(binding, changed_tools),

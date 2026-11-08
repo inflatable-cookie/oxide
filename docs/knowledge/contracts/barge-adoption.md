@@ -2699,7 +2699,15 @@ staging, engine or parse failure still retains the evidence already produced and
 writes a bounded report whose `outcome` names the state and phase and whose
 `closure` says the guard's post-leader census, not this script, decides closure
 and may delete its own scratch afterwards. That is the difference between the
-script's unknown and actual guard closure, and the two are separate fields. Past
+script's unknown and actual guard closure, and the two are separate fields. A
+failed build is covered too: each stage log and stderr path is registered
+**before** Cargo is spawned, so a nonzero exit or a timeout still retains that
+build's own output. A timed-out engine window returns the partial output it
+produced instead of discarding it: the report records `timed_out` with that
+output and the outcome is the script's unknown, not a refusal. And an
+unpublished report is an apparatus failure: `finish` returns whether it
+published, and the success path raises rather than returning 0, so the guard can
+never close a status 0 with no required observation report. Past
 384 MiB per file or 768 MiB in aggregate an artifact is **omitted and named** in
 the report and a gap, never summarised into a hash and never replaced; a missing
 artifact is recorded as not written. Every source is re-validated before it is
@@ -2743,7 +2751,7 @@ owner-only/canonical-root and escaping-report refusals, the missing manifest and
 missing transcript, a `/1` and an apparatus document, truncation, signalled and
 nonzero exits, and equal and unequal raw fates with no agreement, equivalence or
 divergence field. `effigy proof:tape-prune:observation-test` drives the real
-orchestration functions with scripted seams (111 controls: binding shape and
+orchestration functions with scripted seams (115 controls: binding shape and
 digest including the Barge custody block; source/toolchain/volume/worktree
 drift; derived paths; the real sibling guard topology with 0755 evidence
 accepted and 0777 or nested evidence refused; outside-root retention; engine
@@ -2752,11 +2760,13 @@ engine; the shipped custody gate refusing before any staging write; the bound
 `cargo`/`RUSTC`/`PATH` staging invocation; at most one window per engine; one
 complete scripted occurrence with its retained evidence tree; an over-budget
 artifact omitted and named; a Barge timeout, parse failure and staging failure
-each retaining what was reached and writing a bounded failure report; a
-symlinked or outside Barge artifact refused rather than read; and the reviewed
-revision and file digests still checked once the gate is open). Both are
-apparatus evidence and run no engine, compiler, fixture, image or observer
-campaign.
+each retaining what was reached and writing a bounded failure report, with a
+failed build's own stage log and stderr kept and a timed-out window's partial
+output retained; an unwritable report propagating as an apparatus failure while
+its evidence stays; a symlinked or outside Barge artifact refused rather than
+read; and the reviewed revision and file digests still checked once the gate is
+open). Both are apparatus evidence and run no engine, compiler, fixture, image
+or observer campaign.
 
 **Covering validation for this preparation.** `effigy rust:compile`,
 `effigy rust:compile-release`, `effigy rust:format`, `effigy rust:capture-wire`,
