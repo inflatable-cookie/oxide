@@ -3746,36 +3746,43 @@ fn emitted_volume_kind_is_bound_by_volume_identity() -> Control {
             verdict.blocking
         ),
     )?;
-    // Counterfactual 1: the recorder does not bind the row, exactly as it would
-    // report for a fixture without the matching dynamic entry.
+    // Counterfactual 1, recorder-faithful: with no matching dynamic entry the
+    // recorder reports the row unbound, and that is the document this note
+    // belongs to. The verdict must block.
+    let mut without_entry = manifest.clone();
+    without_entry["dynamic"]["volumes"] = json!([]);
     let mut unbound = transcript.clone();
     unbound["notes"] = json!([
         "absolute monotonic window origin and end unproven",
         "extra or unbound observation at absence-walk:binding-open",
     ]);
-    let without_entry = {
-        let mut manifest = manifest.clone();
-        manifest["dynamic"]["volumes"] = json!([]);
-        manifest
-    };
-    for (label, document) in [
-        ("the matching entry present", &manifest),
-        ("the matching entry absent", &without_entry),
-    ] {
-        let blocked = evaluate_limited(&unbound, document, CONTROL_DIGEST);
-        control(
-            blocked_at(&blocked, BlockingRule::ExtraUnboundObservation, SITE),
-            format!(
-                "the recorder's unbound note blocks the volume row with {label}: {:?}",
-                blocked.blocking
-            ),
-        )?;
-        control(
-            !blocked.sufficient(),
-            format!("an unbound volume row is never sufficient with {label}"),
-        )?;
-    }
-    // Counterfactual 2: a different device is a different volume identity.
+    let recorder_faithful = evaluate_limited(&unbound, &without_entry, CONTROL_DIGEST);
+    control(
+        blocked_at(
+            &recorder_faithful,
+            BlockingRule::ExtraUnboundObservation,
+            SITE,
+        ) && !recorder_faithful.sufficient(),
+        format!(
+            "the entry-absent document the recorder would emit the note for blocks: {:?}",
+            recorder_faithful.blocking
+        ),
+    )?;
+    // Counterfactual 2, policy-only: the recorder never emits this pair (an
+    // entry-present manifest with an unbound note). The policy takes the
+    // recorder's note as decisive and does not re-implement `bound_volume`, so
+    // it blocks here too. This is a policy test, not recorder evidence.
+    let policy_only = evaluate_limited(&unbound, &manifest, CONTROL_DIGEST);
+    control(
+        blocked_at(&policy_only, BlockingRule::ExtraUnboundObservation, SITE)
+            && !policy_only.sufficient(),
+        format!(
+            "a supplied unbound note is decisive even beside a matching entry (policy-only): \
+{:?}",
+            policy_only.blocking
+        ),
+    )?;
+    // Counterfactual 3: a different device is a different volume identity.
     let mut wrong = transcript.clone();
     wrong["reads"] = json!([volume_row("/dev/disk9s2")]);
     let mismatch = evaluate_limited(&wrong, &manifest, CONTROL_DIGEST);

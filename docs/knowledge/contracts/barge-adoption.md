@@ -2141,9 +2141,11 @@ K1 rule exactly: a handle parent is discharged only when
 
 **The volume bind is the recorder's.** For volume-form rows the policy does
 not re-implement `bound_volume`: it inherits the recorder's verdict through the
-`extra or unbound observation` note, which is blocking. The volume-kind control
-therefore builds its fixture document with the matching `dynamic.volumes` entry
-and exercises the unbound note as its counterfactual.
+`extra or unbound observation` note, which is blocking. That note is emitted
+only when no matching `dynamic.volumes` entry exists, so the volume-kind
+control builds its bound case with the matching entry and its recorder-faithful
+counterfactual with the entry absent; the entry-present-with-note pair is
+labelled a policy-only check.
 
 **The path-only exclusion is not live.** No first-batch input can use it: the
 recorder reports every path-only file row unbound, and the policy refuses the
@@ -2189,10 +2191,12 @@ sentences (no own identity) that stays insufficient, the same with a bound leaf
 but no fixture binding, an emitted `absence-walk:fstatat` component that is
 named handle-class rather than unlisted, an emitted `absence-walk:binding-open`
 volume row whose obligation binds on its volume identity, carrying the matching
-`dynamic.volumes` entry the recorder's `bound_volume` rule needs, with two
-counterfactuals: the recorder's own `extra or unbound observation` note blocks
-the same row (with and without that entry), and a different volume device is a
-wrong leaf identity, the malformed-obligation recorder
+`dynamic.volumes` entry the recorder's `bound_volume` rule needs, with three
+counterfactuals: the entry-absent document the recorder would emit its
+`extra or unbound observation` note for blocks; a policy-only check confirms
+the policy treats that note as decisive even beside a matching entry (a pair the
+recorder never emits, so it is a policy test, not recorder evidence); and a
+different volume device is a wrong leaf identity, the malformed-obligation recorder
 note,
 the parser entry point refusing a `/1` transcript and an invalid manifest, a
 Barge-only incomplete batch that is insufficient, and a declared mismatch that
