@@ -1898,9 +1898,107 @@ pub(crate) fn tape_restore_errno(value: Option<libc::c_int>) {
     }
 }
 
+/// The reviewed first-batch path-only authority sites (oxide#287).
+///
+/// Each site below passes a live `File` that the unchanged `authority_read`
+/// consumes, and each site's production reader opens no parent for that read:
+/// the document is opened by path (`store::private_file`, or `File::open` for
+/// the outputs marker readers and the removable registration) and the read is
+/// the only statement that supplies the bytes. Where a site stats the path
+/// before opening, that precheck's identity is never used here: the recorded
+/// device and inode are the read descriptor's own. The one declared `cfg(test)`
+/// observation of that exact held descriptor is permitted only here.
+///
+/// The handle-class `prune::observe_root_in:marker` site and every `store::*`
+/// custody read share `authority_read_observed` and are deliberately absent:
+/// the marker's parent is the live held root descriptor, and the custody reads
+/// belong to the deferred second batch, so a leaf observation must never stand
+/// in for their parent or promote them. Absence from this list is not a
+/// fallback and never manufactures an identity.
+#[cfg(test)]
+pub(crate) struct ObservedPathOnlySite {
+    /// The site name the instrumented call passes.
+    pub(crate) site: &'static str,
+    /// The `read-bounded:open` row this leaf also emits from the same single
+    /// fstat, when its own open happens in the observed function.
+    pub(crate) open_row: Option<&'static str>,
+}
+
+#[cfg(test)]
+pub(crate) const OBSERVED_PATH_ONLY_SITES: &[ObservedPathOnlySite] = &[
+    ObservedPathOnlySite {
+        site: "prune::read_bounded",
+        open_row: Some("read-bounded:open"),
+    },
+    ObservedPathOnlySite {
+        site: "prune::read_registry",
+        open_row: None,
+    },
+    ObservedPathOnlySite {
+        site: "outputs::read_receipt_with",
+        open_row: None,
+    },
+    ObservedPathOnlySite {
+        site: "outputs::read_marker",
+        open_row: None,
+    },
+    ObservedPathOnlySite {
+        site: "outputs::marker_digest",
+        open_row: None,
+    },
+    ObservedPathOnlySite {
+        site: "removable::read_registration",
+        open_row: None,
+    },
+];
+
+/// The declared-observation lookup for one instrumented call site. Exact match
+/// only: a shared helper never inherits an observation.
+#[cfg(test)]
+pub(crate) fn observed_path_only_site(site: &str) -> Option<&'static ObservedPathOnlySite> {
+    OBSERVED_PATH_ONLY_SITES
+        .iter()
+        .find(|declared| declared.site == site)
+}
+
+/// The same lookup keyed by the row kind a declared site records
+/// (`authority-read@<site>`), which is also the manifest obligation's `site`.
+#[cfg(test)]
+pub(crate) fn observed_path_only_row_kind(kind: &str) -> Option<&'static ObservedPathOnlySite> {
+    observed_path_only_site(kind.strip_prefix("authority-read@")?)
+}
+
+/// Test-only seam for the one declared held-descriptor observation (oxide#287).
+///
+/// When armed, the next declared observation reports the failure a failed
+/// `dup`/`fstat` would report (`None`) **without touching the descriptor**, so a
+/// bounded control can prove that the observation-failure branch keeps the
+/// unchanged read's bytes, result and errno and records an unknown identity. It
+/// is one-shot, compiled only under `cfg(test)`, and reachable only from the
+/// observation statement in `authority_read_observed`; nothing in it can move a
+/// cursor, rewrite a cap or deadline, or change what `authority_read` returns.
+#[cfg(test)]
+thread_local! {
+    static OBSERVATION_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn force_held_descriptor_observation_failure(failed: bool) {
+    OBSERVATION_FAILURE.with(|slot| slot.set(failed));
+}
+
+#[cfg(test)]
+fn observation_forced_to_fail() -> bool {
+    OBSERVATION_FAILURE.with(|slot| slot.replace(false))
+}
+
 /// Test-only observation of the exact descriptor passed to authority_read.
 /// The production call below remains unchanged; the descriptor stays open
 /// until the real read result has been recorded.
+///
+/// Only a declared path-only site takes the one extra `fstat` of the held
+/// descriptor. Every other site keeps its previous behaviour: no observation,
+/// an explicit unbound note, and a row that binds nothing.
 #[cfg(test)]
 pub(crate) fn authority_read_observed(
     file: &File,
@@ -1909,25 +2007,27 @@ pub(crate) fn authority_read_observed(
     limit: u64,
     bytes: &mut Vec<u8>,
 ) -> std::io::Result<usize> {
+    let declared = observed_path_only_site(site);
     // Declared extra fstat of this held descriptor. It never changes the
     // evaluator result, including when the observation fails.
     let before_observation = tape_errno();
-    let held = if site == "prune::read_bounded" {
+    let forced_failure = declared.is_some() && observation_forced_to_fail();
+    let held = if declared.is_some() && !forced_failure {
         crate::tape::fd_dev_ino(file.as_fd())
     } else {
         None
     };
-    if site == "prune::read_bounded" {
-        if let Some((dev, ino)) = held {
-            crate::tape::read_row_handle(
-                "read-bounded:open",
-                path,
-                dev,
-                ino,
-                crate::tape::TapeOutcome::Opened { dev, ino },
-                Some(limit),
-            );
-        }
+    if let (Some((dev, ino)), Some(open_row)) =
+        (held, declared.and_then(|declared| declared.open_row))
+    {
+        crate::tape::read_row_handle(
+            open_row,
+            path,
+            dev,
+            ino,
+            crate::tape::TapeOutcome::Opened { dev, ino },
+            Some(limit),
+        );
     }
     tape_restore_errno(before_observation);
     let result = authority_read(file.take(limit + 1), bytes);
@@ -1940,11 +2040,11 @@ pub(crate) fn authority_read_observed(
             reason: error.to_string(),
         },
     };
-    match held {
-        Some((dev, ino)) => {
+    match (declared, held) {
+        (Some(_), Some((dev, ino))) => {
             crate::tape::authority_bind_descriptor(site, path, dev, ino, limit, outcome)
         }
-        None if site == "prune::read_bounded" => {
+        (Some(_), None) => {
             crate::tape::authority_unbound(site, "held-descriptor fstat failed");
             crate::tape::read_row(
                 &format!("authority-read@{site}"),
@@ -1953,7 +2053,7 @@ pub(crate) fn authority_read_observed(
                 Some(limit),
             );
         }
-        None => {
+        (None, _) => {
             crate::tape::authority_unbound(site, "no authorized descriptor observation");
             crate::tape::read_row(
                 &format!("authority-read@{site}"),

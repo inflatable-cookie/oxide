@@ -1308,6 +1308,36 @@ pub(crate) fn identity_fields_match(
     true
 }
 
+/// The identity comparison at a declared path-only direct-read site
+/// (oxide#287). The production reader at such a site opens no parent, so an
+/// obligation's `parent_device` and `parent_inode` describe an object the leaf
+/// never observed; the recorder reports that parent obligation on its own line
+/// rather than reading it as a wrong leaf identity. Every other named key is
+/// compared exactly as [`identity_fields_match`] compares it, and a non-empty
+/// `path` is required, so this rule can never match on an empty identity and
+/// never matches a row outside the named path. It is the single rule both the
+/// recorder and the limited policy use; it is not a second identity policy.
+pub(crate) fn path_only_identity_fields_match(
+    obligation_identity: &serde_json::Value,
+    row_identity: &serde_json::Value,
+    window: Option<&str>,
+) -> bool {
+    let Some(want) = obligation_identity.as_object() else {
+        return false;
+    };
+    if !want
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|path| !path.is_empty())
+    {
+        return false;
+    }
+    let mut observed = want.clone();
+    observed.remove("parent_device");
+    observed.remove("parent_inode");
+    identity_fields_match(&serde_json::Value::Object(observed), row_identity, window)
+}
+
 /// The one completed-effect rule, shared by parity and fixture-diff
 /// reconciliation: not attempted, observed `succeeded`, and an identified path.
 /// Anything else is never completed parity.
