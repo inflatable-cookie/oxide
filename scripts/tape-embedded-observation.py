@@ -29,10 +29,22 @@ staging build or the diagnostic: `--plan` and `--self-test` are effect-free and
 `--observe` refuses before any effect until a planner supplies one bound
 binding document.
 
+Every canonical parse pass reads an owner-private copy of the retained document
+in its own fresh workspace (oxide#298): the parser refuses a producer's 0644 input,
+and the producer's own bytes are only read.
+
+The supplemental parse-only control (oxide#298) re-parses two already-retained
+captures from the failed 297 occurrence. It runs only the staged canonical
+`--parse-capture` and refuses before any effect unless `--sha256` is the digest
+printed by `--parse-control-plan`.
+
 Usage:
     tape-embedded-observation.py --plan
     tape-embedded-observation.py --self-test
     tape-embedded-observation.py --observe --binding <path> --sha256 <hex>
+    tape-embedded-observation.py --parse-control-plan
+    tape-embedded-observation.py --parse-control-self-test
+    tape-embedded-observation.py --parse-control --sha256 <hex>
 """
 from __future__ import annotations
 
@@ -40,9 +52,12 @@ import hashlib
 import json
 import os
 import plistlib
+import shutil
+import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 
 sys.dont_write_bytecode = True
@@ -92,7 +107,160 @@ BOUNDED_REFUSAL_MARKER = "bounded refusal (not qualification)"
 TRANSCRIPT_MARKER = "barge.tape.exercise/1: retained "
 USAGE = (
     "usage: tape-embedded-observation.py "
-    "[--plan | --self-test | --observe --binding <path> --sha256 <hex>]"
+    "[--plan | --self-test | --observe --binding <path> --sha256 <hex> | "
+    "--parse-control-plan | --parse-control-self-test | "
+    "--parse-control --sha256 <hex>]"
+)
+
+# Owner-private parser inputs (oxide#298). The canonical `/2` parser refuses any
+# input component that is not owner-only (`validate_fixture_path`, tape_harness.rs),
+# and the producer's own files are not owner-only. Each retained document is
+# therefore parsed from a byte-identical private copy in a fresh workspace; the
+# original bytes, modes and identities are only read and recorded.
+PARSE_INPUT_CAP_BYTES = 64 * MIB
+PARSE_INPUT_FILE_MODE = 0o600
+PARSE_INPUT_DIR_MODE = 0o700
+PARSE_EXECUTABLE_MODE = 0o700
+PARSE_TIMEOUT_CAP_SECONDS = 120
+PARSE_CONTROL_SCHEMA = "oxide.capture.embedded-parse-control/1"
+PARSE_CONTROL_PLAN_SCHEMA = "oxide.capture.embedded-parse-control-plan/1"
+PARSE_CONTROL_RUN_NAME = "parse-control"
+PARSE_CONTROL_REPORT_NAME = "parse-control-report.json"
+# The supplemental control is bounded like the occurrence, but parses only.
+PARSE_CONTROL_LIMIT_SECONDS = 120
+PARSE_CONTROL_SCRATCH_MIB = 64
+PARSE_CONTROL_MARGIN_SECONDS = 30
+PARSE_CONTROL_PARSE_CAP_SECONDS = 30
+# The parser binary was built from this source head by the 297 occurrence. The
+# control may run only where the current tree differs from it in no path the
+# binary compiles (see `parser_inert_path`).
+PARSE_CONTROL_SOURCE_HEAD = "0ab4f78648505ba508c257e4acf2cb9f796e6fe7"
+PARSE_CONTROL_CLAIM = (
+    "supplemental offline parse of two already-retained captures by the staged "
+    "canonical --parse-capture entrypoint; no engine, staging, seed, image or "
+    "observation; unqualified, and no verdict is promoted from the failed 297 "
+    "occurrence"
+)
+_STASH_EVIDENCE = "/Volumes/Stash/scratch/oxide/oxide-proof.dx70pytd/evidence"
+_OBSERVATION = _STASH_EVIDENCE + "/observation-b9c20bc34cbf7fc39e45a9c7"
+# Authenticated read-only inputs of the failed 297 occurrence (run 471cbe01…).
+# A changed path, size or digest refuses before any copy is made. The executable
+# is copied and run only as the parser; `oxide.parse` and the two report/receipt
+# documents are link evidence, verified and never parsed.
+PARSE_CONTROL_PINS = {
+    "executable": {
+        "path": _OBSERVATION + "/oxide.executable.tape_prune_eval-681eae0d4c799596",
+        "bytes": 10327616,
+        "sha256": "17ae74e91f8497e3bfbdd9a3e61f253d5389115dca6d36da14337c490843f0df",
+        "role": "the staged canonical parser; copied and run only for --parse-capture",
+    },
+    "oxide.transcript": {
+        "path": _OBSERVATION + "/oxide.transcript.transcript.json",
+        "bytes": 124042,
+        "sha256": "e53407ea2996abac9892555cf81f06e3e5da8283f5651dfa139abd766124e3c4",
+        "role": "parse input (Oxide BASE transcript)",
+    },
+    "oxide.manifest": {
+        "path": _OBSERVATION + "/oxide.manifest.manifest.json",
+        "bytes": 4044,
+        "sha256": "639c59f5bb9a552850d4775a06a57f1765852044ca223dd1476ec9756e3437a9",
+        "role": "parse input (Oxide BASE manifest)",
+    },
+    "barge.transcript": {
+        "path": _OBSERVATION + "/barge.transcript.barge-test-tape-eval-real-host-"
+                               "85690-0-735444000.transcript.json",
+        "bytes": 827570,
+        "sha256": "630f5c885229252fd39224397f2d6b2f38105834f5f98d374641590f5e47da05",
+        "role": "parse input (Barge CTL-0 transcript, mode 0644 from the producer)",
+    },
+    "barge.manifest": {
+        "path": _OBSERVATION + "/barge.manifest.manifest.json",
+        "bytes": 1782,
+        "sha256": "49dce006afe265593e937e09f4aaaf3f409cf73a36e217a5609979ea55c4ae56",
+        "role": "parse input (Barge CTL-0 manifest)",
+    },
+    "oxide.parse": {
+        "path": _OBSERVATION + "/oxide.parse.parse.json",
+        "bytes": 21728,
+        "sha256": "cf3c7a8acf0fd1d83cbdcb697a04611d0c9320def8c1e30090cba090bce5df58",
+        "role": "link: the failed 297 Oxide parse document (verified, never parsed)",
+    },
+    "occurrence-report": {
+        "path": _STASH_EVIDENCE + "/embedded-control-observation.json",
+        "bytes": 125909,
+        "sha256": "cf5f6b7a177f042be8113790457bd4c6915847989987b8efd8e73226ccc3578a",
+        "role": "link: the failed 297 occurrence report (verified, never parsed)",
+    },
+    "occurrence-receipt": {
+        "path": _STASH_EVIDENCE + "/receipt.json",
+        "bytes": 18007,
+        "sha256": "52881c935be8d36056135ebd6b350eeaf7954e67a3e6a372d173789b6fb6aef2",
+        "role": "link: the failed 297 guard receipt (verified, never parsed)",
+    },
+}
+PARSE_CONTROL_PARSE_LABELS = {
+    "oxide": ("oxide.transcript", "oxide.manifest"),
+    "barge": ("barge.transcript", "barge.manifest"),
+}
+# Compiled-in documents: the test target includes these at build time, so a change
+# to them changes the parser binary (tape_harness.rs, capture_wire.rs, capture_verdict.rs).
+PARSE_COMPILED_DOCS = (
+    "docs/knowledge/contracts/capture-vectors/",
+    "docs/knowledge/contracts/capture-examples/",
+    "docs/knowledge/contracts/oxide-capture-manifest.v2.schema.json",
+)
+# The nine proof-authoring premises (docs/knowledge/contracts/workflow.md#proof-
+# authoring-premise-checklist), traced through the parse-only route. Each item has
+# the executable sites it was traced through, or the concrete reason it does not
+# apply. The self-test checks that every named site exists in this module.
+PARSE_CONTROL_PREMISES = (
+    ("private-home-and-rustup",
+     "not applicable as a toolchain premise: the control runs no Cargo, rustc or "
+     "rustup. The copied executable is invoked by absolute path with a fixed PATH. "
+     "The child's HOME is private (<workspace>/engine/home), created through "
+     "engine_directories.",
+     ("engine_environment", "engine_directories", "parse_capture")),
+    ("account-home-control",
+     "not applicable: the staged --parse-capture route (src/bin/oxide/tape_harness.rs "
+     "run_capture_parse) never calls validate_engine_environment, the only reader of "
+     "OXIDE_TEST_HOME_FROM_ENV. The control sets neither that variable nor any account "
+     "home control.",
+     ("parse_capture", "engine_environment")),
+    ("environment-isolation",
+     "applies: scrubbed removes every inherited OXIDE_, XDG_, CARGO_, SCCACHE_, RUSTC, "
+     "GIT_ and BARGE_ value before engine_environment sets HOME, TMPDIR, TMP, TEMP and "
+     "PATH. The guard's OXIDE_PROOF_* values never reach the parser child.",
+     ("scrubbed", "engine_environment")),
+    ("automatic-adoption",
+     "not applicable: the parser reads owner-private copies and writes only parse.json "
+     "in its own workspace. No pool, outputs root, receipt or adoption is reached.",
+     ("parse_side", "parse_capture")),
+    ("cargo-external-argv",
+     "not applicable: the executable is not an external Cargo subcommand. It is invoked "
+     "directly with the argv --parse-capture --root ... --transcript ... --report-out.",
+     ("parse_capture",)),
+    ("owned-images",
+     "not applicable: no image is attached or detached. The control writes only a 0700 "
+     "workspace inside the guard scratch and one evidence report.",
+     ("parse_control", "parse_side")),
+    ("compiler-flags",
+     "applies as a pin, not a build: the executable is pinned by size and SHA-256 and "
+     "verified before it is copied and run. Nothing is compiled, so no RUSTFLAGS or "
+     "CARGO_ENCODED_RUSTFLAGS value is consumed.",
+     ("PARSE_CONTROL_PINS", "private_input_copy")),
+    ("temporary-storage",
+     "applies: the workspace, the child's TMPDIR and every copy lie under the guard's "
+     "OXIDE_TASK_SCRATCH_ROOT on the selected volume (the parser's fixture_namespace "
+     "requires /Volumes/<x>/scratch/oxide). A /private/tmp scratch root would make the "
+     "parser refuse, which the report would record as a refusal. The control never "
+     "falls back.",
+     ("guard_context", "parse_side", "engine_directories")),
+    ("macos-mktemp",
+     "applies to the real-file self-test only: its one host write is "
+     "tempfile.mkdtemp(prefix=...), which Python resolves through TMPDIR, and it is "
+     "removed with shutil.rmtree. The control uses no mktemp; its roots are explicit "
+     "paths under the guard scratch.",
+     ("parse_control_self_test",)),
 )
 
 # The two controls. Each side has exactly one, and no argument can add one.
@@ -448,6 +616,49 @@ class Seams:
                     break
                 writer.write(block)
 
+    def identity(self, path):
+        """The path's own identity, without following a final symlink."""
+        return identity_of(os.lstat(path))
+
+    def read_input(self, path, cap):
+        """One bounded, no-follow read of a regular file. Returns its bytes and the
+        identity observed on the open descriptor, so a swap after the lstat is seen."""
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise Obstruction(f"{path} is not a regular file")
+            chunks = []
+            total = 0
+            while True:
+                block = os.read(descriptor, 1 << 20)
+                if not block:
+                    break
+                total += len(block)
+                if total > cap:
+                    raise Obstruction(f"{path} grew past the {cap} byte input cap")
+                chunks.append(block)
+            return b"".join(chunks), identity_of(os.fstat(descriptor))
+        finally:
+            os.close(descriptor)
+
+    def write_input_new(self, path, payload, mode):
+        """An exclusively new owner-private copy. A write that fails after this call
+        created the file removes that file, and only that file."""
+        descriptor = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            mode)
+        try:
+            os.fchmod(descriptor, mode)
+            view = memoryview(payload)
+            while view:
+                view = view[os.write(descriptor, view):]
+        except BaseException:
+            os.close(descriptor)
+            os.unlink(path)
+            raise
+        os.close(descriptor)
+
     def extract(self, sibling, commit, destination):
         """Extract one verified commit with no write to the sibling checkout."""
         archive = subprocess.run(
@@ -638,8 +849,6 @@ def staging_environment(parent, environ=None, toolchain=None):
     home = os.path.join(parent, "home")
     cargo_home = os.path.join(parent, "cargo-home")
     tmp = os.path.join(parent, "tmp")
-    for path in (home, cargo_home, tmp):
-        os.makedirs(path, mode=0o700, exist_ok=True)
     env.update({
         "HOME": home,
         "CARGO_HOME": cargo_home,
@@ -664,10 +873,17 @@ def staging_environment(parent, environ=None, toolchain=None):
     return env
 
 
-def engine_environment(parent, environ=None, extra=None):
-    env = scrubbed(dict(os.environ if environ is None else environ))
+def engine_directories(seams, parent):
+    """The child's private HOME and temp directories, created through the seams.
+    The environment builders never create anything, so a self-test that uses a
+    fake seam cannot leave a host directory behind (oxide#298)."""
     for name in ("home", "tmp"):
-        os.makedirs(os.path.join(parent, name), mode=0o700, exist_ok=True)
+        seams.make_dirs(os.path.join(parent, name))
+
+
+def engine_environment(parent, environ=None, extra=None):
+    """Pure: the child's environment. Its directories come from engine_directories."""
+    env = scrubbed(dict(os.environ if environ is None else environ))
     env.update({
         "HOME": os.path.join(parent, "home"),
         "TMPDIR": os.path.join(parent, "tmp"),
@@ -839,7 +1055,10 @@ def derive_paths(binding, guard):
         "oxide_fixture": os.path.join(run_root, "oxide", "fixture"),
         "barge_run": os.path.join(run_root, "barge", "run"),
         "barge_source": os.path.join(run_root, "barge", "source"),
-        "report": os.path.join(guard["evidence"], binding["paths"]["report_name"]),
+        # Fresh owner-private parse workspaces, one per side (oxide#298).
+        "parse_oxide": os.path.join(run_root, "parse", "oxide"),
+        "parse_barge": os.path.join(run_root, "parse", "barge"),
+        "report":os.path.join(guard["evidence"], binding["paths"]["report_name"]),
         "evidence_retained": os.path.join(guard["evidence"],
                                           binding["paths"]["run_root_name"]),
         "guard_receipt": os.path.join(guard["evidence"], "receipt.json"),
@@ -965,6 +1184,8 @@ def stage(seams, *, parent, cwd, lock_path, cargo_argv, target, label, toolchain
     spawned, so a nonzero exit or a timeout still leaves them known to the
     failure-path retention and their actual output is retained."""
     seams.make_dirs(parent)
+    for name in ("home", "cargo-home", "tmp"):
+        seams.make_dirs(os.path.join(parent, name))
     out_path = os.path.join(parent, "stage.json")
     err_path = os.path.join(parent, "stage.stderr")
     prefix = label.lower()
@@ -1208,6 +1429,7 @@ def run_oxide(seams, paths, staged):
     report = os.path.join(root, "observation.json")
     argv = [staged["executable"]["path"], "--observe-base", "--root", root,
             "--report-out", report]
+    engine_directories(seams, os.path.join(paths["oxide"], "engine"))
     env = engine_environment(os.path.join(paths["oxide"], "engine"))
     timeout_s = remaining_child_seconds(seams)
     result = seams.run_captured(
@@ -1224,6 +1446,7 @@ def run_barge(seams, paths, staged):
     run_root = paths["barge_run"]
     seams.make_dirs(run_root)
     argv = [staged["executable"]["path"]]
+    engine_directories(seams, os.path.join(paths["barge"], "engine"))
     env = engine_environment(os.path.join(paths["barge"], "engine"),
                              extra={BARGE_CUSTODY_OPT_IN_ENV: BARGE_CUSTODY_OPT_IN_VALUE,
                                     BARGE_SCRATCH_ROOT_ENV: run_root})
@@ -1288,8 +1511,79 @@ def require_barge_custody_record(barge):
             "verdict applies; the window's own manifest is missing")
 
 
-def parse_capture(seams, staged, *, root, transcript, manifest, report):
-    """One canonical `/2` parser pass over a retained document. No engine."""
+def identity_of(meta):
+    """The facts a copy is checked against: identity, size, mtime and mode."""
+    return {"dev": meta.st_dev, "ino": meta.st_ino, "size": meta.st_size,
+            "mtime_ns": meta.st_mtime_ns, "mode": stat.S_IMODE(meta.st_mode),
+            "regular": stat.S_ISREG(meta.st_mode), "dir": stat.S_ISDIR(meta.st_mode),
+            "symlink": stat.S_ISLNK(meta.st_mode)}
+
+
+def same_identity(left, right):
+    return all(left[key] == right[key]
+               for key in ("dev", "ino", "size", "mtime_ns", "mode"))
+
+
+def private_input_copy(seams, source, destination, *, label, expected=None,
+                       cap=PARSE_INPUT_CAP_BYTES, mode=PARSE_INPUT_FILE_MODE):
+    """One byte-for-byte owner-private copy of a retained document, for the
+    canonical parser only. The source is read, never changed: its bytes, mode and
+    identity are recorded as provenance, not as evidence about the operation.
+
+    Refused before any copy exists: a symlink, a non-regular file, a source over
+    the cap, a source that changed while it was read, and bytes that do not match
+    the pinned `expected` size and digest. `destination=None` verifies the source
+    alone and copies nothing (link evidence). An existing destination is refused
+    and never touched.
+    """
+    try:
+        before = seams.identity(source)
+    except OSError as error:
+        raise Obstruction(f"{label}: the source cannot be observed: {error}")
+    if before["symlink"] or not before["regular"]:
+        raise Obstruction(f"{label}: the source is not a regular non-symlink file; "
+                          "nothing was read or copied")
+    if before["size"] > cap:
+        raise Obstruction(f"{label}: the source is {before['size']} bytes, over the "
+                          f"{cap} byte input cap; nothing was copied")
+    try:
+        payload, read_identity = seams.read_input(source, cap)
+        after = seams.identity(source)
+    except OSError as error:
+        raise Obstruction(f"{label}: the source cannot be read: {error}")
+    if not same_identity(before, read_identity) or not same_identity(before, after):
+        raise Obstruction(f"{label}: the source changed while it was read; "
+                          "nothing was copied")
+    digest = sha256_bytes(payload)
+    if expected is not None and (len(payload) != expected["bytes"]
+                                 or digest != expected["sha256"]):
+        raise Obstruction(f"{label}: the source bytes do not match the pinned size "
+                          "and digest; nothing was copied")
+    record = {"label": label, "source": source, "source_bytes": len(payload),
+              "source_sha256": digest, "source_mode": oct(before["mode"]),
+              "copy": destination, "copy_bytes": None, "copy_sha256": None,
+              "copy_mode": None, "bytes_equal": None}
+    if destination is None:
+        return record
+    try:
+        seams.write_input_new(destination, payload, mode)
+    except OSError as error:
+        raise Obstruction(f"{label}: the private copy could not be created: {error}")
+    copied = seams.identity(destination)
+    copied_digest = seams.sha256(destination)
+    if (copied_digest != digest or copied["size"] != len(payload)
+            or copied["mode"] != mode or not copied["regular"]):
+        raise Obstruction(f"{label}: the private copy does not match its source")
+    if not same_identity(before, seams.identity(source)):
+        raise Obstruction(f"{label}: the source changed while it was copied")
+    record.update({"copy_bytes": copied["size"], "copy_sha256": copied_digest,
+                   "copy_mode": oct(copied["mode"]), "bytes_equal": True})
+    return record
+
+
+def parse_capture(seams, staged, *, root, transcript, manifest, report, timeout_s):
+    """One canonical `/2` parser pass over a retained document. No engine. The
+    caller passes owner-private copies inside `root`, never the producer's files."""
     if not seams.isfile(transcript):
         return None
     argv = [staged["executable"]["path"], "--parse-capture", "--root", root,
@@ -1297,11 +1591,90 @@ def parse_capture(seams, staged, *, root, transcript, manifest, report):
     if manifest and seams.isfile(manifest):
         argv += ["--manifest", manifest]
     argv += ["--report-out", report]
-    env = engine_environment(os.path.join(root, "parse"))
+    engine_directories(seams, os.path.join(root, "engine"))
+    env = engine_environment(os.path.join(root, "engine"))
     result = seams.run_captured(argv, cwd=os.path.dirname(root), env=env,
-                                timeout_s=120)
+                                timeout_s=timeout_s)
     document = read_document(seams, report) if seams.isfile(report) else None
     return {"argv": argv, "engine": result, "report": document}
+
+
+def parse_side(seams, staged, *, side, workspace, transcript, manifest, timeout_cap_s,
+               margin_s=SHUTDOWN_MARGIN_SECONDS, pins=None, sink=None):
+    """One side's canonical parse pass over owner-private copies in its own fresh
+    workspace. Each copy is recorded in `sink` as soon as it exists, so provenance
+    survives a later expiry. Every copy and every parse is preceded by a check of
+    the guard's remaining window; nothing starts after the window ends."""
+    if not seams.isfile(transcript):
+        return None
+    pins = pins or {}
+    sink = sink if sink is not None else []
+    remaining_child_seconds(seams, margin_s=margin_s)
+    seams.make_root(workspace)
+    inputs_dir = os.path.join(workspace, "input")
+    seams.make_dirs(inputs_dir)
+    transcript_copy = private_input_copy(
+        seams, transcript, os.path.join(inputs_dir, "transcript.json"),
+        label=f"{side} transcript", expected=pins.get("transcript"))
+    sink.append(transcript_copy)
+    manifest_copy = None
+    if manifest and seams.isfile(manifest):
+        manifest_copy = private_input_copy(
+            seams, manifest, os.path.join(inputs_dir, "manifest.json"),
+            label=f"{side} manifest", expected=pins.get("manifest"))
+        sink.append(manifest_copy)
+    timeout_s = min(timeout_cap_s, remaining_child_seconds(seams, margin_s=margin_s))
+    parse = parse_capture(
+        seams, staged, root=workspace, transcript=transcript_copy["copy"],
+        manifest=manifest_copy["copy"] if manifest_copy else None,
+        report=os.path.join(workspace, "parse.json"), timeout_s=timeout_s)
+    if parse is not None:
+        parse["inputs"] = list(sink)
+    return parse
+
+
+def parser_inert_path(path):
+    """True when a changed path cannot change the parser binary: no compiled-in
+    document and no source. Scripts, Markdown and the Effigy task file are inert."""
+    if path.startswith(PARSE_COMPILED_DOCS):
+        return False
+    return (path.startswith(("scripts/", "docs/"))
+            or path in ("AGENTS.md", "README.md", "effigy.toml"))
+
+
+def parser_source_facts(seams):
+    """The parser binary was built at PARSE_CONTROL_SOURCE_HEAD. The control runs
+    only when HEAD descends from it and every changed path is inert for that
+    binary. Equality of the Rust bytes is therefore a checked fact, not an
+    assumption carried over from the 297 build."""
+    base = PARSE_CONTROL_SOURCE_HEAD
+
+    def git(*args):
+        result = seams.query(["git", "-C", REPO, *args], timeout_s=60)
+        if result["code"] != 0:
+            raise Obstruction(f"git {args[0]} failed; the source cannot be bound: "
+                              + (result["stderr"] or "")[-200:])
+        return result["stdout"]
+
+    head = git("rev-parse", "HEAD").strip()
+    if not is_hex(head, 40):
+        raise Obstruction("HEAD is not an exact commit identity")
+    if git("rev-parse", "--verify", base + "^{commit}").strip() != base:
+        raise Obstruction(f"the parser source head {base} is not present")
+    if git("status", "--porcelain", "--untracked-files=no").strip():
+        raise Obstruction("the tracked worktree is dirty; the parser source is not bound")
+    if seams.query(["git", "-C", REPO, "merge-base", "--is-ancestor", base, head],
+                   timeout_s=60)["code"] != 0:
+        raise Obstruction(f"HEAD does not descend from the parser source head {base}")
+    changed = sorted(line for line in git("diff", "--name-only", base, head).splitlines()
+                     if line)
+    compiled = [path for path in changed if not parser_inert_path(path)]
+    if compiled:
+        raise Obstruction("the tree changed compiled parser input since "
+                          f"{base}: {compiled[:5]}; the staged binary is no longer "
+                          "its source")
+    return {"base": base, "head": head, "changed_since_base": changed,
+            "compiled_changes": 0}
 
 
 def retain(seams, paths, stage_artifacts, windows, parses, gaps):
@@ -1323,10 +1696,10 @@ def retain(seams, paths, stage_artifacts, windows, parses, gaps):
         ("oxide.transcript", os.path.join(oxide_fixture, "transcript.json")),
         ("oxide.manifest", os.path.join(oxide_fixture, "manifest.json")),
         ("oxide.observation", os.path.join(paths["oxide_fixture"], "observation.json")),
-        ("oxide.parse", os.path.join(paths["oxide_fixture"], "parse.json")),
+        ("oxide.parse", os.path.join(paths["parse_oxide"], "parse.json")),
         ("barge.transcript", (barge or {}).get("retained")),
         ("barge.manifest", (barge or {}).get("manifest")),
-        ("barge.parse", os.path.join(paths["barge_run"], "parse.json")),
+        ("barge.parse", os.path.join(paths["parse_barge"], "parse.json")),
     ]
     # Stage logs and the executable are known before or as soon as they exist,
     # because `stage` registers them before spawning Cargo; a failed build's own
@@ -1373,15 +1746,20 @@ def retain(seams, paths, stage_artifacts, windows, parses, gaps):
         entries.append({"label": label, "source": inside, "retained": True,
                         "path": destination, "bytes": size,
                         "sha256": seams.sha256(destination)})
-    for side, window in (("oxide", oxide), ("barge", barge)):
-        if window is None:
-            continue
+    # Engine windows, then parser passes: the parser's own stdout and stderr are
+    # kept even when it wrote no report, so a refusal's text is never lost.
+    streams = [(side, window["engine"], "") for side, window in
+               (("oxide", oxide), ("barge", barge)) if window is not None]
+    streams += [(side, parse["engine"], "parse.") for side, parse in
+                (("oxide", parses[0]), ("barge", parses[1])) if parse is not None]
+    for side, engine, kind in streams:
         for stream in ("stdout", "stderr"):
-            text_value = window["engine"].get(stream) or ""
-            destination = os.path.join(target, f"{side}.{stream}.txt")
+            text_value = engine.get(stream) or ""
+            label = f"{side}.{kind}{stream}"
+            destination = os.path.join(target, f"{label}.txt")
             seams.write_text(destination, text_value)
             total += len(text_value.encode("utf-8", "replace"))
-            entries.append({"label": f"{side}.{stream}", "retained": True,
+            entries.append({"label": label, "retained": True,
                             "path": destination,
                             "bytes": len(text_value.encode("utf-8", "replace")),
                             "sha256": seams.sha256(destination)})
@@ -1444,9 +1822,11 @@ def closure_record(guard_receipt):
 
 
 def build_report(*, binding, guard, paths, envelope, oxide, barge, oxide_parse,
-                 barge_parse, retained, outcome, closure, gaps, seeds=None):
+                 barge_parse, retained, outcome, closure, gaps, seeds=None,
+                 parse_inputs=None):
     """One bounded, honest report. `qualified` is false unconditionally and no
     field records agreement, equivalence or divergence."""
+    parse_inputs = parse_inputs or {"oxide": [], "barge": []}
     bounded_gaps = list(gaps)
     if len(bounded_gaps) > GAP_CAP:
         omitted = len(bounded_gaps) - GAP_CAP
@@ -1485,6 +1865,7 @@ def build_report(*, binding, guard, paths, envelope, oxide, barge, oxide_parse,
                 "classification": classification(oxide["engine"] if oxide else None),
                 "observation": oxide["observation"] if oxide else None,
                 "parse": oxide_parse,
+                "parse_inputs": parse_inputs["oxide"],
             },
             "barge": {
                 "case": "CTL-0",
@@ -1513,6 +1894,7 @@ def build_report(*, binding, guard, paths, envelope, oxide, barge, oxide_parse,
                     "manifest": barge["manifest"] if barge else None,
                 },
                 "parse": barge_parse,
+                "parse_inputs": parse_inputs["barge"],
             },
         },
         "outcome": outcome,
@@ -1571,7 +1953,8 @@ def observe(options, seams=None, environ=None):
     gaps = []
     reached = {"phase": "binding", "binding": None, "guard": None, "paths": None,
                "envelope": None, "stage_artifacts": {}, "seeds": {}, "oxide": None,
-               "barge": None, "oxide_parse": None, "barge_parse": None}
+               "barge": None, "oxide_parse": None, "barge_parse": None,
+               "parse_inputs": {"oxide": [], "barge": []}}
 
     def finish(outcome, failure=None):
         """Retain what was reached and publish the report. Returns whether the
@@ -1602,6 +1985,7 @@ def observe(options, seams=None, environ=None):
                 oxide=reached["oxide"], barge=reached["barge"],
                 oxide_parse=reached["oxide_parse"], barge_parse=reached["barge_parse"],
                 retained=retained, outcome=outcome, seeds=reached["seeds"],
+                parse_inputs=reached["parse_inputs"],
                 closure=closure_record(paths["guard_receipt"]), gaps=gaps)
             try:
                 seams.write_json(paths["report"], report)
@@ -1679,15 +2063,18 @@ def observe(options, seams=None, environ=None):
         reached["phase"] = "barge-custody"
         require_barge_custody_record(barge)
 
+        # Each parse reads owner-private copies in its own workspace; the producer's
+        # files are only read. The canonical parser refuses a producer's 0644 input.
         reached["phase"] = "parse"
         if oxide["observation"] is not None:
-            reached["oxide_parse"] = parse_capture(
-                seams, oxide_staged, root=oxide["fixture"],
+            reached["oxide_parse"] = parse_side(
+                seams, oxide_staged, side="oxide", workspace=paths["parse_oxide"],
                 transcript=os.path.join(oxide["fixture"], "fixture-base",
                                         "transcript.json"),
                 manifest=os.path.join(oxide["fixture"], "fixture-base",
                                       "manifest.json"),
-                report=os.path.join(oxide["fixture"], "parse.json"))
+                timeout_cap_s=PARSE_TIMEOUT_CAP_SECONDS,
+                sink=reached["parse_inputs"]["oxide"])
             oxide_parse = reached["oxide_parse"]
             if oxide_parse is None:
                 gaps.append("Oxide retained no transcript; its side has no parser result")
@@ -1696,11 +2083,11 @@ def observe(options, seams=None, environ=None):
             elif oxide_parse["report"]["document"] is None:
                 gaps.append("the Oxide parse report is unparsable and was not repaired")
 
-        barge_root = paths["barge_run"]
-        reached["barge_parse"] = parse_capture(
-            seams, oxide_staged, root=barge_root, transcript=barge["retained"],
-            manifest=barge["manifest"],
-            report=os.path.join(barge_root, "parse.json"))
+        reached["barge_parse"] = parse_side(
+            seams, oxide_staged, side="barge", workspace=paths["parse_barge"],
+            transcript=barge["retained"], manifest=barge["manifest"],
+            timeout_cap_s=PARSE_TIMEOUT_CAP_SECONDS,
+            sink=reached["parse_inputs"]["barge"])
         barge_parse = reached["barge_parse"]
         if barge_parse is None or barge_parse["report"] is None:
             raise Obstruction(
@@ -1768,9 +2155,16 @@ def plan_document():
                             "--message-format=json"],
             "barge_engine": ["<staged tape_eval>", "(no arguments)"],
             "parse_pass": ["<staged tape_prune_eval>", "--parse-capture", "--root",
-                           "<run>/<side>", "--transcript", "<retained>",
-                           "[--manifest <retained manifest>]",
-                           "--report-out", "<run>/<side>/parse.json"],
+                           "<run>/parse/<side>", "--transcript",
+                           "<run>/parse/<side>/input/transcript.json (owner-private "
+                           "copy of the retained transcript)",
+                           "[--manifest <run>/parse/<side>/input/manifest.json]",
+                           "--report-out", "<run>/parse/<side>/parse.json"],
+            "parse_inputs": "each retained transcript and manifest is read, verified "
+                            "against its own size and digest, and copied byte for byte "
+                            "to an exclusively new 0600 file in a fresh 0700 workspace "
+                            "before the parser runs; the producer's bytes, mode and "
+                            "identity are only recorded",
             "engine_windows": "one per side, sequential, inside the guard's own group",
         },
         "controls": list(CONTROLS),
@@ -1848,9 +2242,10 @@ def plan_document():
                 "oxide staging target in scratch (no debug info, incremental off)": 448,
                 "barge staging target (14-package workspace)": 192,
                 "two private seeded Cargo homes": 192,
-                "engine windows: fixtures, transcripts, observation and parse reports": 32,
+                "engine windows: fixtures, transcripts, observation and parse reports, "
+                "and private parser input copies": 40,
                 "retained evidence copies (transcripts, manifest, logs, executables)": 416,
-                "slack": 256,
+                "slack": 248,
             },
             "allocation_seconds": {
                 "two cold sequential staging builds in scratch": 420,
@@ -2027,6 +2422,237 @@ def plan():
 
 
 # ---------------------------------------------------------------------------
+# Supplemental parse-only control (oxide#298)
+# ---------------------------------------------------------------------------
+
+
+def parse_control_premise_records():
+    return [{"premise": name, "disposition": text, "sites": list(sites)}
+            for name, text, sites in PARSE_CONTROL_PREMISES]
+
+
+def parse_control_plan(pins=None):
+    """The fixed, effect-free plan. Its canonical digest is the activation token:
+    a planner supplies it, so the occurrence is bound to these exact pins, bounds
+    and source head, and any other value refuses before any effect."""
+    pins = PARSE_CONTROL_PINS if pins is None else pins
+    return {
+        "schema": PARSE_CONTROL_PLAN_SCHEMA,
+        "qualified": False,
+        "claim": PARSE_CONTROL_CLAIM,
+        "route": (f"python3 scripts/bounded-test.py --limit {PARSE_CONTROL_LIMIT_SECONDS} "
+                  f"--scratch-budget-mib {PARSE_CONTROL_SCRATCH_MIB} -- "
+                  "python3 scripts/tape-embedded-observation.py --parse-control "
+                  "--sha256 \"$PARSE_CONTROL_SHA256\""),
+        "activation": "PARSE_CONTROL_SHA256 is the plan_sha256 printed by "
+                      "--parse-control-plan for the reviewed head; any other value "
+                      "refuses before any effect",
+        "source": {
+            "head": PARSE_CONTROL_SOURCE_HEAD,
+            "rule": "HEAD must descend from the head and every changed path must be "
+                    "inert for the parser binary (scripts/, Markdown, effigy.toml and "
+                    "docs/ outside the compiled-in capture vectors, examples and "
+                    "manifest schema); otherwise the control refuses before any copy",
+        },
+        "bounds": {
+            "limit_seconds": PARSE_CONTROL_LIMIT_SECONDS,
+            "scratch_mib": PARSE_CONTROL_SCRATCH_MIB,
+            "shutdown_margin_seconds": PARSE_CONTROL_MARGIN_SECONDS,
+            "per_parse_cap_seconds": PARSE_CONTROL_PARSE_CAP_SECONDS,
+            "input_cap_bytes": PARSE_INPUT_CAP_BYTES,
+            "fit": "unmeasured",
+            "resource_basis": "the parser executable (10.3 MB) copied once, both "
+                              "transcripts (about 0.95 MB) and manifests (about 6 KB) "
+                              "copied once each, and two parse reports: about 11 MB "
+                              "of owned scratch",
+        },
+        "executable": {"path": pins["executable"]["path"],
+                       "bytes": pins["executable"]["bytes"],
+                       "sha256": pins["executable"]["sha256"]},
+        "parse_commands": {
+            side: ["<run>/executable/oxide-parse", "--parse-capture", "--root",
+                   f"<run>/parse/{side}", "--transcript",
+                   f"<run>/parse/{side}/input/transcript.json",
+                   "[--manifest <run>/parse/" + side + "/input/manifest.json]",
+                   "--report-out", f"<run>/parse/{side}/parse.json"]
+            for side in ("oxide", "barge")
+        },
+        "pins": {label: dict(pin) for label, pin in pins.items()
+                 if label != "executable"},
+        "premises": parse_control_premise_records(),
+        "controls": [
+            "no engine window, staging, seed, image, mount, detach or network",
+            "every pinned input is verified by size and digest before its copy",
+            "the report, receipt and oxide.parse are verified links, never parsed",
+        ],
+        "awards": "nothing: no verdict is promoted from the failed 297 occurrence; "
+                  "strict, truncation, source and identity insufficiencies are "
+                  "reported unchanged",
+    }
+
+
+def parse_control_plan_bytes(pins=None):
+    return json.dumps(parse_control_plan(pins), indent=2, sort_keys=True).encode()
+
+
+def parse_control_print():
+    plan_text = parse_control_plan_bytes()
+    say(json.dumps({"plan_sha256": sha256_bytes(plan_text),
+                    "plan": json.loads(plan_text)}, indent=2, sort_keys=True))
+    return 0
+
+
+def parse_control(options, seams=None, environ=None, pins=None):
+    """Run the one supplemental parse-only control. Refused before any effect unless
+    `sha256` is the plan digest. The guard context and the source gate come next,
+    then the executable and link evidence are verified, then the staged canonical
+    parser alone runs once per side on owner-private copies. Every exit publishes
+    one bounded report that `qualified` marks as unqualified."""
+    seams = seams or Seams()
+    pins = PARSE_CONTROL_PINS if pins is None else pins
+    digest = sha256_bytes(parse_control_plan_bytes(pins))
+    supplied = options.get("sha256")
+    if not supplied or not is_hex(supplied, 64) or supplied != digest:
+        raise Obstruction(
+            "the parse-only control is not activated: --sha256 must be the "
+            "plan_sha256 printed by --parse-control-plan; nothing ran")
+    gaps = []
+    reached = {"guard": None, "run_root": None, "report": None, "phase": "guard",
+               "source": None, "executable": None, "links": {},
+               "parse": {"oxide": None, "barge": None},
+               "inputs": {"oxide": [], "barge": []}}
+
+    def finish(state, phase, reason):
+        """Publish the bounded report. Returns whether it was published; a control
+        whose report never exists is never a closed success."""
+        if reached["report"] is None:
+            return False
+        document = build_parse_control_report(
+            digest=digest, reached=reached, gaps=gaps, pins=pins,
+            outcome={"state": state, "phase": phase, "reason": reason})
+        try:
+            seams.write_json(reached["report"], document)
+        except OSError as error:
+            say(f"parse-control: the report could not be published: {error}")
+            return False
+        say(f"parse-control: {state} report {reached['report']} (phase {phase}); "
+            "qualified=false")
+        return True
+
+    try:
+        guard = guard_context(seams, environ)
+        reached["guard"] = guard
+        run_root = os.path.join(guard["scratch_root"], PARSE_CONTROL_RUN_NAME)
+        report = os.path.join(guard["evidence"], PARSE_CONTROL_REPORT_NAME)
+        reached["run_root"], reached["report"] = run_root, report
+        if seams.exists(run_root) or seams.exists(report):
+            raise Obstruction("this control's root or report already exists; refusing")
+        reached["phase"] = "source"
+        reached["source"] = parser_source_facts(seams)
+        remaining_child_seconds(seams, margin_s=PARSE_CONTROL_MARGIN_SECONDS)
+        seams.make_root(run_root)
+
+        reached["phase"] = "copy"
+        executable_dir = os.path.join(run_root, "executable")
+        seams.make_dirs(executable_dir)
+        reached["executable"] = private_input_copy(
+            seams, pins["executable"]["path"],
+            os.path.join(executable_dir, "oxide-parse"),
+            label="parser executable", expected=pins["executable"],
+            mode=PARSE_EXECUTABLE_MODE)
+        for label in ("oxide.parse", "occurrence-report", "occurrence-receipt"):
+            reached["phase"] = f"link {label}"
+            reached["links"][label] = private_input_copy(
+                seams, pins[label]["path"], None, label=label, expected=pins[label])
+
+        staged = {"executable": {"path": reached["executable"]["copy"]}}
+        for side in ("oxide", "barge"):
+            transcript_label, manifest_label = PARSE_CONTROL_PARSE_LABELS[side]
+            reached["phase"] = f"{side}-parse"
+            parse = parse_side(
+                seams, staged, side=side, workspace=os.path.join(run_root, "parse", side),
+                transcript=pins[transcript_label]["path"],
+                manifest=pins[manifest_label]["path"],
+                timeout_cap_s=PARSE_CONTROL_PARSE_CAP_SECONDS,
+                margin_s=PARSE_CONTROL_MARGIN_SECONDS,
+                pins={"transcript": pins[transcript_label],
+                      "manifest": pins[manifest_label]},
+                sink=reached["inputs"][side])
+            reached["parse"][side] = parse
+            if parse is None:
+                raise Obstruction(f"the pinned {side} transcript is absent; no parse ran")
+            if parse["report"] is None:
+                raise Obstruction(
+                    f"the canonical parse pass wrote no report for the {side} side; "
+                    "its captured output is retained in this report")
+            if parse["report"]["document"] is None:
+                gaps.append(f"the {side} parse report is unparsable and was not repaired")
+    except Obstruction as error:
+        finish("refused", reached["phase"], str(error))
+        raise
+    except BaseException as error:  # retain what exists before propagating
+        finish("aborted", reached["phase"], f"{type(error).__name__}: {error}")
+        raise
+
+    if not finish("collected", "complete", None):
+        raise Obstruction("the parse-control report could not be published; the guard "
+                          "must not record a closed success")
+    return 0
+
+
+def build_parse_control_report(*, digest, reached, gaps, pins, outcome):
+    """One bounded record: each side's argv, verbatim engine output, the parser's own
+    report and fate, and the copy provenance. Nothing is summarised or repaired."""
+    guard = reached["guard"]
+    bounded_gaps = list(gaps)
+    if len(bounded_gaps) > GAP_CAP:
+        omitted = len(bounded_gaps) - GAP_CAP
+        bounded_gaps = bounded_gaps[:GAP_CAP] + [f"{omitted} further gap(s) omitted"]
+
+    def side(name):
+        parse = reached["parse"][name]
+        return {
+            "argv": parse["argv"] if parse else None,
+            "engine": parse["engine"] if parse else None,
+            "classification": classification(parse["engine"] if parse else None),
+            "report": parse["report"] if parse else None,
+            "fate": fate_of(parse),
+            "inputs": reached["inputs"][name],
+        }
+
+    return {
+        "schema": PARSE_CONTROL_SCHEMA,
+        "qualified": False,
+        "claim": PARSE_CONTROL_CLAIM,
+        "plan_sha256": digest,
+        "pins": {label: {"path": pin["path"], "bytes": pin["bytes"],
+                         "sha256": pin["sha256"], "role": pin["role"]}
+                 for label, pin in pins.items()},
+        "bounds": {"limit_seconds": PARSE_CONTROL_LIMIT_SECONDS,
+                   "scratch_mib": PARSE_CONTROL_SCRATCH_MIB,
+                   "shutdown_margin_seconds": PARSE_CONTROL_MARGIN_SECONDS,
+                   "per_parse_cap_seconds": PARSE_CONTROL_PARSE_CAP_SECONDS,
+                   "fit": "unmeasured"},
+        "premises": parse_control_premise_records(),
+        "source": reached["source"],
+        "guard": ({"scratch_root": guard["scratch_root"],
+                   "evidence": guard["evidence"], "run_id": guard["run_id"],
+                   "deadline_ns": guard["deadline_ns"],
+                   "supervisor_sha256": guard["supervisor_sha256"]}
+                  if guard else None),
+        "executable": reached["executable"],
+        "links": reached["links"],
+        "windows": {"oxide": side("oxide"), "barge": side("barge")},
+        "outcome": outcome,
+        "comparison": "not-claimed: the two fates are observations of two physically "
+                      "different fixtures; no agreement, equivalence or divergence",
+        "gaps": bounded_gaps,
+        "closure": closure_record(os.path.join(guard["evidence"], "receipt.json")
+                                  if guard else None),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Pure self-test
 # ---------------------------------------------------------------------------
 
@@ -2090,6 +2716,12 @@ class FakeSeams(Seams):
             label = "barge"
         if self.script.get("raise_on") == label:
             raise UnknownOutcome(f"the {label} window did not finish in its bound")
+        if label == "parse":
+            # A scripted expiry lands after the Nth parse returns, so the next
+            # side's window check is the one that must refuse.
+            self.script["parses"] = self.script.get("parses", 0) + 1
+            if self.script.get("expire_after_parses") == self.script["parses"]:
+                self.script["work_left"] = 0
         return dict(self.script[label])
 
     def query(self, argv, **kwargs):
@@ -2129,8 +2761,52 @@ class FakeSeams(Seams):
         return path in self.script.get("exists", set())
 
     def isfile(self, path):
+        if path in self.script.get("made", {}):
+            return True
         return (path in self.script.get("isfiles", set())
                 and path not in self.script.get("missing", set()))
+
+    def identity(self, path):
+        """Scripted identities are consumed in order; the last entry repeats, so a
+        list of two drives a change between the before and after observations."""
+        self.calls.append(("identity", path))
+        if path in self.script.get("missing", set()):
+            raise OSError(f"not scripted: {path}")
+        made = self.script.get("made", {})
+        if path in made:
+            return dict(made[path]["identity"])
+        scripted = self.script.get("identities", {}).get(path)
+        if isinstance(scripted, list):
+            return dict(scripted.pop(0) if len(scripted) > 1 else scripted[0])
+        if scripted:
+            return dict(scripted)
+        files = self.script.get("files", {})
+        kind = {"regular": True, "dir": False, "symlink": False}
+        kind.update(self.script.get("kinds", {}).get(path, {}))
+        return {"dev": 1, "ino": 1, "size": len(files[path]) if path in files else 1,
+                "mtime_ns": 0, "mode": self.script.get("modes", {}).get(path, 0o600),
+                **kind}
+
+    def read_input(self, path, cap):
+        self.calls.append(("read_input", path))
+        files = self.script.get("files", {})
+        if path not in files:
+            raise OSError(f"not scripted: {path}")
+        if len(files[path]) > cap:
+            raise Obstruction(f"{path} grew past the {cap} byte input cap")
+        return files[path], self.identity(path)
+
+    def write_input_new(self, path, payload, mode):
+        self.calls.append(("write_input_new", path, mode))
+        if self.script.get("write_input_fail") == path:
+            raise OSError("no space left on device")
+        made = self.script.setdefault("made", {})
+        if path in made:
+            raise FileExistsError(path)
+        made[path] = {"payload": bytes(payload), "mode": mode,
+                      "identity": {"dev": 1, "ino": 2, "size": len(payload),
+                                   "mtime_ns": 0, "mode": mode, "regular": True,
+                                   "dir": False, "symlink": False}}
 
     def isdir(self, path):
         return path in self.script.get("isdirs", set())
@@ -2147,7 +2823,9 @@ class FakeSeams(Seams):
 
     def sha256(self, path):
         self.calls.append(("sha256", path))
-        matches = [(key, value) for key, value in self.script.get("digests", {}).items()
+        if path in self.script.get("made", {}):
+            return sha256_bytes(self.script["made"][path]["payload"])
+        matches =[(key, value) for key, value in self.script.get("digests", {}).items()
                    if key in path]
         if not matches:
             return "0" * 64
@@ -2256,8 +2934,8 @@ def scripted_occurrence(binding, facts, *, barge_stderr, stage_exit=0,
     transcript = os.path.join(oxide_root, "fixture-base", "transcript.json")
     manifest = os.path.join(oxide_root, "fixture-base", "manifest.json")
     observation_report = os.path.join(oxide_root, "observation.json")
-    oxide_parse_report = os.path.join(oxide_root, "parse.json")
-    barge_parse_report = os.path.join(barge_run, "parse.json")
+    oxide_parse_report = os.path.join(run_root, "parse", "oxide", "parse.json")
+    barge_parse_report = os.path.join(run_root, "parse", "barge", "parse.json")
     oxide_executable = os.path.join(run_root, "oxide", "stage", "target", "debug",
                                     "deps", "tape_prune_eval-1")
     barge_executable = os.path.join(run_root, "barge", "stage", "target", "debug",
@@ -2279,6 +2957,11 @@ def scripted_occurrence(binding, facts, *, barge_stderr, stage_exit=0,
     files = {
         "/binding.json": json.dumps(binding).encode(),
         "Cargo.lock": b"",
+        # The retained inputs the parse passes read through private copies.
+        transcript: b'{"fixture": "oxide-base"}\n',
+        manifest: b'{"fixture": "oxide-manifest"}\n',
+        retained: b'{"fixture": "barge-transcript"}\n',
+        kept_manifest: b'{"fixture": "barge-manifest"}\n',
         os.path.join(barge_source, "crates", "barge", "src", "testkit.rs"): b"",
         os.path.join(barge_source, "crates", "barge", "src",
                      "tape_harness.rs"): b"",
@@ -3043,7 +3726,7 @@ def _self_test():
              "not a safe directory"),
         )
         parse_missing = barge_case(ok_stderr)
-        parse_missing["missing"] = {os.path.join(paths["barge_run"], "parse.json")}
+        parse_missing["missing"] = {os.path.join(paths["parse_barge"], "parse.json")}
         barge_refusals += (
             ("a missing Barge parse report",
              parse_missing, "no report for the Barge side"),
@@ -3190,6 +3873,96 @@ def _self_test():
               failure["outcome"]["phase"] == "parse"
               and entries["oxide.transcript"]["retained"] is True
               and entries["oxide.executable"]["retained"] is True)
+
+        # Owner-private parser inputs (oxide#298): both parse passes read copies in
+        # their own workspace, the producer's files are only read, and each copy
+        # matches its source byte for byte.
+        oxide_source = os.path.join(paths["oxide_fixture"], "fixture-base", "transcript.json")
+        oxide_manifest_source = os.path.join(paths["oxide_fixture"], "fixture-base",
+                                             "manifest.json")
+        barge_source = os.path.join(paths["barge_run"], "barge-test-x.transcript.json")
+        happy = scripted_occurrence(binding, facts, barge_stderr=ok_stderr)
+        happy_fake = FakeSeams(happy)
+        observe({"binding": "/binding.json", "sha256": sha256_bytes(binding_bytes)},
+                happy_fake, FIXTURE_ENV)
+        parse_calls = [call[1] for call in happy_fake.calls
+                       if call[0] == "run_captured" and "--parse-capture" in call[1]]
+        check("each side makes one canonical parse pass and no engine argv runs there",
+              len(parse_calls) == 2
+              and not any("--observe-base" in call for call in parse_calls))
+        check("each parse reads its own owner-private copy, never the producer's file",
+              parse_calls[0][parse_calls[0].index("--transcript") + 1]
+              == os.path.join(paths["parse_oxide"], "input", "transcript.json")
+              and parse_calls[1][parse_calls[1].index("--transcript") + 1]
+              == os.path.join(paths["parse_barge"], "input", "transcript.json")
+              and oxide_source not in " ".join(parse_calls[0])
+              and barge_source not in " ".join(parse_calls[1]))
+        check("the copies are 0600 and byte-equal to what the producer wrote",
+              happy["made"][os.path.join(paths["parse_oxide"], "input", "transcript.json")]
+              ["mode"] == 0o600
+              and happy["made"][os.path.join(paths["parse_barge"], "input",
+                                             "transcript.json")]["payload"]
+              == happy["files"][barge_source]
+              and happy["made"][os.path.join(paths["parse_oxide"], "input",
+                                             "manifest.json")]["payload"]
+              == happy["files"][oxide_manifest_source])
+        check("no write ever lands on an original retained path",
+              not any(call[0] == "write_input_new" and call[1] in (
+                  oxide_source, oxide_manifest_source, barge_source)
+                  for call in happy_fake.calls))
+        parse_inputs = happy["written"]["windows"]["barge"]["parse_inputs"]
+        check("the report records the original and copy digests, sizes and modes",
+              parse_inputs[0]["source"] == barge_source
+              and parse_inputs[0]["source_sha256"] == sha256_bytes(happy["files"][barge_source])
+              and parse_inputs[0]["copy_sha256"] == parse_inputs[0]["source_sha256"]
+              and parse_inputs[0]["copy_mode"] == "0o600"
+              and parse_inputs[0]["bytes_equal"] is True
+              and happy["written"]["outcome"]["state"] == "collected")
+
+        drift = scripted_occurrence(binding, facts, barge_stderr=ok_stderr)
+        stable = {"dev": 1, "ino": 1, "size": len(drift["files"][barge_source]),
+                  "mtime_ns": 0, "mode": 0o600, "regular": True, "dir": False,
+                  "symlink": False}
+        drift["identities"] = {barge_source: [stable, stable,
+                                              dict(stable, mtime_ns=1)]}
+        refuses("a source that changes while it is copied is refused",
+                lambda: observe({"binding": "/binding.json",
+                                 "sha256": sha256_bytes(binding_bytes)},
+                                FakeSeams(drift), FIXTURE_ENV), "changed while")
+        check("a drifted source leaves no copy behind",
+              not any(key.startswith(paths["parse_barge"]) for key in drift.get("made", {})))
+
+        linked = scripted_occurrence(binding, facts, barge_stderr=ok_stderr)
+        linked["kinds"][oxide_source] = {"regular": False, "dir": False, "symlink": True}
+        refuses("a symlinked transcript is refused before any copy",
+                lambda: observe({"binding": "/binding.json",
+                                 "sha256": sha256_bytes(binding_bytes)},
+                                FakeSeams(linked), FIXTURE_ENV), "not a regular")
+        check("a refused symlink writes no copy and runs no parser",
+              not linked.get("made"))
+
+        collision = scripted_occurrence(binding, facts, barge_stderr=ok_stderr)
+        collision["write_input_fail"] = os.path.join(paths["parse_oxide"], "input",
+                                                     "transcript.json")
+        refuses("a copy that cannot be created refuses the side",
+                lambda: observe({"binding": "/binding.json",
+                                 "sha256": sha256_bytes(binding_bytes)},
+                                FakeSeams(collision), FIXTURE_ENV), "could not be created")
+        check("a failed copy is recorded as a parse-phase refusal",
+              collision["written"]["outcome"]["phase"] == "parse")
+
+        expired = scripted_occurrence(binding, facts, barge_stderr=ok_stderr)
+        expired["expire_after_parses"] = 1
+        expired_fake = FakeSeams(expired)
+        refuses("an expired window stops the second side before its copy or parse",
+                lambda: observe({"binding": "/binding.json",
+                                 "sha256": sha256_bytes(binding_bytes)},
+                                expired_fake, FIXTURE_ENV), "no work window")
+        check("expiry between parses starts no Barge copy and no second parse",
+              expired["parses"] == 1
+              and not any(key.startswith(paths["parse_barge"])
+                          for key in expired.get("made", {}))
+              and expired["written"]["outcome"]["phase"] == "parse")
 
         staged_bad = scripted_occurrence(binding, facts, barge_stderr=ok_stderr)
         staged_bad["stage_exit"] = 101
@@ -3637,6 +4410,8 @@ def _self_test():
     check("an unknown binding cannot write a report",
           guessed["written"] is None)
 
+    check("no fixture path reaches the host: the fake guard root is absent",
+          not os.path.exists(FIXTURE_GUARD["root"]))
     failures = [(name, detail) for name, passed, detail in checks if not passed]
     for name, passed, detail in checks:
         say(f"self-test: {name}: {'ok' if passed else 'FAILED ' + detail}")
@@ -3648,11 +4423,406 @@ def _self_test():
     return 0
 
 
+PARSE_CONTROL_HEAD_NOW = "a" * 40
+
+
+def parser_component_admits(mode):
+    """A model of the parser's per-component rule (tape_harness.rs
+    `validate_fixture_path`): no group or other bit. The owner and symlink rules
+    are checked by the copy itself, so this is the mode half only."""
+    return mode & 0o077 == 0
+
+
+def parse_control_self_test():
+    """Pure controls for the supplemental parse-only control and the copy helper.
+    The fake controls run no child and touch no file; the real-file controls write
+    one fresh directory under TMPDIR, the only file effect, and remove it."""
+    checks = []
+
+    def check(name, condition, detail=""):
+        checks.append((name, bool(condition), detail))
+
+    def refuses(name, call, needle=None):
+        try:
+            call()
+        except Obstruction as error:
+            check(name, needle is None or needle in str(error), str(error))
+        except Exception as error:  # noqa: BLE001 - an unexpected class is a failure
+            check(name, False, f"unexpected {type(error).__name__}: {error}")
+        else:
+            check(name, False, "no refusal")
+
+    # 1. The fixed plan and its activation token.
+    plan_bytes = parse_control_plan_bytes()
+    plan_doc = json.loads(plan_bytes)
+    check("the plan is unqualified and names the reviewed parser head",
+          plan_doc["qualified"] is False
+          and plan_doc["source"]["head"] == PARSE_CONTROL_SOURCE_HEAD)
+    check("each side runs one canonical parse and no engine command",
+          all(argv[1] == "--parse-capture" for argv in plan_doc["parse_commands"].values())
+          and not any("--observe-base" in json.dumps(argv)
+                      for argv in plan_doc["parse_commands"].values()))
+    check("the plan carries the reviewed 120 s / 64 MiB bounds with a 30 s margin",
+          plan_doc["bounds"]["limit_seconds"] == 120
+          and plan_doc["bounds"]["scratch_mib"] == 64
+          and plan_doc["bounds"]["shutdown_margin_seconds"] == 30
+          and plan_doc["bounds"]["per_parse_cap_seconds"] == 30)
+    expected_premises = ("private-home-and-rustup", "account-home-control",
+                         "environment-isolation", "automatic-adoption",
+                         "cargo-external-argv", "owned-images", "compiler-flags",
+                         "temporary-storage", "macos-mktemp")
+    check("the plan carries the nine proof-authoring premises, each with a disposition",
+          [entry["premise"] for entry in plan_doc["premises"]] == list(expected_premises)
+          and all(entry["disposition"].strip() and entry["sites"]
+                  for entry in plan_doc["premises"]))
+    check("every cited premise site exists in this module",
+          all(site in globals() for entry in plan_doc["premises"]
+              for site in entry["sites"]))
+    copied_bytes = sum(PARSE_CONTROL_PINS[label]["bytes"] for label in (
+        "executable", "oxide.transcript", "oxide.manifest",
+        "barge.transcript", "barge.manifest"))
+    check("the bytes copied into scratch fit well inside the 64 MiB budget",
+          copied_bytes < PARSE_CONTROL_SCRATCH_MIB * MIB // 4)
+    digest = sha256_bytes(plan_bytes)
+    changed_pins = json.loads(json.dumps(PARSE_CONTROL_PINS))
+    changed_pins["barge.manifest"]["sha256"] = "0" * 64
+    check("the activation digest covers every pin",
+          sha256_bytes(parse_control_plan_bytes(changed_pins)) != digest)
+    idle = FakeSeams({})
+    refuses("a missing activation digest refuses before any effect",
+            lambda: parse_control({}, idle, FIXTURE_ENV), "not activated")
+    refuses("a wrong activation digest refuses before any effect",
+            lambda: parse_control({"sha256": "0" * 64}, idle, FIXTURE_ENV), "not activated")
+    check("the refused activations made no call", not idle.calls)
+
+    # 2. The parser-input rule, its inert-path classification and the source gate.
+    for path, inert in (
+            ("scripts/tape-embedded-observation.py", True),
+            ("docs/knowledge/contracts/barge-adoption.md", True),
+            ("effigy.toml", True),
+            ("src/bin/oxide/tape_harness.rs", False),
+            ("Cargo.lock", False),
+            ("tests/tape_prune_eval.rs", False),
+            ("docs/knowledge/contracts/capture-vectors/v2/valid/absent.json", False),
+            ("docs/knowledge/contracts/capture-examples/v2/manifest-example.json", False),
+            ("docs/knowledge/contracts/oxide-capture-manifest.v2.schema.json", False)):
+        check(f"a change to {path} is {'inert' if inert else 'compiled'} for the parser",
+              parser_inert_path(path) is inert)
+
+    base = PARSE_CONTROL_SOURCE_HEAD
+
+    def source_fake(changed=(), dirty="", ancestor=0, base_present=True):
+        def answer(stdout="", code=0):
+            return {"code": code, "stdout": stdout, "stderr": ""}
+        queries = {
+            f"git -C {REPO} rev-parse HEAD": answer(PARSE_CONTROL_HEAD_NOW),
+            f"git -C {REPO} rev-parse --verify {base}^{{commit}}":
+                answer(base if base_present else ""),
+            f"git -C {REPO} status --porcelain --untracked-files=no": answer(dirty),
+            f"git -C {REPO} merge-base --is-ancestor {base} {PARSE_CONTROL_HEAD_NOW}":
+                answer(code=ancestor),
+            f"git -C {REPO} diff --name-only {base} {PARSE_CONTROL_HEAD_NOW}":
+                answer("\n".join(changed)),
+        }
+        return FakeSeams({"queries": queries})
+
+    accepted = parser_source_facts(source_fake(changed=(
+        "scripts/tape-embedded-observation.py",
+        "docs/knowledge/contracts/barge-adoption.md", "effigy.toml")))
+    check("inert changes since the parser head are accepted and counted",
+          accepted["compiled_changes"] == 0 and accepted["base"] == base
+          and len(accepted["changed_since_base"]) == 3)
+    refuses("a changed Rust source refuses the control",
+            lambda: parser_source_facts(source_fake(changed=("src/bin/oxide/tape_harness.rs",))),
+            "compiled parser input")
+    refuses("a changed compiled-in capture vector refuses the control",
+            lambda: parser_source_facts(source_fake(changed=(
+                "docs/knowledge/contracts/capture-vectors/v2/valid/absent.json",))),
+            "compiled parser input")
+    refuses("a dirty tracked worktree refuses the control",
+            lambda: parser_source_facts(source_fake(dirty=" M scripts/x.py")), "dirty")
+    refuses("a HEAD that does not descend from the parser head refuses",
+            lambda: parser_source_facts(source_fake(ancestor=1)), "does not descend")
+    refuses("a missing parser head refuses",
+            lambda: parser_source_facts(source_fake(base_present=False)), "not present")
+
+    # 3. The control run on fixture bytes: the real verification, copies and parser
+    # calls, with every pin and identity computed from the fixture payloads.
+    payloads = {
+        "executable": b"\x7fELF-fixture-parser\n" * 4,
+        "oxide.transcript": b'{"transcript": "oxide"}\n',
+        "oxide.manifest": b'{"manifest": "oxide"}\n',
+        "barge.transcript": b'{"transcript": "barge"}\n' * 3,
+        "barge.manifest": b'{"manifest": "barge"}\n',
+        "oxide.parse": b'{"parse": "oxide"}\n',
+        "occurrence-report": b'{"report": "occurrence"}\n',
+        "occurrence-receipt": b'{"receipt": "occurrence"}\n',
+    }
+    pins = {}
+    for label, payload in payloads.items():
+        pins[label] = {"path": f"/fixture/parse-control-inputs/{label}",
+                       "bytes": len(payload), "sha256": sha256_bytes(payload),
+                       "role": "fixture"}
+    run_root = os.path.join(FIXTURE_GUARD["scratch_root"], PARSE_CONTROL_RUN_NAME)
+    report_path = os.path.join(FIXTURE_GUARD["evidence"], PARSE_CONTROL_REPORT_NAME)
+    parse_result = {"code": 0, "signal": None, "stdout": "parsed", "stdout_truncated": False,
+                    "stderr": "", "stderr_truncated": False, "timed_out": False}
+
+    def control_script(**changes):
+        files = {pins[label]["path"]: payload for label, payload in payloads.items()}
+        reports = {}
+        for side in ("oxide", "barge"):
+            reports[os.path.join(run_root, "parse", side, "parse.json")] = json.dumps(
+                {"schema": "oxide.capture.embedded-capture-parse/1", "qualified": False,
+                 "outcome": {"state": "completed"}}).encode()
+        files.update(reports)
+        script = {
+            "files": files,
+            "isfiles": set(files),
+            "isdirs": {GUARD_ROOT, FIXTURE_GUARD["scratch_root"], FIXTURE_GUARD["evidence"]},
+            "modes": {**{pin["path"]: 0o644 for pin in pins.values()},
+                      GUARD_ROOT: 0o700, FIXTURE_GUARD["scratch_root"]: 0o700,
+                      FIXTURE_GUARD["evidence"]: 0o755},
+            "digests": {"bounded-test.py": SUPERVISOR_SHA256},
+            "queries": {
+                f"git -C {REPO} rev-parse HEAD": {"code": 0, "stdout": base, "stderr": ""},
+                f"git -C {REPO} rev-parse --verify {base}^{{commit}}":
+                    {"code": 0, "stdout": base, "stderr": ""},
+                f"git -C {REPO} status --porcelain --untracked-files=no":
+                    {"code": 0, "stdout": "", "stderr": ""},
+                f"git -C {REPO} merge-base --is-ancestor {base} {base}":
+                    {"code": 0, "stdout": "", "stderr": ""},
+                f"git -C {REPO} diff --name-only {base} {base}":
+                    {"code": 0, "stdout": "", "stderr": ""},
+            },
+            "work_left": 300,
+            "parse": dict(parse_result),
+            "written": None,
+        }
+        script.update(changes)
+        return script
+
+    def run_control(script, pins_map=None):
+        fake = FakeSeams(script)
+        try:
+            result = parse_control({"sha256": sha256_bytes(parse_control_plan_bytes(
+                pins_map or pins))}, fake, FIXTURE_ENV, pins=pins_map or pins)
+        except Obstruction as error:
+            return fake, None, error
+        return fake, result, None
+
+    happy_script = control_script()
+    happy, happy_result, happy_error = run_control(happy_script)
+    written = happy_script["written"] or {}
+    parse_calls = [call[1] for call in happy.calls
+                   if call[0] == "run_captured" and "--parse-capture" in call[1]]
+    check("the control completes its two parses and publishes one unqualified report",
+          happy_error is None and happy_result == 0 and written.get("qualified") is False
+          and written.get("outcome", {}).get("state") == "collected")
+    check("only the copied parser runs, once per side, and no engine command runs",
+          len(parse_calls) == 2
+          and all(argv[0] == os.path.join(run_root, "executable", "oxide-parse")
+                  and argv[1] == "--parse-capture" for argv in parse_calls)
+          and not any("--observe-base" in argv for argv in parse_calls))
+    check("each parse reads its own private copy, not a pinned source path",
+          parse_calls[0][parse_calls[0].index("--transcript") + 1]
+          == os.path.join(run_root, "parse", "oxide", "input", "transcript.json")
+          and parse_calls[1][parse_calls[1].index("--transcript") + 1]
+          == os.path.join(run_root, "parse", "barge", "input", "transcript.json")
+          and not any(pins[label]["path"] in " ".join(argv)
+                      for argv in parse_calls
+                      for label in ("oxide.transcript", "barge.transcript")))
+    barge_input = written["windows"]["barge"]["inputs"][0]
+    check("the report keeps the pinned digest, the producer's mode and the copy's 0600",
+          barge_input["source_sha256"] == pins["barge.transcript"]["sha256"]
+          and barge_input["source_mode"] == "0o644"
+          and barge_input["copy_mode"] == "0o600"
+          and barge_input["copy_sha256"] == barge_input["source_sha256"]
+          and barge_input["bytes_equal"] is True)
+    check("the executable copy is owner-only and executable, and links are never copied",
+          written["executable"]["copy_mode"] == "0o700"
+          and all(record["copy"] is None for record in written["links"].values())
+          and set(written["links"]) == {"oxide.parse", "occurrence-report",
+                                        "occurrence-receipt"})
+    check("every write lands inside this control's own root",
+          all(key.startswith(run_root + os.sep) for key in happy_script["made"]))
+    check("the report records no comparison and no closure claim",
+          written.get("comparison", "").startswith("not-claimed")
+          and written["closure"]["script"] == "does-not-conclude")
+
+    expired_script = control_script(work_left=30)
+    expired, _, expired_error = run_control(expired_script)
+    check("an expired window before any copy refuses with no root, copy or parse",
+          expired_error is not None and "no work window" in str(expired_error)
+          and not any(call[0] == "make_root" and call[1] == run_root
+                      for call in expired.calls)
+          and not any(call[0] == "run_captured" for call in expired.calls))
+
+    between_script = control_script(expire_after_parses=1)
+    between, _, between_error = run_control(between_script)
+    between_written = between_script["written"] or {}
+    check("expiry between the two parses refuses the second side before its copy",
+          between_error is not None
+          and between_written.get("outcome", {}).get("phase") == "barge-parse"
+          and between_script["parses"] == 1
+          and not any(key.startswith(os.path.join(run_root, "parse", "barge"))
+                      for key in between_script["made"]))
+
+    drifted_script = control_script()
+    drifted_script["files"][pins["oxide.transcript"]["path"]] = b'{"transcript": "moved"}\n'
+    _, _, drifted_error = run_control(drifted_script)
+    check("a pinned input whose bytes moved refuses before its copy",
+          drifted_error is not None and "pinned size and digest" in str(drifted_error)
+          and not any(key.startswith(os.path.join(run_root, "parse", "oxide"))
+                      for key in drifted_script.get("made", {})))
+
+    missing_script = control_script(missing={os.path.join(run_root, "parse", "barge",
+                                                           "parse.json")})
+    _, _, missing_error = run_control(missing_script)
+    check("a missing Barge parse report is an apparatus refusal, never a verdict",
+          missing_error is not None and "no report for the barge side" in str(missing_error))
+
+    unpublished_script = control_script(write_fail=True)
+    _, _, unpublished_error = run_control(unpublished_script)
+    check("an unpublished control report is never a closed success",
+          unpublished_error is not None
+          and "must not record a closed success" in str(unpublished_error)
+          and unpublished_script["written"] is None)
+
+    linked_script = control_script(kinds={pins["barge.manifest"]["path"]:
+                                          {"regular": False, "dir": False, "symlink": True}})
+    _, _, linked_error = run_control(linked_script)
+    check("a symlinked pinned manifest is refused before any copy",
+          linked_error is not None and "not a regular" in str(linked_error))
+
+    # The copy helper with real files: a producer-shaped 0644 input, the owner-private
+    # copy, and the refusals the copy must make. One fresh directory, removed here.
+    root = tempfile.mkdtemp(prefix="parse-control-selftest.")
+    check("the one host write is under TMPDIR, the directory Python resolves",
+          os.path.dirname(root) == tempfile.gettempdir())
+    try:
+        real = Seams()
+        producer = os.path.join(root, "producer")
+        os.mkdir(producer, 0o755)
+        source = os.path.join(producer, "transcript.json")
+        payload = b'{"producer": "0644"}\n' * 8
+        with open(source, "wb") as handle:
+            handle.write(payload)
+        os.chmod(source, 0o644)
+        source_mode = stat.S_IMODE(os.lstat(source).st_mode)
+        check("a producer-shaped 0644 input is refused by the parser's component rule",
+              source_mode == 0o644 and not parser_component_admits(source_mode))
+        workspace = os.path.join(root, "parse", "oxide")
+        real.make_root(workspace)
+        inputs = os.path.join(workspace, "input")
+        real.make_dirs(inputs)
+        copy_path = os.path.join(inputs, "transcript.json")
+        record = private_input_copy(real, source, copy_path, label="fixture transcript")
+        copy_mode = stat.S_IMODE(os.lstat(copy_path).st_mode)
+        with open(copy_path, "rb") as handle:
+            copied_bytes = handle.read()
+        check("the owner-private copy is 0600, byte-equal and admitted by the rule",
+              copy_mode == 0o600 and parser_component_admits(copy_mode)
+              and copied_bytes == payload and record["bytes_equal"] is True)
+        with open(source, "rb") as handle:
+            unchanged = handle.read()
+        check("the producer's bytes and mode are unchanged by the copy",
+              unchanged == payload and stat.S_IMODE(os.lstat(source).st_mode) == 0o644)
+        check("the provenance names both digests, sizes and modes",
+              record["source_sha256"] == sha256_bytes(payload)
+              and record["copy_sha256"] == sha256_bytes(payload)
+              and record["source_bytes"] == record["copy_bytes"] == len(payload)
+              and record["source_mode"] == "0o644" and record["copy_mode"] == "0o600")
+        link = os.path.join(producer, "linked.json")
+        os.symlink(source, link)
+        linked_copy = os.path.join(inputs, "linked.json")
+        refuses("a symlink source is refused and no copy is made",
+                lambda: private_input_copy(real, link, linked_copy, label="linked"),
+                "not a regular non-symlink")
+        check("a refused symlink leaves no destination", not os.path.exists(linked_copy))
+        refuses("a directory source is refused",
+                lambda: private_input_copy(real, producer, linked_copy, label="directory"),
+                "not a regular non-symlink")
+        existing = os.path.join(inputs, "existing.json")
+        with open(existing, "wb") as handle:
+            handle.write(b"keep")
+        refuses("an existing destination is refused and never touched",
+                lambda: private_input_copy(real, source, existing, label="collision"),
+                "could not be created")
+        with open(existing, "rb") as handle:
+            check("the colliding file keeps its bytes", handle.read() == b"keep")
+        refuses("a source over the cap is refused before any copy",
+                lambda: private_input_copy(real, source, os.path.join(inputs, "big.json"),
+                                           label="oversized", cap=8),
+                "over the 8 byte input cap")
+        check("an oversized source leaves no destination",
+              not os.path.exists(os.path.join(inputs, "big.json")))
+        refuses("bytes that miss the pinned digest are refused before any copy",
+                lambda: private_input_copy(real, source, os.path.join(inputs, "pinned.json"),
+                                           label="pinned",
+                                           expected={"bytes": len(payload),
+                                                     "sha256": "0" * 64}),
+                "pinned size and digest")
+        check("a pinned mismatch leaves no destination",
+              not os.path.exists(os.path.join(inputs, "pinned.json")))
+        verified = private_input_copy(real, source, None, label="link evidence",
+                                      expected={"bytes": len(payload),
+                                                "sha256": sha256_bytes(payload)})
+        check("link evidence is verified and copies nothing",
+              verified["copy"] is None and verified["source_sha256"] == sha256_bytes(payload))
+        partial = os.path.join(inputs, "partial.json")
+        try:  # an int is not buffer-like, so the write fails after the file exists
+            real.write_input_new(partial, 12345, 0o600)
+        except TypeError:
+            pass
+        check("a failed write removes only the file it created",
+              not os.path.exists(partial) and os.path.exists(copy_path)
+              and os.path.exists(existing))
+        check("the partial copy is gone and the rest of the workspace stands",
+              not os.path.exists(os.path.join(inputs, "partial.json"))
+              and os.path.exists(copy_path) and os.path.exists(existing))
+    finally:
+        shutil.rmtree(root)
+
+    check("no fixture path reaches the host: the fake guard root is absent",
+          not os.path.exists(FIXTURE_GUARD["root"]))
+    failures = [(name, detail) for name, passed, detail in checks if not passed]
+    for name, passed, detail in checks:
+        say(f"parse-control self-test: {name}: {'ok' if passed else 'FAILED ' + detail}")
+    if failures:
+        say(f"parse-control self-test: {len(failures)} control(s) failed of {len(checks)}")
+        return 1
+    say(f"parse-control self-test: {len(checks)} controls passed; no engine, compiler, "
+        "image or retained-input parse ran")
+    return 0
+
+
 def main(argv):
     if argv == ["--plan"]:
         return plan()
     if argv == ["--self-test"]:
         return self_test()
+    if argv == ["--parse-control-plan"]:
+        return parse_control_print()
+    if argv == ["--parse-control-self-test"]:
+        return parse_control_self_test()
+    if argv and argv[0] == "--parse-control":
+        if len(argv) != 3 or argv[1] != "--sha256":
+            say(USAGE)
+            return 2
+        try:
+            return parse_control({"sha256": argv[2]})
+        except Obstruction as error:
+            print(f"parse-control: refused: {error}", file=sys.stderr)
+            return 2
+        except UnknownOutcome as error:
+            print("parse-control: collection unknown; this script does not conclude "
+                  f"closure and the guard's census decides it: {error}", file=sys.stderr)
+            return 2
+        except BaseException as error:  # unexpected: retain, report, then fail
+            print(f"parse-control: unexpected {type(error).__name__}: {error}",
+                  file=sys.stderr)
+            return 2
     if argv and argv[0] == "--observe":
         options = {}
         index = 1
