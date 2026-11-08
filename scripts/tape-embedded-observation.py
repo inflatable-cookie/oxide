@@ -61,6 +61,12 @@ MIB = 1024 * 1024
 REPORT_NAME = "embedded-control-observation.json"
 TEXT_CAP = 64 * 1024
 GAP_CAP = 64
+# The volume resolver (oxide#292) walks at most this many ancestors, asks diskutil
+# once for the resolved mount, and must finish inside its own window, which sits
+# inside the guard's limit and the 900 s occurrence bound.
+MOUNT_WALK_CAP = 64
+VOLUME_RESOLVE_WINDOW_NS = 30 * 10 ** 9
+DISKUTIL_TIMEOUT_S = 20
 # One occurrence: two offline staging builds with debug info off, two private
 # bounded offline seeds, two engine windows, two parse passes and shutdown
 # margin, all inside the guard's limit.
@@ -347,13 +353,16 @@ class Seams:
                 "stderr": done.stderr.decode("utf-8", "replace")}
 
     def volume_facts(self, path):
-        result = self.query(["diskutil", "info", "-plist", path], timeout_s=20)
-        if result["code"] != 0:
-            raise Obstruction(f"the volume facts for {path} are unreadable")
-        document = plistlib.loads(result["stdout"].encode("utf-8"))
-        return {"uuid": document.get("VolumeUUID"),
-                "mount": document.get("MountPoint"),
-                "boot": bool(document.get("BootVolume"))}
+        return resolve_volume(path, self)
+
+    def realpath(self, path):
+        return os.path.realpath(path)
+
+    def device(self, path):
+        return os.stat(path).st_dev
+
+    def device_node(self, path):
+        return os.stat(path).st_rdev
 
     def read_bytes(self, path):
         with open(path, "rb") as handle:
@@ -471,6 +480,78 @@ class Seams:
                 host_cargo_home, cargo_home, lock_bytes, deadline_ns=deadline_ns)
         except offline_seed.SeedRefusal as error:
             raise Obstruction(f"the private offline seed refused: {error}")
+
+
+def resolve_volume(path, seams, *, step_cap=MOUNT_WALK_CAP,
+                   window_ns=VOLUME_RESOLVE_WINDOW_NS):
+    """The non-boot volume that holds `path`, found from filesystem facts first.
+
+    `diskutil info` answers for a mount point, not for a directory below one: on
+    Stash it reports `Could not find disk` for a scratch descendant (oxide#291).
+    The mount is therefore the highest ancestor on the path's own device (the
+    qualified supervisor's `mount_root` rule), and diskutil is asked about that
+    mount alone. Every fact must then agree: the path stays canonical, its device
+    is not the boot device, diskutil names this mount, the mount's device node is
+    its own device, and the path's device has not changed while the query ran.
+    Unreadable, ambiguous, drifted, out-of-bound or incomplete facts refuse; none
+    is guessed. The result is point-in-time readiness, not a stability or lifetime
+    claim. Nothing here walks a payload or lists host-wide mounts.
+    """
+    started = seams.now_ns()
+
+    def within_window():
+        if seams.now_ns() - started > window_ns:
+            raise Obstruction(f"the volume facts for {path} ran past their time bound")
+
+    try:
+        if seams.realpath(path) != path:
+            raise Obstruction(f"the volume path is not canonical: {path}")
+        device = seams.device(path)
+        if device == seams.device("/"):
+            raise Obstruction(f"{path} sits on the boot volume")
+        mount, steps = path, 0
+        while True:
+            parent = os.path.dirname(mount)
+            if parent == mount or seams.device(parent) != device:
+                break
+            steps += 1
+            if steps > step_cap:
+                raise Obstruction(f"the mount walk for {path} exceeded {step_cap} ancestors")
+            within_window()
+            mount = parent
+        result = seams.query(["diskutil", "info", "-plist", mount],
+                             timeout_s=DISKUTIL_TIMEOUT_S)
+        if result["code"] != 0:
+            raise Obstruction(f"diskutil cannot describe the mount {mount}")
+        try:
+            document = plistlib.loads(result["stdout"].encode("utf-8"))
+        except Exception as error:  # noqa: BLE001 - any malformed answer is unreadable
+            raise Obstruction(f"diskutil's answer for {mount} is not a property list: "
+                              f"{type(error).__name__}")
+        if not isinstance(document, dict):
+            raise Obstruction(f"diskutil's answer for {mount} is not a dictionary")
+        uuid = document.get("VolumeUUID")
+        named = document.get("MountPoint")
+        node = document.get("DeviceNode")
+        if not (isinstance(uuid, str) and uuid and isinstance(named, str)
+                and isinstance(node, str) and node):
+            raise Obstruction(f"diskutil's facts for {mount} are incomplete")
+        if document.get("BootVolume"):
+            raise Obstruction(f"the mount {mount} is the boot volume")
+        if seams.realpath(named) != mount:
+            raise Obstruction(f"diskutil names {named}, not the resolved mount {mount}")
+        if seams.device(mount) != device:
+            raise Obstruction(f"the mount {mount} is not on the device of {path}")
+        if seams.device_node(node) != device:
+            raise Obstruction(f"the mount {mount} is not on its own device node {node}")
+        if seams.device(path) != device or seams.realpath(path) != path:
+            raise Obstruction(f"the volume facts for {path} changed while they were read")
+        within_window()
+        return {"uuid": uuid.upper(), "mount": mount, "boot": False,
+                "device": device, "node": node, "steps": steps}
+    except OSError as error:
+        raise Obstruction(f"the volume facts for {path} are unreadable: "
+                          f"{type(error).__name__} {getattr(error, 'filename', '') or ''}".rstrip())
 
 
 def invoking_rustup():
@@ -688,6 +769,11 @@ def guard_context(seams=None, environ=None):
 def derive_paths(binding, guard):
     """Every owned path, derived from the guard's own roots. Nothing absolute
     comes from the binding, so no caller can name a path outside the run."""
+    names = binding["paths"]
+    if names["report_name"] in ("receipt.json", names["run_root_name"]):
+        # The guard's own receipt and the retained-evidence subtree are reserved:
+        # a report under either name would overwrite or collide with them.
+        raise Obstruction(f"the report name {names['report_name']} is reserved")
     run_root = os.path.join(guard["scratch_root"], binding["paths"]["run_root_name"])
     return {
         "run_root": run_root,
@@ -1459,12 +1545,16 @@ def observe(options, seams=None, environ=None):
         reached["binding"] = binding
         guard = guard_context(seams, environ)
         reached["guard"] = guard
+        # The owned destination exists once the guard context is valid, so every
+        # later refusal, including a source or volume refusal, can publish its
+        # bounded report there. Derivation is pure: it names no path and creates
+        # nothing.
+        paths = derive_paths(binding, guard)
+        reached["paths"] = paths
         reached["phase"] = "source"
         facts = source_facts(binding, seams, guard["scratch_root"])
         envelope = verify_source_bindings(binding, facts, guard)
         reached["envelope"] = envelope
-        paths = derive_paths(binding, guard)
-        reached["paths"] = paths
         if seams.exists(paths["run_root"]) or seams.exists(paths["report"]):
             raise Obstruction(
                 "this occurrence's root or report already exists; refusing")
@@ -1778,6 +1868,18 @@ def plan_document():
                           "created with the inherited umask (normally 0755), both "
                           "canonical and not group- or other-writable; an adopted "
                           "scratch root or an explicit evidence directory refuses",
+        "volume_resolution": "the scratch's mount is the highest ancestor on its own "
+                             "device, found from filesystem facts (at most "
+                             f"{MOUNT_WALK_CAP} ancestors, inside a "
+                             f"{VOLUME_RESOLVE_WINDOW_NS // 10 ** 9} s window); diskutil "
+                             "is asked about that mount alone and must agree with it, "
+                             "its device node, the scratch's device and the bound "
+                             "UUID. Point-in-time readiness, not a lifetime claim.",
+        "early_refusal": "a source or volume refusal after the guard context publishes "
+                         "one bounded unqualified report at phase source and runs no "
+                         "staging or engine. A refusal before a safe destination exists "
+                         "(binding or guard) has only stderr and the guard receipt as "
+                         "evidence, and an unpublished report is a nonzero exit",
         "toolchain_binding": "staging runs the bound cargo by absolute path with RUSTC "
                              "set to the bound rustc and PATH fixed to the system path, "
                              "and both tool digests are re-read after staging, so an "
@@ -1840,7 +1942,24 @@ class FakeSeams(Seams):
         self.calls = []
 
     def now_ns(self):
-        return 0
+        # A scripted clock may step on every read, so a time bound can be driven.
+        self.clock = getattr(self, "clock", 0) + self.script.get("clock_step", 0)
+        return self.clock
+
+    def realpath(self, path):
+        return self.script.get("realpaths", {}).get(path, path)
+
+    def device(self, path):
+        devices = self.script.get("devices", {})
+        if path not in devices:
+            raise OSError(f"not scripted: device of {path}")
+        return devices[path]
+
+    def device_node(self, path):
+        nodes = self.script.get("nodes", {})
+        if path not in nodes:
+            raise OSError(f"not scripted: device node {path}")
+        return nodes[path]
 
     def deadline_ns(self):
         return self.script.get("deadline_ns", 10 ** 12)
@@ -1874,6 +1993,8 @@ class FakeSeams(Seams):
         return dict(value)
 
     def volume_facts(self, path):
+        if self.script.get("volume_error"):
+            raise Obstruction(self.script["volume_error"])
         return dict(self.script.get(
             "volume", {"uuid": SELECTED_VOLUME_UUID, "mount": "/Volumes/Stash",
                        "boot": False}))
@@ -2931,6 +3052,156 @@ def self_test():
                 "changed while this occurrence was running")
     finally:
         globals()["BARGE_CUSTODY_REVIEWED"] = original_custody
+
+    # 19. Volume resolution (oxide#292). The mount is found from filesystem facts,
+    #     and diskutil is asked only about that mount, never the scratch path.
+    stash = "/Volumes/Stash"
+    nested = stash + "/scratch/oxide/proof-1/scratch"
+    chain = {"/": 1, "/Volumes": 1, stash: 16, stash + "/scratch": 16,
+             stash + "/scratch/oxide": 16, stash + "/scratch/oxide/proof-1": 16,
+             nested: 16}
+
+    def stash_plist(**changes):
+        document = {"VolumeUUID": SELECTED_VOLUME_UUID, "MountPoint": stash,
+                    "BootVolume": False, "DeviceNode": "/dev/disk7s1"}
+        document.update(changes)
+        document = {key: value for key, value in document.items() if value is not None}
+        return plistlib.dumps(document, fmt=plistlib.FMT_XML).decode("utf-8")
+
+    def stash_seams(answer=None, **script):
+        base = {
+            "devices": dict(chain),
+            "nodes": {"/dev/disk7s1": 16},
+            "queries": {"diskutil info -plist " + stash: {
+                "code": 0, "stdout": answer if answer is not None else stash_plist(),
+                "stderr": ""}},
+        }
+        base.update(script)
+        return FakeSeams(base)
+
+    stash_fake = stash_seams()
+    resolved = resolve_volume(nested, stash_fake)
+    check("a nested scratch path resolves to its own mount",
+          resolved["mount"] == stash and resolved["uuid"] == SELECTED_VOLUME_UUID
+          and resolved["device"] == 16 and resolved["boot"] is False)
+    check("diskutil receives only the resolved mount, never the scratch path",
+          [call[1] for call in stash_fake.calls if call[0] == "query"]
+          == [["diskutil", "info", "-plist", stash]])
+    lowered = resolve_volume(nested, stash_seams(
+        answer=stash_plist(VolumeUUID=SELECTED_VOLUME_UUID.lower())))
+    check("the resolved UUID is normalised to the binding's upper-case form",
+          lowered["uuid"] == SELECTED_VOLUME_UUID)
+    refuses("a scratch path on the boot device refuses",
+            lambda: resolve_volume(nested, stash_seams(devices=dict(chain, **{"/": 16}))),
+            "boot volume")
+    refuses("a non-canonical scratch path refuses (symlink)",
+            lambda: resolve_volume(nested, stash_seams(
+                realpaths={nested: "/private/tmp/elsewhere"})), "not canonical")
+    refuses("diskutil naming another mount refuses",
+            lambda: resolve_volume(nested, stash_seams(
+                answer=stash_plist(MountPoint="/Volumes/Other"))), "not the resolved mount")
+    refuses("a mount on another device node refuses",
+            lambda: resolve_volume(nested, stash_seams(nodes={"/dev/disk7s1": 99})),
+            "own device node")
+    refuses("diskutil reporting the boot volume refuses",
+            lambda: resolve_volume(nested, stash_seams(
+                answer=stash_plist(BootVolume=True))), "boot volume")
+    refuses("diskutil facts without a device node are incomplete",
+            lambda: resolve_volume(nested, stash_seams(
+                answer=stash_plist(DeviceNode=None))), "incomplete")
+    refuses("a failed diskutil query refuses",
+            lambda: resolve_volume(nested, FakeSeams({"devices": dict(chain)})),
+            "cannot describe the mount")
+    refuses("a malformed diskutil answer refuses",
+            lambda: resolve_volume(nested, stash_seams(answer="not a plist")),
+            "not a property list")
+    refuses("an unreadable device of the scratch path refuses",
+            lambda: resolve_volume(nested, stash_seams(devices={"/": 1})),
+            "unreadable")
+
+    class Drifting(FakeSeams):
+        """The scratch device changes between the first read and the recheck."""
+
+        def device(self, path):
+            if path == nested:
+                self.nested_reads = getattr(self, "nested_reads", 0) + 1
+                return 16 if self.nested_reads == 1 else 17
+            return super().device(path)
+
+    drifting = Drifting({"devices": dict(chain), "nodes": {"/dev/disk7s1": 16},
+                         "queries": {"diskutil info -plist " + stash: {
+                             "code": 0, "stdout": stash_plist(), "stderr": ""}}})
+    refuses("facts that drift while diskutil is asked refuse",
+            lambda: resolve_volume(nested, drifting), "changed while they were read")
+    refuses("the mount walk refuses past its ancestor bound",
+            lambda: resolve_volume(nested, stash_seams(), step_cap=2),
+            "exceeded 2 ancestors")
+    refuses("the resolver refuses past its time window",
+            lambda: resolve_volume(nested, stash_seams(clock_step=10 ** 10),
+                                   window_ns=10 ** 9), "time bound")
+    wrong_uuid = resolve_volume(nested, stash_seams(
+        answer=stash_plist(VolumeUUID="00000000-0000-0000-0000-000000000000")))
+    drifted_volume = fixture_facts()
+    drifted_volume["volume"] = wrong_uuid
+    refuses("a resolved wrong UUID refuses at the binding gate",
+            lambda: verify_source_bindings(binding, drifted_volume, FIXTURE_GUARD),
+            "scratch volume")
+    reserved = json.loads(json.dumps(binding))
+    reserved["paths"]["report_name"] = "receipt.json"
+    refuses("a report named like the guard receipt is refused",
+            lambda: derive_paths(reserved, FIXTURE_GUARD), "reserved")
+
+    # 20. A source or volume refusal after the guard context publishes one bounded,
+    #     unqualified report at phase `source` and runs no engine or staging.
+    early = scripted_occurrence(binding, facts, barge_stderr="")
+    early["volume_error"] = ("the volume facts for the scratch are unreadable: "
+                             "diskutil cannot describe the mount")
+    early_fake = FakeSeams(early)
+    refuses("a volume refusal after the guard context refuses",
+            lambda: observe({"binding": "/binding.json",
+                             "sha256": sha256_bytes(binding_bytes)}, early_fake,
+                            FIXTURE_ENV),
+            "unreadable")
+    report_doc = early["written"]
+    check("an early refusal publishes one bounded unqualified report",
+          report_doc is not None and report_doc["qualified"] is False
+          and report_doc["outcome"]["state"] == "refused"
+          and report_doc["outcome"]["phase"] == "source"
+          and "cannot describe" in report_doc["outcome"]["reason"])
+    check("an early report claims no engine outcome and no complete envelope",
+          report_doc["envelope"] == {}
+          and report_doc["windows"]["oxide"]["classification"]["state"] == "not-run"
+          and report_doc["windows"]["barge"]["classification"]["state"] == "not-run"
+          and report_doc["closure"]["script"] == "does-not-conclude")
+    check("an early refusal runs no staging, seed, engine or run root",
+          not any(call[0] in ("run_logged", "run_captured", "seed")
+                  for call in early_fake.calls)
+          and not any(call[0] == "make_root" and call[1] == paths["run_root"]
+                      for call in early_fake.calls))
+    unwritten = scripted_occurrence(binding, facts, barge_stderr="")
+    unwritten["volume_error"] = "unreadable volume"
+    unwritten["write_fail"] = True
+    refuses("an unpublished early report still refuses (nonzero)",
+            lambda: observe({"binding": "/binding.json",
+                             "sha256": sha256_bytes(binding_bytes)},
+                            FakeSeams(unwritten), FIXTURE_ENV), "unreadable")
+    check("an unpublished early report leaves no written document",
+          unwritten["written"] is None)
+    existing = scripted_occurrence(binding, facts, barge_stderr="")
+    existing["volume_error"] = "unreadable volume"
+    existing["exists"] = {"/siblings/barge", paths["report"]}
+    refuses("an early refusal with an existing report refuses",
+            lambda: observe({"binding": "/binding.json",
+                             "sha256": sha256_bytes(binding_bytes)},
+                            FakeSeams(existing), FIXTURE_ENV), "unreadable")
+    check("an existing report is never overwritten by an early refusal",
+          existing["written"] is None)
+    guessed = scripted_occurrence(binding, facts, barge_stderr="")
+    refuses("a wrong binding digest writes no report to a guessed path",
+            lambda: observe({"binding": "/binding.json", "sha256": "0" * 64},
+                            FakeSeams(guessed), FIXTURE_ENV), "not the supplied")
+    check("an unknown binding cannot write a report",
+          guessed["written"] is None)
 
     failures = [(name, detail) for name, passed, detail in checks if not passed]
     for name, passed, detail in checks:

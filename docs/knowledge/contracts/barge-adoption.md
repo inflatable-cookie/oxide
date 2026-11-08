@@ -2542,7 +2542,7 @@ policy-only document is labelled as such, and no control claims a native run.
 
 ## Observation-only embedded control diagnostic (oxide#289)
 
-**Status: source-bound (oxide#290) and pure-validated; not executed.** Tom's operator decision
+**Status: source-bound (oxide#290) and pure-validated; first occurrence oxide#291 spent as failed setup (no credit); volume-resolution correction oxide#292 pure-validated and not activated.** Tom's operator decision
 `90b7bbeb` v2 selected "Prepare one observation-only control diagnostic" and
 the scoped Queue brief activates source and readiness preparation plus pure
 covering only. No real engine, fixture, staging build, image or diagnostic ran,
@@ -2771,7 +2771,7 @@ owner-only/canonical-root and escaping-report refusals, the missing manifest and
 missing transcript, a `/1` and an apparatus document, truncation, signalled and
 nonzero exits, and equal and unequal raw fates with no agreement, equivalence or
 divergence field. `effigy proof:tape-prune:observation-test` drives the real
-orchestration functions with scripted seams (152 controls: binding shape and
+orchestration functions with scripted seams (179 controls at oxide#292, 152 at oxide#290: binding shape and
 digest including the Barge custody block; source/toolchain/volume/worktree
 drift; derived paths; the real sibling guard topology with 0755 evidence
 accepted and 0777 or nested evidence refused; outside-root retention; engine
@@ -2797,6 +2797,67 @@ change. The one uncounted observation-only occurrence stays separately
 planner-activated at the final exact head, on the binding described above. The
 changed inputs are the Python apparatus, its scripted controls, the plan
 document, this contract and `AGENTS.md`.
+
+**Spent occurrence oxide#291 (failed setup, no credit).** The first authenticated
+occurrence ran exactly one selector with binding digest `1f69d147…` against driver
+`ac05f121…` (source `52d4e7f`, tree `c4498d42…`, planning base `43e73890`). It
+exited 2 before staging or either engine. Its owned evidence holds only
+`receipt.json`, a 116-byte `stderr.log` and an empty `stdout.log`: no report,
+stage artifact, manifest or engine outcome. The guard closed with status 2, no
+fault and no deadline, a reaped leader and no uncertain member. The cause is
+source, not an engine. `volume_facts` passed the nested scratch path to
+`diskutil info -plist`, which on this host answers only for a mount point
+(`Could not find disk` for a descendant of `/Volumes/Stash`). The refusal then
+came before the report paths were derived, so nothing was published. The
+occurrence is spent: no retry, no reuse of its binding and no rebuild of its
+deleted scratch.
+
+**Correction (oxide#292, source only; not activated).**
+
+- `resolve_volume` finds the scratch's mount from filesystem facts first: the
+  highest ancestor on the path's own device, within 64 ancestors and a 30 s
+  window. It is the qualified supervisor's `mount_root` rule. `diskutil` is then
+  asked about that mount alone. Every fact must agree: a canonical path, a
+  non-boot device, `MountPoint` equal to the mount, the mount's device equal to
+  the scratch's device and to the `st_rdev` of `DeviceNode`, the scratch device
+  unchanged after the query, and the bound UUID (checked by
+  `verify_source_bindings`). Unreadable, incomplete, ambiguous, drifted or
+  out-of-bound facts refuse. No label is remembered or hard-coded, no host-wide
+  mount list is read and no payload is touched.
+- The owned destination is derived as soon as the guard context is valid. A
+  source or volume refusal therefore publishes one bounded report at phase
+  `source`: unqualified, `envelope` empty, both windows `not-run`, and the guard
+  receipt named as not read by this script. A refusal before a safe destination
+  (binding or guard) writes nothing and leaves stderr and the guard receipt as
+  the only evidence. An existing report is never overwritten, a report named
+  `receipt.json` or like the run root is refused, and an unpublished report
+  exits nonzero. Nothing continues to staging after a refusal.
+
+**Metadata premise control.** `effigy proof:tape-prune:observation-volume-control`
+(heavy) is the whole command of the qualified supervisor with `--limit 60
+--scratch-budget-mib 32`. The parser requires a limit above the 30 s stop
+reserve and setup, so 60 s is the smallest limit that leaves the 30 s work window
+the control needs. `scripts/tape-observation-volume-control.py` creates one owned
+empty nested directory in the guard scratch, resolves it through the real `Seams`,
+and re-derives the mount (kernel `ismount`), device, device node and UUID. Its run
+passed at the source head: mount `/Volumes/Stash`, UUID
+`8A660440-C919-45C6-A3F1-3365B9BD2006`, device `16777245`, node `/dev/disk7s1`,
+5 ancestor steps. The guard closed with status 0 and no fault, owned peak 0.0 MiB
+of the 32 MiB budget, and removed its scratch. The control confirms the device
+premise and the diskutil-on-mount answer on this host. It is not an engine,
+observation or qualification credit, and it says nothing about lifetime or
+stability.
+
+**Validation at this head.** `proof:tape-prune:observation-test` passes 179
+controls (the 152 above plus the resolver, early-report and reserved-name
+controls), `proof:tape-prune:observation-plan` is effect-free, the volume control
+above passed, and `docs:check` gates this text. No Rust input changed, so no Rust
+covering selector ran. No engine, staging build, seed or observation ran.
+
+**Not activated.** A fresh source-immutable binding and activation, after this
+merges and the planner's readiness check, are still required before any occurrence.
+The 900 s and 1536 MiB envelope, the qualified supervisor, the Barge custody gate
+and every strict and limited rule are unchanged.
 
 **Unchanged.** `/2` wire, parser acceptance, caps, `K1_PREMISE_QUALIFIED`, the
 two reviewed exclusions, `assess_completeness`, the limited and comparison
