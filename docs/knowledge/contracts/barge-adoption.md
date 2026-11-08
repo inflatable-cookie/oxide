@@ -3169,9 +3169,11 @@ is presently unreachable; see [Feasibility](#feasibility).
 
 Oxide BASE as built today is a different example: three roots (ra
 selected+present, rb selected+absent, rc legacy unlisted). After Tom's
-current-selection ruling, selected+absent is kept. CTL-0's Barge 297/299 row
-is settled (`current: false`) and eligible. Mapping BASE onto CTL-0 by
-renaming, or treating ra/rc as the comparable root, is refused.
+current-selection ruling, selected+absent is kept. ra/rb registry rows are
+`selected: true` and their receipts carry a `links[].selected` placement.
+CTL-0's Barge 297/299 row is settled (`current: false`) and eligible, with
+no Oxide receipt file. Mapping BASE onto CTL-0 by renaming, or treating
+ra/rc as the comparable root, is refused.
 
 ### Common deliberate fixture
 
@@ -3180,25 +3182,33 @@ physical instances**. Identities (paths, device, inode, UUID, checkout id,
 nonce, marker digest) stay instance-local and appear in each side's
 manifest.
 
-| Slot | State |
-| --- | --- |
-| Volume | One kernel-verified APFS mount whose path is exactly `/Volumes/<name>`; UUID recorded from that mount; `oxide-outputs` a direct child of that mount |
-| Owned root | One directory `<mount>/oxide-outputs/<root-id>` with a v2 marker whose checkout, nonce, generation and digest match the registry row |
-| Registry | `oxide.outputs.registry/2`, `complete: true`, one settled row, `selected: false`, `pending: false`, no intents |
-| Receipt | One committed `oxide.outputs.transition/2` for that checkout; no current selection placement |
-| Checkout | Parent chain present; leaf absent (`ENOENT` at the recorded checkout path) |
-| Control / fence | Ready fenced state; admission lock file already present |
-| Pool / ledger | Empty directory-budget pool; lock file already present |
-| Declaration | Barge `oxide/outputs` area declared; Oxide needs no Barge declaration file |
-| Operator list | Absent (CTL-0 is not the legacy family) |
-| Writers | Empty declared set; no in-window writer |
-| Window | Setup complete, writers closed, then one observation window; no mutation while either evaluator runs |
+| Slot | Deliberate state | Who writes today |
+| --- | --- | --- |
+| Volume | One kernel-verified APFS mount whose path is exactly `/Volumes/<name>`; UUID recorded from that mount; `oxide-outputs` a direct child of that mount | Neither nested fixture is that mount (see nested-volume) |
+| Owned root | One directory `<mount>/oxide-outputs/<root-id>` with a v2 Oxide marker whose checkout, nonce, generation and digest match the registry row | Oxide BASE writes markers for ra/rb. Barge CTL-0 `create_root` through the real platform; no Oxide marker |
+| Registry | `oxide.outputs.registry/2`, `complete: true`, one settled row, `selected: false`, `pending: false`, no intents | Barge `fixture_oxide_records` already. Oxide ra/rb `selected: true` |
+| Receipt | One committed `oxide.outputs.transition/2` for that checkout with **no** `links[].selected` placement (NonSelecting) | Oxide BASE writes `/2` **with** a selected placement. Barge names `receipt.json` on the registry row and writes no file |
+| Checkout | Parent chain present; leaf absent (`ENOENT` at the recorded checkout path) | Both (Barge never creates the leaf; Oxide rb parent exists) |
+| Control / fence | Ready fenced state; admission lock file already present | **Oxide BASE only.** Barge CTL-0 does not write Oxide control or `admission.lock` (297 `setup_differences`; oxide#289) |
+| Pool / ledger | Empty directory-budget pool; lock file already present | **Oxide BASE only.** Same. Barge's `StateLock::shared_if_present` is Barge state, not Oxide's pool |
+| Declaration | Barge `oxide/outputs` area declared; Oxide needs no Barge declaration file | Barge CTL-0 already |
+| Operator list | Absent (CTL-0 is not the legacy family) | Both |
+| Writers | Empty declared set; no in-window writer | Both |
+| Window | Setup complete, writers closed, then one observation window; no mutation while either evaluator runs | Both, once setup is complete |
+| Expected fates | `fixture.roots` and `expected.roots` name the one comparable root; Oxide fate `candidate`, Barge fate `release` (CASES[0] `RELEASED`) | Oxide copies the example manifest (`root-a` / `keep`). Barge `manifest_document` sets `expected.roots: []` |
 
 CF-1 applies (Barge enumerates plan roots, placements, declarations and
 Oxide receipts on every CTL-0 run; Oxide enumerates the outputs directory
 for receipts). CF-2/3/5/6/7 do not: no writer, no marker replacement, no
 epoch change, no missing admission input, no second read under a changed
 epoch. CF-4 applies as the pure reconciler check.
+
+Fence, admission lock and pool ledger are Oxide-evaluator inputs. They
+stay on the Oxide instance. They are not Barge CTL-0 inputs and are not
+added to Barge to force a match. Receipt and marker are documents both
+evaluators can read; CTL-0 currently omits them, and a selecting receipt
+would keep the root (current reference), so any Barge addition is
+NonSelecting plus a matching v2 marker.
 
 Each physical instance maps to this spec by recording its own root,
 receipt, marker, registry row, volume UUID and mount path. A shared
@@ -3228,10 +3238,12 @@ census.
 
 | Fact | Class | Reason |
 | --- | --- | --- |
-| Registry / receipt / marker bytes, settled row, absent checkout leaf, ready fence, pre-created locks, empty ledger | Already supplied by both builders | 297/299 produced those files; CTL-0 `BASE_STATE` plus `fixture_oxide_records` already write them |
 | Native case IDs `BASE` and `CTL-0` | Already supplied | Observation route and Barge no-argument exercise |
-| One unselected comparable root (Oxide `selected: false` on the CTL-0 root) | Small test-only fixture correction | Oxide BASE currently marks ra/rb `selected: true`; that is a specification error for this claim |
-| Manifest `fixture.entries` bound to path-only authority reads (`prune::read_registry`, receipts, markers); CF-1 listed names bound through their own leaf reads; source block filled from the export receipt rather than `embedded-unverified` / zero digests | Small test-only recorder/manifest correction | 299 Oxide: 65 `extra-unbound-observation`, missing obligation at `prune::read_registry`, `topology-drift` on that site, `unlisted-site`. 299 Barge: `unknown-engine-note` `source binding: embedded-unverified` |
+| Barge volume record, `oxide/outputs` declaration, platform-created owned root, settled unselected registry row, absent checkout leaf, no intents | Already supplied by Barge CTL-0 | `finish_base_fixture` / `fixture_oxide_records`. 297 `setup_differences`: "one real volume record, one declaration, one owned root … and one settled Oxide row" |
+| Oxide receipts, markers, ready fence, `admission.lock`, empty pool/ledger with lock | Already supplied by Oxide BASE only | 297 `setup_differences` and oxide#289. Barge CTL-0 does not write these |
+| One unselected comparable root: registry `selected: false` **and** receipt with no `links[].selected` placement | Small test-only Oxide fixture correction | Oxide BASE marks ra/rb `selected: true` and writes a selected placement on each receipt. After Tom's current-selection ruling, a selected receipt keeps the absent root. Clearing only the registry flag leaves the receipt selecting |
+| Barge Oxide receipt (committed `/2`, NonSelecting) and matching v2 marker | Small test-only Barge fixture correction | `BASE_STATE` is ControlDir, OutputsDir, Registry Base, Checkout Absent. `fixture_oxide_records` writes the registry only and names a `receipt.json` that does not exist. A selecting (`ReceiptShape::Base`) receipt would keep the root |
+| Manifest `fixture.entries` bound to path-only authority reads (`prune::read_registry`, receipts, markers); CF-1 listed names bound through their own leaf reads; `fixture.roots` and `expected.roots` name the one comparable root (Oxide fate `candidate`, Barge fate `release`); source block filled from the export receipt rather than `embedded-unverified` / zero digests | Small test-only recorder/manifest correction | 299 Oxide: 65 `extra-unbound-observation`, missing obligation at `prune::read_registry`, `topology-drift` on that site, `unlisted-site`. 299 Barge: `unknown-engine-note` `source binding: embedded-unverified`. Oxide copies the example `expected.roots` (`root-a` / `keep`). Barge `manifest_document` sets `expected.roots: []`. Verdict topology requires those two lists to agree |
 | Oxide `oxide-outputs` as direct child of `/Volumes/<name>` | Unavailable under the existing nested-scratch boundary | `observe_row_root` takes `root.parent().parent()` as the mount. Nested Stash scratch makes that grandparent a fixture directory. `Binding::open` refuses it (`only a volume mounted directly under /Volumes is accepted`). Recording Stash's UUID onto a nested path pretends a layout. Walking past the grandparent is a production reader change (decision `0bcedf55` v2). Putting `oxide-outputs` at `/Volumes/Stash/oxide-outputs` writes live volume state. The remaining layout is an owned 128 MiB image whose mount *is* `/Volumes/<name>` (established X-S2 / first-batch plan). That attach is future ELEVATED validation, not a nested-scratch edit |
 | Absence-walk parents | Unavailable (K1) | CTL-0's candidate/eligible fate consumes positive checkout absence. Oxide's walk is handle-class. `K1_PREMISE_QUALIFIED` is false. The reviewed exclusions are window-null and path-only parent sites with a bound leaf. Absence-walk is outside both. 299 Oxide collisions at `absence-walk:revalidate-descriptor\|name` on components `scratch` and `oxide` are the identity-key collapse with parent `none` |
 | `pool-lock-open` attempted / result `unknown` | Unavailable as a limited-sufficient fact; evaluator behaviour | BASE's own self-check requires this attempt. Limited policy blocks attempted, unknown and uncompleted effects. Reclassifying it as completed, or excluding it, widens the policy. Barge's `shared_if_present` creates nothing; the SCOPE on the lock stays |
@@ -3261,7 +3273,8 @@ the window):
 - Fixture-specification: recorded volume path is the nested fixture
   directory; whole batch kept as incomplete. Registry obligation missing /
   topology-drift: the example manifest does not declare `prune::read_registry`
-  against the fixture file.
+  against the fixture file. `expected.roots` is the example `root-a` /
+  `keep`, not BASE's actual roots.
 - Observation coverage: 65 extra/unbound rows (config, lease, pool,
   scratch-io, volume, absence-walk, receipts). The recorder emitted them;
   the manifest did not bind them. Handle-class absence-walk collisions stay
@@ -3275,6 +3288,8 @@ the window):
   under fixed caps).
 - `unknown-engine-note` on `embedded-unverified` source and on K1/process
   coverage (manifest placeholder, not a parse bug).
+- Fixture-specification: no Oxide receipt or marker; `expected.roots` is
+  empty while CASES[0] declares `RELEASED`.
 - Raw plan: one eligible root, effects empty, checkout absence proved
   path-wise. Different physical fixture from Oxide BASE; no policy
   disagreement follows.
@@ -3319,14 +3334,19 @@ repeats these same blockers.
 
 ### Ordered deltas, if root proceeds
 
-1. Oxide test-only fixture: one unselected settled root matching CTL-0
-   `BASE_STATE`; native ID remains `BASE`; ra/rc stay BASE-only.
+1. Oxide test-only fixture: one unselected settled root; registry
+   `selected: false`; receipt committed `/2` with no `links[].selected`
+   placement. Native ID remains `BASE`; ra/rc stay BASE-only. Fence,
+   admission lock and pool ledger stay as BASE already writes them.
 2. Oxide test-only manifest/recorder: bind the declared path-only
-   authority reads and CF-1 leaf names; replace `embedded-unverified`
-   placeholders once an export receipt exists.
-3. Linked Barge task: fill CTL-0 manifest source/entries the same way
-   (per-case builder already exists). Process-table seam only if the
-   boundary question lands.
+   authority reads and CF-1 leaf names; set `fixture.roots` and
+   `expected.roots` to that one root with fate `candidate`; replace
+   `embedded-unverified` placeholders once an export receipt exists.
+3. Linked Barge task: write the NonSelecting Oxide receipt and matching
+   v2 marker (CTL-0 currently writes neither). Set `expected.roots` to
+   the owned root with fate `release`. Fill source/entries (per-case
+   builder already exists). Do not add Oxide fence, `admission.lock` or
+   pool ledger. Process-table seam only if the boundary question lands.
 4. Future ELEVATED validation: one owned 128 MiB image, ordinary
    post-census detach, qualified supervisor `fcfda2b0…`, owned Stash
    scratch UUID `8A660440-C919-45C6-A3F1-3365B9BD2006`. Proposed envelope
