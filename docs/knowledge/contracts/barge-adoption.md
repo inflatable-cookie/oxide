@@ -1817,6 +1817,244 @@ Remaining limits (finite):
 | In-window fixture binding (`extra or unbound observation`: path, component and volume rules) | Engine-side only in `tape.rs`; completeness does not apply it yet |
 | Barge `/2` adoption and live or native use | Dependent task; no production read changed |
 
+### Bounded comparison evidence boundary (oxide#285 design)
+
+**Status: design only.** No implementation, fixture, comparison, native run,
+wire or parser change, production reader change, pin change or Barge write.
+Nothing here passes a D8 case or a CF realization. The section fixes which
+conclusions the current `/2` captures and the two actual evaluators can
+support, states what is blocked, and names one weaker claim for a planner
+decision. It extends the `/2` section and the D8 matrix above; where they
+differ on current truth, the `/2` section and its vectors win.
+
+Labels used below: **observed** = a `/2` row or a source symbol read in this
+pass; **documented** = stated in a cited contract and not re-verified here;
+**unproven** = required and absent.
+
+#### Source binding
+
+- Oxide `main` `923d01f8` (PR #248 merge; reviewed head `ef8364b0`). Read:
+  `src/bin/oxide/capture_wire.rs` (`K1_PREMISE_QUALIFIED` = false at line 22;
+  caps at 24–27; `identity_key` at 1259; `completed_effect` at 1314;
+  `assess_completeness` at 1402, which emits `window origin and end unproven`
+  for any null window bound at 1437 and `process lifetime unproven` for a
+  null holder kernel start at 1544); `src/bin/oxide/tape.rs` (the in-window
+  `extra or unbound observation` note at 541); `src/bin/oxide/prune.rs`
+  (`read_registry` 686, `read_operator_list` 2520, `revalidate_chain` 3455,
+  `walk_checkout` 3551, `checkout_absence` 3857, `observe_row_root` 4267,
+  `judge_recorded_root` 4586, `evaluate_receiptless` 7566); and
+  `src/bin/oxide/store.rs` (`active_holders` 1154, `checkout_custody` 3301).
+- Barge sibling checkout at `f9f81f72` (PR #47 merge; reviewed `00c701cf`),
+  with `bcb1f58` (PR #46 merge) carrying the reader-compatibility analysis.
+  `oxide-capture-parent-identity.md` names its own source as `b613506`, an
+  ancestor of `f9f81f72`; its line numbers drift by about two lines at
+  `f9f81f72` (for example `census::read_registry` is at 347, not 349). Barge
+  `crates/` differs from the O1 pin `4af9360b` across 100 files (15,158
+  insertions, 6 deletions). Barge's statement audit lists six non-test lines
+  re-expressed under `cfg(not(test))`/`cfg(test)` splits, and separately five
+  comment-only SAFETY repairs. Those five are comment-only and are not counted
+  as non-test changes here. Barge's `o2-tape.md` "Production statement audit"
+  records these and claims behaviour is preserved by review; that claim, and the separate
+  `scripts/native/release-proof.py` change, are relied on here and not
+  re-audited. Non-test code is therefore not byte-identical to the pin.
+- Barge `o2-tape.md`: real-host cap measurement and the `/2` emitter. Barge
+  `crates/barge/src/tape.rs` `wire_reads` (about 841–890) renumbers
+  occurrences per emitted key and stops at 64.
+- Tom decision `0bcedf55` v2 (answered Nov 8): defer the production
+  parent-reader conversion. Recorded in Barge's Route B disposition as R-K2
+  option A. Not re-asked.
+
+#### Claim levels
+
+Each level needs everything below it. A higher level never follows from a
+lower one.
+
+| Level | Claim | Needs | Status now |
+| --- | --- | --- | --- |
+| L0 | Wire and schema conformance | Parser, vectors and emitted shape agree with `/2` | Supported, structure only. Says nothing about inputs. |
+| L1 | Observed-input binding | Each read or effect row binds to a manifest entry by complete identity | Partial. A leaf's own object identity can bind. Parent, holder lifetime and window origin cannot. |
+| L2 | Evaluator decision agreement under declared fixture assumptions | L1 for every input the decision reads; every applicable CF realization; both raw results kept | Reachable per case after authorised execution. Not reached. |
+| L3 | Complete equivalent-input claim (O2 acceptance) | L2 plus discharged parent binding for every direct read, qualified K1, holder kernel start and uid, enumeration parents, window origin, no cap overflow, source-bound export | Unreachable under current readers and `/2`. |
+| L4 | Live deletion or adoption qualification | L3 plus live Builds evidence and the O3 gates | Held. Out of scope. |
+
+A matching keep fate on one case is an L2 fact about that case. It is not
+equivalence of the inputs both engines read.
+
+#### Conflict resolution
+
+| Item | Source fact | Disposition here | What it blocks |
+| --- | --- | --- | --- |
+| Direct-reader parents | The "Direct state reads" row in the shared contract requires parent identity. The 19 `read_bounded` production sites have parent `none` (documented, Barge Route B table). C1 would change refusals and selection (search-only `EACCES`, parent `EMFILE`, trailing slash, single relative component). R-K2 is answered A. | Path-only reads supply own-object facts for L1. Their parent obligation stays unproven and is named, not discharged. | L3 for every direct-read input. |
+| K1 descriptor lifetime | `K1_PREMISE_QUALIFIED` = false (observed). APFS `(dev, ino)` non-reuse and stability over a descriptor lifetime are unverified (documented, Barge K1). | A handle-class parent cannot discharge `parent_required`. Held-handle facts stay own-object facts, scoped to one walk or call. No continuity claim. | L3. Any claim that a parent held across a window is the same object. |
+| Operation-time process, fd and holder identity | Recorded holders carry explicit null `kernel_start` and `uid` unless observed (observed in `capture_wire.rs` 1544). Vnode rows carry the device and inode the descriptor returned and do not inherit a process identity. | Custody-dependent cases keep only fully identified process rows (observed pid, start and uid). A recorded holder with null start is named unproven and cannot feed a keep fate. | L2 for WRT-* where the fate rests on a recorded holder. |
+| Enumeration parents (K4) | `read_dir` rows (receipts, intents, declarations, placements) carry parent `none` or `extracted`. | A listed name is an input only when its own leaf read binds to a manifest entry. An unbound listed entry is insufficient (CF-1). No listing completeness is asserted beyond what the fixture controls. | L3. Any complete-inventory claim. |
+| Shared process-family key collapse | Emitter (Barge `wire_reads`) and parser (Oxide `identity_key`) key a read by `(site#family, path, component, parent_device, parent_inode)` (observed). Pid, fd, start, uid and volume UUID are not in the key, so process and descriptor families with null path, component and parent collapse per site family. | The 64-occurrence cap applies to the collapsed key. A truncated collapsed family is insufficient. The key is not widened; fixture process tables stay under cap by construction and say so. | L2 for custody-heavy cases on process tables of real-host size. |
+| Fixed-cap overflow | Caps unchanged: 8192 read rows, 512 process rows, 8 MiB, 64 occurrences per key, 4096 fixture entries per side (observed). Real host measured in Barge `o2-tape.md`: about 4,700 per-fd rows plus process rows; the retained window emits about 1,860 of 8,192 rows and is truncated. | Overflow stays insufficient by rule. No cap change, no omitted process, no sampling. | Any real-host comparison; L3 everywhere. |
+| Engine-side in-window binding | `tape.rs` records `extra or unbound observation` at 541 from the manifest bind check (file, component and volume rules). `assess_completeness` does not apply it (observed). | The L2 verdict treats that note as blocking. The check stays test-only and its shape unchanged. A verdict-policy requirement on the reconciler; no wire change. | L1 and L2 without it. |
+| Window origin and clocks | `/2` window origin and end are required null; a number is refused. `assess_completeness` always reports `window origin and end unproven`, so no `/2` transcript can be complete. Unobserved clocks are null and an issue. The manifest's `start_monotonic_ns` and `end_monotonic_ns` have no transcript counterpart. | The L2 verdict names this one issue as a declared limit. It still blocks on any unobserved clock a decision reads. A later origin proof needs its own wire design and is not assumed here. | L3 for every case. Any cross-engine ordering or absolute-time claim. |
+| Completed versus attempted or partial effects | `completed_effect` = not attempted, `succeeded`, pathed (observed). The recorder reports any error as `partial`. Descriptor-only effects are unpathed. Fixture-diff rows are `unknown` at epoch 0. Oxide's pool-lock `O_CREAT` open is an uncertain attempt. | Effect expectations are completed effects only. EFFECT-1 claims refusal with no completed effect. EFFECT-2 claims a fence save only where completed. Attempts and partials are named non-parity. | L2 for EFFECT-* and creation paths in WRT-*. |
+| Source-bound export and capture qualification | No export receipt or launcher block is authorised or has run. The stage artifact is not a `barge.tape.export/1` receipt (documented, Barge `o2-tape.md`). Tom's `c6e3e9c8` v2 permits four capture-only Cargo selectors (`rust:compile:cargo`, `rust:compile-release:cargo`, `rust:format:cargo`, `rust:test-600:cargo`; AGENTS.md command map). They establish build and embedded-harness behaviour only. They do not establish private launcher isolation, global live-state invariance or current export production. | Every L2 run needs an independently supplied export-closure digest and receipt before its engine window. None is qualified. | Any counted L2 native before a separately activated export route. |
+
+#### What a bounded L2 comparison can and cannot say
+
+It has independent value, but only at L2. It runs both actual evaluators on
+controlled inputs, so it can settle the EXPLAIN-OR-BLOCK rows
+(`REF-ORPHAN-MARKED`, `RCP-V1`, `WRT-RETIRED-CLEAN`, the D-label routes) by
+observed decision instead of source inference. It can also expose decision
+divergences a source audit missed. A divergence is a real finding even without
+parity. Both uses need only the rows that do not depend on the unproven
+premises above, and only if the verdict policy names those exclusions.
+
+It cannot establish, under unchanged production readers:
+
+1. That a direct-read input was the object the production reader resolved
+   through a particular parent. Path-only reads have parent `none`.
+2. That a held handle's parent was the same object across a window (K1).
+3. That a recorded holder was alive as its record says, unless kernel start
+   was observed.
+4. That an enumeration or inventory is complete.
+5. Any cross-engine ordering, absolute-time or window-span claim.
+6. Anything at real-host process scale under the fixed caps.
+7. Writer closure or the absence of an unknown writer outside the fixture's
+   own declared actors (CF-2 keeps this declared).
+8. Parity for attempted, partial or unpathed effects.
+9. Behaviour of Route B or any parent-bound reader. The current readers' C1
+   differences stay unexercised by design.
+10. Live Builds behaviour, deletion safety or O3 readiness.
+
+#### Inference rules
+
+- Numeric equality of device or inode before and after a window is not
+  continuity (K1, reuse).
+- A classification (held, closed, unknown, acquiring) is not an identity fact.
+- A pathname lookup after an open is not the object the open used.
+- An empty trace, writer list or listing is absence only where the fixture and
+  the window bind it. Otherwise it is unknown.
+- An omitted, truncated or unbound observation is insufficient, never an empty
+  value.
+- A refusal from either engine is that engine's outcome. It is never an absent
+  root and never a match.
+- A documented assumption (APFS non-reuse, an absolute `pw_dir`, a fixture
+  writer's absence) is labelled as an assumption, never as observed evidence.
+
+#### Case-family disposition (D8 and CF inventory, no new matrix)
+
+Each family keeps every applicable CF realization. None is dropped to fit a
+case. A CF applies only where its precondition exists in the family:
+
+- CF-4 (broken or exhausted tape): every family, as a pure reconciler check.
+- CF-1 (unbound extra folder): families with an enumerated set. References and
+  intents (`read_intents`), receipts (`read_receipts_with`), the fence and
+  declaration family (`area::read_declarations`). The control family also
+  enumerates on every run: Barge's plan roots (`area::list_names`), its
+  placements (`BargeReferences::read` → `cache::read_placements` →
+  `area::read_directory`) and Oxide's receipts (`OxideSnapshot::read_within` →
+  `read_receipts`, `read_dir(outputs)`). CTL-0 relies on that receipt read.
+  The registry-shape family is excluded: its cases decide on the registry file
+  itself.
+- CF-3 (identical bytes, new inode): families with a root marker. Receipts and
+  markers, and identity and volume.
+- CF-7 (second reads under changed epochs): identity and volume (the marker
+  reread under the second root-id lock), and checkout absence (Oxide's
+  `revalidate_chain`).
+- CF-2 (writer between runs): families with holders or custody. Writers and
+  custody, admission effects, and VOL-REMOVED-DURING.
+- CF-5 (identity epoch change): writers and custody, and the DYNAMIC rows
+  ID-DEVICE-LIVE and VOL-REMOVED-DURING.
+- CF-6 (missing admission inputs): admission effects only.
+
+A family with no precondition for a CF names that CF as not applicable and
+why; it is not silently dropped. "Strongest outcome" is the most a successful
+execution could state. No row is passed here.
+
+| Family | Cases | Actual sites (Oxide / Barge) | Own observation | Missing binding or premise | Strongest outcome after execution |
+| --- | --- | --- | --- | --- | --- |
+| Control and sticky batch | CTL-0, CTL-1 | Oxide `evaluate`, `require_ready`; Barge `release::plan` | Registry and marker bytes via bounded reads; enumerated names of plan roots, Barge placements and Oxide receipts | Path-only parents; enumeration parents (K4), so a listed name binds only through its own leaf read | MATCH for the no-write control and sticky-incomplete batch, with CF-1 binding over the three enumerations and CF-4 applied |
+| Registry shape and caps | REG-MISSING, REG-MALFORMED, REG-OVERSIZE, REG-CONTRADICTORY, REG-OVERFLOW, CAP-1 | Oxide `read_registry`; Barge `census::read_registry`, `OxideSnapshot::read_within` | Bytes, cap, occurrence | Path-only parent. CAP-1 exceeds shared caps | MATCH or MATCH-KEPT per case. CAP-1 stays engine-local, not shared parity |
+| References and intents | REF-PENDING, REF-RESERVATION, REF-CANCELLING, REF-PRUNING, REF-SELECTED-NOT-CURRENT, REF-ORPHAN-MARKED | Oxide `Row::live`, `dry_run`, `eligibility`; Barge `OxideRow::live`, `references_for`, `pending_intents` | Registry rows; intent bytes; enumerated names | K4 enumeration parent. Scope differs (whole-command refusal versus named root) | MATCH or SCOPE per case. REF-ORPHAN-MARKED stays EXPLAIN-OR-BLOCK until observed |
+| Receipts and markers | RCP-MISSING, RCP-MALFORMED, RCP-NONCOMMITTED, RCP-CONTRADICTORY, RCP-V1, MRK-MISSING, MRK-MALFORMED, MRK-REPLACED, ID-NONCE, ID-GENERATION | Oxide `read_receipt_for_prune`, marker parser; Barge `reference::read_receipts_with`, `read_oxide_marker` | Bytes and digests; enumerated entries as `extracted` | K4 for receipt enumeration. Barge reads `/1` markers as unknown | MATCH-KEPT for missing and malformed. RCP-V1 stays EXPLAIN-OR-BLOCK: an observed difference is reportable, a match is not available from current source |
+| Identity and volume | ID-INODE, ID-DEVICE-STALE, ID-DEVICE-LIVE, VOL-ABSENT, VOL-REMOVED-DURING, VOL-DUP-REGISTRY, ABS-UUID-CONFLICT | Oxide `judge_recorded_root`, `volume::Binding`; Barge `identity::read`, `identity::compare`, `VolumeRoot::open_with` | Own dev and inode; UUID; mount census at the declared epoch | K1 for any marker-read parent. DYNAMIC remount epochs. VOL-DUP-LIVE is a coverage limit | MATCH for ID-DEVICE-STALE (current binding decides). D-2 for ID-INODE only with a second eligible root. DYNAMIC rows only on declared outcomes |
+| Checkout absence | ABS-ANCESTOR-MISSING, ABS-ANCESTOR-REPLACED, ABS-BOOT-DATA | Oxide `checkout_absence`, `walk_checkout`, `revalidate_chain`; Barge `os::prove_absence` | Component-level leaf facts (Oxide held descriptors: documented, not re-verified here; Barge path-based component facts) | Oxide held-descriptor parents are handle-class and K1-unqualified. Barge ancestor reads are path-based. Boot-Data legacy exception is internal placement only | MATCH for missing and replaced ancestor (both keep). D-3-scope for boot Data. No absence-parent claim |
+| Writers and custody | WRT-LIVE-THIS, WRT-LIVE-OTHER, WRT-UNKNOWN, WRT-ACQUIRING, WRT-RETIRED-CLEAN | Oxide `checkout_custody`, `active_holders`; Barge `PoolCustody::read`, `pool_custody::classify`, `custody::take_custody_by`, `custody::decide` | Identified process rows (observed pid, start, uid); recorded holders with null kernel start | Recorded-holder lifetime unproven. Collapsed process key. Intermediate classifications differ | Keep-fate MATCH only, and only on identified process rows. WRT-RETIRED-CLEAN stays EXPLAIN-OR-BLOCK. WRT-UNKNOWN and WRT-ACQUIRING: keep-fate MATCH only |
+| Fence, declaration, policy | FENCE-MISSING, FENCE-UNKNOWN, DECL-MISSING, DECL-POLICY-NONE | Oxide `outputs_initialization`, state parser; Barge `area::show`, `pool_custody::parse_state`, `decide_root` | State bytes | Path-only parent | MATCH-KEPT for missing and unknown fence. SCOPE for DECL-MISSING. CONFIG for DECL-POLICY-NONE (no parity) |
+| Admission effects | EFFECT-1, EFFECT-2 | Oxide `checkout_custody` lock open, `fence_admission_state`, `ledger_view`; Barge `StateLock::shared_if_present` | Attempt rows with the attempted flag; completed only when succeeded and pathed | `O_CREAT` open is an uncertain attempt. Pending holding or eviction reconciliation is a stop, not a read | EFFECT-1: refusal and no completed effect. EFFECT-2: fence save as a named completed effect, MATCH on fates. A reconciliation stop is recorded as a stop |
+| Legacy and operator list | LEG-UNLISTED, LEG-LISTED, LEG-LISTED-MARKED, LEG-RECEIPTLESS | Oxide `read_operator_list`, `evaluate_receiptless`; Barge identity and reference conditions | List bytes; receipts | K4 receipts. D-3 partition | MATCH for unlisted and receiptless. D-3 only when both actual outcomes are observed for the listed case |
+| Transcript conformance | none (L0) | Oxide `capture_wire` parser and vectors; Barge emitter conformance | Shape only | Not an input claim | L0 only |
+
+#### Recommendation and alternatives
+
+**R1 (recommended; planner decision).** Name a weaker claim,
+**O2-CAL**: owned-fixture decision agreement, window-incomplete,
+parent-unproven, holder-lifetime-limited. It is L2 only and is a new
+acceptance, not a relabelling of O2. Smallest path:
+
+- **S1, Oxide test-only verdict policy.** Blocking: engine-side
+  `extra or unbound` notes; an unbound effect; an unproven holder feeding a
+  decision; an unobserved clock a decision reads; any cap or truncation flag;
+  a missing mandatory key; a row bound to nothing. Named exclusions: window
+  origin and end null (listed as a declared limit); `parent_required` for
+  path-only direct reads, with each excluded site listed in the verdict. The
+  exclusion never applies to a handle-class row. No wire, parser, cap or
+  production change.
+- **S2, Oxide test-only D8 case bodies, first batch.** Families control,
+  registry shape, references, receipts and markers, identity and volume,
+  checkout absence, fence and declaration, and legacy. Second batch after S1
+  is reviewed: writers and custody, and admission effects. The second batch
+  needs the holder-identity and effect rules applied in the verdict.
+- **S3, Barge.** Any Barge case support is a linked Barge task. This task
+  makes no Barge write.
+- **Gates.** Pure self-tests for each blocking rule and each named exclusion,
+  with counterfactuals: an unbound extra row, a null-start holder in a
+  decision, a null decision clock, a numeric window origin, a truncated
+  document, a missing row. Each applicable CF realization runs. Order: one
+  uncounted keep-going diagnostic, then one counted author native, then an
+  independent reviewer native. Classify ELEVATED for the second batch, because
+  it decides writer custody and drives an admission lock create and fence save
+  (AGENTS elevated trigger). The first batch's class is the planner's call.
+- **Bounds.** Wall clock and scratch are the planner's to set. Proposal:
+  600 s and 512 MiB monitored scratch, owned Stash scratch under the lane
+  placement, at most one owned image with ordinary detach if the second batch
+  attaches one. Fit is unmeasured.
+- **Validation for this design.** `effigy docs:check` once, for the changed
+  contract. No Rust or native check: nothing executable changed.
+
+**R0 (alternative).** Hold O2 as it stands. No comparison until K1 is
+qualified and an origin design exists. Honest, and it produces no evidence.
+Choose this if no weaker claim is wanted.
+
+**R2 (alternative, not recommended now).** Production parent-reader change
+(Route B, C1, C1′ or C2). Deferred by Tom (R-K2 A). It adds refusals and
+selection changes and still does not discharge L3 without a qualified K1.
+Reopen only after K1 is qualified and the owner re-rules.
+
+**R3 (alternative, larger).** A `/3` wire with an origin proof and captured
+holder kernel start. A separate design. Not needed for L2 and not assumed by
+R1.
+
+**R4.** Full O2 parity. Blocked on every L3 item above.
+
+#### Affected acceptance
+
+- O2 full acceptance (L3): unchanged. Still blocked.
+- O2-CAL (L2): does not exist until the planner or operator names it. Its
+  limits are the list above.
+- O3 and the full-comparison hold: unchanged.
+- Route B, R-K2 and decision `0bcedf55` v2: unchanged.
+- Pin, production behaviour, `/2` wire, caps and selectors: unchanged.
+
+#### Decisions for planner or operator (not made here)
+
+1. Whether to name O2-CAL and accept its limits (R1), or hold (R0).
+2. Whether the first batch excludes writers and custody, and admission
+   effects (recommended).
+3. The ELEVATED or STANDARD class for each batch, and the wall-clock and
+   scratch bounds.
+4. Whether any `/3` origin or holder design is wanted before a later
+   comparison (R3).
+
+No case is passed by this section. It gives no parity, timing, closure or
+deployment credit.
+
 ## Shared private-build validation gate (oxide#248)
 
 The capture tasks' private debug-build validation shares one common
