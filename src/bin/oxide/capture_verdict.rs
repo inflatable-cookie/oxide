@@ -3681,21 +3681,36 @@ fn emitted_absence_kind_blocks() -> Control {
 /// observation, so they are neither unlisted nor handle-class, and a declared
 /// obligation at such a site is judged on the volume facts rather than on a
 /// parent.
+///
+/// The fixture document carries the matching `dynamic.volumes` entry, because
+/// that is what makes the recorder's `bound_volume` rule bind the row
+/// (`tape.rs check_manifest_obligations`). The policy does not re-implement that
+/// rule: it inherits the recorder's verdict through the `extra or unbound
+/// observation` note, which the second counterfactual exercises with the same
+/// row.
 fn emitted_volume_kind_is_bound_by_volume_identity() -> Control {
     const SITE: &str = "absence-walk:binding-open";
     const UUID: &str = "11111111-2222-3333-4444-555555555555";
+    const MOUNT: &str = "/Volumes/oxide-fixture";
+    const DEVICE: &str = "/dev/disk9s1";
     let mut manifest = synthetic_manifest();
     if let Some(window) = manifest.pointer_mut("/window/identity") {
         *window = json!("window-1");
     }
+    manifest["dynamic"]["volumes"] = json!([{
+        "uuid": UUID,
+        "mount": MOUNT,
+        "device": DEVICE,
+        "window_identity": "window-1",
+    }]);
     manifest["mandatory_observations"] = json!([{
         "engine": "oxide",
         "site": SITE,
         "parent_required": false,
         "identity": {
             "volume_uuid": UUID,
-            "mount": "/Volumes/oxide-fixture",
-            "device": "/dev/disk9s1",
+            "mount": MOUNT,
+            "device": DEVICE,
             "window_identity": "window-1",
         },
     }]);
@@ -3703,13 +3718,13 @@ fn emitted_volume_kind_is_bound_by_volume_identity() -> Control {
         let mut row = synthetic_row(SITE, "none", None, None);
         row["identity"]["path"] = Value::Null;
         row["identity"]["volume_uuid"] = json!(UUID);
-        row["identity"]["mount"] = json!("/Volumes/oxide-fixture");
+        row["identity"]["mount"] = json!(MOUNT);
         row["identity"]["volume_device"] = json!(device);
         row["outcome"] = json!({"type": "facts", "facts": "mount=/Volumes/oxide-fixture"});
         row
     };
     let mut transcript = synthetic_transcript();
-    transcript["reads"] = json!([volume_row("/dev/disk9s1")]);
+    transcript["reads"] = json!([volume_row(DEVICE)]);
     transcript["notes"] = json!(["absolute monotonic window origin and end unproven"]);
     let verdict = evaluate_limited(&transcript, &manifest, CONTROL_DIGEST);
     control(
@@ -3731,7 +3746,36 @@ fn emitted_volume_kind_is_bound_by_volume_identity() -> Control {
             verdict.blocking
         ),
     )?;
-    // Counterfactual: a different device is a different volume identity.
+    // Counterfactual 1: the recorder does not bind the row, exactly as it would
+    // report for a fixture without the matching dynamic entry.
+    let mut unbound = transcript.clone();
+    unbound["notes"] = json!([
+        "absolute monotonic window origin and end unproven",
+        "extra or unbound observation at absence-walk:binding-open",
+    ]);
+    let without_entry = {
+        let mut manifest = manifest.clone();
+        manifest["dynamic"]["volumes"] = json!([]);
+        manifest
+    };
+    for (label, document) in [
+        ("the matching entry present", &manifest),
+        ("the matching entry absent", &without_entry),
+    ] {
+        let blocked = evaluate_limited(&unbound, document, CONTROL_DIGEST);
+        control(
+            blocked_at(&blocked, BlockingRule::ExtraUnboundObservation, SITE),
+            format!(
+                "the recorder's unbound note blocks the volume row with {label}: {:?}",
+                blocked.blocking
+            ),
+        )?;
+        control(
+            !blocked.sufficient(),
+            format!("an unbound volume row is never sufficient with {label}"),
+        )?;
+    }
+    // Counterfactual 2: a different device is a different volume identity.
     let mut wrong = transcript.clone();
     wrong["reads"] = json!([volume_row("/dev/disk9s2")]);
     let mismatch = evaluate_limited(&wrong, &manifest, CONTROL_DIGEST);

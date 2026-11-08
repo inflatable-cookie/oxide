@@ -2139,6 +2139,12 @@ always blocking, so nothing is silently ignored. The policy mirrors the strict
 K1 rule exactly: a handle parent is discharged only when
 `K1_PREMISE_QUALIFIED` holds, and blocks while it is false.
 
+**The volume bind is the recorder's.** For volume-form rows the policy does
+not re-implement `bound_volume`: it inherits the recorder's verdict through the
+`extra or unbound observation` note, which is blocking. The volume-kind control
+therefore builds its fixture document with the matching `dynamic.volumes` entry
+and exercises the unbound note as its counterfactual.
+
 **The path-only exclusion is not live.** No first-batch input can use it: the
 recorder reports every path-only file row unbound, and the policy refuses the
 exclusion for any row the recorder reports unbound. It is implemented, pure-
@@ -2182,8 +2188,11 @@ own output, a real-shaped path-only row carrying exactly that site's emitted
 sentences (no own identity) that stays insufficient, the same with a bound leaf
 but no fixture binding, an emitted `absence-walk:fstatat` component that is
 named handle-class rather than unlisted, an emitted `absence-walk:binding-open`
-volume row whose obligation binds on its volume identity (with a different
-device as the wrong-identity counterfactual), the malformed-obligation recorder
+volume row whose obligation binds on its volume identity, carrying the matching
+`dynamic.volumes` entry the recorder's `bound_volume` rule needs, with two
+counterfactuals: the recorder's own `extra or unbound observation` note blocks
+the same row (with and without that entry), and a different volume device is a
+wrong leaf identity, the malformed-obligation recorder
 note,
 the parser entry point refusing a `/1` transcript and an invalid manifest, a
 Barge-only incomplete batch that is insufficient, and a declared mismatch that
