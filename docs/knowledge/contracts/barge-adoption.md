@@ -1850,9 +1850,10 @@ pass; **documented** = stated in a cited contract and not re-verified here;
   ancestor of `f9f81f72`; its line numbers drift by about two lines at
   `f9f81f72` (for example `census::read_registry` is at 347, not 349). Barge
   `crates/` differs from the O1 pin `4af9360b` across 100 files (15,158
-  insertions, 6 deletions). The six deletions are non-test lines re-expressed
-  under `cfg(not(test))`/`cfg(test)` splits, plus five comment-only SAFETY
-  repairs. Barge's `o2-tape.md` "Production statement audit" records these and
+  insertions, 6 deletions). Barge's statement audit lists six non-test lines
+  re-expressed under `cfg(not(test))`/`cfg(test)` splits, and separately five
+  comment-only SAFETY repairs. Those five are comment-only and are not counted
+  as non-test changes here. Barge's `o2-tape.md` "Production statement audit" records these and
   claims behaviour is preserved by review; that claim, and the separate
   `scripts/native/release-proof.py` change, are relied on here and not
   re-audited. Non-test code is therefore not byte-identical to the pin.
@@ -1963,7 +1964,7 @@ execution could state. No row is passed here.
 
 | Family | Cases | Actual sites (Oxide / Barge) | Own observation | Missing binding or premise | Strongest outcome after execution |
 | --- | --- | --- | --- | --- | --- |
-| Control and sticky batch | CTL-0, CTL-1 | Oxide `evaluate`, `require_ready`; Barge `release::plan` | Registry and marker bytes via bounded reads | Path-only parents | MATCH for the no-write control and sticky-incomplete batch, with CF-1 binding |
+| Control and sticky batch | CTL-0, CTL-1 | Oxide `evaluate`, `require_ready`; Barge `release::plan` | Registry and marker bytes via bounded reads | Path-only parents | MATCH for the no-write control and sticky-incomplete batch. CF-4 applies. CF-1 is not applicable: the control reads single files and has no enumerated set |
 | Registry shape and caps | REG-MISSING, REG-MALFORMED, REG-OVERSIZE, REG-CONTRADICTORY, REG-OVERFLOW, CAP-1 | Oxide `read_registry`; Barge `census::read_registry`, `OxideSnapshot::read_within` | Bytes, cap, occurrence | Path-only parent. CAP-1 exceeds shared caps | MATCH or MATCH-KEPT per case. CAP-1 stays engine-local, not shared parity |
 | References and intents | REF-PENDING, REF-RESERVATION, REF-CANCELLING, REF-PRUNING, REF-SELECTED-NOT-CURRENT, REF-ORPHAN-MARKED | Oxide `Row::live`, `dry_run`, `eligibility`; Barge `OxideRow::live`, `references_for`, `pending_intents` | Registry rows; intent bytes; enumerated names | K4 enumeration parent. Scope differs (whole-command refusal versus named root) | MATCH or SCOPE per case. REF-ORPHAN-MARKED stays EXPLAIN-OR-BLOCK until observed |
 | Receipts and markers | RCP-MISSING, RCP-MALFORMED, RCP-NONCOMMITTED, RCP-CONTRADICTORY, RCP-V1, MRK-MISSING, MRK-MALFORMED, MRK-REPLACED, ID-NONCE, ID-GENERATION | Oxide `read_receipt_for_prune`, marker parser; Barge `reference::read_receipts_with`, `read_oxide_marker` | Bytes and digests; enumerated entries as `extracted` | K4 for receipt enumeration. Barge reads `/1` markers as unknown | MATCH-KEPT for missing and malformed. RCP-V1 stays EXPLAIN-OR-BLOCK: an observed difference is reportable, a match is not available from current source |
