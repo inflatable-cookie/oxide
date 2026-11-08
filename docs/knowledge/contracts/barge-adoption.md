@@ -1853,8 +1853,8 @@ pass; **documented** = stated in a cited contract and not re-verified here;
   insertions, 6 deletions). Barge's statement audit lists six non-test lines
   re-expressed under `cfg(not(test))`/`cfg(test)` splits, and separately five
   comment-only SAFETY repairs. Those five are comment-only and are not counted
-  as non-test changes here. Barge's `o2-tape.md` "Production statement audit" records these and
-  claims behaviour is preserved by review; that claim, and the separate
+  as non-test changes here. Barge's `o2-tape.md` "Production statement audit"
+  records these and claims behaviour is preserved by review; that claim, and the separate
   `scripts/native/release-proof.py` change, are relied on here and not
   re-audited. Non-test code is therefore not byte-identical to the pin.
 - Barge `o2-tape.md`: real-host cap measurement and the `/2` emitter. Barge
@@ -1945,8 +1945,13 @@ case. A CF applies only where its precondition exists in the family:
 - CF-4 (broken or exhausted tape): every family, as a pure reconciler check.
 - CF-1 (unbound extra folder): families with an enumerated set. References and
   intents (`read_intents`), receipts (`read_receipts_with`), the fence and
-  declaration family (`area::read_declarations`). Not the control or registry
-  families, which read single files.
+  declaration family (`area::read_declarations`). The control family also
+  enumerates on every run: Barge's plan roots (`area::list_names`), its
+  placements (`BargeReferences::read` → `cache::read_placements` →
+  `area::read_directory`) and Oxide's receipts (`OxideSnapshot::read_within` →
+  `read_receipts`, `read_dir(outputs)`). CTL-0 relies on that receipt read.
+  The registry-shape family is excluded: its cases decide on the registry file
+  itself.
 - CF-3 (identical bytes, new inode): families with a root marker. Receipts and
   markers, and identity and volume.
 - CF-7 (second reads under changed epochs): identity and volume (the marker
@@ -1964,7 +1969,7 @@ execution could state. No row is passed here.
 
 | Family | Cases | Actual sites (Oxide / Barge) | Own observation | Missing binding or premise | Strongest outcome after execution |
 | --- | --- | --- | --- | --- | --- |
-| Control and sticky batch | CTL-0, CTL-1 | Oxide `evaluate`, `require_ready`; Barge `release::plan` | Registry and marker bytes via bounded reads | Path-only parents | MATCH for the no-write control and sticky-incomplete batch. CF-4 applies. CF-1 is not applicable: the control reads single files and has no enumerated set |
+| Control and sticky batch | CTL-0, CTL-1 | Oxide `evaluate`, `require_ready`; Barge `release::plan` | Registry and marker bytes via bounded reads; enumerated names of plan roots, Barge placements and Oxide receipts | Path-only parents; enumeration parents (K4), so a listed name binds only through its own leaf read | MATCH for the no-write control and sticky-incomplete batch, with CF-1 binding over the three enumerations and CF-4 applied |
 | Registry shape and caps | REG-MISSING, REG-MALFORMED, REG-OVERSIZE, REG-CONTRADICTORY, REG-OVERFLOW, CAP-1 | Oxide `read_registry`; Barge `census::read_registry`, `OxideSnapshot::read_within` | Bytes, cap, occurrence | Path-only parent. CAP-1 exceeds shared caps | MATCH or MATCH-KEPT per case. CAP-1 stays engine-local, not shared parity |
 | References and intents | REF-PENDING, REF-RESERVATION, REF-CANCELLING, REF-PRUNING, REF-SELECTED-NOT-CURRENT, REF-ORPHAN-MARKED | Oxide `Row::live`, `dry_run`, `eligibility`; Barge `OxideRow::live`, `references_for`, `pending_intents` | Registry rows; intent bytes; enumerated names | K4 enumeration parent. Scope differs (whole-command refusal versus named root) | MATCH or SCOPE per case. REF-ORPHAN-MARKED stays EXPLAIN-OR-BLOCK until observed |
 | Receipts and markers | RCP-MISSING, RCP-MALFORMED, RCP-NONCOMMITTED, RCP-CONTRADICTORY, RCP-V1, MRK-MISSING, MRK-MALFORMED, MRK-REPLACED, ID-NONCE, ID-GENERATION | Oxide `read_receipt_for_prune`, marker parser; Barge `reference::read_receipts_with`, `read_oxide_marker` | Bytes and digests; enumerated entries as `extracted` | K4 for receipt enumeration. Barge reads `/1` markers as unknown | MATCH-KEPT for missing and malformed. RCP-V1 stays EXPLAIN-OR-BLOCK: an observed difference is reportable, a match is not available from current source |
