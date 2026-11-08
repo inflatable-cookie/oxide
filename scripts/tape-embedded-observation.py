@@ -47,6 +47,8 @@ import time
 
 sys.dont_write_bytecode = True
 
+import offline_seed  # shared CLOCK_UPTIME_RAW helper the guard deadline uses
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCHEMA = "oxide.capture.embedded-control-observation/1"
 BINDING_SCHEMA = "oxide.capture.embedded-control-binding/1"
@@ -294,15 +296,32 @@ class Seams:
     """Real effects of the one observation occurrence."""
 
     def now_ns(self):
-        return time.monotonic_ns()
+        """The guard's CLOCK_UPTIME_RAW clock. No wall or monotonic conversion."""
+        try:
+            return offline_seed.now_ns()
+        except OSError as error:
+            raise Obstruction(f"the guard clock is unreadable: {error}") from error
 
     def deadline_ns(self):
-        return int(os.environ.get("OXIDE_PROOF_DEADLINE_NS", "0"))
+        raw = os.environ.get("OXIDE_PROOF_DEADLINE_NS")
+        if raw is None or raw == "":
+            raise Obstruction(
+                "OXIDE_PROOF_DEADLINE_NS is missing: not under the guard")
+        try:
+            deadline = int(raw)
+        except (TypeError, ValueError) as error:
+            raise Obstruction(
+                f"OXIDE_PROOF_DEADLINE_NS is unreadable: {error}") from error
+        if deadline <= 0:
+            raise Obstruction(
+                "OXIDE_PROOF_DEADLINE_NS is missing: not under the guard")
+        return deadline
 
     def work_left(self):
-        if not self.deadline_ns():
+        deadline = self.deadline_ns()
+        if not deadline:
             raise Obstruction("OXIDE_PROOF_DEADLINE_NS is missing: not under the guard")
-        return (self.deadline_ns() - self.now_ns()) / 1e9
+        return (deadline - self.now_ns()) / 1e9
 
     def run_logged(self, argv, *, cwd, env, out_path, err_path, timeout_s):
         with open(out_path, "wb") as out, open(err_path, "wb") as err:
@@ -486,6 +505,20 @@ class Seams:
                 provenance=provenance)
         except offline_seed.SeedRefusal as error:
             raise Obstruction(f"the private offline seed refused: {error}")
+
+
+def remaining_child_seconds(seams, *, margin_s=SHUTDOWN_MARGIN_SECONDS):
+    """Positive seconds still inside the guard's work window.
+
+    A derived stage or engine timeout is this value. After the window ends
+    there is no fresh minimum allowance: the call refuses instead of flooring
+    to 1 s. Equal remaining is spent. The guard remains the outer bound; a
+    deadline can still pass during a blocking child.
+    """
+    left = seams.work_left() - margin_s
+    if left <= 0:
+        raise Obstruction("the guard's deadline leaves no work window")
+    return left
 
 
 def resolve_volume(path, seams, *, step_cap=MOUNT_WALK_CAP,
@@ -752,6 +785,14 @@ def guard_context(seams=None, environ=None):
             "this route runs only under the qualified shared supervisor: "
             "OXIDE_TASK_SCRATCH_ROOT, OXIDE_PROOF_EVIDENCE, OXIDE_PROOF_RUN_ID "
             "and OXIDE_PROOF_DEADLINE_NS are all required")
+    try:
+        deadline_ns = int(deadline)
+    except (TypeError, ValueError) as error:
+        raise Obstruction(
+            f"OXIDE_PROOF_DEADLINE_NS is unreadable: {error}") from error
+    if deadline_ns <= 0:
+        raise Obstruction(
+            "OXIDE_PROOF_DEADLINE_NS is missing: not under the guard")
     for label, path in (("scratch root", scratch), ("evidence directory", evidence)):
         real = os.path.realpath(path)
         if real != path:
@@ -778,7 +819,7 @@ def guard_context(seams=None, environ=None):
             f"the running supervisor bytes are {supervisor}, not the qualified "
             f"{SUPERVISOR_SHA256}")
     return {"root": root, "scratch_root": scratch, "evidence": evidence,
-            "run_id": run_id, "deadline_ns": int(deadline),
+            "run_id": run_id, "deadline_ns": deadline_ns,
             "supervisor_sha256": supervisor}
 
 
@@ -946,9 +987,9 @@ def stage(seams, *, parent, cwd, lock_path, cargo_argv, target, label, toolchain
     seed = seams.seed(invoking_cargo_home(), env["CARGO_HOME"], lock_bytes,
                       seams.deadline_ns(), provenance=provenance)
     argv = [toolchain["cargo"], *cargo_argv, "--message-format=json"]
+    timeout_s = remaining_child_seconds(seams)
     code = seams.run_logged(argv, cwd=cwd, env=env, out_path=out_path,
-                            err_path=err_path,
-                            timeout_s=max(1, seams.work_left() - SHUTDOWN_MARGIN_SECONDS))
+                            err_path=err_path, timeout_s=timeout_s)
     if code != 0:
         raise Obstruction(
             f"{label} staging exited {code}; see {out_path} and {err_path}")
@@ -1168,9 +1209,9 @@ def run_oxide(seams, paths, staged):
     argv = [staged["executable"]["path"], "--observe-base", "--root", root,
             "--report-out", report]
     env = engine_environment(os.path.join(paths["oxide"], "engine"))
+    timeout_s = remaining_child_seconds(seams)
     result = seams.run_captured(
-        argv, cwd=paths["oxide"], env=env,
-        timeout_s=max(1, seams.work_left() - SHUTDOWN_MARGIN_SECONDS))
+        argv, cwd=paths["oxide"], env=env, timeout_s=timeout_s)
     observation = read_document(seams, report) if seams.isfile(report) else None
     return {"argv": argv, "engine": result, "observation": observation,
             "fixture": root}
@@ -1186,9 +1227,9 @@ def run_barge(seams, paths, staged):
     env = engine_environment(os.path.join(paths["barge"], "engine"),
                              extra={BARGE_CUSTODY_OPT_IN_ENV: BARGE_CUSTODY_OPT_IN_VALUE,
                                     BARGE_SCRATCH_ROOT_ENV: run_root})
+    timeout_s = remaining_child_seconds(seams)
     result = seams.run_captured(
-        argv, cwd=paths["barge"], env=env,
-        timeout_s=max(1, seams.work_left() - SHUTDOWN_MARGIN_SECONDS))
+        argv, cwd=paths["barge"], env=env, timeout_s=timeout_s)
     reported = None
     for line in result["stderr"].splitlines():
         if line.startswith(TRANSCRIPT_MARKER):
@@ -1593,8 +1634,7 @@ def observe(options, seams=None, environ=None):
         if seams.exists(paths["run_root"]) or seams.exists(paths["report"]):
             raise Obstruction(
                 "this occurrence's root or report already exists; refusing")
-        if seams.work_left() <= SHUTDOWN_MARGIN_SECONDS:
-            raise Obstruction("the guard's deadline leaves no work window")
+        remaining_child_seconds(seams)
         require_reviewed_custody(binding)
         seams.make_root(paths["run_root"])
         seams.make_root(paths["oxide"])
@@ -1788,6 +1828,18 @@ def plan_document():
         },
         "premises": [{"premise": name, "disposition": text}
                      for name, text in PREMISES],
+        "guard_clock": {
+            "name": "CLOCK_UPTIME_RAW",
+            "helper": "scripts/offline_seed.py now_ns",
+            "deadline": "OXIDE_PROOF_DEADLINE_NS is an absolute CLOCK_UPTIME_RAW "
+                        "value; work_left subtracts the same clock; a missing or "
+                        "unreadable clock or deadline refuses with bounded evidence "
+                        "retention",
+            "child_timeout": "remaining_child_seconds: work_left minus the 60 s "
+                             "shutdown margin, checked immediately before each stage "
+                             "or engine child; a spent or equal-boundary window "
+                             "spawns no child and does not floor to a 1 s allowance",
+        },
         "bounds": {
             "limit_seconds": LIMIT_SECONDS,
             "scratch_mib": SCRATCH_MIB,
@@ -1989,7 +2041,14 @@ class FakeSeams(Seams):
 
     def now_ns(self):
         # A scripted clock may step on every read, so a time bound can be driven.
-        self.clock = getattr(self, "clock", 0) + self.script.get("clock_step", 0)
+        # clock_error is the production Obstruction from an unreadable
+        # CLOCK_UPTIME_RAW read; the wrap itself is tested on Seams.now_ns.
+        if self.script.get("clock_error"):
+            raise Obstruction(
+                f"the guard clock is unreadable: {self.script['clock_error']}")
+        if not hasattr(self, "clock"):
+            self.clock = self.script.get("clock_start", 0)
+        self.clock += self.script.get("clock_step", 0)
         return self.clock
 
     def realpath(self, path):
@@ -2011,15 +2070,18 @@ class FakeSeams(Seams):
         return self.script.get("deadline_ns", 10 ** 12)
 
     def work_left(self):
-        return self.script.get("work_left", 600)
+        if "work_left" in self.script:
+            return self.script["work_left"]
+        return super().work_left()
 
     def run_logged(self, argv, **kwargs):
-        self.calls.append(("run_logged", list(argv), dict(kwargs.get("env") or {})))
+        self.calls.append(("run_logged", list(argv), dict(kwargs.get("env") or {}),
+                           kwargs.get("timeout_s")))
         return self.script.get("stage_exit", 0)
 
     def run_captured(self, argv, **kwargs):
         self.calls.append(("run_captured", list(argv),
-                           dict(kwargs.get("env") or {})))
+                           dict(kwargs.get("env") or {}), kwargs.get("timeout_s")))
         if "--observe-base" in argv:
             label = "oxide"
         elif "--parse-capture" in argv:
@@ -2603,7 +2665,8 @@ def _self_test():
           not any(call[0] in ("run_captured", "make_root", "run_logged")
                   for call in fake.calls))
     spent = scripted_occurrence(binding, facts, barge_stderr="")
-    spent["work_left"] = 1
+    del spent["work_left"]
+    spent["clock_start"] = spent["deadline_ns"] - 1 * 10 ** 9
     fake = FakeSeams(spent)
     refuses("a spent work window refuses before staging",
             lambda: observe({"binding": "/binding.json",
@@ -2616,6 +2679,132 @@ def _self_test():
           spent["written"] is not None
           and spent["written"]["outcome"]["state"] == "refused"
           and spent["written"]["outcome"]["phase"] == "source")
+    equal = scripted_occurrence(binding, facts, barge_stderr="")
+    del equal["work_left"]
+    equal["clock_start"] = equal["deadline_ns"] - SHUTDOWN_MARGIN_SECONDS * 10 ** 9
+    equal_fake = FakeSeams(equal)
+    refuses("an equal-boundary work window refuses before staging",
+            lambda: observe({"binding": "/binding.json",
+                             "sha256": sha256_bytes(binding_bytes)}, equal_fake,
+                            FIXTURE_ENV),
+            "no work window")
+    check("an equal-boundary window staged and ran nothing", not any(
+        call[0] in ("run_logged", "run_captured", "make_dirs")
+        for call in equal_fake.calls))
+    check("an equal-boundary window still writes a bounded refusal report",
+          equal["written"] is not None
+          and equal["written"]["outcome"]["state"] == "refused"
+          and equal["written"]["outcome"]["phase"] == "source")
+
+    # 10b. work_left uses CLOCK_UPTIME_RAW, not monotonic. Remaining is deadline
+    #      minus now minus the unchanged 60 s margin; a spent window never floors
+    #      to a 1 s child timeout.
+    uptime_ns = 8_000_000_000_000
+    monotonic_ns = 200_000_000
+    deadline_ns = uptime_ns + 180 * 10 ** 9
+    saved_gt = time.clock_gettime_ns
+    saved_mono = time.monotonic_ns
+    saved_deadline = os.environ.get("OXIDE_PROOF_DEADLINE_NS")
+    clock_seen = []
+
+    def pinned_uptime(clk):
+        clock_seen.append(clk)
+        if clk == time.CLOCK_UPTIME_RAW:
+            return uptime_ns
+        raise OSError(f"unexpected clock {clk}")
+
+    def forbidden_monotonic():
+        raise AssertionError("monotonic_ns must not be consulted for the guard deadline")
+
+    time.clock_gettime_ns = pinned_uptime
+    time.monotonic_ns = forbidden_monotonic
+    os.environ["OXIDE_PROOF_DEADLINE_NS"] = str(deadline_ns)
+    try:
+        live = Seams()
+        check("Seams.now_ns reads CLOCK_UPTIME_RAW through the shared helper",
+              live.now_ns() == uptime_ns
+              and clock_seen == [time.CLOCK_UPTIME_RAW])
+        left = live.work_left()
+        check("work_left is deadline minus CLOCK_UPTIME_RAW, not monotonic",
+              abs(left - 180.0) < 1e-9)
+        remaining = remaining_child_seconds(live)
+        check("positive remaining is work_left minus the 60 s shutdown margin",
+              abs(remaining - 120.0) < 1e-9)
+        reversed_uptime = 200_000_000
+        reversed_deadline = reversed_uptime + 180 * 10 ** 9
+        reversed_seen = []
+
+        def reversed_clock(clk):
+            reversed_seen.append(clk)
+            if clk == time.CLOCK_UPTIME_RAW:
+                return reversed_uptime
+            raise OSError(f"unexpected clock {clk}")
+
+        time.clock_gettime_ns = reversed_clock
+        os.environ["OXIDE_PROOF_DEADLINE_NS"] = str(reversed_deadline)
+        reversed_left = Seams().work_left()
+        check("work_left stays on CLOCK_UPTIME_RAW when monotonic is far ahead",
+              abs(reversed_left - 180.0) < 1e-9
+              and reversed_seen == [time.CLOCK_UPTIME_RAW])
+
+        def unreadable(_clk):
+            raise OSError("CLOCK_UPTIME_RAW: [Errno 22] Invalid argument")
+
+        time.clock_gettime_ns = unreadable
+        refuses("an unreadable CLOCK_UPTIME_RAW refuses",
+                lambda: Seams().now_ns(), "unreadable")
+        os.environ["OXIDE_PROOF_DEADLINE_NS"] = "not-an-integer"
+        refuses("an unreadable deadline refuses",
+                lambda: Seams().deadline_ns(), "unreadable")
+        os.environ.pop("OXIDE_PROOF_DEADLINE_NS", None)
+        refuses("a missing deadline refuses",
+                lambda: Seams().deadline_ns(), "missing")
+    finally:
+        time.clock_gettime_ns = saved_gt
+        time.monotonic_ns = saved_mono
+        if saved_deadline is None:
+            os.environ.pop("OXIDE_PROOF_DEADLINE_NS", None)
+        else:
+            os.environ["OXIDE_PROOF_DEADLINE_NS"] = saved_deadline
+
+    stepped = FakeSeams({"deadline_ns": 200 * 10 ** 9, "clock_start": 10 * 10 ** 9,
+                         "clock_step": 5 * 10 ** 9})
+    first_left = stepped.work_left()
+    second_left = stepped.work_left()
+    check("a stepped CLOCK_UPTIME_RAW seam drives work_left from the pinned clock",
+          abs(first_left - 185.0) < 1e-9 and abs(second_left - 180.0) < 1e-9)
+    positive = FakeSeams({"deadline_ns": 200 * 10 ** 9,
+                          "clock_start": 125 * 10 ** 9, "clock_step": 0})
+    check("remaining_child_seconds derives from the unchanged deadline and margin",
+          abs(remaining_child_seconds(positive) - 15.0) < 1e-9)
+    boundary = FakeSeams({"deadline_ns": 200 * 10 ** 9,
+                          "clock_start": 140 * 10 ** 9, "clock_step": 0})
+    refuses("remaining_child_seconds refuses at the equal-boundary window",
+            lambda: remaining_child_seconds(boundary), "no work window")
+    exhausted = FakeSeams({"deadline_ns": 200 * 10 ** 9,
+                           "clock_start": 200 * 10 ** 9, "clock_step": 0})
+    refuses("remaining_child_seconds refuses a spent window instead of flooring to 1 s",
+            lambda: remaining_child_seconds(exhausted), "no work window")
+    check("the plan records the guard CLOCK_UPTIME_RAW contract",
+          plan_document()["guard_clock"]["name"] == "CLOCK_UPTIME_RAW"
+          and "offline_seed.py now_ns" in plan_document()["guard_clock"]["helper"]
+          and "1 s" in plan_document()["guard_clock"]["child_timeout"])
+    clock_fail = scripted_occurrence(binding, facts, barge_stderr="")
+    del clock_fail["work_left"]
+    clock_fail["clock_error"] = "CLOCK_UPTIME_RAW: [Errno 22] Invalid argument"
+    clock_fail_fake = FakeSeams(clock_fail)
+    refuses("a clock read failure after the guard context refuses",
+            lambda: observe({"binding": "/binding.json",
+                             "sha256": sha256_bytes(binding_bytes)}, clock_fail_fake,
+                            FIXTURE_ENV),
+            "unreadable")
+    check("a clock read failure publishes a bounded refusal and runs no child",
+          clock_fail["written"] is not None
+          and clock_fail["written"]["outcome"]["state"] == "refused"
+          and clock_fail["written"]["outcome"]["phase"] == "source"
+          and clock_fail["written"]["qualified"] is False
+          and not any(call[0] in ("run_logged", "run_captured", "seed")
+                      for call in clock_fail_fake.calls))
     # 11. The source gate binds the reviewed Barge custody revision. The shipped
     #     constant is the Barge049 review at 05b4b52 (tree 68f96990, run 1808bf0e);
     #     the fixture binding is not that source and refuses before any staging.
@@ -3189,6 +3378,112 @@ def _self_test():
         refuses("a changed bound toolchain refuses",
                 lambda: verify_toolchain_unchanged(binding, changed_tools),
                 "changed while this occurrence was running")
+
+        # 18b. Expiry after seed and between engines: remaining_child_seconds
+        #      runs immediately before each stage/engine child, so a spent window
+        #      after seed or after Oxide never grants a 1 s cargo or engine timeout.
+        class ExpireAfterSeed(FakeSeams):
+            def seed(self, host_cargo_home, cargo_home, lock_bytes, deadline_ns,
+                     provenance=None):
+                result = super().seed(
+                    host_cargo_home, cargo_home, lock_bytes, deadline_ns,
+                    provenance=provenance)
+                self.clock = self.deadline_ns()
+                return result
+
+        after_seed = scripted_occurrence(binding, facts, barge_stderr="")
+        del after_seed["work_left"]
+        after_seed["clock_start"] = after_seed["deadline_ns"] - 120 * 10 ** 9
+        after_seed_fake = ExpireAfterSeed(after_seed)
+        refuses("expiry after seed spawns no staging child",
+                lambda: observe({"binding": "/binding.json",
+                                 "sha256": sha256_bytes(binding_bytes)},
+                                after_seed_fake, FIXTURE_ENV),
+                "no work window")
+        check("expiry after seed still seeded, then refused before cargo",
+              any(call[0] == "seed" for call in after_seed_fake.calls)
+              and not any(call[0] == "run_logged" for call in after_seed_fake.calls)
+              and not any(call[0] == "run_captured" for call in after_seed_fake.calls))
+        check("expiry after seed retains the reached seed record and refuses nonzero",
+              after_seed["written"] is not None
+              and after_seed["written"]["outcome"]["state"] == "refused"
+              and after_seed["written"]["outcome"]["phase"] == "staging"
+              and after_seed["written"]["qualified"] is False
+              and (after_seed["written"].get("seeds") or {}).get("oxide", {}).get("role")
+              == SEED_ROLE)
+
+        class ExpireAfterOxide(FakeSeams):
+            def run_captured(self, argv, **kwargs):
+                result = super().run_captured(argv, **kwargs)
+                if "--observe-base" in argv:
+                    self.clock = self.deadline_ns()
+                return result
+
+        after_oxide = scripted_occurrence(
+            binding, facts,
+            barge_stderr="barge.tape.exercise/1: retained "
+                         + os.path.join(paths["barge_run"],
+                                        "barge-test-x.transcript.json") + "\n"
+                         "barge.tape.exercise/1: kept fixture "
+                         + os.path.join(paths["barge_run"], "barge-test-x") + "\n")
+        del after_oxide["work_left"]
+        after_oxide["clock_start"] = after_oxide["deadline_ns"] - 120 * 10 ** 9
+        after_oxide_fake = ExpireAfterOxide(after_oxide)
+        refuses("expiry between engines spawns no Barge child",
+                lambda: observe({"binding": "/binding.json",
+                                 "sha256": sha256_bytes(binding_bytes)},
+                                after_oxide_fake, FIXTURE_ENV),
+                "no work window")
+        oxide_windows = [call for call in after_oxide_fake.calls
+                         if call[0] == "run_captured" and "--observe-base" in call[1]]
+        barge_windows = [call for call in after_oxide_fake.calls
+                         if call[0] == "run_captured"
+                         and "--observe-base" not in call[1]
+                         and "--parse-capture" not in call[1]]
+        check("expiry between engines ran Oxide and then refused before Barge",
+              len(oxide_windows) == 1 and barge_windows == [])
+        check("expiry between engines retains the reached Oxide window",
+              after_oxide["written"] is not None
+              and after_oxide["written"]["outcome"]["state"] == "refused"
+              and after_oxide["written"]["outcome"]["phase"] == "barge-window"
+              and after_oxide["written"]["windows"]["oxide"]["classification"]["state"]
+              != "not-run"
+              and after_oxide["written"]["windows"]["barge"]["classification"]["state"]
+              == "not-run")
+        staged_timeouts = [call[3] for call in after_oxide_fake.calls
+                           if call[0] == "run_logged"]
+        oxide_timeout = oxide_windows[0][3] if oxide_windows else None
+        check("a live window's child timeout is the derived remaining, not a 1 s floor",
+              staged_timeouts
+              and all(abs(timeout - 60.0) < 1e-9 for timeout in staged_timeouts)
+              and oxide_timeout is not None and abs(oxide_timeout - 60.0) < 1e-9)
+
+        class FailClockAfterSeed(FakeSeams):
+            def seed(self, host_cargo_home, cargo_home, lock_bytes, deadline_ns,
+                     provenance=None):
+                result = super().seed(
+                    host_cargo_home, cargo_home, lock_bytes, deadline_ns,
+                    provenance=provenance)
+                self.script["clock_error"] = (
+                    "CLOCK_UPTIME_RAW: [Errno 22] Invalid argument")
+                return result
+
+        fail_after_seed = scripted_occurrence(binding, facts, barge_stderr="")
+        del fail_after_seed["work_left"]
+        fail_after_seed["clock_start"] = (
+            fail_after_seed["deadline_ns"] - 120 * 10 ** 9)
+        fail_after_seed_fake = FailClockAfterSeed(fail_after_seed)
+        refuses("a clock read failure after seed refuses before cargo",
+                lambda: observe({"binding": "/binding.json",
+                                 "sha256": sha256_bytes(binding_bytes)},
+                                fail_after_seed_fake, FIXTURE_ENV),
+                "unreadable")
+        check("a clock failure after seed retains the seed and writes a refusal",
+              fail_after_seed["written"] is not None
+              and fail_after_seed["written"]["outcome"]["state"] == "refused"
+              and fail_after_seed["written"]["outcome"]["phase"] == "staging"
+              and not any(call[0] == "run_logged" for call in fail_after_seed_fake.calls)
+              and (fail_after_seed["written"].get("seeds") or {}).get("oxide"))
     finally:
         globals()["BARGE_CUSTODY_REVIEWED"] = original_custody
 

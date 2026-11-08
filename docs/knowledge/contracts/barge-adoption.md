@@ -2542,7 +2542,7 @@ policy-only document is labelled as such, and no control claims a native run.
 
 ## Observation-only embedded control diagnostic (oxide#289)
 
-**Status: source-bound (oxide#290) and pure-validated; first occurrence oxide#291 spent as failed setup (no credit); volume-resolution correction oxide#292 pure-validated and not activated.** Tom's operator decision
+**Status: source-bound (oxide#290) and pure-validated; first occurrence oxide#291 spent as failed setup (no credit); volume-resolution correction oxide#292 pure-validated and not activated; clock-domain correction oxide#296 source-prepared and not activated.** Tom's operator decision
 `90b7bbeb` v2 selected "Prepare one observation-only control diagnostic" and
 the scoped Queue brief activates source and readiness preparation plus pure
 covering only. No real engine, fixture, staging build, image or diagnostic ran,
@@ -2736,6 +2736,14 @@ kept fixture) resolving inside the owned run root is recorded with its reason
 and is neither read nor copied, so an engine-reported manifest or transcript
 that links outside is refused rather than followed. Nothing is deleted from the
 scratch tree by this script.
+
+**Guard clock (oxide#296).** `OXIDE_PROOF_DEADLINE_NS` is an absolute
+`CLOCK_UPTIME_RAW` instant. `Seams.now_ns` and `work_left` use that same clock
+through `offline_seed.now_ns`. Derived stage and engine timeouts are
+`remaining_child_seconds` (work left minus the 60 s shutdown margin), checked
+immediately before each of those children; a spent or equal-boundary window
+spawns no child. A missing or unreadable clock or deadline refuses with bounded
+evidence retention. See [oxide#296](#observation-work-deadlines-use-the-guard-clock-oxide296).
 
 **Bounds and premises.** 900 s whole-occurrence wall clock and 1536 MiB of
 monitored scratch. The allocation is explicit and sums to the bound: 448 MiB
@@ -2943,6 +2951,60 @@ spent, and no fact here reopens it.
 **Unchanged.** The 900 s and 1536 MiB observation envelope, the qualified
 supervisor bytes, the Barge custody gate, the parser, verdict and export rules,
 the 45 s and 256 MiB seeder bounds, locks, toolchain, pins and every live gate.
+
+## Observation work deadlines use the guard clock (oxide#296)
+
+**Status: source-prepared with synthetic covering; not activated.** No real seed,
+Cargo resolution, staging, engine, diagnostic, image or observation ran. Oxide#295
+remains the separately activated seed-only control at immutable `c99962db`; this
+correction does not prompt, mutate or retry it.
+
+**Mismatch.** At merged main `c99962db`, `Seams.now_ns` read `time.monotonic_ns`
+while `work_left` subtracted that value from the guard's absolute
+`OXIDE_PROOF_DEADLINE_NS`, which is a `CLOCK_UPTIME_RAW` instant. The two clocks
+are independent on this host, so remaining work and derived child timeouts were
+not in the guard's domain. The seed-only readiness control already overrode
+`now_ns` with the shared seeder's `CLOCK_UPTIME_RAW` helper and is unchanged.
+
+**Correction.** Every calculation against the guard's absolute deadline uses
+`CLOCK_UPTIME_RAW` through `offline_seed.now_ns`. There is no wall or monotonic
+conversion and no new timer or supervisor. A missing or unreadable clock or
+deadline refuses with the existing bounded-evidence finish path. The 900 s /
+1536 MiB envelope, the 60 s observation shutdown margin and the seeder's 45 s
+caps are unchanged.
+
+A derived stage or engine timeout is `remaining_child_seconds`: `work_left`
+minus the 60 s margin, checked immediately before each stage or engine child.
+A spent or equal-boundary window spawns no child and does not floor to a 1 s
+allowance. A deadline can still pass during a blocking child; the guard remains
+the outer bound. Parse stays on its fixed 120 s window.
+
+**Pure evidence.** Discriminating controls pin monotonic and uptime far apart
+(and reversed/stepped) and drive the real `Seams.now_ns` / `work_left` /
+`remaining_child_seconds` through existing seams. They prove remaining values
+come from the unchanged deadline and margin, that spent and equal-boundary
+windows spawn no stage or engine child, and that expiry after seed, expiry
+between engines, and a clock-read failure retain reached evidence and refuse
+nonzero. The nine proof-authoring premises stay at their executable source
+sites (`staging_environment` / `engine_environment`: private `HOME`/`CARGO_HOME`,
+frozen empty `RUSTFLAGS`, pinned 1.97.1, `RUSTUP_AUTO_INSTALL=0`).
+
+**Validation at this head.** Covering selectors are
+`proof:tape-prune:observation-test` (213 controls: the 187 recorded at
+oxide#294 plus the clock-domain, remaining, expiry and clock-failure
+controls), `proof:tape-prune:observation-plan`, `proof:seed-readiness:test`,
+`proof:seed-readiness:plan` and `docs:check`. No Rust source changed. No real
+seed, Cargo, staging, engine, diagnostic, image or observation ran.
+
+**Not claimed.** Reviewed source preparation may merge. No native, control or
+observation starts from this task. The planner separately binds any later
+observation after actual seed evidence is judged. Oxide#291/#293 stay
+failed/spent.
+
+**Unchanged.** Guard 900 s / 1536 MiB, 60 s observation shutdown margin, seed
+45 s limits, strict/limited parser and verdict rules, source/custody/private
+environment, evidence caps, qualified supervisor bytes, Barge custody gate,
+readiness control, and every live gate.
 
 ## Shared private-build validation gate (oxide#248)
 
