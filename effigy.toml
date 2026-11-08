@@ -1591,8 +1591,9 @@ run = "python3 scripts/bounded-test.py --limit 60 --scratch-budget-mib 32 -- pyt
 # Seed-only readiness for the observation's two locks (oxide#294). `:test` runs
 # the synthetic controls: fake git, seed and guard seams for the orchestration
 # (both locks, one shared deadline, clean and unknown-closure first outcomes,
-# partial records, bound-digest and tree refusals, publication failure), plus two
-# real locks through the shared seeder on tiny fixtures. It runs no Cargo, no
+# partial records, bound-digest and tree refusals, shared-window expiry, non-object
+# binding refusals, publication failure), plus two fixture locks through the real
+# shared seeder on one tiny fixture host. It runs no Cargo, no
 # resolution, no staging, no engine and no observation. `:plan` is effect-free.
 # `:control` is the ONE prospective uncounted occurrence: it refuses before any
 # effect until a planner binds one occurrence through the two environment

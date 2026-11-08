@@ -700,7 +700,8 @@ def parse_binding(payload):
         raise Obstruction("the binding does not name the qualified supervisor")
     if guard.get("limit_seconds") != LIMIT_SECONDS or guard.get("scratch_mib") != SCRATCH_MIB:
         raise Obstruction("the binding's guard bounds are not this route's fixed bounds")
-    if document.get("volume", {}).get("uuid") != SELECTED_VOLUME_UUID:
+    volume = document.get("volume")
+    if not isinstance(volume, dict) or volume.get("uuid") != SELECTED_VOLUME_UUID:
         raise Obstruction("the binding does not name the selected Stash volume")
     paths = document.get("paths")
     if not isinstance(paths, dict) or not safe_component(paths.get("run_root_name")):
@@ -1704,6 +1705,16 @@ def plan_document():
                  "--binding \"$TAPE_OBSERVATION_BINDING\" "
                  "--sha256 \"$TAPE_OBSERVATION_BINDING_SHA256\"",
         "selection_refuses_before_effect": True,
+        "seed_source": {
+            "input": "an absolute CARGO_HOME in the invoking environment, named "
+                     "explicitly; the implicit ~/.cargo fallback is refused before "
+                     "staging",
+            "role": SEED_ROLE,
+            "report_key": "seeds",
+            "record": "per side: role, lock digest and the seeder's provenance or "
+                      "refusal, published even when the seed refuses before any stage "
+                      "record exists",
+        },
         "binding_template": BINDING_TEMPLATE,
         "commands": {
             "oxide_stage": ["cargo", "test", "--test", "tape_prune_eval",
@@ -1772,8 +1783,8 @@ def plan_document():
             "schema": SCHEMA,
             "always_false": "qualified",
             "keys": ["claim", "planner_reference", "controls", "premises", "bounds",
-                     "guard", "paths", "envelope", "windows", "fates",
-                     "setup_differences", "closure", "gaps"],
+                     "guard", "paths", "envelope", "windows", "fates", "seeds",
+                     "setup_differences", "outcome", "retained", "closure", "gaps"],
         },
         "premises": [{"premise": name, "disposition": text}
                      for name, text in PREMISES],
@@ -2386,6 +2397,7 @@ def _self_test():
         ({"guard": {"scratch_mib": 4096}}, "fixed bounds"),
         ({"volume": {"uuid": "00000000-0000-0000-0000-000000000000"}},
          "Stash volume"),
+        ({"volume": "SELECTED"}, "Stash volume"),
         ({"paths": {"run_root_name": "../escape"}}, "safe component"),
         ({"paths": {"report_name": "a/b"}}, "safe component"),
     ):
@@ -3069,6 +3081,14 @@ def _self_test():
               == "index.crates.io-1949cf8c6b5b557f")
         check("a seed refusal runs no Cargo staging, engine or parse",
               not any(call[0] in ("run_logged", "run_captured") for call in seed_fake.calls))
+        published_keys = set(refused_seed) - {"schema", "qualified"}
+        planned_keys = set(plan_document()["report_schema"]["keys"])
+        check("the plan's report key list covers every key the refused report publishes",
+              published_keys <= planned_keys and "seeds" in planned_keys,
+              str(sorted(published_keys - planned_keys)))
+        check("the plan names the explicit CARGO_HOME seed source and the seeds key",
+              plan_document()["seed_source"]["report_key"] == "seeds"
+              and "absolute CARGO_HOME" in plan_document()["seed_source"]["input"])
 
         # The seed source is named explicitly: an unset or relative CARGO_HOME
         # refuses, and the implicit ~/.cargo fallback is never read.

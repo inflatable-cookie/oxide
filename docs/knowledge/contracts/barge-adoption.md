@@ -2918,13 +2918,19 @@ Effigy selectors: `proof:seed-readiness:test` (heavy, 300 s, 512 MiB, synthetic)
 
 **Validation at this head.** `proof:offline-seed:test` passed 21 synthetic cases
 (seven new provenance cases). `proof:tape-prune:observation-test` passed 184
-controls, five of them new: two for the seed-refusal report and its run
-boundary, and three for the explicit seed source (an unset, a relative and an
-absolute `CARGO_HOME`). `proof:tape-prune:observation-plan` and
+controls, eight of them new: two for the seed-refusal report and its run
+boundary, three for the explicit seed source (an unset, a relative and an
+absolute `CARGO_HOME`), one that the plan's key list covers every published
+key, one for the plan's seed-source record, and one for a non-object `volume`. `proof:tape-prune:observation-plan` and
 `proof:seed-readiness:plan` are effect-free and passed. `proof:seed-readiness:test`
-passed 32 controls, including two real locks through the shared seeder on tiny
-fixtures (an explicit source with a private destination, a refused second seed
-with its partial provenance, and an unchanged host tree). `docs:check` gates
+passed 38 controls: the orchestration, the shared-window gates (a second lock
+that runs inside the window, a second lock refused once the window closes, and an
+already-closed window refusing before any effect), the binding refusals (including
+non-object `volume`, `guard` and `paths`), and four checks through the real seeder
+on two fixture locks sharing one tiny fixture host (an explicit source with a
+private destination, a refused second seed with its partial provenance, a host
+tree whose names, modes, sizes, inodes and times are unchanged, and a bounded
+summary). `docs:check` gates
 this text. No Rust input changed.
 
 **Not claimed.** A completed seed would establish current copy and verification

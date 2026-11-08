@@ -68,14 +68,6 @@ SIDES = ("oxide", "barge")
 # The Oxide lock digest this preparation was reviewed against. The bound commit's
 # blob must match the binding; the digest here is a plan-time reference only.
 OXIDE_REFERENCE_LOCK_SHA256 = "e7dcf4647e41e3a1b5449e107ac1dac9a1da98076a868a10b1bdfeafa6f37b28"
-# The reviewed Barge custody source and its identical-tree merge (the pinned sibling).
-BARGE_REFERENCE = {
-    "reviewed_source": "05b4b5290852a0c9c697005794f1fda78f1b4420",
-    "commit": "d9eac3b573fb5d431e29160844290093030bfc19",
-    "tree": "68f96990d6e190852fe61e298d76b6aebdb31076",
-    "lock_blob": "e188bee6c4d641a707492d22d7443eab0eda10a7",
-    "lock_sha256": "4cb40dd563cf078088000e5f72edfe23a606b7cb89477d1aabb1792386c475c0",
-}
 CLAIM = (
     "none: current seed copy and verification facts for two locks; no historical "
     "cause, Cargo sparse-index acceptance, Git namespace choice, compilation, build "
@@ -106,6 +98,17 @@ def _load(name: str, filename: str):
 # The observation driver's binding and seam helpers are reused, not copied.
 obs = _load("tape_embedded_observation", "tape-embedded-observation.py")
 import offline_seed  # noqa: E402  (the shared seeder, on sys.path beside this file)
+
+# The reviewed Barge custody source, its identical-tree merge and its lock digest are
+# the observation's own record (never copied here). The lock blob is the one value
+# this control adds: `git rev-parse 05b4b52:Cargo.lock`, checked read-only at authoring.
+BARGE_REFERENCE = {
+    "reviewed_source": obs.BARGE_CUSTODY_REVIEWED["review_head"],
+    "commit": obs.BARGE_CUSTODY_REVIEWED["runtime_commit"],
+    "tree": obs.BARGE_CUSTODY_REVIEWED["tree"],
+    "lock_blob": "e188bee6c4d641a707492d22d7443eab0eda10a7",
+    "lock_sha256": obs.BARGE_CUSTODY_REVIEWED["lock_sha256"],
+}
 
 SHUTDOWN_NS = SHUTDOWN_MARGIN_SECONDS * 1_000_000_000
 
@@ -177,7 +180,8 @@ def parse_binding(payload: bytes) -> dict:
         raise obs.Obstruction("the binding does not name the qualified supervisor")
     if guard.get("limit_seconds") != LIMIT_SECONDS or guard.get("scratch_mib") != SCRATCH_MIB:
         raise obs.Obstruction("the binding's guard bounds are not this route's fixed bounds")
-    if document.get("volume", {}).get("uuid") != SELECTED_VOLUME_UUID:
+    volume = document.get("volume")
+    if not isinstance(volume, dict) or volume.get("uuid") != SELECTED_VOLUME_UUID:
         raise obs.Obstruction("the binding does not name the selected Stash volume")
     paths = document.get("paths")
     if not isinstance(paths, dict) or not obs.safe_component(paths.get("run_root_name")):
@@ -298,6 +302,19 @@ def seed_summary(seed: dict) -> dict:
         ],
         "limits": seed["limits"],
     }
+
+
+def tree_signature(root: str) -> list:
+    """Every entry under `root` with its mode, size, inode and both times. A read
+    leaves ctime alone; a write, chmod, rename or link changes it."""
+    rows = []
+    for directory, dirnames, filenames in os.walk(root):
+        for name in sorted(dirnames + filenames):
+            path = os.path.join(directory, name)
+            info = os.lstat(path)
+            rows.append((os.path.relpath(path, root), info.st_mode, info.st_size,
+                         info.st_ino, info.st_mtime_ns, info.st_ctime_ns))
+    return rows
 
 
 def closure_unknown(provenance: dict) -> bool:
@@ -535,6 +552,7 @@ class FakeReadiness(ReadinessSeams):
     def seed(self, host_cargo_home, cargo_home, lock_bytes, deadline_ns, provenance=None):
         self.calls.append(("seed", host_cargo_home, cargo_home, deadline_ns))
         behaviour = self.script["seed"][lock_bytes]
+        self.clock += behaviour.get("advance_ns", 0)
         if provenance is not None:
             provenance.update(behaviour.get("provenance", {}))
         if behaviour.get("refuse"):
@@ -706,6 +724,38 @@ def self_test() -> int:
     check("a second-lock refusal keeps its own partial provenance",
           locks["barge"]["status"] == "refused" and locks["barge"]["provenance"]["refusal"]["errno"] == "ENOENT")
 
+    # Shared window: the first seed spends time; the second lock gets the same
+    # absolute deadline (no fresh clock) and still runs while the window is open.
+    seeds = {oxide_lock: dict(_seed_ok(oxide_lock), advance_ns=100 * 1_000_000_000),
+             barge_lock: _seed_ok(barge_lock)}
+    code, fake, script = run(seeds)
+    seed_calls = [call for call in fake.calls if call[0] == "seed"]
+    locks = {entry["side"]: entry for entry in script["written"]["locks"]}
+    check("the second lock runs inside the shared window after the first spent 100 s",
+          locks["barge"]["status"] == "completed" and code == 0
+          and [call[3] for call in seed_calls] == [expected_deadline, expected_deadline],
+          (code, [call[3] for call in seed_calls]))
+
+    # Shared window: the first seed runs the window out; the second lock is not run,
+    # its reason names the closed window, and the occurrence is incomplete.
+    seeds = {oxide_lock: dict(_seed_ok(oxide_lock), advance_ns=160 * 1_000_000_000),
+             barge_lock: _seed_ok(barge_lock)}
+    code, fake, script = run(seeds)
+    locks = {entry["side"]: entry for entry in script["written"]["locks"]}
+    seed_count = len([call for call in fake.calls if call[0] == "seed"])
+    check("a first seed that closes the shared window keeps the second lock not-run",
+          locks["barge"]["status"] == "not-run" and seed_count == 1
+          and "window closed" in (locks["barge"]["reason"] or "")
+          and code == 1, (code, seed_count, locks["barge"]))
+
+    # An already-closed window refuses before any effect, with no run root and no seed.
+    def expired(script):
+        script["now"] = expected_deadline + 1
+    code, fake, script = run({oxide_lock: _seed_ok(oxide_lock), barge_lock: _seed_ok(barge_lock)},
+                             script_edit=expired)
+    check("an already-closed shared window refuses before any run root or seed",
+          code == 2 and not any(call[0] in ("make_root", "seed") for call in fake.calls), (code, fake.calls))
+
     # A bound commit whose tree differs refuses that lock before its seed runs.
     def wrong_commit_tree(script):
         script["git"][(SELF_TEST_SIBLING, ("rev-parse", "--verify", BARGE_REFERENCE["commit"] + "^{tree}"))] = "9" * 40
@@ -742,8 +792,14 @@ def self_test() -> int:
         except obs.Obstruction as error:
             check(name, True, str(error))
             return
+        except Exception as error:  # noqa: BLE001 - an unexpected class is a failure
+            check(name, False, f"unexpected {type(error).__name__}: {error}")
+            return
         check(name, False, "the malformed binding was accepted")
 
+    refuses("a non-object volume refuses as a binding refusal", lambda b: b.update(volume="SELECTED"))
+    refuses("a non-object guard refuses as a binding refusal", lambda b: b.update(guard=["x"]))
+    refuses("a non-object paths refuses as a binding refusal", lambda b: b.update(paths=None))
     refuses("a relative seed source refuses", lambda b: b.update(seed_source="relative/cache"))
     refuses("a 900 s limit is not this route's bound", lambda b: b["guard"].update(limit_seconds=900))
     refuses("a wrong volume refuses", lambda b: b.update(volume={"uuid": "0" * 8}))
@@ -762,7 +818,7 @@ def self_test() -> int:
           len(PREMISES) == 9 and all(text.startswith(("applicable:", "not-applicable:"))
                                      for _name, text in PREMISES))
 
-    # The real seeder on two real fixture locks: explicit source, private
+    # The real seeder on two fixture locks: explicit source, private
     # destinations, a clean first seed and a refused second with its provenance.
     real = self_test_real_seeder()
     checks.extend(real)
@@ -779,17 +835,17 @@ def self_test() -> int:
 
 
 def self_test_real_seeder() -> list:
-    """Two real locks through the shared seeder on tiny fixtures: an explicit host
-    source, a private destination, one clean seed and one refused seed whose
-    partial provenance survives. The host tree is unchanged afterwards."""
+    """Two fixture locks through the shared seeder on one tiny fixture host: an
+    explicit host source, a private destination, one clean seed and one refused
+    seed whose partial provenance survives. The host tree is unchanged afterwards.
+    Real host locks are not read here."""
     results = []
     # Under the qualified supervisor the fixtures stay inside its owned scratch root.
     base = tempfile.mkdtemp(prefix="seed-readiness-",
                             dir=os.environ.get("OXIDE_TASK_SCRATCH_ROOT") or None)
     try:
         host, rev, checksum = offline_seed._fixture_host(pathlib.Path(base) / "a")
-        before = sorted(os.path.relpath(os.path.join(dp, name), host)
-                        for dp, _dn, fns in os.walk(host) for name in fns)
+        before = tree_signature(str(host))
         lock_a = offline_seed._lock_text(rev, checksum).encode()
         lock_b = offline_seed._lock_text("0" * 40, checksum).encode()
         seams = obs.Seams()
@@ -803,8 +859,7 @@ def self_test_real_seeder() -> list:
             seams.seed(str(host), dest_b, lock_b, deadline, provenance=prov_b)
         except obs.Obstruction as error:
             refused = str(error)
-        after = sorted(os.path.relpath(os.path.join(dp, name), host)
-                       for dp, _dn, fns in os.walk(host) for name in fns)
+        after = tree_signature(str(host))
         results.append(("real seed: explicit source, private destination, first lock complete",
                         seed_a["packages"] == 1 and prov_a["requested_source"] == str(host)
                         and prov_a["destination"] == dest_a and prov_a["refusal"] is None, prov_a))
@@ -812,8 +867,8 @@ def self_test_real_seeder() -> list:
                         refused is not None and prov_b["refusal"] is not None
                         and prov_b["source"] is not None and prov_b["registry"]["config_json"] is not None,
                         refused))
-        results.append(("real seed: the explicit host source is not written",
-                        before == after, (len(before), len(after))))
+        results.append(("real seed: the explicit host source is not written (names, modes, sizes, inodes and times)",
+                        before == after and len(before) > 0, (len(before), len(after))))
         results.append(("real seed: the seed summary is bounded and names no file list",
                         len(json.dumps(seed_summary(seed_a))) < 16 * 1024, len(json.dumps(seed_summary(seed_a)))))
     except Exception as error:  # a broken fixture is a failed control, not a pass
