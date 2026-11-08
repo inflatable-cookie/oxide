@@ -69,6 +69,21 @@ test-only recorder change (bind a leaf identity without a parent at the enumerat
 sites, and give the parent-required obligation note its own declared rule); this preparation does \
 not make it";
 
+/// The exact smallest Barge source requirement for the first batch, read from the
+/// pinned sibling `f9f81f72`. The harness, argv contract, `release::plan`
+/// call and export binding already exist; what is missing is fixture breadth.
+pub(crate) const BARGE_SUPPORT_REQUIREMENT: &str = "Barge at f9f81f72 already provides the \
+in-crate harness: crates/barge/tests/tape_eval.rs (harness = false) implements the fixed argv \
+contract, calls the unchanged release::plan through tape_harness::run_bound, requires the export \
+binding (BARGE_TAPE_EXPORT_RECEIPT, _SHA256, _CLOSURE_SHA256) and builds one BASE-shaped fixture. \
+The smallest remaining source requirement is a per-case fixture builder inside \
+crates/barge/src/tape_harness.rs: build_fixture(label) materialises one fixed fixture (one volume \
+record, one owned root, one settled Oxide row, an absent checkout) and its manifest carries empty \
+fixture.entries, fixture.roots and dynamic.writers, so a first-batch case's own state (registry \
+rows and intents, receipt and marker variants, volume records, declaration and fence, operator \
+list, legacy rows) and the manifest's description of it cannot be produced. No new schema, argv \
+contract, target or release::plan path is needed";
+
 /// The `/2` manifest schema's fixed Barge pin. The comparison commit is carried
 /// by `source.barge_slice_commit`; the pin field itself is not a drift knob.
 pub(crate) const SCHEMA_BARGE_PIN: &str = "4af9360bd09629e970c143080ca159de8eef2562";
@@ -260,6 +275,25 @@ that site (read_row_handle)",
         class: SiteClass::HandleParent,
         source: "src/bin/oxide/prune.rs revalidate_chain (component_without_parent)",
     },
+    // The volume-binding observations. Both the absence walk and the root
+    // observation record them through `volume_row`, whose identity is the
+    // volume form (mount, UUID, device), so their parent provenance is a
+    // declared dynamic observation rather than a path or a handle.
+    KnownSite {
+        kind: "absence-walk:binding-open",
+        class: SiteClass::DeclaredObservation,
+        source: "src/bin/oxide/prune.rs checkout_absence -> volume::Binding::open (volume_row)",
+    },
+    KnownSite {
+        kind: "absence-walk:binding-verify",
+        class: SiteClass::DeclaredObservation,
+        source: "src/bin/oxide/prune.rs checkout_absence volume verification (volume_row)",
+    },
+    KnownSite {
+        kind: "root-observe:binding-open",
+        class: SiteClass::DeclaredObservation,
+        source: "src/bin/oxide/prune.rs observe_row_root -> volume::Binding::open (volume_row)",
+    },
     KnownSite {
         kind: "root-observe:entry",
         class: SiteClass::HandleParent,
@@ -338,8 +372,23 @@ fn known_site(kind: &str) -> Option<&'static KnownSite> {
 /// Every blocking reason is structured: rule, site (or empty), detail. The
 /// limited verdict never reports a bare string, so no caller can filter a
 /// blocking reason by matching warning text.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum BlockingRule {
+/// One macro, one source of truth: the enum and its full `ALL_BLOCKING_RULES`
+/// list are generated together, so the vocabulary the plan prints cannot omit a
+/// variant the verdict can return. `name()` stays an exhaustive match, so a new
+/// variant cannot compile without its printed name.
+macro_rules! blocking_rules {
+    ($($variant:ident),* $(,)?) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+        pub(crate) enum BlockingRule {
+            $($variant,)*
+        }
+
+        /// Every blocking rule, in the enum's own order.
+        pub(crate) const ALL_BLOCKING_RULES: &[BlockingRule] = &[$(BlockingRule::$variant,)*];
+    };
+}
+
+blocking_rules! {
     // Caps, structure and window.
     Truncation,
     FixtureCaptureTruncated,
@@ -363,11 +412,10 @@ pub(crate) enum BlockingRule {
     WrongLeafIdentity,
     HandleParentUnqualified,
     ParentRequiredUnproven,
-    /// The recorder's own obligation check says the obligation was not met
-    /// (`mandatory observation missing or identity unproven at <site>`).
+    // The recorder's own obligation sentences: `mandatory observation missing or
+    // identity unproven at <site>` and `obligation missing parent_required at
+    // <site>`.
     RecorderObligationUnmet,
-    /// The recorder reports a malformed obligation
-    /// (`obligation missing parent_required at <site>`).
     RecorderObligationMalformed,
     // Clocks and holders.
     UnobservedDecisionClock,
@@ -1745,7 +1793,9 @@ pub(crate) enum Prerequisite {
     ExportClosure,
     /// A bound manifest whose digest the transcript recorded.
     BoundManifest,
-    /// Barge-side case support, which is a linked Barge task (S3).
+    /// Barge-side case support. The pinned harness exists; the smallest
+    /// remaining source requirement is a per-case fixture builder, named in the
+    /// plan's `barge_support` and owned by a linked Barge task (S3).
     BargeCaseSupport,
     /// A fixture that writes its own state, receipts and markers.
     FixtureWrite,
@@ -2439,6 +2489,12 @@ pub(crate) fn plan_document() -> Value {
         "execution_gate": "two independent gates: no export-closure digest and receipt is \
     qualified, and no first-batch input binds under the current recorder (see binding_gap); this plan \
     is readiness only and gives no comparison, parity or native credit",
+        "barge_support": {
+            "summary": BARGE_SUPPORT_REQUIREMENT,
+            "harness": "crates/barge/tests/tape_eval.rs (harness = false) at f9f81f72",
+            "smallest_requirement": "a per-case fixture builder in \
+    crates/barge/src/tape_harness.rs; a linked Barge task, not this PR",
+        },
         "binding_gap": {
             "summary": BINDING_GAP,
             "site_classes": KNOWN_SITES
@@ -2463,7 +2519,10 @@ pub(crate) fn plan_document() -> Value {
                     .collect::<Vec<_>>(),
             },
         ],
-        "blocking_rules": BLOCKING_RULE_NAMES,
+        "blocking_rules": ALL_BLOCKING_RULES
+            .iter()
+            .map(|rule| rule.name())
+            .collect::<Vec<_>>(),
         "families": FAMILIES
             .iter()
             .map(|family| json!({
@@ -2541,47 +2600,6 @@ pub(crate) fn plan_document() -> Value {
         },
     })
 }
-
-/// The blocking-rule vocabulary, printed by the plan so an unknown rule is
-/// visibly absent rather than silently ignored.
-const BLOCKING_RULE_NAMES: &[&str] = &[
-    "truncation",
-    "fixture-capture-truncated",
-    "window-value-not-null",
-    "missing-mandatory-key",
-    "unknown-engine-note",
-    "extra-unbound-observation",
-    "unbound-object-identity",
-    "unbound-component-parent",
-    "unbound-authority-read",
-    "unbound-descriptor-identity",
-    "unbound-descriptor-process",
-    "authority-budget-failed",
-    "engine-counterfactual",
-    "authority-deadline-unproven",
-    "stale-observation",
-    "unlisted-site",
-    "missing-mandatory-observation",
-    "wrong-leaf-identity",
-    "handle-parent-k1-unqualified",
-    "parent-required-unproven",
-    "unobserved-decision-clock",
-    "unproven-recorded-holder",
-    "attempted-effect",
-    "uncompleted-effect",
-    "unpathed-effect",
-    "unknown-effect-kind",
-    "declared-attempt",
-    "omitted-effect",
-    "extra-effect",
-    "substituted-effect",
-    "fixture-change-unmatched",
-    "case-drift",
-    "digest-drift",
-    "source-drift",
-    "topology-drift",
-    "strict-issue-unexplained",
-];
 
 // ---------------------------------------------------------------------------
 // Pure policy controls
@@ -2815,6 +2833,14 @@ fn controls() -> Vec<(&'static str, fn() -> Control)> {
         (
             "a real path-only row stays insufficient",
             recorder_path_only_row_is_insufficient,
+        ),
+        (
+            "the malformed-obligation recorder note blocks",
+            recorder_malformed_obligation_note_blocks,
+        ),
+        (
+            "the printed blocking vocabulary is the enum",
+            plan_blocking_vocabulary,
         ),
         (
             "a bound leaf without a fixture binding stays insufficient",
@@ -3485,6 +3511,9 @@ fn recorder_path_only_row_is_insufficient() -> Control {
     row["outcome"] = json!({"type": "digest", "digest": hex('9', 64)});
     let mut transcript = synthetic_transcript();
     transcript["reads"] = json!([row]);
+    // Exactly the sentences the recorder emits for this site: `read_registry`
+    // goes through `read_row` (object-or-parent unproven), not
+    // `read_row_owned` (parent unproven).
     transcript["notes"] = json!([
         "absolute monotonic window origin and end unproven",
         "descriptor identity unavailable at authority-read@prune::read_registry: no authorized \
@@ -3493,7 +3522,6 @@ descriptor observation",
         "extra or unbound observation at authority-read@prune::read_registry",
         "mandatory observation missing or identity unproven at \
 authority-read@prune::read_registry",
-        "parent identity unproven at authority-read@prune::read_registry",
     ]);
     let verdict = evaluate_limited(&transcript, &synthetic_manifest(), CONTROL_DIGEST);
     control(
@@ -3519,6 +3547,64 @@ authority-read@prune::read_registry",
             .any(|limitation| limitation.rule == ExclusionRule::PathOnlyDirectReadParent),
         "the path-only exclusion is not granted to a row the recorder does not bind",
     )
+}
+
+/// The recorder's malformed-obligation sentence has its own blocking rule, so it
+/// is attributed rather than reading as an unknown note.
+fn recorder_malformed_obligation_note_blocks() -> Control {
+    let mut transcript = synthetic_transcript();
+    transcript["reads"] = json!([synthetic_row(CONTROL_SITE, "none", Some(3), Some(4))]);
+    transcript["notes"] = json!([
+        "absolute monotonic window origin and end unproven",
+        "parent identity unproven at authority-read@prune::read_registry",
+        "obligation missing parent_required at authority-read@prune::read_registry",
+    ]);
+    let verdict = evaluate_limited(&transcript, &synthetic_manifest(), CONTROL_DIGEST);
+    control(
+        blocked_at(
+            &verdict,
+            BlockingRule::RecorderObligationMalformed,
+            CONTROL_SITE,
+        ),
+        "the malformed-obligation note blocks under its own rule",
+    )?;
+    control(
+        !blocked_by(&verdict, BlockingRule::UnknownNote),
+        "the malformed-obligation note is not an unknown note",
+    )
+}
+
+/// The plan's printed blocking vocabulary is generated from the enum's own list,
+/// so it cannot omit a rule the verdict can return.
+fn plan_blocking_vocabulary() -> Control {
+    let printed: Vec<&str> = ALL_BLOCKING_RULES.iter().map(|rule| rule.name()).collect();
+    let mut unique = printed.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    control(
+        unique.len() == printed.len(),
+        "two blocking rules print the same name",
+    )?;
+    let plan = plan_document();
+    let documented: Vec<&str> = plan["blocking_rules"]
+        .as_array()
+        .map(|names| names.iter().filter_map(|name| name.as_str()).collect())
+        .unwrap_or_default();
+    control(
+        documented == printed,
+        format!("the plan prints {documented:?}, the enum declares {printed:?}"),
+    )?;
+    for rule in [
+        BlockingRule::RecorderObligationUnmet,
+        BlockingRule::RecorderObligationMalformed,
+        BlockingRule::StrictIssueUnexplained,
+    ] {
+        control(
+            documented.contains(&rule.name()),
+            format!("the plan omits {}", rule.name()),
+        )?;
+    }
+    Ok(())
 }
 
 /// `prune::read_bounded` does record the leaf's own device and inode, and the
@@ -3961,6 +4047,13 @@ fn plan_export_gate() -> Control {
     control(
         plan["binding_gap"]["summary"].as_str() == Some(BINDING_GAP),
         "the plan names the recorder binding gap",
+    )?;
+    control(
+        plan["barge_support"]["summary"].as_str() == Some(BARGE_SUPPORT_REQUIREMENT)
+            && plan["barge_support"]["smallest_requirement"]
+                .as_str()
+                .is_some_and(|text| text.contains("per-case fixture builder")),
+        "the plan names the exact smallest Barge source requirement",
     )?;
     control(
         plan["binding_gap"]["site_classes"]

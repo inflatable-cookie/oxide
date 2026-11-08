@@ -2102,13 +2102,25 @@ exclusion waives a decision input's identity.
 | `window-origin-end-null` | The transcript's required-null window origin and end | Both fields as `null`; no ordering, absolute-time or window-span claim |
 | `path-only-direct-read-parent` | `parent_required` at a site in the policy's fixed `KNOWN_SITES` table whose class is path-only direct read, only when that row binds its own device and inode and **only when the recorder did not report the row unbound** | The exact site and the leaf's own `(device, inode)` |
 
-The site table names the row kinds the recorder actually emits
-(`authority-read@<site>`, `read-bounded:lstat`, `read-bounded:open`,
-`outputs:read-marker:open`, `absence-walk:*`, `root-observe:*`, `volume-site`,
-`fixture-diff`, and the `store::*` custody reads), each with its parent
-provenance. A kind absent from the table is unlisted and blocking. The prune
-owner-marker read is **handle-class**, because `openat` runs from a live held
-root descriptor; only the path-opened marker reader is path-only.
+The site table names the row kinds the recorder actually emits, each with its
+parent provenance: `authority-read@prune::read_registry`,
+`authority-read@prune::read_bounded`, `authority-read@prune::observe_root_in:marker`,
+`authority-read@outputs::read_receipt_with`, `authority-read@outputs::read_marker`,
+`authority-read@outputs::marker_digest`,
+`authority-read@removable::read_registration`, the `authority-read@store::*`
+custody reads, `read-bounded:lstat`, `read-bounded:open`,
+`outputs:read-marker:open`, `absence-walk:start`, `absence-walk:fstatat`,
+`absence-walk:openat`, `absence-walk:boot-data`,
+`absence-walk:revalidate-descriptor`, `absence-walk:revalidate-name`,
+`absence-walk:binding-open`, `absence-walk:binding-verify`,
+`root-observe:entry`, `root-observe:root-dir`, `root-observe:outputs-dir`,
+`root-observe:marker-open`, `root-observe:binding-open`, `volume-site` and
+`fixture-diff`. A kind absent from the table is unlisted and blocking; the table
+is exact-match, never a prefix or wildcard. The prune owner-marker read is
+**handle-class**, because `openat` runs from a live held root descriptor; only
+the path-opened marker reader is path-only. The three volume-binding kinds are
+declared dynamic observations, because `volume_row` carries the volume identity
+form.
 
 **Blocking, all structured.** A handle-class (K1) parent; a missing,
 non-matching or unbound leaf identity; a missing mandatory row; any cap,
@@ -2122,6 +2134,12 @@ and the recorder's own two obligation sentences. An unknown rule or site is
 always blocking, so nothing is silently ignored. The policy mirrors the strict
 K1 rule exactly: a handle parent is discharged only when
 `K1_PREMISE_QUALIFIED` holds, and blocks while it is false.
+
+**The path-only exclusion is not live.** No first-batch input can use it: the
+recorder reports every path-only file row unbound, and the policy refuses the
+exclusion for any row the recorder reports unbound. It is implemented, pure-
+tested and reviewed so that the recorder change below has a policy to meet, not
+so that a current case can use it.
 
 The exclusion set is a source-owned enumeration, never a caller waiver list
 and never derived from warning text. The only strict issues an exclusion may
@@ -2142,7 +2160,7 @@ a cross-engine divergence. `Agreed` needs two sufficient sides, two complete
 batches and the declared fates. A deferred or unexecuted case is never
 agreement.
 
-**Pure controls (47, discriminating).** Each asserts an exact rule and site,
+**Pure controls (49, discriminating).** Each asserts an exact rule and site,
 not merely failure: the allowed path-only limitation with its site and leaf
 identity while the strict result stays insufficient; a handle parent blocking
 with no limitation granted; missing row; wrong leaf identity; unlisted site;
@@ -2156,12 +2174,15 @@ decisions over insufficient inputs; a deferred case; a divergence; agreement
 requiring two sufficient sides; an informative identity note on an undeclared
 row not becoming a defect while the same sentence on a declared input blocks;
 an unrequired parent leaving nothing to exclude; and, built from the recorder's
-own output, a real-shaped path-only row (its four notes, no own identity) that
-stays insufficient, the same with a bound leaf but no fixture binding, an
-emitted `absence-walk:fstatat` component that is named handle-class rather than
-unlisted, the parser entry point refusing a `/1` transcript and an invalid
-manifest, a Barge-only incomplete batch that is insufficient, and a declared
-mismatch that is not a divergence. They run in the `--self-check` route, so
+own output, a real-shaped path-only row carrying exactly that site's emitted
+sentences (no own identity) that stays insufficient, the same with a bound leaf
+but no fixture binding, an emitted `absence-walk:fstatat` component that is
+named handle-class rather than unlisted, the malformed-obligation recorder note,
+the parser entry point refusing a `/1` transcript and an invalid manifest, a
+Barge-only incomplete batch that is insufficient, and a declared mismatch that
+is not a divergence. A further control compares the plan's printed blocking
+vocabulary with the enum's own list, which is generated by one macro so a rule
+cannot be printed twice or omitted. They run in the `--self-check` route, so
 `effigy rust:capture-wire` covers them.
 
 Two boundaries of the policy are deliberate. The manifest's
@@ -2237,6 +2258,23 @@ Recorded insufficiencies, named rather than absorbed:
    need a second mount epoch and CF-2/CF-5 writers inside one window.
 8. **ABS-BOOT-DATA** needs internal boot Data placement and remains a D-3
    scope difference.
+
+**Barge support: the exact smallest requirement.** The pinned sibling
+`f9f81f72` already provides the in-crate harness: `crates/barge/tests/tape_eval.rs`
+(`harness = false`) implements the fixed argv contract, calls the unchanged
+`release::plan` through `tape_harness::run_bound`, requires the export binding
+(`BARGE_TAPE_EXPORT_RECEIPT`, `_SHA256`, `_CLOSURE_SHA256`) and builds one
+BASE-shaped fixture. What is missing is fixture breadth, not a seam:
+`build_fixture(label)` materialises one fixed fixture (one volume record, one
+owned root, one settled Oxide row, an absent checkout) and its manifest carries
+empty `fixture.entries`, `fixture.roots` and `dynamic.writers`, so a first-batch
+case's own state — registry rows and intents, receipt and marker variants,
+volume records, declaration and fence, operator list, legacy rows — and the
+manifest's description of it cannot be produced. The smallest remaining source
+requirement is therefore a **per-case fixture builder inside
+`crates/barge/src/tape_harness.rs`**, with no new schema, argv contract, target
+or `release::plan` path. That is a linked Barge task; this PR makes no Barge
+write and the plan prints the requirement in its `barge_support` object.
 
 **Next occurrence: a proposal, not permission.** The plan prints it: **both
 batches ELEVATED**. The first batch attaches one owned 128 MiB image at a
