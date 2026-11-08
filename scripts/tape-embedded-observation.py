@@ -10,8 +10,11 @@ shared proof supervisor's own supervised group:
   `--fixture-root/--manifest/--transcript-out/--case BASE` engine chain.
 - Barge: its existing no-argument `tape_eval` embedded route, which builds its
   CTL-0 fixture, calls `run` with `embedded-unverified` and retains the
-  transcript under this run's own `BARGE_TEST_SCRATCH_ROOT`. Its export-gated
-  `--fixture-root` argv is deliberately not used.
+  transcript under this run's own `BARGE_TEST_SCRATCH_ROOT`. The route runs
+  under the explicit retained-custody opt-in of the reviewed Barge revision
+  (`BARGE_CUSTODY_REVIEWED`, Barge 05b4b52, tree 68f96990), so the fixture
+  survives for the guard's census. Its export-gated `--fixture-root` argv is
+  deliberately not used.
 
 The two case IDs stay distinct, the two fixtures stay physically distinct and
 their deliberate setup differences are recorded, never normalised into a
@@ -171,24 +174,44 @@ PREMISES = (
     ),
 )
 
-# The Barge custody property this route requires, and the only way it can be
-# established: source review of an exact Barge revision whose fixture is kept
-# from creation through every error path (see `plan_document`). A string search
-# cannot prove it, so this constant is the activation gate instead. It is None
-# because no reviewed Barge revision carries retained custody: the pinned
-# `TempDir` destructor still removes the fixture on every early return and
-# panic. A reviewed Oxide change that binds that exact revision and its two file
-# digests sets this constant; nothing in a binding can satisfy it.
-BARGE_CUSTODY_REVIEWED = None
+# The reviewed Barge custody source this route binds (oxide#290). Barge049
+# (`cefb5d3e`, Barge PR #49) was independently reviewed `ready_to_merge` at
+# `05b4b52`, tree `68f96990` (review run `1808bf0e`). Its merge `d9eac3b`, the
+# pinned sibling head, carries the same tree, so tree identity is the
+# source-equivalence proof: a binding names the merge commit, its tree must be
+# the reviewed tree, and the archived lock and the lifetime files must match
+# these digests before any staging. The gate is source-owned; no binding,
+# environment value or marker can open it.
+BARGE_CUSTODY_REVIEWED = {
+    "linked_task": "cefb5d3e-579c-41e3-89f4-0e3b90ecb39a",
+    "review_run": "1808bf0e-51ed-4b45-8470-f29222b40086",
+    "revision": "05b4b5290852a0c9c697005794f1fda78f1b4420",
+    "tree": "68f96990d6e190852fe61e298d76b6aebdb31076",
+    "lock_sha256": "4cb40dd563cf078088000e5f72edfe23a606b7cb89477d1aabb1792386c475c0",
+    "files": {
+        "testkit": "396d0eb9bbe9de201e8448485ae661b41682999cae32e879248875218d6da44f",
+        "tape_harness": "83f51163c74705e3d1abcae2650601eb066f57a17d87593f53291616ab39d45c",
+        "tape_eval": "c1ed42f8e76a050233e5de7d5fa14ea794ca069b0d49cf6199819c4826895c19",
+    },
+}
+# The lifetime property holds only under the explicit, source-owned opt-in: the
+# driver sets both variables for the Barge child and no other route keeps a
+# fixture. Without them the no-argument route is the ordinary self-removing one.
+BARGE_CUSTODY_OPT_IN_ENV = "BARGE_TAPE_CUSTODY"
+BARGE_CUSTODY_OPT_IN_VALUE = "barge.tape.kept-fixture/1"
+BARGE_SCRATCH_ROOT_ENV = "BARGE_TEST_SCRATCH_ROOT"
 BARGE_CUSTODY_PROPERTY = (
-    "fixture-kept-from-creation-through-every-error-path: the fixture directory "
-    "is taken out of TempDir ownership immediately after creation, before any "
-    "fallible step, so the guard's post-leader census and not the process owns "
-    "removal; the manifest is written inside it before the run; the kept path is "
-    "printed in a bounded line")
+    "fixture-kept-from-creation-under-explicit-opt-in: with "
+    "BARGE_TAPE_CUSTODY=barge.tape.kept-fixture/1 and this invocation's own "
+    "BARGE_TEST_SCRATCH_ROOT, the fixture leaves TempDir ownership inside its "
+    "creation call before any fallible step, so the guard's post-leader census and "
+    "not the process owns removal; the kept path is printed in one bounded line; "
+    "manifest.json is published inside it before the window runs; without the "
+    "opt-in the ordinary self-removing route is unchanged")
 BARGE_CUSTODY_FILES = {
     "testkit": os.path.join("crates", "barge", "src", "testkit.rs"),
     "tape_harness": os.path.join("crates", "barge", "src", "tape_harness.rs"),
+    "tape_eval": os.path.join("crates", "barge", "tests", "tape_eval.rs"),
 }
 
 
@@ -458,12 +481,14 @@ def invoking_cargo_home():
 
 
 def scrubbed(environ):
-    """Every inherited product, tool and VCS setting is dropped first."""
+    """Every inherited product, tool and VCS setting is dropped first. The
+    Barge custody opt-in is dropped too: only `run_barge` sets it, for its own
+    child, so a stray inherited value can never reach a staging or engine child."""
     return {
         name: value
         for name, value in environ.items()
         if not name.startswith(("OXIDE_", "XDG_", "CARGO_", "SCCACHE_", "RUSTC",
-                                "GIT_"))
+                                "GIT_", "BARGE_"))
         and name not in ("CARGO", "CARGO_INCREMENTAL", "RUSTFLAGS",
                          "CARGO_ENCODED_RUSTFLAGS", "RUSTUP_TOOLCHAIN")
     }
@@ -853,59 +878,62 @@ def stage_oxide(seams, binding, paths, artifacts):
     )
 
 
-BARGE_RETENTION_FILES = {
-    "testkit": os.path.join("crates", "barge", "src", "testkit.rs"),
-    "tape_harness": os.path.join("crates", "barge", "src", "tape_harness.rs"),
-}
-
-
 def require_reviewed_custody(binding):
-    """The activation gate: refuse before any staging write unless a reviewed
-    Barge custody revision is bound. Nothing a binding contains can satisfy it."""
+    """The source gate: refuse before any archive, staging write or engine unless
+    a reviewed Barge custody revision is bound in this source. Nothing a binding
+    contains can open it."""
     custody = binding["barge"]["custody"]
     if globals()["BARGE_CUSTODY_REVIEWED"] is None:
         raise Obstruction(
-            "owner-gated impediment: no reviewed Barge revision with retained "
-            "fixture custody exists, so this occurrence refuses before any engine. "
-            "The pinned route's TempDir destructor removes the fixture on every "
-            "early return and panic, before the guard's post-leader census. Required "
-            f"property: {BARGE_CUSTODY_PROPERTY}. Linked task: {custody['linked_task']}")
+            "owner-gated impediment: no reviewed Barge custody revision is bound in "
+            "this source, so this occurrence refuses before any engine. The pinned "
+            "route's TempDir destructor removes the fixture on every early return "
+            f"and panic. Required property: {BARGE_CUSTODY_PROPERTY}. Linked task: "
+            f"{custody['linked_task']}")
 
 
 def verify_barge_custody(binding, source, seams):
-    """Refuse unless a reviewed Barge revision with retained custody is bound.
+    """Refuse unless the archived Barge source is the reviewed custody source.
 
     The property is not verifiable from bytes: a comment or an unrelated method
-    could satisfy any text search, and the pinned path removes the fixture on
-    every early return and panic. Safety therefore rests on source review of the
-    exact revision, which `BARGE_CUSTODY_REVIEWED` represents. Today it is None,
-    so the occurrence refuses here with the owner-gated impediment named, before
-    any engine runs.
+    could satisfy any text search. Safety rests on source review of the reviewed
+    tree, which `BARGE_CUSTODY_REVIEWED` binds: the bound commit may be a merge or
+    a rebase only if its tree is the reviewed tree (tree identity covers every
+    byte), the binding's custody block names the reviewed revision and property,
+    and the archived lock and each lifetime file match their reviewed digests.
+    Everything is checked against the archive before any staging write.
     """
     require_reviewed_custody(binding)
     custody = binding["barge"]["custody"]
-    revision, digests = globals()["BARGE_CUSTODY_REVIEWED"]
-    if custody["reviewed_revision"] != revision or binding["barge"]["commit"] != revision:
+    reviewed = globals()["BARGE_CUSTODY_REVIEWED"]
+    if custody["reviewed_revision"] != reviewed["revision"]:
         raise Obstruction(
-            "the bound Barge revision is not the reviewed custody revision "
-            f"({revision})")
+            "the bound Barge custody revision is not the reviewed revision "
+            f"({reviewed['revision']})")
+    if binding["barge"]["tree"] != reviewed["tree"]:
+        raise Obstruction(
+            "the bound Barge tree is not the reviewed custody tree "
+            f"({reviewed['tree']}); the commit is not the reviewed source")
     if custody["property"] != BARGE_CUSTODY_PROPERTY:
         raise Obstruction("the binding does not name the required custody property")
+    lock_path = os.path.join(source, "Cargo.lock")
+    if not seams.isfile(lock_path):
+        raise Obstruction("the archived Barge tree has no Cargo.lock")
+    if seams.sha256(lock_path) != reviewed["lock_sha256"]:
+        raise Obstruction("the archived Barge lock is not the reviewed custody lock")
     for name, relative in BARGE_CUSTODY_FILES.items():
         path = os.path.join(source, relative)
         if not seams.isfile(path):
             raise Obstruction(f"the archived Barge tree has no {relative}")
-        if seams.sha256(path) != digests[name]:
+        if seams.sha256(path) != reviewed["files"][name]:
             raise Obstruction(
                 f"the archived Barge {relative} is not the reviewed custody revision")
-    return {"linked_task": storage_custody_label(custody),
-            "reviewed_revision": revision,
+    return {"linked_task": custody["linked_task"],
+            "review_run": reviewed["review_run"],
+            "reviewed_revision": reviewed["revision"],
+            "reviewed_tree": reviewed["tree"],
             "property": BARGE_CUSTODY_PROPERTY,
-            "files": {name: digests[name] for name in BARGE_CUSTODY_FILES}}
-
-
-def storage_custody_label(custody):
-    return custody["linked_task"]
+            "files": {name: reviewed["files"][name] for name in BARGE_CUSTODY_FILES}}
 
 
 def verify_toolchain_unchanged(binding, seams):
@@ -918,14 +946,23 @@ def verify_toolchain_unchanged(binding, seams):
                 f"the bound {name} changed while this occurrence was running")
 
 
-def stage_barge(seams, binding, paths, artifacts):
+def prepare_barge(seams, binding, paths):
+    """Archive the bound Barge commit and validate it before any staging or
+    engine: the reviewed custody source, its lock and its lifetime files."""
     source = paths["barge_source"]
     archive = seams.extract(binding["barge"]["sibling"], binding["barge"]["commit"],
                             source)
     retention = verify_barge_custody(binding, source, seams)
-    lock_path = os.path.join(source, "Cargo.lock")
-    if seams.sha256(lock_path) != binding["barge"]["lock_sha256"]:
+    if seams.sha256(os.path.join(source, "Cargo.lock")) != binding["barge"]["lock_sha256"]:
         raise Obstruction("the archived Barge lock is not the bound lock")
+    return {"source": source, "archive": archive, "retention": retention}
+
+
+def stage_barge(seams, binding, paths, artifacts, prepared):
+    """One bounded offline staging build of the archive `prepare_barge` already
+    validated."""
+    source = prepared["source"]
+    lock_path = os.path.join(source, "Cargo.lock")
     staged = stage(
         seams,
         parent=os.path.join(paths["barge"], "stage"),
@@ -938,8 +975,8 @@ def stage_barge(seams, binding, paths, artifacts):
         toolchain=binding["toolchain"],
         artifacts=artifacts,
     )
-    staged["archive"] = archive
-    staged["retention"] = retention
+    staged["archive"] = prepared["archive"]
+    staged["retention"] = prepared["retention"]
     return staged
 
 
@@ -1009,11 +1046,15 @@ def run_oxide(seams, paths, staged):
 
 
 def run_barge(seams, paths, staged):
+    """The bound no-argument embedded route, run under the explicit retained-custody
+    opt-in. The child gets exactly the opt-in and this run's own root; no other
+    Barge variable survives `scrubbed`, and no argv is added."""
     run_root = paths["barge_run"]
     seams.make_dirs(run_root)
     argv = [staged["executable"]["path"]]
     env = engine_environment(os.path.join(paths["barge"], "engine"),
-                             extra={"BARGE_TEST_SCRATCH_ROOT": run_root})
+                             extra={BARGE_CUSTODY_OPT_IN_ENV: BARGE_CUSTODY_OPT_IN_VALUE,
+                                    BARGE_SCRATCH_ROOT_ENV: run_root})
     result = seams.run_captured(
         argv, cwd=paths["barge"], env=env,
         timeout_s=max(1, seams.work_left() - SHUTDOWN_MARGIN_SECONDS))
@@ -1022,10 +1063,10 @@ def run_barge(seams, paths, staged):
         if line.startswith(TRANSCRIPT_MARKER):
             reported = line[len(TRANSCRIPT_MARKER):].strip()
     retained = safe_artifact(seams, run_root, reported)
-    kept = None
-    for line in result["stderr"].splitlines():
-        if line.startswith(SUPERVISOR_PATH_MARKER):
-            kept = line[len(SUPERVISOR_PATH_MARKER):].strip()
+    kept_lines = [line for line in result["stderr"].splitlines()
+                  if line.startswith(SUPERVISOR_PATH_MARKER)]
+    kept = kept_lines[0][len(SUPERVISOR_PATH_MARKER):].strip() if len(kept_lines) == 1 \
+        else None
     kept_fixture = safe_artifact(seams, run_root, kept, kind="dir")
     manifest = None
     if kept_fixture:
@@ -1034,10 +1075,45 @@ def run_barge(seams, paths, staged):
     return {"argv": argv, "engine": result, "reported": reported,
             "retained": retained,
             "retention_refused": bool(reported) and retained is None,
+            "kept_lines": len(kept_lines),
             "kept_fixture": kept_fixture,
             "fixture_kept": bool(kept_fixture),
             "manifest": manifest,
             "fixture": run_root}
+
+
+def require_barge_custody_record(barge):
+    """Every missing, partial or unsafe Barge custody fact is an apparatus
+    obstruction, not a recorded fate. The retained evidence is still written by
+    `observe`'s finish path, which runs on every exit."""
+    engine = barge["engine"]
+    if engine["stderr_truncated"]:
+        raise Obstruction(
+            "Barge's output exceeded its capture bound, so its custody line and "
+            "transcript line may be missing; partial output is retained and no fate "
+            "is recorded")
+    if barge["kept_lines"] != 1:
+        raise Obstruction(
+            f"Barge announced {barge['kept_lines']} kept-fixture lines, not exactly "
+            "one; no custody record exists")
+    if not barge["fixture_kept"]:
+        raise Obstruction(
+            "the announced kept fixture is not a safe directory inside this run's "
+            "own root; it was not read and no custody record exists")
+    if engine["code"] != 0 or engine["signal"] is not None:
+        raise Obstruction(
+            f"Barge exited {engine['code']} signal {engine['signal']} before a "
+            "complete window; its publication or engine failure is retained")
+    if barge["retention_refused"]:
+        raise Obstruction(
+            "Barge reported a retained transcript that is not a safe regular file "
+            "inside this run's own root; it was not read")
+    if not barge["retained"]:
+        raise Obstruction("Barge reported no retained transcript inside its kept fixture")
+    if barge["manifest"] is None:
+        raise Obstruction(
+            "the kept fixture holds no safe manifest.json, so no strict or limited "
+            "verdict applies; the window's own manifest is missing")
 
 
 def parse_capture(seams, staged, *, root, transcript, manifest, report):
@@ -1381,10 +1457,16 @@ def observe(options, seams=None, environ=None):
         seams.make_root(paths["oxide"])
         seams.make_root(paths["barge"])
 
+        # The Barge archive is validated against the reviewed custody source
+        # before either staging build, so no write to a staged tree precedes it.
+        reached["phase"] = "barge-source"
+        barge_prepared = prepare_barge(seams, binding, paths)
+
         reached["phase"] = "staging"
         oxide_staged = stage_oxide(seams, binding, paths, reached["stage_artifacts"])
         verify_toolchain_unchanged(binding, seams)
-        barge_staged = stage_barge(seams, binding, paths, reached["stage_artifacts"])
+        barge_staged = stage_barge(seams, binding, paths, reached["stage_artifacts"],
+                                   barge_prepared)
         verify_toolchain_unchanged(binding, seams)
         envelope["oxide"]["stage"] = oxide_staged
         envelope["barge"]["stage"] = barge_staged
@@ -1410,11 +1492,8 @@ def observe(options, seams=None, environ=None):
             gaps.append("the Barge window did not finish in its bound; its partial "
                         "captured output is kept and its closure is unknown")
             raise UnknownOutcome("the Barge window did not finish in its bound")
-        if barge["retention_refused"]:
-            gaps.append(
-                "Barge reported a retained transcript that is not a safe regular file "
-                "inside this run's own root; it was not read and no fate is recorded "
-                "for that side")
+        reached["phase"] = "barge-custody"
+        require_barge_custody_record(barge)
 
         reached["phase"] = "parse"
         if oxide["observation"] is not None:
@@ -1433,29 +1512,18 @@ def observe(options, seams=None, environ=None):
             elif oxide_parse["report"]["document"] is None:
                 gaps.append("the Oxide parse report is unparsable and was not repaired")
 
-        if not barge["fixture_kept"]:
-            gaps.append(
-                "Barge did not keep its fixture directory inside this run's own root, "
-                "so an uncertain writer or descendant could not be kept; the reviewed "
-                "Barge custody revision is required before this side can be observed")
-        if barge["retained"]:
-            barge_root = paths["barge_run"]
-            reached["barge_parse"] = parse_capture(
-                seams, oxide_staged, root=barge_root, transcript=barge["retained"],
-                manifest=barge["manifest"],
-                report=os.path.join(barge_root, "parse.json"))
-            barge_parse = reached["barge_parse"]
-            if barge_parse is not None and barge_parse["report"] is not None \
-                    and barge_parse["report"]["document"] is None:
-                gaps.append("the Barge parse report is unparsable and was not repaired")
-            if barge["manifest"] is None:
-                gaps.append(
-                    "Barge retained no manifest document, so no strict or limited "
-                    "verdict applies to that side; the reviewed custody revision "
-                    "writes the manifest bytes `embedded_exercise` already holds "
-                    "inside the kept fixture")
-        elif not barge["retention_refused"]:
-            gaps.append("Barge reported no retained transcript; its side has no fate")
+        barge_root = paths["barge_run"]
+        reached["barge_parse"] = parse_capture(
+            seams, oxide_staged, root=barge_root, transcript=barge["retained"],
+            manifest=barge["manifest"],
+            report=os.path.join(barge_root, "parse.json"))
+        barge_parse = reached["barge_parse"]
+        if barge_parse is None or barge_parse["report"] is None:
+            raise Obstruction(
+                "the canonical parse pass wrote no report for the Barge side; its kept "
+                "transcript has no parser verdict")
+        if barge_parse["report"]["document"] is None:
+            gaps.append("the Barge parse report is unparsable and was not repaired")
 
     except Obstruction as error:
         finish({"state": "refused", "phase": reached["phase"], "reason": str(error)},
@@ -1610,35 +1678,70 @@ def plan_document():
                            "and retained-evidence bytes in its report, so a later bound "
                            "revision can replace the allowance with a measurement",
         },
-        "barge_impediment": {
-            "state": "owner-gated: the ONE occurrence refuses before any engine",
-            "pinned_commit": "3dbee28e015fb20bfd465c52258d2a6067dea483",
-            "why": "crates/barge/src/testkit.rs TempDir::Drop removes the fixture, "
-                   "there is no keep/into_path, and embedded_exercise performs "
-                   "fallible construction, the engine run, transcript retention and "
-                   "reads before it returns, so an error or panic on any of those "
-                   "paths drops the fixture before the guard's post-leader census; the "
-                   "route also retains no manifest",
+        "barge_custody": {
+            "state": "source-bound at the reviewed revision; the one occurrence is not "
+                     "activated and no engine, fixture or staging build has run",
+            "reviewed": {
+                "linked_task": BARGE_CUSTODY_REVIEWED["linked_task"],
+                "review_run": BARGE_CUSTODY_REVIEWED["review_run"],
+                "revision": BARGE_CUSTODY_REVIEWED["revision"],
+                "tree": BARGE_CUSTODY_REVIEWED["tree"],
+                "lock_sha256": BARGE_CUSTODY_REVIEWED["lock_sha256"],
+                "files": dict(BARGE_CUSTODY_REVIEWED["files"]),
+            },
+            "pinned_sibling_merge": "d9eac3b573fb5d431e29160844290093030bfc19 (PR #49 "
+                                    "merge; same tree as the reviewed revision, so tree "
+                                    "identity is the source-equivalence proof)",
             "required_custody_property": BARGE_CUSTODY_PROPERTY,
-            "smallest_linked_change": [
-                "crates/barge/src/testkit.rs: add `TempDir::keep()` that clears the "
-                "owned root, takes the path and forgets the destructor",
-                "crates/barge/src/tape_harness.rs embedded_exercise: take the fixture "
-                "out of TempDir ownership immediately after creation and before any "
-                "fallible step, so the guard and not the process owns removal; write "
-                "the manifest bytes it already holds as `manifest.json` inside it "
-                "before the run; print `barge.tape.exercise/1: kept fixture <path>` in "
-                "the same bounded form as the retained-transcript line",
+            "opt_in": {"env": BARGE_CUSTODY_OPT_IN_ENV,
+                       "value": BARGE_CUSTODY_OPT_IN_VALUE,
+                       "root_env": BARGE_SCRATCH_ROOT_ENV,
+                       "set_by": "run_barge, for the Barge child only; never inherited"},
+            "child_environment": "the scrub drops every inherited BARGE_ key; the child "
+                                 "receives only the opt-in and this run's own root; argv "
+                                 "is the bound executable with no arguments",
+            "source_gate": "require_reviewed_custody refuses while no reviewed revision "
+                           "is bound in this source; verify_barge_custody then checks the "
+                           "bound custody revision, the bound tree against the reviewed "
+                           "tree, the property name, the archived lock and each lifetime "
+                           "file against the reviewed digests, all before any staging",
+            "implemented_at": "Barge 05b4b52 (merged d9eac3b): TempDir::keep, the "
+                              "opt-in-gated retained branch of embedded_exercise, the "
+                              "kept-fixture line, manifest-before-run",
+            "barge_side_failures": "a missing, duplicate or unsafe custody line, a missing "
+                                   "or unsafe manifest, a missing Barge parse report, a "
+                                   "nonzero or signalled exit, a truncated output, an unsafe "
+                                   "transcript path and a timed-out window are apparatus "
+                                   "obstructions (retained, unqualified, nonzero), never "
+                                   "fates. The Oxide side keeps its recorded-observation "
+                                   "semantics for its own report and exit",
+            "readiness_fields_for_the_planner": {
+                "note": "issued only after this source is merged; none is pre-issued here "
+                        "and no field below is a valid input yet",
+                "oxide": "the merged head's commit, tree and Cargo.lock digest",
+                "barge": {"sibling": "the authenticated read-only sibling checkout",
+                          "commit": "d9eac3b573fb5d431e29160844290093030bfc19",
+                          "tree": BARGE_CUSTODY_REVIEWED["tree"],
+                          "lock_sha256": BARGE_CUSTODY_REVIEWED["lock_sha256"],
+                          "custody": {"linked_task": BARGE_CUSTODY_REVIEWED["linked_task"],
+                                      "reviewed_revision": BARGE_CUSTODY_REVIEWED["revision"],
+                                      "property": BARGE_CUSTODY_PROPERTY}},
+                "toolchain": "the bound rustc and cargo absolute paths and digests at 1.97.1",
+                "guard": "the fixed limits and the unchanged supervisor digest",
+                "volume": SELECTED_VOLUME_UUID,
+                "planner_reference": "the Queue reference that activates this one occurrence",
+            },
+            "residual_risks": [
+                "tree identity covers the reviewed source, but git archive is trusted to "
+                "honour the tree; the sibling carries no .gitattributes",
+                "the kept fixture stays in the monitored scratch until the guard's own "
+                "closed-run cleanup; retained evidence is the manifest and transcript, "
+                "not the fixture tree",
+                "the staging, seed and engine allowances are unmeasured; the diagnostic "
+                "records its own owned bytes",
             ],
-            "enforcement": "verify_barge_custody refuses while "
-                           "BARGE_CUSTODY_REVIEWED is None, which it is: a reviewed "
-                           "Barge revision with retained custody does not exist. The "
-                           "gate is a reviewed-revision binding, not a text search, "
-                           "because no byte pattern can prove a lifetime property. "
-                           "parse_binding requires barge.custody (linked task, exact "
-                           "reviewed revision, the required property name), and a "
-                           "reviewed Oxide change that sets BARGE_CUSTODY_REVIEWED also "
-                           "binds that revision and its two file digests",
+            "fit": "unmeasured: the 900 s / 1536 MiB envelope is unchanged and was not "
+                   "re-measured against the qualified supervisor",
         },
         "guard_topology": "the qualified supervisor's default owned-root layout: "
                           "<root>/scratch and <root>/evidence as siblings, evidence "
@@ -1720,7 +1823,8 @@ class FakeSeams(Seams):
         return self.script.get("stage_exit", 0)
 
     def run_captured(self, argv, **kwargs):
-        self.calls.append(("run_captured", list(argv)))
+        self.calls.append(("run_captured", list(argv),
+                           dict(kwargs.get("env") or {})))
         if "--observe-base" in argv:
             label = "oxide"
         elif "--parse-capture" in argv:
@@ -1965,6 +2069,7 @@ def scripted_occurrence(binding, facts, *, barge_stderr, stage_exit=0,
             "cargo": "8" * 64,
             "testkit.rs": "a" * 64,
             "tape_harness.rs": "b" * 64,
+            "tape_eval.rs": "c" * 64,
             "bounded-test.py": SUPERVISOR_SHA256,
         },
         "volume": facts["volume"],
@@ -1983,7 +2088,10 @@ def scripted_occurrence(binding, facts, *, barge_stderr, stage_exit=0,
                     os.path.join(barge_source, "crates", "barge", "src",
                                  "testkit.rs"),
                     os.path.join(barge_source, "crates", "barge", "src",
-                                 "tape_harness.rs")} | set(extra_isfiles),
+                                 "tape_harness.rs"),
+                    os.path.join(barge_source, "crates", "barge", "tests",
+                                 "tape_eval.rs"),
+                    os.path.join(barge_source, "Cargo.lock")} | set(extra_isfiles),
         "texts": {
             "oxide/stage/stage.json": artifact("tape_prune_eval", oxide_executable),
             "barge/stage/stage.json": artifact("tape_eval", barge_executable),
@@ -2035,11 +2143,13 @@ def self_test():
           and sum(plan_doc["bounds"]["allocation_seconds"].values()) <= LIMIT_SECONDS
           and plan_doc["bounds"]["task_owned_measurements"]
           and plan_doc["bounds"]["uncertainty"])
-    check("the plan records the Barge custody impediment",
-          plan_doc["barge_impediment"]["state"].startswith("owner-gated")
-          and len(plan_doc["barge_impediment"]["smallest_linked_change"]) == 2
-          and plan_doc["barge_impediment"]["required_custody_property"]
+    check("the plan records the source-bound Barge custody readiness",
+          plan_doc["barge_custody"]["state"].startswith("source-bound")
+          and plan_doc["barge_custody"]["reviewed"]["revision"]
+          == BARGE_CUSTODY_REVIEWED["revision"]
+          and plan_doc["barge_custody"]["required_custody_property"]
           == BARGE_CUSTODY_PROPERTY
+          and plan_doc["barge_custody"]["opt_in"]["value"] == BARGE_CUSTODY_OPT_IN_VALUE
           and "not this script" in plan_doc["failure_retention"])
     check("the plan records the guard topology and the toolchain binding",
           "scratch" in plan_doc["guard_topology"]
@@ -2287,62 +2397,195 @@ def self_test():
           spent["written"] is not None
           and spent["written"]["outcome"]["state"] == "refused"
           and spent["written"]["outcome"]["phase"] == "source")
-    # 11. The shipped gate refuses: no reviewed Barge custody revision exists.
+    # 11. The source gate binds the reviewed Barge custody revision. The shipped
+    #     constant is the Barge049 review at 05b4b52 (tree 68f96990, run 1808bf0e);
+    #     the fixture binding is not that source and refuses before any staging.
     barge_source = paths["barge_source"]
+    check("the source binds the reviewed Barge custody revision and tree",
+          BARGE_CUSTODY_REVIEWED["revision"] == "05b4b5290852a0c9c697005794f1fda78f1b4420"
+          and BARGE_CUSTODY_REVIEWED["tree"] == "68f96990d6e190852fe61e298d76b6aebdb31076"
+          and BARGE_CUSTODY_REVIEWED["review_run"] == "1808bf0e-51ed-4b45-8470-f29222b40086"
+          and set(BARGE_CUSTODY_FILES) == set(BARGE_CUSTODY_REVIEWED["files"]))
     shipped = FakeSeams(scripted_occurrence(binding, facts, barge_stderr=""))
-    check("the shipped custody gate is closed",
-          globals()["BARGE_CUSTODY_REVIEWED"] is None)
-    refuses("the shipped route refuses with the custody impediment",
+    refuses("the fixture binding is refused by the shipped reviewed source",
             lambda: verify_barge_custody(binding, barge_source, shipped),
-            "owner-gated impediment")
-    shipped_run = scripted_occurrence(binding, facts, barge_stderr="")
-    fake = FakeSeams(shipped_run)
-    refuses("the shipped route refuses before any staging write",
-            lambda: observe({"binding": "/binding.json",
-                             "sha256": sha256_bytes(binding_bytes)}, fake,
-                            FIXTURE_ENV),
-            "owner-gated impediment")
-    check("no staging, run root or engine ran on the shipped route",
-          not any(call[0] in ("run_logged", "run_captured", "make_dirs")
-                  for call in fake.calls)
-          and [call[1] for call in fake.calls if call[0] == "make_root"]
-          == [paths["evidence_retained"]])
-    check("the shipped refusal still writes a bounded report",
-          shipped_run["written"] is not None
-          and shipped_run["written"]["outcome"]["state"] == "refused"
-          and shipped_run["written"]["outcome"]["phase"] == "source")
-
+            "not the reviewed revision")
+    closed_fake = FakeSeams(scripted_occurrence(binding, facts, barge_stderr=""))
     original_custody = globals()["BARGE_CUSTODY_REVIEWED"]
-
-    def enable_custody():
-        globals()["BARGE_CUSTODY_REVIEWED"] = (
-            facts["barge"]["commit"],
-            {"testkit": "a" * 64, "tape_harness": "b" * 64})
-
-    def disable_custody():
-        globals()["BARGE_CUSTODY_REVIEWED"] = original_custody
-
-    enable_custody()
+    globals()["BARGE_CUSTODY_REVIEWED"] = None
     try:
-        # 12. Once a reviewed revision is bound, the exact revision and file
-        #     digests are still checked; no text pattern is consulted.
-        check("a bound reviewed custody revision is accepted",
-              verify_barge_custody(binding, barge_source, shipped)
+        refuses("a closed source gate refuses with the owner-gated impediment",
+                lambda: observe({"binding": "/binding.json",
+                                 "sha256": sha256_bytes(binding_bytes)}, closed_fake,
+                                FIXTURE_ENV),
+                "owner-gated impediment")
+    finally:
+        globals()["BARGE_CUSTODY_REVIEWED"] = original_custody
+    check("a closed gate runs no staging, archive or engine",
+          not any(call[0] in ("run_logged", "run_captured") for call in closed_fake.calls)
+          and not any(call[0] == "make_root" and call[1] == paths["run_root"]
+                      for call in closed_fake.calls))
+
+    # The fixture reviewed revision is the fixture binding's own revision, tree
+    # and lock, so every refusal below is caused by the one value it varies.
+    fixture_reviewed = {
+        "linked_task": "barge-custody-fixture",
+        "review_run": "fixture-review",
+        "revision": facts["barge"]["commit"],
+        "tree": facts["barge"]["tree"],
+        "lock_sha256": facts["barge"]["lock_sha256"],
+        "files": {"testkit": "a" * 64, "tape_harness": "b" * 64, "tape_eval": "c" * 64},
+    }
+
+    def custody_seams(*, digests=None, drop=()):
+        script = scripted_occurrence(binding, facts, barge_stderr="")
+        script["digests"].update(digests or {})
+        script["isfiles"] = set(script["isfiles"]) - set(drop)
+        return FakeSeams(script)
+
+    globals()["BARGE_CUSTODY_REVIEWED"] = fixture_reviewed
+    try:
+        # 12. An exact reviewed revision, tree, lock and file set is accepted; a
+        #     different commit with the reviewed tree is accepted by tree identity.
+        check("an exact reviewed revision, tree, lock and file set is accepted",
+              verify_barge_custody(binding, barge_source, custody_seams())
               ["reviewed_revision"] == facts["barge"]["commit"])
-        bad_digest = FakeSeams({
-            "isfiles": set(shipped.script["isfiles"]),
-            "digests": {"testkit.rs": "c" * 64, "tape_harness.rs": "b" * 64},
-        })
-        refuses("an archived file outside the reviewed digests refuses",
-                lambda: verify_barge_custody(binding, barge_source, bad_digest),
-                "not the reviewed custody revision")
-        other_revision = fixture_binding(facts, custody={
-            "linked_task": "barge-custody-fixture",
-            "reviewed_revision": "9" * 40,
-            "property": BARGE_CUSTODY_PROPERTY})
-        refuses("a binding whose revision is not the reviewed one refuses",
-                lambda: verify_barge_custody(other_revision, barge_source, shipped),
-                "not the reviewed custody revision")
+        merged = fixture_binding(facts)
+        merged["barge"]["commit"] = "7" * 40
+        check("a merge with the reviewed tree is the same source by tree identity",
+              verify_barge_custody(merged, barge_source, custody_seams())
+              ["reviewed_tree"] == facts["barge"]["tree"])
+        for name, candidate, seams, needle in (
+            ("a binding naming another custody revision",
+             fixture_binding(facts, custody={
+                 "linked_task": "barge-custody-fixture", "reviewed_revision": "9" * 40,
+                 "property": BARGE_CUSTODY_PROPERTY}),
+             custody_seams(), "not the reviewed revision"),
+            ("a binding whose tree is not the reviewed tree",
+             fixture_binding(facts), None, "not the reviewed custody tree"),
+            ("a binding with another custody property",
+             fixture_binding(facts, custody={
+                 "linked_task": "barge-custody-fixture",
+                 "reviewed_revision": facts["barge"]["commit"],
+                 "property": "anything"}),
+             custody_seams(), "required custody property"),
+            ("an archived lock that is not the reviewed lock",
+             binding, custody_seams(digests={"barge/source/Cargo.lock": "0" * 64}),
+             "not the reviewed custody lock"),
+            ("an archived lifetime file outside the reviewed digests",
+             binding, custody_seams(digests={"testkit.rs": "d" * 64}),
+             "not the reviewed custody revision"),
+            ("an archived entry point that is missing",
+             binding, custody_seams(drop={os.path.join(barge_source, "crates", "barge",
+                                                       "tests", "tape_eval.rs")}),
+             "has no crates"),
+        ):
+            if name == "a binding whose tree is not the reviewed tree":
+                candidate["barge"]["tree"] = "8" * 40
+                seams = custody_seams()
+            refuses(name, lambda candidate=candidate, seams=seams: verify_barge_custody(
+                candidate, barge_source, seams), needle)
+
+        # The observe path: a wrong bound value refuses before any staging write.
+        bad_tree = fixture_binding(facts)
+        bad_tree["barge"]["tree"] = "8" * 40
+        bad_tree_bytes = json.dumps(bad_tree).encode()
+        bad_tree_fake = FakeSeams(scripted_occurrence(bad_tree, facts, barge_stderr=""))
+        bad_tree_fake.script["files"]["/binding.json"] = bad_tree_bytes
+        bad_tree_fake.script["queries"][f"git -C /siblings/barge rev-parse HEAD^{{tree}}"] \
+            = {"code": 0, "stdout": "8" * 40, "stderr": ""}
+        refuses("a wrong bound tree refuses the observation before any staging",
+                lambda: observe({"binding": "/binding.json",
+                                 "sha256": sha256_bytes(bad_tree_bytes)}, bad_tree_fake,
+                                FIXTURE_ENV),
+                "not the reviewed custody tree")
+        check("a refused tree runs no staging or engine",
+              not any(call[0] in ("run_logged", "run_captured")
+                      for call in bad_tree_fake.calls))
+
+        # 12b. The Barge child gets exactly the opt-in and this run's own root, and
+        #      no other Barge variable survives the scrub. Its argv is the bound
+        #      executable alone: no fixture root or export-gated argument.
+        kept_path = os.path.join(paths["barge_run"], "barge-test-x")
+        kept_manifest_path = os.path.join(kept_path, "manifest.json")
+        retained_line = ("barge.tape.exercise/1: retained "
+                         + os.path.join(paths["barge_run"], "barge-test-x.transcript.json"))
+        kept_line = "barge.tape.exercise/1: kept fixture " + kept_path
+        ok_stderr = BOUNDED_REFUSAL_MARKER + ": x\n" + retained_line + "\n" + kept_line + "\n"
+
+        def barge_case(stderr, *, code=0, truncated=False, manifest=True):
+            script = scripted_occurrence(binding, facts, barge_stderr=stderr)
+            script["barge"]["code"] = code
+            script["barge"]["stderr_truncated"] = truncated
+            if not manifest:
+                script["missing"] = {kept_manifest_path}
+            return script
+
+        env_fake = FakeSeams(barge_case(ok_stderr))
+        code = observe({"binding": "/binding.json",
+                        "sha256": sha256_bytes(binding_bytes)}, env_fake, FIXTURE_ENV)
+        barge_calls = [call for call in env_fake.calls if call[0] == "run_captured"
+                       and "--observe-base" not in call[1]
+                       and "--parse-capture" not in call[1]]
+        check("the Barge window runs once, with only the bound executable as argv",
+              code == 0 and len(barge_calls) == 1
+              and barge_calls[0][1] == [os.path.join(paths["barge"], "stage", "target",
+                                                     "debug", "deps", "tape_eval-1")])
+        barge_env = barge_calls[0][2] if barge_calls else {}
+        check("the Barge child receives the exact opt-in and its own run root",
+              barge_env.get(BARGE_CUSTODY_OPT_IN_ENV) == BARGE_CUSTODY_OPT_IN_VALUE
+              and barge_env.get(BARGE_SCRATCH_ROOT_ENV) == paths["barge_run"])
+        check("no other Barge variable reaches the child",
+              sorted(name for name in barge_env if name.startswith("BARGE_"))
+              == sorted([BARGE_CUSTODY_OPT_IN_ENV, BARGE_SCRATCH_ROOT_ENV]))
+        check("the scrub drops an inherited Barge opt-in and root",
+              scrubbed({"BARGE_TAPE_CUSTODY": "barge.tape.kept-fixture/1",
+                        "BARGE_TEST_SCRATCH_ROOT": "/elsewhere", "PATH": "/p"})
+              == {"PATH": "/p"})
+
+        # 12c. Every missing, duplicate, partial or unsafe Barge custody fact is an
+        #      apparatus obstruction: nothing is fated, the evidence is retained and
+        #      the report is bounded, unqualified and written before the refusal.
+        barge_refusals = (
+            ("a duplicate kept-fixture line",
+             barge_case(kept_line + "\n" + kept_line + "\n" + retained_line + "\n"),
+             "kept-fixture lines"),
+            ("a missing kept-fixture line",
+             barge_case(BOUNDED_REFUSAL_MARKER + ": x\n" + retained_line + "\n"),
+             "kept-fixture lines"),
+            ("a nonzero Barge exit",
+             barge_case(ok_stderr, code=1), "exited 1"),
+            ("a publication failure before any transcript",
+             barge_case(kept_line + "\n", code=1), "exited 1"),
+            ("a missing manifest inside the kept fixture",
+             barge_case(ok_stderr, manifest=False), "no safe manifest.json"),
+            ("an output that exceeded its capture bound",
+             barge_case(ok_stderr, truncated=True), "capture bound"),
+            ("a kept fixture outside this run's root",
+             barge_case(BOUNDED_REFUSAL_MARKER + ": x\n" + retained_line + "\n"
+                        + "barge.tape.exercise/1: kept fixture /elsewhere/barge-test-x\n"),
+             "not a safe directory"),
+        )
+        parse_missing = barge_case(ok_stderr)
+        parse_missing["missing"] = {os.path.join(paths["barge_run"], "parse.json")}
+        barge_refusals += (
+            ("a missing Barge parse report",
+             parse_missing, "no report for the Barge side"),
+        )
+        for name, script, needle in barge_refusals:
+            fake = FakeSeams(script)
+            refuses(f"a Barge window with {name} is an obstruction",
+                    lambda fake=fake: observe({"binding": "/binding.json",
+                                               "sha256": sha256_bytes(binding_bytes)},
+                                              fake, FIXTURE_ENV),
+                    needle)
+            written = script["written"]
+            check(f"a Barge window with {name} writes a bounded refused report",
+                  written is not None and written["qualified"] is False
+                  and written["outcome"]["state"] == "refused"
+                  and written["outcome"]["phase"] == ("parse" if "parse report" in name
+                                                      else "barge-custody")
+                  and ("make_root", paths["evidence_retained"]) in fake.calls)
 
         # 13. A complete scripted occurrence: bound tools, retained raw
         #     evidence, one unqualified report, at most one window per engine.
@@ -2457,7 +2700,7 @@ def self_test():
               and failure["closure"]["guard_receipt"]["closure"]
               == "not-read-by-this-script")
 
-        parse_script = scripted_occurrence(binding, facts, barge_stderr="")
+        parse_script = scripted_occurrence(binding, facts, barge_stderr=ok_stderr)
         parse_script["raise_on"] = "parse"
         fake = FakeSeams(parse_script)
         try:
@@ -2472,7 +2715,7 @@ def self_test():
               and entries["oxide.transcript"]["retained"] is True
               and entries["oxide.executable"]["retained"] is True)
 
-        staged_bad = scripted_occurrence(binding, facts, barge_stderr="")
+        staged_bad = scripted_occurrence(binding, facts, barge_stderr=ok_stderr)
         staged_bad["stage_exit"] = 101
         fake = FakeSeams(staged_bad)
         refuses("a failing staging build refuses",
@@ -2483,15 +2726,18 @@ def self_test():
         check("a failing staging build ran no engine",
               not any(call[0] == "run_captured" for call in fake.calls))
 
-        stage_script = scripted_occurrence(binding, facts, barge_stderr="")
+        stage_script = scripted_occurrence(binding, facts, barge_stderr=ok_stderr)
         stage_script["stage_exit"] = 101
+        # The archive that prepare_barge validates stays present: the failure is
+        # the staging build's, not the source's.
         stage_script["missing"] = set(stage_script["isfiles"]) - {
             os.path.join(paths["oxide"], "stage", "stage.json"),
             os.path.join(paths["oxide"], "stage", "stage.stderr"),
             os.path.join(paths["barge"], "stage", "stage.json"),
             os.path.join(paths["barge"], "stage", "stage.stderr"),
             "/rust/rustc", "/rust/cargo",
-        }
+        } - {path for path in stage_script["isfiles"]
+             if path.startswith(paths["barge_source"])}
         fake = FakeSeams(stage_script)
         try:
             observe({"binding": "/binding.json",
@@ -2528,28 +2774,34 @@ def self_test():
                                              "manifest.json")] = {
             "regular": True, "dir": False, "symlink": True}
         fake = FakeSeams(symlink_script)
-        observe({"binding": "/binding.json", "sha256": sha256_bytes(binding_bytes)},
-                fake, FIXTURE_ENV)
+        refuses("a symlinked Barge manifest is an obstruction, not read",
+                lambda: observe({"binding": "/binding.json",
+                                 "sha256": sha256_bytes(binding_bytes)}, fake,
+                                FIXTURE_ENV),
+                "no safe manifest.json")
         written = symlink_script["written"]
         entries = {entry["label"]: entry for entry in written["retained"]["entries"]}
         check("a symlinked Barge manifest is refused, not read",
-              written["windows"]["barge"]["fixture_custody"]["manifest"] is None
-              and entries["barge.manifest"]["retained"] is False
-              and any("not a safe artifact" in gap for gap in written["gaps"]))
+              written["outcome"]["state"] == "refused"
+              and written["windows"]["barge"]["fixture_custody"]["manifest"] is None
+              and entries["barge.manifest"]["retained"] is False)
         outside_script = scripted_occurrence(
             binding, facts,
             barge_stderr="barge.tape.exercise/1: retained /elsewhere/x.json\n"
                          "barge.tape.exercise/1: kept fixture "
                          + os.path.join(paths["barge_run"], "barge-test-x") + "\n")
         fake = FakeSeams(outside_script)
-        observe({"binding": "/binding.json", "sha256": sha256_bytes(binding_bytes)},
-                fake, FIXTURE_ENV)
+        refuses("an outside retained transcript is an obstruction, not read",
+                lambda: observe({"binding": "/binding.json",
+                                 "sha256": sha256_bytes(binding_bytes)}, fake,
+                                FIXTURE_ENV),
+                "not a safe regular file")
         written = outside_script["written"]
         entries = {entry["label"]: entry for entry in written["retained"]["entries"]}
         check("an outside retained transcript is refused, not read",
               written["windows"]["barge"]["retained_transcript"]["retention_refused"]
               is True
-              and written["fates"]["barge"]["state"] == "absent"
+              and written["outcome"]["state"] == "refused"
               and entries["barge.transcript"]["retained"] is False)
 
         # 17. An unwritable report is an apparatus failure, never a success.
@@ -2578,7 +2830,7 @@ def self_test():
                 lambda: verify_toolchain_unchanged(binding, changed_tools),
                 "changed while this occurrence was running")
     finally:
-        disable_custody()
+        globals()["BARGE_CUSTODY_REVIEWED"] = original_custody
 
     failures = [(name, detail) for name, passed, detail in checks if not passed]
     for name, passed, detail in checks:

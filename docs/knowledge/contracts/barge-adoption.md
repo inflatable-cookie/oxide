@@ -2542,7 +2542,7 @@ policy-only document is labelled as such, and no control claims a native run.
 
 ## Observation-only embedded control diagnostic (oxide#289)
 
-**Status: prepared and pure-validated; not executed.** Tom's operator decision
+**Status: source-bound (oxide#290) and pure-validated; not executed.** Tom's operator decision
 `90b7bbeb` v2 selected "Prepare one observation-only control diagnostic" and
 the scoped Queue brief activates source and readiness preparation plus pure
 covering only. No real engine, fixture, staging build, image or diagnostic ran,
@@ -2601,47 +2601,51 @@ apparatus diagnostic, a truncation flag, a nonzero or signalled engine exit and
 an unparsable retained document as recorded observations; an absent fate is
 `absent`, never empty.
 
-**Barge custody is an owner-gated impediment, and the gate is a reviewed
-revision, not a text search.** The pinned no-argument route is unsafe for this
-observation: `crates/barge/src/testkit.rs` `TempDir`'s destructor calls
-`remove_dir_all`, there is no `keep`/`into_path`, and
-`tape_harness::embedded_exercise` performs fallible construction, the engine
-run, transcript retention and reads **before** it returns, so an error or panic
-on any of those paths drops the fixture before the process exits and before the
-supervisor's post-leader census. An uncertain writer or descendant would have
-its fixture deleted, which the brief forbids, and the route also retains no
-manifest.
+**Barge custody is source-bound (oxide#290).** The oxide#289 impediment is
+closed at source. Barge049 (`cefb5d3e`, Barge PR #49) added `TempDir::keep`, an
+opt-in retained branch of `embedded_exercise`, the bounded kept-fixture line and
+the manifest-before-run order. Its independent review (run `1808bf0e`) returned
+`ready_to_merge` at `05b4b52`, tree `68f96990`. The merge `d9eac3b`, the pinned
+sibling head, carries the same tree, so tree identity is the source-equivalence
+proof. The review's follow-ups do not gate the lifetime: a publication failure
+returns the bare error, a composition control is missing, and a panic in
+directory creation exits 101 with no line. Each leaves no custody record, which
+the driver treats as an obstruction.
 
-The required custody property is therefore **from creation through every error
-path**: the fixture directory must leave `TempDir` ownership immediately after
-creation and before any fallible step, so the guard and not the process owns
-removal; the manifest must be written inside it before the run; and the kept
-path must be printed in a bounded line. The exact smallest linked Barge change
-is two statements plus one method, with no schema, argv, target,
-fixture-builder or `release::plan` change:
+The gate is `BARGE_CUSTODY_REVIEWED`, a constant in this source: the reviewed
+revision `05b4b52`, tree `68f96990`, `Cargo.lock` digest `4cb40dd5…`, and the
+digests of `testkit.rs` (`396d0eb9…`), `tape_harness.rs` (`83f51163…`) and the
+`tests/tape_eval.rs` entry point (`c1ed42f8…`). `verify_barge_custody` requires
+the binding's custody revision and tree to be the reviewed ones (the commit may
+differ, because tree identity covers every byte), the exact property name, and
+the archived lock and file digests. All of it runs before any staging write.
+No binding, environment value or marker opens the gate.
 
-1. `crates/barge/src/testkit.rs`: add `TempDir::keep()` that clears the owned
-   root, takes the path and forgets the destructor.
-2. `crates/barge/src/tape_harness.rs` `embedded_exercise`: take the fixture out
-   of `TempDir` ownership immediately after creation and before any fallible
-   step, write the manifest bytes it already holds as `manifest.json` inside it
-   before the run, and print `barge.tape.exercise/1: kept fixture <path>`.
+The child contract is the opt-in and nothing else. `run_barge` sets
+`BARGE_TAPE_CUSTODY=barge.tape.kept-fixture/1` and `BARGE_TEST_SCRATCH_ROOT` to
+its own run root; `scrubbed` drops every inherited `BARGE_` key; argv is the
+bound executable with no arguments. The lifetime property holds only under that
+opt-in. Without it the route is the ordinary self-removing one, and nothing in
+this driver claims otherwise.
 
-No byte pattern can prove a lifetime property, so this route does not pretend
-one can: the activation gate is `BARGE_CUSTODY_REVIEWED`, a reviewed Barge
-revision plus its two exact file digests, which is **None** today and is set
-only by a reviewed Oxide change that binds the reviewed Barge revision.
-`parse_binding` requires the `barge.custody` block (linked task, exact reviewed
-revision, the fixed property name), `require_reviewed_custody` refuses before
-any staging write or engine window while the gate is closed, and
-`verify_barge_custody` then re-checks the archived commit and both file digests
-against the reviewed values. Nothing in a binding can satisfy it.
-**Readiness verdict: not ready for planner activation.** The owner-gated
-impediment is that linked Barge custody change and its source review; once it
-lands, the reviewed Oxide change binds its revision and digests and the same
-command runs unchanged. A run whose kept fixture or manifest is absent or is not
-a safe artifact afterwards is recorded as a gap with no fate, never as an empty
-one. No Barge write, dependency, pin or API change happens here.
+Barge-side custody failures are apparatus obstructions: retained, unqualified,
+nonzero and never a fate. They cover a missing, duplicate or unsafe
+kept-fixture line; a missing or unsafe `manifest.json`; a missing Barge parse
+report; a nonzero or signalled exit, which includes a publication failure; an output past its capture bound; an
+unsafe transcript path; and a timed-out window, which stays unknown. Oxide's
+own observation keeps its recorded-observation semantics.
+
+**Readiness verdict: source-bound, not activated.** This source is ready for
+planner activation once it merges. No binding, engine, fixture or staging build
+has run, and the merge carries no native or diagnostic credit. The planner issues
+the one binding after the Oxide head is final: that head's commit, tree and
+lock; the Barge sibling commit `d9eac3b…`, tree `68f96990…` and lock
+`4cb40dd5…`; the custody block (linked task `cefb5d3e…`, reviewed revision
+`05b4b52…`, the property name); the 1.97.1 `rustc` and `cargo` paths and
+digests; the Stash volume UUID; a planner reference; and the run-root and report
+names. No field is pre-issued here. The 900 s and 1536 MiB envelope is unchanged
+(the allocation sums to both bounds), and the qualified supervisor digest is
+still `fcfda2b0…`. Fit against that supervisor is unmeasured.
 
 **The one future command.** `effigy rust:tape-prune-observation` is
 `python3 scripts/bounded-test.py --limit 900 --scratch-budget-mib 1536 --
@@ -2751,12 +2755,12 @@ owner-only/canonical-root and escaping-report refusals, the missing manifest and
 missing transcript, a `/1` and an apparatus document, truncation, signalled and
 nonzero exits, and equal and unequal raw fates with no agreement, equivalence or
 divergence field. `effigy proof:tape-prune:observation-test` drives the real
-orchestration functions with scripted seams (115 controls: binding shape and
+orchestration functions with scripted seams (143 controls: binding shape and
 digest including the Barge custody block; source/toolchain/volume/worktree
 drift; derived paths; the real sibling guard topology with 0755 evidence
 accepted and 0777 or nested evidence refused; outside-root retention; engine
 classification; equal and unequal fates; gap overflow; refusal before any
-engine; the shipped custody gate refusing before any staging write; the bound
+engine; the source gate (exact reviewed revision, tree, lock and file digests, refused before any staging write); the Barge child environment and the custody-record obstructions, including a missing Barge parse report; the bound
 `cargo`/`RUSTC`/`PATH` staging invocation; at most one window per engine; one
 complete scripted occurrence with its retained evidence tree; an over-budget
 artifact omitted and named; a Barge timeout, parse failure and staging failure
@@ -2768,17 +2772,15 @@ read; and the reviewed revision and file digests still checked once the gate is
 open). Both are apparatus evidence and run no engine, compiler, fixture, image
 or observer campaign.
 
-**Covering validation for this preparation.** `effigy rust:compile`,
-`effigy rust:compile-release`, `effigy rust:format`, `effigy rust:capture-wire`,
-`effigy docs:check`, `effigy proof:tape-prune:observation-test` and
-`effigy proof:tape-prune:observation-plan`. No native, diagnostic, staged
-build or embedded engine run is part of this merge, and the ONE uncounted
-observation-only occurrence stays separately planner-activated at a reviewed
-exact head — and, per the readiness verdict above, only after the linked Barge
-retention change lands. The Rust bytes are unchanged by the review correction,
-so their recorded runs stay bound to them; the Python apparatus, its 96 scripted
-controls, the plan document, this contract and `AGENTS.md` are the changed
-inputs.
+**Covering validation for oxide#290 (source binding).** No Rust bytes change, so
+the Rust selectors are not repeated. The covering checks are
+`effigy proof:tape-prune:observation-test` (143 controls, pure),
+`effigy proof:tape-prune:observation-plan` (effect-free) and `effigy docs:check`.
+No native, diagnostic, staged build or embedded engine run is part of this
+change. The one uncounted observation-only occurrence stays separately
+planner-activated at the final exact head, on the binding described above. The
+changed inputs are the Python apparatus, its scripted controls, the plan
+document, this contract and `AGENTS.md`.
 
 **Unchanged.** `/2` wire, parser acceptance, caps, `K1_PREMISE_QUALIFIED`, the
 two reviewed exclusions, `assess_completeness`, the limited and comparison
