@@ -1849,9 +1849,13 @@ pass; **documented** = stated in a cited contract and not re-verified here;
   `oxide-capture-parent-identity.md` names its own source as `b613506`, an
   ancestor of `f9f81f72`; its line numbers drift by about two lines at
   `f9f81f72` (for example `census::read_registry` is at 347, not 349). Barge
-  `crates/` differs from the O1 pin `4af9360b` by test-only additions across
-  100 files. The production-unchanged claim is Barge's own statement audit
-  (`o2-tape.md`), relied on here and not repeated.
+  `crates/` differs from the O1 pin `4af9360b` across 100 files (15,158
+  insertions, 6 deletions). The six deletions are non-test lines re-expressed
+  under `cfg(not(test))`/`cfg(test)` splits, plus five comment-only SAFETY
+  repairs. Barge's `o2-tape.md` "Production statement audit" records these and
+  claims behaviour is preserved by review; that claim, and the separate
+  `scripts/native/release-proof.py` change, are relied on here and not
+  re-audited. Non-test code is therefore not byte-identical to the pin.
 - Barge `o2-tape.md`: real-host cap measurement and the `/2` emitter. Barge
   `crates/barge/src/tape.rs` `wire_reads` (about 841–890) renumbers
   occurrences per emitted key and stops at 64.
@@ -1888,7 +1892,7 @@ equivalence of the inputs both engines read.
 | Engine-side in-window binding | `tape.rs` records `extra or unbound observation` at 541 from the manifest bind check (file, component and volume rules). `assess_completeness` does not apply it (observed). | The L2 verdict treats that note as blocking. The check stays test-only and its shape unchanged. A verdict-policy requirement on the reconciler; no wire change. | L1 and L2 without it. |
 | Window origin and clocks | `/2` window origin and end are required null; a number is refused. `assess_completeness` always reports `window origin and end unproven`, so no `/2` transcript can be complete. Unobserved clocks are null and an issue. The manifest's `start_monotonic_ns` and `end_monotonic_ns` have no transcript counterpart. | The L2 verdict names this one issue as a declared limit. It still blocks on any unobserved clock a decision reads. A later origin proof needs its own wire design and is not assumed here. | L3 for every case. Any cross-engine ordering or absolute-time claim. |
 | Completed versus attempted or partial effects | `completed_effect` = not attempted, `succeeded`, pathed (observed). The recorder reports any error as `partial`. Descriptor-only effects are unpathed. Fixture-diff rows are `unknown` at epoch 0. Oxide's pool-lock `O_CREAT` open is an uncertain attempt. | Effect expectations are completed effects only. EFFECT-1 claims refusal with no completed effect. EFFECT-2 claims a fence save only where completed. Attempts and partials are named non-parity. | L2 for EFFECT-* and creation paths in WRT-*. |
-| Source-bound export and capture qualification | No export receipt or launcher block is authorised or has run. The stage artifact is not a `barge.tape.export/1` receipt (documented, Barge `o2-tape.md`). Tom's `c6e3e9c8` v2 covers capture-only Cargo selectors (compile, format, lint, recorder, harness), not launcher isolation or the export producer. | Every L2 run needs an independently supplied export-closure digest and receipt before its engine window. None is qualified. | Any counted L2 native before a separately activated export route. |
+| Source-bound export and capture qualification | No export receipt or launcher block is authorised or has run. The stage artifact is not a `barge.tape.export/1` receipt (documented, Barge `o2-tape.md`). Tom's `c6e3e9c8` v2 permits four capture-only Cargo selectors (`rust:compile:cargo`, `rust:compile-release:cargo`, `rust:format:cargo`, `rust:test-600:cargo`; AGENTS.md command map). They establish build and embedded-harness behaviour only. They do not establish private launcher isolation, global live-state invariance or current export production. | Every L2 run needs an independently supplied export-closure digest and receipt before its engine window. None is qualified. | Any counted L2 native before a separately activated export route. |
 
 #### What a bounded L2 comparison can and cannot say
 
@@ -1935,9 +1939,27 @@ It cannot establish, under unchanged production readers:
 #### Case-family disposition (D8 and CF inventory, no new matrix)
 
 Each family keeps every applicable CF realization. None is dropped to fit a
-case. CF-1 through CF-4 and CF-7 apply to every L2 family; CF-5 applies to
-WRT-* and VOL-REMOVED-DURING; CF-6 applies to EFFECT-*. "Strongest outcome"
-is the most a successful execution could state. No row is passed here.
+case. A CF applies only where its precondition exists in the family:
+
+- CF-4 (broken or exhausted tape): every family, as a pure reconciler check.
+- CF-1 (unbound extra folder): families with an enumerated set. References and
+  intents (`read_intents`), receipts (`read_receipts_with`), the fence and
+  declaration family (`area::read_declarations`). Not the control or registry
+  families, which read single files.
+- CF-3 (identical bytes, new inode): families with a root marker. Receipts and
+  markers, and identity and volume.
+- CF-7 (second reads under changed epochs): identity and volume (the marker
+  reread under the second root-id lock), and checkout absence (Oxide's
+  `revalidate_chain`).
+- CF-2 (writer between runs): families with holders or custody. Writers and
+  custody, admission effects, and VOL-REMOVED-DURING.
+- CF-5 (identity epoch change): writers and custody, and the DYNAMIC rows
+  ID-DEVICE-LIVE and VOL-REMOVED-DURING.
+- CF-6 (missing admission inputs): admission effects only.
+
+A family with no precondition for a CF names that CF as not applicable and
+why; it is not silently dropped. "Strongest outcome" is the most a successful
+execution could state. No row is passed here.
 
 | Family | Cases | Actual sites (Oxide / Barge) | Own observation | Missing binding or premise | Strongest outcome after execution |
 | --- | --- | --- | --- | --- | --- |
