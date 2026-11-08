@@ -2943,16 +2943,24 @@ output, each parser report and fate, and the original and copy digests, sizes an
 modes. `qualified` is false. Missing parser reports, expiry and parser refusals
 stay separate outcomes. Nothing is a comparison, a closure claim or a credit.
 
-**Pinned inputs and activation digest.** The digest is `f6b8e704…` at the plan's
-current text. Any change to a pin or the bounds changes it, and the planner must
-re-issue activation.
+**Pinned inputs and activation digest.** The digest is
+`f6bc2eca3c7849d2a246957747b8cbd68a23913949dfe247b7cb22bbfd7fe552` at the plan's
+current text. Any change to a pin, bound, premise or site changes it, and the
+planner must re-issue activation. The nine proof-authoring premises are in the
+plan and the report, each with its executable sites or a concrete not-applicable
+reason; the self-test checks that every cited site exists.
 
-**Validation at this head.** `proof:tape-prune:observation-test` (observation
-controls, now 226, including 13 new copy, refusal, drift, symlink, collision and
-expiry controls), `proof:tape-prune:parse-control:test` (51 controls, including
-real-file copy checks in one fresh directory that is removed), the two plan
-selectors, `proof:seed-readiness:test` and `plan` (which import the changed
-helper), and `docs:check`.
+**Validation at this head.** `proof:tape-prune:observation-test` (227 controls,
+including 14 new copy, refusal, drift, symlink, collision, expiry and host-leak
+controls), `proof:tape-prune:parse-control:test` (56 controls, including the
+nine-premise trace, the TMPDIR placement of its one host write, the host-leak
+check and real-file copy checks in one fresh directory that is removed),
+`proof:tape-prune:parse-control:plan`, `proof:seed-readiness:test` and `plan` (which
+import the changed helper), and `docs:check`. The self-tests' fake seams no longer
+create host directories: `engine_environment` and `staging_environment` are pure,
+and their callers create the directories through the seams. A leaked fixture tree
+at `/Volumes/Stash/scratch/oxide/guard-run` from earlier self-test runs held only
+empty directories and was removed.
 
 **Not activated.** The heavy `proof:tape-prune:parse-control` selector needs a
 planner activation, the reviewed head and the digest above. Its result is one

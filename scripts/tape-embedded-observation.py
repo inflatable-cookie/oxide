@@ -209,6 +209,59 @@ PARSE_COMPILED_DOCS = (
     "docs/knowledge/contracts/capture-examples/",
     "docs/knowledge/contracts/oxide-capture-manifest.v2.schema.json",
 )
+# The nine proof-authoring premises (docs/knowledge/contracts/workflow.md#proof-
+# authoring-premise-checklist), traced through the parse-only route. Each item has
+# the executable sites it was traced through, or the concrete reason it does not
+# apply. The self-test checks that every named site exists in this module.
+PARSE_CONTROL_PREMISES = (
+    ("private-home-and-rustup",
+     "not applicable as a toolchain premise: the control runs no Cargo, rustc or "
+     "rustup. The copied executable is invoked by absolute path with a fixed PATH. "
+     "The child's HOME is private (<workspace>/engine/home), created through "
+     "engine_directories.",
+     ("engine_environment", "engine_directories", "parse_capture")),
+    ("account-home-control",
+     "not applicable: the staged --parse-capture route (src/bin/oxide/tape_harness.rs "
+     "run_capture_parse) never calls validate_engine_environment, the only reader of "
+     "OXIDE_TEST_HOME_FROM_ENV. The control sets neither that variable nor any account "
+     "home control.",
+     ("parse_capture", "engine_environment")),
+    ("environment-isolation",
+     "applies: scrubbed removes every inherited OXIDE_, XDG_, CARGO_, SCCACHE_, RUSTC, "
+     "GIT_ and BARGE_ value before engine_environment sets HOME, TMPDIR, TMP, TEMP and "
+     "PATH. The guard's OXIDE_PROOF_* values never reach the parser child.",
+     ("scrubbed", "engine_environment")),
+    ("automatic-adoption",
+     "not applicable: the parser reads owner-private copies and writes only parse.json "
+     "in its own workspace. No pool, outputs root, receipt or adoption is reached.",
+     ("parse_side", "parse_capture")),
+    ("cargo-external-argv",
+     "not applicable: the executable is not an external Cargo subcommand. It is invoked "
+     "directly with the argv --parse-capture --root ... --transcript ... --report-out.",
+     ("parse_capture",)),
+    ("owned-images",
+     "not applicable: no image is attached or detached. The control writes only a 0700 "
+     "workspace inside the guard scratch and one evidence report.",
+     ("parse_control", "parse_side")),
+    ("compiler-flags",
+     "applies as a pin, not a build: the executable is pinned by size and SHA-256 and "
+     "verified before it is copied and run. Nothing is compiled, so no RUSTFLAGS or "
+     "CARGO_ENCODED_RUSTFLAGS value is consumed.",
+     ("PARSE_CONTROL_PINS", "private_input_copy")),
+    ("temporary-storage",
+     "applies: the workspace, the child's TMPDIR and every copy lie under the guard's "
+     "OXIDE_TASK_SCRATCH_ROOT on the selected volume (the parser's fixture_namespace "
+     "requires /Volumes/<x>/scratch/oxide). A /private/tmp scratch root would make the "
+     "parser refuse, which the report would record as a refusal. The control never "
+     "falls back.",
+     ("guard_context", "parse_side", "engine_directories")),
+    ("macos-mktemp",
+     "applies to the real-file self-test only: its one host write is "
+     "tempfile.mkdtemp(prefix=...), which Python resolves through TMPDIR, and it is "
+     "removed with shutil.rmtree. The control uses no mktemp; its roots are explicit "
+     "paths under the guard scratch.",
+     ("parse_control_self_test",)),
+)
 
 # The two controls. Each side has exactly one, and no argument can add one.
 CONTROLS = (
@@ -796,8 +849,6 @@ def staging_environment(parent, environ=None, toolchain=None):
     home = os.path.join(parent, "home")
     cargo_home = os.path.join(parent, "cargo-home")
     tmp = os.path.join(parent, "tmp")
-    for path in (home, cargo_home, tmp):
-        os.makedirs(path, mode=0o700, exist_ok=True)
     env.update({
         "HOME": home,
         "CARGO_HOME": cargo_home,
@@ -822,10 +873,17 @@ def staging_environment(parent, environ=None, toolchain=None):
     return env
 
 
-def engine_environment(parent, environ=None, extra=None):
-    env = scrubbed(dict(os.environ if environ is None else environ))
+def engine_directories(seams, parent):
+    """The child's private HOME and temp directories, created through the seams.
+    The environment builders never create anything, so a self-test that uses a
+    fake seam cannot leave a host directory behind (oxide#298)."""
     for name in ("home", "tmp"):
-        os.makedirs(os.path.join(parent, name), mode=0o700, exist_ok=True)
+        seams.make_dirs(os.path.join(parent, name))
+
+
+def engine_environment(parent, environ=None, extra=None):
+    """Pure: the child's environment. Its directories come from engine_directories."""
+    env = scrubbed(dict(os.environ if environ is None else environ))
     env.update({
         "HOME": os.path.join(parent, "home"),
         "TMPDIR": os.path.join(parent, "tmp"),
@@ -1126,6 +1184,8 @@ def stage(seams, *, parent, cwd, lock_path, cargo_argv, target, label, toolchain
     spawned, so a nonzero exit or a timeout still leaves them known to the
     failure-path retention and their actual output is retained."""
     seams.make_dirs(parent)
+    for name in ("home", "cargo-home", "tmp"):
+        seams.make_dirs(os.path.join(parent, name))
     out_path = os.path.join(parent, "stage.json")
     err_path = os.path.join(parent, "stage.stderr")
     prefix = label.lower()
@@ -1369,6 +1429,7 @@ def run_oxide(seams, paths, staged):
     report = os.path.join(root, "observation.json")
     argv = [staged["executable"]["path"], "--observe-base", "--root", root,
             "--report-out", report]
+    engine_directories(seams, os.path.join(paths["oxide"], "engine"))
     env = engine_environment(os.path.join(paths["oxide"], "engine"))
     timeout_s = remaining_child_seconds(seams)
     result = seams.run_captured(
@@ -1385,6 +1446,7 @@ def run_barge(seams, paths, staged):
     run_root = paths["barge_run"]
     seams.make_dirs(run_root)
     argv = [staged["executable"]["path"]]
+    engine_directories(seams, os.path.join(paths["barge"], "engine"))
     env = engine_environment(os.path.join(paths["barge"], "engine"),
                              extra={BARGE_CUSTODY_OPT_IN_ENV: BARGE_CUSTODY_OPT_IN_VALUE,
                                     BARGE_SCRATCH_ROOT_ENV: run_root})
@@ -1529,6 +1591,7 @@ def parse_capture(seams, staged, *, root, transcript, manifest, report, timeout_
     if manifest and seams.isfile(manifest):
         argv += ["--manifest", manifest]
     argv += ["--report-out", report]
+    engine_directories(seams, os.path.join(root, "engine"))
     env = engine_environment(os.path.join(root, "engine"))
     result = seams.run_captured(argv, cwd=os.path.dirname(root), env=env,
                                 timeout_s=timeout_s)
@@ -2363,6 +2426,11 @@ def plan():
 # ---------------------------------------------------------------------------
 
 
+def parse_control_premise_records():
+    return [{"premise": name, "disposition": text, "sites": list(sites)}
+            for name, text, sites in PARSE_CONTROL_PREMISES]
+
+
 def parse_control_plan(pins=None):
     """The fixed, effect-free plan. Its canonical digest is the activation token:
     a planner supplies it, so the occurrence is bound to these exact pins, bounds
@@ -2411,6 +2479,7 @@ def parse_control_plan(pins=None):
         },
         "pins": {label: dict(pin) for label, pin in pins.items()
                  if label != "executable"},
+        "premises": parse_control_premise_records(),
         "controls": [
             "no engine window, staging, seed, image, mount, detach or network",
             "every pinned input is verified by size and digest before its copy",
@@ -2564,6 +2633,7 @@ def build_parse_control_report(*, digest, reached, gaps, pins, outcome):
                    "shutdown_margin_seconds": PARSE_CONTROL_MARGIN_SECONDS,
                    "per_parse_cap_seconds": PARSE_CONTROL_PARSE_CAP_SECONDS,
                    "fit": "unmeasured"},
+        "premises": parse_control_premise_records(),
         "source": reached["source"],
         "guard": ({"scratch_root": guard["scratch_root"],
                    "evidence": guard["evidence"], "run_id": guard["run_id"],
@@ -4340,6 +4410,8 @@ def _self_test():
     check("an unknown binding cannot write a report",
           guessed["written"] is None)
 
+    check("no fixture path reaches the host: the fake guard root is absent",
+          not os.path.exists(FIXTURE_GUARD["root"]))
     failures = [(name, detail) for name, passed, detail in checks if not passed]
     for name, passed, detail in checks:
         say(f"self-test: {name}: {'ok' if passed else 'FAILED ' + detail}")
@@ -4395,6 +4467,17 @@ def parse_control_self_test():
           and plan_doc["bounds"]["scratch_mib"] == 64
           and plan_doc["bounds"]["shutdown_margin_seconds"] == 30
           and plan_doc["bounds"]["per_parse_cap_seconds"] == 30)
+    expected_premises = ("private-home-and-rustup", "account-home-control",
+                         "environment-isolation", "automatic-adoption",
+                         "cargo-external-argv", "owned-images", "compiler-flags",
+                         "temporary-storage", "macos-mktemp")
+    check("the plan carries the nine proof-authoring premises, each with a disposition",
+          [entry["premise"] for entry in plan_doc["premises"]] == list(expected_premises)
+          and all(entry["disposition"].strip() and entry["sites"]
+                  for entry in plan_doc["premises"]))
+    check("every cited premise site exists in this module",
+          all(site in globals() for entry in plan_doc["premises"]
+              for site in entry["sites"]))
     copied_bytes = sum(PARSE_CONTROL_PINS[label]["bytes"] for label in (
         "executable", "oxide.transcript", "oxide.manifest",
         "barge.transcript", "barge.manifest"))
@@ -4615,6 +4698,8 @@ def parse_control_self_test():
     # The copy helper with real files: a producer-shaped 0644 input, the owner-private
     # copy, and the refusals the copy must make. One fresh directory, removed here.
     root = tempfile.mkdtemp(prefix="parse-control-selftest.")
+    check("the one host write is under TMPDIR, the directory Python resolves",
+          os.path.dirname(root) == tempfile.gettempdir())
     try:
         real = Seams()
         producer = os.path.join(root, "producer")
@@ -4699,6 +4784,8 @@ def parse_control_self_test():
     finally:
         shutil.rmtree(root)
 
+    check("no fixture path reaches the host: the fake guard root is absent",
+          not os.path.exists(FIXTURE_GUARD["root"]))
     failures = [(name, detail) for name, passed, detail in checks if not passed]
     for name, passed, detail in checks:
         say(f"parse-control self-test: {name}: {'ok' if passed else 'FAILED ' + detail}")
