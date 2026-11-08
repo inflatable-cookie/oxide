@@ -1579,6 +1579,24 @@ run = "python3 scripts/tape-embedded-observation.py --self-test"
 [tasks."proof:tape-prune:observation-plan"]
 run = "python3 scripts/tape-embedded-observation.py --plan"
 
+# The supplemental parse-only control over the retained 297 captures (oxide#298).
+# `:test` runs the pure controls: owner-private copies, refusals, expiry, the source
+# gate and a fake-seam control run, plus real-file copy checks in a fresh TMPDIR
+# directory it removes. `:plan` is effect-free and prints the plan_sha256 that is the
+# activation token. The heavy selector is NOT activated here: it refuses before any
+# effect unless PARSE_CONTROL_SHA256 equals that digest. It runs only the staged
+# canonical --parse-capture, twice, under a 120 s / 64 MiB guard with a 30 s margin,
+# and runs no engine, staging, seed, image or observation.
+[tasks."proof:tape-prune:parse-control:test"]
+run = "python3 scripts/tape-embedded-observation.py --parse-control-self-test"
+
+[tasks."proof:tape-prune:parse-control:plan"]
+run = "python3 scripts/tape-embedded-observation.py --parse-control-plan"
+
+[tasks."proof:tape-prune:parse-control"]
+admission = "heavy"
+run = 'python3 scripts/bounded-test.py --limit 120 --scratch-budget-mib 64 -- python3 scripts/tape-embedded-observation.py --parse-control --sha256 "$PARSE_CONTROL_SHA256"'
+
 # The metadata premise control for the observation volume resolver (oxide#292):
 # one nested owned directory on the selected scratch volume, resolved through the
 # real corrected helper. It runs no engine, staging, image or observation. The

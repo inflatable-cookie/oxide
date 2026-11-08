@@ -2699,7 +2699,8 @@ It derives every owned path from the guard's own roots (a binding cannot name an
 absolute path), seeds each private `CARGO_HOME` from its own lock with the
 shared bounded offline seeder, stages each test binary once and reads the exact
 executable from Cargo's own artifact message, runs the two engines sequentially
-at most once each, applies the canonical parse pass to each retained transcript,
+at most once each, applies the canonical parse pass to each retained transcript
+through an owner-private copy (oxide#298, [section below](#private-parser-inputs-and-the-supplemental-parse-only-control-oxide298)),
 and writes one `oxide.capture.embedded-control-observation/1` report naming the
 raw outcome, engine and tool exits, stdout/stderr with their caps, the setup as
 emitted, the parser result, strict and limited warnings, the source/binary
@@ -2872,6 +2873,91 @@ two reviewed exclusions, `assess_completeness`, the limited and comparison
 rules, production readers, locks, errors, selection, dependencies, pins,
 toolchain, MSRV, the private-build/export provider and its qualification, the
 O2/C1/C1-prime/C2 holds, Route B, `oxide#241`/#222 and every live gate.
+
+## Private parser inputs and the supplemental parse-only control (oxide#298)
+
+**Status: source-prepared; not activated.** Tom's routine correction under the
+standing Oxide authority and the observation-only decision `90b7bbeb` v2 covers
+this source change and its covering checks only. No engine, staging build, seed,
+image, observation or parse ran here, and no retained input was parsed.
+
+**The failed 297 occurrence stays failed.** Oxide `297` at `0ab4f786` (executor
+`04dbc185`, run `471cbe01f96c1eeb96dc55293cc1d047`, report and receipt hashes in
+the control's `links`) completed both fresh builds and both engine windows. Its
+Oxide BASE raw outcome was `completed` with an incomplete batch that kept every
+root, because the fixture's recorded volume path was not an accepted direct mount;
+its strict parse is incomplete and limited-insufficient. Barge CTL-0's raw outcome
+was `completed` with one eligible candidate and recorder truncation. These are two
+fixtures, not equivalent inputs, and they are not a policy divergence. The Barge
+canonical parse exited 2 with `oxide: capture parse: unsafe fixture component` and
+wrote no report. That is a parser refusal of its input, not an engine failure.
+Nothing here promotes a verdict from that occurrence.
+
+**Cause, bounded.** `validate_fixture_path` (`src/bin/oxide/tape_harness.rs`) refuses
+any input component that is not owner-only and owned by the caller. The Barge
+producer writes its transcript with ordinary file writes, so it lands at mode
+`0644`. The exact offending component, mode and UID were not retained for that run,
+so the historical cause is not asserted. The rule is modelled in the self-test
+(`parser_component_admits`); the real parser's refusal of a synthetic `0644` input
+was not reproduced, because that would run the parser on fixture input.
+
+**The correction.** Every canonical parse pass now reads an owner-private copy.
+For each retained transcript and manifest, the driver reads the producer's file
+through a no-follow descriptor, checks its size against the cap, checks its
+identity before and after the read, verifies the digest when one is pinned, and
+then writes a byte-identical copy with exclusive creation at mode `0600` inside a
+fresh `0700` workspace (`<run>/parse/<side>/input/`). The parser runs only on the
+copy, with its report in the same workspace. The producer's bytes, mode and
+identity are never changed; they are recorded as provenance. A symlink, a
+non-regular file, an oversized file, a source that changes while it is read, a
+mismatched pin and an existing destination all refuse before any copy exists. A
+failed write removes only the file it created. Each copy and each parse is
+preceded by the guard's remaining-window check, so nothing starts after the window
+ends. The parser's own stdout and stderr are retained even when no report appears.
+The parse timeout is the 120 s cap clipped to the remaining window. The canonical
+parser, its caps and its strict and limited verdict rules are unchanged.
+
+**The supplemental control.** `python3 scripts/tape-embedded-observation.py
+--parse-control-plan` prints the fixed plan and its `plan_sha256`, which is the
+activation token. `--parse-control --sha256 <plan_sha256>` refuses before any
+effect unless it matches. The control is bounded at 120 s with a 30 s shutdown
+margin, 64 MiB of owned scratch and at most 30 s per parse, clipped to the window.
+It runs under the qualified supervisor and never writes outside its own
+`<run>/parse-control` root and its evidence report. It does this in order:
+
+1. Binds the source. HEAD must descend from `0ab4f786`, and every changed path
+   must be inert for the parser binary. The compiled-in capture vectors,
+   examples and the manifest schema under `docs/knowledge/contracts/` are not
+   inert, and neither are `src/`, `tests/` or the Cargo files. Any other change
+   refuses. The tracked worktree must be clean.
+2. Verifies every pinned input by size and digest. These are the staged parser
+   executable (`17ae74e9…`, 10 327 616 B), both transcripts, both manifests, the
+   297 parse document and the 297 report and receipt, which are links only.
+3. Copies the parser executable into its own `0700` directory and runs only
+   `--parse-capture`, once per side, on the owner-private copies of the two
+   transcripts and manifests. The Oxide parser is the executable for both sides,
+   as in the occurrence.
+
+The report, `parse-control-report.json`, records the argv, the verbatim engine
+output, each parser report and fate, and the original and copy digests, sizes and
+modes. `qualified` is false. Missing parser reports, expiry and parser refusals
+stay separate outcomes. Nothing is a comparison, a closure claim or a credit.
+
+**Pinned inputs and activation digest.** The digest is `f6b8e704…` at the plan's
+current text. Any change to a pin or the bounds changes it, and the planner must
+re-issue activation.
+
+**Validation at this head.** `proof:tape-prune:observation-test` (observation
+controls, now 226, including 13 new copy, refusal, drift, symlink, collision and
+expiry controls), `proof:tape-prune:parse-control:test` (51 controls, including
+real-file copy checks in one fresh directory that is removed), the two plan
+selectors, `proof:seed-readiness:test` and `plan` (which import the changed
+helper), and `docs:check`.
+
+**Not activated.** The heavy `proof:tape-prune:parse-control` selector needs a
+planner activation, the reviewed head and the digest above. Its result is one
+supplemental re-analysis of retained bytes. It is not a rerun of the engine, not a
+transfer of 297's allowance and not a parse credit for 297.
 
 ## Seed-only readiness for the observation's two locks (oxide#294)
 
