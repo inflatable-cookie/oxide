@@ -910,7 +910,8 @@ establish parity. X-S2 must reconcile the reviewed shape with B-S1 before use.
 One manifest and two transcripts per case window, JSON, deterministic field
 order, SHA-256 bound in every header.
 
-**`oxide.capture.manifest/1`** — written by the orchestrator immediately before
+**`oxide.capture.manifest/1`** (historical design text; the current schema is
+`/2`, see "Current shared capture wire `/2`" below) — written by the orchestrator immediately before
 each engine's window. Carries: `case`; the window identity; the source binding
 (Oxide commit with a clean tracked worktree, per-file source digests over
 `src/`, `Cargo.lock`, `rust-toolchain.toml`; Barge pin `4af9360`, Barge slice
@@ -929,8 +930,9 @@ mandatory keys. A cap, a read failure on a mandatory fact, an ambiguous
 root-to-area mapping, or an unclassified actor makes the manifest
 insufficient — never an empty value.
 
-**`oxide.capture.transcript/1`** — one per engine, always written, including on
-refusal. Carries: `engine` (`barge`/`oxide`), `case`, `manifest_sha256`, the
+**`oxide.capture.transcript/1`** (historical design text; the current schema is
+`/2`) — one per engine, always written, including on
+refusal. An apparatus refusal is not a transcript at `/2`; it is an `oxide.capture.apparatus/2` diagnostic. Carries: `engine` (`barge`/`oxide`), `case`, `manifest_sha256`, the
 entrypoint identity (symbol and source binding), the outcome
 (`completed`/`refused` with the engine's own refusal vocabulary and exit
 code), the engine's actual result in its own document (the full bounded `Evaluation` entries and completeness, or the serialized `PruneReport`, with a truncation marker when either
@@ -1142,7 +1144,7 @@ authorizes a real run, a pin change or a production behaviour change.
   (`read_document`, `classify`), `identity.rs` (`read`, `verify`), `area.rs`
   (`show`, `read_holds`, `scan_activity_within`), `registry.rs` (`read`),
   `custody.rs` (`decide` observation points), a cfg(test) transcript writer
-  implementing `oxide.capture.transcript/1`, and the `[[test]]` harness
+  implementing `oxide.capture.transcript/1` (historical; `/2` is current), and the `[[test]]` harness
   (proposed `crates/barge/tests/tape_eval.rs`) whose argv contract is
   `--fixture-root --manifest --transcript-out --case`, which builds the
   fixture `StatePaths` and `AccountFacts`, calls the real `release::plan` with
@@ -1331,13 +1333,13 @@ release-profile compile is needed to establish compile-away; a source claim
 alone is insufficient.
 
 - **Files.** `src/bin/oxide/tape.rs` (the binary tape engine: the
-  `oxide.capture.transcript/1` document, epochs assigned at the leaf,
+  `oxide.capture.transcript/2` document (`/1` historical), epochs assigned at the leaf,
   per-key occurrence bookkeeping under the fixed 64 cap, the 8192 read-row
   and 8 MiB document caps with explicit `truncation` flags, effect rows,
   clock rows, an additive bounded `classifications` array, and the
   additive bounded pre/post `fixture_capture` with its diff),
   `src/tape.rs` (the separate sink used only by library unit tests),
-  `src/bin/oxide/capture_wire.rs` (strict `/1` parser and completeness),
+  `src/bin/oxide/capture_wire.rs` (strict `/2` parser and completeness),
   `docs/knowledge/contracts/capture-vectors/` (canonical hashed JSON),
   and `src/bin/oxide/tape_harness.rs` (the `[[test]]`
   `tape_prune_eval` target, `harness = false`). Recorder statements sit in
@@ -1420,9 +1422,10 @@ alone is insufficient.
   start; a short-circuited branch does not invent a sample. These offsets are
   not the unknown absolute origin or deadline.
   Fixture snapshot read errors or the 32 MiB byte bound mark the snapshot
-  truncated; a pre/post diff cannot replace effect observations. Refused
-  transcripts identify `source` as `apparatus` for pre-entry validation or
-  `engine` for the actual prune chain; truncation preserves that distinction.
+  truncated; a pre/post diff cannot replace effect observations. Current
+  (`/2`) refusals are engine-only: a pre-entry apparatus refusal writes an
+  `oxide.capture.apparatus/2` diagnostic instead of a transcript, so no
+  transcript can name `apparatus` as its source.
 - **Fixture configuration.** Preparation uses `config::Facts` with injected
   platform-directory inputs; the evaluator child uses the existing debug-only
   `OXIDE_TEST_HOME_FROM_ENV=1` control and explicit fixture paths. Its
@@ -1730,7 +1733,8 @@ Shape. Every key is present; absence is an explicit `null`.
 
 - Transcript: `schema` and `version` are both `oxide.capture.transcript/2`.
   `manifest_sha256` is `null` (no manifest bound) or lowercase SHA-256.
-  Window origin and end are `null` (unproven). `outcome` is `completed` with
+  Window origin and end must both be `null`: no absolute origin is proven,
+  and a number there is refused (`must be null`). `outcome` is `completed` with
   an object `result`, or `refused` with `reason`, `exit_code` (u8) and
   `source` `engine`. `truncation` is exactly five booleans.
 - Reads: `cap` is `null` when no cap applies, or a u64; `0` is a real zero
@@ -1751,9 +1755,14 @@ Shape. Every key is present; absence is an explicit `null`.
   classifications and holders.
 - Caps unchanged: 8192 rows, 8 MiB, 64 occurrences per key, 512 holders,
   4096 fixture entries per side.
-- Manifest `/2`: strict types and source digests, `window` start not after
-  end, obligations and expected effects carry exact keys. Schema file
-  `oxide-capture-manifest.v2.schema.json`; examples under `capture-examples/v2/`.
+- Manifest `/2`: typed against `oxide-capture-manifest.v2.schema.json`.
+  Exact keys per object; a fixture entry is one of the schema's shapes,
+  selected by `kind` (`file`, `directory`, `symlink`, `absent`,
+  `unreadable`); an obligation identity matches one of the four complete
+  alternatives (file-like, component, process, volume); an expected effect
+  requires `attempted`; source digests are pinned lowercase hex and the Barge
+  pin is the schema const; `window` start is not after end. The canonical
+  examples in `capture-examples/v2/` are parsed by the self-check.
 
 Completeness. One implementation, `capture_wire::assess_completeness`. The
 in-window engine check delegates identity matching
@@ -1762,22 +1771,31 @@ same functions, so the rules cannot diverge.
 
 - Identity: every named obligation key must equal the row value; `null`
   never matches.
-- Effects: only `attempted: false`, `succeeded`, pathed rows form completed
-  parity. Others are issues: `effect not completed at <site> (<result>)` or
-  `effect identity unproven at <site>`. An attempt matching a declared effect
-  is not parity.
+- Effects: one completed rule (`capture_wire::completed_effect`: not
+  attempted, `succeeded`, pathed) is shared by parity and fixture-diff
+  reconciliation. Others are issues: `effect not completed at <site>
+  (<result>)` or `effect identity unproven at <site>`. An attempt, a
+  `partial` or `failed` row, or a declared attempt (`declared attempt is not
+  completed parity at <site>`) never matches. Parity is a multiset: an extra
+  or repeated completed row, or a repeated declared effect, is `omitted or
+  extra effects`.
 - Unproven gaps are issues: `process lifetime unproven at <site>` (holder
   without kernel start), `clock unproven at <kind>`, `window origin and end
   unproven`.
 - `parent_required` still fails while `K1_PREMISE_QUALIFIED` is false.
   `Completeness` is never success from structure alone.
 
-Evidence. `docs/knowledge/contracts/capture-vectors/v2/` (`SHA256SUMS`):
-eight valid transcripts, seventeen parser refusals, eight parser-positive
-completeness failures, two valid and four invalid manifests. The emitter
-conformance regression `emitted_shape_check` in `tape_harness.rs` writes every
-row kind through the real recorder leaves, parses the bytes as `/2`, and
-refuses tampered, `/1` and apparatus variants of those same bytes. The pure
+Evidence. `docs/knowledge/contracts/capture-vectors/v2/` (`SHA256SUMS`, 48
+files): eight valid transcripts, eighteen parser refusals, twelve
+parser-positive completeness failures (including `partial`, `failed`,
+duplicate observed and duplicate declared effects), three valid and seven
+invalid manifests. Each invalid vector asserts the named refusal it is meant
+to produce, not just a failure. The two canonical examples are checked too.
+The emitter conformance regression `emitted_shape_check` in `tape_harness.rs`
+writes every row kind through the real recorder leaves (including a reported
+`partial` and `failed` effect through `effect_result_row`, and a repeated
+completed effect), parses the bytes as `/2`, and refuses tampered, `/1` and
+apparatus variants of those same bytes. The pure
 selector is `effigy rust:capture-wire`; the regressions run there. Its
 embedded engine fixtures (`tape_prune_eval` with no arguments) are not run by
 this change.
@@ -1796,6 +1814,7 @@ Remaining limits (finite):
 | Attempted or failed effects | Not completed parity |
 | Route B private descriptor-relative read | Not activated |
 | Caps 512 / 8192 / 8 MiB / 64 | Unchanged; known host overflow stays insufficient |
+| In-window fixture binding (`extra or unbound observation`: path, component and volume rules) | Engine-side only in `tape.rs`; completeness does not apply it yet |
 | Barge `/2` adoption and live or native use | Dependent task; no production read changed |
 
 ## Shared private-build validation gate (oxide#248)

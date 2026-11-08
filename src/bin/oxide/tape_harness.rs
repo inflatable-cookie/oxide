@@ -11,7 +11,7 @@
 //! It follows the actual `dry_run` decision prefix through the actual
 //! `evaluate` (via `prune::tape_entry::run_chain`), exports the full bounded
 //! actual `Evaluation` (or the actual pre-evaluate refusal) into one
-//! `oxide.capture.transcript/1` document, always writes the transcript, and
+//! `oxide.capture.transcript/2` document, always writes the transcript, and
 //! exits 0 when the transcript was written (any engine outcome). It never
 //! calls `dry_run`, never renders a preview, and never redirects stdout.
 //!
@@ -1576,6 +1576,18 @@ fn emitted_shape_check(temp: &Path) -> Result<(), CheckFailure> {
     tape::effect_row("save@ledger", Path::new("/fixture/ledger"));
     tape::unbound_effect("descriptor:fchmod", true);
     tape::unbound_effect("descriptor:rename", false);
+    tape::effect_result_row(
+        "save@partial-ledger",
+        Path::new("/fixture/partial"),
+        Some("partial"),
+    );
+    tape::effect_result_row(
+        "save@failed-ledger",
+        Path::new("/fixture/failed"),
+        Some("failed"),
+    );
+    tape::effect_row("save@dup-ledger", Path::new("/fixture/dup"));
+    tape::effect_row("save@dup-ledger", Path::new("/fixture/dup"));
     std::fs::write(fixture.join("a.json"), b"two").map_err(io)?;
     std::fs::write(fixture.join("nested").join("b.json"), b"new").map_err(io)?;
     let post = tape::capture_fixture(&fixture);
@@ -1596,7 +1608,7 @@ fn emitted_shape_check(temp: &Path) -> Result<(), CheckFailure> {
             "parent_required": false,
             "identity": {"path": "/fixture/missing"}
         }],
-        "expected_effects": [{"kind": "save", "site": "ledger", "path": "/fixture/ledger"}]
+        "expected_effects": [{"kind": "save", "site": "ledger", "path": "/fixture/ledger", "attempted": false}]
     });
     tape::check_manifest_effects(&manifest);
     let path = temp.join("emitted-shape.json");
@@ -1673,6 +1685,14 @@ fn emitted_shape_check(temp: &Path) -> Result<(), CheckFailure> {
         "fixture entries use the wire identity names device and inode",
     )?;
     check(
+        at("/effects/4/result") == "partial" && at("/effects/5/result") == "failed",
+        "a reported partial or failed effect keeps its reported result",
+    )?;
+    check(
+        at("/effects/6/attempted") == false && at("/effects/7/path") == "/fixture/dup",
+        "repeated completed effects are emitted once per occurrence",
+    )?;
+    check(
         at("/fixture_capture/diff_effects/0/result") == "unknown",
         "a fixture diff never reports a writer result",
     )?;
@@ -1681,6 +1701,9 @@ fn emitted_shape_check(temp: &Path) -> Result<(), CheckFailure> {
         "effect not completed at ledger (unknown)",
         "effect identity unproven at descriptor:fchmod",
         "effect not completed at descriptor:rename (failed)",
+        "effect not completed at partial-ledger (partial)",
+        "effect not completed at failed-ledger (failed)",
+        "omitted or extra effects",
         "window origin and end unproven",
     ] {
         check(

@@ -85,27 +85,6 @@ const IDENTITY_FIELDS: &[&str] = &[
     "own_source",
 ];
 
-/// Manifest obligation identities are partial by design; any listed key may
-/// appear, but none may be unknown.
-const OBLIGATION_IDENTITY_FIELDS: &[&str] = &[
-    "path",
-    "component",
-    "parent_device",
-    "parent_inode",
-    "device",
-    "inode",
-    "pid",
-    "start",
-    "uid",
-    "fd",
-    "volume_uuid",
-    "mount",
-    "volume_device",
-    "window_identity",
-    "parent_source",
-    "own_source",
-];
-
 const EFFECT_FIELDS: &[&str] = &["kind", "site", "attempted", "path", "epoch", "result"];
 const CLOCK_FIELDS: &[&str] = &["kind", "value", "epoch"];
 const CLASSIFY_FIELDS: &[&str] = &["kind", "identity", "value", "epoch", "occurrence"];
@@ -646,8 +625,15 @@ pub(crate) fn parse_transcript(bytes: &[u8]) -> Result<serde_json::Value, ParseE
         hex64_field(map, "manifest_sha256", "transcript")?;
     }
     string_field(map, "entrypoint", "transcript")?;
-    null_or_u64(map, "window_monotonic_start_ns", "transcript")?;
-    null_or_u64(map, "window_monotonic_end_ns", "transcript")?;
+    // The window origin and end stay unproven until an absolute origin exists,
+    // so both are an explicit null, never a number that could look measured.
+    for key in ["window_monotonic_start_ns", "window_monotonic_end_ns"] {
+        if !field(map, key, "transcript")?.is_null() {
+            return Err(parse_err(format!(
+                "{key} must be null: no absolute window origin is proven"
+            )));
+        }
+    }
     u64_field(map, "window_elapsed_ns", "transcript")?;
     parse_engine_outcome(field(map, "outcome", "transcript")?)?;
     let truncation = object(field(map, "truncation", "transcript")?, "truncation")?;
@@ -741,6 +727,8 @@ const MANIFEST_REQUIRED: &[&str] = &[
     "barge",
 ];
 
+/// The schema's pinned Barge commit (`oxide-capture-manifest.v2.schema.json`).
+const BARGE_PIN: &str = "4af9360bd09629e970c143080ca159de8eef2562";
 const SOURCE_FIELDS: &[&str] = &[
     "oxide_commit",
     "oxide_files",
@@ -756,12 +744,147 @@ const SOURCE_FIELDS: &[&str] = &[
     "barge_executable_sha256",
     "oxide_tree",
 ];
-
+const WINDOW_FIELDS: &[&str] = &["identity", "start_monotonic_ns", "end_monotonic_ns"];
+const MANIFEST_FIXTURE_FIELDS: &[&str] = &[
+    "root", "device", "inode", "mode", "entries", "roots", "volume",
+];
+/// The `file`, `directory` and `symlink` entry shape. `absent` and
+/// `unreadable` entries have their own, narrower field lists.
+const FIXTURE_OBJECT_FIELDS: &[&str] = &[
+    "rel",
+    "parent_device",
+    "parent_inode",
+    "kind",
+    "bytes_sha256",
+    "size",
+    "device",
+    "inode",
+    "mode",
+];
+const FIXTURE_ABSENT_FIELDS: &[&str] = &["rel", "parent_device", "parent_inode", "kind"];
+const FIXTURE_UNREADABLE_FIELDS: &[&str] =
+    &["rel", "parent_device", "parent_inode", "kind", "reason"];
+const FIXTURE_VOLUME_FIELDS: &[&str] = &["uuid", "mount"];
+const DYNAMIC_FIELDS: &[&str] = &["volumes", "writers", "external_allowances"];
+const DYNAMIC_VOLUME_FIELDS: &[&str] =
+    &["uuid", "mount", "device", "f_mntonname", "window_identity"];
+const DYNAMIC_WRITER_FIELDS: &[&str] = &["pid", "start", "uid", "descriptor_targets", "lifecycle"];
+const DESCRIPTOR_TARGET_FIELDS: &[&str] = &[
+    "path",
+    "component",
+    "parent_device",
+    "parent_inode",
+    "device",
+    "inode",
+    "pid",
+    "start",
+    "uid",
+    "fd",
+    "volume_uuid",
+    "mount",
+];
+const DESCRIPTOR_TARGET_REQUIRED: &[&str] = &[
+    "path",
+    "parent_device",
+    "parent_inode",
+    "device",
+    "inode",
+    "fd",
+];
+const ALLOWANCE_FIELDS: &[&str] = &["path_class", "path"];
 const OBLIGATION_FIELDS: &[&str] = &["engine", "site", "identity", "parent_required"];
-const MANIFEST_EFFECT_FIELDS: &[&str] = &["kind", "site", "path"];
-const MANIFEST_FIXTURE_FIELDS: &[&str] = &["root", "device", "inode", "mode", "entries", "roots"];
+/// Every obligation identity key the schema admits. Keys outside this list,
+/// including the transcript-only `parent_source` and `own_source`, are unknown.
+const OBLIGATION_IDENTITY_FIELDS: &[&str] = &[
+    "path",
+    "component",
+    "parent_device",
+    "parent_inode",
+    "device",
+    "inode",
+    "pid",
+    "start",
+    "uid",
+    "fd",
+    "volume_uuid",
+    "mount",
+    "window_identity",
+];
+/// The schema's expected-effect shape. Every declared effect states whether
+/// the write is expected to be attempted; completed parity needs `false`.
+const MANIFEST_EFFECT_FIELDS: &[&str] = &["kind", "path", "site", "attempted"];
+const MANIFEST_EFFECT_KINDS: &[&str] = &[
+    "create",
+    "save",
+    "fence",
+    "reconcile",
+    "lock-create",
+    "rename",
+    "unlink",
+];
+const EXPECTED_FIELDS: &[&str] = &["classification", "roots"];
+const EXPECTED_CLASSIFICATIONS: &[&str] = &[
+    "MATCH",
+    "D-1",
+    "D-2",
+    "D-3",
+    "SCOPE",
+    "CONFIG",
+    "EXPLAIN-OR-BLOCK",
+];
+const EXPECTED_ROOT_FIELDS: &[&str] = &["root", "fate"];
+const BARGE_FIELDS: &[&str] = &[
+    "volume_uuid",
+    "namespace",
+    "area",
+    "named_roots",
+    "volume_mount",
+];
 
-/// Strict manifest parse. `parent_required` is mandatory on every obligation.
+/// A non-empty string field, as the schema's `minLength: 1` requires.
+fn nonempty_value(value: &serde_json::Value, what: &str) -> Result<(), ParseError> {
+    match value.as_str() {
+        Some(text) if !text.is_empty() => Ok(()),
+        _ => Err(parse_err(format!("{what} is not a non-empty string"))),
+    }
+}
+
+fn uint_value(value: &serde_json::Value, what: &str) -> Result<(), ParseError> {
+    if value.is_u64() {
+        Ok(())
+    } else {
+        Err(parse_err(format!("{what} is not an integer at least 0")))
+    }
+}
+
+/// An array field bounded by the schema's `maxItems`.
+fn capped_array<'a>(
+    object: &'a Object,
+    key: &str,
+    max: usize,
+    what: &str,
+) -> Result<&'a Vec<serde_json::Value>, ParseError> {
+    let rows = array_field(object, key, what)?;
+    if rows.len() > max {
+        return Err(parse_err(format!(
+            "{what} {key} exceeds its {max}-item cap"
+        )));
+    }
+    Ok(rows)
+}
+
+fn lower_hex_value(value: &serde_json::Value, what: &str, length: usize) -> Result<(), ParseError> {
+    match value.as_str() {
+        Some(text) if is_lower_hex(text, length) => Ok(()),
+        _ => Err(parse_err(format!(
+            "{what} is not a lowercase hex digest of {length}"
+        ))),
+    }
+}
+
+/// Strict manifest parse against `oxide-capture-manifest.v2.schema.json`.
+/// Every nested member is typed as the schema states; `parent_required` is
+/// mandatory on every obligation; declared effects state `attempted`.
 pub(crate) fn parse_manifest(bytes: &[u8]) -> Result<serde_json::Value, ParseError> {
     if bytes.len() > MAX_DOCUMENT_BYTES {
         return Err(parse_err("manifest exceeds the 8 MiB document cap"));
@@ -769,9 +892,10 @@ pub(crate) fn parse_manifest(bytes: &[u8]) -> Result<serde_json::Value, ParseErr
     let doc: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|error| parse_err(error.to_string()))?;
     let map = object(&doc, "manifest")?;
-    refuse_historical(string_field(map, "schema", "manifest")?)?;
-    if string_field(map, "schema", "manifest")? != MANIFEST_SCHEMA {
-        return Err(parse_err("unknown manifest schema"));
+    let schema = string_field(map, "schema", "manifest")?;
+    refuse_historical(schema)?;
+    if schema != MANIFEST_SCHEMA {
+        return Err(parse_err(format!("unknown manifest schema {schema}")));
     }
     for key in map.keys() {
         if !MANIFEST_FIELDS.contains(&key.as_str()) {
@@ -782,135 +906,334 @@ pub(crate) fn parse_manifest(bytes: &[u8]) -> Result<serde_json::Value, ParseErr
         field(map, key, "manifest")?;
     }
     nonempty_field(map, "case", "manifest")?;
-    let window = object(field(map, "window", "manifest")?, "window")?;
-    exact_fields(
-        window,
-        &["identity", "start_monotonic_ns", "end_monotonic_ns"],
-        "window",
-    )?;
+    manifest_window(field(map, "window", "manifest")?)?;
+    manifest_source(field(map, "source", "manifest")?)?;
+    manifest_fixture(field(map, "fixture", "manifest")?)?;
+    manifest_dynamic(field(map, "dynamic", "manifest")?)?;
+    for obligation in capped_array(map, "mandatory_observations", 256, "manifest")? {
+        manifest_obligation(obligation)?;
+    }
+    for effect in capped_array(map, "expected_effects", 8192, "manifest")? {
+        manifest_effect(effect)?;
+    }
+    manifest_expected(field(map, "expected", "manifest")?)?;
+    manifest_barge(field(map, "barge", "manifest")?)?;
+    match map.get("operator_list") {
+        None => {}
+        Some(value) if value.is_null() || value.is_string() => {}
+        Some(_) => return Err(parse_err("operator_list is not a string or null")),
+    }
+    Ok(doc)
+}
+
+fn manifest_window(value: &serde_json::Value) -> Result<(), ParseError> {
+    let window = object(value, "window")?;
+    exact_fields(window, WINDOW_FIELDS, "window")?;
     nonempty_field(window, "identity", "window")?;
     let start = u64_field(window, "start_monotonic_ns", "window")?;
     let end = u64_field(window, "end_monotonic_ns", "window")?;
     if start > end {
         return Err(parse_err("window starts after it ends"));
     }
-    let source = object(field(map, "source", "manifest")?, "source")?;
-    exact_fields(source, SOURCE_FIELDS, "source")?;
-    for key in SOURCE_FIELDS {
-        if key.ends_with("_files") {
-            object(field(source, key, "source")?, key)?;
-        } else if key.ends_with("_sha256") {
-            hex64_field(source, key, "source")?;
-        } else if *key == "barge_pin" || *key == "oxide_tree" {
-            let text = string_field(source, key, "source")?;
-            if !is_lower_hex(text, 40) {
-                return Err(parse_err(format!("source {key} is not a 40-hex identity")));
-            }
-        } else {
-            string_field(source, key, "source")?;
-        }
-    }
-    let fixture = object(field(map, "fixture", "manifest")?, "fixture")?;
-    exact_fields(fixture, MANIFEST_FIXTURE_FIELDS, "fixture")?;
-    string_field(fixture, "root", "fixture")?;
-    u64_field(fixture, "device", "fixture")?;
-    u64_field(fixture, "inode", "fixture")?;
-    null_or_u32(fixture, "mode", "fixture")?;
-    if array_field(fixture, "entries", "fixture")?.len() > MAX_FIXTURE_ENTRIES {
-        return Err(parse_err("fixture entries exceed the 4096-entry cap"));
-    }
-    array_field(fixture, "roots", "fixture")?;
-    let dynamic = object(field(map, "dynamic", "manifest")?, "dynamic")?;
-    exact_fields(
-        dynamic,
-        &["volumes", "writers", "external_allowances"],
-        "dynamic",
-    )?;
-    for key in ["volumes", "writers", "external_allowances"] {
-        array_field(dynamic, key, "dynamic")?;
-    }
-    let expected = object(field(map, "expected", "manifest")?, "expected")?;
-    exact_fields(expected, &["classification", "roots"], "expected")?;
-    string_field(expected, "classification", "expected")?;
-    array_field(expected, "roots", "expected")?;
-    object(field(map, "barge", "manifest")?, "barge")?;
-    for obligation in array_field(map, "mandatory_observations", "manifest")? {
-        let obligation = object(obligation, "obligation")?;
-        exact_fields(obligation, OBLIGATION_FIELDS, "obligation")?;
-        let engine = string_field(obligation, "engine", "obligation")?;
-        if !matches!(engine, "oxide" | "barge") {
-            return Err(parse_err(format!("unknown obligation engine {engine}")));
-        }
-        nonempty_field(obligation, "site", "obligation")?;
-        bool_field(obligation, "parent_required", "obligation")?;
-        let identity = object(
-            field(obligation, "identity", "obligation")?,
-            "obligation identity",
-        )?;
-        if identity.is_empty() {
-            return Err(parse_err("obligation identity is empty"));
-        }
-        type_check_obligation_identity(identity)?;
-    }
-    for effect in array_field(map, "expected_effects", "manifest")? {
-        let effect = object(effect, "expected effect")?;
-        exact_fields(effect, MANIFEST_EFFECT_FIELDS, "expected effect")?;
-        let kind = string_field(effect, "kind", "expected effect")?;
-        if !EFFECT_KINDS.contains(&kind) || kind == DESCRIPTOR_EFFECT {
-            return Err(parse_err(format!("unknown effect kind {kind}")));
-        }
-        nonempty_field(effect, "site", "expected effect")?;
-        nonempty_field(effect, "path", "expected effect")?;
-    }
-    Ok(doc)
+    Ok(())
 }
 
-/// Obligation identities are partial, so any listed key may be absent. A
-/// `device` is a string only for a volume obligation (`volume_uuid` present).
-fn type_check_obligation_identity(identity: &Object) -> Result<(), ParseError> {
-    exact_or_known(identity, OBLIGATION_IDENTITY_FIELDS, "obligation identity")?;
-    let volume_shape = identity
-        .get("volume_uuid")
-        .is_some_and(serde_json::Value::is_string);
-    for (key, value) in identity {
-        match key.as_str() {
-            "path" | "component" | "volume_uuid" | "mount" | "volume_device"
-            | "window_identity" => {
-                if !value.is_string() {
-                    return Err(parse_err(format!("obligation {key} is not a string")));
-                }
-            }
-            "device" if volume_shape => {
-                if !value.is_string() {
-                    return Err(parse_err("volume obligation device is not a string"));
-                }
-            }
-            "parent_source" | "own_source" => {
-                Provenance::parse(Some(value)).map_err(parse_err)?;
-            }
-            "fd" => {
-                if !value
-                    .as_i64()
-                    .is_some_and(|n| (0..=i64::from(i32::MAX)).contains(&n))
-                {
-                    return Err(parse_err("obligation fd is not a non-negative i32"));
-                }
-            }
-            "pid" | "uid" => {
-                if !value.as_u64().is_some_and(|n| n <= u64::from(u32::MAX)) {
-                    return Err(parse_err(format!("obligation {key} is not a u32")));
-                }
-            }
-            _ => {
-                if !value.is_u64() {
-                    return Err(parse_err(format!("obligation {key} is not a u64")));
-                }
-            }
+fn manifest_source(value: &serde_json::Value) -> Result<(), ParseError> {
+    let source = object(value, "source")?;
+    exact_fields(source, SOURCE_FIELDS, "source")?;
+    for key in [
+        "oxide_commit",
+        "barge_slice_commit",
+        "oxide_toolchain",
+        "barge_toolchain",
+    ] {
+        nonempty_field(source, key, "source")?;
+    }
+    for key in [
+        "cargo_lock_sha256",
+        "rust_toolchain_sha256",
+        "staged_lock_sha256",
+        "oxide_executable_sha256",
+        "barge_executable_sha256",
+    ] {
+        lower_hex_value(field(source, key, "source")?, key, 64)?;
+    }
+    if string_field(source, "barge_pin", "source")? != BARGE_PIN {
+        return Err(parse_err("source barge_pin is not the pinned Barge commit"));
+    }
+    lower_hex_value(field(source, "oxide_tree", "source")?, "oxide_tree", 40)?;
+    for key in ["oxide_files", "barge_files"] {
+        for digest in object(field(source, key, "source")?, key)?.values() {
+            lower_hex_value(digest, key, 64)?;
         }
     }
     Ok(())
 }
 
+fn manifest_fixture(value: &serde_json::Value) -> Result<(), ParseError> {
+    let fixture = object(value, "fixture")?;
+    exact_or_known(fixture, MANIFEST_FIXTURE_FIELDS, "fixture")?;
+    // `volume` is optional; the rest are required.
+    for key in ["root", "device", "inode", "mode", "entries", "roots"] {
+        field(fixture, key, "fixture")?;
+    }
+    for key in ["device", "inode", "mode"] {
+        uint_value(field(fixture, key, "fixture")?, key)?;
+    }
+    nonempty_field(fixture, "root", "fixture")?;
+    for entry in capped_array(fixture, "entries", 4096, "fixture")? {
+        manifest_fixture_entry(entry)?;
+    }
+    let roots = capped_array(fixture, "roots", 64, "fixture")?;
+    for root in roots {
+        nonempty_value(root, "fixture root")?;
+    }
+    if let Some(volume) = fixture.get("volume") {
+        let volume = object(volume, "fixture volume")?;
+        exact_fields(volume, FIXTURE_VOLUME_FIELDS, "fixture volume")?;
+        nonempty_field(volume, "uuid", "fixture volume")?;
+        nonempty_field(volume, "mount", "fixture volume")?;
+    }
+    Ok(())
+}
+
+/// Each fixture entry is exactly one of the schema's four shapes, selected by
+/// `kind`. A kind outside the set is refused, never reinterpreted.
+fn manifest_fixture_entry(value: &serde_json::Value) -> Result<(), ParseError> {
+    let entry = object(value, "fixture entry")?;
+    let kind = string_field(entry, "kind", "fixture entry")?;
+    let fields = match kind {
+        "file" | "directory" | "symlink" => FIXTURE_OBJECT_FIELDS,
+        "absent" => FIXTURE_ABSENT_FIELDS,
+        "unreadable" => FIXTURE_UNREADABLE_FIELDS,
+        other => return Err(parse_err(format!("unknown fixture entry kind {other}"))),
+    };
+    exact_fields(entry, fields, "fixture entry")?;
+    nonempty_field(entry, "rel", "fixture entry")?;
+    uint_value(
+        field(entry, "parent_device", "fixture entry")?,
+        "fixture entry parent_device",
+    )?;
+    uint_value(
+        field(entry, "parent_inode", "fixture entry")?,
+        "fixture entry parent_inode",
+    )?;
+    match kind {
+        "file" => lower_hex_value(
+            field(entry, "bytes_sha256", "fixture entry")?,
+            "bytes_sha256",
+            64,
+        ),
+        "directory" | "symlink" => {
+            let digest = field(entry, "bytes_sha256", "fixture entry")?;
+            if digest.is_null() {
+                Ok(())
+            } else {
+                lower_hex_value(digest, "bytes_sha256", 64)
+            }
+        }
+        "unreadable" => nonempty_field(entry, "reason", "fixture entry").map(|_| ()),
+        _ => Ok(()),
+    }?;
+    if fields == FIXTURE_OBJECT_FIELDS {
+        for key in ["size", "device", "inode", "mode"] {
+            uint_value(field(entry, key, "fixture entry")?, key)?;
+        }
+    }
+    Ok(())
+}
+
+fn manifest_dynamic(value: &serde_json::Value) -> Result<(), ParseError> {
+    let dynamic = object(value, "dynamic")?;
+    exact_fields(dynamic, DYNAMIC_FIELDS, "dynamic")?;
+    for volume in capped_array(dynamic, "volumes", 64, "dynamic")? {
+        let volume = object(volume, "dynamic volume")?;
+        exact_fields(volume, DYNAMIC_VOLUME_FIELDS, "dynamic volume")?;
+        for key in DYNAMIC_VOLUME_FIELDS {
+            nonempty_field(volume, key, "dynamic volume")?;
+        }
+    }
+    for writer in capped_array(dynamic, "writers", 512, "dynamic")? {
+        let writer = object(writer, "dynamic writer")?;
+        exact_fields(writer, DYNAMIC_WRITER_FIELDS, "dynamic writer")?;
+        for key in ["pid", "start", "uid"] {
+            uint_value(field(writer, key, "dynamic writer")?, key)?;
+        }
+        nonempty_field(writer, "lifecycle", "dynamic writer")?;
+        for target in capped_array(writer, "descriptor_targets", 8192, "dynamic writer")? {
+            descriptor_target(target)?;
+        }
+    }
+    for allowance in capped_array(dynamic, "external_allowances", 256, "dynamic")? {
+        let allowance = object(allowance, "external allowance")?;
+        exact_fields(allowance, ALLOWANCE_FIELDS, "external allowance")?;
+        nonempty_field(allowance, "path_class", "external allowance")?;
+        nonempty_field(allowance, "path", "external allowance")?;
+    }
+    Ok(())
+}
+
+fn descriptor_target(value: &serde_json::Value) -> Result<(), ParseError> {
+    let target = object(value, "descriptor target")?;
+    exact_or_known(target, DESCRIPTOR_TARGET_FIELDS, "descriptor target")?;
+    // The schema requires the six keys below; the rest are optional.
+    for key in DESCRIPTOR_TARGET_REQUIRED {
+        field(target, key, "descriptor target")?;
+    }
+    for key in ["path", "component", "volume_uuid", "mount"] {
+        if target.contains_key(key) {
+            nonempty_field(target, key, "descriptor target")?;
+        }
+    }
+    for key in [
+        "parent_device",
+        "parent_inode",
+        "device",
+        "inode",
+        "pid",
+        "start",
+        "uid",
+        "fd",
+    ] {
+        if target.contains_key(key) {
+            uint_value(field(target, key, "descriptor target")?, key)?;
+        }
+    }
+    Ok(())
+}
+
+fn manifest_obligation(value: &serde_json::Value) -> Result<(), ParseError> {
+    let obligation = object(value, "obligation")?;
+    exact_fields(obligation, OBLIGATION_FIELDS, "obligation")?;
+    let engine = string_field(obligation, "engine", "obligation")?;
+    if !matches!(engine, "oxide" | "barge") {
+        return Err(parse_err(format!("unknown obligation engine {engine}")));
+    }
+    nonempty_field(obligation, "site", "obligation")?;
+    bool_field(obligation, "parent_required", "obligation")?;
+    let identity = object(
+        field(obligation, "identity", "obligation")?,
+        "obligation identity",
+    )?;
+    obligation_identity(identity)
+}
+
+/// The schema's obligation identity: typed keys, plus one of four complete
+/// alternatives (file-like, component, process, volume).
+fn obligation_identity(identity: &Object) -> Result<(), ParseError> {
+    exact_or_known(identity, OBLIGATION_IDENTITY_FIELDS, "obligation identity")?;
+    for key in [
+        "path",
+        "component",
+        "volume_uuid",
+        "mount",
+        "window_identity",
+    ] {
+        if identity.contains_key(key) {
+            nonempty_field(identity, key, "obligation identity")?;
+        }
+    }
+    for key in [
+        "parent_device",
+        "parent_inode",
+        "inode",
+        "pid",
+        "start",
+        "uid",
+        "fd",
+    ] {
+        if let Some(value) = identity.get(key) {
+            uint_value(value, key)?;
+        }
+    }
+    let device = identity.get("device");
+    let device_is_integer = device.is_some_and(serde_json::Value::is_u64);
+    let device_is_text =
+        device.is_some_and(|value| value.as_str().is_some_and(|text| !text.is_empty()));
+    if device.is_some() && !device_is_integer && !device_is_text {
+        return Err(parse_err(
+            "obligation device is neither an integer nor a non-empty string",
+        ));
+    }
+    let has = |key: &str| identity.contains_key(key);
+    let complete = (has("path")
+        && has("parent_device")
+        && has("parent_inode")
+        && device_is_integer
+        && has("inode"))
+        || (has("component") && has("parent_device") && has("parent_inode"))
+        || (has("pid") && has("start") && has("uid"))
+        || (has("volume_uuid") && has("mount") && device_is_text && has("window_identity"));
+    if !complete {
+        return Err(parse_err(
+            "obligation identity matches no schema alternative",
+        ));
+    }
+    Ok(())
+}
+
+fn manifest_effect(value: &serde_json::Value) -> Result<(), ParseError> {
+    let effect = object(value, "expected effect")?;
+    exact_fields(effect, MANIFEST_EFFECT_FIELDS, "expected effect")?;
+    let kind = string_field(effect, "kind", "expected effect")?;
+    if !MANIFEST_EFFECT_KINDS.contains(&kind) {
+        return Err(parse_err(format!("unknown expected effect kind {kind}")));
+    }
+    nonempty_field(effect, "path", "expected effect")?;
+    nonempty_field(effect, "site", "expected effect")?;
+    bool_field(effect, "attempted", "expected effect")?;
+    Ok(())
+}
+
+fn manifest_expected(value: &serde_json::Value) -> Result<(), ParseError> {
+    let expected = object(value, "expected")?;
+    exact_fields(expected, EXPECTED_FIELDS, "expected")?;
+    let classification = string_field(expected, "classification", "expected")?;
+    if !EXPECTED_CLASSIFICATIONS.contains(&classification) {
+        return Err(parse_err(format!(
+            "unknown expected classification {classification}"
+        )));
+    }
+    for root in capped_array(expected, "roots", 64, "expected")? {
+        let root = object(root, "expected root")?;
+        exact_fields(root, EXPECTED_ROOT_FIELDS, "expected root")?;
+        nonempty_field(root, "root", "expected root")?;
+        match string_field(root, "fate", "expected root")? {
+            "keep" | "release" => {}
+            other => return Err(parse_err(format!("unknown expected root fate {other}"))),
+        }
+    }
+    Ok(())
+}
+
+fn manifest_barge(value: &serde_json::Value) -> Result<(), ParseError> {
+    let barge = object(value, "barge")?;
+    exact_or_known(barge, BARGE_FIELDS, "barge")?;
+    // `named_roots` and `volume_mount` are optional; the rest are required.
+    for key in ["volume_uuid", "namespace", "area"] {
+        field(barge, key, "barge")?;
+    }
+    for key in ["volume_uuid", "namespace", "area"] {
+        nonempty_field(barge, key, "barge")?;
+    }
+    if barge.contains_key("volume_mount") {
+        nonempty_field(barge, "volume_mount", "barge")?;
+    }
+    if let Some(roots) = barge.get("named_roots") {
+        let roots = roots
+            .as_array()
+            .ok_or_else(|| parse_err("barge named_roots is not an array"))?;
+        if roots.len() > 64 {
+            return Err(parse_err("barge named_roots exceeds its 64-item cap"));
+        }
+        for root in roots {
+            nonempty_value(root, "barge named root")?;
+        }
+    }
+    Ok(())
+}
+
+/// Deny unknown keys only. Presence of required keys is the caller's check.
 fn exact_or_known(object: &Object, allowed: &[&str], what: &str) -> Result<(), ParseError> {
     for key in object.keys() {
         if !allowed.contains(&key.as_str()) {
@@ -985,10 +1308,17 @@ pub(crate) fn identity_fields_match(
     true
 }
 
-/// The one effect-parity rule. Only a completed, identified effect (not
-/// attempted, `succeeded`, with a path) can match a declared effect.
-/// Attempted, failed, partial or unknown rows are named as not completed and
-/// never counted as parity.
+/// The one completed-effect rule, shared by parity and fixture-diff
+/// reconciliation: not attempted, observed `succeeded`, and an identified path.
+/// Anything else is never completed parity.
+pub(crate) fn completed_effect(attempted: bool, result: &str, path: Option<&str>) -> bool {
+    !attempted && result == "succeeded" && path.is_some()
+}
+
+/// The one effect-parity rule. Declared effects are compared with the
+/// completed observed rows only. A declared attempt cannot be completed
+/// parity, so it is named and never matched. Observed attempts and
+/// unsucceeded results are named as not completed, so they cannot match.
 pub(crate) fn effect_parity_issues(
     declared: &[serde_json::Value],
     observed: &[serde_json::Value],
@@ -1002,25 +1332,36 @@ pub(crate) fn effect_parity_issues(
             .get("attempted")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
+        let path = effect.get("path").and_then(|v| v.as_str());
         if attempted || result != "succeeded" {
             issues.push(format!("effect not completed at {site} ({result})"));
-            continue;
-        }
-        let Some(path) = effect.get("path").and_then(|v| v.as_str()) else {
+        } else if path.is_none() {
             issues.push(format!("effect identity unproven at {site}"));
-            continue;
-        };
-        completed.push((
-            effect
-                .get("kind")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned(),
-            site.to_owned(),
-            path.to_owned(),
-        ));
+        }
+        if completed_effect(attempted, result, path) {
+            completed.push((
+                effect
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+                site.to_owned(),
+                path.unwrap_or("").to_owned(),
+            ));
+        }
     }
-    let want = effect_bag(declared);
+    let mut want = Vec::new();
+    for effect in declared {
+        let site = effect.get("site").and_then(|v| v.as_str()).unwrap_or("");
+        match effect.get("attempted").and_then(serde_json::Value::as_bool) {
+            Some(false) => want.push(effect.clone()),
+            Some(true) => issues.push(format!(
+                "declared attempt is not completed parity at {site}"
+            )),
+            None => issues.push(format!("declared effect lacks attempted at {site}")),
+        }
+    }
+    let want = effect_bag(&want);
     completed.sort();
     if want.len() != completed.len() {
         issues.push("omitted or extra effects".to_owned());
@@ -1300,9 +1641,19 @@ const VECTORS: &[Vector] = &[
         "78cc67035fb02a8e21892c3cdbd36e45c4f525b63e5866fc7981a896a0810fed"
     ),
     vector!(
+        "invalid/duplicate-declared-effect.json",
+        CompletenessInvalid,
+        "53156a3fe0667095daee0215863d2271355ae8dd52e13d503889da1a762279a7"
+    ),
+    vector!(
         "invalid/duplicate-epoch.json",
         InvalidTranscript,
         "090fd04e378f5156d35b47edb1a9f7fcd3835f1c24a7bf0d9c624b78ecccf048"
+    ),
+    vector!(
+        "invalid/duplicate-observed-effect.json",
+        CompletenessInvalid,
+        "8ef7d5174e150e1bbe470ff9c11f3793155c948661c518595d4f3c0bd32bdd82"
     ),
     vector!(
         "invalid/effect-result-maybe.json",
@@ -1313,6 +1664,11 @@ const VECTORS: &[Vector] = &[
         "invalid/extra-effect.json",
         CompletenessInvalid,
         "52281a2ef287976130a52b4d2724c9deaac147511a4b5db099247b9e0e381b3c"
+    ),
+    vector!(
+        "invalid/failed-effect.json",
+        CompletenessInvalid,
+        "a83abecb523c1dbab2b425fabc6d9bcf7a8860cb3cd745daa2fa6b0c7e0e6b62"
     ),
     vector!(
         "invalid/fixture-device-string.json",
@@ -1360,6 +1716,11 @@ const VECTORS: &[Vector] = &[
         "8a576589088e43511987f5224a7e54c8aafabe3e4fa5930cc8f5c185ed89b963"
     ),
     vector!(
+        "invalid/partial-effect.json",
+        CompletenessInvalid,
+        "bc97ad63b5b311c55bca2222e515c54734f6abb329275ead88fae84c180299cf"
+    ),
+    vector!(
         "invalid/source-mismatch.json",
         CompletenessInvalid,
         "142b909a1747ee531a9095addce1a4587ebc8070724ce00a0be9414d9b15b5f6"
@@ -1380,14 +1741,34 @@ const VECTORS: &[Vector] = &[
         "4fef961450de6bf388f1fca40219a81afb12fef557f45fa5a81db5f040eb14e9"
     ),
     vector!(
+        "invalid/window-origin-claimed.json",
+        InvalidTranscript,
+        "011b9b1740694632c32a99ddf247e4965c9f53970f8235f34658f6f22816f59d"
+    ),
+    vector!(
         "invalid/wrong-inode.json",
         CompletenessInvalid,
         "06d9c40ef3336e8965b6f3319adbc9528de34e435cdd4e3d33ce3c80a88740ba"
     ),
     vector!(
+        "manifest/invalid-effect-attempted-missing.json",
+        InvalidManifest,
+        "89530c16f847c7e751d77257ab75533484c4806989950d94ee08e5052c788a08"
+    ),
+    vector!(
         "manifest/invalid-extra-field.json",
         InvalidManifest,
-        "134be79f3550f4b3b20fa9224c60d7fb51f2c068f2605cac91a7785bf1ab4449"
+        "b0dd58abd4bf5bcc9c8abde563de3febcc22f67cdb3be1e112776dbcadd15a9c"
+    ),
+    vector!(
+        "manifest/invalid-fixture-entry-kind.json",
+        InvalidManifest,
+        "b7dd7f0ccc07e57b0649895368b0a378aec80a372d9d1f6c06460b97a04105b1"
+    ),
+    vector!(
+        "manifest/invalid-identity-shape.json",
+        InvalidManifest,
+        "c8d59664d80d177d573635d61cbe50cdbf4ae197a29e504ec573a590d25f33ed"
     ),
     vector!(
         "manifest/invalid-missing-parent-required.json",
@@ -1397,12 +1778,17 @@ const VECTORS: &[Vector] = &[
     vector!(
         "manifest/invalid-source-digest.json",
         InvalidManifest,
-        "4ff4d08f8122c43dad96f27e001ab100d66a73f207964ddb76d42676a29ecf0d"
+        "6817159e5ef356f50bc64a7f4032df99ce27c19dc16458744522af9e78e383dc"
     ),
     vector!(
         "manifest/invalid-window-order.json",
         InvalidManifest,
-        "73dfa2166407416ec76b3660456e8f46a42d6e7d51880619099a9af5d107d110"
+        "453f92253c4b8ee2a5b33557a28566cd71f9109fe3211db9bd425464587482a1"
+    ),
+    vector!(
+        "manifest/valid-fixture-volume.json",
+        ValidManifest,
+        "1d435677a708cbd2cf5b62077c319a4c7d3bd68a36312f9cc7da7720b0c806b5"
     ),
     vector!(
         "manifest/valid-parent-required.json",
@@ -1507,8 +1893,11 @@ fn vector_manifest(
 /// The manifest each completeness vector is judged against. Declared effects
 /// are completed parity only.
 fn completeness_fixture(name: &str, transcript_case: &str) -> serde_json::Value {
-    let save_ledger =
-        serde_json::json!([{"kind": "save", "site": "ledger", "path": "/fixture/ledger"}]);
+    let save_ledger = serde_json::json!([{"kind": "save", "site": "ledger", "path": "/fixture/ledger", "attempted": false}]);
+    let two_save_ledgers = serde_json::json!([
+        {"kind": "save", "site": "ledger", "path": "/fixture/ledger", "attempted": false},
+        {"kind": "save", "site": "ledger", "path": "/fixture/ledger", "attempted": false}
+    ]);
     let registry = serde_json::json!({"path": "/fixture/registry"});
     match name {
         "valid/absent.json" | "valid/truncated.json" => vector_manifest(
@@ -1572,7 +1961,10 @@ fn completeness_fixture(name: &str, transcript_case: &str) -> serde_json::Value 
         ),
         "invalid/omitted-effect.json"
         | "invalid/extra-effect.json"
-        | "invalid/attempted-as-completed.json" => vector_manifest(
+        | "invalid/attempted-as-completed.json"
+        | "invalid/partial-effect.json"
+        | "invalid/failed-effect.json"
+        | "invalid/duplicate-observed-effect.json" => vector_manifest(
             transcript_case,
             "prune::read_registry",
             false,
@@ -1587,6 +1979,14 @@ fn completeness_fixture(name: &str, transcript_case: &str) -> serde_json::Value 
             registry,
             false,
             save_ledger,
+        ),
+        "invalid/duplicate-declared-effect.json" => vector_manifest(
+            transcript_case,
+            "prune::read_registry",
+            false,
+            registry.clone(),
+            false,
+            two_save_ledgers,
         ),
         "invalid/collision.json" => vector_manifest(
             transcript_case,
@@ -1654,6 +2054,20 @@ fn expected_issues(name: &str) -> &'static [&'static str] {
         "invalid/attempted-as-completed.json" => &[
             "window origin and end unproven",
             "effect not completed at ledger (unknown)",
+            "omitted or extra effects",
+        ],
+        "invalid/partial-effect.json" => &[
+            "window origin and end unproven",
+            "effect not completed at ledger (partial)",
+            "omitted or extra effects",
+        ],
+        "invalid/failed-effect.json" => &[
+            "window origin and end unproven",
+            "effect not completed at ledger (failed)",
+            "omitted or extra effects",
+        ],
+        "invalid/duplicate-observed-effect.json" | "invalid/duplicate-declared-effect.json" => &[
+            "window origin and end unproven",
             "omitted or extra effects",
         ],
         "invalid/collision.json" => &[
@@ -1753,6 +2167,43 @@ fn cap_checks() -> Result<usize, String> {
     Ok(checked)
 }
 
+/// The refusal each invalid vector must produce. A vector that fails for some
+/// other reason is a failed check, not a pass.
+fn expected_refusal(name: &str) -> &'static str {
+    match name {
+        "invalid/historical-v1.json" => "historical /1 capture document",
+        "invalid/apparatus-diagnostic.json" => "unknown version oxide.capture.apparatus/2",
+        "invalid/unknown-field-nested.json" => "unknown identity field extra",
+        "invalid/cap-string.json" => "cap is not a u64 or null",
+        "invalid/cap-absent.json" => "read row missing cap",
+        "invalid/clock-string.json" => "clock value is not a u64 or null",
+        "invalid/occurrence-zero.json" => "occurrence is outside 1..=64",
+        "invalid/effect-result-maybe.json" => "unknown effect result maybe",
+        "invalid/attempt-succeeded.json" => "an attempted effect cannot report succeeded",
+        "invalid/parent-pair-mismatch.json" => "parent device and inode must be both present",
+        "invalid/duplicate-epoch.json" => "epoch 1 is reused",
+        "invalid/holder-kernel-missing.json" => "recorded holder missing kernel_start",
+        "invalid/truncation-missing-flag.json" => "truncation missing classifications_truncated",
+        "invalid/fixture-device-string.json" => "fixture entry device is not a u64",
+        "invalid/outcome-state-unknown.json" => "unknown outcome state maybe",
+        "invalid/derived-provenance.json" => "unknown provenance derived",
+        "invalid/fixture-diff-epoch.json" => "diff effect result is not unknown",
+        "invalid/window-origin-claimed.json" => "window_monotonic_start_ns must be null",
+        "manifest/invalid-missing-parent-required.json" => "obligation missing parent_required",
+        "manifest/invalid-extra-field.json" => "unknown manifest field extra",
+        "manifest/invalid-source-digest.json" => {
+            "cargo_lock_sha256 is not a lowercase hex digest of 64"
+        }
+        "manifest/invalid-window-order.json" => "window starts after it ends",
+        "manifest/invalid-identity-shape.json" => {
+            "obligation identity matches no schema alternative"
+        }
+        "manifest/invalid-effect-attempted-missing.json" => "expected effect missing attempted",
+        "manifest/invalid-fixture-entry-kind.json" => "unknown fixture entry kind dir",
+        _ => "",
+    }
+}
+
 /// Pure parser, completeness, emitted-shape and hashed-vector checks. Invoked
 /// from the harness `--self-check` so the `harness = false` target runs them.
 pub(crate) fn run_self_checks() -> Result<(), String> {
@@ -1799,24 +2250,49 @@ pub(crate) fn run_self_checks() -> Result<(), String> {
                 }
                 checked += 1;
             }
-            VectorKind::InvalidTranscript => {
-                if parse_transcript(vector.bytes).is_ok() {
-                    failed.push(format!("{} should fail parse", vector.name));
-                } else {
-                    checked += 1;
-                }
-            }
+            VectorKind::InvalidTranscript => match parse_transcript(vector.bytes) {
+                Ok(_) => failed.push(format!("{} should fail parse", vector.name)),
+                Err(error) if error.message.contains(expected_refusal(vector.name)) => checked += 1,
+                Err(error) => failed.push(format!(
+                    "{} refused for {:?}, expected {:?}",
+                    vector.name,
+                    error.message,
+                    expected_refusal(vector.name)
+                )),
+            },
             VectorKind::ValidManifest => match parse_manifest(vector.bytes) {
                 Ok(_) => checked += 1,
                 Err(error) => failed.push(format!("{} parse: {}", vector.name, error.message)),
             },
-            VectorKind::InvalidManifest => {
-                if parse_manifest(vector.bytes).is_ok() {
-                    failed.push(format!("{} should fail parse", vector.name));
-                } else {
-                    checked += 1;
-                }
-            }
+            VectorKind::InvalidManifest => match parse_manifest(vector.bytes) {
+                Ok(_) => failed.push(format!("{} should fail parse", vector.name)),
+                Err(error) if error.message.contains(expected_refusal(vector.name)) => checked += 1,
+                Err(error) => failed.push(format!(
+                    "{} refused for {:?}, expected {:?}",
+                    vector.name,
+                    error.message,
+                    expected_refusal(vector.name)
+                )),
+            },
+        }
+    }
+    // The canonical examples are the documented shape; the parser must accept them.
+    let examples: [(&str, &[u8]); 2] = [
+        (
+            "capture-examples/v2/manifest-example.json",
+            include_bytes!("../../../docs/knowledge/contracts/capture-examples/v2/manifest-example.json"),
+        ),
+        (
+            "capture-examples/v2/manifest-effects-all-kinds.json",
+            include_bytes!(
+                "../../../docs/knowledge/contracts/capture-examples/v2/manifest-effects-all-kinds.json"
+            ),
+        ),
+    ];
+    for (name, bytes) in examples {
+        match parse_manifest(bytes) {
+            Ok(_) => checked += 1,
+            Err(error) => failed.push(format!("{name} parse: {}", error.message)),
         }
     }
     if K1_PREMISE_QUALIFIED {

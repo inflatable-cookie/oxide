@@ -40,7 +40,9 @@
       "site": "config:inspect:initial",
       "parent_required": false,
       "identity": {
-        "path": "/fixture/missing"
+        "component": "missing",
+        "parent_device": 1,
+        "parent_inode": 2
       }
     }
   ],

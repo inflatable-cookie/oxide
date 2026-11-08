@@ -13,8 +13,11 @@ wire `/2`".
   epochs, bad outcome or provenance) and parser-positive completeness
   failures (`source-mismatch`, `wrong-inode`, `omitted-obligation`,
   `omitted-effect`, `extra-effect`, `substituted-effect`,
-  `attempted-as-completed`, `collision`).
-- `v2/manifest/`: valid and invalid `/2` manifests.
+  `attempted-as-completed`, `partial-effect`, `failed-effect`,
+  `duplicate-observed-effect`, `duplicate-declared-effect`, `collision`).
+  Each parser refusal asserts the named refusal it must produce.
+- `v2/manifest/`: valid and invalid `/2` manifests, typed against
+  `oxide-capture-manifest.v2.schema.json`.
 
 The `/1` files at this directory's root and their `SHA256SUMS` are historical
 evidence, unchanged. They are refused as proof input. Barge copies these

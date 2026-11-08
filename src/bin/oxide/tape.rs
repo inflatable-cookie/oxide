@@ -7,7 +7,7 @@
 //! injection stub: every leaf records what the real syscalls and parsers
 //! actually returned, feeds nothing back, and never changes a decision.
 //!
-//! The transcript implements the fixed `oxide.capture.transcript/1` schema and
+//! The transcript implements the fixed `oxide.capture.transcript/2` schema and
 //! caps: at most 8192 read rows, 8 MiB of document, 64 occurrences per
 //! identity key and 512 process rows. An exhausted cap is recorded as
 //! truncation and marks the transcript insufficient; it never silently drops
@@ -237,7 +237,7 @@ pub(crate) struct TapeTruncation {
     pub(crate) classifications_truncated: bool,
 }
 
-/// The transcript document, `oxide.capture.transcript/1`.
+/// The transcript document, `oxide.capture.transcript/2`.
 #[derive(Debug, Serialize)]
 pub(crate) struct TapeTranscript {
     pub(crate) version: &'static str,
@@ -580,8 +580,11 @@ pub(crate) fn check_fixture_diff(root: &Path, capture: &TapeFixtureCapture) {
         for diff in &capture.diff_effects {
             let path = root.join(diff.path.as_deref().unwrap_or(""));
             let matched = state.effects.iter().any(|effect| {
-                !effect.attempted
-                    && effect.path.as_deref().map(Path::new) == Some(path.as_path())
+                capture_wire::completed_effect(
+                    effect.attempted,
+                    effect.result,
+                    effect.path.as_deref(),
+                ) && effect.path.as_deref().map(Path::new) == Some(path.as_path())
                     && match diff.kind.as_str() {
                         "create" => {
                             matches!(effect.kind.as_str(), "create" | "lock-create" | "rename")
@@ -997,6 +1000,14 @@ pub(crate) fn unbound_effect(site: &str, succeeded: bool) {
 /// Internal labels carry `kind@site`; serialized fields separate them. A fence
 /// override relabels only the next save, avoiding a duplicate effect row.
 pub(crate) fn effect_row(kind: &str, path: &Path) {
+    effect_result_row(kind, path, None);
+}
+
+/// Record an effect with the result the leaf reported. `None` keeps the
+/// default: `succeeded` for a completed write and `unknown` for an attempt.
+/// An attempt never records `succeeded`; a reported `failed` or `partial`
+/// stays as reported.
+pub(crate) fn effect_result_row(kind: &str, path: &Path, observed: Option<&'static str>) {
     let saved_errno = observer_errno();
     with_state(|state| {
         let epoch = next_epoch(state);
@@ -1044,14 +1055,18 @@ pub(crate) fn effect_row(kind: &str, path: &Path) {
                 format!("attempted effect at {site} remains insufficient"),
             );
         }
+        let result = match observed {
+            Some("succeeded") | None if attempted => "unknown",
+            Some(reported) => reported,
+            None => "succeeded",
+        };
         state.effects.push(TapeEffectRow {
             kind: verb.to_owned(),
             site: site.to_owned(),
             attempted,
             path: Some(path_text.to_owned()),
             epoch,
-            // An attempt's completion is never observed here.
-            result: if attempted { "unknown" } else { "succeeded" },
+            result,
         });
         charge_document(state, 96);
     });
