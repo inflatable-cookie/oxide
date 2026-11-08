@@ -1327,6 +1327,492 @@ fn run_case(
 }
 
 // ---------------------------------------------------------------------------
+// Observation-only embedded control (oxide#289)
+// ---------------------------------------------------------------------------
+//
+// One control on this side, run at most once: the existing `Case::Base` setup
+// and the existing `run_case` chain, with no assertion able to discard a
+// nonzero engine exit, a refusal or an invalid transcript before it is
+// recorded. The report is a distinct diagnostic schema, `qualified` is false
+// unconditionally, and matching fates award nothing.
+
+/// The distinct diagnostic schema. It is not a transcript, a manifest or an
+/// acceptance document.
+const OBSERVATION_SCHEMA: &str = "oxide.capture.embedded-observation/1";
+/// The canonical-parser report for one retained capture document. Also a
+/// distinct diagnostic, never a verdict an acceptance could rest on.
+const CAPTURE_PARSE_SCHEMA: &str = "oxide.capture.embedded-capture-parse/1";
+const OBSERVATION_CLAIM: &str = "none: one raw observation per engine; no agreement, equivalence, timing, writer-closure, export, deletion or deployment credit";
+/// Bounded capture of one child's own output. Anything past the cap is reported
+/// as truncated, never summarised as if complete.
+const OBSERVATION_TEXT_CAP: usize = 64 * 1024;
+/// Bounded gap list; the remainder is counted, never silently dropped.
+const OBSERVATION_GAP_CAP: usize = 32;
+const TRUNCATION_FLAGS: [&str; 5] = [
+    "document_truncated",
+    "read_rows_truncated",
+    "occurrences_truncated",
+    "process_rows_truncated",
+    "classifications_truncated",
+];
+
+/// The one control this route can select. A single-variant enum is the point:
+/// no argument can name a second fixture, a second case or the broad
+/// `--diagnostic` route on this side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObservedControl {
+    Base,
+}
+
+impl ObservedControl {
+    fn case(self) -> Case {
+        match self {
+            Self::Base => Case::Base,
+        }
+    }
+}
+
+/// One observation invocation. It carries no case field: the control is fixed
+/// at `ObservedControl::Base`.
+struct ObservationArgs {
+    root: PathBuf,
+    report: PathBuf,
+}
+
+fn parse_observation_args(args: &[String]) -> Result<ObservationArgs, String> {
+    if args.first().map(String::as_str) != Some("--observe-base") {
+        return Err(format!("observation needs --observe-base; {}", usage()));
+    }
+    let mut root: Option<PathBuf> = None;
+    let mut report: Option<PathBuf> = None;
+    let mut index = 1;
+    while index < args.len() {
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("{} needs a value", args[index]))?;
+        match args[index].as_str() {
+            "--root" if root.is_none() => root = Some(PathBuf::from(value)),
+            "--report-out" if report.is_none() => report = Some(PathBuf::from(value)),
+            other => return Err(format!("unexpected observation argument {other}")),
+        }
+        index += 2;
+    }
+    match (root, report) {
+        (Some(root), Some(report)) => Ok(ObservationArgs { root, report }),
+        _ => Err("observation needs one --root and one --report-out".to_owned()),
+    }
+}
+
+/// The observation root must already be this user's owner-only canonical
+/// directory under the selected-volume scratch namespace, so nothing is
+/// created outside the caller's owned subtree.
+fn validate_observation_root(root: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let link = std::fs::symlink_metadata(root)
+        .map_err(|error| format!("{} cannot be observed: {error}", root.display()))?;
+    if link.file_type().is_symlink() || !link.is_dir() {
+        return Err(format!("{} is not a real directory", root.display()));
+    }
+    let metadata = std::fs::metadata(root).map_err(|error| error.to_string())?;
+    if metadata.uid() != unsafe { libc::getuid() } || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(format!("{} is not an owner-only directory", root.display()));
+    }
+    if std::fs::canonicalize(root).map_err(|error| error.to_string())? != root {
+        return Err(format!("{} is not the canonical root", root.display()));
+    }
+    Ok(())
+}
+
+struct EngineRun {
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    stdout: String,
+    stdout_truncated: bool,
+    stderr: String,
+    stderr_truncated: bool,
+}
+
+fn bounded_text(bytes: &[u8]) -> (String, bool) {
+    let kept = bytes.len().min(OBSERVATION_TEXT_CAP);
+    (
+        String::from_utf8_lossy(&bytes[..kept]).into_owned(),
+        bytes.len() > OBSERVATION_TEXT_CAP,
+    )
+}
+
+/// Run the one engine child for this control. `output()` waits for and reaps
+/// this direct child, exactly as the self-check case does; it concludes
+/// nothing about any descendant, which stays the guard's post-leader census.
+fn run_engine(setup: &CaseSetup, control: ObservedControl) -> Result<EngineRun, String> {
+    let output = engine_child(setup, control.case(), false)?
+        .output()
+        .map_err(|error| format!("the engine child cannot run: {error}"))?;
+    use std::os::unix::process::ExitStatusExt;
+    let (stdout, stdout_truncated) = bounded_text(&output.stdout);
+    let (stderr, stderr_truncated) = bounded_text(&output.stderr);
+    Ok(EngineRun {
+        exit_code: output.status.code(),
+        signal: output.status.signal(),
+        stdout,
+        stdout_truncated,
+        stderr,
+        stderr_truncated,
+    })
+}
+
+fn relative_label(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .map(|relative| relative.display().to_string())
+        .unwrap_or_else(|_| path.display().to_string())
+}
+
+fn manifest_fixture(manifest: &[u8]) -> serde_json::Value {
+    serde_json::from_slice::<serde_json::Value>(manifest)
+        .ok()
+        .and_then(|document| document.get("fixture").cloned())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn pushbounded(gaps: &mut Vec<String>, text: String) {
+    if gaps.len() < OBSERVATION_GAP_CAP {
+        gaps.push(text);
+    }
+}
+
+/// The one observation document for one control. Every input here is an
+/// observation: no branch can turn an absent, refused, truncated or uncertain
+/// fact into an empty or successful one, and `qualified` is always false.
+fn observation_document(
+    setup: &CaseSetup,
+    control: ObservedControl,
+    run: &EngineRun,
+    manifest: &[u8],
+    transcript: Option<&[u8]>,
+) -> serde_json::Value {
+    let case = control.case();
+    let mut gaps: Vec<String> = Vec::new();
+    let transcript_report = match transcript {
+        None => {
+            pushbounded(
+                &mut gaps,
+                "missing transcript: the engine child wrote no capture document, so no outcome or fate is recorded".to_owned(),
+            );
+            serde_json::Value::Null
+        }
+        Some(bytes) => {
+            match tape::capture_wire::parse_transcript(bytes) {
+                Ok(document) => {
+                    let schema = document
+                        .get("schema")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default();
+                    if schema == tape::APPARATUS_VERSION {
+                        pushbounded(
+                            &mut gaps,
+                            format!("apparatus diagnostic retained instead of a capture document ({schema})"),
+                        );
+                    }
+                    if let Some(flags) = document
+                        .get("truncation")
+                        .and_then(|value| value.as_object())
+                    {
+                        for flag in TRUNCATION_FLAGS {
+                            if flags.get(flag).and_then(|value| value.as_bool()) == Some(true) {
+                                pushbounded(&mut gaps, format!("capture truncated: {flag}"));
+                            }
+                        }
+                    }
+                    if document
+                        .pointer("/fixture_capture/truncated")
+                        .and_then(|value| value.as_bool())
+                        == Some(true)
+                    {
+                        pushbounded(&mut gaps, "capture truncated: fixture_capture".to_owned());
+                    }
+                }
+                Err(error) => pushbounded(
+                    &mut gaps,
+                    format!(
+                        "retained document does not parse as a /2 capture document: {}",
+                        error.message
+                    ),
+                ),
+            }
+            serde_json::json!({
+                "path": relative_label(&setup.root, &setup.transcript_path),
+                "present": true,
+                "bytes": bytes.len(),
+                "sha256": tape::sha256_hex(bytes),
+            })
+        }
+    };
+    if run.exit_code != Some(0) {
+        pushbounded(
+            &mut gaps,
+            format!(
+                "engine did not exit 0 (code {:?}, signal {:?}); the raw outcome stays as observed",
+                run.exit_code, run.signal
+            ),
+        );
+    }
+    if run.stdout_truncated || run.stderr_truncated {
+        pushbounded(
+            &mut gaps,
+            "engine output truncated at the capture cap".to_owned(),
+        );
+    }
+    let recorded = gaps.len();
+    if recorded == OBSERVATION_GAP_CAP && recorded > 0 {
+        // The cap is visible, so a full list is never read as complete.
+        gaps.push(format!(
+            "at most {OBSERVATION_GAP_CAP} gaps are recorded; further gaps are omitted"
+        ));
+    }
+    serde_json::json!({
+        "schema": OBSERVATION_SCHEMA,
+        "qualified": false,
+        "claim": OBSERVATION_CLAIM,
+        "control": {"engine": ENGINE, "case": case.name(), "selection": "base-only"},
+        "setup": {
+            "root": setup.root.display().to_string(),
+            "manifest": relative_label(&setup.root, &setup.manifest_path),
+            "manifest_sha256": tape::sha256_hex(manifest),
+            "volume": setup.volume.as_ref().map(|(mount, uuid)| serde_json::json!({
+                "mount": mount.display().to_string(),
+                "uuid": uuid,
+            })),
+            "fixture": manifest_fixture(manifest),
+        },
+        "engine_run": {
+            "exit_code": run.exit_code,
+            "signal": run.signal,
+            "stdout": run.stdout,
+            "stdout_truncated": run.stdout_truncated,
+            "stderr": run.stderr,
+            "stderr_truncated": run.stderr_truncated,
+        },
+        "transcript": transcript_report,
+        "gaps": gaps,
+    })
+}
+
+fn run_observation(args: &ObservationArgs) -> Result<(), String> {
+    validate_observation_root(&args.root)?;
+    // The report stays inside the owned root; an arbitrary, escaping or
+    // pre-existing destination refuses before any fixture exists.
+    validate_fixture_path(&args.root, &args.report)?;
+    match std::fs::symlink_metadata(&args.report) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return Err("observation report destination already exists".to_owned()),
+        Err(error) => return Err(error.to_string()),
+    }
+    let control = ObservedControl::Base;
+    let setup = prepare_case(&args.root, control.case(), false)?;
+    let manifest = std::fs::read(&setup.manifest_path).map_err(|error| error.to_string())?;
+    let run = run_engine(&setup, control)?;
+    let transcript = match std::fs::read(&setup.transcript_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("the transcript cannot be read: {error}")),
+    };
+    let document = observation_document(&setup, control, &run, &manifest, transcript.as_deref());
+    write_private_file(
+        &args.report,
+        &serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?,
+    )?;
+    println!(
+        "oxide: embedded observation {} -> {} (engine exit {:?}, signal {:?}); capture remains unqualified",
+        control.case().name(),
+        args.report.display(),
+        run.exit_code,
+        run.signal
+    );
+    Ok(())
+}
+
+/// One canonical-parser pass over one retained capture document. Used for the
+/// other engine's transcript, which this side cannot observe in process; it
+/// runs no engine and changes no document.
+struct CaptureParseArgs {
+    root: PathBuf,
+    transcript: PathBuf,
+    manifest: Option<PathBuf>,
+    report: PathBuf,
+}
+
+fn parse_capture_args(args: &[String]) -> Result<CaptureParseArgs, String> {
+    if args.first().map(String::as_str) != Some("--parse-capture") {
+        return Err(format!(
+            "capture parsing needs --parse-capture; {}",
+            usage()
+        ));
+    }
+    let mut root: Option<PathBuf> = None;
+    let mut transcript: Option<PathBuf> = None;
+    let mut manifest: Option<PathBuf> = None;
+    let mut report: Option<PathBuf> = None;
+    let mut index = 1;
+    while index < args.len() {
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("{} needs a value", args[index]))?;
+        let slot = match args[index].as_str() {
+            "--root" => &mut root,
+            "--transcript" => &mut transcript,
+            "--manifest" => &mut manifest,
+            "--report-out" => &mut report,
+            other => return Err(format!("unexpected capture-parse argument {other}")),
+        };
+        if slot.is_some() {
+            return Err(format!("{} was given twice", args[index]));
+        }
+        *slot = Some(PathBuf::from(value));
+        index += 2;
+    }
+    match (root, transcript, report) {
+        (Some(root), Some(transcript), Some(report)) => Ok(CaptureParseArgs {
+            root,
+            transcript,
+            manifest,
+            report,
+        }),
+        _ => Err("capture parsing needs --root, --transcript and --report-out".to_owned()),
+    }
+}
+
+/// The canonical `/2` parse, strict completeness and limited verdict for one
+/// document pair. A missing manifest is recorded as absent, never invented.
+fn capture_parse_document(transcript: &[u8], manifest: Option<&[u8]>) -> serde_json::Value {
+    let mut gaps: Vec<String> = Vec::new();
+    let parsed = tape::capture_wire::parse_transcript(transcript);
+    let parser = match &parsed {
+        Ok(_) => serde_json::json!({"state": "parsed", "reason": null}),
+        Err(error) => {
+            pushbounded(
+                &mut gaps,
+                format!("transcript parser refused: {}", error.message),
+            );
+            serde_json::json!({"state": "refused", "reason": error.message})
+        }
+    };
+    let manifest_parsed = manifest.map(tape::capture_wire::parse_manifest);
+    let manifest_parser = match &manifest_parsed {
+        None => serde_json::Value::Null,
+        Some(Ok(_)) => serde_json::json!({"state": "parsed", "reason": null}),
+        Some(Err(error)) => {
+            pushbounded(
+                &mut gaps,
+                format!("manifest parser refused: {}", error.message),
+            );
+            serde_json::json!({"state": "refused", "reason": error.message})
+        }
+    };
+    let mut strict = serde_json::Value::Null;
+    let mut outcome = serde_json::Value::Null;
+    let mut limited = serde_json::json!({
+        "state": "not-applicable",
+        "reason": "no manifest document was retained for this side",
+    });
+    if let Ok(document) = &parsed {
+        // The engine's own outcome, verbatim. It is an observation, never a
+        // normalised fate and never a comparison result.
+        outcome = document
+            .get("outcome")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let schema = document
+            .get("schema")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if schema == tape::APPARATUS_VERSION {
+            pushbounded(
+                &mut gaps,
+                format!("apparatus diagnostic retained instead of a capture document ({schema})"),
+            );
+        }
+        if let Some(flags) = document
+            .get("truncation")
+            .and_then(|value| value.as_object())
+        {
+            for flag in TRUNCATION_FLAGS {
+                if flags.get(flag).and_then(|value| value.as_bool()) == Some(true) {
+                    pushbounded(&mut gaps, format!("capture truncated: {flag}"));
+                }
+            }
+        }
+        let manifest_document = match &manifest_parsed {
+            Some(Ok(manifest_document)) => Some(manifest_document),
+            _ => None,
+        };
+        let completeness = tape::assess_completeness(document, manifest_document);
+        strict = serde_json::json!({
+            "complete": completeness.ok(),
+            "issues": completeness.issues,
+        });
+        if let Some(manifest_bytes) = manifest {
+            match tape::capture_verdict::evaluate_limited_capture(transcript, manifest_bytes) {
+                Ok(verdict) => limited = verdict.to_document(),
+                Err(reason) => {
+                    pushbounded(&mut gaps, format!("limited verdict refused: {reason}"));
+                    limited = serde_json::json!({"state": "refused", "reason": reason});
+                }
+            }
+        }
+    }
+    serde_json::json!({
+        "schema": CAPTURE_PARSE_SCHEMA,
+        "qualified": false,
+        "claim": OBSERVATION_CLAIM,
+        "transcript": {
+            "bytes": transcript.len(),
+            "sha256": tape::sha256_hex(transcript),
+        },
+        "manifest": manifest.map(|bytes| serde_json::json!({
+            "present": true,
+            "bytes": bytes.len(),
+            "sha256": tape::sha256_hex(bytes),
+        })),
+        "parser": {"transcript": parser, "manifest": manifest_parser},
+        "outcome": outcome,
+        "strict": strict,
+        "limited": limited,
+        "gaps": gaps,
+    })
+}
+
+fn run_capture_parse(args: &CaptureParseArgs) -> Result<(), String> {
+    validate_observation_root(&args.root)?;
+    validate_fixture_path(&args.root, &args.transcript)?;
+    validate_fixture_path(&args.root, &args.report)?;
+    if let Some(manifest) = args.manifest.as_deref() {
+        validate_fixture_path(&args.root, manifest)?;
+    }
+    match std::fs::symlink_metadata(&args.report) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return Err("capture-parse report destination already exists".to_owned()),
+        Err(error) => return Err(error.to_string()),
+    }
+    let transcript = std::fs::read(&args.transcript)
+        .map_err(|error| format!("the transcript cannot be read: {error}"))?;
+    let manifest = match args.manifest.as_deref() {
+        None => None,
+        Some(path) => Some(
+            std::fs::read(path).map_err(|error| format!("the manifest cannot be read: {error}"))?,
+        ),
+    };
+    let document = capture_parse_document(&transcript, manifest.as_deref());
+    write_private_file(
+        &args.report,
+        &serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?,
+    )?;
+    println!(
+        "oxide: capture parse -> {} (canonical /2 parser; no engine run); remains unqualified",
+        args.report.display()
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Transcript reading for the self-check
 // ---------------------------------------------------------------------------
 
@@ -3620,90 +4106,132 @@ fn has_read(rows: &[serde_json::Value], kind: &str) -> bool {
         .any(|row| row.get("kind").and_then(|value| value.as_str()) == Some(kind))
 }
 
-fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), CheckFailure> {
-    let spec = FixtureSpec {
+/// The one fixture specification each case uses. The observation-only route
+/// (oxide#289) calls this with `Case::Base` and nothing else, so it cannot
+/// diverge from the setup the self-check case already asserts.
+fn fixture_spec(case: Case, volume: Option<(PathBuf, String)>) -> FixtureSpec {
+    FixtureSpec {
         case,
-        volume: fixture_volume(temp),
+        volume,
         ready: true,
         admission_lock: !matches!(case, Case::Effect1),
         fenced_state: !matches!(case, Case::Effect2),
         registry: !matches!(case, Case::RegistryMissing),
         intent: matches!(case, Case::UnsettledIntent),
-    };
+    }
+}
+
+/// One prepared case: the exclusively owned fixture, its manifest on disk and
+/// the transcript destination. Building it writes only inside `temp` and calls
+/// no engine.
+struct CaseSetup {
+    root: PathBuf,
+    paths: FixturePaths,
+    manifest_path: PathBuf,
+    transcript_path: PathBuf,
+    volume: Option<(PathBuf, String)>,
+}
+
+fn prepare_case(temp: &Path, case: Case, disconnected: bool) -> Result<CaseSetup, String> {
+    let spec = fixture_spec(case, fixture_volume(temp));
     let root = temp.join(format!(
         "fixture-{}{}",
         case.name().to_lowercase(),
         if disconnected { "-disconnected" } else { "" }
     ));
-    let paths = build_fixture(&root, &spec).map_err(|error| CheckFailure { what: error })?;
+    let paths = build_fixture(&root, &spec)?;
     // Schema-example data is a unit-test envelope, not source or fixture
     // qualification evidence. X-S2 supplies observed manifest facts.
     let mut manifest: serde_json::Value = serde_json::from_str(include_str!(
         "../../../docs/knowledge/contracts/capture-examples/v2/manifest-example.json"
     ))
-    .map_err(|error| CheckFailure {
-        what: error.to_string(),
-    })?;
+    .map_err(|error| error.to_string())?;
     manifest["case"] = serde_json::Value::String(case.name().to_owned());
     manifest["fixture"]["root"] = serde_json::Value::String(root.display().to_string());
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let root_meta = std::fs::symlink_metadata(&root).map_err(|error| CheckFailure {
-        what: error.to_string(),
-    })?;
+    let root_meta = std::fs::symlink_metadata(&root).map_err(|error| error.to_string())?;
     manifest["fixture"]["device"] = root_meta.dev().into();
     manifest["fixture"]["inode"] = root_meta.ino().into();
     manifest["fixture"]["mode"] = u64::from(root_meta.permissions().mode() & 0o777).into();
     let manifest_path = root.join("manifest.json");
     write_private_file(
         &manifest_path,
-        &serde_json::to_vec_pretty(&manifest).map_err(|error| CheckFailure {
-            what: error.to_string(),
-        })?,
-    )
-    .map_err(|error| CheckFailure { what: error })?;
-    let transcript_path = root.join("transcript.json");
+        &serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?,
+    )?;
+    Ok(CaseSetup {
+        transcript_path: root.join("transcript.json"),
+        root,
+        paths,
+        manifest_path,
+        volume: spec.volume,
+    })
+}
 
-    // The engine child: this executable, one case, scrubbed fixture env.
-    let exe = std::env::current_exe().map_err(|error| CheckFailure {
-        what: error.to_string(),
-    })?;
+/// The one engine child argv and environment every route uses: this
+/// executable, the fixture entry, one case and the scrubbed fixture env. The
+/// observation route cannot add a case or a second fixture here.
+fn engine_child(setup: &CaseSetup, case: Case, disconnected: bool) -> Result<Command, String> {
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
     let mut envs: Vec<(String, String)> = vec![
-        ("HOME".to_owned(), root.join("home").display().to_string()),
+        (
+            "HOME".to_owned(),
+            setup.root.join("home").display().to_string(),
+        ),
         ("OXIDE_TEST_HOME_FROM_ENV".to_owned(), "1".to_owned()),
         (
             "OXIDE_CONFIG".to_owned(),
-            root.join("config.toml").display().to_string(),
+            setup.root.join("config.toml").display().to_string(),
         ),
-        ("OXIDE_POOL".to_owned(), paths.pool.display().to_string()),
+        (
+            "OXIDE_POOL".to_owned(),
+            setup.paths.pool.display().to_string(),
+        ),
         ("OXIDE_POOL_CAP".to_owned(), "1073741824".to_owned()),
     ];
-    if spec.volume.is_some() {
+    if setup.volume.is_some() {
         envs.push((
             "OXIDE_SCRATCH_ROOT".to_owned(),
-            root.join("scratch").display().to_string(),
+            setup.root.join("scratch").display().to_string(),
         ));
     }
-    let mut command = Command::new(&exe);
+    let mut command = Command::new(exe);
     if disconnected {
         command.arg("--counterfactual-disconnected");
     }
-    let output = command
+    command
         .arg("--fixture-root")
-        .arg(&root)
+        .arg(&setup.root)
         .arg("--manifest")
-        .arg(&manifest_path)
+        .arg(&setup.manifest_path)
         .arg("--transcript-out")
-        .arg(&transcript_path)
+        .arg(&setup.transcript_path)
         .arg("--case")
         .arg(case.name())
         .env_clear()
         .envs(envs)
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-        .env("TMPDIR", std::env::temp_dir())
+        .env("TMPDIR", std::env::temp_dir());
+    Ok(command)
+}
+
+fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), CheckFailure> {
+    let setup =
+        prepare_case(temp, case, disconnected).map_err(|error| CheckFailure { what: error })?;
+    let output = engine_child(&setup, case, disconnected)
+        .map_err(|error| CheckFailure {
+            what: format!("cannot run the engine child: {error}"),
+        })?
         .output()
         .map_err(|error| CheckFailure {
             what: format!("cannot run the engine child: {error}"),
         })?;
+    let CaseSetup {
+        root,
+        paths,
+        manifest_path,
+        transcript_path,
+        ..
+    } = setup;
     // The child was waited for above (`output()`); it is reaped by the OS
     // through that wait. This proves only that the direct child was reaped;
     // it does not establish closure of any descendant the child may start.
@@ -4038,6 +4566,335 @@ fn fixture_case(temp: &Path, case: Case, disconnected: bool) -> Result<(), Check
     Ok(())
 }
 
+fn argv(items: &[&str]) -> Vec<String> {
+    items.iter().map(|item| (*item).to_owned()).collect()
+}
+
+fn document_gap(document: &serde_json::Value, needle: &str) -> bool {
+    document
+        .get("gaps")
+        .and_then(|gaps| gaps.as_array())
+        .is_some_and(|gaps| {
+            gaps.iter()
+                .any(|gap| gap.as_str().is_some_and(|text| text.contains(needle)))
+        })
+}
+
+/// Pure controls for the observation-only route (oxide#289). No engine, no
+/// fixture build and no staging: only the argv, the retention bounds and the
+/// report builder's honest classification are exercised. The transcripts used
+/// here are canonical `/2` vectors and clearly labelled apparatus input, never
+/// engine evidence.
+fn observation_check(temp: &Path) -> Result<(), CheckFailure> {
+    let root = temp.join("observation-argv");
+    let paths = FixturePaths {
+        root: root.clone(),
+        pool: root.join("scratch/pool"),
+        control: root.join("scratch/pool/oxide-managed"),
+        outputs_dir: root.join("oxide-outputs"),
+        checkout_present: root.join("checkouts/ra-present"),
+        checkout_gone: root.join("checkouts/rb-gone"),
+        root_ra: root.join("oxide-outputs/oxide-ra"),
+        root_rb: root.join("oxide-outputs/oxide-rb"),
+    };
+    let setup = CaseSetup {
+        manifest_path: root.join("manifest.json"),
+        transcript_path: root.join("transcript.json"),
+        root: root.clone(),
+        paths,
+        volume: None,
+    };
+
+    // One control, one case, one fixed argv: the observation route re-invokes
+    // exactly the argv the self-check BASE case uses, so it cannot select a
+    // second fixture or reach the broad `--diagnostic` route.
+    let expected = argv(&[
+        "--fixture-root",
+        &root.display().to_string(),
+        "--manifest",
+        &setup.manifest_path.display().to_string(),
+        "--transcript-out",
+        &setup.transcript_path.display().to_string(),
+        "--case",
+        "BASE",
+    ]);
+    let actual: Vec<String> = engine_child(&setup, ObservedControl::Base.case(), false)
+        .map_err(|error| CheckFailure { what: error })?
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    check(
+        actual == expected,
+        &format!("the observation route runs only the existing BASE argv: {actual:?}"),
+    )?;
+    check(
+        ObservedControl::Base.case() == Case::Base,
+        "the observation control is BASE",
+    )?;
+
+    // Retaining nothing outside the owned subtree.
+    write_private_dir(&root).map_err(|error| CheckFailure { what: error })?;
+    check(
+        validate_observation_root(&root).is_ok(),
+        "an owner-only canonical observation root is accepted",
+    )?;
+    let group_writable = temp.join("observation-group-writable");
+    write_private_dir(&group_writable).map_err(|error| CheckFailure { what: error })?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&group_writable, std::fs::Permissions::from_mode(0o2775))
+            .map_err(|error| CheckFailure {
+                what: error.to_string(),
+            })?;
+    }
+    check(
+        validate_observation_root(&group_writable).is_err(),
+        "a group-writable observation root is refused",
+    )?;
+    check(
+        validate_fixture_path(&root, &temp.join("observation-outside.json")).is_err(),
+        "a report outside the owned root is refused",
+    )?;
+
+    // The fixed argv parses, and every other shape refuses at the argument
+    // boundary, including an attempt to name a case or a second root.
+    check(
+        parse_observation_args(&argv(&[
+            "--observe-base",
+            "--root",
+            "/r",
+            "--report-out",
+            "/r/report.json",
+        ]))
+        .is_ok(),
+        "the fixed observation argv parses",
+    )?;
+    for refused in [
+        argv(&["--observe-base", "--root", "/r"]),
+        argv(&[
+            "--observe-base",
+            "--root",
+            "/r",
+            "--report-out",
+            "/r/report.json",
+            "--case",
+            "EFFECT-1",
+        ]),
+        argv(&[
+            "--observe-base",
+            "--root",
+            "/a",
+            "--root",
+            "/b",
+            "--report-out",
+            "/r/report.json",
+        ]),
+        argv(&[
+            "--observe-base",
+            "--root",
+            "/r",
+            "--report-out",
+            "/r/report.json",
+            "--diagnostic",
+        ]),
+        argv(&["--observe-base", "--report-out", "/r/report.json"]),
+    ] {
+        check(
+            parse_observation_args(&refused).is_err(),
+            &format!("an uncontrolled observation argv is refused: {refused:?}"),
+        )?;
+    }
+    for refused in [
+        argv(&[
+            "--parse-capture",
+            "--root",
+            "/r",
+            "--report-out",
+            "/r/p.json",
+        ]),
+        argv(&[
+            "--parse-capture",
+            "--root",
+            "/r",
+            "--root",
+            "/r",
+            "--transcript",
+            "/r/t.json",
+            "--report-out",
+            "/r/p.json",
+        ]),
+    ] {
+        check(
+            parse_capture_args(&refused).is_err(),
+            &format!("a malformed capture-parse argv is refused: {refused:?}"),
+        )?;
+    }
+    check(
+        parse_capture_args(&argv(&[
+            "--parse-capture",
+            "--root",
+            "/r",
+            "--transcript",
+            "/r/t.json",
+            "--manifest",
+            "/r/m.json",
+            "--report-out",
+            "/r/p.json",
+        ]))
+        .is_ok(),
+        "the capture-parse argv with a manifest parses",
+    )?;
+
+    // A missing transcript is missing, never empty fates; and no observation
+    // document carries an agreement, equivalence or divergence claim.
+    let manifest_example: &[u8] = include_bytes!(
+        "../../../docs/knowledge/contracts/capture-examples/v2/manifest-example.json"
+    );
+    let clean_exit = EngineRun {
+        exit_code: Some(0),
+        signal: None,
+        stdout: String::new(),
+        stdout_truncated: false,
+        stderr: String::new(),
+        stderr_truncated: false,
+    };
+    let missing = observation_document(
+        &setup,
+        ObservedControl::Base,
+        &clean_exit,
+        manifest_example,
+        None,
+    );
+    check(
+        missing["qualified"] == serde_json::Value::from(false),
+        "an observation with no transcript is unqualified",
+    )?;
+    check(
+        missing["transcript"].is_null() && document_gap(&missing, "missing transcript"),
+        "a missing transcript is recorded as missing, not as empty fates",
+    )?;
+    for absent in ["agreement", "equivalence", "divergence", "comparison"] {
+        check(
+            missing.get(absent).is_none(),
+            &format!("an observation document records no {absent} claim"),
+        )?;
+    }
+
+    let refused_exit = EngineRun {
+        exit_code: None,
+        signal: Some(15),
+        stdout: String::new(),
+        stdout_truncated: false,
+        stderr: "terminated".to_owned(),
+        stderr_truncated: false,
+    };
+    let signalled = observation_document(
+        &setup,
+        ObservedControl::Base,
+        &refused_exit,
+        manifest_example,
+        Some(b"not a capture document"),
+    );
+    check(
+        signalled["qualified"] == serde_json::Value::from(false)
+            && signalled["engine_run"]["exit_code"].is_null()
+            && signalled["engine_run"]["signal"] == serde_json::Value::from(15),
+        "a signalled engine run keeps its raw exit facts and stays unqualified",
+    )?;
+    check(
+        document_gap(&signalled, "does not parse as a /2 capture document")
+            && signalled["engine_run"]["stderr"] == serde_json::Value::from("terminated"),
+        "an unparsable retained document and the engine stderr are both recorded",
+    )?;
+
+    // The canonical parser pass: parsed, refused, absent-manifest and
+    // truncated, each recorded verbatim and unqualified.
+    let absent_vector: &[u8] =
+        include_bytes!("../../../docs/knowledge/contracts/capture-vectors/v2/valid/absent.json");
+    let refused_vector: &[u8] =
+        include_bytes!("../../../docs/knowledge/contracts/capture-vectors/v2/valid/refused.json");
+    let parsed = capture_parse_document(absent_vector, Some(manifest_example));
+    check(
+        parsed["qualified"] == serde_json::Value::from(false)
+            && parsed["parser"]["transcript"]["state"] == serde_json::Value::from("parsed")
+            && parsed["strict"].is_object()
+            && parsed["limited"]
+                .get("sufficient")
+                .and_then(|value| value.as_bool())
+                == Some(false),
+        "a parsed vector keeps a strict result and an insufficient limited verdict",
+    )?;
+    let without_manifest = capture_parse_document(absent_vector, None);
+    check(
+        without_manifest["limited"]["state"] == serde_json::Value::from("not-applicable")
+            && without_manifest["manifest"].is_null()
+            && without_manifest["strict"]["complete"] == serde_json::Value::from(false),
+        "a side with no retained manifest records that absence instead of inventing a verdict",
+    )?;
+    let historical = capture_parse_document(
+        b"{\"version\":\"oxide.capture.transcript/1\"}",
+        Some(manifest_example),
+    );
+    check(
+        historical["parser"]["transcript"]["state"] == serde_json::Value::from("refused")
+            && historical["qualified"] == serde_json::Value::from(false)
+            && document_gap(&historical, "transcript parser refused"),
+        "a historical or invalid wire is recorded as a parser refusal",
+    )?;
+    let mut truncated: serde_json::Value =
+        serde_json::from_slice(absent_vector).map_err(|error| CheckFailure {
+            what: error.to_string(),
+        })?;
+    truncated["truncation"]["document_truncated"] = serde_json::Value::from(true);
+    let truncated_bytes = serde_json::to_vec(&truncated).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    let truncated_report = capture_parse_document(&truncated_bytes, None);
+    check(
+        document_gap(&truncated_report, "capture truncated: document_truncated")
+            && truncated_report["qualified"] == serde_json::Value::from(false),
+        "a truncated capture is recorded as truncated and stays unqualified",
+    )?;
+
+    // Equal and unequal raw fates are both raw observations: neither document
+    // records agreement, equivalence, divergence or a normalised comparison.
+    let equal = capture_parse_document(absent_vector, None);
+    let unequal = capture_parse_document(refused_vector, None);
+    check(
+        equal["outcome"] == absent_vector_outcome(absent_vector)?
+            && unequal["outcome"] != equal["outcome"]
+            && equal["qualified"] == serde_json::Value::from(false)
+            && unequal["qualified"] == serde_json::Value::from(false),
+        "equal and unequal raw fates are recorded verbatim and equally unqualified",
+    )?;
+    for absent in ["agreement", "equivalence", "divergence", "comparison"] {
+        check(
+            equal.get(absent).is_none() && unequal.get(absent).is_none(),
+            &format!("neither fate document records a {absent} claim"),
+        )?;
+    }
+
+    // The bounded output capture reports its own truncation.
+    let oversized = vec![b'x'; OBSERVATION_TEXT_CAP + 1];
+    let (text, was_truncated) = bounded_text(&oversized);
+    check(
+        was_truncated && text.len() == OBSERVATION_TEXT_CAP,
+        "engine output past the cap is recorded as truncated",
+    )?;
+    Ok(())
+}
+
+fn absent_vector_outcome(vector: &[u8]) -> Result<serde_json::Value, CheckFailure> {
+    let document: serde_json::Value =
+        serde_json::from_slice(vector).map_err(|error| CheckFailure {
+            what: error.to_string(),
+        })?;
+    Ok(document
+        .get("outcome")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null))
+}
+
 fn self_check(pure_only: bool, diagnostic: bool) -> Result<(), String> {
     let base = if diagnostic {
         PathBuf::from(
@@ -4063,6 +4920,7 @@ fn self_check(pure_only: bool, diagnostic: bool) -> Result<(), String> {
         pure_checks(&dir).map_err(|failure| failure.what)?;
         tape::capture_verdict::run_checks()
             .map_err(|what| format!("limited-verdict policy: {what}"))?;
+        observation_check(&dir).map_err(|failure| failure.what)?;
         occurrence_cap_check(&dir).map_err(|failure| failure.what)?;
         read_row_cap_check(&dir).map_err(|failure| failure.what)?;
         unbound_authority_note_check(&dir).map_err(|failure| failure.what)?;
@@ -4128,7 +4986,7 @@ fn self_check(pure_only: bool, diagnostic: bool) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: tape_prune_eval [--self-check | --diagnostic | --limited-plan] [--fixture-root <dir> --manifest <path> --transcript-out <path> --case <CASE>]".to_owned()
+    "usage: tape_prune_eval [--self-check | --diagnostic | --limited-plan | --observe-base --root <dir> --report-out <path> | --parse-capture --root <dir> --transcript <path> [--manifest <path>] --report-out <path>] [--fixture-root <dir> --manifest <path> --transcript-out <path> --case <CASE>]".to_owned()
 }
 
 fn main() {
@@ -4213,6 +5071,33 @@ fn main() {
                 Err(reason) => {
                     eprintln!("oxide: prune capture harness: {reason}");
                     1
+                }
+            };
+            std::process::exit(code);
+        }
+        Some("--observe-base") => {
+            // One control on this side, run once: the existing BASE setup and
+            // the existing engine chain, with no success assertion able to
+            // discard a nonzero exit, a refusal or an invalid transcript.
+            let code =
+                match parse_observation_args(&args).and_then(|parsed| run_observation(&parsed)) {
+                    Ok(()) => 0,
+                    Err(reason) => {
+                        eprintln!("oxide: embedded observation: {reason}");
+                        2
+                    }
+                };
+            std::process::exit(code);
+        }
+        Some("--parse-capture") => {
+            // The canonical `/2` parser over a retained document. No engine,
+            // no fixture and no document change.
+            let code = match parse_capture_args(&args).and_then(|parsed| run_capture_parse(&parsed))
+            {
+                Ok(()) => 0,
+                Err(reason) => {
+                    eprintln!("oxide: capture parse: {reason}");
+                    2
                 }
             };
             std::process::exit(code);

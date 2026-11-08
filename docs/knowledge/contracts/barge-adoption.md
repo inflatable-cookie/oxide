@@ -2540,6 +2540,252 @@ pre-existing `tape_harness.rs leaf_binding_check` real-recorder window now
 asserts the sufficient limited result and the retained strict issue together; a
 policy-only document is labelled as such, and no control claims a native run.
 
+## Observation-only embedded control diagnostic (oxide#289)
+
+**Status: prepared and pure-validated; not executed.** Tom's operator decision
+`90b7bbeb` v2 selected "Prepare one observation-only control diagnostic" and
+the scoped Queue brief activates source and readiness preparation plus pure
+covering only. No real engine, fixture, staging build, image or diagnostic ran,
+no native proof is assigned to this merge, and O2 (L3), O3, `oxide#241`/#222,
+Route B and decision `0bcedf55` v2 are unchanged.
+
+**What it is not.** This is not the held O2 comparison, not a qualification and
+not a policy verdict. It uses the existing `embedded-unverified` route and does
+not impersonate or waive private export qualification. The report schema is a
+distinct diagnostic, `qualified` is false unconditionally, and matching
+outcomes award no agreement, equivalence, timing, writer-closure, export,
+deletion or deployment credit. Different outcomes are raw observations to
+investigate, never a proved policy divergence.
+
+**Source binding (observed at this head).** Oxide `f26e0528` (merge of PR #252;
+reviewed `2587991e`) and Barge `3dbee28e` (merge of PR #48; reviewed
+`29903c53`), read through the authenticated read-only sibling checkout. The
+Oxide side is `src/bin/oxide/tape_harness.rs`: `Case::Base`, the one
+`fixture_spec`/`prepare_case`/`engine_child` setup every route shares, and the
+unchanged `run_case` chain. The Barge side is its no-argument route:
+`crates/barge/tests/tape_eval.rs` `main` →
+`tape_harness::embedded_exercise` (`tape_harness.rs:1102`) → `build_fixture`
+(`:1085`, manifest case `CTL-0` at `:1089`) → `run` (`:484`) → `run_bound(…,
+"embedded-unverified")` (`:499`), which retains the transcript beside the
+fixture under the caller's `BARGE_TEST_SCRATCH_ROOT` (`testkit.rs:35`,
+`retain_transcript` at `:786`).
+
+**Two controls, two physical fixtures, no renaming.** Each side runs exactly
+one control, and no argument can add a second: Oxide always builds `Case::Base`
+(`--observe-base` has no case argument) and Barge runs its fixed no-argument
+exercise. The case IDs stay `BASE` and `CTL-0`. The setups are deliberately
+different and are recorded, not normalised: BASE carries a budget-only
+directory pool, fenced control state, an admission lock and receipt/marker
+pairs for a present and an absent checkout, with its roots under its own
+`oxide-outputs`; CTL-0 carries one real volume record, one area declaration,
+one owned root created through the real platform and one settled Oxide row
+whose checkout is absent. On shared-volume scratch the BASE fixture's own
+binding is not a `/Volumes/<name>` mount, so its honest outcome is a completed,
+incomplete batch that keeps every root — a fixture-placement fact, not a policy
+difference and never evidence of agreement.
+
+**The Oxide-side integration is the smallest one.** `tape_harness.rs` gains
+`--observe-base --root <dir> --report-out <path>` (one BASE fixture, one engine
+child through the same argv the self-check case already uses, the child's exit
+and bounded output, the retained transcript bytes and digest, and the setup as
+emitted) and `--parse-capture --root <dir> --transcript <path> [--manifest
+<path>] --report-out <path>` (the canonical `/2` parser, strict completeness
+and limited verdict over one retained document pair, with no engine). The
+existing `--self-check`, `--diagnostic` and `--limited-plan` paths and their
+assertions are untouched; `fixture_case` now destructures the extracted
+`CaseSetup`, so its fixture, manifest, argv and checks are byte-identical in
+behaviour. Both new modes write inside the caller's owner-only root only, refuse
+an escaping or pre-existing report path, and never select another fixture. The
+report builder treats a missing transcript, an invalid or `/1` document, an
+apparatus diagnostic, a truncation flag, a nonzero or signalled engine exit and
+an unparsable retained document as recorded observations; an absent fate is
+`absent`, never empty.
+
+**Barge custody is an owner-gated impediment, and the gate is a reviewed
+revision, not a text search.** The pinned no-argument route is unsafe for this
+observation: `crates/barge/src/testkit.rs` `TempDir`'s destructor calls
+`remove_dir_all`, there is no `keep`/`into_path`, and
+`tape_harness::embedded_exercise` performs fallible construction, the engine
+run, transcript retention and reads **before** it returns, so an error or panic
+on any of those paths drops the fixture before the process exits and before the
+supervisor's post-leader census. An uncertain writer or descendant would have
+its fixture deleted, which the brief forbids, and the route also retains no
+manifest.
+
+The required custody property is therefore **from creation through every error
+path**: the fixture directory must leave `TempDir` ownership immediately after
+creation and before any fallible step, so the guard and not the process owns
+removal; the manifest must be written inside it before the run; and the kept
+path must be printed in a bounded line. The exact smallest linked Barge change
+is two statements plus one method, with no schema, argv, target,
+fixture-builder or `release::plan` change:
+
+1. `crates/barge/src/testkit.rs`: add `TempDir::keep()` that clears the owned
+   root, takes the path and forgets the destructor.
+2. `crates/barge/src/tape_harness.rs` `embedded_exercise`: take the fixture out
+   of `TempDir` ownership immediately after creation and before any fallible
+   step, write the manifest bytes it already holds as `manifest.json` inside it
+   before the run, and print `barge.tape.exercise/1: kept fixture <path>`.
+
+No byte pattern can prove a lifetime property, so this route does not pretend
+one can: the activation gate is `BARGE_CUSTODY_REVIEWED`, a reviewed Barge
+revision plus its two exact file digests, which is **None** today and is set
+only by a reviewed Oxide change that binds the reviewed Barge revision.
+`parse_binding` requires the `barge.custody` block (linked task, exact reviewed
+revision, the fixed property name), `require_reviewed_custody` refuses before
+any staging write or engine window while the gate is closed, and
+`verify_barge_custody` then re-checks the archived commit and both file digests
+against the reviewed values. Nothing in a binding can satisfy it.
+**Readiness verdict: not ready for planner activation.** The owner-gated
+impediment is that linked Barge custody change and its source review; once it
+lands, the reviewed Oxide change binds its revision and digests and the same
+command runs unchanged. A run whose kept fixture or manifest is absent or is not
+a safe artifact afterwards is recorded as a gap with no fate, never as an empty
+one. No Barge write, dependency, pin or API change happens here.
+
+**The one future command.** `effigy rust:tape-prune-observation` is
+`python3 scripts/bounded-test.py --limit 900 --scratch-budget-mib 1536 --
+python3 scripts/tape-embedded-observation.py --observe --binding
+"$TAPE_OBSERVATION_BINDING" --sha256 "$TAPE_OBSERVATION_BINDING_SHA256"`.
+
+*Guard topology.* The route binds the qualified supervisor's **actual** default
+layout: `Monitor.setup` creates `<root>/scratch` and `<root>/evidence` as
+siblings, the evidence directory with the inherited umask (normally 0755), and
+cleanup deletes only `<root>/scratch`. `guard_context` therefore requires both
+directories canonical, real and **not group- or other-writable** (0755
+evidence passes, 0777 refuses), requires the exact sibling layout, and refuses
+an adopted scratch root, an explicit evidence directory or a
+`supervisor-evidence.*` leaf inside scratch. The supervisor's own bytes must
+still equal `fcfda2b0…`.
+
+*Bound tools.* The script refuses before any effect unless it runs under that
+guard (with `OXIDE_TASK_SCRATCH_ROOT`, `OXIDE_PROOF_EVIDENCE`,
+`OXIDE_PROOF_RUN_ID`, `OXIDE_PROOF_DEADLINE_NS`) and holds one planner-bound
+`oxide.capture.embedded-control-binding/1` document whose digest matches: exact
+Oxide commit/tree/lock, exact Barge sibling commit/tree/lock plus the retention
+block, exact `rustc`/`cargo` paths and digests at 1.97.1, the fixed bounds, the
+Stash volume UUID `8A660440-C919-45C6-A3F1-3365B9BD2006`, and one safe run-root
+and report name. Staging then invokes the **bound `cargo` by absolute path with
+`RUSTC` set to the bound `rustc` and `PATH` fixed to the system path**, and both
+tool digests are re-read after each staging build, so an inherited cargo or
+rustc can neither build the artifacts nor be reported as the bound one. This is
+the established bounded proof-script staging route — plain Cargo under heavy
+admission and the qualified guard, `--locked --offline`, no wrapper or hook and
+no new Effigy selector exception; the approved capture-only Cargo selectors
+cannot be scoped to one harness test binary in a foreign pinned checkout, and
+this route invents no exception for that.
+
+It derives every owned path from the guard's own roots (a binding cannot name an
+absolute path), seeds each private `CARGO_HOME` from its own lock with the
+shared bounded offline seeder, stages each test binary once and reads the exact
+executable from Cargo's own artifact message, runs the two engines sequentially
+at most once each, applies the canonical parse pass to each retained transcript,
+and writes one `oxide.capture.embedded-control-observation/1` report naming the
+raw outcome, engine and tool exits, stdout/stderr with their caps, the setup as
+emitted, the parser result, strict and limited warnings, the source/binary
+envelope, the guard context and every gap. A retained path outside the run's own
+root is never read, and no path is ever picked by modification time. Unknown
+closure keeps everything, exits non-zero and claims nothing; descendant closure
+is the guard's post-leader census, not this script's conclusion.
+
+*Retained evidence, on every exit.* Because cleanup deletes `<root>/scratch` on a
+closed run, the script copies the raw occurrence evidence into the guard's
+retained `<root>/evidence/<run-root-name>` subtree under the same monitored
+budget, critical bytes first: both transcripts, the emitted manifest, the
+observation and parse documents, both stage logs and stderr, both staged
+executables and both engines' captured stdout/stderr — with each retained path's
+bytes and SHA-256 recorded. **The copy and the report run on every exit**: a
+staging, engine or parse failure still retains the evidence already produced and
+writes a bounded report whose `outcome` names the state and phase and whose
+`closure` says the guard's post-leader census, not this script, decides closure
+and may delete its own scratch afterwards. That is the difference between the
+script's unknown and actual guard closure, and the two are separate fields. A
+failed build is covered too: each stage log and stderr path is registered
+**before** Cargo is spawned, so a nonzero exit or a timeout still retains that
+build's own output. A timed-out engine window returns the partial output it
+produced instead of discarding it: the report records `timed_out` with that
+output and the outcome is the script's unknown, not a refusal. And an
+unpublished report is an apparatus failure: `finish` returns whether it
+published, and the success path raises rather than returning 0, so the guard can
+never close a status 0 with no required observation report. Past
+384 MiB per file or 768 MiB in aggregate an artifact is **omitted and named** in
+the report and a gap, never summarised into a hash and never replaced; a missing
+artifact is recorded as not written. Every source is re-validated before it is
+read: a path that is not a real, non-symlink regular file (or directory, for a
+kept fixture) resolving inside the owned run root is recorded with its reason
+and is neither read nor copied, so an engine-reported manifest or transcript
+that links outside is refused rather than followed. Nothing is deleted from the
+scratch tree by this script.
+
+**Bounds and premises.** 900 s whole-occurrence wall clock and 1536 MiB of
+monitored scratch. The allocation is explicit and sums to the bound: 448 MiB
+Oxide staging target, 192 MiB Barge staging target, 192 MiB for the two private
+seeds, 32 MiB fixtures/transcripts/reports, 416 MiB retained evidence copies and
+256 MiB slack; 420 s for the two cold sequential staging builds, 120 s for the
+two engine windows, 20 s for the parse passes, 30 s for the copies, 90 s for the
+two seeds at the seeder's own 45 s cumulative cap each, 60 s shutdown margin and
+160 s slack. The available **task-owned measurements** are this task's own
+covering guard receipts at `f2a97f12`: 300 s limit, closed, status 0, owned-byte
+peak 36 KiB to 3.7 MiB (those builds dogfood the pool, so the figure does not
+size in-scratch staging), host free minimum about 2.87 TiB, and this same
+target's own `18.3 s` warm build-and-execute line. Because the covering runs
+build in the pool, the staging figures are explicit **allowances, not
+measurements**: the repository's recorded in-scratch staging peaks for the same
+`oxide` debug recipe are 179.3 and 182.7 MiB for a binary build, and this route
+allows roughly twice that plus the seeds and retained copies. The diagnostic
+records its own measured owned bytes and retained-evidence bytes, so a later
+bound revision can replace the allowance with a measurement. The nine
+proof-authoring premises are traced in the script's `PREMISES` table and printed
+by `proof:tape-prune:observation-plan`: private HOME/rustup and per-engine
+private Cargo homes with a seeded lock; the account-home control on the Oxide
+side only; the `OXIDE_`/`XDG_`/`CARGO_`/`SCCACHE_`/`RUSTC*`/`GIT_` scrub; no
+permanent-drive adoption; no external Cargo argv; no image or mount; one frozen
+`RUSTFLAGS` with `CARGO_ENCODED_RUSTFLAGS` removed; selected-volume scratch with
+per-engine `TMPDIR` and a `/private/tmp` guard fallback that refuses; and
+`os.mkdir` inside the owned root rather than a fixed temporary name.
+
+**Pure evidence.** `effigy rust:capture-wire` also runs
+`tape_harness.rs observation_check`: the fixed BASE argv, the argument boundary
+that refuses a second root, another case or the `--diagnostic` route, the
+owner-only/canonical-root and escaping-report refusals, the missing manifest and
+missing transcript, a `/1` and an apparatus document, truncation, signalled and
+nonzero exits, and equal and unequal raw fates with no agreement, equivalence or
+divergence field. `effigy proof:tape-prune:observation-test` drives the real
+orchestration functions with scripted seams (115 controls: binding shape and
+digest including the Barge custody block; source/toolchain/volume/worktree
+drift; derived paths; the real sibling guard topology with 0755 evidence
+accepted and 0777 or nested evidence refused; outside-root retention; engine
+classification; equal and unequal fates; gap overflow; refusal before any
+engine; the shipped custody gate refusing before any staging write; the bound
+`cargo`/`RUSTC`/`PATH` staging invocation; at most one window per engine; one
+complete scripted occurrence with its retained evidence tree; an over-budget
+artifact omitted and named; a Barge timeout, parse failure and staging failure
+each retaining what was reached and writing a bounded failure report, with a
+failed build's own stage log and stderr kept and a timed-out window's partial
+output retained; an unwritable report propagating as an apparatus failure while
+its evidence stays; a symlinked or outside Barge artifact refused rather than
+read; and the reviewed revision and file digests still checked once the gate is
+open). Both are apparatus evidence and run no engine, compiler, fixture, image
+or observer campaign.
+
+**Covering validation for this preparation.** `effigy rust:compile`,
+`effigy rust:compile-release`, `effigy rust:format`, `effigy rust:capture-wire`,
+`effigy docs:check`, `effigy proof:tape-prune:observation-test` and
+`effigy proof:tape-prune:observation-plan`. No native, diagnostic, staged
+build or embedded engine run is part of this merge, and the ONE uncounted
+observation-only occurrence stays separately planner-activated at a reviewed
+exact head — and, per the readiness verdict above, only after the linked Barge
+retention change lands. The Rust bytes are unchanged by the review correction,
+so their recorded runs stay bound to them; the Python apparatus, its 96 scripted
+controls, the plan document, this contract and `AGENTS.md` are the changed
+inputs.
+
+**Unchanged.** `/2` wire, parser acceptance, caps, `K1_PREMISE_QUALIFIED`, the
+two reviewed exclusions, `assess_completeness`, the limited and comparison
+rules, production readers, locks, errors, selection, dependencies, pins,
+toolchain, MSRV, the private-build/export provider and its qualification, the
+O2/C1/C1-prime/C2 holds, Route B, `oxide#241`/#222 and every live gate.
+
 ## Shared private-build validation gate (oxide#248)
 
 The capture tasks' private debug-build validation shares one common
