@@ -54,6 +54,21 @@ pub(crate) const PLAN_VERSION: &str = "oxide.capture.limited-plan/1";
 /// The one claim this policy can support. It is L2 only.
 pub(crate) const CLAIM: &str = "L2 owned-fixture decision agreement: window-incomplete, \
 parent-unproven at enumerated path-only direct-read sites, holder-lifetime-limited";
+/// Why no first-batch case is runnable today, beyond the export gate. Source
+/// facts only; no fixture, engine run or measurement is involved.
+pub(crate) const BINDING_GAP: &str = "the /2 recorder binds a read row to a fixture entry only \
+when the row carries parent device and inode (tape.rs check_manifest_obligations: bound_file \
+requires parent_device and parent_inode). No file read records a parent: read_row and \
+read_row_owned set none, and authority_read_observed passes a held descriptor's own device and \
+inode only for prune::read_bounded. Every path-only file row therefore reports `extra or unbound \
+observation at <kind>`, and every parent_required obligation over such a row reports `mandatory \
+observation missing or identity unproven at <site>`. The reviewed \
+path-only-direct-read-parent exclusion covers the parent obligation only and cannot manufacture a \
+fixture binding, so no first-batch case is runnable. Closing the gap is a separately reviewed \
+test-only recorder change (bind a leaf identity without a parent at the enumerated path-only \
+sites, and give the parent-required obligation note its own declared rule); this preparation does \
+not make it";
+
 /// The `/2` manifest schema's fixed Barge pin. The comparison commit is carried
 /// by `source.barge_slice_commit`; the pin field itself is not a drift knob.
 pub(crate) const SCHEMA_BARGE_PIN: &str = "4af9360bd09629e970c143080ca159de8eef2562";
@@ -116,12 +131,13 @@ pub(crate) struct Limitation {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SiteClass {
-    /// A bounded authority read with no parent open; leaf identity only.
+    /// A bounded direct read that opens no parent; the row can carry the
+    /// leaf's own device and inode. Only this class is ever eligible for the
+    /// reviewed `path-only-direct-read-parent` exclusion.
     PathOnlyDirectRead,
-    /// A component read whose parent is a live held descriptor (K1 class).
+    /// A read or walk component whose parent is a live held descriptor (K1
+    /// class). Never eligible for an exclusion.
     HandleParent,
-    /// A read of a name obtained from a directory listing.
-    EnumeratedLeaf,
     /// A fixture-declared dynamic observation (mount census, fixture diff).
     DeclaredObservation,
     /// A pool/ledger read behind the custody and admission chain. These rows
@@ -134,7 +150,6 @@ impl SiteClass {
         match self {
             Self::PathOnlyDirectRead => "path-only-direct-read",
             Self::HandleParent => "handle-parent",
-            Self::EnumeratedLeaf => "enumerated-leaf",
             Self::DeclaredObservation => "declared-observation",
             Self::Custody => "custody",
         }
@@ -149,18 +164,21 @@ struct KnownSite {
     source: &'static str,
 }
 
-/// The finite site registry. A site absent from this table is unlisted and
-/// blocking: the policy never guesses a site's class.
+/// The finite site registry, keyed by the row kind the recorder actually
+/// emits (`src/bin/oxide/tape.rs` and the instrumented leaves). A site absent
+/// from this table is unlisted and blocking: the policy never guesses a site's
+/// class. The class is about the row's parent provenance, which is what the
+/// one reviewed parent exclusion turns on.
 const KNOWN_SITES: &[KnownSite] = &[
     KnownSite {
         kind: "authority-read@prune::read_registry",
         class: SiteClass::PathOnlyDirectRead,
-        source: "src/bin/oxide/prune.rs read_registry",
+        source: "src/bin/oxide/prune.rs read_registry (authority_read_observed)",
     },
     KnownSite {
         kind: "authority-read@prune::read_bounded",
         class: SiteClass::PathOnlyDirectRead,
-        source: "src/bin/oxide/prune.rs read_bounded",
+        source: "src/bin/oxide/prune.rs read_bounded (authority_bind_descriptor)",
     },
     KnownSite {
         kind: "read-bounded:lstat",
@@ -168,44 +186,94 @@ const KNOWN_SITES: &[KnownSite] = &[
         source: "src/bin/oxide/prune.rs read_bounded",
     },
     KnownSite {
-        kind: "authority-read@prune::observe_root_in:marker",
+        kind: "read-bounded:open",
         class: SiteClass::PathOnlyDirectRead,
-        source: "src/bin/oxide/prune.rs observe_root_in",
+        source: "src/bin/oxide/prune.rs read_bounded, and authority_read_observed for \
+that site (read_row_handle)",
+    },
+    // The prune marker read opens the marker with `openat(root.as_raw_fd())`
+    // from a live held root descriptor, so its parent is handle-class.
+    KnownSite {
+        kind: "authority-read@prune::observe_root_in:marker",
+        class: SiteClass::HandleParent,
+        source: "src/bin/oxide/prune.rs observe_root_in (openat from the held root)",
+    },
+    KnownSite {
+        kind: "root-observe:marker-open",
+        class: SiteClass::HandleParent,
+        source: "src/bin/oxide/prune.rs observe_row_root (openat from the held root)",
     },
     KnownSite {
         kind: "authority-read@outputs::read_receipt_with",
         class: SiteClass::PathOnlyDirectRead,
-        source: "src/bin/oxide/outputs.rs read_receipt_with",
+        source: "src/bin/oxide/outputs.rs read_receipt_with (authority_read_observed)",
     },
     KnownSite {
         kind: "authority-read@outputs::read_marker",
         class: SiteClass::PathOnlyDirectRead,
-        source: "src/bin/oxide/outputs.rs read_marker",
+        source: "src/bin/oxide/outputs.rs read_marker (File::open, then authority_read_observed)",
+    },
+    KnownSite {
+        kind: "outputs:read-marker:open",
+        class: SiteClass::PathOnlyDirectRead,
+        source: "src/bin/oxide/outputs.rs observed_marker_open (read_row_dev)",
     },
     KnownSite {
         kind: "authority-read@outputs::marker_digest",
         class: SiteClass::PathOnlyDirectRead,
-        source: "src/bin/oxide/outputs.rs marker_digest",
+        source: "src/bin/oxide/outputs.rs marker_digest (authority_read_observed)",
     },
     KnownSite {
         kind: "authority-read@removable::read_registration",
         class: SiteClass::PathOnlyDirectRead,
-        source: "src/bin/oxide/removable.rs read_registration",
+        source: "src/bin/oxide/removable.rs read_registration (authority_read_observed)",
+    },
+    // The absence walk: its start object is a path-only observation, and every
+    // component row below it comes from a held parent descriptor.
+    KnownSite {
+        kind: "absence-walk:start",
+        class: SiteClass::PathOnlyDirectRead,
+        source: "src/bin/oxide/prune.rs walk_checkout (walk_start_row)",
     },
     KnownSite {
-        kind: "walk-start",
+        kind: "absence-walk:fstatat",
         class: SiteClass::HandleParent,
-        source: "src/bin/oxide/prune.rs checkout absence walk start",
+        source: "src/bin/oxide/prune.rs walk_checkout (component_row)",
     },
     KnownSite {
-        kind: "absence-component",
+        kind: "absence-walk:openat",
         class: SiteClass::HandleParent,
-        source: "src/bin/oxide/prune.rs walk_checkout component rows",
+        source: "src/bin/oxide/prune.rs walk_checkout (component_row)",
+    },
+    KnownSite {
+        kind: "absence-walk:boot-data",
+        class: SiteClass::HandleParent,
+        source: "src/bin/oxide/prune.rs walk_checkout (component_row)",
+    },
+    KnownSite {
+        kind: "absence-walk:revalidate-descriptor",
+        class: SiteClass::HandleParent,
+        source: "src/bin/oxide/prune.rs revalidate_chain (component_without_parent)",
+    },
+    KnownSite {
+        kind: "absence-walk:revalidate-name",
+        class: SiteClass::HandleParent,
+        source: "src/bin/oxide/prune.rs revalidate_chain (component_without_parent)",
     },
     KnownSite {
         kind: "root-observe:entry",
-        class: SiteClass::EnumeratedLeaf,
-        source: "src/bin/oxide/prune.rs observe_row_root listing",
+        class: SiteClass::HandleParent,
+        source: "src/bin/oxide/prune.rs observe_row_root listing (component_row)",
+    },
+    KnownSite {
+        kind: "root-observe:root-dir",
+        class: SiteClass::HandleParent,
+        source: "src/bin/oxide/prune.rs observe_row_root (held root descriptor)",
+    },
+    KnownSite {
+        kind: "root-observe:outputs-dir",
+        class: SiteClass::HandleParent,
+        source: "src/bin/oxide/prune.rs observe_row_root (held outputs descriptor)",
     },
     KnownSite {
         kind: "volume-site",
@@ -295,6 +363,12 @@ pub(crate) enum BlockingRule {
     WrongLeafIdentity,
     HandleParentUnqualified,
     ParentRequiredUnproven,
+    /// The recorder's own obligation check says the obligation was not met
+    /// (`mandatory observation missing or identity unproven at <site>`).
+    RecorderObligationUnmet,
+    /// The recorder reports a malformed obligation
+    /// (`obligation missing parent_required at <site>`).
+    RecorderObligationMalformed,
     // Clocks and holders.
     UnobservedDecisionClock,
     UnprovenHolder,
@@ -340,6 +414,8 @@ impl BlockingRule {
             Self::WrongLeafIdentity => "wrong-leaf-identity",
             Self::HandleParentUnqualified => "handle-parent-k1-unqualified",
             Self::ParentRequiredUnproven => "parent-required-unproven",
+            Self::RecorderObligationUnmet => "recorder-obligation-unmet",
+            Self::RecorderObligationMalformed => "recorder-obligation-malformed",
             Self::UnobservedDecisionClock => "unobserved-decision-clock",
             Self::UnprovenHolder => "unproven-recorded-holder",
             Self::AttemptedEffect => "attempted-effect",
@@ -402,6 +478,14 @@ const NOTE_VOCABULARY: &[(&str, NoteRule)] = &[
     (
         "parent identity unproven at ",
         NoteRule::PathOnlyParentExplained,
+    ),
+    (
+        "mandatory observation missing or identity unproven at ",
+        NoteRule::Blocking(BlockingRule::RecorderObligationUnmet),
+    ),
+    (
+        "obligation missing parent_required at ",
+        NoteRule::Blocking(BlockingRule::RecorderObligationMalformed),
     ),
     (
         "extra or unbound observation at ",
@@ -629,6 +713,16 @@ impl LimitedVerdict {
     }
 }
 
+/// A local SHA-256, so this module needs no new visibility on `capture_wire`'s
+/// own helpers.
+fn digest_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn is_lower_hex(text: &str, length: usize) -> bool {
     text.len() == length
         && text
@@ -685,11 +779,36 @@ fn own_identity_bound(row: &Value) -> bool {
         && identity.get("inode").is_some_and(|value| !value.is_null())
 }
 
+/// Evaluate one capture pair under the limited policy.
+///
+/// This is the entry point a case body uses. Both documents go through the
+/// canonical `/2` parsers first (`capture_wire::parse_transcript` and
+/// `capture_wire::parse_manifest`), so schema, version, cap and envelope
+/// refusals are the wire's own and never the policy's guess. The manifest
+/// digest is computed from the exact bytes that were parsed, so it always
+/// matches what the transcript recorded.
+///
+/// A parser refusal is returned as the error string; it is never a verdict, so
+/// a malformed input can never read as a limited result.
+pub(crate) fn evaluate_limited_capture(
+    transcript_bytes: &[u8],
+    manifest_bytes: &[u8],
+) -> Result<LimitedVerdict, String> {
+    let transcript = capture_wire::parse_transcript(transcript_bytes)
+        .map_err(|error| format!("transcript: {}", error.message))?;
+    let manifest = capture_wire::parse_manifest(manifest_bytes)
+        .map_err(|error| format!("manifest: {}", error.message))?;
+    let digest = digest_hex(manifest_bytes);
+    Ok(evaluate_limited(&transcript, &manifest, &digest))
+}
+
 /// Evaluate one transcript against its manifest under the limited policy.
 ///
-/// `manifest_sha256` is the digest of the exact manifest bytes the caller read.
-/// It must equal the digest the transcript recorded, or the verdict records
-/// `digest-drift`.
+/// `transcript` and `manifest` must already be parser-validated `/2`
+/// documents; [`evaluate_limited_capture`] is the entry point that guarantees
+/// it. `manifest_sha256` is the digest of the exact manifest bytes the caller
+/// read, and must equal the digest the transcript recorded, or the verdict
+/// records `digest-drift`.
 pub(crate) fn evaluate_limited(
     transcript: &Value,
     manifest: &Value,
@@ -958,6 +1077,24 @@ decision",
         .and_then(Value::as_array)
         .map(|obligations| obligations.iter().collect())
         .unwrap_or_default();
+    // The recorder's own bind verdict, read structurally from its fixed note
+    // vocabulary. A row it reports unbound is never granted an exclusion, so
+    // the policy cannot outrun the engine's own binding.
+    const UNBOUND_NOTE: &str = "extra or unbound observation at ";
+    let mut unbound_sites: Vec<String> = Vec::new();
+    for note in transcript
+        .get("notes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(text) = note.as_str() else {
+            continue;
+        };
+        if let Some(site) = text.strip_prefix(UNBOUND_NOTE) {
+            unbound_sites.push(site.to_owned());
+        }
+    }
     let mut obligation_sites: Vec<(String, bool)> = Vec::new();
     for obligation in &obligations {
         if obligation.get("engine").and_then(Value::as_str) != Some(engine.as_str()) {
@@ -1067,13 +1204,23 @@ decision",
         let mut disposition = "bound";
         if parent_required {
             if parent_source == "handle" {
-                blocking.push(Blocking::new(
-                    BlockingRule::HandleParentUnqualified,
-                    site,
-                    "a handle-class parent is never excludable while K1 is unqualified",
-                ));
-                disposition = "handle-parent-k1-unqualified";
-            } else if known.class == SiteClass::PathOnlyDirectRead && bound_own {
+                // The strict rule discharges a handle parent exactly when the
+                // K1 premise is qualified; the policy mirrors that rule rather
+                // than blocking unconditionally.
+                if capture_wire::K1_PREMISE_QUALIFIED {
+                    disposition = "handle-parent-qualified";
+                } else {
+                    blocking.push(Blocking::new(
+                        BlockingRule::HandleParentUnqualified,
+                        site,
+                        "a handle-class parent is never excludable while K1 is unqualified",
+                    ));
+                    disposition = "handle-parent-k1-unqualified";
+                }
+            } else if known.class == SiteClass::PathOnlyDirectRead
+                && bound_own
+                && !unbound_sites.iter().any(|unbound| unbound == site)
+            {
                 let leaf = leaf_identity(row);
                 limitations.push(Limitation {
                     rule: ExclusionRule::PathOnlyDirectReadParent,
@@ -1084,6 +1231,13 @@ decision",
                     ),
                 });
                 disposition = "path-only-parent-limitation";
+            } else if unbound_sites.iter().any(|unbound| unbound == site) {
+                blocking.push(Blocking::new(
+                    BlockingRule::ParentRequiredUnproven,
+                    site,
+                    "the recorder reports this row unbound, so no reviewed limitation applies",
+                ));
+                disposition = "row-unbound-by-recorder";
             } else {
                 blocking.push(Blocking::new(
                     BlockingRule::ParentRequiredUnproven,
@@ -1097,7 +1251,14 @@ parent_required",
                 disposition = "parent-required-unproven";
             }
         }
-        if !bound_own {
+        // Only a file-shaped obligation names the leaf's own object. A
+        // component obligation names a name plus its parent, and a volume
+        // obligation names the volume facts; neither requires an own inode.
+        let volume_form = identity
+            .get("volume_uuid")
+            .is_some_and(|value| !value.is_null());
+        let file_form = !volume_form && identity.get("inode").is_some();
+        if file_form && !bound_own {
             blocking.push(Blocking::new(
                 BlockingRule::UnboundObjectIdentity,
                 site,
@@ -1390,11 +1551,18 @@ pub(crate) struct CaseOutcome {
 /// engines' decisions are identical.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ComparisonState {
-    /// One or both sides are insufficient or did not run: no agreement.
+    /// One or both sides are insufficient, did not run, refused the case or
+    /// reported an incomplete batch: no agreement, whatever the fates say.
     Insufficient,
-    /// Both sides sufficient and the observed fates equal the declared fates.
+    /// Both sides sufficient, both batches complete and the observed fates
+    /// equal the declared fates.
     Agreed,
-    /// Both sides sufficient and the fates differ: a real finding, no credit.
+    /// Both sides sufficient and complete and they agree with each other, but
+    /// the observed fates are not the fates the manifest declares. That is a
+    /// fixture or expectation defect, not a cross-engine divergence.
+    DeclaredMismatch,
+    /// Both sides sufficient and complete, and the observed fates differ
+    /// between the engines: a real finding, no credit.
     Divergence,
 }
 
@@ -1465,17 +1633,30 @@ never an absent root"
     expected.sort();
     let oxide_fates = fates(&oxide_outcome.decision);
     let barge_fates = fates(&barge_outcome.decision);
-    if oxide_fates != expected {
-        reasons.push(format!(
-            "oxide fates {oxide_fates:?} differ from the declared {expected:?}"
-        ));
+    // An incomplete batch on EITHER side is insufficient, never agreement:
+    // a partial batch is not a decision over the whole root set.
+    for (engine, decision) in [
+        ("oxide", &oxide_outcome.decision),
+        ("barge", &barge_outcome.decision),
+    ] {
+        if let Decision::Evaluated {
+            batch_complete: false,
+            ..
+        } = decision
+        {
+            reasons.push(format!(
+                "{engine} reported an incomplete batch; an incomplete batch is not a decision \
+over the declared root set"
+            ));
+        }
     }
-    if let Decision::Evaluated {
-        batch_complete: false,
-        ..
-    } = oxide_outcome.decision
-    {
-        reasons.push("oxide reported an incomplete batch".to_owned());
+    if !reasons.is_empty() {
+        return ComparisonVerdict {
+            state: ComparisonState::Insufficient,
+            reasons,
+            oxide_sufficient,
+            barge_sufficient,
+        };
     }
     if oxide_fates != barge_fates {
         reasons.push(format!(
@@ -1488,9 +1669,13 @@ never an absent root"
             barge_sufficient,
         };
     }
-    if !reasons.is_empty() {
+    if oxide_fates != expected {
+        reasons.push(format!(
+            "both engines observed {oxide_fates:?} but the manifest declares {expected:?}; the \
+fixture or its expectation is unproven"
+        ));
         return ComparisonVerdict {
-            state: ComparisonState::Divergence,
+            state: ComparisonState::DeclaredMismatch,
             reasons,
             oxide_sufficient,
             barge_sufficient,
@@ -1620,9 +1805,13 @@ const FAMILIES: &[Family] = &[
     Family {
         name: "control and sticky batch",
         cases: &["CTL-0", "CTL-1"],
-        status: CaseStatus::Runnable,
-        reason: "both engines decide on the registry and marker bytes; the three plan-time \
-enumerations bind through their own leaf reads under CF-1",
+        status: CaseStatus::Insufficient,
+        reason: "every file input this decision reads is a path-only or handle-class read: the \
+registry and receipts are opened by path and the owner marker with openat from a held root \
+descriptor, so the recorder's in-window bind check reports `extra or unbound observation at \
+<kind>` and its obligation check reports `mandatory observation missing or identity unproven at \
+<site>`. The reviewed path-only exclusion covers a parent obligation only and cannot bind the \
+row",
         overrides: &[],
         cf: &[Cf::Cf1, Cf::Cf4],
         cf_absent: &[
@@ -1640,10 +1829,10 @@ enumerations bind through their own leaf reads under CF-1",
             "<pool>/admission.lock (absent)",
         ],
         enumerations: &[
-            "oxide: read_receipts over read_dir(outputs)",
             "barge: area::list_names (plan roots)",
-            "barge: BargeReferences::read -> cache::read_placements -> area::read_directory",
-            "barge: area::read_declarations",
+            "barge: cache::read_placements (placements)",
+            "barge: area::read_declarations (declarations)",
+            "barge: reference::read_receipts over read_dir(outputs) (OxideSnapshot::read_within)",
         ],
         entrypoints: &[
             "oxide: prune::tape_entry::run_chain -> require_ready -> evaluate",
@@ -1667,9 +1856,11 @@ enumerations bind through their own leaf reads under CF-1",
             "REG-OVERFLOW",
             "CAP-1",
         ],
-        status: CaseStatus::Runnable,
-        reason: "the case decides on the registry file itself; the fixture creates no outputs \
-directory and no checked root, so no enumeration runs",
+        status: CaseStatus::Insufficient,
+        reason: "the registry is a path-only direct read (`authority-read@prune::read_registry`): \
+the recorder records no parent for it, so the in-window bind check reports `extra or unbound \
+observation` and the parent-required obligation note is unmet. No fixture can bind that row \
+under the current recorder",
         overrides: &[CaseOverride {
             id: "CAP-1",
             status: CaseStatus::Insufficient,
@@ -1714,9 +1905,10 @@ partial parity is claimed",
             "REF-SELECTED-NOT-CURRENT",
             "REF-ORPHAN-MARKED",
         ],
-        status: CaseStatus::Runnable,
-        reason: "the registry row is read directly and the intent files are enumerated, so every \
-listed intent name must bind through its own leaf read (CF-1)",
+        status: CaseStatus::Insufficient,
+        reason: "the registry row and the intent files are path-only reads with no recorded \
+parent, so their rows are unbound in the in-window check and their obligations report unmet; \
+the CF-1 enumeration of the intents directory is a second, separate requirement",
         overrides: &[CaseOverride {
             id: "REF-ORPHAN-MARKED",
             status: CaseStatus::Insufficient,
@@ -1737,10 +1929,14 @@ can produce an agreement for an orphaned marked row",
             "<pool>/oxide-managed/intents/ (exists and is enumerated)",
             "<mount>/oxide-outputs/<root>/ (exists, unread by this family)",
         ],
-        enumerations: &["oxide: read_intents over the intents directory"],
+        enumerations: &[
+            "barge: state::read_intents_with_deadline over the intents directory \
+(release::pending_intents)",
+        ],
         entrypoints: &[
-            "oxide: Row::live, dry_run, eligibility",
-            "barge: OxideRow::live, references_for, pending_intents",
+            "oxide: Row::live, dry_run, eligibility, unfinished_intents (a registry-document \
+projection, not a directory read)",
+            "barge: OxideRow::live, references_for, release::pending_intents",
         ],
         actions: &[
             "write the registry row and one intent document",
@@ -1763,10 +1959,10 @@ can produce an agreement for an orphaned marked row",
             "ID-NONCE",
             "ID-GENERATION",
         ],
-        status: CaseStatus::Runnable,
-        reason: "receipts and markers are bounded direct reads with a bound leaf identity; the \
-outputs directory is enumerated, so every listed entry must bind (CF-1) and a replaced marker \
-supplies the identical-bytes/new-inode control (CF-3)",
+        status: CaseStatus::Insufficient,
+        reason: "receipts are path-only reads (unbound in the in-window check) and the owner \
+marker is opened with openat from a held root descriptor, so its parent is handle-class: the \
+path-only exclusion can cover neither the unbound row nor the K1 parent",
         overrides: &[CaseOverride {
             id: "RCP-V1",
             status: CaseStatus::Insufficient,
@@ -1787,12 +1983,12 @@ difference is reportable and a match is not available from current source",
             "<mount>/oxide-outputs/<root>/ (exists with the receipt and owner marker)",
         ],
         enumerations: &[
-            "oxide: read_receipts, read_dir(outputs)",
-            "barge: reference::read_receipts_with",
+            "barge: reference::read_receipts over read_dir(outputs) (OxideSnapshot::read_within)",
         ],
         entrypoints: &[
-            "oxide: read_receipt_for_prune, the owner-marker parser",
-            "barge: reference::read_receipts_with, read_oxide_marker",
+            "oxide: read_receipt_for_prune (one receipt per registry row, no directory \
+enumeration), outputs::read_marker and prune::observe_root_in's owner-marker parser",
+            "barge: reference::read_within, reference::read_oxide_marker",
         ],
         actions: &[
             "write the receipt and marker bytes for the case",
@@ -1813,9 +2009,10 @@ difference is reportable and a match is not available from current source",
             "VOL-DUP-LIVE",
             "ABS-UUID-CONFLICT",
         ],
-        status: CaseStatus::Runnable,
-        reason: "the marker and volume facts are direct reads or declared dynamic observations, \
-and the marker reread under the second root-id lock supplies CF-7",
+        status: CaseStatus::Insufficient,
+        reason: "the owner marker is handle-class and the registry row is path-only and \
+unbound; the volume-census rows do bind their own volume identity, but the decision's file \
+inputs do not",
         overrides: &[
             CaseOverride {
                 id: "ID-INODE",
@@ -1915,9 +2112,10 @@ inputs stay insufficient",
     Family {
         name: "fence, declaration and policy",
         cases: &["FENCE-MISSING", "FENCE-UNKNOWN", "DECL-MISSING", "DECL-POLICY-NONE"],
-        status: CaseStatus::Runnable,
-        reason: "the fence is a bounded direct read with a bound leaf identity; Barge's \
-declaration enumeration binds through its own leaf read (CF-1)",
+        status: CaseStatus::Insufficient,
+        reason: "the fence lives in the pool control read (`authority-read@store::load`), a \
+custody-class read no reviewed exclusion covers, and the registry row that precedes it is \
+path-only and unbound",
         overrides: &[
             CaseOverride {
                 id: "DECL-MISSING",
@@ -1962,9 +2160,10 @@ claim exists",
     Family {
         name: "legacy and operator list",
         cases: &["LEG-UNLISTED", "LEG-LISTED", "LEG-LISTED-MARKED", "LEG-RECEIPTLESS"],
-        status: CaseStatus::Runnable,
-        reason: "the operator list is a bounded direct read and the receipts it authorizes are \
-enumerated, so each listed receipt binds through its own leaf read (CF-1)",
+        status: CaseStatus::Insufficient,
+        reason: "the operator list and the receipts are path-only reads with no recorded parent, \
+so their rows are unbound in the in-window check and their obligations report unmet; the receipt \
+enumeration is a second, separate requirement",
         overrides: &[CaseOverride {
             id: "LEG-LISTED",
             status: CaseStatus::Insufficient,
@@ -1987,12 +2186,11 @@ Barge keeps at the pin); a declared difference is not agreement",
             "<mount>/oxide-outputs/<root>/ (exists or is positively missing)",
         ],
         enumerations: &[
-            "oxide: read_receipts over read_dir(outputs)",
-            "barge: reference::read_receipts_with",
+            "barge: reference::read_receipts over read_dir(outputs) (OxideSnapshot::read_within)",
         ],
         entrypoints: &[
-            "oxide: read_operator_list, evaluate_receiptless",
-            "barge: identity and reference conditions",
+            "oxide: read_operator_list, evaluate_receiptless, read_receipt_for_prune",
+            "barge: identity and reference conditions (reference::read_within)",
         ],
         actions: &[
             "write the legacy row and the operator list document",
@@ -2116,8 +2314,9 @@ setting fixture facts, restoring only the guard controls the supervisor needs",
     ),
     (
         "volume and image",
-        "one owned 128 MiB image, hdiutil attach -owners on, ordinary post-census detach, real \
-custody facts; the second batch is the only batch that attaches one",
+        "one owned 128 MiB image per occurrence in both batches, hdiutil attach -owners on, \
+ordinary post-census detach, real custody facts; the first batch attaches one only to give the \
+fixture a real /Volumes root binding",
     ),
     (
         "Rust flags",
@@ -2152,23 +2351,24 @@ struct NextOccurrence {
 }
 
 const NEXT_OCCURRENCE: NextOccurrence = NextOccurrence {
-    first_batch_tier: "STANDARD",
+    first_batch_tier: "ELEVATED",
     first_batch_rationale:
-        "the first batch deletes nothing, recycles no storage, decides no crash \
-recovery or writer closure and writes to no removable media; it only reads a fixture it created",
+        "the first batch attaches one owned 128 MiB image at a /Volumes mount so the fixture \
+gets a real external root binding, and an attached image is removable media: that is the \
+ELEVATED trigger even though nothing is deleted, recycled or recovered",
     second_batch_tier: "ELEVATED",
     second_batch_rationale: "the second batch decides writer custody and drives an admission lock \
-create and a fence save on removable media, which is the ELEVATED trigger",
+create and a fence save on the same attached removable media, which is the ELEVATED trigger",
     wall_clock_seconds: 600,
     scratch_mib: 512,
-    images: "at most one owned 128 MiB image, attached -owners on, ordinary post-census detach; \
-second batch only",
+    images: "one owned 128 MiB image per occurrence in both batches, attached with hdiutil \
+-owners on and detached ordinarily after the supervisor's post-leader census",
     runner: "the qualified shared supervisor scripts/bounded-test.py",
     command: "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- \
 python3 scripts/<case>.py",
-    scratch_interface: "the supervisor selects its own <mount>/scratch/oxide run root and \
-evidence directory; the case exports OXIDE_TASK_SCRATCH_ROOT inside it and passes no \
---root-parent and no --evidence",
+    scratch_interface: "owned Stash scratch, volume UUID 8A660440-C919-45C6-A3F1-3365B9BD2006: \
+the supervisor selects its own <mount>/scratch/oxide run root and evidence directory there, the \
+case exports OXIDE_TASK_SCRATCH_ROOT inside it and passes no --root-parent and no --evidence",
     measurement: "the 600 s and 512 MiB figures are unmeasured proposals; no live-host size or \
 timing is inferred here",
 };
@@ -2236,8 +2436,18 @@ pub(crate) fn plan_document() -> Value {
         "policy": POLICY_VERSION,
         "claim": CLAIM,
         "executable_today": false,
-        "execution_gate": "no export-closure digest and receipt is qualified, so no counted L2 \
-    native can run; this plan is readiness only and gives no comparison, parity or native credit",
+        "execution_gate": "two independent gates: no export-closure digest and receipt is \
+    qualified, and no first-batch input binds under the current recorder (see binding_gap); this plan \
+    is readiness only and gives no comparison, parity or native credit",
+        "binding_gap": {
+            "summary": BINDING_GAP,
+            "site_classes": KNOWN_SITES
+                .iter()
+                .map(|site| json!({"site": site.kind, "class": site.class.name(), "source": site.source}))
+                .collect::<Vec<_>>(),
+            "closure": "a separately reviewed test-only recorder change; not authorised, started or \
+    assumed by this preparation",
+        },
         "exclusions": [
             {
                 "rule": ExclusionRule::WindowOriginEndNull.name(),
@@ -2601,6 +2811,30 @@ fn controls() -> Vec<(&'static str, fn() -> Control)> {
         (
             "an unrequired parent is not an exclusion",
             unrequired_parent_is_not_an_exclusion,
+        ),
+        (
+            "a real path-only row stays insufficient",
+            recorder_path_only_row_is_insufficient,
+        ),
+        (
+            "a bound leaf without a fixture binding stays insufficient",
+            recorder_bound_leaf_without_binding_is_insufficient,
+        ),
+        (
+            "an emitted absence kind is handle-class",
+            emitted_absence_kind_blocks,
+        ),
+        (
+            "the parser entry point refuses a non-/2 document",
+            parser_entry_point_refuses_non_v2,
+        ),
+        (
+            "a Barge-only incomplete batch is insufficient",
+            barge_only_incomplete_is_insufficient,
+        ),
+        (
+            "a declared mismatch is not a divergence",
+            declared_mismatch_is_not_divergence,
         ),
         ("strict insufficiency is preserved", strict_preservation),
         ("identical decisions cannot override", identical_decisions),
@@ -3093,22 +3327,19 @@ fn topology_drift_blocks() -> Control {
 }
 
 fn unbound_leaf_blocks() -> Control {
-    // A defensive policy counterfactual: the /2 manifest envelope already
-    // requires a complete obligation identity, so this document is not a wire
-    // input. The policy still refuses to grant an exclusion whose leaf binds
-    // no own device and inode.
-    let mut manifest = synthetic_manifest();
-    manifest["mandatory_observations"][0]["identity"] = json!({"path": CONTROL_PATH});
+    // A file-form obligation names the leaf's own device and inode. When the
+    // row carries none, the obligation's leaf identity is unproven and the
+    // exclusion cannot be granted.
     let mut transcript = synthetic_transcript();
     transcript["reads"] = json!([synthetic_row(CONTROL_SITE, "none", None, None)]);
     transcript["notes"] = json!([
         "absolute monotonic window origin and end unproven",
         "parent identity unproven at authority-read@prune::read_registry",
     ]);
-    let verdict = evaluate_limited(&transcript, &manifest, CONTROL_DIGEST);
+    let verdict = evaluate_limited(&transcript, &synthetic_manifest(), CONTROL_DIGEST);
     control(
-        blocked_at(&verdict, BlockingRule::UnboundObjectIdentity, CONTROL_SITE),
-        "an exclusion needs the leaf's own identity bound",
+        blocked_at(&verdict, BlockingRule::WrongLeafIdentity, CONTROL_SITE),
+        "a file obligation whose row binds no own identity is unproven",
     )?;
     control(
         !verdict
@@ -3246,6 +3477,160 @@ fn second_path_only_site_blocks() -> Control {
     )
 }
 
+/// The exact shape the recorder produces for a non-`read_bounded` authority
+/// read: no own identity and no parent, plus the recorder's own four notes. The
+/// reviewed path-only exclusion cannot rescue it, so the case is insufficient.
+fn recorder_path_only_row_is_insufficient() -> Control {
+    let mut row = synthetic_row(CONTROL_SITE, "none", None, None);
+    row["outcome"] = json!({"type": "digest", "digest": hex('9', 64)});
+    let mut transcript = synthetic_transcript();
+    transcript["reads"] = json!([row]);
+    transcript["notes"] = json!([
+        "absolute monotonic window origin and end unproven",
+        "descriptor identity unavailable at authority-read@prune::read_registry: no authorized \
+descriptor observation",
+        "object or parent identity unproven at authority-read@prune::read_registry",
+        "extra or unbound observation at authority-read@prune::read_registry",
+        "mandatory observation missing or identity unproven at \
+authority-read@prune::read_registry",
+        "parent identity unproven at authority-read@prune::read_registry",
+    ]);
+    let verdict = evaluate_limited(&transcript, &synthetic_manifest(), CONTROL_DIGEST);
+    control(
+        blocked_at(
+            &verdict,
+            BlockingRule::ExtraUnboundObservation,
+            CONTROL_SITE,
+        ),
+        "the recorder's own unbound verdict blocks",
+    )?;
+    control(
+        blocked_at(
+            &verdict,
+            BlockingRule::RecorderObligationUnmet,
+            CONTROL_SITE,
+        ),
+        "the recorder's unmet-obligation note blocks",
+    )?;
+    control(
+        !verdict
+            .limitations
+            .iter()
+            .any(|limitation| limitation.rule == ExclusionRule::PathOnlyDirectReadParent),
+        "the path-only exclusion is not granted to a row the recorder does not bind",
+    )
+}
+
+/// `prune::read_bounded` does record the leaf's own device and inode, and the
+/// exclusion's leaf requirement is met there, but the fixture binding still
+/// fails because the row carries no parent.
+fn recorder_bound_leaf_without_binding_is_insufficient() -> Control {
+    const SITE: &str = "authority-read@prune::read_bounded";
+    let mut manifest = synthetic_manifest();
+    manifest["mandatory_observations"][0]["site"] = json!(SITE);
+    let mut transcript = synthetic_transcript();
+    transcript["reads"] = json!([synthetic_row(SITE, "none", Some(3), Some(4))]);
+    transcript["notes"] = json!([
+        "absolute monotonic window origin and end unproven",
+        "parent identity unproven at authority-read@prune::read_bounded",
+        "extra or unbound observation at authority-read@prune::read_bounded",
+        "mandatory observation missing or identity unproven at \
+authority-read@prune::read_bounded",
+    ]);
+    let verdict = evaluate_limited(&transcript, &manifest, CONTROL_DIGEST);
+    control(
+        blocked_at(&verdict, BlockingRule::ExtraUnboundObservation, SITE),
+        "a path-only row the recorder never binds stays insufficient",
+    )?;
+    control(
+        blocked_at(&verdict, BlockingRule::RecorderObligationUnmet, SITE),
+        "the unmet-obligation note blocks",
+    )?;
+    control(
+        !verdict
+            .limitations
+            .iter()
+            .any(|limitation| limitation.rule == ExclusionRule::PathOnlyDirectReadParent),
+        "no limitation is granted while the recorder reports the row unbound",
+    )?;
+    control(!verdict.sufficient(), "the case is insufficient")
+}
+
+/// An obligation at a kind the recorder really emits for the absence walk, with
+/// a handle-class parent: the K1 rule must be the named rule.
+fn emitted_absence_kind_blocks() -> Control {
+    const SITE: &str = "absence-walk:fstatat";
+    let mut manifest = synthetic_manifest();
+    manifest["mandatory_observations"] = json!([{
+        "engine": "oxide",
+        "site": SITE,
+        "parent_required": true,
+        "identity": {"component": "checkout", "parent_device": 1, "parent_inode": 2},
+    }]);
+    let mut row = synthetic_row(SITE, "handle", None, None);
+    row["identity"]["path"] = Value::Null;
+    row["identity"]["component"] = json!("checkout");
+    row["identity"]["parent_device"] = json!(1);
+    row["identity"]["parent_inode"] = json!(2);
+    row["outcome"] = json!({"type": "absent"});
+    let mut transcript = synthetic_transcript();
+    transcript["reads"] = json!([row]);
+    transcript["notes"] = json!(["absolute monotonic window origin and end unproven"]);
+    let verdict = evaluate_limited(&transcript, &manifest, CONTROL_DIGEST);
+    control(
+        blocked_at(&verdict, BlockingRule::HandleParentUnqualified, SITE),
+        "an emitted absence-walk kind is classified handle-class",
+    )?;
+    control(
+        !blocked_at(&verdict, BlockingRule::UnlistedSite, SITE),
+        "the emitted kind is listed, not unlisted",
+    )
+}
+
+/// The entry point parses with the canonical /2 parsers first.
+fn parser_entry_point_refuses_non_v2() -> Control {
+    let good = evaluate_limited_capture(
+        include_bytes!(
+            "../../../docs/knowledge/contracts/capture-vectors/v2/valid/handle-parent.json"
+        ),
+        include_bytes!(
+            "../../../docs/knowledge/contracts/capture-vectors/v2/manifest/valid-parent-required.json"
+        ),
+    );
+    control(
+        good.is_ok(),
+        format!("a canonical /2 pair must evaluate: {:?}", good.err()),
+    )?;
+    let historical = evaluate_limited_capture(
+        include_bytes!("../../../docs/knowledge/contracts/capture-vectors/v2/invalid/historical-v1.json"),
+        include_bytes!(
+            "../../../docs/knowledge/contracts/capture-vectors/v2/manifest/valid-parent-required.json"
+        ),
+    );
+    control(
+        historical.is_err()
+            && historical
+                .err()
+                .is_some_and(|error| error.starts_with("transcript:")),
+        "a /1 transcript is refused by the parser before any verdict",
+    )?;
+    let bad_manifest = evaluate_limited_capture(
+        include_bytes!(
+            "../../../docs/knowledge/contracts/capture-vectors/v2/valid/handle-parent.json"
+        ),
+        include_bytes!(
+            "../../../docs/knowledge/contracts/capture-vectors/v2/manifest/invalid-extra-field.json"
+        ),
+    );
+    control(
+        bad_manifest.is_err()
+            && bad_manifest
+                .err()
+                .is_some_and(|error| error.starts_with("manifest:")),
+        "an invalid manifest is refused by the parser before any verdict",
+    )
+}
+
 fn strict_preservation() -> Control {
     // The window issue is explained only by a null window, so a strict issue
     // the two fixed templates cannot explain always blocks.
@@ -3362,8 +3747,48 @@ fn agreement_needs_both() -> Control {
     let incomplete = outcome(&[("root-a", "keep")], false);
     let verdict = limited_comparison(&oxide, &incomplete, &barge, &incomplete);
     control(
-        verdict.state == ComparisonState::Divergence,
-        "an incomplete batch is not a clean agreement",
+        verdict.state == ComparisonState::Insufficient,
+        "an incomplete batch is insufficient, not agreement and not divergence",
+    )
+}
+
+/// A Barge-only incomplete batch with fates identical to Oxide's is never
+/// agreement: the incomplete side alone decides the result.
+fn barge_only_incomplete_is_insufficient() -> Control {
+    let oxide = sufficient_verdict("oxide");
+    let barge = sufficient_verdict("barge");
+    let complete = outcome(&[("root-a", "keep")], true);
+    let barge_incomplete = outcome(&[("root-a", "keep")], false);
+    let verdict = limited_comparison(&oxide, &complete, &barge, &barge_incomplete);
+    control(
+        verdict.state == ComparisonState::Insufficient,
+        format!(
+            "a Barge-only incomplete batch is insufficient, got {:?}",
+            verdict.state
+        ),
+    )?;
+    control(
+        verdict
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("barge reported an incomplete")),
+        "the incomplete side is named",
+    )
+}
+
+/// Agreement between the engines on fates the manifest does not declare is a
+/// declared mismatch, never a cross-engine divergence.
+fn declared_mismatch_is_not_divergence() -> Control {
+    let oxide = sufficient_verdict("oxide");
+    let barge = sufficient_verdict("barge");
+    let observed = outcome(&[("root-a", "release")], true);
+    let verdict = limited_comparison(&oxide, &observed, &barge, &observed);
+    control(
+        verdict.state == ComparisonState::DeclaredMismatch,
+        format!(
+            "an agreeing pair that contradicts the declaration is a declared mismatch, got {:?}",
+            verdict.state
+        ),
     )
 }
 
@@ -3373,7 +3798,10 @@ fn plan_controls() -> Vec<(&'static str, fn() -> Control)> {
         ("deferred set is exact", plan_deferred_set),
         ("every case names all seven CFs", plan_cf_complete),
         ("enumerations imply CF-1", plan_cf1_consistency),
-        ("runnable cases need the export gate", plan_export_gate),
+        (
+            "no case is runnable and both gates are named",
+            plan_export_gate,
+        ),
         ("no case claims execution", plan_no_execution_claim),
         (
             "the next occurrence names the qualified runner",
@@ -3500,19 +3928,46 @@ fn plan_export_gate() -> Control {
         plan["executable_today"] == json!(false),
         "the plan never claims a case is executable",
     )?;
-    for row in planned_cases() {
-        if row.status == CaseStatus::Runnable {
-            control(
-                row.prerequisites.contains(&Prerequisite::ExportClosure),
-                format!("{} is runnable without the export gate", row.id),
-            )?;
-            control(
-                row.prerequisites.contains(&Prerequisite::BargeCaseSupport),
-                format!("{} is runnable without Barge case support", row.id),
-            )?;
+    let rows = planned_cases();
+    let runnable: Vec<&str> = rows
+        .iter()
+        .filter(|row| row.status == CaseStatus::Runnable)
+        .map(|row| row.id)
+        .collect();
+    control(
+        runnable.is_empty(),
+        format!("no case is runnable under the current recorder, but got {runnable:?}"),
+    )?;
+    let mut counts = (0usize, 0usize, 0usize);
+    for row in &rows {
+        match row.status {
+            CaseStatus::Runnable => counts.0 += 1,
+            CaseStatus::Insufficient => counts.1 += 1,
+            CaseStatus::Deferred => counts.2 += 1,
         }
+        control(
+            row.prerequisites.contains(&Prerequisite::ExportClosure),
+            format!("{} does not name the export gate", row.id),
+        )?;
+        control(
+            row.prerequisites.contains(&Prerequisite::BargeCaseSupport),
+            format!("{} does not name Barge case support", row.id),
+        )?;
     }
-    Ok(())
+    control(
+        counts == (0, 43, 7),
+        format!("plan status counts are {counts:?}, expected (0, 43, 7)"),
+    )?;
+    control(
+        plan["binding_gap"]["summary"].as_str() == Some(BINDING_GAP),
+        "the plan names the recorder binding gap",
+    )?;
+    control(
+        plan["binding_gap"]["site_classes"]
+            .as_array()
+            .is_some_and(|sites| sites.len() == KNOWN_SITES.len()),
+        "the plan prints every registered site and class",
+    )
 }
 
 fn plan_no_execution_claim() -> Control {
@@ -3549,9 +4004,21 @@ fn plan_next_occurrence() -> Control {
         "the proposed bounds are 600 s and 512 MiB",
     )?;
     control(
-        next["first_batch"]["tier"].as_str() == Some("STANDARD")
+        next["first_batch"]["tier"].as_str() == Some("ELEVATED")
             && next["second_batch"]["tier"].as_str() == Some("ELEVATED"),
-        "the tiers are STANDARD then ELEVATED",
+        "both batches are ELEVATED because both attach one owned image at a /Volumes mount",
+    )?;
+    control(
+        next["images"]
+            .as_str()
+            .is_some_and(|images| !images.contains("second batch only")),
+        "the image is not described as second-batch only",
+    )?;
+    control(
+        next["scratch_interface"]
+            .as_str()
+            .is_some_and(|text| text.contains("8A660440-C919-45C6-A3F1-3365B9BD2006")),
+        "the scratch placement names the lane's Stash volume",
     )?;
     control(
         next["command"]
