@@ -1825,7 +1825,9 @@ Nothing here passes a D8 case or a CF realization. The section fixes which
 conclusions the current `/2` captures and the two actual evaluators can
 support, states what is blocked, and names one weaker claim for a planner
 decision. It extends the `/2` section and the D8 matrix above; where they
-differ on current truth, the `/2` section and its vectors win.
+differ on current truth, the `/2` section and its vectors win. The separate
+verdict policy (S1) and the effect-free first-batch plan are implemented
+below; this section's proposal text stays as design history for them.
 
 Labels used below: **observed** = a `/2` row or a source symbol read in this
 pass; **documented** = stated in a cited contract and not re-verified here;
@@ -2036,8 +2038,10 @@ R1.
 #### Affected acceptance
 
 - O2 full acceptance (L3): unchanged. Still blocked.
-- O2-CAL (L2): does not exist until the planner or operator names it. Its
-  limits are the list above.
+- O2-CAL (L2): does not exist as an acceptance until the planner or operator
+  names it (design decision 1). Its limits are the list above. The separate
+  verdict policy and the effect-free first-batch plan that such a claim would
+  rest on are prepared below; they grant no comparison credit.
 - O3 and the full-comparison hold: unchanged.
 - Route B, R-K2 and decision `0bcedf55` v2: unchanged.
 - Pin, production behaviour, `/2` wire, caps and selectors: unchanged.
@@ -2054,6 +2058,162 @@ R1.
 
 No case is passed by this section. It gives no parity, timing, closure or
 deployment credit.
+
+### Limited verdict policy and first-batch plan (oxide#286 implemented)
+
+**Status: prepared and pure-validated; not executed.** Tom's operator decision
+`ba36f411` v2 selected "Prepare the limited fixture comparison (recommended)"
+and the scoped Queue brief activates preparation and pure validation only.
+This subsection is the current truth for design slice **S1** (the separate
+verdict policy) and for the effect-free first-batch plan. No comparison ran,
+no evaluator ran inside a case, no fixture exists, no Barge write happened, no
+export or capture qualification is claimed, and O2 (L3), O3 and every hold are
+unchanged.
+
+**Separate verdict, preserved strict result.** The policy lives in
+`src/bin/oxide/capture_verdict.rs`, which is reached only through
+`src/bin/oxide/tape.rs` (the binary compiles that module under `cfg(test)`),
+so a production build compiles none of it.
+`capture_verdict::evaluate_limited(transcript, manifest, manifest_sha256)`
+returns one verdict carrying:
+
+- the strict result, `capture_wire::assess_completeness` issues, verbatim;
+- structured blocking reasons (`rule`, `site`, `detail`), never a bare string;
+- the named limitations the verdict set aside;
+- one evidence row per obligation site (class, bound leaf identity,
+disposition).
+
+`sufficient()` is true only with no blocking reason, so the strict result is
+retained and a strict insufficiency can never read as a pass. Schema
+conformance (`/2` parse), observed decision agreement and complete
+equivalent-input proof stay three distinct things: the policy only speaks to
+the second, at L2.
+
+**The two reviewed exclusions.** Nothing else is excludable, and neither
+exclusion waives a decision input's identity.
+
+| Rule | Applies to | What the limitation must still name |
+| --- | --- | --- |
+| `window-origin-end-null` | The transcript's required-null window origin and end | Both fields as `null`; no ordering, absolute-time or window-span claim |
+| `path-only-direct-read-parent` | `parent_required` at a site in the policy's fixed `KNOWN_SITES` table whose class is path-only direct read, and only when that row binds its own device and inode | The exact site and the leaf's own `(device, inode)` |
+
+**Blocking, all structured.** A handle-class (K1) parent; a missing,
+non-matching or unbound leaf identity; a missing mandatory row; any cap,
+truncation or fixture-capture truncation flag; a conflicting read under one
+key; an unobserved clock; a recorded holder without an observed kernel start
+and uid; an extra or unbound observation; an attempted, partial, failed or
+unpathed effect; an omitted, extra or substituted completed effect; an
+unmatched fixture change; a non-null `/2` window value; case, digest, source
+or fixture/expected topology drift; an unknown engine note; and an unlisted
+site. An unknown rule or site is always blocking, so nothing is silently
+ignored.
+
+The exclusion set is a source-owned enumeration, never a caller waiver list
+and never derived from warning text. The only strict issues an exclusion may
+explain are the completeness module's own two fixed templates (the window
+sentence, and `parent_required unproven at <site>: handle parent still needs
+qualified K1` for a site with a granted path-only limitation). Every other
+strict issue becomes `strict-issue-unexplained`, so the strict judgement
+survives by construction rather than by review attention.
+
+**Comparison rule.** `limited_comparison` reports `Insufficient` whenever
+either side is insufficient or did not run; a refusal is that engine's own
+outcome and never an absent root; identical decisions cannot override
+insufficient inputs; an incomplete batch is not a clean agreement; and an
+observed divergence is reported as a divergence, never folded into a match.
+A deferred or unexecuted case is never agreement.
+
+**Pure controls (41, discriminating).** Each asserts an exact rule and site,
+not merely failure: the allowed path-only limitation with its site and leaf
+identity while the strict result stays insufficient; a handle parent blocking
+with no limitation granted; missing row; wrong leaf identity; unlisted site;
+extra or unbound observation; unknown note; unobserved clock; unproven holder;
+all five truncation flags and a truncated fixture capture; a conflicting read
+under one key; attempted, partial, unpathed, omitted, extra, substituted and repeated
+effects, so multiplicity is preserved; a numeric window origin; case, digest, source and topology drift; an
+unbound leaf refusing the exclusion; two path-only obligations each excluded at
+its own site with its own leaf identity; strict preservation; identical
+decisions over insufficient inputs; a deferred case; a divergence; agreement
+requiring two sufficient sides; an informative identity note on an undeclared
+row not becoming a defect while the same sentence on a declared input blocks;
+and an unrequired parent leaving nothing to exclude. They run in the
+`--self-check` route, so `effigy rust:capture-wire` covers them.
+
+Two boundaries of the policy are deliberate. The manifest's
+`mandatory_observations` list is the declaration of which reads the decision
+consumes; the policy checks every declared obligation and every row the
+recorder itself reports as unbound (`extra or unbound observation`), but it
+cannot prove a manifest declared every input, so obligation completeness stays
+a review obligation. And the recorder's per-row sentences "object or parent
+identity unproven" and "component parent identity unproven" block only where
+that row kind is a declared decision input; on any other row the recorder's own
+bind verdict decides, and re-implementing that bind here would be a second,
+divergent rule.
+
+**First-batch plan, effect-free.** `oxide test --test tape_prune_eval --locked
+-- --limited-plan` (equivalently the harness binary with `--limited-plan`)
+prints one `oxide.capture.limited-plan/1` document and writes, stages,
+evaluates and probes nothing. It lists all 50 rows of the finite D8/CF
+inventory in eight first-batch families plus the two deferred families, and
+per row: status (`runnable`, `insufficient`, `deferred`), the prospective
+reason, the applicable CF obligations with an explicit reason for every
+non-applicable one, the directories the fixture actually creates, the engine
+enumerations the state triggers, the actual in-crate entrypoints, the ordered
+per-case actions and the prerequisites. Current shape: **29 runnable, 14
+insufficient, 7 deferred**, and **no case is executable today** because no
+export-closure digest and receipt is qualified.
+
+CF-1 applicability follows the fixture, not a family label. The registry-shape
+family decides on the registry file and creates no `oxide-managed/outputs`
+directory, so it enumerates nothing and names CF-1 as not applicable. The
+control, references/intents, receipts/markers, fence/declaration and legacy
+families do enumerate (plan roots, Barge placements, declarations, intents,
+receipts) and name CF-1 with the enumerated set each case must bind.
+
+Recorded insufficiencies, named rather than absorbed:
+
+1. **Checkout absence is insufficient under this policy.** Its decision reads
+   component rows of a no-follow walk whose parents are live held descriptors.
+   That is handle-class (K1) and no reviewed exclusion covers it, so
+   ABS-ANCESTOR-MISSING and ABS-ANCESTOR-REPLACED stay insufficient even though
+   the design's family table lists a keep-fate match as their strongest
+   outcome. Reaching it needs qualified K1 or a `/3`-class capture, not a wider
+   exclusion.
+2. **CAP-1 is insufficient by rule.** It exceeds the unchanged shared caps;
+   an overflowed or truncated document is never partial parity.
+3. **EXPLAIN-OR-BLOCK rows** (REF-ORPHAN-MARKED, RCP-V1): a difference is
+   reportable, a match is not available from current source.
+4. **Declared scope or configuration differences** are not agreement: ID-INODE
+   (D-2 batch versus root scope), DECL-MISSING (SCOPE), DECL-POLICY-NONE
+   (CONFIG), LEG-LISTED (D-3) and VOL-DUP-REGISTRY (per-engine record only).
+5. **VOL-DUP-LIVE is a declared coverage limit**: a real duplicate-UUID mount
+   census cannot be produced without kernel forgery.
+6. **Dynamic rows are insufficient**: ID-DEVICE-LIVE and VOL-REMOVED-DURING
+   need a second mount epoch and CF-2/CF-5 writers inside one window.
+7. **ABS-BOOT-DATA** needs internal boot Data placement and remains a D-3
+   scope difference.
+
+**Next occurrence: a proposal, not permission.** The plan prints it:
+first batch STANDARD (it deletes nothing, recycles no storage, decides no
+crash recovery or writer closure and writes no removable media), second batch
+ELEVATED (custody plus an admission lock create and a fence save on removable
+media); 600 s and 512 MiB monitored scratch; the existing qualified
+`fcfda2b0…` supervisor; its own selected-volume `<mount>/scratch/oxide` run
+root and evidence directory with no `--root-parent` and no `--evidence`; at
+most one owned 128 MiB image attached `-owners on` with an ordinary
+post-census detach, second batch only; and the nine native-proof premises,
+each with its disposition. The 600 s and 512 MiB figures are unmeasured
+proposals, and no live-host size or timing is inferred. A diagnostic, counted
+author native and independent reviewer native each still need separate
+activation at the reviewed head; this preparation grants none of them, and a
+source-only review cannot grant comparison credit.
+
+**Unchanged.** `/2` wire, parser acceptance, caps, `K1_PREMISE_QUALIFIED`,
+production readers, locks, errors, selection, dependencies, pins, toolchain,
+MSRV, the private-build/export provider and its qualification, the O2 and O3
+holds, Route B and decision `0bcedf55` v2, and oxide#241/#222. Naming O2-CAL
+as an acceptance stays open (design decision 1); this policy is what such a
+claim would rest on and is not the claim.
 
 ## Shared private-build validation gate (oxide#248)
 
