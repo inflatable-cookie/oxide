@@ -1814,7 +1814,7 @@ Remaining limits (finite):
 | Attempted or failed effects | Not completed parity |
 | Route B private descriptor-relative read | Not activated |
 | Caps 512 / 8192 / 8 MiB / 64 | Unchanged; known host overflow stays insufficient |
-| In-window fixture binding (`extra or unbound observation`: path, component and volume rules) | Engine-side only in `tape.rs`; completeness does not apply it yet |
+| In-window fixture binding (`extra or unbound observation`: path, component and volume rules) | Engine-side only in `tape.rs`; completeness does not apply it yet. **Gap (oxide#286):** `bound_file` requires the row's parent device and inode, and no file read records a parent, so a path-only file row never binds its fixture entry and its `parent_required` obligation is reported unmet. The reviewed path-only parent exclusion cannot close that; see [the limited verdict policy](#limited-verdict-policy-and-first-batch-plan-oxide286-implemented) |
 | Barge `/2` adoption and live or native use | Dependent task; no production read changed |
 
 ### Bounded comparison evidence boundary (oxide#285 design)
@@ -1825,7 +1825,9 @@ Nothing here passes a D8 case or a CF realization. The section fixes which
 conclusions the current `/2` captures and the two actual evaluators can
 support, states what is blocked, and names one weaker claim for a planner
 decision. It extends the `/2` section and the D8 matrix above; where they
-differ on current truth, the `/2` section and its vectors win.
+differ on current truth, the `/2` section and its vectors win. The separate
+verdict policy (S1) and the effect-free first-batch plan are implemented
+below; this section's proposal text stays as design history for them.
 
 Labels used below: **observed** = a `/2` row or a source symbol read in this
 pass; **documented** = stated in a cited contract and not re-verified here;
@@ -2036,8 +2038,10 @@ R1.
 #### Affected acceptance
 
 - O2 full acceptance (L3): unchanged. Still blocked.
-- O2-CAL (L2): does not exist until the planner or operator names it. Its
-  limits are the list above.
+- O2-CAL (L2): does not exist as an acceptance until the planner or operator
+  names it (design decision 1). Its limits are the list above. The separate
+  verdict policy and the effect-free first-batch plan that such a claim would
+  rest on are prepared below; they grant no comparison credit.
 - O3 and the full-comparison hold: unchanged.
 - Route B, R-K2 and decision `0bcedf55` v2: unchanged.
 - Pin, production behaviour, `/2` wire, caps and selectors: unchanged.
@@ -2054,6 +2058,268 @@ R1.
 
 No case is passed by this section. It gives no parity, timing, closure or
 deployment credit.
+
+### Limited verdict policy and first-batch plan (oxide#286 implemented)
+
+**Status: prepared and pure-validated; not executed.** Tom's operator decision
+`ba36f411` v2 selected "Prepare the limited fixture comparison (recommended)"
+and the scoped Queue brief activates preparation and pure validation only.
+This subsection is the current truth for design slice **S1** (the separate
+verdict policy) and for the effect-free first-batch plan. No comparison ran,
+no evaluator ran inside a case, no fixture exists, no Barge write happened, no
+export or capture qualification is claimed, and O2 (L3), O3 and every hold are
+unchanged.
+
+**Separate verdict, preserved strict result.** The policy lives in
+`src/bin/oxide/capture_verdict.rs`, which is reached only through
+`src/bin/oxide/tape.rs` (the binary compiles that module under `cfg(test)`),
+so a production build compiles none of it.
+`capture_verdict::evaluate_limited_capture(transcript_bytes, manifest_bytes)` is
+the entry point: both documents go through the canonical `/2` parsers first, so
+schema, version, cap and envelope refusals are the wire's own and a malformed
+input is an error rather than a verdict. The digest it records is computed from
+the exact manifest bytes it parsed. `evaluate_limited(transcript, manifest,
+manifest_sha256)` is the document-level form for already parser-validated input,
+and returns one verdict carrying:
+
+- the strict result, `capture_wire::assess_completeness` issues, verbatim;
+- structured blocking reasons (`rule`, `site`, `detail`), never a bare string;
+- the named limitations the verdict set aside;
+- one evidence row per obligation site (class, bound leaf identity,
+disposition).
+
+`sufficient()` is true only with no blocking reason, so the strict result is
+retained and a strict insufficiency can never read as a pass. Schema
+conformance (`/2` parse), observed decision agreement and complete
+equivalent-input proof stay three distinct things: the policy only speaks to
+the second, at L2.
+
+**The two reviewed exclusions.** Nothing else is excludable, and neither
+exclusion waives a decision input's identity.
+
+| Rule | Applies to | What the limitation must still name |
+| --- | --- | --- |
+| `window-origin-end-null` | The transcript's required-null window origin and end | Both fields as `null`; no ordering, absolute-time or window-span claim |
+| `path-only-direct-read-parent` | `parent_required` at a site in the policy's fixed `KNOWN_SITES` table whose class is path-only direct read, only when that row binds its own device and inode and **only when the recorder did not report the row unbound** | The exact site and the leaf's own `(device, inode)` |
+
+The site table names the **decision-relevant** row kinds the recorder emits,
+each with its parent provenance: `authority-read@prune::read_registry`,
+`authority-read@prune::read_bounded`, `authority-read@prune::observe_root_in:marker`,
+`authority-read@outputs::read_receipt_with`, `authority-read@outputs::read_marker`,
+`authority-read@outputs::marker_digest`,
+`authority-read@removable::read_registration`, the `authority-read@store::*`
+custody reads, `read-bounded:lstat`, `read-bounded:open`,
+`outputs:read-marker:open`, `absence-walk:start`, `absence-walk:fstatat`,
+`absence-walk:openat`, `absence-walk:boot-data`,
+`absence-walk:revalidate-descriptor`, `absence-walk:revalidate-name`,
+`absence-walk:binding-open`, `absence-walk:binding-verify`,
+`root-observe:entry`, `root-observe:root-dir`, `root-observe:outputs-dir`,
+`root-observe:marker-open`, `root-observe:binding-open`, `volume-site` and
+`fixture-diff`. Any other kind an obligation names is unlisted and blocking — the table
+is exact-match, never a prefix or wildcard — and kinds that are not decision
+obligations today are deliberately absent (for example `config:read-config`,
+`config:inspect:canonicalize`, `control-directory:open`, the `scratch-io:*`
+reads, `store:open-existing*`, `pool:ledger-view`, and the dynamic
+`read_row(site, …)` observations in `outputs.rs`). The prune owner-marker read is
+**handle-class**, because `openat` runs from a live held root descriptor; only
+the path-opened marker reader is path-only. The three volume-binding kinds are
+declared dynamic observations, because `volume_row` carries the volume identity
+form.
+
+**Blocking, all structured.** A handle-class (K1) parent; a missing,
+non-matching or unbound leaf identity; a missing mandatory row; any cap,
+truncation or fixture-capture truncation flag; a conflicting read under one
+key; an unobserved clock; a recorded holder without an observed kernel start
+and uid; an extra or unbound observation; an attempted, partial, failed or
+unpathed effect; an omitted, extra or substituted completed effect; an
+unmatched fixture change; a non-null `/2` window value; case, digest, source
+or fixture/expected topology drift; an unknown engine note; an unlisted site;
+and the recorder's own two obligation sentences. An unknown rule or site is
+always blocking, so nothing is silently ignored. The policy mirrors the strict
+K1 rule exactly: a handle parent is discharged only when
+`K1_PREMISE_QUALIFIED` holds, and blocks while it is false.
+
+**The volume bind is the recorder's.** For volume-form rows the policy does
+not re-implement `bound_volume`: it inherits the recorder's verdict through the
+`extra or unbound observation` note, which is blocking. That note is emitted
+only when no matching `dynamic.volumes` entry exists, so the volume-kind
+control builds its bound case with the matching entry and its recorder-faithful
+counterfactual with the entry absent; the entry-present-with-note pair is
+labelled a policy-only check.
+
+**The path-only exclusion is not live.** No first-batch input can use it: the
+recorder reports every path-only file row unbound, and the policy refuses the
+exclusion for any row the recorder reports unbound. It is implemented, pure-
+tested and reviewed so that the recorder change below has a policy to meet, not
+so that a current case can use it.
+
+The exclusion set is a source-owned enumeration, never a caller waiver list
+and never derived from warning text. The only strict issues an exclusion may
+explain are the completeness module's own two fixed templates (the window
+sentence, and `parent_required unproven at <site>: handle parent still needs
+qualified K1` for a site with a granted path-only limitation). Every other
+strict issue becomes `strict-issue-unexplained`, so the strict judgement
+survives by construction rather than by review attention.
+
+**Comparison rule.** `limited_comparison` has four states.
+`Insufficient` covers: either side's inputs insufficient, a side that did not
+run, a refusal (that engine's own outcome, never an absent root), or an
+incomplete batch **on either side**. Identical decisions cannot override any of
+these. `Divergence` means only that two sufficient, complete engines observed
+different fates. `DeclaredMismatch` means the engines agree with each other but
+not with the fates the manifest declares: a fixture or expectation defect, not
+a cross-engine divergence. `Agreed` needs two sufficient sides, two complete
+batches and the declared fates. A deferred or unexecuted case is never
+agreement.
+
+**Pure controls (50, discriminating).** Each asserts an exact rule and site,
+not merely failure: the allowed path-only limitation with its site and leaf
+identity while the strict result stays insufficient; a handle parent blocking
+with no limitation granted; missing row; wrong leaf identity; unlisted site;
+extra or unbound observation; unknown note; unobserved clock; unproven holder;
+all five truncation flags and a truncated fixture capture; a conflicting read
+under one key; attempted, partial, unpathed, omitted, extra, substituted and repeated
+effects, so multiplicity is preserved; a numeric window origin; case, digest, source and topology drift; an
+unbound leaf refusing the exclusion; two path-only obligations each excluded at
+its own site with its own leaf identity; strict preservation; identical
+decisions over insufficient inputs; a deferred case; a divergence; agreement
+requiring two sufficient sides; an informative identity note on an undeclared
+row not becoming a defect while the same sentence on a declared input blocks;
+an unrequired parent leaving nothing to exclude; and, built from the recorder's
+own output, a real-shaped path-only row carrying exactly that site's emitted
+sentences (no own identity) that stays insufficient, the same with a bound leaf
+but no fixture binding, an emitted `absence-walk:fstatat` component that is
+named handle-class rather than unlisted, an emitted `absence-walk:binding-open`
+volume row whose obligation binds on its volume identity, carrying the matching
+`dynamic.volumes` entry the recorder's `bound_volume` rule needs, with three
+counterfactuals: the entry-absent document the recorder would emit its
+`extra or unbound observation` note for blocks; a policy-only check confirms
+the policy treats that note as decisive even beside a matching entry (a pair the
+recorder never emits, so it is a policy test, not recorder evidence); and a
+different volume device is a wrong leaf identity, the malformed-obligation recorder
+note,
+the parser entry point refusing a `/1` transcript and an invalid manifest, a
+Barge-only incomplete batch that is insufficient, and a declared mismatch that
+is not a divergence. A further control compares the plan's printed blocking
+vocabulary with the enum's own list, which is generated by one macro so a rule
+cannot be printed twice or omitted. They run in the `--self-check` route, so
+`effigy rust:capture-wire` covers them.
+
+Two boundaries of the policy are deliberate. The manifest's
+`mandatory_observations` list is the declaration of which reads the decision
+consumes; the policy checks every declared obligation and every row the
+recorder itself reports as unbound (`extra or unbound observation`), but it
+cannot prove a manifest declared every input, so obligation completeness stays
+a review obligation. And the recorder's per-row sentences "object or parent
+identity unproven" and "component parent identity unproven" block only where
+that row kind is a declared decision input; on any other row the recorder's own
+bind verdict decides, and re-implementing that bind here would be a second,
+divergent rule.
+
+**First-batch plan, effect-free.** `oxide test --test tape_prune_eval --locked
+-- --limited-plan` (equivalently the harness binary with `--limited-plan`)
+prints one `oxide.capture.limited-plan/1` document and writes, stages,
+evaluates and probes nothing. It lists all 50 rows of the finite D8/CF
+inventory in eight first-batch families plus the two deferred families, and
+per row: status (`runnable`, `insufficient`, `deferred`), the prospective
+reason, the applicable CF obligations with an explicit reason for every
+non-applicable one, the directories the fixture actually creates, the engine
+enumerations the state triggers, the actual in-crate entrypoints, the ordered
+per-case actions and the prerequisites. Current shape: **0 runnable, 43
+insufficient, 7 deferred**. No case is executable today, for two independent
+reasons: no export-closure digest and receipt is qualified, and no first-batch
+input binds under the current recorder (below).
+
+CF-1 applicability follows the fixture and the actual readers, not a family
+label. Oxide enumerates no directory for receipts or intents: the registry
+document carries the rows, each receipt is read by `read_receipt_for_prune`,
+and `unfinished_intents` is a projection over those rows. The enumerations are
+Barge's: `area::list_names` (plan roots), `cache::read_placements`,
+`area::read_declarations`, `reference::read_receipts` over `read_dir(outputs)`
+(`OxideSnapshot::read_within`), and `state::read_intents_with_deadline` over the
+intents directory (`release::pending_intents`). The registry-shape, identity and
+absence families enumerate nothing and name CF-1 as not applicable; the control,
+references/intents, receipts/markers, fence/declaration and legacy families name
+it with the enumerated set each case must bind.
+
+Recorded insufficiencies, named rather than absorbed:
+
+1. **No first-batch input binds under the current recorder.** The recorder's
+   in-window bind check requires a row's parent device and inode
+   (`tape.rs check_manifest_obligations`: `bound_file`). No file read records a
+   parent: `read_row`/`read_row_owned` set none, and `authority_read_observed`
+   passes a held descriptor's own device and inode only for
+   `prune::read_bounded`. So every path-only file row reports `extra or unbound
+   observation at <kind>`, and every `parent_required` obligation over such a row
+   reports `mandatory observation missing or identity unproven at <site>`. The
+   reviewed path-only exclusion covers the parent obligation only; it cannot
+   manufacture a fixture binding, so the plan reports zero runnable rows.
+   Closing this is a separately reviewed test-only recorder change (bind a leaf
+   identity without a parent at the enumerated path-only sites, and give the
+   parent-required obligation note its own declared rule). This preparation does
+   not make it, and no exclusion was widened to hide it.
+2. **Checkout absence is insufficient under this policy.** Its decision reads
+   component rows of a no-follow walk whose parents are live held descriptors.
+   That is handle-class (K1) and no reviewed exclusion covers it, so
+   ABS-ANCESTOR-MISSING and ABS-ANCESTOR-REPLACED stay insufficient even though
+   the design's family table lists a keep-fate match as their strongest
+   outcome. Reaching it needs qualified K1 or a `/3`-class capture, not a wider
+   exclusion.
+3. **CAP-1 is insufficient by rule.** It exceeds the unchanged shared caps;
+   an overflowed or truncated document is never partial parity.
+4. **EXPLAIN-OR-BLOCK rows** (REF-ORPHAN-MARKED, RCP-V1): a difference is
+   reportable, a match is not available from current source.
+5. **Declared scope or configuration differences** are not agreement: ID-INODE
+   (D-2 batch versus root scope), DECL-MISSING (SCOPE), DECL-POLICY-NONE
+   (CONFIG), LEG-LISTED (D-3) and VOL-DUP-REGISTRY (per-engine record only).
+6. **VOL-DUP-LIVE is a declared coverage limit**: a real duplicate-UUID mount
+   census cannot be produced without kernel forgery.
+7. **Dynamic rows are insufficient**: ID-DEVICE-LIVE and VOL-REMOVED-DURING
+   need a second mount epoch and CF-2/CF-5 writers inside one window.
+8. **ABS-BOOT-DATA** needs internal boot Data placement and remains a D-3
+   scope difference.
+
+**Barge support: the exact smallest requirement.** The pinned sibling
+`f9f81f72` already provides the in-crate harness: `crates/barge/tests/tape_eval.rs`
+(`harness = false`) implements the fixed argv contract, calls the unchanged
+`release::plan` through `tape_harness::run_bound`, requires the export binding
+(`BARGE_TAPE_EXPORT_RECEIPT`, `_SHA256`, `_CLOSURE_SHA256`) and builds one
+BASE-shaped fixture. What is missing is fixture breadth, not a seam:
+`build_fixture(label)` materialises one fixed fixture (one volume record, one
+owned root, one settled Oxide row, an absent checkout) and its manifest carries
+empty `fixture.entries`, `fixture.roots` and `dynamic.writers`, so a first-batch
+case's own state — registry rows and intents, receipt and marker variants,
+volume records, declaration and fence, operator list, legacy rows — and the
+manifest's description of it cannot be produced. The smallest remaining source
+requirement is therefore a **per-case fixture builder inside
+`crates/barge/src/tape_harness.rs`**, with no new schema, argv contract, target
+or `release::plan` path. That is a linked Barge task; this PR makes no Barge
+write and the plan prints the requirement in its `barge_support` object.
+
+**Next occurrence: a proposal, not permission.** The plan prints it: **both
+batches ELEVATED**. The first batch attaches one owned 128 MiB image at a
+`/Volumes` mount so the fixture has a real external root binding, and an
+attached image is removable media — that is the ELEVATED trigger even though
+nothing is deleted, recycled or recovered. The second batch keeps ELEVATED for
+custody plus an admission lock create and a fence save on the same attached
+media. Bounds: 600 s and 512 MiB monitored scratch; the existing qualified
+`fcfda2b0…` supervisor; owned Stash scratch (volume UUID
+`8A660440-C919-45C6-A3F1-3365B9BD2006`), whose `<mount>/scratch/oxide` run root
+and evidence directory the supervisor selects itself, with no `--root-parent`
+and no `--evidence`; at most one owned 128 MiB image attached `-owners on` with
+an ordinary post-census detach; and the nine native-proof premises, each with
+its disposition. The 600 s and 512 MiB figures are unmeasured proposals, and no
+live-host size or timing is inferred. A diagnostic, counted
+author native and independent reviewer native each still need separate
+activation at the reviewed head; this preparation grants none of them, and a
+source-only review cannot grant comparison credit.
+
+**Unchanged.** `/2` wire, parser acceptance, caps, `K1_PREMISE_QUALIFIED`,
+production readers, locks, errors, selection, dependencies, pins, toolchain,
+MSRV, the private-build/export provider and its qualification, the O2 and O3
+holds, Route B and decision `0bcedf55` v2, and oxide#241/#222. Naming O2-CAL
+as an acceptance stays open (design decision 1); this policy is what such a
+claim would rest on and is not the claim.
 
 ## Shared private-build validation gate (oxide#248)
 

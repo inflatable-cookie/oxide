@@ -3094,6 +3094,8 @@ fn self_check(pure_only: bool, diagnostic: bool) -> Result<(), String> {
         emitted_wire_round_trip_check(&dir).map_err(|failure| failure.what)?;
         emitted_shape_check(&dir).map_err(|failure| failure.what)?;
         pure_checks(&dir).map_err(|failure| failure.what)?;
+        tape::capture_verdict::run_checks()
+            .map_err(|what| format!("limited-verdict policy: {what}"))?;
         occurrence_cap_check(&dir).map_err(|failure| failure.what)?;
         read_row_cap_check(&dir).map_err(|failure| failure.what)?;
         unbound_authority_note_check(&dir).map_err(|failure| failure.what)?;
@@ -3159,7 +3161,7 @@ fn self_check(pure_only: bool, diagnostic: bool) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: tape_prune_eval [--self-check | --diagnostic] [--fixture-root <dir> --manifest <path> --transcript-out <path> --case <CASE>]".to_owned()
+    "usage: tape_prune_eval [--self-check | --diagnostic | --limited-plan] [--fixture-root <dir> --manifest <path> --transcript-out <path> --case <CASE>]".to_owned()
 }
 
 fn main() {
@@ -3185,6 +3187,20 @@ fn main() {
         std::process::exit(code);
     }
     match args.first().map(String::as_str) {
+        // The effect-free first-batch plan: prints one document, writes and
+        // runs nothing (no fixture, engine, staging, Cargo, image or probe).
+        Some("--limited-plan") if args.len() == 1 => {
+            match serde_json::to_string_pretty(&tape::capture_verdict::plan_document()) {
+                Ok(text) => {
+                    println!("{text}");
+                    std::process::exit(0);
+                }
+                Err(error) => {
+                    eprintln!("oxide: limited plan: {error}");
+                    std::process::exit(2);
+                }
+            }
+        }
         Some("--path-preflight") => {
             let result = (|| -> Result<(), String> {
                 if args.len() != 2 {

@@ -1545,7 +1545,10 @@ admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- oxide test --bin oxide --locked selection_protection -- --test-threads=1"
 
 # oxide#283: shared capture-wire parser, hashed vectors and adapter emission.
-# Pure `--self-check` only; the existing 300 s / 512 MiB wrapper. STANDARD unit.
+# oxide#286: the separate limited-verdict policy and its pure controls; the
+# effect-free plan is the same target's `--limited-plan` mode (also no child,
+# fixture or staging). Pure `--self-check` only; the existing 300 s / 512 MiB
+# wrapper. STANDARD unit.
 [tasks."rust:capture-wire"]
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- oxide test --test tape_prune_eval --locked -- --self-check"
 
