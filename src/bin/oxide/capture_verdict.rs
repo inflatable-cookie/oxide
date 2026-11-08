@@ -369,15 +369,15 @@ fn known_site(kind: &str) -> Option<&'static KnownSite> {
 // Blocking reasons
 // ---------------------------------------------------------------------------
 
-/// Every blocking reason is structured: rule, site (or empty), detail. The
-/// limited verdict never reports a bare string, so no caller can filter a
-/// blocking reason by matching warning text.
 /// One macro, one source of truth: the enum and its full `ALL_BLOCKING_RULES`
 /// list are generated together, so the vocabulary the plan prints cannot omit a
 /// variant the verdict can return. `name()` stays an exhaustive match, so a new
 /// variant cannot compile without its printed name.
 macro_rules! blocking_rules {
     ($($variant:ident),* $(,)?) => {
+        /// Every blocking reason is structured: rule, site (or empty), detail. The
+        /// limited verdict never reports a bare string, so no caller can filter a
+        /// blocking reason by matching warning text.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
         pub(crate) enum BlockingRule {
             $($variant,)*
@@ -2851,6 +2851,10 @@ fn controls() -> Vec<(&'static str, fn() -> Control)> {
             emitted_absence_kind_blocks,
         ),
         (
+            "an emitted volume kind is bound by its volume identity",
+            emitted_volume_kind_is_bound_by_volume_identity,
+        ),
+        (
             "the parser entry point refuses a non-/2 document",
             parser_entry_point_refuses_non_v2,
         ),
@@ -3516,8 +3520,8 @@ fn recorder_path_only_row_is_insufficient() -> Control {
     // `read_row_owned` (parent unproven).
     transcript["notes"] = json!([
         "absolute monotonic window origin and end unproven",
-        "descriptor identity unavailable at authority-read@prune::read_registry: no authorized \
-descriptor observation",
+        "descriptor identity unavailable at prune::read_registry: no authorized descriptor \
+observation",
         "object or parent identity unproven at authority-read@prune::read_registry",
         "extra or unbound observation at authority-read@prune::read_registry",
         "mandatory observation missing or identity unproven at \
@@ -3556,7 +3560,6 @@ fn recorder_malformed_obligation_note_blocks() -> Control {
     transcript["reads"] = json!([synthetic_row(CONTROL_SITE, "none", Some(3), Some(4))]);
     transcript["notes"] = json!([
         "absolute monotonic window origin and end unproven",
-        "parent identity unproven at authority-read@prune::read_registry",
         "obligation missing parent_required at authority-read@prune::read_registry",
     ]);
     let verdict = evaluate_limited(&transcript, &synthetic_manifest(), CONTROL_DIGEST);
@@ -3670,6 +3673,71 @@ fn emitted_absence_kind_blocks() -> Control {
     control(
         !blocked_at(&verdict, BlockingRule::UnlistedSite, SITE),
         "the emitted kind is listed, not unlisted",
+    )
+}
+
+/// The three volume kinds the recorder emits through `volume_row` are read rows
+/// with the volume identity form. Their table class is a declared dynamic
+/// observation, so they are neither unlisted nor handle-class, and a declared
+/// obligation at such a site is judged on the volume facts rather than on a
+/// parent.
+fn emitted_volume_kind_is_bound_by_volume_identity() -> Control {
+    const SITE: &str = "absence-walk:binding-open";
+    const UUID: &str = "11111111-2222-3333-4444-555555555555";
+    let mut manifest = synthetic_manifest();
+    if let Some(window) = manifest.pointer_mut("/window/identity") {
+        *window = json!("window-1");
+    }
+    manifest["mandatory_observations"] = json!([{
+        "engine": "oxide",
+        "site": SITE,
+        "parent_required": false,
+        "identity": {
+            "volume_uuid": UUID,
+            "mount": "/Volumes/oxide-fixture",
+            "device": "/dev/disk9s1",
+            "window_identity": "window-1",
+        },
+    }]);
+    let volume_row = |device: &str| {
+        let mut row = synthetic_row(SITE, "none", None, None);
+        row["identity"]["path"] = Value::Null;
+        row["identity"]["volume_uuid"] = json!(UUID);
+        row["identity"]["mount"] = json!("/Volumes/oxide-fixture");
+        row["identity"]["volume_device"] = json!(device);
+        row["outcome"] = json!({"type": "facts", "facts": "mount=/Volumes/oxide-fixture"});
+        row
+    };
+    let mut transcript = synthetic_transcript();
+    transcript["reads"] = json!([volume_row("/dev/disk9s1")]);
+    transcript["notes"] = json!(["absolute monotonic window origin and end unproven"]);
+    let verdict = evaluate_limited(&transcript, &manifest, CONTROL_DIGEST);
+    control(
+        !blocked_by(&verdict, BlockingRule::UnlistedSite)
+            && !blocked_at(&verdict, BlockingRule::HandleParentUnqualified, SITE),
+        "an emitted volume kind is neither unlisted nor handle-class",
+    )?;
+    control(
+        verdict
+            .per_site
+            .iter()
+            .any(|site| site.site == SITE && site.class == "declared-observation"),
+        "the volume kind's registered class is a declared observation",
+    )?;
+    control(
+        verdict.sufficient(),
+        format!(
+            "a volume obligation binds on its volume identity: {:?}",
+            verdict.blocking
+        ),
+    )?;
+    // Counterfactual: a different device is a different volume identity.
+    let mut wrong = transcript.clone();
+    wrong["reads"] = json!([volume_row("/dev/disk9s2")]);
+    let mismatch = evaluate_limited(&wrong, &manifest, CONTROL_DIGEST);
+    control(
+        blocked_at(&mismatch, BlockingRule::WrongLeafIdentity, SITE),
+        "a different volume device is a wrong leaf identity, not a bound row",
     )
 }
 

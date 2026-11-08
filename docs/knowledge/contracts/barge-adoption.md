@@ -2102,8 +2102,8 @@ exclusion waives a decision input's identity.
 | `window-origin-end-null` | The transcript's required-null window origin and end | Both fields as `null`; no ordering, absolute-time or window-span claim |
 | `path-only-direct-read-parent` | `parent_required` at a site in the policy's fixed `KNOWN_SITES` table whose class is path-only direct read, only when that row binds its own device and inode and **only when the recorder did not report the row unbound** | The exact site and the leaf's own `(device, inode)` |
 
-The site table names the row kinds the recorder actually emits, each with its
-parent provenance: `authority-read@prune::read_registry`,
+The site table names the **decision-relevant** row kinds the recorder emits,
+each with its parent provenance: `authority-read@prune::read_registry`,
 `authority-read@prune::read_bounded`, `authority-read@prune::observe_root_in:marker`,
 `authority-read@outputs::read_receipt_with`, `authority-read@outputs::read_marker`,
 `authority-read@outputs::marker_digest`,
@@ -2115,8 +2115,12 @@ custody reads, `read-bounded:lstat`, `read-bounded:open`,
 `absence-walk:binding-open`, `absence-walk:binding-verify`,
 `root-observe:entry`, `root-observe:root-dir`, `root-observe:outputs-dir`,
 `root-observe:marker-open`, `root-observe:binding-open`, `volume-site` and
-`fixture-diff`. A kind absent from the table is unlisted and blocking; the table
-is exact-match, never a prefix or wildcard. The prune owner-marker read is
+`fixture-diff`. Any other kind an obligation names is unlisted and blocking — the table
+is exact-match, never a prefix or wildcard — and kinds that are not decision
+obligations today are deliberately absent (for example `config:read-config`,
+`config:inspect:canonicalize`, `control-directory:open`, the `scratch-io:*`
+reads, `store:open-existing*`, `pool:ledger-view`, and the dynamic
+`read_row(site, …)` observations in `outputs.rs`). The prune owner-marker read is
 **handle-class**, because `openat` runs from a live held root descriptor; only
 the path-opened marker reader is path-only. The three volume-binding kinds are
 declared dynamic observations, because `volume_row` carries the volume identity
@@ -2160,7 +2164,7 @@ a cross-engine divergence. `Agreed` needs two sufficient sides, two complete
 batches and the declared fates. A deferred or unexecuted case is never
 agreement.
 
-**Pure controls (49, discriminating).** Each asserts an exact rule and site,
+**Pure controls (50, discriminating).** Each asserts an exact rule and site,
 not merely failure: the allowed path-only limitation with its site and leaf
 identity while the strict result stays insufficient; a handle parent blocking
 with no limitation granted; missing row; wrong leaf identity; unlisted site;
@@ -2177,7 +2181,10 @@ an unrequired parent leaving nothing to exclude; and, built from the recorder's
 own output, a real-shaped path-only row carrying exactly that site's emitted
 sentences (no own identity) that stays insufficient, the same with a bound leaf
 but no fixture binding, an emitted `absence-walk:fstatat` component that is
-named handle-class rather than unlisted, the malformed-obligation recorder note,
+named handle-class rather than unlisted, an emitted `absence-walk:binding-open`
+volume row whose obligation binds on its volume identity (with a different
+device as the wrong-identity counterfactual), the malformed-obligation recorder
+note,
 the parser entry point refusing a `/1` transcript and an invalid manifest, a
 Barge-only incomplete batch that is insufficient, and a declared mismatch that
 is not a divergence. A further control compares the plan's printed blocking
