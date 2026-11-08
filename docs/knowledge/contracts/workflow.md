@@ -3735,6 +3735,21 @@ proof never copies the host registry whole.
   and config are skipped and the private config is regenerated. The shared host
   cache is mutable, so candidate contents and outcomes can differ between
   runs; the receipt records each run's own per-candidate records.
+- **Provenance (oxide#294).** `seed_cargo_home(..., provenance=dict)` fills
+  an additive `oxide.seed-provenance/1` record in place: the explicit requested
+  host CARGO_HOME and the private destination, the identity of each descriptor
+  the seeder actually opened (source root, the two namespace directories,
+  `config.json`, each database root and candidate), and on refusal the first
+  failed component and its index, the attempted operation, the errno name when
+  the syscall gave one, and a `kind` that is `unknown` unless the same
+  operation's own stat obtained it. An errno is never read as a kind: a symlink
+  under `O_NOFOLLOW|O_DIRECTORY` reports `ENOTDIR` on macOS, so the record says
+  `kind: unknown`. Facts gathered before a refusal stay in the record, and a Git
+  child that did not answer marks closure `unknown`. Candidate file lists stay
+  in the manifest. Callers that pass no record see no change, and every
+  no-follow, same-device, checksum, bound and host-read rule is unchanged. The
+  module's `--self-test` now runs 21 synthetic cases, seven of them provenance
+  controls.
 - **Receipts.** A consumer proof records the seeder's SHA-256 in its own
   exact-head receipt together with its own script. Importing the seeder
   transfers no qualification: each proof's evidence stays bound to the exact

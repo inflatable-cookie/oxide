@@ -59,6 +59,10 @@ SELECTED_VOLUME_UUID = "8A660440-C919-45C6-A3F1-3365B9BD2006"
 BUILDER = "1.97.1"
 MIB = 1024 * 1024
 REPORT_NAME = "embedded-control-observation.json"
+# The seed source is a chosen input read by the shared seeder, nothing more.
+SEED_ROLE = ("seed source only: the explicit CARGO_HOME is read by the bounded "
+             "seeder; staging HOME and CARGO_HOME are fresh private destinations "
+             "and no host cache is written")
 TEXT_CAP = 64 * 1024
 GAP_CAP = 64
 # The volume resolver (oxide#292) walks at most this many ancestors, asks diskutil
@@ -473,11 +477,13 @@ class Seams:
             os.unlink(member_file)
         return {"entries": entries, "bytes": written}
 
-    def seed(self, host_cargo_home, cargo_home, lock_bytes, deadline_ns):
+    def seed(self, host_cargo_home, cargo_home, lock_bytes, deadline_ns,
+             provenance=None):
         import offline_seed
         try:
             return offline_seed.seed_cargo_home(
-                host_cargo_home, cargo_home, lock_bytes, deadline_ns=deadline_ns)
+                host_cargo_home, cargo_home, lock_bytes, deadline_ns=deadline_ns,
+                provenance=provenance)
         except offline_seed.SeedRefusal as error:
             raise Obstruction(f"the private offline seed refused: {error}")
 
@@ -560,8 +566,17 @@ def invoking_rustup():
 
 
 def invoking_cargo_home():
-    return os.environ.get("CARGO_HOME") or os.path.join(
-        os.path.expanduser("~"), ".cargo")
+    """The host cache that is the SEED SOURCE ONLY, named explicitly by an
+    absolute CARGO_HOME. The implicit `~/.cargo` fallback is refused: the seed
+    source must be a chosen input, never an accident of the invoking account.
+    Staging's own HOME and CARGO_HOME are fresh private destinations."""
+    value = os.environ.get("CARGO_HOME", "")
+    if not os.path.isabs(value):
+        raise Obstruction(
+            "the seed source is not named: set an absolute CARGO_HOME to the "
+            "host cache the seed reads (seed source only); the implicit ~/.cargo "
+            "fallback is refused")
+    return value
 
 
 def scrubbed(environ):
@@ -685,7 +700,8 @@ def parse_binding(payload):
         raise Obstruction("the binding does not name the qualified supervisor")
     if guard.get("limit_seconds") != LIMIT_SECONDS or guard.get("scratch_mib") != SCRATCH_MIB:
         raise Obstruction("the binding's guard bounds are not this route's fixed bounds")
-    if document.get("volume", {}).get("uuid") != SELECTED_VOLUME_UUID:
+    volume = document.get("volume")
+    if not isinstance(volume, dict) or volume.get("uuid") != SELECTED_VOLUME_UUID:
         raise Obstruction("the binding does not name the selected Stash volume")
     paths = document.get("paths")
     if not isinstance(paths, dict) or not safe_component(paths.get("run_root_name")):
@@ -898,7 +914,7 @@ def artifact_from_log(text, target):
 
 
 def stage(seams, *, parent, cwd, lock_path, cargo_argv, target, label, toolchain,
-          artifacts):
+          artifacts, seeds=None):
     """One bounded offline staging build into the owned root with the bound
     `cargo` and `rustc`, then the exact reported executable and its digest. The
     staging tree is retained in place: only the guard's post-leader census can
@@ -918,8 +934,17 @@ def stage(seams, *, parent, cwd, lock_path, cargo_argv, target, label, toolchain
         lock_bytes = seams.read_bytes(lock_path)
     except OSError as error:
         raise Obstruction(f"the {label} lock is unreadable: {error}")
+    # The seed's provenance is kept in `seeds` before the seed runs, so a refusal
+    # still publishes the source, identities and failing component it reached.
+    provenance = {}
+    if seeds is not None:
+        seeds[label.lower()] = {
+            "role": SEED_ROLE,
+            "lock_sha256": sha256_bytes(lock_bytes),
+            "provenance": provenance,
+        }
     seed = seams.seed(invoking_cargo_home(), env["CARGO_HOME"], lock_bytes,
-                      seams.deadline_ns())
+                      seams.deadline_ns(), provenance=provenance)
     argv = [toolchain["cargo"], *cargo_argv, "--message-format=json"]
     code = seams.run_logged(argv, cwd=cwd, env=env, out_path=out_path,
                             err_path=err_path,
@@ -952,7 +977,7 @@ def stage(seams, *, parent, cwd, lock_path, cargo_argv, target, label, toolchain
     }
 
 
-def stage_oxide(seams, binding, paths, artifacts):
+def stage_oxide(seams, binding, paths, artifacts, seeds=None):
     return stage(
         seams,
         parent=os.path.join(paths["oxide"], "stage"),
@@ -964,6 +989,7 @@ def stage_oxide(seams, binding, paths, artifacts):
         label="Oxide",
         toolchain=binding["toolchain"],
         artifacts=artifacts,
+        seeds=seeds,
     )
 
 
@@ -1062,7 +1088,7 @@ def prepare_barge(seams, binding, paths):
     return {"source": source, "archive": archive, "retention": retention}
 
 
-def stage_barge(seams, binding, paths, artifacts, prepared):
+def stage_barge(seams, binding, paths, artifacts, prepared, seeds=None):
     """One bounded offline staging build of the archive `prepare_barge` already
     validated."""
     source = prepared["source"]
@@ -1078,6 +1104,7 @@ def stage_barge(seams, binding, paths, artifacts, prepared):
         label="Barge",
         toolchain=binding["toolchain"],
         artifacts=artifacts,
+        seeds=seeds,
     )
     staged["archive"] = prepared["archive"]
     staged["retention"] = prepared["retention"]
@@ -1376,7 +1403,7 @@ def closure_record(guard_receipt):
 
 
 def build_report(*, binding, guard, paths, envelope, oxide, barge, oxide_parse,
-                 barge_parse, retained, outcome, closure, gaps):
+                 barge_parse, retained, outcome, closure, gaps, seeds=None):
     """One bounded, honest report. `qualified` is false unconditionally and no
     field records agreement, equivalence or divergence."""
     bounded_gaps = list(gaps)
@@ -1456,9 +1483,17 @@ def build_report(*, binding, guard, paths, envelope, oxide, barge, oxide_parse,
                           "recorded",
         },
         "setup_differences": setup_differences(),
+        "seeds": seed_report(seeds),
         "closure": closure,
         "gaps": bounded_gaps,
     }
+
+
+def seed_report(seeds):
+    """Per side: the seed-source role, the lock digest and the seeder's own
+    provenance or refusal. Present even when a seed refused before any stage
+    record existed; empty only when no staging began."""
+    return {side: dict(entry) for side, entry in sorted((seeds or {}).items())}
 
 
 def setup_differences():
@@ -1494,7 +1529,7 @@ def observe(options, seams=None, environ=None):
     seams = seams or Seams()
     gaps = []
     reached = {"phase": "binding", "binding": None, "guard": None, "paths": None,
-               "envelope": None, "stage_artifacts": {}, "oxide": None,
+               "envelope": None, "stage_artifacts": {}, "seeds": {}, "oxide": None,
                "barge": None, "oxide_parse": None, "barge_parse": None}
 
     def finish(outcome, failure=None):
@@ -1525,7 +1560,7 @@ def observe(options, seams=None, environ=None):
                 envelope=reached["envelope"] or {},
                 oxide=reached["oxide"], barge=reached["barge"],
                 oxide_parse=reached["oxide_parse"], barge_parse=reached["barge_parse"],
-                retained=retained, outcome=outcome,
+                retained=retained, outcome=outcome, seeds=reached["seeds"],
                 closure=closure_record(paths["guard_receipt"]), gaps=gaps)
             try:
                 seams.write_json(paths["report"], report)
@@ -1571,10 +1606,11 @@ def observe(options, seams=None, environ=None):
         barge_prepared = prepare_barge(seams, binding, paths)
 
         reached["phase"] = "staging"
-        oxide_staged = stage_oxide(seams, binding, paths, reached["stage_artifacts"])
+        oxide_staged = stage_oxide(seams, binding, paths, reached["stage_artifacts"],
+                                   reached["seeds"])
         verify_toolchain_unchanged(binding, seams)
         barge_staged = stage_barge(seams, binding, paths, reached["stage_artifacts"],
-                                   barge_prepared)
+                                   barge_prepared, reached["seeds"])
         verify_toolchain_unchanged(binding, seams)
         envelope["oxide"]["stage"] = oxide_staged
         envelope["barge"]["stage"] = barge_staged
@@ -1669,6 +1705,16 @@ def plan_document():
                  "--binding \"$TAPE_OBSERVATION_BINDING\" "
                  "--sha256 \"$TAPE_OBSERVATION_BINDING_SHA256\"",
         "selection_refuses_before_effect": True,
+        "seed_source": {
+            "input": "an absolute CARGO_HOME in the invoking environment, named "
+                     "explicitly; the implicit ~/.cargo fallback is refused before "
+                     "staging",
+            "role": SEED_ROLE,
+            "report_key": "seeds",
+            "record": "per side: role, lock digest and the seeder's provenance or "
+                      "refusal, published even when the seed refuses before any stage "
+                      "record exists",
+        },
         "binding_template": BINDING_TEMPLATE,
         "commands": {
             "oxide_stage": ["cargo", "test", "--test", "tape_prune_eval",
@@ -1737,8 +1783,8 @@ def plan_document():
             "schema": SCHEMA,
             "always_false": "qualified",
             "keys": ["claim", "planner_reference", "controls", "premises", "bounds",
-                     "guard", "paths", "envelope", "windows", "fates",
-                     "setup_differences", "closure", "gaps"],
+                     "guard", "paths", "envelope", "windows", "fates", "seeds",
+                     "setup_differences", "outcome", "retained", "closure", "gaps"],
         },
         "premises": [{"premise": name, "disposition": text}
                      for name, text in PREMISES],
@@ -2075,7 +2121,8 @@ class FakeSeams(Seams):
         self.calls.append(("extract", sibling))
         return {"entries": 1, "bytes": 1}
 
-    def seed(self, host_cargo_home, cargo_home, lock_bytes, deadline_ns):
+    def seed(self, host_cargo_home, cargo_home, lock_bytes, deadline_ns,
+             provenance=None):
         self.calls.append(("seed", cargo_home))
         return {"lock_sha256": sha256_bytes(lock_bytes), "packages": 0,
                 "aggregate_bytes": 0}
@@ -2260,7 +2307,25 @@ def scripted_occurrence(binding, facts, *, barge_stderr, stage_exit=0,
 
 def self_test():
     """Pure apparatus controls: no engine, compiler, fixture, image or native
-    campaign runs. Each control names the exact refusal it must produce."""
+    campaign runs. Each control names the exact refusal it must produce.
+
+    The scripted occurrences seed through a fake seam, so the one explicit seed
+    source they need is a fixture value, set for this run only and restored."""
+    saved = os.environ.get("CARGO_HOME")
+    os.environ["CARGO_HOME"] = SELF_TEST_SEED_SOURCE
+    try:
+        return _self_test()
+    finally:
+        if saved is None:
+            os.environ.pop("CARGO_HOME", None)
+        else:
+            os.environ["CARGO_HOME"] = saved
+
+
+SELF_TEST_SEED_SOURCE = "/self-test/explicit-seed-source"
+
+
+def _self_test():
     checks = []
 
     def check(name, condition, detail=""):
@@ -2332,6 +2397,7 @@ def self_test():
         ({"guard": {"scratch_mib": 4096}}, "fixed bounds"),
         ({"volume": {"uuid": "00000000-0000-0000-0000-000000000000"}},
          "Stash volume"),
+        ({"volume": "SELECTED"}, "Stash volume"),
         ({"paths": {"run_root_name": "../escape"}}, "safe component"),
         ({"paths": {"report_name": "a/b"}}, "safe component"),
     ):
@@ -2970,6 +3036,79 @@ def self_test():
               failure is not None and failure["outcome"]["state"] == "refused"
               and failure["outcome"]["phase"] == "staging"
               and failure["qualified"] is False)
+        class SeedRefusingSeams(FakeSeams):
+            """The seed refuses after it opened the explicit source and before any
+            stage record exists; its provenance is filled as the seeder fills it."""
+
+            def seed(self, host_cargo_home, cargo_home, lock_bytes, deadline_ns,
+                     provenance=None):
+                self.calls.append(("seed", cargo_home))
+                if provenance is not None:
+                    provenance.update({
+                        "schema": "oxide.seed-provenance/1",
+                        "requested_source": host_cargo_home,
+                        "destination": cargo_home,
+                        "source": {"dev": 1, "ino": 2, "kind": "directory"},
+                        "registry": {"index_namespace": None,
+                                     "cache_namespace": None,
+                                     "config_json": None},
+                        "git": [],
+                        "refusal": {
+                            "component": "index.crates.io-1949cf8c6b5b557f",
+                            "component_index": 2,
+                            "operation": "open directory without following links (O_NOFOLLOW|O_DIRECTORY)",
+                            "errno": "ENOENT",
+                            "kind": "unknown",
+                            "message": "required seed directory is missing",
+                        },
+                    })
+                raise Obstruction("the private offline seed refused: required seed directory is missing")
+
+        seed_script = scripted_occurrence(binding, facts, barge_stderr=ok_stderr)
+        seed_fake = SeedRefusingSeams(seed_script)
+        try:
+            observe({"binding": "/binding.json",
+                     "sha256": sha256_bytes(binding_bytes)}, seed_fake, FIXTURE_ENV)
+        except Obstruction:
+            pass
+        refused_seed = seed_script["written"] or {}
+        seed_entry = (refused_seed.get("seeds") or {}).get("oxide") or {}
+        check("a seed refusal publishes the explicit source and the failing component",
+              refused_seed.get("outcome", {}).get("phase") == "staging"
+              and seed_entry.get("role") == SEED_ROLE
+              and seed_entry.get("provenance", {}).get("requested_source") == SELF_TEST_SEED_SOURCE
+              and seed_entry.get("provenance", {}).get("refusal", {}).get("component")
+              == "index.crates.io-1949cf8c6b5b557f")
+        check("a seed refusal runs no Cargo staging, engine or parse",
+              not any(call[0] in ("run_logged", "run_captured") for call in seed_fake.calls))
+        published_keys = set(refused_seed) - {"schema", "qualified"}
+        planned_keys = set(plan_document()["report_schema"]["keys"])
+        check("the plan's report key list covers every key the refused report publishes",
+              published_keys <= planned_keys and "seeds" in planned_keys,
+              str(sorted(published_keys - planned_keys)))
+        check("the plan names the explicit CARGO_HOME seed source and the seeds key",
+              plan_document()["seed_source"]["report_key"] == "seeds"
+              and "absolute CARGO_HOME" in plan_document()["seed_source"]["input"])
+
+        # The seed source is named explicitly: an unset or relative CARGO_HOME
+        # refuses, and the implicit ~/.cargo fallback is never read.
+        saved_cargo_home = os.environ.pop("CARGO_HOME", None)
+        try:
+            refuses("an unset CARGO_HOME refuses the implicit seed source",
+                    invoking_cargo_home, "seed source is not named")
+            os.environ["CARGO_HOME"] = "relative/cache"
+            refuses("a relative CARGO_HOME refuses the seed source",
+                    invoking_cargo_home, "seed source is not named")
+            os.environ["CARGO_HOME"] = SELF_TEST_SEED_SOURCE
+            check("an absolute CARGO_HOME is the explicit seed source",
+                  invoking_cargo_home() == SELF_TEST_SEED_SOURCE)
+        finally:
+            os.environ.pop("CARGO_HOME", None)
+            if saved_cargo_home is not None:
+                os.environ["CARGO_HOME"] = saved_cargo_home
+            else:
+                os.environ["CARGO_HOME"] = SELF_TEST_SEED_SOURCE
+
         engine_labels = {"oxide.transcript", "oxide.manifest", "oxide.observation",
                          "oxide.parse", "barge.transcript", "barge.manifest",
                          "barge.parse", "oxide.executable", "barge.executable"}
