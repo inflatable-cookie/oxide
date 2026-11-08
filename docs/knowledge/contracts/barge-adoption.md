@@ -2605,21 +2605,29 @@ an unparsable retained document as recorded observations; an absent fate is
 closed at source. Barge049 (`cefb5d3e`, Barge PR #49) added `TempDir::keep`, an
 opt-in retained branch of `embedded_exercise`, the bounded kept-fixture line and
 the manifest-before-run order. Its independent review (run `1808bf0e`) returned
-`ready_to_merge` at `05b4b52`, tree `68f96990`. The merge `d9eac3b`, the pinned
-sibling head, carries the same tree, so tree identity is the source-equivalence
-proof. The review's follow-ups do not gate the lifetime: a publication failure
+`ready_to_merge` at `05b4b52`, tree `68f96990`. The published merge `d9eac3b`, the pinned
+sibling head, carries the same tree. The review's follow-ups do not gate the lifetime: a publication failure
 returns the bare error, a composition control is missing, and a panic in
 directory creation exits 101 with no line. Each leaves no custody record, which
 the driver treats as an obstruction.
 
-The gate is `BARGE_CUSTODY_REVIEWED`, a constant in this source: the reviewed
-revision `05b4b52`, tree `68f96990`, `Cargo.lock` digest `4cb40dd5…`, and the
-digests of `testkit.rs` (`396d0eb9…`), `tape_harness.rs` (`83f51163…`) and the
-`tests/tape_eval.rs` entry point (`c1ed42f8…`). `verify_barge_custody` requires
-the binding's custody revision and tree to be the reviewed ones (the commit may
-differ, because tree identity covers every byte), the exact property name, and
-the archived lock and file digests. All of it runs before any staging write.
-No binding, environment value or marker opens the gate.
+The gate is `BARGE_CUSTODY_REVIEWED`, a constant in this source, and every
+value is compared exactly. It binds four things:
+
+- the linked task `cefb5d3e-579c-41e3-89f4-0e3b90ecb39a`, the only task the gate
+  accepts;
+- the **runtime commit** `d9eac3b573fb5d431e29160844290093030bfc19`, the
+  published merge. It is the only commit a binding may name, and the sibling's
+  live HEAD must be it. The reviewed head `05b4b52` is a correlation field, not
+  a runtime binding, so a binding naming it is refused;
+- the tree `68f96990`, which the reviewed head and the merge share, and the
+  `Cargo.lock` digest `4cb40dd5…`;
+- the digests of `testkit.rs` (`396d0eb9…`), `tape_harness.rs` (`83f51163…`) and
+  the `tests/tape_eval.rs` entry point (`c1ed42f8…`).
+
+Sharing the tree approves no other commit: an arbitrary commit with the reviewed
+tree is refused by name. `verify_barge_custody` runs before any staging write,
+and no binding, environment value or marker opens the gate.
 
 The child contract is the opt-in and nothing else. `run_barge` sets
 `BARGE_TAPE_CUSTODY=barge.tape.kept-fixture/1` and `BARGE_TEST_SCRATCH_ROOT` to
@@ -2627,6 +2635,14 @@ its own run root; `scrubbed` drops every inherited `BARGE_` key; argv is the
 bound executable with no arguments. The lifetime property holds only under that
 opt-in. Without it the route is the ordinary self-removing one, and nothing in
 this driver claims otherwise.
+
+Disclosed limits, reported as unknown, partial or missing and never as
+success: caller creation and ownership of the run root is a driver premise that
+the Barge child does not prove; a directory-creation failure in the child panics
+with exit 101 before any custody line, which the driver reads as a missing
+record; and a failed manifest publication can leave partial `manifest.json`
+bytes with no engine run, which the driver retains as raw evidence and never
+reads as a verdict.
 
 Barge-side custody failures are apparatus obstructions: retained, unqualified,
 nonzero and never a fate. They cover a missing, duplicate or unsafe
@@ -2755,12 +2771,12 @@ owner-only/canonical-root and escaping-report refusals, the missing manifest and
 missing transcript, a `/1` and an apparatus document, truncation, signalled and
 nonzero exits, and equal and unequal raw fates with no agreement, equivalence or
 divergence field. `effigy proof:tape-prune:observation-test` drives the real
-orchestration functions with scripted seams (143 controls: binding shape and
+orchestration functions with scripted seams (152 controls: binding shape and
 digest including the Barge custody block; source/toolchain/volume/worktree
 drift; derived paths; the real sibling guard topology with 0755 evidence
 accepted and 0777 or nested evidence refused; outside-root retention; engine
 classification; equal and unequal fates; gap overflow; refusal before any
-engine; the source gate (exact reviewed revision, tree, lock and file digests, refused before any staging write); the Barge child environment and the custody-record obstructions, including a missing Barge parse report; the bound
+engine; the source gate (exact reviewed revision, tree, lock and file digests, refused before any staging write); the Barge child environment and the custody-record obstructions, including a missing Barge parse report, a same-tree commit, a foreign task and the reviewed head as a runtime commit; the bound
 `cargo`/`RUSTC`/`PATH` staging invocation; at most one window per engine; one
 complete scripted occurrence with its retained evidence tree; an over-budget
 artifact omitted and named; a Barge timeout, parse failure and staging failure
@@ -2774,7 +2790,7 @@ or observer campaign.
 
 **Covering validation for oxide#290 (source binding).** No Rust bytes change, so
 the Rust selectors are not repeated. The covering checks are
-`effigy proof:tape-prune:observation-test` (143 controls, pure),
+`effigy proof:tape-prune:observation-test` (152 controls, pure),
 `effigy proof:tape-prune:observation-plan` (effect-free) and `effigy docs:check`.
 No native, diagnostic, staged build or embedded engine run is part of this
 change. The one uncounted observation-only occurrence stays separately

@@ -176,16 +176,19 @@ PREMISES = (
 
 # The reviewed Barge custody source this route binds (oxide#290). Barge049
 # (`cefb5d3e`, Barge PR #49) was independently reviewed `ready_to_merge` at
-# `05b4b52`, tree `68f96990` (review run `1808bf0e`). Its merge `d9eac3b`, the
-# pinned sibling head, carries the same tree, so tree identity is the
-# source-equivalence proof: a binding names the merge commit, its tree must be
-# the reviewed tree, and the archived lock and the lifetime files must match
-# these digests before any staging. The gate is source-owned; no binding,
-# environment value or marker can open it.
+# `review_head` (review run `1808bf0e`, comment 6723601916). Its published merge
+# `runtime_commit` is the ONLY runtime commit this gate accepts: a binding names
+# that exact commit, and the sibling's live HEAD must be it. The reviewed head
+# and the merge carry the same tree, which correlates the review with the merge
+# and proves the merge's bytes are the reviewed bytes. Equal trees do NOT make
+# another commit approved: a different commit with the same tree is refused.
+# Nothing a binding, environment value or marker supplies can open this gate.
 BARGE_CUSTODY_REVIEWED = {
     "linked_task": "cefb5d3e-579c-41e3-89f4-0e3b90ecb39a",
     "review_run": "1808bf0e-51ed-4b45-8470-f29222b40086",
-    "revision": "05b4b5290852a0c9c697005794f1fda78f1b4420",
+    "review_comment_id": 6723601916,
+    "review_head": "05b4b5290852a0c9c697005794f1fda78f1b4420",
+    "runtime_commit": "d9eac3b573fb5d431e29160844290093030bfc19",
     "tree": "68f96990d6e190852fe61e298d76b6aebdb31076",
     "lock_sha256": "4cb40dd563cf078088000e5f72edfe23a606b7cb89477d1aabb1792386c475c0",
     "files": {
@@ -896,24 +899,38 @@ def verify_barge_custody(binding, source, seams):
     """Refuse unless the archived Barge source is the reviewed custody source.
 
     The property is not verifiable from bytes: a comment or an unrelated method
-    could satisfy any text search. Safety rests on source review of the reviewed
-    tree, which `BARGE_CUSTODY_REVIEWED` binds: the bound commit may be a merge or
-    a rebase only if its tree is the reviewed tree (tree identity covers every
-    byte), the binding's custody block names the reviewed revision and property,
-    and the archived lock and each lifetime file match their reviewed digests.
-    Everything is checked against the archive before any staging write.
+    could satisfy any text search. Safety rests on source review, which
+    `BARGE_CUSTODY_REVIEWED` binds in this file. Every value is compared exactly,
+    and nothing is generalised:
+
+    * the custody block names the source-owned linked task and reviewed head;
+    * the binding's commit is the approved runtime merge and nothing else, so a
+      different commit with the same tree is refused;
+    * the binding's tree, the property name, the archived lock and each lifetime
+      file match their reviewed values.
+
+    All of it is checked against the archive before any staging write.
     """
     require_reviewed_custody(binding)
     custody = binding["barge"]["custody"]
     reviewed = globals()["BARGE_CUSTODY_REVIEWED"]
-    if custody["reviewed_revision"] != reviewed["revision"]:
+    if custody["linked_task"] != reviewed["linked_task"]:
         raise Obstruction(
-            "the bound Barge custody revision is not the reviewed revision "
-            f"({reviewed['revision']})")
+            f"the bound custody task {custody['linked_task']} is not the reviewed "
+            f"Barge custody task ({reviewed['linked_task']})")
+    if custody["reviewed_revision"] != reviewed["review_head"]:
+        raise Obstruction(
+            "the bound Barge custody revision is not the reviewed head "
+            f"({reviewed['review_head']})")
+    if binding["barge"]["commit"] != reviewed["runtime_commit"]:
+        raise Obstruction(
+            "the bound Barge commit is not the approved runtime merge "
+            f"({reviewed['runtime_commit']}); a commit is not approved by sharing "
+            "the reviewed tree")
     if binding["barge"]["tree"] != reviewed["tree"]:
         raise Obstruction(
             "the bound Barge tree is not the reviewed custody tree "
-            f"({reviewed['tree']}); the commit is not the reviewed source")
+            f"({reviewed['tree']})")
     if custody["property"] != BARGE_CUSTODY_PROPERTY:
         raise Obstruction("the binding does not name the required custody property")
     lock_path = os.path.join(source, "Cargo.lock")
@@ -928,9 +945,10 @@ def verify_barge_custody(binding, source, seams):
         if seams.sha256(path) != reviewed["files"][name]:
             raise Obstruction(
                 f"the archived Barge {relative} is not the reviewed custody revision")
-    return {"linked_task": custody["linked_task"],
+    return {"linked_task": reviewed["linked_task"],
             "review_run": reviewed["review_run"],
-            "reviewed_revision": reviewed["revision"],
+            "review_head": reviewed["review_head"],
+            "runtime_commit": reviewed["runtime_commit"],
             "reviewed_tree": reviewed["tree"],
             "property": BARGE_CUSTODY_PROPERTY,
             "files": {name: reviewed["files"][name] for name in BARGE_CUSTODY_FILES}}
@@ -1684,14 +1702,18 @@ def plan_document():
             "reviewed": {
                 "linked_task": BARGE_CUSTODY_REVIEWED["linked_task"],
                 "review_run": BARGE_CUSTODY_REVIEWED["review_run"],
-                "revision": BARGE_CUSTODY_REVIEWED["revision"],
+                "review_head": BARGE_CUSTODY_REVIEWED["review_head"],
+                "runtime_commit": BARGE_CUSTODY_REVIEWED["runtime_commit"],
                 "tree": BARGE_CUSTODY_REVIEWED["tree"],
                 "lock_sha256": BARGE_CUSTODY_REVIEWED["lock_sha256"],
                 "files": dict(BARGE_CUSTODY_REVIEWED["files"]),
             },
-            "pinned_sibling_merge": "d9eac3b573fb5d431e29160844290093030bfc19 (PR #49 "
-                                    "merge; same tree as the reviewed revision, so tree "
-                                    "identity is the source-equivalence proof)",
+            "runtime_binding": "the binding's barge.commit must be exactly the approved "
+                               "runtime merge d9eac3b573fb5d431e29160844290093030bfc19 "
+                               "(PR #49 merge); the sibling's live HEAD must match it. The "
+                               "reviewed head 05b4b52 and the merge share tree 68f96990, "
+                               "which correlates the review with the merge. Sharing the "
+                               "tree approves no other commit",
             "required_custody_property": BARGE_CUSTODY_PROPERTY,
             "opt_in": {"env": BARGE_CUSTODY_OPT_IN_ENV,
                        "value": BARGE_CUSTODY_OPT_IN_VALUE,
@@ -1720,11 +1742,11 @@ def plan_document():
                         "and no field below is a valid input yet",
                 "oxide": "the merged head's commit, tree and Cargo.lock digest",
                 "barge": {"sibling": "the authenticated read-only sibling checkout",
-                          "commit": "d9eac3b573fb5d431e29160844290093030bfc19",
+                          "commit": BARGE_CUSTODY_REVIEWED["runtime_commit"],
                           "tree": BARGE_CUSTODY_REVIEWED["tree"],
                           "lock_sha256": BARGE_CUSTODY_REVIEWED["lock_sha256"],
                           "custody": {"linked_task": BARGE_CUSTODY_REVIEWED["linked_task"],
-                                      "reviewed_revision": BARGE_CUSTODY_REVIEWED["revision"],
+                                      "reviewed_revision": BARGE_CUSTODY_REVIEWED["review_head"],
                                       "property": BARGE_CUSTODY_PROPERTY}},
                 "toolchain": "the bound rustc and cargo absolute paths and digests at 1.97.1",
                 "guard": "the fixed limits and the unchanged supervisor digest",
@@ -1734,6 +1756,14 @@ def plan_document():
             "residual_risks": [
                 "tree identity covers the reviewed source, but git archive is trusted to "
                 "honour the tree; the sibling carries no .gitattributes",
+                "caller creation and ownership of the run root is a driver premise: the "
+                "Barge child does not prove that this invocation created the directory",
+                "a directory-creation failure in the Barge child panics with exit 101 before "
+                "any custody line, so the driver reads it as a missing custody record and "
+                "no fixture is announced",
+                "a failed manifest publication can leave partial manifest.json bytes with no "
+                "engine run; the driver reads a nonzero exit as an obstruction and retains "
+                "the partial bytes as raw evidence, never as a verdict",
                 "the kept fixture stays in the monitored scratch until the guard's own "
                 "closed-run cleanup; retained evidence is the manifest and transcript, "
                 "not the fixture tree",
@@ -2145,8 +2175,10 @@ def self_test():
           and plan_doc["bounds"]["uncertainty"])
     check("the plan records the source-bound Barge custody readiness",
           plan_doc["barge_custody"]["state"].startswith("source-bound")
-          and plan_doc["barge_custody"]["reviewed"]["revision"]
-          == BARGE_CUSTODY_REVIEWED["revision"]
+          and plan_doc["barge_custody"]["reviewed"]["review_head"]
+          == BARGE_CUSTODY_REVIEWED["review_head"]
+          and plan_doc["barge_custody"]["reviewed"]["runtime_commit"]
+          == BARGE_CUSTODY_REVIEWED["runtime_commit"]
           and plan_doc["barge_custody"]["required_custody_property"]
           == BARGE_CUSTODY_PROPERTY
           and plan_doc["barge_custody"]["opt_in"]["value"] == BARGE_CUSTODY_OPT_IN_VALUE
@@ -2401,15 +2433,18 @@ def self_test():
     #     constant is the Barge049 review at 05b4b52 (tree 68f96990, run 1808bf0e);
     #     the fixture binding is not that source and refuses before any staging.
     barge_source = paths["barge_source"]
-    check("the source binds the reviewed Barge custody revision and tree",
-          BARGE_CUSTODY_REVIEWED["revision"] == "05b4b5290852a0c9c697005794f1fda78f1b4420"
+    check("the source binds the approved runtime merge, the reviewed head and the task",
+          BARGE_CUSTODY_REVIEWED["runtime_commit"] == "d9eac3b573fb5d431e29160844290093030bfc19"
+          and BARGE_CUSTODY_REVIEWED["review_head"] == "05b4b5290852a0c9c697005794f1fda78f1b4420"
           and BARGE_CUSTODY_REVIEWED["tree"] == "68f96990d6e190852fe61e298d76b6aebdb31076"
+          and BARGE_CUSTODY_REVIEWED["linked_task"] == "cefb5d3e-579c-41e3-89f4-0e3b90ecb39a"
           and BARGE_CUSTODY_REVIEWED["review_run"] == "1808bf0e-51ed-4b45-8470-f29222b40086"
           and set(BARGE_CUSTODY_FILES) == set(BARGE_CUSTODY_REVIEWED["files"]))
+    barge_source = paths["barge_source"]
     shipped = FakeSeams(scripted_occurrence(binding, facts, barge_stderr=""))
     refuses("the fixture binding is refused by the shipped reviewed source",
             lambda: verify_barge_custody(binding, barge_source, shipped),
-            "not the reviewed revision")
+            "not the reviewed Barge custody task")
     closed_fake = FakeSeams(scripted_occurrence(binding, facts, barge_stderr=""))
     original_custody = globals()["BARGE_CUSTODY_REVIEWED"]
     globals()["BARGE_CUSTODY_REVIEWED"] = None
@@ -2426,43 +2461,89 @@ def self_test():
           and not any(call[0] == "make_root" and call[1] == paths["run_root"]
                       for call in closed_fake.calls))
 
-    # The fixture reviewed revision is the fixture binding's own revision, tree
-    # and lock, so every refusal below is caused by the one value it varies.
-    fixture_reviewed = {
-        "linked_task": "barge-custody-fixture",
-        "review_run": "fixture-review",
-        "revision": facts["barge"]["commit"],
-        "tree": facts["barge"]["tree"],
-        "lock_sha256": facts["barge"]["lock_sha256"],
-        "files": {"testkit": "a" * 64, "tape_harness": "b" * 64, "tape_eval": "c" * 64},
-    }
-
     def custody_seams(*, digests=None, drop=()):
         script = scripted_occurrence(binding, facts, barge_stderr="")
         script["digests"].update(digests or {})
         script["isfiles"] = set(script["isfiles"]) - set(drop)
         return FakeSeams(script)
 
+    # The shipped constant, against the approved values exactly. A binding is the
+    # real published merge with the reviewed custody block and the real digests.
+    real_digests = {
+        "barge/source/Cargo.lock": BARGE_CUSTODY_REVIEWED["lock_sha256"],
+        "testkit.rs": BARGE_CUSTODY_REVIEWED["files"]["testkit"],
+        "tape_harness.rs": BARGE_CUSTODY_REVIEWED["files"]["tape_harness"],
+        "tape_eval.rs": BARGE_CUSTODY_REVIEWED["files"]["tape_eval"],
+    }
+
+    def approved_binding(commit=None, linked_task=None, reviewed_head=None, tree=None):
+        document = fixture_binding(facts, custody={
+            "linked_task": linked_task or BARGE_CUSTODY_REVIEWED["linked_task"],
+            "reviewed_revision": reviewed_head or BARGE_CUSTODY_REVIEWED["review_head"],
+            "property": BARGE_CUSTODY_PROPERTY})
+        document["barge"]["commit"] = commit or BARGE_CUSTODY_REVIEWED["runtime_commit"]
+        document["barge"]["tree"] = tree or BARGE_CUSTODY_REVIEWED["tree"]
+        return document
+
+    accepted = verify_barge_custody(approved_binding(), barge_source,
+                                    custody_seams(digests=real_digests))
+    check("the exact approved runtime merge, task, head and digests are accepted",
+          accepted["runtime_commit"] == BARGE_CUSTODY_REVIEWED["runtime_commit"]
+          and accepted["linked_task"] == BARGE_CUSTODY_REVIEWED["linked_task"]
+          and accepted["review_head"] == BARGE_CUSTODY_REVIEWED["review_head"])
+    for name, candidate, needle in (
+        ("the reviewed head itself, though it shares the approved tree",
+         approved_binding(commit=BARGE_CUSTODY_REVIEWED["review_head"]),
+         "not the approved runtime merge"),
+        ("an arbitrary commit that shares the approved tree",
+         approved_binding(commit="7" * 40), "not the approved runtime merge"),
+        ("a different task label on the otherwise exact binding",
+         approved_binding(linked_task="00000000-0000-4000-8000-000000000000"),
+         "not the reviewed Barge custody task"),
+        ("a different reviewed head on the exact runtime merge",
+         approved_binding(reviewed_head="9" * 40), "not the reviewed head"),
+        ("a different tree on the exact runtime merge",
+         approved_binding(tree="8" * 40), "not the reviewed custody tree"),
+    ):
+        refuses(f"the shipped gate refuses {name}",
+                lambda candidate=candidate: verify_barge_custody(
+                    candidate, barge_source, custody_seams(digests=real_digests)),
+                needle)
+
+    # The fixture reviewed values are the fixture binding's own, so each refusal
+    # below is caused by the one value it varies.
+    fixture_reviewed = {
+        "linked_task": "barge-custody-fixture",
+        "review_run": "fixture-review",
+        "review_comment_id": 0,
+        "review_head": facts["barge"]["commit"],
+        "runtime_commit": facts["barge"]["commit"],
+        "tree": facts["barge"]["tree"],
+        "lock_sha256": facts["barge"]["lock_sha256"],
+        "files": {"testkit": "a" * 64, "tape_harness": "b" * 64, "tape_eval": "c" * 64},
+    }
     globals()["BARGE_CUSTODY_REVIEWED"] = fixture_reviewed
     try:
-        # 12. An exact reviewed revision, tree, lock and file set is accepted; a
-        #     different commit with the reviewed tree is accepted by tree identity.
-        check("an exact reviewed revision, tree, lock and file set is accepted",
+        # 12. The exact reviewed values are accepted; every wrong one is refused.
+        check("an exact reviewed head, runtime commit, tree, lock and file set is accepted",
               verify_barge_custody(binding, barge_source, custody_seams())
-              ["reviewed_revision"] == facts["barge"]["commit"])
-        merged = fixture_binding(facts)
-        merged["barge"]["commit"] = "7" * 40
-        check("a merge with the reviewed tree is the same source by tree identity",
-              verify_barge_custody(merged, barge_source, custody_seams())
-              ["reviewed_tree"] == facts["barge"]["tree"])
+              ["runtime_commit"] == facts["barge"]["commit"])
         for name, candidate, seams, needle in (
+            ("a commit that shares the reviewed tree",
+             fixture_binding(facts), custody_seams(), "not the approved runtime merge"),
             ("a binding naming another custody revision",
              fixture_binding(facts, custody={
                  "linked_task": "barge-custody-fixture", "reviewed_revision": "9" * 40,
                  "property": BARGE_CUSTODY_PROPERTY}),
-             custody_seams(), "not the reviewed revision"),
+             custody_seams(), "not the reviewed head"),
             ("a binding whose tree is not the reviewed tree",
              fixture_binding(facts), None, "not the reviewed custody tree"),
+            ("a binding naming another task",
+             fixture_binding(facts, custody={
+                 "linked_task": "barge-custody-other",
+                 "reviewed_revision": facts["barge"]["commit"],
+                 "property": BARGE_CUSTODY_PROPERTY}),
+             custody_seams(), "not the reviewed Barge custody task"),
             ("a binding with another custody property",
              fixture_binding(facts, custody={
                  "linked_task": "barge-custody-fixture",
@@ -2483,6 +2564,8 @@ def self_test():
             if name == "a binding whose tree is not the reviewed tree":
                 candidate["barge"]["tree"] = "8" * 40
                 seams = custody_seams()
+            if name == "a commit that shares the reviewed tree":
+                candidate["barge"]["commit"] = "7" * 40
             refuses(name, lambda candidate=candidate, seams=seams: verify_barge_custody(
                 candidate, barge_source, seams), needle)
 
@@ -2502,6 +2585,23 @@ def self_test():
         check("a refused tree runs no staging or engine",
               not any(call[0] in ("run_logged", "run_captured")
                       for call in bad_tree_fake.calls))
+
+        # The observe path: a commit that shares the tree is refused by commit.
+        same_tree = fixture_binding(facts)
+        same_tree["barge"]["commit"] = "7" * 40
+        same_tree_bytes = json.dumps(same_tree).encode()
+        same_tree_fake = FakeSeams(scripted_occurrence(same_tree, facts, barge_stderr=""))
+        same_tree_fake.script["files"]["/binding.json"] = same_tree_bytes
+        same_tree_fake.script["queries"]["git -C /siblings/barge rev-parse HEAD"] \
+            = {"code": 0, "stdout": "7" * 40, "stderr": ""}
+        refuses("a same-tree commit refuses the observation before any staging",
+                lambda: observe({"binding": "/binding.json",
+                                 "sha256": sha256_bytes(same_tree_bytes)}, same_tree_fake,
+                                FIXTURE_ENV),
+                "not the approved runtime merge")
+        check("a refused same-tree commit runs no staging or engine",
+              not any(call[0] in ("run_logged", "run_captured")
+                      for call in same_tree_fake.calls))
 
         # 12b. The Barge child gets exactly the opt-in and this run's own root, and
         #      no other Barge variable survives the scrub. Its argv is the bound
