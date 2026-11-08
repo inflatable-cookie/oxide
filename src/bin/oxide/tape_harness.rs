@@ -1439,6 +1439,563 @@ fn live_held_descriptor_check(temp: &Path) -> Result<(), CheckFailure> {
     )
 }
 
+/// One deliberately created `/2` manifest for the leaf-binding windows. Every
+/// required envelope key the canonical parser validates is present, and the
+/// only variation between controls is the entry that should or should not bind.
+fn leaf_manifest(
+    case: &str,
+    root: &Path,
+    path: &Path,
+    entries: Vec<serde_json::Value>,
+    device: u64,
+    inode: u64,
+    site: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema": tape::MANIFEST_VERSION,
+        "case": case,
+        "window": {"identity": "leaf-window", "start_monotonic_ns": 1, "end_monotonic_ns": 2},
+        "source": {
+            "oxide_commit": "923d01f803cc7708569985cd5217edc294a1189c",
+            "oxide_files": {},
+            "cargo_lock_sha256": tape::sha256_hex(b"lock"),
+            "rust_toolchain_sha256": tape::sha256_hex(b"rust"),
+            "barge_pin": "4af9360bd09629e970c143080ca159de8eef2562",
+            "barge_slice_commit": "f9f81f72a20e0f4d694b8046acfbe3a0558f8c9b",
+            "barge_files": {},
+            "staged_lock_sha256": tape::sha256_hex(b"staged"),
+            "oxide_toolchain": "1.97.1",
+            "barge_toolchain": "1.97.1",
+            "oxide_executable_sha256": tape::sha256_hex(b"oxide"),
+            "barge_executable_sha256": tape::sha256_hex(b"barge"),
+            "oxide_tree": tape::sha256_hex(b"tree")[..40].to_owned(),
+        },
+        "fixture": {
+            "root": root.to_str(),
+            "device": device,
+            "inode": inode,
+            "mode": 448,
+            "entries": entries,
+            "roots": ["root-a"],
+        },
+        "dynamic": {"volumes": [], "writers": [], "external_allowances": []},
+        "mandatory_observations": [{
+            "engine": "oxide",
+            "site": site,
+            "parent_required": true,
+            "identity": {
+                "path": path.to_str(),
+                "parent_device": 1,
+                "parent_inode": 2,
+                "device": device,
+                "inode": inode,
+            },
+        }],
+        "expected_effects": [],
+        "expected": {
+            "classification": "MATCH",
+            "roots": [{"root": "root-a", "fate": "keep"}],
+        },
+        "barge": {
+            "volume_uuid": "00000000-0000-0000-0000-000000000000",
+            "namespace": "oxide",
+            "area": "outputs",
+            "named_roots": [],
+            "volume_mount": "/fixture",
+        },
+        "operator_list": serde_json::Value::Null,
+    })
+}
+
+/// One observed read window: begin the tape, run the unchanged production read
+/// through the real instrumented statement, evaluate the manifest obligations,
+/// and close the window. Returns the bytes the read returned, the transcript as
+/// parsed JSON, its exact bytes and the manifest's exact bytes.
+#[allow(clippy::type_complexity)]
+fn leaf_window(
+    temp: &Path,
+    case: &str,
+    label: &Path,
+    file: &std::fs::File,
+    site: &str,
+    limit: u64,
+    manifest: &serde_json::Value,
+    root: &Path,
+) -> Result<(Vec<u8>, serde_json::Value, Vec<u8>, Vec<u8>), CheckFailure> {
+    let manifest_bytes = serde_json::to_vec(manifest).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    let digest = tape::sha256_hex(&manifest_bytes);
+    tape::begin("oxide", case, &digest, "pure");
+    // A sentinel errno the declared observation must not disturb.
+    prune::tape_restore_errno(Some(libc::EPERM));
+    let mut bytes = Vec::new();
+    let result = prune::authority_read_observed(file, label, site, limit, &mut bytes);
+    let errno_after = prune::tape_errno();
+    tape::check_manifest_obligations(manifest, root);
+    let transcript_path = temp.join(format!("leaf-{case}.json"));
+    tape::finish_and_write(
+        &transcript_path,
+        TapeEngineOutcome::Completed {
+            result: serde_json::json!({"complete": true, "entries": []}),
+        },
+        None,
+    )
+    .map_err(|what| CheckFailure { what })?;
+    result.map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    check(
+        errno_after == Some(libc::EPERM),
+        "the declared observation and the unchanged read leave the caller's errno intact",
+    )?;
+    let transcript = std::fs::read(&transcript_path).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    let doc: serde_json::Value =
+        serde_json::from_slice(&transcript).map_err(|error| CheckFailure {
+            what: error.to_string(),
+        })?;
+    Ok((bytes, doc, transcript, manifest_bytes))
+}
+
+fn notes_contain(doc: &serde_json::Value, needle: &str) -> bool {
+    doc.get("notes")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .any(|note| note == needle)
+}
+
+/// oxide#287: the declared held-descriptor leaf observation and the one
+/// `bound_leaf` fixture binding rule, driven through the real recorder and then
+/// through the canonical `/2` parser, the strict assessment and the limited
+/// verdict.
+fn leaf_binding_check(temp: &Path) -> Result<(), CheckFailure> {
+    use std::os::unix::fs::MetadataExt;
+    const SITE: &str = "prune::read_registry";
+    const ROW: &str = "authority-read@prune::read_registry";
+    let root = temp.join("leaf-binding-fixture");
+    write_private_dir(&root).map_err(|what| CheckFailure { what })?;
+    let path = root.join("registry.json");
+    write_private_file(&path, b"registry-bytes").map_err(|what| CheckFailure { what })?;
+    let meta = std::fs::metadata(&path).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    let (dev, ino, mode, size) = (meta.dev(), meta.ino(), meta.mode(), meta.len());
+    let digest = tape::sha256_hex(b"registry-bytes");
+    let entry = serde_json::json!({
+        "rel": "registry.json",
+        "parent_device": 1,
+        "parent_inode": 2,
+        "kind": "file",
+        "bytes_sha256": digest,
+        "size": size,
+        "device": dev,
+        "inode": ino,
+        "mode": mode,
+    });
+
+    // 1. A present leaf whose deliberately created entry matches binds, the
+    // parent obligation is reported on its own line, and the canonical parser,
+    // strict assessment and limited verdict all see the real emitted row.
+    let file = std::fs::File::open(&path).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    let manifest = leaf_manifest(
+        "LEAF-BOUND",
+        &root,
+        &path,
+        vec![entry.clone()],
+        dev,
+        ino,
+        ROW,
+    );
+    let (bytes, doc, transcript, manifest_bytes) =
+        leaf_window(temp, "LEAF-BOUND", &path, &file, SITE, 64, &manifest, &root)?;
+    check(
+        bytes == b"registry-bytes",
+        "the unchanged production read still returns the file's bytes",
+    )?;
+    let row = doc
+        .get("reads")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row.get("site").and_then(|v| v.as_str()) == Some(ROW))
+        })
+        .ok_or_else(|| CheckFailure {
+            what: format!("no {ROW} row was emitted"),
+        })?;
+    check(
+        row.pointer("/identity/device").and_then(|v| v.as_u64()) == Some(dev)
+            && row.pointer("/identity/inode").and_then(|v| v.as_u64()) == Some(ino)
+            && row.pointer("/identity/own_source").and_then(|v| v.as_str()) == Some("handle")
+            && row
+                .pointer("/identity/parent_device")
+                .is_some_and(|v| v.is_null())
+            && row
+                .pointer("/identity/parent_inode")
+                .is_some_and(|v| v.is_null())
+            && row.pointer("/outcome/digest").and_then(|v| v.as_str()) == Some(digest.as_str()),
+        "the row carries the held descriptor's own identity, no parent and the read digest",
+    )?;
+    check(
+        !notes_contain(&doc, &format!("extra or unbound observation at {ROW}"))
+            && notes_contain(
+                &doc,
+                &format!("obligation parent_required unproven at {ROW}"),
+            )
+            && !notes_contain(
+                &doc,
+                &format!("mandatory observation missing or identity unproven at {ROW}"),
+            ),
+        &format!(
+            "the leaf binds and the parent keeps its own line: {:?}",
+            doc.get("notes")
+        ),
+    )?;
+    let verdict = tape::capture_verdict::evaluate_limited_capture(&transcript, &manifest_bytes)
+        .map_err(|what| CheckFailure {
+            what: format!("canonical parse or verdict: {what}"),
+        })?;
+    let limited: Vec<&str> = verdict
+        .limitations
+        .iter()
+        .filter(|limitation| {
+            limitation.rule == tape::capture_verdict::ExclusionRule::PathOnlyDirectReadParent
+        })
+        .map(|limitation| limitation.site.as_str())
+        .collect();
+    check(
+        limited == vec![ROW],
+        &format!("the real emitted row is explained only at its own site: {limited:?}"),
+    )?;
+    check(
+        verdict.blocking_names() == vec!["strict-issue-unexplained"]
+            && !verdict.strict.complete
+            && verdict
+                .strict
+                .issues
+                .iter()
+                .any(|issue| issue == &format!("wrong identity at {ROW}")),
+        &format!(
+            "only the /2 file-form identity template remains unexplained: {:?}",
+            verdict.blocking
+        ),
+    )?;
+    check(
+        !verdict.sufficient(),
+        "a real bound leaf is still not a complete /2 decision input",
+    )?;
+
+    // 2. Same bytes, new inode: the identity must come from the held descriptor.
+    // A later pathname stat would see the replacement object and bind it.
+    let renamed = root.join("registry-original.json");
+    std::fs::rename(&path, &renamed).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    write_private_file(&path, b"registry-bytes").map_err(|what| CheckFailure { what })?;
+    let replacement = std::fs::metadata(&path).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    check(
+        replacement.ino() != ino,
+        "the replacement path really is a different inode with the same bytes",
+    )?;
+    let held = std::fs::File::open(&renamed).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    let replacement_entry = serde_json::json!({
+        "rel": "registry.json",
+        "parent_device": 1,
+        "parent_inode": 2,
+        "kind": "file",
+        "bytes_sha256": digest,
+        "size": replacement.len(),
+        "device": replacement.dev(),
+        "inode": replacement.ino(),
+        "mode": replacement.mode(),
+    });
+    let manifest = leaf_manifest(
+        "LEAF-REPLACED",
+        &root,
+        &path,
+        vec![replacement_entry.clone()],
+        dev,
+        ino,
+        ROW,
+    );
+    let (bytes, doc, _, _) = leaf_window(
+        temp,
+        "LEAF-REPLACED",
+        &path,
+        &held,
+        SITE,
+        64,
+        &manifest,
+        &root,
+    )?;
+    check(
+        bytes == b"registry-bytes",
+        "the held descriptor still returns its own bytes after the path was replaced",
+    )?;
+    let emitted = doc
+        .get("reads")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row.get("site").and_then(|v| v.as_str()) == Some(ROW))
+        })
+        .ok_or_else(|| CheckFailure {
+            what: format!("no {ROW} row was emitted after replacement"),
+        })?;
+    check(
+        emitted.pointer("/identity/inode").and_then(|v| v.as_u64()) == Some(ino),
+        "the emitted identity is the held descriptor's, not the path's new inode",
+    )?;
+    check(
+        notes_contain(&doc, &format!("extra or unbound observation at {ROW}")),
+        "an entry describing the replacement object does not bind the held read",
+    )?;
+
+    // 3. Same label and identity, different digest: never a present-leaf binding.
+    let file = std::fs::File::open(&renamed).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    let mut wrong_digest = entry.clone();
+    wrong_digest["rel"] = serde_json::json!("registry-original.json");
+    wrong_digest["bytes_sha256"] = serde_json::json!(tape::sha256_hex(b"other-bytes"));
+    let manifest = leaf_manifest(
+        "LEAF-WRONG-DIGEST",
+        &root,
+        &renamed,
+        vec![wrong_digest],
+        dev,
+        ino,
+        ROW,
+    );
+    let (_, doc, _, _) = leaf_window(
+        temp,
+        "LEAF-WRONG-DIGEST",
+        &renamed,
+        &file,
+        SITE,
+        64,
+        &manifest,
+        &root,
+    )?;
+    check(
+        notes_contain(&doc, &format!("extra or unbound observation at {ROW}")),
+        "a wrong bytes digest does not bind a present leaf",
+    )?;
+
+    // 4. Same bytes and inode, wrong safe relative label: a path label is not
+    // an identity, so an outside-root entry cannot bind this row.
+    let file = std::fs::File::open(&renamed).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    let mut outside = entry.clone();
+    outside["rel"] = serde_json::json!("elsewhere/registry-original.json");
+    let manifest = leaf_manifest(
+        "LEAF-OUTSIDE",
+        &root,
+        &renamed,
+        vec![outside],
+        dev,
+        ino,
+        ROW,
+    );
+    let (bytes, doc, transcript, manifest_bytes) = leaf_window(
+        temp,
+        "LEAF-OUTSIDE",
+        &renamed,
+        &file,
+        SITE,
+        64,
+        &manifest,
+        &root,
+    )?;
+    check(
+        bytes == b"registry-bytes"
+            && notes_contain(&doc, &format!("extra or unbound observation at {ROW}")),
+        "a different relative label does not bind the same bytes and inode",
+    )?;
+    let verdict = tape::capture_verdict::evaluate_limited_capture(&transcript, &manifest_bytes)
+        .map_err(|what| CheckFailure {
+            what: format!("canonical parse or verdict: {what}"),
+        })?;
+    check(
+        !verdict.sufficient(),
+        "the parser, strict assessment and limited verdict all see the unbound real row",
+    )?;
+
+    // 5. A label with a traversal component is refused by the binding rule. This
+    // window is recorder-only: the `/2` envelope refuses such a `rel` earlier.
+    let file = std::fs::File::open(&renamed).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    let mut traversal = entry.clone();
+    traversal["rel"] = serde_json::json!("../registry-original.json");
+    let manifest = leaf_manifest(
+        "LEAF-TRAVERSAL",
+        &root,
+        &renamed,
+        vec![traversal],
+        dev,
+        ino,
+        ROW,
+    );
+    let (_, doc, _, _) = leaf_window(
+        temp,
+        "LEAF-TRAVERSAL",
+        &renamed,
+        &file,
+        SITE,
+        64,
+        &manifest,
+        &root,
+    )?;
+    check(
+        notes_contain(&doc, &format!("extra or unbound observation at {ROW}")),
+        "a traversal label never binds",
+    )?;
+
+    // 6. A shared-helper site outside the declared set takes no observation: the
+    // handle-class owner-marker site records an explicit unbound note and no
+    // own identity, so nothing can be promoted by sharing the helper.
+    let file = std::fs::File::open(&renamed).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    const MARKER_SITE: &str = "prune::observe_root_in:marker";
+    const MARKER_ROW: &str = "authority-read@prune::observe_root_in:marker";
+    let manifest = leaf_manifest(
+        "LEAF-UNDECLARED-SITE",
+        &root,
+        &renamed,
+        vec![{
+            let mut renamed_entry = entry.clone();
+            renamed_entry["rel"] = serde_json::json!("registry-original.json");
+            renamed_entry
+        }],
+        dev,
+        ino,
+        MARKER_ROW,
+    );
+    let (bytes, doc, _, _) = leaf_window(
+        temp,
+        "LEAF-UNDECLARED-SITE",
+        &renamed,
+        &file,
+        MARKER_SITE,
+        64,
+        &manifest,
+        &root,
+    )?;
+    let undeclared = doc
+        .get("reads")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row.get("site").and_then(|v| v.as_str()) == Some(MARKER_ROW))
+        })
+        .ok_or_else(|| CheckFailure {
+            what: format!("no {MARKER_ROW} row was emitted"),
+        })?;
+    check(
+        bytes == b"registry-bytes"
+            && undeclared
+                .pointer("/identity/device")
+                .is_some_and(|v| v.is_null())
+            && notes_contain(
+                &doc,
+                &format!(
+                    "descriptor identity unavailable at {MARKER_SITE}: no authorized \
+descriptor observation"
+                ),
+            )
+            && notes_contain(
+                &doc,
+                &format!("extra or unbound observation at {MARKER_ROW}"),
+            ),
+        "a site outside the declared set stays unobserved and unbound",
+    )?;
+
+    // 7. A refusal keeps its own identity but is never converted into a present
+    // leaf row, so it binds nothing.
+    let directory = std::fs::File::open(&root).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    let dir_meta = std::fs::metadata(&root).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    const DIGEST_SITE: &str = "outputs::marker_digest";
+    const DIGEST_ROW: &str = "authority-read@outputs::marker_digest";
+    let dir_entry = serde_json::json!({
+        "rel": "registry-original.json",
+        "parent_device": 1,
+        "parent_inode": 2,
+        "kind": "file",
+        "bytes_sha256": digest,
+        "size": 0,
+        "device": dir_meta.dev(),
+        "inode": dir_meta.ino(),
+        "mode": dir_meta.mode(),
+    });
+    let manifest = leaf_manifest(
+        "LEAF-REFUSAL",
+        &root,
+        &renamed,
+        vec![dir_entry],
+        dir_meta.dev(),
+        dir_meta.ino(),
+        DIGEST_ROW,
+    );
+    // A directory read is refused by the kernel; the window asserts the recorder's
+    // own refusal outcome rather than a present read.
+    let refusal_manifest_bytes = serde_json::to_vec(&manifest).map_err(|error| CheckFailure {
+        what: error.to_string(),
+    })?;
+    tape::begin(
+        "oxide",
+        "LEAF-REFUSAL",
+        &tape::sha256_hex(&refusal_manifest_bytes),
+        "pure",
+    );
+    let mut refused_bytes = Vec::new();
+    let refused =
+        prune::authority_read_observed(&directory, &renamed, DIGEST_SITE, 64, &mut refused_bytes);
+    tape::check_manifest_obligations(&manifest, &root);
+    let refusal_path = temp.join("leaf-LEAF-REFUSAL.json");
+    tape::finish_and_write(
+        &refusal_path,
+        TapeEngineOutcome::Completed {
+            result: serde_json::json!({"complete": true, "entries": []}),
+        },
+        None,
+    )
+    .map_err(|what| CheckFailure { what })?;
+    let refusal_doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&refusal_path).map_err(|error| CheckFailure {
+            what: error.to_string(),
+        })?)
+        .map_err(|error| CheckFailure {
+            what: error.to_string(),
+        })?;
+    check(
+        refused.is_err(),
+        "reading a directory is the kernel's own refusal",
+    )?;
+    check(
+        notes_contain(
+            &refusal_doc,
+            &format!("extra or unbound observation at {DIGEST_ROW}"),
+        ),
+        "a refused read is not converted into a present leaf row",
+    )
+}
+
 /// Adapter emission round-trips through the shared parser; path-only
 /// parent_required stays incomplete.
 fn emitted_wire_round_trip_check(temp: &Path) -> Result<(), CheckFailure> {
@@ -3091,6 +3648,7 @@ fn self_check(pure_only: bool, diagnostic: bool) -> Result<(), String> {
     let result = (|| -> Result<(), String> {
         tape::run_self_checks().map_err(|what| format!("capture-wire: {what}"))?;
         live_held_descriptor_check(&dir).map_err(|failure| failure.what)?;
+        leaf_binding_check(&dir).map_err(|failure| failure.what)?;
         emitted_wire_round_trip_check(&dir).map_err(|failure| failure.what)?;
         emitted_shape_check(&dir).map_err(|failure| failure.what)?;
         pure_checks(&dir).map_err(|failure| failure.what)?;

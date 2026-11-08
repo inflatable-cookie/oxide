@@ -54,20 +54,30 @@ pub(crate) const PLAN_VERSION: &str = "oxide.capture.limited-plan/1";
 /// The one claim this policy can support. It is L2 only.
 pub(crate) const CLAIM: &str = "L2 owned-fixture decision agreement: window-incomplete, \
 parent-unproven at enumerated path-only direct-read sites, holder-lifetime-limited";
-/// Why no first-batch case is runnable today, beyond the export gate. Source
-/// facts only; no fixture, engine run or measurement is involved.
-pub(crate) const BINDING_GAP: &str = "the /2 recorder binds a read row to a fixture entry only \
-when the row carries parent device and inode (tape.rs check_manifest_obligations: bound_file \
-requires parent_device and parent_inode). No file read records a parent: read_row and \
-read_row_owned set none, and authority_read_observed passes a held descriptor's own device and \
-inode only for prune::read_bounded. Every path-only file row therefore reports `extra or unbound \
-observation at <kind>`, and every parent_required obligation over such a row reports `mandatory \
-observation missing or identity unproven at <site>`. The reviewed \
-path-only-direct-read-parent exclusion covers the parent obligation only and cannot manufacture a \
-fixture binding, so no first-batch case is runnable. Closing the gap is a separately reviewed \
-test-only recorder change (bind a leaf identity without a parent at the enumerated path-only \
-sites, and give the parent-required obligation note its own declared rule); this preparation does \
-not make it";
+/// The precise state of the fixture binding after oxide#287. Source facts
+/// only; no fixture, engine run or measurement is involved.
+pub(crate) const BINDING_GAP: &str = "the recorder now observes and binds a present path-only leaf. \
+At the six enumerated sites (`prune::read_bounded`, `prune::read_registry`, \
+`outputs::read_receipt_with`, `outputs::read_marker`, `outputs::marker_digest`, \
+`removable::read_registration`) `prune.rs authority_read_observed` takes one declared cfg(test) \
+fstat of the exact held descriptor the unchanged read consumes \
+(`prune.rs OBSERVED_PATH_ONLY_SITES`), so the row carries its own device and inode with `handle` \
+provenance and no parent. `tape.rs check_manifest_obligations` binds such a row to a deliberately \
+created `fixture.entries` entry through one rule, `bound_leaf`: a safe relative path label, the \
+row's own device and inode, the same bytes digest or observed outcome, and the declared window; a \
+path label is not parent proof and the entry's declared parent is never compared. The remaining \
+`parent_required` obligation is reported on its own line (`obligation parent_required unproven at \
+<site>`), which the limited policy explains only with a granted path-only limitation. What still \
+blocks, precisely: (1) the /2 file-form obligation identity requires `parent_device` and \
+`parent_inode` (`capture_wire.rs obligation_identity`), so the strict assessment reports `wrong \
+identity at <site>` for a parent-free leaf and that template is not one of the two reviewed \
+exclusions, so no limited verdict is sufficient; (2) no export-closure digest and receipt is \
+qualified; (3) Barge has no per-case fixture builder (see barge_support), so neither side can \
+declare the case; (4) the owner marker read (`openat` from a held root descriptor), the absence-walk \
+components and every `authority-read@store::*` custody read stay handle-class or custody-class and \
+unexcludable while K1 is unqualified; (5) the pre-open observation rows \
+(`private-file:open`, the first `read-bounded:open` row) carry no identity by design and stay \
+unbound, because those sites are shared helpers this change must not observe";
 
 /// The exact smallest Barge source requirement for the first batch, read from the
 /// pinned sibling `f9f81f72`. The harness, argv contract, `release::plan`
@@ -188,12 +198,14 @@ const KNOWN_SITES: &[KnownSite] = &[
     KnownSite {
         kind: "authority-read@prune::read_registry",
         class: SiteClass::PathOnlyDirectRead,
-        source: "src/bin/oxide/prune.rs read_registry (authority_read_observed)",
+        source: "src/bin/oxide/prune.rs read_registry (authority_read_observed, declared \
+held-descriptor fstat)",
     },
     KnownSite {
         kind: "authority-read@prune::read_bounded",
         class: SiteClass::PathOnlyDirectRead,
-        source: "src/bin/oxide/prune.rs read_bounded (authority_bind_descriptor)",
+        source: "src/bin/oxide/prune.rs read_bounded (authority_bind_descriptor, declared \
+held-descriptor fstat)",
     },
     KnownSite {
         kind: "read-bounded:lstat",
@@ -204,7 +216,7 @@ const KNOWN_SITES: &[KnownSite] = &[
         kind: "read-bounded:open",
         class: SiteClass::PathOnlyDirectRead,
         source: "src/bin/oxide/prune.rs read_bounded, and authority_read_observed for \
-that site (read_row_handle)",
+that site (read_row_handle from the same single fstat)",
     },
     // The prune marker read opens the marker with `openat(root.as_raw_fd())`
     // from a live held root descriptor, so its parent is handle-class.
@@ -221,12 +233,14 @@ that site (read_row_handle)",
     KnownSite {
         kind: "authority-read@outputs::read_receipt_with",
         class: SiteClass::PathOnlyDirectRead,
-        source: "src/bin/oxide/outputs.rs read_receipt_with (authority_read_observed)",
+        source: "src/bin/oxide/outputs.rs read_receipt_with (authority_read_observed, declared \
+held-descriptor fstat)",
     },
     KnownSite {
         kind: "authority-read@outputs::read_marker",
         class: SiteClass::PathOnlyDirectRead,
-        source: "src/bin/oxide/outputs.rs read_marker (File::open, then authority_read_observed)",
+        source: "src/bin/oxide/outputs.rs read_marker (File::open, then authority_read_observed \
+with the declared held-descriptor fstat)",
     },
     KnownSite {
         kind: "outputs:read-marker:open",
@@ -236,12 +250,14 @@ that site (read_row_handle)",
     KnownSite {
         kind: "authority-read@outputs::marker_digest",
         class: SiteClass::PathOnlyDirectRead,
-        source: "src/bin/oxide/outputs.rs marker_digest (authority_read_observed)",
+        source: "src/bin/oxide/outputs.rs marker_digest (authority_read_observed, declared \
+held-descriptor fstat)",
     },
     KnownSite {
         kind: "authority-read@removable::read_registration",
         class: SiteClass::PathOnlyDirectRead,
-        source: "src/bin/oxide/removable.rs read_registration (authority_read_observed)",
+        source: "src/bin/oxide/removable.rs read_registration (authority_read_observed, declared \
+held-descriptor fstat)",
     },
     // The absence walk: its start object is a path-only observation, and every
     // component row below it comes from a held parent descriptor.
@@ -530,6 +546,14 @@ const NOTE_VOCABULARY: &[(&str, NoteRule)] = &[
     (
         "mandatory observation missing or identity unproven at ",
         NoteRule::Blocking(BlockingRule::RecorderObligationUnmet),
+    ),
+    // The recorder's separate parent-obligation sentence (oxide#287): the row
+    // and its observed identity are proven and only `parent_required` is not.
+    // It is explained by a granted path-only limitation on that exact site and
+    // by nothing else.
+    (
+        "obligation parent_required unproven at ",
+        NoteRule::PathOnlyParentExplained,
     ),
     (
         "obligation missing parent_required at ",
@@ -1225,10 +1249,30 @@ decision",
             });
             continue;
         }
+        // The identity keys a declared path-only authority site actually
+        // observes (oxide#287). This is the recorder's own declared observation
+        // set (`prune.rs OBSERVED_PATH_ONLY_SITES`), shared rather than
+        // re-implemented: only those sites carry the held descriptor's own
+        // identity and no parent, so an obligation's parent keys there describe
+        // an object the leaf never opened. The parent is judged by the
+        // exclusion below and is never silently treated as a matched identity.
+        // Every other site, including the helper rows the exclusion's class
+        // covers, keeps the full comparison.
+        let observed_leaf_site = crate::prune::observed_path_only_row_kind(site).is_some();
         let matching: Vec<&&Value> = at_site
             .iter()
             .copied()
-            .filter(|row| capture_wire::identity_fields_match(identity, &row["identity"], window))
+            .filter(|row| {
+                if observed_leaf_site {
+                    capture_wire::path_only_identity_fields_match(
+                        identity,
+                        &row["identity"],
+                        window,
+                    )
+                } else {
+                    capture_wire::identity_fields_match(identity, &row["identity"], window)
+                }
+            })
             .collect();
         if matching.is_empty() {
             blocking.push(Blocking::new(
@@ -1856,12 +1900,13 @@ const FAMILIES: &[Family] = &[
         name: "control and sticky batch",
         cases: &["CTL-0", "CTL-1"],
         status: CaseStatus::Insufficient,
-        reason: "every file input this decision reads is a path-only or handle-class read: the \
-registry and receipts are opened by path and the owner marker with openat from a held root \
-descriptor, so the recorder's in-window bind check reports `extra or unbound observation at \
-<kind>` and its obligation check reports `mandatory observation missing or identity unproven at \
-<site>`. The reviewed path-only exclusion covers a parent obligation only and cannot bind the \
-row",
+        reason: "the registry and receipt rows are declared path-only sites and now bind their \
+own leaf entries, but the owner marker is opened with openat from a held root descriptor \
+(handle-class, K1 unqualified) and the pre-open `private-file:open` row carries no identity by \
+design, so those rows bind nothing. The path-only rows' `parent_required` obligation stays \
+unproven and the /2 file-form obligation identity still demands a parent, so the strict `wrong \
+identity at <site>` template is left unexplained. The export gate and Barge's missing per-case \
+fixture builder hold the case regardless",
         overrides: &[],
         cf: &[Cf::Cf1, Cf::Cf4],
         cf_absent: &[
@@ -1907,10 +1952,12 @@ row",
             "CAP-1",
         ],
         status: CaseStatus::Insufficient,
-        reason: "the registry is a path-only direct read (`authority-read@prune::read_registry`): \
-the recorder records no parent for it, so the in-window bind check reports `extra or unbound \
-observation` and the parent-required obligation note is unmet. No fixture can bind that row \
-under the current recorder",
+        reason: "the registry read is a declared path-only site: its row now carries the held \
+descriptor's own device and inode and binds a deliberately created fixture entry, and its \
+`parent_required` obligation is reported on its own line. The case is still held because the /2 \
+file-form obligation identity requires a parent, so the strict `wrong identity at <site>` \
+template stays unexplained, and because Barge has no per-case fixture builder and no \
+export-closure receipt is qualified",
         overrides: &[CaseOverride {
             id: "CAP-1",
             status: CaseStatus::Insufficient,
@@ -1956,9 +2003,11 @@ partial parity is claimed",
             "REF-ORPHAN-MARKED",
         ],
         status: CaseStatus::Insufficient,
-        reason: "the registry row and the intent files are path-only reads with no recorded \
-parent, so their rows are unbound in the in-window check and their obligations report unmet; \
-the CF-1 enumeration of the intents directory is a second, separate requirement",
+        reason: "the registry row is a declared path-only site and now binds its own fixture \
+entry; the intents this family needs are a projection over those same rows for Oxide (Barge \
+enumerates the directory, CF-1). The case is still held by the /2 file-form obligation identity \
+(parent-free leaves keep the strict `wrong identity at <site>` template unexplained), by the \
+export gate and by Barge's missing per-case fixture builder",
         overrides: &[CaseOverride {
             id: "REF-ORPHAN-MARKED",
             status: CaseStatus::Insufficient,
@@ -2010,9 +2059,11 @@ projection, not a directory read)",
             "ID-GENERATION",
         ],
         status: CaseStatus::Insufficient,
-        reason: "receipts are path-only reads (unbound in the in-window check) and the owner \
-marker is opened with openat from a held root descriptor, so its parent is handle-class: the \
-path-only exclusion can cover neither the unbound row nor the K1 parent",
+        reason: "the receipt and marker readers are declared path-only sites and now bind their \
+own leaf entries, but the prune decision's owner-marker read is opened with openat from a held \
+root descriptor: that row is handle-class and its parent is unexcludable while K1 is \
+unqualified, and the `root-observe:*` component rows stay handle-class too. The export gate and \
+Barge's missing per-case fixture builder hold the family as well",
         overrides: &[CaseOverride {
             id: "RCP-V1",
             status: CaseStatus::Insufficient,
@@ -2060,9 +2111,11 @@ enumeration), outputs::read_marker and prune::observe_root_in's owner-marker par
             "ABS-UUID-CONFLICT",
         ],
         status: CaseStatus::Insufficient,
-        reason: "the owner marker is handle-class and the registry row is path-only and \
-unbound; the volume-census rows do bind their own volume identity, but the decision's file \
-inputs do not",
+        reason: "the volume-census rows bind their own volume identity, and the registry row now \
+binds its own leaf entry. The owner marker stays handle-class (openat from the held root), so \
+the decision's marker input is unexcludable while K1 is unqualified; the /2 file-form obligation \
+identity keeps the strict parent-free-leaf template unexplained; the export gate and Barge's \
+missing per-case fixture builder hold the family too",
         overrides: &[
             CaseOverride {
                 id: "ID-INODE",
@@ -2165,7 +2218,8 @@ inputs stay insufficient",
         status: CaseStatus::Insufficient,
         reason: "the fence lives in the pool control read (`authority-read@store::load`), a \
 custody-class read no reviewed exclusion covers, and the registry row that precedes it is \
-path-only and unbound",
+path-only: it now binds its own leaf entry but keeps its unproven parent, whose limit the /2 \
+file-form obligation identity still reports as a strict wrong identity",
         overrides: &[
             CaseOverride {
                 id: "DECL-MISSING",
@@ -2211,9 +2265,10 @@ claim exists",
         name: "legacy and operator list",
         cases: &["LEG-UNLISTED", "LEG-LISTED", "LEG-LISTED-MARKED", "LEG-RECEIPTLESS"],
         status: CaseStatus::Insufficient,
-        reason: "the operator list and the receipts are path-only reads with no recorded parent, \
-so their rows are unbound in the in-window check and their obligations report unmet; the receipt \
-enumeration is a second, separate requirement",
+        reason: "the operator list and the receipts are declared path-only sites and now bind \
+their own leaf entries; their `parent_required` obligations stay unproven and the /2 file-form \
+obligation identity still leaves the strict `wrong identity at <site>` template unexplained. \
+Barge's receipt enumeration (CF-1) is a second, separate requirement",
         overrides: &[CaseOverride {
             id: "LEG-LISTED",
             status: CaseStatus::Insufficient,
@@ -2486,9 +2541,10 @@ pub(crate) fn plan_document() -> Value {
         "policy": POLICY_VERSION,
         "claim": CLAIM,
         "executable_today": false,
-        "execution_gate": "two independent gates: no export-closure digest and receipt is \
-    qualified, and no first-batch input binds under the current recorder (see binding_gap); this plan \
-    is readiness only and gives no comparison, parity or native credit",
+        "execution_gate": "every case is still held: no export-closure digest and receipt is \
+    qualified, Barge has no per-case fixture builder, and no first-batch decision input is complete \
+    under /2 (a parent-free leaf keeps the strict wrong-identity template unexplained; see \
+    binding_gap); this plan is readiness only and gives no comparison, parity or native credit",
         "barge_support": {
             "summary": BARGE_SUPPORT_REQUIREMENT,
             "harness": "crates/barge/tests/tape_eval.rs (harness = false) at f9f81f72",
@@ -2497,12 +2553,22 @@ pub(crate) fn plan_document() -> Value {
         },
         "binding_gap": {
             "summary": BINDING_GAP,
+            // The one declared observation set (prune.rs OBSERVED_PATH_ONLY_SITES).
+            "observed_path_only_sites": crate::prune::OBSERVED_PATH_ONLY_SITES
+                .iter()
+                .map(|declared| json!({"site": declared.site, "open_row": declared.open_row}))
+                .collect::<Vec<_>>(),
+            "binding_rule": "tape.rs bound_leaf: safe relative path label, the row's own device \
+    and inode, the same bytes digest or observed outcome, and the declared window; parent absent and \
+    never inferred from the label",
+            "parent_obligation_note": "obligation parent_required unproven at <site>",
             "site_classes": KNOWN_SITES
                 .iter()
                 .map(|site| json!({"site": site.kind, "class": site.class.name(), "source": site.source}))
                 .collect::<Vec<_>>(),
-            "closure": "a separately reviewed test-only recorder change; not authorised, started or \
-    assumed by this preparation",
+            "closure": "the recorder observation and the entry binding are implemented \
+    (oxide#287); what remains is a /2 identity form or a reviewed exclusion for a parent-free file \
+    obligation, the export gate and Barge's per-case fixture builder, each separately authorised",
         },
         "exclusions": [
             {
@@ -2845,6 +2911,14 @@ fn controls() -> Vec<(&'static str, fn() -> Control)> {
         (
             "a bound leaf without a fixture binding stays insufficient",
             recorder_bound_leaf_without_binding_is_insufficient,
+        ),
+        (
+            "a parent-free leaf is explained only by the strict template",
+            parent_free_leaf_is_explained_only_by_the_strict_template,
+        ),
+        (
+            "the parent obligation note is explained only at its own site",
+            parent_obligation_note_is_explained_only_at_its_own_site,
         ),
         (
             "an emitted absence kind is handle-class",
@@ -3610,9 +3684,11 @@ fn plan_blocking_vocabulary() -> Control {
     Ok(())
 }
 
-/// `prune::read_bounded` does record the leaf's own device and inode, and the
-/// exclusion's leaf requirement is met there, but the fixture binding still
-/// fails because the row carries no parent.
+/// `prune::read_bounded` records the leaf's own device and inode from the
+/// declared held-descriptor fstat, and the exclusion's leaf requirement is met
+/// there, but a row the recorder could not bind to a fixture entry stays
+/// insufficient: the recorder says so on its own unbound line, and the parent
+/// obligation is then not excludable.
 fn recorder_bound_leaf_without_binding_is_insufficient() -> Control {
     const SITE: &str = "authority-read@prune::read_bounded";
     let mut manifest = synthetic_manifest();
@@ -3623,8 +3699,7 @@ fn recorder_bound_leaf_without_binding_is_insufficient() -> Control {
         "absolute monotonic window origin and end unproven",
         "parent identity unproven at authority-read@prune::read_bounded",
         "extra or unbound observation at authority-read@prune::read_bounded",
-        "mandatory observation missing or identity unproven at \
-authority-read@prune::read_bounded",
+        "obligation parent_required unproven at authority-read@prune::read_bounded",
     ]);
     let verdict = evaluate_limited(&transcript, &manifest, CONTROL_DIGEST);
     control(
@@ -3632,8 +3707,12 @@ authority-read@prune::read_bounded",
         "a path-only row the recorder never binds stays insufficient",
     )?;
     control(
-        blocked_at(&verdict, BlockingRule::RecorderObligationUnmet, SITE),
-        "the unmet-obligation note blocks",
+        blocked_at(&verdict, BlockingRule::ParentRequiredUnproven, SITE),
+        "an unbound leaf cannot have its parent explained away",
+    )?;
+    control(
+        !blocked_by(&verdict, BlockingRule::RecorderObligationUnmet),
+        "the recorder now separates the parent obligation from identity",
     )?;
     control(
         !verdict
@@ -3641,6 +3720,157 @@ authority-read@prune::read_bounded",
             .iter()
             .any(|limitation| limitation.rule == ExclusionRule::PathOnlyDirectReadParent),
         "no limitation is granted while the recorder reports the row unbound",
+    )?;
+    control(!verdict.sufficient(), "the case is insufficient")
+}
+
+/// The `/2` file form names leaf and parent together (schema shape, from a
+/// deliberately created entry), while the recorder's row carries only the own
+/// identity its held descriptor observed. The policy compares the observed
+/// keys, grants exactly one path-only parent limitation for that leaf, and the
+/// strict `/2` identity template is the single thing it cannot explain.
+/// This is a policy-only document: the recorder emits it once a path-only site's
+/// leaf binds its entry, and the harness check drives that real shape.
+fn parent_free_leaf_is_explained_only_by_the_strict_template() -> Control {
+    let mut manifest = synthetic_manifest();
+    manifest["mandatory_observations"] = json!([{
+        "engine": "oxide",
+        "site": CONTROL_SITE,
+        "parent_required": true,
+        "identity": {
+            "path": CONTROL_PATH,
+            "parent_device": 1,
+            "parent_inode": 2,
+            "device": 3,
+            "inode": 4,
+        },
+    }]);
+    let mut transcript = synthetic_transcript();
+    transcript["reads"] = json!([synthetic_row(CONTROL_SITE, "none", Some(3), Some(4))]);
+    transcript["notes"] = json!([
+        "absolute monotonic window origin and end unproven",
+        "parent identity unproven at authority-read@prune::read_registry",
+        "obligation parent_required unproven at authority-read@prune::read_registry",
+    ]);
+    let verdict = evaluate_limited(&transcript, &manifest, CONTROL_DIGEST);
+    let limited: Vec<&Limitation> = verdict
+        .limitations
+        .iter()
+        .filter(|limitation| limitation.rule == ExclusionRule::PathOnlyDirectReadParent)
+        .collect();
+    control(
+        limited.len() == 1 && limited[0].site == CONTROL_SITE,
+        format!("expected one site-bound path-only limitation, got {limited:?}"),
+    )?;
+    control(
+        limited[0].leaf_identity.contains("device=3")
+            && limited[0].leaf_identity.contains("inode=4"),
+        "the limitation names the leaf the descriptor observed",
+    )?;
+    control(
+        !blocked_by(&verdict, BlockingRule::WrongLeafIdentity)
+            && !blocked_by(&verdict, BlockingRule::ParentRequiredUnproven)
+            && !blocked_by(&verdict, BlockingRule::RecorderObligationUnmet)
+            && !blocked_by(&verdict, BlockingRule::UnknownNote),
+        format!(
+            "the observed-key comparison and the parent note are both explained: {:?}",
+            verdict.blocking
+        ),
+    )?;
+    control(
+        verdict
+            .per_site
+            .iter()
+            .any(|site| site.site == CONTROL_SITE && site.bound && site.parent_required),
+        "the site evidence records a bound leaf with an unproven parent",
+    )?;
+    control(
+        verdict.blocking_names() == vec![BlockingRule::StrictIssueUnexplained.name()],
+        format!(
+            "only the strict /2 identity template remains: {:?}",
+            verdict.blocking
+        ),
+    )?;
+    control(
+        !verdict.strict.complete
+            && verdict
+                .strict
+                .issues
+                .iter()
+                .any(|issue| issue == "wrong identity at authority-read@prune::read_registry"),
+        "the strict /2 judgement is retained verbatim and stays incomplete",
+    )?;
+    control(
+        !verdict.sufficient(),
+        "a strict identity template the exclusions do not name is never a pass",
+    )
+}
+
+/// The recorder's parent sentence is explained by a granted limitation at its
+/// own site and by nothing else. One site binds its leaf and gets the
+/// limitation; the other could not bind, so its parent sentence is a blocking
+/// parent reason, never an unknown note and never a silent pass.
+fn parent_obligation_note_is_explained_only_at_its_own_site() -> Control {
+    const BOUND: &str = "authority-read@prune::read_registry";
+    const UNBOUND: &str = "authority-read@outputs::read_marker";
+    let mut manifest = synthetic_manifest();
+    manifest["mandatory_observations"] = json!([
+        {
+            "engine": "oxide",
+            "site": BOUND,
+            "parent_required": true,
+            "identity": {
+                "path": CONTROL_PATH,
+                "parent_device": 1,
+                "parent_inode": 2,
+                "device": 3,
+                "inode": 4,
+            },
+        },
+        {
+            "engine": "oxide",
+            "site": UNBOUND,
+            "parent_required": true,
+            "identity": {
+                "path": "/fixture/marker",
+                "parent_device": 1,
+                "parent_inode": 2,
+                "device": 7,
+                "inode": 8,
+            },
+        },
+    ]);
+    let mut unbound_row = synthetic_row(UNBOUND, "none", Some(7), Some(8));
+    unbound_row["identity"]["path"] = json!("/fixture/marker");
+    unbound_row["occurrence"] = json!(2);
+    let mut transcript = synthetic_transcript();
+    transcript["reads"] = json!([synthetic_row(BOUND, "none", Some(3), Some(4)), unbound_row]);
+    transcript["notes"] = json!([
+        "absolute monotonic window origin and end unproven",
+        "parent identity unproven at authority-read@prune::read_registry",
+        "obligation parent_required unproven at authority-read@prune::read_registry",
+        "extra or unbound observation at authority-read@outputs::read_marker",
+        "obligation parent_required unproven at authority-read@outputs::read_marker",
+    ]);
+    let verdict = evaluate_limited(&transcript, &manifest, CONTROL_DIGEST);
+    let limited: Vec<&str> = verdict
+        .limitations
+        .iter()
+        .filter(|limitation| limitation.rule == ExclusionRule::PathOnlyDirectReadParent)
+        .map(|limitation| limitation.site.as_str())
+        .collect();
+    control(
+        limited == vec![BOUND],
+        format!("only the bound leaf gets its limitation: {limited:?}"),
+    )?;
+    control(
+        blocked_at(&verdict, BlockingRule::ParentRequiredUnproven, UNBOUND)
+            && !blocked_at(&verdict, BlockingRule::ParentRequiredUnproven, BOUND),
+        "the parent sentence blocks only where no limitation is granted",
+    )?;
+    control(
+        !blocked_by(&verdict, BlockingRule::UnknownNote),
+        "the parent sentence is a declared note, not an unknown one",
     )?;
     control(!verdict.sufficient(), "the case is insufficient")
 }

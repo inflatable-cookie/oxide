@@ -1814,7 +1814,7 @@ Remaining limits (finite):
 | Attempted or failed effects | Not completed parity |
 | Route B private descriptor-relative read | Not activated |
 | Caps 512 / 8192 / 8 MiB / 64 | Unchanged; known host overflow stays insufficient |
-| In-window fixture binding (`extra or unbound observation`: path, component and volume rules) | Engine-side only in `tape.rs`; completeness does not apply it yet. **Gap (oxide#286):** `bound_file` requires the row's parent device and inode, and no file read records a parent, so a path-only file row never binds its fixture entry and its `parent_required` obligation is reported unmet. The reviewed path-only parent exclusion cannot close that; see [the limited verdict policy](#limited-verdict-policy-and-first-batch-plan-oxide286-implemented) |
+| In-window fixture binding (`extra or unbound observation`: path, component and volume rules) | Engine-side only in `tape.rs`; completeness does not apply it yet. oxide#287 adds one rule for a present leaf: a safe relative path label, the row's own device and inode from a declared held-descriptor fstat, the same bytes digest or observed outcome, and the declared window (`bound_leaf`). A path label is not parent proof and the parent stays absent. **Remaining gap:** the `/2` file-form obligation identity requires `parent_device` and `parent_inode` (`capture_wire.rs obligation_identity`), so the strict assessment reports `wrong identity at <site>` for a parent-free leaf and that template is not a reviewed exclusion; see [the leaf-binding section](#leaf-binding-for-enumerated-path-only-authority-reads-oxide287-implemented) |
 | Barge `/2` adoption and live or native use | Dependent task; no production read changed |
 
 ### Bounded comparison evidence boundary (oxide#285 design)
@@ -2147,11 +2147,12 @@ control builds its bound case with the matching entry and its recorder-faithful
 counterfactual with the entry absent; the entry-present-with-note pair is
 labelled a policy-only check.
 
-**The path-only exclusion is not live.** No first-batch input can use it: the
-recorder reports every path-only file row unbound, and the policy refuses the
-exclusion for any row the recorder reports unbound. It is implemented, pure-
-tested and reviewed so that the recorder change below has a policy to meet, not
-so that a current case can use it.
+**The path-only exclusion needs a recorder-observed leaf.** At the oxide#286
+head no first-batch input could use it: the recorder reported every path-only
+file row unbound and the policy refuses the exclusion for any row the recorder
+reports unbound. oxide#287 closes that except at the `/2` identity form
+(below); the exclusion still never applies to a handle-class row and still
+never waives a decision input's identity.
 
 The exclusion set is a source-owned enumeration, never a caller waiver list
 and never derived from warning text. The only strict issues an exclusion may
@@ -2244,20 +2245,19 @@ it with the enumerated set each case must bind.
 
 Recorded insufficiencies, named rather than absorbed:
 
-1. **No first-batch input binds under the current recorder.** The recorder's
-   in-window bind check requires a row's parent device and inode
+1. **No first-batch input binds under the oxide#286 recorder.** *Historical at
+   that head; superseded by [oxide#287](#leaf-binding-for-enumerated-path-only-authority-reads-oxide287-implemented).*
+   The recorder's in-window bind check required a row's parent device and inode
    (`tape.rs check_manifest_obligations`: `bound_file`). No file read records a
    parent: `read_row`/`read_row_owned` set none, and `authority_read_observed`
-   passes a held descriptor's own device and inode only for
-   `prune::read_bounded`. So every path-only file row reports `extra or unbound
+   passed a held descriptor's own device and inode only for
+   `prune::read_bounded`. So every path-only file row reported `extra or unbound
    observation at <kind>`, and every `parent_required` obligation over such a row
-   reports `mandatory observation missing or identity unproven at <site>`. The
-   reviewed path-only exclusion covers the parent obligation only; it cannot
-   manufacture a fixture binding, so the plan reports zero runnable rows.
-   Closing this is a separately reviewed test-only recorder change (bind a leaf
-   identity without a parent at the enumerated path-only sites, and give the
-   parent-required obligation note its own declared rule). This preparation does
-   not make it, and no exclusion was widened to hide it.
+   reported `mandatory observation missing or identity unproven at <site>`. The
+   reviewed path-only exclusion covers the parent obligation only; it could not
+   manufacture a fixture binding, so the plan reported zero runnable rows. The
+   separately reviewed test-only recorder change that section named is oxide#287;
+   no exclusion was widened to hide the gap.
 2. **Checkout absence is insufficient under this policy.** Its decision reads
    component rows of a no-follow walk whose parents are live held descriptors.
    That is handle-class (K1) and no reviewed exclusion covers it, so
@@ -2320,6 +2320,112 @@ MSRV, the private-build/export provider and its qualification, the O2 and O3
 holds, Route B and decision `0bcedf55` v2, and oxide#241/#222. Naming O2-CAL
 as an acceptance stays open (design decision 1); this policy is what such a
 claim would rest on and is not the claim.
+
+### Leaf binding for enumerated path-only authority reads (oxide#287 implemented)
+
+**Status: prepared and pure-validated; not executed.** A test-only recorder
+change under the `ba36f411` v2 preparation scope. No comparison ran, no fixture
+exists, no export or capture qualification is claimed, and O2 (L3), O3, Route B
+and decision `0bcedf55` v2 are unchanged. Every changed statement compiles away
+outside `cfg(test)`: `src/bin/oxide/tape.rs` is reached only from
+`#[cfg(test)] mod tape`, and the instrumented leaves already carry their
+`#[cfg(not(test))]`/`#[cfg(test)]` split.
+
+**The declared observation set.** `prune.rs OBSERVED_PATH_ONLY_SITES` enumerates
+the only sites where the production reader opens no parent and the whole input
+is one live `File`: `prune::read_bounded`, `prune::read_registry`,
+`outputs::read_receipt_with`, `outputs::read_marker`, `outputs::marker_digest`
+and `removable::read_registration`. Only those take one declared cfg(test)
+`fstat` of that exact held descriptor (`tape::fd_dev_ino`, which duplicates the
+fd, restores the caller's errno and classifies its cost). Where a site stats the
+path before opening (`removable::read_registration`), that precheck identity is
+never borrowed: the recorded device and inode are the read descriptor's own. The
+row then carries
+the leaf's own `device`/`inode` with `handle` provenance and **no parent**; the
+unchanged `authority_read` supplies the bytes, and nothing reopens the path or
+stats it later. The handle-class `prune::observe_root_in:marker` site, the
+absence-walk components and every `authority-read@store::*` custody read share
+`authority_read_observed` and are deliberately absent: a leaf observation must
+never stand in for a held parent or promote a deferred custody read. A failed
+observation stays unknown: no identity is manufactured and `authority_unbound`
+records why.
+
+**The one binding rule.** `tape.rs bound_leaf` binds a present leaf row to a
+deliberately created `fixture.entries` entry only when the entry names the same
+safe relative path label (`root.join(rel) == row.path`, every component
+`Normal`), the same own `device` and `inode`, the same `bytes_sha256` for a
+digest outcome (or the same identity for an `Opened` outcome), and the manifest
+declares its window. A path label is never parent proof: the row's parent fields
+stay absent, the entry's declared parent fields are compared with nothing, and
+nothing in this rule can discharge `parent_required`. Absent and refusal
+outcomes are never converted into present rows, so they stay unbound.
+
+**The parent obligation gets its own line.** When a row matches an obligation's
+identity and `parent_required` is not discharged, the recorder now reports
+`obligation parent_required unproven at <site>` instead of the conflated
+`mandatory observation missing or identity unproven at <site>`; the row's own
+per-row sentence (`parent identity unproven at <kind>`) is unchanged. The
+limited policy maps the new sentence to the same rule as the per-row sentence:
+it is explained by a granted `path-only-direct-read-parent` limitation **at that
+exact site** and by nothing else; anywhere else it blocks as
+`parent-required-unproven`. An unbound row still blocks on
+`extra-unbound-observation` and can never be given the limitation.
+
+**The identity comparison is shared, not duplicated.**
+`capture_wire::path_only_identity_fields_match` compares an obligation's
+identity minus `parent_device`/`parent_inode` — the two keys a path-only reader
+cannot observe — and requires a non-empty `path`, so it never matches an empty
+identity. Both `tape.rs check_manifest_obligations` and
+`capture_verdict::evaluate_limited` use that one rule, and only for a site in
+that declared set; every other site — including the helper rows the exclusion's
+class covers, such as `read-bounded:lstat` — keeps the full
+`identity_fields_match`, so the declared set is the one gate for both layers.
+The strict `assess_completeness` is untouched and still applies the full rule.
+
+**What still blocks, precisely.** The `/2` file form requires
+`path`+`parent_device`+`parent_inode`+`device`+`inode`
+(`capture_wire.rs obligation_identity`), so a parent-free leaf row can never
+satisfy the strict identity comparison: `assess_completeness` reports
+`wrong identity at <site>`, and that template is neither of the two reviewed
+exclusions, so the verdict records `strict-issue-unexplained` and is never
+sufficient. Closing that needs either a `/2` identity form for a parent-free
+leaf or a new reviewed exclusion; both are outside this preparation and neither
+is assumed. Together with the export gate, Barge's missing per-case fixture
+builder, the unexcludable handle-class marker/absence/custody rows and the
+identity-less pre-open rows (`private-file:open`, the first `read-bounded:open`
+row, whose shared helper must not be observed), the plan still reports **0
+runnable, 43 insufficient, 7 deferred**; its per-family reasons are updated from
+source and no case is marked runnable.
+
+**Evidence.** `effigy rust:capture-wire` runs the `--self-check` route, which now
+includes `tape_harness.rs leaf_binding_check`: every window opens a real private
+file, runs `prune::authority_read_observed` through the unchanged read statement
+and `tape::check_manifest_obligations`, and then passes the **actually emitted**
+transcript through `capture_verdict::evaluate_limited_capture` (canonical `/2`
+parser → strict assessment → limited verdict). Its controls: a matching entry
+binds and yields exactly one site-bound limitation whose leaf identity is the
+observed `(device, inode)`, with `strict-issue-unexplained` as the only blocking
+reason; same bytes with a new inode after a rename/replacement leaves the
+emitted identity at the held descriptor's inode and an entry describing the
+replacement object unbound; a wrong `bytes_sha256`, a different safe relative
+label and a traversal label each stay unbound with the identity unchanged; a
+shared-helper site outside the declared set emits no own identity and an
+explicit `descriptor identity unavailable` note; a kernel-refused read keeps its
+identity but is not converted into a present row; and every window asserts the
+caller's `errno` sentinel survives the observation and the unchanged read. A
+deliberate mutation (`bound_leaf` accepting any label) failed that check by name
+before the change was reverted, so the control is not vacuous. Two new pure
+policy controls pin the note mapping: a schema-shaped parent-naming obligation
+over a parent-free leaf yields the limitation and only
+`strict-issue-unexplained`, and the parent sentence is explained at the site that
+bound its leaf and blocks at the site that did not. A failed `fstat` itself is
+not injectable without an invalid descriptor; both of its branches restore errno
+and reuse the same unchanged read, and only the recorded rows differ.
+
+**Unchanged.** Production readers, the `/2` wire and parser, caps,
+`K1_PREMISE_QUALIFIED`, the two reviewed exclusions, `assess_completeness`, the
+comparison rule, pins, toolchain, MSRV, the private-build/export provider and
+its qualification, and every hold.
 
 ## Shared private-build validation gate (oxide#248)
 

@@ -378,12 +378,110 @@ fn identity_matches(row: &TapeReadRow, identity: &serde_json::Value, window: Opt
     capture_wire::identity_fields_match(identity, &row_identity, window)
 }
 
+/// The obligation's identity as the site actually observes it. At a declared
+/// path-only direct-read site the production reader opens no parent, so an
+/// obligation's parent keys name an object the leaf never observed and are
+/// reported by the separate parent obligation below, not as a wrong leaf
+/// identity. Every other site keeps the full comparison.
+fn observed_identity_matches(
+    row: &TapeReadRow,
+    identity: &serde_json::Value,
+    window: Option<&str>,
+    path_only: bool,
+) -> bool {
+    if path_only {
+        let row_identity = serde_json::to_value(&row.identity).unwrap_or(serde_json::Value::Null);
+        capture_wire::path_only_identity_fields_match(identity, &row_identity, window)
+    } else {
+        identity_matches(row, identity, window)
+    }
+}
+
+/// The one in-window fixture binding rule for a leaf row that observed its own
+/// object and no parent (oxide#287).
+///
+/// A row binds a deliberately created entry only when the entry names the same
+/// safe relative path label, the row's own observed device and inode, and the
+/// same observed outcome or bytes digest. A path label is never parent proof:
+/// the row's parent fields stay absent, the entry's declared parent fields are
+/// not compared with anything, and nothing here can discharge `parent_required`.
+fn bound_leaf(
+    entries: &[serde_json::Value],
+    root: &Path,
+    row: &TapeReadRow,
+    window: Option<&str>,
+) -> bool {
+    let Some(path) = row.identity.path.as_deref() else {
+        return false;
+    };
+    let (Some(dev), Some(ino)) = (row.identity.dev, row.identity.ino) else {
+        return false;
+    };
+    // A row that already carries a parent is judged by the parent rules.
+    if row.identity.parent_dev.is_some() || row.identity.parent_ino.is_some() {
+        return false;
+    }
+    // Only an identity the leaf itself observed can bind: a fabricated or
+    // borrowed provenance is never a leaf observation.
+    if !matches!(
+        row.identity.own_source,
+        Provenance::Handle | Provenance::Extracted
+    ) {
+        return false;
+    }
+    // The row belongs to this transcript's window and the manifest declares
+    // that window; a fixture entry carries no window field of its own.
+    if window.is_none() {
+        return false;
+    }
+    entries.iter().any(|entry| {
+        let Some(rel) = entry.get("rel").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        let relative = Path::new(rel);
+        if !relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            return false;
+        }
+        if root.join(relative) != Path::new(path) {
+            return false;
+        }
+        if entry.get("kind").and_then(|v| v.as_str()) != Some("file")
+            || entry.get("device").and_then(|v| v.as_u64()) != Some(dev)
+            || entry.get("inode").and_then(|v| v.as_u64()) != Some(ino)
+        {
+            return false;
+        }
+        match &row.outcome {
+            TapeOutcome::Digest { digest } => {
+                entry.get("bytes_sha256").and_then(|v| v.as_str()) == Some(digest.as_str())
+            }
+            TapeOutcome::Opened { dev, ino } => {
+                entry.get("device").and_then(|v| v.as_u64()) == Some(*dev)
+                    && entry.get("inode").and_then(|v| v.as_u64()) == Some(*ino)
+            }
+            // An absence or a refusal is never converted into a present row.
+            _ => false,
+        }
+    })
+}
+
 /// Evaluate manifest observation obligations without changing the engine's
 /// result. Absent parent, process, component or volume identity remains
 /// insufficient.
 pub(crate) fn check_manifest_obligations(manifest: &serde_json::Value, root: &Path) {
     with_state(|state| {
         let mut issues = std::collections::BTreeSet::new();
+        let window = manifest
+            .pointer("/window/identity")
+            .and_then(|v| v.as_str());
+        let entries: &[serde_json::Value] = manifest
+            .pointer("/fixture/entries")
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         if let Some(obligations) = manifest
             .get("mandatory_observations")
             .and_then(|v| v.as_array())
@@ -404,49 +502,112 @@ pub(crate) fn check_manifest_obligations(manifest: &serde_json::Value, root: &Pa
                         continue;
                     }
                 };
-                if !state.reads.iter().any(|row| {
-                    row.kind == site
-                        && identity_matches(
-                            row,
-                            identity,
-                            manifest
-                                .pointer("/window/identity")
-                                .and_then(|v| v.as_str()),
-                        )
-                        && (!parent_required
-                            || (row.identity.parent_source == Provenance::Handle
-                                && K1_PREMISE_QUALIFIED))
+                let path_only = crate::prune::observed_path_only_row_kind(site).is_some();
+                let matching: Vec<&TapeReadRow> = state
+                    .reads
+                    .iter()
+                    .filter(|row| {
+                        row.kind == site
+                            && observed_identity_matches(row, identity, window, path_only)
+                    })
+                    .collect();
+                if matching.is_empty() {
+                    issues.insert(format!(
+                        "mandatory observation missing or identity unproven at {site}"
+                    ));
+                    continue;
+                }
+                if !parent_required {
+                    continue;
+                }
+                if matching.iter().any(|row| {
+                    row.identity.parent_source == Provenance::Handle && K1_PREMISE_QUALIFIED
                 }) {
+                    continue;
+                }
+                // The row and its observed identity are proven; only the
+                // parent obligation is not. At a declared path-only site that
+                // is the whole remaining limit: the leaf must also bind its own
+                // fixture entry, and then the parent gets its own line instead
+                // of a false `identity unproven`.
+                if path_only
+                    && matching
+                        .iter()
+                        .any(|row| bound_leaf(entries, root, row, window))
+                {
+                    issues.insert(format!("obligation parent_required unproven at {site}"));
+                } else {
                     issues.insert(format!(
                         "mandatory observation missing or identity unproven at {site}"
                     ));
                 }
             }
         }
-        let entries = manifest
-            .pointer("/fixture/entries")
-            .and_then(|v| v.as_array());
         for row in &state.reads {
             let bound_file = row.identity.path.as_deref().is_some_and(|path| {
-                let fixture_match = entries.is_some_and(|entries| {
-                    entries.iter().any(|entry| {
-                        let Some(rel) = entry.get("rel").and_then(|v| v.as_str()) else {
-                            return false;
-                        };
-                        let relative = Path::new(rel);
-                        if !relative
-                            .components()
-                            .all(|part| matches!(part, std::path::Component::Normal(_)))
-                        {
-                            return false;
+                entries.iter().any(|entry| {
+                    let Some(rel) = entry.get("rel").and_then(|v| v.as_str()) else {
+                        return false;
+                    };
+                    let relative = Path::new(rel);
+                    if !relative
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_)))
+                    {
+                        return false;
+                    }
+                    root.join(relative) == Path::new(path)
+                        && entry.get("parent_device").and_then(|v| v.as_u64())
+                            == row.identity.parent_dev
+                        && entry.get("parent_inode").and_then(|v| v.as_u64())
+                            == row.identity.parent_ino
+                        && row.identity.parent_dev.is_some()
+                        && row.identity.parent_ino.is_some()
+                        && match &row.outcome {
+                            TapeOutcome::Absent => {
+                                entry.get("kind").and_then(|v| v.as_str()) == Some("absent")
+                            }
+                            TapeOutcome::Refusal { reason } => {
+                                entry.get("kind").and_then(|v| v.as_str()) == Some("unreadable")
+                                    && entry.get("reason").and_then(|v| v.as_str())
+                                        == Some(reason.as_str())
+                            }
+                            outcome => {
+                                entry.get("device").and_then(|v| v.as_u64()) == row.identity.dev
+                                    && entry.get("inode").and_then(|v| v.as_u64())
+                                        == row.identity.ino
+                                    && row.identity.dev.is_some()
+                                    && row.identity.ino.is_some()
+                                    && match outcome {
+                                        TapeOutcome::Digest { digest } => {
+                                            entry.get("bytes_sha256").and_then(|v| v.as_str())
+                                                == Some(digest.as_str())
+                                        }
+                                        _ => true,
+                                    }
+                            }
                         }
-                        root.join(relative) == Path::new(path)
+                })
+            });
+            let bound_component = row.identity.component.as_deref().is_some_and(|name| {
+                row.identity.parent_dev.is_some()
+                    && row.identity.parent_ino.is_some()
+                    && entries.iter().any(|entry| {
+                        let rel = entry
+                            .get("rel")
+                            .and_then(|value| value.as_str())
+                            .map(Path::new);
+                        rel.is_some_and(|path| {
+                            path.components()
+                                .all(|part| matches!(part, std::path::Component::Normal(_)))
+                        }) && rel
+                            .and_then(Path::file_name)
+                            .and_then(|value| value.to_str())
+                            == Some(name)
                             && entry.get("parent_device").and_then(|v| v.as_u64())
                                 == row.identity.parent_dev
                             && entry.get("parent_inode").and_then(|v| v.as_u64())
                                 == row.identity.parent_ino
-                            && row.identity.parent_dev.is_some()
-                            && row.identity.parent_ino.is_some()
                             && match &row.outcome {
                                 TapeOutcome::Absent => {
                                     entry.get("kind").and_then(|v| v.as_str()) == Some("absent")
@@ -456,68 +617,15 @@ pub(crate) fn check_manifest_obligations(manifest: &serde_json::Value, root: &Pa
                                         && entry.get("reason").and_then(|v| v.as_str())
                                             == Some(reason.as_str())
                                 }
-                                outcome => {
-                                    entry.get("device").and_then(|v| v.as_u64()) == row.identity.dev
-                                        && entry.get("inode").and_then(|v| v.as_u64())
-                                            == row.identity.ino
-                                        && row.identity.dev.is_some()
-                                        && row.identity.ino.is_some()
-                                        && match outcome {
-                                            TapeOutcome::Digest { digest } => {
-                                                entry.get("bytes_sha256").and_then(|v| v.as_str())
-                                                    == Some(digest.as_str())
-                                            }
-                                            _ => true,
-                                        }
+                                TapeOutcome::Opened { dev, ino } => {
+                                    entry.get("device").and_then(|v| v.as_u64()) == Some(*dev)
+                                        && entry.get("inode").and_then(|v| v.as_u64()) == Some(*ino)
                                 }
+                                _ => !matches!(
+                                    entry.get("kind").and_then(|v| v.as_str()),
+                                    Some("absent" | "unreadable")
+                                ),
                             }
-                    })
-                });
-                // The proposed allowance carries a path/class but no observed
-                // parent or object identity; it cannot establish a binding.
-                fixture_match
-            });
-            let bound_component = row.identity.component.as_deref().is_some_and(|name| {
-                row.identity.parent_dev.is_some()
-                    && row.identity.parent_ino.is_some()
-                    && entries.is_some_and(|items| {
-                        items.iter().any(|entry| {
-                            let rel = entry
-                                .get("rel")
-                                .and_then(|value| value.as_str())
-                                .map(Path::new);
-                            rel.is_some_and(|path| {
-                                path.components()
-                                    .all(|part| matches!(part, std::path::Component::Normal(_)))
-                            }) && rel
-                                .and_then(Path::file_name)
-                                .and_then(|value| value.to_str())
-                                == Some(name)
-                                && entry.get("parent_device").and_then(|v| v.as_u64())
-                                    == row.identity.parent_dev
-                                && entry.get("parent_inode").and_then(|v| v.as_u64())
-                                    == row.identity.parent_ino
-                                && match &row.outcome {
-                                    TapeOutcome::Absent => {
-                                        entry.get("kind").and_then(|v| v.as_str()) == Some("absent")
-                                    }
-                                    TapeOutcome::Refusal { reason } => {
-                                        entry.get("kind").and_then(|v| v.as_str())
-                                            == Some("unreadable")
-                                            && entry.get("reason").and_then(|v| v.as_str())
-                                                == Some(reason.as_str())
-                                    }
-                                    TapeOutcome::Opened { dev, ino } => {
-                                        entry.get("device").and_then(|v| v.as_u64()) == Some(*dev)
-                                            && entry.get("inode").and_then(|v| v.as_u64())
-                                                == Some(*ino)
-                                    }
-                                    _ => !matches!(
-                                        entry.get("kind").and_then(|v| v.as_str()),
-                                        Some("absent" | "unreadable")
-                                    ),
-                                }
-                        })
                     })
             });
             let bound_volume = manifest
@@ -541,7 +649,12 @@ pub(crate) fn check_manifest_obligations(manifest: &serde_json::Value, root: &Pa
                             && volume.get("window_identity").and_then(|v| v.as_str()) == window
                     })
                 });
-            if !bound_file && !bound_component && !bound_volume {
+            // The proposed allowance carries a path/class but no observed parent
+            // or object identity; on its own it cannot establish a binding. A
+            // leaf row the recorder observed binds only through the one
+            // `bound_leaf` rule, which never supplies a parent.
+            let bound_by_leaf = bound_leaf(entries, root, row, window);
+            if !bound_file && !bound_component && !bound_volume && !bound_by_leaf {
                 issues.insert(format!("extra or unbound observation at {}", row.kind));
             }
         }
@@ -1317,7 +1430,10 @@ fn read_row_owned(
     });
 }
 
-/// Record a read against the descriptor that supplied the bytes.
+/// Record a read against the descriptor that supplied the bytes. The own
+/// identity is the one its live held-descriptor fstat observed (`handle`
+/// provenance); the parent stays absent because the production reader never
+/// opened one at a declared path-only site.
 pub(crate) fn authority_bind_descriptor(
     site: &str,
     path: &Path,
@@ -1329,7 +1445,7 @@ pub(crate) fn authority_bind_descriptor(
     with_state(|state| {
         state.pending_authority = None;
     });
-    read_row_without_parent(
+    read_row_handle(
         &format!("authority-read@{site}"),
         path,
         dev,
