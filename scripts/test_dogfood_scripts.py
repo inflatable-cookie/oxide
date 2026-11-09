@@ -314,9 +314,13 @@ class AuthenticatePinTests(unittest.TestCase):
 
         def interlude(stage):
             if stage == "fetched":
-                # A concurrent fetch of another ref rewrites shared FETCH_HEAD
-                # between this run's fetch and its decision: the interleaving
-                # that made the old shared-ref check falsely refuse.
+                # Fires after this run's fetch (its private ref already
+                # exists) and before the decision: a concurrent fetch of
+                # another ref rewrites shared FETCH_HEAD inside the exact
+                # race window where an old shared-ref check would read it.
+                self.assertEqual(
+                    len(self.git(self.work, "for-each-ref", installer.PRIVATE_REF_PREFIX).splitlines()), 1
+                )
                 self.git(self.work, "fetch", "-q", str(self.remote), "refs/heads/feature")
                 moved["head"] = (self.work / ".git/FETCH_HEAD").read_text().split()[0]
 
@@ -330,6 +334,7 @@ class AuthenticatePinTests(unittest.TestCase):
     def test_a_deleted_fetch_head_is_not_needed(self):
         def interlude(stage):
             if stage == "fetched":
+                # Deleted inside the race window, before this run decides.
                 (self.work / ".git/FETCH_HEAD").unlink()
 
         pin, _, tip = installer.authenticate_pin(None, interlude=interlude)

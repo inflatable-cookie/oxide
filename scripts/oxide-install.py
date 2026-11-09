@@ -91,7 +91,11 @@ def authenticate_pin(requested, interlude=None):
     so a main that advanced between the advertisement and the fetch, or a
     tip that is not a commit, refuses and the install can simply be retried.
     `interlude(stage)` is the dogfood suite's deterministic seam, called with
-    "advertised" and "fetched"; production never passes one.
+    "advertised" between reading the advertisement and fetching, and with
+    "fetched" immediately after the fetch completes and BEFORE this run
+    decides anything, so a regression that decided from shared `FETCH_HEAD`
+    would observe exactly the concurrent interleaving at its deciding read.
+    Production never passes one.
     """
     ref = PRIVATE_REF_PREFIX + secrets.token_hex(16)
     try:
@@ -108,11 +112,11 @@ def authenticate_pin(requested, interlude=None):
             git("fetch", "--quiet", "origin", f"{REMOTE_MAIN}:{ref}")
         except subprocess.CalledProcessError as error:
             raise Refusal(f"fetching {REMOTE_MAIN} from origin failed: {error}")
+        if interlude is not None:
+            interlude("fetched")
         fetched = verify_commit(f"{ref}^{{commit}}")
         if fetched != tip:
             raise Refusal("fetched main does not match ls-remote; retry")
-        if interlude is not None:
-            interlude("fetched")
         pin = verify_commit(f"{requested or tip}^{{commit}}")
         if subprocess.run(
             ["git", "-C", str(REPOSITORY), "merge-base", "--is-ancestor", pin, tip]
