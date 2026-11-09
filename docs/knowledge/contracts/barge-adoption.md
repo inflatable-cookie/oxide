@@ -3592,22 +3592,31 @@ dead → `Busy`. They never delete. A second Barge deleter on the same
 volume waits 5 s then `locked`. Crash drops the process-held barrier;
 durable exclusion is the Oxide intent.
 
-**Pre-intent `locked` is a known no-effect (same-call rule).** Choice
-(a): this call's own `Locked` return is the no-effect fact. Positive
-absence via `observe_volume` cannot run in the same call: that shared
-lock (`state.rs:1316-1318`) is the one the exclusive holder is denying,
-so a four-state lookup would return unknown and the rollback would fail.
+**Pre-intent `locked` is a known no-effect (same-call rule, first adapter
+call only).** Choice (a): this call's own `Locked` return is the
+no-effect fact. Positive absence via `observe_volume` cannot run in the
+same call: that shared lock (`state.rs:1316-1318`) is the one the
+exclusive holder is denying, so a four-state lookup would return unknown
+and the rollback would fail.
 
-If step 4 returns `ErrorKind::Locked` (`release.rs:524` shared observe,
-`:2042` exclusive `lock_volume`) and this call had not written
-`barge.intent/2`, those errors already say "nothing was changed". Oxide,
+The same-call rollback applies only to the adapter call made immediately
+after this attempt published a new Oxide intent in step 3. At that
+moment no `barge.intent/2` for this caller id can exist: the Oxide intent
+is fresh and Barge has not been asked. If that first step-4 call returns
+`ErrorKind::Locked` (`release.rs:524` shared observe, `:2042` exclusive
+`lock_volume`), those errors already say "nothing was changed". Oxide,
 still holding the barrier, confirms the original root is present with
 the recorded identity, then rolls back the Oxide intent and drops
 exclusion. It does not take `observe_volume` here. If the original root
-is gone or the identity mismatches, keep pending (unknown). A `locked`
-after this call wrote `barge.intent/2` is not pre-intent: keep pending.
-Later prune replay, once the volume lock is free, uses the four-state
-lookup as usual.
+is gone or the identity mismatches, keep pending (unknown).
+
+Every resumed, replayed or restarted adapter call uses the four-state
+lookup under the volume lock. A `Locked` there keeps the Oxide intent
+pending and rolls back nothing: a prior attempt may already have written
+`barge.intent/2` (idempotency resumes that record). Testing only that
+"this call had not written `barge.intent/2`" is not enough, because that
+test is about the current call only. Later prune replay, once the volume
+lock is free, uses the four-state lookup as usual.
 
 ### Correlation (supported protocol)
 
@@ -3722,11 +3731,15 @@ Barge intent or `.barge-prune-<id>` leaf remains would leave a permanent
 contradictory pair. The operator verb stays; it cannot drop a covered
 root's exclusion while Barge still holds bytes or a pending intent.
 
+| Same-call outcome | Fact | Oxide | Exclusion |
+| --- | --- | --- | --- |
+| First adapter call immediately after this attempt published a new Oxide intent in step 3 returns `Locked` | This call's `Locked` return is the no-effect fact (`release.rs:524`, `:2042`). Original root present with recorded identity. No `barge.intent/2` for this caller id can exist. No same-call `observe_volume` | Oxide rollback | After rollback |
+| Resumed, replayed or restarted adapter call returns `Locked` | Four-state lookup under the volume lock. `Locked` is unknown. A `barge.intent/2` for this caller id may already exist | Keep pending | No |
+
 | Durable point | On crash / restart | Who resumes | When Oxide may drop exclusion |
 | --- | --- | --- | --- |
 | Before Oxide intent | No journals. Root unchanged. Next prune re-evaluates | Oxide prune | n/a (never taken) |
-| After Oxide intent, Barge `locked` before `barge.intent/2` | This call's `Locked` return is the no-effect fact (`release.rs:524`, `:2042`). Original root present with recorded identity. No same-call `observe_volume` | Oxide rollback | After rollback |
-| After Oxide intent, before Barge intent | Oxide `intent`, root in place. Replay may roll back **only after** Barge lookup **positively absent** (not unknown) and no `.barge-prune-*` | Oxide, then optional rollback | After rollback, or after later settlement |
+| After Oxide intent, before Barge intent | Oxide `intent`, root in place. Replay may roll back **only after** Barge lookup **positively absent** (not unknown) and no `.barge-prune-*`. A resumed adapter `Locked` is unknown: keep pending | Oxide, then optional rollback | After rollback, or after later settlement |
 | After Barge intent, before rename | Both `intent`, root in place. Barge replay rolls back the Barge intent (`delete.rs` intent-still-in-place). Oxide stays `intent` until that rollback is **found terminal or positively absent**, then may roll back | Barge replay first | After both rollbacks |
 | After Barge rename | Barge `renamed` (or later). Oxide `intent`. `.barge-prune-<id>` present. Resume Barge deletion. Oxide must not roll back, must not local-delete, must not `resolve-intent` | Barge replay | Only after Barge `deleted` and Oxide settlement |
 | Partial deletion | Barge pending at `renamed` / `marker_last`. Capture/verify/unlink as shipped S5. Unknown capture keeps pending | Barge replay | No |
@@ -3794,9 +3807,13 @@ Oxide adopt and competing Barge volume lock; interruption at each durable
 row above; Oxide replay and Barge replay; unknown / lost reply; operator
 `resolve-intent` while Barge is pending (must refuse, journals unchanged);
 Barge state directory lost after rename (Oxide `intent`, `.barge-prune-<id>`
-present, unknown, keep pending); definite pre-intent `locked` (Oxide
-rollback from this call's `Locked` plus original root present with
-recorded identity; no same-call `observe_volume`); host `release` run
+present, unknown, keep pending); definite pre-intent `locked` on the
+first adapter call after this attempt published a new Oxide intent
+(Oxide rollback from this call's `Locked` plus original root present
+with recorded identity; no same-call `observe_volume`; no
+`barge.intent/2` for this caller id can exist); a resumed adapter call
+returns `Locked` while a `barge.intent/2` exists for the same caller id
+(Oxide keeps pending and rolls back nothing); host `release` run
 with the area grant present (deletes none of Oxide's roots); group intent
 of N members / one root (one Barge unit, Oxide settles the group); Barge
 seeing an absent Oxide control directory (unknown, not absent, refuse).
