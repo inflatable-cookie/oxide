@@ -3429,6 +3429,20 @@ install, live prune, fixture materialization or engine run follows from it.
 Independent approval is design readiness. It is never deletion, comparison or
 adoption credit.
 
+**Implementation ruling.** Tom selected “Implement the reviewed mechanism-only
+slice on disposable fixtures” in decision
+`63ad6fc4-52c3-4b75-bdf8-c1a89ac7eb35` v2 on 2026-11-09. This accepts the
+area-scoped outputs grant, Barge-only deletion for the covered class and the
+adapter-specific D3 changes described below, for scoped implementation and
+direct integrated fixture qualification. Oxide retains eligibility and its
+pool-level writer decision; Barge re-proves unit custody at effect. An unknown
+or unavailable Barge may leave the Oxide intent pending and block builds or
+adoption until safe recovery. Uncovered and legacy behavior stays unchanged.
+Separate reviewed briefs and proof activations are required. No installation,
+real declaration or grant, live adoption or existing-data deletion is authorized;
+full O2/O3 and the production-reader deferral remain held. The protocol below
+remains proposed until implemented and qualified.
+
 `release::execute` at Barge `590d0e51` is a working deleter for
 **Barge-marked** roots. It is not an Oxide outputs adapter. Barge044 qualified
 disposable Barge-marked roots with synthetic account facts; it does not
