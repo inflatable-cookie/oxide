@@ -15,8 +15,10 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import signal
 import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -219,6 +221,189 @@ class InstallerTests(unittest.TestCase):
         with self.assertRaises(installer.Refusal):
             installer.preflight(True)
 
+
+class AuthenticatePinTests(unittest.TestCase):
+    """The installer authenticates its own fetched source (oxide#302).
+
+    Tiny owned local Git repositories model origin, a publisher and the
+    installer's checkout; `installer.REPOSITORY` is repointed at the fixture
+    checkout and restored in tearDown, so the real repository is never
+    touched. No network, no build, no install, no receipt.
+    """
+
+    def setUp(self):
+        self.original_repository = installer.REPOSITORY
+        self.root = Path(tempfile.mkdtemp(dir=SCRATCH)).resolve()
+        self.remote = self.root / "origin.git"
+        self.git_raw(None, "init", "-q", "-b", "main", "--bare", str(self.remote))
+        self.author = self.root / "author"
+        self.git_raw(None, "init", "-q", "-b", "main", str(self.author))
+        self.git(self.author, "config", "user.email", "fixture@example.invalid")
+        self.git(self.author, "config", "user.name", "fixture")
+        (self.author / "one.txt").write_text("one\n")
+        self.git(self.author, "add", ".")
+        self.git(self.author, "commit", "-qm", "one")
+        self.git(self.author, "remote", "add", "origin", str(self.remote))
+        self.git(self.author, "push", "-q", "origin", "main")
+        (self.author / "two.txt").write_text("two\n")
+        self.git(self.author, "add", ".")
+        self.git(self.author, "commit", "-qm", "two")
+        self.git(self.author, "push", "-q", "origin", "main")
+        # An ancestor branch for the requested-pin and interleaving cases.
+        self.git(self.author, "branch", "feature", "main~1")
+        self.git(self.author, "push", "-q", "origin", "feature")
+        self.work = self.root / "work"
+        self.git_raw(None, "clone", "-q", str(self.remote), str(self.work))
+        installer.REPOSITORY = self.work
+
+    def tearDown(self):
+        installer.REPOSITORY = self.original_repository
+
+    def git_raw(self, cwd, *args):
+        result = subprocess.run(
+            ["git", *([] if cwd is None else ["-C", str(cwd)]), *args],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def git(self, cwd, *args):
+        return self.git_raw(cwd, *args).strip()
+
+    def push(self, message, filename):
+        (self.author / filename).write_text(message + "\n")
+        self.git(self.author, "add", ".")
+        self.git(self.author, "commit", "-qm", message)
+        self.git(self.author, "push", "-q", "origin", "main")
+        return self.git(self.author, "rev-parse", "main")
+
+    def push_side_branch(self):
+        """A tip on the remote that is a commit but not an ancestor of main."""
+        self.git(self.author, "switch", "-q", "-c", "side", "main~1")
+        (self.author / "side.txt").write_text("side\n")
+        self.git(self.author, "add", ".")
+        self.git(self.author, "commit", "-qm", "side")
+        self.git(self.author, "push", "-q", "origin", "side")
+        return self.git(self.author, "rev-parse", "side")
+
+    def assert_no_private_refs(self):
+        self.assertEqual(self.git(self.work, "for-each-ref", installer.PRIVATE_REF_PREFIX), "")
+
+    def private_fixture_home(self):
+        self.home = Path(tempfile.mkdtemp(dir=SCRATCH)).resolve()
+        (self.home / ".local/bin").mkdir(parents=True)
+        os.chmod(self.home / ".local", 0o755)
+        installer.HOME = self.home
+        installer.DESTINATION = self.home / ".local/bin/oxide"
+        installer.RECEIPTS = self.home / ".local/state/oxide/install"
+
+    def test_exact_advertised_tip_and_requested_ancestors_bind(self):
+        tip = self.git(self.author, "rev-parse", "main")
+        ancestor = self.git(self.author, "rev-parse", "main~1")
+        pin, tree, observed = installer.authenticate_pin(None)
+        self.assertEqual((pin, observed), (tip, tip))
+        self.assertEqual(tree, self.git(self.work, "rev-parse", f"{tip}^{{tree}}"))
+        pin, tree, observed = installer.authenticate_pin(ancestor)
+        self.assertEqual((pin, observed), (ancestor, tip))
+        self.assertEqual(tree, self.git(self.work, "rev-parse", f"{ancestor}^{{tree}}"))
+        self.assert_no_private_refs()
+
+    def test_an_interleaved_fetch_cannot_move_the_deciding_source(self):
+        feature = self.git(self.author, "rev-parse", "feature")
+        moved = {}
+
+        def interlude(stage):
+            if stage == "fetched":
+                # Fires after this run's fetch (its private ref already
+                # exists) and before the decision: a concurrent fetch of
+                # another ref rewrites shared FETCH_HEAD inside the exact
+                # race window where an old shared-ref check would read it.
+                self.assertEqual(
+                    len(self.git(self.work, "for-each-ref", installer.PRIVATE_REF_PREFIX).splitlines()), 1
+                )
+                self.git(self.work, "fetch", "-q", str(self.remote), "refs/heads/feature")
+                moved["head"] = (self.work / ".git/FETCH_HEAD").read_text().split()[0]
+
+        pin, tree, tip = installer.authenticate_pin(None, interlude=interlude)
+        self.assertEqual(moved["head"], feature)
+        self.assertNotEqual(moved["head"], tip)
+        self.assertEqual(pin, tip)
+        self.assertEqual(tree, self.git(self.work, "rev-parse", f"{tip}^{{tree}}"))
+        self.assert_no_private_refs()
+
+    def test_a_deleted_fetch_head_is_not_needed(self):
+        def interlude(stage):
+            if stage == "fetched":
+                # Deleted inside the race window, before this run decides.
+                (self.work / ".git/FETCH_HEAD").unlink()
+
+        pin, _, tip = installer.authenticate_pin(None, interlude=interlude)
+        self.assertEqual(pin, tip)
+        self.assert_no_private_refs()
+
+    def test_remote_main_advancing_between_advertisement_and_fetch_refuses(self):
+        self.private_fixture_home()
+
+        def interlude(stage):
+            if stage == "advertised":
+                self.push("advance", "advance.txt")
+
+        with self.assertRaises(installer.Refusal) as caught:
+            installer.authenticate_pin(None, interlude=interlude)
+        self.assertIn("does not match ls-remote", str(caught.exception))
+        self.assertFalse(installer.RECEIPTS.exists())
+        self.assertEqual(os.listdir(installer.DESTINATION.parent), [])
+        self.assertEqual(os.listdir(self.home / ".local"), ["bin"])
+        self.assert_no_private_refs()
+
+    def test_a_pin_off_observed_main_refuses(self):
+        side = self.push_side_branch()
+        # The requested pin must resolve locally; fetching it also leaves
+        # shared FETCH_HEAD naming exactly this unauthenticatable commit.
+        self.git(self.work, "fetch", "-q", str(self.remote), "refs/heads/side")
+        with self.assertRaises(installer.Refusal) as caught:
+            installer.authenticate_pin(side)
+        self.assertIn("is not on pushed origin main", str(caught.exception))
+        self.assert_no_private_refs()
+
+    def test_missing_or_non_commit_requested_objects_refuse(self):
+        blob = self.git(self.work, "hash-object", "-w", str(self.author / "one.txt"))
+        for bad in ("1" * 40, blob):
+            with self.assertRaises(installer.Refusal):
+                installer.authenticate_pin(bad)
+        self.assert_no_private_refs()
+
+    def test_missing_advertisement_and_unreachable_origin_refuse(self):
+        empty = self.root / "empty.git"
+        self.git_raw(None, "init", "-q", "--bare", str(empty))
+        bare_checkout = self.root / "empty-work"
+        self.git_raw(None, "clone", "-q", str(empty), str(bare_checkout))
+        installer.REPOSITORY = bare_checkout
+        with self.assertRaises(installer.Refusal) as caught:
+            installer.authenticate_pin(None)
+        self.assertIn("not found", str(caught.exception))
+        # The advertisement answers, then the origin vanishes before the fetch.
+        installer.REPOSITORY = self.work
+
+        def interlude(stage):
+            if stage == "advertised":
+                shutil.rmtree(self.remote)
+
+        with self.assertRaises(installer.Refusal) as caught:
+            installer.authenticate_pin(None, interlude=interlude)
+        self.assertIn("fetching", str(caught.exception))
+        self.assert_no_private_refs()
+
+    def test_a_malformed_advertisement_refuses(self):
+        original_git = installer.git
+        for listing in ("", "9bba566 refs/heads/other", "one two three"):
+            installer.git = lambda *args, listing=listing: listing
+            try:
+                with self.assertRaises(installer.Refusal):
+                    installer.authenticate_pin(None)
+            finally:
+                installer.git = original_git
+        self.assert_no_private_refs()
 
 
 class AccountHomeCustodyTests(unittest.TestCase):

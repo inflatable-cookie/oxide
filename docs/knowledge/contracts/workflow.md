@@ -1630,7 +1630,14 @@ or global Cargo configuration is involved.
 - **Installed binary.** `~/.local/bin/oxide` is a regular file built with
   `cargo build --release --locked --offline --bin oxide` from a commit on
   pushed `origin/main`, never from a branch. `effigy oxide:install`
-  authenticates the pin with `git ls-remote`, builds it from `git archive` in
+  authenticates the pin against `git ls-remote`'s advertised main tip, which
+  it fetches into a private per-invocation ref under
+  `refs/oxide-install-auth/` deleted again in the same call; the deciding
+  identity never comes from shared `FETCH_HEAD` or a remote-tracking ref, so
+  concurrent fetch activity cannot change it, and remote main advancing
+  between advertisement and fetch — or a tip that is not a commit — is a
+  clean refusal the install can simply retry (oxide#302). It builds the pin
+  from `git archive` in
   a private `/private/tmp/oxide-install.*` staging directory, installs through
   a sibling temporary file and `link` (no clobber), and writes a JSON receipt
   under `~/.local/state/oxide/install/`. The receipt records pin, tree,

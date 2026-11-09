@@ -41,6 +41,7 @@ BUILD_PIN_VARIABLE = "OXIDE_BUILD_PIN"
 BUILD_INSTANCE_VARIABLE = "OXIDE_BUILD_INSTANCE"
 REPOSITORY = Path(__file__).resolve().parent.parent
 REMOTE_MAIN = "refs/heads/main"
+PRIVATE_REF_PREFIX = "refs/oxide-install-auth/"
 
 
 class Refusal(Exception):
@@ -61,21 +62,82 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def authenticate_pin(requested):
-    """Return (pin, tree, remote tip); the pin must be reachable from origin main."""
-    listing = git("ls-remote", "origin", REMOTE_MAIN).split()
-    if len(listing) != 2 or listing[1] != REMOTE_MAIN:
-        raise Refusal(f"origin {REMOTE_MAIN} not found")
-    tip = listing[0]
-    git("fetch", "--quiet", "origin", REMOTE_MAIN)
-    if git("rev-parse", "FETCH_HEAD") != tip:
-        raise Refusal("fetched main does not match ls-remote; retry")
-    pin = git("rev-parse", "--verify", f"{requested or tip}^{{commit}}")
-    if subprocess.run(
-        ["git", "-C", str(REPOSITORY), "merge-base", "--is-ancestor", pin, tip]
-    ).returncode != 0:
-        raise Refusal(f"{pin} is not on pushed origin main ({tip})")
-    return pin, git("rev-parse", f"{pin}^{{tree}}"), tip
+def verify_commit(revision):
+    """The commit id `revision` names, or a refusal.
+
+    Missing, malformed and non-commit objects refuse here, so nothing
+    downstream decides from an object this run has not authenticated.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(REPOSITORY), "rev-parse", "--verify", revision],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise Refusal(
+            f"{revision} is not a commit this run can authenticate: {result.stderr.strip()}"
+        )
+    return result.stdout.strip()
+
+
+def authenticate_pin(requested, interlude=None):
+    """Return (pin, tree, remote tip); the pin must be reachable from origin main.
+
+    The fetch lands the advertised main tip in a private per-invocation ref
+    under `refs/oxide-install-auth/`, deleted again before this returns, and
+    every decision below reads that ref: shared `FETCH_HEAD` and the mutable
+    remote-tracking refs are never consulted, so concurrent fetch activity
+    cannot change the source identity this run decides from. The fetched
+    object is accepted only as a commit whose id equals the advertised tip,
+    so a main that advanced between the advertisement and the fetch, or a
+    tip that is not a commit, refuses and the install can simply be retried.
+    `interlude(stage)` is the dogfood suite's deterministic seam, called with
+    "advertised" between reading the advertisement and fetching, and with
+    "fetched" immediately after the fetch completes and BEFORE this run
+    decides anything, so a regression that decided from shared `FETCH_HEAD`
+    would observe exactly the concurrent interleaving at its deciding read.
+    Production never passes one.
+    """
+    ref = PRIVATE_REF_PREFIX + secrets.token_hex(16)
+    try:
+        try:
+            listing = git("ls-remote", "origin", REMOTE_MAIN).split()
+        except subprocess.CalledProcessError as error:
+            raise Refusal(f"cannot list origin {REMOTE_MAIN}: {error}")
+        if len(listing) != 2 or listing[1] != REMOTE_MAIN:
+            raise Refusal(f"origin {REMOTE_MAIN} not found")
+        tip = listing[0]
+        if interlude is not None:
+            interlude("advertised")
+        try:
+            git("fetch", "--quiet", "origin", f"{REMOTE_MAIN}:{ref}")
+        except subprocess.CalledProcessError as error:
+            raise Refusal(f"fetching {REMOTE_MAIN} from origin failed: {error}")
+        if interlude is not None:
+            interlude("fetched")
+        fetched = verify_commit(f"{ref}^{{commit}}")
+        if fetched != tip:
+            raise Refusal("fetched main does not match ls-remote; retry")
+        pin = verify_commit(f"{requested or tip}^{{commit}}")
+        if subprocess.run(
+            ["git", "-C", str(REPOSITORY), "merge-base", "--is-ancestor", pin, tip]
+        ).returncode != 0:
+            raise Refusal(f"{pin} is not on pushed origin main ({tip})")
+        return pin, git("rev-parse", f"{pin}^{{tree}}"), tip
+    finally:
+        # Narrow cleanup of this invocation's own ref. A ref that still exists
+        # but cannot be removed refuses the run rather than polluting the
+        # repository; a ref the failed body never created is simply absent.
+        present = subprocess.run(
+            ["git", "-C", str(REPOSITORY), "rev-parse", "--verify", "--quiet", ref],
+            capture_output=True, text=True,
+        )
+        if present.returncode == 0:
+            removed = subprocess.run(
+                ["git", "-C", str(REPOSITORY), "update-ref", "-d", ref],
+                capture_output=True, text=True,
+            )
+            if removed.returncode != 0:
+                raise Refusal(f"cannot remove the private ref {ref}: {removed.stderr.strip()}")
 
 
 def path_entries():
