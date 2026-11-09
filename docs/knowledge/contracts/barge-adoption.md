@@ -25,6 +25,22 @@ It is documentation only. Limited-sufficient MATCH of that control is
 unavailable under the current limited verdict policy. Design acceptance grants
 no implementation, comparison, image, native or Barge write.
 
+**Joint output-deletion protocol (oxide#303).** One source-backed protocol for
+mechanism-only delegation lives in [joint protocol for Barge output deletion](#joint-protocol-for-barge-output-deletion-oxide303-design).
+It is documentation only. A useful first slice can keep eligibility and durable
+prune authority in Oxide while Barge re-proves and deletes the exact covered
+root. Design acceptance grants no implementation, pin, area declare, grant,
+Barge write, host install, live prune, O2 comparison or O3 cutover. Tom's
+`d354ec02` v2 deferral and production parent-reader deferral `0bcedf55` v2
+remain intact. Operator ruling required after this design: the new area-grant
+authority; replacing Oxide's local deleter for the covered class; and the D3
+cutover-precondition, keep-rule and adapter R4-gate changes this slice
+makes (Barge adapter real-delete against a live Oxide prune-intent; adapter
+does not re-read the pool ledger as a gate). [vision](../vision.md#storage)
+already approves owned-root pruning moving to Barge, with Oxide's
+implementation authoritative until each part moves. Ruling requests map onto
+open [Q-021](../questions.md#q-021--how-should-oxides-output-roots-move-to-barge).
+
 Oxide's test-only capture apparatus uses a single re-rooted test crate for
 binary and library leaves. The shared capture contract below remains the
 acceptance authority; this composition alone is not parity evidence. O3
@@ -406,8 +422,13 @@ never writes them:
    nonce and generation, in Oxide's order;
 4. Oxide's pool-ledger writer custody (`R4`);
 5. the checkout path's absence chain, through Barge's absence primitive (`F2`);
-6. Oxide's control-state fence (state version 3, `owned_outputs: oxide.outputs/2`).
-   An unknown fence keeps every root it covers.
+6. Oxide's control-state fence (state version 4, `owned_outputs:
+   oxide.outputs/3`; `OWNED_OUTPUTS_FENCE`, `src/lease/control.rs:121`).
+   Only the `/3` successor advances the numeric version to 4
+   (`store.rs:5536-5544`). `oxide.outputs/2` is
+   `LEGACY_OWNED_OUTPUTS_FENCE` (`control.rs:125`) and keeps version 3.
+   Barge's reader accepts `/1`, `/2` and `/3` (`pool_custody.rs:88`). An
+   unknown fence keeps every root it covers.
 
 **Cutover (`O3`).** `oxide outputs prune` becomes a thin caller over Barge's
 plan and, for the real run, over `R1`'s effect. It keeps its flags, its exit
@@ -3397,6 +3418,475 @@ pins, toolchain, MSRV, private-build/export qualification, O2 (L3), O3,
 Route B, `oxide#241` / `#222`, and decision `0bcedf55` v2. 291/293/297
 remain spent historical evidence. O2-CAL remains unnamed as an
 acceptance.
+
+## Joint protocol for Barge output deletion (oxide#303 design)
+
+**Status: design only.** Tom asked on 2026-11-09 to work out how to unblock
+Barge delegation: finite source-only design and independent review, not a new
+product authority or implementation. This section is the owning-contract
+deliverable. No Rust change, pin, area declare, grant, Barge write, host
+install, live prune, fixture materialization or engine run follows from it.
+Independent approval is design readiness. It is never deletion, comparison or
+adoption credit.
+
+`release::execute` at Barge `590d0e51` is a working deleter for
+**Barge-marked** roots. It is not an Oxide outputs adapter. Barge044 qualified
+disposable Barge-marked roots with synthetic account facts; it does not
+qualify this join. O2 (`oxide#241`) and O3 (`oxide#222`) stay undispatched
+with their original history. This protocol may be accepted by a later
+direct-integration route for the covered class; it does not substitute that
+route, waive existing gates or count old observations as qualification.
+
+### Source binding
+
+- Oxide published `main` `a87b656e1f6b165cafdd322ddb2c6ddcd53afad9` (this
+  planning head). File and line claims below are at that commit.
+- Barge sibling `590d0e51d87388149db56518407c0fd7f0747c35`, read-only.
+  Oxide's library pin remains `4af9360bd09629e970c143080ca159de8eef2562`
+  (`Cargo.toml`); a later adapter needs its own pin brief.
+- Oxide prune contract: [workflow](workflow.md#pruning-owned-output-roots-oxide129).
+- Barge delete/grant/lock contracts: `stage1-design.md` (grants, lock order),
+  `stage4-design.md` (release gate), `delete.rs`, `unit.rs`, `state.rs`.
+
+### Feasibility
+
+**Yes.** A useful first slice exists: Oxide keeps selection, registry
+completeness, receipt consistency, checkout-absence, pending/prepared/pruning/
+reservation and writer safeguards, and publishes the durable prune intent that
+already excludes adopt/build after caller death. Barge re-proves the exact
+covered root and is the only deleter of that root. [vision](../vision.md#storage)
+already approves owned-root pruning moving to Barge, with Oxide's
+implementation authoritative until each part moves; this split keeps prune
+*authority* in Oxide and moves only the covered-class *effect*. The missing
+pieces are a new outputs marker family, an area-scoped grant (scratch grants
+do not confer it), correlated journals, the four-state lookup, the
+`resolve-intent` precheck against Barge's quarantine leaf, and a recovery
+rule that forbids Oxide's current intent-phase rollback once Barge may have
+started.
+
+Negative only for the **full** O3 cutover: that still needs equivalent-input
+O2 evidence, expendable Builds durability, `oxide/outputs` declaration and
+the operator gates already in this file. This slice does not wait on those.
+
+### Covered root class
+
+The smallest useful class, all conjuncts required. Anything else is outside
+the slice and keeps today's Oxide deleter unless a later operator ruling
+says otherwise.
+
+| Fact | Shipped source | Slice rule |
+| --- | --- | --- |
+| Owner marker | Oxide `outputs.rs:60` `.oxide-output.json`; `MARKER_VERSION` `oxide.outputs.root/2`. Barge `reference.rs:142` `OXIDE_MARKER_FILE`, `read_oxide_marker` (`:2327`); `/1` is unknown | Exact `/2` bytes; `/1` is not covered |
+| Identity | Registry row nonce, `root_ino`, `marker_digest`; volume UUID on the marker. Device is an observation ([workflow](workflow.md#pruning-owned-output-roots-oxide129) oxide#216) | Bind UUID + inode + nonce + digest. Never bind device alone |
+| Registry / receipt | `oxide.outputs.registry/2` complete, no `pending`/`reservation`/`cancelling`/`pruning`, not `selected`. Receipt committed and no longer places this root. Current selection protects (`dc1d6924`) | Whole-batch incomplete authority still refuses. History-only rows do not grant deletion |
+| Volume | Registered, APFS, not boot, durability `expendable` | `kept` / `undeclared` / unregistered refuse. Barge `stage1-design.md` durability |
+| Area | Declared `oxide/outputs` with `release_on_reference`, folder `oxide-outputs` | Undeclared area is not covered |
+| Writers / D3 item 4 (R4) | Oxide witnessed admission, internal first. D3's gate also reads Oxide's pool-ledger writer custody (`pool_custody.rs:510-540` parses control state and ledger) | Adapter: Oxide eligibility under the barrier; Barge re-proves **unit** custody at effect. The adapter does not re-read the pool ledger as a gate (ruling c). Generic `release::plan` still reads R4. Unknown writers keep |
+| Checkout absence / D3 item 5 (F2) | Positively absent under the held-descriptor chain | Oxide requires it for coverage. The adapter re-proves through Barge's F2 absence primitive at effect |
+| Control-state fence / D3 item 6 | Ready registry behind successor fence `oxide.outputs/3` (`OWNED_OUTPUTS_FENCE`, `src/lease/control.rs:121`). Only `/3` advances state version to 4 (`store.rs:5536-5544`). `/2` is `LEGACY_OWNED_OUTPUTS_FENCE` (`control.rs:125`). Barge `pool_custody.rs:88` accepts `/1`, `/2` and `/3` | Covered class requires `/3` at version 4. Legacy `/2` is not covered. Barge lookup: an unknown fence is **unknown**, never absent |
+| Group | `Intent.group` (`prune.rs:257`): every verified reference of this `(checkout, root)`, never a single row (`group_rows` keys on that pair, `prune.rs:6519-6523`). `complete_resolution` (`prune.rs:8225`) expects `group.len()` blocking rows (or 1 when empty) | Covered: one physical root, N member rows. One Barge unit deletes that directory. Oxide settlement walks the whole group. A two-root group is unconstructible |
+
+A covered root is one Oxide already classified as a prune candidate under
+those rules. Barge does not become a second eligibility engine in this slice.
+D3 item 4's pool-ledger gate is dropped on the adapter path (ruling c).
+Items 5–6 stay Oxide's eligibility; Barge repeats F2 absence at effect,
+and an unknown fence remains unknown.
+
+### Marker family and area grant (proposal, not shipped)
+
+Shipped Barge families (`unit.rs:119`): `barge` (`.barge-root.json`),
+`effigy_scratch`, `oxide_scratch`. `validate_grant_shape` (`unit.rs:651`)
+maps `barge` → `native_root` and every other directory marker →
+`delegation` named in `scratch_grants`. Registry `MarkerFamily`
+(`registry.rs:124`) is scratch-only.
+
+`release::unit_for` (`release.rs:1496`) currently builds
+`UnitMarker::new(MarkerFamily::Barge, …)` and
+`UnitGrant::native_root(root.name)`. Custody then re-reads
+`.barge-root.json` (`custody.rs:1148`). That path cannot delete an
+`.oxide-output.json` root. Scratch `oxide_scratch` grants cover
+`.oxide-scratch.json` only (`scratch.rs:93`).
+
+**Proposal.** Add family `oxide_outputs`, filename `.oxide-output.json`,
+distinct from `oxide_scratch`. Grant kind stays `delegation`, but the
+record is an **area-scoped** field on `barge.area/1` for `oxide/outputs`
+(generation-bumped), re-read under the volume lock immediately before the
+Barge intent. It is not a `scratch_grants` row. Empty, withdrawn, wrong
+family, wrong area or a generation older than the caller's recorded grant
+refuses before any Barge intent.
+
+Revocation is a re-declare that omits the grant and bumps `generation`.
+No undeclare verb exists (D2). A withdrawn grant cannot be used; bytes
+stay. Oxide's unfinished intent still excludes that checkout until
+rollback or `resolve-intent`.
+
+This grant is new authority. It is not shipped. Operator ruling required
+before any declare or pin that carries it.
+
+**Generic Barge release is barred from this family.** `validate_grant_shape`
+(`unit.rs:651`) accepts any directory family whose delegation `reference`
+equals the family name. Once `oxide_outputs` exists, that shape check
+alone would let a host `release::plan` / `execute` construct a unit.
+Proposal:
+
+- Only the Oxide-supplied adapter entry may construct an `oxide_outputs`
+  `DeletionUnit`. Generic `unit_for` (`release.rs:1496`) and generic
+  `release::plan` refuse that family.
+- Generic `execute` / replay of an `oxide_outputs` intent requires the
+  **live** Oxide intent (id, identity, phase `intent`) as a call argument.
+  Without it they refuse, settle nothing, and delete nothing. A host
+  `release` run that happens to hold the area grant still deletes none of
+  Oxide's roots. Replay of pending intents (`release.rs:1983`) skips
+  `oxide_outputs` rows unless that live intent is supplied.
+- `native_root` remains refused for this family.
+
+### Lock order
+
+Process-held locks die with the process. Recovery is journals, not flock.
+
+**Oxide, shipped.** Custody: both admission locks, internal then removable,
+non-blocking, released before traversal (`prune.rs` witnessed route;
+workflow oxide#235). The pre-intent clean barrier and binding are
+`prune_one_barrier` (`prune.rs:6269`) and `under_checkout_barrier`
+(`prune.rs:7264`). `prune.rs:2251` is the **resume** replay loop (comment
+at `:2252`), not the pre-intent barrier. Registry writes take the internal
+publication lock. Admission is not held during the delete pass.
+`unsettled_for` (`prune.rs:965`) makes adopt/bind/reserve refuse while an
+unfinished intent names the checkout (`outputs.rs:2295`, `:4481`).
+
+**Barge, shipped.** `LockSet` order: registry, then volume, then root, then
+intent write (`state.rs:19`). Grant writes take registry then volume
+(`stage1-design.md`). `release::execute` plans under the shared volume
+lock, then takes the exclusive volume lock, replays, then deletes
+(`release.rs:1915`, `:1983`, `:2038`). Lock wait is 5 s (`LOCK_WAIT`,
+`state.rs:66`); busy is `ErrorKind::Locked` (`release.rs:524`, `:2038`),
+nothing changed.
+
+**Joint order (proposal).** One process, one covered root:
+
+1. Oxide eligibility (admission locks already dropped).
+2. Checkout barrier + binding via `prune_one_barrier` / `under_checkout_barrier`.
+   Held through the Barge call as a live-writer fence.
+3. Publication lock: write `oxide.outputs.prune-intent/1` at phase `intent`
+   with the exact identity and this preview SHA; drop publication (keep
+   the barrier).
+4. Barge adapter: registry (grant/area re-read) → exclusive volume → root →
+   `barge.intent/2`. Never take Oxide admission or publication. Oxide
+   passes Barge's existing `ReleaseBounds`; it does not add a second wall.
+   Barge lock wait stays 5 s.
+5. After Barge returns a terminal: publication lock, settle Oxide registry
+   and receipt, drop publication, drop barrier.
+
+Never hold Oxide admission while waiting for a Barge lock. Never take a
+Barge lock and then wait for Oxide admission or publication. Barge does
+not call Oxide.
+
+**Concurrent commands while the barrier is held.** After step 3,
+`unsettled_for` makes adopt / `bind_for_command` / reserve refuse
+(`outputs.rs:2295`, `:4481`, `:6232`). A second prune sees the unfinished
+intent and resumes it; it never starts a local delete of a covered root.
+If it takes `begin_clean` (`CleanMode::Recovering`, `store.rs:529`) while
+this process holds the barrier, it waits. Guarded verbs
+(`CleanMode::Barrier`, `store.rs:536`): live holder → `Cleaning::Retry`;
+dead → `Busy`. They never delete. A second Barge deleter on the same
+volume waits 5 s then `locked`. Crash drops the process-held barrier;
+durable exclusion is the Oxide intent.
+
+**Pre-intent `locked` is a known no-effect (same-call rule, first adapter
+call only).** Choice (a): this call's own `Locked` return is the
+no-effect fact. Positive absence via `observe_volume` cannot run in the
+same call: that shared lock (`state.rs:1316-1318`) is the one the
+exclusive holder is denying, so a four-state lookup would return unknown
+and the rollback would fail.
+
+The same-call rollback applies only to the adapter call made immediately
+after this attempt published a new Oxide intent in step 3. At that
+moment no `barge.intent/2` for this caller id can exist: the Oxide intent
+is fresh and Barge has not been asked. If that first step-4 call returns
+`ErrorKind::Locked` (`release.rs:524` shared observe, `:2042` exclusive
+`lock_volume`), those errors already say "nothing was changed". Oxide,
+still holding the barrier, confirms the original root is present with
+the recorded identity, then rolls back the Oxide intent and drops
+exclusion. It does not take `observe_volume` here. If the original root
+is gone or the identity mismatches, keep pending (unknown).
+
+Every resumed, replayed or restarted adapter call uses the four-state
+lookup under the volume lock. A `Locked` there keeps the Oxide intent
+pending and rolls back nothing: a prior attempt may already have written
+`barge.intent/2` (idempotency resumes that record). Testing only that
+"this call had not written `barge.intent/2`" is not enough, because that
+test is about the current call only. Later prune replay, once the volume
+lock is free, uses the four-state lookup as usual.
+
+### Correlation (supported protocol)
+
+No new bearer token. The correlation key is the Oxide intent id (existing
+128-bit id in `oxide.outputs.prune-intent/1`). Do **not** add
+`barge_intent_id` (or any other field) to `oxide.outputs.prune-intent/1`:
+Barge reads that schema strictly (`reference.rs:1280` `RawIntent`
+`deny_unknown_fields`; version check at `:1508`).
+
+`caller_intent_id` on `barge.intent/2` is **proposal**, not shipped.
+`IntentRecord` at Barge `590d0e51` (`state.rs:1562-1595`) has no caller
+field; the token occurs nowhere in non-test Barge source. Adding it is
+Barge adapter work (implementation table). Lookup by that field runs
+only after that work lands.
+
+| Journal | Who writes | What it records | What it must not do |
+| --- | --- | --- | --- |
+| `oxide.outputs.prune-intent/1` | Oxide only | Identity, preview SHA, phase. Same field set Barge already parses | Rewrite `barge.intent/*`; infer Barge completion from absence |
+| `barge.intent/2` | Barge only | Unit (family `oxide_outputs`, inode, digest, grant), plan/request digest, `caller_intent_id` = Oxide intent id | Rewrite Oxide registry/receipt/intent; use `native_root` / `.barge-root.json` |
+
+**Four-state lookup**, both directions. Never collapse unknown into
+absent.
+
+| State | Meaning | Effect |
+| --- | --- | --- |
+| Found pending | Matching journal exists, phase not terminal | Keep both pending; resume that side |
+| Found terminal | Oxide `deleted`/`resolved`, or Barge `deleted` | The other side may settle against that terminal |
+| Positively absent | The named directory was read under the lock below, the document parsed complete, and this id is not in it | The caller may treat "no journal" as a fact |
+| Unknown | Unreadable, incomplete, deadline expired, pools record unknown, lock not taken, volume missing, or any other failure to finish the read | Keep pending. Usable recovery message. Never roll back, never local-delete, never `resolve-intent` |
+
+Positive absence, Oxide looking up Barge: Barge state is account-scoped
+(`StatePaths`, `state.rs:103-199`), not on the volume. Production account
+dir is `AccountFacts::state_root` (`os/macos.rs:40` `STATE_ROOT_RELATIVE`,
+`:808`). Take the volume observation lock (`LockSet` order), read the
+intent directory, parse every `barge.intent/2`. This `caller_intent_id`
+is not among them. Also prove the original root present with the recorded
+identity and that no `.barge-prune-<id>` leaf exists in the outputs
+folder (`QUARANTINE_PREFIX`, `state.rs:1911`). A missing or unreadable
+Barge state directory, an unreadable intent file, or a lock timeout is
+**unknown**.
+
+Positive absence, Barge looking up Oxide: `control_directory`
+(`reference.rs:975`) already returns `Ok(None)` only after every named
+and default pool was inspected and none holds `outputs/`; anything that
+makes "every pool" uncertain is `ErrorKind::UnknownState` (`:1013-1026`).
+For this adapter, `Ok(None)` while the caller supplied a live Oxide
+intent is **unknown**, not absent (the caller just claimed the journal
+exists). Positive absence of **this** intent requires: control directory
+found, registry complete and parsed (`deny_unknown_fields`), intents
+array readable, this id not present. An absent, unreadable or incomplete
+registry, an unreadable intents directory, an unknown fence (D3 item 6),
+or an expired deadline is **unknown**.
+
+Lookup: Oxide finds Barge intents by `caller_intent_id`. Barge re-proof
+reads the Oxide intent in place (`reference.rs:79` `OXIDE_INTENT_V1`) and
+refuses if it is settled or names a different identity. Missing is the
+four-state table, not a single "if missing". Idempotency: a second call
+with the same Oxide intent id resumes the existing Barge intent or
+reports the settled outcome; it does not start a second unit.
+
+Root identity replacement (new nonce at the same path): Barge re-proof
+mismatches digest/nonce/inode and refuses. The new root is not this
+operation. Volume remount: UUID + inode + digest still bind; device may
+change. Volume absent: unknown, both journals stay pending. Lost Barge
+reply: Oxide keeps `intent` and looks up by `caller_intent_id` / unit
+identity; unknown keeps pending. Concurrent selection: the pruning flag
+and the barrier make a new selection refuse; if Barge nonetheless sees a
+live reference it keeps the root.
+
+### State machine and crash recovery
+
+Oxide local phases (`prune.rs:191`): `intent` → `renamed` → `deleting` →
+`marker_last` → `deleted` / `resolved`. Barge phases (`state.rs:1398`):
+`intent` → `renamed` → `marker_last` → `removed` → `deleted`. For a
+covered root Oxide does **not** walk its local rename/delete phases.
+Oxide stays at `intent` until Barge is `deleted` or a proven rollback,
+then Oxide publishes `deleted` (registry terminal, then receipt, then
+`receipt_settled`). `resolved` remains the operator settlement verb when
+deletion cannot complete.
+
+`intent`-phase rollback of a covered root is **forbidden** until Barge
+lookup is **positively absent** for that `caller_intent_id`, the original
+root is still present with the recorded identity, and no `.barge-prune-*`
+leaf for this unit exists. A lookup that is unknown does not authorise
+rollback. Today's `prune.rs:2227` comment is the plan-path local-deleter
+rollback of an effect-free intent; applying it after a Barge call can
+hide a live Barge quarantine.
+
+**`resolve-intent` on a covered intent (new precheck).** Shipped
+`resolve_precheck` (`prune.rs:8072`) requires only that the original root
+and Oxide's own `.prune-<id>` quarantine (`QUARANTINE_PREFIX`,
+`prune.rs:64`) are positively absent. Barge renames to
+`.barge-prune-<intent-id>` (`state.rs:1911`), which that precheck never
+names. `complete_resolution` (`prune.rs:8225`) then sets phase `Resolved`
+and clears `selected` / `pending` / `pruning` on the group. Proposal: a
+covered intent's `resolve-intent` **refuses** unless (all of):
+
+1. Barge lookup is **found terminal** (`deleted`) or **positively
+   absent** (the four-state table). Unknown refuses.
+2. The `.barge-prune-<id>` leaf is positively absent under the same
+   outputs-folder `fstatat` Oxide already uses for its own quarantine
+   (`prune.rs:8144`). Present or unreadable refuses.
+3. Shipped `resolve_precheck` still holds (original leaf and
+   `.prune-<id>` absent, registry complete, blocking row matches).
+
+The new Barge-lookup and `.barge-prune-<id>` checks run in both
+`resolve_precheck` sites: the pre-barrier refusal (`prune.rs:7950`) and
+the inside-barrier recheck (`prune.rs:7985`).
+
+Barge then refuses a settled Oxide intent, so releasing exclusion while a
+Barge intent or `.barge-prune-<id>` leaf remains would leave a permanent
+contradictory pair. The operator verb stays; it cannot drop a covered
+root's exclusion while Barge still holds bytes or a pending intent.
+
+| Same-call outcome | Fact | Oxide | Exclusion |
+| --- | --- | --- | --- |
+| First adapter call immediately after this attempt published a new Oxide intent in step 3 returns `Locked` | This call's `Locked` return is the no-effect fact (`release.rs:524`, `:2042`). Original root present with recorded identity. No `barge.intent/2` for this caller id can exist. No same-call `observe_volume` | Oxide rollback | After rollback |
+| Resumed, replayed or restarted adapter call returns `Locked` | Four-state lookup under the volume lock. `Locked` is unknown. A `barge.intent/2` for this caller id may already exist | Keep pending | No |
+
+| Durable point | On crash / restart | Who resumes | When Oxide may drop exclusion |
+| --- | --- | --- | --- |
+| Before Oxide intent | No journals. Root unchanged. Next prune re-evaluates | Oxide prune | n/a (never taken) |
+| After Oxide intent, before Barge intent | Oxide `intent`, root in place. Replay may roll back **only after** Barge lookup **positively absent** (not unknown) and no `.barge-prune-*`. A resumed adapter `Locked` is unknown: keep pending | Oxide, then optional rollback | After rollback, or after later settlement |
+| After Barge intent, before rename | Both `intent`, root in place. Barge replay rolls back the Barge intent (`delete.rs` intent-still-in-place). Oxide stays `intent` until that rollback is **found terminal or positively absent**, then may roll back | Barge replay first | After both rollbacks |
+| After Barge rename | Barge `renamed` (or later). Oxide `intent`. `.barge-prune-<id>` present. Resume Barge deletion. Oxide must not roll back, must not local-delete, must not `resolve-intent` | Barge replay | Only after Barge `deleted` and Oxide settlement |
+| Partial deletion | Barge pending at `renamed` / `marker_last`. Capture/verify/unlink as shipped S5. Unknown capture keeps pending | Barge replay | No |
+| Barge `removed` but not `deleted` | Leaf absence without `removed` is unknown (`state.rs:1406`, `delete.rs:54`). With `removed`, replay may settle Barge `deleted` | Barge replay | No, until Oxide settlement |
+| Barge `deleted`, Oxide not settled | Bytes gone. Oxide still unfinished. Prune replay (or `resolve-intent` after the new precheck) reads Barge **found terminal** `deleted` + matching `caller_intent_id` and finishes registry/receipt | Oxide settlement | After Oxide `deleted` + `receipt_settled` |
+| Barge rollback, original root present | Barge lookup positively absent; identity still matches; no `.barge-prune-*` | Oxide rollback | After Oxide rollback |
+| Barge state directory lost after rename | Oxide `intent`, `.barge-prune-<id>` present, Barge lookup unknown | Keep pending. Recovery names both leaves and the Oxide intent id | No |
+| Caller death during Barge call | Same as "after Oxide intent" or "after Barge intent" depending on whether `barge.intent/2` exists. Process locks are gone | Lookup, then the row above | Per that row |
+| Barge unavailable / unknown | Oxide `intent` stays. Message names the Oxide intent id, the root identity, and that Barge must be retried. No local deleter. `resolve-intent` refuses | Operator / later prune | No |
+| Operator `resolve-intent` while Barge pending | New precheck refuses. Journals unchanged | Operator retries after Barge terminal or proven absence | No |
+
+Unknown keeps bytes (if still present) and authority pending, and prints a
+usable recovery line. No side fabricates the other's terminal phase.
+
+### Single deleter and classes outside the slice
+
+For a covered root, a Barge refusal, `locked`, unavailable or unknown
+outcome **must not** call `oxide_storage::owned_delete` (the module
+imported at `prune.rs:25`) or Oxide's local `.prune-<id>` quarantine
+path. Keep or pending only. `owned_delete` is not a function in the
+binary.
+
+| Class | Today's deleter | This slice | Recommendation for the later ruling |
+| --- | --- | --- | --- |
+| Covered v2 (table above), including a one-root group of N members | Oxide local prune | Barge only; one unit; Oxide settles the group | Adopt after grant + fixture acceptance. Product change |
+| `oxide.outputs.root/1` | Oxide, operator list | Out of slice | Unchanged |
+| Receiptless / operator-list 91 | Oxide evaluator + list (D4 A) | Out of slice | Unchanged; D4 still open |
+| Sticky-incomplete registry | Whole batch kept | Out of slice | Unchanged |
+| Selected / pending / reserved / cancelling | Kept | Out of slice | Unchanged (`dc1d6924`) |
+| Unregistered or non-expendable volume | Oxide keep / Barge refuse | Covered path refuses | Keep/refusal; do not add a new deleter |
+| `.oxide-scratch.json` | Scratch grants only | Never outputs | Unchanged |
+| Barge-native `.barge-root.json` | Barge `native_root` | Unchanged | Unchanged |
+| Local `.oxide-outputs` fallback | Oxide | Out of slice | Unchanged |
+
+This modern-only slice does not eliminate every legacy deleter. Removing
+Oxide's local deleter for the covered class is the operator ruling, not a
+silent default.
+
+**Changed user behaviour (covered class only; needs the ruling).** A
+checkout whose covered root is Barge-only, with Barge missing,
+unregistered or unknown, keeps its Oxide `intent`. That blocks
+`bind_for_command` and adopt (`outputs.rs:2295`, `:4481`) until prune
+replay or a passing `resolve-intent`. `--dry-run` stays no-effect and
+does not call Barge execute. The preview of a covered root records
+`deleter: barge` (optional field; uncovered stay default Oxide). If
+Barge is unregistered, dry-run still emits the preview and names
+`barge_unavailable` on those candidates; it does not refuse the whole
+preview. The real run of those candidates publishes the intent, gets
+Barge unavailable, leaves the intent pending, and exits 3 (unsettled).
+That exit and the pending-intent block are the operator-visible change.
+
+### Direct acceptance (proposal, not run)
+
+Integrated default code, disposable fixture, existing host safeguards
+(qualified supervisor `fcfda2b0…`, owned Stash UUID
+`8A660440-C919-45C6-A3F1-3365B9BD2006`, `scripts/bounded-test.py`, one
+owned 128 MiB image, ordinary detach). Do not author a new proof runner.
+Do not use production account lookup or a live Builds/Stash consumer
+root. Synthetic account facts stay labelled synthetic (Barge044 limit).
+
+Required cases: positive deletion of one covered root; identity / marker /
+owner / grant mismatch; grant withdrawal mid-window; selected root;
+existing and unknown writers in each pool; volume refusal; competing
+Oxide adopt and competing Barge volume lock; interruption at each durable
+row above; Oxide replay and Barge replay; unknown / lost reply; operator
+`resolve-intent` while Barge is pending (must refuse, journals unchanged);
+Barge state directory lost after rename (Oxide `intent`, `.barge-prune-<id>`
+present, unknown, keep pending); definite pre-intent `locked` on the
+first adapter call after this attempt published a new Oxide intent
+(Oxide rollback from this call's `Locked` plus original root present
+with recorded identity; no same-call `observe_volume`; no
+`barge.intent/2` for this caller id can exist); a resumed adapter call
+returns `Locked` while a `barge.intent/2` exists for the same caller id
+(Oxide keeps pending and rolls back nothing); host `release` run
+with the area grant present (deletes none of Oxide's roots); group intent
+of N members / one root (one Barge unit, Oxide settles the group); Barge
+seeing an absent Oxide control directory (unknown, not absent, refuse).
+Existing runtime custody and descriptor checks stay on the path. Full
+transcript equivalence is a different claim (O2) and is not this
+acceptance.
+
+Envelope proposal: 300 s / 512 MiB, unmeasured. Order under existing
+Elevated policy: uncounted diagnostic, counted author native, distinct
+reviewer native. Covering docs/compile stay with the implementation
+briefs, not this design.
+
+Named gaps: production account lookup, live adoption, Builds `expendable`
+restore (G7 / `G-D`), host reaper cutover (`G-F1`).
+
+### Implementation split
+
+| Side | Smallest work | Depends on |
+| --- | --- | --- |
+| Barge | `MarkerFamily::OxideOutputs`; area-grant field; `validate_grant_shape`; custody reads `.oxide-output.json` via existing `read_oxide_marker`; `caller_intent_id` on `barge.intent/2`; generic `plan` / `unit_for` / `execute` refuse to construct or settle this family unless the live Oxide intent is supplied; `native_root` refused; four-state Oxide lookup | Area schema; tests for grant mismatch/withdrawal, generic-release refusal, unknown-vs-absent |
+| Oxide | After publishing `intent` for a covered root, call that Barge entry; never local-delete that class; replay rolls back only after Barge **positively absent**; `resolve-intent` new precheck (Barge terminal or absent, `.barge-prune-<id>` absent); uncovered classes keep the local deleter; no new field on `oxide.outputs.prune-intent/1` | Barge pin with the adapter; declared area + grant; operator ruling |
+| Shared | One request digest: Oxide preview SHA + root identity + grant generation. Both journals store it | Neither rewrites the other |
+
+`release::execute` as it stands remains the Barge-native deleter. Do not
+route Oxide outputs through `unit_for`'s `MarkerFamily::Barge` grant.
+Generic host `release` with the grant present is an acceptance case, not
+an allowed deleter.
+
+### Planner recommendation
+
+1. Treat this protocol as the implementation shape for mechanism-only
+   delegation. First Barge adapter, then Oxide caller, each with its own
+   reviewed brief.
+2. Accept the covered class by **direct integrated fixture tests**, not by
+   reopening O2 comparison. `d354ec02` v2 stays. O2/O3 stay held.
+3. Ask the operator, after independent design review, through
+   [Q-021](../questions.md#q-021--how-should-oxides-output-roots-move-to-barge)
+   (declaration authority, single deleter, when Barge may act on a pending
+   Oxide intent). Three ruling items:
+
+   - **(a)** the new `oxide_outputs` area-scoped grant as deletion
+     authority (Q-021 declaration authority). Recommended: yes for
+     disposable-fixture work only until `G-C`/`G-D`.
+   - **(b)** whether the covered class's Oxide local deleter is replaced
+     (single deleter) or left until O3 (Q-021 "switches the release prune
+     through a single deleter"). Recommended: replace the local deleter
+     for the covered class in the Oxide caller brief; leave every other
+     class unchanged.
+   - **(c)** D3 cutover, keep-rule, and reference-set changes this slice
+     makes. D3 today: Oxide's pending `prune-intent` entries are settled
+     by Oxide's own replay before the first Barge real run; "Barge keeps
+     a root that Oxide still marks pending, and it never settles an
+     Oxide intent." This slice runs the Barge **adapter** real-delete
+     against a live Oxide prune-intent, and Barge's adapter no longer
+     keeps that root. Generic `release::plan` still keeps pending
+     Oxide-intent roots and still never writes an Oxide intent. Also:
+     the adapter does not re-read Oxide's pool ledger as a D3 item 4
+     gate (`pool_custody.rs:510-540`). Oxide's witnessed admission under
+     the checkout barrier is eligibility; Barge re-proves unit custody
+     at effect. Generic `release::plan` still reads R4. Recommended:
+     accept (c) for the adapter path only; keep the generic keep-rule
+     and the generic R4 read.
+
+4. Stop. No pin, declare, grant write or prune follows from this section.
+
+### Unchanged
+
+O1 pin, O2 capture, O3 cutover as a product landing (this slice does not
+dispatch it), D4 legacy 91, S8-pool/scratch, `d354ec02` v2, `0bcedf55`
+v2, `dc1d6924`, comparison evidence, host job, Builds durability,
+production readers, and every current prune/adopt path outside the
+covered class. D3's cutover precondition, keep rule and item-4 pool-ledger
+gate stay the shipped contract until ruling (c).
 
 ## Shared private-build validation gate (oxide#248)
 
