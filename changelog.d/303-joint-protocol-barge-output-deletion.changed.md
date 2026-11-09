@@ -1,0 +1,1 @@
+Propose the joint Oxide/Barge protocol for mechanism-only output deletion: Oxide keeps eligibility and durable prune intent; Barge re-proves and deletes the covered v2 root under a new area-scoped grant.
