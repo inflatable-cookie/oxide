@@ -8,6 +8,8 @@ Queue project: `oxide`; repository: `inflatable-cookie/oxide`. Queue owns the pl
 
 Tom's scope and authority ruling lives in [vision](docs/knowledge/vision.md); storage invariants live in [architecture](docs/knowledge/architecture.md). Read [questions](docs/knowledge/questions.md) and [retirements](docs/knowledge/retired.toml) before planning.
 
+For each pull request, add one short unreleased entry in `changelog.d/<task-or-PR>-<slug>.<type>.md` (`added`, `changed`, `fixed`, `removed` or `security`). Keep `CHANGELOG.md`'s `[Unreleased]` section empty; release preparation folds fragments there. See the [release contract](docs/knowledge/contracts/release.md).
+
 ## Guardrails
 
 Tom authorized planning and queueing the next bounded tranche on 2026-10-09. Approved Queue briefs define each task’s authority, prerequisites and validation scope; dependency completion is not permission to bypass an explicit dispatch hold. Oxide-only implementation and its targeted repository validation must follow the independently reviewed design. Real-project qualification, consumer adoption and host installation remain separately gated. No live cache cleanup, settings/scheduler or consumer wire mutations, releases, tags or workflow changes without scoped approval. Do not prompt or mutate active Nucleus work. Resolve the repo-owned RustQuality profile/deviations before future Rust authoring; use each package's declared `rust-version` and do not infer one where absent.

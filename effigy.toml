@@ -45,9 +45,13 @@ minimum_effigy_version = "0.14.0"
 # and not a real project-target scan.
 "rust:storage-inventory-cli" = "python3 scripts/test-storage-inventory-cli.py"
 "build-context:comparison:test" = "python3 scripts/test_build_context_comparison.py"
+"changelog:check" = "python3 scripts/changelog.py check"
+"changelog:fold" = "python3 scripts/changelog.py fold {args}"
+"changelog:test" = "bash scripts/changelog.test.sh"
 "docs:check" = [
   "effigy skill run northstar/check-links -- --frozen '^docs/knowledge/architecture[.]md$'",
   "effigy skill run northstar/retired-concepts",
+  "effigy changelog:check",
   "git diff --check HEAD",
 ]
 
