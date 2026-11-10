@@ -31,7 +31,7 @@ BARGE = '63163686d212e6e5a900d6cc2ddfcce65b475890'
 BARGE_REVIEWED = '547fbe99cdc9676b80b58730cf09715c64c5a9cd'
 BARGE_TREE = '8a3b368e7883be862fe8319bb34e9f987e38731b'
 STASH = '8A660440-C919-45C6-A3F1-3365B9BD2006'
-SECONDS, MIB, BUDGET = 300, 1024 * 1024, 512
+SECONDS, MIB, BUDGET = 600, 1024 * 1024, 512
 PREPARE_MIB, RESIDENT_MIB, GROWTH_MIB = 448, 288, 32
 FEATURES = 'barge/proof-synthetic-account'
 # Support is established from the published source export, lock and actual
@@ -935,7 +935,11 @@ def plan_document():
             'selectors':['proof:outputs-delegation:test','proof:outputs-delegation:plan','rust:outputs-delegation:diagnostic','rust:outputs-delegation'],
             'supervisor_sha256':SUPERVISOR,'barge':BARGE,'seconds':SECONDS,'scratch_mib':BUDGET,
             'work_stop_margin_s':30,'image_mib':128,'staging':'clean exact tree, Rust1.97.1 locked/offline, private Cargo seed, '+FEATURES,
-            'fit':{'measured':False,'prospective_seconds':{'seed_and_source':45,'build_seal_cleanup':170,'cases':55,'closure_margin':30},
+            'fit':{'measured':False,'prospective_seconds':{'seed_and_source':45,'build_seal_cleanup':170,'cases':355,'closure_margin':30},
+                   'historical_partial':{'head':'ff8c7638','overall_limit_s':300,'script_elapsed_s':269.44583875,'stage_s':23.40,'returned_rows':20,'completed':1,'failed':19,'unexecuted':23,
+                       'linear_projection_s':(269.44583875-23.40)/20*43+23.40+30,
+                       'method':'failed-path elapsed excluding stage, scaled from 20 returned rows to 43, plus observed stage and 30s margin; not an acceptance bound',
+                       'limitation':'positive deletion/recovery and remaining setup costs unmeasured; 600s sufficiency unproved; prior 300s outcomes/charges unchanged'},
                    'prospective_phase_mib':{'preparation':{'all_owned':448,'margin':64},'run':{'retained':288,'image':128,'fixture_and_evidence_growth':32,'margin':64}},
                    'seed_copy_mib':128,'artifact_lifecycle':'closed producer -> exclusive verified executable in evidence -> bound provenance -> dispose only fresh target -> verify retained copy -> resident gate',
                    'accounting':'all run-owned source, target, expanded Cargo cache including seed, home, tools copied if any, evidence, sealed artifact and other files; phase observations plus unchanged qualified guard'},
@@ -947,7 +951,7 @@ def plan_document():
                 'Stage Cargo argv fixed locked/offline/bin oxide/features; exec writer uses explicit dependency-free command.',
                 'Native entry binds its actual ImageCustody module to the permanent runtime; shared guard CLOCK_UPTIME_RAW deadline/30s margin checked before allocation. Default effects attach APFS owners-on; fixture helper rebinds kernel UUID.',
                 'Stage and fixture RUSTFLAGS empty, no encoded overrides; stage feature/binary/tool/lock hashes retained.',
-                'All scratch/TMP values are guard-provided, private worlds under scratch; image backing under guard evidence.',
+                'All scratch/TMP values are guard-provided, private worlds under scratch; image backing under guard evidence. Fixture outputs container uses actual volume.dir_at owner/type/device gate; fresh 0700 roots and exclusive no-follow 0600 marker/payload/receipt writes; product controls and negative cases unchanged.',
                 'Every world uses /usr/bin/mktemp -d with explicit owned template ending XXXXXXXX.'],
             'cases':list(CASES),'limits':['no source test is native credit','no evaluator equivalence or production account qualification','unknown child/writer/image custody aborts and retains; no force or retry']}
 
@@ -1044,6 +1048,12 @@ def self_check():
     require(plan_document()['fit']['measured'] is False,'unmeasured plan claimed measurement')
     require(all(sum(phase.values())==BUDGET for phase in plan_document()['fit']['prospective_phase_mib'].values()),'phase envelope mismatch')
     require(sum(plan_document()['fit']['prospective_seconds'].values())==SECONDS,'time envelope mismatch')
+    manifest=(HERE.parent/'effigy.toml').read_text()
+    for selector,suffix in (('rust:outputs-delegation',''),('rust:outputs-delegation:diagnostic',' --diagnostic')):
+        section=manifest.split('[tasks."'+selector+'"]',1)[1].split('[tasks.',1)[0]
+        command=f'python3 scripts/bounded-test.py --limit {SECONDS} --scratch-budget-mib {BUDGET} -- python3 scripts/test-outputs-delegation.py'+suffix
+        require('run = "'+command+'"' in section,'integrated selector/time envelope mismatch: '+selector)
+    require(SECONDS==600 and plan_document()['work_stop_margin_s']==30,'prospective clock amendment mismatch')
     class StopProbe(Exception):pass
     class Probe:
         data={'uuid':'fixture','mount':'fixture'}

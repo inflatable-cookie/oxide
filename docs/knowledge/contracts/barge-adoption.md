@@ -5027,7 +5027,7 @@ controls, with no child/engine/seed/image effects), `proof:outputs-delegation:pl
 `rust:compile:outputs-delegation` (the staging account feature through Oxide),
 and the separately activated heavy `rust:outputs-delegation:diagnostic` and
 `rust:outputs-delegation`. Both heavy selectors use the unchanged qualified
-`fcfda2b0…` supervisor, one 128 MiB owners-on APFS image, 300 s / 512 MiB and a
+`fcfda2b0…` supervisor, one 128 MiB owners-on APFS image, prospective600s /512MiB and a
 30 s work-stop margin. Declaring these selectors activates no native run.
 
 The fixed script composes existing source-archive verification, the bounded
@@ -5080,8 +5080,8 @@ image, 32 MiB fixtures/evidence and 64 MiB margin. Read-only cache metadata
 found about 35.8 MiB of admissible candidates plus registry inputs; a roughly
 2.73 GiB candidate is skipped by the existing seeder before copying. These
 are source-readiness observations, not measured staging, native runtime or
-peak RSS. The 45/170/55/30 s source+seed/build/cases/closure allocation is
-prospective. Actual native fit and every integrated outcome remain unproved
+peak RSS. The original45/170/55/30s allocation failed to fit the partial
+run; the v19 amendment below prospectively replaces it with45/170/355/30s. Actual native fit and every integrated outcome remain unproved
 until the separately planner-activated diagnostic and counted sessions.
 
 Two caller corrections accompany this readiness work: profile receipt writes
@@ -5250,8 +5250,9 @@ no binary or payload reconstruction follows. The retained packet
 binds report, seed/source/tool/build inputs, guard and omissions. This spent
 failure does not establish the first attempt's unknown seed result.
 
-The prospective internal allocation now has two phases under the same300s /
-512MiB qualified guard,30s work stop and128MiB image:
+The internal allocation adopted at this historical correction has two phases
+under the qualified guard,30s work stop and128MiB image. Its then-current300s
+limit is superseded prospectively by the600s amendment below:
 
 | Phase | Prospective allocation |
 | --- | --- |
@@ -5389,3 +5390,78 @@ only; they never stand in for product or native outcomes. Existing image,
 stage/phase/cleanup, reporting and oracle controls remain within1MiB of local
 files. Independent corrected-head readiness and separately activated diagnostic,
 counted author/reviewer and final judgment remain required under mergeHold.
+
+#### Fixture permissions and prospective time amendment (oxide#304)
+
+The `ff8c7638` diagnostic (run `fb13c25e`, guard
+`ac19a3f18f6892c7e4164c61b810c8e0`) is spent and failed: one completed row
+(`generic-release`, with empty release rows and Barge intents),19 failed and23
+unexecuted. Every failed row carries the real preview refusal that
+`oxide-outputs` must be an owner-only directory; no covered deletion was
+established. The final `partial-replay-barge` setup reached the inherited work
+cutoff with script child closure unknown. Script elapsed269.44583875s and the
+successful stage23.40s are actual observations. Later guard process closure
+(closed/status1, deadline:false, certain empty joined census) does not repair
+that script custody record. Overall125 and cleanup kept/live-image retain the
+attached image; no detach request or image closure occurred.
+
+The actual packet is
+`/Volumes/Stash/scratch/oxide/35a6d753/diagnostic.ZmIZFyiA/packet.json`
+(150390B, SHA256 `1d06747bd21e374ef6962038e7d647249c6e83c155de443bffbe0da5c0e385f3`).
+Both retained images (`qu9ztib0` and `nvt4967w`) remain open custody
+obligations. Their recorded devices are historical identities, not cleanup
+or signal authority. No backing/payload/binary inspection, reuse, kernel survey
+or manual detach/cleanup follows. All five failed diagnostics, the804c
+no-launch admission refusal, first unknown seed result and original bounds and
+charges remain unchanged.
+
+Only disposable fixture construction changes. `create_fixture_root` opens the
+real mount without following a final link, creates/validates the outputs
+container through the same `volume::dir_at` owner/type/device gate preview
+uses, and exclusively creates0700 roots. It reopens through that held parent
+and compares named/held identities. An existing root, wrong-mode container,
+link or wrong type refuses; nothing existing is chmodded or repaired.
+Payloads, markers and receipts use the existing exclusive no-follow0600
+`write_fixture_file`. Ordinary filesystem regressions enter these actual
+helpers and real permission gates; they retain tiny owned fixtures and check
+valid construction, wrong container/root modes, linked mount/container/root,
+replacement, file collision, traversal and immutable-file refusal. They do
+not mount an image, run a synthetic executable or substitute a copied validator.
+
+| Filesystem premise consumed by preview/adapter/replay | Source and disposition |
+| --- | --- |
+| Image and outputs parent | `setup` retains declared backing/kernel UUID checks through `Binding::open`; `create_fixture_root` uses `volume::dir_at` on the same device. The mounted volume itself need not be0700. |
+| Root and marker | Fresh0700 roots, held/named identity and exclusive0600 marker/payload writes; actual registry rows bind device/inode and exact marker bytes. Marker mismatch and root-replacement cases retain their deliberate invalid input. |
+| Checkout ancestors | `setup` uses existing `ensure_private_dir` for private HOME/checkouts/anchor; checkout remains absent until a named adoption/writer case. Ancestor-replacement control remains explicit. |
+| Pool controls, registry, receipts, request sidecars and journals | Existing Store/paired initialization, publication guards, bounded private-file readers and actual Barge state writers own these directories/files. Fixture receipt publication now uses the same no-follow0600 writer; no product validator or journal format changes. |
+| Removable library metadata | `register_fixture_volume` checks the prior private source pointer, held library lock and bound registration; creates the new account's control directory with `ensure_private_dir` and metadata with `write_fixture_file`. It never reinitializes a live payload. |
+| Pause/hold markers and negative mutations | Existing guarded product hooks own pauses; Python gate/checkout files stay inside the world's0700 base, and lock evidence stays inside guarded evidence. Deliberate grant/metadata corruption, missing journal and replacement controls remain invalid, with existing unknown/refusal assertions. No foreign-owner or host permission is repaired. |
+
+Planner brief v19 prospectively supplies600s through the existing `--limit`
+for BOTH integrated native selectors and the script/plan. No600s execution is
+activated by this amendment. The qualified `fcfda2b0` supervisor is unchanged,
+as are512MiB scratch,128MiB image/seeder cap,448MiB prep/288MiB resident
+phases,170s stage cap, all child waits, flags/features and43 cases. Every
+consumer retains the one inherited absolute deadline minus the original30s
+work/shutdown margin; no per-case allowance or clock reset is introduced.
+The self-check binds both selector command strings to the script's600s/512MiB
+constants. Ordinary `rust:test-600` keeps its existing distinct recipe/bounds.
+
+The prospective source budget is45s source/seed +170s build/seal/disposal
++355s cases +30s shutdown. A transparent failed-path linear projection is
+`(269.44583875 - 23.40) / 20 * 43 + 23.40 + 30 = 582.3985533125s`.
+It scales20 returned rows (19 failures, one empty release), not20 successful
+native cases, and includes observed setup overhead in the scaled interval.
+Positive deletion/recovery and remaining setup costs remain unmeasured;
+600s sufficiency is unproved. Independent exact-head readiness must judge
+selector/clock agreement and this estimate before a separately activated fresh
+diagnostic. Counted author, distinct reviewer native, final judgment and merge
+remain held.
+
+The nine-premise map remains the executable `plan_document().premises`:
+installed absolute tools/rustup before private HOME; one Oxide/Barge private
+account mode; inherited product/tool/XDG/flags isolation with genuine Nucleus
+context; explicit synthetic history and adoption; fixed Cargo/external argv;
+actual owners-on image/default custody; unchanged flags; selected scratch/TMP
+and private filesystem construction; explicit macOS mktemp. Permission controls
+add ordinary filesystem evidence only, never native or deployment credit.

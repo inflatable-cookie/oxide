@@ -4,7 +4,7 @@
 use super::*;
 use barge::os::AccountFacts;
 use std::ffi::OsString;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 
 fn guard() -> Result<PathBuf, String> {
     let evidence = proof_evidence().ok_or("delegation fixtures require the shared proof guard")?;
@@ -198,6 +198,35 @@ fn write_fixture_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// The image container may be reused by later isolated worlds, but each root
+/// must be freshly created. Use the same descriptor-based permission gate as
+/// preview; never adopt or chmod an unexpected existing root or container.
+fn create_fixture_root(mount: &Path, name: &str) -> Result<PathBuf, String> {
+    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+        return Err("fixture root must be one directory name".into());
+    }
+    let mount_fd = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(mount)
+        .map_err(|e| e.to_string())?;
+    let parent_fd = oxide_storage::volume::dir_at(mount_fd.as_fd(), outputs::EXTERNAL_DIR, true)?;
+    let root = mount.join(outputs::EXTERNAL_DIR).join(name);
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&root)
+        .map_err(|e| format!("cannot create fresh fixture root: {e}"))?;
+    let opened = oxide_storage::volume::dir_at(parent_fd.as_fd(), name, false)?;
+    let held = fs::File::from(opened)
+        .metadata()
+        .map_err(|e| e.to_string())?;
+    let named = fs::symlink_metadata(&root).map_err(|e| e.to_string())?;
+    if named.dev() != held.dev() || named.ino() != held.ino() {
+        return Err("fixture root was replaced during creation".into());
+    }
+    Ok(root)
+}
+
 fn setup(label: &str, mount: &Path, uuid: &str) -> Result<(), String> {
     if label.is_empty()
         || label.len() > 40
@@ -261,20 +290,17 @@ fn setup(label: &str, mount: &Path, uuid: &str) -> Result<(), String> {
     let checkout_uuid = checkout_volume_uuid(checkout.parent().ok_or("checkout parent missing")?)
         .ok_or("checkout volume unknown")?;
     let id = sha256_hex(checkout.as_os_str().as_bytes());
-    let parent = mount.join(outputs::EXTERNAL_DIR);
-    fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
     let mut rows = Vec::new();
     let mut roots = Vec::new();
     for (suffix, generation, nonce, selected) in [
         ("old", 1, "b".repeat(32), false),
         ("successor", 2, "c".repeat(32), true),
     ] {
-        let root = parent.join(format!("{label}-{suffix}"));
-        fs::create_dir(&root).map_err(|e| e.to_string())?;
-        fs::write(root.join("payload-a"), b"disposable payload one").map_err(|e| e.to_string())?;
-        fs::write(root.join("payload-b"), b"disposable payload two").map_err(|e| e.to_string())?;
+        let root = create_fixture_root(mount, &format!("{label}-{suffix}"))?;
+        write_fixture_file(&root.join("payload-a"), b"disposable payload one")?;
+        write_fixture_file(&root.join("payload-b"), b"disposable payload two")?;
         let marker = serde_json::to_vec(&serde_json::json!({"version":"oxide.outputs.root/2", "checkout":checkout, "checkout_id":id, "checkout_volume_uuid":checkout_uuid, "label":label, "recipe":outputs::RECIPE_PUBLIC, "kind":"external", "volume_uuid":uuid, "nonce":nonce, "generation":generation, "created_ms":1})).map_err(|e| e.to_string())?;
-        fs::write(root.join(outputs::MARKER), &marker).map_err(|e| e.to_string())?;
+        write_fixture_file(&root.join(outputs::MARKER), &marker)?;
         let facts = fs::metadata(&root).map_err(|e| e.to_string())?;
         for member in ["debug", "release"] {
             rows.push(Row {
@@ -305,18 +331,10 @@ fn setup(label: &str, mount: &Path, uuid: &str) -> Result<(), String> {
     let receipt = serde_json::json!({"version":"oxide.outputs.transition/3", "checkout":checkout, "checkout_id":id, "generation":2, "state":"committed", "updated_ms":1, "layout":"profile", "roots":roots, "links":[{"member":"debug","selected":roots[1]},{"member":"release","selected":roots[1]}]});
     let _publication = store::publication_guard(control)?;
     let receipt_path = outputs::receipt_path_public(control, &id);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&receipt_path)
-        .map_err(|e| e.to_string())?;
-    file.write_all(&serde_json::to_vec(&receipt).map_err(|e| e.to_string())?)
-        .and_then(|()| file.sync_all())
-        .map_err(|e| e.to_string())?;
-    File::open(receipt_path.parent().ok_or("receipt parent missing")?)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| e.to_string())?;
+    write_fixture_file(
+        &receipt_path,
+        &serde_json::to_vec(&receipt).map_err(|e| e.to_string())?,
+    )?;
     let mut registry = ready_registry(control)?;
     registry.rows = rows;
     registry.revision += 1;
@@ -446,5 +464,77 @@ pub(super) fn run(args: &[OsString]) -> Result<(), String> {
             Ok(())
         }
         _ => Err("unknown guarded delegation fixture operation".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fixture_construction_passes_real_private_gates_and_preserves_refusals() {
+        use super::*;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        // Tiny owner-private ordinary fixture, no image, engine or process survey.
+        // Retain it under the test runner's selected TMPDIR; never touch old roots.
+        let output = std::process::Command::new("/usr/bin/mktemp")
+            .arg("-d")
+            .arg(std::env::temp_dir().join("delegation-permissions.XXXXXXXX"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let base = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+        let root = create_fixture_root(&base, "valid-old").unwrap();
+        let parent = base.join(outputs::EXTERNAL_DIR);
+        for path in [&parent, &root] {
+            let file = store::open_control_directory(path).unwrap().unwrap();
+            assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o700);
+        }
+        let marker = root.join(outputs::MARKER);
+        write_fixture_file(&marker, b"bounded fixture marker").unwrap();
+        let file = store::private_file(&marker, false).unwrap().unwrap();
+        assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);
+        assert!(write_fixture_file(&marker, b"replacement").is_err());
+        assert_eq!(fs::read(&marker).unwrap(), b"bounded fixture marker");
+
+        // A second world can use the valid container, but never reuse a root.
+        create_fixture_root(&base, "valid-successor").unwrap();
+        assert!(create_fixture_root(&base, "valid-old").is_err());
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(create_fixture_root(&base, "wrong-mode")
+            .unwrap_err()
+            .contains("owner-only"));
+        assert_eq!(fs::metadata(&parent).unwrap().mode() & 0o777, 0o755);
+        assert!(!parent.join("wrong-mode").exists());
+        // Restore only this test's deliberate corruption to exercise later inputs.
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let held_parent = File::open(&parent).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(oxide_storage::volume::dir_at(held_parent.as_fd(), "valid-old", false).is_err());
+        assert!(create_fixture_root(&base, "valid-old").is_err());
+        assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o755);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let held_root =
+            oxide_storage::volume::dir_at(held_parent.as_fd(), "valid-old", false).unwrap();
+        fs::rename(&root, parent.join("retained-old")).unwrap();
+        symlink(parent.join("retained-old"), &root).unwrap();
+        assert!(oxide_storage::volume::dir_at(held_parent.as_fd(), "valid-old", false).is_err());
+        assert!(create_fixture_root(&base, "valid-old").is_err());
+        assert_eq!(
+            fs::File::from(held_root).metadata().unwrap().ino(),
+            fs::metadata(parent.join("retained-old")).unwrap().ino()
+        );
+        fs::write(parent.join("foreign-file"), b"keep").unwrap();
+        assert!(create_fixture_root(&base, "foreign-file").is_err());
+        assert!(create_fixture_root(&base, "../escape").is_err());
+        let linked_mount = base.join("linked-mount");
+        symlink(&base, &linked_mount).unwrap();
+        assert!(create_fixture_root(&linked_mount, "linked").is_err());
+        fs::rename(&parent, base.join("retained-container")).unwrap();
+        symlink(base.join("retained-container"), &parent).unwrap();
+        assert!(create_fixture_root(&base, "linked-container").is_err());
+        assert_eq!(
+            fs::read(base.join("retained-container/foreign-file")).unwrap(),
+            b"keep"
+        );
     }
 }

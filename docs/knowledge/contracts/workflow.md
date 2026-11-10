@@ -6176,9 +6176,21 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
 ## Pruning owned output roots (oxide#129)
 
+The [fixture permissions/time correction](barge-adoption.md#fixture-permissions-and-prospective-time-amendment-oxide304)
+records the failed `ff8c7638` diagnostic (1 completed,19 failed,23 unexecuted),
+its owner-only-directory refusal and later work cutoff. Disposable roots now
+use the real private-directory gate and exclusive private-file construction;
+ordinary filesystem regressions preserve invalid-input refusals. The future
+600s source budget keeps one inherited deadline/30s margin and all disk/case
+limits. Its582.4s failed-path extrapolation is not positive/recovery fit proof.
+Both retained images remain open custody obligations, with no survey, reuse or
+manual cleanup authority. A fresh diagnostic and the counted qualification
+chain remain separately planner-activated after independent readiness.
+
 The focused [integrated delegation apparatus](barge-adoption.md#integrated-delegation-proof-readiness-oxide304)
-uses the ordinary qualified supervisor and separately activated 300 s / 512 MiB
-native selectors. The pinned reviewed Barge054 now supplies deciding checkout-volume absence
+uses the ordinary qualified supervisor and separately activated600s /512MiB
+native selectors (the prospective v19 amendment; all earlier occurrences
+retain their original300s bounds). The pinned reviewed Barge054 now supplies deciding checkout-volume absence
 and replay evidence. The effect-free plan binds its actual exported source,
 lock, installed tools and selected scratch; a ready source plan grants no native,
 installation or live migration credit. Its first integrated diagnostic failed

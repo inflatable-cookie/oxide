@@ -1667,11 +1667,11 @@ run = "python3 scripts/test-outputs-delegation.py --plan"
 
 [tasks."rust:outputs-delegation"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-outputs-delegation.py"
+run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-outputs-delegation.py"
 
 [tasks."rust:outputs-delegation:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-outputs-delegation.py --diagnostic"
+run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- python3 scripts/test-outputs-delegation.py --diagnostic"
 
 # Compile the exact staging feature through normal Oxide admission; no staging
 # or native execution. Default product covering remains unchanged.
