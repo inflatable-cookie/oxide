@@ -6181,7 +6181,13 @@ uses the ordinary qualified supervisor and separately activated 300 s / 512 MiB
 native selectors. The pinned reviewed Barge054 now supplies deciding checkout-volume absence
 and replay evidence. The effect-free plan binds its actual exported source,
 lock, installed tools and selected scratch; a ready source plan grants no native,
-installation or live migration credit.
+installation or live migration credit. Its first integrated diagnostic failed
+before all43 cases because JSON publication called a nonexistent imported
+helper; the [failure and apparatus correction](barge-adoption.md#first-integrated-diagnostic-and-publication-correction-oxide304)
+preserve that spent occurrence and unknown seed result. The source/local-file
+self-check now exercises the real replacement writer and primary/secondary
+failure composition with fake execution boundaries. It starts no engine or
+image and supplies no diagnostic credit.
 
 The approved Barge mechanism-only extension (Tom `63ad6fc4` v2 and explicit
 recovery-format ruling `60a85553` v2) is implemented behind the explicit

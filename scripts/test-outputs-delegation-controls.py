@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""Local apparatus controls only: real JSON writer, fake execution boundaries."""
+import ast
+import inspect
+import io
+import json
+import os
+from pathlib import Path
+import stat
+import tempfile
+from contextlib import ExitStack, redirect_stdout, redirect_stderr
+from unittest.mock import patch
+
+
+def imported_contracts(m):
+    roots={'wrapper':m.wrapper,'prior':m.prior,'fresh':m.fresh,
+           'permanent':m.permanent,'source':m.source,'seed':m.wrapper.offline_seed}
+    calls=set()
+    for node in ast.walk(ast.parse(Path(m.__file__).read_text())):
+        if not isinstance(node,ast.Call):continue
+        parts=[];target=node.func
+        while isinstance(target,ast.Attribute):parts.insert(0,target.attr);target=target.value
+        if not isinstance(target,ast.Name) or target.id not in roots:continue
+        function=roots[target.id]
+        for part in parts:function=getattr(function,part)  # old missing writer fails here
+        assert callable(function),parts
+        assert not any(isinstance(arg,ast.Starred) for arg in node.args)
+        inspect.signature(function).bind(*([None]*len(node.args)),**{k.arg:None for k in node.keywords})
+        calls.add('.'.join([target.id,*parts]))
+    # Runtime receiver methods do not appear as module-qualified AST calls.
+    for cls,name,args,keywords in (
+        (m.wrapper.Proof,'run',[None,[]],{'label':'control','cwd':None,'env':{},'limit':1}),
+        (m.wrapper.Proof,'env',[None,{}],{}),
+        (m.wrapper.Proof,'remaining',[None],{}),
+        (m.wrapper.Proof,'elapsed',[None],{}),
+        (m.prior.ImageCustody,'allocate',[None,'evidence','scratch'],{}),
+        (m.prior.ImageCustody,'attach',[None],{}),
+        (m.wrapper.offline_seed.Anchor,'open_file',[None,('file',)],{}),
+        (m.wrapper.offline_seed.Anchor,'open_dir',[None,('dir',)],{})):
+        inspect.signature(getattr(cls,name)).bind(*args,**keywords)
+    print('imported helper call shapes checked:',len(calls))
+
+
+def publication(m,root):
+    path=root/'partial.json'
+    m.write_json(path,{'cases':[]})
+    assert json.loads(path.read_text())=={'cases':[]}
+    first=path.stat().st_ino
+    m.write_json(path,{'cases':[{'state':'completed'}]})
+    assert json.loads(path.read_text())=={'cases':[{'state':'completed'}]}
+    assert path.stat().st_ino!=first and stat.S_IMODE(path.stat().st_mode)==0o600
+    # Real imported writer's mode and replace failures must propagate.
+    with patch.object(m.fresh.os,'chmod',side_effect=PermissionError('MODE_FAILURE')):
+        try:m.write_json(root/'mode.json',{'bounded':True})
+        except PermissionError as exc:assert str(exc)=='MODE_FAILURE'
+        else:raise AssertionError('mode failure hidden')
+    blocked=root/'directory.json';blocked.mkdir()
+    try:m.write_json(blocked,{'bounded':True})
+    except IsADirectoryError:pass
+    else:raise AssertionError('publication failure hidden')
+    m.fresh.image_document(root,'once.json',{'once':1})
+    try:m.fresh.image_document(root,'once.json',{'once':2})
+    except RuntimeError as exc:assert 'already exists' in str(exc)
+    else:raise AssertionError('create-only custody indication replaced')
+    assert json.loads((root/'once.json').read_text())=={'once':1}
+
+
+def setup_failures(m,root):
+    class Proof:
+        def __init__(self,base):
+            self.root=base;self.evidence=base/'evidence';self.evidence.mkdir()
+            self.deadline_ns=1;self.unclosed=set();self.closure_known=True;self.mount=None
+            self.commands=[]
+        def elapsed(self):return 0.0
+        def run(self,argv,*,label,limit):
+            self.commands.append(label)
+            if label=='stash-identity':return 0,m.plistlib.dumps({'VolumeUUID':m.STASH}).decode(),''
+            assert label in ('resolve-cargo','resolve-rustc'),'real build/child boundary reached'
+            return 0,str(root/label)+'\n',''
+    class Image:
+        state='unallocated'
+        def allocate(self,*args):raise AssertionError('image allocation reached')
+        def attach(self):raise AssertionError('image attach reached')
+    for tool in ('resolve-cargo','resolve-rustc'):(root/tool).write_text('local control, never executed')
+    rustup=root/'rustup';rustup.mkdir()
+    for kind in ('setup','seed','seed-and-provenance','provenance','report','unwritable'):
+        base=root/kind;base.mkdir();proof=Proof(base);events=[]
+        if kind=='seed-and-provenance':(proof.evidence/'delegation-seed.json').mkdir()
+        if kind=='provenance':(proof.evidence/'delegation-seed.json').mkdir()
+        if kind=='report':(proof.evidence/'delegation-report.json').mkdir()
+        if kind=='unwritable':proof.evidence.chmod(0o500)
+        def readiness():
+            events.append('readiness')
+            if kind in ('setup','report'):raise RuntimeError('SETUP_PRIMARY')
+        def archive(repo,destination,head,tree,*,deadline_ns):
+            events.append('archive-fake')
+            (destination/'Cargo.lock').write_text(m.BARGE)
+            return {'local_control_only':True}
+        def seed(host,cargo,lock,*,limits,deadline_ns,provenance):
+            events.append('seed-fake');provenance['local_control_only']=True
+            if kind!='provenance':raise RuntimeError('SEED_PRIMARY')
+            return {'git_sources':[]}
+        out,err=io.StringIO(),io.StringIO()
+        try:
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(m,'source_readiness',readiness))
+                stack.enter_context(patch.object(m.prior,'ImageCustody',side_effect=AssertionError('orchestration replaced its supplied image executor')))
+                stack.enter_context(patch.object(m,'stash_mount',lambda path:base))
+                stack.enter_context(patch.object(m,'host_cache',lambda:base/'never-read-host'))
+                stack.enter_context(patch.object(m.wrapper,'git',lambda proof,*args:'b'*40 if args[-1]=='HEAD^{tree}' else ('a'*40 if args[-1]=='HEAD' else '')))
+                stack.enter_context(patch.object(m.source,'stage_git_tree',archive))
+                stack.enter_context(patch.object(m.wrapper.offline_seed,'seed_cargo_home',seed))
+                stack.enter_context(patch.dict(os.environ,{'RUSTUP_HOME':str(rustup)}))
+                stack.enter_context(redirect_stdout(out));stack.enter_context(redirect_stderr(err))
+                code=m.run_proof(True,proof,Image())  # real orchestration + real publication
+        finally:proof.evidence.chmod(0o700)
+        report=json.loads(out.getvalue())
+        assert code==1 and report['qualified'] is False and report['detach']=='retained'
+        assert len(out.getvalue())<64*1024 and len(report['cases'])==43
+        assert all(row['state']=='unexecuted' for row in report['cases'])
+        assert [row['case'] for row in report['cases']]==list(m.CASES)
+        primary='SETUP_PRIMARY' if kind in ('setup','report') else ('IsADirectoryError' if kind=='provenance' else 'SEED_PRIMARY')
+        assert primary in report['error'],(kind,report)
+        assert not proof.unclosed and proof.closure_known
+        assert not (proof.evidence/'image-custody.json').exists()
+        assert not (proof.evidence/'delegation-stage-inputs.json').exists()
+        if kind in ('report','unwritable'):
+            assert report['report_published'] is False
+            assert any('final report publication' in error for error in report['secondary_errors'])
+            assert 'final report publication' in err.getvalue()
+            assert not (proof.evidence/'delegation-report.json').is_file()
+        else:
+            assert report['report_published'] is True
+            assert json.loads((proof.evidence/'delegation-report.json').read_text())==report
+        if kind in ('seed-and-provenance','unwritable'):
+            assert any('seed provenance publication' in error for error in report['secondary_errors'])
+            assert 'seed provenance publication' in err.getvalue()
+        if kind in ('setup','report'):assert events==['readiness'] and not proof.commands
+        else:assert events==['readiness','archive-fake','seed-fake']
+        if kind=='seed':
+            assert json.loads((proof.evidence/'delegation-seed.json').read_text())=={'local_control_only':True}
+            assert not report['secondary_errors']
+
+
+def stage_contract(m,root):
+    # Traverse the real stage function with synthetic, never-executed tools,
+    # archive, seed and child executors; real publication/hashes stay active.
+    base=root/'stage-contract';base.mkdir();events=[]
+    for name in ('cargo','rustc'):(base/name).write_text('local tool bytes, never executed')
+    rustup=base/'rustup';rustup.mkdir()
+    class Proof:
+        root=base;deadline_ns=1;secondary_errors=[];tool_dirs=str(base)
+        evidence=base/'evidence'
+        def env(self,extra=None):return m.wrapper.Proof.env(self,extra)
+        def run(self,argv,*,label,limit,cwd=None,env=None):
+            events.append(label)
+            if label.startswith('resolve-'):return 0,str(base/label.removeprefix('resolve-'))+'\n',''
+            assert env['RUSTFLAGS']=='' and env['RUSTC_WRAPPER']==''
+            assert 'CARGO_ENCODED_RUSTFLAGS' not in env
+            assert env['RUSTUP_AUTO_INSTALL']=='0' and env['CARGO_NET_OFFLINE']=='true'
+            assert env['HOME']==str(base/'stage-home') and env['CARGO_HOME']==str(base/'stage-cargo')
+            if label.startswith('version-'):
+                index=0 if label=='version-cargo' else 1
+                return 0,m.wrapper.BUILDER_VERSIONS[index],' '
+            assert label=='delegation-stage'
+            assert argv==[str(base/'cargo'),'build','--locked','--offline','--bin','oxide','--features',m.FEATURES]
+            binary=base/'target/debug/oxide';binary.parent.mkdir(parents=True);binary.write_bytes(b'not an executable')
+            return 0,'',''
+    proof=Proof();proof.evidence.mkdir()
+    def archive(repo,destination,head,tree,*,deadline_ns):
+        (destination/'Cargo.lock').write_text(m.BARGE)
+        return {'local_control_only':True}
+    def seed(host,cargo,lock,*,limits,deadline_ns,provenance):
+        assert limits.aggregate_bytes==128*m.MIB
+        provenance['local_control_only']=True
+        return {'git_sources':[{'rev':m.BARGE,'candidates':[{'database':'local-only'}]}]}
+    def checkout(cargo,rev,idents,*,deadline_ns):
+        assert rev==m.BARGE and idents==['local-only'];events.append('checkout-verified-fake');return 'local-only'
+    with ExitStack() as stack:
+        for obj,name,value in ((m.wrapper,'git',lambda proof,*args:'b'*40 if args[-1]=='HEAD^{tree}' else ('a'*40 if args[-1]=='HEAD' else '')),
+            (m.source,'stage_git_tree',archive),(m,'host_cache',lambda:base/'not-read-host'),
+            (m.wrapper.offline_seed,'seed_cargo_home',seed),(m.wrapper.offline_seed,'verify_private_checkout',checkout),
+            (m,'adapter_binding',lambda cache:{'local_control_only':True})):
+            stack.enter_context(patch.object(obj,name,value))
+        stack.enter_context(patch.dict(os.environ,{'RUSTUP_HOME':str(rustup),'CARGO_ENCODED_RUSTFLAGS':'must-be-scrubbed'}))
+        binary,tools,env=m.stage(proof)
+    assert events==['resolve-cargo','resolve-rustc','version-cargo','version-rustc','delegation-stage','checkout-verified-fake']
+    assert binary.read_bytes()==b'not an executable' and tools['cargo']==base/'cargo'
+    inputs=json.loads((proof.evidence/'delegation-stage-inputs.json').read_text())
+    final=json.loads((proof.evidence/'delegation-stage.json').read_text())
+    assert inputs['features']==m.FEATURES and inputs['flags']==final['flags']==''
+    assert final['seed']['git_sources'][0]['rev']==m.BARGE and final['adapter_source']=={'local_control_only':True}
+    assert final['source']=={'local_control_only':True} and len(final['binary_sha256'])==64
+    fixture=base/'fixture';fixture.mkdir()
+    fixture_env=m.fixture_env(proof,fixture,tools,env)
+    assert fixture_env['HOME']==fixture_env['BARGE_ACCOUNT_HOME']==fixture_env['OXIDE_TEST_ACCOUNT_HOME']
+    assert fixture_env['RUSTFLAGS']=='' and 'CARGO_ENCODED_RUSTFLAGS' not in fixture_env
+    assert fixture_env['RUSTUP_AUTO_INSTALL']=='0'
+
+
+def closure_request(m,root):
+    base=root/'closure';base.mkdir()
+    proof=type('Proof',(),{'evidence':base,'closure_known':True,'unclosed':set()})()
+    image=type('Image',(),{'state':'attached','volume_uuid':'FAKE-CONTROL',
+        'device':'/dev/fake-control','mount':'/not-mounted-control','backing':str(base/'never-created')})()
+    for error,known,unclosed in (('PRIMARY',True,set()),(None,False,set()),(None,True,{123})):
+        proof.closure_known=known;proof.unclosed=unclosed
+        disposition,_=m.fresh.request_guard_detach(proof,image,error)
+        assert disposition=='retained' and not (base/'detach-request.json').exists()
+    proof.closure_known=True;proof.unclosed=set()
+    assert m.fresh.request_guard_detach(proof,image,None)==('requested',None)
+    request=json.loads((base/'detach-request.json').read_text())
+    assert request['device']=='/dev/fake-control' and request['backing']==image.backing
+    assert image.state=='attached'  # a request never establishes detach/absence
+    assert not Path(image.backing).exists()
+
+
+def child_contract(m,root):
+    events=[]
+    class Child:
+        pid=123;returncode=0
+        def communicate(self,timeout):events.append('communicate');return b'out',b'err'
+    proof=type('Proof',(),{'unclosed':set(),'mount':None})()
+    scratch=root/'scratch';scratch.mkdir()
+    env={'OXIDE_POOL':str(scratch/'pool'),'OXIDE_SCRATCH_ROOT':str(scratch),'TMPDIR':str(scratch)}
+    out=io.StringIO()
+    with patch.object(m.permanent.subprocess,'Popen',return_value=Child()) as spawn,patch.object(m.permanent,'work_left',return_value=1),redirect_stdout(out):
+        child=m.permanent.start_child(proof,['never-executed'],str(root),env)
+        assert child.pid in proof.unclosed and spawn.call_count==1
+        assert m.permanent.finish_child(proof,child,'local-control')==(0,'out','err')
+    assert not proof.unclosed and events==['communicate']
+    for code in (None,-9):
+        try:m.permanent.require_normal_exit('control',code)
+        except m.permanent.ProofAbort:pass
+        else:raise AssertionError('unknown child exit accepted')
+    try:m.permanent.require_confirmed_closure('control','could not confirm Cargo group')
+    except m.permanent.ProofAbort:pass
+    else:raise AssertionError('unknown writer closure accepted')
+
+
+def check(m):
+    imported_contracts(m)
+    # Standard secure mkdtemp: no child is launched. Leave the owned root and
+    # small failed-publication files as local-control evidence, never old roots.
+    parent=Path(os.environ['TMPDIR']).resolve(strict=True)
+    root=Path(tempfile.mkdtemp(prefix='delegation-controls.',dir=parent))
+    assert root.parent==parent and stat.S_IMODE(root.stat().st_mode)==0o700
+    print('local control root:',root)
+    publication(m,root)
+    setup_failures(m,root)
+    child_contract(m,root)
+    closure_request(m,root)
+    stage_contract(m,root)
+    allocated=m.wrapper.owned_bytes(root);assert allocated<=1024*1024,'local controls exceed1MiB allocation'
+    print('local publication/setup/child controls: OK; allocated bytes',allocated,'; small owned files retained at',root)

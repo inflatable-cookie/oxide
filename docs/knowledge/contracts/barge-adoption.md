@@ -5022,8 +5022,8 @@ No native/image/staging or live upgrade/adoption was run for this source.
 
 #### Integrated delegation proof readiness (oxide#304)
 
-The focused selectors are `proof:outputs-delegation:test` (effect-free
-oracles), `proof:outputs-delegation:plan` (bounded read-only input metadata),
+The focused selectors are `proof:outputs-delegation:test` (source/oracle and bounded local-file
+controls, with no child/engine/seed/image effects), `proof:outputs-delegation:plan` (bounded read-only input metadata),
 `rust:compile:outputs-delegation` (the staging account feature through Oxide),
 and the separately activated heavy `rust:outputs-delegation:diagnostic` and
 `rust:outputs-delegation`. Both heavy selectors use the unchanged qualified
@@ -5176,3 +5176,59 @@ same retained reviewer must judge the complete exact head and author covering;
 merge still requires separately activated integrated diagnostic, counted author,
 distinct reviewer native and final judgment. No installation, live upgrade,
 real grants/registration, adoption, O2/O3 or parent-reader release follows.
+
+
+#### First integrated diagnostic and publication correction (oxide#304)
+
+The single diagnostic at `a355234371472ef664a63aa0fd9f3e94e25b016d`
+failed in setup/report publication. All 43 cases were unexecuted; no case,
+seed/build or image qualification follows. The traceback called missing
+`atomic_write` on the imported prune-image module. The same call in seed-finally
+could mask a seed exception; the old seed result remains unknown. Guard
+`86548b34eac1b883df517d64af056ffa` closed/status1 with positive leader reap,
+no fault/deadline and joined certain empty census. No image identity, custody
+indication or detach request was reached. Guard closure proves process closure
+only. Its ordinary cleanup removed scratch payload; no reconstruction follows.
+
+The retained packet is
+`/Volumes/Stash/scratch/oxide/d53a3b39/diagnostic.LtxrF7oI/packet.json`
+(10509 bytes, SHA256 `20e74385c00778b629dc0307e888a3bd9c650e8509e9470b216c30049ab37811`).
+It retains exact available-file hashes, absent outputs and sampling limits.
+The invalid negative cross-process monotonic subtraction stays invalid;
+guard elapsed and the UTC span are separate observations. This failed occurrence
+is spent, not a successful diagnostic's intentional exit1 or permission to retry.
+
+`write_json` now uses the existing fresh-custody `atomic_write(str, bytes,
+mode=0600)`, whose replacement semantics support partial results. Create-only
+`image_document` retains its separate custody role. Seed exceptions survive
+provenance-write failures; secondary errors are bounded and observable. The
+real orchestration records a primary setup error and all unreached cases in
+a final report. If final publication fails, captured output keeps the primary
+and secondary failures with `report_published:false` and nonzero exit. That
+fallback is explicitly not a published report or native pass.
+
+The existing self-check additionally uses small private local files under the
+selected run TMPDIR (at most1MiB allocated), preserving its no-child/engine/seed/
+image boundary. It tests actual writer round-trip, inode replacement,0600 mode,
+mode/publication refusal, unwritable report and seed/provenance failures.
+Fake archive/seed/child/image executors drive the actual stage and run seams;
+JSON publication, error composition, fixed argv/environment assertions and
+manifest data flow stay real. Synthetic files and tool bytes are labelled and
+never executed. No old diagnostic root is reused or cleaned.
+
+| Imported boundary | Contract/control disposition |
+| --- | --- |
+| Writer/custody documents | Actual replacement writer and create-only refusal are exercised, including their different exception contracts. |
+| Read-only Git/source archive | Bytes/dict signatures and exact-head call shape checked; archive executor is fake locally because real export remains separately activated. |
+| Offline seed/private checkout | Actual call signatures, limits, provenance and candidate-id data flow checked through fake executors; primary/secondary failure controls use real publication. No host cache is copied. |
+| Installed tools/stage child | Fixed argv, tuple return, absolute path, version/flag/private environment and manifest propagation checked with never-executed synthetic tools. Actual runtime fit unmeasured. |
+| Writer children | Actual start/finish wrappers use a fake process handle; tuple/reap bookkeeping and unknown-exit/closure refusals tested without spawning or signalling. |
+| Image/guard closure | Allocate/attach signatures and existing source protocol checked; failed setup cannot reach fake image effects. Actual request helper retains on error/unknown custody; a synthetic request never proves detach. Kernel image/guard closure still needs native evidence. |
+
+The whole apparatus's module-qualified imported call inventory and runtime
+receiver signatures are checked before local controls. The nine native-premise
+mapping above, strict safety predicates, fixed43 cases and300s/512MiB/128MiB/
+30s bounds remain unchanged. These controls establish source readiness only.
+A newly bound diagnostic, counted author, distinct reviewer native and final
+judgment still require prospective planner activation; no execution is activated
+by this correction or its passing plan.

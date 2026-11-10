@@ -4,7 +4,8 @@
 Composition of the qualified shared guard, existing private source/seed builder,
 image custody and direct-child helpers. No new supervisor, reserve sampler,
 cleanup policy, alternate eligibility evaluator or Barge journal parser.
---self-check and --plan have no native/image/staging effects.
+--self-check uses bounded private local files; neither it nor --plan has
+child/engine/seed/image/staging effects.
 """
 from __future__ import annotations
 import fcntl
@@ -76,7 +77,7 @@ def require(value, message):
 
 
 def write_json(path, value):
-    prior.atomic_write(str(path), json.dumps(value, sort_keys=True).encode())
+    fresh.atomic_write(str(path), json.dumps(value, sort_keys=True).encode(), mode=0o600)
 
 
 def last_json(text):
@@ -272,6 +273,27 @@ def source_readiness():
     return result
 
 
+def secondary_error(proof, phase, exc):
+    message=f'{phase}: {type(exc).__name__}: {str(exc)[:600]}'
+    if len(proof.secondary_errors)<8:proof.secondary_errors.append(message)
+    try:print(message,file=sys.stderr,flush=True)
+    except BaseException as error:
+        if len(proof.secondary_errors)<8:proof.secondary_errors.append(f'secondary stderr publication: {type(error).__name__}: {str(error)[:600]}')
+
+
+def seed_inputs(proof, host, cargo, lock):
+    # Preserve the seed exception if its provenance publication also fails.
+    provenance={}
+    try:
+        seed=wrapper.offline_seed.seed_cargo_home(host,cargo,lock,limits=wrapper.offline_seed.Limits(aggregate_bytes=128*MIB),deadline_ns=proof.deadline_ns,provenance=provenance)
+    except BaseException:
+        try:write_json(proof.evidence/'delegation-seed.json',provenance)
+        except BaseException as exc:secondary_error(proof,'seed provenance publication',exc)
+        raise
+    write_json(proof.evidence/'delegation-seed.json',provenance)
+    return seed
+
+
 def stage(proof):
     require(wrapper.sha256_file(HERE/'bounded-test.py') == SUPERVISOR, 'ordinary supervisor bytes changed')
     head = wrapper.git(proof, 'rev-parse', 'HEAD')
@@ -292,11 +314,7 @@ def stage(proof):
     home.mkdir(mode=0o700); cargo.mkdir(mode=0o700)
     host = host_cache()
     # This bounded seeder copies only locked inputs; never changes host caches.
-    seed_provenance={}
-    try:
-        seed = wrapper.offline_seed.seed_cargo_home(host,cargo,lock,limits=wrapper.offline_seed.Limits(aggregate_bytes=128*MIB),deadline_ns=proof.deadline_ns,provenance=seed_provenance)
-    finally:
-        write_json(proof.evidence/'delegation-seed.json',seed_provenance)
+    seed = seed_inputs(proof,host,cargo,lock)
     env = proof.env({'HOME':str(home),'CARGO_HOME':str(cargo),'RUSTUP_HOME':str(rustup_home),
                      'RUSTUP_TOOLCHAIN':wrapper.BUILDER,'RUSTC':str(tools['rustc']),
                      'CARGO_NET_OFFLINE':'true','CARGO_BUILD_JOBS':'6','CARGO_INCREMENTAL':'0',
@@ -811,6 +829,7 @@ def fresh_locked_oracle_check():
 
 def self_check():
     # Counterfactuals exercise orchestration oracles, not product semantics.
+    load('delegation_controls','test-outputs-delegation-controls.py').check(sys.modules[__name__])
     settlement_oracle_check()
     fresh_locked_oracle_check()
     require(len(set(CASES))==len(CASES),'duplicate cases')
@@ -881,8 +900,16 @@ def main(argv):
         except Exception as exc:doc['impediment']=type(exc).__name__+': '+str(exc)[:1200]
         print(json.dumps(doc,indent=2));return 0 if doc['execution_ready'] else 2
     if argv not in ([],['--diagnostic']):raise SystemExit('use --self-check, --plan, --diagnostic or no args')
-    diagnostic=bool(argv);proof=wrapper.Proof();proof.unclosed=set();proof.mount=None
-    rows=[];error=None;image=prior.ImageCustody('Ox304'+secrets.token_hex(4),custody_protocol=True)
+    proof=wrapper.Proof();proof.unclosed=set();proof.mount=None
+    image=prior.ImageCustody('Ox304'+secrets.token_hex(4),custody_protocol=True)
+    return run_proof(bool(argv),proof,image)
+
+
+def run_proof(diagnostic,proof,image):
+    # Shared by native entry and local failure controls; executors are replaced
+    # only by the self-check. Publication and error composition stay real.
+    proof.secondary_errors=[]
+    rows=[];error=None
     disposition='retained'
     try:
         source_readiness()
@@ -912,16 +939,27 @@ def main(argv):
         error=f'{type(exc).__name__}: {str(exc)[:1600]}'
     finally:
         if error is None and any(r['state']!='completed' for r in rows):error='classified oracle failures; failed worlds retained'
-        disposition,detach_error=fresh.request_guard_detach(proof,image,error)
-        error=error or (str(detach_error) if detach_error else None)
+        try:
+            disposition,detach_error=fresh.request_guard_detach(proof,image,error)
+            error=error or (str(detach_error) if detach_error else None)
+        except BaseException as exc:
+            secondary_error(proof,'detach disposition',exc)
+            error=error or f'{type(exc).__name__}: {str(exc)[:1600]}'
         observed={r['case'] for r in rows}
         rows.extend({'case':n,'state':'unexecuted'} for n in CASES if n not in observed)
         report={'version':'oxide.outputs.delegation.proof/1','diagnostic':diagnostic,'qualified':False,
-                'cases':rows,'error':error,'image':image.state,'detach':disposition,
+                'cases':rows,'error':error,'secondary_errors':proof.secondary_errors,
+                'image':image.state,'detach':disposition,'report_published':True,
                 'elapsed_s':proof.elapsed(),'limits':plan_document()['limits']}
-        write_json(proof.evidence/'delegation-report.json',report)
+        try:write_json(proof.evidence/'delegation-report.json',report)
+        except BaseException as exc:
+            secondary_error(proof,'final report publication',exc)
+            error=error or f'{type(exc).__name__}: {str(exc)[:1600]}'
+            report.update(error=error,report_published=False)
+        # A failed final write still leaves bounded primary/secondary facts in
+        # the guard's captured output. Never retry publication or hide failure.
         print(json.dumps(report,indent=2),flush=True)
-    if error or disposition!='requested' or any(r['state']!='completed' for r in rows):return 1
+    if error or proof.secondary_errors or disposition!='requested' or any(r['state']!='completed' for r in rows):return 1
     # Diagnostic is always uncounted/nonzero. Guard closure remains independent.
     return 1 if diagnostic else 0
 
