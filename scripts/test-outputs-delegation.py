@@ -12,6 +12,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import stat
 import subprocess
 import plistlib
 import re
@@ -139,7 +140,7 @@ def binding_document():
     data=SOURCE_BINDING.read_bytes()
     require(len(data)<=32*1024,'source-binding document exceeds bound')
     doc=json.loads(data,object_pairs_hook=unique)
-    require(set(doc)=={'version','published','reviewed','tree','files'},'source-binding fields differ')
+    require(set(doc)=={'version','published','reviewed','tree','files','links'},'source-binding fields differ')
     require(doc['version']=='oxide.outputs.delegation.source/1' and doc['published']==BARGE and doc['reviewed']==BARGE_REVIEWED and doc['tree']==BARGE_TREE,'unreviewed adapter source binding')
     return doc
 
@@ -153,6 +154,17 @@ def verify_source_files(files,reader):
         require(isinstance(digest,str) and re.fullmatch('[0-9a-f]{64}',digest),'invalid bound source digest')
         require(reader(path.parts)==digest,'cached adapter source differs: '+name)
     return {'files':len(files),'manifest_sha256':hashlib.sha256(json.dumps(files,sort_keys=True,separators=(',',':')).encode()).hexdigest()}
+
+
+def verify_source_links(files,links,reader):
+    require(isinstance(links,dict) and len(links)<=8,'invalid source link table')
+    for name,target in links.items():
+        path=Path(name);relative=Path(target)
+        require(name.startswith('crates/barge/src/') and not path.is_absolute() and all(p not in ('.','..') for p in path.parts),'unsafe source link path')
+        require(not relative.is_absolute() and bool(relative.parts) and all(p not in ('.','..') for p in relative.parts),'source link escapes bound files')
+        require(str(path.parent/relative) in files,'source link target is not independently bound')
+        require(reader(path.parts)==target,'published source link changed')
+    return len(links)
 
 
 def adapter_binding(cache_root=None):
@@ -188,7 +200,18 @@ def adapter_binding(cache_root=None):
                         require((info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns)==(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns),'adapter source changed during read')
                         return result.hexdigest()
                     finally:os.close(fd)
+                def link_target(parts):
+                    dfd=anchor.open_dir(prefix+parts[:-1])
+                    try:
+                        before=os.stat(parts[-1],dir_fd=dfd,follow_symlinks=False)
+                        require(stat.S_ISLNK(before.st_mode) and before.st_size<=1024,'published source link has wrong type/bound')
+                        target=os.readlink(parts[-1],dir_fd=dfd)
+                        after=os.stat(parts[-1],dir_fd=dfd,follow_symlinks=False)
+                        require((before.st_dev,before.st_ino,before.st_mtime_ns)==(after.st_dev,after.st_ino,after.st_mtime_ns),'source link changed during observation')
+                        return target
+                    finally:os.close(dfd)
                 verified=verify_source_files(doc['files'],digest)
+                verified['links']=verify_source_links(doc['files'],doc['links'],link_target)
                 matches.append(dict(verified,path=str(cache.joinpath(*prefix)),bytes=used))
     require(len(matches)==1,'expected one exact reviewed adapter source export')
     return dict(matches[0],published=BARGE,reviewed=BARGE_REVIEWED,tree=BARGE_TREE)
@@ -716,6 +739,15 @@ def self_check():
         try:verify_source_files(bad,lambda parts:hashlib.sha256(fake['/'.join(parts)]).hexdigest())
         except OracleFailure:pass
         else:raise AssertionError('unbound adapter source accepted')
+    links={'crates/barge/src/alias.rs':'delete.rs'}
+    verify_source_links(digests,links,lambda parts:'delete.rs')
+    for bad in ('../delete.rs','missing.rs'):
+        try:verify_source_links(digests,{'crates/barge/src/alias.rs':bad},lambda parts:bad)
+        except OracleFailure:pass
+        else:raise AssertionError('escaping/unbound source link accepted')
+    try:verify_source_links(digests,links,lambda parts:'other.rs')
+    except OracleFailure:pass
+    else:raise AssertionError('changed source link accepted')
     binding_document()
     require(plan_document()['fit']['measured'] is False,'unmeasured plan claimed measurement')
     require(sum(plan_document()['fit']['prospective_mib'].values())==BUDGET,'envelope mismatch')

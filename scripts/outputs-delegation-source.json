@@ -13,10 +13,8 @@
     "crates/barge/src/describe.rs": "a643ed61c0e9fffeabcab9e1bb4ad6fc782ed7e2c7ee3ed87e9717ca2437411b",
     "crates/barge/src/diagnostic.rs": "f4a5b5910c03d53124cfcd3a0bd20e9d80195c3164562f19d5222fc79b94cc83",
     "crates/barge/src/digest.rs": "04132ffdb38955e71ded8f7a90c4a00be3b9427245489a2c7e22d64defb1ccf5",
-    "crates/barge/src/effect.rs": "3af2d1610dbfbd91ee933888f5814650aba67b49a593fd343717e4813bc871ba",
     "crates/barge/src/error.rs": "4eb4958ea98520fe23a471da055c8afef0ab8e04925091ef4da5f0f8e131a4eb",
     "crates/barge/src/evidence.rs": "8a3ecea2f62a0fddcd3f2ab13a5bafcec0b6b6b5a478876c64088a8602707002",
-    "crates/barge/src/guard.rs": "94a0180dcec7d32c9f0aab7da15f0882049f8a52ed3ec2f5d73eede29900b62f",
     "crates/barge/src/identity.rs": "d9e67af877efeef437acef40f9716ec652627495996aa144e7b59e226d90f8f9",
     "crates/barge/src/inspect.rs": "88a490b200e9e8917553b1380eaf03a96690678dd35b5b68e6fdf9d6d806fcec",
     "crates/barge/src/lib.rs": "20f986cff8ab830641eed05694eb0c540301dd7f5a078abd57ce7b404484b5e3",
@@ -46,9 +44,13 @@
     "crates/barge/src/tape_cases.rs": "e188ca8f7ca4dd0c162811cad8249833203e5cb4fef77f513d870917e28fa8b3",
     "crates/barge/src/tape_harness.rs": "bc1de117fc2b5be8131ad229a8c1e5f14bd1e9b43f34c742f73dec4cae532845",
     "crates/barge/src/testkit.rs": "d8f4f6952e01189da95bf1212d362bebacc9ccef4e67fa9771450a2f092599e0",
-    "crates/barge/src/undo_capture.rs": "9e992fabd15ba65bca23c2272605f39c2c09a5eea948bbaab8d8edd57e0d114b",
     "crates/barge/src/unit.rs": "cbf4e0ada16672b2911288b8b72318a9fa654d67cc8684429cd9fcce5c662a3f",
     "crates/barge/src/volume.rs": "b7b5b0ff02caa36d3d844de103de6ae4ded02db1261f9895bf041b95c960b09a"
+  },
+  "links": {
+    "crates/barge/src/effect.rs": "space/effect.rs",
+    "crates/barge/src/guard.rs": "space/guard.rs",
+    "crates/barge/src/undo_capture.rs": "cache/undo_capture.rs"
   },
   "published": "63163686d212e6e5a900d6cc2ddfcce65b475890",
   "reviewed": "547fbe99cdc9676b80b58730cf09715c64c5a9cd",

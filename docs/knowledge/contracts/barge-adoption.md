@@ -5128,8 +5128,8 @@ and skipped A15–A18 remain failed history; the fresh accepted session does not
 explain or erase them. All packets retain synthetic-account, bounded-tail,
 sampling and omission limits and provide no integrated Oxide credit.
 
-The effect-free plan verifies the actual lock/rev, 49 exported source/manifest-file
-hashes in `scripts/outputs-delegation-source.json`, qualified supervisor,
+The effect-free plan verifies the actual lock/rev, 49 exported source/manifest bindings (46 regular-file hashes and three
+exact relative links to independently hashed files) in `scripts/outputs-delegation-source.json`, qualified supervisor,
 clean Oxide tree, installed tools and selected Stash UUID. It measures only
 admissible seed metadata, not build/native runtime or peak RSS. A ready plan
 never activates seed, staging, image or native work. The proposed 300 s /
