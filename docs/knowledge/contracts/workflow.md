@@ -4457,6 +4457,14 @@ failure; that occurrence lacked the captured report and phase observations.
 The source-backed avoidance of unused ancestry has a discriminating regression
 for failed/incomplete/non-material results and a positive material-advice
 control; it is not retrospective attribution or erasure of the old failure.
+Changed-input covering at `7b26475b` then passed the complete existing
+`rust:test-600` in 77.0 s, including all three launch-check cases and the
+embedded harness. The fixed 600 s / 512 MiB guard closed0 with no fault or
+deadline, 320 reserve samples (minimum 2298.3 GiB, largest gap 0.257 s) and
+0.5 MiB sampled guard-owned peak; these are samples, not RSS or total shared
+build-pool footprint. The passing wrapper's ordinary cleanup removed its
+temporary roots; the raw command log records those observations. Original
+failed roots, limits and the unattributed old occurrence remain retained.
 
 - **Lifecycle observations (oxide#304).** The bounded test packet retains
   CLI stdout/stderr, outer uptime timestamps and temporary-directory entries
