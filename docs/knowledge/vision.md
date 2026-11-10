@@ -396,6 +396,12 @@ the operating rules.
     denial.
 - **Model routing:** briefs declare task complexity; Queue selects the author
   and reviewer models.
+- **Barge descriptor-listing design** (Tom, 2026-11-10, decision
+  `9e68c8ce-ac61-4190-a31c-b45f99fd6ecd` v2): investigate a bounded shared
+  listing within the existing total descriptor, process and time budgets,
+  through source-only design and independent review. Implementation, capacity
+  changes, native runs, retained-image cleanup, installation and live adoption
+  remain separately gated.
 - **Still need Tom's scoped approval:**
   - host installs beyond the planner's receipt-matched `oxide` reinstall;
   - releases, tags and workflow changes;
