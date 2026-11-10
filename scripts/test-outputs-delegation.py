@@ -217,6 +217,13 @@ def adapter_binding(cache_root=None):
     return dict(matches[0],published=BARGE,reviewed=BARGE_REVIEWED,tree=BARGE_TREE)
 
 
+def stash_mount(scratch):
+    mount=Path('/Volumes/Stash').resolve(strict=True)
+    owned=mount/'scratch/oxide'
+    require(scratch.is_relative_to(owned) and scratch!=owned and scratch.stat().st_dev==mount.stat().st_dev,'scratch is not on the owned Stash subtree')
+    return mount
+
+
 def source_readiness():
     result={'adapter':adapter_binding(),'supervisor_sha256':wrapper.sha256_file(HERE/'bounded-test.py')}
     require(result['supervisor_sha256']==SUPERVISOR,'ordinary supervisor differs')
@@ -228,7 +235,8 @@ def source_readiness():
     scratch=Path(os.environ['TMPDIR']).resolve(strict=True)
     info=scratch.stat()
     require(str(scratch)==os.environ['TMPDIR'] and scratch.is_dir() and info.st_uid==os.getuid(),'selected scratch not canonical/owned')
-    probe=subprocess.run(['/usr/sbin/diskutil','info','-plist',str(scratch)],capture_output=True,timeout=10,check=True)
+    probe=subprocess.run(['/usr/sbin/diskutil','info','-plist',str(stash_mount(scratch))],capture_output=True,timeout=10)
+    require(probe.returncode==0,'Stash diskutil info refused: '+probe.stderr.decode(errors='replace')[-600:])
     volume=plistlib.loads(probe.stdout)
     require(volume.get('VolumeUUID','').upper()==STASH,'selected scratch is not the approved Stash UUID')
     result['scratch']={'path':str(scratch),'volume_uuid':STASH,'point_in_time_only':True}
@@ -795,7 +803,7 @@ def main(argv):
         source_readiness()
         # Selected scratch is verified by the real kernel before any backing
         # allocation. Neither quiet host nor task completion grants activation.
-        code,out,err=proof.run(['/usr/sbin/diskutil','info','-plist',str(proof.root)],label='stash-identity',limit=10)
+        code,out,err=proof.run(['/usr/sbin/diskutil','info','-plist',str(stash_mount(proof.root))],label='stash-identity',limit=10)
         import plistlib
         require(code==0 and plistlib.loads(out.encode()).get('VolumeUUID','').upper()==STASH,'scratch is not the approved Stash volume')
         binary,tools,env=stage(proof)
