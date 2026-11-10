@@ -2747,11 +2747,19 @@ fn ledger_view_keeps_status_refusals_and_non_gating_gaps() {
         .expect("missing held root is still a member");
     assert_eq!(held.state, SlotOccupancy::Held);
     assert_eq!(held.lease_id.as_deref(), Some(missing.lease_id.as_str()));
-    // Reuse still needs its own walk complete.
-    let refused = with_accounting_limits(10, 64, 5_000, || {
+    // Normal warm reuse is root-bound and does not recursively account the
+    // payload. The same low walk bound must still make measured status
+    // incomplete; the passive ledger view must not turn that into admission.
+    let warm = with_accounting_limits(10, 64, 5_000, || {
         lease_injected(request(&gaps, &deep_project, &workspace, "p2"))
-    });
-    assert_eq!(incomplete(refused).coverage, AccountingCoverage::Partial);
+    })
+    .expect("normal warm reuse ignores descendant accounting gaps");
+    assert!(warm.reused_slot);
+    assert_eq!(warm.slot_id, deep.slot_id);
+    release_injected(&gaps, &warm.lease_id).expect("release warm");
+    let after = with_accounting_limits(10, 64, 5_000, || status_injected(&gaps))
+        .expect("measured status remains readable");
+    assert_eq!(after.coverage, AccountingCoverage::Unknown);
 }
 
 /// A foreign pool entry refuses both before any slot is read.

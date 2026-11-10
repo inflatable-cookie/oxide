@@ -1,1 +1,1 @@
-Updated the Barge library pin to the reviewed outputs adapter with exact recovery binding and proposed crash-safe caller persistence for independent review. Integrated Oxide deletion remains unimplemented and unqualified.
+Updated the Barge library pin to the reviewed outputs adapter with exact recovery binding and proposed crash-safe caller persistence for independent review. Corrected the ledger-view regression to distinguish incomplete measured accounting from Normal warm-reuse admission. Integrated Oxide deletion remains unimplemented and unqualified.
