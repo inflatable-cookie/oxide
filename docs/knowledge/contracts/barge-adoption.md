@@ -3751,10 +3751,9 @@ file sync before exclusive rename and directory sync, and exact SHA-256 reads.
 Partials and orphans are counted and never removed or replaced. Its read-open
 creates nothing, and all errors remain errors rather than absence facts.
 The writer requires the caller's publication custody. It deliberately does
-not parse a sidecar, choose a route, migrate a registry or call Barge. No
-deletion command publishes a request yet; the explicit upgrade and strict
-metadata reader are implemented, while the caller connection remains to be
-completed against the now-published Barge#053 API. Ordinary unit coverage of this layer is not integrated proof or
+not parse a sidecar or grant deletion authority. The caller's strict metadata
+reader and journal writer now use it: request publication precedes the atomic
+intent-and-route image. Ordinary source coverage is not integrated proof or
 production adoption credit.
 
 The independent registry validator recognizes schema 3 with the exact route
@@ -3762,8 +3761,10 @@ field sets published in Barge PR #53 at `9a91199b545de7b71ca8c1609d564e5aac57ea8
 It rejects null/missing/duplicate/extra routes and malformed hashes, including
 routes missing for terminal intents. Historical schemas reject the new field.
 The reviewed published pin now supplies this wire. The ordinary registry
-read path validates Barge sidecars and explicitly refuses schema 3 before
-legacy replay or exclusion release until the new-format connection is complete.
+read path validates Barge sidecars before replay or exclusion decisions.
+Paired `/4` readers require the same ready transaction and internal schema3
+registry, including through private per-control views. Missing fence/state
+or an incomplete upgrade is never reconstructed or downgraded.
 
 #### Choice and reader boundary
 
@@ -4960,10 +4961,11 @@ unreadable registry, unfinished predecessor intent, conflicting transaction
 or impossible paired ordering refuses. Numeric owned-output state floor
 remains 4; higher unrelated fences remain intact. No host upgrade was run.
 
-The new readers remain deliberately gated before ordinary replay or
-exclusion release while caller integration is incomplete. Source regressions
-exercise the five paired crash images and failed registry publication;
-these are source tests, not native crash proof.
+The connected readers reject partial paired readiness and missing or corrupt
+metadata before ordinary replay or exclusion decisions. Private per-control
+views retain the pair identity in memory, without new durable fields. Source
+regressions exercise five paired crash images, missing state and failed
+registry publication; these are not native crash proof.
 
 Barge053 is now published at merge
 `4069398b5dd576635e38acc221a94f580b9e23c5`, reviewed head
@@ -4973,3 +4975,46 @@ reviewer A1–A16 fixtures in comment6766022020. The corrected reader/route and
 absence-only API is the current pin. Prior051/052 packets retain their own
 source and limits. These synthetic-account adapter fixtures provide no
 integrated Oxide caller, production-account or live-adoption credit.
+
+#### Connected caller and recovery source (oxide#304)
+
+Delegation starts only after the explicit `/4` + registry3 upgrade. Historical
+schema1/2 and `/3` retain their existing local meaning. In the upgraded store,
+the complete existing candidate/group checks and exact `/2` marker image
+choose the Barge route; selected, legacy, receiptless, local and known
+superseded-generation classes retain their existing handling. Unregistered,
+non-expendable or undeclared authority does not turn a Barge candidate local.
+Preview records the deleter and a bounded per-root unavailable reason, with
+no execute or upgrade. The real call reads the original grant once before
+publication custody, persists ready or tagged-unavailable metadata, and
+publishes intent plus route together. It drops publication before Barge,
+retaining the checkout barrier and binding. Unavailable/unknown keeps pending
+with exit3 and a recovery line naming operation and root.
+
+`prune_barge.rs` calls the pinned adapter, checked four-state lookup and
+absence-only API. Recovery takes its route before inspecting local phases;
+local quarantine, deletion and rollback also refuse Barge routes directly.
+Pending lookup replays the same request and checks the returned Barge id;
+terminal settlement confirms that id and positively absent original/local
+and matching Barge leaves. Caller ids never stand in for Barge ids.
+A refused or rolled-back adapter reply needs positive absence and original
+identity before Oxide rollback. Only the first immediately published call
+may use KnownNoEffectLocked without that lookup; the privilege is consumed
+before the call, including a lost reply. Resumed Locked remains pending.
+Both resolve prechecks require terminal or positively absent Barge state;
+terminal lookup additionally requires the actual Barge quarantine absent.
+Missing/corrupt metadata refuses without journal changes.
+
+Barge alone handles rename and partial deletion. Oxide retains its group,
+receipt preimage and writer/absence checks, then uses the existing terminal,
+receipt image and receipt-settled ordering. A failed receipt stays
+recoverable; a durable Oxide terminal record completes only its remaining
+receipt work. Route compaction follows intent compaction; request files
+remain retained, including after rollback and settlement. No Barge journal
+is read or rewritten by Oxide.
+
+Default calls use Barge's production AccountFacts and account state path.
+Only the existing guarded debug proof context can supply its fixture state
+path; the linked proof-account feature is off by default. Synthetic-account
+and native integrated qualification remain separate from source regressions.
+No native/image/staging or live upgrade/adoption was run for this source.

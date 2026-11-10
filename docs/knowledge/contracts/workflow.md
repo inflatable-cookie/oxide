@@ -6144,6 +6144,19 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
 ## Pruning owned output roots (oxide#129)
 
+The approved Barge mechanism-only extension (Tom `63ad6fc4` v2 and explicit
+recovery-format ruling `60a85553` v2) is implemented behind the explicit
+`oxide outputs upgrade-recovery` transition to paired `/4` and registry3.
+Its [owning protocol](barge-adoption.md#connected-caller-and-recovery-source-oxide304)
+keeps Oxide eligibility, exclusion and group/receipt settlement while Barge
+alone deletes covered roots. Immutable request metadata and a mandatory
+route survive crashes; unavailable/unknown keeps pending, with no local
+fallback. Historical formats and uncovered classes retain the local protocol
+below. Source implementation and covering do not establish integrated fixture
+qualification, production-account lookup, installation or live adoption;
+the separately activated Elevated proof sequence and merge hold remain.
+
+
 **Bounded-batch qualification (oxide#256, 2026-11-03).** Source `afa28a9d`
 passed the pure dispatcher controls, the uncounted diagnostic and the counted
 author and distinct reviewer sessions: all 22 native cases completed, with

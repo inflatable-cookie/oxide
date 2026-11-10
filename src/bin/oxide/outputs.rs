@@ -120,6 +120,7 @@ usage: oxide outputs plan      effect-free JSON plan for this checkout (oxide.ou
        oxide outputs status    read-only state of this checkout's owned outputs
        oxide outputs prune     explicitly prune roots whose checkout is gone
        oxide outputs resolve-intent ID  settle one pending prune intent
+       oxide outputs upgrade-recovery  explicitly upgrade paired recovery metadata
 
 Permanent drive mode owns one `<checkout>/target` symlink. Its real root is
 <mount>/oxide-outputs/<project>-<checkout id>/ while the registered volume is
@@ -1587,7 +1588,7 @@ pub fn run(args: &[OsString]) -> Result<u8, String> {
         .collect::<Result<_, _>>()?;
     match args.as_slice() {
         ["plan"] => plan_command(),
-        ["prune", ..] | ["resolve-intent", ..] => crate::prune::run(
+        ["prune", ..] | ["resolve-intent", ..] | ["upgrade-recovery", ..] => crate::prune::run(
             &args
                 .iter()
                 .map(|arg| OsString::from(*arg))
@@ -8604,6 +8605,12 @@ pub(crate) fn receipt_is_pruning(receipt: &Receipt) -> bool {
 }
 
 fn read_marker(root: &Path) -> Result<Marker, String> {
+    read_marker_image_for_prune(root).map(|(marker, _)| marker)
+}
+
+/// One validated marker and the digest of those same bytes. The delegation
+/// classifier must never combine a parsed marker with a different read's SHA.
+pub(crate) fn read_marker_image_for_prune(root: &Path) -> Result<(Marker, String), String> {
     let path = root.join(MARKER);
     #[cfg(not(test))]
     let metadata = fs::symlink_metadata(&path)
@@ -8644,7 +8651,7 @@ fn read_marker(root: &Path) -> Result<Marker, String> {
     marker
         .validate()
         .map_err(|reason| format!("{} is invalid ({reason})", path.display()))?;
-    Ok(marker)
+    Ok((marker, crate::prune::sha256_hex(&bytes)))
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -9445,6 +9452,12 @@ mod tests {
 
     /// P5: the pinned receipt preimage is a SHA-256 digest and nothing else.
     /// These are pure string-shape assertions and touch no file system.
+    #[test]
+    fn recovery_upgrade_is_reachable_through_the_real_outputs_dispatcher() {
+        let args = [OsString::from("upgrade-recovery"), OsString::from("--help")];
+        assert_eq!(run(&args).unwrap(), 0);
+    }
+
     #[test]
     fn migration_receipt_digest_is_strictly_sha256() {
         assert!(is_receipt_digest(&"a".repeat(64)));

@@ -12,7 +12,7 @@ const VERSION: &str = "oxide.outputs.prune-delegation/1";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
-enum Metadata {
+pub(super) enum Metadata {
     Ready {
         version: String,
         caller_intent_id: String,
@@ -102,7 +102,54 @@ impl Metadata {
     }
 }
 
-fn original_claim(intent: &Intent) -> LiveIntent {
+pub(super) fn bounded_reason(reason: &str) -> String {
+    let mut reason = reason.to_owned();
+    while reason.len() > 1024 {
+        reason.pop();
+    }
+    if reason.is_empty() {
+        reason.push_str("Barge authority unavailable");
+    }
+    reason
+}
+
+pub(super) fn encode(intent: &Intent, authority: &Result<u64, String>) -> Result<Vec<u8>, String> {
+    let metadata = match authority {
+        Ok(generation) => Metadata::Ready {
+            version: VERSION.to_owned(),
+            caller_intent_id: intent.id.clone(),
+            identity: intent.identity.clone(),
+            preview_sha256: intent.preview_sha256.clone(),
+            grant_generation: *generation,
+            caller_request_digest: DelegatedRequest {
+                grant_generation: *generation,
+                request_sha256: None,
+            }
+            .digest(&original_claim(intent))
+            .map_err(|error| error.to_string())?,
+        },
+        Err(reason) => Metadata::Unavailable {
+            version: VERSION.to_owned(),
+            caller_intent_id: intent.id.clone(),
+            identity: intent.identity.clone(),
+            preview_sha256: intent.preview_sha256.clone(),
+            reason: bounded_reason(reason),
+        },
+    };
+    metadata.validate(intent)?;
+    serde_json::to_vec(&metadata).map_err(|error| error.to_string())
+}
+
+pub(super) fn load(control: &Path, intent: &Intent, sha: &str) -> Result<Metadata, String> {
+    let _authority = super::AuthorityScope::join_or_begin()?;
+    let fd = crate::store::open_control_directory(control)?
+        .ok_or("the delegated control is absent; keep pending")?;
+    let outputs = super::open_directory_at(fd.as_fd(), c"outputs")
+        .map_err(|error| format!("cannot open delegated outputs: {error}"))?;
+    read(outputs.as_fd(), intent, sha)
+}
+
+pub(super) fn original_claim(intent: &Intent) -> LiveIntent {
     let identity = &intent.identity;
     LiveIntent {
         id: intent.id.clone(),
@@ -132,7 +179,11 @@ fn decode(bytes: &[u8], intent: &Intent) -> Result<Metadata, String> {
     Ok(metadata)
 }
 
-fn read(outputs: BorrowedFd<'_>, intent: &Intent, sha: &str) -> Result<Metadata, String> {
+pub(super) fn read(
+    outputs: BorrowedFd<'_>,
+    intent: &Intent,
+    sha: &str,
+) -> Result<Metadata, String> {
     let store = RequestStore::open(outputs, false).map_err(|error| error.to_string())?;
     let bytes = store
         .read_with(&intent.id, sha, |reader, bytes| {
@@ -146,6 +197,7 @@ pub(super) fn validate_registry_requests(
     control: &Path,
     registry: &Registry,
 ) -> Result<(), String> {
+    let _authority = super::AuthorityScope::join_or_begin()?;
     let routes = registry
         .deletion_routes
         .as_ref()

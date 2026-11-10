@@ -1379,6 +1379,9 @@ pub struct Store {
     /// registered: the host-wide limit counts both pools and a checkout's
     /// clean barrier spans both.
     sibling: Option<Sibling>,
+    /// In-memory pair identity retained by private per-control views. It is
+    /// not control-state data and confers no custody or migration authority.
+    output_controls: Option<(PathBuf, Option<PathBuf>)>,
 }
 
 /// The other pool of a registered pair.
@@ -2086,6 +2089,7 @@ impl Store {
             recorded_budget: view.cap_bytes,
             max_active,
             sibling: None,
+            output_controls: None,
         };
         store.ensure_control()?;
         Ok(store)
@@ -2231,6 +2235,7 @@ impl Store {
             recorded_budget: snapshot.cap_bytes,
             max_active: settings.active_build_limit.value,
             sibling: None,
+            output_controls: None,
         })
     }
 
@@ -2255,6 +2260,7 @@ impl Store {
             recorded_budget: snapshot.cap_bytes,
             max_active,
             sibling: None,
+            output_controls: None,
         })
     }
 
@@ -2289,6 +2295,7 @@ impl Store {
             recorded_budget: view.cap_bytes,
             max_active: settings.active_build_limit.value,
             sibling: None,
+            output_controls: None,
         })
     }
 
@@ -2710,6 +2717,7 @@ impl Store {
                 recorded_budget: self.recorded_budget,
                 max_active: self.max_active,
                 sibling: None,
+                output_controls: None,
             };
             store.ensure_control()?;
             let _admission = store.admission()?;
@@ -2895,6 +2903,12 @@ impl Store {
                 transaction: recorded,
                 ..
             }) => {
+                if internal_state.owned_outputs.as_deref() == Some(DELEGATED_OUTPUTS_FENCE) {
+                    // load() already proved paired /4 readiness and the exact
+                    // schema3 image. This path validates; it never downgrades.
+                    create(&recorded, false)?;
+                    return Ok(true);
+                }
                 if internal_state.owned_outputs.as_deref() != Some(OWNED_OUTPUTS_FENCE) {
                     // The published whole-target fence is upgraded to the
                     // successor only with positive writer closure across both
@@ -3179,6 +3193,25 @@ impl Store {
         Ok(())
     }
 
+    fn recovery_controls(&self) -> (PathBuf, Option<PathBuf>) {
+        if let Some(context) = &self.output_controls {
+            return context.clone();
+        }
+        let owner = self.owner_control().to_path_buf();
+        let peer = self
+            .sibling
+            .as_ref()
+            .map(|sibling| {
+                if owner == self.control {
+                    sibling.control.clone()
+                } else {
+                    self.control.clone()
+                }
+            })
+            .filter(|control| control != &owner);
+        (owner, peer)
+    }
+
     fn view(&self, control: &Path) -> Store {
         Store {
             pool: self.pool.clone(),
@@ -3189,6 +3222,7 @@ impl Store {
             recorded_budget: self.recorded_budget,
             max_active: self.max_active,
             sibling: None,
+            output_controls: Some(self.recovery_controls()),
         }
     }
 
@@ -3205,6 +3239,7 @@ impl Store {
             recorded_budget: 1,
             max_active: 2,
             sibling: None,
+            output_controls: None,
         };
         store.ensure_control().unwrap();
         store
@@ -3230,6 +3265,7 @@ impl Store {
             budget: self.budget,
             recorded_budget: self.recorded_budget,
             max_active: self.max_active,
+            output_controls: self.output_controls.clone(),
             sibling: self.sibling.as_ref().map(|sibling| Sibling {
                 control: sibling.control.clone(),
                 barrier: sibling.barrier,
@@ -5602,10 +5638,30 @@ impl Store {
 
     fn load(&self) -> Result<State, String> {
         let state = self.load_recovery_upgrade()?;
-        // Until the real delegated caller/recovery is connected, every /4
-        // command stays fenced, including a partially completed upgrade.
+        if state.owned_outputs.is_none() {
+            let (owner, _) = self.recovery_controls();
+            crate::prune::refuse_delegated_without_fence(&owner)?;
+        }
         if state.owned_outputs.as_deref() == Some(DELEGATED_OUTPUTS_FENCE) {
-            return Err("delegated recovery is not yet connected; resume the explicit recovery upgrade and keep pending".to_owned());
+            let Some(OutputsInit::Ready { transaction, .. }) = &state.outputs_init else {
+                return Err(
+                    "output recovery upgrade is incomplete; resume oxide outputs upgrade-recovery"
+                        .to_owned(),
+                );
+            };
+            let (owner, peer) = self.recovery_controls();
+            for control in std::iter::once(&owner).chain(peer.as_ref()) {
+                if control == &self.control {
+                    continue;
+                }
+                let paired = self.view(control).load_recovery_upgrade()?;
+                if paired.owned_outputs.as_deref() != Some(DELEGATED_OUTPUTS_FENCE)
+                    || !matches!(&paired.outputs_init, Some(OutputsInit::Ready { transaction: other, .. }) if other == transaction)
+                {
+                    return Err("the paired output recovery upgrade is incomplete; resume oxide outputs upgrade-recovery".to_owned());
+                }
+            }
+            crate::prune::recovery_format_ready(&owner, transaction)?;
         }
         Ok(state)
     }
@@ -5644,9 +5700,13 @@ impl Store {
         // fields and object caps first; an oversized legacy field refuses
         // with the original file untouched.
         if state.owned_outputs.as_deref() != Some(DELEGATED_OUTPUTS_FENCE) {
-            if let Some(sibling) = &self.sibling {
+            let (owner, peer) = self.recovery_controls();
+            for control in std::iter::once(&owner).chain(peer.as_ref()) {
+                if control == &self.control {
+                    continue;
+                }
                 if self
-                    .view(&sibling.control)
+                    .view(control)
                     .load_recovery_upgrade()?
                     .owned_outputs
                     .as_deref()
@@ -7766,7 +7826,7 @@ pub(crate) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    fn paired_controls(label: &str) -> (PathBuf, Store, Store) {
+    pub(crate) fn paired_controls(label: &str) -> (PathBuf, Store, Store) {
         let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
@@ -7786,6 +7846,7 @@ pub(crate) mod tests {
             recorded_budget: 1,
             max_active: 2,
             sibling: None,
+            output_controls: None,
         };
         let (internal, removable) = (store("internal"), store("removable"));
         for side in [&internal, &removable] {
@@ -8424,6 +8485,7 @@ pub(crate) mod tests {
             recorded_budget: 1 << 30,
             max_active: 16,
             sibling: None,
+            output_controls: None,
         };
         store.ensure_control().unwrap();
         let checkout = root.join("checkout");
@@ -9459,6 +9521,7 @@ pub(crate) mod tests {
             recorded_budget: 1 << 30,
             max_active: 16,
             sibling: None,
+            output_controls: None,
         };
         store.ensure_control().unwrap();
         let checkout = root.join("checkout");
@@ -10131,6 +10194,7 @@ pub(crate) mod tests {
             recorded_budget: 1 << 30,
             max_active: 16,
             sibling: None,
+            output_controls: None,
         };
         store.ensure_control().unwrap();
         let checkout = fs::canonicalize(&root).unwrap().join("checkout");
@@ -10222,6 +10286,7 @@ pub(crate) mod tests {
             recorded_budget: 1 << 30,
             max_active: 16,
             sibling: None,
+            output_controls: None,
         };
         store.ensure_control().unwrap();
         let checkout = fs::canonicalize(&root).unwrap().join("checkout");
@@ -11154,6 +11219,7 @@ pub(crate) mod tests {
             recorded_budget: 1 << 30,
             max_active: 1,
             sibling: None,
+            output_controls: None,
         };
         let slot = ledger_slot("1", "1", Some("oxide-abcd/quick-1"));
         let store_id = "a".repeat(32);
@@ -11387,6 +11453,7 @@ pub(crate) mod tests {
             recorded_budget: 1 << 30,
             max_active: 1,
             sibling: None,
+            output_controls: None,
         };
         let slot = ledger_slot("1", "1", Some("oxide-abcd/quick-1"));
         store
@@ -11558,6 +11625,7 @@ pub(crate) mod tests {
             recorded_budget: budget,
             max_active: 16,
             sibling: None,
+            output_controls: None,
         };
         store.ensure_control().unwrap();
         let checkout = root.join("checkout");
@@ -13289,6 +13357,7 @@ pub(crate) mod tests {
                 recorded_budget: 1 << 30,
                 max_active: 16,
                 sibling: None,
+                output_controls: None,
             };
             store.ensure_control().unwrap();
             let checkout = root.join("checkout");
@@ -13502,6 +13571,7 @@ pub(crate) mod tests {
             recorded_budget: 1 << 30,
             max_active: 16,
             sibling: None,
+            output_controls: None,
         };
         store.ensure_control().unwrap();
         let checkout = root.join("checkout");

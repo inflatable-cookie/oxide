@@ -293,7 +293,13 @@ code and non-macOS/Linux platforms.
 
 ## Q-021 — How should Oxide's output roots move to Barge?
 
-Open, with a proposed design: [Barge adoption](contracts/barge-adoption.md). The proposal uses Barge's Rust library at a pinned commit, declares `oxide/outputs` only, switches the release prune through a single deleter, keeps the 91 legacy roots Oxide-side unless Tom rules otherwise, and adds no guard call in F6. Barge-side gaps (no release effect verb, `maintain` acting on declared age policies, no release-only policy kind) need the Barge delegate's ruling first. Operator choices: Builds `root_dir`, outputs reserve participation, release from maintain, the 91 legacy roots, parity differences D-1/D-2, pool-slot ownership, declaration authority, and whether to run the read-only census first.
+Open for full adoption: [Barge adoption](contracts/barge-adoption.md). The original proposal uses Barge's Rust library at a pinned commit, declares `oxide/outputs` only, switches the release prune through a single deleter, keeps the 91 legacy roots Oxide-side unless Tom rules otherwise, and adds no guard call in F6. Its original Barge-side gaps included the release effect verb, maintain policy and release-only policy kind; the scoped adapter and reader work below now has separate approved source and proof records. Broader operator choices included: Builds `root_dir`, outputs reserve participation, release from maintain, the 91 legacy roots, parity differences D-1/D-2, pool-slot ownership, declaration authority, and whether to run the read-only census first.
+
+The approved mechanism-only source slice and explicit recovery-format upgrade
+are described in the [connected caller contract](contracts/barge-adoption.md#connected-caller-and-recovery-source-oxide304).
+They do not qualify the full O2/O3 comparison, production account lookup or
+live adoption; the integrated Elevated proof gates remain separate.
+
 
 
 ## Q-022 — Can a held zombie establish its group's lifetime?
