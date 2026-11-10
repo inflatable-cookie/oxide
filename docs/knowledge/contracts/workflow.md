@@ -6144,6 +6144,13 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
 ## Pruning owned output roots (oxide#129)
 
+The focused [integrated delegation apparatus](barge-adoption.md#integrated-delegation-proof-readiness-oxide304)
+uses the ordinary qualified supervisor and separately activated 300 s / 512 MiB
+native selectors. The current plan explicitly refuses execution for the pinned
+adapter's missing deciding checkout-volume absence support. Its effect-free
+self-check and input plan grant no native,
+installation or live migration credit.
+
 The approved Barge mechanism-only extension (Tom `63ad6fc4` v2 and explicit
 recovery-format ruling `60a85553` v2) is implemented behind the explicit
 `oxide outputs upgrade-recovery` transition to paired `/4` and registry3.

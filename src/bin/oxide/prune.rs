@@ -41,6 +41,9 @@ use std::time::{Duration, Instant};
 
 #[path = "prune_barge.rs"]
 mod delegation;
+#[cfg(debug_assertions)]
+#[path = "prune_delegation_fixture.rs"]
+mod delegation_fixture;
 #[path = "prune_request.rs"]
 mod request;
 
@@ -444,6 +447,13 @@ struct ObservedRoot {
 /// incomplete reports exit 3. Errors are therefore mapped here instead of
 /// reaching the front door's generic exit 1.
 pub fn run(args: &[std::ffi::OsString]) -> Result<u8, String> {
+    #[cfg(debug_assertions)]
+    if args
+        .first()
+        .is_some_and(|arg| arg == "__delegation-fixture")
+    {
+        return delegation_fixture::run(&args[1..]).map(|()| 0);
+    }
     let args: Vec<&str> = match args
         .iter()
         .map(|arg| arg.to_str().ok_or("arguments must be valid UTF-8"))
@@ -1169,7 +1179,9 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
     require_registry(control)?;
     let mut registry = ready_registry(control)?;
     registry.validate()?;
-    if receipt.layout() == outputs::LayoutKind::Profile {
+    if receipt.layout() == outputs::LayoutKind::Profile
+        && registry.version == LEGACY_REGISTRY_VERSION
+    {
         registry.version = REGISTRY_VERSION.to_owned();
         registry.schema = REGISTRY_SCHEMA;
     }
@@ -2384,6 +2396,20 @@ impl Preview {
 }
 
 /// `oxide outputs prune --plan FILE --plan-sha256 HEX`
+/// A strict raw image can identify durable exclusion even when original
+/// metadata cannot authenticate. This diagnostic never changes that image.
+fn readiness_refusal(control: &Path, reason: &str) -> u8 {
+    if let Ok(Some(image)) = read_registry_image(control) {
+        if let Some(intent) = image
+            .unfinished_intents()
+            .find(|intent| delegation::route(&image, &intent.id).is_some())
+        {
+            return unsettled(control,&format!("operation {} for {} cannot authenticate its original Barge metadata: {reason}; keep pending and inspect this operation before recovery",intent.id,intent.identity.root.display()));
+        }
+    }
+    refused(reason)
+}
+
 fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, String> {
     if !hex64(sha) {
         return Ok(refused(
@@ -2423,7 +2449,9 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
     let control = store.owner_control().to_path_buf();
     let mut registry = match require_ready(&store, &control) {
         Ok(registry) => registry,
-        Err(reason) => return Ok(refused(&reason)),
+        Err(reason) => {
+            return Ok(readiness_refusal(&control, &reason));
+        }
     };
     if !registry.complete {
         return Ok(refused(
@@ -6446,6 +6474,65 @@ fn update_intent(control: &Path, id: &str, phase: IntentPhase) -> Result<(), Str
     write_registry(control, &registry)
 }
 
+/// Source-bound upgrade interruption seam, under the same proof guard.
+pub(crate) fn recovery_upgrade_pause(
+    control: &Path,
+    transaction: &str,
+    phase: &str,
+) -> Result<(), String> {
+    #[cfg(debug_assertions)]
+    if std::env::var("OXIDE_TEST_RECOVERY_UPGRADE_PHASE").as_deref() == Ok(phase)
+        && prune_fixture_fault(
+            control,
+            "OXIDE_TEST_RECOVERY_UPGRADE_PAUSE",
+            control,
+            &format!("upgrade-{phase}-{transaction}"),
+        )
+    {
+        let evidence = proof_evidence().ok_or("proof evidence missing")?;
+        let stop = Instant::now() + Duration::from_secs(5);
+        while !evidence
+            .join(format!("upgrade-release-{transaction}"))
+            .exists()
+        {
+            if Instant::now() >= stop {
+                return Err("bounded upgrade pause expired".into());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    let _ = (control, transaction, phase);
+    Ok(())
+}
+
+/// Guarded interruption seam: a parent observes the real durable image before
+/// terminating its own child. It grants no effect or recovery authority.
+fn delegation_pause(control: &Path, intent: &Intent, phase: &str) -> Result<(), String> {
+    #[cfg(debug_assertions)]
+    if std::env::var("OXIDE_TEST_BARGE_OXIDE_PHASE").as_deref() == Ok(phase)
+        && prune_fixture_fault(
+            control,
+            "OXIDE_TEST_BARGE_OXIDE_PAUSE",
+            &intent.identity.root,
+            &format!("oxide-{phase}-{}", intent.id),
+        )
+    {
+        let evidence = proof_evidence().ok_or("proof evidence missing")?;
+        let stop = Instant::now() + Duration::from_secs(5);
+        while !evidence
+            .join(format!("oxide-phase-release-{}", intent.id))
+            .exists()
+        {
+            if Instant::now() >= stop {
+                return Err("bounded Oxide durable-point pause expired".into());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    let _ = (control, intent, phase);
+    Ok(())
+}
+
 fn crash_point(point: &str) -> Result<(), String> {
     #[cfg(debug_assertions)]
     if std::env::var(CRASH_ENVIRONMENT).is_ok_and(|value| value == point) {
@@ -7200,6 +7287,7 @@ fn journal_intent_with_route(
             "operation {id} for {}: original request publication is uncertain ({error}); retain metadata and inspect before recovery",
             candidate.root.display()
         )))?;
+        delegation_pause(control, &intent, "request").map_err(Stop::Pending)?;
         crash_point("delegation-request").map_err(Stop::Pending)?;
         DeletionRoute::Barge {
             intent_id: id.to_owned(),
@@ -7303,6 +7391,13 @@ fn complete_intent(_store: &Store, control: &Path, id: &str, outcome: &str) -> R
             }
             registry.bump().map_err(Stop::Refuse)?;
             write_registry(control, &registry).map_err(Stop::Refuse)?;
+        }
+    }
+    #[cfg(debug_assertions)]
+    if std::env::var("OXIDE_TEST_BARGE_OXIDE_PHASE").as_deref() == Ok("terminal") {
+        let registry = ready_registry(control).map_err(Stop::Pending)?;
+        if let Some(intent) = registry.intent(id) {
+            delegation_pause(control, intent, "terminal").map_err(Stop::Pending)?;
         }
     }
     crash_point("terminal").map_err(Stop::Pending)?;
@@ -7446,6 +7541,7 @@ fn settle_receipt(control: &Path, id: &str, outcome: &str) -> Result<(), String>
         // pre-settlement meaning.
         crash_point("terminal-image")?;
     }
+    delegation_pause(control, &intent, "receipt")?;
     {
         let _guard = store::publication_guard(control)?;
         let mut registry = ready_registry(control)?;
@@ -10001,6 +10097,12 @@ mod tests {
         assert!(text(&request::bounded_reason(&"☃".repeat(1000))));
     }
 
+    #[test]
+    #[cfg(debug_assertions)]
+    fn delegation_fixture_refuses_without_qualified_guard() {
+        assert!(delegation_fixture::run(&[]).is_err());
+    }
+
     fn delegated_group_fixture() -> (Fixture, PathBuf, Store, Candidate) {
         let fixture = Fixture::new();
         let root = fixture.root.join("oxide-outputs").join("owned");
@@ -10065,6 +10167,36 @@ mod tests {
         candidate.deleter = Some("barge".to_owned());
         let store = Store::for_tests(&fixture.root.join("pool"));
         (fixture, control, store, candidate)
+    }
+
+    #[test]
+    fn profile_receipt_writer_preserves_the_explicit_successor_format() {
+        let (_fixture, control, _store, candidate) = delegated_group_fixture();
+        let receipt =
+            outputs::read_receipt_for_prune(&control, &candidate.checkout, &candidate.checkout_id)
+                .unwrap()
+                .unwrap();
+        note_receipt(&control, &receipt).unwrap();
+        let registry = ready_registry(&control).unwrap();
+        assert_eq!(registry.version, DELEGATED_REGISTRY_VERSION);
+        assert_eq!(registry.schema, 3);
+        assert!(registry.deletion_routes.as_ref().is_some_and(Vec::is_empty));
+    }
+
+    #[test]
+    fn unreadable_original_request_is_pending_without_mutating_exclusion() {
+        let (fixture, mut registry) = routed_registry();
+        let control = fixture.root.clone();
+        let id = registry.intents[0].id.clone();
+        registry.deletion_routes = Some(vec![DeletionRoute::Barge {
+            intent_id: id,
+            request_sha256: "f".repeat(64),
+        }]);
+        write_registry(&control, &registry).unwrap();
+        let before = fs::read(registry_path(&control)).unwrap();
+        assert!(ready_registry(&control).is_err());
+        assert_eq!(readiness_refusal(&control, "missing original request"), 3);
+        assert_eq!(fs::read(registry_path(&control)).unwrap(), before);
     }
 
     #[test]

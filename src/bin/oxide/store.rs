@@ -2848,11 +2848,21 @@ impl Store {
                     started_ms: process::now_ms(),
                 });
                 side.save(state)?;
+                crate::prune::recovery_upgrade_pause(
+                    &control,
+                    &transaction,
+                    if side.control == control {
+                        "internal-fence"
+                    } else {
+                        "paired-fence"
+                    },
+                )?;
             }
         }
         // Both /4 fences are synced before the atomic schema-3 image. On a
         // failure leave every fence/initializer in place; the same call resumes.
         registry(&transaction, true)?;
+        crate::prune::recovery_upgrade_pause(&control, &transaction, "registry")?;
         for (side, state) in
             std::iter::once((&internal, &mut first)).chain(sibling.as_ref().zip(second.as_mut()))
         {
@@ -2862,6 +2872,15 @@ impl Store {
                     ready_ms: process::now_ms(),
                 });
                 side.save(state)?;
+                crate::prune::recovery_upgrade_pause(
+                    &control,
+                    &transaction,
+                    if side.control == control {
+                        "internal-ready"
+                    } else {
+                        "paired-ready"
+                    },
+                )?;
             }
         }
         Ok(())

@@ -32,11 +32,13 @@ cache (checksum `ba62675e8242a4c4e806d12f11d136e626e6c8361d6b829310732241652a178
 
 Since oxide#219 the package also depends on Barge's library at one full
 40-hex commit. Oxide#304 updates it to
-`594494061b18bef4821ab19723f4adfff6119d51` (the merged PR #52 commit,
-including the outputs adapter and checked recovery binding; see the
+`4069398b5dd576635e38acc221a94f580b9e23c5` (the merged PR #53 commit,
+including the checked outputs adapter, registry3 routes and `/4` readers; see the
 [joint protocol](contracts/barge-adoption.md#joint-protocol-for-barge-output-deletion-oxide303-design)).
 The dependency is feature-off, so
-`proof-synthetic-account` is not enabled. `Cargo.lock` gains only the `barge`
+`proof-synthetic-account` is not enabled by default. The focused integrated
+fixture staging and its named compile selector explicitly enable that feature
+under the existing proof guard; they qualify no production account lookup. `Cargo.lock` gains only the `barge`
 package; its `serde`, `serde_json` and `libc` are already pinned. Offline builds
 take the locked Barge source from the bounded seeder, as they do for Longhorn.
 

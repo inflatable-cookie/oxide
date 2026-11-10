@@ -5018,3 +5018,90 @@ Only the existing guarded debug proof context can supply its fixture state
 path; the linked proof-account feature is off by default. Synthetic-account
 and native integrated qualification remain separate from source regressions.
 No native/image/staging or live upgrade/adoption was run for this source.
+
+
+#### Integrated delegation proof readiness (oxide#304)
+
+The focused selectors are `proof:outputs-delegation:test` (effect-free
+oracles), `proof:outputs-delegation:plan` (bounded read-only input metadata),
+`rust:compile:outputs-delegation` (the staging account feature through Oxide),
+and the separately activated heavy `rust:outputs-delegation:diagnostic` and
+`rust:outputs-delegation`. Both heavy selectors use the unchanged qualified
+`fcfda2b0…` supervisor, one 128 MiB owners-on APFS image, 300 s / 512 MiB and a
+30 s work-stop margin. Declaring these selectors activates no native run.
+
+The fixed script composes existing source-archive verification, the bounded
+lock seeder, child runner and image-custody primitives. It stages the exact
+clean tree inside the guard with installed Rust 1.97.1, locked/offline Cargo,
+private HOME/CARGO_HOME and explicit `barge/proof-synthetic-account`. Before
+fixture writes, the debug fixture entry requires Oxide and Barge account
+paths to agree inside that guard, checks its private backing declaration,
+and binds the image's kernel UUID. Ordinary calls keep the feature off.
+Stage inputs, tool/binary/lock/source hashes, partial outputs and bounded
+per-case failures are retained. There is no Barge journal parser: fixture
+observations use Barge's typed public reader; only fixture fault cases move
+an owned journal directory aside, unchanged, to model lost state.
+
+Case bodies exercise the real commands and default adapter, including grouped
+delete/settlement, selected roots, identity and grant refusals, unavailable
+previews versus pending real calls, actual held writers and busy custody
+admission in each pool, competing adopt/Barge locks, lost/malformed replies,
+first/resumed Locked, both replay entry points, replacement/lost state,
+resolve refusals, immutable metadata failures and generic host release.
+Transparent debug descriptor wrappers pause real effects after the actual
+Barge intent, rename sync or first unlink. Parent-owned children are observed
+at that durable point and positively reaped after interruption. Additional
+pauses cover original-request publication, Oxide intent/terminal/receipt
+settlement and the five paired-upgrade publication boundaries. A history
+receipt whose current successor is unchanged takes the existing no-rewrite
+settlement branch; that observation is not a claim of publishing another
+receipt image. No source test or final-row match earns native credit.
+
+All nine workflow premises are applied in the executable preparation and
+environments and listed by the plan. Genuine Nucleus admission remains
+inherited. Image custody is published before backing creation; detach is
+requested only after known child closure, then the independent guard must
+prove ordinary detach/reap and whole-backing absence. Unknown child, writer
+or image custody aborts and retains resources. Diagnostic continuation is
+limited to classified oracle failures after child closure; failed worlds
+remain retained. Missing or incomplete final reports fail.
+
+The proposed allocations are 128 MiB seed, 160 MiB source/target, 128 MiB
+image, 32 MiB fixtures/evidence and 64 MiB margin. Read-only cache metadata
+found about 35.8 MiB of admissible candidates plus registry inputs; a roughly
+2.73 GiB candidate is skipped by the existing seeder before copying. These
+are source-readiness observations, not measured staging, native runtime or
+peak RSS. The 45/170/55/30 s source+seed/build/cases/closure allocation is
+prospective. Actual native fit and every integrated outcome remain unproved
+until the separately planner-activated diagnostic and counted sessions.
+
+Two caller corrections accompany this readiness work: profile receipt writes
+preserve registry3 after upgrade, and an authenticated raw pending Barge route
+with unreadable original metadata reports exit3 with operation/root while
+leaving exclusion unchanged. Neither path repairs metadata, chooses a current
+replacement grant or falls back to local deletion.
+
+
+**Current executable prerequisite: deciding checkout-volume absence.** Source
+inspection of published Barge `4069398b…` found that `oxide_outputs.rs`
+1275–1283 calls `prove_checkout_absent` without a checkout-volume identity.
+At 1304–1321, any mount-parent prefix is an unconditional `UnknownState`;
+only the boot-data branch can prove absence. Its `OxideIntentIdentity` has no
+checkout-volume field. Although the `/2` marker carries
+`checkout_volume_uuid`, the deciding adapter call does not use it. Thus the
+approved all-Stash fixture cannot produce positive actual adapter deletion
+or replay. This finding does not invalidate or extend PR53's original A1–A16
+synthetic-account evidence.
+
+Retained reviewer `571ea642-ef37-4c64-b30b-b44bae3739dc` confirmed this exact
+source conflict in Nucleus answer
+`bea8c7e7ce76f9f1a5c556233ad0536848b0c37145ffefe7cd8d5736e390c5d2`:
+request a linked Barge correction using the verified digest-bound marker's
+checkout volume for deciding F2 and replay; preserve strict Oxide intent/1
+and conservative unknown. The correction needs actual adapter/replay
+observations for matching, missing, mismatched and changed volume facts.
+No boot-volume substitution, alternate evaluator, journal parsing or guessed
+API is a workaround. The proof plan now reports `execution_ready: false`,
+with a named refusal before staging or backing creation. Source preparation
+is retained on the same task/PR; qualification waits for reviewed published
+Barge code and evidence, followed by this task's separate activation gates.

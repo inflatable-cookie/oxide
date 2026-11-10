@@ -1587,6 +1587,10 @@ pub fn run(args: &[OsString]) -> Result<u8, String> {
         .map(|arg| arg.to_str().ok_or("arguments must be valid UTF-8"))
         .collect::<Result<_, _>>()?;
     match args.as_slice() {
+        #[cfg(debug_assertions)]
+        ["__delegation-fixture", ..] => {
+            crate::prune::run(&args.iter().map(OsString::from).collect::<Vec<_>>())
+        }
         ["plan"] => plan_command(),
         ["prune", ..] | ["resolve-intent", ..] | ["upgrade-recovery", ..] => crate::prune::run(
             &args

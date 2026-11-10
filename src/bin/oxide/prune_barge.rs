@@ -1,5 +1,8 @@
 //! Covered-root handoff. Oxide owns eligibility and settlement; only Barge
 //! executes or replays deletion. No branch here opens a local quarantine.
+#[cfg(debug_assertions)]
+#[path = "prune_barge_observed.rs"]
+mod observed;
 use super::{
     request, Candidate, DeletionRoute, Intent, IntentPhase, Registry, Resumed, RootKind,
     RootSession, Store,
@@ -60,7 +63,7 @@ pub(super) fn covered(registry: &Registry, candidate: &Candidate) -> Result<bool
     Ok(marker.generation() == candidate.generation)
 }
 
-fn state_paths() -> Result<StatePaths, String> {
+pub(super) fn state_paths() -> Result<StatePaths, String> {
     let os = barge::os::platform();
     // Reuse the existing debug proof guard. Ordinary builds ignore fixture
     // path overrides; the linked Barge proof-account feature has its own
@@ -196,9 +199,20 @@ fn execute(_control: &Path, intent: &Intent, request: &DelegatedRequest) -> Outc
     };
     let os = barge::os::platform();
     let claim = request::original_claim(intent);
+    #[cfg(debug_assertions)]
+    let observed = observed::ObservedDirs {
+        inner: &os,
+        control: _control,
+        intent,
+        renamed: std::cell::Cell::new(false),
+    };
+    #[cfg(debug_assertions)]
+    let dirs: &dyn barge::os::DirOps = &observed;
+    #[cfg(not(debug_assertions))]
+    let dirs: &dyn barge::os::DirOps = &os;
     let outcome = oxide_outputs::execute(&AdapterCall {
         state_paths: &paths,
-        dirs: &os,
+        dirs,
         facts: &os,
         mounts: &os,
         observer: &os,
@@ -212,7 +226,7 @@ fn execute(_control: &Path, intent: &Intent, request: &DelegatedRequest) -> Outc
         _control,
         "OXIDE_TEST_BARGE_LOST_REPLY",
         &intent.identity.root,
-        "barge-reply-lost",
+        &format!("barge-reply-lost-{}", intent.id),
     ) {
         return Outcome {
             kind: OutcomeKind::Unknown,
@@ -226,7 +240,7 @@ fn execute(_control: &Path, intent: &Intent, request: &DelegatedRequest) -> Outc
         _control,
         "OXIDE_TEST_BARGE_MALFORMED_REPLY",
         &intent.identity.root,
-        "barge-reply-malformed",
+        &format!("barge-reply-malformed-{}", intent.id),
     ) {
         return Outcome {
             caller_intent_id: "malformed".to_owned(),
@@ -472,11 +486,14 @@ fn call(
         control,
         "OXIDE_TEST_BARGE_BEFORE_CALL",
         &intent.identity.root,
-        "barge-before-call",
+        &format!("barge-before-call-{}", intent.id),
     ) {
         let evidence = super::proof_evidence().ok_or("proof evidence unavailable")?;
         let stop = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !evidence.join("barge-call-release").exists() {
+        while !evidence
+            .join(format!("barge-call-release-{}", intent.id))
+            .exists()
+        {
             if std::time::Instant::now() >= stop {
                 return Err("bounded adapter-call fixture pause expired".to_owned());
             }

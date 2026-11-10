@@ -1656,3 +1656,24 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 [tasks."proof:warm-reuse"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-warm-reuse.py"
+
+# 304: source-only apparatus checks and effect-free readiness. Native selectors
+# remain separately planner-activated; declaring them grants no activation.
+[tasks."proof:outputs-delegation:test"]
+run = "python3 scripts/test-outputs-delegation.py --self-check"
+
+[tasks."proof:outputs-delegation:plan"]
+run = "python3 scripts/test-outputs-delegation.py --plan"
+
+[tasks."rust:outputs-delegation"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-outputs-delegation.py"
+
+[tasks."rust:outputs-delegation:diagnostic"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-outputs-delegation.py --diagnostic"
+
+# Compile the exact staging feature through normal Oxide admission; no staging
+# or native execution. Default product covering remains unchanged.
+[tasks."rust:compile:outputs-delegation"]
+run = "oxide check --bin oxide --locked --features barge/proof-synthetic-account"
