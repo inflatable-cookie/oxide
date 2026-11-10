@@ -396,6 +396,15 @@ the operating rules.
     denial.
 - **Model routing:** briefs declare task complexity; Queue selects the author
   and reviewer models.
+- **Shared recovery simplicity** (Tom, 2026-11-10, decision
+  `1d4a7aee-a8e6-4a75-96f0-b142c4176db2` v2): Oxide and Barge must both
+  become simpler and dependable as integrations grow. Investigate one
+  Barge-owned operation journal with durable caller hooks before extending
+  the two-journal integration. The source-only design and independent review
+  must identify machinery removed from both products and preserve admission,
+  crash recovery and safe repeated finalization. The architecture remains a
+  proposal; implementation, migration and deployment need a subsequent scoped
+  disposition. Existing work and evidence stay preserved.
 - **Barge descriptor-listing design** (Tom, 2026-11-10, decision
   `9e68c8ce-ac61-4190-a31c-b45f99fd6ecd` v2): investigate a bounded shared
   listing within the existing total descriptor, process and time budgets,
