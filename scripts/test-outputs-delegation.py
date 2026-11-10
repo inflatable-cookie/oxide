@@ -12,6 +12,8 @@ import hashlib
 import importlib.util
 import json
 import os
+import subprocess
+import plistlib
 import re
 from pathlib import Path
 import secrets
@@ -22,14 +24,15 @@ sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 SUPERVISOR = 'fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b'
-BARGE = '4069398b5dd576635e38acc221a94f580b9e23c5'
+BARGE = '63163686d212e6e5a900d6cc2ddfcce65b475890'
+BARGE_REVIEWED = '547fbe99cdc9676b80b58730cf09715c64c5a9cd'
+BARGE_TREE = '8a3b368e7883be862fe8319bb34e9f987e38731b'
 STASH = '8A660440-C919-45C6-A3F1-3365B9BD2006'
 SECONDS, MIB, BUDGET = 300, 1024 * 1024, 512
 FEATURES = 'barge/proof-synthetic-account'
-# Source-verified and retained-reviewer-confirmed prerequisite at this exact pin.
-# Change only after the linked reviewed/published adapter correction is supplied.
-ADAPTER_CHECKOUT_VOLUME_SUPPORTED = False
-ADAPTER_IMPEDIMENT = ('Barge '+BARGE+' oxide_outputs.rs:1304-1321 refuses all mount-parent checkout paths at deciding F2; the approved owned Stash fixture cannot establish positive deletion or replay. Linked Barge correction required; no boot-volume substitution.')
+# Support is established from the published source export, lock and actual
+# cached bytes below. No task-completion notice or boolean forces readiness.
+SOURCE_BINDING = HERE / 'outputs-delegation-source.json'
 # Every name has an executable body below. No native credit from self-checks.
 CASES = (
     'positive-group', 'generic-release', 'selected', 'marker-nonce',
@@ -38,7 +41,7 @@ CASES = (
     'lost-reply', 'malformed-reply', 'fresh-locked', 'resumed-locked',
     'intent-replay-oxide', 'intent-replay-barge', 'rename-replay-oxide',
     'partial-replay-barge', 'terminal-before-receipt', 'receipt-before-settled',
-    'root-replaced', 'missing-barge-after-rename', 'resolve-pending',
+    'root-replaced', 'checkout-ancestor-replaced', 'missing-barge-after-rename', 'resolve-pending',
     'resolve-quarantine-original-absent', 'metadata-missing', 'metadata-corrupt',
     'metadata-swapped', 'adoption-race', 'internal-held-writer',
     'removable-held-writer', 'internal-unknown-custody', 'removable-unknown-custody',
@@ -99,7 +102,7 @@ def native_phase(doc, phase):
 def fixture_env(proof, root, tools, stage_env):
     # Preserve the genuine inherited Nucleus hook; scrub product/tool overrides.
     env = proof.env()
-    env = {k:v for k,v in env.items() if not k.startswith(('BARGE_', 'CARGO_', 'RUSTUP_'))}
+    env = {k:v for k,v in env.items() if not k.startswith(('BARGE_', 'CARGO_', 'RUSTUP_', 'GIT_'))}
     home, cargo, state, scratch = [root / name for name in ('home','cargo-home','barge-state','scratch-pools')]
     for path in (home, cargo, state, scratch):
         path.mkdir(mode=0o700)
@@ -110,7 +113,7 @@ def fixture_env(proof, root, tools, stage_env):
                CARGO_NET_OFFLINE='true', CARGO_BUILD_JOBS='2', RUSTUP_AUTO_INSTALL='0',
                RUSTUP_HOME=stage_env['RUSTUP_HOME'], RUSTUP_TOOLCHAIN=wrapper.BUILDER,
                RUSTC=str(tools['rustc']), CARGO=str(tools['cargo']),
-               RUSTFLAGS='', RUSTC_WRAPPER='', CARGO_INCREMENTAL='0')
+               RUSTFLAGS='', RUSTC_WRAPPER='', CARGO_INCREMENTAL='0',CARGO_PROFILE_DEV_DEBUG='0')
     return env
 
 
@@ -124,6 +127,97 @@ def host_cache():
     if registry.name!='registry' or git.name!='git' or registry.parent!=git.parent:
         raise RuntimeError('registry and Git caches do not share one canonical source')
     return registry.parent
+
+
+def binding_document():
+    def unique(pairs):
+        result={}
+        for key,value in pairs:
+            if key in result:raise OracleFailure('duplicate source-binding key')
+            result[key]=value
+        return result
+    data=SOURCE_BINDING.read_bytes()
+    require(len(data)<=32*1024,'source-binding document exceeds bound')
+    doc=json.loads(data,object_pairs_hook=unique)
+    require(set(doc)=={'version','published','reviewed','tree','files'},'source-binding fields differ')
+    require(doc['version']=='oxide.outputs.delegation.source/1' and doc['published']==BARGE and doc['reviewed']==BARGE_REVIEWED and doc['tree']==BARGE_TREE,'unreviewed adapter source binding')
+    return doc
+
+
+def verify_source_files(files,reader):
+    required={'Cargo.toml','crates/barge/Cargo.toml',*('crates/barge/src/'+name for name in ('oxide_outputs.rs','delete.rs','evidence.rs','reference.rs','state.rs'))}
+    require(isinstance(files,dict) and required<=set(files) and len(files)<=128,'source binding omits deciding/replay source')
+    for name,digest in sorted(files.items()):
+        path=Path(name)
+        require(not path.is_absolute() and all(p not in ('','.','..') for p in path.parts) and (name in ('Cargo.toml','crates/barge/Cargo.toml') or name.startswith('crates/barge/src/')),'unsafe bound source path')
+        require(isinstance(digest,str) and re.fullmatch('[0-9a-f]{64}',digest),'invalid bound source digest')
+        require(reader(path.parts)==digest,'cached adapter source differs: '+name)
+    return {'files':len(files),'manifest_sha256':hashlib.sha256(json.dumps(files,sort_keys=True,separators=(',',':')).encode()).hexdigest()}
+
+
+def adapter_binding(cache_root=None):
+    doc=binding_document()
+    seed=wrapper.offline_seed
+    budget=seed.Budget(seed.Limits(work_seconds=10))
+    _,packages=seed.parse_lock_packages((REPO/'Cargo.lock').read_text(),budget)
+    barge=[p for p in packages if p['name']=='barge']
+    require(len(barge)==1 and barge[0]['rev']==BARGE,'Cargo.lock does not bind the reviewed adapter')
+    require(re.search(r'^barge = .*rev = "'+BARGE+r'"',(REPO/'Cargo.toml').read_text(),re.M),'manifest pin differs')
+    cache=cache_root or host_cache()
+    matches=[]
+    with seed.Anchor(cache,'adapter source export') as anchor:
+        for namespace in seed._list_names(anchor,('git','checkouts'),budget,'adapter checkout namespaces'):
+            if not re.fullmatch(r'barge-[0-9a-f]{16}',namespace):continue
+            base=('git','checkouts',namespace)
+            for revision in seed._list_names(anchor,base,budget,'adapter revisions'):
+                if not re.fullmatch(re.escape(BARGE[:7])+r'(?:-[0-9]+)?',revision):continue
+                prefix=base+(revision,)
+                used=0
+                def digest(parts):
+                    nonlocal used
+                    fd,info=anchor.open_file(prefix+parts)
+                    try:
+                        require(info.st_size<=4*MIB and used+info.st_size<=16*MIB,'adapter export exceeds read bound')
+                        used+=info.st_size;result=hashlib.sha256();remaining=info.st_size
+                        while remaining:
+                            budget.check('adapter source digest')
+                            data=os.read(fd,min(65536,remaining));require(bool(data),'adapter source shortened')
+                            result.update(data);remaining-=len(data)
+                        require(not os.read(fd,1),'adapter source grew')
+                        after=os.fstat(fd)
+                        require((info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns)==(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns),'adapter source changed during read')
+                        return result.hexdigest()
+                    finally:os.close(fd)
+                verified=verify_source_files(doc['files'],digest)
+                matches.append(dict(verified,path=str(cache.joinpath(*prefix)),bytes=used))
+    require(len(matches)==1,'expected one exact reviewed adapter source export')
+    return dict(matches[0],published=BARGE,reviewed=BARGE_REVIEWED,tree=BARGE_TREE)
+
+
+def source_readiness():
+    result={'adapter':adapter_binding(),'supervisor_sha256':wrapper.sha256_file(HERE/'bounded-test.py')}
+    require(result['supervisor_sha256']==SUPERVISOR,'ordinary supervisor differs')
+    result['head']=source.git_output(REPO,'rev-parse','HEAD').decode().strip()
+    result['tree']=source.git_output(REPO,'rev-parse','HEAD^{tree}').decode().strip()
+    result['clean']=not source.git_output(REPO,'status','--porcelain').strip()
+    require(result['clean'],'source plan requires a clean published tree')
+    require(sys.platform=='darwin','native apparatus requires macOS')
+    scratch=Path(os.environ['TMPDIR']).resolve(strict=True)
+    info=scratch.stat()
+    require(str(scratch)==os.environ['TMPDIR'] and scratch.is_dir() and info.st_uid==os.getuid(),'selected scratch not canonical/owned')
+    probe=subprocess.run(['/usr/sbin/diskutil','info','-plist',str(scratch)],capture_output=True,timeout=10,check=True)
+    volume=plistlib.loads(probe.stdout)
+    require(volume.get('VolumeUUID','').upper()==STASH,'selected scratch is not the approved Stash UUID')
+    result['scratch']={'path':str(scratch),'volume_uuid':STASH,'point_in_time_only':True}
+    env=dict(os.environ,RUSTUP_AUTO_INSTALL='0')
+    result['toolchain']={}
+    for tool in ('cargo','rustc'):
+        probe=subprocess.run(['rustup','which','--toolchain',wrapper.BUILDER,tool],env=env,capture_output=True,timeout=10,check=True)
+        path=Path(probe.stdout.decode().strip()).resolve(strict=True)
+        require(path.is_file(),'required installed tool absent')
+        result['toolchain'][tool]=str(path)
+    result['limits']='source and installed-input observations only; no seed, staging, image or native outcome; no activation or reservation'
+    return result
 
 
 def stage(proof):
@@ -156,7 +250,7 @@ def stage(proof):
                      'CARGO_NET_OFFLINE':'true','CARGO_BUILD_JOBS':'6','CARGO_INCREMENTAL':'0',
                      'CARGO_PROFILE_DEV_DEBUG':'0','RUSTFLAGS':'','RUSTC_WRAPPER':'',
                      'CARGO_TARGET_DIR':str(proof.root/'target')})
-    env = {k:v for k,v in env.items() if not k.startswith('BARGE_')}
+    env = {k:v for k,v in env.items() if not k.startswith(('BARGE_','GIT_'))}
     versions=[]
     for tool in ('cargo','rustc'):
         code,out,err = proof.run([str(tools[tool]),'--version'],env=env,label='version-'+tool,limit=10)
@@ -175,7 +269,7 @@ def stage(proof):
                 'tools':{k:{'path':str(v),'sha256':wrapper.sha256_file(v)} for k,v in tools.items()},
                 'versions':versions,'features':FEATURES,'argv':argv,'flags':'','seed':seed,
                 'supervisor':SUPERVISOR,'proof_sha256':wrapper.sha256_file(Path(__file__)),
-                'manifest_sha256':wrapper.sha256_file(REPO/'effigy.toml')}
+                'manifest_sha256':wrapper.sha256_file(REPO/'effigy.toml'),'adapter_source':adapter_binding(cargo)}
     write_json(proof.evidence/'delegation-stage.json',provenance)
     return binary, tools, env
 
@@ -191,7 +285,9 @@ class World:
         self.env=fixture_env(proof,self.base,tools,stage_env)
         self.data=self.helper('setup',hashlib.sha256(name.encode()).hexdigest()[:12],image.mount,image.volume_uuid)
         self.root=Path(self.data['root']); self.successor=Path(self.data['successor'])
-        self.control=Path(self.data['control']); self.checkout=Path(self.data['checkout'])
+        self.control=Path(self.data['control']); self.peer=Path(self.data['peer_control']); self.checkout=Path(self.data['checkout'])
+        self.env['OXIDE_TEST_BARGE_RECORD_REPLY']=str(self.root)
+        self.reply_records=set()
         if not name.startswith('upgrade-'):
             self.invoke(['outputs','upgrade-recovery'],expect=0,label='upgrade')
         self.plan_path=self.base/'presented.json'
@@ -203,8 +299,22 @@ class World:
         code,out,err=result
         permanent.require_confirmed_closure(label,err)
         permanent.require_normal_exit(label,code)
-        if expect is not None: require(code == expect,f'{label}: exit {code}: {err[-1200:]}')
+        self.check_replies()
+        if expect is not None and code!=expect:raise RuntimeError(f'{label}: unexpected exit {code}: {err[-1200:]}')
         return result
+
+    def check_replies(self):
+        if not hasattr(self,'reply_records'):return
+        for path in self.proof.evidence.glob('barge-actual-reply-*.json'):
+            if path in self.reply_records:continue
+            value=json.loads(path.read_text())
+            if value.get('root')!=str(self.root):continue
+            self.reply_records.add(path)
+            kind=value.get('kind');reason=str(value.get('reason') or '').lower()
+            if any(word in reason for word in ('writer','descriptor','custody','process observation')) and kind not in ('Deleted','KnownNoEffectLocked'):
+                raise RuntimeError('actual writer/custody uncertainty; retain and abort: '+str(value)[:2400])
+            if kind in ('Unknown','Pending') and self.name!='root-replaced':
+                raise RuntimeError('unexpected actual adapter uncertainty; retain and abort: '+str(value)[:2400])
 
     def helper(self,*args):
         _,out,_=self.invoke(['outputs','__delegation-fixture',*args],expect=0,label='fixture-'+str(args[0]))
@@ -243,8 +353,16 @@ class World:
         rows=[r for r in doc['oxide']['rows'] if r['root']==str(self.root)]
         require(len(rows)==2 and all(r.get('pruned_ms') is not None and not r.get('pruning') for r in rows),'whole group not settled')
         require(not list(self.root.parent.glob('.prune-*')),'local quarantine used')
-        native_phase(doc,'deleted')
+        self.absence(native_phase(doc,'deleted'))
         return doc
+
+    def absence(self,record):
+        value=record.get('absence')
+        require(isinstance(value,dict) and value.get('verdict')=='absent','actual Barge absence evidence missing')
+        ancestor=value.get('ancestor',{});volume=ancestor.get('volume',{})
+        require(value.get('path')==str(self.checkout) and value.get('anchor',{}).get('kind')=='registered','absence path/route not the real Stash checkout')
+        require(volume.get('kind')=='registered' and str(volume.get('volume_uuid','')).upper()==self.data['checkout_volume_uuid'].upper(),'absence checkout volume differs')
+        require(ancestor.get('path')==str(self.checkout.parent) and ancestor.get('inode')==self.data['checkout_ancestor_inode'],'absence ancestor differs')
 
     def start(self,args,extra=None):
         old_markers=set(self.proof.evidence.iterdir())
@@ -258,10 +376,11 @@ class World:
         if interrupted:
             # This direct child executes no Cargo/build/writer descendants; its
             # only work is the real synchronous adapter. Reap is mandatory.
-            require(code == -15,'durable-point child did not terminate by our TERM')
+            require(code == -9,'durable-point child did not terminate by our owned-child KILL')
         else:
             permanent.require_normal_exit(label,code)
             permanent.require_confirmed_closure(label,err)
+        self.check_replies()
         return code,out,err
 
     def wait(self,pattern,child):
@@ -282,6 +401,7 @@ class World:
             doc=self.inspect()
             require(len(pending(doc))==1,'durable Oxide intent not observed')
             record=native_phase(doc,'intent' if phase in ('intent','renamed') else ('deleted' if side=='oxide' else 'renamed'))
+            self.absence(record)
             original=self.root.exists()
             quarantine=self.root.parent/('.barge-prune-'+record['intent_id'])
             if phase=='partial':
@@ -291,12 +411,12 @@ class World:
             if phase=='intent': require(original,'intent-before-rename already renamed')
             else:require(not original,'post-rename original still exists')
             write_json(self.proof.evidence/(self.name+'-interruption.json'),{'pid':child.pid,'point':phase,'side':side,'observed':doc,'original_exists':original,'record':record})
-            child.terminate()
+            child.kill()
             self.finish(child,'interrupted',interrupted=True)
             return doc
         except BaseException:
             if child.poll() is None:
-                child.terminate()
+                child.kill()
                 self.finish(child,'failed-interruption',interrupted=True)
             raise
 
@@ -325,6 +445,7 @@ def run_case(world, name):
     if name in ('lost-reply','malformed-reply'):
         w.preview();variable='OXIDE_TEST_BARGE_'+('LOST_REPLY' if name=='lost-reply' else 'MALFORMED_REPLY')
         w.execute(expect=3,extra={variable:str(w.root)})
+        require(any(json.loads(p.read_text()).get('kind')=='Deleted' for p in w.reply_records),'lost/malformed case lacks actual Deleted reply')
         doc=w.inspect();native_phase(doc,'deleted');require(len(pending(doc))==1,'lost reply cleared exclusion')
         w.execute(expect=0,label='resume');w.settled();return
     if name in ('marker-nonce','marker-digest','marker-owner','marker-volume','grant-withdrawn','grant-generation','adoption-race'):
@@ -351,7 +472,7 @@ def run_case(world, name):
             require(code in (0,2,3),err);w.kept();require(not w.inspect()['barge'],'refusal created a Barge effect')
         finally:
             if child.poll() is None:
-                child.terminate();w.finish(child,'refusal-stop',interrupted=True)
+                child.kill();w.finish(child,'refusal-stop',interrupted=True)
         return
     if name=='fresh-locked':
         w.preview();token=secrets.token_hex(16);child=w.start(['outputs','__delegation-fixture','lock',w.data['uuid'],token])
@@ -372,15 +493,15 @@ def run_case(world, name):
             require(not doc['barge'] and len(pending(doc))==(0 if sidecar else 1),'pre-Barge publication boundary wrong')
             require(list((w.control/'outputs/prune-delegations').iterdir()),'synced original metadata missing')
             write_json(w.proof.evidence/(name+'-observed.json'),{'pid':child.pid,'observed':doc})
-            child.terminate();w.finish(child,'pre-Barge-interrupted',interrupted=True);w.kept()
+            child.kill();w.finish(child,'pre-Barge-interrupted',interrupted=True);w.kept()
             w.execute(expect=0,label='resume');w.settled()
         finally:
-            if child.poll() is None:child.terminate();w.finish(child,'pre-Barge-stop',interrupted=True)
+            if child.poll() is None:child.kill();w.finish(child,'pre-Barge-stop',interrupted=True)
         return
     if name in ('internal-held-writer','removable-held-writer'):
         held_writer(w,name.startswith('removable'));return
     if name in ('internal-unknown-custody','removable-unknown-custody'):
-        control=w.control/('removable' if name.startswith('removable') else '')
+        control=w.peer if name.startswith('removable') else w.control
         # A real held flock means the actual writer witness is unavailable.
         # This is uncertainty in custody admission, not a fabricated process row.
         with (control/'admission.lock').open('rb') as handle:
@@ -390,12 +511,23 @@ def run_case(world, name):
             require('admission lock is busy' in json.dumps(doc),'unknown custody reason absent')
             require(fresh.tree_digest(str(w.control))==before,'unknown custody mutated journals')
         w.kept();return
-    require(name in {'intent-replay-oxide','intent-replay-barge','rename-replay-oxide','partial-replay-barge','terminal-before-receipt','receipt-before-settled','root-replaced','missing-barge-after-rename','resolve-pending','resolve-quarantine-original-absent','metadata-missing','metadata-corrupt','metadata-swapped','resumed-locked'}, 'unimplemented native case '+name)
+    require(name in {'intent-replay-oxide','intent-replay-barge','rename-replay-oxide','partial-replay-barge','terminal-before-receipt','receipt-before-settled','root-replaced','checkout-ancestor-replaced','missing-barge-after-rename','resolve-pending','resolve-quarantine-original-absent','metadata-missing','metadata-corrupt','metadata-swapped','resumed-locked'}, 'unimplemented native case '+name)
     phase={'intent-replay-oxide':'intent','intent-replay-barge':'intent','rename-replay-oxide':'renamed','partial-replay-barge':'partial','terminal-before-receipt':'terminal','receipt-before-settled':'receipt'}.get(name,'renamed')
     if name in ('metadata-missing','metadata-corrupt','metadata-swapped','resumed-locked','resolve-pending'):
         phase='intent'
     doc=w.interrupt(phase,'oxide' if name in ('terminal-before-receipt','receipt-before-settled') else 'barge')
     intent=pending(doc)[0];actual=doc['barge'][0]['intent_id']
+    if name=='checkout-ancestor-replaced':
+        anchor=w.checkout.parent
+        anchor.rename(anchor.with_name('retained-anchor'))
+        anchor.mkdir(mode=0o700)
+        require(anchor.stat().st_ino!=w.data['checkout_ancestor_inode'],'ancestor replacement did not change identity')
+        # Actual replay must reprove the recorded ancestor. Its expected
+        # conservative refusal is inspected directly, never retried destructively.
+        report=w.helper('replay')
+        require(bool(report['pending']),'changed ancestor was completed by Barge replay')
+        require(len(pending(w.inspect()))==1,'changed ancestor cleared Oxide exclusion')
+        return
     if name=='root-replaced':
         w.root.mkdir();(w.root/'replacement').write_text('different object')
         w.execute(expect=3);require((w.root/'replacement').exists(),'replacement deleted');return
@@ -429,7 +561,7 @@ def run_case(world, name):
         finally:
             (w.proof.evidence/('release-'+token)).write_text('release')
             if lock is not None:w.finish(lock,'lock')
-            if child.poll() is None:child.terminate();w.finish(child,'resumed-stop',interrupted=True)
+            if child.poll() is None:child.kill();w.finish(child,'resumed-stop',interrupted=True)
         return
     if name.endswith('barge'):
         w.helper('replay')
@@ -442,7 +574,7 @@ def upgrade_case(w,phase):
     child=w.start(['outputs','upgrade-recovery'],{'OXIDE_TEST_RECOVERY_UPGRADE_PAUSE':str(w.control),'OXIDE_TEST_RECOVERY_UPGRADE_PHASE':phase})
     try:
         w.wait('upgrade-'+phase+'-*',child)
-        states=[json.loads((p/'state.json').read_text()) for p in (w.control,w.control/'removable')]
+        states=[json.loads((p/'state.json').read_text()) for p in (w.control,w.peer)]
         registry=json.loads((w.control/'outputs/registry.json').read_text())
         expected={
             'internal-fence':(['/4','/3'],['initializing','ready'],2),
@@ -455,14 +587,14 @@ def upgrade_case(w,phase):
         require([next(iter(s['outputs_init'])) for s in states]==expected[1],'upgrade ready ordering')
         require(registry['schema']==expected[2],'upgrade registry publication ordering')
         write_json(w.proof.evidence/(w.name+'-observed.json'),{'states':states,'registry':registry,'pid':child.pid})
-        child.terminate();w.finish(child,'upgrade-interrupted',interrupted=True)
+        child.kill();w.finish(child,'upgrade-interrupted',interrupted=True)
         if phase!='paired-ready':
             before=fresh.tree_digest(str(w.control));w.invoke(['outputs','prune','--dry-run'],expect=2,label='partial-refusal')
             require(fresh.tree_digest(str(w.control))==before,'ordinary mutation crossed partial upgrade')
         w.invoke(['outputs','upgrade-recovery'],expect=0,label='upgrade-resume')
         w.preview();w.execute(expect=0);w.settled()
     finally:
-        if child.poll() is None:child.terminate();w.finish(child,'upgrade-stop',interrupted=True)
+        if child.poll() is None:child.kill();w.finish(child,'upgrade-stop',interrupted=True)
 
 
 def held_writer(w, removable):
@@ -491,7 +623,7 @@ def held_writer(w, removable):
         if not removable: retained.rename(registration)
         # Assert which pool the REAL command actually entered. An ignored
         # selection variable cannot earn evidence for the other pool.
-        controls=[w.control,w.control/'removable']
+        controls=[w.control,w.peer]
         states=[json.loads((c/'state.json').read_text()) for c in controls]
         active=[n for n,state in enumerate(states) if any(r.get('checkout')==str(w.checkout) and r.get('phase') in ('running','spawning') for r in state.get('records',[]))]
         require(active==[1 if removable else 0],f'writer entered wrong pool: {active}')
@@ -544,7 +676,7 @@ def input_fit():
 
 
 def plan_document():
-    return {'version':'oxide.outputs.delegation.proof/1','native_activated':False,'execution_ready':ADAPTER_CHECKOUT_VOLUME_SUPPORTED,'impediment':None if ADAPTER_CHECKOUT_VOLUME_SUPPORTED else ADAPTER_IMPEDIMENT,
+    return {'version':'oxide.outputs.delegation.proof/1','native_activated':False,'execution_ready':False,'readiness_meaning':'Source/installed-input plan only; a ready plan never activates execution.',
             'selectors':['proof:outputs-delegation:test','proof:outputs-delegation:plan','rust:outputs-delegation:diagnostic','rust:outputs-delegation'],
             'supervisor_sha256':SUPERVISOR,'barge':BARGE,'seconds':SECONDS,'scratch_mib':BUDGET,
             'work_stop_margin_s':30,'image_mib':128,'staging':'clean exact tree, Rust1.97.1 locked/offline, private Cargo seed, '+FEATURES,
@@ -573,7 +705,18 @@ def self_check():
         except OracleFailure:pass
         else:raise AssertionError('phase oracle accepted missing/wrong actual record')
     require(pending({'oxide':{'intents':[{'receipt_settled':False},{'receipt_settled':True}]}})==[{'receipt_settled':False}],'pending settlement oracle')
-    require(plan_document()['execution_ready'] is False and BARGE in plan_document()['impediment'],'known API prerequisite must block native staging')
+    require(plan_document()['native_activated'] is False,'plan cannot activate native')
+    fake={name:b'bound source' for name in ('Cargo.toml','crates/barge/Cargo.toml','crates/barge/src/oxide_outputs.rs','crates/barge/src/delete.rs','crates/barge/src/evidence.rs','crates/barge/src/reference.rs','crates/barge/src/state.rs')}
+    digests={name:hashlib.sha256(data).hexdigest() for name,data in fake.items()}
+    verify_source_files(digests,lambda parts:hashlib.sha256(fake['/'.join(parts)]).hexdigest())
+    for altered in ('missing','changed'):
+        bad=dict(digests)
+        if altered=='missing':bad.pop('crates/barge/src/delete.rs')
+        else:bad['crates/barge/src/delete.rs']='0'*64
+        try:verify_source_files(bad,lambda parts:hashlib.sha256(fake['/'.join(parts)]).hexdigest())
+        except OracleFailure:pass
+        else:raise AssertionError('unbound adapter source accepted')
+    binding_document()
     require(plan_document()['fit']['measured'] is False,'unmeasured plan claimed measurement')
     require(sum(plan_document()['fit']['prospective_mib'].values())==BUDGET,'envelope mismatch')
     require(sum(plan_document()['fit']['prospective_seconds'].values())==SECONDS,'time envelope mismatch')
@@ -606,13 +749,18 @@ def self_check():
 def main(argv):
     if argv==['--self-check']:return self_check()
     if argv==['--plan']:
-        doc=plan_document();doc['input_readiness']=input_fit();print(json.dumps(doc,indent=2));return 0 if doc['input_readiness']['seed_metadata_fits'] and doc['execution_ready'] else 2
+        doc=plan_document()
+        try:
+            doc['source_readiness']=source_readiness();doc['input_readiness']=input_fit()
+            doc['execution_ready']=doc['input_readiness']['seed_metadata_fits']
+        except Exception as exc:doc['impediment']=type(exc).__name__+': '+str(exc)[:1200]
+        print(json.dumps(doc,indent=2));return 0 if doc['execution_ready'] else 2
     if argv not in ([],['--diagnostic']):raise SystemExit('use --self-check, --plan, --diagnostic or no args')
     diagnostic=bool(argv);proof=wrapper.Proof();proof.unclosed=set();proof.mount=None
     rows=[];error=None;image=prior.ImageCustody('Ox304'+secrets.token_hex(4),custody_protocol=True)
     disposition='retained'
     try:
-        require(ADAPTER_CHECKOUT_VOLUME_SUPPORTED,ADAPTER_IMPEDIMENT)
+        source_readiness()
         # Selected scratch is verified by the real kernel before any backing
         # allocation. Neither quiet host nor task completion grants activation.
         code,out,err=proof.run(['/usr/sbin/diskutil','info','-plist',str(proof.root)],label='stash-identity',limit=10)

@@ -77,6 +77,127 @@ fn grant(present: bool) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+/// One physical image has one library payload. Each isolated account gets
+/// private wrapper controls; copy the last closed library metadata unchanged
+/// under its real library lock instead of reinitializing a nonempty payload.
+/// This is fixture input construction, never an alternate product evaluator.
+fn register_fixture_volume(
+    internal: &Store,
+    mount: &Path,
+    uuid: &str,
+) -> Result<serde_json::Value, String> {
+    let root =
+        fs::canonicalize(std::env::var_os("OXIDE_TASK_SCRATCH_ROOT").ok_or("scratch missing")?)
+            .map_err(|e| e.to_string())?;
+    let pointer = root.join("delegation-volume-source.json");
+    let control = internal.control();
+    let mut source_bytes = Vec::new();
+    let previous = if let Some(file) = store::private_file(&pointer, false)? {
+        file.take(4097)
+            .read_to_end(&mut source_bytes)
+            .map_err(|e| e.to_string())?;
+        if source_bytes.len() > 4096 {
+            return Err("fixture source pointer exceeds bound".into());
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Source {
+            control: PathBuf,
+        }
+        let source: Source = serde_json::from_slice(&source_bytes).map_err(|e| e.to_string())?;
+        let previous = fs::canonicalize(&source.control).map_err(|e| e.to_string())?;
+        if previous != source.control || !previous.starts_with(&root) || previous == control {
+            return Err("fixture library source escapes owned scratch".into());
+        }
+        Some(previous)
+    } else {
+        None
+    };
+    let observation = if let Some(previous) = previous {
+        let registration = removable::read_registration(&previous)?
+            .ok_or("fixture registration source missing")?;
+        if registration.mount_point != mount || !registration.volume_uuid.eq_ignore_ascii_case(uuid)
+        {
+            return Err("fixture registration differs from held image binding".into());
+        }
+        let library = previous.join(removable::POOL_DIR);
+        let lock = store::private_file(&library.join("lock"), false)?
+            .ok_or("fixture library lock missing")?;
+        // SAFETY: lock is our held file descriptor; this never waits for a writer.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err("prior fixture library still has a writer; retain and abort".into());
+        }
+        let target = control.join(removable::POOL_DIR);
+        ensure_private_dir(&target)?;
+        let mut hashes = serde_json::Map::new();
+        for name in ["config.json", "ledger.json"] {
+            let file = store::private_file(&library.join(name), false)?
+                .ok_or("fixture library metadata missing")?;
+            let mut bytes = Vec::new();
+            file.take(1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| e.to_string())?;
+            if bytes.len() > 1024 * 1024 {
+                return Err("fixture library metadata exceeds bound".into());
+            }
+            write_fixture_file(&target.join(name), &bytes)?;
+            hashes.insert(name.into(), serde_json::json!(sha256_hex(&bytes)));
+        }
+        write_fixture_file(&target.join("lock"), b"")?;
+        write_fixture_file(
+            &control.join(removable::REGISTRATION),
+            &serde_json::to_vec(&registration).map_err(|e| e.to_string())?,
+        )?;
+        oxide_storage::lease::managed::ledger_view(&target).map_err(|e| e.to_string())?;
+        serde_json::json!({"source_control":previous,"library_bytes_sha256":hashes,"physical_payload_reused":true})
+    } else {
+        let code = removable::run(
+            &[
+                "register-removable",
+                mount.to_str().ok_or("mount is not UTF-8")?,
+                "--reserve",
+                "16MiB",
+                "--cap",
+                "64MiB",
+                "--mode",
+                "permanent",
+            ]
+            .map(OsString::from),
+        )?;
+        if code != 0 {
+            return Err("fixture registration refused".into());
+        }
+        serde_json::json!({"actual_product_registration":true,"physical_payload_reused":false})
+    };
+    let bytes =
+        serde_json::to_vec(&serde_json::json!({"control":control})).map_err(|e| e.to_string())?;
+    // A fixture pointer, not a safety journal. Old per-case source observations
+    // and actual config/ledger bytes remain retained in their original worlds.
+    let temp = root.join(".delegation-volume-source.new");
+    write_fixture_file(&temp, &bytes)?;
+    fs::rename(&temp, &pointer).map_err(|e| e.to_string())?;
+    File::open(&root)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| e.to_string())?;
+    Ok(observation)
+}
+
+fn write_fixture_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| e.to_string())?;
+    File::open(path.parent().ok_or("fixture parent missing")?)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| e.to_string())
+}
+
 fn setup(label: &str, mount: &Path, uuid: &str) -> Result<(), String> {
     if label.is_empty()
         || label.len() > 40
@@ -121,29 +242,22 @@ fn setup(label: &str, mount: &Path, uuid: &str) -> Result<(), String> {
     let _binding = Binding::open(mount, Some(uuid))?;
     let internal = Store::open_or_create()?;
     crate::config::remember_pool(&crate::config::Facts::from_env(), &internal.pool)?;
-    let code = removable::run(
-        &[
-            "register-removable",
-            mount.to_str().ok_or("mount is not UTF-8")?,
-            "--reserve",
-            "16MiB",
-            "--cap",
-            "64MiB",
-            "--mode",
-            "permanent",
-        ]
-        .map(OsString::from),
-    )?;
-    if code != 0 {
-        return Err("fixture registration refused".into());
-    }
+    let removable_seed = register_fixture_volume(&internal, mount, uuid)?;
     let store = paired_store()?;
     let control = store.owner_control();
     let tx = fresh_nonce()?;
     store.initialize_outputs(&tx, None, &|tx, create| {
         create_or_validate_registry(control, tx, create)
     })?;
-    let checkout = PathBuf::from(std::env::var_os("HOME").ok_or("HOME missing")?).join("c");
+    let checkout =
+        PathBuf::from(std::env::var_os("HOME").ok_or("HOME missing")?).join("checkouts/anchor/c");
+    let checkout_parent = checkout.parent().ok_or("checkout parent missing")?;
+    ensure_private_dir(
+        checkout_parent
+            .parent()
+            .ok_or("checkout container missing")?,
+    )?;
+    ensure_private_dir(checkout_parent)?;
     let checkout_uuid = checkout_volume_uuid(checkout.parent().ok_or("checkout parent missing")?)
         .ok_or("checkout volume unknown")?;
     let id = sha256_hex(checkout.as_os_str().as_bytes());
@@ -212,7 +326,7 @@ fn setup(label: &str, mount: &Path, uuid: &str) -> Result<(), String> {
     grant(true)?;
     println!(
         "{}",
-        serde_json::json!({"root":roots[0]["root"],"successor":roots[1]["root"],"checkout":checkout,"control":control,"receipt":outputs::receipt_path_public(control,&id),"uuid":uuid,"mount":mount})
+        serde_json::json!({"root":roots[0]["root"],"successor":roots[1]["root"],"checkout":checkout,"control":control,"receipt":outputs::receipt_path_public(control,&id),"uuid":uuid,"mount":mount,"peer_control":removable::removable_control(control),"checkout_volume_uuid":checkout_uuid,"checkout_ancestor_inode":fs::metadata(checkout.parent().ok_or("checkout parent missing")?).map_err(|e|e.to_string())?.ino(),"removable_seed":removable_seed})
     );
     Ok(())
 }

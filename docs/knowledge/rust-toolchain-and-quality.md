@@ -32,8 +32,9 @@ cache (checksum `ba62675e8242a4c4e806d12f11d136e626e6c8361d6b829310732241652a178
 
 Since oxide#219 the package also depends on Barge's library at one full
 40-hex commit. Oxide#304 updates it to
-`4069398b5dd576635e38acc221a94f580b9e23c5` (the merged PR #53 commit,
-including the checked outputs adapter, registry3 routes and `/4` readers; see the
+`63163686d212e6e5a900d6cc2ddfcce65b475890` (the merged PR #54 commit,
+including the checked outputs adapter, registry3 routes, `/4` readers and
+digest-bound registered checkout-volume absence/replay; see the
 [joint protocol](contracts/barge-adoption.md#joint-protocol-for-barge-output-deletion-oxide303-design)).
 The dependency is feature-off, so
 `proof-synthetic-account` is not enabled by default. The focused integrated

@@ -4972,7 +4972,7 @@ Barge053 is now published at merge
 `102454f91a6feffc70b24dce016fd4970007f1ef` (PR53). Its retained reviewer accepted
 source, the adequate uncounted diagnostic and separate counted author and
 reviewer A1–A16 fixtures in comment6766022020. The corrected reader/route and
-absence-only API is the current pin. Prior051/052 packets retain their own
+absence-only API was the prerequisite pin. Prior051/052 packets retain their own
 source and limits. These synthetic-account adapter fixtures provide no
 integrated Oxide caller, production-account or live-adoption credit.
 
@@ -5082,7 +5082,7 @@ leaving exclusion unchanged. Neither path repairs metadata, chooses a current
 replacement grant or falls back to local deletion.
 
 
-**Current executable prerequisite: deciding checkout-volume absence.** Source
+**Historical executable prerequisite: deciding checkout-volume absence.** Source
 inspection of published Barge `4069398b…` found that `oxide_outputs.rs`
 1275–1283 calls `prove_checkout_absent` without a checkout-volume identity.
 At 1304–1321, any mount-parent prefix is an unconditional `UnknownState`;
@@ -5101,13 +5101,69 @@ checkout volume for deciding F2 and replay; preserve strict Oxide intent/1
 and conservative unknown. The correction needs actual adapter/replay
 observations for matching, missing, mismatched and changed volume facts.
 No boot-volume substitution, alternate evaluator, journal parsing or guessed
-API is a workaround. The proof plan now reports `execution_ready: false`,
+API is a workaround. At that source, the proof plan reported `execution_ready: false`,
 with a named refusal before staging or backing creation. Source preparation
 is retained on the same task/PR; qualification waits for reviewed published
 Barge code and evidence, followed by this task's separate activation gates.
 
 
-The deciding F2/replay prerequisite is linked as Barge054, task
+The deciding F2/replay prerequisite was linked as Barge054, task
 `36cd1a04-a367-411a-bff5-abf2810f1034`. Its actual reviewed published source
 and accepted evidence must be bound before removing the integrated execution
 gate; dispatch alone grants no API, staging, image or native credit.
+
+
+#### Completed F2 binding and current source readiness (oxide#304)
+
+Barge054 is now pinned at published `63163686d212e6e5a900d6cc2ddfcce65b475890`,
+reviewed `547fbe99cdc9676b80b58730cf09715c64c5a9cd`; both trees are
+`8a3b368e7883be862fe8319bb34e9f987e38731b`. Its actual adapter uses the
+strictly verified marker's checkout UUID with registered-volume F2, carries
+actual typed absence evidence in existing Barge intent/2, and re-proves its
+path, volume and ancestor before replay. Missing old evidence remains pending.
+No public adapter API or strict Oxide intent/1 field changed. The owning task
+and final review6770001441 accepted source, diagnostic and distinct author/
+reviewer A1–A18 fixtures. The first reviewer A14 unknown-descriptor failure
+and skipped A15–A18 remain failed history; the fresh accepted session does not
+explain or erase them. All packets retain synthetic-account, bounded-tail,
+sampling and omission limits and provide no integrated Oxide credit.
+
+The effect-free plan verifies the actual lock/rev, 49 exported source/manifest-file
+hashes in `scripts/outputs-delegation-source.json`, qualified supervisor,
+clean Oxide tree, installed tools and selected Stash UUID. It measures only
+admissible seed metadata, not build/native runtime or peak RSS. A ready plan
+never activates seed, staging, image or native work. The proposed 300 s /
+512 MiB envelope and 128 MiB image remain unmeasured; the separately activated
+uncounted diagnostic must establish actual fit before counted sessions.
+
+Fixture worlds share one physical library payload. The first world performs
+actual product registration; later synthetic accounts copy unchanged library
+config/ledger bytes under the previous account's nonblocking library lock.
+Private wrapper journals, receipts and Barge state stay per-world; unknown
+writers abort. This avoids reinitializing a nonempty payload. Actual peer
+controls come from the product helper. Actual adapter replies are recorded
+before deliberate lost/malformed-reply substitutions; unexpected uncertainty
+aborts instead of becoming a recoverable oracle failure. Durable-point
+interruptions kill and positively reap their own direct child. The joined
+proof checks typed registered-volume absence, exact checkout ancestor and
+replay refusal after replacing that ancestor, without parsing Barge journals.
+
+The nine premise dispositions map to executable bodies as follows:
+
+| Premise | Executable source / disposition |
+| --- | --- |
+| Rustup and private HOME | `stage` resolves installed absolute Cargo/rustc before private HOME; AUTO_INSTALL=0, fixed1.97.1. |
+| Account-home control | `fixture_env` sets both account homes; fixture `guard` positively compares Barge and Oxide paths. Production lookup unproved. |
+| Environment isolation | `stage` and `fixture_env` scrub product/Cargo/Git overrides; genuine Nucleus hook/admission remain inherited. |
+| Auto-adoption | Fixture `setup` writes explicit synthetic history; `adoption-race` invokes the real refusal path. No live checkout adoption. |
+| External Cargo argv | `stage` fixes locked/offline/bin/features; held-writer case uses the explicit dependency-free exec fixture. |
+| Owners-on image | Existing `ImageCustody.attach` uses owners-on; fixture `setup` binds actual kernel UUID before writes. |
+| Flags | `stage` and `fixture_env` use empty RUSTFLAGS/wrapper, no encoded overrides; source/lock/tools/binary hashes retained. |
+| Scratch and TMP | Existing guard exports all temporary roots; worlds stay inside its scratch, backing/evidence inside custody. |
+| macOS mktemp | `World.__init__` invokes `/usr/bin/mktemp -d` with an explicit owned XXXXXXXX template. |
+
+This source mapping is not an integrated diagnostic or qualification. The
+same retained reviewer must judge the complete exact head and author covering;
+merge still requires separately activated integrated diagnostic, counted author,
+distinct reviewer native and final judgment. No installation, live upgrade,
+real grants/registration, adoption, O2/O3 or parent-reader release follows.

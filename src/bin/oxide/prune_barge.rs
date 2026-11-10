@@ -224,6 +224,34 @@ fn execute(_control: &Path, intent: &Intent, request: &DelegatedRequest) -> Outc
     #[cfg(debug_assertions)]
     if super::prune_fixture_fault(
         _control,
+        "OXIDE_TEST_BARGE_RECORD_REPLY",
+        &intent.identity.root,
+        &format!(
+            "barge-actual-reply-{}-{}.armed",
+            intent.id,
+            std::process::id()
+        ),
+    ) {
+        if let Some(evidence) = super::proof_evidence() {
+            let value = serde_json::json!({
+                "caller_intent_id": outcome.caller_intent_id,
+                "intent_id": outcome.intent_id,
+                "kind": format!("{:?}", outcome.kind),
+                "reason": outcome.reason.as_deref().map(|s| s.chars().take(2048).collect::<String>()),
+                "root": intent.identity.root,
+            });
+            let path = evidence.join(format!(
+                "barge-actual-reply-{}-{}.json",
+                intent.id,
+                std::process::id()
+            ));
+            // Observation only; the proof refuses a missing/malformed record.
+            let _ = std::fs::write(path, value.to_string());
+        }
+    }
+    #[cfg(debug_assertions)]
+    if super::prune_fixture_fault(
+        _control,
         "OXIDE_TEST_BARGE_LOST_REPLY",
         &intent.identity.root,
         &format!("barge-reply-lost-{}", intent.id),

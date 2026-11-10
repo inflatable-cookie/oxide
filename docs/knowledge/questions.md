@@ -302,6 +302,10 @@ live adoption; the integrated Elevated proof gates remain separate.
 
 
 
+The implemented caller now pins reviewed Barge054 F2/replay support; see the
+[exact source and premise binding](contracts/barge-adoption.md#completed-f2-binding-and-current-source-readiness-oxide304).
+Integrated diagnostic, author and reviewer native sessions remain separately held.
+
 ## Q-022 — Can a held zombie establish its group's lifetime?
 
 Open: the positive held-zombie group-lifetime proposition remains unproved.

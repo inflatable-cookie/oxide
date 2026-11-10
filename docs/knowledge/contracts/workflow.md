@@ -6178,9 +6178,9 @@ The stable, read-only interface other tools use to find the registered Builds dr
 
 The focused [integrated delegation apparatus](barge-adoption.md#integrated-delegation-proof-readiness-oxide304)
 uses the ordinary qualified supervisor and separately activated 300 s / 512 MiB
-native selectors. The current plan explicitly refuses execution for the pinned
-adapter's missing deciding checkout-volume absence support. Its effect-free
-self-check and input plan grant no native,
+native selectors. The pinned reviewed Barge054 now supplies deciding checkout-volume absence
+and replay evidence. The effect-free plan binds its actual exported source,
+lock, installed tools and selected scratch; a ready source plan grants no native,
 installation or live migration credit.
 
 The approved Barge mechanism-only extension (Tom `63ad6fc4` v2 and explicit
