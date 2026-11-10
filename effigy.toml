@@ -1677,3 +1677,9 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # or native execution. Default product covering remains unchanged.
 [tasks."rust:compile:outputs-delegation"]
 run = "oxide check --bin oxide --locked --features barge/proof-synthetic-account"
+
+# 304/v5: exactly one separately authorized focused ordinary investigation.
+# This is not the held integrated Barge diagnostic or a staging/image run.
+[tasks."rust:test-launch-check"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 120 --scratch-budget-mib 512 -- oxide test --locked --test launch_check a_blocked_copy_start_or_removal_cannot_outlive_the_cli -- --exact --nocapture --test-threads=1"

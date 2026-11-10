@@ -32,6 +32,63 @@ const RUNS: usize = 5;
 const POLL: Duration = Duration::from_micros(250);
 const MAX_ANCESTORS: usize = 64;
 
+/// Bounded debug-only phase observation for the launch lifecycle regression.
+/// It neither changes a deadline nor permits an effect. The empty environment
+/// of helper/probes stays empty; these records describe the outer CLI only.
+pub fn record_timing(phase: &str) {
+    #[cfg(all(debug_assertions, target_os = "macos"))]
+    {
+        let Some(path) = std::env::var_os("OXIDE_TEST_LAUNCH_TIMING_LOG") else {
+            return;
+        };
+        if oxide_storage::proof::evidence().is_none() {
+            return;
+        }
+        let path = PathBuf::from(path);
+        let Some(parent) = path.parent().and_then(|p| std::fs::canonicalize(p).ok()) else {
+            return;
+        };
+        let Some(root) =
+            std::env::var_os("OXIDE_TASK_SCRATCH_ROOT").and_then(|p| std::fs::canonicalize(p).ok())
+        else {
+            return;
+        };
+        if !parent.starts_with(&root) || parent == root || path.parent() != Some(parent.as_path()) {
+            return;
+        }
+        // SAFETY: the writable timespec is valid; the shared cross-process
+        // uptime clock is observation only, never the product's time owner.
+        let mut clock: libc::timespec = unsafe { std::mem::zeroed() };
+        if unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut clock) } != 0 {
+            return;
+        }
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+        else {
+            return;
+        };
+        use std::os::unix::fs::MetadataExt;
+        let Ok(facts) = file.metadata() else {
+            return;
+        };
+        if !facts.is_file()
+            || facts.nlink() != 1
+            || facts.uid() != unsafe { libc::geteuid() }
+            || facts.len() > 8192
+        {
+            return;
+        }
+        let nanos = i128::from(clock.tv_sec) * 1_000_000_000 + i128::from(clock.tv_nsec);
+        let _ = writeln!(file, "{} {} {}", std::process::id(), nanos, phase);
+    }
+    #[cfg(not(all(debug_assertions, target_os = "macos")))]
+    let _ = phase;
+}
+
 /// Raw timings in microseconds.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct Samples {
@@ -547,6 +604,7 @@ fn sweep(dir: &Path) -> Vec<String> {
 /// Nothing this check started outlives it unless the kernel holds a killed
 /// process past the limit, which the report names.
 pub fn run_measure(plan: &Plan, oxide: &Path) -> Outcome {
+    record_timing("measure-entry");
     let started = Instant::now();
     let limit = started + plan.limit;
     let work = started + plan.work;
@@ -567,6 +625,7 @@ pub fn run_measure(plan: &Plan, oxide: &Path) -> Outcome {
         return finish(samples, Some(failure), Cleanup::Removed);
     }
     let millis = |duration: Duration| duration.as_millis().to_string();
+    record_timing("helper-spawn-before");
     let spawned = Command::new(oxide)
         .arg(MEASURE)
         .arg(&dir)
@@ -594,6 +653,7 @@ pub fn run_measure(plan: &Plan, oxide: &Path) -> Outcome {
             return finish(samples, Some(failure), cleanup);
         }
     };
+    record_timing("helper-spawn-after");
     let group = i32::try_from(child.id()).unwrap_or(0);
     record_group_for_tests(group);
     let (lines, received) = mpsc::channel();
@@ -627,6 +687,7 @@ pub fn run_measure(plan: &Plan, oxide: &Path) -> Outcome {
             }
         }
     };
+    record_timing("collection-ended");
     if group > 1 {
         // SAFETY: the helper is not yet reaped, so this group ID is still
         // its own group: the helper and the probes it started.
@@ -641,6 +702,7 @@ pub fn run_measure(plan: &Plan, oxide: &Path) -> Outcome {
             _ => break false,
         }
     };
+    record_timing("helper-reap-ended");
     let closed = reaped
         && loop {
             if crate::process::group_empty(group) {
@@ -651,7 +713,9 @@ pub fn run_measure(plan: &Plan, oxide: &Path) -> Outcome {
             }
             std::thread::sleep(POLL);
         };
+    record_timing("group-check-ended");
     let left = sweep(&dir);
+    record_timing("sweep-ended");
     let cleanup = match (closed, left.is_empty()) {
         (true, true) => Cleanup::Removed,
         (true, false) => Cleanup::Left(left),
@@ -681,6 +745,7 @@ fn record_group_for_tests(group: i32) {
 
 /// `oxide status --launch-check`.
 pub fn run_check() -> Result<u8, String> {
+    record_timing("check-entry");
     if !cfg!(target_os = "macos") {
         println!("launch check: not applicable (it measures a macOS first-launch cost)");
         return Ok(0);
@@ -699,8 +764,11 @@ pub fn run_check() -> Result<u8, String> {
         ));
     }
     let outcome = run_measure(&plan, &oxide);
+    record_timing("measure-returned");
     let app = launching_app(&ancestry());
+    record_timing("ancestry-ended");
     print!("{}", report(&outcome, plan.limit, &app));
+    record_timing("report-ended");
     Ok(0)
 }
 

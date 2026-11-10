@@ -38,6 +38,17 @@ fn scratch(label: &str) -> PathBuf {
     root
 }
 
+/// The same clock the shared guard exports, for phase comparison only.
+fn observation_ns() -> i128 {
+    let mut clock: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: clock points to a writable timespec.
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut clock) },
+        0
+    );
+    i128::from(clock.tv_sec) * 1_000_000_000 + i128::from(clock.tv_nsec)
+}
+
 fn check(label: &str, script: &str, environment: &[(&str, &str)]) -> Run {
     let root = scratch(label);
     let tmp = root.join("tmp");
@@ -54,18 +65,31 @@ fn check(label: &str, script: &str, environment: &[(&str, &str)]) -> Run {
         .status()
         .expect("probe");
     assert!(warm.success());
+    let timing = root.join("timing.log");
+    let before_ns = observation_ns();
     let started = Instant::now();
     let output = Command::new(OXIDE)
         .args(["status", "--launch-check"])
         .env("TMPDIR", &tmp)
         .env("PATH", root.join("no-bin"))
         .env("OXIDE_TEST_LAUNCH_SOURCE", &source)
+        .env("OXIDE_TEST_LAUNCH_TIMING_LOG", &timing)
         .env("OXIDE_TEST_LAUNCH_GROUP_LOG", &group)
         .envs(environment.iter().copied())
         .output()
         .expect("oxide status --launch-check");
     let wall = started.elapsed();
+    let after_ns = observation_ns();
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    // Retain the report BEFORE any assertion can discard it. One bounded
+    // packet per case, under its fresh guard-owned test directory.
+    let packet = serde_json::json!({"label":label,"actor_pid":std::process::id(),"before_ns":before_ns.to_string(),"after_ns":after_ns.to_string(),"wall_us":wall.as_micros().to_string(),"status":output.status.code(),"stdout":stdout.chars().take(16384).collect::<String>(),"stderr":String::from_utf8_lossy(&output.stderr).chars().take(16384).collect::<String>(),"timing":std::fs::read_to_string(&timing).unwrap_or_default().chars().take(8192).collect::<String>(),"tmp_entries":std::fs::read_dir(&tmp).expect("observe temp directory").take(32).map(|entry|entry.expect("observe temp entry").file_name().to_string_lossy().into_owned()).collect::<Vec<_>>()});
+    std::fs::write(
+        root.join("observation.json"),
+        serde_json::to_vec_pretty(&packet).expect("encode observation"),
+    )
+    .expect("retain observation");
+    println!("launch-check observation: {}", packet);
     assert!(output.status.success(), "{label}: {output:?}");
     assert!(output.stderr.is_empty(), "{label}: {output:?}");
     let run = Run {
@@ -76,6 +100,7 @@ fn check(label: &str, script: &str, environment: &[(&str, &str)]) -> Run {
         group,
     };
     assert_group_closed(&run, label);
+    println!("launch-check group closed: {label}");
     run
 }
 

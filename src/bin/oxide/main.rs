@@ -141,6 +141,7 @@ Linux default; macOS defaults to a hard-capped APFS image).
 ";
 
 fn main() -> ExitCode {
+    launch::record_timing("cli-entry");
     // The launch-check probe exits, and its measuring helper runs, before
     // any other work.
     if let Some(code) = launch::hidden() {

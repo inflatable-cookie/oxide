@@ -4442,6 +4442,14 @@ with exit 1), and reads or changes no setting.
   raw samples, the advice lines when advised. No penalty size is asserted.
   Unit tests cover the medians, the strict threshold, the bundle choice and
   the report and advice text.
+- **Lifecycle observations (oxide#304).** The bounded test packet retains
+  CLI stdout/stderr, outer uptime timestamps and temporary-directory entries
+  before assertions. Under the existing proof guard, a debug-only timing log
+  records CLI entry, measurement/spawn/cleanup and ancestry/report phases.
+  Helper/probe environments, product deadlines and cleanup assertions stay
+  unchanged. `rust:test-launch-check` is the separately authorized single-test
+  investigation under the qualified 120 s / 512 MiB guard, not an integrated
+  deletion diagnostic or permission to retry a failed full suite.
 - **Lifecycle tests.** `tests/launch_check.rs` runs the built `oxide` to
   exit. Its probes are shell scripts named by `OXIDE_TEST_LAUNCH_SOURCE`
   (test-only, like `OXIDE_TEST_LAUNCH_LIMIT_MS` and
