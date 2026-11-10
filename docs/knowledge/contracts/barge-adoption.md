@@ -3736,8 +3736,8 @@ recovery-format upgrade on disposable fixtures (recommended)” in decision
 Oxide readers, writers, explicit resumable initialization and regressions for
 the semantics below in oxide#304. Barge#053 supplies the precise shared wire
 and supported reader/absence-only APIs; its reviewed published source and
-accepted evidence remain prerequisites to connecting or executing the new
-format handoff. The corrected Barge#052 pin alone is insufficient. No native,
+accepted evidence were bound at merge4069398b below. The corrected Barge#052
+pin alone was insufficient; Barge#053 now supplies that executable input. No native,
 image, staging, installation, live-store migration or adoption is activated.
 The fixed metadata cap deliberately refuses when retained files exhaust it;
 missing or uncertain metadata remains pending, never local or a replacement
@@ -3752,18 +3752,18 @@ Partials and orphans are counted and never removed or replaced. Its read-open
 creates nothing, and all errors remain errors rather than absence facts.
 The writer requires the caller's publication custody. It deliberately does
 not parse a sidecar, choose a route, migrate a registry or call Barge. No
-ordinary command uses it yet; the precise shared wire, successor readers and
-caller connection still need Barge#053's supported contract and published
-evidence. Ordinary unit coverage of this layer is not integrated proof or
+deletion command publishes a request yet; the explicit upgrade and strict
+metadata reader are implemented, while the caller connection remains to be
+completed against the now-published Barge#053 API. Ordinary unit coverage of this layer is not integrated proof or
 production adoption credit.
 
 The independent registry validator recognizes schema 3 with the exact route
 field sets published in Barge PR #53 at `9a91199b545de7b71ca8c1609d564e5aac57ea81`.
 It rejects null/missing/duplicate/extra routes and malformed hashes, including
 routes missing for terminal intents. Historical schemas reject the new field.
-This is source alignment with an unreviewed prerequisite, not an adopted pin:
-the ordinary registry read path explicitly refuses schema 3 before any legacy
-replay or exclusion release until the new-format connection is complete.
+The reviewed published pin now supplies this wire. The ordinary registry
+read path validates Barge sidecars and explicitly refuses schema 3 before
+legacy replay or exclusion release until the new-format connection is complete.
 
 #### Choice and reader boundary
 
@@ -3786,12 +3786,13 @@ with precisely its existing fields. `quarantine` continues to name the real
 Oxide `.prune-<oxide-id>` leaf, which a Barge-routed operation never creates;
 `preview_sha256` remains the SHA of the exact user-approved preview bytes.
 
-Before publishing schema 3, a future implementation must advance every paired
-pool's `owned_outputs` fence to proposed `oxide.outputs/4`, internal first,
+Before publishing schema 3, the explicit upgrade advances every paired
+pool's `owned_outputs` fence to `oxide.outputs/4`, internal first,
 under the existing initialization/admission/publication ordering. No Barge
 lock is taken during this transition. Do not raise the numeric control-state
 version or disturb unrelated fences: the new string is the downgrade fence.
-`control::parse_state` currently rejects unrecognized owned-output strings;
+`control::parse_state` accepts `/4` only with initialization and numeric floor4,
+and still rejects unrecognized owned-output strings;
 `Registry::validate` rejects unknown registry versions. Both refusals matter:
 some registry readers, including `unsettled_for`, read without loading pool
 state first. A sidecar and pool fence alone do not protect those readers.
@@ -3824,6 +3825,12 @@ Proposed sidecar path:
 `oxide.outputs.prune-delegation/1` contains the caller intent id, full original
 intent identity, original preview SHA, original `grant_generation` and
 `caller_request_digest` computed by Barge's actual `DelegatedRequest::digest`.
+The implemented strict wire uses `state: "ready"` with required `version`,
+`caller_intent_id`, `identity`, `preview_sha256`, `grant_generation` and
+`caller_request_digest`. The `unavailable` state instead requires `reason`
+and forbids generation or request-digest fields. Unknown, duplicate, null or
+missing fields refuse. Reads charge the existing authority-read budget.
+
 The original claim's phase is `intent`; later Oxide terminal phases do not
 rewrite that claim. The registry route binds the sidecar's exact byte SHA,
 and the reader recomputes its canonical Barge request digest. Neither hash
@@ -4937,3 +4944,32 @@ pre-Cargo `Acquiring`. The real `Clear` custody verdict is distinct from the
 still-held record's availability. That failed run remains charged; the owned
 child's positive reap and observed descriptors remain evidence, not a pass.
 Original custody/seed oracles, CLOEXEC and historical uncertainty are preserved.
+
+#### Explicit recovery upgrade implementation boundary (oxide#304)
+
+`oxide outputs upgrade-recovery` is the explicit metadata-only transition;
+ordinary preview and adoption never invoke it. It requires the existing
+complete registry and the same initialized transaction in both controls,
+with writers positively closed under internal-first publication/admission
+custody. Preflight validates the prospective image and its size before any
+fence. Each pool syncs `/4` plus `initializing`, internal first; the registry
+then atomically publishes schema 3 with explicit local routes for retained
+settled history, before each control syncs `ready`, internal first. A restart
+uses the same transaction and retains every published fence. A missing or
+unreadable registry, unfinished predecessor intent, conflicting transaction
+or impossible paired ordering refuses. Numeric owned-output state floor
+remains 4; higher unrelated fences remain intact. No host upgrade was run.
+
+The new readers remain deliberately gated before ordinary replay or
+exclusion release while caller integration is incomplete. Source regressions
+exercise the five paired crash images and failed registry publication;
+these are source tests, not native crash proof.
+
+Barge053 is now published at merge
+`4069398b5dd576635e38acc221a94f580b9e23c5`, reviewed head
+`102454f91a6feffc70b24dce016fd4970007f1ef` (PR53). Its retained reviewer accepted
+source, the adequate uncounted diagnostic and separate counted author and
+reviewer A1–A16 fixtures in comment6766022020. The corrected reader/route and
+absence-only API is the current pin. Prior051/052 packets retain their own
+source and limits. These synthetic-account adapter fixtures provide no
+integrated Oxide caller, production-account or live-adoption credit.

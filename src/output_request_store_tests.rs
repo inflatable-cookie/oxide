@@ -164,3 +164,41 @@ fn invalid_names_cannot_traverse_and_a_directory_link_is_not_followed() {
     assert!(RequestStore::open(linked.outputs.as_fd(), true).is_err());
     assert_eq!(fs::read_dir(linked.root.join("other")).unwrap().count(), 0);
 }
+
+#[test]
+fn caller_read_budget_failures_and_partial_reads_never_validate() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let sha = store.publish(ID, b"complete original request").unwrap();
+    let denied = store.read_with(ID, &sha, |_, _| {
+        Err(io::Error::other("authority budget exhausted"))
+    });
+    assert!(denied
+        .unwrap_err()
+        .to_string()
+        .contains("authority budget exhausted"));
+    assert!(store
+        .read_with(ID, &sha, |mut reader, bytes| {
+            let mut prefix = [0; 4];
+            reader.read_exact(&mut prefix)?;
+            bytes.extend_from_slice(&prefix);
+            Ok(())
+        })
+        .is_err());
+    assert_eq!(store.read(ID, &sha).unwrap(), b"complete original request");
+}
+
+#[test]
+fn a_matching_prefix_digest_is_not_the_complete_file_image() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    store.publish(ID, b"prefix plus unconsumed tail").unwrap();
+    assert!(store
+        .read_with(ID, &digest(b"prefix"), |mut reader, bytes| {
+            let mut prefix = [0; 6];
+            reader.read_exact(&mut prefix)?;
+            bytes.extend_from_slice(&prefix);
+            Ok(())
+        })
+        .is_err());
+}

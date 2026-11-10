@@ -118,6 +118,9 @@ pub const MAX_HOLDER_OBJECT_BYTES: usize = 5 * 1024;
 pub const MAX_STATE_HEADER_BYTES: usize = 4 * 1024;
 
 /// The owned-outputs fence value; see [`State::owned_outputs`].
+/// Explicit delegated-recovery upgrade. Its numeric state floor remains 4.
+pub const DELEGATED_OUTPUTS_FENCE: &str = "oxide.outputs/4";
+
 pub const OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/3";
 /// The published whole-target fence: read unchanged (its legacy receipts keep
 /// their place and key) and upgraded only by the explicit successor
@@ -939,9 +942,19 @@ pub fn parse_state(bytes: &[u8]) -> Result<State, String> {
         return Err("Oxide state exceeds its byte limit".to_owned());
     }
     if state.owned_outputs.as_deref().is_some_and(|fence| {
-        fence != OWNED_OUTPUTS_FENCE && !predecessor_owned_outputs_fence(fence)
+        fence != DELEGATED_OUTPUTS_FENCE
+            && fence != OWNED_OUTPUTS_FENCE
+            && !predecessor_owned_outputs_fence(fence)
     }) {
         return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
+    }
+    if state.owned_outputs.as_deref() == Some(DELEGATED_OUTPUTS_FENCE)
+        && (state.version < PREVIOUS_STATE_VERSION || state.outputs_init.is_none())
+    {
+        return Err(
+            "delegated output recovery requires state version 4 and explicit initialization"
+                .to_owned(),
+        );
     }
     validate_state(&state, legacy)?;
     Ok(state)

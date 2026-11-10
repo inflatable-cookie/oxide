@@ -2760,6 +2760,105 @@ impl Store {
         Ok(self.load()?.outputs_init)
     }
 
+    /// Explicitly and resumably advance the paired output-recovery format.
+    /// The callback validates without writes first, then publishes the
+    /// successor registry after both /4 fences have synced. Every error
+    /// retains the last durable state; ordinary commands cannot use it.
+    pub fn upgrade_output_recovery(
+        &self,
+        registry: &dyn Fn(&str, bool) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let control = self.owner_control().to_path_buf();
+        let internal = self.view(&control);
+        // Same publication/admission custody as registry writers, internal
+        // first. No Barge locks, pool reconciliation or absent-state creation.
+        let _publication = publication_guard(&control)?;
+        let mut first = internal.load_recovery_upgrade()?;
+        let transaction = first
+            .outputs_init
+            .as_ref()
+            .ok_or("output recovery upgrade requires an existing initialized registry")?
+            .transaction()
+            .to_owned();
+        let sibling = self
+            .sibling
+            .as_ref()
+            .filter(|side| side.control != control)
+            .map(|side| self.view(&side.control));
+        let _paired_admission = sibling
+            .as_ref()
+            .map(|side| lock_admission(&side.control))
+            .transpose()?;
+        let mut second = sibling
+            .as_ref()
+            .map(Self::load_recovery_upgrade)
+            .transpose()?;
+        for (state, label) in std::iter::once((&first, "the internal"))
+            .chain(second.as_ref().map(|state| (state, "the paired")))
+        {
+            let initialization = state
+                .outputs_init
+                .as_ref()
+                .ok_or("recovery upgrade refuses a missing paired initialization")?;
+            if initialization.transaction() != transaction
+                || !matches!(
+                    state.owned_outputs.as_deref(),
+                    Some(OWNED_OUTPUTS_FENCE | DELEGATED_OUTPUTS_FENCE)
+                )
+                || (state.owned_outputs.as_deref() == Some(OWNED_OUTPUTS_FENCE)
+                    && !matches!(initialization, OutputsInit::Ready { .. }))
+            {
+                return Err(
+                    "recovery upgrade refuses a different or unfinished predecessor transaction"
+                        .to_owned(),
+                );
+            }
+            writers_closed(state, label, None)?;
+        }
+        if let Some(second) = &second {
+            let delegated =
+                |state: &State| state.owned_outputs.as_deref() == Some(DELEGATED_OUTPUTS_FENCE);
+            let ready =
+                |state: &State| matches!(state.outputs_init, Some(OutputsInit::Ready { .. }));
+            if (!delegated(&first) && delegated(second))
+                || (delegated(&first) && !ready(&first) && delegated(second) && ready(second))
+                || (delegated(&first) && ready(&first) && !delegated(second))
+            {
+                return Err("recovery upgrade refuses an out-of-order paired state".to_owned());
+            }
+        }
+        // Validate the actual registry before the first durable change. This
+        // must never create a missing registry or accept unfinished old intent.
+        registry(&transaction, false)?;
+        for (side, state) in
+            std::iter::once((&internal, &mut first)).chain(sibling.as_ref().zip(second.as_mut()))
+        {
+            if state.owned_outputs.as_deref() != Some(DELEGATED_OUTPUTS_FENCE) {
+                state.owned_outputs = Some(DELEGATED_OUTPUTS_FENCE.to_owned());
+                state.outputs_init = Some(OutputsInit::Initializing {
+                    transaction: transaction.clone(),
+                    started_ms: process::now_ms(),
+                });
+                side.save(state)?;
+            }
+        }
+        // Both /4 fences are synced before the atomic schema-3 image. On a
+        // failure leave every fence/initializer in place; the same call resumes.
+        registry(&transaction, true)?;
+        for (side, state) in
+            std::iter::once((&internal, &mut first)).chain(sibling.as_ref().zip(second.as_mut()))
+        {
+            if !matches!(state.outputs_init, Some(OutputsInit::Ready { .. })) {
+                state.outputs_init = Some(OutputsInit::Ready {
+                    transaction: transaction.clone(),
+                    ready_ms: process::now_ms(),
+                });
+                side.save(state)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Run the owned-outputs initialization protocol exactly once
     /// (oxide#129). The internal control is durable first
     /// (`initializing` + the successor `oxide.outputs/3` fence), then the
@@ -5502,6 +5601,18 @@ impl Store {
     }
 
     fn load(&self) -> Result<State, String> {
+        let state = self.load_recovery_upgrade()?;
+        // Until the real delegated caller/recovery is connected, every /4
+        // command stays fenced, including a partially completed upgrade.
+        if state.owned_outputs.as_deref() == Some(DELEGATED_OUTPUTS_FENCE) {
+            return Err("delegated recovery is not yet connected; resume the explicit recovery upgrade and keep pending".to_owned());
+        }
+        Ok(state)
+    }
+
+    /// Strict read reserved for the explicit, forward-only format upgrade.
+    /// It performs no replay, admission, exclusion release or state repair.
+    fn load_recovery_upgrade(&self) -> Result<State, String> {
         let Some(file) = private_file(&self.control.join("state.json"), false)? else {
             return Ok(State::default());
         };
@@ -5532,6 +5643,19 @@ impl Store {
         // build ran (oxide#129). A legacy state is validated against the new
         // fields and object caps first; an oversized legacy field refuses
         // with the original file untouched.
+        if state.owned_outputs.as_deref() != Some(DELEGATED_OUTPUTS_FENCE) {
+            if let Some(sibling) = &self.sibling {
+                if self
+                    .view(&sibling.control)
+                    .load_recovery_upgrade()?
+                    .owned_outputs
+                    .as_deref()
+                    == Some(DELEGATED_OUTPUTS_FENCE)
+                {
+                    return Err("the paired pool is upgrading delegated recovery; ordinary mutation refuses".to_owned());
+                }
+            }
+        }
         let mut fenced = state.clone();
         // Only the successor `oxide.outputs/3` fence advances the numeric
         // version to 4. The published `/2` fence keeps version 3 so a state-3
@@ -5541,7 +5665,10 @@ impl Store {
         let one_use = fenced.one_use_workspaces.is_some();
         let slot_ceiling = fenced.slot_ceiling.is_some();
         let holding = fenced.holding.is_some();
-        let successor = fenced.owned_outputs.as_deref() == Some(OWNED_OUTPUTS_FENCE);
+        let successor = matches!(
+            fenced.owned_outputs.as_deref(),
+            Some(OWNED_OUTPUTS_FENCE | DELEGATED_OUTPUTS_FENCE)
+        );
         let previous = fenced.outputs_init.is_some()
             || fenced.owned_outputs.as_deref() == Some(LEGACY_OWNED_OUTPUTS_FENCE);
         fenced.version = if holding {
@@ -7213,7 +7340,7 @@ pub(crate) mod tests {
     /// Isolate only fixtures whose oracle requires a just-closed flock to be
     /// free. Parallel runner process creation can inherit an open description
     /// until exec, even when the parent has already dropped its File.
-    pub(super) fn fixture_child(test: &str) -> bool {
+    pub(crate) fn fixture_child(test: &str) -> bool {
         if std::env::var("OXIDE_STORE_FIXTURE_CHILD").as_deref() == Ok(test) {
             return false;
         }
@@ -7672,6 +7799,182 @@ pub(crate) mod tests {
             internal.with_sibling(&removable_control, false),
             removable.with_sibling(&internal_control, true),
         )
+    }
+
+    #[test]
+    fn explicit_recovery_upgrade_resumes_every_paired_durable_boundary() {
+        if fixture_child(
+            "store::tests::explicit_recovery_upgrade_resumes_every_paired_durable_boundary",
+        ) {
+            return;
+        }
+        for (label, first_fence, first_ready, second_fence, second_ready) in [
+            (
+                "fresh",
+                OWNED_OUTPUTS_FENCE,
+                true,
+                OWNED_OUTPUTS_FENCE,
+                true,
+            ),
+            (
+                "internal-fence",
+                DELEGATED_OUTPUTS_FENCE,
+                false,
+                OWNED_OUTPUTS_FENCE,
+                true,
+            ),
+            (
+                "paired-fence",
+                DELEGATED_OUTPUTS_FENCE,
+                false,
+                DELEGATED_OUTPUTS_FENCE,
+                false,
+            ),
+            (
+                "internal-ready",
+                DELEGATED_OUTPUTS_FENCE,
+                true,
+                DELEGATED_OUTPUTS_FENCE,
+                false,
+            ),
+            (
+                "all-ready",
+                DELEGATED_OUTPUTS_FENCE,
+                true,
+                DELEGATED_OUTPUTS_FENCE,
+                true,
+            ),
+        ] {
+            let (_root, internal, paired) = paired_controls(label);
+            for (side, fence, ready) in [
+                (&internal, first_fence, first_ready),
+                (&paired, second_fence, second_ready),
+            ] {
+                let mut state = State {
+                    owned_outputs: Some(DELEGATED_OUTPUTS_FENCE.to_owned()),
+                    outputs_init: Some(if ready {
+                        OutputsInit::Ready {
+                            transaction: "a".repeat(32),
+                            ready_ms: 1,
+                        }
+                    } else {
+                        OutputsInit::Initializing {
+                            transaction: "a".repeat(32),
+                            started_ms: 1,
+                        }
+                    }),
+                    holding: Some(HOLDING_FENCE.to_owned()),
+                    recorded_accounting: Some(RECORDED_ACCOUNTING_FENCE.to_owned()),
+                    eviction_accounting: Some(EVICTION_ACCOUNTING_FENCE.to_owned()),
+                    slot_ceiling: Some(SLOT_CEILING_FENCE.to_owned()),
+                    ..State::default()
+                };
+                // Seed exact crash images directly: no ordinary writer is
+                // allowed to restore the historical string after /4 exists.
+                state.owned_outputs = Some(fence.to_owned());
+                state.version = HOLDING_STATE_VERSION;
+                validate_state(&state, false).unwrap();
+                fs::write(
+                    side.control.join("state.json"),
+                    serde_json::to_vec(&state).unwrap(),
+                )
+                .unwrap();
+                fs::set_permissions(
+                    side.control.join("state.json"),
+                    fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+            }
+            let calls = std::cell::Cell::new(0);
+            internal
+                .upgrade_output_recovery(&|transaction, publish| {
+                    assert_eq!(transaction, "a".repeat(32));
+                    if publish {
+                        for side in [&internal, &paired] {
+                            assert_eq!(
+                                side.load_recovery_upgrade()
+                                    .unwrap()
+                                    .owned_outputs
+                                    .as_deref(),
+                                Some(DELEGATED_OUTPUTS_FENCE)
+                            );
+                        }
+                    }
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(calls.get(), 2);
+            for side in [&internal, &paired] {
+                let state = side.load_recovery_upgrade().unwrap();
+                assert_eq!(state.version, HOLDING_STATE_VERSION);
+                assert_eq!(state.holding.as_deref(), Some(HOLDING_FENCE));
+                assert!(matches!(
+                    state.outputs_init,
+                    Some(OutputsInit::Ready { .. })
+                ));
+                assert!(
+                    side.load().is_err(),
+                    "unconnected ordinary reader must stay fenced"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_upgrade_preserves_failure_and_refuses_unknown_or_writing_predecessors() {
+        if fixture_child("store::tests::recovery_upgrade_preserves_failure_and_refuses_unknown_or_writing_predecessors") { return; }
+        let (_root, internal, paired) = paired_controls("recovery-refusal");
+        let tx = "b".repeat(32);
+        internal
+            .initialize_outputs(&tx, None, &|_, _| Ok(()))
+            .unwrap();
+        let before = fs::read(internal.control.join("state.json")).unwrap();
+        assert!(internal
+            .upgrade_output_recovery(&|_, _| Err("registry absent".to_owned()))
+            .is_err());
+        assert_eq!(
+            before,
+            fs::read(internal.control.join("state.json")).unwrap()
+        );
+        assert!(internal
+            .upgrade_output_recovery(&|_, publish| if publish {
+                Err("publication uncertain".to_owned())
+            } else {
+                Ok(())
+            })
+            .is_err());
+        for side in [&internal, &paired] {
+            let state = side.load_recovery_upgrade().unwrap();
+            assert_eq!(
+                state.owned_outputs.as_deref(),
+                Some(DELEGATED_OUTPUTS_FENCE)
+            );
+            assert!(matches!(
+                state.outputs_init,
+                Some(OutputsInit::Initializing { .. })
+            ));
+            assert!(side.load().is_err());
+        }
+        // A retained higher fence is never lowered to make the upgrade fit.
+        internal.upgrade_output_recovery(&|_, _| Ok(())).unwrap();
+        let (_root, internal, paired) = paired_controls("recovery-transaction");
+        internal
+            .initialize_outputs(&tx, None, &|_, _| Ok(()))
+            .unwrap();
+        let mut mismatch = paired.load().unwrap();
+        mismatch.outputs_init = Some(OutputsInit::Ready {
+            transaction: "c".repeat(32),
+            ready_ms: 1,
+        });
+        paired.save(&mismatch).unwrap();
+        assert!(internal
+            .upgrade_output_recovery(&|_, _| panic!("invalid pair reached registry"))
+            .is_err());
+        assert_eq!(
+            internal.load().unwrap().owned_outputs.as_deref(),
+            Some(OWNED_OUTPUTS_FENCE)
+        );
     }
 
     /// Output receipts are keyed in the internal pool's control directory,

@@ -93,6 +93,18 @@ impl RequestStore {
     /// Missing files, links, non-private files, oversized images and mismatches
     /// all refuse. This byte check does not validate a schema or grant.
     pub fn read(&self, id: &str, expected_sha256: &str) -> io::Result<Vec<u8>> {
+        self.read_with(id, expected_sha256, |mut reader, bytes| {
+            reader.read_to_end(bytes).map(|_| ())
+        })
+    }
+
+    /// Read under the caller's existing authority-read budget. The adapter
+    /// receives a capped reader; file custody and exact-image checks still
+    /// apply after it returns. A partial read cannot validate an image.
+    pub fn read_with<F>(&self, id: &str, expected_sha256: &str, read: F) -> io::Result<Vec<u8>>
+    where
+        F: FnOnce(std::io::Take<&File>, &mut Vec<u8>) -> io::Result<()>,
+    {
         private(&self.directory, true)?;
         validate_id(id)?;
         if expected_sha256.len() != 64 || !expected_sha256.bytes().all(lower_hex) {
@@ -100,12 +112,15 @@ impl RequestStore {
         }
         let file = self.open_file(&c_name(&format!("{id}.json"))?, false)?;
         private(&file, false)?;
+        let file_len = file.metadata()?.len();
         let mut bytes = Vec::new();
-        (&file)
-            .take(MAX_REQUEST_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)?;
+        read((&file).take(MAX_REQUEST_BYTES as u64 + 1), &mut bytes)?;
         private(&file, false)?;
-        if bytes.is_empty() || bytes.len() > MAX_REQUEST_BYTES || digest(&bytes) != expected_sha256
+        if bytes.is_empty()
+            || bytes.len() > MAX_REQUEST_BYTES
+            || bytes.len() as u64 != file_len
+            || file.metadata()?.len() != file_len
+            || digest(&bytes) != expected_sha256
         {
             return Err(invalid("request bytes do not match their recorded image"));
         }

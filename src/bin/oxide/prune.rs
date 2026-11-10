@@ -39,6 +39,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[path = "prune_request.rs"]
+mod request;
+
 pub const REGISTRY_VERSION: &str = "oxide.outputs.registry/2";
 const DELEGATED_REGISTRY_VERSION: &str = "oxide.outputs.registry/3";
 /// Schema 1 named only a whole `target` placement; schema 2 names one
@@ -86,6 +89,7 @@ const USAGE: &str = "\
 usage: oxide outputs prune --dry-run [--operator-list FILE]
        oxide outputs prune --plan FILE --plan-sha256 HEX [--operator-list FILE]
        oxide outputs resolve-intent <intent-id>
+       oxide outputs upgrade-recovery
 
 `--dry-run` prints a bounded preview of output roots whose checkout is
 positively absent, with the SHA-256 of exactly those bytes on stderr. It
@@ -457,6 +461,7 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<u8, String> {
             real_run(plan, sha, Some(Path::new(list)))
         }
         ["resolve-intent", id] => resolve_intent(id),
+        ["upgrade-recovery"] => upgrade_recovery(),
         _ => {
             eprintln!("{USAGE}");
             return Ok(2);
@@ -533,6 +538,67 @@ pub fn ensure_ready(internal: &Store, checkout: &Path) -> Result<(), String> {
     })?;
     let registry = ready_registry(&control)?;
     registry.validate()?;
+    Ok(())
+}
+
+/// An explicit metadata upgrade, never called by preview or adoption. No
+/// adapter or filesystem root effect is possible here.
+fn upgrade_recovery() -> Result<u8, String> {
+    let internal = paired_store()?;
+    let control = internal.owner_control().to_path_buf();
+    let _authority = AuthorityScope::begin()?;
+    internal.upgrade_output_recovery(&|transaction, publish| {
+        upgrade_registry_recovery(&control, transaction, publish)
+    })?;
+    println!(
+        "Output recovery format upgraded; delegated deletion remains pending source qualification."
+    );
+    Ok(0)
+}
+
+fn upgrade_registry_recovery(
+    control: &Path,
+    transaction: &str,
+    publish: bool,
+) -> Result<(), String> {
+    let mut registry = read_registry_image(control)?
+        .ok_or("recovery upgrade refuses a missing registry; it is never reconstructed")?;
+    if registry.created_by != transaction || !registry.complete || registry.incomplete.is_some() {
+        return Err("recovery upgrade requires the same complete initialized registry".to_owned());
+    }
+    if registry.version == DELEGATED_REGISTRY_VERSION {
+        request::validate_registry_requests(control, &registry)?;
+        return Ok(());
+    }
+    if registry.intents.iter().any(|intent| !intent.settled()) {
+        return Err(
+            "settle every unfinished predecessor intent before upgrading recovery".to_owned(),
+        );
+    }
+    registry.version = DELEGATED_REGISTRY_VERSION.to_owned();
+    registry.schema = 3;
+    registry.revision = registry
+        .revision
+        .checked_add(1)
+        .ok_or("registry revision exhausted")?;
+    registry.deletion_routes = Some(
+        registry
+            .intents
+            .iter()
+            .map(|intent| DeletionRoute::Local {
+                intent_id: intent.id.clone(),
+            })
+            .collect(),
+    );
+    registry.validate()?;
+    // Validate size before publishing even the first pool fence.
+    let bytes = serde_json::to_vec(&registry).map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_REGISTRY_BYTES {
+        return Err("the upgraded registry exceeds its byte limit".to_owned());
+    }
+    if publish {
+        write_registry(control, &registry)?;
+    }
     Ok(())
 }
 
@@ -721,6 +787,22 @@ fn create_or_validate_registry(
 /// foreign-version document. `Ok(None)` only when the file is positively
 /// absent.
 fn read_registry(control: &Path) -> Result<Option<Registry>, String> {
+    let registry = read_registry_image(control)?;
+    if let Some(registry) = &registry {
+        if registry.version == DELEGATED_REGISTRY_VERSION {
+            request::validate_registry_requests(control, registry)?;
+            return Err(
+                "the delegated recovery format is not yet connected; keep its intents pending"
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(registry)
+}
+
+/// Strict image read reserved for the explicit format transaction. Ordinary
+/// replay/exclusion readers use read_registry and cannot pass its connection gate.
+fn read_registry_image(control: &Path) -> Result<Option<Registry>, String> {
     let path = registry_path(control);
     let Some(file) = store::private_file(&path, false)? else {
         return Ok(None);
@@ -747,16 +829,6 @@ fn read_registry(control: &Path) -> Result<Option<Registry>, String> {
     let registry: Registry = serde_json::from_slice(&bytes)
         .map_err(|error| format!("{} is invalid: {error}", path.display()))?;
     registry.validate()?;
-    // Source/readiness only until Barge053 is reviewed, published and bound.
-    // In particular a legacy replay must never roll back a delegated intent
-    // merely because its original root still matches. No new-format command
-    // can pass this gate while the old caller/recovery remains connected.
-    if registry.version == DELEGATED_REGISTRY_VERSION {
-        return Err(
-            "the delegated recovery format is not yet connected; keep its intents pending"
-                .to_owned(),
-        );
-    }
     Ok(Some(registry))
 }
 
@@ -9214,7 +9286,7 @@ mod tests {
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-    struct Fixture {
+    pub(super) struct Fixture {
         root: PathBuf,
     }
 
@@ -9465,13 +9537,15 @@ mod tests {
         }
     }
 
-    fn routed_registry() -> (Fixture, Registry) {
+    pub(super) fn routed_registry() -> (Fixture, Registry) {
         let fixture = Fixture::new();
         seed_test_registry(&fixture.root).unwrap();
         seed_test_intent(&fixture.root, &"a".repeat(64), false);
         let mut registry = ready_registry(&fixture.root).unwrap();
         registry.version = DELEGATED_REGISTRY_VERSION.to_owned();
         registry.schema = 3;
+        registry.intents[0].identity.volume_uuid =
+            Some("A6AC3ED7-33EA-46B4-8082-7254CF291ED2".to_owned());
         registry.deletion_routes = Some(vec![DeletionRoute::Barge {
             intent_id: registry.intents[0].id.clone(),
             request_sha256: "d".repeat(64),
@@ -9564,6 +9638,19 @@ mod tests {
         fs::create_dir(&original).unwrap();
         fs::write(original.join("payload"), b"kept").unwrap();
         registry.intents[0].identity.root = original.clone();
+        let outputs = File::open(registry_dir(&fixture.root)).unwrap();
+        let requests =
+            oxide_storage::output_request_store::RequestStore::open(outputs.as_fd(), true).unwrap();
+        let sha = requests
+            .publish(
+                &registry.intents[0].id,
+                &request::ready_fixture(&registry.intents[0], 7),
+            )
+            .unwrap();
+        registry.deletion_routes = Some(vec![DeletionRoute::Barge {
+            intent_id: registry.intents[0].id.clone(),
+            request_sha256: sha,
+        }]);
         write_registry(&fixture.root, &registry).unwrap();
         let before = fs::read(registry_path(&fixture.root)).unwrap();
         assert!(read_registry(&fixture.root)
@@ -9572,6 +9659,44 @@ mod tests {
         assert!(unsettled_for(&fixture.root, &registry.intents[0].identity.checkout_id).is_err());
         assert_eq!(fs::read(registry_path(&fixture.root)).unwrap(), before);
         assert_eq!(fs::read(original.join("payload")).unwrap(), b"kept");
+    }
+
+    #[test]
+    fn recovery_registry_upgrade_is_explicit_atomic_and_preserves_local_history() {
+        let fixture = Fixture::new();
+        seed_test_registry(&fixture.root).unwrap();
+        seed_test_intent(&fixture.root, &"a".repeat(64), false);
+        let mut old = read_registry(&fixture.root).unwrap().unwrap();
+        let transaction = old.created_by.clone();
+        let before = fs::read(registry_path(&fixture.root)).unwrap();
+        assert!(upgrade_registry_recovery(&fixture.root, &transaction, false).is_err());
+        assert_eq!(before, fs::read(registry_path(&fixture.root)).unwrap());
+        old.intents[0].phase = IntentPhase::Deleted;
+        old.intents[0].receipt_settled = true;
+        write_registry(&fixture.root, &old).unwrap();
+        let before = fs::read(registry_path(&fixture.root)).unwrap();
+        upgrade_registry_recovery(&fixture.root, &transaction, false).unwrap();
+        assert_eq!(before, fs::read(registry_path(&fixture.root)).unwrap());
+        assert!(upgrade_registry_recovery(&fixture.root, "wrong", true).is_err());
+        upgrade_registry_recovery(&fixture.root, &transaction, true).unwrap();
+        let next = read_registry_image(&fixture.root).unwrap().unwrap();
+        assert_eq!(next.schema, 3);
+        assert_eq!(next.revision, old.revision + 1);
+        assert_eq!(
+            serde_json::to_value(&next.intents).unwrap(),
+            serde_json::to_value(&old.intents).unwrap()
+        );
+        assert!(matches!(
+            &next.deletion_routes.as_ref().unwrap()[0],
+            DeletionRoute::Local { .. }
+        ));
+        let upgraded = fs::read(registry_path(&fixture.root)).unwrap();
+        upgrade_registry_recovery(&fixture.root, &transaction, true).unwrap();
+        assert_eq!(upgraded, fs::read(registry_path(&fixture.root)).unwrap());
+        assert!(read_registry(&fixture.root).is_err());
+        let absent = Fixture::new();
+        assert!(upgrade_registry_recovery(&absent.root, &transaction, true).is_err());
+        assert!(!registry_path(&absent.root).exists());
     }
 
     fn synthetic_entry(index: usize, pad: usize, kept: Option<&str>) -> Evaluated {
@@ -12553,6 +12678,11 @@ mod tests {
     /// under the caller's own barrier, where the records-only split applies.
     #[test]
     fn witnessed_custody_maps_onto_the_keep_contract() {
+        if store::tests::fixture_child(
+            "prune::tests::witnessed_custody_maps_onto_the_keep_contract",
+        ) {
+            return;
+        }
         let fixture = Fixture::new();
         let control = fixture.root.join("control");
         fs::create_dir(&control).unwrap();
