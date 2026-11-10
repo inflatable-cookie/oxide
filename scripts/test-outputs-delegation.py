@@ -19,6 +19,7 @@ import plistlib
 import re
 from pathlib import Path
 import secrets
+import shutil
 import sys
 import time
 
@@ -31,6 +32,7 @@ BARGE_REVIEWED = '547fbe99cdc9676b80b58730cf09715c64c5a9cd'
 BARGE_TREE = '8a3b368e7883be862fe8319bb34e9f987e38731b'
 STASH = '8A660440-C919-45C6-A3F1-3365B9BD2006'
 SECONDS, MIB, BUDGET = 300, 1024 * 1024, 512
+PREPARE_MIB, RESIDENT_MIB, GROWTH_MIB = 448, 288, 32
 FEATURES = 'barge/proof-synthetic-account'
 # Support is established from the published source export, lock and actual
 # cached bytes below. No task-completion notice or boolean forces readiness.
@@ -294,6 +296,135 @@ def seed_inputs(proof, host, cargo, lock):
     return seed
 
 
+def owned_directory(path, device=None):
+    facts=path.lstat()
+    require(path.resolve(strict=True)==path and stat.S_ISDIR(facts.st_mode),'staging directory is linked/noncanonical')
+    require(facts.st_uid==os.getuid() and not facts.st_mode&0o022,'staging directory ownership is unsafe')
+    require(device is None or facts.st_dev==device,'staging directory crossed devices')
+    return (facts.st_dev,facts.st_ino)
+
+
+def phase_snapshot(proof,phase,limit):
+    proof.remaining()
+    root=Path(os.path.commonpath((proof.root,proof.evidence)))
+    require(root in (proof.root,proof.root.parent),'evidence/scratch do not share this owned run root')
+    device=owned_directory(root)[0]
+    owned_directory(proof.root,device);owned_directory(proof.evidence,device)
+    components={}
+    for name,path in [('source',proof.root/'source'),('target',proof.root/'target'),
+        ('expanded_cargo_including_seed',proof.root/'stage-cargo'),('stage_home',proof.root/'stage-home'),
+        ('evidence_including_sealed_artifact',proof.evidence)]:
+        if path.exists():owned_directory(path,device)
+        components[name]=wrapper.owned_bytes(path) if path.exists() else 0
+    total=wrapper.owned_bytes(root)
+    components['other_owned_bytes']=total-sum(components.values())
+    require(components['other_owned_bytes']>=0,'phase components overlap')
+    record={'phase':phase,'total_allocated_bytes':total,'components':components,'limit_bytes':limit,
+        'scope':'all current run-owned data; sampled phase observation, not a continuous guarantee'}
+    if not hasattr(proof,'stage_phases'):proof.stage_phases=[]
+    proof.stage_phases.append(record)
+    write_json(proof.evidence/'delegation-stage-phases.json',proof.stage_phases)
+    # Include this publication too; no optimistic subtraction for expanded
+    # cache, logs, copied artifacts, or arbitrary other run-owned files.
+    admitted=wrapper.owned_bytes(root)
+    record['total_after_publication_bytes']=admitted
+    require(admitted<=limit,f'{phase}: all-owned phase allocation {admitted} exceeds {limit} bytes')
+    proof.remaining()
+    return record
+
+
+def producer_closed(proof,code,stderr):
+    permanent.require_normal_exit('stage producer',code)
+    permanent.require_confirmed_closure('stage producer',stderr)
+    require(code==0 and proof.closure_known and not proof.unclosed,'stage producer custody is not positively closed/reaped')
+    return {'exit':code,'reaped':True,'direct_child_reaped_by':'existing Proof.run wait',
+        'closure_known':proof.closure_known,'unclosed_handles':len(proof.unclosed),
+        'limit':'cooperative producer custody; final qualified guard group census remains separate'}
+
+
+def dispose_fresh_target(proof,target,identity):
+    # Target-specific authorization around Python's established fd-safe
+    # rmtree. Never a general cache/root deletion interface.
+    require(target==proof.root/'target','only this fresh compilation target may be disposed')
+    device=owned_directory(proof.root)[0]
+    require(owned_directory(target,device)==identity,'fresh target identity changed')
+    require(shutil.rmtree.avoids_symlink_attacks,'fd-safe target cleanup is unavailable')
+    proof.remaining()
+    for _,dirs,files,fd in os.fwalk(target,follow_symlinks=False):
+        proof.remaining()
+        for name in dirs+files:
+            info=os.stat(name,dir_fd=fd,follow_symlinks=False)
+            require(info.st_uid==os.getuid() and info.st_dev==device and
+                (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)),
+                'fresh target contains unknown ownership/device/type or a link')
+    parent=os.open(proof.root,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:
+        info=os.stat('target',dir_fd=parent,follow_symlinks=False)
+        require((info.st_dev,info.st_ino)==identity,'fresh target replaced before cleanup')
+        proof.remaining()
+        fd=os.open('target',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+        try:
+            require((os.fstat(fd).st_dev,os.fstat(fd).st_ino)==identity,'target changed while opened for cleanup')
+            def fail_cleanup(function,path,exc_info):raise exc_info[1]
+            # The fd-safe engine already used by this Python's rmtree; its
+            # public wrapper lacks dir_fd here. Reuse it, never pathname-follow.
+            shutil._rmtree_safe_fd(fd,str(target),fail_cleanup)
+        finally:os.close(fd)
+        info=os.stat('target',dir_fd=parent,follow_symlinks=False)
+        require((info.st_dev,info.st_ino)==identity,'target changed before final rmdir')
+        proof.remaining()
+        os.rmdir('target',dir_fd=parent)
+        try:os.stat('target',dir_fd=parent,follow_symlinks=False)
+        except FileNotFoundError:pass
+        else:raise RuntimeError('fresh target cleanup did not establish absence')
+    finally:os.close(parent)
+    proof.remaining()
+
+
+def seal_stage(proof,binary,target_identity,provenance):
+    require(proof.closure_known and not proof.unclosed,'unknown stage custody refuses sealing/cleanup')
+    require(provenance.get('producer',{}).get('reaped') is True and provenance['producer']['exit']==0,'stage producer reap is not recorded')
+    target=proof.root/'target'
+    require(owned_directory(target,owned_directory(proof.root)[0])==target_identity,'target identity changed before sealing')
+    require(binary==target/'debug/oxide','unexpected stage artifact path')
+    source.canonical_file(binary)
+    info=binary.lstat()
+    require(info.st_uid==os.getuid() and info.st_dev==target_identity[0] and info.st_mode&0o100,'stage artifact ownership/device/mode is unsafe')
+    digest=source.sha256_file(binary,cap=source.MAX_ADMISSION_ARTIFACT_BYTES,deadline_ns=proof.deadline_ns)
+    artifact=source.copy_candidate_artifact(binary,proof.evidence,digest,info.st_size,deadline_ns=proof.deadline_ns)
+    sealed=Path(artifact['path'])
+    sealed_identity=sealed.lstat()
+    artifact['identity']=[sealed_identity.st_dev,sealed_identity.st_ino]
+    provenance.update(binary_sha256=digest,binary_bytes=info.st_size,sealed_artifact=artifact,
+        target={'path':str(target),'identity':list(target_identity),'cleanup':'not_started'})
+    write_json(proof.evidence/'delegation-stage.json',provenance)
+    phase_snapshot(proof,'sealed-before-target-cleanup',PREPARE_MIB*MIB)
+    # Verify the retained copy and durable provenance before authorizing any
+    # deletion. A copy/hash/publication error leaves the target untouched.
+    require(source.sha256_file(sealed,cap=source.MAX_ADMISSION_ARTIFACT_BYTES,deadline_ns=proof.deadline_ns)==digest,'sealed artifact hash changed')
+    provenance['target']['cleanup']='started'
+    write_json(proof.evidence/'delegation-stage.json',provenance)
+    dispose_fresh_target(proof,target,target_identity)
+    after=sealed.lstat()
+    require(sealed.resolve(strict=True)==sealed and (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns)==(sealed_identity.st_dev,sealed_identity.st_ino,sealed_identity.st_size,sealed_identity.st_mtime_ns),'sealed artifact identity changed during cleanup')
+    require(source.sha256_file(sealed,cap=source.MAX_ADMISSION_ARTIFACT_BYTES,deadline_ns=proof.deadline_ns)==digest,'sealed artifact changed after cleanup')
+    provenance['target']['cleanup']='absent_verified'
+    write_json(proof.evidence/'delegation-stage.json',provenance)
+    phase_snapshot(proof,'resident-after-target-cleanup',RESIDENT_MIB*MIB)
+    return sealed
+
+
+def run_phase_snapshot(proof,image,phase):
+    record=phase_snapshot(proof,phase,(RESIDENT_MIB+128+GROWTH_MIB)*MIB)
+    backing=Path(image.backing)
+    info=backing.lstat()
+    require(stat.S_ISREG(info.st_mode) and info.st_uid==os.getuid(),'image backing accounting is unknown')
+    image_bytes=info.st_blocks*512
+    require(image_bytes<=128*MIB,'image backing exceeds its128MiB allocation')
+    require(record['total_after_publication_bytes']-image_bytes-proof.resident_baseline<=GROWTH_MIB*MIB,
+        'all fixture/evidence growth exceeds32MiB')
+
+
 def stage(proof):
     require(wrapper.sha256_file(HERE/'bounded-test.py') == SUPERVISOR, 'ordinary supervisor bytes changed')
     head = wrapper.git(proof, 'rev-parse', 'HEAD')
@@ -326,22 +457,25 @@ def stage(proof):
         code,out,err = proof.run([str(tools[tool]),'--version'],env=env,label='version-'+tool,limit=10)
         require(code == 0,err); versions.append(out.strip())
     require(tuple(versions) == wrapper.BUILDER_VERSIONS, f'toolchain mismatch: {versions}')
+    target=proof.root/'target';target.mkdir(mode=0o700)
+    target_identity=owned_directory(target,owned_directory(proof.root)[0])
+    phase_snapshot(proof,'prepared-before-build',PREPARE_MIB*MIB)
     argv=[str(tools['cargo']),'build','--locked','--offline','--bin','oxide','--features',FEATURES]
     write_json(proof.evidence/'delegation-stage-inputs.json',{'head':head,'tree':tree,'source':binding,'lock_sha256':hashlib.sha256(lock).hexdigest(),'argv':argv,'features':FEATURES,'versions':versions,'flags':'','tools':{k:str(v) for k,v in tools.items()}})
     code,_,err = proof.run(argv,cwd=root,env=env,label='delegation-stage',limit=170)
-    require(code == 0,err[-2000:])
+    producer=producer_closed(proof,code,err)
+    phase_snapshot(proof,'build-finished-before-sealing',PREPARE_MIB*MIB)
     for item in seed['git_sources']:
         wrapper.offline_seed.verify_private_checkout(cargo,item['rev'],[c['database'] for c in item['candidates']],deadline_ns=proof.deadline_ns)
-    require(wrapper.owned_bytes(root)+wrapper.owned_bytes(proof.root/'target')<=160*MIB,'staged source/target exceed prospective 160MiB allocation; no image allocated')
     binary = proof.root/'target/debug/oxide'
     provenance={'head':head,'tree':tree,'source':binding,'lock_sha256':hashlib.sha256(lock).hexdigest(),
-                'barge':BARGE,'binary_sha256':wrapper.sha256_file(binary),
+                'barge':BARGE,'producer':producer,
                 'tools':{k:{'path':str(v),'sha256':wrapper.sha256_file(v)} for k,v in tools.items()},
                 'versions':versions,'features':FEATURES,'argv':argv,'flags':'','seed':seed,
                 'supervisor':SUPERVISOR,'proof_sha256':wrapper.sha256_file(Path(__file__)),
                 'manifest_sha256':wrapper.sha256_file(REPO/'effigy.toml'),'adapter_source':adapter_binding(cargo)}
-    write_json(proof.evidence/'delegation-stage.json',provenance)
-    return binary, tools, env
+    sealed=seal_stage(proof,binary,target_identity,provenance)
+    return sealed, tools, env
 
 
 class World:
@@ -757,8 +891,10 @@ def plan_document():
             'selectors':['proof:outputs-delegation:test','proof:outputs-delegation:plan','rust:outputs-delegation:diagnostic','rust:outputs-delegation'],
             'supervisor_sha256':SUPERVISOR,'barge':BARGE,'seconds':SECONDS,'scratch_mib':BUDGET,
             'work_stop_margin_s':30,'image_mib':128,'staging':'clean exact tree, Rust1.97.1 locked/offline, private Cargo seed, '+FEATURES,
-            'fit':{'measured':False,'prospective_seconds':{'seed_and_source':45,'build':170,'cases':55,'closure_margin':30},
-                   'prospective_mib':{'seed':128,'source_and_target':160,'image_backing':128,'fixtures_and_evidence':32,'margin':64}},
+            'fit':{'measured':False,'prospective_seconds':{'seed_and_source':45,'build_seal_cleanup':170,'cases':55,'closure_margin':30},
+                   'prospective_phase_mib':{'preparation':{'all_owned':448,'margin':64},'run':{'retained':288,'image':128,'fixture_and_evidence_growth':32,'margin':64}},
+                   'seed_copy_mib':128,'artifact_lifecycle':'closed producer -> exclusive verified executable in evidence -> bound provenance -> dispose only fresh target -> verify retained copy -> resident gate',
+                   'accounting':'all run-owned source, target, expanded Cargo cache including seed, home, tools copied if any, evidence, sealed artifact and other files; phase observations plus unchanged qualified guard'},
             'premises':[
                 'Installed toolchain resolved before private HOME; absolute Cargo/rustc; AUTO_INSTALL=0.',
                 'Oxide synthetic account and Barge proof-account feature positively agree before fixture writes; production account lookup unproved.',
@@ -862,7 +998,7 @@ def self_check():
     else:raise AssertionError('changed source link accepted')
     binding_document()
     require(plan_document()['fit']['measured'] is False,'unmeasured plan claimed measurement')
-    require(sum(plan_document()['fit']['prospective_mib'].values())==BUDGET,'envelope mismatch')
+    require(all(sum(phase.values())==BUDGET for phase in plan_document()['fit']['prospective_phase_mib'].values()),'phase envelope mismatch')
     require(sum(plan_document()['fit']['prospective_seconds'].values())==SECONDS,'time envelope mismatch')
     class StopProbe(Exception):pass
     class Probe:
@@ -919,10 +1055,13 @@ def run_proof(diagnostic,proof,image):
         import plistlib
         require(code==0 and plistlib.loads(out.encode()).get('VolumeUUID','').upper()==STASH,'scratch is not the approved Stash volume')
         binary,tools,env=stage(proof)
+        resident=phase_snapshot(proof,'resident-before-image',RESIDENT_MIB*MIB)
+        proof.resident_baseline=resident['total_after_publication_bytes']
         image.allocate(str(proof.evidence),str(proof.root))
         fresh.image_document(proof.evidence,'image-custody.json',{'version':1,'backings':[os.path.realpath(image.backing)]})
         image.attach();proof.mount=image.mount
         fresh.image_document(proof.evidence,'delegation-image.json',{'mount':image.mount,'volume_uuid':image.volume_uuid,'backing':image.backing})
+        run_phase_snapshot(proof,image,'image-attached')
         for name in CASES:
             proof.remaining()
             try:
@@ -935,6 +1074,7 @@ def run_proof(diagnostic,proof,image):
                 if not diagnostic or proof.unclosed or not proof.closure_known:raise
             # Every partial case result is retained even if a later stage fails.
             write_json(proof.evidence/'delegation-partial.json',{'cases':rows,'qualified':False})
+            run_phase_snapshot(proof,image,'case-'+name)
     except BaseException as exc:
         error=f'{type(exc).__name__}: {str(exc)[:1600]}'
     finally:
@@ -950,7 +1090,7 @@ def run_proof(diagnostic,proof,image):
         report={'version':'oxide.outputs.delegation.proof/1','diagnostic':diagnostic,'qualified':False,
                 'cases':rows,'error':error,'secondary_errors':proof.secondary_errors,
                 'image':image.state,'detach':disposition,'report_published':True,
-                'elapsed_s':proof.elapsed(),'limits':plan_document()['limits']}
+                'elapsed_s':proof.elapsed(),'phase_accounting':getattr(proof,'stage_phases',[]),'limits':plan_document()['limits']}
         try:write_json(proof.evidence/'delegation-report.json',report)
         except BaseException as exc:
             secondary_error(proof,'final report publication',exc)

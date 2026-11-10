@@ -5075,7 +5075,7 @@ or image custody aborts and retains resources. Diagnostic continuation is
 limited to classified oracle failures after child closure; failed worlds
 remain retained. Missing or incomplete final reports fail.
 
-The proposed allocations are 128 MiB seed, 160 MiB source/target, 128 MiB
+The historical simultaneous allocation was 128 MiB seed, 160 MiB source/target, 128 MiB
 image, 32 MiB fixtures/evidence and 64 MiB margin. Read-only cache metadata
 found about 35.8 MiB of admissible candidates plus registry inputs; a roughly
 2.73 GiB candidate is skipped by the existing seeder before copying. These
@@ -5232,3 +5232,83 @@ mapping above, strict safety predicates, fixed43 cases and300s/512MiB/128MiB/
 A newly bound diagnostic, counted author, distinct reviewer native and final
 judgment still require prospective planner activation; no execution is activated
 by this correction or its passing plan.
+
+
+#### Phased staging and sealed case executable (oxide#304)
+
+The replacement diagnostic at `65c86590ac79cfc3746eab0b14a1d9c07b290ff1`
+failed the former160MiB source+target gate after a successful45.04s private
+Cargo build. Its actual final report published with no secondary errors;
+all43 cases were unexecuted and no image was allocated. Guard
+`8cbc3a74c06b2b5324322b670dbe2a8f` closed1 with no fault/deadline and a
+certain empty joined census. Its sampled whole-owned peak313,634,816 bytes
+is neither an exact source+target size nor an instantaneous upper bound.
+The only established component fact is >160MiB. Guard cleanup removed scratch;
+no binary or payload reconstruction follows. The retained packet
+`/Volumes/Stash/scratch/oxide/d1d19a80/diagnostic.HiJXpzy8/packet.json`
+(16278 bytes, SHA256 `496401731dc419d87d7613cfdecb17a218d142fe00be40c7f214f15f7ac4855d`)
+binds report, seed/source/tool/build inputs, guard and omissions. This spent
+failure does not establish the first attempt's unknown seed result.
+
+The prospective internal allocation now has two phases under the same300s /
+512MiB qualified guard,30s work stop and128MiB image:
+
+| Phase | Prospective allocation |
+| --- | --- |
+| Preparation/build/sealing, no image |448MiB ALL owned data +64MiB margin. Seeder copy aggregate remains128MiB; expanded private Cargo/Git data is charged too. |
+| After target disposal, before image |At most288MiB retained data, including source, expanded private cache, home, evidence and sealed executable. |
+| Cases |288MiB retained +128MiB image +32MiB ALL fixture/evidence/cache growth +64MiB margin. |
+
+`phase_snapshot` measures the common owned scratch/evidence root, reports
+components and a total including unknown other owned files, and checks again
+after its own manifest write. Logs, expanded cache and the retained copy are
+never free. Snapshots before build, after build, after sealing, after target
+cleanup, before image and after image/each case are point-in-time allocated-byte
+observations, not a new continuous guarantee. The unchanged qualified guard
+continues its512MiB monitoring and reserve checks. Run-phase accounting separates
+actual backing blocks from all other growth; it refuses over32MiB growth.
+
+Successful `Proof.run` completion is the existing positive direct-child wait;
+normal exit, explicit unconfirmed-custody messages, `closure_known` and unclosed
+handles are checked before sealing. This is cooperative producer custody, not
+an invented pre-image global census. The qualified guard still independently
+decides final group closure. Unknown custody refuses without target disposal.
+
+The actual regular, canonical, same-device owned executable is copied by the
+existing `copy_candidate_artifact` into exclusive owner-only `evidence/candidate/oxide`.
+The helper verifies both endpoints, digest, size and executable mode. Full
+head/tree/lock/source/tool/Barge/flags/seed provenance and sealed identity/hash
+are published before disposal. Only the fresh target directory created by this
+stage is eligible: its device/inode token, canonical containment, ownership,
+entry types/devices and remaining window are checked. Cleanup reuses Python's
+existing fd-safe rmtree engine with held no-follow parent/target descriptors;
+the installed Python's public wrapper lacks `dir_fd`. Identity is checked again
+before final descriptor-relative rmdir. No host cache, old target, source or
+seed tree is eligible; failure refuses before image allocation, retaining the
+sealed copy and available evidence rather than retrying partial cleanup.
+
+After cleanup the retained executable is reverified, target absence recorded,
+and resident accounting must pass before stage returns that sealed path. Later
+worlds execute it, not the deleted target. `fixture_env` uses only installed
+absolute tools and the retained rustup-home value from stage environment;
+it scrubs inherited Cargo target overrides and creates each private Cargo home.
+The held-writer case runs its own dependency-free command. No later case reads
+compilation target outputs. Source, expanded private seed/cache and evidence
+stay available for binding; no additional cleanup is proposed. Compiler
+optimization/debug/features and fixed43 cases are unchanged.
+
+Local controls traverse the actual stage/run seams with tiny synthetic files
+and fake archive/seed/build/image/process executors. They prove the sealed
+hash/mode/provenance survives target removal, and refuse missing, linked,
+non-executable/outside artifacts, copy/hash/publication/cleanup errors, target
+replacement, expired window, unknown producer and over-preparation/resident
+gates before image allocation. Expanded cache/evidence/other-root accounting
+and run-growth charging have independent controls. The previous actual-writer
+and primary/secondary error controls remain. All local files stay under the
+same1MiB control limit; no real source export, seed, build, image or native runs.
+
+These phase allocations are prospective. No new diagnostic is activated by
+this source correction or its plan. The same retained reviewer must assess
+cleanup/dependency safety and readiness; a fresh diagnostic, counted author,
+distinct reviewer native and final judgment remain separately planner-activated.
+Both failed histories and all prior gates remain intact.

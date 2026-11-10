@@ -38,6 +38,8 @@ def imported_contracts(m):
         (m.wrapper.offline_seed.Anchor,'open_file',[None,('file',)],{}),
         (m.wrapper.offline_seed.Anchor,'open_dir',[None,('dir',)],{})):
         inspect.signature(getattr(cls,name)).bind(*args,**keywords)
+    assert m.shutil.rmtree.avoids_symlink_attacks
+    inspect.signature(m.shutil._rmtree_safe_fd).bind(0,'target',lambda *args:None)
     print('imported helper call shapes checked:',len(calls))
 
 
@@ -142,18 +144,24 @@ def setup_failures(m,root):
             assert not report['secondary_errors']
 
 
-def stage_contract(m,root):
+def stage_contract(m,root,case="ok"):
     # Traverse the real stage function with synthetic, never-executed tools,
     # archive, seed and child executors; real publication/hashes stay active.
-    base=root/'stage-contract';base.mkdir();events=[]
+    base=root/('stage-'+case);base.mkdir();events=[]
     for name in ('cargo','rustc'):(base/name).write_text('local tool bytes, never executed')
     rustup=base/'rustup';rustup.mkdir()
     class Proof:
-        root=base;deadline_ns=1;secondary_errors=[];tool_dirs=str(base)
+        root=base;deadline_ns=None;secondary_errors=[];tool_dirs=str(base)
+        closure_known=True;unclosed=set()
+        def remaining(self):
+            if case=='expired' and (self.evidence/'candidate/oxide').exists():raise RuntimeError('EXPIRED_WINDOW')
+            return 1
+        def elapsed(self):return 0.0
         evidence=base/'evidence'
         def env(self,extra=None):return m.wrapper.Proof.env(self,extra)
         def run(self,argv,*,label,limit,cwd=None,env=None):
             events.append(label)
+            if label=='stash-identity':return 0,m.plistlib.dumps({'VolumeUUID':m.STASH}).decode(),''
             if label.startswith('resolve-'):return 0,str(base/label.removeprefix('resolve-'))+'\n',''
             assert env['RUSTFLAGS']=='' and env['RUSTC_WRAPPER']==''
             assert 'CARGO_ENCODED_RUSTFLAGS' not in env
@@ -164,7 +172,14 @@ def stage_contract(m,root):
                 return 0,m.wrapper.BUILDER_VERSIONS[index],' '
             assert label=='delegation-stage'
             assert argv==[str(base/'cargo'),'build','--locked','--offline','--bin','oxide','--features',m.FEATURES]
-            binary=base/'target/debug/oxide';binary.parent.mkdir(parents=True);binary.write_bytes(b'not an executable')
+            binary=base/'target/debug/oxide'
+            if case=='outside':
+                outside=base/'outside';outside.mkdir();(base/'target/debug').symlink_to(outside,target_is_directory=True)
+            else:binary.parent.mkdir(parents=True)
+            if case!='missing':
+                if case=='linked':binary.symlink_to(base/'cargo')
+                else:binary.write_bytes(b'not an executable');binary.chmod(0o600 if case=='mode' else 0o700)
+            if case=='unconfirmed':self.closure_known=False
             return 0,'',''
     proof=Proof();proof.evidence.mkdir()
     def archive(repo,destination,head,tree,*,deadline_ns):
@@ -173,9 +188,27 @@ def stage_contract(m,root):
     def seed(host,cargo,lock,*,limits,deadline_ns,provenance):
         assert limits.aggregate_bytes==128*m.MIB
         provenance['local_control_only']=True
+        (cargo/'expanded-cache.bin').write_bytes(b'expanded private cache')
         return {'git_sources':[{'rev':m.BARGE,'candidates':[{'database':'local-only'}]}]}
     def checkout(cargo,rev,idents,*,deadline_ns):
         assert rev==m.BARGE and idents==['local-only'];events.append('checkout-verified-fake');return 'local-only'
+    original_copy=m.source.copy_candidate_artifact
+    def copy(*args,**kwargs):
+        if case=='copy':raise OSError('COPY_FAILURE')
+        result=original_copy(*args,**kwargs)
+        if case=='hash':Path(result['path']).write_bytes(b'wrong copied bytes')
+        if case=='target-swap':
+            (base/'target').rename(base/'retained-target');(base/'target').mkdir(mode=0o700)
+        return result
+    original_write=m.write_json
+    def publish(path,value):
+        if case=='publication' and path.name=='delegation-stage.json':raise OSError('PUBLICATION_FAILURE')
+        return original_write(path,value)
+    class Image:
+        state='unallocated'
+        def allocate(self,*args):events.append('IMAGE_ALLOCATION_REACHED');raise AssertionError('IMAGE_ALLOCATION_REACHED')
+        def attach(self):raise AssertionError('IMAGE_ATTACH_REACHED')
+    out=io.StringIO();err=io.StringIO()
     with ExitStack() as stack:
         for obj,name,value in ((m.wrapper,'git',lambda proof,*args:'b'*40 if args[-1]=='HEAD^{tree}' else ('a'*40 if args[-1]=='HEAD' else '')),
             (m.source,'stage_git_tree',archive),(m,'host_cache',lambda:base/'not-read-host'),
@@ -183,19 +216,67 @@ def stage_contract(m,root):
             (m,'adapter_binding',lambda cache:{'local_control_only':True})):
             stack.enter_context(patch.object(obj,name,value))
         stack.enter_context(patch.dict(os.environ,{'RUSTUP_HOME':str(rustup),'CARGO_ENCODED_RUSTFLAGS':'must-be-scrubbed'}))
-        binary,tools,env=m.stage(proof)
+        stack.enter_context(patch.object(m.source,'copy_candidate_artifact',copy))
+        stack.enter_context(patch.object(m,'write_json',publish))
+        stack.enter_context(patch.object(m,'source_readiness',lambda:None))
+        stack.enter_context(patch.object(m,'stash_mount',lambda path:base))
+        if case=='cleanup':stack.enter_context(patch.object(m.shutil,'_rmtree_safe_fd',side_effect=OSError('CLEANUP_FAILURE')))
+        if case=='over-prep':stack.enter_context(patch.object(m,'PREPARE_MIB',0))
+        if case=='over-resident':stack.enter_context(patch.object(m,'RESIDENT_MIB',0))
+        if case=='ok':binary,tools,env=m.stage(proof)
+        else:
+            stack.enter_context(redirect_stdout(out));stack.enter_context(redirect_stderr(err))
+            code=m.run_proof(True,proof,Image())
+    if case!='ok':
+        report=json.loads(out.getvalue());assert code==1 and report['error']
+        expected={'copy':'COPY_FAILURE','hash':'hash changed','publication':'PUBLICATION_FAILURE',
+            'cleanup':'CLEANUP_FAILURE','unconfirmed':'custody','over-prep':'prepared-before-build',
+            'over-resident':'resident-after-target-cleanup','expired':'EXPIRED_WINDOW',
+            'missing':'FileNotFoundError','linked':'canonical regular','outside':'canonical regular',
+            'mode':'mode is unsafe','target-swap':'identity changed'}[case]
+        assert expected in report['error'],(case,report['error'])
+        assert all(row['state']=='unexecuted' for row in report['cases']) and 'IMAGE_ALLOCATION_REACHED' not in events
+        assert (base/'target').exists() or case=='over-resident'
+        if case in ('hash','publication','cleanup','target-swap','expired','over-resident'):
+            assert (proof.evidence/'candidate/oxide').is_file()
+        return
+
     assert events==['resolve-cargo','resolve-rustc','version-cargo','version-rustc','delegation-stage','checkout-verified-fake']
     assert binary.read_bytes()==b'not an executable' and tools['cargo']==base/'cargo'
+    assert binary==proof.evidence/'candidate/oxide' and stat.S_IMODE(binary.stat().st_mode)==0o700
+    assert not (base/'target').exists() and (base/'source/Cargo.lock').is_file()
     inputs=json.loads((proof.evidence/'delegation-stage-inputs.json').read_text())
     final=json.loads((proof.evidence/'delegation-stage.json').read_text())
     assert inputs['features']==m.FEATURES and inputs['flags']==final['flags']==''
     assert final['seed']['git_sources'][0]['rev']==m.BARGE and final['adapter_source']=={'local_control_only':True}
     assert final['source']=={'local_control_only':True} and len(final['binary_sha256'])==64
+    assert final['target']['cleanup']=='absent_verified' and final['producer']['reaped'] is True
+    assert any(r['components']['expanded_cargo_including_seed']>0 and r['components']['evidence_including_sealed_artifact']>0 and r['components']['other_owned_bytes']>0 for r in proof.stage_phases)
+    assert proof.stage_phases[-1]['components']['target']==0
     fixture=base/'fixture';fixture.mkdir()
     fixture_env=m.fixture_env(proof,fixture,tools,env)
     assert fixture_env['HOME']==fixture_env['BARGE_ACCOUNT_HOME']==fixture_env['OXIDE_TEST_ACCOUNT_HOME']
     assert fixture_env['RUSTFLAGS']=='' and 'CARGO_ENCODED_RUSTFLAGS' not in fixture_env
     assert fixture_env['RUSTUP_AUTO_INSTALL']=='0'
+    assert fixture_env.get('CARGO_TARGET_DIR')!=str(base/'target')
+
+
+def run_accounting(m,root):
+    base=root/'run-accounting';base.mkdir();evidence=base/'evidence';evidence.mkdir()
+    class Proof:
+        root=base
+        def remaining(self):return 1
+    proof=Proof();proof.evidence=evidence
+    baseline=m.wrapper.owned_bytes(base)
+    backing=evidence/'synthetic-accounting-image';backing.write_bytes(b'not an image')
+    proof.resident_baseline=baseline
+    image=type('Image',(),{'backing':str(backing)})()
+    m.run_phase_snapshot(proof,image,'local-run-accounting')
+    (base/'expanded-later-cache').write_bytes(b'counts as growth')
+    with patch.object(m,'GROWTH_MIB',0):
+        try:m.run_phase_snapshot(proof,image,'local-growth-refusal')
+        except m.OracleFailure as error:assert 'growth exceeds' in str(error)
+        else:raise AssertionError('fixture/evidence/cache growth was not charged')
 
 
 def closure_request(m,root):
@@ -250,6 +331,8 @@ def check(m):
     setup_failures(m,root)
     child_contract(m,root)
     closure_request(m,root)
-    stage_contract(m,root)
+    run_accounting(m,root)
+    for case in ('ok','missing','linked','outside','mode','copy','hash','publication','cleanup','unconfirmed','target-swap','expired','over-prep','over-resident'):
+        stage_contract(m,root,case)
     allocated=m.wrapper.owned_bytes(root);assert allocated<=1024*1024,'local controls exceed1MiB allocation'
     print('local publication/setup/child controls: OK; allocated bytes',allocated,'; small owned files retained at',root)

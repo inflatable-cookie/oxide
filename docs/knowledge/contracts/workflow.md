@@ -6188,6 +6188,11 @@ preserve that spent occurrence and unknown seed result. The source/local-file
 self-check now exercises the real replacement writer and primary/secondary
 failure composition with fake execution boundaries. It starts no engine or
 image and supplies no diagnostic credit.
+The replacement65c86590 diagnostic built but failed the160MiB staging allocation
+before all43 cases. The [phased staging correction](barge-adoption.md#phased-staging-and-sealed-case-executable-oxide304)
+keeps the512MiB overall guard while sealing the case executable and disposing
+only the fresh, positively owned target before the288MiB resident gate. No
+execution activation follows from those prospective allocations or local controls.
 
 The approved Barge mechanism-only extension (Tom `63ad6fc4` v2 and explicit
 recovery-format ruling `60a85553` v2) is implemented behind the explicit
