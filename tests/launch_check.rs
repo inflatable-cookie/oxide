@@ -40,6 +40,7 @@ fn scratch(label: &str) -> PathBuf {
 
 /// The same clock the shared guard exports, for phase comparison only.
 fn observation_ns() -> i128 {
+    // SAFETY: an all-zero timespec is valid plain data.
     let mut clock: libc::timespec = unsafe { std::mem::zeroed() };
     // SAFETY: clock points to a writable timespec.
     assert_eq!(

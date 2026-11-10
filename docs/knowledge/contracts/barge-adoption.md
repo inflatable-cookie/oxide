@@ -5105,3 +5105,9 @@ API is a workaround. The proof plan now reports `execution_ready: false`,
 with a named refusal before staging or backing creation. Source preparation
 is retained on the same task/PR; qualification waits for reviewed published
 Barge code and evidence, followed by this task's separate activation gates.
+
+
+The deciding F2/replay prerequisite is linked as Barge054, task
+`36cd1a04-a367-411a-bff5-abf2810f1034`. Its actual reviewed published source
+and accepted evidence must be bound before removing the integrated execution
+gate; dispatch alone grants no API, staging, image or native credit.

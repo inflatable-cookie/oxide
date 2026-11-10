@@ -58,6 +58,7 @@ pub fn record_timing(phase: &str) {
         }
         // SAFETY: the writable timespec is valid; the shared cross-process
         // uptime clock is observation only, never the product's time owner.
+        // SAFETY: an all-zero timespec is valid plain data.
         let mut clock: libc::timespec = unsafe { std::mem::zeroed() };
         if unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut clock) } != 0 {
             return;
@@ -75,11 +76,9 @@ pub fn record_timing(phase: &str) {
         let Ok(facts) = file.metadata() else {
             return;
         };
-        if !facts.is_file()
-            || facts.nlink() != 1
-            || facts.uid() != unsafe { libc::geteuid() }
-            || facts.len() > 8192
-        {
+        // SAFETY: geteuid has no preconditions.
+        let owner = unsafe { libc::geteuid() };
+        if !facts.is_file() || facts.nlink() != 1 || facts.uid() != owner || facts.len() > 8192 {
             return;
         }
         let nanos = i128::from(clock.tv_sec) * 1_000_000_000 + i128::from(clock.tv_nsec);
@@ -743,6 +742,22 @@ fn record_group_for_tests(group: i32) {
     let _ = group;
 }
 
+/// Only a successful material measurement can print ancestry-based advice.
+/// Do not add an unused, potentially slow lookup after deadline/cleanup when
+/// report() will return its inconclusive or no-penalty text first.
+fn app_for_advice(outcome: &Outcome, ancestors: impl FnOnce() -> Vec<PathBuf>) -> App {
+    if outcome.failure.is_none()
+        && outcome
+            .samples
+            .measured()
+            .is_some_and(|value| value.material())
+    {
+        launching_app(&ancestors())
+    } else {
+        App::None
+    }
+}
+
 /// `oxide status --launch-check`.
 pub fn run_check() -> Result<u8, String> {
     record_timing("check-entry");
@@ -765,8 +780,8 @@ pub fn run_check() -> Result<u8, String> {
     }
     let outcome = run_measure(&plan, &oxide);
     record_timing("measure-returned");
-    let app = launching_app(&ancestry());
-    record_timing("ancestry-ended");
+    let app = app_for_advice(&outcome, ancestry);
+    record_timing("advice-app-ended");
     print!("{}", report(&outcome, plan.limit, &app));
     record_timing("report-ended");
     Ok(0)
@@ -860,6 +875,40 @@ mod tests {
         // A single slow outlier does not move the median.
         let outlier = full([2_000, 2_100, 2_200, 2_300, 290_000], [2_400; 5]);
         assert!(!outlier.measured().unwrap().material());
+    }
+
+    #[test]
+    fn ancestry_is_unused_after_failed_incomplete_or_non_material_measurement() {
+        let outcome = |samples, failure| Outcome {
+            samples,
+            failure,
+            cleanup: Cleanup::Removed,
+            elapsed: Duration::from_millis(600),
+        };
+        let unused = || panic!("ancestry lookup must not run without printable advice");
+        let failed = outcome(
+            full([1; 5], [100_000; 5]),
+            Some(limit_reached(Duration::from_millis(600))),
+        );
+        assert_eq!(app_for_advice(&failed, unused), App::None);
+        assert!(report(&failed, Duration::from_millis(600), &App::None).contains("inconclusive"));
+        let incomplete = outcome(Samples::default(), None);
+        assert_eq!(app_for_advice(&incomplete, unused), App::None);
+        let non_material = outcome(full([2_000; 5], [2_001; 5]), None);
+        assert_eq!(app_for_advice(&non_material, unused), App::None);
+        let at_threshold = outcome(full([2_000; 5], [32_000; 5]), None);
+        assert_eq!(app_for_advice(&at_threshold, unused), App::None);
+        let called = std::cell::Cell::new(0);
+        let material = outcome(full([2_000; 5], [32_001; 5]), None);
+        let app = app_for_advice(&material, || {
+            called.set(called.get() + 1);
+            vec![PathBuf::from(
+                "/Applications/Fixture.app/Contents/MacOS/Fixture",
+            )]
+        });
+        assert_eq!(called.get(), 1);
+        assert_eq!(app, App::One(PathBuf::from("/Applications/Fixture.app")));
+        assert!(report(&material, DEADLINE, &app).contains("launching app (best effort"));
     }
 
     #[test]

@@ -4414,7 +4414,11 @@ with exit 1), and reads or changes no setting.
   launches can take longer. Copies share content and code signature, so the
   result is likely a lower bound for a freshly linked binary
   ([finding](../rust-dx-landscape.md#oxide-launch-check-runs-2026-10-19)).
-- **Advice.** Only when the difference exceeds 30 ms. It states the cause is
+- **Advice.** Only when the successful complete measurement's difference
+  exceeds 30 ms. Only that branch asks for ancestry: an inconclusive,
+  incomplete or non-material result performs no unused ancestry lookup after
+  measurement/cleanup. This does not move the work deadline or weaken the
+  outer lifecycle/cleanup assertions. It states the cause is
   inferred, not measured, and names a best-effort launching app: the
   outermost `.app` bundle on the executable paths of this process's
   ancestors (`proc_pidpath`, same-user readable only, at most 64 hops). No
@@ -4442,6 +4446,18 @@ with exit 1), and reads or changes no setting.
   raw samples, the advice lines when advised. No penalty size is asserted.
   Unit tests cover the medians, the strict threshold, the bundle choice and
   the report and advice text.
+The single authorized ordinary reproduction at source `79d8b43f` passed
+copy/start/remove interruption under their unchanged 600 ms + 1000 ms outer
+assertion: observed CLI walls 0.704/0.656/0.596 s, reported measurement
+603/583/563 ms, empty temp directories and immediate helper-group closure.
+The qualified 120 s / 512 MiB guard closed0 without fault/deadline; the
+packet lives at `/Volumes/Stash/scratch/oxide/oxide-proof.6r1vywn2/evidence`.
+Its phase records do not identify the cause of the earlier 4.588 s full-suite
+failure; that occurrence lacked the captured report and phase observations.
+The source-backed avoidance of unused ancestry has a discriminating regression
+for failed/incomplete/non-material results and a positive material-advice
+control; it is not retrospective attribution or erasure of the old failure.
+
 - **Lifecycle observations (oxide#304).** The bounded test packet retains
   CLI stdout/stderr, outer uptime timestamps and temporary-directory entries
   before assertions. Under the existing proof guard, a debug-only timing log
