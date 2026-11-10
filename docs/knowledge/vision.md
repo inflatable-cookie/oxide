@@ -399,9 +399,14 @@ the operating rules.
 - **Barge descriptor-listing design** (Tom, 2026-11-10, decision
   `9e68c8ce-ac61-4190-a31c-b45f99fd6ecd` v2): investigate a bounded shared
   listing within the existing total descriptor, process and time budgets,
-  through source-only design and independent review. Implementation, capacity
-  changes, native runs, retained-image cleanup, installation and live adoption
-  remain separately gated.
+  through source-only design and independent review. The implementation ruling
+  below is separate.
+- **Barge descriptor-listing implementation** (Tom, 2026-11-10, decision
+  `13834566-5b7f-44be-a655-6444a4eeaa32` v2): implement the reviewed bounded
+  listing design and qualify it on disposable fixtures, preserving the existing
+  total scan ceilings. Scoped implementation, independent review and separately
+  activated Elevated proofs precede the Oxide reconnection. This grants no
+  installation, live adoption or retained-image cleanup.
 - **Still need Tom's scoped approval:**
   - host installs beyond the planner's receipt-matched `oxide` reinstall;
   - releases, tags and workflow changes;
