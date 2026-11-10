@@ -3462,6 +3462,24 @@ route, waive existing gates or count old observations as qualification.
 - Barge delete/grant/lock contracts: `stage1-design.md` (grants, lock order),
   `stage4-design.md` (release gate), `delete.rs`, `unit.rs`, `state.rs`.
 
+**Caller dependency (oxide#304).** The library pin now names Barge PR #52's
+merge `594494061b18bef4821ab19723f4adfff6119d51`, independently reviewed at
+`9a65089e8114860d498c5721c8f19ca93a07e481`. It includes PR #51's outputs
+adapter and the correction requiring exact root/unit, volume and request
+binding for both pending and terminal recovery. `oxide_outputs::lookup`
+accepts `LiveIntent`, `DelegatedRequest` and an optional Barge intent id;
+the latter names Barge's quarantine, not Oxide's intent id. The deleted fast
+path also checks the binding. No caller-id-only recovery is supported.
+
+The retained review of PR #52 records an adequate uncounted diagnostic and
+counted author and distinct reviewer fixture runs, all A1–A13 passing. These
+use synthetic account facts; they establish neither production account lookup
+nor integrated Oxide behavior. PR #51's earlier evidence remains bound to its
+own source and does not cover the corrected mismatch dimension. This pin
+does not implement the Oxide caller, qualify its handoff, install Barge or
+authorize live adoption. Oxide's integrated proof stages remain separately
+planner-activated under the Elevated tier.
+
 ### Feasibility
 
 **Yes.** A useful first slice exists: Oxide keeps selection, registry

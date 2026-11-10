@@ -194,6 +194,7 @@ fn release_comparison_case(spec: ComparisonCase) {
         },
         prune: area::PrunePolicy::ReleaseOnReference,
         reserve: area::ReserveParticipation::Excluded,
+        outputs_grant: None,
     };
     area::declare(&state, &declaration, 1000).unwrap();
     let resolved = area::resolve(
