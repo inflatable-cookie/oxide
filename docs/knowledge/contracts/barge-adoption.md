@@ -3800,8 +3800,9 @@ Reads require a regular owner-only, no-follow file, strict schema and field
 validation, at most 64 KiB, matching id/path/identity/preview/digests and
 bounded total reads within the existing authority budget. The private parent
 and files must pass existing ownership and ancestor checks. Initial storage
-is capped at 256 sidecars (16 MiB of document bytes), including orphans and terminal records; exhaustion
-refuses a new operation rather than overwriting or garbage collecting one.
+is capped at 256 files (16 MiB of document bytes), including partial files,
+orphans and terminal records; exhaustion refuses a new operation rather than
+overwriting or garbage collecting one.
 That availability limit is explicit, not permission for automatic cleanup.
 
 For one candidate, retain whole-group eligibility, checkout barrier and
@@ -3809,7 +3810,8 @@ binding. Read the original grant through the supported Barge area API before
 publication custody, holding no admission lock and retaining no Barge lock.
 Under Oxide publication custody, repeat the deciding eligibility/absence and
 revision checks. Exclusively create a private temporary sidecar in the owned
-directory; write and sync it, publish its final name without replacement,
+directory (sync any newly created directory and its parent first); write and
+sync the file, publish its final name without replacement,
 then sync the directory. Only then atomically publish and sync the Oxide
 intent **and its route in the same registry image**. Any failed or uncertain
 publication keeps metadata and refuses the Barge call. Never reuse the id or
@@ -3817,6 +3819,32 @@ overwrite a stale sidecar. A revision retry uses the same immutable request;
 it cannot adopt a replacement grant. Release publication custody before any
 adapter call; retain the checkout barrier/binding throughout it. Barge still
 re-proves the current grant, root and checkout absence at effect.
+
+**Unavailable authority before a request exists is a distinct review item.**
+The brief requires a real unavailable run to publish exclusion and exit 3,
+even when no original grant generation could be read. It cannot manufacture
+a generation, borrow the current one on restart, or call checked lookup with
+a fabricated request. Proposed extension: an explicitly tagged `unavailable`
+sidecar binds the original identity, preview and reason, with no request or
+grant generation, and its registry route remains `barge`. No adapter execute
+is ever allowed from that variant. Missing/corrupt metadata still refuses;
+valid unavailable metadata preserves exclusion until a no-effect recovery is
+positively proved, never until a new grant merely appears.
+
+The pinned checked API cannot prove no prior Barge record without a request.
+The linked Barge work therefore needs a bounded **absence-only** query under
+the existing observation lock: a complete journal with no caller id and no
+attributable quarantine may establish absence; any matching record,
+unreadable state or uncertainty refuses. It supplies no terminal or replay
+authority. Oxide additionally proves the original root identity before
+rollback. A later real operation requires a fresh preview and intent, not
+replacement of the unavailable record. This is a concrete compatibility
+requirement for independent review and subsequent planner scoping, not a
+guessed executable interface or permission to bypass the existing checked
+lookup. If that API is not selected and supplied, unavailable intents keep
+pending; the published pin alone is insufficient to complete that recovery
+row. The representation and its availability behavior need explicit
+disposition after review before implementation.
 
 #### Recovery, retention and crash boundaries
 
@@ -3831,6 +3859,7 @@ behavior. Unknown metadata never becomes `local`.
 | Durable boundary / interruption | Next action and exclusion |
 | --- | --- |
 | Before sidecar final-name sync | No adapter call. No new intent; retain partial metadata. Fresh eligibility is needed for any new operation |
+| Authority unavailable before a request exists | Publish the tagged unavailable sidecar and Barge route with the intent; exit 3. No execute or replacement grant; recovery needs the reviewed absence-only prerequisite and original-root proof |
 | Sidecar synced; registry intent/route not positively published | No adapter call. Retain orphan. Read the registry to distinguish published from absent; unknown refuses, and this id is not retried as fresh |
 | Registry publication uncertain | Keep every observed blocking reference and metadata; read exact registry on recovery, never roll back based on the failed write's return |
 | Intent and route synced; no adapter call yet | Exclusion is durable. Restart is resumed, not first; use the original sidecar and checked lookup |
