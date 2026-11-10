@@ -3718,6 +3718,156 @@ identity; unknown keeps pending. Concurrent selection: the pruning flag
 and the barrier make a new selection refuse; if Barge nonetheless sees a
 live reference it keeps the root.
 
+### Persistence amendment for independent review (oxide#304)
+
+**Source-only proposal, 2026-11-10.** Planner answer to question
+`b6257b7dc31ab2d4e97111b881695486e1b576d05826596714ce69d995649c1e`
+requires independent review before recovery is wired. No new representation,
+fence migration or native execution is activated here. This closes a design
+omission in the preceding protocol: the original grant generation and the
+durable choice of deleter must survive caller death. Neither a current grant
+nor the existence of a sidecar can supply that choice. Barge PR #52's checked
+API requires the original `LiveIntent` and `DelegatedRequest` even at terminal
+lookup; it does not reconstruct the caller's request.
+
+#### Choice and reader boundary
+
+| Candidate | Failure on lost metadata or downgrade | Disposition |
+| --- | --- | --- |
+| Sidecar alone, unchanged registry and fence | An absent sidecar looks like an old local operation; old readers ignore it and can resume local deletion | Reject |
+| Encode delegation/generation in `quarantine` or replace `preview_sha256` | Overloads an existing safety field; old readers still accept the intent and the real local leaf/plan SHA meaning is lost | Reject |
+| Preserve real quarantine and plan SHA; versioned delegation marker in a successor registry, plus immutable request sidecar and successor pool fence | Route is mandatory in the journal publication; absent metadata refuses; predecessor readers reject the registry/fence | Select for review |
+
+The selected marker is a **required registry-level route**, not another file
+whose absence could mean local. Proposed registry version
+`oxide.outputs.registry/3`, schema `3`, adds `deletion_routes`: a bounded list
+with exactly one unique entry for every retained intent id, and no extra ids.
+Every entry is explicitly either `local` or `barge`. A Barge entry also binds
+the SHA-256 of its immutable request-sidecar bytes. No default, empty/missing
+route, duplicate id, unknown deleter or unknown field is accepted. Existing
+row/group and 4 MiB registry limits remain; routes share the existing
+256-intent cap. The intent itself remains `oxide.outputs.prune-intent/1`
+with precisely its existing fields. `quarantine` continues to name the real
+Oxide `.prune-<oxide-id>` leaf, which a Barge-routed operation never creates;
+`preview_sha256` remains the SHA of the exact user-approved preview bytes.
+
+Before publishing schema 3, a future implementation must advance every paired
+pool's `owned_outputs` fence to proposed `oxide.outputs/4`, internal first,
+under the existing initialization/admission/publication ordering. No Barge
+lock is taken during this transition. Do not raise the numeric control-state
+version or disturb unrelated fences: the new string is the downgrade fence.
+`control::parse_state` currently rejects unrecognized owned-output strings;
+`Registry::validate` rejects unknown registry versions. Both refusals matter:
+some registry readers, including `unsettled_for`, read without loading pool
+state first. A sidecar and pool fence alone do not protect those readers.
+
+Upgrade is explicit and resumable through the existing initialization
+transaction, never a dry-run effect. It requires a complete registry and no
+unfinished pre-upgrade intents; operators first settle those using existing
+semantics. Retained settled old intents receive explicit `local` routes.
+After any pool fence is published, a partial upgrade refuses ordinary output
+mutations until that same initialization completes; it never restores `/3`
+or guesses success from the other pool. Registry publication follows all pool
+fence syncs. It is not permissible to synthesize a missing registry.
+
+This needs reviewed Oxide reader/writer changes and a **linked Barge reader
+change before caller execution**. Barge's strict registry reader must accept
+schema 3, validate route completeness, and require the matching Barge route
+for adapter execution against schema 3. Historical schema-1/2 inputs retain
+their old interpretation; they never acquire an inferred schema-3 route.
+Its pool parser and covered-class predicate must
+recognize `/4` while retaining their existing `/3` behavior for historical
+inputs. Generic release keeps these roots; no new family permission follows.
+The pinned PR #52 alone does not implement these reader changes. No edits to
+the sibling repository, silent reinterpretation of `/3`, or caller workaround
+are authorized by this proposal.
+
+#### Immutable request and publication
+
+Proposed sidecar path:
+`<control>/outputs/prune-delegations/<oxide-intent-id>.json`. Version
+`oxide.outputs.prune-delegation/1` contains the caller intent id, full original
+intent identity, original preview SHA, original `grant_generation` and
+`caller_request_digest` computed by Barge's actual `DelegatedRequest::digest`.
+The original claim's phase is `intent`; later Oxide terminal phases do not
+rewrite that claim. The registry route binds the sidecar's exact byte SHA,
+and the reader recomputes its canonical Barge request digest. Neither hash
+is substituted for the preview SHA. The sidecar is evidence, never grant
+authority: Barge still re-reads the stored declaration and custody at effect.
+No Barge journal bytes are parsed by Oxide (D1).
+
+Reads require a regular owner-only, no-follow file, strict schema and field
+validation, at most 64 KiB, matching id/path/identity/preview/digests and
+bounded total reads within the existing authority budget. The private parent
+and files must pass existing ownership and ancestor checks. Initial storage
+is capped at 256 sidecars (16 MiB of document bytes), including orphans and terminal records; exhaustion
+refuses a new operation rather than overwriting or garbage collecting one.
+That availability limit is explicit, not permission for automatic cleanup.
+
+For one candidate, retain whole-group eligibility, checkout barrier and
+binding. Read the original grant through the supported Barge area API before
+publication custody, holding no admission lock and retaining no Barge lock.
+Under Oxide publication custody, repeat the deciding eligibility/absence and
+revision checks. Exclusively create a private temporary sidecar in the owned
+directory; write and sync it, publish its final name without replacement,
+then sync the directory. Only then atomically publish and sync the Oxide
+intent **and its route in the same registry image**. Any failed or uncertain
+publication keeps metadata and refuses the Barge call. Never reuse the id or
+overwrite a stale sidecar. A revision retry uses the same immutable request;
+it cannot adopt a replacement grant. Release publication custody before any
+adapter call; retain the checkout barrier/binding throughout it. Barge still
+re-proves the current grant, root and checkout absence at effect.
+
+#### Recovery, retention and crash boundaries
+
+Every reader selects the deleter from the validated route, never from the
+root's current marker, sidecar presence, current area grant or Barge reply.
+A missing/corrupt/stale/mismatched Barge sidecar keeps the intent pending,
+prints its id and metadata path, and refuses execute, rollback and both
+`resolve-intent` prechecks without journal changes. An unreadable route map
+refuses the whole registry. A valid `local` route retains existing local
+behavior. Unknown metadata never becomes `local`.
+
+| Durable boundary / interruption | Next action and exclusion |
+| --- | --- |
+| Before sidecar final-name sync | No adapter call. No new intent; retain partial metadata. Fresh eligibility is needed for any new operation |
+| Sidecar synced; registry intent/route not positively published | No adapter call. Retain orphan. Read the registry to distinguish published from absent; unknown refuses, and this id is not retried as fresh |
+| Registry publication uncertain | Keep every observed blocking reference and metadata; read exact registry on recovery, never roll back based on the failed write's return |
+| Intent and route synced; no adapter call yet | Exclusion is durable. Restart is resumed, not first; use the original sidecar and checked lookup |
+| First adapter call returns known-no-effect Locked | Only this live first call, still under barrier, may roll back after positively matching the original root; no second call inherits this privilege |
+| Resumed call returns Locked, or reply lost/malformed | Keep pending; no local effect or new destructive id; later checked lookup uses the original request |
+| Barge intent before rename | Resume the matching Barge operation first. Oxide rollback requires Barge positively absent after its rollback, original identity present and no matching quarantine |
+| Barge rename, partial deletion, removed-before-deleted | Oxide remains at `intent`. Resume only that checked Barge record; missing state or uncertain quarantine keeps exclusion |
+| Barge deleted; Oxide terminal not committed | Checked terminal lookup with original request, then settle every group member through existing registry terminal → receipt → receipt_settled ordering |
+| Oxide terminal committed; receipt incomplete | Retain route and sidecar, finish exact terminal receipt transaction; no new request or deletion |
+| Operator resolve | Require original metadata, checked Barge terminal or positive absence, matching Barge quarantine positively absent and every old precheck, both before and inside the barrier |
+
+The actual Barge intent id and quarantine come from checked adapter outcomes
+and lookup. They are never inferred from the Oxide id. They need not be added
+to the immutable sidecar: a lost reply uses checked lookup without an expected
+Barge id, whose no-record path conservatively rejects any unattributable
+quarantine. A returned id is checked on further calls within that attempt.
+
+Rollback removes the blocking Oxide intent and its route atomically, only
+after the existing exact receipt-preimage/group checks and Barge no-effect
+proof required above. An uncertain rollback publication is re-read, never
+reported as successful from its failed return; no independent removal of the
+route is allowed. The immutable sidecar stays retained, including after
+known-no-effect rollback. Successful deletion/resolution retains the route
+with the terminal intent and keeps the sidecar. Existing terminal-intent
+compaction may remove a settled intent and its route together, never an
+unfinished one; it does not delete its sidecar. Orphans are never completion
+or replay authority. Sidecar retirement/space reclamation is deferred; this
+slice refuses at its stated cap instead of adding a cleanup mechanism.
+
+Acceptance must distinguish missing route from explicit local; missing,
+malformed, stale and swapped sidecars; replacement grants; every sync and
+uncertain-publication boundary above; partial fence upgrade; old Oxide and
+Barge reader refusal; both resolution prechecks; and same-process first vs
+resumed Locked. These extend the existing required integrated cases and need
+fresh scoped source/readiness plus separately activated proof stages. Source
+review of this amendment supplies no native, migration or deployment credit.
+
 ### State machine and crash recovery
 
 Oxide local phases (`prune.rs:191`): `intent` → `renamed` → `deleting` →
