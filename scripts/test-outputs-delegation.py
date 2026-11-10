@@ -901,7 +901,7 @@ def plan_document():
                 'Scrub inherited product/Cargo/flags settings; retain genuine Nucleus hook and admission.',
                 'Fixture roots are explicit synthetic history; no real checkout or auto-adoption. Actual competing adopt is a refusal case.',
                 'Stage Cargo argv fixed locked/offline/bin oxide/features; exec writer uses explicit dependency-free command.',
-                'Existing ImageCustody attaches APFS owners-on; fixture helper rebinds kernel UUID.',
+                'Native entry binds its actual ImageCustody module to the permanent runtime; shared guard CLOCK_UPTIME_RAW deadline/30s margin checked before allocation. Default effects attach APFS owners-on; fixture helper rebinds kernel UUID.',
                 'Stage and fixture RUSTFLAGS empty, no encoded overrides; stage feature/binary/tool/lock hashes retained.',
                 'All scratch/TMP values are guard-provided, private worlds under scratch; image backing under guard evidence.',
                 'Every world uses /usr/bin/mktemp -d with explicit owned template ending XXXXXXXX.'],
@@ -1037,8 +1037,28 @@ def main(argv):
         print(json.dumps(doc,indent=2));return 0 if doc['execution_ready'] else 2
     if argv not in ([],['--diagnostic']):raise SystemExit('use --self-check, --plan, --diagnostic or no args')
     proof=wrapper.Proof();proof.unclosed=set();proof.mount=None
+    # These imports are distinct module instances. Wiring fresh.prior does
+    # not initialize the ImageCustody/default effects used by this entry.
+    prior.permanent=permanent
+    prior.expect=permanent.expect
+    prior.fail=permanent.fail
     image=prior.ImageCustody('Ox304'+secrets.token_hex(4),custody_protocol=True)
     return run_proof(bool(argv),proof,image)
+
+
+def attach_image(proof,image):
+    require(prior.permanent is permanent and prior.expect is permanent.expect
+            and prior.fail is permanent.fail,'image helper runtime binding differs')
+    require(proof.deadline_ns==int(os.environ['OXIDE_PROOF_DEADLINE_NS'])-wrapper.SHUTDOWN_MARGIN_NS
+            and permanent.SHUTDOWN_MARGIN_S*wrapper.NS==wrapper.SHUTDOWN_MARGIN_NS,
+            'image helper does not share the guard work deadline')
+    # Use the original exported CLOCK_UPTIME_RAW deadline and 30s margin.
+    # Missing/expired input refuses before allocation or an external effect.
+    permanent.work_left()
+    image.allocate(str(proof.evidence),str(proof.root))
+    fresh.image_document(proof.evidence,'image-custody.json',{'version':1,'backings':[os.path.realpath(image.backing)]})
+    image.attach();proof.mount=image.mount
+    fresh.image_document(proof.evidence,'delegation-image.json',{'mount':image.mount,'volume_uuid':image.volume_uuid,'backing':image.backing})
 
 
 def run_proof(diagnostic,proof,image):
@@ -1057,10 +1077,7 @@ def run_proof(diagnostic,proof,image):
         binary,tools,env=stage(proof)
         resident=phase_snapshot(proof,'resident-before-image',RESIDENT_MIB*MIB)
         proof.resident_baseline=resident['total_after_publication_bytes']
-        image.allocate(str(proof.evidence),str(proof.root))
-        fresh.image_document(proof.evidence,'image-custody.json',{'version':1,'backings':[os.path.realpath(image.backing)]})
-        image.attach();proof.mount=image.mount
-        fresh.image_document(proof.evidence,'delegation-image.json',{'mount':image.mount,'volume_uuid':image.volume_uuid,'backing':image.backing})
+        attach_image(proof,image)
         run_phase_snapshot(proof,image,'image-attached')
         for name in CASES:
             proof.remaining()

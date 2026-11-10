@@ -10,6 +10,7 @@ import stat
 import tempfile
 from contextlib import ExitStack, redirect_stdout, redirect_stderr
 from unittest.mock import patch
+from types import SimpleNamespace
 
 
 def imported_contracts(m):
@@ -319,6 +320,108 @@ def child_contract(m,root):
     else:raise AssertionError('unknown writer closure accepted')
 
 
+def native_image_composition(m,root):
+    # Main, Proof construction, ImageCustody and DEFAULT CustodyEffects remain
+    # real. Only process/kernel lookups are deterministic fakes. The successful
+    # consumer stops at the real guard request: it asserts no detach/closure.
+    original_run=m.run_proof
+    for case in ('ok','missing-binding','wrong-binding','missing-deadline','expired',
+                 'malformed-attach','unknown-volume','unknown-child'):
+        base=root/('image-'+case);base.mkdir(mode=0o700)
+        scratch=base/'scratch';scratch.mkdir(mode=0o700)
+        evidence=base/'evidence';evidence.mkdir(mode=0o700)
+        calls=[];now=[m.wrapper.NS];deadline=51*m.wrapper.NS
+        def external(argv,*,capture_output,timeout):
+            assert capture_output is True and timeout==20.0,(argv,timeout)
+            calls.append(argv)
+            if argv[:3]==['/usr/bin/hdiutil','create','-size']:
+                assert argv[3:6]==['128m','-fs','APFS'] and argv[-3:-1]==['-type','SPARSE']
+                backing=Path(argv[-1]);assert backing.parent==evidence
+                indication=json.loads((evidence/'image-custody.json').read_text())
+                assert indication['backings']==[str(backing)]
+                backing.write_bytes(b'synthetic local bytes; never an image')
+                return SimpleNamespace(returncode=0,stdout=b'',stderr=b'')
+            if argv[:2]==['/usr/bin/hdiutil','attach']:
+                assert argv[2:6]==['-nobrowse','-owners','on','-plist']
+                name=Path(argv[-1]).name.removeprefix('152-image-').removesuffix('.sparseimage')
+                data=m.plistlib.dumps({'system-entities':[
+                    {'dev-entry':'/dev/control-container'},
+                    {'dev-entry':'/dev/control-volume','mount-point':'/Volumes/'+name}]})
+                return SimpleNamespace(returncode=0,stdout=b'bad plist' if case=='malformed-attach' else data,stderr=b'')
+            assert argv==['/usr/sbin/diskutil','info','-plist','/dev/control-volume'],argv
+            data={'VolumeUUID':'' if case=='unknown-volume' else 'CONTROL-UUID','ParentWholeDisk':'control-whole'}
+            return SimpleNamespace(returncode=0,stdout=m.plistlib.dumps(data),stderr=b'')
+        def consumer(diagnostic,proof,image):
+            assert diagnostic and type(proof) is m.wrapper.Proof
+            assert type(image) is m.prior.ImageCustody and image.effects is m.prior.REAL_CUSTODY_EFFECTS
+            assert type(image.effects) is m.prior.CustodyEffects
+            assert m.prior.permanent is m.permanent and m.prior.expect is m.permanent.expect and m.prior.fail is m.permanent.fail
+            assert m.fresh.prior is not m.prior and m.fresh.prior.permanent is m.fresh.permanent
+            # Audit the globals of every reached collaborator, including both
+            # module instances and the real publication/detach request path.
+            functions=[m.prior.ImageCustody.allocate,m.prior.ImageCustody.attach,
+                m.prior.ImageCustody._write,m.prior.ImageCustody.verify_backing,
+                m.prior.verify_evidence_root,m.prior.parse_attach_entities,
+                m.permanent.work_left,m.fresh.image_document,m.fresh.atomic_write,
+                m.fresh.request_guard_detach]
+            functions += [getattr(m.prior.CustodyEffects,n) for n in
+                ('stat','realpath','euid','exists','write_record','create_image','attach_raw','retain_attach_document','volume_facts')]
+            for function in functions:
+                assert all(value is not None for value in inspect.getclosurevars(function).globals.values()),function.__qualname__
+            assert m.prior.CustodyEffects.create_image.__globals__ is vars(m.prior)
+            assert proof.deadline_ns==deadline-30*m.wrapper.NS and m.permanent.work_left()==20.0
+            if case=='missing-binding':m.prior.permanent=None
+            if case=='wrong-binding':m.prior.permanent=m.fresh.permanent
+            if case=='missing-deadline':os.environ.pop('OXIDE_PROOF_DEADLINE_NS')
+            if case=='expired':now[0]+=16*m.wrapper.NS
+            if case in ('ok','unknown-volume','unknown-child'):
+                m.attach_image(proof,image)
+                assert image.state=='attached' and image.mount==image.expected_mount
+                assert image.device=='/dev/control-volume' and image.whole_disk=='/dev/control-whole'
+                assert image.backing_identity['ino']==Path(image.backing).stat().st_ino
+                assert Path(image.attach_document).read_bytes()
+                if case=='unknown-child':proof.closure_known=False
+                disposition,error=m.fresh.request_guard_detach(proof,image,None)
+                if case=='ok':
+                    assert (disposition,error)==('requested',None)
+                    request=json.loads((evidence/'detach-request.json').read_text())
+                    assert request==dict(version=1,backing=image.backing,mount=image.expected_mount,
+                        device='/dev/control-volume',volume_uuid='control-uuid',note='fresh custody proof')
+                else:assert disposition=='retained' and not (evidence/'detach-request.json').exists()
+                assert image.state=='attached' and Path(image.backing).exists()  # never closed by a request
+            else:
+                # The real final-report/error path, with only unrelated stage
+                # and kernel/child executors faked; no case or engine runs.
+                out=io.StringIO()
+                with patch.object(m,'source_readiness',lambda:None),patch.object(m,'stash_mount',lambda root:base), \
+                     patch.object(m,'stage',lambda proof:(None,None,None)), \
+                     patch.object(proof,'run',return_value=(0,m.plistlib.dumps({'VolumeUUID':m.STASH}).decode(),'')),redirect_stdout(out):
+                    assert original_run(True,proof,image)==1
+                report=json.loads((evidence/'delegation-report.json').read_text())
+                assert report==json.loads(out.getvalue()) and report['report_published'] and not report['secondary_errors']
+                assert all(r['state']=='unexecuted' for r in report['cases']) and report['detach']=='retained'
+                expected={'missing-binding':'binding differs','wrong-binding':'binding differs',
+                    'missing-deadline':'KeyError','expired':'work deadline','malformed-attach':'malformed'}[case]
+                assert expected in report['error'],report
+                if case=='malformed-attach':
+                    assert image.state=='unknown' and len(calls)==2 and Path(image.backing).exists()
+                    assert json.loads(Path(image.record).read_text())['state']=='unknown'
+                else:assert not calls and image.state=='unallocated' and not (evidence/'image-custody.json').exists()
+            assert not (evidence/'detach-request.json').exists() or case=='ok'
+            return 73
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ,{**{k:str(scratch) for k in m.wrapper.TEMP_VARS},
+                'OXIDE_PROOF_EVIDENCE':str(evidence),'OXIDE_PROOF_DEADLINE_NS':str(deadline)}))
+            stack.enter_context(patch.object(m.permanent.time,'clock_gettime_ns',side_effect=lambda clock:now[0]))
+            stack.enter_context(patch.object(m.wrapper.shutil,'which',side_effect=lambda tool:str(base/tool)))
+            stack.enter_context(patch.object(m.prior.subprocess,'run',external))
+            for name in ('permanent','expect','fail'):stack.enter_context(patch.object(m.prior,name,None))
+            stack.enter_context(patch.object(m,'run_proof',consumer))
+            assert m.main(['--diagnostic'])==73
+        assert all('detach' not in argv for argv in calls)
+    print('native image composition: real entry/default effects, fake external executors; OK')
+
+
 def check(m):
     imported_contracts(m)
     # Standard secure mkdtemp: no child is launched. Leave the owned root and
@@ -330,6 +433,7 @@ def check(m):
     publication(m,root)
     setup_failures(m,root)
     child_contract(m,root)
+    native_image_composition(m,root)
     closure_request(m,root)
     run_accounting(m,root)
     for case in ('ok','missing','linked','outside','mode','copy','hash','publication','cleanup','unconfirmed','target-swap','expired','over-prep','over-resident'):

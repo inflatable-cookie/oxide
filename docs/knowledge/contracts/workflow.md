@@ -6193,6 +6193,14 @@ before all43 cases. The [phased staging correction](barge-adoption.md#phased-sta
 keeps the512MiB overall guard while sealing the case executable and disposing
 only the fresh, positively owned target before the288MiB resident gate. No
 execution activation follows from those prospective allocations or local controls.
+The admitted58ff477f diagnostic passed staging/sealing/target disposal but
+failed image setup before all43 cases because its separate imported image
+module lacked its runtime. The [image-helper composition correction](barge-adoption.md#image-helper-runtime-composition-correction-oxide304)
+wires the actual instance and checks the unchanged guard deadline/margin.
+Local controls use the real native setup and default image effects with fake
+external executors through attach identity and guard-request publication.
+The spent image state stays unknown; process closure and a missing backing
+do not establish image closure. No new native execution follows from this fix.
 
 The approved Barge mechanism-only extension (Tom `63ad6fc4` v2 and explicit
 recovery-format ruling `60a85553` v2) is implemented behind the explicit

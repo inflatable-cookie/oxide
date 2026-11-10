@@ -5312,3 +5312,37 @@ this source correction or its plan. The same retained reviewer must assess
 cleanup/dependency safety and readiness; a fresh diagnostic, counted author,
 distinct reviewer native and final judgment remain separately planner-activated.
 Both failed histories and all prior gates remain intact.
+
+#### Image-helper runtime composition correction (oxide#304)
+
+The `58ff477f` attempt in run `804c4e96` was refused by normal admission
+before launch. The separately activated run `889359bf` was admitted and built,
+sealed and disposed its fresh target, but failed before all43 cases at image
+creation: the delegation module's separately imported image helper still had
+`permanent=None`. The fresh-custody module had initialized a different instance.
+The actual image record remains **unknown**, with an indication published but
+no guard image verdict, kernel attachment or ordinary detach evidence. Guard
+`c4b7b70d166d7a8485315ae4a70a264d` closed1 with a certain empty joined census;
+that proves process closure only. The maximum phase358051840B and pre-image
+resident164663296B are observations, not image/runtime fit. Earlier publication
+and160MiB failures and the first unknown seed result remain unchanged.
+
+The retained packet is
+`/Volumes/Stash/scratch/oxide/0838a053/diagnostic.eADmDN8Z/packet.json`
+(101302B, SHA256 `05a16572f4b523bc6e8ff55f25de8041a7830c605d9600114b3c1eda6e80f071`).
+It binds the actual report, stage/phase/source/seed records, sealed binary,
+custody records and process guard; it supplies no native qualification.
+
+Native entry now wires its actual image module's `permanent`, `expect` and
+`fail` collaborators. Before image allocation it checks those exact identities
+and agreement with the existing exported guard deadline and30s margin, then
+uses the existing `work_left`. No deadline is reset. Local controls enter the
+real native setup and actual `ImageCustody`/default `CustodyEffects`, replacing
+external process/kernel lookups with deterministic fakes. They exercise create
+arguments, owners-on attach parsing, backing identity, volume facts and real
+guard-request publication. Missing/wrong runtime, missing/expired deadline,
+malformed attach, unknown volume and child custody retain/refuse; the real
+report path preserves image failures. A request never asserts image closure.
+All files remain under the1MiB local-control limit; no image or engine runs.
+Source readiness and any fresh diagnostic/counting stages require their
+separate retained review and owner activations under the unchanged merge hold.
