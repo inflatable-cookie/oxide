@@ -931,7 +931,7 @@ pub enum RootCaptureState {
 
 /// One exclusive rename inside a single held directory: never across
 /// directories, never replacing an existing name.
-fn rename_exclusive(dir: BorrowedFd<'_>, from: &CStr, to: &CStr) -> io::Result<()> {
+pub(crate) fn rename_exclusive(dir: BorrowedFd<'_>, from: &CStr, to: &CStr) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         // SAFETY: the descriptor and both C strings are live for the call.
@@ -1875,7 +1875,12 @@ pub fn restore_owner_access(dir: BorrowedFd<'_>) -> io::Result<()> {
 /// this only enumerates a directory it holds by descriptor. The Finder-race
 /// recovery uses its own capped listing.
 pub fn names_of(dir: BorrowedFd<'_>) -> io::Result<Vec<OsString>> {
-    match list_names(dir, usize::MAX)? {
+    names_bounded(dir, usize::MAX)
+}
+
+/// The same held-directory enumeration, with a caller's fixed entry cap.
+pub(crate) fn names_bounded(dir: BorrowedFd<'_>, limit: usize) -> io::Result<Vec<OsString>> {
+    match list_names(dir, limit)? {
         Names::Listed(names) => Ok(names
             .into_iter()
             .map(|name| OsString::from_vec(name.into_bytes()))

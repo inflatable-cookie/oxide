@@ -3730,6 +3730,41 @@ nor the existence of a sidecar can supply that choice. Barge PR #52's checked
 API requires the original `LiveIntent` and `DelegatedRequest` even at terminal
 lookup; it does not reconstruct the caller's request.
 
+**Implementation ruling (2026-11-10).** Tom selected “Implement explicit
+recovery-format upgrade on disposable fixtures (recommended)” in decision
+`60a85553-3e61-4280-9037-0f3965d5ff65` v2. Queue brief v4 activates independent
+Oxide readers, writers, explicit resumable initialization and regressions for
+the semantics below in oxide#304. Barge#053 supplies the precise shared wire
+and supported reader/absence-only APIs; its reviewed published source and
+accepted evidence remain prerequisites to connecting or executing the new
+format handoff. The corrected Barge#052 pin alone is insufficient. No native,
+image, staging, installation, live-store migration or adoption is activated.
+The fixed metadata cap deliberately refuses when retained files exhaust it;
+missing or uncertain metadata remains pending, never local or a replacement
+grant. Earlier source-only review and test receipts retain their own limits.
+
+**Independent storage source (oxide#304).**
+`oxide_storage::output_request_store::RequestStore` implements only immutable
+byte custody: held-descriptor private-directory access, no-follow regular
+single-link files, a 64 KiB document limit and a 256-entry retained-file cap,
+file sync before exclusive rename and directory sync, and exact SHA-256 reads.
+Partials and orphans are counted and never removed or replaced. Its read-open
+creates nothing, and all errors remain errors rather than absence facts.
+The writer requires the caller's publication custody. It deliberately does
+not parse a sidecar, choose a route, migrate a registry or call Barge. No
+ordinary command uses it yet; the precise shared wire, successor readers and
+caller connection still need Barge#053's supported contract and published
+evidence. Ordinary unit coverage of this layer is not integrated proof or
+production adoption credit.
+
+The independent registry validator recognizes schema 3 with the exact route
+field sets published in Barge PR #53 at `9a91199b545de7b71ca8c1609d564e5aac57ea81`.
+It rejects null/missing/duplicate/extra routes and malformed hashes, including
+routes missing for terminal intents. Historical schemas reject the new field.
+This is source alignment with an unreviewed prerequisite, not an adopted pin:
+the ordinary registry read path explicitly refuses schema 3 before any legacy
+replay or exclusion release until the new-format connection is complete.
+
 #### Choice and reader boundary
 
 | Candidate | Failure on lost metadata or downgrade | Disposition |

@@ -13585,6 +13585,10 @@ mod scratch_internal_tests {
 /// refusal of every uncertain identity.
 #[cfg(test)]
 mod fresh_custody_tests {
+    // Primed-flock fixtures run through the existing exact-test child helper:
+    // process creation elsewhere in a parallel test runner can temporarily
+    // retain a just-closed flock description until exec. Keep the real lock
+    // and state refusal assertions; do not accept busy as their substitute.
     use super::{
         boot_session, custody_verdict, holder_lines, lock_admission, open_control_directory,
         CheckoutCustody, CustodyWitness, Lost, Phase, Record, State, WorkspaceClass,
@@ -13821,6 +13825,11 @@ mod fresh_custody_tests {
     /// row refuses instead of locking a stranger's file.
     #[test]
     fn a_replaced_admission_lock_refuses() {
+        if super::tests::fixture_child(
+            "store::fresh_custody_tests::a_replaced_admission_lock_refuses",
+        ) {
+            return;
+        }
         let fixture = CustodyFixture::new("lock-replaced");
         fixture.prime();
         let checkout = checkout(&fixture);
@@ -13837,6 +13846,11 @@ mod fresh_custody_tests {
     /// identity no longer matches the path.
     #[test]
     fn a_replaced_control_directory_refuses() {
+        if super::tests::fixture_child(
+            "store::fresh_custody_tests::a_replaced_control_directory_refuses",
+        ) {
+            return;
+        }
         let fixture = CustodyFixture::new("control-replaced");
         fixture.prime();
         let checkout = checkout(&fixture);
@@ -13860,6 +13874,11 @@ mod fresh_custody_tests {
     /// read-only route: absence is not permission to mutate the control.
     #[test]
     fn a_missing_admission_lock_refuses_without_creation() {
+        if super::tests::fixture_child(
+            "store::fresh_custody_tests::a_missing_admission_lock_refuses_without_creation",
+        ) {
+            return;
+        }
         let fixture = CustodyFixture::new("lock-missing");
         fixture.prime();
         let lock = fixture.control.join("admission.lock");
@@ -13875,6 +13894,9 @@ mod fresh_custody_tests {
     /// internal lock is free again immediately after the refusal.
     #[test]
     fn a_busy_removable_lock_releases_the_internal_lock_and_refuses() {
+        if super::tests::fixture_child("store::fresh_custody_tests::a_busy_removable_lock_releases_the_internal_lock_and_refuses") {
+            return;
+        }
         let fixture = CustodyFixture::new("busy-removable");
         fixture.prime();
         let state = State {
@@ -13912,6 +13934,11 @@ mod fresh_custody_tests {
     /// A busy internal lock refuses without waiting.
     #[test]
     fn a_busy_internal_lock_refuses_immediately() {
+        if super::tests::fixture_child(
+            "store::fresh_custody_tests::a_busy_internal_lock_refuses_immediately",
+        ) {
+            return;
+        }
         let fixture = CustodyFixture::new("busy-internal");
         fixture.prime();
         let held = File::options()
@@ -13933,6 +13960,9 @@ mod fresh_custody_tests {
     /// unknown at every stage, never empty.
     #[test]
     fn a_registered_sibling_without_control_lock_or_state_is_unknown() {
+        if super::tests::fixture_child("store::fresh_custody_tests::a_registered_sibling_without_control_lock_or_state_is_unknown") {
+            return;
+        }
         let fixture = CustodyFixture::new("sibling-unprovable");
         fixture.prime();
         let checkout = checkout(&fixture);
@@ -13959,6 +13989,9 @@ mod fresh_custody_tests {
     /// between rows is seen by the next decision.
     #[test]
     fn an_absent_sibling_is_rewitnessed_when_a_registration_appears() {
+        if super::tests::fixture_child("store::fresh_custody_tests::an_absent_sibling_is_rewitnessed_when_a_registration_appears") {
+            return;
+        }
         let fixture = CustodyFixture::new("absent-sibling");
         fixture.prime();
         let checkout = checkout(&fixture);
@@ -13988,6 +14021,9 @@ mod fresh_custody_tests {
     /// ambiguous absence, not a known one.
     #[test]
     fn an_ambiguous_absence_refuses() {
+        if super::tests::fixture_child("store::fresh_custody_tests::an_ambiguous_absence_refuses") {
+            return;
+        }
         let fixture = CustodyFixture::new("ambiguous-absence");
         fixture.prime();
         let sibling = removable::removable_control(&fixture.control);
@@ -14004,6 +14040,11 @@ mod fresh_custody_tests {
     /// place refuse instead of guessing.
     #[test]
     fn in_place_mutation_is_reread_and_invalid_bytes_refuse() {
+        if super::tests::fixture_child(
+            "store::fresh_custody_tests::in_place_mutation_is_reread_and_invalid_bytes_refuse",
+        ) {
+            return;
+        }
         let fixture = CustodyFixture::new("in-place");
         fixture.prime();
         let checkout = checkout(&fixture);
@@ -14031,6 +14072,11 @@ mod fresh_custody_tests {
     /// alone.
     #[test]
     fn same_size_in_place_change_is_reread_from_change_metadata() {
+        if super::tests::fixture_child(
+            "store::fresh_custody_tests::same_size_in_place_change_is_reread_from_change_metadata",
+        ) {
+            return;
+        }
         let fixture = CustodyFixture::new("same-size");
         fixture.prime();
         let checkout = checkout(&fixture);
@@ -14084,6 +14130,9 @@ mod fresh_custody_tests {
     /// unverifiable, so the row refuses.
     #[test]
     fn a_second_hard_link_refuses() {
+        if super::tests::fixture_child("store::fresh_custody_tests::a_second_hard_link_refuses") {
+            return;
+        }
         let fixture = CustodyFixture::new("hardlink");
         fixture.prime();
         fs::hard_link(
@@ -14103,6 +14152,9 @@ mod fresh_custody_tests {
     /// A symlinked state document is never followed.
     #[test]
     fn a_symlinked_state_refuses() {
+        if super::tests::fixture_child("store::fresh_custody_tests::a_symlinked_state_refuses") {
+            return;
+        }
         let fixture = CustodyFixture::new("symlink");
         fixture.prime();
         let real = fixture.root.join("elsewhere.json");
@@ -14128,6 +14180,9 @@ mod fresh_custody_tests {
     /// every other reader applies.
     #[test]
     fn an_oversized_state_refuses() {
+        if super::tests::fixture_child("store::fresh_custody_tests::an_oversized_state_refuses") {
+            return;
+        }
         let fixture = CustodyFixture::new("oversized");
         fixture.prime();
         let limit = super::MAX_STATE_BYTES;
@@ -14186,6 +14241,11 @@ mod fresh_custody_tests {
     /// witnessed states and a fresh boot session, never cached.
     #[test]
     fn lost_writers_and_boot_closure_are_recomputed_per_row() {
+        if super::tests::fixture_child(
+            "store::fresh_custody_tests::lost_writers_and_boot_closure_are_recomputed_per_row",
+        ) {
+            return;
+        }
         let fixture = CustodyFixture::new("lost");
         fixture.prime();
         let checkout = checkout(&fixture);
@@ -14238,6 +14298,11 @@ mod fresh_custody_tests {
     /// have always reported.
     #[test]
     fn holder_lines_match_the_record_and_barrier_split() {
+        if super::tests::fixture_child(
+            "store::fresh_custody_tests::holder_lines_match_the_record_and_barrier_split",
+        ) {
+            return;
+        }
         let fixture = CustodyFixture::new("holders");
         fixture.prime();
         let checkout = checkout(&fixture);
@@ -14283,6 +14348,11 @@ mod fresh_custody_tests {
     /// own record is exempt only in its own pool.
     #[test]
     fn the_verdict_matches_checkout_custody_classification() {
+        if super::tests::fixture_child(
+            "store::fresh_custody_tests::the_verdict_matches_checkout_custody_classification",
+        ) {
+            return;
+        }
         let fixture = CustodyFixture::new("verdict-parity");
         fixture.prime();
         let checkout = checkout(&fixture);

@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 pub const REGISTRY_VERSION: &str = "oxide.outputs.registry/2";
+const DELEGATED_REGISTRY_VERSION: &str = "oxide.outputs.registry/3";
 /// Schema 1 named only a whole `target` placement; schema 2 names one
 /// reference per profile member and is read from a version-1 document without
 /// changing its meaning.
@@ -118,6 +119,41 @@ struct Registry {
     /// listed reservation; never compacted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     cancelled_overflow: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "read_deletion_routes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    deletion_routes: Option<Vec<DeletionRoute>>,
+}
+
+// Wire pinned to Barge053's published stage4 contract at 9a91199b. Explicit
+// null is not a missing predecessor field and must fail deserialization.
+fn read_deletion_routes<'de, D>(deserializer: D) -> Result<Option<Vec<DeletionRoute>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::deserialize(deserializer).map(Some)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "deleter", rename_all = "snake_case", deny_unknown_fields)]
+enum DeletionRoute {
+    Local {
+        intent_id: String,
+    },
+    Barge {
+        intent_id: String,
+        request_sha256: String,
+    },
+}
+
+impl DeletionRoute {
+    fn intent_id(&self) -> &str {
+        match self {
+            Self::Local { intent_id } | Self::Barge { intent_id, .. } => intent_id,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -645,6 +681,7 @@ fn create_or_validate_registry(
                 rows: Vec::new(),
                 intents: Vec::new(),
                 cancelled_overflow: Vec::new(),
+                deletion_routes: None,
             };
             // Seed live references from the bounded committed receipts this
             // control directory already holds. Never from markers, and never
@@ -710,6 +747,16 @@ fn read_registry(control: &Path) -> Result<Option<Registry>, String> {
     let registry: Registry = serde_json::from_slice(&bytes)
         .map_err(|error| format!("{} is invalid: {error}", path.display()))?;
     registry.validate()?;
+    // Source/readiness only until Barge053 is reviewed, published and bound.
+    // In particular a legacy replay must never roll back a delegated intent
+    // merely because its original root still matches. No new-format command
+    // can pass this gate while the old caller/recovery remains connected.
+    if registry.version == DELEGATED_REGISTRY_VERSION {
+        return Err(
+            "the delegated recovery format is not yet connected; keep its intents pending"
+                .to_owned(),
+        );
+    }
     Ok(Some(registry))
 }
 
@@ -773,6 +820,7 @@ fn ready_registry(control: &Path) -> Result<Registry, String> {
 impl Registry {
     fn validate(&self) -> Result<(), String> {
         let schema = match self.version.as_str() {
+            DELEGATED_REGISTRY_VERSION if self.schema == 3 => 3,
             REGISTRY_VERSION if self.schema == REGISTRY_SCHEMA => REGISTRY_SCHEMA,
             LEGACY_REGISTRY_VERSION if self.schema == LEGACY_REGISTRY_SCHEMA => {
                 LEGACY_REGISTRY_SCHEMA
@@ -784,7 +832,6 @@ impl Registry {
                 ))
             }
         };
-        let _ = schema;
         if self.revision == 0 {
             return Err("the output registry has no revision".to_owned());
         }
@@ -807,6 +854,45 @@ impl Registry {
         }
         for intent in &self.intents {
             intent.validate()?;
+        }
+        self.validate_routes(schema)?;
+        Ok(())
+    }
+
+    fn validate_routes(&self, schema: u32) -> Result<(), String> {
+        if schema != 3 {
+            return if self.deletion_routes.is_none() {
+                Ok(())
+            } else {
+                Err("a predecessor registry cannot carry deletion routes".to_owned())
+            };
+        }
+        let routes = self
+            .deletion_routes
+            .as_ref()
+            .ok_or("deletion routes are missing")?;
+        if routes.len() != self.intents.len() || routes.len() > MAX_INTENTS {
+            return Err("deletion routes do not cover exactly the retained intents".to_owned());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for route in routes {
+            let id = route.intent_id();
+            if !hex32(id) || !seen.insert(id) || self.intent(id).is_none() {
+                return Err("a deletion route is duplicate, extra or invalid".to_owned());
+            }
+            if let DeletionRoute::Barge { request_sha256, .. } = route {
+                if !hex64(request_sha256) {
+                    return Err("a Barge route has no exact request byte digest".to_owned());
+                }
+            }
+        }
+        let intent_ids: std::collections::BTreeSet<&str> = self
+            .intents
+            .iter()
+            .map(|intent| intent.id.as_str())
+            .collect();
+        if seen != intent_ids || intent_ids.len() != self.intents.len() {
+            return Err("retained intents and routes are not one-to-one".to_owned());
         }
         Ok(())
     }
@@ -9239,6 +9325,7 @@ mod tests {
             rows: vec![release.clone(), debug.clone()],
             intents: Vec::new(),
             cancelled_overflow: Vec::new(),
+            deletion_routes: None,
         };
         let rows = group_rows(&registry, &debug.checkout_id, &debug.root);
         assert_eq!(
@@ -9302,6 +9389,7 @@ mod tests {
             rows: vec![debug, release],
             intents: vec![intent.clone()],
             cancelled_overflow: Vec::new(),
+            deletion_routes: None,
         };
         write_registry(&fixture.root, &registry).unwrap();
         let loaded = read_registry(&fixture.root).unwrap().unwrap();
@@ -9348,6 +9436,7 @@ mod tests {
             rows: Vec::new(),
             intents: Vec::new(),
             cancelled_overflow: Vec::new(),
+            deletion_routes: None,
         };
         let preview = build_preview(&registry, &[], None, registry.complete).unwrap();
         let first = serde_json::to_vec(&preview).unwrap();
@@ -9372,7 +9461,117 @@ mod tests {
             rows: Vec::new(),
             intents: Vec::new(),
             cancelled_overflow: Vec::new(),
+            deletion_routes: None,
         }
+    }
+
+    fn routed_registry() -> (Fixture, Registry) {
+        let fixture = Fixture::new();
+        seed_test_registry(&fixture.root).unwrap();
+        seed_test_intent(&fixture.root, &"a".repeat(64), false);
+        let mut registry = ready_registry(&fixture.root).unwrap();
+        registry.version = DELEGATED_REGISTRY_VERSION.to_owned();
+        registry.schema = 3;
+        registry.deletion_routes = Some(vec![DeletionRoute::Barge {
+            intent_id: registry.intents[0].id.clone(),
+            request_sha256: "d".repeat(64),
+        }]);
+        (fixture, registry)
+    }
+
+    #[test]
+    fn successor_routes_cover_pending_and_terminal_intents_exactly() {
+        let (_fixture, mut registry) = routed_registry();
+        registry.validate().unwrap();
+        let mut terminal = registry.intents[0].clone();
+        terminal.id = "c".repeat(32);
+        terminal.phase = IntentPhase::Deleted;
+        terminal.receipt_settled = true;
+        registry.intents.push(terminal.clone());
+        assert!(
+            registry.validate().is_err(),
+            "terminal routes are required too"
+        );
+        registry
+            .deletion_routes
+            .as_mut()
+            .unwrap()
+            .push(DeletionRoute::Local {
+                intent_id: terminal.id,
+            });
+        registry.validate().unwrap();
+        let bytes = serde_json::to_vec(&registry).unwrap();
+        let reread: Registry = serde_json::from_slice(&bytes).unwrap();
+        reread.validate().unwrap();
+        assert!(matches!(
+            &reread.deletion_routes.as_ref().unwrap()[1],
+            DeletionRoute::Local { .. }
+        ));
+    }
+
+    #[test]
+    fn successor_routes_reject_missing_null_extra_duplicate_and_bad_wire() {
+        let (_fixture, registry) = routed_registry();
+        let original = serde_json::to_value(&registry).unwrap();
+        let id = registry.intents[0].id.clone();
+        let cases = [
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!([{"intent_id": id, "deleter": "unknown"}]),
+            serde_json::json!([{"intent_id": id, "deleter": "barge"}]),
+            serde_json::json!([{"intent_id": id, "deleter": "barge", "request_sha256": "bad"}]),
+            serde_json::json!([{"intent_id": id, "deleter": "local", "request_sha256": "d".repeat(64)}]),
+            serde_json::json!([{"intent_id": "e".repeat(32), "deleter": "local"}]),
+            serde_json::json!([{"intent_id": id, "deleter": "local"}, {"intent_id": id, "deleter": "local"}]),
+        ];
+        for routes in cases {
+            let mut wire = original.clone();
+            wire["deletion_routes"] = routes;
+            let accepted = serde_json::from_value::<Registry>(wire)
+                .map(|parsed| parsed.validate().is_ok())
+                .unwrap_or(false);
+            assert!(!accepted);
+        }
+        let mut missing = original;
+        missing.as_object_mut().unwrap().remove("deletion_routes");
+        assert!(serde_json::from_value::<Registry>(missing)
+            .unwrap()
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn predecessor_documents_never_infer_or_accept_successor_routes() {
+        for (version, schema) in [(LEGACY_REGISTRY_VERSION, 1), (REGISTRY_VERSION, 2)] {
+            let mut registry = empty_registry();
+            registry.version = version.to_owned();
+            registry.schema = schema;
+            registry.validate().unwrap();
+            assert!(serde_json::to_value(&registry)
+                .unwrap()
+                .get("deletion_routes")
+                .is_none());
+            registry.deletion_routes = Some(Vec::new());
+            assert!(registry.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn an_unconnected_successor_cannot_reach_legacy_replay_or_release_exclusion() {
+        let (fixture, mut registry) = routed_registry();
+        let original = fixture.root.join("original");
+        fs::create_dir(&original).unwrap();
+        fs::write(original.join("payload"), b"kept").unwrap();
+        registry.intents[0].identity.root = original.clone();
+        write_registry(&fixture.root, &registry).unwrap();
+        let before = fs::read(registry_path(&fixture.root)).unwrap();
+        assert!(read_registry(&fixture.root)
+            .unwrap_err()
+            .contains("keep its intents pending"));
+        assert!(unsettled_for(&fixture.root, &registry.intents[0].identity.checkout_id).is_err());
+        assert_eq!(fs::read(registry_path(&fixture.root)).unwrap(), before);
+        assert_eq!(fs::read(original.join("payload")).unwrap(), b"kept");
     }
 
     fn synthetic_entry(index: usize, pad: usize, kept: Option<&str>) -> Evaluated {
@@ -9663,6 +9862,7 @@ mod tests {
             rows: Vec::new(),
             intents: Vec::new(),
             cancelled_overflow: Vec::new(),
+            deletion_routes: None,
         };
         assert!(registry.validate().is_err());
         registry.version = REGISTRY_VERSION.to_owned();
@@ -10186,6 +10386,7 @@ mod tests {
             rows: vec![row],
             intents: Vec::new(),
             cancelled_overflow: Vec::new(),
+            deletion_routes: None,
         };
         write_registry(&control, &registry).unwrap();
         let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
@@ -10721,6 +10922,7 @@ mod tests {
             rows: Vec::new(),
             intents: vec![intent.clone()],
             cancelled_overflow: Vec::new(),
+            deletion_routes: None,
         };
         let refused = resolve_precheck(&store, &control, &intent, &registry).unwrap_err();
         assert!(refused.contains("sticky-incomplete"), "{refused}");
@@ -10746,6 +10948,7 @@ mod tests {
             rows,
             intents,
             cancelled_overflow: Vec::new(),
+            deletion_routes: None,
         };
         write_registry(&control, &registry).unwrap();
         control
@@ -11868,6 +12071,7 @@ mod tests {
             rows: vec![debug.clone(), release.clone()],
             intents: Vec::new(),
             cancelled_overflow: Vec::new(),
+            deletion_routes: None,
         };
         let mut candidate = candidate_of(&debug);
         candidate.dev = 777;
@@ -12568,6 +12772,7 @@ mod tests {
             rows: vec![debug.clone(), release.clone(), history.clone()],
             intents: Vec::new(),
             cancelled_overflow: Vec::new(),
+            deletion_routes: None,
         };
         let candidate = candidate_of(&debug);
         let group = verified_group(&registry, &candidate).unwrap();
@@ -12607,6 +12812,7 @@ mod tests {
             rows: vec![debug.clone(), release.clone()],
             intents: Vec::new(),
             cancelled_overflow: Vec::new(),
+            deletion_routes: None,
         };
         let group = verified_group(&registry, &candidate_of(&debug)).unwrap();
         assert_eq!(group.len(), 2);
@@ -12827,6 +13033,7 @@ mod tests {
             rows: vec![debug.clone()],
             intents: Vec::new(),
             cancelled_overflow: Vec::new(),
+            deletion_routes: None,
         };
         let candidate = candidate_of(&debug);
         verified_group(&base, &candidate).unwrap();
