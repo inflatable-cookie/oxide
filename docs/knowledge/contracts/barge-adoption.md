@@ -5055,7 +5055,16 @@ pauses cover original-request publication, Oxide intent/terminal/receipt
 settlement and the five paired-upgrade publication boundaries. A history
 receipt whose current successor is unchanged takes the existing no-rewrite
 settlement branch; that observation is not a claim of publishing another
-receipt image. No source test or final-row match earns native credit.
+receipt image. Before effects, the proof independently captures both old
+members and both selected successor rows. After settlement it requires the
+old members and completed intent to be absent from the live registry and the
+successor rows to match that capture. An omitted empty intent list is the
+actual serde representation of an empty list. Fresh first-call Locked must
+report the all-kept exit2, an actual KnownNoEffectLocked reply, unchanged
+physical roots, no Barge intent/effect and no pending Oxide exclusion. Pure
+controls reject retained pruned rows, incomplete groups, changed successors,
+remaining intents and the old success-exit expectation before native use.
+No source test or final-row match earns native credit.
 
 All nine workflow premises are applied in the executable preparation and
 environments and listed by the plan. Genuine Nucleus admission remains

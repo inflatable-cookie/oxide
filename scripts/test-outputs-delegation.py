@@ -87,7 +87,28 @@ def last_json(text):
 
 
 def pending(doc):
-    return [i for i in doc['oxide']['intents'] if not i.get('receipt_settled', False)]
+    return [i for i in doc['oxide'].get('intents', []) if not i.get('receipt_settled', False)]
+
+
+def fixture_groups(doc, root, successor):
+    """Capture both actual member groups before any prune effect."""
+    groups={}
+    for key,path,selected in (('old',root,False),('successor',successor,True)):
+        rows=sorted((r for r in doc['oxide']['rows'] if r['root']==str(path)),key=lambda r:r['member'])
+        require(len(rows)==2 and {r['member'] for r in rows}=={'debug','release'},'fixture lacks a complete two-member '+key+' group')
+        require(all(r.get('selected') is selected and not r.get('pending') and all(r.get(field) is None for field in ('pruning','pruned_ms','reservation','cancelling')) for r in rows),'fixture '+key+' group is not settled')
+        groups[key]=json.loads(json.dumps(rows))
+    return groups
+
+
+def settled_group(doc, root, successor, before):
+    # A complete settlement compacts the old non-live rows and intent. The
+    # independent pre-effect capture proves this was an N-member group.
+    fixture_groups({'oxide':{'rows':before['old']+before['successor']}},root,successor)
+    require(not [r for r in doc['oxide']['rows'] if r['root']==str(root)],'completed old members remain in the live registry')
+    rows=sorted((r for r in doc['oxide']['rows'] if r['root']==str(successor)),key=lambda r:r['member'])
+    require(rows==before['successor'],'selected successor group changed during settlement')
+    require(not doc['oxide'].get('intents', []),'completed fixture intent remains in the live registry')
 
 
 def native_phase(doc, phase):
@@ -321,6 +342,8 @@ class World:
         self.reply_records=set()
         if not name.startswith('upgrade-'):
             self.invoke(['outputs','upgrade-recovery'],expect=0,label='upgrade')
+        self.groups_before=fixture_groups(self.inspect(),self.root,self.successor)
+        write_json(self.proof.evidence/(self.name+'-groups-before.json'),self.groups_before)
         self.plan_path=self.base/'presented.json'
         self.plan=None
 
@@ -346,6 +369,9 @@ class World:
                 raise RuntimeError('actual writer/custody uncertainty; retain and abort: '+str(value)[:2400])
             if kind in ('Unknown','Pending') and self.name!='root-replaced':
                 raise RuntimeError('unexpected actual adapter uncertainty; retain and abort: '+str(value)[:2400])
+
+    def require_reply(self,kind):
+        require(any(json.loads(path.read_text()).get('kind')==kind for path in self.reply_records),'actual adapter reply missing: '+kind)
 
     def helper(self,*args):
         _,out,_=self.invoke(['outputs','__delegation-fixture',*args],expect=0,label='fixture-'+str(args[0]))
@@ -380,9 +406,7 @@ class World:
     def settled(self):
         doc=self.inspect()
         require(not self.root.exists() and self.successor.is_dir(),'root/successor deletion oracle failed')
-        require(not pending(doc),'Oxide intent not settled')
-        rows=[r for r in doc['oxide']['rows'] if r['root']==str(self.root)]
-        require(len(rows)==2 and all(r.get('pruned_ms') is not None and not r.get('pruning') for r in rows),'whole group not settled')
+        settled_group(doc,self.root,self.successor,self.groups_before)
         require(not list(self.root.parent.glob('.prune-*')),'local quarantine used')
         self.absence(native_phase(doc,'deleted'))
         return doc
@@ -508,10 +532,14 @@ def run_case(world, name):
     if name=='fresh-locked':
         w.preview();token=secrets.token_hex(16);child=w.start(['outputs','__delegation-fixture','lock',w.data['uuid'],token])
         try:
-            w.wait('lock-'+token,child);w.execute(expect=0);w.kept()
-            require(not pending(w.inspect()),'fresh known-no-effect Locked did not roll back')
+            w.wait('lock-'+token,child);w.execute(expect=2);w.kept()
+            w.require_reply('KnownNoEffectLocked')
+            doc=w.inspect()
+            require(not pending(doc),'fresh known-no-effect Locked did not roll back')
+            require(not doc['barge'],'fresh Locked created a Barge intent/effect')
         finally:
-            (w.proof.evidence/('release-'+token)).write_text('release');w.finish(child,'lock')
+            (w.proof.evidence/('release-'+token)).write_text('release')
+            code,_,err=w.finish(child,'lock');require(code==0,err)
         return
     if name in ('sidecar-before-intent','oxide-intent-before-call'):
         w.preview()
@@ -726,8 +754,65 @@ def plan_document():
             'cases':list(CASES),'limits':['no source test is native credit','no evaluator equivalence or production account qualification','unknown child/writer/image custody aborts and retains; no force or retry']}
 
 
+def settlement_oracle_check():
+    def image(rows,intents=None):
+        oxide={'rows':rows}
+        if intents is not None:oxide['intents']=intents
+        return {'oxide':oxide}
+    old=[{'root':'old','member':m,'selected':False,'pending':False} for m in ('debug','release')]
+    successor=[{'root':'successor','member':m,'selected':True,'pending':False} for m in ('debug','release')]
+    before=fixture_groups(image(old+successor),'old','successor')
+    settled_group(image(successor),'old','successor',before)  # serde omits empty intents
+    settled_group(image(successor,[]),'old','successor',before)
+    bad_before=[image(old[:1]+successor),image([old[0],old[0]]+successor)]
+    for bad in bad_before:
+        try:fixture_groups(bad,'old','successor')
+        except OracleFailure:pass
+        else:raise AssertionError('incomplete/duplicate old member evidence accepted')
+    stale=[dict(r,pruned_ms=1) for r in old]
+    changed=[dict(r,selected=False) for r in successor]
+    for bad in (image(stale+successor),image(old[:1]+successor),image(successor[:1]),image(changed),image(successor,[{'receipt_settled':False}]),image(successor,[{'receipt_settled':True}])):
+        try:settled_group(bad,'old','successor',before)
+        except OracleFailure:pass
+        else:raise AssertionError('incomplete compaction, successor loss/change or pending exclusion accepted')
+
+
+def fresh_locked_oracle_check():
+    # Drive the actual case body with no filesystem or child effects. This
+    # catches the old expect=0 before any separately activated native session.
+    class Evidence:
+        def __init__(self,events):self.events=events
+        def __truediv__(self,key):return self
+        def write_text(self,text):self.events.append('release')
+    class Locked:
+        data={'uuid':'fixture'}
+        def __init__(self,code=2,doc=None,kind='KnownNoEffectLocked'):
+            self.code,self.doc,self.kind=code,doc or {'oxide':{},'barge':[]},kind
+            self.events=[]
+            self.proof=type('Proof',(),{'evidence':Evidence(self.events)})()
+        def preview(self):self.events.append('preview')
+        def start(self,args):self.events.append('start');return object()
+        def wait(self,*args):self.events.append('wait')
+        def execute(self,expect):
+            self.events.append('execute')
+            require(self.code==expect,'fresh Locked exit oracle differs')
+        def kept(self):self.events.append('kept')
+        def require_reply(self,kind):require(self.kind==kind,'fresh Locked actual outcome differs')
+        def inspect(self):return self.doc
+        def finish(self,*args):self.events.append('finish');return 0,'',''
+    world=Locked();run_case(world,'fresh-locked')
+    require(world.events==['preview','start','wait','execute','kept','release','finish'],'fresh Locked case skipped effect/closure controls')
+    for world in (Locked(code=0),Locked(code=3),Locked(doc={'oxide':{'intents':[{'receipt_settled':False}]},'barge':[]}),Locked(doc={'oxide':{},'barge':[{'phase':'intent'}]}),Locked(kind='Refused')):
+        try:run_case(world,'fresh-locked')
+        except OracleFailure:pass
+        else:raise AssertionError('wrong Locked exit/outcome or remaining Oxide/Barge intent accepted')
+        require(world.events[-2:]==['release','finish'],'failed Locked oracle did not close its lock child')
+
+
 def self_check():
     # Counterfactuals exercise orchestration oracles, not product semantics.
+    settlement_oracle_check()
+    fresh_locked_oracle_check()
     require(len(set(CASES))==len(CASES),'duplicate cases')
     good={'barge':[{'intent_id':'a'*32,'phase':'intent'}]}
     native_phase(good,'intent')
