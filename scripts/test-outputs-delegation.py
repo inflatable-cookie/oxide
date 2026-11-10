@@ -126,17 +126,24 @@ def native_phase(doc, phase):
 
 def fixture_env(proof, root, tools, stage_env):
     # Preserve the genuine inherited Nucleus hook; scrub product/tool overrides.
+    device,_=owned_directory(proof.root)
+    require(root.parent==proof.root,'fixture home escapes owned scratch')
+    owned_directory(root,device)
+    require(all(key in tools and Path(tools[key]).is_absolute() for key in ('cargo','rustc')),
+            'fixture installed tools missing')
+    rustup=Path(stage_env['RUSTUP_HOME'])
+    owned_directory(rustup)
     env = proof.env()
-    env = {k:v for k,v in env.items() if not k.startswith(('BARGE_', 'CARGO_', 'RUSTUP_', 'GIT_'))}
+    env = {k:v for k,v in env.items() if not k.startswith(('BARGE_', 'CARGO_', 'RUSTUP_', 'GIT_', 'XDG_'))}
     home, cargo, state, scratch = [root / name for name in ('home','cargo-home','barge-state','scratch-pools')]
     for path in (home, cargo, state, scratch):
         path.mkdir(mode=0o700)
     env.update(HOME=str(home), BARGE_ACCOUNT_HOME=str(home), BARGE_STATE_DIR=str(state),
-               OXIDE_TEST_ACCOUNT_HOME=str(home), OXIDE_TEST_HOME_FROM_ENV='1',
+               OXIDE_TEST_HOME_FROM_ENV='1',
                OXIDE_POOL=str(scratch/'pool'), OXIDE_SCRATCH_ROOT=str(scratch),
                OXIDE_POOL_CAP='64MiB', OXIDE_POOL_CREATE='1', CARGO_HOME=str(cargo),
                CARGO_NET_OFFLINE='true', CARGO_BUILD_JOBS='2', RUSTUP_AUTO_INSTALL='0',
-               RUSTUP_HOME=stage_env['RUSTUP_HOME'], RUSTUP_TOOLCHAIN=wrapper.BUILDER,
+               RUSTUP_HOME=str(rustup), RUSTUP_TOOLCHAIN=wrapper.BUILDER,
                RUSTC=str(tools['rustc']), CARGO=str(tools['cargo']),
                RUSTFLAGS='', RUSTC_WRAPPER='', CARGO_INCREMENTAL='0',CARGO_PROFILE_DEV_DEBUG='0')
     return env
@@ -488,6 +495,7 @@ class World:
         require(self.base.parent == proof.root,'mktemp escaped owned scratch')
         self.env=fixture_env(proof,self.base,tools,stage_env)
         self.data=self.helper('setup',hashlib.sha256(name.encode()).hexdigest()[:12],image.mount,image.volume_uuid)
+        self.check_setup(image)
         self.root=Path(self.data['root']); self.successor=Path(self.data['successor'])
         self.control=Path(self.data['control']); self.peer=Path(self.data['peer_control']); self.checkout=Path(self.data['checkout'])
         self.env['OXIDE_TEST_BARGE_RECORD_REPLY']=str(self.root)
@@ -499,8 +507,38 @@ class World:
         self.plan_path=self.base/'presented.json'
         self.plan=None
 
-    def invoke(self,args,*,expect=None,label='command',extra=None):
+    def check_setup(self,image):
+        require(all(isinstance(self.data.get(key),str) and self.data[key] for key in
+                    ('root','successor','control','peer_control','checkout','uuid','mount','checkout_volume_uuid')),
+                'fixture setup paths/identity missing')
+        require(self.data['mount']==image.mount and self.data['uuid']==image.volume_uuid,
+                'fixture setup image binding differs')
+        for key in ('root','successor'):
+            path=Path(self.data[key])
+            require(path.parent==Path(image.mount)/'oxide-outputs' and path.resolve(strict=True)==path,
+                    'fixture setup root escaped image')
+        for key in ('control','peer_control','checkout'):
+            path=Path(self.data[key])
+            require(path.is_relative_to(self.base) and path!=self.base and path.resolve()==path,
+                    'fixture setup private path escaped')
+
+    def command_env(self,extra=None):
         env=dict(self.env,**(extra or {}))
+        require(env.get('OXIDE_TEST_HOME_FROM_ENV')=='1' and 'OXIDE_TEST_ACCOUNT_HOME' not in env,
+                'fixture account mode differs or conflicts')
+        for key,relative in (('HOME','home'),('BARGE_ACCOUNT_HOME','home'),('BARGE_STATE_DIR','barge-state'),
+                             ('CARGO_HOME','cargo-home'),('OXIDE_SCRATCH_ROOT','scratch-pools')):
+            require(env.get(key)==str(self.base/relative),'fixture private environment escaped: '+key)
+        require(env.get('OXIDE_POOL')==str(self.base/'scratch-pools/pool'),'fixture pool escaped')
+        require(all(env.get(key)==str(self.proof.root) for key in ('OXIDE_TASK_SCRATCH_ROOT','TMPDIR','TMP','TEMP')),
+                'fixture temporary root differs')
+        require(env.get('OXIDE_PROOF_EVIDENCE')==str(self.proof.evidence)
+                and env.get('OXIDE_PROOF_DEADLINE_NS')==str(self.proof.deadline_ns+wrapper.SHUTDOWN_MARGIN_NS),
+                'fixture guard context differs')
+        return env
+
+    def invoke(self,args,*,expect=None,label='command',extra=None):
+        env=self.command_env(extra)
         result=self.proof.run([str(self.binary),*map(str,args)],cwd=self.base,env=env,label=self.name+'-'+label,limit=15)
         code,out,err=result
         permanent.require_confirmed_closure(label,err)
@@ -527,7 +565,13 @@ class World:
 
     def helper(self,*args):
         _,out,_=self.invoke(['outputs','__delegation-fixture',*args],expect=0,label='fixture-'+str(args[0]))
-        return last_json(out) if args[0] in ('setup','inspect','replay','generic-release') else None
+        if args[0] not in ('setup','inspect','replay','generic-release'):return None
+        value=last_json(out)
+        require(isinstance(value,dict),'fixture helper response is not an object')
+        if args[0]=='inspect':
+            require(isinstance(value.get('oxide'),dict) and isinstance(value.get('barge'),list)
+                    and isinstance(value['oxide'].get('rows'),list),'fixture inspect shape differs')
+        return value
 
     def preview(self, candidate=True):
         before=fresh.tree_digest(str(self.control))
@@ -573,7 +617,7 @@ class World:
 
     def start(self,args,extra=None):
         old_markers=set(self.proof.evidence.iterdir())
-        child=permanent.start_child(self.proof,[str(self.binary),*map(str,args)],str(self.base),dict(self.env,**(extra or {})))
+        child=permanent.start_child(self.proof,[str(self.binary),*map(str,args)],str(self.base),self.command_env(extra))
         child.delegation_old_markers=old_markers
         return child
 
@@ -672,7 +716,7 @@ def run_case(world, name):
                 # the caller retains the checkout barrier; do not mutate rows.
                 w.checkout.mkdir()
                 (w.checkout/'Cargo.toml').write_text('[package]\nname="fixture"\nversion="0.1.0"\nedition="2021"\n')
-                code,_,_=w.proof.run([str(w.binary),'outputs','adopt'],cwd=w.checkout,env=w.env,label=w.name+'-adopt-race',limit=4)
+                code,_,_=w.proof.run([str(w.binary),'outputs','adopt'],cwd=w.checkout,env=w.command_env(),label=w.name+'-adopt-race',limit=4)
                 require(code!=0,'adoption crossed a pending prune exclusion')
             (w.proof.evidence/('barge-call-release-'+intent['id'])).write_text('release')
             code,_,err=w.finish(child,'refusal')
@@ -824,7 +868,7 @@ def held_writer(w, removable):
         # Fixture-only absence during selection, restored before the custody
         # observation. The real command positively records its chosen pool.
         registration.rename(retained)
-    child=permanent.start_child(w.proof,[str(w.binary),'exec','--','/usr/bin/python3',str(script)],str(w.checkout),dict(w.env,**env))
+    child=permanent.start_child(w.proof,[str(w.binary),'exec','--','/usr/bin/python3',str(script)],str(w.checkout),w.command_env(env))
     away=w.checkout.with_name('retained-running-checkout')
     try:
         end=time.monotonic()+min(10,w.proof.remaining())
@@ -897,7 +941,7 @@ def plan_document():
                    'accounting':'all run-owned source, target, expanded Cargo cache including seed, home, tools copied if any, evidence, sealed artifact and other files; phase observations plus unchanged qualified guard'},
             'premises':[
                 'Installed toolchain resolved before private HOME; absolute Cargo/rustc; AUTO_INSTALL=0.',
-                'Oxide synthetic account and Barge proof-account feature positively agree before fixture writes; production account lookup unproved.',
+                'One Oxide private HOME route (TEST_HOME_FROM_ENV=1, no TEST_ACCOUNT_HOME) and Barge proof-account feature agree on that same home before fixture writes; production account lookup unproved.',
                 'Scrub inherited product/Cargo/flags settings; retain genuine Nucleus hook and admission.',
                 'Fixture roots are explicit synthetic history; no real checkout or auto-adoption. Actual competing adopt is a refusal case.',
                 'Stage Cargo argv fixed locked/offline/bin oxide/features; exec writer uses explicit dependency-free command.',

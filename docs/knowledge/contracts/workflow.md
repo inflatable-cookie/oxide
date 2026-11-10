@@ -6201,6 +6201,14 @@ Local controls use the real native setup and default image effects with fake
 external executors through attach identity and guard-request publication.
 The spent image state stays unknown; process closure and a missing backing
 do not establish image closure. No new native execution follows from this fix.
+The later27e230f7 diagnostic attached its image but failed first fixture setup
+because two mutually exclusive account controls were set. Its process census
+closed, while image cleanup kept the root and overall exit125. The
+[fixture environment correction](barge-adoption.md#fixture-account-and-world-composition-correction-oxide304)
+uses one supported private HOME route shared with Barge and adds actual World
+composition controls with external commands faked. Product conflict rejection
+and the retained image's custody obligation remain unchanged. Source/local
+readiness supplies neither native credit nor cleanup/retry authority.
 
 The approved Barge mechanism-only extension (Tom `63ad6fc4` v2 and explicit
 recovery-format ruling `60a85553` v2) is implemented behind the explicit

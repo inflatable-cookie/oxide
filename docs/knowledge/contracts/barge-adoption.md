@@ -5346,3 +5346,46 @@ report path preserves image failures. A request never asserts image closure.
 All files remain under the1MiB local-control limit; no image or engine runs.
 Source readiness and any fresh diagnostic/counting stages require their
 separate retained review and owner activations under the unchanged merge hold.
+
+#### Fixture account and World composition correction (oxide#304)
+
+The admitted `27e230f7` diagnostic (run `520e6c4b`, guard
+`0cbf55ed6de65b4c8f749e0309b8992c`) built, sealed, disposed its target and
+attached its image. First fixture setup then hit the product's deliberate
+rejection of simultaneous `OXIDE_TEST_HOME_FROM_ENV` and
+`OXIDE_TEST_ACCOUNT_HOME`. All43 report rows remain unexecuted. The report
+published without secondary errors; no partial results or detach request were
+produced. The packet
+`/Volumes/Stash/scratch/oxide/86d2ad42/diagnostic.hGFkgF2k/packet.json`
+(38576B, SHA256 `36808e26bf1e4665528dbd7feee4ebcfdeb27da8f5f35034af58c42f7cb4e007`)
+binds those observations. Phase maximum358772736B, resident164683776B and
+image-attached173092864B are point-in-time values, not runtime fit.
+
+Process closure is separate: the guard's closed/status1 and certain empty
+joined census did not detach the image. Overall exit125 and cleanup kept the
+root with its live-image marker because a declared backing entity remained
+attached. The recorded mount/device/UUID are historical identities, not current
+detach authority. The retained image remains a custody obligation; no survey,
+backing read, reuse or manual cleanup follows. All four failed diagnostics and
+the no-launch admission refusal retain their original source, bounds and charges.
+
+Fixtures now select the existing `OXIDE_TEST_HOME_FROM_ENV=1` route alone;
+Barge synthetic account facts use that same private `HOME`. Product proof
+controls and their conflict rejection are unchanged. The environment scrubs
+inherited XDG settings along with product/tool/Git/flags/target controls,
+preserves the genuine Nucleus hook and guard context, and uses the installed
+tools/rustup home with private Cargo/Barge state. Canonical owned fixture roots
+are checked before private directory creation. Commands reject conflicting or
+escaped account/temp/guard context; setup and inspect response shape/path/image
+bindings are checked before consuming them. Upgrade, replay, competing adopt
+and held-writer paths consume the same environment.
+
+Local controls construct actual normal and upgrade Worlds through the real
+environment, invoke/helper, child wait and publication paths, with only external
+executors faked. Contaminated inherited settings, command argv/cwd/timeouts,
+private paths, hook/deadline preservation and malformed/refused setup/inspect
+responses have explicit discriminators. Synthetic responses establish wiring
+only; they never stand in for product or native outcomes. Existing image,
+stage/phase/cleanup, reporting and oracle controls remain within1MiB of local
+files. Independent corrected-head readiness and separately activated diagnostic,
+counted author/reviewer and final judgment remain required under mergeHold.

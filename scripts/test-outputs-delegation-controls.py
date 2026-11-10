@@ -256,7 +256,8 @@ def stage_contract(m,root,case="ok"):
     assert proof.stage_phases[-1]['components']['target']==0
     fixture=base/'fixture';fixture.mkdir()
     fixture_env=m.fixture_env(proof,fixture,tools,env)
-    assert fixture_env['HOME']==fixture_env['BARGE_ACCOUNT_HOME']==fixture_env['OXIDE_TEST_ACCOUNT_HOME']
+    assert fixture_env['HOME']==fixture_env['BARGE_ACCOUNT_HOME']
+    assert fixture_env['OXIDE_TEST_HOME_FROM_ENV']=='1' and 'OXIDE_TEST_ACCOUNT_HOME' not in fixture_env
     assert fixture_env['RUSTFLAGS']=='' and 'CARGO_ENCODED_RUSTFLAGS' not in fixture_env
     assert fixture_env['RUSTUP_AUTO_INSTALL']=='0'
     assert fixture_env.get('CARGO_TARGET_DIR')!=str(base/'target')
@@ -422,6 +423,130 @@ def native_image_composition(m,root):
     print('native image composition: real entry/default effects, fake external executors; OK')
 
 
+def fixture_composition(m,root):
+    # Exercise real fixture_env, World, invoke/helper and child helpers. Fake
+    # ONLY external executors; response data below is labelled synthetic and
+    # makes no claim about any product command or eligibility outcome.
+    base=root/'fixture-composition';base.mkdir(mode=0o700)
+    scratch=base/'scratch';scratch.mkdir(mode=0o700)
+    evidence=base/'evidence';evidence.mkdir(mode=0o700)
+    rustup=base/'rustup';rustup.mkdir()
+    mount=base/'synthetic-mount';mount.mkdir()
+    image=SimpleNamespace(mount=str(mount),volume_uuid='synthetic-volume')
+    tools={name:base/name for name in ('cargo','rustc')};binary=base/'never-executed'
+    context={k:v for k,v in os.environ.items() if k.startswith('NUCLEUS_') or k=='EFFIGY_ADMISSION_HOOK'}
+    dirty={k:'inherited-contamination' for k in ('OXIDE_TEST_ACCOUNT_HOME','OXIDE_TEST_HOME_FROM_ENV',
+        'OXIDE_POOL','OXIDE_BARGE_UNAVAILABLE','BARGE_ACCOUNT_HOME','BARGE_STATE_DIR','XDG_CONFIG_HOME',
+        'XDG_CACHE_HOME','CARGO_HOME','CARGO_TARGET_DIR','CARGO_ENCODED_RUSTFLAGS','GIT_CONFIG_GLOBAL',
+        'RUSTFLAGS','RUSTC_WRAPPER','RUSTC_WORKSPACE_WRAPPER','SCCACHE_DIR','RUSTUP_TOOLCHAIN','RUSTUP_HOME')}
+    calls=[];data={};mode=['ok']
+    def spawn(argv,*,env=None,cwd=None,stdout=None,stderr=None):
+        calls.append((argv,cwd,env))
+        if argv[0]=='/usr/bin/mktemp':
+            assert argv[1:3]==['-d',str(scratch/('delegation-'+current[0]+'.XXXXXXXX'))]
+            child_base=scratch/current[0];child_base.mkdir(mode=0o700)
+            text=str(child_base)+'\n';err='';code=0
+        else:
+            assert argv[0]==str(binary) and cwd is not None
+            home=str(Path(cwd)/'home')
+            assert env['HOME']==env['BARGE_ACCOUNT_HOME']==home
+            assert env['OXIDE_TEST_HOME_FROM_ENV']=='1' and 'OXIDE_TEST_ACCOUNT_HOME' not in env
+            assert env['BARGE_STATE_DIR']==str(Path(cwd)/'barge-state') and env['CARGO_HOME']==str(Path(cwd)/'cargo-home')
+            assert env['RUSTUP_HOME']==str(rustup) and env['RUSTUP_TOOLCHAIN']==m.wrapper.BUILDER
+            assert env['CARGO']==str(tools['cargo']) and env['RUSTC']==str(tools['rustc'])
+            assert env['RUSTUP_AUTO_INSTALL']=='0' and env['CARGO_NET_OFFLINE']=='true'
+            assert env['CARGO_PROFILE_DEV_DEBUG']=='0' and env['CARGO_INCREMENTAL']=='0'
+            assert env['RUSTFLAGS']==env['RUSTC_WRAPPER']=='' and env['CARGO_BUILD_JOBS']=='2'
+            assert not any(k.startswith(('XDG_','GIT_','SCCACHE_')) for k in env)
+            assert 'CARGO_ENCODED_RUSTFLAGS' not in env and 'CARGO_TARGET_DIR' not in env and 'RUSTC_WORKSPACE_WRAPPER' not in env
+            assert 'OXIDE_BARGE_UNAVAILABLE' not in env
+            assert all(env.get(k)==v for k,v in context.items())
+            assert env['OXIDE_PROOF_DEADLINE_NS']==str(51*m.wrapper.NS) and env['OXIDE_PROOF_EVIDENCE']==str(evidence)
+            assert all(env[k]==str(scratch) for k in m.wrapper.TEMP_VARS)
+            text='';err='';code=0
+            if argv[1:4]==['outputs','__delegation-fixture','setup']:
+                assert argv[4:]==[m.hashlib.sha256(current[0].encode()).hexdigest()[:12],image.mount,image.volume_uuid]
+                control=Path(cwd)/'scratch-pools/pool/oxide-managed'
+                peer=control/'removable/oxide-managed'
+                old=mount/('oxide-outputs/'+current[0]+'-old');successor=old.with_name(current[0]+'-successor')
+                for path in (control,peer,old,successor):path.mkdir(parents=True,exist_ok=True)
+                data.update(root=str(old),successor=str(successor),control=str(control),peer_control=str(peer),
+                    checkout=home+'/checkouts/anchor/c',uuid=image.volume_uuid,mount=image.mount,
+                    checkout_volume_uuid='synthetic-checkout-volume',checkout_ancestor_inode=1)
+                text=json.dumps(data)
+                if mode[0]=='setup-malformed':text='[]'
+            elif argv[1:4]==['outputs','__delegation-fixture','inspect']:
+                rows=[dict(root=data[key],member=member,selected=selected,pending=False)
+                    for key,selected in (('root',False),('successor',True)) for member in ('debug','release')]
+                text=json.dumps({'oxide':{'rows':rows,'intents':[]},'barge':[]})
+                if mode[0]=='inspect-malformed':text='{"oxide":[],"barge":{}}'
+            elif argv[1:4]==['outputs','__delegation-fixture','replay']:text='{"synthetic_control_only":true}'
+            else:assert argv[1:]==['outputs','upgrade-recovery'] or argv[1:3]==['exec','--'],argv
+            if mode[0]=='exit':code=2;err='SYNTHETIC_SETUP_REFUSAL'
+            if mode[0]=='no-json':text='synthetic command has no response'
+        class Child:
+            pid=100+len(calls);returncode=None
+            def wait(self,timeout):
+                assert 0<timeout<=20
+                stdout.write(text.encode());stderr.write(err.encode());self.returncode=code;return code
+            def communicate(self,timeout):self.returncode=code;return text.encode(),err.encode()
+        return Child()
+    with ExitStack() as stack:
+        stack.enter_context(patch.dict(os.environ,{**dirty,**{k:str(scratch) for k in m.wrapper.TEMP_VARS},
+            'OXIDE_PROOF_EVIDENCE':str(evidence),'OXIDE_PROOF_DEADLINE_NS':str(51*m.wrapper.NS)}))
+        stack.enter_context(patch.object(m.permanent.time,'clock_gettime_ns',return_value=m.wrapper.NS))
+        stack.enter_context(patch.object(m.wrapper.shutil,'which',side_effect=lambda tool:str(base/tool)))
+        stack.enter_context(patch.object(m.wrapper.subprocess,'Popen',spawn))
+        proof=m.wrapper.Proof();proof.unclosed=set();proof.mount=None
+        stage_env={'RUSTUP_HOME':str(rustup)}
+        for current_name in ('positive-group','upgrade-internal-fence'):
+            current=[current_name];start=len(calls)
+            world=m.World(proof,binary,tools,stage_env,image,current_name)
+            commands=[argv[1:] for argv,_,_ in calls[start:] if argv[0]==str(binary)]
+            assert commands[0][:3]==['outputs','__delegation-fixture','setup']
+            assert commands[-1]==['outputs','__delegation-fixture','inspect']
+            assert (['outputs','upgrade-recovery'] in commands)==(current_name=='positive-group')
+            if current_name.startswith('upgrade-'):
+                world.invoke(['outputs','upgrade-recovery'],expect=0,label='local-upgrade-resume')
+        assert world.helper('replay')=={'synthetic_control_only':True}
+        child=world.start(['outputs','upgrade-recovery'],{'OXIDE_TEST_RECOVERY_UPGRADE_PHASE':'registry'})
+        with redirect_stdout(io.StringIO()):assert world.finish(child,'local-replay')[0]==0
+        assert not proof.unclosed
+        # Held-writer's actual child helper consumes the same deciding env.
+        with redirect_stdout(io.StringIO()):
+            child=m.permanent.start_child(proof,[str(binary),'exec','--','/usr/bin/python3','never-executed.py'],str(world.base),world.command_env({'WRITER_GATE':str(world.base)}))
+            assert m.permanent.finish_child(proof,child,'local-writer')[0]==0
+        for extra in ({'OXIDE_TEST_ACCOUNT_HOME':str(world.base/'home')},{'OXIDE_TEST_HOME_FROM_ENV':''},
+                      {'HOME':str(base)},{'BARGE_ACCOUNT_HOME':str(base)}, {'OXIDE_PROOF_DEADLINE_NS':'999999999999999'}):
+            count=len(calls)
+            try:world.invoke(['outputs','upgrade-recovery'],extra=extra)
+            except m.OracleFailure:pass
+            else:raise AssertionError('conflicting/missing/escaped private account reached command')
+            assert len(calls)==count
+        original_data=world.data
+        for changes in ({'checkout':None},{'control':str(base)},{'root':str(scratch)}, {'uuid':'wrong-image'}):
+            world.data=dict(original_data,**changes);count=len(calls)
+            try:world.check_setup(image)
+            except m.OracleFailure:pass
+            else:raise AssertionError('missing/escaped/swapped setup binding accepted')
+            assert len(calls)==count
+        world.data=original_data
+        for bad in ('setup-malformed','inspect-malformed','no-json','exit'):
+            mode[0]=bad
+            try:world.helper('setup',m.hashlib.sha256(current[0].encode()).hexdigest()[:12],image.mount,image.volume_uuid) if bad in ('setup-malformed','exit') else world.inspect()
+            except (m.OracleFailure,RuntimeError):pass
+            else:raise AssertionError('malformed/refused helper accepted: '+bad)
+        mode[0]='ok'
+        for invalid_root,invalid_tools,invalid_stage in ((base,tools,stage_env),(scratch/'missing',tools,stage_env),
+                (world.base,{},stage_env),(world.base,tools,{})):
+            count=len(calls)
+            try:m.fixture_env(proof,invalid_root,invalid_tools,invalid_stage)
+            except (m.OracleFailure,FileNotFoundError,KeyError):pass
+            else:raise AssertionError('missing/escaped fixture input accepted')
+            assert len(calls)==count
+    print('fixture composition: actual environment/World/invoke/helpers, fake external commands; OK')
+
+
 def check(m):
     imported_contracts(m)
     # Standard secure mkdtemp: no child is launched. Leave the owned root and
@@ -434,6 +559,7 @@ def check(m):
     setup_failures(m,root)
     child_contract(m,root)
     native_image_composition(m,root)
+    fixture_composition(m,root)
     closure_request(m,root)
     run_accounting(m,root)
     for case in ('ok','missing','linked','outside','mode','copy','hash','publication','cleanup','unconfirmed','target-swap','expired','over-prep','over-resident'):
