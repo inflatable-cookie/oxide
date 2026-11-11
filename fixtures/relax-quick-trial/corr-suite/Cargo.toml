@@ -1,0 +1,19 @@
+# Relax quick-run trial, correspondence suite (oxide#307). One workspace of
+# tiny crates, each pinning one semantic the edit loop must preserve. No
+# member carries a registry dependency except `threads-ffi` (libc, the same
+# exact pin this repository resolves), so the suite establishes its lock
+# offline inside the guarded occurrence.
+[workspace]
+resolver = "2"
+members = [
+    "basics",
+    "panic",
+    "overflow",
+    "gen",
+    "threads-ffi",
+    "testkit",
+    "mac-a",
+    "mac-b",
+    "lib-b",
+    "collision-app",
+]

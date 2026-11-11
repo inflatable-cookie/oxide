@@ -1,0 +1,9 @@
+[package]
+name = "greet"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+greet-core = { path = "../greet-core" }
+serde_json = "=1.0.151"

@@ -236,6 +236,111 @@ Limits:
   counters: 29 measured plus 2 version Cargo calls, about 110 s of the 50
   minutes, 0.7 GiB peak owned scratch.
 
+### Relax quick-run trial (2026-11-11, prepared)
+
+Tom approved a bounded compatibility/performance trial on 2026-11-11
+(decision `d6a33913-cc2d-460f-bce0-25c424c176d1` v2): determine whether a
+pinned Relax engine offers more useful quick-run feedback than the earlier
+Cranelift spike ([measurement](#cranelift-measurement-2026-10-18)), whose
+bytes and results stay preserved as historical context, never a contemporary
+benchmark arm or a prediction. One PR (oxide#307) prepares the minimal
+reproducible apparatus; the planner then separately activates an uncounted
+diagnostic and, if adequate, one measured author session at the accepted
+head. A negative result is a valid completed outcome. Everything below is
+source-read eligibility and limitations at the pinned upstream commit; no
+measurement has run, and nothing here is an integration, adoption or
+capability claim.
+
+**Engine and pin.** Upstream https://github.com/makepad/relax at EXACT
+`aa540c1468844af159e2f106d31966b84be9fdf1` (2026-11-11), MIT. Relax is one
+Rust library (about 438k lines, zero crates.io dependencies) that replaces
+the lex/parse/type-check/codegen/link pipeline and runs a Cargo package
+straight from source through its own x86-64/AArch64 JIT, compiling
+`core`/`alloc`/`std` from its own shipped sources; the standalone `relax`
+binary is `tools/run/runner` (crate `relax-runner`, edition 2021, no
+`rust-toolchain` pin in the tree). Its README states the repository builds
+and its tests pass from a fresh clone on Linux x86-64 and macOS arm64.
+Relax's bundled std carries third-party notices upstream under
+`libs/relax/compiler/std/CREDITS.md`; the trial copies no upstream bytes
+into this repository, so those notices stay upstream and any future copied
+material must keep them.
+
+**Runner contract used by the trial** (read from the pinned source):
+`relax run --check-first --no-live --quiet <package> [cargo flags] [-- args]`.
+`--check-first` borrow-checks each function before its first call
+(`jit::CHECK_FIRST`, `compiler/src/run.rs`); `--no-live` makes a
+working-tree run end with its exit code instead of becoming a watcher/hot
+reload live session (`LIVE_SESSION`, `run.rs`). The trial never passes
+`--relaxed` (Relaxed Rust) or `--cached` (newest-snapshot execution), runs
+fresh processes, and keeps only each arm's own declared compilation cache:
+the workspace's `target/makepad-run` (`relax clean` removes it), with stores
+under a private `MAKEPAD_RUN_HOME`. Registry sources are read from
+`$CARGO_HOME/registry/src` (`libs/relax/base/src/resolve.rs`), and with
+Cargo's offline setting or `MAKEPAD_RUN_OFFLINE=1` it never downloads.
+`relax test <package>` runs a package's tests; the trial uses it only as a
+correspondence probe, not as test-route qualification.
+
+**Known upstream gaps relevant to the trial** (`libs/relax/KNOWN_GAPS.md` at
+the pin): derive and bang macros resolve by bare name across the whole graph
+and the first registration wins (#1) — the trial carries the documented
+two-macro `Who` collision as a predeclared case whose expected result is
+rustc's `app=a b=b` and whose Relax divergence, if it reproduces, is recorded
+as `mismatch-known-gap-1`, never passed; the once-seen unreproduced serde
+`Serializer` `type Error = std::fmt::Error` E0277 shape (#2); one observed
+five-minute check spin (#3); late lints still printing after a check error
+(#4); and a liveness-warning span difference (#5). Upstream's own
+performance table says optimised Relax code is still slower than rustc
+`--release` (1.14–1.26x on its profiled workloads, 2.29x on a dense numeric
+kernel, against `-C target-cpu=native` release builds, 2026-11-11); those
+are upstream claims on their workloads, not this trial's evidence, and the
+trial compares today's LLVM quick baseline with today's pinned Relax on its
+own fixtures.
+
+**Apparatus** (this repository): `scripts/relax-quick-trial.py` with the
+effect-free `effigy research:relax:test` and `effigy research:relax:plan`,
+and the heavy guarded `effigy research:relax:diagnostic` and
+`effigy research:relax:measure` — each the whole command of the unchanged
+qualified shared supervisor (600 s including upstream acquisition, engine
+build, staging and every probe; 4096 MiB monitored owned scratch on the
+selected Stash volume; the original 30 s stop-work margin; no image; the
+supervisor's existing 20 GiB reserve safeguards). Both guarded modes refuse
+before any effect until a planner-issued one-use activation binds the exact
+script bytes, head and tree, upstream commit and tree, toolchain, bounds and
+selected volume; the diagnostic is always unqualified keep-going, and the
+measurement requires an adequate diagnostic at the unchanged accepted head
+first. Arms run identical source, dependencies, features, inputs and
+expected outputs: plain Cargo with the product's actual quick recipe
+(`CARGO_PROFILE_DEV_DEBUG=line-tables-only` with
+`CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG` cleared, read from
+`src/bin/oxide/cli.rs` and pinned by the effect-free modes), the staged
+Oxide quick front door where the isolated fixture safely supports it, and
+the pinned Relax runner strict. Workloads: a committed two-member serde
+fixture with deterministic observable output (cold, five warm reruns,
+predeclared body and dependant-invalidating interface edits, arm order
+rotated per repetition) and the pinned task-base Oxide snapshot running its
+read-only `--help` path under isolated test-home controls; a replacement
+synthetic fixture would be labelled as such. The bounded correspondence set
+covers argv/env/cwd/stdout/stderr/exit, `catch_unwind` plus the uncaught
+panic's file:line and a `RUST_BACKTRACE=1` frame expectation, overflow and
+debug assertions, serde derive round trip plus the KNOWN_GAPS #1 collision,
+a tiny build.rs/generated constant, threads and this repository's exact
+libc pin over FFI, and a minimal test-execution probe. No storage mutation,
+deletion or recovery case exists. Measurement reports end-to-end
+case wall time, stage costs separately, occupied cache bytes (never an
+SSD-write claim) and per-command process-tree peak RSS attributed to the
+direct child and its reaped descendants only; filesystem caches cannot be
+globally flushed under this scope, and every report says so. Tool build,
+std preparation, upstream acquisition and lock establishment are separately
+charged, never disguised as first-run latency.
+
+**No result exists yet.** The measured question — whether pinned Relax
+offers a repeatable edit-to-result gain over stable LLVM quick on these
+fixtures, at what memory, cache and setup cost, and with which semantic
+gaps — stays open until the planner-activated diagnostic and measurement
+produce their receipts. This section then records the outcome, the
+guarded go/no-go with its supported scope, and whether Relax offers more
+than the Cranelift spike.
+
 ### Other run-path levers
 
 Any rustc-based JIT or interpreter still runs parsing, macro expansion and
@@ -253,6 +358,7 @@ time separately before any backend is credited.
 | Parallel frontend (`-Zthreads`) | Nightly; speeds frontend work on large crates. Measured 2026-10-18 as arm D: no warm edit gain on Oxide's workspace ([measurement](#cranelift-measurement-2026-10-18)). | Same nightly dependency-set cost as Cranelift; not worth it for small workspaces. |
 | Watch mode | Rebuilds and restarts on save; cuts latency, not work. | Human loop; low value for agents. |
 | [danluu/rust-interpreter](https://github.com/danluu/rust-interpreter) | rustc checks the code, then selected MIR is lowered to bytecode and run in an interpreter or AArch64 JIT. Self-described as "extremely vibe coded"; "cannot yet replace `cargo test`"; no unwinding, threads, FFI or `should_panic`; "no fallback" for unsupported code. Its results are mixed: 20% faster on one five-edit pilot, 2.7x slower on a compute-heavy target. Needs pinned nightly with `rustc-dev`; no license stated. | Not usable or adoptable. It shows the approach can work, and its ceiling is still the check time. |
+| [Relax](https://github.com/makepad/relax) | External standalone JIT compiler/runner that replaces the whole rustc/LLVM/linker/Cargo pipeline in one dependency-free Rust library, compiling std from its own shipped sources. macOS arm64 builds and passes its tests from a fresh clone per its README (2026-11-11). Not a rustc backend, Cargo plugin or Oxide strategy. | Bounded trial prepared at the pinned commit (oxide#307, Tom decision `d6a33913-cc2d-460f-bce0-25c424c176d1` v2); no measurement has run — [trial](#relax-quick-run-trial-2026-11-11-prepared). Not a strategy candidate until that trial reports. |
 | Miri / [Cranelift JIT](https://github.com/rust-lang/rustc_codegen_cranelift/blob/main/docs/usage.md) | Miri is a UB checker that runs far slower than native code. Cranelift JIT is covered above. | Not speed tools. |
 
 ### Optimized-dependency measurement (2026-10-18)
