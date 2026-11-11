@@ -7074,3 +7074,63 @@ separately rather than blindly replacing strings. Consumer-specific limits,
 read-only sibling boundaries and adoption holds remain in force. Old receipts
 stay bound to their actual runner bytes and limits; repinning source does not
 migrate proof credit or authorize reruns, installation or consumer adoption.
+
+**Post-stop census stall, two Barge #056 diagnostic guards (oxide#305
+assessment, 2026-11-10; observation only — no supervisor, proof, candidate or
+consumer change).** Two Barge descriptor-listing diagnostics (Barge task
+`4bab8efb`, heads `43f8bb4d` then `bb8aa725`) each ended with the selector's
+natural exit 125 and an `UNCLOSED` guard sharing one post-stop fingerprint: the
+census thread started within ~0.17 ms of the processed stop, built its Census,
+entered round 0, and `Census.round()` never returned — settlement frozen at
+phase `round-start` with `rounds_started: 1`, `rounds_completed: 0`,
+`loop_exit_ns: null`, no census message, `census_join.joined: false` at the 3 s
+bound, and the custodian's fixed 10 s window ending in the fault `closure not
+established: no certain empty census after the leader was reaped` (occurrence
+`na85ok9x`, guard `a61c3f5b…`, evidence receipts `6ca61a8a…`/`cbc3081b…`;
+occurrence `ye5za15u`, guard `4f58eed6…`, receipts `ce699552…`/`00170998…`; the
+oxide#305 assessment verified all eight packet metadata digests and read source
+only). Both packet source manifests additionally record the guard's runner as
+the deployed default `scripts/bounded-test.py` `fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b`
+(311647 bytes, `expected_sha256` equal to the actual, `match`/`matched` true,
+before and after), so these stalls are observations of the deployed default
+runner, not of the isolated candidate. The stall lasted at least the ~13 s from
+thread start to the final publication in both runs, while the monitor's own tail matched source exactly
+(`stop_requested_ns` → join expiry → final publish 1.5–6.8 ms later) and reserve
+sampling stayed at ~3.9 Hz with a ≤0.47 s maximum gap — the monitor process was
+healthy; only the census thread stalled.
+
+| Boundary or fact | Source and receipts |
+| --- | --- |
+| Round-start → first record | `Monitor.census_loop` notes `round-start`, calls `Census.round()`; the first later settlement stamp (`scanned`) never came. All in-round stats are copied only after return, so the receipt has no visibility inside the round. |
+| Inside `Census.round()` | Snapshot (`Kinfo.all`, ≤3 sysctl attempts), tracked pruning, `exclusion_rule` (never raises; ancestor-PID rows cost 1–3 reads, children of recorded ancestors 6), per-row `getsid` + reread (guarded), up to 19 shared 50 ms confirmation pauses with rereads, one final reread per surviving ESRCH identity (guarded), snapshot-order assembly. Every raising site is guarded, so thread death by exception is source-excluded; a call that did not return, or an extraordinarily slow round, is the remaining class. |
+| What the receipts distinguish | Started vs completed rounds, thread latency, join expiry, zero census messages, EOF witnesses, `deadline: false`, reserve/owned samples. Empty `survivors: []` is not absence. |
+| What they cannot distinguish | Blocked vs slow round; which call stuck; the snapshot row count (`rows: null`); and host process-table size or load at the stall. The runner bytes are NOT among the unknowns: ordinary guard receipts bind no runner digest, but the packets' source manifests record the deployed default `fcfda2b0…` for both guards (expected = actual, match true), so identification comes from the packets, not the receipts. |
+| Proof-side failures, separate | Occurrence one staged in 71 s and failed its own L1–L3 fixed-count oracles (36 vs 35, 5004 vs 5003, cause not established, L4 passed, `first_fault: L1`) — the stall began only after that leader had already exited on its own oracle failure and was reaped with status 256 (exit code 1). Occurrence two timed out staging the proof build at the 270 s work stop (L1–L4 unexecuted, no binary). Neither proof-side outcome shares a demonstrated cause with the stall; the two stalls share only their identical fingerprint, ~53 minutes apart on one host. |
+| Coverage by recorded census work | None demonstrated. The #230/#233 replacement worklist and the counted-qualified isolated candidate `c5782431…` classify replacements in rounds that COMPLETE. The candidate's 2 s phase deadline is enforced inside the round — `CensusWork.check` before every reader and pause and again in each `finally` after the call returns, with one recheck after `round()` — so a slow round becomes honest uncertain evidence at the first returning call, with `replacement_work.status: "deadline"`; the limit that matters here is that an in-progress blocked kernel call cannot be interrupted, so a round stuck inside one call still never returns and yields the identical receipt. The historical completed-but-uncertain rounds (command-budgets/removable-removal receipts) and the Effigy launcher-ancestry rows (oxide#197) are different shapes. Calling the recorded changes a fix for this stall would be hypothesis, not evidence. |
+
+Explicit unknowns: the stuck call and blocked-versus-slow; the snapshot's row
+count; host process-table size and load at the stall moments; and the cause of
+occurrence one's one-extra-row oracle divergence (Barge-owned, historic). The
+runner bytes are established by the packets' source manifests: both guards ran
+the deployed default `fcfda2b0…`.
+
+Smallest defensible next route, proposed not authorized: ONE separately
+owner-activated, source-immutable, observation-only diagnostic that runs a
+synthetic leader under the unchanged default runner on this same route and
+bounds (≤300 s, 512 MiB, no image, no new signal authority, no cap, wait, clock
+or custody change), with a bounded out-of-guard sampler recording the system
+process-table size, load and the guard's census-thread state through the
+post-stop window. A reproduction would discriminate slow-round from blocked-call
+and name the table size; a non-reproduction bounds the phenomenon honestly. A
+source observability correction — sub-phase settlement stamps written as the
+round progresses, and a runner-bytes digest in ordinary guard receipts — is the
+follow-up only if that diagnostic reproduces without discriminating, and it is
+a supervisor-bytes change that needs its own qualification chain before any
+consumer relies on it. No wait/cap increase, fallback observer, weak closure,
+global repin or inferred acceptance is proposed. Closure semantics stand
+unchanged and correctly failed closed — certain-empty named and final census,
+joined thread, both EOFs, identity-bound signal custody, no-signal and
+unknown-keeps — and both retained Barge roots stay `UNCLOSED` and kept. The
+Barge operation-journal native gates stay held until the owner separately
+accepts a safe path; this assessment grants no native, activation, cleanup,
+promotion or pin authority.
