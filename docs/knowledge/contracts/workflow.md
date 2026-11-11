@@ -6187,6 +6187,14 @@ Both retained images remain open custody obligations, with no survey, reuse or
 manual cleanup authority. A fresh diagnostic and the counted qualification
 chain remain separately planner-activated after independent readiness.
 
+The [domain-verification preparation](barge-adoption.md#domain-verification-preparation-for-single-authority)
+separates exact registry/receipt checks from the existing covered caller's intent
+lookup. Its wrapper retains the same barrier/binding, publication boundaries and
+separate runtime custody/absence checks. The verifier acquires no lock and its
+verdict cannot be reused across a guarded publication revision. This source refactor
+neither activates the selected single-authority integration nor resumes the old
+native protocol; actual published Barge journal/coordinator inputs remain required.
+
 The focused [integrated delegation apparatus](barge-adoption.md#integrated-delegation-proof-readiness-oxide304)
 uses the ordinary qualified supervisor and separately activated600s /512MiB
 native selectors (the prospective v19 amendment; all earlier occurrences

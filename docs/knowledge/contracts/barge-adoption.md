@@ -5020,6 +5020,31 @@ and native integrated qualification remain separate from source regressions.
 No native/image/staging or live upgrade/adoption was run for this source.
 
 
+#### Domain verification preparation for single authority
+
+Tom decision `1735df31-7cc1-4748-9f8a-0767ee6259ff` v2 selects Barge-owned
+progress and repeatable Oxide domain settlement on disposable fixtures. The
+current caller still uses the historical two-journal protocol above. Its private
+`verify_domain_group` now checks the complete exact member set, recorded row
+facts, foreign live references and actual receipt independently of intent lookup.
+The existing wrapper retains durable-intent equality, the same pruning/preimage
+expectations, clean barrier/binding and runtime custody and absence checks.
+The verifier acquires no lock; current call sites and publication boundaries are
+unchanged. Future guarded settlement must supply its freshly read complete
+revision and may not cache this verdict across guard release. Explicit
+duplicate-member refusal also protects direct checker inputs; validated registry
+behavior is unchanged.
+
+Ordinary regressions exercise this checker with private receipt files and no
+journal, including changed fields, partial/absent groups, live foreign references,
+receipt placement/transition and byte-pin refusals. They establish no runtime
+custody or native qualification. The old covered route, sidecars and recovery
+remain until the actual published, qualified Barge operation journal and checked
+coordinator/hooks are available. This preparation adds no Barge interface,
+format, dependency, settlement write or runtime effect. Integrated diagnostics,
+counted sessions, image closure and live adoption remain separately held; all
+failed sessions and retained image obligations remain historical facts.
+
 #### Integrated delegation proof readiness (oxide#304)
 
 The focused selectors are `proof:outputs-delegation:test` (source/oracle and bounded local-file

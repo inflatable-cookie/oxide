@@ -332,6 +332,81 @@ fn pending(intent: &Intent, reason: impl std::fmt::Display) -> String {
     format!("operation {} for {} remains pending: {reason}; retry `oxide outputs prune --plan FILE --plan-sha256 HEX` with the original plan, or inspect `oxide outputs resolve-intent {}` after Barge safely settles; never locally delete this root", intent.id, intent.identity.root.display(), intent.id)
 }
 
+/// Verify the caller's registry snapshot and re-read the actual receipt.
+/// `pruning` is the existing row-phase expectation, not a journal lookup.
+/// This acquires no lock and grants no filesystem-effect authority: callers
+/// retain their synchronization, clean barrier/binding and runtime checks.
+/// A guarded publication must supply its freshly read revision; this result
+/// cannot be cached across that guard's release or a registry revision.
+pub(super) fn verify_domain_group<'a>(
+    control: &Path,
+    registry: &'a Registry,
+    identity: &super::RootIdentity,
+    group: &[super::GroupRow],
+    pruning: &str,
+    prior_receipt_sha: &str,
+) -> Result<&'a super::Row, String> {
+    if !registry.complete {
+        return Err("the registry is incomplete".to_owned());
+    }
+    let rows: Vec<_> = registry
+        .rows
+        .iter()
+        .filter(|row| row.checkout_id == identity.checkout_id && row.root == identity.root)
+        .collect();
+    if rows.len() != group.len() || rows.is_empty() {
+        return Err("the blocking registry group changed".to_owned());
+    }
+    let mut members: Vec<_> = rows.iter().map(|row| row.member.as_str()).collect();
+    members.sort_unstable();
+    let mut expected: Vec<_> = group.iter().map(|row| row.member.as_str()).collect();
+    expected.sort_unstable();
+    if members != expected || expected.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("the blocking registry members changed or repeat".to_owned());
+    }
+    for old in group {
+        let row = rows
+            .iter()
+            .find(|row| row.member == old.member)
+            .ok_or("a group member disappeared")?;
+        if row.selected
+            || row.pending
+            || row.reservation.is_some()
+            || row.cancelling.is_some()
+            || row.pruning.as_deref() != Some(pruning)
+            || row.nonce != old.nonce
+            || row.generation != old.generation
+            || row.root_dev != old.root_dev
+            || row.root_ino != old.root_ino
+            || row.marker_digest != old.marker_digest
+            || row.checkout != identity.checkout
+            || row.receipt != identity.receipt
+            || row.root_kind != identity.root_kind
+            || row.volume_uuid != identity.volume_uuid
+        {
+            return Err("a blocking group member changed or became selected".to_owned());
+        }
+    }
+    if registry.rows.iter().any(|row| {
+        row.root == identity.root && row.checkout_id != identity.checkout_id && row.live()
+    }) {
+        return Err("another checkout references this root".to_owned());
+    }
+    if !prior_receipt_sha.is_empty()
+        && super::receipt_preimage(control, &identity.checkout_id)? != prior_receipt_sha
+    {
+        return Err("the original receipt changed before Barge settled".to_owned());
+    }
+    super::verify_group_receipt(
+        control,
+        &identity.checkout,
+        &identity.checkout_id,
+        &identity.root,
+        group,
+    )?;
+    Ok(rows[0])
+}
+
 /// Existing Oxide authority remains a gate before every resumed adapter effect.
 fn recheck(
     store: &Store,
@@ -351,62 +426,17 @@ fn recheck(
     {
         return Err("the durable intent changed".to_owned());
     }
-    let rows: Vec<_> = registry
-        .rows
-        .iter()
-        .filter(|row| {
-            row.checkout_id == intent.identity.checkout_id && row.root == intent.identity.root
-        })
-        .collect();
-    if rows.len() != intent.group.len() || rows.is_empty() {
-        return Err("the blocking registry group changed".to_owned());
-    }
-    for old in &intent.group {
-        let row = rows
-            .iter()
-            .find(|row| row.member == old.member)
-            .ok_or("a group member disappeared")?;
-        if row.selected
-            || row.pending
-            || row.reservation.is_some()
-            || row.cancelling.is_some()
-            || row.pruning.as_deref() != Some(intent.id.as_str())
-            || row.nonce != old.nonce
-            || row.generation != old.generation
-            || row.root_dev != old.root_dev
-            || row.root_ino != old.root_ino
-            || row.marker_digest != old.marker_digest
-            || row.checkout != intent.identity.checkout
-            || row.receipt != intent.identity.receipt
-            || row.root_kind != intent.identity.root_kind
-            || row.volume_uuid != intent.identity.volume_uuid
-        {
-            return Err("a blocking group member changed or became selected".to_owned());
-        }
-    }
-    if registry.rows.iter().any(|row| {
-        row.root == intent.identity.root
-            && row.checkout_id != intent.identity.checkout_id
-            && row.live()
-    }) {
-        return Err("another checkout references this root".to_owned());
-    }
-    if !intent.prior_receipt_sha.is_empty()
-        && super::receipt_preimage(control, &intent.identity.checkout_id)?
-            != intent.prior_receipt_sha
-    {
-        return Err("the original receipt changed before Barge settled".to_owned());
-    }
-    super::verify_group_receipt(
+    let row = verify_domain_group(
         control,
-        &intent.identity.checkout,
-        &intent.identity.checkout_id,
-        &intent.identity.root,
+        registry,
+        &intent.identity,
         &intent.group,
+        &intent.id,
+        &intent.prior_receipt_sha,
     )?;
     let mut authority = super::AuthorityScope::begin()?;
     super::custody_clear_under_barrier(&mut authority, control, &intent.identity.checkout)?;
-    match super::checkout_absence(rows[0], false)? {
+    match super::checkout_absence(row, false)? {
         super::Absence::Absent(_) => {}
         super::Absence::Present => return Err("the checkout reappeared".to_owned()),
         super::Absence::Unknown(reason) => return Err(reason),
@@ -701,6 +731,32 @@ mod tests {
             caller_intent_id: intent.id.clone(),
             intent_id: actual,
             reason: None,
+        }
+    }
+
+    #[test]
+    fn existing_recheck_still_requires_the_exact_durable_intent_before_domain_io() {
+        let (fixture, mut registry) = crate::prune::tests::routed_registry();
+        let intent = registry.intents[0].clone();
+        let store = Store::for_tests(&fixture.root.join("pool"));
+        let control = fixture.root.join("not-a-control");
+        registry.intents.clear();
+        assert_eq!(
+            recheck(&store, &control, &registry, &intent).unwrap_err(),
+            "the intent disappeared"
+        );
+        for change in [
+            |entry: &mut Intent| entry.identity.generation += 1,
+            |entry: &mut Intent| entry.phase = IntentPhase::Deleted,
+            |entry: &mut Intent| entry.preview_sha256 = "e".repeat(64),
+        ] {
+            let mut changed = intent.clone();
+            change(&mut changed);
+            registry.intents = vec![changed];
+            assert_eq!(
+                recheck(&store, &control, &registry, &intent).unwrap_err(),
+                "the durable intent changed"
+            );
         }
     }
 

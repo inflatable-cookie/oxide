@@ -9589,7 +9589,7 @@ mod tests {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     pub(super) struct Fixture {
-        root: PathBuf,
+        pub(super) root: PathBuf,
     }
 
     impl Fixture {
@@ -11352,6 +11352,186 @@ mod tests {
         fs::write(&path, serde_json::to_vec_pretty(document).unwrap()).unwrap();
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// Drive the production domain verifier with an actual private receipt.
+    /// No intent is present: journal correlation and runtime custody remain
+    /// separate obligations of the existing caller.
+    #[test]
+    fn delegated_domain_recheck_requires_the_exact_complete_group_and_receipt() {
+        let fixture = Fixture::new();
+        let mut first = row_for(&fixture.root);
+        first.selected = false;
+        let mut second = first.clone();
+        second.member = "debug".to_owned();
+        let mut registry = empty_registry();
+        registry.rows = vec![first.clone(), second];
+        let candidate = candidate_of(&first);
+        let group = verified_group(&registry, &candidate).unwrap();
+        let identity = RootIdentity {
+            checkout_id: first.checkout_id.clone(),
+            checkout: first.checkout.clone(),
+            receipt: first.receipt.clone(),
+            member: first.member.clone(),
+            root: first.root.clone(),
+            root_kind: first.root_kind,
+            volume_uuid: first.volume_uuid.clone(),
+            nonce: first.nonce.clone(),
+            generation: first.generation,
+            dev: candidate.dev,
+            ino: candidate.ino,
+            marker_digest: candidate.marker_digest.clone(),
+        };
+        let pruning = "d".repeat(32);
+        for row in &mut registry.rows {
+            row.pruning = Some(pruning.clone());
+        }
+        let control = ready_control(&fixture, registry.rows.clone(), Vec::new());
+        let receipt = snapshot_receipt(&first, "oxide.outputs.transition/2", "detached", None);
+        publish_snapshot_receipt(&control, &first, &receipt);
+        let prior = receipt_preimage(&control, &first.checkout_id).unwrap();
+        let verify = |registry: &Registry, group: &[GroupRow], prior: &str| {
+            delegation::verify_domain_group(&control, registry, &identity, group, &pruning, prior)
+                .map(|row| row.member.clone())
+        };
+        assert!(registry.intents.is_empty());
+        assert_eq!(verify(&registry, &group, &prior).unwrap(), first.member);
+        let mut reordered = registry.clone();
+        reordered.rows.reverse();
+        assert!(verify(&reordered, &group, &prior).is_ok());
+
+        let changes: &[(&str, fn(&mut Row))] = &[
+            ("member", |row| row.member = "other".to_owned()),
+            ("checkout id", |row| row.checkout_id = "e".repeat(64)),
+            ("root", |row| row.root.push("replacement")),
+            ("selected", |row| row.selected = true),
+            ("pending", |row| row.pending = true),
+            ("reservation", |row| row.reservation = Some("e".repeat(32))),
+            ("cancelling", |row| row.cancelling = Some("e".repeat(32))),
+            ("missing pruning", |row| row.pruning = None),
+            ("other pruning", |row| row.pruning = Some("e".repeat(32))),
+            ("nonce", |row| row.nonce = Some("e".repeat(32))),
+            ("generation", |row| row.generation += 1),
+            ("device", |row| row.root_dev = Some(42)),
+            ("inode", |row| row.root_ino = Some(42)),
+            ("marker", |row| row.marker_digest = Some("e".repeat(64))),
+            ("checkout", |row| row.checkout.push("replacement")),
+            ("receipt", |row| row.receipt.push("replacement")),
+            ("kind", |row| row.root_kind = RootKind::Local),
+            ("volume", |row| row.volume_uuid = None),
+        ];
+        for (name, change) in changes {
+            let mut changed = registry.clone();
+            change(&mut changed.rows[1]);
+            assert!(verify(&changed, &group, &prior).is_err(), "{name}");
+        }
+        let mut incomplete = registry.clone();
+        incomplete.complete = false;
+        assert!(verify(&incomplete, &group, &prior).is_err());
+        for count in [0, 1] {
+            let mut partial = registry.clone();
+            partial.rows.truncate(count);
+            assert!(verify(&partial, &group, &prior).is_err());
+        }
+        let mut extra = registry.clone();
+        let mut row = first.clone();
+        row.member = "extra".to_owned();
+        extra.rows.push(row);
+        assert!(verify(&extra, &group, &prior).is_err());
+        let mut duplicate = registry.clone();
+        duplicate.rows[1] = duplicate.rows[0].clone();
+        assert!(verify(&duplicate, &group, &prior).is_err());
+        let duplicate_group = vec![group[0].clone(), group[0].clone()];
+        assert!(verify(&duplicate, &duplicate_group, &prior).is_err());
+        assert!(verify(&registry, &[], &prior).is_err());
+
+        let mut foreign = registry.clone();
+        let mut row = first.clone();
+        row.checkout_id = "e".repeat(64);
+        // Released history is permitted; every live reference must refuse.
+        foreign.rows.push(row);
+        assert!(verify(&foreign, &group, &prior).is_ok());
+        for index in [3, 4, 5, 6, 8] {
+            let (name, change) = changes[index];
+            let mut live = foreign.clone();
+            change(live.rows.last_mut().unwrap());
+            let error = verify(&live, &group, &prior).unwrap_err();
+            assert!(error.contains("another checkout"), "{name}: {error}");
+        }
+
+        let mut changed = receipt.clone();
+        changed["updated_ms"] = serde_json::json!(2);
+        publish_snapshot_receipt(&control, &first, &changed);
+        assert!(verify(&registry, &group, &prior)
+            .unwrap_err()
+            .contains("original receipt"));
+        // Refresh the byte pin to distinguish semantic refusal from SHA refusal.
+        let mut placing = snapshot_receipt(
+            &first,
+            "oxide.outputs.transition/2",
+            "committed",
+            Some(&first.root),
+        );
+        placing["links"][0]["selected"]["nonce"] = serde_json::json!(first.nonce);
+        publish_snapshot_receipt(&control, &first, &placing);
+        let pin = receipt_preimage(&control, &first.checkout_id).unwrap();
+        assert!(verify(&registry, &group, &pin).is_err());
+        let mut selected_group = group.clone();
+        selected_group
+            .iter_mut()
+            .find(|row| row.member == first.member)
+            .unwrap()
+            .selected = true;
+        // A matching selected subset is accepted by the existing receipt rule;
+        // changing its generation or nonce independently must still refuse.
+        assert!(verify(&registry, &selected_group, "").is_ok());
+        for field in ["generation", "nonce"] {
+            let mut mismatch = placing.clone();
+            mismatch["links"][0]["selected"][field] = if field == "generation" {
+                serde_json::json!(42)
+            } else {
+                serde_json::json!("e".repeat(32))
+            };
+            publish_snapshot_receipt(&control, &first, &mismatch);
+            assert!(verify(&registry, &selected_group, "").is_err(), "{field}");
+        }
+        let mut pruning_receipt = receipt.clone();
+        pruning_receipt["state"] = serde_json::json!("pruning");
+        pruning_receipt["pruned"] = serde_json::json!({
+            "intent": "e".repeat(32), "outcome": "pruning", "at_ms": 2
+        });
+        publish_snapshot_receipt(&control, &first, &pruning_receipt);
+        let read = outputs::read_receipt_for_prune(&control, &first.checkout, &first.checkout_id)
+            .unwrap()
+            .unwrap();
+        assert!(outputs::receipt_is_pruning(&read));
+        // The existing wrapper pins the original receipt: a later pruning
+        // publication cannot replace that preimage, even with no placements.
+        assert!(verify(&registry, &group, &prior)
+            .unwrap_err()
+            .contains("original receipt"));
+        let mut prepared = snapshot_receipt(
+            &first,
+            "oxide.outputs.transition/1",
+            "prepared",
+            Some(&first.root),
+        );
+        prepared["prepared"] = serde_json::json!({
+            "generation": 2,
+            "to": {"kind": "external", "root": first.root, "volume_uuid": first.volume_uuid, "generation": 2},
+            "link": first.checkout.join("target")
+        });
+        publish_snapshot_receipt(&control, &first, &prepared);
+        let read = outputs::read_receipt_for_prune(&control, &first.checkout, &first.checkout_id)
+            .unwrap()
+            .unwrap();
+        assert!(read.prepared_ref().is_some());
+        let pin = receipt_preimage(&control, &first.checkout_id).unwrap();
+        assert!(verify(&registry, &group, &pin)
+            .unwrap_err()
+            .contains("pending transition"));
+        fs::remove_file(outputs::receipt_path_public(&control, &first.checkout_id)).unwrap();
+        assert!(verify(&registry, &group, "").is_err());
     }
 
     /// oxide#152: a mixed snapshot of version-1, version-2 and version-3
