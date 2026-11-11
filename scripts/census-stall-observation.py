@@ -2987,8 +2987,9 @@ def self_test():
             assert_that(os.path.realpath(bootstrap.__file__) == os.path.realpath(BOOTSTRAP_PATH),
                         "the helper is the pinned qualification bootstrap")
             assert_that(bootstrap.bounded.__module__ == bootstrap.__name__
-                        and callable(bootstrap.hold) and callable(bootstrap.now_ns),
-                        "the imported outer actor is that module's own bounded/hold/now_ns")
+                        and bootstrap.hold.__module__ == bootstrap.__name__
+                        and bootstrap.now_ns.__module__ == bootstrap.__name__,
+                        "the imported outer actor and its hold/clock are that module's own")
             first = bootstrap.now_ns()
             second = bootstrap.now_ns()
             assert_that(strict_int(first) and strict_int(second) and first <= second,
