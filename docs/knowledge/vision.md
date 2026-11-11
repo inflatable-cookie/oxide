@@ -403,8 +403,19 @@ the operating rules.
   the two-journal integration. The source-only design and independent review
   must identify machinery removed from both products and preserve admission,
   crash recovery and safe repeated finalization. The architecture remains a
-  proposal; implementation, migration and deployment need a subsequent scoped
-  disposition. Existing work and evidence stay preserved.
+  proposal until the implementation ruling below; existing work and evidence
+  stay preserved.
+- **Single-authority recovery implementation** (Tom, 2026-11-11, decision
+  `1735df31-7cc1-4748-9f8a-0767ee6259ff` v2): implement the independently
+  reviewed Barge stage 4 operation-journal design on disposable fixtures.
+  Barge owns operation progress and durable hook obligations; Oxide keeps
+  eligibility and repeatable domain settlement. Scope the journal integrity,
+  coordinator and caller removals separately, with independent review and
+  bounded Elevated qualification. The selected design includes retained
+  cancellation, atomic settlement entries and fail-fast journal consults
+  under admission, with their refusal and retention costs. Native sessions
+  remain separately owner-activated. This grants no installation, live
+  migration or adoption, retained-resource cleanup or supervisor promotion.
 - **Barge descriptor-listing design** (Tom, 2026-11-10, decision
   `9e68c8ce-ac61-4190-a31c-b45f99fd6ecd` v2): investigate a bounded shared
   listing within the existing total descriptor, process and time budgets,
