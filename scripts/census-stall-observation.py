@@ -80,8 +80,10 @@ Usage (under the guard only, in `--leader` mode; the observer is the selector):
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import errno
+import io
 import hashlib
 import importlib.util
 import json
@@ -2482,7 +2484,9 @@ def self_test():
                    "OXIDE_PROOF_DEADLINE_NS": str(600 * NS),
                    "OXIDE_TASK_SCRATCH_ROOT": scratch, PUBLISH_DIR_VAR: publish,
                    TOKEN_VAR: "0123456789abcdef", "TMPDIR": scratch}
-            code = leader_main(seams, env)
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                code = leader_main(seams, env)
             path = os.path.join(publish, DOC_NAME)
             assert_that(code == 1, "the synthetic leader exits its declared status")
             assert_that(path in seams.written, "the identity document is published once")
@@ -2511,12 +2515,14 @@ def self_test():
                 assert_that(validate_leader_document(changed, "0123456789abcdef", 5001, 12),
                             f"leader {name}: refused")
             empty = FakeSeams(script)
-            assert_that(leader_main(empty, {}) == 2, "a stray leader invocation refuses")
-            assert_that(not empty.written, "a refusal publishes nothing")
-            asymmetric = dict(env)
-            asymmetric["OXIDE_TASK_SCRATCH_ROOT"] = "/Volumes/Stash/elsewhere"
-            assert_that(leader_main(FakeSeams(script), asymmetric) == 2,
-                        "an asymmetric guard layout refuses")
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                assert_that(leader_main(empty, {}) == 2, "a stray leader invocation refuses")
+                assert_that(not empty.written, "a refusal publishes nothing")
+                asymmetric = dict(env)
+                asymmetric["OXIDE_TASK_SCRATCH_ROOT"] = "/Volumes/Stash/elsewhere"
+                assert_that(leader_main(FakeSeams(script), asymmetric) == 2,
+                            "an asymmetric guard layout refuses")
         check("leader: publication, declared exit and every identity gate", leader_document)
 
         def plan():
