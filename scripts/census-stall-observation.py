@@ -2331,6 +2331,36 @@ def self_test():
                         "a malformed guard receipt is incomplete")
         check("identity: monitor attribution, recycled tokens, malformed receipt", monitor_resolution)
 
+        def unreadable_data():
+            base = stall_script("blocked")
+            base["threads"] = {4244: "unreadable"}
+            report, code, _seams = run_script(base)
+            assert_that(code == 0, "unreadable thread data still completes the observation")
+            assert_that(report["classification"]["outcome"] == OUTCOME_REPRODUCED_INSUFFICIENT,
+                        "unreadable thread data cannot discriminate")
+            assert_that(report["census_thread"]["state"] != "attributed",
+                        "an unreadable thread list is never attributed")
+            base = stall_script("blocked")
+            base["threads"] = {4244: lambda _pid, _at: [9001, 9002, 9003]}
+
+            def no_info(thread, at):
+                return "unreadable" if thread == 9003 else {
+                    "cpu_ns": 1_000_000, "state": 3, "name": ""}
+            base["thread_info"] = {9001: no_info, 9002: no_info, 9003: no_info}
+            report, _code, _seams = run_script(base)
+            assert_that(report["classification"]["outcome"] == OUTCOME_REPRODUCED_INSUFFICIENT,
+                        "unreadable census-thread state is never a shape")
+            base = base_script()
+            base["exit_at"] = 1_050_000_000
+            base["files"].pop(document_path())
+            report, code, _seams = run_script(base)
+            assert_that(code == 1 and report["classification"]["outcome"]
+                        == OUTCOME_INCOMPLETE,
+                        "a leader document that never arrives is incomplete")
+            assert_that(report["attempts"]["doc"] >= 1,
+                        "the bounded document attempts are recorded, not hidden")
+        check("data: unreadable thread state and a late document are not invented", unreadable_data)
+
         def window_bounds():
             script = base_script()
             script["exit_at"] = 10 ** 12
