@@ -1656,3 +1656,27 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 [tasks."proof:warm-reuse"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-warm-reuse.py"
+
+# Post-stop census-stall observation diagnostic (oxide#306). `:test` is the
+# pure apparatus check (`--self-test`): it stages nothing, starts no supervisor,
+# queries no kernel process or thread state, runs no Cargo/image/fixture, and
+# writes only one private TMPDIR directory it removes. `:plan` is effect-free.
+# `rust:census-stall-observation` is the ONE future observation occurrence,
+# declared here but NOT activated or run by this preparation: it spawns the
+# unchanged deployed default supervisor (`scripts/bounded-test.py`, SHA-256
+# `fcfda2b0…`) as its own direct child with the default selected-volume scratch
+# routing around a synthetic leader that declares exit 1; it samples only its
+# own new monitor's census-thread CPU/run state and a count-only process-table
+# size plus load under fixed caps (100 instants at 4 Hz, 64 monitor threads,
+# 1 MiB observer bytes, one ≤300 s absolute deadline, 512 MiB guard scratch),
+# never signals/traces/suspends the guard's processes, and always records
+# `qualified: false` with no qualification, consumer or supervisor credit.
+[tasks."proof:census-stall-observation:test"]
+run = "python3 scripts/census-stall-observation.py --self-test"
+
+[tasks."proof:census-stall-observation:plan"]
+run = "python3 scripts/census-stall-observation.py --plan"
+
+[tasks."rust:census-stall-observation"]
+admission = "heavy"
+run = "python3 scripts/census-stall-observation.py --observe"

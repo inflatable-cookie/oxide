@@ -7114,22 +7114,72 @@ occurrence one's one-extra-row oracle divergence (Barge-owned, historic). The
 runner bytes are established by the packets' source manifests: both guards ran
 the deployed default `fcfda2b0…`.
 
-Smallest defensible next route, proposed not authorized: ONE separately
-owner-activated, source-immutable, observation-only diagnostic that runs a
-synthetic leader under the unchanged default runner on this same route and
-bounds (≤300 s, 512 MiB, no image, no new signal authority, no cap, wait, clock
-or custody change), with a bounded out-of-guard sampler recording the system
-process-table size, load and the guard's census-thread state through the
-post-stop window. A reproduction would discriminate slow-round from blocked-call
-and name the table size; a non-reproduction bounds the phenomenon honestly. A
+**Prepared diagnostic (oxide#306; source and ordinary effect-free readiness
+only — not activated, no observation credit).** `scripts/census-stall-observation.py`
+is the ONE source-immutable, observation-only diagnostic the assessment asked
+for, with three fixed Effigy selectors: `proof:census-stall-observation:test`
+(`--self-test`, the pure apparatus check), `proof:census-stall-observation:plan`
+(`--plan`, effect-free) and the heavy `rust:census-stall-observation`
+(`--observe`, the one future occurrence, declared but **not activated** here).
+`--observe` is an outside-guard observer: it spawns the unchanged deployed
+default `scripts/bounded-test.py` (`fcfda2b0…`) as its own direct child with the
+guard's normal default selected-volume routing, and the guard's leader is the
+same script in `--leader` mode. That synthetic leader publishes one bounded
+document naming the guard's own run id, its own PID/start, its parent
+(custodian) PID/start, session/group, and the guard's evidence/scratch/deadline,
+then exits the **declared** status 1, which the run labels as synthetic and
+never as either historical producer exit. The observer records only this new
+run's own identities and facts: the guard/custodian PID plus the same `kinfo_proc`
+start token the census uses, the monitor as the guard's other direct child
+(exactly one remaining same-session child; zero, several or unreadable is
+recorded Unknown), and the census thread as the ONE monitor thread that appears
+after the guard's recorded `stopped` receive (source establishes no other
+post-`ready` thread; anything else is Unknown). Per sample it records
+`CLOCK_UPTIME_RAW`, the monitor thread ids/CPU/run state, the system process-table
+size as a **count only** (`libproc`, no foreign identities or rows persisted)
+and the load average, under fixed caps: at most 100 instants at ~4 Hz, 64
+monitor threads, 16 stored thread rows per sample, 1 MiB of observer bytes
+(256 KiB report, 64 KiB per captured stream), one absolute ≤300 s deadline and
+the guard's unchanged 512 MiB monitored scratch. It reads the guard's own new
+`evidence/receipt.json` and copies a bounded digest of the decision-relevant
+fields; closure, signals, deadlines, custody and cleanup remain the unchanged
+guard's. It uses no ptrace/DTrace/sample, no suspension, no signal injection, no
+host setting or limit change and no historical root/image/process read; its only
+signal is a last-resort SIGKILL of its own still-unreaped direct child if the
+guard misses the observer's deadline, and an unreaped guard or an unobserved
+monitor keeps every resource and fails the observation as unknown custody.
+The observer's own root (report, captured streams and leader document) lives
+under the run `TMPDIR` outside the guard's owned-byte accounting; its bounded
+allocation is counted in the task total and is not a guard measurement, and the
+sampler supplies no closure, reserve or cleanup verdict.
+
+Four outcomes are recorded separately: `reproduced_discriminated` (the exact
+receipt fingerprint — round started, zero completed, no loop exit, join expired,
+no census message, the census fault and guard exit 125 — plus an attributed
+census thread and a late window of at least 1 s that names either
+`blocked_call_shape` (no measurable CPU progress, parked run state) or
+`slow_round_shape` (CPU progress)), `reproduced_insufficient` (the fingerprint
+without honest thread evidence), `not_reproduced` (a normal closure with the
+declared leader status in this one window) and `observation_incomplete`
+(apparatus, identity, custody, receipt or guard-outcome facts missing or
+contradictory). Thread state cannot name the kernel call or prove
+blocked-versus-slow by itself, so the report states the observed shape, records
+the exact call as Unknown, and describes the sampler's own perturbation. A
+non-reproduction only bounds current behaviour; neither outcome is a historical
+cause, a fix, a qualification or permission for any consumer native.
+
+**Remaining gates.** The source has an independent exact-head reviewer; the ONE
+actual occurrence is separately owner-activated on the same verified Stash
+route (UUID `8A660440-C919-45C6-A3F1-3365B9BD2006`) and its packet is returned to
+that same reviewer for interpretation. No wait/cap increase, fallback observer,
+weak closure, global repin, candidate use or promotion, consumer resume or
+inferred acceptance follows. If a reproduction still does not discriminate, a
 source observability correction — sub-phase settlement stamps written as the
-round progresses, and a runner-bytes digest in ordinary guard receipts — is the
-follow-up only if that diagnostic reproduces without discriminating, and it is
-a supervisor-bytes change that needs its own qualification chain before any
-consumer relies on it. No wait/cap increase, fallback observer, weak closure,
-global repin or inferred acceptance is proposed. Closure semantics stand
-unchanged and correctly failed closed — certain-empty named and final census,
-joined thread, both EOFs, identity-bound signal custody, no-signal and
+round progresses, and a runner-bytes digest in ordinary guard receipts — is a
+separately scoped future supervisor-bytes change with its own qualification
+chain; it is not activated here. Closure semantics stand unchanged and correctly
+failed closed — certain-empty named and final census, joined thread, both EOFs,
+identity-bound signal custody, no-signal and
 unknown-keeps — and both retained Barge roots stay `UNCLOSED` and kept. The
 Barge operation-journal native gates stay held until the owner separately
 accepts a safe path; this assessment grants no native, activation, cleanup,
