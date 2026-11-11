@@ -28,6 +28,23 @@ evidence/scratch/deadline and its DECLARED expected exit status 1) into a
 directory the observer owns, then exits 1 by design. The declared exit is
 labelled: it is never a relabelling of either historical producer failure.
 
+The whole observer is placed behind ONE actual absolute bound by the existing
+qualification bootstrap's minimal outer actor (`scripts/qualify-supervisor.py`,
+pinned bytes, its `bounded`/`hold` pattern and CLOCK_UPTIME_RAW clock): the
+actor forks the entire observer as one worker child, holds it unreaped, forwards
+INT/TERM, and KILLs it only at the fixed actor deadline. Every probe, filesystem,
+stdio and report step runs in that worker, so a blocked read or write cannot
+extend the run. The inner budgets compose inside the one original <=300 s:
+guard 270 s, worker deadline 286 s, actor KILL 293 s, actor finish 299 s. A
+sample cap (100 instants) ends SAMPLING only; it is not the guard's deadline,
+and the worker still waits for the guard's own natural settlement up to its
+deadline. The observer KILLs its own still-unreaped direct guard child only on
+explicit cancellation, on a post-spawn internal error after one bounded grace,
+or when the fixed worker deadline is reached. If the actor must KILL the worker
+(including a blocked call), the worker's report is omitted or partial and any
+guard it spawned remains Unknown under its own bound: the exit is 124 and no
+closure is claimed.
+
 The observer's whole authority is read-only observation of its OWN new run:
 
 - the guard/custodian identity is its own direct child (PID plus the same
@@ -44,21 +61,26 @@ The observer's whole authority is read-only observation of its OWN new run:
 - per sample it records CLOCK_UPTIME_RAW, the monitor thread ids/CPU/run state
   (bounded), the system process-table SIZE as a count only (libproc count, no
   foreign identities or rows persisted) and the load average. Sampling stops at
-  the guard's exit, at 100 sample instants at ~4 Hz, or at one absolute
-  deadline, whichever comes first;
+  the guard's exit, at 100 sample instants at ~4 Hz, at the worker deadline or
+  on caller cancellation, whichever comes first, and the stop reason is
+  recorded;
 - it reads the guard's OWN new `evidence/receipt.json` after exit and copies a
-  bounded digest and the decision-relevant fields; the guard's own closure,
-  signal, deadline and cleanup authority is untouched.
+  bounded digest and the decision-relevant fields. The receipt's `command` is
+  compared with the INNER leader command the pinned runner's own parser
+  constructs after `--` (not with the observer's outer invocation), and
+  `limit_s` with the fixed inner guard limit; the guard's own closure, signal,
+  deadline and cleanup authority is untouched.
 
 It never signals, reaps, suspends or traces the guard's monitor/leader, never
 uses ptrace/DTrace/sample, never injects a signal, changes no host setting or
 limit, touches no historical retained root/image/process, and never rebinds or
-repins the supervisor or its candidate. Its only signal is a last-resort
-SIGKILL of its own direct child (the guard) if the guard does not exit by the
-observer's absolute deadline; the child is held unreaped, so its PID cannot
-have been recycled, and it is positively reaped afterwards. An unreaped guard or
-an unobserved monitor is recorded as unknown custody, keeps every resource and
-fails the observation; the observer never claims the guard's closure.
+repins the supervisor or its candidate. Its only signals are a SIGKILL of its
+own still-unreaped direct child (the guard) on cancellation, internal error or
+the fixed worker deadline, and the pinned actor's SIGKILL of that actor's own
+worker; neither ever reaches a sampled descendant or a peer. An unreaped guard,
+an unobserved monitor or a worker KILLed at the actor deadline is recorded as
+unknown/omitted custody, keeps every resource and fails the observation; the
+observer never claims the guard's closure.
 
 Four outcome classes are recorded separately: `reproduced_discriminated`
 (census-stall fingerprint plus attributed census-thread evidence that names the
@@ -120,11 +142,22 @@ CLAIM = ("observation only: one bounded outside-guard sample of this run's own "
 # the candidate is declared read-only and never executed, imported or repinned.
 EXPECTED_RUNNER_SHA256 = "fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b"
 EXPECTED_CANDIDATE_SHA256 = "c578243126a2470cde0dfd19530254b3ec61b4ea5bb1fa43c6bbd2d41853c2b7"
+# The qualification bootstrap whose minimal outer bounded actor (`bounded` and
+# `hold`) enforces the whole-observer deadline. Its bytes are pinned and its
+# import/receiver/clock semantics are checked before use; its `main` never runs.
+BOOTSTRAP_PATH = os.path.join(REPO, "scripts", "qualify-supervisor.py")
+EXPECTED_BOOTSTRAP_SHA256 = "fa1ad548b5fea7a657b2de6e9ddfd3622f0110b43086b7eabed72918cf1d9d31"
 SELECTED_VOLUME_UUID = "8a660440-c919-45c6-a3f1-3365b9bd2006"
 
-# Fixed bounds. The guard runs its own unchanged 300 s / 512 MiB contract; these
-# are the observer's own, so no fresh allowance exists per sample or retry.
-LIMIT_S = 300
+# Fixed budgets INSIDE the one original <=300 s occurrence. The guard limit is
+# reduced so its own stop/exit and the observer's settlement, receipt read and
+# report publication all fit before the outer actor's fixed KILL. No step adds a
+# fresh allowance: every wait is clipped to one of these absolute stamps.
+TOTAL_S = 300
+GUARD_LIMIT_S = 270
+WORKER_DEADLINE_S = 286
+ACTOR_DEADLINE_S = 293
+ACTOR_FINISH_S = 299
 SCRATCH_BUDGET_MIB = 512
 SAMPLE_INTERVAL_NS = 250_000_000
 MAX_SAMPLES = 100
@@ -138,7 +171,7 @@ RECEIPT_READ_MAX_BYTES = 2 * 1024 * 1024
 LEADER_HOLD_S = 0.7
 DOC_POLL_NS = 25_000_000
 DOC_WAIT_NS = 15_000_000_000
-EXIT_DRAIN_NS = 2_000_000_000
+EXIT_GRACE_NS = 2_000_000_000
 MONITOR_GONE_WAIT_NS = 5_000_000_000
 LATE_WINDOW_START_NS = 1_000_000_000
 MIN_LATE_WINDOW_NS = 1_000_000_000
@@ -205,6 +238,12 @@ PREMISE_CHECKLIST = (
      "`<mount>/scratch/oxide` leaf; `preflight` refuses a non-canonical, "
      "group/other-writable, boot-volume or non-Stash-UUID route, and the post-run "
      "gate re-derives the guard's recorded source, UUID and device"),
+    ("whole-observer-bound",
+     "applies: the existing qualification bootstrap's minimal outer actor (pinned "
+     "`qualify-supervisor.py` `bounded`/`hold`) forks the whole observer as one "
+     "worker child and holds it unreaped, so a blocked probe, read, stdio write or "
+     "report publication cannot extend the fixed total; inner guard 270 s, worker "
+     "286 s, actor KILL 293 s, finish 299 s"),
     ("mktemp",
      "applies: the observer creates exactly one root with `tempfile.mkdtemp` "
      "inside the explicit run `TMPDIR` (never a bare `mktemp` and never a fixed "
@@ -506,6 +545,14 @@ class RealSeams:
         for thread in handle.get("drains") or []:
             thread.join(max(0.0, timeout_s))
 
+    def bounded(self, work, deadline_ns, finish_ns):
+        """The pinned qualification bootstrap's minimal outer bounded actor."""
+        return load_bootstrap(self).bounded(work, deadline_ns, finish_ns)
+
+    def outer_line(self, text):
+        """One bounded, never-blocking line from the outer actor."""
+        bounded_stderr(text)
+
     def guard_output(self, handle):
         return {name: {"bytes": record["bytes"],
                        "text": bytes(record["kept"]).decode("utf-8", "replace"),
@@ -707,9 +754,68 @@ def guard_environment(env, publish_dir, token):
 
 
 def guard_argv():
-    return [sys.executable, RUNNER_PATH, "--limit", str(LIMIT_S),
+    """The OUTER invocation the observer launches: the unchanged guard, its
+    fixed inner budget, and the synthetic leader after `--`."""
+    return [sys.executable, RUNNER_PATH, "--limit", str(GUARD_LIMIT_S),
             "--scratch-budget-mib", str(SCRATCH_BUDGET_MIB), "--",
             sys.executable, SCRIPT_PATH, "--leader"]
+
+
+_LOADED = {}
+
+
+def load_module(name, path):
+    """Load one repository source file as a module, once. Its top level defines
+    constants, classes and functions only; no main runs."""
+    key = (name, path)
+    if key not in _LOADED:
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _LOADED[key] = module
+    return _LOADED[key]
+
+
+def pinned_runner(seams):
+    """The unchanged deployed default supervisor, loaded for its own parser and
+    identity primitives. Never executed, modified or repinned."""
+    digest = seams.sha256_file(RUNNER_PATH)
+    if digest != EXPECTED_RUNNER_SHA256:
+        raise ValueError(f"the deployed default supervisor bytes are {digest}, not "
+                         f"the bound {EXPECTED_RUNNER_SHA256}")
+    return load_module("census_stall_pinned_runner", RUNNER_PATH)
+
+
+def pinned_command(seams):
+    """The guard receipt contract, derived from the ACTUAL pinned runner's parser.
+
+    `bounded-test.py` parses the outer argv, takes only the command after `--`,
+    stores that in `Custodian.ctx["command"]`, and writes it to
+    `receipt["command"]`. This returns that inner leader command and the parsed
+    outer options, so the observer compares the receipt to the real contract
+    instead of to its own outer argv."""
+    runner = pinned_runner(seams)
+    command, parsed = runner.parse(list(guard_argv()[2:]))
+    return command, parsed
+
+
+def load_bootstrap(seams):
+    """The pinned qualification bootstrap's minimal outer bounded actor.
+
+    Its bytes are verified before import; only `bounded`, `hold` and `now_ns`
+    are used, and its main never runs. Importing it defines constants only."""
+    digest = seams.sha256_file(BOOTSTRAP_PATH)
+    if digest != EXPECTED_BOOTSTRAP_SHA256:
+        raise ValueError(f"the bootstrap helper bytes are {digest}, not the bound "
+                         f"{EXPECTED_BOOTSTRAP_SHA256}")
+    bootstrap = load_module("census_stall_bootstrap", BOOTSTRAP_PATH)
+    if not (callable(getattr(bootstrap, "bounded", None))
+            and callable(getattr(bootstrap, "hold", None))
+            and callable(getattr(bootstrap, "now_ns", None))):
+        raise ValueError("the bootstrap helper does not expose bounded/hold/now_ns")
+    if getattr(bootstrap.bounded, "__module__", None) != bootstrap.__name__:
+        raise ValueError("the bootstrap bounded actor is not this pinned module")
+    return bootstrap
 
 
 # ---------------------------------------------------------------------------
@@ -884,24 +990,33 @@ def sample_once(seams, guard, monitor, sample_index):
 
 def sample_window(seams, guard, monitor, deadline_ns, control, interval_ns=SAMPLE_INTERVAL_NS,
                   max_samples=MAX_SAMPLES):
-    """The bounded sampling loop. It stops at the guard's own exit or the
-    observer's absolute deadline, never extends either."""
+    """The bounded sampling loop.
+
+    It stops at the guard's own exit, at the fixed sample cap, at the worker's
+    absolute deadline or on an explicit caller cancellation, and never extends
+    any of them. A sample cap only stops SAMPLING: it is not the guard's
+    deadline and the caller must still wait for the guard's own settlement."""
     samples = []
     guard_exit = None
-    cancelled = None
-    while len(samples) < max_samples:
+    stop_reason = None
+    while True:
         if control.get("cancelled") is not None:
-            cancelled = f"observer cancelled by signal {control['cancelled']}"
+            stop_reason = "cancelled"
             break
         exit_code = seams.poll(guard["handle"])
         if exit_code is not None:
             guard_exit = exit_code
+            stop_reason = "guard-exit"
             break
         if seams.now_ns() >= deadline_ns:
+            stop_reason = "deadline"
+            break
+        if len(samples) >= max_samples:
+            stop_reason = "sample-cap"
             break
         samples.append(sample_once(seams, guard, monitor, len(samples)))
         seams.sleep(interval_ns / NS)
-    return samples, guard_exit, cancelled
+    return samples, guard_exit, stop_reason
 
 
 def attribute_census_thread(samples, settlement):
@@ -1186,17 +1301,123 @@ def bounded_report(document):
 # ---------------------------------------------------------------------------
 
 
-def observe_core(seams, env, control=None):
-    """The one bounded occurrence, seam-driven end to end. It never writes the
-    report; `run_observe` publishes the bounded result."""
+class GuardChild:
+    """Exact custody of the observer's one direct child (the guard).
+
+    It is held unreaped across every poll, wait and signal, so its PID cannot
+    be recycled. `settle` is the single settlement path for every post-spawn
+    outcome: natural exit, sample cap, the worker's own deadline, cancellation
+    or an internal error. The first three wait for the guard's own natural
+    settlement up to the fixed worker deadline; cancellation and error get one
+    short bounded grace; only then, and only at the fixed bound, is this same
+    still-unreaped direct child KILLed and positively reaped. Nothing else is
+    ever signalled, and an unreaped child is recorded as Unknown custody."""
+
+    def __init__(self, seams, handle, pid, start, hard_deadline_ns):
+        self.seams, self.handle = seams, handle
+        self.pid, self.start = pid, start
+        self.hard_deadline_ns = hard_deadline_ns
+        self.exit_code = None
+        self.reaped = False
+        self.killed = False
+        self.trigger = None
+        self.waited_ns = 0
+        self.unknown = False
+
+    def poll(self):
+        if self.exit_code is None:
+            code = self.seams.poll(self.handle)
+            if code is not None:
+                self.exit_code = code
+                self.reaped = True
+        return self.exit_code
+
+    def _wait(self, until_ns):
+        started = self.seams.now_ns()
+        while self.exit_code is None:
+            now = self.seams.now_ns()
+            if now >= until_ns:
+                break
+            remaining = min((until_ns - now) / NS, 0.02)
+            code = self.seams.wait(self.handle, remaining)
+            if code is not None:
+                self.exit_code = code
+                self.reaped = True
+                break
+        self.poll()
+        self.waited_ns += max(0, self.seams.now_ns() - started)
+        return self.exit_code
+
+    def settle(self, trigger, worker_deadline_ns):
+        """One bounded settlement. `trigger` is the reason sampling stopped."""
+        self.trigger = trigger
+        if self.poll() is not None:
+            return self.record("natural")
+        if trigger in ("cancelled", "error"):
+            self._wait(min(worker_deadline_ns, self.seams.now_ns() + EXIT_GRACE_NS))
+            if self.exit_code is None:
+                self.killed = self.seams.kill(self.handle)
+                self._wait(min(self.hard_deadline_ns,
+                               self.seams.now_ns() + EXIT_GRACE_NS))
+            final = trigger
+        else:
+            self._wait(worker_deadline_ns)
+            if self.exit_code is None:
+                self.killed = self.seams.kill(self.handle)
+                self._wait(min(self.hard_deadline_ns,
+                               self.seams.now_ns() + EXIT_GRACE_NS))
+            final = "worker-deadline"
+        self.unknown = self.exit_code is None
+        self.reaped = not self.unknown
+        return self.record(final if self.killed or self.unknown else "natural")
+
+    def record(self, trigger):
+        return {"trigger": trigger, "pid": self.pid, "start": self.start,
+                "reaped": self.reaped, "exit": self.exit_code,
+                "killed": self.killed, "unknown": self.unknown,
+                "waited_ns": self.waited_ns,
+                "hard_deadline_ns": self.hard_deadline_ns}
+
+
+def settle_guard(guard, trigger, worker_deadline_ns):
+    """The one never-raising settlement call for any post-spawn path.
+
+    If the normal settlement itself fails, this still makes one bounded
+    termination/reap attempt on the same unreaped direct child and records an
+    honest Unknown when that cannot be positively observed."""
+    if guard is None:
+        return None
+    try:
+        return guard.settle(trigger, worker_deadline_ns)
+    except BaseException:
+        try:
+            if guard.exit_code is None:
+                guard.killed = guard.seams.kill(guard.handle)
+                guard._wait(min(guard.hard_deadline_ns,
+                                guard.seams.now_ns() + EXIT_GRACE_NS))
+        except BaseException:
+            pass
+        guard.unknown = guard.exit_code is None
+        guard.reaped = not guard.unknown
+        return guard.record("settlement-error")
+
+
+def observe_core(seams, env, control=None, worker_deadline_ns=None,
+                 actor_deadline_ns=None):
+    """The observation work. `observe_entry` runs this inside the pinned outer
+    actor; it never reaches the report publication by itself."""
     control = control if control is not None else {}
+    start = seams.now_ns()
+    worker_deadline = (worker_deadline_ns if worker_deadline_ns is not None
+                       else start + WORKER_DEADLINE_S * NS)
+    actor_deadline = (actor_deadline_ns if actor_deadline_ns is not None
+                      else start + ACTOR_DEADLINE_S * NS)
     report = {
         "schema": SCHEMA, "qualified": False, "claim": CLAIM, "mode": "observe",
-        "source": {}, "invocation": {"selector": "rust:census-stall-observation",
-                                     "guard_argv": guard_argv(), "limit_s": LIMIT_S,
-                                     "scratch_budget_mib": SCRATCH_BUDGET_MIB},
-        "environment_removed": [], "topology": {}, "identity": {},
-        "samples": [], "sample_cap": MAX_SAMPLES, "sample_interval_ns": SAMPLE_INTERVAL_NS,
+        "source": {}, "invocation": {}, "environment_removed": [], "topology": {},
+        "identity": {}, "samples": [], "sample_cap": MAX_SAMPLES,
+        "sample_interval_ns": SAMPLE_INTERVAL_NS,
+        "sampling": {"stopped_by": None, "deadline_ns": worker_deadline},
         "census_thread": {"state": "unknown", "tid": None, "reason": None},
         "census_series": {}, "guard": {}, "guard_stdout": {}, "guard_stderr": {},
         "synthetic_leader": {"declared_status": LEADER_EXPECTED_STATUS,
@@ -1204,7 +1425,14 @@ def observe_core(seams, env, control=None):
         "classification": {"outcome": OUTCOME_INCOMPLETE, "reasons": [],
                            "stall_fingerprint": False, "normal_closure": False},
         "custody": {"guard_spawned": False, "guard_reaped": False, "guard_exit": None,
-                    "guard_killed_by_observer": False, "monitor_observed_gone": None},
+                    "guard_killed_by_observer": False, "monitor_observed_gone": None,
+                    "settlement": None},
+        "budgets": {"total_s": TOTAL_S, "guard_limit_s": GUARD_LIMIT_S,
+                    "worker_deadline_s": WORKER_DEADLINE_S,
+                    "actor_deadline_s": ACTOR_DEADLINE_S,
+                    "actor_finish_s": ACTOR_FINISH_S,
+                    "worker_deadline_ns": worker_deadline,
+                    "actor_deadline_ns": actor_deadline},
         "limits": {"report_max_bytes": REPORT_MAX_BYTES, "log_max_bytes": LOG_MAX_BYTES,
                    "observer_total_max_bytes": OBSERVER_TOTAL_MAX_BYTES,
                    "leader_document_max_bytes": LEADER_DOC_MAX_BYTES,
@@ -1225,10 +1453,14 @@ def observe_core(seams, env, control=None):
             "the run TMPDIR outside the guard's owned-byte accounting; their bounded "
             "allocation is counted in the task total and is not a guard measurement, and "
             "the observer supplies no closure, reserve or cleanup verdict",
+            "the outer actor's own pinned-helper read/import is the only pre-bound step; "
+            "all probe, filesystem, stdio and report work runs in its worker, and an "
+            "actor-deadline KILL leaves that run's guard Unknown under its own bound",
         ],
         "finished_ns": None,
     }
     handle = None
+    guard = None
     doc = None
     guard_pid = guard_start = None
     monitor = {"attribution": "unknown", "pid": None, "start": None, "reason": None}
@@ -1240,17 +1472,44 @@ def observe_core(seams, env, control=None):
     if source_problems:
         problems.extend(source_problems)
         report["classification"]["reasons"] = problems[:8]
-        return report, 2
+        return report, 2, None
+
+    try:
+        leader_command, guard_options = pinned_command(seams)
+    except (OSError, ValueError) as error:
+        problems.append(f"{type_name(error)}: {bounded_text(error)}")
+        report["classification"]["reasons"] = problems[:8]
+        return report, 2, None
+    report["invocation"] = {
+        "selector": "rust:census-stall-observation", "guard_argv": guard_argv(),
+        "leader_argv": leader_command,
+        "guard_options": {"limit": guard_options.get("limit"),
+                          "budget": guard_options.get("budget"),
+                          "evidence": guard_options.get("evidence"),
+                          "root_parent": guard_options.get("root_parent")},
+        "total_s": TOTAL_S, "guard_limit_s": GUARD_LIMIT_S,
+        "scratch_budget_mib": SCRATCH_BUDGET_MIB,
+    }
+    if (guard_options.get("limit") != GUARD_LIMIT_S
+            or guard_options.get("budget") != SCRATCH_BUDGET_MIB * MIB
+            or guard_options.get("evidence") is not None
+            or guard_options.get("root_parent") is not None
+            or guard_options.get("limit", 0) <= 30):
+        problems.append("the pinned runner's parsed options are not this fixed invocation")
+        report["classification"]["reasons"] = problems[:8]
+        return report, 2, None
 
     topology, topology_problems = preflight(seams, env)
     report["topology"] = topology
     if topology_problems:
         problems.extend(topology_problems)
         report["classification"]["reasons"] = problems[:8]
-        return report, 2
+        return report, 2, None
+    if seams.now_ns() >= worker_deadline:
+        problems.append("the worker deadline was already spent before any observer root")
+        report["classification"]["reasons"] = problems[:8]
+        return report, 1, None
 
-    start = seams.now_ns()
-    deadline = start + LIMIT_S * NS
     token = secrets.token_hex(8)
     try:
         root = seams.mkdtemp(topology["tmpdir"], "census-stall-observation.")
@@ -1260,22 +1519,28 @@ def observe_core(seams, env, control=None):
         report["files"]["publish_dir"] = publish_dir
         child_env, removed = guard_environment(env, publish_dir, token)
         report["environment_removed"] = removed
+        if seams.now_ns() >= worker_deadline:
+            problems.append("the worker deadline was already spent before launch")
+            return report, 1, worker_deadline
         handle = seams.spawn(guard_argv(), child_env, REPO)
         report["custody"]["guard_spawned"] = True
         guard_pid = handle["process"].pid
+        # Custody exists from the instant the child does, before any identity
+        # read: a failing read still settles the same unreaped direct child.
+        guard = GuardChild(seams, handle, guard_pid, None, actor_deadline)
         row, problem = seams.process_row(guard_pid)
         if problem is not None or row is None or not strict_int(row.get("start")):
             raise RuntimeError(f"the guard's own identity is unreadable ({problem or 'absent'})")
         guard_start = row["start"]
+        guard.start = guard_start
         report["identity"]["guard"] = {"pid": guard_pid, "start": guard_start,
                                        "parent": seams.self_pid()}
         document_path = os.path.join(publish_dir, DOC_NAME)
-        doc_wait_until = min(deadline, start + DOC_WAIT_NS)
+        doc_wait_until = min(worker_deadline, start + DOC_WAIT_NS)
         while seams.now_ns() < doc_wait_until:
             exit_code = seams.poll(handle)
             if exit_code is not None:
-                report["custody"]["guard_exit"] = exit_code
-                report["custody"]["guard_reaped"] = True
+                guard.poll()
                 break
             if seams.exists(document_path):
                 try:
@@ -1306,31 +1571,29 @@ def observe_core(seams, env, control=None):
                 monitor = resolve_monitor(seams, guard_pid, guard_start, leader_pid,
                                           leader_start)
                 report["identity"]["monitor"] = dict(monitor)
-        samples, guard_exit, cancelled = sample_window(
+        samples, guard_exit, stop_reason = sample_window(
             seams, {"pid": guard_pid, "start": guard_start, "handle": handle},
-            monitor, deadline, control)
+            monitor, worker_deadline, control)
         report["samples"] = samples
-        if guard_exit is None:
-            guard_exit = seams.poll(handle)
-        if guard_exit is None:
-            drain_until = min(deadline, seams.now_ns() + EXIT_DRAIN_NS)
-            while seams.now_ns() < drain_until:
-                guard_exit = seams.poll(handle)
-                if guard_exit is not None:
-                    break
-                seams.sleep(0.02)
-        if guard_exit is None:
-            report["custody"]["guard_killed_by_observer"] = seams.kill(handle)
-            guard_exit = seams.wait(handle, EXIT_DRAIN_NS / NS)
-            if guard_exit is None:
-                problems.append("the guard child could not be positively reaped; custody is unknown")
-            else:
-                report["custody"]["guard_reaped"] = True
-        else:
-            report["custody"]["guard_reaped"] = True
-        report["custody"]["guard_exit"] = guard_exit
-        if cancelled:
-            problems.append(cancelled)
+        report["sampling"]["stopped_by"] = stop_reason
+        if guard_exit is not None:
+            guard.poll()
+        if stop_reason == "cancelled":
+            problems.append(f"observer cancelled by signal {control.get('cancelled')}")
+        trigger = ("cancelled" if stop_reason == "cancelled"
+                   else "deadline" if stop_reason == "deadline" else "natural")
+        settlement = settle_guard(guard, trigger, worker_deadline)
+        report["custody"]["settlement"] = settlement
+        report["custody"]["guard_reaped"] = settlement["reaped"]
+        report["custody"]["guard_exit"] = settlement["exit"]
+        report["custody"]["guard_killed_by_observer"] = settlement["killed"]
+        if settlement["killed"]:
+            problems.append(f"the guard did not settle naturally ({trigger}); the "
+                            "observer KILLed its own unreaped direct child")
+        if settlement["unknown"]:
+            problems.append("the guard child could not be positively reaped; custody is unknown")
+        if stop_reason == "sample-cap" and settlement["trigger"] == "natural":
+            report["sampling"]["cap_reached_before_natural_exit"] = True
         seams.join_drains(handle)
         output = {}
         try:
@@ -1344,7 +1607,8 @@ def observe_core(seams, env, control=None):
                            "truncated": bool(entry.get("truncated")) if isinstance(entry, dict) else False}
         if monitor.get("pid") is not None:
             gone = False
-            gone_until = min(deadline, seams.now_ns() + MONITOR_GONE_WAIT_NS)
+            gone_until = min(worker_deadline,
+                             seams.now_ns() + MONITOR_GONE_WAIT_NS)
             while seams.now_ns() < gone_until:
                 ok, live, _zombie, problem = identity_facts(seams, monitor["pid"],
                                                            monitor["start"])
@@ -1364,7 +1628,9 @@ def observe_core(seams, env, control=None):
             if abs_canonical(evidence):
                 receipt_path = os.path.join(evidence, "receipt.json")
         receipt = None
-        if receipt_path is not None:
+        if seams.now_ns() >= worker_deadline:
+            problems.append("the worker deadline was already spent before the guard receipt read")
+        elif receipt_path is not None:
             try:
                 attempts["receipt"] += 1
                 receipt, receipt_size, receipt_sha = seams.read_document(
@@ -1387,13 +1653,15 @@ def observe_core(seams, env, control=None):
                 if report["guard"].get("leader") != [(doc.get("leader") or {}).get("pid"),
                                                      (doc.get("leader") or {}).get("start")]:
                     problems.append("the guard receipt leader identity is not the observed leader")
-                command = receipt.get("command")
-                if not (isinstance(command, list) and command == guard_argv()):
-                    problems.append("the guard ran a different command than the fixed one")
-                settlement = report["guard"].get("settlement") or {}
-                report["census_thread"] = attribute_census_thread(samples, settlement)
+                if receipt.get("command") != leader_command:
+                    problems.append("the guard receipt command is not the inner leader command "
+                                    "the pinned runner constructs")
+                if receipt.get("limit_s") != GUARD_LIMIT_S:
+                    problems.append("the guard receipt limit is not this fixed invocation")
+                settlement_facts = report["guard"].get("settlement") or {}
+                report["census_thread"] = attribute_census_thread(samples, settlement_facts)
                 report["census_series"] = census_thread_series(
-                    samples, report["census_thread"], settlement)
+                    samples, report["census_thread"], settlement_facts)
             selection = report["guard"].get("selection") or {}
             boot = topology.get("boot_device")
             if selection.get("source") != "selected-volume":
@@ -1420,14 +1688,22 @@ def observe_core(seams, env, control=None):
         report["sample_count"] = len(samples)
         report["table"] = bounded_table(samples)
         report["load"] = bounded_load(samples)
-        outcome, stamp, reasons = classify(report, receipt, guard_exit, problems)
+        outcome, stamp, reasons = classify(report, receipt, settlement["exit"], problems)
         report["classification"].update(outcome=outcome, reasons=reasons[:8], **stamp)
-        return report, exit_for(outcome)
+        return report, exit_for(outcome), worker_deadline
     except BaseException as error:
         problems.append(f"{type_name(error)}: {bounded_text(error)}")
+        if guard is not None:
+            settlement = settle_guard(guard, "error", worker_deadline)
+            report["custody"]["settlement"] = settlement
+            report["custody"]["guard_reaped"] = settlement["reaped"]
+            report["custody"]["guard_exit"] = settlement["exit"]
+            report["custody"]["guard_killed_by_observer"] = settlement["killed"]
+            if settlement["unknown"]:
+                problems.append("the guard child could not be positively reaped; custody is unknown")
         report["classification"]["outcome"] = OUTCOME_INCOMPLETE
         report["classification"]["reasons"] = problems[:8]
-        return report, 1
+        return report, 1, worker_deadline
     finally:
         report["finished_ns"] = seams.now_ns()
         report["custody"]["observer_children"] = 1 if report["custody"]["guard_spawned"] else 0
@@ -1438,13 +1714,23 @@ def observe_core(seams, env, control=None):
                 pass
 
 
-def publish_report(seams, report):
+def publish_report(seams, report, worker_deadline_ns=None):
     """Publish the bounded report and the captured streams. A failure is an
-    incomplete observation, never a silent success."""
+    incomplete observation, never a silent success. A publication that begins
+    after the worker deadline is still written (the outer actor is the bound)
+    and is recorded as incomplete."""
     root = (report.get("files") or {}).get("root")
     if not root:
         return 1
     try:
+        published = seams.now_ns()
+        after = (worker_deadline_ns is not None and published >= worker_deadline_ns)
+        report["publication"] = {"at_ns": published, "after_worker_deadline": after}
+        if after:
+            report["classification"]["outcome"] = OUTCOME_INCOMPLETE
+            report["classification"]["reasons"] = (
+                list(report["classification"].get("reasons") or [])[:7]
+                + ["the report publication began after the worker deadline"])
         files = report.setdefault("files", {})
         files["report"] = os.path.join(root, REPORT_NAME)
         extra = 0
@@ -1479,11 +1765,79 @@ def publish_report(seams, report):
         return 1
 
 
-def run_observe(seams, env, control=None):
-    report, code = observe_core(seams, env, control)
+def run_observe(seams, env, control=None, worker_deadline_ns=None,
+                actor_deadline_ns=None):
+    """The worker body: observation plus its bounded report publication."""
+    report, code, deadline = observe_core(seams, env, control, worker_deadline_ns,
+                                          actor_deadline_ns)
     if (report.get("files") or {}).get("root"):
-        code = publish_report(seams, report)
+        code = publish_report(seams, report, deadline)
     return report, code
+
+
+def bounded_stderr(text):
+    """One bounded, never-blocking report line from the outer actor."""
+    try:
+        os.set_blocking(2, False)
+        os.write(2, bounded_text(text, 400).encode() + b"\n")
+    except OSError:
+        pass
+
+
+def observe_entry(seams, env):
+    """The one occurrence: the pinned outer bounded actor around the worker.
+
+    Every probe, filesystem, stdio and report step runs in the worker. The
+    actor owns only that worker, holds it unreaped, forwards INT/TERM and KILLs
+    it at the fixed actor deadline. A KILLed worker's report is omitted and any
+    guard it spawned remains Unknown under its own bound; the exit is 124."""
+    try:
+        bootstrap = load_bootstrap(seams)
+    except (OSError, ValueError) as error:
+        seams.outer_line(f"census-stall-observation: refused: {type_name(error)}: {error}")
+        return 2
+    start = bootstrap.now_ns()
+    worker_deadline = start + WORKER_DEADLINE_S * NS
+    actor_deadline = start + ACTOR_DEADLINE_S * NS
+    finish = start + ACTOR_FINISH_S * NS
+    control = {"cancelled": None}
+
+    def work():
+        for number in (signal.SIGINT, signal.SIGTERM):
+            try:
+                signal.signal(number, lambda n, _f: control.__setitem__("cancelled", n))
+            except (OSError, ValueError):
+                pass
+        report, code = run_observe(seams, env, control, worker_deadline,
+                                   actor_deadline)
+        classification = report["classification"]
+        if code == 2 and not (report.get("files") or {}).get("root"):
+            for reason in classification.get("reasons") or ["refused"]:
+                print(f"census-stall-observation: refused: {reason}", file=sys.stderr)
+            return 2
+        if (report.get("files") or {}).get("report"):
+            print(f"census-stall-observation: report {report['files']['report']}")
+        print(summary_line(report))
+        for reason in classification.get("reasons") or []:
+            print(f"census-stall-observation: {reason}", file=sys.stderr)
+        return code
+
+    try:
+        code = seams.bounded(work, actor_deadline, finish)
+    except BaseException as error:
+        seams.outer_line(f"census-stall-observation: outer actor failed "
+                         f"({type_name(error)}); observer evidence omitted")
+        return 1
+    if code == 124:
+        seams.outer_line("census-stall-observation: outer deadline reached; the worker was "
+                         "KILLed by the pinned actor. Observer evidence is omitted or partial, "
+                         "and any guard it spawned remains Unknown under its own bound. "
+                         "No closure is claimed.")
+    elif code not in (0, 1, 2):
+        seams.outer_line(f"census-stall-observation: the worker ended with code {code} "
+                         "without a completed observation; evidence may be omitted or "
+                         "partial and no closure is claimed")
+    return code
 
 
 def exit_for(outcome):
@@ -1628,7 +1982,15 @@ def plan_document(seams):
             "candidate_sha256": EXPECTED_CANDIDATE_SHA256,
             "candidate_used": False,
             "selected_volume_uuid": SELECTED_VOLUME_UUID,
-            "limits_s": LIMIT_S, "scratch_budget_mib": SCRATCH_BUDGET_MIB,
+            "total_s": TOTAL_S, "guard_limit_s": GUARD_LIMIT_S,
+            "worker_deadline_s": WORKER_DEADLINE_S,
+            "actor_deadline_s": ACTOR_DEADLINE_S, "actor_finish_s": ACTOR_FINISH_S,
+            "scratch_budget_mib": SCRATCH_BUDGET_MIB,
+            "guard_sha256": EXPECTED_RUNNER_SHA256,
+            "bootstrap_sha256": EXPECTED_BOOTSTRAP_SHA256,
+            "bootstrap": BOOTSTRAP_PATH,
+            "outer_actor": "the pinned qualification bootstrap's bounded/hold pattern; "
+                           "the worker is held unreaped and KILLed only at the actor deadline",
             "leader_declared_status": LEADER_EXPECTED_STATUS,
             "no_image": True, "no_build": True, "no_cargo": True, "no_staging": True,
         },
@@ -1651,6 +2013,10 @@ def plan_document(seams):
                       "foreign identity persistence"],
             "last_resort_signal": "SIGKILL of its own still-unreaped direct child guard",
         },
+        "leader_argv": (pinned_command(seams)[0] if seams is not None else None),
+        "receipt_contract": ("receipt.command is the INNER leader command the pinned "
+                             "runner's own parse constructs after `--`; receipt.limit_s "
+                             "must be the fixed guard limit"),
         "outcomes": list(OUTCOMES),
         "premises": [{"item": item, "disposition": text} for item, text in PREMISE_CHECKLIST],
         "source": source,
@@ -1708,8 +2074,11 @@ class FakeSeams:
         self.table = script.get("table")
         self.load = script.get("load")
         self.guard_exit = script.get("guard_exit")
-        self.guard_output = script.get("guard_output") or {}
+        self.guard_output_value = script.get("guard_output") or {}
         self.killed = False
+        self.bounded_calls = []
+        self.worker_killed = False
+        self.outer_lines = []
         self.kill_returns = script.get("kill_returns", True)
         self.wait_returns = script.get("wait_returns", 125)
         self.root = script.get("root", "/Volumes/Stash/scratch/oxide/3881b6d0/census-stall-observation.test")
@@ -1729,6 +2098,8 @@ class FakeSeams:
             return EXPECTED_RUNNER_SHA256
         if path == CANDIDATE_PATH:
             return EXPECTED_CANDIDATE_SHA256
+        if path == BOOTSTRAP_PATH:
+            return EXPECTED_BOOTSTRAP_SHA256
         return "0" * 64
 
     def git(self, *arguments):
@@ -1794,6 +2165,8 @@ class FakeSeams:
         return len(data)
 
     def process_row(self, pid):
+        if self.script.get("fault") == "guard-identity" and pid == getattr(self, "guard_pid", None):
+            raise OSError(errno.EIO, "injected identity read failure")
         if pid in (4243, 4244) and self.clock.now() >= self.script.get("exit_at", 10 ** 12):
             return None, None
         rows = self.process.get(pid)
@@ -1856,7 +2229,11 @@ class FakeSeams:
 
     def wait(self, handle, timeout_s):
         self.clock.sleep(timeout_s)
-        return self.wait_returns
+        if self.killed:
+            return self.wait_returns
+        if self.clock.now() >= self.script.get("exit_at", 10 ** 12):
+            return self.guard_exit
+        return None
 
     def kill(self, handle):
         self.killed = True
@@ -1866,7 +2243,23 @@ class FakeSeams:
         return None
 
     def guard_output(self, handle):
-        return self.guard_output
+        jump = self.script.get("jump_on_output_ns")
+        if jump:
+            self.clock.value += int(jump)
+        return self.guard_output_value
+
+    def outer_line(self, text):
+        self.outer_lines.append(bounded_text(text, 400))
+
+    def bounded(self, work, deadline_ns, finish_ns):
+        self.bounded_calls.append({"deadline_ns": deadline_ns,
+                                   "finish_ns": finish_ns})
+        if self.script.get("worker_overruns"):
+            self.worker_killed = True
+            return 124
+        if self.script.get("bounded_returns") is not None:
+            return self.script["bounded_returns"]
+        return work()
 
     def mkdtemp(self, parent, prefix):
         return self.root
@@ -1896,6 +2289,7 @@ def base_script(**overrides):
     leader_pid, leader_start = 4243, 800
     monitor_pid, monitor_start = 4244, 801
     token = "0123456789abcdef"
+    leader_command, _options = pinned_command(FakeSeams({"files": {}}))
     doc = {
         "schema": LEADER_SCHEMA, "token": token, "run_id": "c" * 32,
         "published_ns": 1_100_000_000,
@@ -1906,7 +2300,8 @@ def base_script(**overrides):
                   "tmpdir": scratch, "deadline_ns": 300 * NS},
     }
     receipt = {
-        "run_id": "c" * 32, "command": guard_argv(), "root": scratch.rsplit("/", 1)[0],
+        "run_id": "c" * 32, "command": list(leader_command),
+        "limit_s": GUARD_LIMIT_S, "root": scratch.rsplit("/", 1)[0],
         "scratch": scratch, "evidence": evidence, "scratch_owned": True,
         "leader": [leader_pid, leader_start],
         "outcome": {"closure": "closed", "status": 1, "fault": None,
@@ -1977,7 +2372,8 @@ def base_script(**overrides):
     return script
 
 
-def run_script(overrides=None, token="0123456789abcdef"):
+def run_script(overrides=None, token="0123456789abcdef", worker_deadline_ns=None,
+               actor_deadline_ns=None, control=None):
     """One scripted observation against the fake external boundaries."""
     script = base_script(**(overrides or {}))
     seams = FakeSeams(script)
@@ -1991,7 +2387,9 @@ def run_script(overrides=None, token="0123456789abcdef"):
     secrets.token_hex = token_hex
     try:
         report, code = run_observe(
-            seams, {"TMPDIR": "/Volumes/Stash/scratch/oxide/3881b6d0"})
+            seams, {"TMPDIR": "/Volumes/Stash/scratch/oxide/3881b6d0"},
+            control=control, worker_deadline_ns=worker_deadline_ns,
+            actor_deadline_ns=actor_deadline_ns)
     finally:
         secrets.token_hex = original
     return report, code, seams
@@ -2370,20 +2768,232 @@ def self_test():
                 seams.clock.value += 60 * NS
             seams.sleep = jump
             deadline = seams.now_ns() + 120 * NS
-            samples, exit_code, cancelled = sample_window(
+            samples, exit_code, stop_reason = sample_window(
                 seams, {"pid": 4242, "start": 700, "handle": object()},
                 {"pid": None}, deadline, {"cancelled": None})
-            assert_that(exit_code is None and cancelled is None,
+            assert_that(exit_code is None and stop_reason == "deadline",
                         "the deadline stop is not a guard exit or a cancellation")
             assert_that(len(samples) <= 3, "the sampling loop stops at the absolute deadline")
             assert_that(seams.now_ns() >= deadline, "no sample continues past the deadline")
             seams = FakeSeams(base_script())
-            samples, _exit_code, cancelled = sample_window(
+            samples, _exit_code, stop_reason = sample_window(
                 seams, {"pid": 4242, "start": 700, "handle": object()},
                 {"pid": None}, seams.now_ns() + 120 * NS, {"cancelled": 15})
-            assert_that(samples == [] and cancelled and "15" in cancelled,
+            assert_that(samples == [] and stop_reason == "cancelled",
                         "a caller's signal ends sampling without inventing a class")
         check("window: absolute deadline and caller cancellation", window_bounds)
+
+        def runner_contract():
+            """The receipt command must be the INNER leader command the pinned
+            runner's own parser constructs, not the observer's outer argv."""
+            seams = FakeSeams(base_script())
+            command, options = pinned_command(seams)
+            assert_that(command == [sys.executable, SCRIPT_PATH, "--leader"],
+                        "the pinned runner constructs exactly the inner leader command")
+            assert_that(command != guard_argv(),
+                        "the receipt contract is not the full outer invocation")
+            assert_that(options.get("limit") == GUARD_LIMIT_S
+                        and options.get("budget") == SCRATCH_BUDGET_MIB * MIB
+                        and options.get("evidence") is None
+                        and options.get("root_parent") is None,
+                        "the fixed outer options are parsed from the pinned runner")
+            wrong = list(guard_argv())
+            wrong[3] = "300"  # a wrong inner guard limit
+            _wrong_command, wrong_options = pinned_runner(seams).parse(list(wrong[2:]))
+            assert_that(wrong_options.get("limit") != GUARD_LIMIT_S,
+                        "a wrong outer flag changes the parsed options and is not this contract")
+            report, code, _seams = run_script()
+            assert_that(code == 0 and report["classification"]["outcome"]
+                        == OUTCOME_NOT_REPRODUCED,
+                        "a leader-only receipt command is accepted")
+            assert_that(report["invocation"]["leader_argv"]
+                        == [sys.executable, SCRIPT_PATH, "--leader"],
+                        "the report binds the inner command it verified")
+            counterfactuals = [
+                ("full outer argv", lambda receipt: receipt.update(command=guard_argv())),
+                ("wrong leader", lambda receipt: receipt.update(
+                    command=[sys.executable, SCRIPT_PATH, "--other"])),
+                ("wrong limit", lambda receipt: receipt.update(limit_s=300)),
+            ]
+            for name, mutate in counterfactuals:
+                base = base_script()
+                mutate(base["files"][receipt_path()])
+                report, code, _seams = run_script(base)
+                assert_that(code == 1 and report["classification"]["outcome"]
+                            == OUTCOME_INCOMPLETE,
+                            f"{name}: the receipt contract is refused")
+                assert_that(any("inner leader command" in reason or "limit" in reason
+                                for reason in report["classification"]["reasons"]),
+                            f"{name}: the refusal names the command contract")
+        check("receipt: actual pinned-runner parse and inner-command contract", runner_contract)
+
+        def post_spawn_custody():
+            """A failure immediately after spawn still settles the same child."""
+            base = base_script()
+            base["fault"] = "guard-identity"
+            base["exit_at"] = 10 ** 12
+            base["wait_returns"] = 125
+            report, code, seams = run_script(base)
+            assert_that(code == 1, "a post-spawn failure is incomplete")
+            assert_that(report["classification"]["outcome"] == OUTCOME_INCOMPLETE,
+                        "a post-spawn failure never classifies a closure")
+            assert_that(seams.killed is True
+                        and report["custody"]["guard_killed_by_observer"] is True,
+                        "the still-owned child is terminated only after its grace")
+            assert_that(report["custody"]["guard_reaped"] is True,
+                        "the terminated own child is positively reaped")
+            assert_that(report["custody"]["settlement"]["trigger"] in ("error", "natural"),
+                        "the settlement names its trigger")
+            base = base_script()
+            base["fault"] = "guard-identity"
+            base["exit_at"] = 10 ** 12
+            base["wait_returns"] = None
+            report, _code, _seams = run_script(base)
+            assert_that(report["custody"]["guard_reaped"] is False
+                        and report["custody"]["settlement"]["unknown"] is True,
+                        "an unreaped child is recorded Unknown, never claimed closed")
+        check("custody: every post-spawn fault settles the actual handle", post_spawn_custody)
+
+        def cap_versus_deadline():
+            """A sample cap ends sampling, not the guard's settlement window."""
+            base = base_script()
+            base["exit_at"] = 30_000_000_000
+            report, code, seams = run_script(
+                base, worker_deadline_ns=40_000_000_000,
+                actor_deadline_ns=45_000_000_000)
+            assert_that(report["sampling"]["stopped_by"] == "sample-cap",
+                        "the sample cap is recorded as the sampling stop")
+            assert_that(report["sample_count"] == MAX_SAMPLES,
+                        "the fixed sample cap is honoured")
+            assert_that(report["sampling"].get("cap_reached_before_natural_exit") is True,
+                        "a cap stop is not mistaken for the guard's deadline")
+            assert_that(seams.killed is False
+                        and report["custody"]["guard_killed_by_observer"] is False,
+                        "the guard's own natural settlement is preserved after a cap")
+            assert_that(report["custody"]["guard_reaped"] is True and code == 0,
+                        "a natural exit after the cap is accepted, not KILLed")
+            assert_that(report["classification"]["outcome"] == OUTCOME_NOT_REPRODUCED,
+                        "a normal receipt still classifies after a capped sample window")
+            base = base_script()
+            base["exit_at"] = 10 ** 12
+            report, code, seams = run_script(
+                base, worker_deadline_ns=30_000_000_000,
+                actor_deadline_ns=35_000_000_000)
+            assert_that(report["sampling"]["stopped_by"] == "sample-cap",
+                        "the cap ended sampling in the hung case too")
+            assert_that(seams.killed is True and code == 1,
+                        "only the worker deadline triggers permitted own-child KILL")
+            assert_that(report["custody"]["settlement"]["trigger"] == "worker-deadline",
+                        "the settlement waits for the deadline before terminating")
+            assert_that(report["classification"]["outcome"] == OUTCOME_INCOMPLETE,
+                        "a forced settlement is never a classification success")
+        check("custody: sampler cap is not the guard deadline", cap_versus_deadline)
+
+        def cancellation_and_deadline():
+            base = base_script()
+            base["exit_at"] = 10 ** 12
+            report, code, seams = run_script(
+                base, worker_deadline_ns=30_000_000_000,
+                actor_deadline_ns=35_000_000_000,
+                control={"cancelled": 15})
+            assert_that(code == 1 and report["sampling"]["stopped_by"] == "cancelled",
+                        "a caller signal ends sampling")
+            assert_that(seams.killed is True
+                        and report["custody"]["guard_killed_by_observer"] is True,
+                        "cancellation is a named permitted own-child KILL trigger")
+            assert_that(any("cancelled" in reason
+                            for reason in report["classification"]["reasons"]),
+                        "the cancellation trigger is reported")
+            assert_that(report["classification"]["outcome"] == OUTCOME_INCOMPLETE,
+                        "a cancelled observation is incomplete, never a class")
+            report, code, seams = run_script(
+                worker_deadline_ns=1_000_000_000, actor_deadline_ns=5_000_000_000)
+            assert_that(code == 1 and not seams.spawned,
+                        "a deadline spent before launch refuses to spawn")
+            assert_that(report["classification"]["outcome"] == OUTCOME_INCOMPLETE,
+                        "a pre-launch deadline is incomplete")
+            base = base_script()
+            report, code, _seams = run_script(
+                base, worker_deadline_ns=1_300_000_000,
+                actor_deadline_ns=1_400_000_000)
+            assert_that(report["sampling"]["stopped_by"] == "guard-exit",
+                        "the guard's own exit wins the sampling stop")
+            assert_that("guard_receipt" not in report["files"],
+                        "a deadline spent before the receipt read omits that evidence")
+            assert_that(any("before the guard receipt read" in reason
+                            for reason in report["classification"]["reasons"]),
+                        "the omitted receipt read is named")
+            assert_that(report["classification"]["outcome"] == OUTCOME_INCOMPLETE,
+                        "an omitted receipt is incomplete")
+        check("deadline: cancellation, pre-launch and pre-receipt are honest", cancellation_and_deadline)
+
+        def publication_bound():
+            seams = FakeSeams(base_script())
+            report = {"files": {"root": seams.root},
+                      "classification": {"outcome": OUTCOME_NOT_REPRODUCED, "reasons": []},
+                      "limits": {}, "observer_bytes": None}
+            code = publish_report(seams, report,
+                                  worker_deadline_ns=seams.now_ns() - 1)
+            assert_that(code == 1, "a publication after the worker deadline is incomplete")
+            assert_that(report["publication"]["after_worker_deadline"] is True,
+                        "the late publication is recorded")
+            assert_that(report["classification"]["outcome"] == OUTCOME_INCOMPLETE,
+                        "late publication never claims a class")
+            assert_that(seams.written, "the bounded report is still published, not silently dropped")
+        check("publication: a spent worker deadline still writes bounded evidence", publication_bound)
+
+        def outer_actor():
+            base = base_script()
+            base["worker_overruns"] = True
+            seams = FakeSeams(base)
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = observe_entry(seams, {"TMPDIR": "/Volumes/Stash/scratch/oxide/3881b6d0"})
+            assert_that(code == 124, "an outer-deadline KILL exits 124")
+            assert_that(seams.worker_killed is True, "the actor killed its own worker")
+            assert_that(seams.bounded_calls, "the pinned actor was used")
+            call = seams.bounded_calls[-1]
+            assert_that(call["deadline_ns"] < call["finish_ns"],
+                        "the actor has its own fixed KILL and finish stamps")
+            assert_that(any("evidence is omitted" in line for line in seams.outer_lines),
+                        "the overrun line names the omitted evidence")
+            base = base_script()
+            seams = FakeSeams(base)
+            original = secrets.token_hex
+
+            def fixed(bits):
+                return "0123456789abcdef" if bits == 8 else original(bits)
+            secrets.token_hex = fixed
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    code = observe_entry(seams, {"TMPDIR": "/Volumes/Stash/scratch/oxide/3881b6d0"})
+            finally:
+                secrets.token_hex = original
+            assert_that(code == 0, "a normal worker exit passes through the actor")
+            assert_that(seams.bounded_calls, "the fixed actor encloses the normal worker too")
+        check("outer bound: actor KILL, omitted evidence, normal pass-through", outer_actor)
+
+        def bootstrap_pin():
+            base = base_script()
+            base["files"] = {BOOTSTRAP_PATH: "0" * 64}
+            seams = FakeSeams(base)
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = observe_entry(seams, {"TMPDIR": "/Volumes/Stash/scratch/oxide/3881b6d0"})
+            assert_that(code == 2 and not seams.bounded_calls,
+                        "a bootstrap hash drift refuses before the actor and worker")
+            assert_that(any("bootstrap" in line.lower() for line in seams.outer_lines),
+                        "the helper refusal is named")
+            bootstrap = load_bootstrap(FakeSeams(base_script()))
+            assert_that(os.path.realpath(bootstrap.__file__) == os.path.realpath(BOOTSTRAP_PATH),
+                        "the helper is the pinned qualification bootstrap")
+            assert_that(bootstrap.bounded.__module__ == bootstrap.__name__
+                        and callable(bootstrap.hold) and callable(bootstrap.now_ns),
+                        "the imported outer actor is that module's own bounded/hold/now_ns")
+            first = bootstrap.now_ns()
+            second = bootstrap.now_ns()
+            assert_that(strict_int(first) and strict_int(second) and first <= second,
+                        "the helper clock is a monotonic integer CLOCK_UPTIME_RAW stamp")
+        check("helper: pinned source, import receiver and clock semantics", bootstrap_pin)
 
         def custody_paths():
             base = base_script()
@@ -2559,14 +3169,20 @@ def self_test():
             document = plan_document(FakeSeams(base_script()))
             assert_that(document["qualified"] is False and document["activated"] is False,
                         "the plan activates nothing")
-            assert_that(len(document["premises"]) == 9, "all nine premise dispositions are present")
+            assert_that(len(document["premises"]) == 10,
+                        "all ten premise dispositions are present")
             assert_that(document["caps"]["sample_instants"] == MAX_SAMPLES
                         and document["caps"]["monitor_threads"] == MAX_MONITOR_THREADS,
                         "the plan states the fixed caps")
+            assert_that(document["occurrence"]["guard_limit_s"] <
+                        document["occurrence"]["worker_deadline_s"] <
+                        document["occurrence"]["actor_deadline_s"] <
+                        document["occurrence"]["actor_finish_s"] <= TOTAL_S,
+                        "the inner budgets compose inside the one original total")
             assert_that(document["selectors"]["rust:census-stall-observation"].endswith("--observe"),
                         "the future occurrence selector is fixed")
             assert_that(document["source_problems"] == [], "the fake source gate is clean")
-        check("plan: effect-free, fixed caps and nine premises", plan)
+        check("plan: effect-free, fixed caps and ten premises", plan)
 
         # -- one real filesystem fixture, inside this owned temp root ------
         def filesystem_fixture():
@@ -2639,29 +3255,7 @@ def main(argv):
         return 0
     if mode == "--leader":
         return leader_main(RealSeams(), dict(os.environ))
-    seams = RealSeams()
-    control = {"cancelled": None}
-
-    def cancelled(number, _frame):
-        control["cancelled"] = number
-
-    for number in (signal.SIGINT, signal.SIGTERM):
-        try:
-            signal.signal(number, cancelled)
-        except (OSError, ValueError):
-            pass
-    report, code = run_observe(seams, dict(os.environ), control)
-    classification = report["classification"]
-    if code == 2 and not (report.get("files") or {}).get("root"):
-        for reason in classification.get("reasons") or ["refused"]:
-            print(f"census-stall-observation: refused: {reason}", file=sys.stderr)
-        return 2
-    if report.get("files", {}).get("report"):
-        print(f"census-stall-observation: report {report['files']['report']}")
-    print(summary_line(report))
-    for reason in classification.get("reasons") or []:
-        print(f"census-stall-observation: {reason}", file=sys.stderr)
-    return code
+    return observe_entry(RealSeams(), dict(os.environ))
 
 
 if __name__ == "__main__":

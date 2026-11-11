@@ -7138,20 +7138,40 @@ post-`ready` thread; anything else is Unknown). Per sample it records
 `CLOCK_UPTIME_RAW`, the monitor thread ids/CPU/run state, the system process-table
 size as a **count only** (`libproc`, no foreign identities or rows persisted)
 and the load average, under fixed caps: at most 100 instants at ~4 Hz, 64
-monitor threads, 16 stored thread rows per sample, 1 MiB of observer bytes
-(256 KiB report, 64 KiB per captured stream), one absolute ≤300 s deadline and
-the guard's unchanged 512 MiB monitored scratch. It reads the guard's own new
+monitor threads, 16 stored thread rows per sample and 1 MiB of observer bytes
+(256 KiB report, 64 KiB per captured stream). It reads the guard's own new
 `evidence/receipt.json` and copies a bounded digest of the decision-relevant
 fields; closure, signals, deadlines, custody and cleanup remain the unchanged
-guard's. It uses no ptrace/DTrace/sample, no suspension, no signal injection, no
-host setting or limit change and no historical root/image/process read; its only
-signal is a last-resort SIGKILL of its own still-unreaped direct child if the
-guard misses the observer's deadline, and an unreaped guard or an unobserved
-monitor keeps every resource and fails the observation as unknown custody.
+guard's.
+
+The whole observer is bounded by the pinned qualification bootstrap's minimal
+outer actor (`scripts/qualify-supervisor.py`, SHA-256
+`fa1ad548…`, `bounded`/`hold` and `CLOCK_UPTIME_RAW`): the actor forks the whole
+observer as one worker child, holds it unreaped, forwards INT/TERM, and KILLs it
+only at the fixed actor deadline. All probe, filesystem, stdio and report work
+runs in that worker, so a blocked read or write cannot extend the run. The inner
+budgets compose inside the one original ≤300 s occurrence and never grant a
+fresh allowance: guard 270 s, worker deadline 286 s, actor KILL 293 s, actor
+finish 299 s, with the guard's 512 MiB monitored scratch. A sample cap stops
+**sampling only**: it is not the guard's deadline, and the worker still waits for
+the guard's natural settlement up to its own deadline. The observer KILLs its
+own still-unreaped direct guard child only on explicit cancellation, on a
+post-spawn internal error after one bounded grace, or at the fixed worker
+deadline, and it records which trigger applied. If the actor must KILL the
+worker (including a blocked call), that worker's report is omitted or partial
+and any guard it spawned remains Unknown under its own bound: the exit is 124
+and no closure is claimed. The receipt's `command` is checked against the INNER
+leader command the pinned runner's own parser constructs after `--` (never the
+outer invocation), and `limit_s` against the fixed inner limit. It uses no
+ptrace/DTrace/sample, no suspension, no signal injection, no host setting or
+limit change and no historical root/image/process read; an unreaped guard, an
+unobserved monitor or a killed worker keeps every resource and fails the
+observation as unknown/omitted custody.
 The observer's own root (report, captured streams and leader document) lives
 under the run `TMPDIR` outside the guard's owned-byte accounting; its bounded
 allocation is counted in the task total and is not a guard measurement, and the
-sampler supplies no closure, reserve or cleanup verdict.
+sampler supplies no closure, reserve or cleanup verdict. The actor's own pinned
+helper read/import is its only pre-bound step; it creates nothing.
 
 Four outcomes are recorded separately: `reproduced_discriminated` (the exact
 receipt fingerprint — round started, zero completed, no loop exit, join expired,
