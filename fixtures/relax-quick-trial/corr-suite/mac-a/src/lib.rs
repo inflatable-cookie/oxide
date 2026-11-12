@@ -1,8 +1,7 @@
 //! The first of the two same-name derive macros (Relax KNOWN_GAPS #1 shape,
-//! oxide#307). For the derived item `pub struct <Name>;` this emits an
-//! inherent `impl <Name>` whose `who()` answers `"a"`. The item is
-//! re-emitted unchanged plus the generated impl, so the derive compiles
-//! without syn and the output is exactly rustc's truth shape.
+//! oxide#307). A `#[proc_macro_derive]` result is appended to the annotated
+//! item, so this returns ONLY the generated inherent `impl <Name>` whose
+//! `who()` answers `"a"`; rustc keeps the item from the input itself.
 
 use proc_macro::TokenTree;
 
@@ -26,15 +25,7 @@ fn derived_name(input: proc_macro::TokenStream) -> String {
 
 #[proc_macro_derive(Who)]
 pub fn derive_who(input: proc_macro::TokenStream) -> TokenStream {
-    let name = derived_name(input.clone());
-    let mut out = input;
-    let body = format!(
-        "impl {name} {{ pub fn who() -> &'static str {{ \"a\" }} }}",
-        name = name,
-    );
-    out.extend(
-        body.parse::<TokenStream>()
-            .expect("emit impl for mac-a"),
-    );
-    out
+    let name = derived_name(input);
+    let body = format!("impl {name} {{ pub fn who() -> &'static str {{ \"a\" }} }}");
+    body.parse::<TokenStream>().expect("emit impl for mac-a")
 }

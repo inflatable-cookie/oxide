@@ -181,7 +181,8 @@ GREET_EXPECTED_V2 = (
 )
 SNAPSHOT_HELP_MARKER = "oxide: Cargo with managed build storage and profiles"
 SNAPSHOT_HELP_EDITED = SNAPSHOT_HELP_MARKER + " [trial]"
-PANIC_LOCATION = "main.rs:11:5"
+PANIC_LOCATION = "main.rs:10:5"
+PANIC_PROBE_LINE = '    panic!("corr-uncaught-boom");'
 COLLISION_RUSTC = "app=a b=b"
 COLLISION_KNOWN_GAP = "app=a b=a"
 
@@ -990,6 +991,56 @@ def self_check() -> None:
     expect(collection_exit("greet: boom", [{"verdict": "match"}]) == 1,
            "an aborted collection exits 1")
 
+    # Panic probe location: derived from the committed bytes, so line drift
+    # fails here instead of as a truth-arm mismatch in a guarded run.
+    panic_source = read_fixture("corr-suite", "panic", "src", "main.rs")
+    panic_lines = panic_source.splitlines()
+    matches = [i for i, line in enumerate(panic_lines, start=1)
+               if line == PANIC_PROBE_LINE]
+    expect(len(matches) == 1, "the uncaught panic probe line occurs exactly once")
+    derived = f"main.rs:{matches[0]}:5"
+    expect(derived == PANIC_LOCATION,
+           f"PANIC_LOCATION {PANIC_LOCATION} must equal the committed probe line {derived}")
+
+    # The derive macros return only their generated impl: a #[proc_macro_derive]
+    # result is appended to the annotated item, so re-emitting the input would
+    # define the struct twice (E0428) and the collision truth is unreachable.
+    for mac in ("mac-a", "mac-b"):
+        source = read_fixture("corr-suite", mac, "src", "lib.rs")
+        expect("input.clone()" not in source and "let mut out = input" not in source,
+               f"{mac} must not re-emit the annotated item")
+        expect("body.parse::<TokenStream>()" in source,
+               f"{mac} returns only its parsed impl body")
+        expect('impl {name} {{ pub fn who()' in source,
+               f"{mac} emits an inherent impl on the derived name")
+
+    # Receipt trimming: every case-derived figure is recomputed from the rows
+    # the receipt carries, so a truncated receipt never claims more than it
+    # carries; cases_omitted + cases_in_receipt == cases_total.
+    huge_row = {
+        "workload": "greet", "case": "cold", "arm": "cargo", "verdict": "match",
+        "seconds": 1.0, "stdout_evidence": {"prefix": "x" * 4096, "truncated": True},
+    }
+    trim_cases = [dict(huge_row, case=f"cold-{index}") for index in range(64)]
+    trim_cases.append({"workload": "greet", "case": "cold", "arm": "relax",
+                       "verdict": "unexecuted"})
+    trimmed = build_receipt({"schema": "t"}, trim_cases, cap_bytes=32 * 1024)
+    expect(trimmed["cases_omitted"] + trimmed["cases_in_receipt"] == trimmed["cases_total"],
+           "omitted + carried equals the total")
+    expect(sum(trimmed["verdicts"].values()) == trimmed["cases_in_receipt"],
+           "verdicts tally exactly the carried rows")
+    expect(trimmed["declared_unexecuted"]
+           == sum(1 for row in trimmed["cases"] if row["verdict"] == "unexecuted"),
+           "declared_unexecuted counts only carried rows")
+    expect(all(key.startswith("greet/cold-") and row["case"].startswith("cold-")
+               for key in trimmed["timing_summary"]
+               for row in trimmed["cases"] if f"{row['workload']}/{row['case']}" == key),
+           "timing_summary keys all come from carried rows")
+    untrimmed = build_receipt({"schema": "t"}, trim_cases, cap_bytes=8 * 1024 * 1024)
+    expect(untrimmed["cases_omitted"] == 0
+           and untrimmed["cases_in_receipt"] == len(trim_cases),
+           "a fitting receipt carries every row")
+
     print("self-check: all controls passed (no scratch, child, network or engine)\n")
 
 
@@ -1281,6 +1332,45 @@ def collection_exit(aborted: str | None, cases: list[dict]) -> int:
     return 0
 
 
+def verdict_tally(cases: list[dict]) -> dict[str, int]:
+    tally: dict[str, int] = {}
+    for row in cases:
+        verdict = row.get("verdict", "?")
+        tally[verdict] = tally.get(verdict, 0) + 1
+    return tally
+
+
+def build_receipt(base: dict, cases: list[dict], cap_bytes: int = MAX_RECEIPT_BYTES) -> dict:
+    """One bounded receipt document. When the case rows exceed the byte cap,
+    rows are dropped from the end and EVERY case-derived figure — verdicts,
+    declared_unexecuted, timing_summary, cases_in_receipt — is recomputed
+    from the rows the receipt actually carries, so a truncated receipt never
+    claims more than it carries; `cases_omitted` and `cases_total` disclose
+    the remainder."""
+    document = dict(base)
+    document["cases"] = list(cases)
+    document["cases_total"] = len(cases)
+    document["cases_omitted"] = 0
+    document["cases_in_receipt"] = len(document["cases"])
+    document["verdicts"] = verdict_tally(document["cases"])
+    document["declared_unexecuted"] = sum(
+        1 for row in document["cases"] if row.get("verdict") == "unexecuted"
+    )
+    document["timing_summary"] = timing_summary(document["cases"])
+    encoded = json.dumps(document, indent=1).encode()
+    while len(encoded) > cap_bytes and len(document["cases"]) > 1:
+        document["cases"].pop()
+        document["cases_omitted"] += 1
+        document["cases_in_receipt"] = len(document["cases"])
+        document["verdicts"] = verdict_tally(document["cases"])
+        document["declared_unexecuted"] = sum(
+            1 for row in document["cases"] if row.get("verdict") == "unexecuted"
+        )
+        document["timing_summary"] = timing_summary(document["cases"])
+        encoded = json.dumps(document, indent=1).encode()
+    return document
+
+
 def rotate(arms: tuple[str, ...], rep: int) -> tuple[str, ...]:
     shift = rep % len(arms)
     return arms[shift:] + arms[:shift]
@@ -1308,8 +1398,10 @@ exported scratch, evidence and deadline, after the source and volume gates."""
     # -- setup phases (infrastructure; a failure aborts) -------------------
 
     def setup(self) -> None:
-        # Refuse before creating anything: mount/volume identity and the
-        # source gate come first, then the owned roots exist.
+        # The evidence packet directory exists before any gate so a refusal
+        # still publishes its bounded receipt; the disposable run root is
+        # only created after the volume and source gates pass.
+        os.makedirs(self.packet_dir, exist_ok=True)
         mount = mount_of(self.exports["OXIDE_TASK_SCRATCH_ROOT"])
         uuid = volume_uuid_of(mount)
         if uuid.upper() != self.binding["volume"]["uuid"].upper():
@@ -1320,7 +1412,6 @@ exported scratch, evidence and deadline, after the source and volume gates."""
         if os.path.exists(self.run_root):
             raise Refusal(f"the bound run root already exists: {self.run_root}")
         os.makedirs(self.run_root)
-        os.makedirs(self.packet_dir, exist_ok=True)
         self.private_home()
         self.acquire_upstream()
         self.build_relax()
@@ -1831,11 +1922,8 @@ exported scratch, evidence and deadline, after the source and volume gates."""
                 self.aborted = f"{name}: {error}"
                 break
 
-    def receipt(self) -> dict:
-        verdicts: dict[str, int] = {}
-        for row in self.cases:
-            verdicts[row.get("verdict", "?")] = verdicts.get(row.get("verdict", "?"), 0) + 1
-        document = {
+    def receipt(self) -> bytes:
+        base = {
             "schema": "oxide.relax-quick-trial/1",
             "mode": self.mode,
             "qualification": "none: this receipt is research evidence, never a QA pass",
@@ -1846,13 +1934,6 @@ exported scratch, evidence and deadline, after the source and volume gates."""
             "source": self.figures.get("source"),
             "figures": {k: v for k, v in self.figures.items() if k != "acquisition"},
             "acquisition": self.figures.get("acquisition"),
-            "timing_summary": timing_summary(self.cases),
-            "verdicts": verdicts,
-            "cases": self.cases,
-            "cases_total": len(self.cases),
-            "declared_unexecuted": sum(
-                1 for row in self.cases if row.get("verdict") == "unexecuted"
-            ),
             "aborted": self.aborted,
             "exit_rule": (
                 "exit 0 only when nothing aborted, every declared case executed, and "
@@ -1867,13 +1948,8 @@ exported scratch, evidence and deadline, after the source and volume gates."""
                 "filesystem_caches": "not globally flushable under this scope",
             },
         }
-        encoded = json.dumps(document, indent=1).encode()
-        while len(encoded) > MAX_RECEIPT_BYTES and len(document["cases"]) > 1:
-            document["cases"].pop()
-            document["cases_omitted"] = document.get("cases_omitted", 0) + 1
-            document["cases_total"] = len(self.cases)
-            encoded = json.dumps(document, indent=1).encode()
-        return encoded
+        document = build_receipt(base, self.cases)
+        return json.dumps(document, indent=1).encode()
 
     def publish(self) -> None:
         # Unreached declared cases become unexecuted rows before the receipt
@@ -1888,13 +1964,17 @@ exported scratch, evidence and deadline, after the source and volume gates."""
                     "never an SSD-write claim",
         }
         self._receipt_encoded = self.receipt()
+        os.makedirs(self.packet_dir, exist_ok=True)
         destination = os.path.join(
             self.packet_dir, f"receipt-{self.binding['paths']['packet_name']}.json"
         )
         temporary = destination + ".tmp"
-        with open(temporary, "wb") as handle:
-            handle.write(self._receipt_encoded)
-        os.replace(temporary, destination)
+        try:
+            with open(temporary, "wb") as handle:
+                handle.write(self._receipt_encoded)
+            os.replace(temporary, destination)
+        except OSError as error:
+            raise Refusal(f"the receipt packet could not be written: {error}")
         print(f"receipt: {destination} ({len(self._receipt_encoded)} bytes)")
 
 
@@ -1913,10 +1993,11 @@ def guarded_main(mode: str, binding_path: str, binding_sha: str) -> int:
         run.setup()
     except (Refusal, OSError, ValueError, subprocess.SubprocessError) as error:
         run.aborted = f"setup: {error}"
-        run.publish()
         print(f"blocked before any case: {error}", file=sys.stderr)
-        return 1
-    run.execute()
+    if not run.aborted:
+        run.execute()
+    # One bounded receipt in every outcome, including a refusal before the
+    # owned roots exist; a receipt-write failure is itself a bounded refusal.
     run.publish()
     exit_code = collection_exit(run.aborted, run.cases)
     summary = {

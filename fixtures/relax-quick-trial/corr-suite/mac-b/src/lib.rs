@@ -1,14 +1,13 @@
 //! The second same-name derive macro (Relax KNOWN_GAPS #1 shape, oxide#307).
-//! For the derived item `pub struct <Name>;` this emits an inherent
-//! `impl <Name>` whose `who()` answers `"b"`. The item is re-emitted
-//! unchanged plus the generated impl, so the derive compiles without syn
-//! and the output is exactly rustc's truth shape.
+//! A `#[proc_macro_derive]` result is appended to the annotated item, so
+//! this returns ONLY the generated inherent `impl <Name>` whose `who()`
+//! answers `"b"`; rustc keeps the item from the input itself.
 
 use proc_macro::TokenTree;
 
 /// The derived item's name: the identifier that follows the `struct`
 /// keyword. The fixtures derive unit structs with no generics and no
-//! `where` clause, so this token walk is exact for them; anything else
+/// `where` clause, so this token walk is exact for them; anything else
 /// refuses with a compile error naming the crate.
 fn derived_name(input: proc_macro::TokenStream) -> String {
     let mut after_struct = false;
@@ -26,15 +25,7 @@ fn derived_name(input: proc_macro::TokenStream) -> String {
 
 #[proc_macro_derive(Who)]
 pub fn derive_who(input: proc_macro::TokenStream) -> TokenStream {
-    let name = derived_name(input.clone());
-    let mut out = input;
-    let body = format!(
-        "impl {name} {{ pub fn who() -> &'static str {{ \"b\" }} }}",
-        name = name,
-    );
-    out.extend(
-        body.parse::<TokenStream>()
-            .expect("emit impl for mac-b"),
-    );
-    out
+    let name = derived_name(input);
+    let body = format!("impl {name} {{ pub fn who() -> &'static str {{ \"b\" }} }}");
+    body.parse::<TokenStream>().expect("emit impl for mac-b")
 }

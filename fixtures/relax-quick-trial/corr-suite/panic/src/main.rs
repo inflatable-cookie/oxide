@@ -1,11 +1,8 @@
 //! Panic correspondence: `catch_unwind` must catch a panic payload, and an
-//! uncaught panic must exit 101 naming this file and the exact line:column of
-//! the panic call in its message. The driver passes the mode as argv[1].
-//!
-//! The uncaught probe's panic call sits at file main.rs line 11, column 5.
-//! The oracle requires `main.rs:11:5` so the file-name and exact position
-//! are pinned without betting on the path prefix spelling rustc prints for
-//! a workspace member; the captured stderr prefix keeps the full form.
+//! uncaught panic must exit 101 naming this file and the exact line:column
+//! of the panic call. The driver passes the mode as argv[1]. The uncaught
+//! probe's call below is pinned by scripts/relax-quick-trial.py, whose
+//! self-check re-derives that location from these committed bytes.
 
 use std::panic;
 
