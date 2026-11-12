@@ -38,15 +38,16 @@ Modes (exactly one; an unrecognized argument refuses before anything else):
   --compat-plan, --compat-self-check
               The effect-free readiness and the pure controls of the focused
               compatibility recheck (oxide#308, below). `--compat-self-check`
-              drives the real custody core (census parser, custody decision,
-              spawn flags, timeout kill+reap, exceptional wait, survivor and
-              unreadable census, spent-deadline refusal), the disposal gate,
-              the whole setup→verification→disposal→seed→materialize→probe→
-              closeout composition and its abort receipt through named fake
-              external boundaries, changed-input refusals, a later stop after a
-              real divergence, the pinned runner's frozen/unattended argv, and
-              the activation parser and oracles. It compiles, acquires and runs
-              nothing.
+              drives the real direct-child boundary (spawn flags with no
+              setsid, timeout kill and positive reap, exceptional wait,
+              spent-deadline refusal), the whole setup→verification→seed→
+              source-set→materialize→probe→control→closeout composition and its
+              abort receipt through named fake external boundaries, changed-input
+              refusals, a later stop after a real divergence, the pinned runner's
+              frozen/unattended argv, and the activation parser and oracles. It
+              also pins that no private process census or in-run deletion
+              exists and that the published receipt states direct-child facts
+              only. It compiles, acquires and runs nothing.
   --compat-diagnostic --binding P --sha256 H
               The uncounted keep-going compatibility collection: the SAME
               prior Oxide workload plus the float-formatting and CRC32 probes
@@ -255,33 +256,27 @@ and whose lock omits the package: the pinned runner must fail, or resolution was
 not source-constrained and compatibility cannot be cleared. Resolution is thus
 bounded by sources rather than by a flag claim.
 
-Fit correction (the reason this mode is separate): the 307 occurrence was
-stopped at 4100.6 MiB of the fixed 4096 MiB owned-scratch budget, with the
+Fresh-target retention (the reason this mode is separate): the 307 occurrence
+was stopped at 4100.6 MiB of the fixed 4096 MiB owned-scratch budget, with the
 engine build target, a staged Oxide front door it did not need for this
 question, and three snapshot trees alive at once. This mode stages no Oxide
 front door (plain Cargo and the Relax runner are the only arms), keeps one
-snapshot copy per arm, and disposes ONLY this occurrence's own stage output in
-an explicit allowlist: after the copied executable, its retained bundled std
-source and a tiny std-only check/run have all been verified, the disposable
-engine build target is removed; then each probe's own cargo target and Relax
-cache are removed after that probe's two arms completed. Closure stays INSIDE the
-qualified boundary in its REAL topology: the custodian forks a proof leader that
-calls setsid and execs this script, so this script is the session leader and the
-custodian stays in another session. Every child runs in THIS script's session and
-process group (no setsid, no separate group), so the supervisor can see and stop
-it. Every disposal first requires every child positively reaped and then makes
-two identity-bound process-table reads: each must find this script's own
-session-leader row and every helper in OUR session, the custodian's row present
-anywhere, this script's parent the custodian, every row in our session ours or a
-helper (nothing unclassified), and both reads must agree on the start identity of
-this script and the custodian. An empty table, a missing row, a replaced PID, a
-changed parent, an orphaned producer or an unreadable table is unknown, never
-closed. The extracted registry sources the runner can read are authenticated
-against their locked archives and re-checked after use. Every disposal is
-recorded with its closure classification and the bytes removed. The checkout
-(Relax reads its std from the build-time checkout path) is never disposed, and
-the bounds, supervisor bytes, volume, reserve watchdog and stop margin are
-unchanged.
+snapshot copy per arm, and then RETAINS every freshly built target — the engine
+build target plus each probe's cargo target and Relax cache — through the whole
+occurrence. It performs NO in-run deletion, enforces no disposal allowlist,
+keeps no in-run disposal ledger and runs no private process census: whole-group
+closure, survivors and scratch cleanup belong solely to the qualified shared
+supervisor, whose census runs after this body exits. Direct children run in the
+leader's own session and process group (no setsid, no separate group, no
+daemon) and this body records only each direct child's bounded wait/reap facts;
+it never labels that as whole-group closure. An unreaped child, an unknown
+writer or a guard fault leaves the occurrence incomplete/unqualified. The
+extracted registry sources the runner can read are authenticated against their
+locked archives and re-checked after use. Because retained targets are expected
+to exceed 4096 MiB at peak (engine release target plus the snapshot baseline
+target and the Relax caches), fit is UNMEASURED and a truthful fit refusal at
+activation is a valid outcome for the planner to dispose of; no cap is raised,
+no storage is hidden and no per-phase allowance is introduced here.
 
 Compatibility success requires EVERY required probe and the resolution control,
 exact COMPLETE-byte baseline correspondence, a clean exit and positive custody of
@@ -2868,7 +2863,6 @@ CAP_COMPAT_CRC_S = 90
 CAP_COMPAT_SNAPSHOT_S = 180
 CAP_COMPAT_GIT_S = 60
 CAP_COMPAT_ARCHIVE_S = 120
-CAP_COMPAT_CENSUS_S = 20
 
 # The pinned runner's own strict argv, read from
 # libs/relax/compiler/src/run.rs at the bound commit: `--check-first` waits for
@@ -2927,7 +2921,6 @@ COMPAT_CHILD_RUNNER = None
 COMPAT_SPAWNER = None
 COMPAT_WAIT = None
 COMPAT_KILL = None
-COMPAT_PROCESS_TABLE_SEAM = None
 COMPAT_SOURCE_BYTES_SEAM = None
 COMPAT_EXTRACTED_SEAM = None
 COMPAT_VOLUME_SEAM = None
@@ -3003,29 +2996,16 @@ COMPAT_CRC32_CHECK_LINE = "crc32-check 123456789 cbf43926"
 COMPAT_CRC32_CHECK_VALUE = "cbf43926"
 COMPAT_HELLO_STDOUT = "hello-relax-compat\n"
 
-# The ONLY stage output this occurrence may remove, after that phase's children
-# were positively reaped and the copied executable (with its retained checkout
-# and bundled std) was verified. The checkout, the seeded Cargo homes, the
-# private home, the staged binaries and every workload source are NOT listed
-# and are never disposed: Relax reads its std from the build-time checkout.
-COMPAT_DISPOSABLE_PATHS = (
-    "stage-relax-target",
-    "workloads/compat-fmt/cargo/target",
-    "workloads/compat-fmt/relax/compat-fmt/target",
-    "workloads/compat-crc32/cargo/target",
-    "workloads/compat-crc32/relax/compat-crc32/target",
-    "workloads/snapshot/cargo/target",
-)
-
-# Unmeasured planning allocation for the effect-free plan, in seconds. It sums
-# to the 570 s work window (600 s total less the 30 s stop margin). The fixed
-# caps above remain the maxima, each clipped to the remaining time.
+# Every freshly built target is retained through the occurrence: the engine build
+# target, each probe's cargo target and Relax cache, the materialized trees and
+# the evidence packet. This body deletes nothing; the qualified shared supervisor
+# owns whole-group closure and cleanup.
 COMPAT_PLAN_ALLOCATION = (
     ("upstream acquisition", 40),
     ("engine lock establishment", 10),
     ("engine build", 185),
     ("engine verification", 20),
-    ("post-disposal engine smoke", 10),
+    ("post-verification engine smoke", 10),
     ("offline seed from the workload lock", 15),
     ("workload materialization and offline fixture locks", 25),
     ("format probe (both arms)", 35),
@@ -3069,8 +3049,9 @@ COMPAT_PREMISE_CHECKLIST = {
     ),
     "owned_images": (
         "Does not apply: no disk image is created or attached. Scratch is a directory "
-        "inside the supervisor's owned root, and only allowlisted stage output there is "
-        "ever removed. Source: CompatRun.setup, CompatRun.dispose_stage_output."
+        "inside the supervisor's owned root, freshly built targets are retained through "
+        "the occurrence, and this body removes nothing. Source: CompatRun.setup, "
+        "CompatRun.receipt."
     ),
     "compiler_flags": (
         "Applies. RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS are scrubbed and declared "
@@ -4133,33 +4114,24 @@ def compat_plan_text() -> str:
     lines.append("an out-of-tree run dir, so caches and build outputs never land in a source")
     lines.append("tree that is being compared against its own recorded identity.")
     lines.append("")
-    lines.append("Engine lifecycle, custody and disposal (fit correction for the 307 stop):")
+    lines.append("Engine lifecycle and fresh-target retention (fit correction for the 307 stop):")
     lines.append("  1. clone the pinned upstream, re-verify its tree and require the three fix")
     lines.append("     commits; establish the lock offline; build the engine offline. Every")
     lines.append("     setup child (clone, checkout, git queries, archive, extract, patch probes)")
-    lines.append("     runs through the same bounded boundary: the private scrubbed environment,")
-    lines.append("     its own session, a cap clipped by the remaining deadline and stop margin.")
+    lines.append("     runs through the same bounded boundary: the private scrubbed environment")
+    lines.append("     and a cap clipped by the remaining deadline and stop margin.")
     lines.append("  2. copy the runner executable, hash it, and verify the COPIED executable")
     lines.append("     with --version, a frozen check and a strict run of the std-only")
     lines.append("     compat-hello package, with the retained bundled std positively present.")
-    lines.append("  3. only then remove stage-relax-target, and only under positive IN-BOUNDARY")
-    lines.append("     closure in the REAL launcher topology: the custodian forks the proof")
-    lines.append("     leader, the leader calls setsid and execs this script, so this script is")
-    lines.append("     the session leader and the custodian stays in ANOTHER session. Every child")
-    lines.append("     is in this script's own session and process group (no setsid, no separate")
-    lines.append("     group), so the qualified supervisor can see and stop it; every child is")
-    lines.append("     positively reaped; and TWO bounded identity-bound")
-    lines.append("     process-table reads must each be COMPLETE (this script's own session-")
-    lines.append("     leader row and every census helper present in OUR session, the custodian's")
-    lines.append("     row present anywhere, this script's parent the custodian) and CLOSED")
-    lines.append("     (every row in our session is this script, its own descendant or a helper;")
-    lines.append("     nothing unclassified), and must agree on our and the custodian's start")
-    lines.append("     identity. An empty table, a missing own/helper/custodian row, a replaced")
-    lines.append("     PID, a changed parent, an orphaned producer, a live child or an unreadable")
-    lines.append("     read refuses the removal and fails the run closed.")
-    lines.append("  4. re-run a cheap smoke through the copied executable to confirm the retained")
-    lines.append("     checkout/bundled std still serve it after disposal.")
-    lines.append("  5. seed the private Cargo home from the WORKLOAD lock, then verify the")
+    lines.append("  3. RETAIN stage-relax-target and every probe target through the occurrence:")
+    lines.append("     this body performs no in-run deletion, enforces no disposal allowlist and")
+    lines.append("     runs no private process census. Direct children stay in the leader's own")
+    lines.append("     session and process group (no setsid, no separate group, no daemon) and")
+    lines.append("     only their own bounded wait/reap facts are recorded. Whole-group closure,")
+    lines.append("     survivors and scratch cleanup belong solely to the qualified shared")
+    lines.append("     supervisor; an unreaped child, an unknown writer or a guard fault leaves")
+    lines.append("     the occurrence incomplete/unqualified and never authorizes a pass.")
+    lines.append("  4. seed the private Cargo home from the WORKLOAD lock, then verify the")
     lines.append("     seeder's own record AND the actual files: every seeded `.crate` re-hashed")
     lines.append("     against its lock checksum, the crate set and index exactly the lock's,")
     lines.append("     every git source at its locked commit identified by the seeder's")
@@ -4167,34 +4139,33 @@ def compat_plan_text() -> str:
     lines.append("     package authenticated against its locked archive (every file matching")
     lines.append("     the archive except Cargo's normalized Cargo.toml, its Cargo.toml.orig copy")
     lines.append("     and .cargo-ok marker, which are recorded and re-checked). The lock must")
-    lines.append("     force one version per package name; a")
-    lines.append("     multi-version lock refuses, because the resolver's choice would not be")
-    lines.append("     forced. --frozen alone does not enforce lock drift, so this verified set is")
-    lines.append("     what bounds resolution. Then, for each required Cargo arm, `cargo metadata")
-    lines.append("     --locked --offline` derives that arm's locked graph from its own manifest and")
-    lines.append("     lock, and every identity in it is bound to the verified sources (features are")
-    lines.append("     recorded from the same inputs, never claimed as an independent observation")
-    lines.append("     of the pinned runner's feature selection). Enabled features and dependency")
-    lines.append("     edges are read from resolve.nodes, not from each package's declarations,")
-    lines.append("     and every edge target is bound to the same verified sources. The pinned")
-    lines.append("     runner exposes no public command that reports its own resolved graph, so")
-    lines.append("     this plan proves identical inputs, authenticates the extracted sources it")
-    lines.append("     can read and binds Cargo's resolved graph; it does not claim to have")
-    lines.append("     observed the runner's internal selection.")
-    lines.append("  6. materialize the two fixture copies plus one snapshot copy per arm and the")
+    lines.append("     force one version per package name; a multi-version lock refuses, because")
+    lines.append("     the resolver's choice would not be forced. --frozen alone does not enforce")
+    lines.append("     lock drift, so this verified set is what bounds resolution. Then, for each")
+    lines.append("     required Cargo arm, `cargo metadata --locked --offline` derives that arm's")
+    lines.append("     locked graph from its own manifest and lock, and every identity in it is")
+    lines.append("     bound to the verified sources. Enabled features and dependency edges are")
+    lines.append("     read from resolve.nodes, not from each package's declarations, and every")
+    lines.append("     edge target is bound to the same verified sources. The pinned runner")
+    lines.append("     exposes no public command that reports its own resolved graph, so this")
+    lines.append("     plan proves identical inputs, authenticates the extracted sources it can")
+    lines.append("     read and binds Cargo's resolved graph; it does not claim to have observed")
+    lines.append("     the runner's internal selection, and features are never claimed equal.")
+    lines.append("  5. materialize the two fixture copies plus one snapshot copy per arm and the")
     lines.append("     resolution-control copy through bounded children, establish each fixture")
     lines.append("     lock offline and verify its pinned identities.")
-    lines.append("  7. record the identity of the ACTUAL materialized inputs before any probe")
+    lines.append("  6. record the identity of the ACTUAL materialized inputs before any probe")
     lines.append("     (every fixture, snapshot and control source entry and lock, the staged")
     lines.append("     executable, the bundled std) and re-read all of them after the probes. A")
     lines.append("     changed, missing or ADDED source entry aborts the run: only the declared")
     lines.append("     output-only prefix target/ may gain entries, and added Rust modules, build")
     lines.append("     inputs or configuration files always refuse. Git commit identity alone is")
     lines.append("     never treated as proof of what ran.")
-    lines.append("  8. remove each probe's cargo target and Relax cache after that probe's two")
-    lines.append("     arms completed, under the same custody gate; the snapshot baseline target")
-    lines.append("     is removed before the Relax arm for headroom. Only paths in")
-    lines.append("     COMPAT_DISPOSABLE_PATHS may be removed. Never the checkout or bundled std.")
+    lines.append("  7. FIT IS UNMEASURED with retained targets: the engine release target plus the")
+    lines.append("     snapshot baseline target and the Relax caches are expected to exceed the")
+    lines.append("     fixed 4096 MiB monitored scratch at peak. A truthful fit refusal at")
+    lines.append("     activation is a valid outcome for planner disposition; this preparation")
+    lines.append("     does not raise a cap, hide storage or introduce a per-phase allowance.")
     lines.append("  9. each reached arm's bounded RAW stdout/stderr prefix is written into the")
     lines.append("     evidence packet with its exact full-body hash, byte count, completeness and")
     lines.append("     strict-decode facts BEFORE the next child runs, so a later stop cannot erase")
@@ -4282,202 +4253,21 @@ def build_compat_receipt(base: dict, cases: list[dict], cap_bytes: int | None = 
 
 
 # --------------------------------------------------------------------------
-# Bounded children, in-boundary closure and materialized-input identities
+# Bounded direct children and materialized-input identities
 #
-# The qualified supervisor forks a proof leader that calls setsid() and execs
-# this script, so THIS script is the session leader and the custodian stays in
-# its ORIGINAL session, outside ours. Every child runs in this script's own
-# session and process group: nothing leaves the qualified supervisor's
-# cooperative boundary, so the supervisor can see and stop it, and a guard stop
-# reaches it. Closure is NOT claimed per child session; it is established by
-# classifying OUR session: a disposal is allowed only when the only rows there
-# are this script, its own descendants and each read's transient census helper,
-# and the custodian's row is present in the table with this script's parent
-# equal to it. Our own subtree must be empty, and any row in our session that is
-# not ours (an orphaned producer, for example) is unclassified and refuses
-# disposal. An unreadable table is unknown, never closed.
+# Every child runs in the qualified leader's own session and process group: no
+# setsid, no separate group and no daemon. This script records only its direct
+# child's own bounded wait/reap facts and NEVER claims whole-group closure or
+# performs in-run output deletion: the qualified shared supervisor alone decides
+# closure and cleanup after the leader's session census. Freshly built engine
+# and probe targets are retained through the whole occurrence for that decision.
 # --------------------------------------------------------------------------
 
 
-def _parse_ps_census(text: str) -> dict:
-    """Parse `ps -A -o pid=,ppid=,pgid=,sess=,lstart=` rows.
-
-    Every row binds a PID to its parent, process group, session and START time,
-    so a replaced PID is a different row rather than an anonymous one. A short,
-    non-numeric, start-less, malformed or duplicate row makes the whole table
-    UNREADABLE; no decision is ever taken from a partial table."""
-    rows: dict = {}
-    for line in text.splitlines():
-        parts = line.split(None, 4)
-        if len(parts) != 5 or not all(part.isdigit() for part in parts[:4]):
-            return {"readable": False, "rows": {}, "error": f"unreadable census row {line!r}"}
-        start = " ".join(parts[4].split())
-        if not start:
-            return {"readable": False, "rows": {}, "error": f"census row without a start identity {line!r}"}
-        pid, ppid, pgid, sess = (int(part) for part in parts[:4])
-        if pid in rows:
-            return {"readable": False, "rows": {}, "error": f"duplicate census pid {pid}"}
-        rows[pid] = {"ppid": ppid, "pgid": pgid, "sess": sess, "start": start}
-    if not rows:
-        return {"readable": False, "rows": {}, "error": "the process table was empty"}
-    return {"readable": True, "rows": rows, "error": None}
-
-
-def _descendants(rows: dict, root: int) -> set:
-    children: dict = {}
-    for pid, facts in rows.items():
-        children.setdefault(facts["ppid"], []).append(pid)
-    seen: set = set()
-    stack = list(children.get(root, []))
-    while stack:
-        pid = stack.pop()
-        if pid in seen:
-            continue
-        seen.add(pid)
-        stack.extend(children.get(pid, []))
-    return seen
-
-
-def classify_closure(rows: dict, our_pid: int, custodian_pid: int, session_id: int,
-                     transient: set) -> dict:
-    """Classify one complete process-table read against the REAL launcher
-    topology of the qualified supervisor.
-
-    The custodian forks the proof leader, and the leader calls `setsid()` before
-    executing this script: this script IS the session leader, and the custodian
-    stays in its ORIGINAL session, outside ours. Closure is therefore decided
-    over OUR session only: every row in it must be this script, its own
-    descendants, or a transient census helper of this read. The custodian is
-    never required to appear in our session; its row must still exist somewhere
-    in the table (it holds custody), its start identity is compared across
-    reads, and this script's parent must be it. A missing custodian row, a
-    missing own row, a helper that is not our child, an in-session row that is
-    not ours, or a live child of ours is unknown, never closed."""
-    our_row = rows.get(our_pid)
-    custodian_row = rows.get(custodian_pid)
-    helpers = {pid for pid in transient if pid is not None}
-    session_rows = {pid: facts for pid, facts in rows.items() if facts["sess"] == session_id}
-    helpers_present = helpers & set(session_rows)
-    missing = []
-    if our_row is None or our_row.get("sess") != session_id:
-        missing.append(f"our own session-leader row {our_pid}")
-    if custodian_row is None:
-        missing.append(f"the custodian row {custodian_pid}")
-    for pid in sorted(helpers - helpers_present):
-        missing.append(f"the census helper {pid}")
-    chain_ok = bool(
-        our_row is not None and custodian_row is not None
-        and our_row.get("ppid") == custodian_pid
-        and all(session_rows[pid].get("ppid") == our_pid for pid in helpers_present)
-    )
-    complete = not missing and chain_ok
-    ours = _descendants(rows, our_pid) & set(session_rows)
-    ours_live = ours - helpers_present
-    explained = ours | {our_pid} | helpers_present
-    unclassified = set(session_rows) - explained
-    closed = bool(complete and not ours_live and not unclassified)
-    identities = {our_pid: our_row.get("start") if our_row else None,
-                  custodian_pid: custodian_row.get("start") if custodian_row else None}
-    for pid in sorted((ours | {our_pid}) - helpers_present):
-        if pid in session_rows:
-            identities[pid] = session_rows[pid].get("start")
-    return {
-        "closed": closed,
-        "complete": complete,
-        "missing": missing,
-        "chain_ok": chain_ok,
-        "session_rows": len(session_rows),
-        "our_subtree": sorted(ours_live)[:16],
-        "custodian_session": (custodian_row or {}).get("sess"),
-        "unclassified": sorted(unclassified)[:16],
-        "unclassified_count": len(unclassified),
-        "transient": sorted(helpers_present),
-        "identities": identities,
-    }
-
-
-def closure_verdict(reads: list, our_pid: int, custodian_pid: int, session_id: int) -> dict:
-    """Two independent bounded reads must agree: each complete and closed, with
-    the same explained (PID, start identity) map. A replaced PID, a changed
-    parent, an appeared or vanished row, an empty table or an unreadable read is
-    unknown, never closed."""
-    if len(reads) != 2:
-        return {"closed": False, "reason": f"expected two reads, got {len(reads)}", "reads": []}
-    classified = []
-    for index, read in enumerate(reads):
-        if not read.get("readable"):
-            return {"closed": False,
-                    "reason": f"read {index + 1} is unreadable: {read.get('error')}",
-                    "reads": classified}
-        helper = read.get("helper_pid")
-        classified.append(classify_closure(read["rows"], our_pid, custodian_pid, session_id,
-                                           {helper} if helper else set()))
-    first, second = classified
-    for index, result in enumerate(classified):
-        if not result["complete"]:
-            return {"closed": False,
-                    "reason": f"read {index + 1} is incomplete: {result['missing']} "
-                              f"(chain_ok={result['chain_ok']})",
-                    "reads": classified}
-        if not result["closed"]:
-            return {"closed": False,
-                    "reason": f"read {index + 1} is not closed: our_subtree="
-                              f"{result['our_subtree']} unclassified={result['unclassified']}",
-                    "reads": classified}
-    if first["identities"] != second["identities"]:
-        changed = sorted(set(first["identities"]) ^ set(second["identities"])
-                         | {pid for pid in first["identities"]
-                            if pid in second["identities"]
-                            and first["identities"][pid] != second["identities"][pid]})
-        return {"closed": False,
-                "reason": f"the explained process identities changed between reads: {changed[:8]}",
-                "reads": classified}
-    return {"closed": True, "reason": None, "reads": classified,
-            "identities": first["identities"],
-            "session_rows": first["session_rows"]}
-
-
-def compat_process_table(env: dict, cwd: str, deadline_ns: int,
-                         cap_s: float = CAP_COMPAT_CENSUS_S) -> dict:
-    """One bounded, private, positively reaped process-table read.
-
-    The helper is a child of this script in the guard's group; its PID is
-    returned so the classifier can require it to appear. Unreadable, empty,
-    timed-out, non-zero or malformed output is UNKNOWN, never closed."""
-    allowed = budget_s(deadline_ns, cap_s)
-    if allowed <= 0.0:
-        return {"readable": False, "rows": {}, "helper_pid": None,
-                "error": "no census allowance left before the stop margin"}
-    if COMPAT_PROCESS_TABLE_SEAM is not None:
-        return COMPAT_PROCESS_TABLE_SEAM(env, cwd, deadline_ns, cap_s)
-    try:
-        process = subprocess.Popen(
-            ["/bin/ps", "-A", "-o", "pid=,ppid=,pgid=,sess=,lstart="],
-            cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-    except OSError as error:
-        return {"readable": False, "rows": {}, "helper_pid": None,
-                "error": f"{type(error).__name__}: {error}"}
-    helper_pid = process.pid
-    try:
-        out, err = process.communicate(timeout=allowed)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.communicate()
-        return {"readable": False, "rows": {}, "helper_pid": helper_pid,
-                "error": "the census helper did not finish inside its allowance"}
-    if process.returncode != 0:
-        return {"readable": False, "rows": {}, "helper_pid": helper_pid,
-                "error": f"ps exit {process.returncode}: {err[:200].decode('utf-8', 'replace')}"}
-    parsed = _parse_ps_census(out.decode("utf-8", "replace"))
-    parsed["helper_pid"] = helper_pid
-    return parsed
-
-
 def compat_child_custody(spawn_error: str | None, reaped: bool, wait_error: str | None) -> dict:
-    """The per-child custody facts. Closure is NOT decided here: it is the
-    session classification above, taken at each disposal and at closeout."""
+    """The direct-child facts only: whether the spawn succeeded, whether this
+    body's own child was positively reaped, and any wait error. Whole-group
+    closure is never concluded from these."""
     return {
         "spawned": spawn_error is None,
         "spawn_error": spawn_error,
@@ -4841,17 +4631,13 @@ class CompatRun:
         self.env = scrubbed_env()
         self.cases: list[dict] = []
         self.figures: dict = {}
-        self.disposals: list[dict] = []
         self.aborted: str | None = None
         self.children_spawned = 0
-        self.children_closed = 0
-        # One custody record per child this body started. Disposal is authorized
-        # only when every record is positively closed; a counter is never proof.
+        # One direct-child record per child this body started: its own bounded
+        # wait/reap facts only. Whole-group closure is never concluded here.
         self.custody: list[dict] = []
         self.progress_records = 0
         self.progress_failures = 0
-        # The last in-boundary closure classification (see `closure_check`).
-        self.closure: dict | None = None
         self.seed_record: dict | None = None
         scratch = self.exports["OXIDE_TASK_SCRATCH_ROOT"]
         self.run_root = os.path.join(scratch, self.binding["paths"]["run_root_name"])
@@ -4922,13 +4708,8 @@ class CompatRun:
             self.acquire_upstream()
             self.build_relax()
         self.stage_hello()
-        self.verify_engine("before disposal")
-        self.dispose_stage_output(
-            "stage-relax-target",
-            "the fresh engine build exited, its own session was positively closed, and "
-            "the copied executable plus the retained checkout's bundled std were verified",
-        )
-        self.verify_engine("after disposal")
+        self.verify_engine("before probes")
+        self.verify_engine("after engine verification")
         if COMPAT_SEED_SEAM is not None:
             COMPAT_SEED_SEAM(self)
         else:
@@ -4978,69 +4759,6 @@ class CompatRun:
         if custody.get("session_closed"):
             self.children_closed += 1
         return record
-
-    def closure_check(self, reason: str) -> dict:
-        """Two independent process-table reads over OUR session, with identity-
-        bound rows and the real launcher topology.
-
-        The custodian forks a proof leader that calls setsid() and execs this
-        script, so this script is the session leader and the custodian stays in
-        another session. Closure requires BOTH reads to be complete (this
-        script's own session-leader row and each read's census helper present in
-        our session, the custodian's row present anywhere, this script's parent
-        the custodian), closed (every row in our session is this script, its own
-        descendant or a helper; nothing unclassified), and to agree on this
-        script's and the custodian's start identity. A replacement, a parentage
-        change, a vanished or appeared row, an empty table or an unreadable read
-        is unknown, never closed."""
-        reads: list = []
-        for index in (1, 2):
-            if index == 2:
-                settle = min(0.25, max(0.0, remaining_ns(self.deadline_ns) / 1e9
-                                         - COMPAT_STOP_MARGIN_S))
-                if settle <= 0.0:
-                    reads.append({"readable": False, "rows": {}, "helper_pid": None,
-                                  "error": "no settle allowance left before the stop margin"})
-                    break
-                time.sleep(settle)
-            reads.append(compat_process_table(child_env(self.env), self.run_root,
-                                             self.deadline_ns))
-        verdict = closure_verdict(reads, os.getpid(), os.getppid(), os.getsid(0))
-        result = {
-            "closed": verdict["closed"],
-            "reason": reason,
-            "detail": verdict.get("reason"),
-            "reads": [{"readable": read.get("readable"),
-                       "helper_pid": read.get("helper_pid"),
-                       "error": read.get("error")} for read in reads],
-            "identity_rows": (verdict.get("identities") or {}),
-            "read_facts": verdict.get("reads"),
-            "at_monotonic_s": round(time.monotonic(), 3),
-        }
-        self.closure = result
-        self.progress("closure", reason=reason, closed=result["closed"],
-                      detail=result["detail"],
-                      reads=[read["readable"] for read in result["reads"]])
-        return result
-
-    def custody_clean(self) -> tuple[bool, str | None]:
-        """(all closed, first unclean detail). Every child must be positively
-        reaped, and the in-boundary closure classification must be positively
-        closed. With no children started and no census taken there is nothing to
-        close, so the ledger is vacuously clean."""
-        for entry in self.custody:
-            if entry.get("spawned") is False:
-                continue
-            if not entry.get("reaped"):
-                return (False, (
-                    f"{entry.get('label')}: reaped={entry.get('reaped')} "
-                    f"wait_error={entry.get('wait_error')}"
-                ))
-        if not self.custody and self.closure is None:
-            return (True, None)
-        if not self.closure or not self.closure.get("closed"):
-            return (False, f"closure not established: {self.closure}")
-        return (True, None)
 
     def git_text(self, args: list[str], cwd: str | None = None,
                  cap_s: float = CAP_COMPAT_GIT_S, label: str | None = None) -> str:
@@ -5309,52 +5027,6 @@ class CompatRun:
         self.progress("engine_verified", verification_stage=phase,
                       check_exit=check["exit"], run_verdict=verdict,
                       std_dir_present=os.path.isdir(self.relax_std_dir))
-
-    def dispose_stage_output(self, relative: str, reason: str) -> None:
-        """Remove ONE declared stage output inside this run's guard root.
-
-        Only an exact allowlist entry, never a symlink, never a path that
-        resolves outside the owned root, and only when EVERY child this body
-        started is positively closed: its own PID reaped and its own session
-        census readable and empty. A counter, a `finally` or an exited direct
-        child is never accepted as closure. The bytes removed are recorded, and
-        the checkout, bundled std, seeded Cargo homes, private home, staged
-        binaries and workload sources are not on the list at all."""
-        if relative not in COMPAT_DISPOSABLE_PATHS:
-            raise Refusal(f"refusing to dispose undeclared stage output {relative!r}")
-        self.closure_check(f"disposal {relative}")
-        clean, detail = self.custody_clean()
-        if not clean:
-            raise Refusal(
-                "refusing to dispose while a child's custody is unknown: " + str(detail)
-            )
-        full = os.path.join(self.run_root, relative)
-        root_real = os.path.realpath(self.run_root)
-        full_real = os.path.realpath(full)
-        if full_real == root_real or not full_real.startswith(root_real + os.sep):
-            raise Refusal(f"the disposal target {relative!r} escapes the owned run root")
-        entry = {
-            "path": relative,
-            "reason": reason,
-            "children_spawned": self.children_spawned,
-            "custody_records": len(self.custody),
-            "closure": {key: self.closure.get(key) for key in
-                        ("closed", "reason", "session_rows", "our_subtree",
-                         "unclassified", "error")} if self.closure else None,
-        }
-        if not os.path.exists(full):
-            entry["absent"] = True
-        else:
-            if os.path.islink(full):
-                raise Refusal(f"refusing to dispose the symlink {relative!r}")
-            entry["bytes_before"] = walk_bytes(full)
-            shutil.rmtree(full)
-            entry["after"] = {"absent": not os.path.exists(full)}
-            if os.path.exists(full):
-                raise Refusal(f"the disposal of {relative!r} left bytes behind")
-        self.disposals.append(entry)
-        self.progress("disposed", path=relative, absent=entry.get("absent", False),
-                      removed_bytes=(entry.get("bytes_before") or {}).get("bytes_apparent"))
 
     def seed_cargo_home(self) -> None:
         import offline_seed
@@ -5781,20 +5453,6 @@ class CompatRun:
         verdict = compat_correspondence(verdict, baseline_record, record)
         self.record(probe, "relax", record, verdict, facts, baseline_record=baseline_record)
 
-    def dispose_probe(self, probe: str) -> None:
-        if probe == "snapshot":
-            self.dispose_stage_output(
-                "workloads/snapshot/cargo/target",
-                "the snapshot baseline arm completed; the Relax arm does not read it",
-            )
-            return
-        fixture = "compat-fmt" if probe == "format" else "compat-crc32"
-        for relative in (f"workloads/{fixture}/cargo/target",
-                         f"workloads/{fixture}/relax/{fixture}/target"):
-            self.dispose_stage_output(
-                relative, f"the {probe} probe completed for both arms; no later case reads it",
-            )
-
     def case_format(self) -> None:
         baseline, verdict, facts = self.baseline("format", CAP_COMPAT_FMT_S, compat_fmt_oracle)
         if verdict != "match":
@@ -5804,7 +5462,6 @@ class CompatRun:
             )
             return
         self.arm("format", CAP_COMPAT_FMT_S, compat_fmt_oracle, baseline)
-        self.dispose_probe("format")
 
     def case_crc32(self) -> None:
         baseline, verdict, facts = self.baseline("crc32", CAP_COMPAT_CRC_S, compat_crc32_oracle)
@@ -5815,7 +5472,6 @@ class CompatRun:
             )
             return
         self.arm("crc32", CAP_COMPAT_CRC_S, compat_crc32_oracle, baseline)
-        self.dispose_probe("crc32")
 
     def case_source_constrained(self) -> None:
         """The negative resolution control: an unsatisfiable requirement must
@@ -5844,7 +5500,6 @@ class CompatRun:
                 f"({facts})"
             )
             return
-        self.dispose_probe("snapshot")
         self.arm("snapshot", CAP_COMPAT_SNAPSHOT_S, compat_snapshot_oracle, baseline)
 
     def identity_baseline(self) -> None:
@@ -6096,13 +5751,9 @@ class CompatRun:
         except Refusal as error:
             detail = f"closeout source check: {error}"
             self.aborted = f"{self.aborted}; {detail}" if self.aborted else detail
-        # The final closure census runs AFTER every closeout child, so the
-        # published classification covers the whole occurrence.
-        try:
-            self.closure_check("closeout")
-        except (Refusal, OSError, subprocess.SubprocessError) as error:
-            detail = f"closeout closure check: {type(error).__name__}: {error}"
-            self.aborted = f"{self.aborted}; {detail}" if self.aborted else detail
+        # Whole-group closure and cleanup belong solely to the qualified shared
+        # supervisor; this body records only its own direct children and never
+        # claims that verdict.
 
     # -- receipt -----------------------------------------------------------
 
@@ -6115,9 +5766,10 @@ class CompatRun:
                 continue
             failures = [row for row in rows.values() if row.get("verdict") != "match"]
             verdicts[case["case"]] = "match" if not failures else failures[0]["verdict"]
-        custody_closed, custody_detail = self.custody_clean()
-        if (self.aborted or not custody_closed
-                or any(verdict == "unexecuted" for verdict in verdicts.values())):
+        unreaped = [entry.get("label") for entry in self.custody
+                    if entry.get("spawned") is not False and not entry.get("reaped")]
+        if self.aborted or unreaped or any(verdict == "unexecuted"
+                                           for verdict in verdicts.values()):
             result = "incomplete"
         elif all(verdict == "match" for verdict in verdicts.values()):
             result = "cleared"
@@ -6127,14 +5779,16 @@ class CompatRun:
             "required_probes": [case["case"] for case in COMPAT_CASES if case["required"]],
             "probe_verdicts": verdicts,
             "result": result,
-            "children_custody_closed": custody_closed,
-            "children_custody_detail": custody_detail,
+            "unreaped_children": unreaped,
             "success_rule": (
-                "compatibility is cleared only when EVERY required probe ran on both arms, "
-                "its structural oracle matched, the Relax arm reproduced the baseline's "
-                "exact stdout, both children exited cleanly and every child this body "
-                "started was positively reaped with an empty census of its own session; "
-                "whole-group closure stays the guard's"
+                "compatibility is cleared only when EVERY required probe and the resolution "
+                "control ran, their oracles and exact complete-byte correspondence matched, "
+                "and every child this body started was positively reaped. That is "
+                "DIRECT-CHILD custody only: whole-group closure, survivors and cleanup are "
+                "decided by the qualified shared supervisor, and this result stays "
+                "provisional until its completed joined deciding/final certain-empty receipt "
+                "exists. An unreaped child, an unknown writer or a guard fault leaves the "
+                "occurrence incomplete/unqualified"
             ),
             "scope": (
                 f"only makepad/relax {COMPAT_UPSTREAM_COMMIT} on this platform, against the "
@@ -6183,39 +5837,36 @@ class CompatRun:
             "platform": f"{platform.system()} {platform.machine()}",
             "figures": {key: value for key, value in self.figures.items() if key != "acquisition"},
             "acquisition": self.figures.get("acquisition"),
-            "disposals": self.disposals,
             "children": {
                 "spawned": self.children_spawned,
-                "custody_clean": self.custody_clean()[0],
+                "reaped": sum(1 for entry in self.custody if entry.get("reaped")),
+                "unreaped": [entry.get("label") for entry in self.custody
+                             if entry.get("spawned") is not False
+                             and not entry.get("reaped")],
                 "custody": [
                     {key: entry.get(key) for key in
                      ("label", "argv", "spawned", "reaped", "wait_error")}
                     for entry in self.custody[:24]
                 ],
                 "custody_records": len(self.custody),
-                "closure": self.closure,
-                "boundary": (
-                    "the custodian forks a proof leader that calls setsid and execs this "
-                    "script, so this script is the session leader and the custodian stays in "
-                    "its original session, outside ours. Every child runs in THIS script's own "
-                    "session and process group — no setsid and no separate group — so the "
-                    "qualified supervisor can see and stop it and a guard stop reaches it. "
-                    "Closure is decided by classifying OUR session: only this script, its own "
-                    "descendants and each read's transient census helper may appear there, the "
-                    "custodian's row must be present in the table, this script's parent must be "
-                    "the custodian, this script's own subtree must be empty, and any other row "
-                    "in our session (an orphaned producer, for example) is unclassified and "
-                    "refuses every disposal. Two independent reads must agree on this script's "
-                    "and the custodian's start identity. An unreadable or empty table is "
-                    "unknown, never closed, and no compatibility credit is claimed from it"
+                "note": (
+                    "DIRECT-CHILD facts only: every child ran in the qualified leader's own "
+                    "session and process group (no setsid, no separate group, no daemon), and "
+                    "this receipt records each direct child's bounded wait and reap. It does "
+                    "NOT claim whole-group closure or survivors: the qualified shared "
+                    "supervisor alone decides those, its census runs after this body exits, "
+                    "and this occurrence stays incomplete/unqualified on an unreaped child, "
+                    "an unknown writer or a guard fault. Freshly built engine and probe "
+                    "targets are retained through the whole occurrence and cleaned up only by "
+                    "the guard's own policy, never by this script"
                 ),
             },
+            "compatibility": self.compatibility(),
             "retained_evidence": sorted(
                 capture["file"]
                 for row in self.cases for capture in (row.get("captures") or {}).values()
                 if capture.get("file")
             ),
-            "compatibility": self.compatibility(),
             "resolution_basis": {
                 "locked_graphs": self.figures.get("locked_graphs"),
                 "extracted_sources": self.figures.get("extracted_checks"),
@@ -6283,11 +5934,19 @@ class CompatRun:
                     "each per-command cap is the minimum of its fixed value and the remaining "
                     "deadline minus the stop margin; no clock resets and no phase allowance"
                 ),
-                "disposal_basis": (
-                    "only newly created stage output inside this run's guard root, and only "
-                    "after every child this body started is positively reaped with an empty "
-                    "census of its own session; the checkout, bundled std, seeded Cargo homes "
-                    "and workload sources are never disposed"
+                "retention_basis": (
+                    "freshly built engine and probe targets are RETAINED through the whole "
+                    "occurrence; this body performs no in-run deletion, enforces no disposal "
+                    "allowlist and runs no private process census. Whole-group closure and "
+                    "cleanup belong solely to the qualified shared supervisor"
+                ),
+                "fit_basis": (
+                    "retained targets are expected to exceed the fixed 4096 MiB monitored "
+                    "scratch at peak (engine release target plus the snapshot baseline target "
+                    "and the Relax caches). This is a prospective estimate, not a measurement: "
+                    "if retained targets cannot fit, a truthful fit refusal at activation is "
+                    "the valid outcome and the planner disposes of it. No cap is raised, no "
+                    "storage is hidden and no per-phase allowance is introduced here"
                 ),
                 "evidence_basis": (
                     "each reached arm's bounded stdout/stderr is written into the evidence "
@@ -6366,7 +6025,10 @@ def finish_compat_run(run: "CompatRun") -> int:
         "cases": len(run.cases),
         "verdicts": verdict_tally(run.cases),
         "aborted": run.aborted,
-        "disposals": len(run.disposals),
+        "children_reaped": sum(1 for entry in run.custody if entry.get("reaped")),
+        "children_unreaped": [entry.get("label") for entry in run.custody
+                              if entry.get("spawned") is not False
+                              and not entry.get("reaped")],
         "exit": exit_code,
     }
     print(json.dumps(summary))
@@ -6735,107 +6397,18 @@ def compat_self_check() -> None:
     expect(len(rows) == declared_total - 1,
            "unexecuted rows cover exactly the unreached declared combinations")
 
-    # -- the process-table parser and the two-read closure verdict --------
-    session = 4242
-    table_text = (f"  1  0  1  0 Wed Nov 12 09:00:00 2026\n"
-                  f"500  1 500 {session} Wed Nov 12 09:00:01 2026\n"
-                  f"501 500 500 {session} Wed Nov 12 09:00:02 2026\n"
-                  f"600 500 500 {session} Wed Nov 12 09:00:03 2026\n"
-                  f"601 600 500 {session} Wed Nov 12 09:00:04 2026\n")
-    parsed = _parse_ps_census(table_text)
-    expect(parsed["readable"] and len(parsed["rows"]) == 5
-           and parsed["rows"][600]["start"].endswith("2026"),
-           "the process-table parser reads every row with a start identity")
-    expect(not _parse_ps_census("")["readable"],
-           "an EMPTY process table is unreadable, never a positive zero")
-    expect(not _parse_ps_census("  1  0  1\n")["readable"],
-           "a row without a session and start identity is unreadable")
-    expect(not _parse_ps_census("  1  0  1 4242\n")["readable"],
-           "a row without a start identity is unreadable")
-    expect(not _parse_ps_census("  1 x 1 4242 Wed\n")["readable"],
-           "a non-numeric row is unreadable")
-    expect(not _parse_ps_census("  1 0 1 4242 Wed\n  1 0 1 4242 Wed\n")["readable"],
-           "a duplicate pid is unreadable")
-
-    # The REAL topology: the custodian forks the proof leader, the leader calls
-    # setsid and execs this script, so this script is the session leader and the
-    # custodian stays in a DIFFERENT session.
-    custodian, ours = 500, 600
-    custodian_session, our_session = 1000, 4242
-    our_start = "Wed Nov 12 09:00:03 2026"
-    custodian_start = "Wed Nov 12 09:00:01 2026"
-
-    def read(helper: int, rows: dict) -> dict:
-        return {"readable": True, "error": None, "helper_pid": helper, "rows": rows}
-
-    def base_rows(helper: int, our_start_token: str = our_start,
-                  our_ppid: int = custodian) -> dict:
-        return {
-            1: {"ppid": 0, "pgid": 1, "sess": 0, "start": "Wed Nov 12 08:00:00 2026"},
-            custodian: {"ppid": 1, "pgid": 500, "sess": custodian_session,
-                        "start": custodian_start},
-            ours: {"ppid": our_ppid, "pgid": 600, "sess": our_session,
-                   "start": our_start_token},
-            helper: {"ppid": ours, "pgid": 600, "sess": our_session,
-                     "start": f"Wed Nov 12 09:10:0{helper % 10} 2026"},
-        }
-
-    first = read(601, base_rows(601))
-    second = read(602, base_rows(602))
-    verdict = closure_verdict([first, second], ours, custodian, our_session)
-    expect(verdict["closed"],
-           "the real launcher topology (custodian outside our session) closes")
-    expect(not closure_verdict([read(601, {}), read(602, {})], ours, custodian,
-                              our_session)["closed"],
-           "two empty tables are never closed")
-    expect(not closure_verdict([{"readable": False, "rows": {}, "helper_pid": None,
-                                "error": "ps failed"}, second], ours, custodian,
-                              our_session)["closed"],
-           "an unreadable read refuses closure")
-    no_custodian = base_rows(601)
-    del no_custodian[custodian]
-    expect(not closure_verdict([read(601, no_custodian), second], ours, custodian,
-                              our_session)["closed"],
-           "a missing custodian row is unknown, never closed")
-    missing_helper = base_rows(601)
-    del missing_helper[601]
-    expect(not closure_verdict([read(601, missing_helper), second], ours, custodian,
-                              our_session)["closed"],
-           "a read without its own census helper row is incomplete")
-    missing_our = base_rows(601)
-    del missing_our[ours]
-    expect(not closure_verdict([read(601, missing_our), second], ours, custodian,
-                              our_session)["closed"],
-           "a read without our own row is incomplete")
-    reparented_row = base_rows(601)
-    reparented_row[ours]["ppid"] = 777
-    expect(not closure_verdict([read(601, reparented_row), second], ours, custodian,
-                              our_session)["closed"],
-           "a row whose parent is not the custodian is refused")
-    replaced = read(602, base_rows(602, our_start_token="Wed Nov 12 09:59:59 2026"))
-    expect(not closure_verdict([first, replaced], ours, custodian, our_session)["closed"],
-           "a replaced PID start identity between reads refuses closure")
-    orphan_rows = base_rows(601)
-    orphan_rows[700] = {"ppid": 1, "pgid": 600, "sess": our_session,
-                        "start": "Wed Nov 12 09:20:00 2026"}
-    orphan_rows2 = base_rows(602)
-    orphan_rows2[700] = {"ppid": 1, "pgid": 600, "sess": our_session,
-                         "start": "Wed Nov 12 09:20:00 2026"}
-    expect(not closure_verdict([read(601, orphan_rows), read(602, orphan_rows2)],
-                              ours, custodian, our_session)["closed"],
-           "an orphaned producer in our session refuses closure")
-    live_rows = base_rows(601)
-    live_rows[701] = {"ppid": ours, "pgid": 600, "sess": our_session,
-                      "start": "Wed Nov 12 09:21:00 2026"}
-    expect(not closure_verdict([read(601, live_rows), second], ours, custodian,
-                              our_session)["closed"],
-           "a live child of this script refuses closure")
-    foreign_session_rows = base_rows(601)
-    foreign_session_rows[800] = {"ppid": 1, "pgid": 800, "sess": 7777,
-                                 "start": "Wed Nov 12 09:22:00 2026"}
-    expect(closure_verdict([read(601, foreign_session_rows), read(602, base_rows(602))],
-                          ours, custodian, our_session)["closed"],
-           "a row in another session is not our custody and does not refuse")
+    # -- no private closure or disposal framework remains -------------------
+    module_source = open(SCRIPT, encoding="utf-8").read()
+    harness_free_source = module_source[:module_source.index("def compat_self_check(")]
+    for forbidden in ("_parse_ps_census", "_descendants", "classify_closure",
+                      "closure_verdict", "compat_process_table",
+                      "dispose_stage_output", "dispose_probe", "custody_clean",
+                      "closure_check", "COMPAT_DISPOSABLE_PATHS",
+                      "COMPAT_PROCESS_TABLE_SEAM"):
+        expect(forbidden not in harness_free_source,
+               f"the private closure/disposal machinery is gone ({forbidden})")
+    expect("no setsid, no separate group" in module_source,
+           "the direct-child boundary states that no session or group is created")
 
     # -- the real spawn boundary stays inside the guard's group -----------
     spawn_dir = tempfile.mkdtemp(dir=os.environ.get("TMPDIR") or None)
@@ -7295,171 +6868,40 @@ def compat_self_check() -> None:
     except Refusal:
         pass
 
-    # -- disposal policy: allowlist, containment, closure -----------------
+    # -- direct-child custody facts and retained targets -------------------
     seam_dir = tempfile.mkdtemp(dir=os.environ.get("TMPDIR") or None)
-    saved_table = globals()["COMPAT_PROCESS_TABLE_SEAM"]
     try:
-        our_pid, guard_pid, session_id = os.getpid(), os.getppid(), os.getsid(0)
-        own_pgid = session_id
-
-        custodian_session = session_id + 1
-
-        def closed_reads(extra_rows: dict | None = None, our_ppid: int | None = None,
-                         our_start: str = "start-ours") -> callable:
-            """A seam returning a FRESH closed read per call modelling the real
-            topology: the custodian is in ANOTHER session."""
-            state = {"n": 0}
-
-            def seam(*_args, **_kwargs):
-                state["n"] += 1
-                helper = 900000 + state["n"]
-                rows = {
-                    helper: {"ppid": our_pid, "pgid": own_pgid, "sess": session_id,
-                             "start": f"start-helper-{state['n']}"},
-                    our_pid: {"ppid": our_ppid if our_ppid is not None else guard_pid,
-                              "pgid": own_pgid, "sess": session_id, "start": our_start},
-                    guard_pid: {"ppid": 1, "pgid": 700, "sess": custodian_session,
-                                "start": "start-guard"},
-                }
-                rows.update(extra_rows or {})
-                return {"readable": True, "rows": rows, "helper_pid": helper, "error": None}
-            return seam
-
-        def fresh_run(table_seam) -> CompatRun:
-            run = CompatRun.__new__(CompatRun)
-            run.run_root = os.path.join(seam_dir, "run")
-            run.packet_dir = os.path.join(seam_dir, "packet")
-            run.binding = {"paths": {"run_root_name": "run", "packet_name": "packet"}}
-            run.disposals = []
-            run.custody = [{"label": "clean", "spawned": True, "reaped": True}]
-            run.children_spawned = 1
-            run.progress_records = 0
-            run.progress_failures = 0
-            run.closure = None
-            run.env = {"HOME": seam_dir}
-            run.deadline_ns = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) + int(60e9)
-            globals()["COMPAT_PROCESS_TABLE_SEAM"] = table_seam
-            return run
-
-        run = fresh_run(closed_reads())
-        os.makedirs(os.path.join(run.run_root, "stage-relax-target", "release"))
-        with open(os.path.join(run.run_root, "stage-relax-target", "release", "relax"),
-                  "wb") as handle:
-            handle.write(b"x" * 4096)
-        run.dispose_stage_output("stage-relax-target", "self-check: closed in-boundary")
-        expect(not os.path.exists(os.path.join(run.run_root, "stage-relax-target")),
-               "an allowlisted stage output is removed under two-read closed custody")
-        expect(run.disposals[0]["closure"]["closed"] is True
-               and run.disposals[0]["bytes_before"]["entries"] == 1,
-               "the disposal records its two-read closure and removed bytes")
-        run.dispose_stage_output("stage-relax-target", "self-check: absent is recorded")
-        expect(run.disposals[-1]["absent"] is True, "an absent stage output is recorded as absent")
-        for relative in ("relax-src", "cargo-homes/shared", "bin",
-                         "workloads/snapshot/cargo/tree", "../escape",
-                         "stage-relax-target/../relax-src", "/etc"):
-            try:
-                run.dispose_stage_output(relative, "self-check: undeclared")
-                raise AssertionError(f"disposing {relative!r} must refuse")
-            except Refusal:
-                continue
-        os.makedirs(os.path.join(run.run_root, "workloads", "snapshot", "cargo"))
-        target = os.path.join(seam_dir, "outside")
-        os.makedirs(target)
-        with open(os.path.join(target, "keep"), "wb") as handle:
-            handle.write(b"keep")
-        os.symlink(target, os.path.join(run.run_root, "workloads", "snapshot", "cargo",
-                                        "target"))
-        try:
-            run.dispose_stage_output("workloads/snapshot/cargo/target", "self-check: symlink")
-            raise AssertionError("disposing a symlink must refuse")
-        except Refusal:
-            expect(os.path.exists(os.path.join(target, "keep")),
-                   "the symlink refusal leaves the outside target untouched")
-
-        # Unknown closure refuses the removal and leaves the bytes in place.
-        for label, seam in {
-            "orphan": closed_reads({700: {"ppid": 1, "pgid": guard_pid,
-                                          "sess": session_id, "start": "start-orphan"}}),
-            "live-child": closed_reads({701: {"ppid": our_pid, "pgid": guard_pid,
-                                              "sess": session_id, "start": "start-child"}}),
-            "empty-table": lambda *_a, **_k: {"readable": False, "rows": {},
-                                              "helper_pid": None,
-                                              "error": "the process table was empty"},
-            "missing-guard": lambda *_a, **_k: {"readable": True, "error": None,
-                                               "helper_pid": 900009,
-                                               "rows": {900009: {"ppid": our_pid,
-                                                                 "pgid": guard_pid,
-                                                                 "sess": session_id,
-                                                                 "start": "start-h"},
-                                                        our_pid: {"ppid": 1, "pgid": 1,
-                                                                  "sess": 1,
-                                                                  "start": "start-ours"}}},
-        }.items():
-            os.makedirs(os.path.join(run.run_root, "stage-relax-target"), exist_ok=True)
-            with open(os.path.join(run.run_root, "stage-relax-target", "keep"), "wb") as handle:
-                handle.write(b"keep")
-            globals()["COMPAT_PROCESS_TABLE_SEAM"] = seam
-            try:
-                run.dispose_stage_output("stage-relax-target", f"self-check: {label}")
-                raise AssertionError(f"disposal under {label} closure must refuse")
-            except (Refusal, AssertionError) as error:
-                if isinstance(error, AssertionError):
-                    raise
-                expect(os.path.exists(os.path.join(run.run_root, "stage-relax-target",
-                                                   "keep")),
-                       f"the {label} refusal leaves the stage output in place")
-        # A replaced PID or a changed parent between the two reads refuses.
-        def two_read_seam(first_start: str, second_start: str,
-                          second_ppid: int | None = None):
-            state = {"n": 0}
-
-            def seam(*_args, **_kwargs):
-                state["n"] += 1
-                second = state["n"] % 2 == 0
-                helper = 900100 + state["n"]
-                ppid = second_ppid if (second and second_ppid is not None) else guard_pid
-                return {"readable": True, "error": None, "helper_pid": helper,
-                        "rows": {
-                            helper: {"ppid": our_pid, "pgid": own_pgid,
-                                     "sess": session_id, "start": f"h{state['n']}"},
-                            our_pid: {"ppid": ppid, "pgid": own_pgid,
-                                      "sess": session_id,
-                                      "start": second_start if second else first_start},
-                            guard_pid: {"ppid": 1, "pgid": 700,
-                                        "sess": session_id + 1, "start": "start-guard"},
-                        }}
-            return seam
-
-        for label, seam in {
-            "replaced-pid": two_read_seam("start-ours", "start-replaced"),
-            "reparented": two_read_seam("start-ours", "start-ours", second_ppid=777),
-        }.items():
-            os.makedirs(os.path.join(run.run_root, "stage-relax-target"), exist_ok=True)
-            with open(os.path.join(run.run_root, "stage-relax-target", "keep"), "wb") as handle:
-                handle.write(b"keep")
-            globals()["COMPAT_PROCESS_TABLE_SEAM"] = seam
-            try:
-                run.dispose_stage_output("stage-relax-target", f"self-check: {label}")
-                raise AssertionError(f"disposal under {label} closure must refuse")
-            except Refusal:
-                expect(os.path.exists(os.path.join(run.run_root, "stage-relax-target",
-                                                   "keep")),
-                       f"the {label} refusal leaves the stage output in place")
-        run.custody = [{"label": "u", "spawned": True, "reaped": False,
-                        "wait_error": "ECHILD"}]
-        globals()["COMPAT_PROCESS_TABLE_SEAM"] = closed_reads()
-        try:
-            run.dispose_stage_output("stage-relax-target", "self-check: unreaped")
-            raise AssertionError("disposal with an unreaped child must refuse")
-        except Refusal:
-            pass
-        run.custody = [{"label": "clean", "spawned": True, "reaped": True}]
-        expect(fresh_run(lambda *_a, **_k: {"readable": False, "rows": {},
-                                            "helper_pid": None, "error": "x"})
-               .custody_clean()[0] is False,
-               "an unknown closure is never reported clean")
+        run = CompatRun.__new__(CompatRun)
+        run.cases = []
+        run.figures = {}
+        run.custody = [
+            {"label": "a", "spawned": True, "reaped": True},
+            {"label": "b", "spawned": True, "reaped": False, "wait_error": "ECHILD"},
+        ]
+        run.children_spawned = 2
+        run.aborted = None
+        run.mode = "compat-diagnostic"
+        run.binding = {"paths": {"run_root_name": "run", "packet_name": "packet"}}
+        run.progress_records = 0
+        run.progress_failures = 0
+        run.custody = [{"label": "a", "spawned": True, "reaped": True},
+                       {"label": "b", "spawned": True, "reaped": True}]
+        run.cases = [{"case": case["case"], "arm": arm, "verdict": "match"}
+                     for case in COMPAT_CASES for arm in case["arms"]]
+        compatibility = run.compatibility()
+        expect(compatibility["result"] == "cleared"
+               and compatibility["unreaped_children"] == [],
+               "direct-child reaping is the only local gate on the compatibility result")
+        expect("whole-group closure" in compatibility["success_rule"]
+               and "provisional" in compatibility["success_rule"],
+               "the result states that whole-group closure stays the guard's and the "
+               "result is provisional")
+        run.custody[1]["reaped"] = False
+        run.aborted = None
+        expect(run.compatibility()["result"] == "incomplete"
+               and run.compatibility()["unreaped_children"] == ["b"],
+               "an unreaped direct child leaves the occurrence incomplete")
     finally:
-        globals()["COMPAT_PROCESS_TABLE_SEAM"] = saved_table
         shutil.rmtree(seam_dir)
 
     # -- real setup/verification/source-set/closeout composition -----------
@@ -7614,8 +7056,7 @@ def compat_self_check() -> None:
     saved_seams = {name: globals()[name] for name in
                    ("COMPAT_CHILD_RUNNER", "COMPAT_STAGE_SEAM", "COMPAT_SEED_SEAM",
                     "COMPAT_VOLUME_SEAM", "COMPAT_SETUP_SEAM", "SOURCE_GATE_SEAM",
-                    "COMPAT_PROCESS_TABLE_SEAM", "COMPAT_SOURCE_BYTES_SEAM",
-                    "COMPAT_EXTRACTED_SEAM")}
+                    "COMPAT_SOURCE_BYTES_SEAM", "COMPAT_EXTRACTED_SEAM")}
     composition_dir = tempfile.mkdtemp(dir=os.environ.get("TMPDIR") or None)
     saved_env = {key: os.environ.get(key) for key in GUARD_EXPORTS}
     os.environ["OXIDE_TASK_SCRATCH_ROOT"] = os.path.join(composition_dir, "scratch")
@@ -7643,33 +7084,18 @@ def compat_self_check() -> None:
         #    materialization, probes, control, closure, closeout, publication.
         records: list = []
         globals()["COMPAT_CHILD_RUNNER"] = fake_runner(dict(good_stdout), records=records)
-        composition_reads = {"n": 0}
-
-        def composition_table(*_args, **_kwargs):
-            composition_reads["n"] += 1
-            helper = 910000 + composition_reads["n"]
-            own = os.getsid(0)
-            return {"readable": True, "error": None, "helper_pid": helper, "rows": {
-                helper: {"ppid": os.getpid(), "pgid": own,
-                         "sess": own, "start": f"h{composition_reads['n']}"},
-                os.getpid(): {"ppid": os.getppid(), "pgid": own,
-                              "sess": own, "start": "start-ours"},
-                os.getppid(): {"ppid": 1, "pgid": 700, "sess": own + 1,
-                               "start": "start-guard"},
-            }}
-        globals()["COMPAT_PROCESS_TABLE_SEAM"] = composition_table
         run = composed_run("clean")
         with contextlib.redirect_stdout(io.StringIO()):
             with contextlib.redirect_stderr(io.StringIO()):
                 run.setup()
             expect(run.aborted is None, "the real setup/verification composition completes")
             expect(set(run.figures.get("engine_verification", {}))
-                   == {"before disposal", "after disposal"},
-                   "the copied executable is verified both before and after disposal")
-            expect(not os.path.exists(os.path.join(run.run_root, "stage-relax-target")),
-                   "the engine build target is disposed after verification")
-            expect(run.disposals and run.disposals[0]["closure"]["closed"] is True,
-                   "the disposal records its closed in-boundary classification")
+                   == {"before probes", "after engine verification"},
+                   "the copied executable is verified twice before any probe")
+            expect(os.path.isdir(os.path.join(run.run_root, "stage-relax-target")),
+                   "the freshly built engine target is RETAINED through the occurrence")
+            expect(not hasattr(run, "disposals"),
+                   "the occurrence keeps no in-run disposal ledger")
             expect(run.figures.get("source_set", {}).get("registry_packages")
                    == len(lock_sets["registry"]),
                    "the private source set is verified against the workload lock")
@@ -7679,34 +7105,30 @@ def compat_self_check() -> None:
         expect(exit_code == 0, "a fully matching composition exits 0")
         expect(run.compatibility()["result"] == "cleared",
                "a fully matching composition is cleared")
-        expect(run.custody_clean()[0] and len(run.cases) == declared_total,
-               "every composed child is positively reaped and all declared arms recorded")
+        expect(all(entry.get("reaped") for entry in run.custody)
+               and len(run.cases) == declared_total,
+               "every composed direct child is positively reaped and all declared arms "
+               "are recorded")
         receipt_path = os.path.join(run.packet_dir,
                                     f"receipt-{run.binding['paths']['packet_name']}.json")
         receipt = json.load(open(receipt_path))
         expect(receipt["compatibility"]["result"] == "cleared",
                "the published receipt carries the cleared result")
-        boundary = receipt["children"]["boundary"]
-        expect(receipt["children"]["closure"]["closed"] is True,
-               "the receipt publishes the in-boundary closure ledger")
-        expect("custodian" in boundary and "THIS script's own" in boundary,
-               "the published receipt names the real launcher topology (custodian outside "
-               "our session) in its boundary statement")
-        expect("the guard session" not in boundary
-               and "guard's OWN session" not in boundary
-               and "guard's row" not in boundary,
-               "the published receipt no longer claims guard-session classification")
-        seam_doc = CompatRun.closure_check.__doc__ or ""
-        expect("custodian" in seam_doc and "guard's row" not in seam_doc,
-               "the closure seam's own docstring states the real launcher topology")
-        module_source = open(SCRIPT, encoding="utf-8").read()
-        comment_start = module_source.find("# The qualified supervisor forks a proof leader")
-        comment_end = module_source.find("def _parse_ps_census(")
-        closure_comment = module_source[comment_start:comment_end]
-        expect(comment_start > 0 and comment_end > comment_start
-               and "classifying OUR session" in closure_comment
-               and "guard's session" not in closure_comment,
-               "the closure core's section comment states OUR session, not the guard's")
+        children_note = receipt["children"]["note"]
+        expect(children_note.startswith("DIRECT-CHILD facts only")
+               and "qualified shared supervisor alone decides those" in children_note
+               and "retained through the whole occurrence" in children_note,
+               "the published receipt states direct-child facts only, guard-owned closure "
+               "and retained targets")
+        expect(receipt["children"]["reaped"] == receipt["children"]["spawned"]
+               and receipt["children"]["unreaped"] == [],
+               "the receipt records every direct child reaped")
+        expect("disposals" not in receipt, "the receipt publishes no in-run disposal")
+        expect(receipt["limits"]["retention_basis"].startswith(
+                   "freshly built engine and probe targets are RETAINED")
+               and receipt["limits"]["fit_basis"].startswith(
+                   "retained targets are expected to exceed"),
+               "the receipt states the retention basis and the prospective fit estimate")
         expect(receipt["figures"].get("input_identities")
                and receipt["figures"].get("closeout_source_check")
                and receipt["resolution_basis"]["source_set"],
@@ -7942,7 +7364,6 @@ def compat_self_check() -> None:
         # E. A zero-exit resolution control blocks compatibility.
         run = composed_run("control-zero")
         globals()["COMPAT_CHILD_RUNNER"] = fake_runner(dict(good_stdout))
-        globals()["COMPAT_PROCESS_TABLE_SEAM"] = composition_table
         with contextlib.redirect_stdout(io.StringIO()):
             with contextlib.redirect_stderr(io.StringIO()):
                 run.setup()
@@ -8015,8 +7436,11 @@ def compat_self_check() -> None:
                "a diagnostic receipt never claims qualification")
         expect("self-check injected setup refusal" in receipt["aborted"],
                "the injected setup refusal is recorded through the real entry")
-        expect(receipt["children"]["custody_clean"] is False,
-               "a refusal before any closure census never claims clean custody")
+        expect(receipt["children"]["reaped"] == receipt["children"]["spawned"]
+               and receipt["children"]["unreaped"] == []
+               and "DIRECT-CHILD facts only" in receipt["children"]["note"],
+               "an aborted occurrence reports only its own direct-child facts, with no "
+               "whole-group closure claim")
     finally:
         shutil.rmtree(entry_dir)
 
@@ -8034,8 +7458,11 @@ def compat_self_check() -> None:
     expect(RELAX_CACHE_ENV in document, "the plan prints the out-of-tree cache override")
     expect("NOT Cargo's fail-on-drift" in document,
            "the plan states the resolver's frozen-flag limit and the source-set proof")
-    expect("REAL launcher topology" in document and "custodian" in document,
-           "the plan states the real launcher topology and the in-boundary closure")
+    expect("RETAIN stage-relax-target" in document
+           and "Whole-group closure" in document,
+           "the plan states fresh-target retention and guard-owned whole-group closure")
+    expect("FIT IS UNMEASURED" in document,
+           "the plan states the unmeasured retained-target fit")
     expect("Cargo.toml.orig" in document and "resolve.nodes" in document,
            "the plan states the extracted-source authentication and resolved-graph basis")
     expect("materialized inputs" in document, "the plan states the identity recheck")

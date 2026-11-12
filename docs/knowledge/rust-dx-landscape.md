@@ -488,30 +488,28 @@ and whole-group closure stays the guard's. A baseline failure aborts rather
 than reporting an incompatibility, because it invalidates the expected
 observation.
 
-**Fit correction and in-boundary custody.** The 307 occurrence was stopped at
-4100.6 MiB of the fixed 4096 MiB owned-scratch budget, UNCLOSED, with no receipt
-or timings. This mode does not enlarge anything: it stages no Oxide front door
-(plain Cargo and the Relax runner are the only arms), keeps one snapshot copy
-per arm, seeds from the workload lock, and disposes ONLY its own stage output
-inside the guard root — the engine build target after the copied executable and
-its retained bundled std have been verified by real children, and then each
-probe's caches after both arms completed. Closure stays inside the qualified
-boundary in its REAL topology: the custodian forks a proof leader that calls
-`setsid` and execs the proof, so the proof is the session leader and the
-custodian remains in another session. Every child runs in the proof's own
-session and process group (no `setsid`, no separate group), so the supervisor
-can see and stop it. A removal requires every child positively reaped plus TWO
-identity-bound process-table reads: each must find the proof's own
-session-leader row and every census helper in its session, the custodian's row
-present anywhere, the proof's parent the custodian, every row in that session
-ours or a helper, and both reads must agree on the proof's and the custodian's
-`(PID, start identity)`. An empty table, a missing row, a replaced PID, a
-changed parent, an orphaned producer, a live child or an unreadable read is
-unknown, refuses the removal and fails the run closed. The checkout and bundled
-std are never disposed (Relax reads its std from its build-time checkout path),
-and the 600 s total, 4096 MiB, 30 s stop margin, supervisor bytes, selected
-Stash volume and reserve watchdog are unchanged. A truthful fit refusal remains
-a valid outcome, never an automatic retry.
+**Fresh-target retention.** The 307 occurrence was stopped at 4100.6 MiB of the
+fixed 4096 MiB owned-scratch budget, with the engine build target, a staged Oxide
+front door it did not need for this question, and three snapshot trees alive at
+once. This mode stages no Oxide front door (plain Cargo and the Relax runner are
+the only arms), keeps one snapshot copy per arm, and then RETAINS every freshly
+built target — the engine build target plus each probe's cargo target and Relax
+cache — through the whole occurrence. It performs no in-run deletion, enforces
+no disposal allowlist, keeps no in-run disposal ledger and runs no private
+process census: whole-group closure, survivors and scratch cleanup belong solely
+to the qualified shared supervisor, whose census runs after the proof body exits.
+Direct children run in the leader's own session and process group (no `setsid`,
+no separate group, no daemon) and the body records only each direct child's
+bounded wait and reap facts; it never labels that as whole-group closure, and an
+unreaped child, an unknown writer or a guard fault leaves the occurrence
+incomplete/unqualified. The checkout and bundled std are retained (Relax reads
+its std from its build-time checkout path), and the 600 s total, 4096 MiB, 30 s
+stop margin, supervisor bytes, selected Stash volume and reserve watchdog are
+unchanged. Because retained targets are expected to exceed 4096 MiB at peak
+(engine release target plus the snapshot baseline target and the Relax caches),
+fit is **unmeasured**: a truthful fit refusal at activation is a valid outcome
+for the planner to dispose of, and no cap is raised, storage hidden or per-phase
+allowance introduced here.
 
 **Evidence, input identity and the source set.** Each reached arm's bounded RAW
 stdout/stderr prefix is written into the evidence packet — with its exact

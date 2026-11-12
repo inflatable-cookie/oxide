@@ -11,4 +11,7 @@ crc32fast 1.5.3 at the workload lock's exact checksums, plus the snapshot's
 read-only `--help` route, compared byte for byte against plain Cargo. The 307
 no-go for its own pin stays exactly as recorded; nothing ran, no timing is
 measured, and no product behaviour, recipe, default, dependency, installation
-or consumer changes.
+or consumer changes. Freshly built engine and probe targets are retained through the
+occurrence and cleanup belongs solely to the qualified shared supervisor;
+no private process census or in-run deletion exists, and retained-target
+fit is unmeasured (a truthful refusal at activation is a valid outcome).
