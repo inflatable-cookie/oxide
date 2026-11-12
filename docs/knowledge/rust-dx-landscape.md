@@ -507,29 +507,27 @@ build-time checkout path), and the 600 s total, 4096 MiB, 30 s stop margin,
 supervisor bytes, selected Stash volume and reserve watchdog are unchanged. A
 truthful fit refusal remains a valid outcome, never an automatic retry.
 
-**Evidence and input identity.** Each reached arm's bounded stdout/stderr is
-written into the evidence packet, with its full-body SHA-256, byte count and
-omission facts, before the next child runs, so a later stop cannot erase an
-earlier real refusal. The identity of the ACTUAL materialized inputs — every
-fixture and snapshot source file and lock, the staged executable, the bundled
-std, and the retained checkout's pinned head and post-lock worktree state — is
-recorded before the probes and re-read after them; a changed or missing
-recorded byte aborts the run, so the Git commit is never treated as proof of
-what ran. Setup children (clone, checkout, git queries, archive,
-extract, lock establishment, patch probes) all run through the same bounded
-boundary with the private scrubbed environment and a cap clipped by the
+**Evidence, input identity and the source set.** Each reached arm's bounded RAW
+stdout/stderr prefix is written into the evidence packet — with its exact
+full-body SHA-256, byte count, completeness and strict-decode facts — before the
+next child runs, so a later stop cannot erase an earlier real refusal. A body
+over the analysis bound, invalid UTF-8 or an unreadable capture can never match,
+and cross-arm equality is over complete bytes rather than a retained prefix. The
+identity of the ACTUAL materialized inputs — every fixture, snapshot and control
+source entry and lock, the staged executable, the bundled std, and the retained
+checkout's pinned head and post-lock worktree state — is recorded before the
+probes and re-read after them; a changed, missing or ADDED source entry aborts
+the run (only the declared output-only `target/` prefix may gain entries), so the
+Git commit is never treated as proof of what ran. The seeded private Cargo home
+is verified to hold EXACTLY the workload lock's sources — each registry crate
+re-hashed against its lock checksum, the index holding only the lock's packages,
+every git database one of the lock's repositories at its locked commit, and no
+extracted registry package outside the lock. That verified set, not the
+`--frozen` flag, is what bounds the resolved graph. Setup children (clone,
+checkout, git queries, archive, extract, lock establishment, the resolution
+control) all run through the same bounded boundary with the private scrubbed
+environment — created before the first runtime child — and a cap clipped by the
 remaining deadline.
-
-**Authority and limits.** `effigy research:relax:compat:test` and
-`:plan` are effect-free apparatus checks and readiness. The heavy
-`:diagnostic` (uncounted keep-going) and `:qualify` (counted author
-compatibility qualification, after an adequate diagnostic at the unchanged
-head) refuse before any effect until a planner binds one occurrence to the
-exact script bytes, apparatus head/tree, workload commit/tree/lock, upstream
-commit/tree, toolchain, bounds and selected volume. Evidence is scoped to this
-pin, platform (macOS arm64, Rust 1.97.1) and workload; no timing is measured,
-so no speed, semantic or ecosystem-wide claim follows, and nothing here is
-product QA.
 
 ### Other run-path levers
 
