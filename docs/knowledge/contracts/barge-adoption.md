@@ -5078,6 +5078,14 @@ and missing or unreadable self identity. Both command result paths abort before
 expected-exit credit; effect-free controls carry each producer family through
 the real World and diagnostic orchestration, with all cases unexecuted and
 retained disposition. This source-bound classifier makes no kernel observation.
+An unexpected captured-unit live writer also aborts. The intentional held-writer
+cases instead require an effect-free Oxide pool preview naming its active writer;
+there is no case-name exemption for a captured-unit replay error. The root
+replacement case replaces the exact journal-bound captured root, retains the
+original, and requires the correlated checked-replay identity refusal plus
+unchanged operation, domain and all three trees. Recreating the old visible name
+alone is not evidence of this refusal. Fake-boundary controls reject missing,
+wrong-operation, unrelated and live-writer refusals through this actual oracle.
 
 The default-off `outputs-operation-proof` feature enables only Barge's existing
 proof-journal phase faults under the current qualified guard. The staged fixture

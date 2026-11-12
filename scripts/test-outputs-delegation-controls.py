@@ -536,17 +536,57 @@ def fixture_composition(m,root):
             "the process table reports pid 123 as uid Some(999) start 1, not this process's uid 501 start 2",
             'the facts of pid 123 are unreadable: Permission denied',
             'the calling process identity is unavailable',
-            'pid 0 has no process start identity')
+            'pid 0 has no process start identity','a live writer holds the captured unit')
         for message in messages:
+            primary='unexpected live writer' if message=='a live writer holds the captured unit' else 'actual custody uncertainty'
             mode[0]='custody';custody_text[0]=message
             try:world.execute(expect=3,label='conservative-replay')
-            except RuntimeError as exc:assert 'actual custody uncertainty' in str(exc) and message in str(exc)
+            except RuntimeError as exc:assert primary in str(exc) and message in str(exc)
             else:raise AssertionError('expected exit3 accepted actual custody unknown')
             child=world.start(world.argv())
             try:world.finish(child,'conservative-replay')
-            except RuntimeError as exc:assert 'actual custody uncertainty' in str(exc) and message in str(exc)
+            except RuntimeError as exc:assert primary in str(exc) and message in str(exc)
             else:raise AssertionError('child exit3 accepted actual custody unknown')
             assert not proof.unclosed
+        for pool in ('internal','removable'):
+            for bad in (None,'missing-reason','offered-root'):
+                doc={'candidates':[],'kept':[{'reason':'active writer in '+pool+' pool'}]}
+                if bad=='missing-reason':doc['kept']=[]
+                if bad=='offered-root':doc['candidates']=[{'root':str(world.root)}]
+                text=json.dumps(doc);digest=m.hashlib.sha256(text.encode()).hexdigest()
+                with patch.object(proof,'run',return_value=(0,text,digest)):
+                    try:m.held_writer_refusal(world)
+                    except m.OracleFailure:assert bad is not None
+                    else:assert bad is None,'held writer accepted wrong refusal'
+        # Real replacement oracle: tiny actual trees, fake ONLY command results.
+        # The initial captured record is a labelled setup premise, not deletion.
+        output_dir=world.control/'outputs';output_dir.mkdir(mode=0o700,exist_ok=True)
+        (output_dir/'registry.json').write_text('synthetic local domain state')
+        for index,variant in enumerate(('exact','missing-reason','wrong-operation','other-refusal','live-writer','writer-plus-exact')):
+            visible=world.root.with_name('replacement-control-'+str(index))
+            capture=visible.with_name('.captured-control-'+str(index));capture.mkdir(mode=0o700)
+            (capture/'original').write_text('synthetic original payload')
+            record={'schema':'barge.operation/1','sequence':index+1,'key':'a'*32,'caller':'oxide.outputs',
+                'phase':'renamed','unit':{'capture_name':capture.name,'inode':capture.stat().st_ino,'name':visible.name}}
+            doc={'oxide':{'rows':[],'settled':[]},'barge':[record]}
+            reason=f'operation {record["key"]} for {visible} remains pending: Pending("the captured unit identity changed")'
+            if variant=='missing-reason':reason=''
+            if variant=='wrong-operation':reason=reason.replace('a'*32,'b'*32)
+            if variant=='other-refusal':reason='operation remains pending: the capture is absent without recorded removal'
+            if variant=='live-writer':reason='a live writer holds the captured unit'
+            if variant=='writer-plus-exact':reason+='; a live writer holds the captured unit'
+            events=[]
+            def result(argv,**kwargs):
+                if argv[1:4]==['outputs','__delegation-fixture','inspect']:
+                    events.append('inspect');return 0,json.dumps(doc),''
+                assert argv[1:3]==['outputs','prune'];events.append('execute');return 3,'',reason
+            with patch.object(world,'root',visible),patch.object(proof,'run',side_effect=result):
+                try:m.replacement_refusal(world,record)
+                except m.OracleFailure:assert variant in ('missing-reason','wrong-operation','other-refusal')
+                except RuntimeError as exc:
+                    assert variant in ('live-writer','writer-plus-exact') and 'unexpected live writer' in str(exc)
+                    assert events==['execute'],'unexpected writer was credited before inspection'
+                else:assert variant=='exact','replacement oracle accepted an unrelated refusal'
         # A classified ordinary refusal is still observable, not silently
         # converted into a custody failure.
         mode[0]='ok'
@@ -555,6 +595,7 @@ def fixture_composition(m,root):
             with patch.object(proof,'run',return_value=(3,'',reason)):
                 assert world.execute(expect=3,label='conservative-replay')[0]==3
         for message in messages:
+            primary='unexpected live writer' if message=='a live writer holds the captured unit' else 'actual custody uncertainty'
             mode[0]='custody';custody_text[0]=message
             worlds=[]
             def outer_run(argv,*,label,limit,**kwargs):
@@ -570,14 +611,23 @@ def fixture_composition(m,root):
                 outer.enter_context(patch.object(m,'attach_image',return_value=None))
                 outer.enter_context(patch.object(m,'run_phase_snapshot',return_value=None))
                 outer.enter_context(patch.object(m,'World',side_effect=reuse_world))
-                outer.enter_context(patch.object(m,'run_case',side_effect=lambda actual,name:actual.execute(expect=3,label='conservative-replay')))
+                if message=='a live writer holds the captured unit':
+                    visible=world.root.with_name('outer-replacement-control')
+                    capture=visible.with_name('.outer-captured-control');capture.mkdir(mode=0o700)
+                    record={'schema':'barge.operation/1','sequence':99,'key':'c'*32,'caller':'oxide.outputs',
+                        'phase':'renamed','unit':{'capture_name':capture.name,'inode':capture.stat().st_ino,'name':visible.name}}
+                    outer.enter_context(patch.object(world,'root',visible))
+                    outer.enter_context(patch.object(m,'CASES',('root-replaced',)+tuple(n for n in m.CASES if n!='root-replaced')))
+                    outer.enter_context(patch.object(m,'run_case',side_effect=lambda actual,name:m.replacement_refusal(actual,record)))
+                else:
+                    outer.enter_context(patch.object(m,'run_case',side_effect=lambda actual,name:actual.execute(expect=3,label='conservative-replay')))
                 outer.enter_context(patch.object(proof,'run',side_effect=outer_run))
                 detach=outer.enter_context(patch.object(m.fresh,'request_guard_detach',return_value=('retained',None)))
                 outer.enter_context(redirect_stdout(out))
                 assert m.run_proof(True,proof,SimpleNamespace(state='synthetic-not-attached'))==1
             report=json.loads(out.getvalue())
-            assert worlds==[m.CASES[0]],'custody unknown continued into another case'
-            assert 'actual custody uncertainty' in report['error'] and custody_text[0] in report['error']
+            assert worlds==['root-replaced' if message=='a live writer holds the captured unit' else m.CASES[0]],'unexpected custody/writer outcome continued into another case'
+            assert primary in report['error'] and custody_text[0] in report['error']
             assert all(row['state']=='unexecuted' for row in report['cases'])
             assert not report['qualified'] and report['detach']=='retained'
             assert detach.call_args.args[2] is not None,'unknown requested successful image disposition'

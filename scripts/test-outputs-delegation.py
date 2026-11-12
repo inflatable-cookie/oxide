@@ -503,6 +503,8 @@ def require_custody_observation(code,err):
     # rather than one spelling of a bounded scan. No kernel query occurs here.
     if code in (0,-9):return
     text=err.lower()
+    if 'a live writer holds the captured unit' in text:
+        raise RuntimeError('unexpected live writer; abort and retain: '+err[-1600:])
     scan=any(word in text for word in ('custody is not proven','descriptor scan','process observation',
                                       'captured-unit writer custody is unknown','the process table'))
     identity=('the calling process identity is unavailable' in text
@@ -675,6 +677,49 @@ class World:
             raise
 
 
+def replacement_refusal(w,record):
+    # Replace the operation's ACTUAL captured root, not its former visible name.
+    # Pending("the captured unit identity changed") is the pinned checked-replay
+    # refusal before its writer scan. A different refusal proves nothing here.
+    name=record['unit']['capture_name']
+    require(isinstance(name,str) and bool(name) and name not in ('.','..') and Path(name).name==name,
+            'captured root name is not one component')
+    require(record['unit']['name']==w.root.name,'operation does not bind this root name')
+    capture=w.root.parent/name
+    require(capture.resolve(strict=True)==capture,'captured root is linked')
+    facts=capture.lstat()
+    require(stat.S_ISDIR(facts.st_mode) and facts.st_uid==os.getuid()
+            and facts.st_ino==record['unit']['inode'],'capture does not bind the original root')
+    retained=capture.with_name(capture.name+'.fixture-original')
+    require(not retained.exists() and not retained.is_symlink(),'fresh retained fixture path is taken')
+    capture.rename(retained)
+    capture.mkdir(mode=0o700)
+    with os.fdopen(os.open(capture/'replacement',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600),'w') as file:
+        file.write('different object')
+    require(capture.stat().st_ino!=facts.st_ino,'replacement did not change root identity')
+    before=w.domain_digest()
+    trees={path:fresh.tree_digest(str(path)) for path in (capture,retained,w.successor)}
+    _,_,err=w.execute(expect=3,label='replacement-refusal')
+    expected=f'operation {record["key"]} for {w.root} remains pending: Pending("the captured unit identity changed")'
+    require(expected in err,'replacement did not produce its exact correlated identity refusal: '+err[-1200:])
+    after=w.inspect()
+    require(native_phase(after,'renamed')==record,'replacement refusal changed the original operation')
+    require(not after['oxide']['settled'] and w.domain_digest()==before,
+            'replacement refusal changed or settled the domain')
+    require(not w.root.exists(),'replacement case recreated the old visible name')
+    require(all(fresh.tree_digest(str(path))==tree for path,tree in trees.items()),
+            'replacement refusal changed the replacement, retained original or successor')
+
+
+def held_writer_refusal(w):
+    # These intentional writer cases prove Oxide POOL custody in an effect-free
+    # preview, not a captured-unit replay refusal. No broad writer exemption.
+    doc=w.preview(candidate=False)
+    require(not any(c['root']==str(w.root) for c in doc['candidates']),'actual held writer root offered')
+    require('active writer' in json.dumps(doc),'held writer refusal not attributable')
+    w.kept()
+
+
 def run_case(w, name):
     if name.startswith('upgrade-'):upgrade_case(w,name.removeprefix('upgrade-'));return
     if name in ('positive-group','selected'):
@@ -759,13 +804,12 @@ def run_case(w, name):
     w.execute(expect=3,extra={'OXIDE_TEST_OPERATION_ROOT':str(w.root),'OXIDE_TEST_OPERATION_FAULT':fault})
     doc=w.inspect();record=native_phase(doc,{'capture-gap':'intent','unlink-gap':'marker_last','removed-replay':'removed'}.get(name,'renamed'))
     w.absence(record)
-    if name=='root-replaced':w.root.mkdir(mode=0o700);(w.root/'replacement').write_text('different object')
+    if name=='root-replaced':replacement_refusal(w,record);return
     if name=='checkout-ancestor-replaced':
         anchor=w.checkout.parent;anchor.rename(anchor.with_name('retained-anchor'));anchor.mkdir(mode=0o700)
         require(anchor.stat().st_ino!=w.data['checkout_ancestor_inode'],'ancestor replacement was not discriminating')
-    if name in ('capture-gap','unlink-gap','root-replaced','checkout-ancestor-replaced'):
+    if name in ('capture-gap','unlink-gap','checkout-ancestor-replaced'):
         w.execute(expect=3,label='conservative-replay');require(len(pending(w.inspect()))==1,'unknown replay was acknowledged')
-        if name=='root-replaced':require((w.root/'replacement').exists(),'replacement was removed')
         require(not w.inspect()['oxide']['settled'],'unknown removal produced a settlement fact');return
     w.execute(expect=0,label='checked-replay');w.settled()
 
@@ -828,10 +872,7 @@ def held_writer(w, removable):
         active=[n for n,state in enumerate(states) if any(r.get('checkout')==str(w.checkout) and r.get('phase') in ('running','spawning') for r in state.get('records',[]))]
         require(active==[1 if removable else 0],f'writer entered wrong pool: {active}')
         w.checkout.rename(away)
-        doc=w.preview(candidate=False)
-        require(not any(c['root']==str(w.root) for c in doc['candidates']),'actual held writer root offered')
-        require('active writer' in json.dumps(doc),'held writer refusal not attributable')
-        w.kept()
+        held_writer_refusal(w)
     finally:
         if retained.exists():retained.rename(registration)
         if away.exists():away.rename(w.checkout)
