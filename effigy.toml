@@ -1699,10 +1699,15 @@ run = "python3 scripts/census-stall-observation.py --observe"
 # edit-repetition composition against committed bytes (every edit-labelled
 # repetition changes bytes and checks its own expected observation),
 # arm/toolchain env seams (every child pins the declared 1.97.1 with
-# auto-install off and the preserved rustup home), receipt trimming with
-# complete-set statistics, and the hash-bound samples publication through
-# the real publish() seam inside one private temporary directory it removes;
-# no child, no network, no engine, no scratch outside that directory.
+# auto-install off and the preserved rustup home), the seed-source
+# normalization composed with the REAL anchored seeder on tiny real fixture
+# directories and links (accepted common-root relocation seeds; split,
+# renamed, unresolved and interior-link cases refuse through the real
+# SeedRefusal translated at the trial boundary), the real guarded_main
+# abort/publication drive, receipt trimming with complete-set statistics,
+# and the hash-bound samples publication through the real publish() seam
+# inside one private temporary directory it removes; no child, no network,
+# no engine, no scratch outside that directory.
 # `:plan` is effect-free and derives readiness from actual metadata
 # without compiling or running anything.
 # `research:relax:diagnostic` and `research:relax:measure` are heavy guarded

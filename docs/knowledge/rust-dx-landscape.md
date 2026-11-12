@@ -323,32 +323,39 @@ body walks five declared GREETING values and its interface alternates the
 `Record.count` type u32<->u64 five times) and the pinned task-base Oxide
 snapshot running its read-only `--help` path under isolated test-home
 controls (its body block rewrites a cumulative `[trial-N]` marker five
-times and its interface alternates `MAX_STRING_BYTES` usize<->u64); a
-replacement synthetic fixture would be labelled as such. Every sample
-records its repetition index and the shared post-edit source digest. Every
-real arm and correspondence child carries the declared toolchain
+times and its interface alternates `MAX_STRING_BYTES` usize<->u64; the
+oxide arm's actual argv enforces `--locked --offline`); a replacement
+synthetic fixture would be labelled as such. Every sample records its
+repetition index and the shared post-edit source digest. Every real arm
+and correspondence child carries the declared toolchain
 (`RUSTUP_TOOLCHAIN=1.97.1`, the preserved invoking rustup home and
-`RUSTUP_AUTO_INSTALL=0`), overriding any inherited value. The bounded
-correspondence set covers argv/env/cwd/stdout/stderr/exit, `catch_unwind`
-plus the uncaught panic's file:line and a `RUST_BACKTRACE=1` frame
-expectation, overflow and debug assertions, serde derive round trip plus
-the KNOWN_GAPS #1 collision, a tiny build.rs/generated constant, threads
-and this repository's exact libc pin over FFI, and a minimal test-execution
-probe. No storage mutation, deletion or recovery case exists. Measurement
-reports end-to-end case wall time, stage costs separately, occupied cache
-bytes (never an SSD-write claim) and per-command process-tree peak RSS —
-the raw `ru_maxrss` is platform-scaled (macOS: bytes, verified on this
-host) and is retained with its unit name beside a normalized explicit
-`rss_bytes` figure — attributed to the direct child and its reaped
-descendants only; filesystem caches cannot be globally flushed under this
-scope, and every report says so. The bounded summary receipt (64 KiB cap)
-carries statistics computed over the COMPLETE recorded set and a disclosed
-row excerpt, and publishes a complete untrimmed per-sample artifact
-(`samples-<packet>.json`, every reached/unexecuted/aborted row with its
-repetition and edit identities) hash-bound into the summary; filesystem
-caches cannot be globally flushed under this scope, and every report says
-so. Tool build, std preparation, upstream acquisition and lock
-establishment are separately charged, never disguised as first-run latency.
+`RUSTUP_AUTO_INSTALL=0`), overriding any inherited value. The invoking
+cache SOURCE is normalized at the established external boundary before the
+unchanged anchored seeder runs (resolved once, positively, expected
+namespace names under one canonical common parent; interior links stay
+refused), and a real `offline_seed.SeedRefusal` translates into the
+trial's bounded refusal so a setup abort publishes both artifacts with
+every declared case unexecuted. The bounded correspondence set covers
+argv/env/cwd/stdout/stderr/exit, `catch_unwind` plus the uncaught panic's
+file:line and a `RUST_BACKTRACE=1` frame expectation, overflow and debug
+assertions, serde derive round trip plus the KNOWN_GAPS #1 collision, a
+tiny build.rs/generated constant, threads and this repository's exact
+libc pin over FFI, and a minimal test-execution probe. No storage
+mutation, deletion or recovery case exists. Measurement reports
+e2e case wall time, stage costs separately, occupied cache bytes (never
+an SSD-write claim) and per-command process-tree peak RSS — the raw
+`ru_maxrss` is platform-scaled (macOS: bytes, verified on this host) and
+is retained with its unit name beside a normalized explicit `rss_bytes`
+figure — attributed to the direct child and its reaped descendants only;
+filesystem caches cannot be globally flushed under this scope, and every
+report says so. The bounded summary receipt (64 KiB cap) carries
+statistics computed over the COMPLETE recorded set and a disclosed row
+excerpt, and publishes a complete untrimmed per-sample artifact
+(`samples-<packet>.json`) hash-bound into the summary; the upstream
+workspace's lock is explicitly established offline inside the guarded
+allowance before the `--locked --offline` engine build. Tool build, std
+preparation, upstream acquisition and lock establishment are separately
+charged, never disguised as first-run latency.
 
 **No result exists yet.** The measured question — whether pinned Relax
 offers a repeatable edit-to-result gain over stable LLVM quick on these

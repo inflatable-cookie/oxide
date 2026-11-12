@@ -64,14 +64,28 @@ outputs: `cargo-quick` (plain Cargo, the product's actual quick recipe
 `CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG` cleared, read from
 `src/bin/oxide/cli.rs` and pinned by --plan/--self-check), `oxide-quick` (the
 staged Oxide front door of the same head, quick default, private HOME with
-`OXIDE_TEST_HOME_FROM_ENV=1` and a private pool) where the isolated fixture
-safely supports it, and `relax` (the pinned standalone runner, strict ordinary
-Rust: `--check-first --no-live --quiet`, never `--relaxed`, never
-`--cached`). Each arm keeps only its own declared compilation cache between
-warm cases; processes are fresh; tool build, std preparation, upstream
-acquisition and dependency lock establishment are separately charged and
-reported, never mixed into first-run latency. Filesystem caches cannot be
-globally flushed under this scope, and every report says so.
+`OXIDE_TEST_HOME_FROM_ENV=1` and a private pool, its actual argv enforcing
+`--locked --offline`) where the isolated fixture safely supports it, and
+`relax` (the pinned standalone runner, strict ordinary Rust:
+`--check-first --no-live --quiet`, never `--relaxed`, never `--cached`).
+Each arm keeps only its own declared compilation cache between warm cases;
+processes are fresh; tool build, std preparation, upstream acquisition and
+dependency lock establishment are separately charged and reported, never
+mixed into first-run latency. The offline seed normalizes the invoking
+cache SOURCE at the established external boundary first — the declared
+registry and git roots are resolved once, positively, and must keep the
+expected namespace names under ONE canonical common parent (the host_cache
+convention of scripts/test-outputs-delegation.py at 304 head 8346df5e) —
+before the unchanged anchored seeder runs, whose no-follow, private,
+checksum and content rules still guard every component below that root;
+split roots, renamed namespaces, unresolved roots and any interior link
+refuse, and a real `offline_seed.SeedRefusal` is translated at that
+boundary into this entry's bounded refusal so a setup abort always passes
+through the actual publication with every declared case unexecuted. The
+upstream Relax workspace ships no committed lock, so the guarded allowance
+explicitly establishes it offline (`cargo generate-lockfile --offline`,
+recorded) before the `--locked --offline` engine build. Filesystem caches
+cannot be globally flushed under this scope, and every report says so.
 
 Workloads: (1) the committed `greet` fixture, a small two-member workspace
 with a serde/proc-macro dependency path and deterministic observable output;
@@ -146,8 +160,10 @@ run can never read as a clean pass.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
+import pathlib
 import platform
 import re
 import shutil
@@ -305,10 +321,10 @@ PREMISE_CHECKLIST = {
     ),
     "automatic_adoption": (
         "Does not apply: the trial converts nothing and owns no permanent-"
-        "mode checkout; the Oxide arms run the default internal pool under "
-        "a private HOME on fresh fixtures with no target, whose first "
-        "conversion (if any) is an observation recorded per case, never an "
-        "oracle premise."
+        "mode checkout; the Oxide arms run an explicit private OXIDE_POOL "
+        "directory pool inside the run root under a private HOME on fresh "
+        "fixtures with no target, whose first conversion (if any) is an "
+        "observation recorded per case, never an oracle premise."
     ),
     "cargo_external_argv": (
         "Does not apply: the trial invokes no Cargo external subcommand. "
@@ -1278,6 +1294,154 @@ def self_check() -> None:
         corr_argv, corr_env = seam_run.corr_command("relax", "basics", ["one"])
         expect(corr_env.get("RUSTUP_TOOLCHAIN") == TOOLCHAIN,
                "correspondence relax children pin the declared toolchain too")
+
+        # Engine and oxide-arm argv flags at the real seams: the engine build
+        # is --locked --offline after an explicit offline lock establishment,
+        # and every oxide-arm run passes --locked --offline.
+        expect(engine_lock_command() == ["cargo", "generate-lockfile", "--offline"],
+               "the engine lock is established offline inside the guarded allowance")
+        expect("--locked" in engine_build_command() and "--offline" in engine_build_command(),
+               "the engine build is locked and offline")
+        snapshot_argv, _snapshot_env = seam_run.arm_argv_env("oxide", "snapshot", ["--help"])
+        expect("--locked" in snapshot_argv and "--offline" in snapshot_argv,
+               "the oxide arm's actual argv enforces --locked/--offline")
+
+        # Seed-source normalization on tiny real fixture directories and
+        # links, composed with the REAL anchored seeder (its own fixture
+        # builder and lock shape; no copied model):
+        import offline_seed
+        common = os.path.join(seam_dir, "common")
+        host, rev, checksum = offline_seed._fixture_host(pathlib.Path(common))
+        minimal_lock = offline_seed._lock_text(rev, checksum)
+        # Accepted common-root relocation: the declared cargo home holds
+        # boundary symlinks to one canonical real parent; the resolved root
+        # is handed to the unchanged seeder, which seeds successfully.
+        relocated_home = os.path.join(seam_dir, "cargo-home")
+        os.makedirs(relocated_home)
+        os.symlink(os.path.join(common, "host-cargo-home", "registry"), os.path.join(relocated_home, "registry"))
+        os.symlink(os.path.join(common, "host-cargo-home", "git"), os.path.join(relocated_home, "git"))
+        facts = canonical_cache_source(relocated_home)
+        expect(facts["common_root"] == os.path.join(common, "host-cargo-home"),
+               "boundary links resolve to one canonical common root")
+        seed_dest = os.path.join(seam_dir, "seed-dest")
+        os.makedirs(seed_dest)
+        seeded = offline_seed.seed_cargo_home(
+            facts["common_root"], seed_dest, minimal_lock.encode(),
+            limits=offline_seed.Limits(work_seconds=20),
+        )
+        expect(seeded.get("aggregate_bytes", 0) > 0,
+               "the real seeder accepts the normalized relocated source")
+        # Interior links inside the namespace stay refused by the real
+        # seeder, and this entry translates that exact exception class into
+        # its bounded Refusal preserving the phase and reason.
+        interior_home = os.path.join(seam_dir, "interior-home")
+        common2 = os.path.join(seam_dir, "common2")
+        offline_seed._fixture_host(pathlib.Path(common2))
+        os.makedirs(interior_home)
+        os.symlink(os.path.join(common2, "host-cargo-home", "registry"), os.path.join(interior_home, "registry"))
+        os.symlink(os.path.join(common2, "host-cargo-home", "git"), os.path.join(interior_home, "git"))
+        namespace = offline_seed.CRATES_NAMESPACE
+        real_index = os.path.join(common2, "host-cargo-home", "registry", "index", namespace)
+        os.rename(real_index, os.path.join(common2, "host-cargo-home", "registry", "index", "moved"))
+        os.symlink(os.path.join(common2, "host-cargo-home", "registry", "index", "moved"), real_index)
+        facts2 = canonical_cache_source(interior_home)  # boundary passes
+        seam_run2 = TrialRun.__new__(TrialRun)
+        seam_run2.deadline_ns = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) + int(60e9)
+        seam_run2.run_root = os.path.join(seam_dir, "interior-run")
+        os.makedirs(seam_run2.run_root)
+        seam_run2.figures = {}
+        os.environ["CARGO_HOME"] = interior_home
+        try:
+            seam_run2.seed_cargo_home()
+            raise AssertionError("an interior-link seed must refuse")
+        except Refusal as refusal:
+            expect(str(refusal).startswith("seed:")
+                   and "not a real directory" in str(refusal),
+                   "the real SeedRefusal is translated with its phase and reason")
+        finally:
+            os.environ.pop("CARGO_HOME", None)
+        # Split roots, renamed namespaces and unresolved roots refuse.
+        split_a = os.path.join(seam_dir, "split-a", "registry")
+        split_b = os.path.join(seam_dir, "split-b", "git")
+        os.makedirs(split_a); os.makedirs(split_b)
+        split_home = os.path.join(seam_dir, "split-home")
+        os.makedirs(split_home)
+        os.symlink(split_a, os.path.join(split_home, "registry"))
+        os.symlink(split_b, os.path.join(split_home, "git"))
+        try:
+            canonical_cache_source(split_home)
+            raise AssertionError("split roots must refuse")
+        except Refusal:
+            pass
+        renamed = os.path.join(seam_dir, "renamed")
+        os.makedirs(os.path.join(renamed, "registry-x"))
+        os.makedirs(os.path.join(renamed, "git"))
+        try:
+            canonical_cache_source(renamed)
+            raise AssertionError("a renamed registry namespace must refuse")
+        except Refusal:
+            pass
+        try:
+            canonical_cache_source(os.path.join(seam_dir, "missing-home"))
+            raise AssertionError("unresolved roots must refuse")
+        except Refusal:
+            pass
+
+        # A setup abort passes through the ACTUAL guarded_main and publishes
+        # both the bounded summary and the complete samples with every
+        # declared case unexecuted and a nonzero result: a real activation
+        # binding whose head mismatches the source gate.
+        binding_doc = json.dumps({
+            "schema": BINDING_SCHEMA,
+            "planner_reference": "self-check-guarded-main",
+            "mode": "diagnostic",
+            "script_sha256": sha256_file(SCRIPT),
+            "head": "a" * 40,
+            "tree": "b" * 40,
+            "toolchain": TOOLCHAIN,
+            "diagnostic_receipt_sha256": "",
+            "guard": {"supervisor_sha256": EXPECTED_RUNNER_SHA256,
+                      "limit_seconds": LIMIT_SECONDS, "scratch_mib": SCRATCH_MIB,
+                      "stop_margin_seconds": STOP_MARGIN_S},
+            "upstream": {"commit": UPSTREAM_COMMIT, "tree": UPSTREAM_TREE},
+            "volume": {"uuid": SELECTED_VOLUME_UUID},
+            "paths": {"run_root_name": "guarded-seam-run", "packet_name": "guarded-seam-packet"},
+        }).encode()
+        binding_path = os.path.join(seam_dir, "guarded-binding.json")
+        open(binding_path, "wb").write(binding_doc)
+        env_overrides = {
+            "OXIDE_TASK_SCRATCH_ROOT": os.path.join(seam_dir, "guarded-scratch"),
+            "OXIDE_PROOF_DEADLINE_NS": str(time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) + int(120e9)),
+            "OXIDE_PROOF_EVIDENCE": os.path.join(seam_dir, "guarded-evidence"),
+        }
+        saved = {k: os.environ.get(k) for k in env_overrides}
+        os.environ.update(env_overrides)
+        import contextlib
+        try:
+            sink = contextlib.redirect_stdout(io.StringIO())
+            with sink:
+                guarded_exit = guarded_main("diagnostic", binding_path,
+                                            hashlib.sha256(binding_doc).hexdigest())
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        expect(guarded_exit == 1, "an aborted guarded occurrence exits 1")
+        aborted_receipt = json.load(open(os.path.join(
+            env_overrides["OXIDE_PROOF_EVIDENCE"], "guarded-seam-packet",
+            "receipt-guarded-seam-packet.json")))
+        expect(aborted_receipt["aborted"].startswith("setup:"),
+               "the guarded receipt carries the setup refusal")
+        expect(aborted_receipt["declared_unexecuted"]
+               == sum(len(case["arms"]) for case in CASE_TABLE),
+               "every declared case is recorded unexecuted")
+        expect(aborted_receipt["samples_rows"] == aborted_receipt["cases_total"],
+               "the complete samples artifact accompanies the setup abort")
+        expect(collection_exit(aborted_receipt["aborted"],
+                               aborted_receipt["cases"]) == 1,
+               "the aborted collection exits nonzero through the real rule")
     finally:
         shutil.rmtree(seam_dir)
 
@@ -1647,6 +1811,65 @@ def parse_to_tokenstream(source: str) -> bool:
     return re.search(r"\.parse::<(proc_macro::)?TokenStream>\(\)", source) is not None
 
 
+def canonical_cache_source(cargo_home: str) -> dict:
+    """Normalize the invoking cache SOURCE at the established external
+    boundary before the unchanged anchored seeder runs (the host_cache
+    convention of scripts/test-outputs-delegation.py at 304 head 8346df5e):
+    resolve the declared registry and git roots positively (strict), require
+    the expected namespace names under ONE canonical common parent, and hand
+    that common root to the seeder — whose no-follow, private, checksum and
+    content rules still guard every component below it. Boundary links are
+    resolved once, here; links INSIDE the namespace stay refused by the
+    seeder. Split roots, unexpected namespace names and unresolved roots
+    refuse."""
+    registry_declared = os.path.join(cargo_home, "registry")
+    git_declared = os.path.join(cargo_home, "git")
+    facts: dict = {
+        "cargo_home": cargo_home,
+        "registry_declared": registry_declared,
+        "git_declared": git_declared,
+    }
+    registry_real = os.path.realpath(registry_declared)
+    git_real = os.path.realpath(git_declared)
+    facts["registry_real"] = registry_real
+    facts["git_real"] = git_real
+    if not os.path.isdir(registry_real) or not os.path.isdir(git_real):
+        raise Refusal(
+            f"seed source: the invoking registry/git roots do not resolve to "
+            f"real directories: {registry_real} / {git_real}"
+        )
+    if os.path.basename(registry_real) != "registry" or os.path.basename(git_real) != "git":
+        raise Refusal(
+            "seed source: the resolved registry and git roots do not keep the "
+            f"expected namespace names under one canonical source: {registry_real} / {git_real}"
+        )
+    common = os.path.dirname(registry_real)
+    if common != os.path.dirname(git_real):
+        raise Refusal(
+            "seed source: registry and git caches do not share one canonical "
+            f"source root (split roots): {registry_real} / {git_real}"
+        )
+    facts["common_root"] = common
+    facts["resolution"] = (
+        "boundary links resolved once, positively; interior links stay "
+        "refused by the unchanged anchored seeder"
+    )
+    return facts
+
+
+def engine_lock_command() -> list[str]:
+    """The upstream Relax workspace ships no committed lock, so the guarded
+    allowance explicitly establishes it OFFLINE (the engine has zero registry
+    dependencies; path-only resolution needs no index) before any locked
+    engine build. No separate prewarm, network fallback or install."""
+    return ["cargo", "generate-lockfile", "--offline"]
+
+
+def engine_build_command() -> list[str]:
+    return ["cargo", "build", "--release", "--locked", "--offline",
+            "-p", "relax-runner", "--bin", "relax"]
+
+
 def rotate(arms: tuple[str, ...], rep: int) -> tuple[str, ...]:
     shift = rep % len(arms)
     return arms[shift:] + arms[:shift]
@@ -1758,8 +1981,21 @@ exported scratch, evidence and deadline, after the source and volume gates."""
             RUSTUP_TOOLCHAIN=TOOLCHAIN,
             CARGO_TARGET_DIR=os.path.join(self.run_root, "stage-relax-target"),
         )
+        # The upstream workspace ships no committed lock: establish it
+        # OFFLINE inside this guarded allowance before the locked build (the
+        # engine has no registry dependencies, so offline resolution needs no
+        # index). No separate prewarm and no network fallback; a failure
+        # refuses the occurrence.
+        lock_record = measure_one(
+            engine_lock_command(), self.relax_src, env, CAP_LOCK_S, self.deadline_ns,
+        )
+        if lock_record["exit"] != 0:
+            raise Refusal(
+                "the upstream Relax workspace lock could not be established "
+                f"offline (exit {lock_record['exit']}): {lock_record['stderr'][:400]!r}"
+            )
         record = measure_one(
-            ["cargo", "build", "--release", "-p", "relax-runner", "--bin", "relax"],
+            engine_build_command(),
             self.relax_src, env, CAP_ENGINE_BUILD_S, self.deadline_ns,
         )
         if record["exit"] != 0:
@@ -1778,6 +2014,12 @@ exported scratch, evidence and deadline, after the source and volume gates."""
         self.figures["engine"] = {
             "sha256": sha256_file(staged),
             "build_seconds": record["seconds"],
+            "lock_establishment": {
+                "command": lock_record["argv"],
+                "seconds": lock_record["seconds"],
+                "offline": True,
+                "note": "explicit offline generate-lockfile inside the guarded allowance",
+            },
             "version": version["stdout"].strip()[:200],
             "command": record["argv"],
         }
@@ -1788,25 +2030,44 @@ exported scratch, evidence and deadline, after the source and volume gates."""
         host_home = os.environ.get("CARGO_HOME") or os.path.join(
             os.environ.get("HOME", os.path.expanduser("~")), ".cargo"
         )
+        # Normalize the invoking cache SOURCE at the established external
+        # boundary (resolved once, positively) before the unchanged anchored
+        # seeder runs; every component below the canonical common root stays
+        # under the seeder's own no-follow/checksum/content rules.
+        source = canonical_cache_source(host_home)
         with open(os.path.join(REPO, "Cargo.lock"), "rb") as handle:
             lock_bytes = handle.read()
         destination = os.path.join(self.run_root, "cargo-homes", "shared")
         os.makedirs(destination)
         started = time.monotonic()
-        seed = offline_seed.seed_cargo_home(
-            host_home,
-            destination,
-            lock_bytes,
-            deadline_ns=self.deadline_ns - int(STOP_MARGIN_S * 1e9),
-        )
+        try:
+            seed = offline_seed.seed_cargo_home(
+                source["common_root"],
+                destination,
+                lock_bytes,
+                deadline_ns=self.deadline_ns - int(STOP_MARGIN_S * 1e9),
+            )
+        except offline_seed.SeedRefusal as error:
+            # Translate the real seeder exception at this boundary into this
+            # entry's bounded Refusal, preserving the original phase and
+            # reason; setup then aborts through the actual guarded_main
+            # publication with every declared case unexecuted.
+            raise Refusal(f"seed: {error}") from error
         self.shared_cargo_home = destination
         self.figures["seed"] = {
-            "host_home": str(host_home),
+            "source": source,
             "destination": destination,
             "aggregate_bytes": seed.get("aggregate_bytes"),
             "seconds": round(time.monotonic() - started, 3),
             "network_seconds": 0.0,
-            "note": "offline seed from the invoking Cargo home; no download",
+            "limits": {
+                "anchor": "no-follow per component below the canonical common root",
+                "aggregate_bytes": offline_seed.LIMITS.aggregate_bytes,
+                "work_seconds": offline_seed.LIMITS.work_seconds,
+                "git_candidates": offline_seed.LIMITS.git_candidates,
+                "note": "private config, checksum-verified content; host cache read-only",
+            },
+            "note": "offline seed from the normalized invoking Cargo home; no download",
         }
 
     def stage_oxide(self) -> None:
@@ -1918,7 +2179,8 @@ exported scratch, evidence and deadline, after the source and volume gates."""
             )
             os.makedirs(arm_home, exist_ok=True)
             os.makedirs(os.path.join(arm_home, "tmp"), exist_ok=True)
-            argv = [self.oxide_bin, "run", "--bin", package_flags[1], *trailing]
+            argv = [self.oxide_bin, "run", "--locked", "--offline",
+                    "--bin", package_flags[1], *trailing]
             return argv, env
         env = child_env(
             self.env,
