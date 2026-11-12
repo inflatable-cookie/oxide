@@ -3,7 +3,7 @@
 //! item, so this returns ONLY the generated inherent `impl <Name>` whose
 //! `who()` answers `"a"`; rustc keeps the item from the input itself.
 
-use proc_macro::TokenTree;
+use proc_macro::{TokenStream, TokenTree};
 
 /// The derived item's name: the identifier that follows the `struct`
 /// keyword. The fixtures derive unit structs with no generics and no

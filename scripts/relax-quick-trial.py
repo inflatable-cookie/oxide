@@ -1002,17 +1002,36 @@ def self_check() -> None:
     expect(derived == PANIC_LOCATION,
            f"PANIC_LOCATION {PANIC_LOCATION} must equal the committed probe line {derived}")
 
-    # The derive macros return only their generated impl: a #[proc_macro_derive]
-    # result is appended to the annotated item, so re-emitting the input would
-    # define the struct twice (E0428) and the collision truth is unreachable.
+    # The derive macros return only their generated impl and TokenStream is
+    # actually in scope: a #[proc_macro_derive] result is appended to the
+    # annotated item, so re-emitting the input would define the struct twice
+    # (E0412/E0428), and an unimported TokenStream spelling fails E0412
+    # before any derive runs.
     for mac in ("mac-a", "mac-b"):
         source = read_fixture("corr-suite", mac, "src", "lib.rs")
         expect("input.clone()" not in source and "let mut out = input" not in source,
                f"{mac} must not re-emit the annotated item")
-        expect("body.parse::<TokenStream>()" in source,
-               f"{mac} returns only its parsed impl body")
+        expect(parse_to_tokenstream(source),
+               f"{mac} returns its parsed impl body")
         expect('impl {name} {{ pub fn who()' in source,
                f"{mac} emits an inherent impl on the derived name")
+        expect(tokenstream_in_scope(source),
+               f"{mac} must import TokenStream or fully qualify every mention")
+    # The scope control is the property, not a text pin: it must refuse the
+    # exact past defect (TokenTree-only import with bare TokenStream uses)
+    # and accept a fully qualified variant with no import.
+    defect = read_fixture("corr-suite", "mac-a", "src", "lib.rs").replace(
+        "use proc_macro::{TokenStream, TokenTree};", "use proc_macro::TokenTree;"
+    )
+    expect(not tokenstream_in_scope(defect),
+           "the TokenTree-only import defect must fail the scope control")
+    qualified_variant = "\n".join(
+        line for line in defect.splitlines() if not line.strip().startswith("use ")
+    )
+    qualified_variant = re.sub(r"(?<![\w:])TokenStream\b", "proc_macro::TokenStream",
+                               qualified_variant)
+    expect(tokenstream_in_scope(qualified_variant),
+           "a fully qualified TokenStream with no import satisfies the control")
 
     # Receipt trimming: every case-derived figure is recomputed from the rows
     # the receipt carries, so a truncated receipt never claims more than it
@@ -1369,6 +1388,30 @@ def build_receipt(base: dict, cases: list[dict], cap_bytes: int = MAX_RECEIPT_BY
         document["timing_summary"] = timing_summary(document["cases"])
         encoded = json.dumps(document, indent=1).encode()
     return document
+
+
+def tokenstream_in_scope(source: str) -> bool:
+    """Every `TokenStream` mention in code (outside `use` lines) must resolve:
+    either an import line brings TokenStream into scope, or every code
+    mention is fully qualified as proc_macro::TokenStream. The lookbehind
+    already isolates the unqualified mentions — `proc_macro::TokenStream`
+    never matches them — so any unqualified mention without an import is
+    unresolved. This is the property the text-only pin
+    ("body.parse::<TokenStream>() in source") missed: that spelling is
+    exactly the unimported one."""
+    lines = source.splitlines()
+    imports = "\n".join(line for line in lines if line.strip().startswith("use "))
+    code = "\n".join(line for line in lines if not line.strip().startswith("use "))
+    mentions = re.findall(r"(?<![\w:])TokenStream\b", code)
+    if not mentions:
+        return True
+    return "TokenStream" in imports
+
+
+def parse_to_tokenstream(source: str) -> bool:
+    """The macro returns its parsed body: `.parse::<TokenStream>()` in either
+    the imported or the fully qualified spelling."""
+    return re.search(r"\.parse::<(proc_macro::)?TokenStream>\(\)", source) is not None
 
 
 def rotate(arms: tuple[str, ...], rep: int) -> tuple[str, ...]:
