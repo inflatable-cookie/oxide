@@ -3532,29 +3532,6 @@ def graph_from_metadata(payload: str) -> dict:
 
 
 
-    """(pure) Selected package identities and features from one
-    `cargo metadata --format-version 1` document."""
-    try:
-        document = json.loads(payload)
-    except ValueError as error:
-        raise Refusal(f"cargo metadata is not JSON: {error}")
-    packages = document.get("packages")
-    if not isinstance(packages, list) or not packages:
-        raise Refusal("cargo metadata names no packages")
-    rows = []
-    for package in packages:
-        name, version = package.get("name"), package.get("version")
-        if not isinstance(name, str) or not isinstance(version, str):
-            raise Refusal("cargo metadata has a package without a name and version")
-        features = sorted(str(value) for value in (package.get("features") or {}))
-        rows.append({"name": name, "version": version,
-                     "source": package.get("source"), "features": features})
-    rows.sort(key=lambda row: (row["name"], row["version"], str(row["source"])))
-    digest = hashlib.sha256(
-        "\n".join(f"{row['name']} {row['version']} {row['source']} {row['features']}"
-                   for row in rows).encode()
-    ).hexdigest()
-    return {"packages": rows, "count": len(rows), "digest": digest}
 
 
 def graph_binding_facts(graph: dict, lock_text: str, available_crates: dict,
@@ -4307,14 +4284,17 @@ def build_compat_receipt(base: dict, cases: list[dict], cap_bytes: int | None = 
 # --------------------------------------------------------------------------
 # Bounded children, in-boundary closure and materialized-input identities
 #
-# Every child runs in the guard's OWN session and process group: nothing leaves
-# the qualified supervisor's cooperative boundary, so the supervisor can see
-# and stop it, and a guard stop reaches it. Closure is therefore NOT claimed
-# per child session; it is established by classifying the guard's session: a
-# disposal is allowed only when the ONLY rows in that session are the guard
-# and its own descendants plus our script (and this script's transient census
-# helper). Our own subtree must be empty, and any row that is neither ours nor
-# the guard's (an orphaned producer, for example) is unclassified and refuses
+# The qualified supervisor forks a proof leader that calls setsid() and execs
+# this script, so THIS script is the session leader and the custodian stays in
+# its ORIGINAL session, outside ours. Every child runs in this script's own
+# session and process group: nothing leaves the qualified supervisor's
+# cooperative boundary, so the supervisor can see and stop it, and a guard stop
+# reaches it. Closure is NOT claimed per child session; it is established by
+# classifying OUR session: a disposal is allowed only when the only rows there
+# are this script, its own descendants and each read's transient census helper,
+# and the custodian's row is present in the table with this script's parent
+# equal to it. Our own subtree must be empty, and any row in our session that is
+# not ours (an orphaned producer, for example) is unclassified and refuses
 # disposal. An unreadable table is unknown, never closed.
 # --------------------------------------------------------------------------
 
@@ -5000,13 +4980,19 @@ class CompatRun:
         return record
 
     def closure_check(self, reason: str) -> dict:
-        """Two independent process-table reads over the guard session, with
-        identity-bound rows. Closure requires BOTH reads to be complete (our own
-        row, the guard's row and each read's census helper present, our parent
-        the guard), closed (this script's subtree empty, nothing unclassified)
-        and to agree on every explained (PID, start identity). A replacement, a
-        parentage change, a vanished or appeared row, an empty table or an
-        unreadable read is unknown, never closed."""
+        """Two independent process-table reads over OUR session, with identity-
+        bound rows and the real launcher topology.
+
+        The custodian forks a proof leader that calls setsid() and execs this
+        script, so this script is the session leader and the custodian stays in
+        another session. Closure requires BOTH reads to be complete (this
+        script's own session-leader row and each read's census helper present in
+        our session, the custodian's row present anywhere, this script's parent
+        the custodian), closed (every row in our session is this script, its own
+        descendant or a helper; nothing unclassified), and to agree on this
+        script's and the custodian's start identity. A replacement, a parentage
+        change, a vanished or appeared row, an empty table or an unreadable read
+        is unknown, never closed."""
         reads: list = []
         for index in (1, 2):
             if index == 2:
@@ -6209,16 +6195,19 @@ class CompatRun:
                 "custody_records": len(self.custody),
                 "closure": self.closure,
                 "boundary": (
-                    "every child runs in the guard's OWN session and process group — no "
-                    "setsid and no separate group — so the qualified supervisor can see and "
-                    "stop it and a guard stop reaches it. Closure is decided by classifying "
-                    "the guard session: only the guard and its descendants, this script and "
-                    "its transient census helper may appear; this script's own subtree must "
-                    "be empty and any other row (an orphaned producer, for example) is "
-                    "unclassified and refuses every disposal. An unreadable table is unknown, "
-                    "never closed. A descendant that calls setsid leaves the guard session "
-                    "(the supervisor's census has the same limit) and no compatibility credit "
-                    "is claimed from such a run"
+                    "the custodian forks a proof leader that calls setsid and execs this "
+                    "script, so this script is the session leader and the custodian stays in "
+                    "its original session, outside ours. Every child runs in THIS script's own "
+                    "session and process group — no setsid and no separate group — so the "
+                    "qualified supervisor can see and stop it and a guard stop reaches it. "
+                    "Closure is decided by classifying OUR session: only this script, its own "
+                    "descendants and each read's transient census helper may appear there, the "
+                    "custodian's row must be present in the table, this script's parent must be "
+                    "the custodian, this script's own subtree must be empty, and any other row "
+                    "in our session (an orphaned producer, for example) is unclassified and "
+                    "refuses every disposal. Two independent reads must agree on this script's "
+                    "and the custodian's start identity. An unreadable or empty table is "
+                    "unknown, never closed, and no compatibility credit is claimed from it"
                 ),
             },
             "retained_evidence": sorted(
@@ -7697,9 +7686,27 @@ def compat_self_check() -> None:
         receipt = json.load(open(receipt_path))
         expect(receipt["compatibility"]["result"] == "cleared",
                "the published receipt carries the cleared result")
-        expect(receipt["children"]["closure"]["closed"] is True
-               and receipt["children"]["boundary"].startswith("every child runs in the guard's OWN"),
+        boundary = receipt["children"]["boundary"]
+        expect(receipt["children"]["closure"]["closed"] is True,
                "the receipt publishes the in-boundary closure ledger")
+        expect("custodian" in boundary and "THIS script's own" in boundary,
+               "the published receipt names the real launcher topology (custodian outside "
+               "our session) in its boundary statement")
+        expect("the guard session" not in boundary
+               and "guard's OWN session" not in boundary
+               and "guard's row" not in boundary,
+               "the published receipt no longer claims guard-session classification")
+        seam_doc = CompatRun.closure_check.__doc__ or ""
+        expect("custodian" in seam_doc and "guard's row" not in seam_doc,
+               "the closure seam's own docstring states the real launcher topology")
+        module_source = open(SCRIPT, encoding="utf-8").read()
+        comment_start = module_source.find("# The qualified supervisor forks a proof leader")
+        comment_end = module_source.find("def _parse_ps_census(")
+        closure_comment = module_source[comment_start:comment_end]
+        expect(comment_start > 0 and comment_end > comment_start
+               and "classifying OUR session" in closure_comment
+               and "guard's session" not in closure_comment,
+               "the closure core's section comment states OUR session, not the guard's")
         expect(receipt["figures"].get("input_identities")
                and receipt["figures"].get("closeout_source_check")
                and receipt["resolution_basis"]["source_set"],
