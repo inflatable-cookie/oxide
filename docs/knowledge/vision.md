@@ -446,10 +446,15 @@ the operating rules.
   compatibility qualification each need separate planner activation at an
   accepted published head, and a source or fit correction needs its own
   review and activation. Any performance comparison stays conditional on
-  compatibility passing and needs a new measurement activation. No product
+  compatibility passing and needs a new measurement activation. The three
+  spent uncounted diagnostics produced a scoped no-go at `6ea9d063`: the
+  float-formatting and CRC32 probes match the Cargo baseline while the
+  unchanged workload panics in Relax's front end, so the counted
+  qualification was not activated and no performance comparison is
+  justified. No product
   integration, engine fork, installation, default change or consumer adoption
   is authorized by a pass. Owning research record:
-  [landscape](rust-dx-landscape.md#relax-compatibility-recheck-2026-11-12-prepared).
+  [landscape](rust-dx-landscape.md#relax-compatibility-recheck-2026-11-12).
 - **Still need Tom's scoped approval:**
   - host installs beyond the planner's receipt-matched `oxide` reinstall;
   - releases, tags and workflow changes;
