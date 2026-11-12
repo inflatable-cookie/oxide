@@ -11,7 +11,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "barge"
 version = "0.1.0"
-source = "git+https://github.com/inflatable-cookie/barge?rev=8efd3452fcced9b5b322eb3f7ba0ac794244fc82#8efd3452fcced9b5b322eb3f7ba0ac794244fc82"
+source = "git+https://github.com/inflatable-cookie/barge?rev=7514b8e9931b1037411cbdb861db8b3128024035#7514b8e9931b1037411cbdb861db8b3128024035"
 dependencies = [
  "libc",
  "serde",

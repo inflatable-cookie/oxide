@@ -6337,7 +6337,11 @@ control-directory descriptor per outer publication guard. Nested/foreign or
 replaced identities refuse, and the removable admission, fresh state/registration
 witnesses and full writer checks remain unchanged. The borrowed internal lock
 stays held until its caller releases publication custody; the witness releases
-only the external admission it acquired. See the [connected caller
+only the external admission it acquired. The pinned Barge060 readers now
+strictly accept the coordinated registry's required bounded settlement set;
+terminal settlements never become live references, and malformed sets keep the
+whole batch. The caller's atomic `/4` image, row liveness and custody predicates
+are unchanged. See the [connected caller
 contract](barge-adoption.md#connected-caller-and-recovery-source-oxide304).
 
 - **Status.** Default `oxide status` reads only the bounded recorded `outputs/prune-observations.json` (`oxide.outputs.prune-observations/1`, at most 256 KiB and 512 roots) in the pool section. It performs no root walk, replay, lock or reconciliation. Coverage, source and time are explicit; a partial observation never becomes a global orphan total. `--measure` does not scan output roots for prune.

@@ -302,9 +302,9 @@ live adoption; the integrated Elevated proof gates remain separate.
 
 
 
-The implemented single-authority caller pins qualified Barge059
-`8efd3452fcced9b5b322eb3f7ba0ac794244fc82`, including its journal and listing
-prerequisites; see the
+The implemented single-authority caller pins qualified Barge060
+`7514b8e9931b1037411cbdb861db8b3128024035`, including strict `/4` settlement
+reading, its checked coordinator, journal and listing prerequisites; see the
 [current connected caller contract](contracts/barge-adoption.md#connected-caller-and-recovery-source-oxide304).
 Integrated diagnostic, author and reviewer native sessions remain separately held.
 

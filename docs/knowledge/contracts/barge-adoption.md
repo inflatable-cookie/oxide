@@ -4978,14 +4978,28 @@ is assumed to have shipped either transition, and no live migration is activated
 
 #### Connected caller and recovery source (oxide#304)
 
-The caller pins Barge059's published merge
-`8efd3452fcced9b5b322eb3f7ba0ac794244fc82`, tree
-`07147ae958bae5744a0fabbdbcd9db8bc2599152`, equal to its accepted native head
-`b09ce942cb9bfc4936034d91190a16be71f17e1a`. It includes qualified058's journal
+The caller pins Barge060's published merge
+`7514b8e9931b1037411cbdb861db8b3128024035`, tree
+`fd457f39f5aa2eb0a79e1c3b3b3821f71f1794eb`, equal to its qualified native head
+`2accfd9c9ac0e79cd7f5278f9391b905a3104474`. It retains qualified059's checked
+coordinator and includes qualified058's journal
 (published `0e8dd90a031454b8b7319b27d70bd63474c69977`, accepted native
 `ddea813a7e0010cbdc40402056c72c86d81ea262`) and the qualified shared listing.
 Those are prerequisite fixture evidence, never integrated Oxide or production
 account qualification. Barge remains a pinned library, read-only from Oxide.
+
+Barge060's reference/release reader accepts registry `/1`–`/4`; its census reads
+`/1`, `/2` and `/4`, preserving its existing `/3` refusal. Both `/4` readers
+require the exact version/schema pair, a present `settled` array and no
+`deletion_routes`. They share the strict eight-field settlement validator with
+the same 256-entry cap, required nonce and unique `(caller, key)` rule. Validated
+settlements contribute no liveness; the unchanged rows and intents still decide
+references. Missing, null, malformed, repeated or over-cap settlements make the
+whole document unknown and keep the batch. No reader ignores fields or rewrites
+Oxide's atomic settlement image. The proof source binding includes this new
+validator and all other library source files; replay/writer-scan producers and
+their source-bound refusal mapping are unchanged from059. Integrated diagnostic
+and counted qualification remain separate from this dependency capability.
 
 Covered roots branch before Oxide's local intent/quarantine code. Oxide retains
 complete non-selected eligibility, receipt/history, exact marker/owner/nonce,
