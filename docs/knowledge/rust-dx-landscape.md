@@ -488,20 +488,24 @@ and whole-group closure stays the guard's. A baseline failure aborts rather
 than reporting an incompatibility, because it invalidates the expected
 observation.
 
-**Fit correction and custody.** The 307 occurrence was stopped at 4100.6 MiB
-of the fixed 4096 MiB owned-scratch budget, UNCLOSED, with no receipt or
-timings. This mode does not enlarge anything: it stages no Oxide front door
+**Fit correction and in-boundary custody.** The 307 occurrence was stopped at
+4100.6 MiB of the fixed 4096 MiB owned-scratch budget, UNCLOSED, with no receipt
+or timings. This mode does not enlarge anything: it stages no Oxide front door
 (plain Cargo and the Relax runner are the only arms), keeps one snapshot copy
 per arm, seeds from the workload lock, and disposes ONLY its own stage output
 inside the guard root — the engine build target after the copied executable and
 its retained bundled std have been verified by real children, and then each
-probe's caches after both arms completed. Every child this body starts runs in
-its own session, and a removal requires positive custody: the child's PID
-positively reaped and a readable census of its own session positively empty. A
-non-empty or unreadable census is unknown custody, refuses the removal and
-fails the run closed; a timed-out child is killed by its own PID only, and any
-surviving descendant is reported rather than signalled (a descendant that
-itself calls `setsid` leaves that census, as it leaves the guard's own). The
+probe's caches after both arms completed. Nothing leaves the qualified
+boundary: every child runs in the guard's own session and process group (no
+`setsid`, no separate group), so the supervisor can see and stop it. A removal
+requires every child positively reaped plus TWO identity-bound process-table
+reads of the guard session: each read must be complete (our own row, the guard's
+row and that read's census helper present, our parent the guard) and closed
+(only the guard and its descendants, this script and the helper may appear, this
+script's own subtree empty, nothing unclassified), and the two reads must agree
+on every explained `(PID, start identity)`. An empty table, a missing row, a
+replaced PID, a changed parent, an orphaned producer, a live child or an
+unreadable read is unknown, refuses the removal and fails the run closed. The
 checkout and bundled std are never disposed (Relax reads its std from its
 build-time checkout path), and the 600 s total, 4096 MiB, 30 s stop margin,
 supervisor bytes, selected Stash volume and reserve watchdog are unchanged. A
@@ -519,15 +523,22 @@ checkout's pinned head and post-lock worktree state — is recorded before the
 probes and re-read after them; a changed, missing or ADDED source entry aborts
 the run (only the declared output-only `target/` prefix may gain entries), so the
 Git commit is never treated as proof of what ran. The seeded private Cargo home
-is verified to hold EXACTLY the workload lock's sources — each registry crate
-re-hashed against its lock checksum, the index holding only the lock's packages,
-every git database one of the lock's repositories at its locked commit, and no
-extracted registry package outside the lock. That verified set, not the
-`--frozen` flag, is what bounds the resolved graph. Setup children (clone,
-checkout, git queries, archive, extract, lock establishment, the resolution
-control) all run through the same bounded boundary with the private scrubbed
-environment — created before the first runtime child — and a cap clipped by the
-remaining deadline.
+is verified to hold EXACTLY the workload lock's sources: the seeder's own record
+is checked against the lock (git sources by its authoritative `source` spelling
+and `rev`, registry files by name, version and checksum), then the ACTUAL files
+are re-hashed — each `.crate` compared with its lock checksum, the crate set and
+index exactly the lock's, and no extracted registry package outside the lock. The
+lock must force one version per package name; a multi-version lock refuses,
+because the pinned resolver's choice would then not be forced. For each required
+Cargo arm, `cargo metadata --locked --offline` derives that arm's locked graph
+from its own manifest and lock and every identity in it is bound to the verified
+sources; features are recorded from those same inputs and are never claimed as an
+independent observation of the pinned runner's own feature selection. That
+verified set, not the `--frozen` flag, is what bounds the resolved graph. Setup
+children (clone, checkout, git queries, archive, extract, lock establishment,
+the resolution control) all run through the same bounded boundary with the
+private scrubbed environment — created before the first runtime child — and a
+cap clipped by the remaining deadline.
 
 ### Other run-path levers
 

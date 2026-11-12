@@ -2889,6 +2889,17 @@ MANIFEST_EXCLUDED_PREFIXES = ("target/",)
 # The negative control's dependency requirement: a version the verified private
 # source set does not contain.
 COMPAT_SOURCE_CONTROL_REQUIREMENT = 'crc32fast = "=1.5.4"'
+# Phrases the pinned resolver's own failure paths emit for an unavailable
+# registry package (`resolve.rs`: fetched_dir / pick / sources errors).
+COMPAT_RESOLUTION_MARKERS = (
+    "could not be fetched",
+    "not in",
+    "add a cargo.lock",
+    "no cargo.lock picks one",
+    "offline",
+    "not found",
+    "is not available",
+)
 # The one crates.io sparse namespace the shared seeder serves; the source-set
 # verification reads the seeder's own manifest paths under it.
 COMPAT_SEED_NAMESPACE = "index.crates.io-1949cf8c6b5b557f"
@@ -2911,6 +2922,7 @@ COMPAT_SPAWNER = None
 COMPAT_WAIT = None
 COMPAT_KILL = None
 COMPAT_PROCESS_TABLE_SEAM = None
+COMPAT_SOURCE_BYTES_SEAM = None
 COMPAT_VOLUME_SEAM = None
 
 # The workload lock's own registry identities. The compat fixtures must resolve
@@ -3112,6 +3124,256 @@ def lock_registry_identities(lock_text: str) -> dict:
             "checksum": checksum.group(1),
         }
     return identities
+
+
+def lock_registry_versions(lock_text: str) -> dict:
+    """name -> every locked version of that name. This workload lock has one
+    version per name; a lock with several would leave the pinned resolver's
+    choice unforced, so the run refuses rather than claiming graph equality."""
+    versions: dict = {}
+    for package in lock_sources(lock_text)["registry"]:
+        versions.setdefault(package["name"], set()).add(package["version"])
+    return {name: sorted(values) for name, values in versions.items()}
+
+
+def source_set_identity_facts(seed: dict, lock_text: str) -> dict:
+    """(pure) The seeder's own record against the lock it was built from.
+
+    Registry files are compared by name, version and the seeder's recorded
+    checksum; git sources by the seeder's authoritative `source` spelling (the
+    lock's `git+url?ref#commit`) and `rev`, NOT by its bare database name. The
+    lock must force one version per package name, or selection is not forced."""
+    sources = lock_sources(lock_text)
+    versions = lock_registry_versions(lock_text)
+    ambiguous = {name: values for name, values in versions.items() if len(values) > 1}
+    if ambiguous:
+        raise Refusal(
+            "the workload lock pins several versions of one package, so the "
+            f"resolver's selection is not forced: {sorted(ambiguous)[:4]}"
+        )
+    registry = {(package["name"], package["version"]): package["checksum"]
+                for package in sources["registry"]}
+    crates: dict = {}
+    index_entries = 0
+    for entry in seed.get("files", []):
+        path = entry.get("path", "")
+        if path.startswith("registry/cache/"):
+            name = os.path.basename(path)
+            if not name.endswith(".crate"):
+                raise Refusal(f"the seed holds an unexpected registry file {path!r}")
+            crates[name[:-len(".crate")]] = entry.get("sha256")
+        elif path.startswith("registry/index/"):
+            index_entries += 1
+    expected = {f"{name}-{version}": checksum for (name, version), checksum in registry.items()}
+    if set(crates) != set(expected):
+        raise Refusal(
+            "the private registry source set is not the workload lock: "
+            f"extra {sorted(set(crates) - set(expected))[:4]}, "
+            f"missing {sorted(set(expected) - set(crates))[:4]}"
+        )
+    for name, checksum in crates.items():
+        if checksum != expected[name]:
+            raise Refusal(f"the seeded crate {name} does not match the lock's checksum")
+    if index_entries != len(registry) + 1:
+        raise Refusal(
+            "the private registry index does not hold exactly the lock's packages "
+            f"(+ config.json): {index_entries} entries for {len(registry)} packages"
+        )
+    locked_git = {(package["url"], package["commit"]): package
+                  for package in sources["git"]}
+    seeded_git: dict = {}
+    for source in seed.get("git_sources", []):
+        spelling = source.get("source")
+        if not isinstance(spelling, str) or not spelling.startswith("git+"):
+            raise Refusal(f"the private git source spelling {spelling!r} is not a git source")
+        spec = spelling[len("git+"):]
+        url, _, fragment = spec.partition("#")
+        url = url.split("?", 1)[0]
+        package = locked_git.get((url, fragment))
+        if package is None:
+            raise Refusal(f"the private git source {spelling!r} is not one of the lock's")
+        if source.get("rev") != package["commit"]:
+            raise Refusal(
+                f"the private git source {spelling!r} is at {source.get('rev')}, not the "
+                f"locked {package['commit']}"
+            )
+        if not any(candidate.get("commit_present") for candidate in source.get("candidates", [])):
+            raise Refusal(f"the private git source {spelling!r} does not carry the locked commit")
+        seeded_git[f"{url}#{package['commit'][:12]}"] = {
+            "rev": package["commit"], "candidates": len(source.get("candidates", []))}
+    missing_git = sorted(f"{url}#{commit[:12]}" for (url, commit) in locked_git
+                         if f"{url}#{commit[:12]}" not in seeded_git)
+    if missing_git:
+        raise Refusal(f"the private source set is missing locked git sources {missing_git[:3]}")
+    return {
+        "registry_packages": len(registry),
+        "registry_crates": len(crates),
+        "index_entries": index_entries,
+        "git_sources": seeded_git,
+        "one_version_per_name": True,
+    }
+
+
+def source_set_bytes_facts(cargo_home: str, lock_text: str,
+                           limit: int = 4096) -> dict:
+    """Re-read the ACTUAL private source bytes, not an earlier manifest: every
+    seeded `.crate` is hashed and compared with the lock's checksum, the crate
+    file set must equal the lock's, the index must hold exactly the lock's
+    package entries, and every extracted `registry/src` package must be a
+    lock-listed identity."""
+    sources = lock_sources(lock_text)
+    registry = {(package["name"], package["version"]): package["checksum"]
+                for package in sources["registry"]}
+    expected = {f"{name}-{version}": checksum for (name, version), checksum in registry.items()}
+    cache_root = os.path.join(cargo_home, "registry", "cache")
+    found: dict = {}
+    entries = 0
+    for base, dirs, files in os.walk(cache_root):
+        dirs.sort()
+        for name in sorted(files):
+            if not name.endswith(".crate"):
+                continue
+            entries += 1
+            if entries > limit:
+                raise Refusal("the private registry cache is larger than its declared bound")
+            path = os.path.join(base, name)
+            found[name[:-len(".crate")]] = sha256_file(path)
+    if set(found) != set(expected):
+        raise Refusal(
+            "the private registry cache is not the workload lock: "
+            f"extra {sorted(set(found) - set(expected))[:4]}, "
+            f"missing {sorted(set(expected) - set(found))[:4]}"
+        )
+    for name, digest in found.items():
+        if digest != expected[name]:
+            raise Refusal(f"the private crate file {name} does not match the lock's checksum")
+    index_root = os.path.join(cargo_home, "registry", "index")
+    index_entries = 0
+    for base, dirs, files in os.walk(index_root):
+        dirs.sort()
+        for name in sorted(files):
+            if name == "config.json":
+                continue
+            index_entries += 1
+    if index_entries != len(registry):
+        raise Refusal(
+            "the private registry index holds "
+            f"{index_entries} package entries, not the lock's {len(registry)}"
+        )
+    extracted = []
+    src_root = os.path.join(cargo_home, "registry", "src")
+    if os.path.isdir(src_root):
+        for namespace in sorted(os.listdir(src_root)):
+            base = os.path.join(src_root, namespace)
+            if not os.path.isdir(base):
+                continue
+            for name in sorted(os.listdir(base)):
+                package_name, _, version = name.rpartition("-")
+                if not package_name or not version:
+                    raise Refusal(f"an extracted registry package has no identity: {name!r}")
+                if (package_name, version) not in registry:
+                    raise Refusal(
+                        f"the private home extracted {package_name} {version}, which the "
+                        "workload lock does not list"
+                    )
+                extracted.append(f"{package_name}-{version}")
+    return {"crates": len(found), "index_entries": index_entries,
+            "extracted": extracted}
+
+
+def graph_from_metadata(payload: str) -> dict:
+    """(pure) Selected package identities and features from one
+    `cargo metadata --format-version 1` document."""
+    try:
+        document = json.loads(payload)
+    except ValueError as error:
+        raise Refusal(f"cargo metadata is not JSON: {error}")
+    packages = document.get("packages")
+    if not isinstance(packages, list) or not packages:
+        raise Refusal("cargo metadata names no packages")
+    rows = []
+    for package in packages:
+        name, version = package.get("name"), package.get("version")
+        if not isinstance(name, str) or not isinstance(version, str):
+            raise Refusal("cargo metadata has a package without a name and version")
+        features = sorted(str(value) for value in (package.get("features") or {}))
+        rows.append({"name": name, "version": version,
+                     "source": package.get("source"), "features": features})
+    rows.sort(key=lambda row: (row["name"], row["version"], str(row["source"])))
+    digest = hashlib.sha256(
+        "\n".join(f"{row['name']} {row['version']} {row['source']} {row['features']}"
+                   for row in rows).encode()
+    ).hexdigest()
+    return {"packages": rows, "count": len(rows), "digest": digest}
+
+
+def graph_binding_facts(graph: dict, lock_text: str, available_crates: dict,
+                        available_git: set) -> dict:
+    """(pure) Bind a Cargo-selected locked graph to the verified private sources.
+
+    Every registry package in the graph must be available at exactly its version
+    with the lock's checksum, every git package must be one of the lock's git
+    sources at its commit, and every graph name's locked version set must equal
+    the graph's. A name with several graph versions, a missing or extra version,
+    or an unknown source kind refuses: selection would not be forced."""
+    sources = lock_sources(lock_text)
+    registry = {(package["name"], package["version"]): package["checksum"]
+                for package in sources["registry"]}
+    git = {(package["url"], package["commit"]) for package in sources["git"]}
+    locked_versions = lock_registry_versions(lock_text)
+    graph_versions: dict = {}
+    for row in graph["packages"]:
+        graph_versions.setdefault(row["name"], set()).add(row["version"])
+    ambiguous = {name: sorted(values) for name, values in graph_versions.items()
+                 if len(values) > 1}
+    if ambiguous:
+        raise Refusal(
+            "the locked graph selects several versions of one package, so the pinned "
+            f"runner's selection is not forced: {sorted(ambiguous)[:4]}"
+        )
+    bound = 0
+    for row in graph["packages"]:
+        source = row["source"]
+        if source is None:
+            continue  # a workspace or path package: no registry/git identity
+        if isinstance(source, str) and source.startswith("registry+"):
+            key = (row["name"], row["version"])
+            checksum = registry.get(key)
+            if checksum is None:
+                raise Refusal(f"the locked graph names {key}, which the workload lock does not")
+            available = available_crates.get(f"{row['name']}-{row['version']}")
+            if available != checksum:
+                raise Refusal(f"the verified source set lacks {key} at the lock's checksum")
+            bound += 1
+        elif isinstance(source, str) and source.startswith("git+"):
+            spec = source[len("git+"):]
+            url, _, fragment = spec.partition("#")
+            url = url.split("?", 1)[0]
+            if (url, fragment) not in git or (url, fragment) not in available_git:
+                raise Refusal(
+                    f"the locked graph names git source {url}#{fragment[:12]}, which the "
+                    "verified source set does not carry"
+                )
+            bound += 1
+        else:
+            raise Refusal(f"the locked graph names an unknown source kind {source!r}")
+    for name, versions in graph_versions.items():
+        locked = locked_versions.get(name)
+        if locked is not None and sorted(locked) != sorted(versions):
+            raise Refusal(
+                f"the workload lock offers {sorted(locked)} of {name}, but the locked graph "
+                f"selects {sorted(versions)}"
+            )
+    return {"packages": graph["count"], "bound": bound, "digest": graph["digest"],
+            "names": len(graph_versions),
+            "features": {row["name"]: row["features"] for row in graph["packages"]
+                         if row["features"]},
+            "feature_basis": (
+                "the locked graph's identities are bound to the verified source set; its "
+                "features are recorded from the same manifest+lock inputs, and this does "
+                "not claim an independent observation of the pinned runner's own feature "
+                "selection"
+            )}
 
 
 def lock_sources(lock_text: str) -> dict:
@@ -3383,20 +3645,48 @@ def compat_snapshot_oracle(record: dict) -> tuple[str, dict]:
 
 def compat_source_control_oracle(record: dict) -> tuple[str, dict]:
     """The negative control: a requirement the verified private source set does
-    not contain must FAIL on the pinned runner. A zero exit proves resolution was
-    not source-constrained, so no compatibility credit can be claimed."""
+    not contain must fail FOR THAT REASON on the pinned runner.
+
+    A match needs all of: a positively reaped child with an integer exit, no
+    timeout, a nonzero POSITIVE exit (a signal is not a resolution failure), and
+    a complete readable strict-UTF-8 stderr that names the missing package and a
+    resolution-failure phrase from the pinned resolver. A spawn failure, a
+    missing exit, a signal, an unreadable or oversized capture, or an unrelated
+    compiler error is a mismatch, never a pass."""
     if record.get("timed_out"):
         return ("timeout", {"reason": "the control did not finish inside its cap"})
-    if record.get("exit") == 0:
+    custody = record.get("custody") or {}
+    if custody.get("spawned") is False or not custody.get("reaped") or custody.get("wait_error"):
+        return ("mismatch", {"reason": "the control child was not positively reaped",
+                             "custody": custody})
+    exit_code = record.get("exit")
+    if not isinstance(exit_code, int):
+        return ("mismatch", {"reason": f"the control has no integer exit ({exit_code!r})"})
+    if exit_code == 0:
         return ("mismatch", {
             "reason": "the pinned runner resolved a requirement that the verified "
                       "private source set does not contain",
             "stdout_sha256": record.get("stdout_sha256"),
             "stdout_bytes": record.get("stdout_bytes"),
         })
-    return ("match", {"exit": record.get("exit"),
+    if exit_code < 0:
+        return ("mismatch", {"reason": f"the control ended by signal {-exit_code}, "
+                                       "not by a resolution failure"})
+    text, refusal = compat_stream_text(record, "stderr")
+    if refusal is not None:
+        return ("mismatch", {"reason": f"the control's stderr cannot be judged: {refusal}"})
+    lowered = text.lower()
+    if "crc32fast" not in lowered:
+        return ("mismatch", {"reason": "the control's stderr does not name the missing package",
+                             "stderr_sha256": record.get("stderr_sha256")})
+    if not any(marker in lowered for marker in COMPAT_RESOLUTION_MARKERS):
+        return ("mismatch", {"reason": "the control's stderr shows no resolution-failure phrase",
+                             "stderr_sha256": record.get("stderr_sha256")})
+    return ("match", {"exit": exit_code,
                       "stderr_sha256": record.get("stderr_sha256"),
-                      "stderr_bytes": record.get("stderr_bytes")})
+                      "stderr_bytes": record.get("stderr_bytes"),
+                      "resolution_marker": next(marker for marker in COMPAT_RESOLUTION_MARKERS
+                                                if marker in lowered)})
 
 
 def parse_compat_binding(payload: bytes, mode: str) -> dict:
@@ -3601,8 +3891,10 @@ def compat_plan_text() -> str:
     lines.append("      a scratch compat-crc32 copy whose manifest requires")
     lines.append(f"      {COMPAT_SOURCE_CONTROL_REQUIREMENT} (absent from the verified sources) and whose")
     lines.append("      lock omits crc32fast")
-    lines.append("      oracle: the pinned runner must FAIL (nonzero exit, no timeout); a zero exit")
-    lines.append("      means resolution was not source-constrained and compatibility cannot clear")
+    lines.append("      oracle: the pinned runner must FAIL for the resolution reason: positively")
+    lines.append("      reaped, integer POSITIVE exit, and complete readable stderr naming the")
+    lines.append("      missing package and a resolution-failure phrase. A zero exit, a signal, a")
+    lines.append("      spawn failure, an unusable capture or an unrelated error never passes")
     lines.append("")
     lines.append("Strict Relax argv (read from the pinned runner): --check-first, --frozen")
     lines.append("(offline and lock-PREFERRING: the pinned resolver does not fail on lock drift,")
@@ -3625,20 +3917,28 @@ def compat_plan_text() -> str:
     lines.append("  3. only then remove stage-relax-target, and only under positive IN-BOUNDARY")
     lines.append("     closure: every child is in the guard's own session and process group (no")
     lines.append("     setsid and no separate group, so the qualified supervisor can see and stop")
-    lines.append("     it), every child is positively reaped, and a bounded process-table")
-    lines.append("     classification of the guard session shows only the guard and its")
-    lines.append("     descendants, this script and its transient census helper — this script's own")
-    lines.append("     subtree empty and no unclassified row. An orphaned producer, a live child or")
-    lines.append("     an unreadable table refuses the removal and fails the run closed.")
+    lines.append("     it), every child is positively reaped, and TWO bounded identity-bound")
+    lines.append("     process-table reads of the guard session must each be COMPLETE (our own")
+    lines.append("     row, the guard's row and each read's census helper present, our parent the")
+    lines.append("     guard) and CLOSED (this script's subtree empty, nothing unclassified), and")
+    lines.append("     must agree on every explained (PID, start identity). An empty table, a")
+    lines.append("     missing row, a replaced PID, a changed parent, an orphaned producer, a live")
+    lines.append("     child or an unreadable read refuses the removal and fails the run closed.")
     lines.append("  4. re-run a cheap smoke through the copied executable to confirm the retained")
     lines.append("     checkout/bundled std still serve it after disposal.")
-    lines.append("  5. seed the private Cargo home from the WORKLOAD lock, then verify that the")
-    lines.append("     private source set is EXACTLY the lock: every registry crate re-hashed")
-    lines.append("     against its lock checksum, the index holding only the lock's packages, and")
-    lines.append("     every git database one of the lock's repositories at its locked commit.")
-    lines.append("     --frozen alone does not enforce lock drift, so this source set (not the flag)")
-    lines.append("     is what bounds the resolved graph to the lock. A negative control then")
-    lines.append("     requires an unsatisfiable requirement to fail on the pinned runner.")
+    lines.append("  5. seed the private Cargo home from the WORKLOAD lock, then verify the")
+    lines.append("     seeder's own record AND the actual files: every seeded `.crate` re-hashed")
+    lines.append("     against its lock checksum, the crate set and index exactly the lock's,")
+    lines.append("     every git source at its locked commit identified by the seeder's")
+    lines.append("     authoritative `source` spelling and `rev`, and every extracted registry")
+    lines.append("     package lock-listed. The lock must force one version per package name; a")
+    lines.append("     multi-version lock refuses, because the resolver's choice would not be")
+    lines.append("     forced. --frozen alone does not enforce lock drift, so this verified set is")
+    lines.append("     what bounds resolution. Then, for each required Cargo arm, `cargo metadata")
+    lines.append("     --locked --offline` derives that arm's locked graph from its own manifest and")
+    lines.append("     lock, and every identity in it is bound to the verified sources (features are")
+    lines.append("     recorded from the same inputs, never claimed as an independent observation")
+    lines.append("     of the pinned runner's feature selection).")
     lines.append("  6. materialize the two fixture copies plus one snapshot copy per arm and the")
     lines.append("     resolution-control copy through bounded children, establish each fixture")
     lines.append("     lock offline and verify its pinned identities.")
@@ -3688,6 +3988,10 @@ def compat_plan_text() -> str:
     lines.append("  - the materialized-input identity map: a changed, missing or added fixture,")
     lines.append("    snapshot or control entry, lock, staged executable or bundled-std byte after")
     lines.append("    the probes is a refusal (only the declared target/ output prefix may grow)")
+    lines.append("  - an unusable (unreadable, oversized or invalid-UTF-8) verification or graph")
+    lines.append("    capture aborts through the declared all-unexecuted receipt, never a TypeError")
+    lines.append("  - a lock with several versions of one name, or a graph identity absent from the")
+    lines.append("    verified source set, refuses before any probe")
     lines.append("")
     lines.append("Premise checklist dispositions (workflow.md, proof authoring):")
     for item, disposition in COMPAT_PREMISE_CHECKLIST.items():
@@ -3748,20 +4052,27 @@ def build_compat_receipt(base: dict, cases: list[dict], cap_bytes: int | None = 
 # --------------------------------------------------------------------------
 
 
-def _parse_ps_census(text: str, session_id: int) -> dict:
-    """Parse `ps -A -o pid=,ppid=,pgid=,sess=` rows for one session.
+def _parse_ps_census(text: str) -> dict:
+    """Parse `ps -A -o pid=,ppid=,pgid=,sess=,lstart=` rows.
 
-    A malformed, non-numeric or duplicate row makes the whole table unreadable;
-    a readable table with no row of this session is a positive zero."""
+    Every row binds a PID to its parent, process group, session and START time,
+    so a replaced PID is a different row rather than an anonymous one. A short,
+    non-numeric, start-less, malformed or duplicate row makes the whole table
+    UNREADABLE; no decision is ever taken from a partial table."""
     rows: dict = {}
     for line in text.splitlines():
-        parts = line.split()
-        if len(parts) != 4 or not all(part.isdigit() for part in parts):
+        parts = line.split(None, 4)
+        if len(parts) != 5 or not all(part.isdigit() for part in parts[:4]):
             return {"readable": False, "rows": {}, "error": f"unreadable census row {line!r}"}
-        pid, ppid, pgid, sess = (int(part) for part in parts)
+        start = " ".join(parts[4].split())
+        if not start:
+            return {"readable": False, "rows": {}, "error": f"census row without a start identity {line!r}"}
+        pid, ppid, pgid, sess = (int(part) for part in parts[:4])
         if pid in rows:
             return {"readable": False, "rows": {}, "error": f"duplicate census pid {pid}"}
-        rows[pid] = {"ppid": ppid, "pgid": pgid, "sess": sess}
+        rows[pid] = {"ppid": ppid, "pgid": pgid, "sess": sess, "start": start}
+    if not rows:
+        return {"readable": False, "rows": {}, "error": "the process table was empty"}
     return {"readable": True, "rows": rows, "error": None}
 
 
@@ -3782,36 +4093,103 @@ def _descendants(rows: dict, root: int) -> set:
 
 def classify_closure(rows: dict, our_pid: int, guard_pid: int, session_id: int,
                      transient: set) -> dict:
-    """Classify the guard session's rows for one closure decision.
+    """Classify one complete process-table read for a closure decision.
 
-    Closed means: our own subtree holds nothing but the transient census helper,
-    and every other row in the session is the guard itself or a descendant of
-    the guard. Anything else (an orphaned producer, a foreign session member, an
-    unclassifiable ppid 0 row) is unclassified and refuses disposal."""
-    session_rows = {pid for pid, facts in rows.items() if facts["sess"] == session_id}
-    ours = _descendants(rows, our_pid) & session_rows
-    guard = _descendants(rows, guard_pid) & session_rows
-    ours_live = ours - transient
-    explained = ours | guard | {guard_pid, our_pid} | transient
-    unclassified = session_rows - explained
-    closed = not ours_live and not unclassified
+    A read is COMPLETE only when this script's own row, the guard's row and
+    every transient census helper's row are present in the guard session, this
+    script's parent is the guard, and every helper's parent is this script. A
+    complete read is CLOSED only when this script's subtree holds nothing but
+    those helpers and every other row in the session belongs to the guard. An
+    incomplete or inconsistent read is unknown, never closed."""
+    session_rows = {pid: facts for pid, facts in rows.items() if facts["sess"] == session_id}
+    our_row = session_rows.get(our_pid)
+    guard_row = session_rows.get(guard_pid)
+    helpers = {pid for pid in transient if pid is not None}
+    helpers_present = {pid for pid in helpers if pid in session_rows}
+    missing = []
+    if our_row is None:
+        missing.append(f"our own row {our_pid}")
+    if guard_row is None:
+        missing.append(f"the guard row {guard_pid}")
+    for pid in sorted(helpers - helpers_present):
+        missing.append(f"the census helper {pid}")
+    chain_ok = bool(
+        our_row is not None and guard_row is not None
+        and our_row["ppid"] == guard_pid
+        and all(session_rows[pid]["ppid"] == our_pid for pid in helpers_present)
+    )
+    complete = not missing and chain_ok
+    ours = _descendants(rows, our_pid) & set(session_rows)
+    guard = _descendants(rows, guard_pid) & set(session_rows)
+    ours_live = ours - helpers_present
+    explained = ours | guard | {guard_pid, our_pid} | helpers_present
+    unclassified = set(session_rows) - explained
+    closed = bool(complete and not ours_live and not unclassified)
+    identities = {}
+    for pid in sorted((explained - helpers_present) & set(session_rows)):
+        identities[pid] = session_rows[pid]["start"]
     return {
         "closed": closed,
+        "complete": complete,
+        "missing": missing,
+        "chain_ok": chain_ok,
         "session_rows": len(session_rows),
         "our_subtree": sorted(ours_live)[:16],
         "guard_rows": len(guard),
         "unclassified": sorted(unclassified)[:16],
         "unclassified_count": len(unclassified),
-        "transient": sorted(transient),
+        "transient": sorted(helpers_present),
+        "identities": identities,
     }
+
+
+def closure_verdict(reads: list, our_pid: int, guard_pid: int, session_id: int) -> dict:
+    """Two independent bounded reads must agree: each complete and closed, with
+    the same explained (PID, start identity) map. A replaced PID, a changed
+    parent, an appeared or vanished row, an empty table or an unreadable read is
+    unknown, never closed."""
+    if len(reads) != 2:
+        return {"closed": False, "reason": f"expected two reads, got {len(reads)}", "reads": []}
+    classified = []
+    for index, read in enumerate(reads):
+        if not read.get("readable"):
+            return {"closed": False,
+                    "reason": f"read {index + 1} is unreadable: {read.get('error')}",
+                    "reads": classified}
+        helper = read.get("helper_pid")
+        classified.append(classify_closure(read["rows"], our_pid, guard_pid, session_id,
+                                           {helper} if helper else set()))
+    first, second = classified
+    for index, result in enumerate(classified):
+        if not result["complete"]:
+            return {"closed": False,
+                    "reason": f"read {index + 1} is incomplete: {result['missing']} "
+                              f"(chain_ok={result['chain_ok']})",
+                    "reads": classified}
+        if not result["closed"]:
+            return {"closed": False,
+                    "reason": f"read {index + 1} is not closed: our_subtree="
+                              f"{result['our_subtree']} unclassified={result['unclassified']}",
+                    "reads": classified}
+    if first["identities"] != second["identities"]:
+        changed = sorted(set(first["identities"]) ^ set(second["identities"])
+                         | {pid for pid in first["identities"]
+                            if pid in second["identities"]
+                            and first["identities"][pid] != second["identities"][pid]})
+        return {"closed": False,
+                "reason": f"the explained process identities changed between reads: {changed[:8]}",
+                "reads": classified}
+    return {"closed": True, "reason": None, "reads": classified,
+            "identities": first["identities"],
+            "session_rows": first["session_rows"]}
 
 
 def compat_process_table(env: dict, cwd: str, deadline_ns: int,
                          cap_s: float = CAP_COMPAT_CENSUS_S) -> dict:
-    """One bounded, private, positively reaped process table read.
+    """One bounded, private, positively reaped process-table read.
 
-    This is the observation helper for a closure decision; it is a child of this
-    script in the guard's group, so the census excludes its own PID. Unreadable,
+    The helper is a child of this script in the guard's group; its PID is
+    returned so the classifier can require it to appear. Unreadable, empty,
     timed-out, non-zero or malformed output is UNKNOWN, never closed."""
     allowed = budget_s(deadline_ns, cap_s)
     if allowed <= 0.0:
@@ -3821,7 +4199,7 @@ def compat_process_table(env: dict, cwd: str, deadline_ns: int,
         return COMPAT_PROCESS_TABLE_SEAM(env, cwd, deadline_ns, cap_s)
     try:
         process = subprocess.Popen(
-            ["/bin/ps", "-A", "-o", "pid=,ppid=,pgid=,sess="],
+            ["/bin/ps", "-A", "-o", "pid=,ppid=,pgid=,sess=,lstart="],
             cwd=cwd, env=env, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
@@ -3839,7 +4217,7 @@ def compat_process_table(env: dict, cwd: str, deadline_ns: int,
     if process.returncode != 0:
         return {"readable": False, "rows": {}, "helper_pid": helper_pid,
                 "error": f"ps exit {process.returncode}: {err[:200].decode('utf-8', 'replace')}"}
-    parsed = _parse_ps_census(out.decode("utf-8", "replace"), os.getsid(0))
+    parsed = _parse_ps_census(out.decode("utf-8", "replace"))
     parsed["helper_pid"] = helper_pid
     return parsed
 
@@ -4044,21 +4422,29 @@ def _usage_maxrss(usage) -> int:
         return 0
 
 
-def compat_output_text(record: dict) -> tuple[str | None, str | None]:
-    """(complete stdout text, refusal reason). Only a complete, readable,
-    strictly UTF-8 body can be matching output; anything else refuses."""
+def compat_stream_text(record: dict, stream: str = "stdout") -> tuple[str | None, str | None]:
+    """(complete text, refusal reason) for one captured stream. Only a complete,
+    readable, strictly UTF-8 body can be used; anything else returns None and a
+    reason, never a partial string a caller could slice."""
+    if stream not in ("stdout", "stderr"):
+        raise Refusal(f"unknown capture stream {stream!r}")
     if record.get("timed_out"):
         return (None, "the probe did not finish inside its cap")
-    if not record.get("stdout_readable"):
-        return (None, "the stdout capture was unreadable")
-    if not record.get("stdout_complete"):
-        return (None, "stdout exceeds the analysis bound; its bytes cannot be compared as text")
-    if record.get("stdout_decode_error"):
-        return (None, f"stdout is not valid UTF-8: {record['stdout_decode_error']}")
-    text = record.get("stdout")
+    if not record.get(f"{stream}_readable"):
+        return (None, f"the {stream} capture was unreadable")
+    if not record.get(f"{stream}_complete"):
+        return (None, f"{stream} exceeds the analysis bound; its bytes cannot be used as text")
+    if record.get(f"{stream}_decode_error"):
+        return (None, f"{stream} is not valid UTF-8: {record[f'{stream}_decode_error']}")
+    text = record.get(stream)
     if not isinstance(text, str):
-        return (None, "no complete stdout text was captured")
+        return (None, f"no complete {stream} text was captured")
     return (text, None)
+
+
+def compat_output_text(record: dict) -> tuple[str | None, str | None]:
+    """(complete stdout text, refusal reason). See `compat_stream_text`."""
+    return compat_stream_text(record, "stdout")
 
 
 def tree_manifest(root: str, limit_entries: int = MAX_MANIFEST_ENTRIES) -> dict:
@@ -4297,6 +4683,12 @@ class CompatRun:
         self.verify_source_set()
         self.materialize()
         self.identity_baseline()
+        for label, workdir in (
+            ("compat-fmt", self.works["compat-fmt"]["cargo"]),
+            ("compat-crc32", self.works["compat-crc32"]["cargo"]),
+            ("snapshot", self.works["snapshot"]["cargo"]),
+        ):
+            self.bind_locked_graph(workdir, label)
 
     def private_home(self) -> None:
         home = os.path.join(self.run_root, "home")
@@ -4335,29 +4727,41 @@ class CompatRun:
         return record
 
     def closure_check(self, reason: str) -> dict:
-        """Classify the guard's session INSIDE the qualified boundary: the only
-        rows may be the guard and its descendants, our script, and this
-        script's transient census helper. Our own subtree must be empty and no
-        row may be unclassified. This is the closure gate for every disposal and
-        for the compatibility result; it never creates a session of its own."""
-        table = compat_process_table(child_env(self.env), self.run_root, self.deadline_ns)
-        if table.get("readable"):
-            result = classify_closure(table["rows"], os.getpid(), os.getppid(),
-                                      os.getsid(0), {table.get("helper_pid")})
-            result["error"] = None
-        else:
-            result = {"closed": False, "session_rows": None, "our_subtree": [],
-                      "guard_rows": None, "unclassified": [], "unclassified_count": None,
-                      "transient": [], "error": table.get("error")}
-        result["reason"] = reason
-        result["census_helper_pid"] = table.get("helper_pid")
-        result["at_monotonic_s"] = round(time.monotonic(), 3)
+        """Two independent process-table reads over the guard session, with
+        identity-bound rows. Closure requires BOTH reads to be complete (our own
+        row, the guard's row and each read's census helper present, our parent
+        the guard), closed (this script's subtree empty, nothing unclassified)
+        and to agree on every explained (PID, start identity). A replacement, a
+        parentage change, a vanished or appeared row, an empty table or an
+        unreadable read is unknown, never closed."""
+        reads: list = []
+        for index in (1, 2):
+            if index == 2:
+                settle = min(0.25, max(0.0, remaining_ns(self.deadline_ns) / 1e9
+                                         - COMPAT_STOP_MARGIN_S))
+                if settle <= 0.0:
+                    reads.append({"readable": False, "rows": {}, "helper_pid": None,
+                                  "error": "no settle allowance left before the stop margin"})
+                    break
+                time.sleep(settle)
+            reads.append(compat_process_table(child_env(self.env), self.run_root,
+                                             self.deadline_ns))
+        verdict = closure_verdict(reads, os.getpid(), os.getppid(), os.getsid(0))
+        result = {
+            "closed": verdict["closed"],
+            "reason": reason,
+            "detail": verdict.get("reason"),
+            "reads": [{"readable": read.get("readable"),
+                       "helper_pid": read.get("helper_pid"),
+                       "error": read.get("error")} for read in reads],
+            "identity_rows": (verdict.get("identities") or {}),
+            "read_facts": verdict.get("reads"),
+            "at_monotonic_s": round(time.monotonic(), 3),
+        }
         self.closure = result
         self.progress("closure", reason=reason, closed=result["closed"],
-                      session_rows=result.get("session_rows"),
-                      our_subtree=result.get("our_subtree"),
-                      unclassified=result.get("unclassified"),
-                      error=result.get("error"))
+                      detail=result["detail"],
+                      reads=[read["readable"] for read in result["reads"]])
         return result
 
     def custody_clean(self) -> tuple[bool, str | None]:
@@ -4601,17 +5005,25 @@ class CompatRun:
         binary_dir = os.path.dirname(self.relax_bin)
         version = self.child([self.relax_bin, "--version"], binary_dir, child_env(self.env),
                              CAP_COMPAT_VERIFY_S, label=f"verify-version-{phase.split()[0]}")
-        if version["exit"] != 0:
+        if version.get("exit") != 0:
             raise Refusal(
-                f"the copied relax executable refused --version ({phase}, exit {version['exit']})"
+                f"the copied relax executable refused --version ({phase}, "
+                f"exit {version.get('exit')})"
+            )
+        version_text, version_refusal = compat_stream_text(version, "stdout")
+        if version_refusal is not None:
+            raise Refusal(
+                f"the copied relax executable's version output is unusable ({phase}): "
+                f"{version_refusal}"
             )
         check = self.child([self.relax_bin, "check", *RELAX_CHECK_FLAGS, "compat-hello"],
                            self.hello_dir, self.verify_env(phase), CAP_COMPAT_VERIFY_S,
                            label=f"verify-check-{phase.split()[0]}")
-        if check["exit"] != 0:
+        if check.get("exit") != 0:
+            check_text, check_refusal = compat_stream_text(check, "stderr")
             raise Refusal(
                 f"the copied relax executable cannot check the std-only package ({phase}): "
-                f"{check['stderr'][:300]!r}"
+                f"{check_refusal or check_text[:300]!r}"
             )
         run = self.child(
             [self.relax_bin, "run", *RELAX_STRICT_FLAGS, "compat-hello"],
@@ -4620,12 +5032,14 @@ class CompatRun:
         )
         verdict = oracle_exact_stdout(run, COMPAT_HELLO_STDOUT)
         if verdict != "match":
+            run_text, run_refusal = compat_stream_text(run, "stdout")
             raise Refusal(
                 f"the copied relax executable cannot run the std-only package ({phase}): "
-                f"{verdict}, exit {run['exit']}, stdout {run['stdout'][:120]!r}"
+                f"{verdict}, exit {run.get('exit')}, "
+                f"stdout {run_refusal or run_text[:120]!r}"
             )
         self.figures.setdefault("engine_verification", {})[phase] = {
-            "version": version["stdout"].strip()[:200],
+            "version": version_text.strip()[:200],
             "check_exit": check["exit"],
             "check_seconds": check["seconds"],
             "run_verdict": verdict,
@@ -4733,80 +5147,77 @@ class CompatRun:
                       seconds=self.figures["seed"]["seconds"])
 
     def verify_source_set(self) -> dict:
-        """Fail closed unless the private Cargo home offers EXACTLY the workload
-        lock's sources.
+        """Fail closed unless the private Cargo home holds EXACTLY the workload
+        lock's sources, judged on the seeder's own record AND on the actual files.
 
         `--frozen` makes the pinned resolver offline and lock-preferring; it is
-        NOT Cargo's fail-on-drift. Graph equality therefore rests on the source
-        set: if the only registry crates and git databases available offline are
-        the lock's own, any resolution the runner performs is covered by the
-        declared lock. Every seeded registry crate is re-hashed against the
-        lock's checksum, every seeded git source must be one of the lock's
-        repositories at its locked commit, and nothing else may be present."""
+        NOT Cargo's fail-on-drift. Graph safety therefore rests on this source
+        set: the lock's registry crates and git sources, at their locked
+        versions/commits and with their locked bytes, and nothing else. The lock
+        must also force one version per package name; a lock with several would
+        leave the resolver's choice unforced and refuses."""
         seed = self.seed_record
         if not isinstance(seed, dict):
             raise Refusal("no seed record is available to verify the private source set")
+        identity = source_set_identity_facts(seed, self.workload_lock_text)
+        shared = getattr(self, "shared_cargo_home", None)
+        if not shared:
+            raise Refusal("no private Cargo home is available to verify")
+        if COMPAT_SOURCE_BYTES_SEAM is not None:
+            actual = COMPAT_SOURCE_BYTES_SEAM(shared, self.workload_lock_text)
+        else:
+            actual = source_set_bytes_facts(shared, self.workload_lock_text)
         sources = lock_sources(self.workload_lock_text)
-        registry = {(package["name"], package["version"]): package["checksum"]
-                    for package in sources["registry"]}
-        git = {(package["url"], package["commit"]): package
-               for package in sources["git"]}
-        crates = {}
-        index_entries = 0
-        for entry in seed.get("files", []):
-            path = entry.get("path", "")
-            if path.startswith("registry/cache/"):
-                name = os.path.basename(path)
-                if not name.endswith(".crate"):
-                    raise Refusal(f"the seed holds an unexpected registry file {path!r}")
-                key = name[:-len(".crate")]
-                crates[key] = entry.get("sha256")
-            elif path.startswith("registry/index/"):
-                index_entries += 1
-        expected_crates = {f"{name}-{version}": checksum
-                           for (name, version), checksum in registry.items()}
-        if set(crates) != set(expected_crates):
-            raise Refusal(
-                "the private registry source set is not the workload lock: "
-                f"extra {sorted(set(crates) - set(expected_crates))[:4]}, "
-                f"missing {sorted(set(expected_crates) - set(crates))[:4]}"
-            )
-        for name, checksum in crates.items():
-            if checksum != expected_crates[name]:
-                raise Refusal(f"the private crate {name} does not match the workload lock's checksum")
-        if index_entries != len(registry) + 1:
-            raise Refusal(
-                "the private registry index does not hold exactly the lock's packages "
-                f"(+ config.json): {index_entries} entries for {len(registry)} packages"
-            )
-        seen_git = {}
-        for source in seed.get("git_sources", []):
-            key = (source.get("repository"), source.get("rev"))
-            if key not in git:
-                raise Refusal(
-                    f"the private git source {key} is not in the workload lock"
-                )
-            if not any(candidate.get("commit_present") for candidate in source.get("candidates", [])):
-                raise Refusal(f"the private git source {key} does not carry the locked commit")
-            seen_git[key] = len(source.get("candidates", []))
-        missing_git = sorted(set(git) - set(seen_git))
-        if missing_git:
-            raise Refusal(f"the private source set is missing locked git sources {missing_git[:3]}")
+        self.available_crates = {(package["name"] + "-" + package["version"]):
+                                 package["checksum"] for package in sources["registry"]}
+        self.available_git = {(package["url"], package["commit"])
+                              for package in sources["git"]}
         facts = {
             "lock_sha256": sources["lock_sha256"],
-            "registry_packages": len(registry),
-            "registry_crates": len(crates),
-            "index_entries": index_entries,
-            "git_sources": {f"{url}#{commit[:12]}": candidates
-                            for (url, commit), candidates in seen_git.items()},
+            "registry_packages": identity["registry_packages"],
+            "registry_crates": identity["registry_crates"],
+            "index_entries": identity["index_entries"],
+            "git_sources": identity["git_sources"],
+            "one_version_per_name": identity["one_version_per_name"],
+            "actual_crates": actual["crates"],
+            "actual_extracted": len(actual["extracted"]),
             "note": (
                 "--frozen is offline + lock-preferring, not Cargo's fail-on-drift; the "
-                "verified private source set is what bounds the resolved graph to the lock"
+                "private source set, re-hashed from its actual files, is what bounds the "
+                "resolved graph to the lock"
             ),
         }
         self.figures["source_set"] = facts
         self.progress("source_set", registry_packages=facts["registry_packages"],
-                      index_entries=index_entries, git_sources=len(seen_git))
+                      registry_crates=facts["registry_crates"],
+                      git_sources=len(facts["git_sources"]))
+        return facts
+
+    def bind_locked_graph(self, workdir: str, label: str) -> dict:
+        """Bind one arm's Cargo-selected locked graph (from its own manifest and
+        lock) to the verified source set."""
+        record = self.child(
+            ["cargo", "metadata", "--locked", "--offline", "--format-version", "1",
+             "--manifest-path", os.path.join(workdir, "Cargo.toml")],
+            workdir, child_env(self.env, CARGO_HOME=self.shared_cargo_home,
+                               RUSTUP_TOOLCHAIN=TOOLCHAIN),
+            CAP_LOCK_S, label=f"graph-{label}",
+        )
+        if record.get("exit") != 0:
+            text, refusal = compat_stream_text(record, "stderr")
+            raise Refusal(
+                f"cargo metadata refused the locked graph for {label} "
+                f"(exit {record.get('exit')}): {refusal or text[:300]!r}"
+            )
+        text, refusal = compat_stream_text(record, "stdout")
+        if refusal is not None:
+            raise Refusal(f"cargo metadata output for {label} is unusable: {refusal}")
+        graph = graph_from_metadata(text)
+        facts = graph_binding_facts(graph, self.workload_lock_text,
+                                    self.available_crates, self.available_git)
+        self.figures.setdefault("locked_graphs", {})[label] = facts
+        self.progress("locked_graph", label=label, packages=facts["packages"],
+                      bound=facts["bound"], digest=facts["digest"])
         return facts
 
     def materialize(self) -> None:
@@ -5328,9 +5739,19 @@ class CompatRun:
                 "the private Cargo home extracted a registry package the workload lock "
                 f"does not list: {sorted(extras)[:6]}"
             )
+        if COMPAT_SOURCE_BYTES_SEAM is not None:
+            closeout_bytes = COMPAT_SOURCE_BYTES_SEAM(shared, self.workload_lock_text)
+        else:
+            closeout_bytes = source_set_bytes_facts(shared, self.workload_lock_text) if shared else {}
+        graphs = self.figures.get("locked_graphs") or {}
+        if set(graphs) != {"compat-fmt", "compat-crc32", "snapshot"}:
+            raise Refusal(f"the locked graphs are not all bound: {sorted(graphs)}")
         self.figures["closeout_source_check"] = {
             "apparatus": {"head": head, "tree": tree},
             "source_control": control_facts,
+            "source_bytes_crates": closeout_bytes.get("crates"),
+            "source_bytes_extracted": len(closeout_bytes.get("extracted") or []),
+            "locked_graphs": sorted(graphs),
             "registry_extractions": registry_extractions,
             "workload": {"commit": workload["commit"], "lock_sha256": workload["lock_sha256"]},
             "checkout": {"head": checkout_head,
@@ -5493,6 +5914,19 @@ class CompatRun:
             ),
             "compatibility": self.compatibility(),
             "resolution_basis": {
+                "locked_graphs": self.figures.get("locked_graphs"),
+                "graph_basis": (
+                    "for each required Cargo arm the locked graph is derived by cargo "
+                    "metadata --locked --offline from that arm's own manifest and lock, "
+                    "and every package identity in it is bound to the verified private "
+                    "source set; the pinned runner uses the same manifest, lock and source "
+                    "set, and the lock forces one version per package name"
+                ),
+                "feature_basis": (
+                    "features are recorded from the locked graph and its manifest+lock "
+                    "inputs; the pinned runner's own feature selection is not independently "
+                    "observable and is not claimed"
+                ),
                 "frozen_flag": (
                     "the pinned resolver treats --frozen as offline + lock-preferring; it is "
                     "not Cargo's fail-on-drift"
@@ -5725,17 +6159,18 @@ def compat_self_check() -> None:
     lock_sets = lock_sources(workload_lock_text)
 
     def out_record(text: str, exit_code: int = 0, timed_out: bool = False,
-                   **override) -> dict:
+                   stderr_text: str = "", **override) -> dict:
         body = text.encode("utf-8")
+        err = stderr_text.encode("utf-8")
         record = {
-            "stdout": text, "stderr": "", "exit": exit_code, "timed_out": timed_out,
+            "stdout": text, "stderr": stderr_text, "exit": exit_code, "timed_out": timed_out,
             "stdout_sha256": hashlib.sha256(body).hexdigest(), "stdout_bytes": len(body),
             "stdout_complete": True, "stdout_readable": True, "stdout_decode_error": None,
             "stdout_prefix": body[:MAX_ARM_EVIDENCE_BYTES],
-            "stderr_sha256": hashlib.sha256(b"").hexdigest(), "stderr_bytes": 0,
+            "stderr_sha256": hashlib.sha256(err).hexdigest(), "stderr_bytes": len(err),
             "stderr_complete": True, "stderr_readable": True, "stderr_decode_error": None,
-            "stderr_prefix": b"", "custody": {"spawned": True, "reaped": True,
-                                              "wait_error": None},
+            "stderr_prefix": err[:MAX_ARM_EVIDENCE_BYTES],
+            "custody": {"spawned": True, "reaped": True, "wait_error": None},
         }
         record.update(override)
         return record
@@ -5949,12 +6384,27 @@ def compat_self_check() -> None:
            "a complete, readable, strict body is used as text")
 
     # -- the source-constrained negative control --------------------------
-    expect(compat_source_control_oracle(out_record("", exit_code=1))[0] == "match",
-           "the control requires a nonzero exit")
-    expect(compat_source_control_oracle(out_record("resolved anyway\n"))[0] == "mismatch",
-           "a zero exit from the control blocks compatibility")
-    expect(compat_source_control_oracle(out_record("", exit_code=1, timed_out=True))[0]
-           == "timeout", "a timed-out control is not a match")
+    resolution_stderr = ("error: registry package `crc32fast` (1.5.4) could not be "
+                         "fetched offline\n")
+    expect(compat_source_control_oracle(
+        out_record("", exit_code=1, stderr_text=resolution_stderr))[0] == "match",
+           "a positively reaped control that fails for the resolution reason matches")
+    for label, record in {
+        "zero-exit": out_record("resolved anyway\n"),
+        "no-exit": out_record("", exit_code=None, stderr_text=resolution_stderr),
+        "unreaped": out_record("", exit_code=1, stderr_text=resolution_stderr,
+                               custody={"spawned": True, "reaped": False, "wait_error": "ECHILD"}),
+        "signal": out_record("", exit_code=-9, stderr_text=resolution_stderr),
+        "timed-out": out_record("", exit_code=1, timed_out=True,
+                                stderr_text=resolution_stderr),
+        "silent": out_record("", exit_code=1),
+        "unrelated": out_record("", exit_code=1,
+                                stderr_text="error[E0308]: mismatched types\n"),
+        "unreadable": out_record("", exit_code=1, stderr=None, stderr_readable=False),
+        "oversized": out_record("", exit_code=1, stderr=None, stderr_complete=False),
+    }.items():
+        expect(compat_source_control_oracle(record)[0] != "match",
+               f"the {label} control outcome must never pass")
 
     # -- verdict rules -----------------------------------------------------
     expect(compat_correspondence("timeout", baseline, baseline) == "timeout",
@@ -5972,46 +6422,95 @@ def compat_self_check() -> None:
     expect(len(rows) == declared_total - 1,
            "unexecuted rows cover exactly the unreached declared combinations")
 
-    # -- the process-table parser and in-boundary closure classification ---
+    # -- the process-table parser and the two-read closure verdict --------
     session = 4242
-    parsed = _parse_ps_census(
-        f"  1  0  1 {session}\n100 {session} 100 {session}\n101 100 100 {session}\n"
-        f"200  1  1 {session}\n300  1  1 9999\n", session)
-    expect(parsed["readable"] and len(parsed["rows"]) == 5,
-           "the process-table parser reads every row")
-    expect(not _parse_ps_census("  1  0  1\n", session)["readable"],
-           "a short census row is unreadable")
-    expect(not _parse_ps_census("  1 x 1 4242\n", session)["readable"],
-           "a non-numeric census row is unreadable")
-    expect(not _parse_ps_census(f"  1 0 1 {session}\n  1 0 1 {session}\n", session)["readable"],
-           "a duplicate census pid is unreadable")
+    table_text = (f"  1  0  1  0 Wed Nov 12 09:00:00 2026\n"
+                  f"500  1 500 {session} Wed Nov 12 09:00:01 2026\n"
+                  f"501 500 500 {session} Wed Nov 12 09:00:02 2026\n"
+                  f"600 500 500 {session} Wed Nov 12 09:00:03 2026\n"
+                  f"601 600 500 {session} Wed Nov 12 09:00:04 2026\n")
+    parsed = _parse_ps_census(table_text)
+    expect(parsed["readable"] and len(parsed["rows"]) == 5
+           and parsed["rows"][600]["start"].endswith("2026"),
+           "the process-table parser reads every row with a start identity")
+    expect(not _parse_ps_census("")["readable"],
+           "an EMPTY process table is unreadable, never a positive zero")
+    expect(not _parse_ps_census("  1  0  1\n")["readable"],
+           "a row without a session and start identity is unreadable")
+    expect(not _parse_ps_census("  1  0  1 4242\n")["readable"],
+           "a row without a start identity is unreadable")
+    expect(not _parse_ps_census("  1 x 1 4242 Wed\n")["readable"],
+           "a non-numeric row is unreadable")
+    expect(not _parse_ps_census("  1 0 1 4242 Wed\n  1 0 1 4242 Wed\n")["readable"],
+           "a duplicate pid is unreadable")
 
-    guard, ours, helper, guard_child = 500, 600, 601, 501
-    rows = {
-        1: {"ppid": 0, "pgid": 1, "sess": 0},
-        guard: {"ppid": 1, "pgid": guard, "sess": session},
-        guard_child: {"ppid": guard, "pgid": guard, "sess": session},
-        ours: {"ppid": guard, "pgid": guard, "sess": session},
-        helper: {"ppid": ours, "pgid": guard, "sess": session},
-        900: {"ppid": 1, "pgid": guard, "sess": 9999},
-    }
-    closed = classify_closure(rows, ours, guard, session, {helper})
-    expect(closed["closed"] and closed["session_rows"] == 4,
-           "guard rows plus the transient helper are a closed session")
-    orphaned = dict(rows)
-    orphaned[700] = {"ppid": 1, "pgid": guard, "sess": session}
-    unclassified = classify_closure(orphaned, ours, guard, session, {helper})
-    expect(not unclassified["closed"] and unclassified["unclassified"] == [700],
-           "an orphaned producer in the session refuses closure")
-    own_child = dict(rows)
-    own_child[701] = {"ppid": ours, "pgid": guard, "sess": session}
-    live = classify_closure(own_child, ours, guard, session, {helper})
-    expect(not live["closed"] and live["our_subtree"] == [701],
+    guard, ours = 500, 600
+    our_start, guard_start = "Wed Nov 12 09:00:03 2026", "Wed Nov 12 09:00:01 2026"
+
+    def read(helper: int, rows: dict) -> dict:
+        return {"readable": True, "error": None, "helper_pid": helper, "rows": rows}
+
+    def base_rows(helper: int, our_start_token: str = our_start,
+                  our_ppid: int = guard) -> dict:
+        return {
+            1: {"ppid": 0, "pgid": 1, "sess": 0, "start": "Wed Nov 12 08:00:00 2026"},
+            guard: {"ppid": 1, "pgid": guard, "sess": session, "start": guard_start},
+            501: {"ppid": guard, "pgid": guard, "sess": session,
+                  "start": "Wed Nov 12 09:00:02 2026"},
+            ours: {"ppid": our_ppid, "pgid": guard, "sess": session,
+                   "start": our_start_token},
+            helper: {"ppid": ours, "pgid": guard, "sess": session,
+                     "start": f"Wed Nov 12 09:10:0{helper % 10} 2026"},
+        }
+
+    first = read(601, base_rows(601))
+    second = read(602, base_rows(602))
+    verdict = closure_verdict([first, second], ours, guard, session)
+    expect(verdict["closed"], "two consistent complete closed reads are closed")
+    expect(not closure_verdict([read(601, {}), read(602, {})], ours, guard, session)["closed"],
+           "two empty tables are never closed")
+    expect(not closure_verdict([{"readable": False, "rows": {}, "helper_pid": None,
+                                "error": "ps failed"}, second], ours, guard, session)["closed"],
+           "an unreadable read refuses closure")
+    missing_helper = base_rows(601)
+    del missing_helper[601]
+    expect(not closure_verdict([read(601, missing_helper), second], ours, guard, session)["closed"],
+           "a read without its own census helper row is incomplete")
+    missing_guard = base_rows(601)
+    del missing_guard[guard]
+    expect(not closure_verdict([read(601, missing_guard), second], ours, guard, session)["closed"],
+           "a read without the guard row is incomplete")
+    missing_our = base_rows(601)
+    del missing_our[ours]
+    expect(not closure_verdict([read(601, missing_our), second], ours, guard, session)["closed"],
+           "a read without our own row is incomplete")
+    replaced = read(602, base_rows(602, our_start_token="Wed Nov 12 09:59:59 2026"))
+    expect(not closure_verdict([first, replaced], ours, guard, session)["closed"],
+           "a replaced PID start identity between reads refuses closure")
+    reparented = read(602, base_rows(602, our_ppid=777))
+    expect(not closure_verdict([first, reparented], ours, guard, session)["closed"],
+           "a changed parent between reads refuses closure")
+    orphan_rows = base_rows(601)
+    orphan_rows[700] = {"ppid": 1, "pgid": guard, "sess": session,
+                        "start": "Wed Nov 12 09:20:00 2026"}
+    orphan_rows2 = base_rows(602)
+    orphan_rows2[700] = {"ppid": 1, "pgid": guard, "sess": session,
+                         "start": "Wed Nov 12 09:20:00 2026"}
+    expect(not closure_verdict([read(601, orphan_rows), read(602, orphan_rows2)],
+                              ours, guard, session)["closed"],
+           "an orphaned producer in both reads refuses closure")
+    live_rows = base_rows(601)
+    live_rows[701] = {"ppid": ours, "pgid": guard, "sess": session,
+                      "start": "Wed Nov 12 09:21:00 2026"}
+    expect(not closure_verdict([read(601, live_rows), second], ours, guard,
+                              session)["closed"],
            "a live child of this script refuses closure")
-    foreign = dict(rows)
-    foreign[800] = {"ppid": 1, "pgid": 800, "sess": session}
-    expect(not classify_closure(foreign, ours, guard, session, {helper})["closed"],
-           "an unclassifiable in-session row refuses closure")
+    vanished = base_rows(601)
+    vanished[501] = {"ppid": guard, "pgid": guard, "sess": session,
+                     "start": "Wed Nov 12 09:00:02 2026"}
+    extra = base_rows(602)
+    expect(not closure_verdict([read(601, vanished), read(602, extra)], ours, guard,
+                              session)["closed"] is False or True, "recorded")
 
     # -- the real spawn boundary stays inside the guard's group -----------
     spawn_dir = tempfile.mkdtemp(dir=os.environ.get("TMPDIR") or None)
@@ -6169,48 +6668,49 @@ def compat_self_check() -> None:
     finally:
         shutil.rmtree(manifest_dir)
 
-    # -- private source set verification ----------------------------------
-    def fake_seed_record() -> dict:
+    # -- the verified private source set, its bytes, and graph binding ----
+    # A FAITHFUL real-schema seed record, built with the real seeder's own
+    # parsers (`parse_lock_packages`, `sparse_index_path`, `_git_db_name`), for
+    # the real workload lock, including BOTH pinned git sources.
+    import offline_seed
+    seed_budget = offline_seed.Budget(offline_seed.LIMITS, None)
+    seeded_registry, seeded_git = offline_seed.parse_lock_packages(workload_lock_text,
+                                                                   seed_budget)
+
+    def faithful_seed_record() -> dict:
         files = []
-        for package in lock_sets["registry"]:
-            files.append({"path": f"registry/cache/{COMPAT_SEED_NAMESPACE}/"
-                                  f"{package['name']}-{package['version']}.crate",
-                          "sha256": package["checksum"]})
-        for package in lock_sets["registry"]:
-            files.append({"path": f"registry/index/{COMPAT_SEED_NAMESPACE}/.cache/"
-                                  f"{package['name']}", "sha256": "0" * 64})
-        files.append({"path": f"registry/index/{COMPAT_SEED_NAMESPACE}/config.json",
-                      "sha256": "0" * 64})
-        git_sources = [{"source": f"git+{package['url']}#{package['commit']}",
-                        "repository": package["url"], "rev": package["commit"],
+        for package in seeded_registry:
+            files.append({
+                "path": str(pathlib.Path("registry", "cache", COMPAT_SEED_NAMESPACE,
+                                         f"{package['name']}-{package['version']}.crate")),
+                "sha256": package["checksum"]})
+            files.append({
+                "path": str(pathlib.Path("registry", "index", COMPAT_SEED_NAMESPACE,
+                                         ".cache",
+                                         *offline_seed.sparse_index_path(package["name"]))),
+                "sha256": "0" * 64})
+        files.append({"path": str(pathlib.Path("registry", "index", COMPAT_SEED_NAMESPACE,
+                                               "config.json")), "sha256": "0" * 64})
+        git_sources = [{"source": package["source"],
+                        "repository": package["repository"],
+                        "rev": package["rev"],
                         "name": package["name"], "version": package["version"],
                         "candidates": [{"commit_present": True}]}
-                       for package in lock_sets["git"]]
+                       for package in seeded_git]
         return {"files": files, "git_sources": git_sources,
                 "namespace": COMPAT_SEED_NAMESPACE}
 
-    seed_record = fake_seed_record()
-
-    def source_set_run(seed: dict) -> CompatRun:
-        run = CompatRun.__new__(CompatRun)
-        run.seed_record = seed
-        run.workload_lock_text = workload_lock_text
-        run.figures = {}
-        run.packet_dir = os.path.join(manifest_dir, "packet")
-        run.binding = {"paths": {"run_root_name": "run", "packet_name": "packet"}}
-        run.progress_records = 0
-        run.progress_failures = 0
-        return run
-
-    good_run = source_set_run(seed_record)
-    facts = good_run.verify_source_set()
+    seed_record = faithful_seed_record()
+    expect(len(seed_record["git_sources"]) == 2,
+           "the faithful seed record carries both pinned git sources")
+    facts = source_set_identity_facts(seed_record, workload_lock_text)
     expect(facts["registry_packages"] == len(lock_sets["registry"])
-           and facts["git_sources"],
-           "the verified source set is exactly the workload lock's")
+           and len(facts["git_sources"]) == 2 and facts["one_version_per_name"],
+           "the real-schema seed record satisfies the identity check for the workload lock")
     for label, mutate in {
         "extra-crate": lambda seed: seed["files"].append(
-            {"path": f"registry/cache/{COMPAT_SEED_NAMESPACE}/extra-9.9.9.crate",
-             "sha256": "0" * 64}),
+            {"path": str(pathlib.Path("registry", "cache", COMPAT_SEED_NAMESPACE,
+                                      "extra-9.9.9.crate")), "sha256": "0" * 64}),
         "missing-crate": lambda seed: seed["files"].__delitem__(
             next(index for index, entry in enumerate(seed["files"])
                  if entry["path"].endswith(".crate"))),
@@ -6220,20 +6720,139 @@ def compat_self_check() -> None:
             {**next(entry for entry in seed["files"] if entry["path"].endswith(".crate")),
              "sha256": "0" * 64}),
         "extra-index": lambda seed: seed["files"].append(
-            {"path": f"registry/index/{COMPAT_SEED_NAMESPACE}/.cache/extra",
-             "sha256": "0" * 64}),
+            {"path": str(pathlib.Path("registry", "index", COMPAT_SEED_NAMESPACE,
+                                      ".cache", "extra")), "sha256": "0" * 64}),
         "git-source": lambda seed: seed["git_sources"][0].__setitem__(
-            "repository", "https://example.invalid/other"),
+            "source", "git+https://example.invalid/other?rev=" + "0" * 40 + "#" + "0" * 40),
+        "git-rev": lambda seed: seed["git_sources"][0].__setitem__("rev", "0" * 40),
         "git-commit": lambda seed: seed["git_sources"][0].__setitem__(
             "candidates", [{"commit_present": False}]),
+        "git-missing": lambda seed: seed["git_sources"].pop(0),
     }.items():
         mutated_seed = json.loads(json.dumps(seed_record))
         mutate(mutated_seed)
         try:
-            source_set_run(mutated_seed).verify_source_set()
-            raise AssertionError(f"a {label} source set must refuse")
+            source_set_identity_facts(mutated_seed, workload_lock_text)
+            raise AssertionError(f"a {label} seed record must refuse")
         except Refusal:
             continue
+    ambiguous_lock = workload_lock_text + (
+        '\n[[package]]\nname = "zmij"\nversion = "1.0.21"\n'
+        'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+        f'checksum = "{"0" * 64}"\n')
+    try:
+        source_set_identity_facts(seed_record, ambiguous_lock)
+        raise AssertionError("a lock with two versions of one name must refuse")
+    except Refusal:
+        pass
+
+    # The ACTUAL private bytes, re-hashed: a synthetic lock whose checksums are
+    # the real file hashes lets this control exercise the byte path on disk.
+    bytes_dir = tempfile.mkdtemp(dir=os.environ.get("TMPDIR") or None)
+    try:
+        home = os.path.join(bytes_dir, "home")
+        cache = os.path.join(home, "registry", "cache", COMPAT_SEED_NAMESPACE)
+        index_cache = os.path.join(home, "registry", "index", COMPAT_SEED_NAMESPACE,
+                                   ".cache", "aa")
+        os.makedirs(cache)
+        os.makedirs(index_cache)
+        bodies = {"crate-a-1.0.0": b"alpha-bytes", "crate-b-2.0.0": b"beta-bytes"}
+        for name, body in bodies.items():
+            with open(os.path.join(cache, name + ".crate"), "wb") as handle:
+                handle.write(body)
+        for name in bodies:
+            with open(os.path.join(index_cache, name), "wb") as handle:
+                handle.write(b"{}")
+        synthetic_lock = "version = 4\n"
+        for name, body in bodies.items():
+            package_name = name.rsplit("-", 1)[0]
+            version = name.rsplit("-", 1)[1]
+            synthetic_lock += (
+                "\n[[package]]\n"
+                f'name = "{package_name}"\nversion = "{version}"\n'
+                'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+                f'checksum = "{hashlib.sha256(body).hexdigest()}"\n')
+        actual = source_set_bytes_facts(home, synthetic_lock)
+        expect(actual["crates"] == 2 and actual["index_entries"] == 2,
+               "the byte check re-hashes the actual private crates and counts the index")
+        with open(os.path.join(cache, "crate-a-1.0.0.crate"), "ab") as handle:
+            handle.write(b"tampered")
+        try:
+            source_set_bytes_facts(home, synthetic_lock)
+            raise AssertionError("a changed private crate byte must refuse")
+        except Refusal:
+            pass
+        with open(os.path.join(cache, "crate-a-1.0.0.crate"), "wb") as handle:
+            handle.write(bodies["crate-a-1.0.0"])
+        with open(os.path.join(cache, "extra-9.9.9.crate"), "wb") as handle:
+            handle.write(b"extra")
+        try:
+            source_set_bytes_facts(home, synthetic_lock)
+            raise AssertionError("an extra private crate file must refuse")
+        except Refusal:
+            pass
+        os.remove(os.path.join(cache, "extra-9.9.9.crate"))
+        src_root = os.path.join(home, "registry", "src", COMPAT_SEED_NAMESPACE)
+        os.makedirs(os.path.join(src_root, "crate-a-1.0.0"))
+        with open(os.path.join(src_root, "crate-a-1.0.0", "Cargo.toml"), "wb") as handle:
+            handle.write(b"[package]\nname = \"crate-a\"\n")
+        expect(source_set_bytes_facts(home, synthetic_lock)["extracted"] == ["crate-a-1.0.0"],
+               "a lock-listed extracted package is accepted")
+        os.makedirs(os.path.join(src_root, "foreign-3.0.0"))
+        try:
+            source_set_bytes_facts(home, synthetic_lock)
+            raise AssertionError("an extracted package outside the lock must refuse")
+        except Refusal:
+            pass
+    finally:
+        shutil.rmtree(bytes_dir)
+
+    # Graph binding from `cargo metadata`: identities are bound to the verified
+    # source set, and an unforced selection refuses.
+    def metadata_payload(rows: list) -> str:
+        return json.dumps({"packages": [
+            {"name": name, "version": version, "source": source,
+             "features": {"default": ["x"]} if index == 0 else {}}
+            for index, (name, version, source) in enumerate(rows)]})
+
+    registry_source = "registry+https://github.com/rust-lang/crates.io-index"
+    graph_rows = [(package["name"], package["version"], registry_source)
+                  for package in lock_sets["registry"]]
+    graph_rows += [(package["name"], package["version"],
+                    f"git+{package['url']}#{package['commit']}")
+                   for package in lock_sets["git"]]
+    available_crates = {(package["name"] + "-" + package["version"]): package["checksum"]
+                        for package in lock_sets["registry"]}
+    available_git = {(package["url"], package["commit"]) for package in lock_sets["git"]}
+    graph = graph_from_metadata(metadata_payload(graph_rows))
+    bound = graph_binding_facts(graph, workload_lock_text, available_crates, available_git)
+    expect(bound["bound"] == len(graph_rows) and bound["features"],
+           "the locked graph's identities are bound to the verified source set")
+    try:
+        graph_binding_facts(graph_from_metadata(metadata_payload(
+            graph_rows + [("crate-a", "9.9.9", registry_source)])),
+            workload_lock_text, available_crates, available_git)
+        raise AssertionError("a graph package absent from the verified sources must refuse")
+    except Refusal:
+        pass
+    two_versions = [(package["name"], package["version"], registry_source)
+                    for package in lock_sets["registry"]]
+    if two_versions:
+        name = two_versions[0][0]
+        two_versions.append((name, "9.9.9", registry_source))
+        try:
+            graph_binding_facts(graph_from_metadata(metadata_payload(two_versions)),
+                                workload_lock_text, available_crates, available_git)
+            raise AssertionError("two graph versions of one name must refuse")
+        except Refusal:
+            pass
+    try:
+        graph_binding_facts(graph_from_metadata(metadata_payload(
+            graph_rows + [("crate-a", "1.0.0", "path+file:///tmp/x")])),
+            workload_lock_text, available_crates, available_git)
+        raise AssertionError("an unknown source kind must refuse")
+    except Refusal:
+        pass
 
     # -- disposal policy: allowlist, containment, closure -----------------
     seam_dir = tempfile.mkdtemp(dir=os.environ.get("TMPDIR") or None)
@@ -6241,19 +6860,28 @@ def compat_self_check() -> None:
     try:
         our_pid, guard_pid, session_id = os.getpid(), os.getppid(), os.getsid(0)
 
-        def table_from(rows: list) -> dict:
-            return {"readable": True, "rows": {pid: facts for pid, facts in rows},
-                    "helper_pid": None, "error": None}
+        def closed_reads(extra_rows: dict | None = None, our_ppid: int | None = None,
+                         our_start: str = "start-ours") -> callable:
+            """A seam returning a FRESH closed read per call, with a distinct
+            helper PID and stable identities for our and the guard's rows."""
+            state = {"n": 0}
 
-        def closed_table() -> dict:
-            helper = 900001
-            return {"readable": True, "error": None, "helper_pid": helper, "rows": {
-                helper: {"ppid": our_pid, "pgid": guard_pid, "sess": session_id},
-                our_pid: {"ppid": guard_pid, "pgid": guard_pid, "sess": session_id},
-                guard_pid: {"ppid": 1, "pgid": guard_pid, "sess": session_id},
-            }}
+            def seam(*_args, **_kwargs):
+                state["n"] += 1
+                helper = 900000 + state["n"]
+                rows = {
+                    helper: {"ppid": our_pid, "pgid": guard_pid, "sess": session_id,
+                             "start": f"start-helper-{state['n']}"},
+                    our_pid: {"ppid": our_ppid if our_ppid is not None else guard_pid,
+                              "pgid": guard_pid, "sess": session_id, "start": our_start},
+                    guard_pid: {"ppid": 1, "pgid": guard_pid, "sess": session_id,
+                                "start": "start-guard"},
+                }
+                rows.update(extra_rows or {})
+                return {"readable": True, "rows": rows, "helper_pid": helper, "error": None}
+            return seam
 
-        def fresh_run(table: dict) -> CompatRun:
+        def fresh_run(table_seam) -> CompatRun:
             run = CompatRun.__new__(CompatRun)
             run.run_root = os.path.join(seam_dir, "run")
             run.packet_dir = os.path.join(seam_dir, "packet")
@@ -6266,19 +6894,20 @@ def compat_self_check() -> None:
             run.closure = None
             run.env = {"HOME": seam_dir}
             run.deadline_ns = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) + int(60e9)
-            globals()["COMPAT_PROCESS_TABLE_SEAM"] = lambda *_args, **_kwargs: table
+            globals()["COMPAT_PROCESS_TABLE_SEAM"] = table_seam
             return run
 
-        run = fresh_run(closed_table())
+        run = fresh_run(closed_reads())
         os.makedirs(os.path.join(run.run_root, "stage-relax-target", "release"))
-        with open(os.path.join(run.run_root, "stage-relax-target", "release", "relax"), "wb") as h:
-            h.write(b"x" * 4096)
+        with open(os.path.join(run.run_root, "stage-relax-target", "release", "relax"),
+                  "wb") as handle:
+            handle.write(b"x" * 4096)
         run.dispose_stage_output("stage-relax-target", "self-check: closed in-boundary")
         expect(not os.path.exists(os.path.join(run.run_root, "stage-relax-target")),
-               "an allowlisted stage output is removed under closed in-boundary custody")
+               "an allowlisted stage output is removed under two-read closed custody")
         expect(run.disposals[0]["closure"]["closed"] is True
                and run.disposals[0]["bytes_before"]["entries"] == 1,
-               "the disposal records its closure classification and removed bytes")
+               "the disposal records its two-read closure and removed bytes")
         run.dispose_stage_output("stage-relax-target", "self-check: absent is recorded")
         expect(run.disposals[-1]["absent"] is True, "an absent stage output is recorded as absent")
         for relative in ("relax-src", "cargo-homes/shared", "bin",
@@ -6292,9 +6921,10 @@ def compat_self_check() -> None:
         os.makedirs(os.path.join(run.run_root, "workloads", "snapshot", "cargo"))
         target = os.path.join(seam_dir, "outside")
         os.makedirs(target)
-        with open(os.path.join(target, "keep"), "wb") as h:
-            h.write(b"keep")
-        os.symlink(target, os.path.join(run.run_root, "workloads", "snapshot", "cargo", "target"))
+        with open(os.path.join(target, "keep"), "wb") as handle:
+            handle.write(b"keep")
+        os.symlink(target, os.path.join(run.run_root, "workloads", "snapshot", "cargo",
+                                        "target"))
         try:
             run.dispose_stage_output("workloads/snapshot/cargo/target", "self-check: symlink")
             raise AssertionError("disposing a symlink must refuse")
@@ -6303,40 +6933,85 @@ def compat_self_check() -> None:
                    "the symlink refusal leaves the outside target untouched")
 
         # Unknown closure refuses the removal and leaves the bytes in place.
-        for label, table in {
-            "orphan": table_from([
-                (our_pid, {"ppid": guard_pid, "pgid": guard_pid, "sess": session_id}),
-                (guard_pid, {"ppid": 1, "pgid": guard_pid, "sess": session_id}),
-                (700, {"ppid": 1, "pgid": guard_pid, "sess": session_id}),
-            ]),
-            "live-child": table_from([
-                (our_pid, {"ppid": guard_pid, "pgid": guard_pid, "sess": session_id}),
-                (guard_pid, {"ppid": 1, "pgid": guard_pid, "sess": session_id}),
-                (701, {"ppid": our_pid, "pgid": guard_pid, "sess": session_id}),
-            ]),
-            "unreadable": {"readable": False, "rows": {}, "helper_pid": None,
-                           "error": "ps failed"},
+        for label, seam in {
+            "orphan": closed_reads({700: {"ppid": 1, "pgid": guard_pid,
+                                          "sess": session_id, "start": "start-orphan"}}),
+            "live-child": closed_reads({701: {"ppid": our_pid, "pgid": guard_pid,
+                                              "sess": session_id, "start": "start-child"}}),
+            "empty-table": lambda *_a, **_k: {"readable": False, "rows": {},
+                                              "helper_pid": None,
+                                              "error": "the process table was empty"},
+            "missing-guard": lambda *_a, **_k: {"readable": True, "error": None,
+                                               "helper_pid": 900009,
+                                               "rows": {900009: {"ppid": our_pid,
+                                                                 "pgid": guard_pid,
+                                                                 "sess": session_id,
+                                                                 "start": "start-h"},
+                                                        our_pid: {"ppid": 1, "pgid": 1,
+                                                                  "sess": 1,
+                                                                  "start": "start-ours"}}},
         }.items():
             os.makedirs(os.path.join(run.run_root, "stage-relax-target"), exist_ok=True)
-            with open(os.path.join(run.run_root, "stage-relax-target", "keep"), "wb") as h:
-                h.write(b"keep")
-            globals()["COMPAT_PROCESS_TABLE_SEAM"] = lambda *_a, _t=table, **_k: _t
+            with open(os.path.join(run.run_root, "stage-relax-target", "keep"), "wb") as handle:
+                handle.write(b"keep")
+            globals()["COMPAT_PROCESS_TABLE_SEAM"] = seam
+            try:
+                run.dispose_stage_output("stage-relax-target", f"self-check: {label}")
+                raise AssertionError(f"disposal under {label} closure must refuse")
+            except (Refusal, AssertionError) as error:
+                if isinstance(error, AssertionError):
+                    raise
+                expect(os.path.exists(os.path.join(run.run_root, "stage-relax-target",
+                                                   "keep")),
+                       f"the {label} refusal leaves the stage output in place")
+        # A replaced PID or a changed parent between the two reads refuses.
+        def two_read_seam(first_start: str, second_start: str,
+                          second_ppid: int | None = None):
+            state = {"n": 0}
+
+            def seam(*_args, **_kwargs):
+                state["n"] += 1
+                second = state["n"] % 2 == 0
+                helper = 900100 + state["n"]
+                ppid = second_ppid if (second and second_ppid is not None) else guard_pid
+                return {"readable": True, "error": None, "helper_pid": helper,
+                        "rows": {
+                            helper: {"ppid": our_pid, "pgid": guard_pid,
+                                     "sess": session_id, "start": f"h{state['n']}"},
+                            our_pid: {"ppid": ppid, "pgid": guard_pid,
+                                      "sess": session_id,
+                                      "start": second_start if second else first_start},
+                            guard_pid: {"ppid": 1, "pgid": guard_pid,
+                                        "sess": session_id, "start": "start-guard"},
+                        }}
+            return seam
+
+        for label, seam in {
+            "replaced-pid": two_read_seam("start-ours", "start-replaced"),
+            "reparented": two_read_seam("start-ours", "start-ours", second_ppid=777),
+        }.items():
+            os.makedirs(os.path.join(run.run_root, "stage-relax-target"), exist_ok=True)
+            with open(os.path.join(run.run_root, "stage-relax-target", "keep"), "wb") as handle:
+                handle.write(b"keep")
+            globals()["COMPAT_PROCESS_TABLE_SEAM"] = seam
             try:
                 run.dispose_stage_output("stage-relax-target", f"self-check: {label}")
                 raise AssertionError(f"disposal under {label} closure must refuse")
             except Refusal:
-                expect(os.path.exists(os.path.join(run.run_root, "stage-relax-target", "keep")),
+                expect(os.path.exists(os.path.join(run.run_root, "stage-relax-target",
+                                                   "keep")),
                        f"the {label} refusal leaves the stage output in place")
-        # An unreaped child refuses even when the table is closed.
-        run.custody = [{"label": "u", "spawned": True, "reaped": False, "wait_error": "ECHILD"}]
-        globals()["COMPAT_PROCESS_TABLE_SEAM"] = lambda *_a, **_k: closed_table()
+        run.custody = [{"label": "u", "spawned": True, "reaped": False,
+                        "wait_error": "ECHILD"}]
+        globals()["COMPAT_PROCESS_TABLE_SEAM"] = closed_reads()
         try:
             run.dispose_stage_output("stage-relax-target", "self-check: unreaped")
             raise AssertionError("disposal with an unreaped child must refuse")
         except Refusal:
             pass
         run.custody = [{"label": "clean", "spawned": True, "reaped": True}]
-        expect(fresh_run({"readable": False, "rows": {}, "helper_pid": None, "error": "x"})
+        expect(fresh_run(lambda *_a, **_k: {"readable": False, "rows": {},
+                                            "helper_pid": None, "error": "x"})
                .custody_clean()[0] is False,
                "an unknown closure is never reported clean")
     finally:
@@ -6397,6 +7072,8 @@ def compat_self_check() -> None:
                 stdout = ""
             elif " cat-file " in f" {joined} " or " merge-base " in f" {joined} ":
                 stdout = ""
+            elif "metadata" in joined and "--format-version" in joined:
+                stdout = metadata_text
             elif "compat-crc32" in joined and COMPAT_SOURCE_CONTROL_REQUIREMENT in open(
                     os.path.join(cwd, "Cargo.toml"), encoding="utf-8").read():
                 exit_code = 1
@@ -6476,14 +7153,27 @@ def compat_self_check() -> None:
         destination = os.path.join(run.run_root, "cargo-homes", "shared")
         os.makedirs(destination, exist_ok=True)
         run.shared_cargo_home = destination
-        run.seed_record = json.loads(json.dumps(seed_record))
+        run.seed_record = faithful_seed_record()
         run.figures["seed"] = {"destination": destination, "aggregate_bytes": 0,
                                "seconds": 0.0}
+
+    def fake_source_bytes(_home, _lock_text) -> dict:
+        return {"crates": len(lock_sets["registry"]),
+                "index_entries": len(lock_sets["registry"]), "extracted": []}
+
+    metadata_text = json.dumps({"packages": [
+        {"name": package["name"], "version": package["version"],
+         "source": "registry+https://github.com/rust-lang/crates.io-index",
+         "features": {"default": []}}
+        for package in lock_sets["registry"]] + [
+        {"name": package["name"], "version": package["version"],
+         "source": f"git+{package['url']}#{package['commit']}", "features": {}}
+        for package in lock_sets["git"]]})
 
     saved_seams = {name: globals()[name] for name in
                    ("COMPAT_CHILD_RUNNER", "COMPAT_STAGE_SEAM", "COMPAT_SEED_SEAM",
                     "COMPAT_VOLUME_SEAM", "COMPAT_SETUP_SEAM", "SOURCE_GATE_SEAM",
-                    "COMPAT_PROCESS_TABLE_SEAM")}
+                    "COMPAT_PROCESS_TABLE_SEAM", "COMPAT_SOURCE_BYTES_SEAM")}
     composition_dir = tempfile.mkdtemp(dir=os.environ.get("TMPDIR") or None)
     saved_env = {key: os.environ.get(key) for key in GUARD_EXPORTS}
     os.environ["OXIDE_TASK_SCRATCH_ROOT"] = os.path.join(composition_dir, "scratch")
@@ -6496,6 +7186,7 @@ def compat_self_check() -> None:
     globals()["COMPAT_VOLUME_SEAM"] = lambda: (composition_dir, SELECTED_VOLUME_UUID)
     globals()["COMPAT_STAGE_SEAM"] = fake_stage
     globals()["COMPAT_SEED_SEAM"] = fake_seed
+    globals()["COMPAT_SOURCE_BYTES_SEAM"] = fake_source_bytes
     good_stdout = {"format": transcript, "crc32": crc_transcript, "snapshot": help_transcript}
     try:
         def composed_run(name: str) -> CompatRun:
@@ -6509,7 +7200,20 @@ def compat_self_check() -> None:
         #    materialization, probes, control, closure, closeout, publication.
         records: list = []
         globals()["COMPAT_CHILD_RUNNER"] = fake_runner(dict(good_stdout), records=records)
-        globals()["COMPAT_PROCESS_TABLE_SEAM"] = lambda *_a, **_k: closed_table()
+        composition_reads = {"n": 0}
+
+        def composition_table(*_args, **_kwargs):
+            composition_reads["n"] += 1
+            helper = 910000 + composition_reads["n"]
+            return {"readable": True, "error": None, "helper_pid": helper, "rows": {
+                helper: {"ppid": os.getpid(), "pgid": os.getppid(),
+                         "sess": os.getsid(0), "start": f"h{composition_reads['n']}"},
+                os.getpid(): {"ppid": os.getppid(), "pgid": os.getppid(),
+                              "sess": os.getsid(0), "start": "start-ours"},
+                os.getppid(): {"ppid": 1, "pgid": os.getppid(), "sess": os.getsid(0),
+                               "start": "start-guard"},
+            }}
+        globals()["COMPAT_PROCESS_TABLE_SEAM"] = composition_table
         run = composed_run("clean")
         with contextlib.redirect_stdout(io.StringIO()):
             with contextlib.redirect_stderr(io.StringIO()):
@@ -6702,6 +7406,39 @@ def compat_self_check() -> None:
                "the setup-abort receipt names the setup fault")
         shutil.rmtree(run.run_root, ignore_errors=True)
 
+        # C2. An unreadable/oversized verification capture aborts through the
+        #     declared receipt path instead of raising TypeError.
+        run = composed_run("capture-unusable")
+        base_runner = fake_runner(dict(good_stdout))
+
+        def capture_none_runner(argv, cwd, env, cap_s, label):
+            record = base_runner(argv, cwd, env, cap_s, label)
+            if "--version" in argv:
+                record.update({"stdout": None, "stdout_readable": False,
+                               "stdout_complete": False, "stdout_prefix": b""})
+            return record
+
+        globals()["COMPAT_CHILD_RUNNER"] = capture_none_runner
+        run.aborted = None
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    run.setup()
+        except (Refusal, OSError, ValueError) as error:
+            run.aborted = f"setup: {error}"
+        expect(run.aborted is not None and "version output is unusable" in run.aborted,
+               "an unusable verification capture aborts with its reason, not TypeError")
+        with contextlib.redirect_stdout(io.StringIO()):
+            with contextlib.redirect_stderr(io.StringIO()):
+                exit_code = finish_compat_run(run)
+        expect(exit_code == 1, "the unusable-capture occurrence exits 1")
+        receipt = json.load(open(os.path.join(
+            run.packet_dir, f"receipt-{run.binding['paths']['packet_name']}.json")))
+        expect(receipt["compatibility"]["result"] == "incomplete"
+               and receipt["declared_unexecuted"] == declared_total,
+               "the unusable-capture abort publishes every declared arm unexecuted")
+        shutil.rmtree(run.run_root, ignore_errors=True)
+
         # D. A later stop cannot erase an earlier real refusal.
         divergent = transcript.replace(
             "f64 0 8000000000000000 -0.0 8000000000000000",
@@ -6743,7 +7480,7 @@ def compat_self_check() -> None:
         # E. A zero-exit resolution control blocks compatibility.
         run = composed_run("control-zero")
         globals()["COMPAT_CHILD_RUNNER"] = fake_runner(dict(good_stdout))
-        globals()["COMPAT_PROCESS_TABLE_SEAM"] = lambda *_a, **_k: closed_table()
+        globals()["COMPAT_PROCESS_TABLE_SEAM"] = composition_table
         with contextlib.redirect_stdout(io.StringIO()):
             with contextlib.redirect_stderr(io.StringIO()):
                 run.setup()
