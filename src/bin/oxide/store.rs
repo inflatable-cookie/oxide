@@ -6265,7 +6265,15 @@ impl PoolWitness {
     /// Take this pool's existing admission lock for one custody decision:
     /// non-blocking, never creating a missing lock, through the verified
     /// no-follow control descriptor, and refusing a replaced lock identity.
-    fn take_admission(&mut self, deadline: Option<Instant>, label: &str) -> Result<File, String> {
+    /// A borrowed publication guard can supply only the exact internal lock
+    /// it physically owns. The borrow lives through the row decision; all
+    /// directory/lock witnesses and the external admission still run.
+    fn take_admission(
+        &mut self,
+        deadline: Option<Instant>,
+        label: &str,
+        publication: Option<&PublicationGuard>,
+    ) -> Result<File, String> {
         if let Some(deadline) = deadline {
             if Instant::now() > deadline {
                 return Err(format!(
@@ -6327,6 +6335,27 @@ impl PoolWitness {
                     "the {label} pool's admission lock was replaced while it was witnessed"
                 ))
             }
+        }
+        if let Some(guard) = publication {
+            let (Some(directory), Some(held)) = (&guard._directory, &guard._file) else {
+                return Err("custody requires the outer owning publication guard".to_owned());
+            };
+            let directory = fstat_witness(directory)?;
+            let held = fstat_witness(held)?;
+            if guard.control != self.control
+                || (directory.dev, directory.ino) != self.dir_identity
+                || !witness_is_private_file(&held)
+                || (held.dev, held.ino) != (facts.dev, facts.ino)
+            {
+                return Err(
+                    "the publication guard does not own this pool's witnessed admission lock"
+                        .to_owned(),
+                );
+            }
+            // Do not flock the second descriptor: the borrowed guard already
+            // holds EXCL on this very inode. Closing this unlocked descriptor
+            // cannot release the guard's independently owned lock description.
+            return Ok(file);
         }
         // Non-blocking: a busy lock refuses this snapshot, never waits.
         // SAFETY: the descriptor is live for the call.
@@ -6484,7 +6513,22 @@ impl CustodyWitness {
         checkout: &Path,
         cleans: bool,
     ) -> Result<RowCustody, String> {
-        let _internal_admission = self.internal.take_admission(deadline, "internal")?;
+        self.decide_with_publication(deadline, checkout, cleans, None)
+    }
+
+    /// Compose with a real, borrowed internal publication guard instead of
+    /// re-locking its inode. Other pools still acquire admission non-blocking,
+    /// internal first; neither state nor a custody verdict is exempted.
+    pub(crate) fn decide_with_publication(
+        &mut self,
+        deadline: Option<Instant>,
+        checkout: &Path,
+        cleans: bool,
+        publication: Option<&PublicationGuard>,
+    ) -> Result<RowCustody, String> {
+        let _internal_admission =
+            self.internal
+                .take_admission(deadline, "internal", publication)?;
         // The registration witness is re-read under the internal admission
         // lock on every row; inside a prune authority window the read is
         // charged to the shared budget like every other snapshot input.
@@ -6496,7 +6540,7 @@ impl CustodyWitness {
         .is_some();
         let removable_admission = if registered {
             let sibling = self.pinned_sibling()?;
-            Some(sibling.take_admission(deadline, "removable")?)
+            Some(sibling.take_admission(deadline, "removable", None)?)
         } else {
             // A known absent, unregistered sibling is usable only with a
             // positive no-follow absence witness repeated on this row, under
@@ -6521,8 +6565,8 @@ impl CustodyWitness {
             ),
             None => None,
         };
-        // The locks drop when this function returns, before the caller does
-        // any path traversal or report construction.
+        // Per-row locks drop on return. A borrowed internal publication
+        // lock remains held by its caller through the guarded checks.
         let boot = boot_session();
         let pools = [
             (Some(internal), "this", None),
@@ -6583,6 +6627,9 @@ pub(crate) struct PublicationGuard {
     control: PathBuf,
     nested: bool,
     _file: Option<File>,
+    // Pin the control directory as well as the lock for explicit custody
+    // composition. A nested guard carries no independent admission authority.
+    _directory: Option<File>,
 }
 
 thread_local! {
@@ -6597,14 +6644,18 @@ pub(crate) fn publication_guard(control: &Path) -> Result<PublicationGuard, Stri
             control: control.to_path_buf(),
             nested: true,
             _file: None,
+            _directory: None,
         });
     }
+    let directory = open_control_directory(control)?
+        .ok_or_else(|| format!("{} does not exist", control.display()))?;
     let file = lock_admission(control)?;
     HELD_PUBLICATION.with(|held| held.borrow_mut().push(control.to_path_buf()));
     Ok(PublicationGuard {
         control: control.to_path_buf(),
         nested: false,
         _file: Some(file),
+        _directory: Some(directory),
     })
 }
 
@@ -14317,6 +14368,95 @@ mod fresh_custody_tests {
         }
         eprintln!("278-lock {label} pid={} path={} dev={} ino={} observation_fd={} matching_fds={descriptors:?}",
             std::process::id(), fixture.control.display(), identity.dev(), identity.ino(), lock.as_raw_fd());
+    }
+
+    #[test]
+    fn custody_borrows_only_the_exact_owning_publication_guard() {
+        if super::tests::fixture_child(
+            "store::fresh_custody_tests::custody_borrows_only_the_exact_owning_publication_guard",
+        ) {
+            return;
+        }
+        let fixture = CustodyFixture::new("publication-custody");
+        fixture.prime();
+        let checkout = checkout(&fixture);
+        let guard = super::publication_guard(&fixture.control).unwrap();
+        let mut witness = CustodyWitness::open(&fixture.control).unwrap();
+        assert_eq!(
+            witness
+                .decide_with_publication(None, &checkout, false, Some(&guard))
+                .unwrap()
+                .verdict,
+            CheckoutCustody::Clear
+        );
+        // An ordinary observer still conflicts with this held EXCL lock.
+        assert!(witness
+            .decide(None, &checkout, false)
+            .unwrap_err()
+            .contains("internal pool's admission lock is busy"));
+        let nested = super::publication_guard(&fixture.control).unwrap();
+        assert!(witness
+            .decide_with_publication(None, &checkout, false, Some(&nested))
+            .unwrap_err()
+            .contains("outer owning publication guard"));
+        drop(nested);
+        let foreign = CustodyFixture::new("other-publication");
+        foreign.prime();
+        let foreign_guard = super::publication_guard(&foreign.control).unwrap();
+        assert!(witness
+            .decide_with_publication(None, &checkout, false, Some(&foreign_guard))
+            .unwrap_err()
+            .contains("does not own this pool"));
+        drop(foreign_guard);
+
+        fixture.replace_state(&State {
+            records: vec![custody_record(1, &checkout, Phase::Running, None)],
+            ..State::default()
+        });
+        assert_eq!(
+            witness
+                .decide_with_publication(None, &checkout, false, Some(&guard))
+                .unwrap()
+                .verdict,
+            CheckoutCustody::Writers
+        );
+        fixture.replace_state(&State::default());
+        assert_eq!(
+            witness
+                .decide_with_publication(None, &checkout, false, Some(&guard))
+                .unwrap()
+                .verdict,
+            CheckoutCustody::Clear
+        );
+        drop(guard);
+        assert_eq!(
+            witness.decide(None, &checkout, false).unwrap().verdict,
+            CheckoutCustody::Clear
+        );
+
+        let guard = super::publication_guard(&fixture.control).unwrap();
+        fs::rename(
+            fixture.control.join("admission.lock"),
+            fixture.control.join("old-admission.lock"),
+        )
+        .unwrap();
+        lock_admission(&fixture.control).unwrap();
+        let mut fresh = CustodyWitness::open(&fixture.control).unwrap();
+        assert!(fresh
+            .decide_with_publication(None, &checkout, false, Some(&guard))
+            .unwrap_err()
+            .contains("does not own this pool"));
+        drop(guard);
+        let guard = super::publication_guard(&fixture.control).unwrap();
+        fs::rename(&fixture.control, fixture.root.join("old-control")).unwrap();
+        fs::create_dir(&fixture.control).unwrap();
+        fs::set_permissions(&fixture.control, fs::Permissions::from_mode(0o700)).unwrap();
+        fixture.prime();
+        let mut fresh = CustodyWitness::open(&fixture.control).unwrap();
+        assert!(fresh
+            .decide_with_publication(None, &checkout, false, Some(&guard))
+            .unwrap_err()
+            .contains("does not own this pool"));
     }
 
     /// One parsed state is reused across rows, and a replacement between rows

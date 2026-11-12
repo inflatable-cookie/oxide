@@ -5001,7 +5001,19 @@ Publication/admission is released before `begin_checked_delegated`, execution,
 cancellation or replay waits for Barge. The real clean checkout barrier and
 binding remain held across verdict, begin, guarded re-affirmation and effect.
 Re-affirmation freshly checks the complete original group, receipt, marker,
-checkout-volume binding, absence and both pools' writer custody. Changed facts
+checkout-volume binding, absence and both pools' writer custody. The fresh
+verdict and re-affirmation pass their actual owning publication guard into the
+custody witness. Its borrowed lifetime covers the decision; the witness checks
+the exact control-directory and admission-lock inodes before using that held
+internal exclusion. A nested or foreign guard, replaced control or replaced
+lock refuses. Registration, state witnesses, bounded reads, full writer/holder
+classification and non-blocking removable admission still run internal-first.
+No thread-local flag grants this authority. The guard pins one additional
+control-directory descriptor until release; admission is still released before
+blocking Barge work. Ordinary composed regressions model only the mounted-volume
+boundary, use real private markers/receipts, journal records, locks and custody
+states, and cover successful fresh/re-affirm checks, foreign admission contention
+and newly recorded writers. They establish no APFS effect or native credit. Changed facts
 permit only Barge's positively proven pre-effect retained cancellation; Locked
 alone proves nothing. Resumption reconstructs the exact original public
 `BeginRequest` from the checked record, including declaration and absence, never

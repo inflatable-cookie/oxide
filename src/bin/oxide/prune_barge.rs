@@ -598,19 +598,37 @@ struct Reaffirm<'a> {
 }
 impl OperationReaffirmation for Reaffirm<'_> {
     fn reaffirm(&self, record: &OperationRecord) -> barge::error::Result<()> {
+        self.reaffirm_with_root(record, |payload| {
+            let session = super::RootSession::open_recorded(&payload.identity)?;
+            session.verify_marker(&candidate(payload))?;
+            Ok(session)
+        })
+    }
+}
+
+impl Reaffirm<'_> {
+    /// Only the volume/root observation is an external seam. Admission,
+    /// domain, custody, absence and budget checks compose identically.
+    fn reaffirm_with_root<T>(
+        &self,
+        record: &OperationRecord,
+        verify_root: impl FnOnce(&Payload) -> Result<T, String>,
+    ) -> barge::error::Result<()> {
         let result = (|| {
             let payload = Payload::from_record(record)?;
-            let _guard = crate::store::publication_guard(self.control)?;
+            let guard = crate::store::publication_guard(self.control)?;
             let registry = super::ready_registry(self.control)?;
             verify_payload_domain(self.control, &registry, &payload, None)?;
+            // Keep the verified root descriptors alive across custody and
+            // absence, exactly as in the production callback before this seam.
+            let _root = verify_root(&payload)?;
             let candidate = candidate(&payload);
-            let session = super::RootSession::open_recorded(&payload.identity)?;
-            session.verify_marker(&candidate)?;
             let mut authority = super::AuthorityScope::begin()?;
             super::custody_clear_under_barrier(
                 &mut authority,
                 self.control,
                 &payload.identity.checkout,
+                Some(&guard),
             )?;
             match super::checkout_absence(&super::candidate_row(&candidate), false)? {
                 super::Absence::Absent(_) if authority.complete() => Ok(()),
@@ -666,8 +684,16 @@ pub(super) fn fresh(
 ) -> Result<bool, String> {
     let generation = grant(candidate)?;
     let payload = {
-        let _guard = crate::store::publication_guard(control)?;
-        let revision = super::recheck_candidate(store, control, candidate, list, evidence)?;
+        let guard = crate::store::publication_guard(control)?;
+        let revision = super::recheck_candidate(
+            store,
+            control,
+            candidate,
+            list,
+            evidence,
+            Some(&guard),
+            super::observe_row_root,
+        )?;
         super::confirm_absence(candidate, evidence)?;
         let registry = super::ready_registry(control)?;
         if registry.version != super::COORDINATED_REGISTRY_VERSION
@@ -1273,6 +1299,161 @@ mod tests {
     ) -> barge::error::Result<OperationRecord> {
         let os = barge::os::platform();
         operation::finalize_operation(&os, &os, paths, CALLER, key, &[hook])
+    }
+
+    /// The real fresh recheck and reaffirm callback body compose publication
+    /// admission with the real custody witness. Only APFS binding is modelled:
+    /// ordinary tests use a tiny private directory, never an image or effect.
+    #[test]
+    fn guarded_fresh_and_reaffirm_compose_custody_and_refuse_foreign_admission() {
+        if crate::store::tests::fixture_child("prune::delegation::tests::guarded_fresh_and_reaffirm_compose_custody_and_refuse_foreign_admission") {
+            return;
+        }
+        let (fixture, control, store, candidate) = super::super::tests::delegated_group_fixture();
+        // Labelled domain premise: the caller's own clean barrier is recorded
+        // in this very pool. Custody itself is never substituted.
+        let mut state = crate::store::State::default();
+        state.cleans.push(crate::store::Clean {
+            id: 1,
+            checkout: candidate.checkout.clone(),
+            process_group: None,
+        });
+        let write_state = |control: &Path, state: &crate::store::State| {
+            let temp = control.join("state.guard-test");
+            fs::write(&temp, serde_json::to_vec(state).unwrap()).unwrap();
+            fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::rename(temp, control.join("state.json")).unwrap();
+        };
+        write_state(&control, &state);
+        let evidence =
+            match super::super::checkout_absence(&super::super::candidate_row(&candidate), false)
+                .unwrap()
+            {
+                super::super::Absence::Absent(witness) => super::super::SnapshotEvidence {
+                    witness: *witness,
+                    legacy_exception: false,
+                },
+                _ => panic!("fixture checkout must be positively absent"),
+            };
+        fn directory_root(row: &super::super::Row) -> Result<super::super::RootState, String> {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = fs::symlink_metadata(&row.root).map_err(|e| e.to_string())?;
+            assert!(metadata.is_dir());
+            Ok(super::super::RootState::Present(super::super::RootFacts {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                marker_digest: super::super::outputs::marker_digest(&row.root)?,
+                legacy: false,
+            }))
+        }
+        with_test_journal(&fixture.root, |paths| {
+            let payload = payload(&control, &candidate);
+            let record = begin(paths, &payload);
+            let fresh_recheck = || {
+                let guard = crate::store::publication_guard(&control)?;
+                super::super::recheck_candidate(
+                    &store,
+                    &control,
+                    &candidate,
+                    None,
+                    &evidence,
+                    Some(&guard),
+                    directory_root,
+                )
+            };
+            let reaffirm = || {
+                Reaffirm {
+                    store: &store,
+                    control: &control,
+                }
+                .reaffirm_with_root(&record, |payload| {
+                    // Model only the mounted-volume premise. Marker bytes and
+                    // inode checks still read this fixture's actual root.
+                    let root = fs::File::open(&payload.identity.root).map_err(|e| e.to_string())?;
+                    use std::os::fd::AsFd;
+                    let root = root
+                        .as_fd()
+                        .try_clone_to_owned()
+                        .map_err(|e| e.to_string())?;
+                    super::super::verify_root_marker(&root, &candidate)?;
+                    Ok(root)
+                })
+            };
+            assert_eq!(fresh_recheck().unwrap(), payload.registry_revision);
+            reaffirm().unwrap();
+
+            // The borrowed internal lock must not suppress external admission.
+            let registration = crate::removable::Registration {
+                version: crate::removable::REGISTRATION_VERSION,
+                mount_point: fixture.root.clone(),
+                volume_uuid: candidate.volume_uuid.clone().unwrap(),
+                container_uuid: candidate.volume_uuid.clone().unwrap(),
+                reserve_bytes: 1 << 20,
+                cap_bytes: 1 << 20,
+                quota_bytes: None,
+                capacity_bytes: None,
+                registered_ms: 17,
+                mode: crate::removable::DriveMode::Ephemeral,
+            };
+            let registration_path = control.join(crate::removable::REGISTRATION);
+            fs::write(
+                &registration_path,
+                serde_json::to_vec(&registration).unwrap(),
+            )
+            .unwrap();
+            fs::set_permissions(registration_path, fs::Permissions::from_mode(0o600)).unwrap();
+            let sibling = crate::removable::removable_control(&control);
+            fs::create_dir_all(&sibling).unwrap();
+            fs::set_permissions(&sibling, fs::Permissions::from_mode(0o700)).unwrap();
+            write_state(&sibling, &crate::store::State::default());
+            let foreign = crate::store::lock_admission(&sibling).unwrap();
+            let reason = fresh_recheck().unwrap_err();
+            assert!(
+                reason.contains("removable pool's admission lock is busy"),
+                "{reason}"
+            );
+            let reason = reaffirm().unwrap_err().to_string();
+            assert!(
+                reason.contains("removable pool's admission lock is busy"),
+                "{reason}"
+            );
+            drop(foreign);
+            assert_eq!(fresh_recheck().unwrap(), payload.registry_revision);
+            reaffirm().unwrap();
+
+            // Both guarded paths must freshly read the next durable writer
+            // state, rather than carrying a clear verdict across revisions.
+            let mut writing = state.clone();
+            writing.records.push(crate::store::Record {
+                id: 2,
+                identity: "identity".to_owned(),
+                compatibility: "compatibility".to_owned(),
+                profile: "quick".to_owned(),
+                checkout: Some(candidate.checkout.clone()),
+                phase: crate::store::Phase::Running,
+                process_group: None,
+                last_used: 1,
+                holder: None,
+                lease_id: None,
+                pending_recovery: None,
+                retired: None,
+                lost: None,
+                last_used_ms: Some(1),
+                class: crate::store::WorkspaceClass::Normal,
+                class_reason: None,
+            });
+            write_state(&control, &writing);
+            assert!(fresh_recheck().unwrap_err().contains("active writer"));
+            assert!(reaffirm()
+                .unwrap_err()
+                .to_string()
+                .contains("active writer"));
+            assert_eq!(
+                view().unwrap().records[0],
+                record,
+                "no journal progression or effect"
+            );
+        });
     }
 
     #[test]

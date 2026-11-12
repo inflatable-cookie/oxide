@@ -2055,6 +2055,16 @@ impl AuthorityScope {
         checkout: &Path,
         cleans: bool,
     ) -> Result<store::RowCustody, String> {
+        self.fresh_custody_with_publication(control, checkout, cleans, None)
+    }
+
+    fn fresh_custody_with_publication(
+        &mut self,
+        control: &Path,
+        checkout: &Path,
+        cleans: bool,
+        publication: Option<&store::PublicationGuard>,
+    ) -> Result<store::RowCustody, String> {
         if self.custody.is_none() {
             self.custody = Some(store::CustodyWitness::open(control)?);
         }
@@ -2063,7 +2073,7 @@ impl AuthorityScope {
             .custody
             .as_mut()
             .expect("the witness was just created")
-            .decide(deadline, checkout, cleans);
+            .decide_with_publication(deadline, checkout, cleans, publication);
         #[cfg(debug_assertions)]
         if result.is_ok()
             && prune_fixture_fault(
@@ -3173,6 +3183,7 @@ fn evaluate(
                 authority,
                 &mut budget,
                 false,
+                None,
                 &mut evidence,
             )
         };
@@ -3504,6 +3515,7 @@ fn eligibility(
     authority: &mut AuthorityScope,
     _budget: &mut u64,
     under_barrier: bool,
+    publication: Option<&store::PublicationGuard>,
     evidence: &mut Option<SnapshotEvidence>,
 ) -> Result<Option<String>, String> {
     if !registry.complete {
@@ -3652,7 +3664,9 @@ fn eligibility(
     // durable states under both admission locks (oxide#235). A caller holding
     // the checkout's barrier excludes only its own barrier.
     if under_barrier {
-        if let Err(reason) = custody_clear_under_barrier(authority, control, &row.checkout) {
+        if let Err(reason) =
+            custody_clear_under_barrier(authority, control, &row.checkout, publication)
+        {
             return Ok(Some(reason));
         }
         return Ok(None);
@@ -6692,7 +6706,15 @@ fn prune_one_barrier(
         let revision = if candidate.receiptless {
             recheck_receiptless(store, control, candidate, evidence)
         } else {
-            recheck_candidate(store, control, candidate, list, evidence)
+            recheck_candidate(
+                store,
+                control,
+                candidate,
+                list,
+                evidence,
+                None,
+                observe_row_root,
+            )
         }
         .map_err(Stop::Refuse)?;
         #[cfg(debug_assertions)]
@@ -6802,6 +6824,8 @@ fn recheck_candidate(
     candidate: &Candidate,
     list: Option<&OperatorList>,
     evidence: &SnapshotEvidence,
+    publication: Option<&store::PublicationGuard>,
+    observe_root: fn(&Row) -> Result<RootState, String>,
 ) -> Result<u64, String> {
     if prune_fixture_fault(
         control,
@@ -6848,6 +6872,7 @@ fn recheck_candidate(
         &mut authority,
         &mut budget,
         true,
+        publication,
         &mut fresh,
     )? {
         return Err(reason);
@@ -6860,7 +6885,7 @@ fn recheck_candidate(
         ),
         None => return Err("the checkout's absence is no longer positively proved".to_owned()),
     }
-    match observe_row_root(&row)? {
+    match observe_root(&row)? {
         RootState::Present(facts)
             if facts.dev == candidate.dev
                 && facts.ino == candidate.ino
@@ -8067,7 +8092,7 @@ fn custody_reason(
     under_barrier: bool,
 ) -> Result<Option<String>, String> {
     if under_barrier {
-        return Ok(custody_clear_under_barrier(authority, control, checkout).err());
+        return Ok(custody_clear_under_barrier(authority, control, checkout, None).err());
     }
     let custody = match authority.fresh_custody(control, checkout, true) {
         Ok(custody) => custody,
@@ -8650,9 +8675,10 @@ fn custody_clear_under_barrier(
     authority: &mut AuthorityScope,
     control: &Path,
     checkout: &Path,
+    publication: Option<&store::PublicationGuard>,
 ) -> Result<(), String> {
     let custody = authority
-        .fresh_custody(control, checkout, false)
+        .fresh_custody_with_publication(control, checkout, false, publication)
         .map_err(|reason| format!("writer custody could not be witnessed ({reason})"))?;
     custody_under_barrier_refusal(custody)
 }
@@ -11972,6 +11998,7 @@ mod tests {
             &mut authority,
             &mut budget,
             false,
+            None,
             &mut None,
         )
         .unwrap();
@@ -11995,6 +12022,7 @@ mod tests {
             &mut authority,
             &mut budget,
             false,
+            None,
             &mut None,
         )
         .unwrap();
@@ -13329,6 +13357,7 @@ mod tests {
             &mut authority,
             &mut budget,
             false,
+            None,
             &mut None,
         )
         .unwrap()
@@ -13353,6 +13382,7 @@ mod tests {
             &mut authority,
             &mut budget,
             false,
+            None,
             &mut None,
         )
         .unwrap()
@@ -13431,7 +13461,7 @@ mod tests {
             "{reason:?}"
         );
         // Under the caller's own barrier the recorded barrier is excluded.
-        let refusal = custody_clear_under_barrier(&mut authority, &control, &checkout);
+        let refusal = custody_clear_under_barrier(&mut authority, &control, &checkout, None);
         assert!(refusal.is_ok(), "{refusal:?}");
         let mut writing = crate::store::State::default();
         writing.records.push(crate::store::Record {
@@ -13459,7 +13489,8 @@ mod tests {
             Some("an active writer still holds this checkout"),
             "{reason:?}"
         );
-        let refusal = custody_clear_under_barrier(&mut authority, &control, &checkout).unwrap_err();
+        let refusal =
+            custody_clear_under_barrier(&mut authority, &control, &checkout, None).unwrap_err();
         assert!(
             refusal.contains("an active writer still holds the checkout"),
             "{refusal}"
@@ -13467,7 +13498,7 @@ mod tests {
         write_state(&crate::store::State::default());
         let reason = custody_reason(&mut authority, &control, &checkout, false).unwrap();
         assert_eq!(reason, None, "{reason:?}");
-        let refusal = custody_clear_under_barrier(&mut authority, &control, &checkout);
+        let refusal = custody_clear_under_barrier(&mut authority, &control, &checkout, None);
         assert!(refusal.is_ok(), "{refusal:?}");
     }
 
