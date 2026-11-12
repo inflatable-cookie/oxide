@@ -494,6 +494,23 @@ def stage(proof):
     return sealed, tools, env
 
 
+def require_custody_observation(code,err):
+    # Pinned Barge059 check_captured_writers: process_start -> bsd_info (or
+    # missing self); scan_open_descriptors -> process_table (including its
+    # parser/own-row check) -> scan_processes. effective_uid cannot fail on
+    # macOS; later scan faults are Bounded/Unreadable, not propagated Err.
+    # Match whole producer families, including dynamic sizes, offsets and PIDs,
+    # rather than one spelling of a bounded scan. No kernel query occurs here.
+    if code in (0,-9):return
+    text=err.lower()
+    scan=any(word in text for word in ('custody is not proven','descriptor scan','process observation',
+                                      'captured-unit writer custody is unknown','the process table'))
+    identity=('the calling process identity is unavailable' in text
+              or 'pid 0 has no process start identity' in text
+              or re.search(r'\bthe facts of pid [0-9]+ are unreadable:',text) is not None)
+    if scan or identity:raise RuntimeError('actual custody uncertainty; abort and retain: '+err[-1600:])
+
+
 class World:
     def __init__(self, proof, binary, tools, stage_env, image, name):
         self.proof, self.binary, self.name = proof, binary, name
@@ -551,8 +568,7 @@ class World:
         code,out,err=result
         permanent.require_confirmed_closure(label,err)
         permanent.require_normal_exit(label,code)
-        if code not in (0,-9) and any(word in err.lower() for word in ('custody is not proven','descriptor scan','process observation','captured-unit writer custody is unknown')):
-            raise RuntimeError('actual custody uncertainty; abort and retain: '+err[-1600:])
+        require_custody_observation(code,err)
         if expect is not None and code!=expect:raise RuntimeError(f'{label}: unexpected exit {code}: {err[-1200:]}')
         return result
 
@@ -630,8 +646,7 @@ class World:
         else:
             permanent.require_normal_exit(label,code)
             permanent.require_confirmed_closure(label,err)
-        if code not in (0,-9) and any(word in err.lower() for word in ('custody is not proven','descriptor scan','process observation','captured-unit writer custody is unknown')):
-            raise RuntimeError('actual custody uncertainty; abort and retain: '+err[-1600:])
+        require_custody_observation(code,err)
         return code,out,err
 
     def wait(self,pattern,child):

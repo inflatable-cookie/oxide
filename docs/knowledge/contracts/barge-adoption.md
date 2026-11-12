@@ -5072,6 +5072,12 @@ changed groups/receipt, journal integrity and partial adoption. Ordinary tests
 add actual dispatcher/context, concurrent dispatcher and scoped publication
 controls on private journal/receipt files. Crafted terminal-record premises in
 those tests are labelled domain fixtures, never deletion or custody evidence.
+The native consumer classifies every pinned macOS writer-scan error producer:
+returned bounded/unreadable scans, process-table query/parse/own-row failures,
+and missing or unreadable self identity. Both command result paths abort before
+expected-exit credit; effect-free controls carry each producer family through
+the real World and diagnostic orchestration, with all cases unexecuted and
+retained disposition. This source-bound classifier makes no kernel observation.
 
 The default-off `outputs-operation-proof` feature enables only Barge's existing
 proof-journal phase faults under the current qualified guard. The staged fixture

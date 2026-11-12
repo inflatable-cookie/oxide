@@ -522,8 +522,22 @@ def fixture_composition(m,root):
         # failure before an expected exit3 can earn any refusal credit.
         world.plan='a'*64
         world.plan_path.write_text('synthetic control only; never executed')
-        for message in ('custody is not proven','descriptor scan bounded','process observation unreadable',
-                        'operation replay: captured-unit writer custody is unknown'):
+        # Actual pinned macOS producers: process_table query, parser and own
+        # row; process_start/bsd_info missing/unreadable; returned scan faults.
+        messages=('custody is not proven','descriptor scan bounded','process observation unreadable',
+            'operation replay: captured-unit writer custody is unknown',
+            'the process table its size could not be read: Permission denied',
+            'the process table could not be read: Input/output error',
+            'the process table is 1 bytes, which is not a whole number of 648-byte entries',
+            'the process table returned 649 bytes, which is not a whole number of 648-byte entries',
+            'the process table entry is short',
+            'the process table entry ends before the field at offset 32',
+            'the process table does not report pid 123 at all',
+            "the process table reports pid 123 as uid Some(999) start 1, not this process's uid 501 start 2",
+            'the facts of pid 123 are unreadable: Permission denied',
+            'the calling process identity is unavailable',
+            'pid 0 has no process start identity')
+        for message in messages:
             mode[0]='custody';custody_text[0]=message
             try:world.execute(expect=3,label='conservative-replay')
             except RuntimeError as exc:assert 'actual custody uncertainty' in str(exc) and message in str(exc)
@@ -536,34 +550,37 @@ def fixture_composition(m,root):
         # A classified ordinary refusal is still observable, not silently
         # converted into a custody failure.
         mode[0]='ok'
-        with patch.object(proof,'run',return_value=(3,'','synthetic replacement refusal')):
-            assert world.execute(expect=3,label='conservative-replay')[0]==3
-        mode[0]='custody';custody_text[0]='captured-unit writer custody is unknown'
-        worlds=[]
-        def outer_run(argv,*,label,limit,**kwargs):
-            if label=='stash-identity':return 0,m.plistlib.dumps({'VolumeUUID':m.STASH}).decode(),''
-            return 3,'',custody_text[0]
-        def reuse_world(*args):worlds.append(args[-1]);return world
-        out=io.StringIO()
-        with ExitStack() as outer:
-            outer.enter_context(patch.object(m,'source_readiness',return_value={}))
-            outer.enter_context(patch.object(m,'stash_mount',return_value=scratch))
-            outer.enter_context(patch.object(m,'stage',return_value=(binary,tools,stage_env)))
-            outer.enter_context(patch.object(m,'phase_snapshot',return_value={'total_after_publication_bytes':0}))
-            outer.enter_context(patch.object(m,'attach_image',return_value=None))
-            outer.enter_context(patch.object(m,'run_phase_snapshot',return_value=None))
-            outer.enter_context(patch.object(m,'World',side_effect=reuse_world))
-            outer.enter_context(patch.object(m,'run_case',side_effect=lambda actual,name:actual.execute(expect=3,label='conservative-replay')))
-            outer.enter_context(patch.object(proof,'run',side_effect=outer_run))
-            detach=outer.enter_context(patch.object(m.fresh,'request_guard_detach',return_value=('retained',None)))
-            outer.enter_context(redirect_stdout(out))
-            assert m.run_proof(True,proof,SimpleNamespace(state='synthetic-not-attached'))==1
-        report=json.loads(out.getvalue())
-        assert worlds==[m.CASES[0]],'custody unknown continued into another case'
-        assert 'actual custody uncertainty' in report['error'] and custody_text[0] in report['error']
-        assert all(row['state']=='unexecuted' for row in report['cases'])
-        assert not report['qualified'] and report['detach']=='retained'
-        assert detach.call_args.args[2] is not None,'unknown requested successful image disposition'
+        for reason in ("the capture is absent without Barge's recorded removal",
+                       'the removed capture is present again'):
+            with patch.object(proof,'run',return_value=(3,'',reason)):
+                assert world.execute(expect=3,label='conservative-replay')[0]==3
+        for message in messages:
+            mode[0]='custody';custody_text[0]=message
+            worlds=[]
+            def outer_run(argv,*,label,limit,**kwargs):
+                if label=='stash-identity':return 0,m.plistlib.dumps({'VolumeUUID':m.STASH}).decode(),''
+                return 3,'',custody_text[0]
+            def reuse_world(*args):worlds.append(args[-1]);return world
+            out=io.StringIO()
+            with ExitStack() as outer:
+                outer.enter_context(patch.object(m,'source_readiness',return_value={}))
+                outer.enter_context(patch.object(m,'stash_mount',return_value=scratch))
+                outer.enter_context(patch.object(m,'stage',return_value=(binary,tools,stage_env)))
+                outer.enter_context(patch.object(m,'phase_snapshot',return_value={'total_after_publication_bytes':0}))
+                outer.enter_context(patch.object(m,'attach_image',return_value=None))
+                outer.enter_context(patch.object(m,'run_phase_snapshot',return_value=None))
+                outer.enter_context(patch.object(m,'World',side_effect=reuse_world))
+                outer.enter_context(patch.object(m,'run_case',side_effect=lambda actual,name:actual.execute(expect=3,label='conservative-replay')))
+                outer.enter_context(patch.object(proof,'run',side_effect=outer_run))
+                detach=outer.enter_context(patch.object(m.fresh,'request_guard_detach',return_value=('retained',None)))
+                outer.enter_context(redirect_stdout(out))
+                assert m.run_proof(True,proof,SimpleNamespace(state='synthetic-not-attached'))==1
+            report=json.loads(out.getvalue())
+            assert worlds==[m.CASES[0]],'custody unknown continued into another case'
+            assert 'actual custody uncertainty' in report['error'] and custody_text[0] in report['error']
+            assert all(row['state']=='unexecuted' for row in report['cases'])
+            assert not report['qualified'] and report['detach']=='retained'
+            assert detach.call_args.args[2] is not None,'unknown requested successful image disposition'
         mode[0]='ok'
         for extra in ({'OXIDE_TEST_ACCOUNT_HOME':str(world.base/'home')},{'OXIDE_TEST_HOME_FROM_ENV':''},
                       {'HOME':str(base)},{'BARGE_ACCOUNT_HOME':str(base)}, {'OXIDE_PROOF_DEADLINE_NS':'999999999999999'}):
