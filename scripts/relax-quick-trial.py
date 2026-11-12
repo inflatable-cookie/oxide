@@ -2925,44 +2925,56 @@ COMPAT_PREMISE_CHECKLIST = {
     "private_home_rustup": (
         "Applies. The invoking RUSTUP_HOME (or HOME/.rustup when unset) is captured "
         "before HOME is replaced, preserved in every child, RUSTUP_TOOLCHAIN=1.97.1 is "
-        "pinned and RUSTUP_AUTO_INSTALL=0 is set; no toolchain is ever installed."
+        "pinned and RUSTUP_AUTO_INSTALL=0 is set; no toolchain is ever installed. "
+        "Each fixture lock is established offline inside the owned scratch before any "
+        "--locked call. Source: CompatRun.private_home, CompatRun.verify_env, "
+        "CompatRun.relax_env, CompatRun.materialize, scrubbed_env."
     ),
     "account_home_control": (
         "Does not apply: this mode stages no Oxide front door and runs no oxide "
         "command, so no account home is consulted. The private HOME still isolates "
-        "every arm's Relax stores and temporary directories."
+        "every arm's Relax stores and temporary directories. Source: "
+        "CompatRun.arm_argv_env (the only argv are `cargo run` and `<relax> run`)."
     ),
     "environment_isolation": (
         "Applies. Every child environment is built from the scrubbed base that drops "
         "inherited OXIDE_*, CARGO_*, every RUST* value, MAKEPAD_*, XDG_* and SCCACHE_*, "
         "then declares RUSTFLAGS empty, restores the invoking RUSTUP_HOME and pins the "
-        "toolchain. No host pool, wrapper or flag set can reach an arm."
+        "toolchain. No host pool, wrapper or flag set can reach an arm. Source: "
+        "scrubbed_env, child_env, CompatRun.arm_argv_env."
     ),
     "automatic_adoption": (
-        "Does not apply: the compat probes convert nothing and run no product command."
+        "Does not apply: the compat probes convert nothing and run no product "
+        "command. Source: CompatRun.arm_argv_env (no `oxide` invocation exists)."
     ),
     "cargo_external_argv": (
         "Does not apply: the compat probes invoke no Cargo external subcommand. The "
-        "Relax runner is invoked directly."
+        "Relax runner is invoked directly as its own executable, never through Cargo. "
+        "Source: CompatRun.arm_argv_env."
     ),
     "owned_images": (
         "Does not apply: no disk image is created or attached. Scratch is a directory "
-        "inside the supervisor's owned root."
+        "inside the supervisor's owned root, and only allowlisted stage output there is "
+        "ever removed. Source: CompatRun.setup, CompatRun.dispose_stage_output."
     ),
     "compiler_flags": (
         "Applies. RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS are scrubbed and declared "
-        "empty for every arm, so an inherited encoded value cannot change either arm."
+        "empty for every arm, so an inherited encoded value cannot change either arm. "
+        "Source: scrubbed_env (RUSTFLAGS empty, every CARGO_* value dropped, which "
+        "includes CARGO_ENCODED_RUSTFLAGS), quick_recipe_env."
     ),
     "temporary_storage": (
         "Applies. The body runs only under the supervisor's selected-volume default: "
         "run root, private HOME, CARGO_HOME and TMPDIR/TMP/TEMP live inside one fresh "
-        "run root; a /private/tmp fallback is refused before any effect. No image."
+        "run root; a /private/tmp fallback is refused before any effect. No image. "
+        "Source: guard_exports, CompatRun.setup, CompatRun.private_home."
     ),
     "macos_mktemp": (
         "Applies by construction, not by mktemp: one run root is created from the "
         "activation's single safe component under the guard-exported scratch root and "
         "refused if it already exists; every per-arm home, Cargo home and temp "
-        "directory sits inside that owned root."
+        "directory sits inside that owned root. Source: CompatRun.setup, "
+        "CompatRun.private_home (no mktemp call exists in this mode)."
     ),
 }
 
