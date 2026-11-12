@@ -409,6 +409,105 @@ fit amendment (a modestly larger owned-scratch budget or a source-reduced
 footprint, e.g. dropping the ~2 GiB engine stage target once the binary is
 copied) — each separately planned and reviewed.
 
+### Relax compatibility recheck (2026-11-12, prepared)
+
+Tom approved a focused recheck on 2026-11-12 (decision
+`7b5a88ce-96cb-4fab-a584-2e5deffa28ce` v2, "Go for it"): determine whether a
+NEWER Relax pin clears the ARM64 intrinsic blocker the 307 occurrence actually
+hit, on actual float formatting and the same prior Oxide workload. This is new
+approved work, never a reopening of the 307 result: that trial's scoped no-go
+for `aa540c14…` and both spent occurrences stay exactly as recorded, with no
+timings, receipt or proof credit carried anywhere. Oxide#308 prepares the
+apparatus, fixtures and effect-free readiness only, so nothing has been
+acquired, built, staged or run at the new pin. Any performance comparison
+remains conditional on compatibility passing and needs its own later
+activation; a pass still authorizes no integration, adoption, installation,
+default change, engine fork or compiler development.
+
+**Pinned upstream.** https://github.com/makepad/relax at EXACT
+`6ea9d0635f198b9a4510de1c87ac4d7b067f5cf7` (tree
+`514321c9f9677cd4d0e7e11a73b5a01d0f98dc69`, 2026-11-12, MIT; bundled-std
+notices stay upstream). The guarded acquisition re-verifies that tree and
+requires three named fixes to be present as ancestors: `78cb555a` (the NEON
+intrinsic families as tables in `core::arch::aarch64`), `c0c1a4b8`
+(target-feature and safety correction) and `e91301e8` (immediate-argument and
+`vext` correction). Main is never tracked and no newer bytes are substituted.
+
+**Source-level eligibility is not executed correctness.** `zmij-1.0.23`
+imports 43 `core::arch::aarch64` names; 20 of them are absent from the old
+pin's bundled `core::arch::aarch64` source and none from the new pin's. That
+comparison of the two pinned sources (upstream issue #1/#21 material) is
+eligibility for the recheck, not evidence that the float formatter, the Oxide
+graph or anything else now compiles or runs: only the activated probes can
+show that, and a source-name match alone never counts.
+
+**Separate apparatus and workload identities.** The apparatus is this
+repository's HEAD/tree, verified clean and exact by the source gate. The
+workload is the UNCHANGED prior snapshot `61a55ebb98fba45cb708cbe9473a0db09a1e086e`
+(tree `d672048298332d8ebb60073575a167c63dde4dc5`), never an apparatus head, and
+its lock (SHA-256 `e7dcf4647e41e3a1b5449e107ac1dac9a1da98076a868a10b1bdfeafa6f37b28`,
+7202 bytes) is the offline seed source. The three registry identities the
+probes exercise must resolve exactly as that lock records them:
+`serde_json` 1.0.151 (`c841b55e…`), `zmij` 1.0.23 (`29666d0a…`) and
+`crc32fast` 1.5.3 (`0ba106e8…`), each checked by version and checksum before a
+child runs. Dependency versions, features, source and `cfg` are never edited to
+avoid a compiler error.
+
+**Probes.** Two arms — plain Cargo with the product's actual quick recipe and
+the pinned Relax runner strict (`--check-first --no-live`, never `--relaxed`
+or `--cached`) — run three required probes, each compared against the baseline's
+exact stdout:
+
+- `compat-fmt`: the committed float fixture pins `serde_json =1.0.151`, whose
+  aarch64 formatting goes through `zmij`, and walks 30 declared `f64` bit
+  patterns, 18 `f32` patterns and 12 decimal decode inputs covering signs,
+  negative zero, fractions, the scientific-notation thresholds, both finite
+  extremes and the normal/subnormal and rounding boundaries. It prints the
+  input bits, the serialized text and the decoded bits, exits nonzero on any
+  round-trip mismatch, and the apparatus independently decodes every printed
+  number, requires the declared coverage floors and required extreme patterns,
+  and compares the arms byte for byte.
+- `compat-crc32`: the committed fixture pins `crc32fast =1.5.3` from the same
+  workload lock (the aarch64 `__crc32b`/`__crc32d` `target_feature("crc")`
+  path, relevant to upstream issue #21) and prints five ordered pattern
+  digests, a streaming fold over a deterministic 8200-byte multi-stream buffer
+  and the standard `123456789` → `cbf43926` check value.
+- `snapshot`: the unchanged workload's read-only `--help` route must exit
+  cleanly, print its marker and reproduce the baseline's exact stdout.
+
+Compatibility is cleared only when every required probe runs on both arms,
+matches its structural oracle, reproduces the baseline byte for byte and every
+child was positively reaped; a divergence is `mismatch`, a hung arm is
+`timeout`, an unclassified outcome aborts and leaves the rest `unexecuted`,
+and whole-group closure stays the guard's. A baseline failure aborts rather
+than reporting an incompatibility, because it invalidates the expected
+observation.
+
+**Fit correction.** The 307 occurrence was stopped at 4100.6 MiB of the fixed
+4096 MiB owned-scratch budget, UNCLOSED, with no receipt or timings. This mode
+does not enlarge anything: it stages no Oxide front door (plain Cargo and the
+Relax runner are the only arms), keeps one snapshot copy per arm, seeds from
+the workload lock, and disposes ONLY its own known-closed stage output inside
+the guard root — the engine build target after the copied executable and its
+retained bundled std have been verified by real children, and then each
+probe's caches after both arms completed — with zero outstanding children and
+every removed path and byte figure recorded. The checkout and bundled std are
+never disposed (Relax reads its std from its build-time checkout path), and the
+600 s total, 4096 MiB, 30 s stop margin, supervisor bytes, selected Stash
+volume and reserve watchdog are unchanged. A truthful fit refusal remains a
+valid outcome, never an automatic retry.
+
+**Authority and limits.** `effigy research:relax:compat:test` and
+`:plan` are effect-free apparatus checks and readiness. The heavy
+`:diagnostic` (uncounted keep-going) and `:qualify` (counted author
+compatibility qualification, after an adequate diagnostic at the unchanged
+head) refuse before any effect until a planner binds one occurrence to the
+exact script bytes, apparatus head/tree, workload commit/tree/lock, upstream
+commit/tree, toolchain, bounds and selected volume. Evidence is scoped to this
+pin, platform (macOS arm64, Rust 1.97.1) and workload; no timing is measured,
+so no speed, semantic or ecosystem-wide claim follows, and nothing here is
+product QA.
+
 ### Other run-path levers
 
 Any rustc-based JIT or interpreter still runs parsing, macro expansion and
@@ -426,7 +525,7 @@ time separately before any backend is credited.
 | Parallel frontend (`-Zthreads`) | Nightly; speeds frontend work on large crates. Measured 2026-10-18 as arm D: no warm edit gain on Oxide's workspace ([measurement](#cranelift-measurement-2026-10-18)). | Same nightly dependency-set cost as Cranelift; not worth it for small workspaces. |
 | Watch mode | Rebuilds and restarts on save; cuts latency, not work. | Human loop; low value for agents. |
 | [danluu/rust-interpreter](https://github.com/danluu/rust-interpreter) | rustc checks the code, then selected MIR is lowered to bytecode and run in an interpreter or AArch64 JIT. Self-described as "extremely vibe coded"; "cannot yet replace `cargo test`"; no unwinding, threads, FFI or `should_panic`; "no fallback" for unsupported code. Its results are mixed: 20% faster on one five-edit pilot, 2.7x slower on a compute-heavy target. Needs pinned nightly with `rustc-dev`; no license stated. | Not usable or adoptable. It shows the approach can work, and its ceiling is still the check time. |
-| [Relax](https://github.com/makepad/relax) | External standalone JIT compiler/runner that replaces the whole rustc/LLVM/linker/Cargo pipeline in one dependency-free Rust library, compiling std from its own shipped sources. macOS arm64 builds and passes its tests from a fresh clone per its README (2026-11-11). Not a rustc backend, Cargo plugin or Oxide strategy. | Bounded trial prepared at the pinned commit (oxide#307, Tom decision `d6a33913-cc2d-460f-bce0-25c424c176d1` v2); no measurement has run — [trial](#relax-quick-run-trial-2026-11-11-prepared). Not a strategy candidate until that trial reports. |
+| [Relax](https://github.com/makepad/relax) | External standalone JIT compiler/runner that replaces the whole rustc/LLVM/linker/Cargo pipeline in one dependency-free Rust library, compiling std from its own shipped sources. macOS arm64 builds and passes its tests from a fresh clone per its README (2026-11-11). Not a rustc backend, Cargo plugin or Oxide strategy. | The 307 trial at `aa540c14` is a scoped compatibility no-go with no timings — [trial](#relax-quick-run-trial-2026-11-11-prepared). A focused compatibility recheck at the newer pin `6ea9d063` is prepared and not activated — [recheck](#relax-compatibility-recheck-2026-11-12-prepared). Not a strategy candidate until a recheck clears compatibility. |
 | Miri / [Cranelift JIT](https://github.com/rust-lang/rustc_codegen_cranelift/blob/main/docs/usage.md) | Miri is a UB checker that runs far slower than native code. Cranelift JIT is covered above. | Not speed tools. |
 
 ### Optimized-dependency measurement (2026-10-18)

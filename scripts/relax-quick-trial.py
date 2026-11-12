@@ -35,6 +35,21 @@ Modes (exactly one; an unrecognized argument refuses before anything else):
               binding. Requires an adequate diagnostic at the unchanged head
               before separate owner activation; the activation document
               carries the diagnostic receipt digest it follows.
+  --compat-plan, --compat-self-check
+              The effect-free readiness and the pure controls of the focused
+              compatibility recheck (oxide#308, below). They compile, acquire
+              and run nothing.
+  --compat-diagnostic --binding P --sha256 H
+              The uncounted keep-going compatibility collection: the SAME
+              prior Oxide workload plus the float-formatting and CRC32 probes
+              under the plain-Cargo baseline and the patched pinned Relax arm.
+              Refuses before any effect until P names a planner-issued
+              activation bound to this exact source, the workload pin and the
+              new upstream pin. Always unqualified.
+  --compat-qualify --binding P --sha256 H
+              The counted author compatibility qualification under the same
+              guard, pin and case set. Its activation must name the digest of
+              an adequate diagnostic receipt at the unchanged head.
   --help      This text.
 
 Nothing in this preparation builds Relax, runs a third-party executable,
@@ -161,6 +176,82 @@ scratch. A guarded run exits 0 only when nothing aborted, every declared
 case executed and every verdict is `match`; any divergence (including the
 recorded known gap), unexecuted case or abort exits 1, so a divergence-only
 run can never read as a clean pass.
+
+Focused compatibility recheck (oxide#308; separate from the 307 trial)
+---------------------------------------------------------------------
+Tom's 2026-11-12 ruling (`7b5a88ce-96cb-4fab-a584-2e5deffa28ce` v2) asks one
+question: does a NEWER Relax pin clear the ARM64 intrinsic blocker the 307
+occurrence actually hit, on ACTUAL float formatting and the SAME prior Oxide
+workload? The 307 no-go stays exactly as recorded for its own pin; this is new
+work, never a reopening of that result, and a pass authorizes no integration,
+adoption, installation, default change or performance claim.
+
+The compat modes share this script, guard helpers, activation discipline and
+receipt practices but keep their own pin, case table and receipt schema
+(`oxide.relax-compat/1`), so the 307 commands and their history are untouched.
+Two identities are bound separately and required to match exactly:
+
+  * apparatus: this repository's HEAD/tree, verified clean and exact by the
+    source gate;
+  * workload: the UNCHANGED prior snapshot commit
+    `61a55ebb98fba45cb708cbe9473a0db09a1e086e` (tree
+    `d672048298332d8ebb60073575a167c63dde4dc5`, lock SHA-256
+    `e7dcf4647e41e3a1b5449e107ac1dac9a1da98076a868a10b1bdfeafa6f37b28`),
+    never this apparatus head. Its lock is the offline seed source, and its
+    serde_json 1.0.151 / zmij 1.0.23 / crc32fast 1.5.3 versions and checksums
+    are verified before any child runs.
+
+Upstream is pinned to makepad/relax
+`6ea9d0635f198b9a4510de1c87ac4d7b067f5cf7` (tree
+`514321c9f9677cd4d0e7e11a73b5a01d0f98dc69`, 2026-11-12, MIT, bundled-std
+notices upstream). The guarded acquisition re-verifies the tree identity and
+requires the three named fix commits (`78cb555a`, `c0c1a4b8`, `e91301e8`) to
+be present in the checkout. Source-level eligibility is NOT executed
+correctness: `zmij-1.0.23` imports 43 `core::arch::aarch64` names, 20 of which
+the old pin's bundled core lacked and none of which the new pin lacks, and that
+is exactly what the probes must now confirm by running.
+
+Declared probes (each run by the plain-Cargo baseline and the pinned Relax arm
+strict: `--check-first --no-live`, never `--relaxed` or `--cached`):
+
+  1. `compat-fmt` (required): the committed float fixture pins
+     `serde_json =1.0.151`, whose aarch64 float formatting goes through
+     `zmij`, and walks 30 declared f64 bit patterns, 18 f32 patterns and 12
+     decimal decode inputs covering signs, negative zero, fractions, the
+     scientific-notation thresholds, both finite extremes and the
+     normal/subnormal and rounding boundaries. It prints the input bits, the
+     serialized text and the decoded bits and exits nonzero on any round-trip
+     mismatch; the apparatus independently decodes every serialized field and
+     requires exact cross-arm stdout equality.
+  2. `compat-crc32` (required): `crc32fast =1.5.3` from the same workload lock
+     is the aarch64 `__crc32b`/`__crc32d` `target_feature("crc")` path, with a
+     deterministic multi-stream buffer, a 7-byte streaming fold and the
+     standard `123456789` -> `cbf43926` check value.
+  3. `snapshot` (required): the unchanged workload's read-only `--help` route,
+     required to print its marker, exit cleanly and reproduce the baseline's
+     exact stdout.
+
+Fit correction (the reason this mode is separate): the 307 occurrence was
+stopped at 4100.6 MiB of the fixed 4096 MiB owned-scratch budget, with the
+engine build target, a staged Oxide front door it did not need for this
+question, and three snapshot trees alive at once. This mode stages no Oxide
+front door (plain Cargo and the Relax runner are the only arms), keeps one
+snapshot copy per arm, and disposes ONLY this occurrence's own stage output in
+an explicit allowlist: after the copied executable, its retained bundled std
+source and a tiny std-only check/run have all been verified, the disposable
+engine build target is removed; then each probe's own cargo target and Relax
+cache are removed after that probe's two arms completed. Every disposal needs
+zero outstanding children and is recorded with the bytes removed. The checkout
+(Relax reads its std from the build-time checkout path) is never disposed, and
+the bounds, supervisor bytes, volume, reserve watchdog and stop margin are
+unchanged.
+
+Compatibility success requires EVERY required probe, exact baseline
+correspondence, a clean exit and positive child reaping; a timed-out arm is a
+recorded `timeout`, a divergence a `mismatch`, and an unclassified outcome an
+abort with the remaining probes `unexecuted`. The receipt therefore reports
+`cleared`, `blocked` or `incomplete`, states that it measures no timing, and
+claims no closure: the guard's post-leader census owns that.
 """
 
 from __future__ import annotations
@@ -174,6 +265,7 @@ import platform
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import time
@@ -391,14 +483,18 @@ def parse_arguments(argv: list[str]) -> tuple[str, str | None, str | None]:
     """Exactly one mode; --diagnostic/--measure require --binding + --sha256."""
     if not argv:
         return ("refuse", None, "a mode argument is required: --plan, --self-check, "
-                                "--diagnostic, --measure or --help")
+                                "--diagnostic, --measure, --compat-plan, "
+                                "--compat-self-check, --compat-diagnostic, "
+                                "--compat-qualify or --help")
     if len(argv) > 5:
         return ("refuse", None, f"too many arguments, got {argv!r}")
-    modes = ("--plan", "--self-check", "--diagnostic", "--measure", "--help")
+    modes = ("--plan", "--self-check", "--diagnostic", "--measure",
+             "--compat-plan", "--compat-self-check", "--compat-diagnostic",
+             "--compat-qualify", "--help")
     if argv[0] not in modes:
         return ("refuse", None, f"unrecognized first argument {argv[0]!r}")
     mode = argv[0][2:]
-    if mode in ("plan", "self-check", "help"):
+    if mode in ("plan", "self-check", "help", "compat-plan", "compat-self-check"):
         if len(argv) != 1:
             return ("refuse", None, f"{argv[0]} accepts no further arguments")
         return (mode, None, None)
@@ -2687,6 +2783,2067 @@ exported scratch, evidence and deadline, after the source and volume gates."""
         print(f"receipt: {destination} ({len(self._receipt_encoded)} bytes)")
 
 
+# ==========================================================================
+# Focused compatibility recheck (oxide#308)
+#
+# Tom's 2026-11-12 ruling (decision 7b5a88ce-96cb-4fab-a584-2e5deffa28ce v2)
+# asks whether a NEWER Relax pin clears the ARM64 intrinsic blocker the 307
+# occurrence actually hit, on actual float formatting and the SAME prior Oxide
+# workload. The 307 no-go stays exactly as recorded for its own pin. Nothing
+# here is a performance comparison: no timing is measured and no integration,
+# adoption, installation or default change is authorized by a pass.
+# ==========================================================================
+
+COMPAT_UPSTREAM_URL = "https://github.com/makepad/relax"
+COMPAT_UPSTREAM_COMMIT = "6ea9d0635f198b9a4510de1c87ac4d7b067f5cf7"
+COMPAT_UPSTREAM_TREE = "514321c9f9677cd4d0e7e11a73b5a01d0f98dc69"
+COMPAT_UPSTREAM_DATE = "2026-11-12"
+COMPAT_UPSTREAM_FIXES = {
+    "78cb555a603777ec9bf3905fd303d1f5db15f72c":
+        "the NEON intrinsic families as tables in core::arch::aarch64",
+    "c0c1a4b895dc1836880278d1099f591bae3696eb":
+        "target-feature and safety correction",
+    "e91301e873f58c5af56f13e9c04b0028c9e099c3":
+        "immediate-argument and vext correction",
+}
+WORKLOAD_COMMIT = "61a55ebb98fba45cb708cbe9473a0db09a1e086e"
+WORKLOAD_TREE = "d672048298332d8ebb60073575a167c63dde4dc5"
+WORKLOAD_LOCK_SHA256 = "e7dcf4647e41e3a1b5449e107ac1dac9a1da98076a868a10b1bdfeafa6f37b28"
+COMPAT_BINDING_SCHEMA = "oxide.relax-compat-activation/1"
+COMPAT_LIMIT_SECONDS = 600
+COMPAT_SCRATCH_MIB = 4096
+COMPAT_STOP_MARGIN_S = 30
+COMPAT_ARMS = ("cargo", "relax")
+# Fixed per-command caps, each clipped to the remaining deadline margin.
+CAP_COMPAT_VERIFY_S = 60
+CAP_COMPAT_FMT_S = 90
+CAP_COMPAT_CRC_S = 90
+CAP_COMPAT_SNAPSHOT_S = 180
+
+# Effect-free control seams. A guarded run never sets either: COMPAT_CHILD_SEAM
+# substitutes the named fake external child boundary, and COMPAT_SETUP_SEAM
+# substitutes the heavy acquisition/build/seed/materialize phases so a later
+# phase is driven through the real entry, gates and publication.
+COMPAT_SETUP_SEAM = None
+COMPAT_CHILD_SEAM = None
+
+# The workload lock's own registry identities. The compat fixtures must resolve
+# exactly these versions and checksums, so the probes exercise the observer the
+# snapshot uses and nothing newer.
+PINNED_WORKLOAD_DEPS = {
+    "serde_json": ("1.0.151",
+                   "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"),
+    "zmij": ("1.0.23",
+             "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"),
+    "crc32fast": ("1.5.3",
+                  "0ba106e844045ddc02c20768ac4b0b7cb45f2cc2ecbd833ac9f5dacb183c2055"),
+}
+
+COMPAT_CASES = [
+    {"case": "format", "workload": "compat-fmt", "required": True, "arms": COMPAT_ARMS,
+     "probe": "serde_json =1.0.151 float formatting through zmij 1.0.23: 30 f64 and 18 "
+              "f32 declared bit patterns plus 12 decimal decode inputs",
+     "oracle": "exit 0, every printed decode equals its input bits, every serialized "
+               "field independently decodes to those bits, declared coverage meets its "
+               "floor and the required sign/subnormal/extreme patterns, and the Relax "
+               "arm's stdout equals the plain-Cargo baseline byte for byte"},
+    {"case": "crc32", "workload": "compat-crc32", "required": True, "arms": COMPAT_ARMS,
+     "probe": "crc32fast =1.5.3 aarch64 target_feature(\"crc\") path: five named "
+              "patterns, an 8200-byte multi-stream buffer and a 7-byte streaming fold",
+     "oracle": "exit 0, the five ordered named digests, the streaming fold equal to the "
+               "one-shot digest of the same bytes, the standard 123456789 -> cbf43926 "
+               "check value, and exact stdout equality with the baseline"},
+    {"case": "snapshot", "workload": "snapshot", "required": True, "arms": COMPAT_ARMS,
+     "probe": "the unchanged prior workload's read-only --help route "
+              f"({WORKLOAD_COMMIT})",
+     "oracle": "exit 0, stdout carries SNAPSHOT_HELP_MARKER and no edit marker, and the "
+               "Relax arm's stdout equals the baseline byte for byte"},
+]
+
+COMPAT_FMT_MIN = {"f64": 20, "f32": 14, "parse_f64": 6, "parse_f32": 3}
+COMPAT_FMT_REQUIRED_F64 = (
+    "8000000000000000",  # negative zero
+    "0000000000000001",  # smallest subnormal
+    "7fefffffffffffff",  # f64::MAX
+    "0010000000000000",  # smallest normal
+    "000fffffffffffff",  # largest subnormal
+)
+COMPAT_FMT_REQUIRED_F32 = (
+    "80000000",
+    "00000001",
+    "7f7fffff",
+    "00800000",
+    "007fffff",
+)
+COMPAT_FMT_HEADER = re.compile(r"^declared f64=(\d+) f32=(\d+) parse_f64=(\d+) parse_f32=(\d+)$")
+COMPAT_FMT_F64 = re.compile(r"^f64 (\d+) ([0-9a-f]{16}) (\S+) ([0-9a-f]{16})$")
+COMPAT_FMT_F32 = re.compile(r"^f32 (\d+) ([0-9a-f]{8}) (\S+) ([0-9a-f]{8})$")
+COMPAT_FMT_PARSE_F64 = re.compile(r"^parse-f64 (\d+) (\S+) ([0-9a-f]{16}) (\S+) ([0-9a-f]{16})$")
+COMPAT_FMT_PARSE_F32 = re.compile(r"^parse-f32 (\d+) (\S+) ([0-9a-f]{8}) (\S+) ([0-9a-f]{8})$")
+COMPAT_FMT_SUMMARY = re.compile(r"^checked=(\d+) failures=(\d+)$")
+COMPAT_CRC32_ROWS = ("empty", "check", "fox", "long", "zeros")
+COMPAT_CRC32_ROW = re.compile(r"^crc32 (\d) ([a-z]+) ([0-9a-f]{8})$")
+COMPAT_CRC32_FOLD = re.compile(r"^crc32-fold long ([0-9a-f]{8})$")
+COMPAT_CRC32_STREAM = re.compile(r"^crc32-stream check ([0-9a-f]{8})$")
+COMPAT_CRC32_CHECK_LINE = "crc32-check 123456789 cbf43926"
+COMPAT_CRC32_CHECK_VALUE = "cbf43926"
+COMPAT_HELLO_STDOUT = "hello-relax-compat\n"
+
+# The ONLY stage output this occurrence may remove, after that phase's children
+# were positively reaped and the copied executable (with its retained checkout
+# and bundled std) was verified. The checkout, the seeded Cargo homes, the
+# private home, the staged binaries and every workload source are NOT listed
+# and are never disposed: Relax reads its std from the build-time checkout.
+COMPAT_DISPOSABLE_PATHS = (
+    "stage-relax-target",
+    "workloads/compat-fmt/cargo/target",
+    "workloads/compat-fmt/relax/compat-fmt/target",
+    "workloads/compat-crc32/cargo/target",
+    "workloads/compat-crc32/relax/compat-crc32/target",
+    "workloads/snapshot/cargo/target",
+)
+
+# Unmeasured planning allocation for the effect-free plan, in seconds. It sums
+# to the 570 s work window (600 s total less the 30 s stop margin). The fixed
+# caps above remain the maxima, each clipped to the remaining time.
+COMPAT_PLAN_ALLOCATION = (
+    ("upstream acquisition", 40),
+    ("engine lock establishment", 10),
+    ("engine build", 185),
+    ("engine verification", 20),
+    ("post-disposal engine smoke", 10),
+    ("offline seed from the workload lock", 15),
+    ("workload materialization and offline fixture locks", 25),
+    ("format probe (both arms)", 35),
+    ("crc32 probe (both arms)", 25),
+    ("snapshot baseline arm", 70),
+    ("snapshot Relax arm", 120),
+    ("receipt publication", 15),
+)
+
+COMPAT_PREMISE_CHECKLIST = {
+    "private_home_rustup": (
+        "Applies. The invoking RUSTUP_HOME (or HOME/.rustup when unset) is captured "
+        "before HOME is replaced, preserved in every child, RUSTUP_TOOLCHAIN=1.97.1 is "
+        "pinned and RUSTUP_AUTO_INSTALL=0 is set; no toolchain is ever installed."
+    ),
+    "account_home_control": (
+        "Does not apply: this mode stages no Oxide front door and runs no oxide "
+        "command, so no account home is consulted. The private HOME still isolates "
+        "every arm's Relax stores and temporary directories."
+    ),
+    "environment_isolation": (
+        "Applies. Every child environment is built from the scrubbed base that drops "
+        "inherited OXIDE_*, CARGO_*, every RUST* value, MAKEPAD_*, XDG_* and SCCACHE_*, "
+        "then declares RUSTFLAGS empty, restores the invoking RUSTUP_HOME and pins the "
+        "toolchain. No host pool, wrapper or flag set can reach an arm."
+    ),
+    "automatic_adoption": (
+        "Does not apply: the compat probes convert nothing and run no product command."
+    ),
+    "cargo_external_argv": (
+        "Does not apply: the compat probes invoke no Cargo external subcommand. The "
+        "Relax runner is invoked directly."
+    ),
+    "owned_images": (
+        "Does not apply: no disk image is created or attached. Scratch is a directory "
+        "inside the supervisor's owned root."
+    ),
+    "compiler_flags": (
+        "Applies. RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS are scrubbed and declared "
+        "empty for every arm, so an inherited encoded value cannot change either arm."
+    ),
+    "temporary_storage": (
+        "Applies. The body runs only under the supervisor's selected-volume default: "
+        "run root, private HOME, CARGO_HOME and TMPDIR/TMP/TEMP live inside one fresh "
+        "run root; a /private/tmp fallback is refused before any effect. No image."
+    ),
+    "macos_mktemp": (
+        "Applies by construction, not by mktemp: one run root is created from the "
+        "activation's single safe component under the guard-exported scratch root and "
+        "refused if it already exists; every per-arm home, Cargo home and temp "
+        "directory sits inside that owned root."
+    ),
+}
+
+
+# --------------------------------------------------------------------------
+# Compat helpers (pure except the read-only git queries)
+# --------------------------------------------------------------------------
+
+
+def git_bytes(args: list[str]) -> bytes:
+    """One read-only git query in this repository; a failure is a refusal."""
+    run = subprocess.run(["git", *args], cwd=REPO, capture_output=True, timeout=60)
+    if run.returncode != 0:
+        detail = run.stderr[:300].decode("utf-8", "replace")
+        raise Refusal(f"git {' '.join(args)} failed: {detail!r}")
+    return run.stdout
+
+
+def lock_registry_identities(lock_text: str) -> dict:
+    """Registry package identities from one Cargo.lock text, by block parse.
+
+    Only `[[package]]` blocks with a registry source and a checksum qualify; a
+    pinned name without a registry source or checksum is a refusal, never a
+    silently skipped package."""
+    identities: dict = {}
+    for block in lock_text.split("[[package]]")[1:]:
+        name = re.search(r'^name = "([^"]+)"$', block, re.M)
+        version = re.search(r'^version = "([^"]+)"$', block, re.M)
+        source = re.search(r'^source = "([^"]*)"$', block, re.M)
+        checksum = re.search(r'^checksum = "([^"]*)"$', block, re.M)
+        if name is None or version is None:
+            raise Refusal("the lock has an unreadable package block")
+        if source is None or not source.group(1).startswith("registry+"):
+            continue
+        if checksum is None:
+            raise Refusal(f"the lock's registry package {name.group(1)} carries no checksum")
+        identities[name.group(1)] = {
+            "version": version.group(1),
+            "checksum": checksum.group(1),
+        }
+    return identities
+
+
+def pinned_dependency_identities(lock_text: str) -> dict:
+    """The three declared workload pins, all required, all exact."""
+    identities = lock_registry_identities(lock_text)
+    facts: dict = {}
+    for name, (version, checksum) in PINNED_WORKLOAD_DEPS.items():
+        found = identities.get(name)
+        if found is None:
+            raise Refusal(f"the lock does not pin {name}")
+        if found["version"] != version or found["checksum"] != checksum:
+            raise Refusal(
+                f"the lock's {name} is {found['version']} ({found['checksum'][:12]}...), "
+                f"not the declared {version} ({checksum[:12]}...)"
+            )
+        facts[name] = dict(found)
+    return facts
+
+
+def verify_workload(spec: dict) -> dict:
+    """The UNCHANGED prior snapshot identity: commit, tree and lock bytes.
+
+    This is bound separately from the apparatus head, so the workload can never
+    drift to this repository's newer tree. All queries are read-only."""
+    if not isinstance(spec, dict):
+        raise Refusal("the activation has no workload object")
+    if spec.get("commit") != WORKLOAD_COMMIT or spec.get("tree") != WORKLOAD_TREE:
+        raise Refusal("the activation does not bind the prepared workload commit and tree")
+    if spec.get("lock_sha256") != WORKLOAD_LOCK_SHA256:
+        raise Refusal("the activation does not bind the prepared workload lock digest")
+    git_bytes(["cat-file", "-e", f"{WORKLOAD_COMMIT}^{{commit}}"])
+    tree = git_bytes(["rev-parse", f"{WORKLOAD_COMMIT}^{{tree}}"]).decode().strip()
+    if tree != WORKLOAD_TREE:
+        raise Refusal(f"workload commit {WORKLOAD_COMMIT} has tree {tree!r}, not {WORKLOAD_TREE}")
+    lock_bytes = git_bytes(["show", f"{WORKLOAD_COMMIT}:Cargo.lock"])
+    digest = hashlib.sha256(lock_bytes).hexdigest()
+    if digest != WORKLOAD_LOCK_SHA256:
+        raise Refusal(f"the workload lock is {digest}, not the prepared {WORKLOAD_LOCK_SHA256}")
+    dependencies = pinned_dependency_identities(lock_bytes.decode("utf-8"))
+    return {
+        "commit": WORKLOAD_COMMIT,
+        "tree": tree,
+        "lock_sha256": digest,
+        "lock_bytes": len(lock_bytes),
+        "dependencies": dependencies,
+    }
+
+
+def compat_declared_unexecuted(cases: list[dict]) -> list[dict]:
+    present = {(row.get("case"), row.get("arm")) for row in cases}
+    rows: list[dict] = []
+    for case in COMPAT_CASES:
+        for arm in COMPAT_ARMS:
+            if (case["case"], arm) not in present:
+                rows.append({"case": case["case"], "arm": arm, "verdict": "unexecuted"})
+    return rows
+
+
+def compat_correspondence(verdict: str, stdout_equal: bool) -> str:
+    """The Relax arm's verdict: its own structural result, then exact baseline
+    correspondence. A structural failure is reported as itself, never replaced
+    by a byte-comparison result."""
+    if verdict != "match":
+        return verdict
+    return "match" if stdout_equal else "mismatch"
+
+
+def compat_collection_exit(aborted: str | None, cases: list[dict]) -> int:
+    if aborted:
+        return 1
+    if not cases:
+        return 1
+    return 0 if all(row.get("verdict") == "match" for row in cases) else 1
+
+
+def _json_number(text: str) -> float:
+    value = json.loads(text)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{text!r} is not one JSON number")
+    return float(value)
+
+
+def compat_fmt_oracle(record: dict) -> tuple[str, dict]:
+    """The independent float-formatting oracle: structure, self-declared
+    coverage, both decodes (the program's and this process's) and the summary.
+    Only the cross-arm byte comparison is left to the caller."""
+    if record.get("timed_out"):
+        return ("timeout", {"reason": "the probe did not finish inside its cap"})
+    if record.get("exit") != 0:
+        return ("mismatch", {"reason": f"exit {record.get('exit')}"})
+    lines = record.get("stdout", "").splitlines()
+    if not lines:
+        return ("mismatch", {"reason": "empty stdout"})
+    header = COMPAT_FMT_HEADER.match(lines[0])
+    if header is None:
+        return ("mismatch", {"reason": "no declared header line"})
+    counts = {
+        name: int(value)
+        for name, value in zip(("f64", "f32", "parse_f64", "parse_f32"), header.groups())
+    }
+    for name, floor in COMPAT_FMT_MIN.items():
+        if counts[name] < floor:
+            return ("mismatch", {"reason": f"declared {name}={counts[name]} below the floor {floor}"})
+    body = lines[1:]
+    summary = COMPAT_FMT_SUMMARY.match(body[-1]) if body else None
+    if summary is None:
+        return ("mismatch", {"reason": "no checked/failures summary line"})
+    total = counts["f64"] + counts["f32"] + counts["parse_f64"] + counts["parse_f32"]
+    if int(summary.group(1)) != total or int(summary.group(2)) != 0:
+        return ("mismatch", {"reason": f"summary {body[-1]!r} does not cover {total} inputs"})
+    rows = body[:-1]
+    if len(rows) != total:
+        return ("mismatch", {"reason": f"{len(rows)} rows, expected {total}"})
+    position = 0
+    seen_f64: list[str] = []
+    for index in range(counts["f64"]):
+        match = COMPAT_FMT_F64.match(rows[position])
+        position += 1
+        if match is None or int(match.group(1)) != index:
+            return ("mismatch", {"reason": f"f64 row {index} is malformed or out of order"})
+        bits, text, back = match.group(2), match.group(3), match.group(4)
+        if back != bits:
+            return ("mismatch", {"reason": f"f64 row {index} decoded {back} for input {bits}"})
+        try:
+            decoded = _json_number(text)
+        except (ValueError, TypeError) as error:
+            return ("mismatch", {"reason": f"f64 row {index} text is not a JSON number: {error}"})
+        if struct.unpack("<Q", struct.pack("<d", decoded))[0] != int(bits, 16):
+            return ("mismatch", {"reason": f"f64 row {index} independent decode differs from {bits}"})
+        seen_f64.append(bits)
+    seen_f32: list[str] = []
+    for index in range(counts["f32"]):
+        match = COMPAT_FMT_F32.match(rows[position])
+        position += 1
+        if match is None or int(match.group(1)) != index:
+            return ("mismatch", {"reason": f"f32 row {index} is malformed or out of order"})
+        bits, text, back = match.group(2), match.group(3), match.group(4)
+        if back != bits:
+            return ("mismatch", {"reason": f"f32 row {index} decoded {back} for input {bits}"})
+        try:
+            decoded = _json_number(text)
+        except (ValueError, TypeError) as error:
+            return ("mismatch", {"reason": f"f32 row {index} text is not a JSON number: {error}"})
+        if struct.unpack("<I", struct.pack("<f", decoded))[0] != int(bits, 16):
+            return ("mismatch", {"reason": f"f32 row {index} independent decode differs from {bits}"})
+        seen_f32.append(bits)
+    for index in range(counts["parse_f64"]):
+        match = COMPAT_FMT_PARSE_F64.match(rows[position])
+        position += 1
+        if match is None or int(match.group(1)) != index:
+            return ("mismatch", {"reason": f"parse-f64 row {index} is malformed or out of order"})
+        bits, again, back = match.group(3), match.group(4), match.group(5)
+        if back != bits:
+            return ("mismatch", {"reason": f"parse-f64 row {index} re-encode differs from {bits}"})
+        try:
+            decoded = _json_number(again)
+        except (ValueError, TypeError) as error:
+            return ("mismatch", {"reason": f"parse-f64 row {index} re-encoding is unreadable: {error}"})
+        if struct.unpack("<Q", struct.pack("<d", decoded))[0] != int(bits, 16):
+            return ("mismatch", {"reason": f"parse-f64 row {index} independent decode differs from {bits}"})
+    for index in range(counts["parse_f32"]):
+        match = COMPAT_FMT_PARSE_F32.match(rows[position])
+        position += 1
+        if match is None or int(match.group(1)) != index:
+            return ("mismatch", {"reason": f"parse-f32 row {index} is malformed or out of order"})
+        bits, again, back = match.group(3), match.group(4), match.group(5)
+        if back != bits:
+            return ("mismatch", {"reason": f"parse-f32 row {index} re-encode differs from {bits}"})
+        try:
+            decoded = _json_number(again)
+        except (ValueError, TypeError) as error:
+            return ("mismatch", {"reason": f"parse-f32 row {index} re-encoding is unreadable: {error}"})
+        if struct.unpack("<I", struct.pack("<f", decoded))[0] != int(bits, 16):
+            return ("mismatch", {"reason": f"parse-f32 row {index} independent decode differs from {bits}"})
+    missing = [bits for bits in COMPAT_FMT_REQUIRED_F64 if bits not in seen_f64]
+    if missing:
+        return ("mismatch", {"reason": f"required f64 patterns absent: {missing}"})
+    missing = [bits for bits in COMPAT_FMT_REQUIRED_F32 if bits not in seen_f32]
+    if missing:
+        return ("mismatch", {"reason": f"required f32 patterns absent: {missing}"})
+    return ("match", {"counts": counts, "checked": total, "f64_rows": len(seen_f64),
+                      "f32_rows": len(seen_f32)})
+
+
+def compat_crc32_oracle(record: dict) -> tuple[str, dict]:
+    if record.get("timed_out"):
+        return ("timeout", {"reason": "the probe did not finish inside its cap"})
+    if record.get("exit") != 0:
+        return ("mismatch", {"reason": f"exit {record.get('exit')}"})
+    lines = record.get("stdout", "").splitlines()
+    digests: dict = {}
+    for position, name in enumerate(COMPAT_CRC32_ROWS):
+        match = COMPAT_CRC32_ROW.match(lines[position]) if position < len(lines) else None
+        if match is None or int(match.group(1)) != position or match.group(2) != name:
+            return ("mismatch", {"reason": f"crc32 row {position} ({name}) is malformed or out of order"})
+        digests[name] = match.group(3)
+    tail = lines[len(COMPAT_CRC32_ROWS):]
+    fold = COMPAT_CRC32_FOLD.match(tail[0]) if tail else None
+    if fold is None:
+        return ("mismatch", {"reason": "no crc32-fold line"})
+    if fold.group(1) != digests["long"]:
+        return ("mismatch", {"reason": "the streaming fold differs from the one-shot digest"})
+    stream = COMPAT_CRC32_STREAM.match(tail[1]) if len(tail) > 1 else None
+    if stream is None or stream.group(1) != COMPAT_CRC32_CHECK_VALUE:
+        return ("mismatch", {"reason": "the streamed 123456789 digests is not the check value"})
+    if digests["check"] != COMPAT_CRC32_CHECK_VALUE:
+        return ("mismatch", {"reason": f"the one-shot check digest is {digests['check']}"})
+    if len(tail) < 3 or tail[2] != COMPAT_CRC32_CHECK_LINE:
+        return ("mismatch", {"reason": "the explicit check line is absent or different"})
+    return ("match", {"digests": digests, "fold": fold.group(1)})
+
+
+def compat_snapshot_oracle(record: dict) -> tuple[str, dict]:
+    if record.get("timed_out"):
+        return ("timeout", {"reason": "the workload did not finish inside its cap"})
+    if record.get("exit") != 0:
+        return ("mismatch", {"reason": f"exit {record.get('exit')}"})
+    stdout = record.get("stdout", "")
+    if SNAPSHOT_HELP_MARKER not in stdout:
+        return ("mismatch", {"reason": "the help marker is absent"})
+    if "[trial" in stdout:
+        return ("mismatch", {"reason": "the help output carries an edit marker"})
+    return ("match", {"stdout_bytes": len(stdout)})
+
+
+def parse_compat_binding(payload: bytes, mode: str) -> dict:
+    """One planner-issued compat activation. Every field is exact."""
+    if mode not in ("compat-diagnostic", "compat-qualify"):
+        raise Refusal(f"{mode!r} is not a compat mode")
+    try:
+        document = json.loads(payload)
+    except ValueError as error:
+        raise Refusal(f"the activation document is not JSON: {error}")
+    if not isinstance(document, dict) or document.get("schema") != COMPAT_BINDING_SCHEMA:
+        raise Refusal("the activation document is not the compat schema")
+    if not safe_component(document.get("planner_reference")):
+        raise Refusal("the activation names no planner reference")
+    if document.get("mode") != mode:
+        raise Refusal(f"the activation binds mode {document.get('mode')!r}, not {mode!r}")
+    if document.get("script_sha256") != sha256_file(SCRIPT):
+        raise Refusal("the activation does not bind this script's exact bytes")
+    apparatus = document.get("apparatus")
+    if not isinstance(apparatus, dict):
+        raise Refusal("the activation has no apparatus object")
+    if not is_hex(apparatus.get("head"), 40) or not is_hex(apparatus.get("tree"), 40):
+        raise Refusal("the activation's apparatus head and tree are not exact")
+    verify_workload(document.get("workload"))
+    upstream = document.get("upstream")
+    if not isinstance(upstream, dict):
+        raise Refusal("the activation has no upstream object")
+    if upstream.get("commit") != COMPAT_UPSTREAM_COMMIT or upstream.get("tree") != COMPAT_UPSTREAM_TREE:
+        raise Refusal("the activation does not bind the pinned upstream commit and tree")
+    if document.get("toolchain") != TOOLCHAIN:
+        raise Refusal("the activation does not bind the pinned toolchain")
+    guard = document.get("guard")
+    if not isinstance(guard, dict):
+        raise Refusal("the activation has no guard object")
+    if guard.get("supervisor_sha256") != EXPECTED_RUNNER_SHA256:
+        raise Refusal("the activation does not name the qualified supervisor")
+    if (guard.get("limit_seconds") != COMPAT_LIMIT_SECONDS
+            or guard.get("scratch_mib") != COMPAT_SCRATCH_MIB):
+        raise Refusal("the activation's guard bounds are not this route's fixed bounds")
+    if guard.get("stop_margin_seconds") != COMPAT_STOP_MARGIN_S:
+        raise Refusal("the activation's stop margin is not the original 30 s")
+    volume = document.get("volume")
+    if not isinstance(volume, dict) or volume.get("uuid") != SELECTED_VOLUME_UUID:
+        raise Refusal("the activation does not name the selected Stash volume")
+    receipt = document.get("diagnostic_receipt_sha256")
+    if receipt and not is_hex(receipt, 64):
+        raise Refusal("the activation's diagnostic receipt digest is not a SHA-256")
+    if mode == "compat-qualify" and not receipt:
+        raise Refusal("a counted compat activation must name the diagnostic receipt it follows")
+    paths = document.get("paths")
+    if not isinstance(paths, dict):
+        raise Refusal("the activation has no paths object")
+    for key in ("run_root_name", "packet_name"):
+        if not safe_component(paths.get(key)):
+            raise Refusal(f"the activation's {key} is not one safe component")
+    return document
+
+
+def compat_binding_document(mode: str, script_sha: str) -> bytes:
+    return json.dumps(
+        {
+            "schema": COMPAT_BINDING_SCHEMA,
+            "planner_reference": "compat-activation-1",
+            "mode": mode,
+            "script_sha256": script_sha,
+            "apparatus": {"head": "a" * 40, "tree": "b" * 40},
+            "workload": {"commit": WORKLOAD_COMMIT, "tree": WORKLOAD_TREE,
+                         "lock_sha256": WORKLOAD_LOCK_SHA256},
+            "upstream": {"commit": COMPAT_UPSTREAM_COMMIT, "tree": COMPAT_UPSTREAM_TREE},
+            "toolchain": TOOLCHAIN,
+            "diagnostic_receipt_sha256": "c" * 64 if mode == "compat-qualify" else "",
+            "guard": {"supervisor_sha256": EXPECTED_RUNNER_SHA256,
+                      "limit_seconds": COMPAT_LIMIT_SECONDS,
+                      "scratch_mib": COMPAT_SCRATCH_MIB,
+                      "stop_margin_seconds": COMPAT_STOP_MARGIN_S},
+            "volume": {"uuid": SELECTED_VOLUME_UUID},
+            "paths": {"run_root_name": "relax-compat-run", "packet_name": "compat-packet"},
+        }
+    ).encode()
+
+
+def compat_fixture_digests() -> dict[str, str]:
+    return {path: digest for path, digest in fixture_digests().items() if "/compat-" in path}
+
+
+def compat_readiness() -> tuple[list[str], list[str]]:
+    """(readiness notes, blockers) from actual metadata. No compile or run."""
+    notes: list[str] = []
+    blockers: list[str] = []
+    notes.append(f"platform: {platform.system()} {platform.machine()}")
+    if platform.system() != "Darwin" or platform.machine() not in ("arm64", "aarch64"):
+        blockers.append("the prepared compat scope is macOS arm64 on this host")
+    notes.append(f"script sha256: {sha256_file(SCRIPT)}")
+    try:
+        supervisor_digest = sha256_file(SUPERVISOR)
+        if supervisor_digest != EXPECTED_RUNNER_SHA256:
+            blockers.append(
+                f"scripts/bounded-test.py is {supervisor_digest}, not the pinned "
+                f"{EXPECTED_RUNNER_SHA256}; the guarded commands must not run"
+            )
+        else:
+            notes.append("supervisor bytes match the pinned qualified digest")
+    except OSError as error:
+        blockers.append(f"cannot read the supervisor: {error}")
+    head, tree, head_blockers = read_only_head()
+    if head:
+        notes.append(f"apparatus head/tree: {head} / {tree}")
+    blockers.extend(head_blockers)
+    try:
+        workload = verify_workload({"commit": WORKLOAD_COMMIT, "tree": WORKLOAD_TREE,
+                                    "lock_sha256": WORKLOAD_LOCK_SHA256})
+        notes.append(
+            "workload identity: " + workload["commit"] + " / " + workload["tree"]
+            + " / lock " + workload["lock_sha256"] + f" ({workload['lock_bytes']} bytes)"
+        )
+        notes.append(
+            "workload dependency pins: " + ", ".join(
+                f"{name} {facts['version']}" for name, facts in workload["dependencies"].items()
+            )
+        )
+    except Refusal as error:
+        blockers.append(f"workload identity: {error}")
+    notes.append(
+        "upstream pin: " + COMPAT_UPSTREAM_COMMIT + " / " + COMPAT_UPSTREAM_TREE
+        + f" ({COMPAT_UPSTREAM_DATE}); the guarded acquisition re-verifies the tree"
+    )
+    notes.append(
+        "upstream fix commits required in the checkout: "
+        + ", ".join(f"{sha[:12]} ({label})" for sha, label in COMPAT_UPSTREAM_FIXES.items())
+    )
+    toolchains = toolchain_inventory()
+    notes.append("installed toolchains: " + "; ".join(toolchains[:8]))
+    if not any(line.startswith(TOOLCHAIN) or f" {TOOLCHAIN} " in f" {line} " for line in toolchains):
+        blockers.append(f"toolchain {TOOLCHAIN} is not installed; the recheck never installs one")
+    digests = compat_fixture_digests()
+    notes.append(f"committed compat fixture files: {len(digests)}")
+    required = [
+        "fixtures/relax-quick-trial/compat-hello/Cargo.toml",
+        "fixtures/relax-quick-trial/compat-hello/src/main.rs",
+        "fixtures/relax-quick-trial/compat-fmt/Cargo.toml",
+        "fixtures/relax-quick-trial/compat-fmt/src/main.rs",
+        "fixtures/relax-quick-trial/compat-crc32/Cargo.toml",
+        "fixtures/relax-quick-trial/compat-crc32/src/main.rs",
+    ]
+    for path in required:
+        if path not in digests:
+            blockers.append(f"required compat fixture input is missing: {path}")
+    return (notes, blockers)
+
+
+def compat_plan_text() -> str:
+    notes, blockers = compat_readiness()
+    lines: list[str] = []
+    lines.append("relax compatibility recheck plan (oxide#308) — effect-free; nothing is")
+    lines.append("compiled, acquired, staged, run or measured by this mode.")
+    lines.append("")
+    lines.append("Readiness from actual metadata:")
+    for note in notes:
+        lines.append(f"  - {note}")
+    lines.append("")
+    lines.append(f"Boundaries (prepared, not execution permission): {COMPAT_LIMIT_SECONDS} s total")
+    lines.append("including acquisition/engine build/seed/staging and every probe;")
+    lines.append(f"{COMPAT_SCRATCH_MIB} MiB monitored owned scratch on the selected Stash volume")
+    lines.append(f"{SELECTED_VOLUME_UUID}; {COMPAT_STOP_MARGIN_S} s stop-work margin; no image;")
+    lines.append("the supervisor's 20 GiB reserve safeguards and heavy admission. Each")
+    lines.append("per-command cap is a minimum of its fixed value and the remaining deadline")
+    lines.append("minus the stop margin.")
+    lines.append("")
+    lines.append("Guarded commands (never run by --compat-plan):")
+    lines.append('  effigy research:relax:compat:diagnostic  # planner-issued RELAX_COMPAT_ACTIVATION')
+    lines.append('  effigy research:relax:compat:qualify     # after an adequate diagnostic')
+    lines.append("  python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 4096 \\")
+    lines.append("      -- python3 scripts/relax-quick-trial.py --compat-diagnostic \\")
+    lines.append('      --binding "$RELAX_COMPAT_ACTIVATION" --sha256 "$RELAX_COMPAT_ACTIVATION_SHA256"')
+    lines.append("")
+    lines.append("Case table (required probes; each runs the plain-Cargo baseline and the")
+    lines.append("pinned Relax arm in that order, exactly these argv):")
+    lines.append("  - format (compat-fmt, serde_json =1.0.151 -> zmij 1.0.23)")
+    lines.append("      cargo: cargo run --locked --offline --quiet --bin compat-fmt")
+    lines.append("      relax: <relax> run --check-first --no-live --quiet compat-fmt")
+    lines.append("      oracle: exit 0, declared coverage, both decodes bit-exact, exact "
+                 "cross-arm stdout")
+    lines.append("  - crc32 (compat-crc32, crc32fast =1.5.3)")
+    lines.append("      cargo: cargo run --locked --offline --quiet --bin compat-crc32")
+    lines.append("      relax: <relax> run --check-first --no-live --quiet compat-crc32")
+    lines.append("      oracle: exit 0, ordered digests, fold == one-shot, check value "
+                 "cbf43926, exact cross-arm stdout")
+    lines.append(f"  - snapshot ({WORKLOAD_COMMIT}, unchanged --help route)")
+    lines.append("      cargo: cargo run --locked --offline --quiet --bin oxide -- --help")
+    lines.append("      relax: <relax> run --check-first --no-live --quiet oxide-storage "
+                 "--bin oxide -- --help")
+    lines.append("      oracle: exit 0, help marker, no edit marker, exact cross-arm stdout")
+    lines.append("")
+    lines.append("Engine lifecycle and disposal (fit correction for the 307 4100.6/4096 MiB stop):")
+    lines.append("  1. clone the pinned upstream, re-verify its tree and require the three fix")
+    lines.append("     commits; establish the lock offline; build the engine offline.")
+    lines.append("  2. copy the runner executable, hash it, and verify the COPIED executable")
+    lines.append("     with --version, a check and a run of the std-only compat-hello package,")
+    lines.append("     with the retained checkout's bundled std positively present.")
+    lines.append("  3. only then remove stage-relax-target, and re-run a cheap smoke through the")
+    lines.append("     copied executable to confirm the retained checkout/bundled std still")
+    lines.append("     serve it after disposal.")
+    lines.append("  4. seed the private Cargo home from the WORKLOAD lock, materialize the two")
+    lines.append("     fixture copies plus one snapshot copy per arm, establish each fixture lock")
+    lines.append("     offline and verify its pinned dependency identities.")
+    lines.append("  5. remove each probe's cargo target and Relax cache after that probe's two")
+    lines.append("     arms completed; the snapshot baseline target is removed before the Relax")
+    lines.append("     arm for headroom. Only paths in COMPAT_DISPOSABLE_PATHS may be removed, and")
+    lines.append("     only with zero outstanding children. Never the checkout or bundled std.")
+    lines.append("")
+    lines.append("Planning allocation (UNMEASURED estimates; the caps above remain the maxima):")
+    for phase, seconds in COMPAT_PLAN_ALLOCATION:
+        lines.append(f"  - {phase}: {seconds} s")
+    lines.append(f"  total: {sum(seconds for _, seconds in COMPAT_PLAN_ALLOCATION)} s of the "
+                 f"{COMPAT_LIMIT_SECONDS - COMPAT_STOP_MARGIN_S} s work window")
+    lines.append("")
+    lines.append("Refusal gates (before any effect):")
+    lines.append("  - activation document digest, schema, mode, script bytes and planner reference")
+    lines.append("  - apparatus head/tree exact and the tracked worktree clean")
+    lines.append("  - workload commit/tree and lock bytes bound and re-verified read-only; the")
+    lines.append("    three registry pins required at their exact versions and checksums")
+    lines.append("  - upstream commit/tree in the activation, re-verified in the checkout, with")
+    lines.append("    the three fix commits present as ancestors")
+    lines.append("  - selected volume UUID, qualified supervisor digest, fixed bounds and the")
+    lines.append("    absence of the bound run root; a counted activation also names the")
+    lines.append("    diagnostic receipt digest it follows")
+    lines.append("  - the offline seed's canonical source boundary and the unchanged anchored")
+    lines.append("    seeder rules; no network fallback, toolchain install or upstream patch")
+    lines.append("")
+    lines.append("Premise checklist dispositions (workflow.md, proof authoring):")
+    for item, disposition in COMPAT_PREMISE_CHECKLIST.items():
+        lines.append(f"  - {item}: {disposition}")
+    lines.append("")
+    lines.append("History: the 307 trial's no-go for Relax aa540c14… (20 unresolved")
+    lines.append("core::arch::aarch64 intrinsics in zmij-1.0.23, and an UNCLOSED 4100.6/4096 MiB")
+    lines.append("occurrence with no timings) stays exact for that pin. Nothing here reopens it;")
+    lines.append("this mode is new work on a different pin and measures no performance.")
+    lines.append("")
+    if blockers:
+        lines.append("Blockers:")
+        for blocker in blockers:
+            lines.append(f"  - {blocker}")
+        lines.append("The guarded compat modes refuse until every blocker above is resolved;")
+        lines.append("this plan itself grants no execution authority.")
+    else:
+        lines.append("No metadata blocker found; activation stays a separate planner step.")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def build_compat_receipt(base: dict, cases: list[dict], cap_bytes: int | None = None) -> dict:
+    """One bounded summary receipt. Statistics cover the COMPLETE recorded set;
+    the `cases` array is a disclosed excerpt when the cap forces trimming, and
+    the complete untrimmed rows live in the hash-bound samples artifact."""
+    cap = MAX_RECEIPT_BYTES if cap_bytes is None else cap_bytes
+    document = dict(base)
+    document["cases"] = list(cases)
+    document["cases_total"] = len(cases)
+    document["cases_omitted"] = 0
+    document["cases_in_receipt"] = len(cases)
+    document["verdicts"] = verdict_tally(cases)
+    document["declared_unexecuted"] = sum(
+        1 for row in cases if row.get("verdict") == "unexecuted"
+    )
+    encoded = json.dumps(document, indent=1).encode()
+    while len(encoded) > cap and len(document["cases"]) > 1:
+        document["cases"].pop()
+        document["cases_omitted"] += 1
+        document["cases_in_receipt"] = len(document["cases"])
+        encoded = json.dumps(document, indent=1).encode()
+    return document
+
+
+class CompatRun:
+    """One bound focused compatibility occurrence. Every effect happens under
+    the guard's exported scratch, evidence and deadline, after the volume,
+    apparatus and workload gates. The compatibility question is answered only
+    by the declared probes; nothing here measures timing."""
+
+    def __init__(self, mode: str, binding: dict) -> None:
+        self.mode = mode
+        self.binding = binding
+        self.exports = guard_exports()
+        self.deadline_ns = int(os.environ["OXIDE_PROOF_DEADLINE_NS"])
+        self.env = scrubbed_env()
+        self.cases: list[dict] = []
+        self.figures: dict = {}
+        self.disposals: list[dict] = []
+        self.aborted: str | None = None
+        self.children_spawned = 0
+        self.children_reaped = 0
+        self.progress_records = 0
+        self.progress_failures = 0
+        scratch = self.exports["OXIDE_TASK_SCRATCH_ROOT"]
+        self.run_root = os.path.join(scratch, self.binding["paths"]["run_root_name"])
+        self.packet_dir = os.path.join(
+            self.exports["OXIDE_PROOF_EVIDENCE"], self.binding["paths"]["packet_name"]
+        )
+
+    # -- bounded progress evidence -----------------------------------------
+
+    def progress_name(self) -> str:
+        return f"progress-{self.binding['paths']['packet_name']}.jsonl"
+
+    def progress(self, phase: str, **fields) -> None:
+        """Append one bounded JSON line to the packet's progress log, outside the
+        disposable scratch, so a later guard stop cannot erase an earlier real
+        refusal or a landed phase. Publication is best effort: a failure is
+        counted and disclosed, never allowed to change a case verdict."""
+        entry = {"phase": phase, "monotonic_s": round(time.monotonic(), 3), **fields}
+        line = json.dumps(entry, separators=(",", ":")).encode()[:4096] + b"\n"
+        try:
+            os.makedirs(self.packet_dir, exist_ok=True)
+            with open(os.path.join(self.packet_dir, self.progress_name()), "ab") as handle:
+                handle.write(line)
+                handle.flush()
+                os.fsync(handle.fileno())
+            self.progress_records += 1
+        except OSError:
+            self.progress_failures += 1
+
+    # -- phases ------------------------------------------------------------
+
+    def setup(self) -> None:
+        os.makedirs(self.packet_dir, exist_ok=True)
+        mount = mount_of(self.exports["OXIDE_TASK_SCRATCH_ROOT"])
+        uuid = volume_uuid_of(mount)
+        if uuid.upper() != self.binding["volume"]["uuid"].upper():
+            raise Refusal(f"the selected volume is {uuid}, not the bound {self.binding['volume']['uuid']}")
+        apparatus = self.binding["apparatus"]
+        head, tree = resolve_source({"head": apparatus["head"], "tree": apparatus["tree"]})
+        workload = verify_workload(self.binding["workload"])
+        self.figures["volume"] = {"mount": mount, "uuid": uuid}
+        self.figures["source"] = {
+            "apparatus": {"head": head, "tree": tree},
+            "workload": {key: workload[key] for key in
+                         ("commit", "tree", "lock_sha256", "lock_bytes", "dependencies")},
+        }
+        self.figures["fixtures"] = compat_fixture_digests()
+        self.progress("gates", mount=mount, uuid=uuid, apparatus_head=head,
+                      apparatus_tree=tree, workload_commit=workload["commit"],
+                      workload_lock_sha256=workload["lock_sha256"])
+        if os.path.exists(self.run_root):
+            raise Refusal(f"the bound run root already exists: {self.run_root}")
+        os.makedirs(self.run_root)
+        self.private_home()
+        if COMPAT_SETUP_SEAM is not None:
+            COMPAT_SETUP_SEAM(self)
+            return
+        self.acquire_upstream()
+        self.build_relax()
+        self.stage_hello()
+        self.verify_engine("before disposal")
+        self.dispose_stage_output(
+            "stage-relax-target",
+            "the fresh engine build exited and every producer was positively reaped; the "
+            "copied executable and the retained checkout's bundled std were verified",
+        )
+        self.verify_engine("after disposal")
+        self.seed_cargo_home()
+        self.materialize()
+
+    def private_home(self) -> None:
+        home = os.path.join(self.run_root, "home")
+        for leaf in (".makepad-run", "tmp"):
+            os.makedirs(os.path.join(home, leaf), exist_ok=True)
+        os.chmod(home, 0o700)
+        self.env["HOME"] = home
+        self.env["TMPDIR"] = os.path.join(home, "tmp")
+        self.env["TMP"] = self.env["TMPDIR"]
+        self.env["TEMP"] = self.env["TMPDIR"]
+        self.env["MAKEPAD_RUN_HOME"] = os.path.join(home, ".makepad-run")
+        self.figures["home"] = home
+
+    def child(self, argv: list[str], cwd: str, env: dict, cap_s: float) -> dict:
+        """One fresh child through the real measured/reaped boundary, or the
+        named fake external boundary the effect-free controls inject. A child
+        counts as reaped only when the call returned (a spawn refusal leaves
+        none outstanding, so both counters still agree)."""
+        if budget_s(self.deadline_ns, cap_s) <= 0.0:
+            raise Refusal("the deadline plus stop margin leaves no budget for the next child")
+        self.children_spawned += 1
+        try:
+            if COMPAT_CHILD_SEAM is not None:
+                return COMPAT_CHILD_SEAM(argv, cwd, env, cap_s)
+            return measure_one(argv, cwd, env, cap_s, self.deadline_ns)
+        finally:
+            self.children_reaped += 1
+
+    def acquire_upstream(self) -> None:
+        dest = os.path.join(self.run_root, "relax-src")
+        clone = ["git", "clone", "--progress", COMPAT_UPSTREAM_URL, dest]
+        started = time.monotonic()
+        record = self.child(clone, self.run_root, child_env(self.env), CAP_CLONE_S)
+        if record["exit"] != 0:
+            raise Refusal(f"upstream clone failed: {record['stderr'][:300]!r}")
+        network_bytes = None
+        for match in re.finditer(
+            r"Receiving objects:\s+\d+% \(\d+/\d+\), ([0-9.]+) (KiB|MiB|GiB)",
+            record["stderr"],
+        ):
+            value, unit = float(match.group(1)), match.group(2)
+            network_bytes = int(value * {"KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3}[unit])
+        checkout = self.child(
+            ["git", "checkout", COMPAT_UPSTREAM_COMMIT], dest, child_env(self.env), 30
+        )
+        if checkout["exit"] != 0:
+            raise Refusal(f"upstream checkout failed: {checkout['stderr'][:300]!r}")
+        verify = subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=dest, capture_output=True, text=True, timeout=20
+        )
+        if verify.returncode != 0 or verify.stdout.strip() != COMPAT_UPSTREAM_TREE:
+            raise Refusal(
+                f"upstream tree is {verify.stdout.strip()!r}, not the bound {COMPAT_UPSTREAM_TREE}"
+            )
+        fixes: dict = {}
+        for commit, label in COMPAT_UPSTREAM_FIXES.items():
+            present = subprocess.run(
+                ["git", "cat-file", "-e", f"{commit}^{{commit}}"], cwd=dest, capture_output=True
+            ).returncode == 0
+            ancestor = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", commit, "HEAD"], cwd=dest, capture_output=True
+            ).returncode == 0
+            fixes[commit] = {"label": label, "present": present, "ancestor": ancestor}
+            if not (present and ancestor):
+                raise Refusal(f"the upstream checkout does not contain fix commit {commit}")
+        self.relax_src = dest
+        self.relax_std_dir = os.path.join(dest, "libs", "relax", "compiler", "std")
+        self.figures["acquisition"] = {
+            "commit": COMPAT_UPSTREAM_COMMIT,
+            "tree": COMPAT_UPSTREAM_TREE,
+            "network_seconds": round(time.monotonic() - started, 3),
+            "network_bytes": network_bytes,
+            "network_bytes_source": (
+                "parsed from the forced git clone progress output" if network_bytes is not None
+                else "unparsed; occupied bytes below bound the checkout instead"
+            ),
+            "occupied": walk_bytes(dest),
+            "fix_commits": fixes,
+        }
+        self.progress("upstream", commit=COMPAT_UPSTREAM_COMMIT,
+                      tree=COMPAT_UPSTREAM_TREE, network_bytes=network_bytes,
+                      fixes={sha: facts["ancestor"] for sha, facts in fixes.items()})
+
+    def build_relax(self) -> None:
+        cargo_home = os.path.join(self.run_root, "cargo-homes", "relax-build")
+        os.makedirs(cargo_home)
+        env = child_env(
+            self.env,
+            CARGO_HOME=cargo_home,
+            RUSTUP_TOOLCHAIN=TOOLCHAIN,
+            CARGO_TARGET_DIR=os.path.join(self.run_root, "stage-relax-target"),
+        )
+        lock_record = self.child(engine_lock_command(), self.relax_src, env, CAP_LOCK_S)
+        if lock_record["exit"] != 0:
+            raise Refusal(
+                "the upstream Relax workspace lock could not be established offline "
+                f"(exit {lock_record['exit']}): {lock_record['stderr'][:400]!r}"
+            )
+        record = self.child(engine_build_command(), self.relax_src, env, CAP_ENGINE_BUILD_S)
+        if record["exit"] != 0:
+            raise Refusal(
+                "the pinned Relax engine did not build with the pinned toolchain "
+                f"(exit {record['exit']}); this is a compatibility blocker: {record['stderr'][:400]!r}"
+            )
+        binary_dir = os.path.join(self.run_root, "bin")
+        os.makedirs(binary_dir, exist_ok=True)
+        staged = os.path.join(binary_dir, "relax")
+        shutil.copy2(os.path.join(self.run_root, "stage-relax-target", "release", "relax"), staged)
+        self.relax_bin = staged
+        self.figures["engine"] = {
+            "sha256": sha256_file(staged),
+            "build_seconds": record["seconds"],
+            "build_command": record["argv"],
+            "lock_establishment": {
+                "command": lock_record["argv"],
+                "seconds": lock_record["seconds"],
+                "offline": True,
+                "note": "explicit offline generate-lockfile inside the guarded allowance",
+            },
+            "build_target": os.path.join(self.run_root, "stage-relax-target"),
+            "retained_checkout": self.relax_src,
+            "bundled_std": self.relax_std_dir,
+            "runtime_requirement": (
+                "the copied executable reads Relax's std from the retained checkout at the "
+                "build-time path recorded here; the checkout is never disposed"
+            ),
+            "fix_commits": self.figures.get("acquisition", {}).get("fix_commits"),
+        }
+        self.progress("engine_built", sha256=self.figures["engine"]["sha256"],
+                      build_seconds=record["seconds"])
+
+    def stage_hello(self) -> None:
+        dest = os.path.join(self.run_root, "workloads", "compat-hello", "relax", "compat-hello")
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copytree(fixture_path("compat-hello"), dest)
+        self.hello_dir = dest
+
+    def verify_env(self) -> dict:
+        """The engine-verification environment: the std-only package needs no
+        seeded registry sources, and the shared home does not exist yet."""
+        home = os.path.join(self.run_root, "cargo-homes", "verify")
+        os.makedirs(home, exist_ok=True)
+        return child_env(
+            self.env,
+            MAKEPAD_RUN_OFFLINE="1",
+            RUSTUP_TOOLCHAIN=TOOLCHAIN,
+            CARGO_HOME=home,
+        )
+
+    def verify_engine(self, phase: str) -> None:
+        """Verify the COPIED executable plus the retained checkout's bundled std
+        with real children: --version, a check of the std-only package and a run
+        with its exact declared stdout. Runs before and (cheaply) after the
+        disposable build target is removed."""
+        if not os.path.isdir(self.relax_std_dir):
+            raise Refusal(f"the pinned checkout's bundled std is absent: {self.relax_std_dir}")
+        binary_dir = os.path.dirname(self.relax_bin)
+        version = self.child([self.relax_bin, "--version"], binary_dir, child_env(self.env),
+                             CAP_COMPAT_VERIFY_S)
+        if version["exit"] != 0:
+            raise Refusal(
+                f"the copied relax executable refused --version ({phase}, exit {version['exit']})"
+            )
+        check = self.child([self.relax_bin, "check", "compat-hello"], self.hello_dir,
+                           self.verify_env(), CAP_COMPAT_VERIFY_S)
+        if check["exit"] != 0:
+            raise Refusal(
+                f"the copied relax executable cannot check the std-only package ({phase}): "
+                f"{check['stderr'][:300]!r}"
+            )
+        run = self.child(
+            [self.relax_bin, "run", "--check-first", "--no-live", "--quiet", "compat-hello"],
+            self.hello_dir, self.verify_env(), CAP_COMPAT_VERIFY_S,
+        )
+        verdict = oracle_exact_stdout(run, COMPAT_HELLO_STDOUT)
+        if verdict != "match":
+            raise Refusal(
+                f"the copied relax executable cannot run the std-only package ({phase}): "
+                f"{verdict}, exit {run['exit']}, stdout {run['stdout'][:120]!r}"
+            )
+        self.figures.setdefault("engine_verification", {})[phase] = {
+            "version": version["stdout"].strip()[:200],
+            "check_exit": check["exit"],
+            "check_seconds": check["seconds"],
+            "run_verdict": verdict,
+            "run_seconds": run["seconds"],
+            "std_dir": self.relax_std_dir,
+            "std_dir_present": os.path.isdir(self.relax_std_dir),
+        }
+        self.progress("engine_verified", phase=phase, check_exit=check["exit"],
+                      run_verdict=verdict, std_dir_present=os.path.isdir(self.relax_std_dir))
+
+    def dispose_stage_output(self, relative: str, reason: str) -> None:
+        """Remove ONE declared stage output inside this run's guard root.
+
+        Only an exact allowlist entry, never a symlink, never a path that
+        resolves outside the owned root, and only when every child this body
+        started was positively reaped. The bytes removed are recorded, and the
+        checkout, bundled std, seeded Cargo homes, private home, staged binaries
+        and workload sources are not on the list at all."""
+        if relative not in COMPAT_DISPOSABLE_PATHS:
+            raise Refusal(f"refusing to dispose undeclared stage output {relative!r}")
+        if self.children_spawned != self.children_reaped:
+            raise Refusal(
+                "refusing to dispose while a child is not positively reaped "
+                f"({self.children_spawned} spawned, {self.children_reaped} reaped)"
+            )
+        full = os.path.join(self.run_root, relative)
+        root_real = os.path.realpath(self.run_root)
+        full_real = os.path.realpath(full)
+        if full_real == root_real or not full_real.startswith(root_real + os.sep):
+            raise Refusal(f"the disposal target {relative!r} escapes the owned run root")
+        entry = {
+            "path": relative,
+            "reason": reason,
+            "children_spawned": self.children_spawned,
+            "children_reaped": self.children_reaped,
+        }
+        if not os.path.exists(full):
+            entry["absent"] = True
+        else:
+            if os.path.islink(full):
+                raise Refusal(f"refusing to dispose the symlink {relative!r}")
+            entry["bytes_before"] = walk_bytes(full)
+            shutil.rmtree(full)
+            entry["after"] = {"absent": not os.path.exists(full)}
+            if os.path.exists(full):
+                raise Refusal(f"the disposal of {relative!r} left bytes behind")
+        self.disposals.append(entry)
+        self.progress("disposed", path=relative, absent=entry.get("absent", False),
+                      removed_bytes=(entry.get("bytes_before") or {}).get("bytes_apparent"))
+
+    def seed_cargo_home(self) -> None:
+        import offline_seed
+
+        lock_bytes = git_bytes(["show", f"{WORKLOAD_COMMIT}:Cargo.lock"])
+        digest = hashlib.sha256(lock_bytes).hexdigest()
+        if digest != WORKLOAD_LOCK_SHA256:
+            raise Refusal(f"the workload lock is {digest}, not the prepared {WORKLOAD_LOCK_SHA256}")
+        host_home = os.environ.get("CARGO_HOME") or os.path.join(
+            os.environ.get("HOME", os.path.expanduser("~")), ".cargo"
+        )
+        source = canonical_cache_source(host_home)
+        limits = {
+            "anchor": "no-follow per component below the canonical common root",
+            "aggregate_bytes": offline_seed.LIMITS.aggregate_bytes,
+            "work_seconds": offline_seed.LIMITS.work_seconds,
+            "git_candidates": offline_seed.LIMITS.git_candidates,
+            "note": "private config, checksum-verified content; host cache read-only; the "
+                    "seed source is the WORKLOAD lock, never this apparatus head's lock",
+        }
+        self.figures["seed_source"] = {**source, "limits": limits}
+        destination = os.path.join(self.run_root, "cargo-homes", "shared")
+        os.makedirs(destination)
+        started = time.monotonic()
+        try:
+            seed = offline_seed.seed_cargo_home(
+                source["common_root"],
+                destination,
+                lock_bytes,
+                deadline_ns=self.deadline_ns - int(COMPAT_STOP_MARGIN_S * 1e9),
+            )
+        except offline_seed.SeedRefusal as error:
+            raise Refusal(f"seed: {error}") from error
+        self.shared_cargo_home = destination
+        self.figures["seed"] = {
+            "source": source,
+            "destination": destination,
+            "lock_sha256": digest,
+            "aggregate_bytes": seed.get("aggregate_bytes"),
+            "seconds": round(time.monotonic() - started, 3),
+            "network_seconds": 0.0,
+            "limits": limits,
+            "note": "offline seed from the normalized invoking Cargo home; no download",
+        }
+        self.progress("seeded", aggregate_bytes=seed.get("aggregate_bytes"),
+                      seconds=self.figures["seed"]["seconds"])
+
+    def materialize(self) -> None:
+        self.works = {}
+        for fixture in ("compat-fmt", "compat-crc32"):
+            self.works[fixture] = {}
+            for arm in COMPAT_ARMS:
+                dest = os.path.join(self.run_root, "workloads", fixture, arm, fixture)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.copytree(fixture_path(fixture), dest)
+                self.works[fixture][arm] = dest
+        identities: dict = {}
+        for fixture, names in (("compat-fmt", ("serde_json", "zmij")),
+                               ("compat-crc32", ("crc32fast",))):
+            identities[fixture] = {}
+            for arm in COMPAT_ARMS:
+                workdir = self.works[fixture][arm]
+                env = child_env(self.env, CARGO_HOME=self.shared_cargo_home,
+                                RUSTUP_TOOLCHAIN=TOOLCHAIN)
+                record = self.child(["cargo", "generate-lockfile", "--offline"], workdir, env,
+                                    CAP_LOCK_S)
+                if record["exit"] != 0:
+                    raise Refusal(
+                        f"offline lock establishment failed for {fixture}/{arm}: "
+                        f"{record['stderr'][:300]!r}"
+                    )
+                with open(os.path.join(workdir, "Cargo.lock"), encoding="utf-8") as handle:
+                    lock_text = handle.read()
+                found = lock_registry_identities(lock_text)
+                for name in names:
+                    version, checksum = PINNED_WORKLOAD_DEPS[name]
+                    current = found.get(name)
+                    if current is None or current["version"] != version or current["checksum"] != checksum:
+                        raise Refusal(
+                            f"{fixture}/{arm} resolved {name} to {current}, not the workload pin "
+                            f"{version} ({checksum[:12]}...)"
+                        )
+                    identities[fixture].setdefault(name, {})[arm] = dict(current)
+        self.figures["fixture_locks"] = identities
+        self.works["snapshot"] = {}
+        for arm in COMPAT_ARMS:
+            dest = os.path.join(self.run_root, "workloads", "snapshot", arm, "tree")
+            os.makedirs(dest, exist_ok=True)
+            archive = subprocess.run(
+                ["git", "archive", WORKLOAD_COMMIT], cwd=REPO, capture_output=True, timeout=60
+            )
+            if archive.returncode != 0:
+                raise Refusal("git archive of the workload commit failed")
+            untar = subprocess.run(["tar", "-x", "-C", dest], input=archive.stdout, timeout=120)
+            if untar.returncode != 0:
+                raise Refusal("materializing the workload snapshot failed")
+            lock_digest = sha256_file(os.path.join(dest, "Cargo.lock"))
+            if lock_digest != WORKLOAD_LOCK_SHA256:
+                raise Refusal(
+                    f"the materialized snapshot lock is {lock_digest}, not the workload pin"
+                )
+            self.works["snapshot"][arm] = dest
+        self.figures["workloads"] = {
+            key: {arm: path for arm, path in arms.items()} for key, arms in self.works.items()
+        }
+        self.progress("workloads", fixture_locks=self.figures.get("fixture_locks"),
+                      snapshot_lock_sha256=WORKLOAD_LOCK_SHA256)
+
+    # -- arms and probes ---------------------------------------------------
+
+    def relax_env(self) -> dict:
+        return child_env(
+            self.env,
+            MAKEPAD_RUN_OFFLINE="1",
+            CARGO_HOME=self.shared_cargo_home,
+            RUSTUP_TOOLCHAIN=TOOLCHAIN,
+        )
+
+    def arm_argv_env(self, probe: str, arm: str) -> tuple[list[str], dict, str]:
+        if probe == "snapshot":
+            root = os.path.join(self.run_root, "workloads", "snapshot", arm)
+            workdir = os.path.join(root, "tree")
+            if arm == "cargo":
+                env = child_env(
+                    quick_recipe_env(self.env),
+                    CARGO_HOME=self.shared_cargo_home,
+                    RUSTUP_TOOLCHAIN=TOOLCHAIN,
+                    CARGO_TARGET_DIR=os.path.join(root, "target"),
+                )
+                return (["cargo", "run", "--locked", "--offline", "--quiet", "--bin", "oxide",
+                         "--", "--help"], env, workdir)
+            return ([self.relax_bin, "run", "--check-first", "--no-live", "--quiet",
+                     "oxide-storage", "--bin", "oxide", "--", "--help"], self.relax_env(), workdir)
+        fixture = "compat-fmt" if probe == "format" else "compat-crc32"
+        root = os.path.join(self.run_root, "workloads", fixture, arm)
+        workdir = os.path.join(root, fixture)
+        if arm == "cargo":
+            env = child_env(
+                quick_recipe_env(self.env),
+                CARGO_HOME=self.shared_cargo_home,
+                RUSTUP_TOOLCHAIN=TOOLCHAIN,
+                CARGO_TARGET_DIR=os.path.join(root, "target"),
+            )
+            return (["cargo", "run", "--locked", "--offline", "--quiet", "--bin", fixture],
+                    env, workdir)
+        return ([self.relax_bin, "run", "--check-first", "--no-live", "--quiet", fixture],
+                self.relax_env(), workdir)
+
+    def record(self, probe: str, arm: str, record: dict, verdict: str, facts: dict,
+               baseline_stdout: str | None = None) -> None:
+        stdout = record.get("stdout", "")
+        row = {
+            "case": probe,
+            "arm": arm,
+            "exit": record.get("exit"),
+            "timed_out": record.get("timed_out"),
+            "seconds": record.get("seconds"),
+            "verdict": verdict,
+            "stdout_sha256": hashlib.sha256(stdout.encode("utf-8", "replace")).hexdigest(),
+            "stdout_bytes": len(stdout),
+            "facts": facts,
+            "stdout_evidence": record.get("stdout_evidence"),
+            "stderr_evidence": record.get("stderr_evidence"),
+        }
+        if baseline_stdout is not None:
+            row["baseline_stdout_sha256"] = hashlib.sha256(
+                baseline_stdout.encode("utf-8", "replace")
+            ).hexdigest()
+            row["stdout_equal_to_baseline"] = stdout == baseline_stdout
+        self.cases.append(row)
+        prefix = (row.get("stdout_evidence") or {}).get("prefix", "")
+        self.progress("case", case=probe, arm=arm, verdict=verdict, exit=row["exit"],
+                      timed_out=row["timed_out"], seconds=row["seconds"],
+                      stdout_sha256=row["stdout_sha256"], stdout_bytes=row["stdout_bytes"],
+                      stdout_prefix=prefix[:256])
+
+    def baseline(self, probe: str, cap_s: float, oracle) -> tuple[dict | None, str, dict]:
+        """Run the plain-Cargo baseline and require it to satisfy the STRUCTURAL
+        oracle: a baseline failure invalidates the probe's expected observation,
+        so it aborts the run instead of being reported as an incompatibility."""
+        argv, env, cwd = self.arm_argv_env(probe, "cargo")
+        record = self.child(argv, cwd, env, cap_s)
+        verdict, facts = oracle(record)
+        self.record(probe, "cargo", record, verdict, facts)
+        return (record, verdict, facts)
+
+    def arm(self, probe: str, cap_s: float, oracle, baseline_record: dict) -> None:
+        argv, env, cwd = self.arm_argv_env(probe, "relax")
+        record = self.child(argv, cwd, env, cap_s)
+        verdict, facts = oracle(record)
+        verdict = compat_correspondence(verdict, record.get("stdout", "") == baseline_record.get("stdout", ""))
+        self.record(probe, "relax", record, verdict, facts,
+                    baseline_stdout=baseline_record.get("stdout", ""))
+
+    def dispose_probe(self, probe: str) -> None:
+        if probe == "snapshot":
+            self.dispose_stage_output(
+                "workloads/snapshot/cargo/target",
+                "the snapshot baseline arm completed; the Relax arm does not read it",
+            )
+            return
+        fixture = "compat-fmt" if probe == "format" else "compat-crc32"
+        for relative in (f"workloads/{fixture}/cargo/target",
+                         f"workloads/{fixture}/relax/{fixture}/target"):
+            self.dispose_stage_output(
+                relative, f"the {probe} probe completed for both arms; no later case reads it",
+            )
+
+    def case_format(self) -> None:
+        baseline, verdict, facts = self.baseline("format", CAP_COMPAT_FMT_S, compat_fmt_oracle)
+        if verdict != "match":
+            self.aborted = (
+                "format: the plain-Cargo baseline did not satisfy the structural float "
+                f"oracle ({facts})"
+            )
+            return
+        self.arm("format", CAP_COMPAT_FMT_S, compat_fmt_oracle, baseline)
+        self.dispose_probe("format")
+
+    def case_crc32(self) -> None:
+        baseline, verdict, facts = self.baseline("crc32", CAP_COMPAT_CRC_S, compat_crc32_oracle)
+        if verdict != "match":
+            self.aborted = (
+                "crc32: the plain-Cargo baseline did not satisfy the structural CRC32 "
+                f"oracle ({facts})"
+            )
+            return
+        self.arm("crc32", CAP_COMPAT_CRC_S, compat_crc32_oracle, baseline)
+        self.dispose_probe("crc32")
+
+    def case_snapshot(self) -> None:
+        baseline, verdict, facts = self.baseline("snapshot", CAP_COMPAT_SNAPSHOT_S,
+                                                 compat_snapshot_oracle)
+        if verdict != "match":
+            self.aborted = (
+                "snapshot: the plain-Cargo baseline did not print the expected help output "
+                f"({facts})"
+            )
+            return
+        self.dispose_probe("snapshot")
+        self.arm("snapshot", CAP_COMPAT_SNAPSHOT_S, compat_snapshot_oracle, baseline)
+
+    def verify_sources_at_closeout(self) -> None:
+        """Re-read the apparatus and workload identities after every probe, so a
+        source drift during the occurrence is disclosed instead of assumed away."""
+        apparatus = self.binding["apparatus"]
+        head, tree = resolve_source({"head": apparatus["head"], "tree": apparatus["tree"]})
+        workload = verify_workload(self.binding["workload"])
+        snapshot_locks: dict = {}
+        for arm in COMPAT_ARMS:
+            path = os.path.join(self.run_root, "workloads", "snapshot", arm, "tree", "Cargo.lock")
+            snapshot_locks[arm] = sha256_file(path) if os.path.exists(path) else "absent"
+            if snapshot_locks[arm] != WORKLOAD_LOCK_SHA256:
+                raise Refusal(
+                    f"the materialized {arm} snapshot lock is {snapshot_locks[arm]}, not "
+                    "the workload pin"
+                )
+        self.figures["closeout_source_check"] = {
+            "apparatus": {"head": head, "tree": tree},
+            "workload": {"commit": workload["commit"], "lock_sha256": workload["lock_sha256"]},
+            "snapshot_locks": snapshot_locks,
+        }
+        self.progress("closeout_sources", apparatus_head=head,
+                      workload_commit=workload["commit"], snapshot_locks=snapshot_locks)
+
+    def execute(self) -> None:
+        probes = (
+            ("format", self.case_format),
+            ("crc32", self.case_crc32),
+            ("snapshot", self.case_snapshot),
+        )
+        for name, method in probes:
+            if self.aborted:
+                break
+            try:
+                method()
+            except Refusal as error:
+                self.aborted = f"{name}: {error}"
+                break
+            except (OSError, ValueError, KeyError, TypeError,
+                    subprocess.SubprocessError) as error:
+                self.aborted = f"{name}: {type(error).__name__}: {error}"
+                break
+        try:
+            self.verify_sources_at_closeout()
+        except Refusal as error:
+            detail = f"closeout source check: {error}"
+            self.aborted = f"{self.aborted}; {detail}" if self.aborted else detail
+
+    # -- receipt -----------------------------------------------------------
+
+    def compatibility(self) -> dict:
+        verdicts: dict = {}
+        for case in COMPAT_CASES:
+            rows = {row.get("arm"): row for row in self.cases if row.get("case") == case["case"]}
+            if len(rows) != len(COMPAT_ARMS):
+                verdicts[case["case"]] = "unexecuted"
+                continue
+            failures = [row for row in rows.values() if row.get("verdict") != "match"]
+            verdicts[case["case"]] = "match" if not failures else failures[0]["verdict"]
+        reaping_clean = self.children_spawned == self.children_reaped
+        if (self.aborted or not reaping_clean
+                or any(verdict == "unexecuted" for verdict in verdicts.values())):
+            result = "incomplete"
+        elif all(verdict == "match" for verdict in verdicts.values()):
+            result = "cleared"
+        else:
+            result = "blocked"
+        return {
+            "required_probes": [case["case"] for case in COMPAT_CASES if case["required"]],
+            "probe_verdicts": verdicts,
+            "result": result,
+            "children_reaping_clean": reaping_clean,
+            "success_rule": (
+                "compatibility is cleared only when EVERY required probe ran on both arms, "
+                "its structural oracle matched, the Relax arm reproduced the baseline's "
+                "exact stdout, both children exited cleanly and every spawned child was "
+                "positively reaped; whole-group closure stays the guard's"
+            ),
+            "scope": (
+                f"only makepad/relax {COMPAT_UPSTREAM_COMMIT} on this platform, against the "
+                f"unchanged workload {WORKLOAD_COMMIT}; no integration, adoption, "
+                "installation, default change or performance claim"
+            ),
+        }
+
+    def samples_bytes(self) -> bytes:
+        document = {
+            "schema": "oxide.relax-compat-samples/1",
+            "cases_total": len(self.cases),
+            "cases": self.cases,
+        }
+        return json.dumps(document, indent=1).encode()
+
+    def receipt(self) -> bytes:
+        samples = self.samples_bytes()
+        packet_name = self.binding["paths"]["packet_name"]
+        base = {
+            "schema": "oxide.relax-compat/1",
+            "mode": self.mode,
+            "qualification": (
+                "none: uncounted keep-going diagnostic; it grants no compatibility credit"
+                if self.mode == "compat-diagnostic" else
+                "counted author compatibility qualification at the bound head; not product QA"
+            ),
+            "closure": (
+                "the guard's post-leader census decides closure; this receipt claims none"
+            ),
+            "planner_reference": self.binding["planner_reference"],
+            "apparatus": self.figures.get("source", {}).get("apparatus"),
+            "workload": self.figures.get("source", {}).get("workload"),
+            "upstream": {
+                "url": COMPAT_UPSTREAM_URL,
+                "commit": COMPAT_UPSTREAM_COMMIT,
+                "tree": COMPAT_UPSTREAM_TREE,
+                "date": COMPAT_UPSTREAM_DATE,
+                "fix_commits": self.figures.get("acquisition", {}).get("fix_commits"),
+                "license": (
+                    "MIT; Relax's bundled-std notices live upstream under "
+                    "libs/relax/compiler/std/CREDITS.md and no upstream bytes are copied here"
+                ),
+            },
+            "toolchain": TOOLCHAIN,
+            "platform": f"{platform.system()} {platform.machine()}",
+            "figures": {key: value for key, value in self.figures.items() if key != "acquisition"},
+            "acquisition": self.figures.get("acquisition"),
+            "disposals": self.disposals,
+            "children": {
+                "spawned": self.children_spawned,
+                "reaped": self.children_reaped,
+                "note": (
+                    "every child this body started was waited for and reaped before any "
+                    "disposal; the guard owns whole-session closure and the census"
+                ),
+            },
+            "compatibility": self.compatibility(),
+            "performance_claim": "none: this focused recheck measures no timing and no cache cost",
+            "integration": (
+                "none: no product behaviour, recipe, default, dependency, installation or "
+                "consumer change"
+            ),
+            "samples_file": f"samples-{packet_name}.json",
+            "samples_rows": len(self.cases),
+            "progress_file": self.progress_name(),
+            "progress_records": self.progress_records,
+            "progress_failures": self.progress_failures,
+            "samples_sha256": hashlib.sha256(samples).hexdigest(),
+            "statistics_basis": (
+                "complete: verdicts, declared_unexecuted and the compatibility result cover "
+                "every recorded case in the hash-bound samples artifact, whether this summary "
+                "carries its row or not"
+            ),
+            "aborted": self.aborted,
+            "exit_rule": (
+                "exit 0 only when nothing aborted, every declared probe ran on both arms and "
+                "every verdict is match; a divergence, timeout or unexecuted probe exits 1"
+            ),
+            "limits": {
+                "wall_limit_s": COMPAT_LIMIT_SECONDS,
+                "scratch_mib": COMPAT_SCRATCH_MIB,
+                "stop_margin_s": COMPAT_STOP_MARGIN_S,
+                "cap_basis": (
+                    "each per-command cap is the minimum of its fixed value and the remaining "
+                    "deadline minus the stop margin; no clock resets and no phase allowance"
+                ),
+                "disposal_basis": (
+                    "only newly created, known-closed stage output inside this run's guard "
+                    "root, after zero outstanding children; the checkout, bundled std, seeded "
+                    "Cargo homes and workload sources are never disposed"
+                ),
+                "filesystem_caches": "not globally flushable under this scope",
+            },
+        }
+        return json.dumps(build_compat_receipt(base, self.cases), indent=1).encode()
+
+    def publish(self) -> None:
+        self.cases.extend(compat_declared_unexecuted(self.cases))
+        self.figures["owned_bytes"] = {
+            "run_root": walk_bytes(self.run_root) if os.path.isdir(self.run_root)
+            else {"path": self.run_root, "absent": True},
+            "packet_dir": walk_bytes(self.packet_dir) if os.path.isdir(self.packet_dir)
+            else {"path": self.packet_dir, "absent": True},
+            "note": "occupied apparent bytes of the owned scratch and evidence packet; "
+                    "never an SSD-write claim",
+        }
+        samples = self.samples_bytes()
+        os.makedirs(self.packet_dir, exist_ok=True)
+        packet_name = self.binding["paths"]["packet_name"]
+        samples_destination = os.path.join(self.packet_dir, f"samples-{packet_name}.json")
+        destination = os.path.join(self.packet_dir, f"receipt-{packet_name}.json")
+        try:
+            with open(samples_destination + ".tmp", "wb") as handle:
+                handle.write(samples)
+            os.replace(samples_destination + ".tmp", samples_destination)
+            encoded = self.receipt()
+            with open(destination + ".tmp", "wb") as handle:
+                handle.write(encoded)
+            os.replace(destination + ".tmp", destination)
+        except OSError as error:
+            raise Refusal(f"the compat receipt packet could not be written: {error}")
+        manifest = os.path.join(self.packet_dir, "SHA256SUMS")
+        try:
+            entries = []
+            for path in (samples_destination,
+                         os.path.join(self.packet_dir, self.progress_name()),
+                         destination):
+                if os.path.exists(path):
+                    entries.append(f"{sha256_file(path)}  {os.path.basename(path)}\n")
+            with open(manifest + ".tmp", "w", encoding="utf-8") as handle:
+                handle.writelines(entries)
+            os.replace(manifest + ".tmp", manifest)
+        except OSError as error:
+            raise Refusal(f"the compat evidence manifest could not be written: {error}")
+        self.published_receipt = destination
+        print(f"samples: {samples_destination} ({len(samples)} bytes)")
+        print(f"progress: {os.path.join(self.packet_dir, self.progress_name())} "
+              f"({self.progress_records} records, {self.progress_failures} failures)")
+        print(f"receipt: {destination} ({len(encoded)} bytes)")
+        print(f"manifest: {manifest}")
+
+
+def guarded_compat_main(mode: str, binding_path: str, binding_sha: str) -> int:
+    guard_exports()  # refuse before reading anything else
+    try:
+        with open(binding_path, "rb") as handle:
+            payload = handle.read()
+    except OSError as error:
+        raise Refusal(f"the activation document is unreadable: {error}")
+    if hashlib.sha256(payload).hexdigest() != binding_sha:
+        raise Refusal("the activation document digest is not the supplied --sha256")
+    binding = parse_compat_binding(payload, mode)
+    run = CompatRun(mode, binding)
+    try:
+        run.setup()
+    except (Refusal, OSError, ValueError, subprocess.SubprocessError) as error:
+        run.aborted = f"setup: {error}"
+        print(f"blocked before any case: {error}", file=sys.stderr)
+    if not run.aborted:
+        run.execute()
+    if run.aborted:
+        run.progress("aborted", reason=run.aborted)
+    # One bounded receipt in every outcome, including a refusal before the
+    # owned roots exist; a receipt-write failure is itself a bounded refusal.
+    try:
+        run.publish()
+    except Refusal as error:
+        print(f"the compat evidence packet could not be published: {error}", file=sys.stderr)
+        return 1
+    compatibility = run.compatibility()
+    exit_code = compat_collection_exit(run.aborted, run.cases)
+    summary = {
+        "compatibility": compatibility["result"],
+        "probes": compatibility["probe_verdicts"],
+        "cases": len(run.cases),
+        "verdicts": verdict_tally(run.cases),
+        "aborted": run.aborted,
+        "disposals": len(run.disposals),
+        "exit": exit_code,
+    }
+    print(json.dumps(summary))
+    if exit_code != 0:
+        print(
+            "the compatibility collection carries a divergence, a timeout, an unreached "
+            "probe or an abort; exit 1",
+            file=sys.stderr,
+        )
+        return 1
+    if mode == "compat-diagnostic":
+        print(
+            "uncounted diagnostic: every required probe matched; this grants no "
+            "qualification or performance credit",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def compat_self_check() -> None:
+    """Effect-free controls for the compat apparatus. Real orchestration runs
+    against named fake external boundaries (a fake child process and an injected
+    heavy setup phase); nothing is compiled, acquired, staged or executed."""
+    import shutil
+    import tempfile
+
+    script_sha = sha256_file(SCRIPT)
+
+    # Argument boundary: compat modes parse, the old modes still parse, and a
+    # bare or over-specified invocation refuses.
+    expect(parse_arguments(["--compat-plan"])[0] == "compat-plan", "--compat-plan parses")
+    expect(parse_arguments(["--compat-plan", "--plan"])[0] == "refuse",
+           "--compat-plan refuses a second mode")
+    expect(parse_arguments(["--compat-self-check"])[0] == "compat-self-check",
+           "--compat-self-check parses")
+    expect(parse_arguments(["--compat-diagnostic"])[0] == "refuse",
+           "a compat diagnostic without a binding refuses")
+    expect(parse_arguments(["--compat-qualify", "--binding", "/p", "--sha256", "a" * 64])[0]
+           == "compat-qualify", "a compat qualification with a binding parses")
+    expect(parse_arguments(["--compat-qualify", "--binding", "/p", "--sha256", "zz"])[0]
+           == "refuse", "a non-hex compat digest refuses")
+    expect(parse_arguments(["--plan"])[0] == "plan", "the 307 plan mode still parses")
+    expect(parse_arguments(["--diagnostic", "--binding", "/p", "--sha256", "a" * 64])[0]
+           == "diagnostic", "the 307 diagnostic mode still parses")
+
+    # Binding parser: accept, then mutate every load-bearing field.
+    good = parse_compat_binding(compat_binding_document("compat-diagnostic", script_sha),
+                                "compat-diagnostic")
+    expect(good["planner_reference"] == "compat-activation-1", "the compat binding is accepted")
+    expect(parse_compat_binding(compat_binding_document("compat-qualify", script_sha),
+                                "compat-qualify") is not None,
+           "a counted compat binding accepts")
+    for label, patch in {
+        "schema": {"schema": "other/1"},
+        "mode": {"mode": "compat-qualify"},
+        "script": {"script_sha256": "0" * 64},
+        "apparatus-head": {"apparatus": {"head": "z" * 40, "tree": "b" * 40}},
+        "apparatus-tree": {"apparatus": {"head": "a" * 40, "tree": "z" * 40}},
+        "workload-commit": {"workload": {"commit": "0" * 40, "tree": WORKLOAD_TREE,
+                                        "lock_sha256": WORKLOAD_LOCK_SHA256}},
+        "workload-tree": {"workload": {"commit": WORKLOAD_COMMIT, "tree": "0" * 40,
+                                      "lock_sha256": WORKLOAD_LOCK_SHA256}},
+        "workload-lock": {"workload": {"commit": WORKLOAD_COMMIT, "tree": WORKLOAD_TREE,
+                                      "lock_sha256": "0" * 64}},
+        "upstream-commit": {"upstream": {"commit": "0" * 40, "tree": COMPAT_UPSTREAM_TREE}},
+        "upstream-tree": {"upstream": {"commit": COMPAT_UPSTREAM_COMMIT, "tree": "0" * 40}},
+        "toolchain": {"toolchain": "1.99.1"},
+        "volume": {"volume": {"uuid": "00000000-0000-0000-0000-000000000000"}},
+        "paths": {"paths": {"run_root_name": "../escape", "packet_name": "packet"}},
+        "planner": {"planner_reference": ""},
+        "guard-limit": {"guard": {"supervisor_sha256": EXPECTED_RUNNER_SHA256,
+                                 "limit_seconds": 300,
+                                 "scratch_mib": COMPAT_SCRATCH_MIB,
+                                 "stop_margin_seconds": COMPAT_STOP_MARGIN_S}},
+        "guard-margin": {"guard": {"supervisor_sha256": EXPECTED_RUNNER_SHA256,
+                                  "limit_seconds": COMPAT_LIMIT_SECONDS,
+                                  "scratch_mib": COMPAT_SCRATCH_MIB,
+                                  "stop_margin_seconds": 60}},
+    }.items():
+        document = json.loads(compat_binding_document("compat-diagnostic", script_sha))
+        document.update(patch)
+        try:
+            parse_compat_binding(json.dumps(document).encode(), "compat-diagnostic")
+            raise AssertionError(f"compat binding mutation {label} must refuse")
+        except Refusal:
+            continue
+    document = json.loads(compat_binding_document("compat-qualify", script_sha))
+    del document["diagnostic_receipt_sha256"]
+    try:
+        parse_compat_binding(json.dumps(document).encode(), "compat-qualify")
+        raise AssertionError("a counted compat activation without a receipt must refuse")
+    except Refusal:
+        pass
+
+    # The real workload identity and its dependency pins, plus mutated locks.
+    workload = verify_workload({"commit": WORKLOAD_COMMIT, "tree": WORKLOAD_TREE,
+                                "lock_sha256": WORKLOAD_LOCK_SHA256})
+    expect(workload["lock_sha256"] == WORKLOAD_LOCK_SHA256,
+           "the workload lock bytes match the prepared digest")
+    for name, (version, checksum) in PINNED_WORKLOAD_DEPS.items():
+        expect(workload["dependencies"][name]["version"] == version,
+               f"the workload lock pins {name} {version}")
+    lock_text = git_bytes(["show", f"{WORKLOAD_COMMIT}:Cargo.lock"]).decode("utf-8")
+    for label, mutate in {
+        "version": lambda text: text.replace('version = "1.0.23"', 'version = "1.0.24"', 1),
+        "checksum": lambda text: text.replace(
+            "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b", "0" * 64, 1),
+        "unpinned": lambda text: text.replace('name = "zmij"', 'name = "zmij-gone"', 1),
+    }.items():
+        try:
+            pinned_dependency_identities(mutate(lock_text))
+            raise AssertionError(f"a {label} mutation of the workload lock must refuse")
+        except Refusal:
+            continue
+    for label, spec in {
+        "commit": {"commit": "0" * 40, "tree": WORKLOAD_TREE, "lock_sha256": WORKLOAD_LOCK_SHA256},
+        "tree": {"commit": WORKLOAD_COMMIT, "tree": "0" * 40, "lock_sha256": WORKLOAD_LOCK_SHA256},
+        "lock": {"commit": WORKLOAD_COMMIT, "tree": WORKLOAD_TREE, "lock_sha256": "0" * 64},
+    }.items():
+        try:
+            verify_workload(spec)
+            raise AssertionError(f"a mutated workload {label} must refuse")
+        except Refusal:
+            continue
+
+    # Oracle transcripts: one valid synthetic transcript per probe, then the
+    # mutations that must each be refused.
+    def fmt_transcript(counts: dict) -> str:
+        lines = [f"declared f64={counts['f64']} f32={counts['f32']} "
+                 f"parse_f64={counts['parse_f64']} parse_f32={counts['parse_f32']}"]
+        f64_bits = [int(bits, 16) for bits in COMPAT_FMT_REQUIRED_F64]
+        while len(f64_bits) < counts["f64"]:
+            f64_bits.append(0x3ff0000000000000)
+        for index, bits in enumerate(f64_bits):
+            text = repr(struct.unpack("<d", struct.pack("<Q", bits))[0])
+            lines.append(f"f64 {index} {bits:016x} {text} {bits:016x}")
+        f32_bits = [int(bits, 16) for bits in COMPAT_FMT_REQUIRED_F32]
+        while len(f32_bits) < counts["f32"]:
+            f32_bits.append(0x3f800000)
+        for index, bits in enumerate(f32_bits):
+            text = repr(struct.unpack("<f", struct.pack("<I", bits))[0])
+            lines.append(f"f32 {index} {bits:08x} {text} {bits:08x}")
+        for index in range(counts["parse_f64"]):
+            bits = 0x3ff0000000000000 + index
+            again = repr(struct.unpack("<d", struct.pack("<Q", bits))[0])
+            lines.append(f"parse-f64 {index} 1.{index:01d}e-7 {bits:016x} {again} {bits:016x}")
+        for index in range(counts["parse_f32"]):
+            bits = 0x3f800000 + index
+            again = repr(struct.unpack("<f", struct.pack("<I", bits))[0])
+            lines.append(f"parse-f32 {index} 1.{index:01d}e-7 {bits:08x} {again} {bits:08x}")
+        total = (counts["f64"] + counts["f32"] + counts["parse_f64"] + counts["parse_f32"])
+        lines.append(f"checked={total} failures=0")
+        return "\n".join(lines) + "\n"
+
+    counts = {"f64": 24, "f32": 16, "parse_f64": 8, "parse_f32": 4}
+    transcript = fmt_transcript(counts)
+    expect(compat_fmt_oracle({"stdout": transcript, "exit": 0})[0] == "match",
+           "a complete synthetic float transcript matches")
+    expect(compat_fmt_oracle({"stdout": transcript, "exit": 1})[0] == "mismatch",
+           "a float transcript with a nonzero exit mismatches")
+    expect(compat_fmt_oracle({"stdout": transcript, "exit": 0, "timed_out": True})[0]
+           == "timeout", "a timed-out float probe is a timeout")
+    fmt_mutations = {
+        "summary": transcript.replace("failures=0", "failures=1"),
+        "short": transcript.replace(f"checked={sum(counts.values())} failures=0",
+                                    f"checked={sum(counts.values()) - 1} failures=0", 1),
+        "count": fmt_transcript({**counts, "f64": 4}),
+        "back": transcript.replace("f64 0 8000000000000000 -0.0 8000000000000000",
+                                   "f64 0 8000000000000000 -0.0 0000000000000000", 1),
+        "decode": transcript.replace("f64 0 8000000000000000 -0.0", "f64 0 8000000000000000 1.5", 1),
+        "order": transcript.replace("f64 1 ", "f64 9 ", 1),
+        "coverage": fmt_transcript(counts).replace(
+            "f64 0 8000000000000000 -0.0 8000000000000000",
+            "f64 0 3ff0000000000000 1.0 3ff0000000000000", 1),
+        "header": transcript.replace("declared", "declare", 1),
+    }
+    for label, mutated in fmt_mutations.items():
+        expect(compat_fmt_oracle({"stdout": mutated, "exit": 0})[0] != "match",
+               f"a {label}-mutated float transcript must not match")
+
+    crc_transcript = (
+        "crc32 0 empty 00000000\n"
+        "crc32 1 check cbf43926\n"
+        "crc32 2 fox 414fa339\n"
+        "crc32 3 long 1234abcd\n"
+        "crc32 4 zeros 62c8e5f2\n"
+        "crc32-fold long 1234abcd\n"
+        "crc32-stream check cbf43926\n"
+        f"{COMPAT_CRC32_CHECK_LINE}\n"
+    )
+    expect(compat_crc32_oracle({"stdout": crc_transcript, "exit": 0})[0] == "match",
+           "a complete synthetic CRC32 transcript matches")
+    for label, mutated in {
+        "check": crc_transcript.replace("crc32 1 check cbf43926", "crc32 1 check deadbeef"),
+        "fold": crc_transcript.replace("crc32-fold long 1234abcd", "crc32-fold long 00000000"),
+        "order": crc_transcript.replace("crc32 2 fox", "crc32 2 zerox"),
+        "exit": crc_transcript.replace("crc32 4 zeros", "crc32 4 zeros"),
+        "line": crc_transcript.replace(COMPAT_CRC32_CHECK_LINE, "crc32-check 123456789 0"),
+    }.items():
+        record = {"stdout": mutated, "exit": 1 if label == "exit" else 0}
+        expect(compat_crc32_oracle(record)[0] != "match",
+               f"a {label}-mutated CRC32 transcript must not match")
+
+    help_transcript = SNAPSHOT_HELP_MARKER + "\nUSAGE:\n    oxide status\n"
+    expect(compat_snapshot_oracle({"stdout": help_transcript, "exit": 0})[0] == "match",
+           "a help transcript with the marker matches")
+    expect(compat_snapshot_oracle({"stdout": help_transcript, "exit": 1})[0] == "mismatch",
+           "a nonzero help exit mismatches")
+    expect(compat_snapshot_oracle({"stdout": help_transcript + "[trial-1]\n", "exit": 0})[0]
+           == "mismatch", "an edited help transcript mismatches")
+    expect(compat_snapshot_oracle({"stdout": help_transcript, "exit": 0, "timed_out": True})[0]
+           == "timeout", "a timed-out help probe is a timeout")
+
+    # Correspondence, exit rule and unexecuted bookkeeping.
+    expect(compat_correspondence("match", True) == "match", "matching and equal is a match")
+    expect(compat_correspondence("match", False) == "mismatch", "a byte difference is a mismatch")
+    expect(compat_correspondence("timeout", False) == "timeout",
+           "a timeout is never masked by correspondence")
+    expect(compat_collection_exit(None, [{"verdict": "match"}]) == 0, "a clean collection exits 0")
+    expect(compat_collection_exit(None, [{"verdict": "mismatch"}]) == 1,
+           "a divergence-only collection exits 1")
+    expect(compat_collection_exit(None, []) == 1, "an empty collection exits 1")
+    expect(compat_collection_exit("format: boom", [{"verdict": "match"}]) == 1,
+           "an aborted collection exits 1")
+    declared_total = len(COMPAT_CASES) * len(COMPAT_ARMS)
+    rows = compat_declared_unexecuted([{"case": "format", "arm": "cargo", "verdict": "match"}])
+    expect(len(rows) == declared_total - 1,
+           "unexecuted rows cover exactly the unreached declared combinations")
+
+    # Disposal policy on a real temporary directory this check removes: only an
+    # allowlisted path, only inside the owned root, never a symlink, and never
+    # while a child is outstanding.
+    seam_dir = tempfile.mkdtemp(dir=os.environ.get("TMPDIR") or None)
+    try:
+        run = CompatRun.__new__(CompatRun)
+        run.run_root = os.path.join(seam_dir, "run")
+        run.packet_dir = os.path.join(seam_dir, "packet")
+        run.binding = {"paths": {"run_root_name": "run", "packet_name": "packet"}}
+        run.disposals = []
+        run.children_spawned = 1
+        run.children_reaped = 1
+        run.progress_records = 0
+        run.progress_failures = 0
+        os.makedirs(os.path.join(run.run_root, "stage-relax-target", "release"))
+        with open(os.path.join(run.run_root, "stage-relax-target", "release", "relax"), "wb") as h:
+            h.write(b"x" * 4096)
+        run.dispose_stage_output("stage-relax-target", "self-check: known-closed stage output")
+        expect(not os.path.exists(os.path.join(run.run_root, "stage-relax-target")),
+               "an allowlisted stage output is removed")
+        expect(run.disposals[0]["bytes_before"]["entries"] == 1
+               and run.disposals[0]["after"]["absent"] is True,
+               "the disposal records the bytes it removed")
+        run.dispose_stage_output("stage-relax-target", "self-check: already absent is recorded")
+        expect(run.disposals[-1]["absent"] is True, "an absent stage output is recorded as absent")
+        for relative in ("relax-src", "cargo-homes/shared", "bin", "workloads/snapshot/cargo/tree",
+                         "../escape", "stage-relax-target/../relax-src", "/etc"):
+            try:
+                run.dispose_stage_output(relative, "self-check: undeclared")
+                raise AssertionError(f"disposing {relative!r} must refuse")
+            except Refusal:
+                continue
+        # A symlink on an allowlisted path refuses, and a symlink that escapes
+        # the owned root refuses before it is followed.
+        os.makedirs(os.path.join(run.run_root, "workloads", "snapshot", "cargo"))
+        target = os.path.join(seam_dir, "outside")
+        os.makedirs(target)
+        with open(os.path.join(target, "keep"), "wb") as h:
+            h.write(b"keep")
+        os.symlink(target, os.path.join(run.run_root, "workloads", "snapshot", "cargo", "target"))
+        try:
+            run.dispose_stage_output("workloads/snapshot/cargo/target", "self-check: symlink")
+            raise AssertionError("disposing a symlink must refuse")
+        except Refusal:
+            expect(os.path.exists(os.path.join(target, "keep")),
+                   "the symlink refusal leaves the outside target untouched")
+        run.children_spawned = 2
+        run.children_reaped = 1
+        try:
+            run.dispose_stage_output("stage-relax-target", "self-check: outstanding child")
+            raise AssertionError("disposal with an outstanding child must refuse")
+        except Refusal:
+            pass
+        run.children_spawned = run.children_reaped
+    finally:
+        shutil.rmtree(seam_dir)
+
+    # Real orchestration with named fake external boundaries: the real
+    # CompatRun case methods, disposal and publication drive a fake child; no
+    # process is spawned, nothing is compiled and no network is touched.
+    def fake_child(probe_stdout: dict, relax_override: dict | None = None) -> object:
+        relax_override = relax_override or {}
+
+        def seam(argv: list[str], cwd: str, env: dict, cap_s: float) -> dict:
+            joined = " ".join(argv)
+            arm = "cargo" if argv[0] == "cargo" else "relax"
+            if "generate-lockfile" in joined:
+                lock = os.path.join(cwd, "Cargo.lock")
+                if not os.path.exists(lock):
+                    with open(lock, "w", encoding="utf-8") as handle:
+                        handle.write(_fake_lock_text())
+            if "--version" in joined:
+                stdout = "relax 0.0.0-compat-check\n"
+            elif joined.endswith("check compat-hello"):
+                stdout = ""
+            elif "compat-hello" in joined:
+                stdout = COMPAT_HELLO_STDOUT
+            else:
+                key = ("format" if "compat-fmt" in joined
+                       else "crc32" if "compat-crc32" in joined else "snapshot")
+                stdout = (relax_override[key] if arm == "relax" and key in relax_override
+                          else probe_stdout[key])
+            body = stdout.encode()
+            return {
+                "argv": argv, "cwd": cwd, "exit": 0, "seconds": 0.001,
+                "rss_maxrss_raw": 0, "rss_unit": RSS_UNIT_NAME, "rss_bytes": 0,
+                "timed_out": False, "cap_s": cap_s, "stdout": stdout, "stderr": "",
+                "stdout_evidence": bounded_text(body), "stderr_evidence": bounded_text(b""),
+            }
+        return seam
+
+    def _fake_lock_text() -> str:
+        blocks = ["version = 4\n"]
+        for name, (version, checksum) in PINNED_WORKLOAD_DEPS.items():
+            blocks.append(
+                "[[package]]\n"
+                f'name = "{name}"\n'
+                f'version = "{version}"\n'
+                'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+                f'checksum = "{checksum}"\n'
+            )
+        return "\n".join(blocks)
+
+    def fake_run(probe_stdout: dict) -> CompatRun:
+        directory = tempfile.mkdtemp(dir=os.environ.get("TMPDIR") or None)
+        run = CompatRun.__new__(CompatRun)
+        run.mode = "compat-diagnostic"
+        run.binding = {"paths": {"run_root_name": "run", "packet_name": "packet"},
+                       "planner_reference": "self-check",
+                       "apparatus": {"head": "a" * 40, "tree": "b" * 40},
+                       "workload": {"commit": WORKLOAD_COMMIT, "tree": WORKLOAD_TREE,
+                                    "lock_sha256": WORKLOAD_LOCK_SHA256}}
+        run.env = scrubbed_env()
+        run.deadline_ns = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) + int(600e9)
+        run.cases = []
+        run.figures = {}
+        run.disposals = []
+        run.aborted = None
+        run.children_spawned = 0
+        run.children_reaped = 0
+        run.progress_records = 0
+        run.progress_failures = 0
+        run.run_root = os.path.join(directory, "run")
+        run.packet_dir = os.path.join(directory, "packet")
+        run.shared_cargo_home = os.path.join(directory, "cargo")
+        run.relax_bin = os.path.join(directory, "bin", "relax")
+        run.relax_std_dir = os.path.join(directory, "relax-src", "libs", "relax", "compiler", "std")
+        os.makedirs(run.relax_std_dir)
+        os.makedirs(run.shared_cargo_home)
+        run.works = {}
+        for fixture in ("compat-fmt", "compat-crc32"):
+            run.works[fixture] = {}
+            for arm in COMPAT_ARMS:
+                dest = os.path.join(run.run_root, "workloads", fixture, arm, fixture)
+                os.makedirs(dest)
+                run.works[fixture][arm] = dest
+        run.works["snapshot"] = {}
+        for arm in COMPAT_ARMS:
+            dest = os.path.join(run.run_root, "workloads", "snapshot", arm, "tree")
+            os.makedirs(dest)
+            with open(os.path.join(dest, "Cargo.lock"), "wb") as handle:
+                handle.write(git_bytes(["show", f"{WORKLOAD_COMMIT}:Cargo.lock"]))
+            run.works["snapshot"][arm] = dest
+        return run
+
+    good_stdout = {"format": transcript, "crc32": crc_transcript, "snapshot": help_transcript}
+    saved_seam = globals()["COMPAT_CHILD_SEAM"]
+    saved_source_seam = globals()["SOURCE_GATE_SEAM"]
+    globals()["SOURCE_GATE_SEAM"] = True
+    globals()["COMPAT_CHILD_SEAM"] = fake_child(dict(good_stdout))
+    try:
+        run = fake_run(dict(good_stdout))
+        try:
+            run.execute()
+            expect(run.aborted is None, "the clean synthetic run does not abort")
+            expect(all(row["verdict"] == "match" for row in run.cases),
+                   "every synthetic probe row matches")
+            expect(run.compatibility()["result"] == "cleared",
+                   "a complete matching collection is cleared")
+            expect(run.children_spawned == 6 and run.children_reaped == 6,
+                   "the six synthetic arms and lock steps are counted as reaped")
+            expect(any(entry["path"] == "workloads/compat-fmt/cargo/target"
+                       for entry in run.disposals),
+                   "the format probe disposes its own cache")
+            expect(not any(entry["path"].startswith("relax-src") for entry in run.disposals),
+                   "no disposal ever names the checkout")
+            run.publish()
+            published = json.loads(open(run.published_receipt).read())
+            expect(published["compatibility"]["result"] == "cleared",
+                   "the published receipt carries the cleared result")
+            expect(published["children"]["spawned"] == published["children"]["reaped"],
+                   "the receipt's child counters agree")
+            expect(published["performance_claim"].startswith("none"),
+                   "the receipt claims no performance")
+        finally:
+            shutil.rmtree(os.path.dirname(run.run_root))
+
+        # A Relax-arm divergence blocks compatibility and still records both arms.
+        divergent = transcript.replace("f64 0 8000000000000000 -0.0 8000000000000000",
+                                       "f64 0 8000000000000000 -0.0 0000000000000001", 1)
+        globals()["COMPAT_CHILD_SEAM"] = fake_child(good_stdout, {"format": divergent})
+        run = fake_run(good_stdout)
+        try:
+            run.execute()
+            expect(run.compatibility()["result"] == "blocked",
+                   "a Relax-arm divergence blocks compatibility")
+            relax_rows = [row for row in run.cases
+                          if row["case"] == "format" and row["arm"] == "relax"]
+            expect(relax_rows and relax_rows[0]["verdict"] == "mismatch",
+                   "the divergent Relax row is recorded as a mismatch")
+            expect(compat_collection_exit(run.aborted, run.cases) == 1,
+                   "a blocked collection exits 1")
+        finally:
+            shutil.rmtree(os.path.dirname(run.run_root))
+
+        # A baseline failure aborts the run: its expected observation is not
+        # established, so the remaining probes stay unexecuted.
+        broken = dict(good_stdout)
+        broken["format"] = transcript.replace("failures=0", "failures=2", 1)
+        globals()["COMPAT_CHILD_SEAM"] = fake_child(broken)
+        run = fake_run(broken)
+        try:
+            run.execute()
+            expect(run.aborted is not None and run.aborted.startswith("format:"),
+                   "a baseline failure aborts the run")
+            run.publish()
+            published = json.loads(open(run.published_receipt).read())
+            expect(published["compatibility"]["result"] == "incomplete",
+                   "an aborted collection is incomplete")
+            expect(published["declared_unexecuted"] == declared_total - 1,
+                   "an aborted collection records every unreached probe as unexecuted")
+        finally:
+            shutil.rmtree(os.path.dirname(run.run_root))
+    finally:
+        globals()["COMPAT_CHILD_SEAM"] = saved_seam
+        globals()["SOURCE_GATE_SEAM"] = saved_source_seam
+
+    # The real guarded entry, gates and publication with an injected setup
+    # failure after the volume and source gates: a bounded receipt with every
+    # declared probe unexecuted and no child. On a host where the run root's
+    # volume is not the pinned volume, the volume gate itself is the refusal
+    # that must publish the same shape, so both branches are asserted.
+    entry_dir = tempfile.mkdtemp(dir=os.environ.get("TMPDIR") or None)
+    try:
+        document = json.loads(compat_binding_document("compat-diagnostic", script_sha))
+        document["apparatus"] = {"head": "a" * 40, "tree": "b" * 40}
+        binding_bytes = json.dumps(document).encode()
+        binding_path = os.path.join(entry_dir, "binding.json")
+        with open(binding_path, "wb") as handle:
+            handle.write(binding_bytes)
+        scratch_root = os.path.join(entry_dir, "scratch")
+        os.makedirs(scratch_root)
+        exports = {
+            "OXIDE_TASK_SCRATCH_ROOT": scratch_root,
+            "OXIDE_PROOF_DEADLINE_NS": str(
+                time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) + int(120e9)),
+            "OXIDE_PROOF_EVIDENCE": os.path.join(entry_dir, "evidence"),
+        }
+        saved_env = {key: os.environ.get(key) for key in exports}
+        os.environ.update(exports)
+        globals()["SOURCE_GATE_SEAM"] = True
+        globals()["COMPAT_SETUP_SEAM"] = lambda _run: (_ for _ in ()).throw(
+            Refusal("self-check injected setup refusal"))
+        import contextlib
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                entry_exit = guarded_compat_main(
+                    "compat-diagnostic", binding_path,
+                    hashlib.sha256(binding_bytes).hexdigest())
+        finally:
+            globals()["SOURCE_GATE_SEAM"] = None
+            globals()["COMPAT_SETUP_SEAM"] = None
+            for key, value in saved_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        expect(entry_exit == 1, "an aborted compat occurrence exits 1")
+        receipt = json.load(open(os.path.join(
+            exports["OXIDE_PROOF_EVIDENCE"], document["paths"]["packet_name"],
+            f"receipt-{document['paths']['packet_name']}.json")))
+        expect(receipt["compatibility"]["result"] == "incomplete",
+               "the aborted receipt reports an incomplete compatibility result")
+        expect(receipt["declared_unexecuted"] == declared_total,
+               "every declared probe is recorded unexecuted in the abort receipt")
+        expect(receipt["qualification"].startswith("none"),
+               "a diagnostic receipt never claims qualification")
+        mounted = None
+        try:
+            mounted = volume_uuid_of(mount_of(scratch_root)).upper()
+        except Refusal:
+            mounted = None
+        if mounted == SELECTED_VOLUME_UUID.upper():
+            expect("self-check injected setup refusal" in receipt["aborted"],
+                   "the injected setup refusal is recorded through the real entry")
+        else:
+            expect("the selected volume is" in receipt["aborted"],
+                   "the volume gate is the recorded refusal on this host")
+    finally:
+        shutil.rmtree(entry_dir)
+
+    # Plan document: it names every case, both guarded commands, the fixed
+    # bounds, the premise dispositions and the preserved 307 history.
+    document = compat_plan_text()
+    for case in COMPAT_CASES:
+        expect(f"  - {case['case']} " in document, f"the plan names the {case['case']} probe")
+    expect("research:relax:compat:diagnostic" in document
+           and "research:relax:compat:qualify" in document,
+           "the plan names both guarded compat selectors")
+    expect(str(COMPAT_LIMIT_SECONDS) in document and str(COMPAT_SCRATCH_MIB) in document,
+           "the plan carries the fixed bounds")
+    for item in COMPAT_PREMISE_CHECKLIST:
+        expect(f"  - {item}: " in document, f"the plan carries the compat disposition {item}")
+    expect("aa540c14" in document, "the plan preserves the 307 no-go pin as history")
+
+    print("compat self-check: all controls passed (removed temp directories; no child, "
+          "compile, network or engine)")
+
+
 def guarded_main(mode: str, binding_path: str, binding_sha: str) -> int:
     guard_exports()  # refuse before reading anything else
     try:
@@ -2747,8 +4904,16 @@ def main(argv: list[str]) -> int:
     if mode == "self-check":
         self_check()
         return 0
+    if mode == "compat-plan":
+        print(compat_plan_text())
+        return 0
+    if mode == "compat-self-check":
+        compat_self_check()
+        return 0
     assert binding is not None and sha is not None
     try:
+        if mode in ("compat-diagnostic", "compat-qualify"):
+            return guarded_compat_main(mode, binding, sha)
         return guarded_main(mode, binding, sha)
     except Refusal as error:
         print(f"refused before any effect: {error}", file=sys.stderr)

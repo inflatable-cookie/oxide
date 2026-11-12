@@ -1,0 +1,20 @@
+# Relax focused compatibility recheck (oxide#308), CRC32 probe.
+#
+# `crc32fast =1.5.3` is the exact version the prior trial's snapshot lock
+# resolves, so its source already flows through the approved bounded offline
+# seed and this probe adds no acquisition. Upstream issue 21 reports aarch64
+# NEON/PMULL gaps breaking a checksum path; crc32fast's aarch64 backend is the
+# `__crc32b`/`__crc32d` instruction path with `#[target_feature(enable =
+# "crc")]` wrappers, so this is a small, deterministic exercise of a second
+# intrinsic family rather than a broad ecosystem benchmark.
+[workspace]
+
+[package]
+name = "compat-crc32"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97.1"
+publish = false
+
+[dependencies]
+crc32fast = "=1.5.3"

@@ -1,0 +1,14 @@
+# Relax focused compatibility recheck (oxide#308), engine-verification package.
+# Std only and dependency-free, so it needs no seeded Cargo source: it proves a
+# freshly copied `relax` executable plus its retained bundled std source can
+# still check and run a program AFTER the disposable engine build target has
+# been removed. That is the verification the disposal decision requires before
+# the compat probes run, and it is not a case in the declared compat matrix.
+[workspace]
+
+[package]
+name = "compat-hello"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97.1"
+publish = false

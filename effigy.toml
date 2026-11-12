@@ -1735,3 +1735,57 @@ run = 'python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 4096 -- 
 [tasks."research:relax:measure"]
 admission = "heavy"
 run = 'python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 4096 -- python3 scripts/relax-quick-trial.py --measure --binding "$RELAX_TRIAL_ACTIVATION" --sha256 "$RELAX_TRIAL_ACTIVATION_SHA256"'
+
+# Relax focused compatibility recheck (oxide#308). A SEPARATE question from the
+# 307 trial above, on a NEWER upstream pin: makepad/relax
+# 6ea9d0635f198b9a4510de1c87ac4d7b067f5cf7 / tree
+# 514321c9f9677cd4d0e7e11a73b5a01d0f98dc69 (2026-11-12, MIT; bundled-std
+# notices stay upstream), which contains the NEON family fix 78cb555a, the
+# target-feature/safety correction c0c1a4b8 and the immediate-argument/vext
+# correction e91301e8. The 307 no-go for aa540c14 stays exactly as recorded;
+# nothing here reopens, rewrites or re-measures it.
+# `:test` runs `--compat-self-check`, the pure apparatus controls: the compat
+# argument boundary and activation parser, the real workload identity and lock
+# pins against read-only git plus mutated locks, all three structural oracles
+# and their mutations, the disposal allowlist/containment/symlink/outstanding-
+# child refusals on a removed temp directory, the real case/disposal/publication
+# composition driven by a named fake child boundary, and the real guarded entry
+# with an injected setup refusal publishing a bounded all-unexecuted receipt.
+# `:plan` runs `--compat-plan`, effect-free readiness from actual metadata
+# (script and supervisor digests, HEAD, workload commit/tree/lock and its three
+# registry pins, toolchain inventory, fixture digests, the exact finite case and
+# argv plan, the disposal lifecycle, the unmeasured planning allocation and the
+# refusal gates). Neither compiles, acquires, stages or runs anything.
+# `research:relax:compat:diagnostic` and `research:relax:compat:qualify` are
+# heavy guarded entries that this preparation does NOT activate: both refuse
+# before any effect until a planner binds one occurrence through
+# RELAX_COMPAT_ACTIVATION and RELAX_COMPAT_ACTIVATION_SHA256, and each is the
+# whole command of the unchanged qualified shared supervisor (600 s INCLUDING
+# upstream acquisition/engine build/seed/staging and every probe, 4096 MiB
+# monitored owned scratch on the selected Stash volume, 30 s stop margin, no
+# image). The diagnostic is always unqualified keep-going; the counted author
+# qualification requires an adequate diagnostic receipt at the unchanged head.
+# Three required probes compare the plain-Cargo baseline with the pinned Relax
+# arm strict (--check-first --no-live, never --relaxed/--cached): an isolated
+# serde_json =1.0.151 float-formatting fixture (the zmij 1.0.23 NEON digit
+# path), an isolated crc32fast =1.5.3 CRC32 fixture, and the UNCHANGED prior
+# Oxide snapshot's read-only --help route. No timing is measured, so a pass
+# authorizes no performance claim, integration, adoption, installation or
+# default change. Fit correction: no Oxide front door is staged, and only this
+# occurrence's own known-closed stage outputs (the engine build target after
+# the copied executable and bundled std are verified, then each probe's caches
+# after both arms complete) are disposed inside the guard root; the checkout,
+# bundled std, seeded Cargo homes and workload sources never are.
+[tasks."research:relax:compat:test"]
+run = "python3 scripts/relax-quick-trial.py --compat-self-check"
+
+[tasks."research:relax:compat:plan"]
+run = "python3 scripts/relax-quick-trial.py --compat-plan"
+
+[tasks."research:relax:compat:diagnostic"]
+admission = "heavy"
+run = 'python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 4096 -- python3 scripts/relax-quick-trial.py --compat-diagnostic --binding "$RELAX_COMPAT_ACTIVATION" --sha256 "$RELAX_COMPAT_ACTIVATION_SHA256"'
+
+[tasks."research:relax:compat:qualify"]
+admission = "heavy"
+run = 'python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 4096 -- python3 scripts/relax-quick-trial.py --compat-qualify --binding "$RELAX_COMPAT_ACTIVATION" --sha256 "$RELAX_COMPAT_ACTIVATION_SHA256"'
