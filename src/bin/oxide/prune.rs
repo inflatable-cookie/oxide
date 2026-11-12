@@ -844,12 +844,21 @@ pub(crate) fn refuse_delegated_without_fence(control: &Path) -> Result<(), Strin
     Ok(())
 }
 
-pub(crate) fn recovery_format_ready(control: &Path, transaction: &str) -> Result<(), String> {
+pub(crate) fn recovery_format_ready(
+    control: &Path,
+    transaction: &str,
+    fence: &str,
+) -> Result<(), String> {
+    let expected = match fence {
+        oxide_storage::lease::control::DELEGATED_OUTPUTS_FENCE => DELEGATED_REGISTRY_VERSION,
+        oxide_storage::lease::control::COORDINATED_OUTPUTS_FENCE => COORDINATED_REGISTRY_VERSION,
+        _ => return Err("unsupported output recovery fence".to_owned()),
+    };
     let registry = read_registry_image(control)?
         .ok_or("the upgraded registry is absent; resume upgrade-recovery")?;
-    if registry.version != COORDINATED_REGISTRY_VERSION || registry.created_by != transaction {
+    if registry.version != expected || registry.created_by != transaction {
         return Err(
-            "the paired operation-adoption fences have no matching registry/4 image; resume upgrade-recovery"
+            "the paired output recovery fences have no matching registry image; resume upgrade-recovery"
                 .to_owned(),
         );
     }

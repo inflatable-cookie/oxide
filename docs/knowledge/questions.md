@@ -302,8 +302,10 @@ live adoption; the integrated Elevated proof gates remain separate.
 
 
 
-The implemented caller now pins reviewed Barge054 F2/replay support; see the
-[exact source and premise binding](contracts/barge-adoption.md#completed-f2-binding-and-current-source-readiness-oxide304).
+The implemented single-authority caller pins qualified Barge059
+`8efd3452fcced9b5b322eb3f7ba0ac794244fc82`, including its journal and listing
+prerequisites; see the
+[current connected caller contract](contracts/barge-adoption.md#connected-caller-and-recovery-source-oxide304).
 Integrated diagnostic, author and reviewer native sessions remain separately held.
 
 ## Q-022 — Can a held zombie establish its group's lifetime?

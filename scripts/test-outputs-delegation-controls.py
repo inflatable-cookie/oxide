@@ -439,7 +439,7 @@ def fixture_composition(m,root):
         'OXIDE_POOL','OXIDE_BARGE_UNAVAILABLE','BARGE_ACCOUNT_HOME','BARGE_STATE_DIR','XDG_CONFIG_HOME',
         'XDG_CACHE_HOME','CARGO_HOME','CARGO_TARGET_DIR','CARGO_ENCODED_RUSTFLAGS','GIT_CONFIG_GLOBAL',
         'RUSTFLAGS','RUSTC_WRAPPER','RUSTC_WORKSPACE_WRAPPER','SCCACHE_DIR','RUSTUP_TOOLCHAIN','RUSTUP_HOME')}
-    calls=[];data={};mode=['ok']
+    calls=[];data={};mode=['ok'];custody_text=['']
     def spawn(argv,*,env=None,cwd=None,stdout=None,stderr=None):
         calls.append((argv,cwd,env))
         if argv[0]=='/usr/bin/mktemp':
@@ -482,8 +482,9 @@ def fixture_composition(m,root):
                 text=json.dumps({'oxide':{'rows':rows,'intents':[]},'barge':[]})
                 if mode[0]=='inspect-malformed':text='{"oxide":[],"barge":{}}'
             elif argv[1:4]==['outputs','__delegation-fixture','replay']:text='{"synthetic_control_only":true}'
-            else:assert argv[1:]==['outputs','upgrade-recovery'] or argv[1:3]==['exec','--'],argv
+            else:assert argv[1:]==['outputs','upgrade-recovery'] or argv[1:3] in (['exec','--'],['outputs','prune']),argv
             if mode[0]=='exit':code=2;err='SYNTHETIC_SETUP_REFUSAL'
+            if mode[0]=='custody':code=3;err=custody_text[0]
             if mode[0]=='no-json':text='synthetic command has no response'
         class Child:
             pid=100+len(calls);returncode=None
@@ -517,6 +518,53 @@ def fixture_composition(m,root):
         with redirect_stdout(io.StringIO()):
             child=m.permanent.start_child(proof,[str(binary),'exec','--','/usr/bin/python3','never-executed.py'],str(world.base),world.command_env({'WRITER_GATE':str(world.base)}))
             assert m.permanent.finish_child(proof,child,'local-writer')[0]==0
+        # Real World execute/invoke and async finish must reject a custody
+        # failure before an expected exit3 can earn any refusal credit.
+        world.plan='a'*64
+        world.plan_path.write_text('synthetic control only; never executed')
+        for message in ('custody is not proven','descriptor scan bounded','process observation unreadable',
+                        'operation replay: captured-unit writer custody is unknown'):
+            mode[0]='custody';custody_text[0]=message
+            try:world.execute(expect=3,label='conservative-replay')
+            except RuntimeError as exc:assert 'actual custody uncertainty' in str(exc) and message in str(exc)
+            else:raise AssertionError('expected exit3 accepted actual custody unknown')
+            child=world.start(world.argv())
+            try:world.finish(child,'conservative-replay')
+            except RuntimeError as exc:assert 'actual custody uncertainty' in str(exc) and message in str(exc)
+            else:raise AssertionError('child exit3 accepted actual custody unknown')
+            assert not proof.unclosed
+        # A classified ordinary refusal is still observable, not silently
+        # converted into a custody failure.
+        mode[0]='ok'
+        with patch.object(proof,'run',return_value=(3,'','synthetic replacement refusal')):
+            assert world.execute(expect=3,label='conservative-replay')[0]==3
+        mode[0]='custody';custody_text[0]='captured-unit writer custody is unknown'
+        worlds=[]
+        def outer_run(argv,*,label,limit,**kwargs):
+            if label=='stash-identity':return 0,m.plistlib.dumps({'VolumeUUID':m.STASH}).decode(),''
+            return 3,'',custody_text[0]
+        def reuse_world(*args):worlds.append(args[-1]);return world
+        out=io.StringIO()
+        with ExitStack() as outer:
+            outer.enter_context(patch.object(m,'source_readiness',return_value={}))
+            outer.enter_context(patch.object(m,'stash_mount',return_value=scratch))
+            outer.enter_context(patch.object(m,'stage',return_value=(binary,tools,stage_env)))
+            outer.enter_context(patch.object(m,'phase_snapshot',return_value={'total_after_publication_bytes':0}))
+            outer.enter_context(patch.object(m,'attach_image',return_value=None))
+            outer.enter_context(patch.object(m,'run_phase_snapshot',return_value=None))
+            outer.enter_context(patch.object(m,'World',side_effect=reuse_world))
+            outer.enter_context(patch.object(m,'run_case',side_effect=lambda actual,name:actual.execute(expect=3,label='conservative-replay')))
+            outer.enter_context(patch.object(proof,'run',side_effect=outer_run))
+            detach=outer.enter_context(patch.object(m.fresh,'request_guard_detach',return_value=('retained',None)))
+            outer.enter_context(redirect_stdout(out))
+            assert m.run_proof(True,proof,SimpleNamespace(state='synthetic-not-attached'))==1
+        report=json.loads(out.getvalue())
+        assert worlds==[m.CASES[0]],'custody unknown continued into another case'
+        assert 'actual custody uncertainty' in report['error'] and custody_text[0] in report['error']
+        assert all(row['state']=='unexecuted' for row in report['cases'])
+        assert not report['qualified'] and report['detach']=='retained'
+        assert detach.call_args.args[2] is not None,'unknown requested successful image disposition'
+        mode[0]='ok'
         for extra in ({'OXIDE_TEST_ACCOUNT_HOME':str(world.base/'home')},{'OXIDE_TEST_HOME_FROM_ENV':''},
                       {'HOME':str(base)},{'BARGE_ACCOUNT_HOME':str(base)}, {'OXIDE_PROOF_DEADLINE_NS':'999999999999999'}):
             count=len(calls)

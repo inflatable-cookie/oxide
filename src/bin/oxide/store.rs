@@ -5664,7 +5664,14 @@ impl Store {
             let (owner, _) = self.recovery_controls();
             crate::prune::refuse_delegated_without_fence(&owner)?;
         }
-        if state.owned_outputs.as_deref() == Some(COORDINATED_OUTPUTS_FENCE) {
+        self.require_recovery_ready(&state)?;
+        Ok(state)
+    }
+
+    fn require_recovery_ready(&self, state: &State) -> Result<(), String> {
+        if let Some(fence @ (DELEGATED_OUTPUTS_FENCE | COORDINATED_OUTPUTS_FENCE)) =
+            state.owned_outputs.as_deref()
+        {
             let Some(OutputsInit::Ready { transaction, .. }) = &state.outputs_init else {
                 return Err(
                     "output recovery upgrade is incomplete; resume oxide outputs upgrade-recovery"
@@ -5677,15 +5684,15 @@ impl Store {
                     continue;
                 }
                 let paired = self.view(control).load_recovery_upgrade()?;
-                if paired.owned_outputs.as_deref() != Some(COORDINATED_OUTPUTS_FENCE)
+                if paired.owned_outputs.as_deref() != Some(fence)
                     || !matches!(&paired.outputs_init, Some(OutputsInit::Ready { transaction: other, .. }) if other == transaction)
                 {
                     return Err("the paired output recovery upgrade is incomplete; resume oxide outputs upgrade-recovery".to_owned());
                 }
             }
-            crate::prune::recovery_format_ready(&owner, transaction)?;
+            crate::prune::recovery_format_ready(&owner, transaction, fence)?;
         }
-        Ok(state)
+        Ok(())
     }
 
     /// Strict read reserved for the explicit, forward-only format upgrade.
@@ -5721,19 +5728,35 @@ impl Store {
         // build ran (oxide#129). A legacy state is validated against the new
         // fields and object caps first; an oversized legacy field refuses
         // with the original file untouched.
-        if state.owned_outputs.as_deref() != Some(COORDINATED_OUTPUTS_FENCE) {
+        // /4 is historical, but its paired readiness and registry binding
+        // still govern ordinary writes. Explicit forward adoption writes /5.
+        if state.owned_outputs.as_deref() == Some(DELEGATED_OUTPUTS_FENCE) {
+            let recorded = self.load()?;
+            if recorded.owned_outputs != state.owned_outputs
+                || recorded.outputs_init != state.outputs_init
+            {
+                return Err(
+                    "ordinary mutation cannot restore or change predecessor recovery fences"
+                        .to_owned(),
+                );
+            }
+        }
+        if !matches!(
+            state.owned_outputs.as_deref(),
+            Some(DELEGATED_OUTPUTS_FENCE | COORDINATED_OUTPUTS_FENCE)
+        ) {
             let (owner, peer) = self.recovery_controls();
             for control in std::iter::once(&owner).chain(peer.as_ref()) {
                 if control == &self.control {
                     continue;
                 }
-                if self
-                    .view(control)
-                    .load_recovery_upgrade()?
-                    .owned_outputs
-                    .as_deref()
-                    == Some(COORDINATED_OUTPUTS_FENCE)
-                {
+                if matches!(
+                    self.view(control)
+                        .load_recovery_upgrade()?
+                        .owned_outputs
+                        .as_deref(),
+                    Some(DELEGATED_OUTPUTS_FENCE | COORDINATED_OUTPUTS_FENCE)
+                ) {
                     return Err("the paired pool is upgrading delegated recovery; ordinary mutation refuses".to_owned());
                 }
             }
@@ -8000,6 +8023,153 @@ pub(crate) mod tests {
                     side.load().is_err(),
                     "unconnected ordinary reader must stay fenced"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn predecessor_recovery_fences_require_the_complete_pair_and_registry() {
+        if fixture_child(
+            "store::tests::predecessor_recovery_fences_require_the_complete_pair_and_registry",
+        ) {
+            return;
+        }
+        for defect in [
+            "internal-fence",
+            "paired-fence",
+            "internal-ready",
+            "reverse-fence",
+            "transaction",
+            "missing-peer",
+            "missing-registry",
+            "wrong-registry",
+            "registry-transaction",
+            "ready",
+        ] {
+            let (root, internal, paired) = paired_controls(defect);
+            let tx = "a".repeat(32);
+            let state = State {
+                version: PREVIOUS_STATE_VERSION,
+                owned_outputs: Some(DELEGATED_OUTPUTS_FENCE.to_owned()),
+                outputs_init: Some(OutputsInit::Ready {
+                    transaction: tx.clone(),
+                    ready_ms: 1,
+                }),
+                ..State::default()
+            };
+            let mut states = [state.clone(), state];
+            match defect {
+                "internal-fence" => {
+                    states[0].outputs_init = Some(OutputsInit::Initializing {
+                        transaction: tx.clone(),
+                        started_ms: 1,
+                    });
+                    states[1].owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
+                }
+                "paired-fence" => {
+                    for state in &mut states {
+                        state.outputs_init = Some(OutputsInit::Initializing {
+                            transaction: tx.clone(),
+                            started_ms: 1,
+                        });
+                    }
+                }
+                "internal-ready" => {
+                    states[1].outputs_init = Some(OutputsInit::Initializing {
+                        transaction: tx.clone(),
+                        started_ms: 1,
+                    })
+                }
+                "reverse-fence" => states[0].owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned()),
+                "transaction" => {
+                    states[1].outputs_init = Some(OutputsInit::Ready {
+                        transaction: "b".repeat(32),
+                        ready_ms: 1,
+                    })
+                }
+                _ => {}
+            }
+            for (side, state) in [&internal, &paired].into_iter().zip(&states) {
+                validate_state(state, false).unwrap();
+                fs::write(
+                    side.control.join("state.json"),
+                    serde_json::to_vec(state).unwrap(),
+                )
+                .unwrap();
+                fs::set_permissions(
+                    side.control.join("state.json"),
+                    fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+            }
+            let output_dir = internal.control.join("outputs");
+            fs::create_dir(&output_dir).unwrap();
+            fs::set_permissions(&output_dir, fs::Permissions::from_mode(0o700)).unwrap();
+            let registry_path = output_dir.join("registry.json");
+            let mut registry = serde_json::json!({"version":"oxide.outputs.registry/3", "schema":3,
+                "revision":1, "created_by":tx, "complete":true, "deletion_routes":[]});
+            if defect == "wrong-registry" {
+                registry["version"] = "oxide.outputs.registry/4".into();
+                registry["schema"] = 4.into();
+                registry.as_object_mut().unwrap().remove("deletion_routes");
+                registry["settled"] = serde_json::json!([]);
+            }
+            if defect == "registry-transaction" {
+                registry["created_by"] = "b".repeat(32).into();
+            }
+            if defect != "missing-registry" {
+                fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
+                fs::set_permissions(&registry_path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            if defect == "missing-peer" {
+                fs::rename(
+                    paired.control.join("state.json"),
+                    paired.control.join("state.retained"),
+                )
+                .unwrap();
+            }
+            let paths = [
+                internal.control.join("state.json"),
+                paired.control.join("state.json"),
+                registry_path,
+            ];
+            let before: Vec<_> = paths.iter().map(|path| fs::read(path).ok()).collect();
+            for (side, state) in [&internal, &paired].into_iter().zip(&states) {
+                let mut changed = state.clone();
+                changed.next_id += 1;
+                if defect == "ready" {
+                    side.load().unwrap();
+                    side.save(&changed).unwrap();
+                    let checkout = root.join("checkout");
+                    let Cleaning::Guard(guard) = side
+                        .begin_clean(&checkout, &mut WaitAccounting::default())
+                        .unwrap()
+                    else {
+                        panic!("ready predecessor refused ordinary clean")
+                    };
+                    side.finish_clean(guard, &checkout).unwrap();
+                } else {
+                    if state.owned_outputs.as_deref() == Some(DELEGATED_OUTPUTS_FENCE) {
+                        assert!(side.load().is_err(), "{defect}: predecessor read admitted");
+                    }
+                    assert!(
+                        side.save(&changed).is_err(),
+                        "{defect}: state write admitted"
+                    );
+                    assert!(
+                        side.begin_clean(&root.join("checkout"), &mut WaitAccounting::default())
+                            .is_err(),
+                        "{defect}: ordinary clean admitted"
+                    );
+                    assert_eq!(
+                        before,
+                        paths
+                            .iter()
+                            .map(|path| fs::read(path).ok())
+                            .collect::<Vec<_>>(),
+                        "{defect}: partial predecessor mutated"
+                    );
+                }
             }
         }
     }

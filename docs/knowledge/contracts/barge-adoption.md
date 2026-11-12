@@ -4964,6 +4964,9 @@ unrelated fences, before publishing `oxide.outputs.registry/4` (numeric schema4)
 with an explicit bounded `settled` array. Both controls become ready afterward.
 Partial adoption refuses ordinary mutation and resumes through this explicit
 command; no missing registry is reconstructed or fence lowered.
+The predecessor `/4` fence still requires both ready controls with the same
+transaction and its exact registry/3 binding before ordinary reads or writes;
+a partially upgraded peer also excludes writes from the older `/3` side.
 
 Registry1/2 and registry3/routes retain their historical meanings. Every
 unfinished predecessor intent must drain with its original supported build

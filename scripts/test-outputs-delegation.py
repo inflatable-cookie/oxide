@@ -551,7 +551,7 @@ class World:
         code,out,err=result
         permanent.require_confirmed_closure(label,err)
         permanent.require_normal_exit(label,code)
-        if code not in (0,-9) and any(word in err.lower() for word in ('custody is not proven','descriptor scan','process observation')):
+        if code not in (0,-9) and any(word in err.lower() for word in ('custody is not proven','descriptor scan','process observation','captured-unit writer custody is unknown')):
             raise RuntimeError('actual custody uncertainty; abort and retain: '+err[-1600:])
         if expect is not None and code!=expect:raise RuntimeError(f'{label}: unexpected exit {code}: {err[-1200:]}')
         return result
@@ -630,7 +630,7 @@ class World:
         else:
             permanent.require_normal_exit(label,code)
             permanent.require_confirmed_closure(label,err)
-        if code not in (0,-9) and any(word in err.lower() for word in ('custody is not proven','descriptor scan','process observation')):
+        if code not in (0,-9) and any(word in err.lower() for word in ('custody is not proven','descriptor scan','process observation','captured-unit writer custody is unknown')):
             raise RuntimeError('actual custody uncertainty; abort and retain: '+err[-1600:])
         return code,out,err
 
