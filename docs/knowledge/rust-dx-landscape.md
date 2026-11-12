@@ -454,9 +454,14 @@ child runs. Dependency versions, features, source and `cfg` are never edited to
 avoid a compiler error.
 
 **Probes.** Two arms — plain Cargo with the product's actual quick recipe and
-the pinned Relax runner strict (`--check-first --no-live`, never `--relaxed`
-or `--cached`) — run three required probes, each compared against the baseline's
-exact stdout:
+the pinned Relax runner with the strict argv read from that pin
+(`--check-first --frozen --unattended --quiet`, never `--relaxed` or
+`--cached`) — run three required probes, each compared against the baseline's
+exact stdout. `--frozen` is carried into the pinned resolver as a lock + offline
+flag (`resolve.rs` reads locked registry versions and git commits from
+`Cargo.lock` and never writes it), and `--unattended` both disables the live
+session and removes parking on a compile error, panic or crash, so one
+occurrence cannot sit waiting for a resume that never comes.
 
 - `compat-fmt`: the committed float fixture pins `serde_json =1.0.151`, whose
   aarch64 formatting goes through `zmij`, and walks 30 declared `f64` bit
@@ -483,19 +488,37 @@ and whole-group closure stays the guard's. A baseline failure aborts rather
 than reporting an incompatibility, because it invalidates the expected
 observation.
 
-**Fit correction.** The 307 occurrence was stopped at 4100.6 MiB of the fixed
-4096 MiB owned-scratch budget, UNCLOSED, with no receipt or timings. This mode
-does not enlarge anything: it stages no Oxide front door (plain Cargo and the
-Relax runner are the only arms), keeps one snapshot copy per arm, seeds from
-the workload lock, and disposes ONLY its own known-closed stage output inside
-the guard root — the engine build target after the copied executable and its
-retained bundled std have been verified by real children, and then each
-probe's caches after both arms completed — with zero outstanding children and
-every removed path and byte figure recorded. The checkout and bundled std are
-never disposed (Relax reads its std from its build-time checkout path), and the
-600 s total, 4096 MiB, 30 s stop margin, supervisor bytes, selected Stash
-volume and reserve watchdog are unchanged. A truthful fit refusal remains a
-valid outcome, never an automatic retry.
+**Fit correction and custody.** The 307 occurrence was stopped at 4100.6 MiB
+of the fixed 4096 MiB owned-scratch budget, UNCLOSED, with no receipt or
+timings. This mode does not enlarge anything: it stages no Oxide front door
+(plain Cargo and the Relax runner are the only arms), keeps one snapshot copy
+per arm, seeds from the workload lock, and disposes ONLY its own stage output
+inside the guard root — the engine build target after the copied executable and
+its retained bundled std have been verified by real children, and then each
+probe's caches after both arms completed. Every child this body starts runs in
+its own session, and a removal requires positive custody: the child's PID
+positively reaped and a readable census of its own session positively empty. A
+non-empty or unreadable census is unknown custody, refuses the removal and
+fails the run closed; a timed-out child is killed by its own PID only, and any
+surviving descendant is reported rather than signalled (a descendant that
+itself calls `setsid` leaves that census, as it leaves the guard's own). The
+checkout and bundled std are never disposed (Relax reads its std from its
+build-time checkout path), and the 600 s total, 4096 MiB, 30 s stop margin,
+supervisor bytes, selected Stash volume and reserve watchdog are unchanged. A
+truthful fit refusal remains a valid outcome, never an automatic retry.
+
+**Evidence and input identity.** Each reached arm's bounded stdout/stderr is
+written into the evidence packet, with its full-body SHA-256, byte count and
+omission facts, before the next child runs, so a later stop cannot erase an
+earlier real refusal. The identity of the ACTUAL materialized inputs — every
+fixture and snapshot source file and lock, the staged executable, the bundled
+std, and the retained checkout's pinned head and post-lock worktree state — is
+recorded before the probes and re-read after them; a changed or missing
+recorded byte aborts the run, so the Git commit is never treated as proof of
+what ran. Setup children (clone, checkout, git queries, archive,
+extract, lock establishment, patch probes) all run through the same bounded
+boundary with the private scrubbed environment and a cap clipped by the
+remaining deadline.
 
 **Authority and limits.** `effigy research:relax:compat:test` and
 `:plan` are effect-free apparatus checks and readiness. The heavy
