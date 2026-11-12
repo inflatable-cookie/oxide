@@ -279,10 +279,14 @@ activation is a valid outcome for the planner to dispose of; no cap is raised,
 no storage is hidden and no per-phase allowance is introduced here.
 
 Compatibility success requires EVERY required probe and the resolution control,
-exact COMPLETE-byte baseline correspondence, a clean exit and positive custody of
-every child (each one reaped, with the in-boundary closure classification
-closed); a body over the analysis bound, invalid UTF-8 or an unreadable capture
-can never match, and a timed-out arm is a recorded
+exact COMPLETE-byte baseline correspondence, a clean exit and every direct child
+positively reaped. That is DIRECT-CHILD custody only: whole-group closure,
+survivors and cleanup are decided by the qualified shared supervisor after this
+body exits, so the result stays PROVISIONAL until its completed joined
+deciding/final certain-empty receipt exists; an unreaped child, an unknown
+writer or a guard fault leaves the occurrence incomplete/unqualified. A body over
+the analysis bound, invalid UTF-8 or an unreadable capture can never match, and a
+timed-out arm is a recorded
 `timeout`, a divergence a `mismatch`, and an unclassified outcome an abort with
 the remaining probes `unexecuted`. Each reached arm's bounded RAW stdout/stderr prefix is
 retained in the packet before the next child runs, with its exact full-body
@@ -2908,7 +2912,7 @@ MAX_MANIFEST_ENTRIES = 4000
 # Effect-free control seams; a guarded run never sets any of them.
 #   COMPAT_SETUP_SEAM   substitutes the whole heavy setup (entry abort control)
 #   COMPAT_STAGE_SEAM   substitutes acquire_upstream + build_relax only, so the
-#                       real verification/disposal/seed/materialize composition
+#                       real verification/seed/materialize composition
 #                       runs against a named fake external boundary
 #   COMPAT_SEED_SEAM    substitutes the offline seeder (heavy) for that control
 #   COMPAT_CHILD_RUNNER substitutes the whole bounded child runner
@@ -3983,6 +3987,14 @@ def compat_binding_document(mode: str, script_sha: str) -> bytes:
     ).encode()
 
 
+def compat_module_docstring() -> str:
+    """The module docstring, read from this file (a published statement)."""
+    with open(SCRIPT, "r", encoding="utf-8") as handle:
+        text = handle.read()
+    start = text.index('"""') + 3
+    return text[start:text.index('"""', start)]
+
+
 def compat_fixture_digests() -> dict[str, str]:
     return {path: digest for path, digest in fixture_digests().items() if "/compat-" in path}
 
@@ -4742,10 +4754,10 @@ class CompatRun:
 
     def child(self, argv: list[str], cwd: str, env: dict, cap_s: float,
               label: str | None = None) -> dict:
-        """One fresh child through the bounded session-closing runner (or the
-        named fake runner the effect-free controls inject), with its custody
-        recorded. The returned record carries the capture evidence and the
-        custody decision; a counter alone is never treated as a reap."""
+        """One fresh child through the bounded direct-child runner (or the named
+        fake runner the effect-free controls inject), with its own bounded
+        wait/reap facts recorded. The returned record carries the capture
+        evidence and those facts; whole-group closure is never concluded here."""
         self.children_spawned += 1
         label = label or f"child-{self.children_spawned:02d}"
         if COMPAT_CHILD_RUNNER is not None:
@@ -4756,8 +4768,6 @@ class CompatRun:
         custody = dict(record.get("custody") or {})
         custody.update({"label": label, "argv": " ".join(str(part) for part in argv[:6])})
         self.custody.append(custody)
-        if custody.get("session_closed"):
-            self.children_closed += 1
         return record
 
     def git_text(self, args: list[str], cwd: str | None = None,
@@ -5243,7 +5253,7 @@ class CompatRun:
             dest = os.path.join(self.run_root, "workloads", "snapshot", arm, "tree")
             os.makedirs(dest, exist_ok=True)
             # Both materialization children go through the same bounded, private,
-            # deadline-clipped and session-closing boundary as every other child;
+            # deadline-clipped and positively reaped boundary as every other child;
             # there is no fixed standalone timeout and no inherited host env.
             archive_path = os.path.join(staging, f"snapshot-{arm}.tar")
             archive = self.child(
@@ -6118,12 +6128,13 @@ def compat_self_check() -> None:
     """Effect-free controls for the compat apparatus.
 
     Real orchestration runs against named fake external boundaries: a fake
-    process-table boundary for the in-boundary closure classification, a fake
-    spawn/wait triple for the bounded child runner, a fake child runner and fake
-    heavy-stage/seed/volume boundaries for the
-    setup→verification→disposal→source-set→materialize→probe→closeout
-    composition. Nothing is compiled, acquired, staged, executed or measured,
-    and no child process is started here."""
+    spawn/wait triple for the bounded direct-child runner, a fake child runner
+    and fake heavy-stage/seed/volume/source-byte boundaries for the
+    setup→verification→seed→source-set→materialize→probe→control→closeout
+    composition, whose fresh targets are RETAINED (no in-run deletion or private
+    process census) and whose whole-group closure belongs to the qualified shared
+    supervisor. Nothing is compiled, acquired, staged, executed or measured, and
+    no child process is started here."""
     import contextlib
     import shutil
     import tarfile
@@ -6409,6 +6420,25 @@ def compat_self_check() -> None:
                f"the private closure/disposal machinery is gone ({forbidden})")
     expect("no setsid, no separate group" in module_source,
            "the direct-child boundary states that no session or group is created")
+    # Published statements must match brief v2 too: the module success
+    # criterion, this harness's own docstring and the AGENTS covering.
+    module_doc = compat_module_docstring()
+    expect("in-boundary closure classification" not in module_doc
+           and "DIRECT-CHILD custody only" in module_doc
+           and "PROVISIONAL" in module_doc,
+           "the module success criterion states direct-child facts and a provisional "
+           "guard-owned verdict, not a closure classification")
+    harness_doc = compat_self_check.__doc__ or ""
+    expect("process-table" not in harness_doc and "disposal" not in harness_doc
+           and "RETAINED" in harness_doc,
+           "the self-check docstring names the retained-target composition, not the "
+           "deleted process-table seam or disposal lifecycle")
+    agents_text = open(os.path.join(REPO, "AGENTS.md"), encoding="utf-8").read()
+    agents_compat = agents_text[agents_text.index("`effigy research:relax:compat:test`"):
+                                agents_text.index("`effigy research:relax:test`")]
+    for stale in ("process-table", "two-read", "closure matrix", "disposal lifecycle"):
+        expect(stale not in agents_compat,
+               f"the AGENTS compat covering no longer claims {stale}")
 
     # -- the real spawn boundary stays inside the guard's group -----------
     spawn_dir = tempfile.mkdtemp(dir=os.environ.get("TMPDIR") or None)
