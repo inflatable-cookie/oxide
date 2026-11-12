@@ -81,11 +81,17 @@ checksum and content rules still guard every component below that root;
 split roots, renamed namespaces, unresolved roots and any interior link
 refuse, and a real `offline_seed.SeedRefusal` is translated at that
 boundary into this entry's bounded refusal so a setup abort always passes
-through the actual publication with every declared case unexecuted. The
-upstream Relax workspace ships no committed lock, so the guarded allowance
-explicitly establishes it offline (`cargo generate-lockfile --offline`,
-recorded) before the `--locked --offline` engine build. Filesystem caches
-cannot be globally flushed under this scope, and every report says so.
+through the actual publication with every declared case unexecuted; the
+normalized source facts and seeder limits are bound into the receipt
+BEFORE the seeder runs, so even an abort receipt carries them, and the
+effect-free controls drive that exact composition — the real seeder
+exception through the real entry, gates, setup, translation and
+publication, with injected external seams for the source identities and
+the heavy acquisition/build phases. The upstream Relax workspace ships no
+committed lock, so the guarded allowance explicitly establishes it
+offline (`cargo generate-lockfile --offline`, recorded) before the
+`--locked --offline` engine build. Filesystem caches cannot be globally
+flushed under this scope, and every report says so.
 
 Workloads: (1) the committed `greet` fixture, a small two-member workspace
 with a serde/proc-macro dependency path and deterministic observable output;
@@ -201,6 +207,15 @@ QUICK_OVERRIDE_ENV = "CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG"
 QUICK_RECIPE_ANCHOR = '(\"CARGO_PROFILE_DEV_DEBUG\", Some(\"line-tables-only\"))'
 
 MAX_RECEIPT_BYTES = 64 * 1024
+# Self-check seam: when set, TrialRun.setup substitutes the heavy
+# acquisition/build phases with this callable so the effect-free controls can
+# drive a later phase (the real seeder refusal) through the real entry, gates
+# and publication. A guarded run never sets it.
+SETUP_HEAVY_SEAM = None
+# Self-check seam: when set, resolve_source returns the activation binding's
+# identities without verifying them against git (a revision worktree is dirty
+# by definition). A guarded run never sets it.
+SOURCE_GATE_SEAM = None
 # The summary receipt's `cases` array is a disclosed excerpt of the complete
 # record; the complete per-sample artifact carries every row (see
 # `build_receipt` and the samples companion). This constant documents the
@@ -1374,30 +1389,50 @@ def self_check() -> None:
         except Refusal:
             pass
         renamed = os.path.join(seam_dir, "renamed")
-        os.makedirs(os.path.join(renamed, "registry-x"))
-        os.makedirs(os.path.join(renamed, "git"))
+        renamed_common = os.path.join(seam_dir, "renamed-common")
+        os.makedirs(os.path.join(renamed_common, "reg-x"))
+        os.makedirs(os.path.join(renamed_common, "git"))
+        os.makedirs(renamed)
+        # The declared names are registry/git, but the boundary links resolve
+        # to directories with different basenames under one parent, so only
+        # the namespace-names rule can fire.
+        os.symlink(os.path.join(renamed_common, "reg-x"), os.path.join(renamed, "registry"))
+        os.symlink(os.path.join(renamed_common, "git"), os.path.join(renamed, "git"))
         try:
             canonical_cache_source(renamed)
             raise AssertionError("a renamed registry namespace must refuse")
-        except Refusal:
-            pass
+        except Refusal as refusal:
+            # The namespace-names branch, specifically: both roots resolve as
+            # real directories under one parent, so only the basename rule
+            # can have fired.
+            expect("expected namespace names" in str(refusal),
+                   "the renamed control exercises the basename branch")
         try:
             canonical_cache_source(os.path.join(seam_dir, "missing-home"))
             raise AssertionError("unresolved roots must refuse")
         except Refusal:
             pass
 
-        # A setup abort passes through the ACTUAL guarded_main and publishes
-        # both the bounded summary and the complete samples with every
-        # declared case unexecuted and a nonzero result: a real activation
-        # binding whose head mismatches the source gate.
+        # The ACTUAL seeder exception class through the real entry, gates,
+        # setup and publication: a real activation binding (live head/tree)
+        # passes the volume and source gates, the injected external seam
+        # substitutes the heavy acquisition/build phases, and the real
+        # seeder raises SeedRefusal on the interior link — translated at the
+        # trial boundary and aborted through guarded_main's publication with
+        # both artifacts, the bound source/limit facts and every declared
+        # case unexecuted.
+        # Under the source seam the gate returns the binding's identities
+        # without git verification, so the document carries exact 40-hex
+        # placeholders; parse_binding validates their shape.
+        head_now = "a" * 40
+        tree_now = "b" * 40
         binding_doc = json.dumps({
             "schema": BINDING_SCHEMA,
             "planner_reference": "self-check-guarded-main",
             "mode": "diagnostic",
             "script_sha256": sha256_file(SCRIPT),
-            "head": "a" * 40,
-            "tree": "b" * 40,
+            "head": head_now,
+            "tree": tree_now,
             "toolchain": TOOLCHAIN,
             "diagnostic_receipt_sha256": "",
             "guard": {"supervisor_sha256": EXPECTED_RUNNER_SHA256,
@@ -1413,16 +1448,28 @@ def self_check() -> None:
             "OXIDE_TASK_SCRATCH_ROOT": os.path.join(seam_dir, "guarded-scratch"),
             "OXIDE_PROOF_DEADLINE_NS": str(time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) + int(120e9)),
             "OXIDE_PROOF_EVIDENCE": os.path.join(seam_dir, "guarded-evidence"),
+            # The invoking cache the real normalization will resolve: the
+            # interior-link fixture, whose boundary passes and whose interior
+            # namespace link makes the REAL seeder refuse.
+            "CARGO_HOME": interior_home,
         }
         saved = {k: os.environ.get(k) for k in env_overrides}
         os.environ.update(env_overrides)
+        # Both injected external seams: the source gate binds the activation
+        # identities without git (a revision worktree is dirty by
+        # definition) and the heavy acquisition/build phases are substituted,
+        # so the REAL seeder refusal is driven through the real entry,
+        # remaining gates, setup, translation and publication.
+        globals()["SOURCE_GATE_SEAM"] = True
+        globals()["SETUP_HEAVY_SEAM"] = lambda run: None
         import contextlib
         try:
-            sink = contextlib.redirect_stdout(io.StringIO())
-            with sink:
+            with contextlib.redirect_stdout(io.StringIO()):
                 guarded_exit = guarded_main("diagnostic", binding_path,
                                             hashlib.sha256(binding_doc).hexdigest())
         finally:
+            globals()["SOURCE_GATE_SEAM"] = None
+            globals()["SETUP_HEAVY_SEAM"] = None
             for key, value in saved.items():
                 if value is None:
                     os.environ.pop(key, None)
@@ -1432,8 +1479,13 @@ def self_check() -> None:
         aborted_receipt = json.load(open(os.path.join(
             env_overrides["OXIDE_PROOF_EVIDENCE"], "guarded-seam-packet",
             "receipt-guarded-seam-packet.json")))
-        expect(aborted_receipt["aborted"].startswith("setup:"),
-               "the guarded receipt carries the setup refusal")
+        expect("seed directory is not a real directory" in aborted_receipt["aborted"],
+               "the REAL SeedRefusal aborts setup through guarded_main, phase and reason preserved")
+        expect(aborted_receipt["figures"]["seed_source"]["common_root"].endswith("common2")
+               or str(common2) in json.dumps(aborted_receipt["figures"]["seed_source"]),
+               "the abort receipt binds the normalized source facts")
+        expect(aborted_receipt["figures"]["seed_source"]["limits"]["aggregate_bytes"] > 0,
+               "the abort receipt binds the seeder limits")
         expect(aborted_receipt["declared_unexecuted"]
                == sum(len(case["arms"]) for case in CASE_TABLE),
                "every declared case is recorded unexecuted")
@@ -1566,6 +1618,12 @@ def volume_uuid_of(mount: str) -> str:
 
 
 def resolve_source(binding: dict) -> tuple[str, str]:
+    # Self-check seam: a revision worktree is dirty by definition, so the
+    # effect-free drive of a later phase binds the source identities from
+    # the real activation document instead of verifying them against git. A
+    # guarded run never sets this.
+    if SOURCE_GATE_SEAM is not None:
+        return binding["head"], binding["tree"]
     queries = [
         ["git", "rev-parse", "HEAD"],
         ["git", "rev-parse", "HEAD^{tree}"],
@@ -1912,11 +1970,19 @@ exported scratch, evidence and deadline, after the source and volume gates."""
             raise Refusal(f"the bound run root already exists: {self.run_root}")
         os.makedirs(self.run_root)
         self.private_home()
-        self.acquire_upstream()
-        self.build_relax()
+        if SETUP_HEAVY_SEAM is not None:
+            # Self-check seam only: substitute the heavy acquisition/build
+            # phases so a later phase (the seeder refusal) is driven through
+            # the real entry, gates and publication. A guarded run never
+            # sets this.
+            SETUP_HEAVY_SEAM(self)
+        else:
+            self.acquire_upstream()
+            self.build_relax()
         self.seed_cargo_home()
-        self.stage_oxide()
-        self.materialize()
+        if SETUP_HEAVY_SEAM is None:
+            self.stage_oxide()
+            self.materialize()
 
     def private_home(self) -> None:
         home = os.path.join(self.run_root, "home")
@@ -2035,6 +2101,16 @@ exported scratch, evidence and deadline, after the source and volume gates."""
         # seeder runs; every component below the canonical common root stays
         # under the seeder's own no-follow/checksum/content rules.
         source = canonical_cache_source(host_home)
+        limits = {
+            "anchor": "no-follow per component below the canonical common root",
+            "aggregate_bytes": offline_seed.LIMITS.aggregate_bytes,
+            "work_seconds": offline_seed.LIMITS.work_seconds,
+            "git_candidates": offline_seed.LIMITS.git_candidates,
+            "note": "private config, checksum-verified content; host cache read-only",
+        }
+        # Bound the normalized source facts and seeder limits BEFORE the
+        # seeder runs, so even a setup-abort receipt carries them.
+        self.figures["seed_source"] = {**source, "limits": limits}
         with open(os.path.join(REPO, "Cargo.lock"), "rb") as handle:
             lock_bytes = handle.read()
         destination = os.path.join(self.run_root, "cargo-homes", "shared")
@@ -2060,13 +2136,7 @@ exported scratch, evidence and deadline, after the source and volume gates."""
             "aggregate_bytes": seed.get("aggregate_bytes"),
             "seconds": round(time.monotonic() - started, 3),
             "network_seconds": 0.0,
-            "limits": {
-                "anchor": "no-follow per component below the canonical common root",
-                "aggregate_bytes": offline_seed.LIMITS.aggregate_bytes,
-                "work_seconds": offline_seed.LIMITS.work_seconds,
-                "git_candidates": offline_seed.LIMITS.git_candidates,
-                "note": "private config, checksum-verified content; host cache read-only",
-            },
+            "limits": limits,
             "note": "offline seed from the normalized invoking Cargo home; no download",
         }
 

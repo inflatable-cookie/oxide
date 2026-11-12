@@ -1702,12 +1702,15 @@ run = "python3 scripts/census-stall-observation.py --observe"
 # auto-install off and the preserved rustup home), the seed-source
 # normalization composed with the REAL anchored seeder on tiny real fixture
 # directories and links (accepted common-root relocation seeds; split,
-# renamed, unresolved and interior-link cases refuse through the real
-# SeedRefusal translated at the trial boundary), the real guarded_main
-# abort/publication drive, receipt trimming with complete-set statistics,
-# and the hash-bound samples publication through the real publish() seam
-# inside one private temporary directory it removes; no child, no network,
-# no engine, no scratch outside that directory.
+# renamed-namespace-basename, unresolved and interior-link cases refuse
+# through the real SeedRefusal translated at the trial boundary), the real
+# guarded_main drive of the ACTUAL seeder refusal through the entry, gates,
+# setup, translation and publication under injected external seams (source
+# identities bound from the activation; heavy acquisition/build substituted),
+# receipt trimming with complete-set statistics, and the hash-bound samples
+# publication through the real publish() seam inside one private temporary
+# directory it removes; no child, no network, no engine, no scratch outside
+# that directory.
 # `:plan` is effect-free and derives readiness from actual metadata
 # without compiling or running anything.
 # `research:relax:diagnostic` and `research:relax:measure` are heavy guarded
