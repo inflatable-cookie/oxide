@@ -436,6 +436,25 @@ the operating rules.
   quick/test/debug/release default, installs nothing and keeps the Barge
   integration independent. Owning research record:
   [landscape](rust-dx-landscape.md#relax-quick-run-trial-2026-11-11-prepared).
+- **Relax compatibility recheck** (Tom, 2026-11-12, decision
+  `7b5a88ce-96cb-4fab-a584-2e5deffa28ce` v2, "Go for it"): a focused,
+  independently reviewed recheck of a NEWER pinned Relax engine on actual
+  float formatting and the unchanged prior Oxide workload, to determine whether
+  the observed ARM64 intrinsic blocker is cleared. The 307 no-go for its own
+  pin stays exactly as recorded. One prepared apparatus PR may land with
+  effect-free readiness; an uncounted diagnostic and then one counted author
+  compatibility qualification each need separate planner activation at an
+  accepted published head, and a source or fit correction needs its own
+  review and activation. Any performance comparison stays conditional on
+  compatibility passing and needs a new measurement activation. The three
+  spent uncounted diagnostics produced a scoped no-go at `6ea9d063`: the
+  float-formatting and CRC32 probes match the Cargo baseline while the
+  unchanged workload panics in Relax's front end, so the counted
+  qualification was not activated and no performance comparison is
+  justified. No product
+  integration, engine fork, installation, default change or consumer adoption
+  is authorized by a pass. Owning research record:
+  [landscape](rust-dx-landscape.md#relax-compatibility-recheck-2026-11-12).
 - **Still need Tom's scoped approval:**
   - host installs beyond the planner's receipt-matched `oxide` reinstall;
   - releases, tags and workflow changes;
