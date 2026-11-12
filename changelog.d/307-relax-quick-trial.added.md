@@ -5,17 +5,11 @@ selectors around `scripts/relax-quick-trial.py`, with committed fixture
 crates under `fixtures/relax-quick-trial/`, comparing the pinned Relax
 engine (makepad/relax `aa540c1468844af159e2f106d31966b84be9fdf1`) with
 stable-LLVM quick execution on isolated fixtures under the qualified shared
-supervisor. Every edit-labelled repetition follows its own fresh predeclared
-change identically across arms; every child pins the declared 1.97.1
-toolchain with auto-install off; the oxide arm's argv enforces
-`--locked --offline` and the upstream engine lock is established offline
-inside the guarded allowance; the invoking cache SOURCE is normalized to
-one canonical common root (boundary links resolved once, interior links
-still refused) before the unchanged anchored seeder runs, and a real
-`offline_seed.SeedRefusal` translates into the trial's bounded refusal so a
-setup abort publishes both artifacts with every declared case unexecuted;
-peak RSS keeps its verified platform unit (macOS: bytes) beside a
-normalized `rss_bytes` figure; and the bounded summary receipt carries
-complete-set statistics plus a hash-bound complete per-sample artifact. No
-product behaviour, recipe, default or dependency changes, no engine build,
-acquisition or measurement is activated by this preparation.
+supervisor. Final scoped outcome: a compatibility no-go for the tested
+pin — the one reached snapshot case recorded 20 unresolved
+`core::arch::aarch64` intrinsics in `zmij-1.0.23` under the pinned engine
+(hash-bound retained stderr), the resource occurrence was budget-stopped
+UNCLOSED at 4100.6/4096 MiB with no receipt, samples or timings, and the
+recommendation is not to integrate this pinned engine; scoped to this
+tested pin/platform, preserving the apparatus and histories. No product
+behaviour, recipe, default or dependency changes.

@@ -357,13 +357,57 @@ allowance before the `--locked --offline` engine build. Tool build, std
 preparation, upstream acquisition and lock establishment are separately
 charged, never disguised as first-run latency.
 
-**No result exists yet.** The measured question — whether pinned Relax
-offers a repeatable edit-to-result gain over stable LLVM quick on these
-fixtures, at what memory, cache and setup cost, and with which semantic
-gaps — stays open until the planner-activated diagnostic and measurement
-produce their receipts. This section then records the outcome, the
-guarded go/no-go with its supported scope, and whether Relax offers more
-than the Cranelift spike.
+**Outcome: scoped compatibility no-go for the tested pinned engine.** Tom's
+approved trial explicitly accepts a genuine compatibility blocker as a valid
+outcome, and brief v6 selected that outcome; no further runtime session ran.
+Two occurrences executed, both uncounted/unqualified, both honestly
+incomplete:
+
+- **Occurrence 1 (at `beb76f75`) — spent setup failure.** The anchored
+  seeder refused fail-closed on this host's symlinked registry boundary
+  (`offline_seed.SeedRefusal`), zero cases ran, no trial receipt or samples
+  existed, and the raw traceback was retained. The normalization,
+  refusal-to-receipt translation and offline-lock corrections (revision
+  `95fb1184`/`61a55ebb`) fixed that entry class; the occurrence stays
+  spent.
+- **Occurrence 2 (at `61a55ebb`) — budget-stopped, one genuine
+  compatibility failure recorded.** The replacement occurrence was admitted
+  and progressed through the entire corrected setup: pinned upstream
+  acquired, the upstream lock established offline, the pinned Relax engine
+  built `--locked --offline`, the normalized seed succeeded
+  (`canonical_cache_source` → `/Volumes/Stash/caches/cargo`), and the
+  staged Oxide front door completed. The qualified guard's continuous
+  sampler then stopped the group at **4100.6 MiB of the fixed 4096 MiB
+  owned-scratch budget** (fault bytes 4,299,771,904 over 4,294,967,296;
+  SIGTERM, status −15, outcome UNCLOSED, deadline false, certain-empty
+  joined census, no survivors), and the trial published no receipt or
+  samples. Before the stop, the snapshot workload's reached case recorded a
+  **real Relax compatibility failure**: the retained, hash-bound stderr
+  (5,167 bytes, SHA-256 `5cfeca0d7bbe0b44365172118b346177f8a34a86bba7d51d0
+  1b513c3854f2351`) reports 20 unresolved `core::arch::aarch64` intrinsics
+  (E0432) in `zmij-1.0.23` — the float formatter behind this repository's
+  pinned `serde_json` — under the pinned engine; `tree.stdout` is empty.
+  The compatibility bytes are copied, with original paths, into the
+  task-owned closeout handoff beside the guard receipt, scratch marker,
+  selector log and owner activation binding.
+
+**Recommendation: do not integrate this pinned engine** (makepad/relax
+`aa540c1468844af159e2f106d31966b84be9fdf1`) for Oxide quick runs. It cannot
+compile the required pinned Oxide snapshot workload on this tested arm64
+setup (macOS 26.6.2, Apple Silicon, Rust 1.97.1), and the resource run
+cannot be read as a speed, semantic or comparison result: one reached case,
+no complete case set, no published receipt or samples, no measured session
+(the formerly conditional measured session was not run and supplies no
+credit), and the budget overrun is a fixed-bound fit fact, not an engine
+benchmark. The no-go is scoped to this tested pin and platform — it does
+not generalize to other Relax revisions or platforms — and it does not
+convert any failure into proof credit. The reproducible apparatus, its
+fixtures, selectors and all failure histories above stay in the tree; the
+MIT notices for the upstream engine remain upstream. A future revisit needs
+a newer Relax revision that compiles this dependency set and an approved
+fit amendment (a modestly larger owned-scratch budget or a source-reduced
+footprint, e.g. dropping the ~2 GiB engine stage target once the binary is
+copied) — each separately planned and reviewed.
 
 ### Other run-path levers
 
