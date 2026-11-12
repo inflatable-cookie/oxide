@@ -315,23 +315,40 @@ expected outputs: plain Cargo with the product's actual quick recipe
 `src/bin/oxide/cli.rs` and pinned by the effect-free modes), the staged
 Oxide quick front door where the isolated fixture safely supports it, and
 the pinned Relax runner strict. Workloads: a committed two-member serde
-fixture with deterministic observable output (cold, five warm reruns,
-predeclared body and dependant-invalidating interface edits, arm order
-rotated per repetition) and the pinned task-base Oxide snapshot running its
-read-only `--help` path under isolated test-home controls; a replacement
-synthetic fixture would be labelled as such. The bounded correspondence set
-covers argv/env/cwd/stdout/stderr/exit, `catch_unwind` plus the uncaught
-panic's file:line and a `RUST_BACKTRACE=1` frame expectation, overflow and
-debug assertions, serde derive round trip plus the KNOWN_GAPS #1 collision,
-a tiny build.rs/generated constant, threads and this repository's exact
-libc pin over FFI, and a minimal test-execution probe. No storage mutation,
-deletion or recovery case exists. Measurement reports end-to-end
-case wall time, stage costs separately, occupied cache bytes (never an
-SSD-write claim) and per-command process-tree peak RSS attributed to the
-direct child and its reaped descendants only; filesystem caches cannot be
-globally flushed under this scope, and every report says so. Tool build,
-std preparation, upstream acquisition and lock establishment are separately
-charged, never disguised as first-run latency.
+fixture with deterministic observable output (cold, a genuinely unchanged
+warm block, and two edit-labelled blocks of five repetitions each — every
+edit-labelled repetition applies its own fresh predeclared change
+identically across arms and checks its own expected observation: greet's
+body walks five declared GREETING values and its interface alternates the
+`Record.count` type u32<->u64 five times) and the pinned task-base Oxide
+snapshot running its read-only `--help` path under isolated test-home
+controls (its body block rewrites a cumulative `[trial-N]` marker five
+times and its interface alternates `MAX_STRING_BYTES` usize<->u64); a
+replacement synthetic fixture would be labelled as such. Every sample
+records its repetition index and the shared post-edit source digest. Every
+real arm and correspondence child carries the declared toolchain
+(`RUSTUP_TOOLCHAIN=1.97.1`, the preserved invoking rustup home and
+`RUSTUP_AUTO_INSTALL=0`), overriding any inherited value. The bounded
+correspondence set covers argv/env/cwd/stdout/stderr/exit, `catch_unwind`
+plus the uncaught panic's file:line and a `RUST_BACKTRACE=1` frame
+expectation, overflow and debug assertions, serde derive round trip plus
+the KNOWN_GAPS #1 collision, a tiny build.rs/generated constant, threads
+and this repository's exact libc pin over FFI, and a minimal test-execution
+probe. No storage mutation, deletion or recovery case exists. Measurement
+reports end-to-end case wall time, stage costs separately, occupied cache
+bytes (never an SSD-write claim) and per-command process-tree peak RSS —
+the raw `ru_maxrss` is platform-scaled (macOS: bytes, verified on this
+host) and is retained with its unit name beside a normalized explicit
+`rss_bytes` figure — attributed to the direct child and its reaped
+descendants only; filesystem caches cannot be globally flushed under this
+scope, and every report says so. The bounded summary receipt (64 KiB cap)
+carries statistics computed over the COMPLETE recorded set and a disclosed
+row excerpt, and publishes a complete untrimmed per-sample artifact
+(`samples-<packet>.json`, every reached/unexecuted/aborted row with its
+repetition and edit identities) hash-bound into the summary; filesystem
+caches cannot be globally flushed under this scope, and every report says
+so. Tool build, std preparation, upstream acquisition and lock
+establishment are separately charged, never disguised as first-run latency.
 
 **No result exists yet.** The measured question — whether pinned Relax
 offers a repeatable edit-to-result gain over stable LLVM quick on these

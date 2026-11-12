@@ -77,14 +77,22 @@ Workloads: (1) the committed `greet` fixture, a small two-member workspace
 with a serde/proc-macro dependency path and deterministic observable output;
 (2) the pinned task-base Oxide snapshot (this repository's tree at the bound
 head) running its read-only `--help` path under isolated test-home controls.
-Cases per workload: cold cache, five unchanged warm reruns, a predeclared
-body edit with changed observable output, and (greet) a predeclared interface
-edit that invalidates the dependant; the snapshot's edits are cumulative, so
-its interface case expects the body edit's `[trial]` marker still applied.
-Five repetitions when deadline fit permits, arm order rotated per repetition,
-all samples reported with median and range, absolute and relative savings. A
-replacement synthetic fixture would be labelled as such, not as evidence that
-Oxide's real graph runs.
+Cases per workload: cold cache, a genuinely unchanged warm block (no edit
+between repetitions), and two edit-labelled blocks of five repetitions each —
+EVERY edit-labelled repetition follows its own fresh predeclared change,
+applied identically across arms, with its own expected observation and
+(greet interface, snapshot interface) dependant invalidation: greet's body
+steps walk GREETING through five declared values, greet's interface
+alternates the `Record.count` type u32<->u64 five times, the snapshot's body
+rewrites a cumulative `[trial-N]` help marker five times, and the snapshot's
+interface alternates `MAX_STRING_BYTES` usize<->u64 with the cast sites
+added once (the snapshot's edits are cumulative, so its interface case
+expects the final `[trial-5]` marker). Every sample records its repetition
+index and the shared post-edit source digest, so an unchanged-source sample
+labelled as an edit is impossible. Arm order rotates per repetition, all
+samples reported with median and range, absolute and relative savings. A
+replacement synthetic fixture would be labelled as such, not as evidence
+that Oxide's real graph runs.
 
 Correspondence set (each with a concrete expected result; a known upstream
 bug is recorded, never worked around by weakening a program): argv/env/cwd/
@@ -101,23 +109,38 @@ reap), stage costs separately, occupied cache bytes per arm after cold and
 warm blocks (occupied size, never an SSD-write claim), and per-command
 process-tree peak RSS from `os.wait4` `ru_maxrss`, attributed to the direct
 child and its reaped descendants only — grandchildren still running at reap
-are not attributed, and that limit is stated in every report.
+are not attributed, and that limit is stated in every report. The raw
+`ru_maxrss` is platform-scaled (macOS: bytes, verified on this host by a
+child with a known 64 MiB unique allocation reporting raw 75,677,696; Linux:
+KiB), so each sample retains the raw figure with its unit name and a
+normalized explicit `rss_bytes` figure; no whole-session monitored RSS is
+claimed. Every real arm and correspondence child carries the declared
+toolchain (`RUSTUP_TOOLCHAIN=1.97.1`), the preserved invoking rustup home
+and `RUSTUP_AUTO_INSTALL=0`, regardless of inherited values.
 
-Receipt and custody: one bounded receipt (64 KiB cap) beside the guard's own
-under `OXIDE_PROOF_EVIDENCE`, with identities, per-case records (bounded
-prefixes, full-output SHA-256s, omission counters), a per-case timing
-summary (sample counts, median/min/max, relative time and absolute saving
-against the cargo baseline arm, matching cases only), the network time and
-received-byte figure parsed from the forced clone progress, owned-scratch
-and evidence-packet occupied-byte totals, declared-but-unreached cases as
-explicit `unexecuted` rows, and the honest statements that this receipt
-never claims guard closure, session census, qualification or a performance
-recommendation from failed or unclosed execution; closure stays the
-supervisor's. Evidence is published beside the guard receipt, outside the
-disposable execution scratch. A guarded run exits 0 only when nothing
-aborted, every declared case executed and every verdict is `match`; any
-divergence (including the recorded known gap), unexecuted case or abort
-exits 1, so a divergence-only run can never read as a clean pass.
+Receipt and custody: one bounded summary receipt (64 KiB cap) beside the
+guard's own under `OXIDE_PROOF_EVIDENCE`, with identities, per-case records
+(bounded prefixes, full-output SHA-256s, omission counters), a per-case
+timing summary (sample counts, median/min/max, relative time and absolute
+saving against the cargo baseline arm, matching cases only), the network
+time and received-byte figure parsed from the forced clone progress,
+owned-scratch and evidence-packet occupied-byte totals,
+declared-but-unreached cases as explicit `unexecuted` rows, and the honest
+statements that this receipt never claims guard closure, session census,
+qualification or a performance recommendation from failed or unclosed
+execution; closure stays the supervisor's. Statistics — verdicts,
+`declared_unexecuted`, `timing_summary` — are always computed over the
+COMPLETE recorded set (`statistics_basis: complete`), never silently over a
+carried suffix; the summary's `cases` array is a disclosed excerpt
+(`cases_in_receipt` + `cases_omitted` + `cases_total`), and the complete
+untrimmed per-sample artifact (`samples-<packet>.json`: every reached,
+unexecuted and aborted row with repetition and edit identities) is
+published beside it and bound into the summary by SHA-256. Evidence is
+published beside the guard receipt, outside the disposable execution
+scratch. A guarded run exits 0 only when nothing aborted, every declared
+case executed and every verdict is `match`; any divergence (including the
+recorded known gap), unexecuted case or abort exits 1, so a divergence-only
+run can never read as a clean pass.
 """
 
 from __future__ import annotations
@@ -162,6 +185,11 @@ QUICK_OVERRIDE_ENV = "CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG"
 QUICK_RECIPE_ANCHOR = '(\"CARGO_PROFILE_DEV_DEBUG\", Some(\"line-tables-only\"))'
 
 MAX_RECEIPT_BYTES = 64 * 1024
+# The summary receipt's `cases` array is a disclosed excerpt of the complete
+# record; the complete per-sample artifact carries every row (see
+# `build_receipt` and the samples companion). This constant documents the
+# expected excerpt scale for the declared matrix and is not a statistics
+# boundary: statistics always cover the complete set.
 MAX_CASE_ROWS = 48
 MAX_PREFIX_BYTES = 512
 # Fixed per-command caps, each clipped to the remaining deadline margin.
@@ -176,33 +204,78 @@ CAP_SNAPSHOT_S = 180
 GREET_EXPECTED_V1 = (
     '{"record":{"count":42,"name":"Tom"},"rendered":"hello Tom count=42"}'
 )
-GREET_EXPECTED_V2 = (
-    '{"record":{"count":42,"name":"Tom"},"rendered":"howdy Tom count=42"}'
-)
 SNAPSHOT_HELP_MARKER = "oxide: Cargo with managed build storage and profiles"
-SNAPSHOT_HELP_EDITED = SNAPSHOT_HELP_MARKER + " [trial]"
 PANIC_LOCATION = "main.rs:10:5"
 PANIC_PROBE_LINE = '    panic!("corr-uncaught-boom");'
 COLLISION_RUSTC = "app=a b=b"
 COLLISION_KNOWN_GAP = "app=a b=a"
 
-# --- Predeclared edits. Each is exact bytes against the committed fixtures. ---
+# Memory-observation units. wait4's ru_maxrss is platform-scaled: macOS
+# reports BYTES (verified on this host: a child with a known 64 MiB unique
+# allocation reported raw 75,677,696, consistent with bytes and absurd as
+# KiB), Linux reports KiB. The raw figure is retained with its unit name and
+# normalized to an explicit byte figure before any comparison.
+RSS_UNIT_NAME = "bytes"
+RSS_UNIT_BYTES = 1
 
-GREET_BODY_OLD = 'pub const GREETING: &str = "hello";'
-GREET_BODY_NEW = 'pub const GREETING: &str = "howdy";'
-GREET_INTERFACE_OLD = "    pub count: u32,"
-GREET_INTERFACE_NEW = "    pub count: u64,"
-SNAPSHOT_BODY_OLD = (
-    "oxide: Cargo with managed build storage and profiles\n"
-)
-SNAPSHOT_BODY_NEW = (
-    "oxide: Cargo with managed build storage and profiles [trial]\n"
-)
-SNAPSHOT_INTERFACE_OLD = "pub const MAX_STRING_BYTES: usize = 2048;"
-SNAPSHOT_INTERFACE_NEW = "pub const MAX_STRING_BYTES: u64 = 2048;"
-SNAPSHOT_INTERFACE_CAST_OLD = "reader.string(MAX_STRING_BYTES)?"
-SNAPSHOT_INTERFACE_CAST_NEW = "reader.string(MAX_STRING_BYTES as usize)?"
-SNAPSHOT_INTERFACE_CASTS = 4
+# --- Predeclared edit sequences. Every edit-labelled repetition follows its
+# own fresh, valid, deterministic change applied identically across arms, so
+# each edit-labelled sample is a real edit-to-result observation; the
+# unchanged warm block stays genuinely unchanged.
+
+GREET_BODY_SEQUENCE = ["howdy", "hiya", "greetings", "welcome", "howdys"]
+# Alternating valid field types: each direction is a fresh change that
+# invalidates the greet dependant; the observable bytes stay identical.
+GREET_INTERFACE_SEQUENCE = [
+    ("u32", "u64"), ("u64", "u32"), ("u32", "u64"), ("u64", "u32"), ("u32", "u64"),
+]
+# Cumulative help-line markers: repetition i rewrites the marker value, so
+# every sample observes a fresh change.
+SNAPSHOT_BODY_SEQUENCE = [f"[trial-{n}]" for n in range(1, 6)]
+# Alternating const types; the four cast sites are added on the first step
+# only (`as usize` is valid for both source types, so later steps change only
+# the const).
+SNAPSHOT_INTERFACE_SEQUENCE = [
+    ("usize", "u64"), ("u64", "usize"), ("usize", "u64"), ("u64", "usize"), ("usize", "u64"),
+]
+
+
+def greet_expected(greeting: str) -> str:
+    """The deterministic greet stdout for one cumulative GREETING value."""
+    return f'{{"record":{{"count":42,"name":"Tom"}},"rendered":"{greeting} Tom count=42"}}'
+
+
+def greet_body_step(index: int) -> tuple[str, str]:
+    """(old, new) for cumulative body step index; `hello` seeds the sequence."""
+    values = ["hello"] + list(GREET_BODY_SEQUENCE)
+    return (
+        f'pub const GREETING: &str = "{values[index]}";',
+        f'pub const GREETING: &str = "{values[index + 1]}";',
+    )
+
+
+def greet_interface_step(index: int) -> tuple[str, str]:
+    first, second = GREET_INTERFACE_SEQUENCE[index]
+    return (f"    pub count: {first},", f"    pub count: {second},")
+
+
+def snapshot_body_step(index: int) -> tuple[str, str]:
+    line = "oxide: Cargo with managed build storage and profiles"
+    if index == 0:
+        return (line + "\n", line + " [trial-1]\n")
+    return (line + f" [trial-{index}]\n", line + f" [trial-{index + 1}]\n")
+
+
+def snapshot_interface_steps(index: int) -> list[tuple[str, str, int]]:
+    """The const-type swap for step index, plus the four cast-site rewrites on
+    the first step only."""
+    first, second = SNAPSHOT_INTERFACE_SEQUENCE[index]
+    ops = [(f"pub const MAX_STRING_BYTES: {first} = 2048;",
+            f"pub const MAX_STRING_BYTES: {second} = 2048;", 1)]
+    if index == 0:
+        ops.append(("reader.string(MAX_STRING_BYTES)?",
+                    "reader.string(MAX_STRING_BYTES as usize)?", 4))
+    return ops
 
 ARMS = ("cargo", "oxide", "relax")
 
@@ -494,7 +567,7 @@ def greeting_expectation(edit: str | None) -> str:
     if edit is None or edit == "warm":
         return GREET_EXPECTED_V1
     if edit == "body":
-        return GREET_EXPECTED_V2
+        return greet_expected("howdy")
     raise Refusal(f"unknown greet edit {edit!r}")
 
 
@@ -643,28 +716,29 @@ CASE_TABLE = [
      "figure": "cold edit-to-result wall time"},
     {"workload": "greet", "case": "warm-unchanged", "reps": 5, "arms": ARMS,
      "oracle": "exact stdout GREET_EXPECTED_V1, exit 0",
-     "figure": "warm no-edit wall time, median/range over reps"},
+     "figure": "genuinely unchanged warm block, no edit between repetitions"},
     {"workload": "greet", "case": "edit-body", "reps": 5, "arms": ARMS,
-     "edit": "GREETING hello->howdy (greet-core)",
-     "oracle": "exact stdout GREET_EXPECTED_V2, exit 0",
-     "figure": "first rep after the edit is the edit-to-result figure"},
+     "edit": "five distinct predeclared GREETING edits, one per repetition "
+             "(hello->howdy->hiya->greetings->welcome->howdys), identical across arms",
+     "oracle": "exact stdout greet_expected(step value), exit 0; every rep changes bytes",
+     "figure": "first rep after each edit is that rep's edit-to-result figure"},
     {"workload": "greet", "case": "edit-interface", "reps": 5, "arms": ARMS,
-     "edit": "Record.count u32->u64 (greet-core)",
-     "oracle": "exact stdout GREET_EXPECTED_V2, exit 0 (unchanged bytes)",
-     "figure": "dependant-invalidating edit"},
+     "edit": "five alternating Record.count type edits (u32<->u64), one per repetition",
+     "oracle": "exact stdout greet_expected(howdys), exit 0 (unchanged bytes); dependant invalidated each rep",
+     "figure": "dependant-invalidating edit per repetition"},
     {"workload": "snapshot", "case": "cold", "arms": ARMS,
      "oracle": "exit 0, stdout contains SNAPSHOT_HELP_MARKER, not '[trial]'",
      "figure": "cold build+run of the read-only --help path"},
     {"workload": "snapshot", "case": "warm-unchanged", "reps": 5, "arms": ARMS,
-     "oracle": "as cold", "figure": "warm no-edit wall time"},
+     "oracle": "as cold", "figure": "genuinely unchanged warm block"},
     {"workload": "snapshot", "case": "edit-body", "reps": 5, "arms": ARMS,
-     "edit": "USAGE first line += ' [trial]' (src/bin/oxide/main.rs)",
-     "oracle": "exit 0, stdout contains SNAPSHOT_HELP_EDITED, not the unedited marker",
-     "figure": "the oxide#075 loop shape"},
+     "edit": "five distinct cumulative [trial-N] marker edits, one per repetition",
+     "oracle": "exit 0, stdout contains marker + [trial-N] for that rep and not the previous marker",
+     "figure": "the oxide#075 loop shape, one fresh change per repetition"},
     {"workload": "snapshot", "case": "edit-interface", "reps": 5, "arms": ARMS,
-     "edit": "MAX_STRING_BYTES usize->u64 + 4 reader.string casts (src/dep_info.rs)",
-     "oracle": "exit 0, stdout contains SNAPSHOT_HELP_EDITED (the body edit's [trial] stays applied)",
-     "figure": "library type change invalidating the bin unit"},
+     "edit": "five alternating MAX_STRING_BYTES type edits (usize<->u64; cast sites on the first)",
+     "oracle": "exit 0, stdout contains the cumulative [trial-5] help line",
+     "figure": "library type change invalidating the bin unit, per repetition"},
 ]
 CASE_TABLE.extend(
     {
@@ -856,31 +930,68 @@ def self_check() -> None:
     expect(recipe is not None and blocker is None,
            f"the quick recipe anchor must bind: {blocker}")
 
-    # Predeclared edits apply exactly to the committed fixture bytes.
+    # The real edit/iteration composition, driven effect-free against the
+    # committed fixture bytes: every edit-labelled repetition must change
+    # bytes (a no-op step refuses) and its expected observation must match
+    # the derivation the guarded loop will use. Text-anchor presence alone
+    # proves nothing; each step's before/after bytes and the per-repetition
+    # expected stdout are checked here end to end.
     core = read_fixture("greet", "greet-core", "src", "lib.rs")  # (pure read)
-    expect(core.count(GREET_BODY_OLD) == 1, "greet body anchor occurs once")
-    expect(core.count(GREET_INTERFACE_OLD) == 1, "greet interface anchor occurs once")
-    edited = apply_edit(apply_edit(core, GREET_BODY_OLD, GREET_BODY_NEW),
-                        GREET_INTERFACE_OLD, GREET_INTERFACE_NEW)
-    expect("howdy" in edited and "pub count: u64," in edited, "greet edits compose")
+    greet_text = core
+    for index in range(5):
+        old, new = greet_body_step(index)
+        before = greet_text
+        greet_text = apply_edit(greet_text, old, new, 1)
+        expect(greet_text != before, f"greet body repetition {index} changes bytes")
+        expected = greet_expected(GREET_BODY_SEQUENCE[index])
+        expect(f'"rendered":"{GREET_BODY_SEQUENCE[index]} Tom count=42"' in expected
+               and expected.startswith('{"record":{"count":42,"name":"Tom"}'),
+               f"greet body repetition {index} derives its expected observation")
+    for index in range(5):
+        old, new = greet_interface_step(index)
+        before = greet_text
+        greet_text = apply_edit(greet_text, old, new, 1)
+        expect(greet_text != before,
+               f"greet interface repetition {index} changes bytes and invalidates the dependant")
+    final_greeting = GREET_BODY_SEQUENCE[-1]
+    expect(f'pub const GREETING: &str = "{final_greeting}";' in greet_text
+           and "pub count: u64," in greet_text,
+           "the cumulative greet sequence lands on its declared final state")
+    # The full expected-output ladder, seed through cumulative final value.
+    expect(greet_expected("hello") == GREET_EXPECTED_V1, "seed expectation is byte-stable")
+    for index, value in enumerate(GREET_BODY_SEQUENCE):
+        expect(greet_expected(value)
+               == f'{{"record":{{"count":42,"name":"Tom"}},"rendered":"{value} Tom count=42"}}',
+               f"greet expectation for repetition {index} is deterministic")
     with open(os.path.join(REPO, "src", "bin", "oxide", "main.rs"), encoding="utf-8") as h:
         usage = h.read()
-    expect(usage.count(SNAPSHOT_BODY_OLD) == 1, "snapshot body anchor occurs once")
+    snapshot_text = usage
+    for index in range(5):
+        old, new = snapshot_body_step(index)
+        before = snapshot_text
+        snapshot_text = apply_edit(snapshot_text, old, new, 1)
+        expect(snapshot_text != before,
+               f"snapshot body repetition {index} changes bytes")
+        expected_marker = SNAPSHOT_HELP_MARKER + " " + SNAPSHOT_BODY_SEQUENCE[index]
+        expect(expected_marker + "\n" in snapshot_text
+               and (index == 0 or SNAPSHOT_BODY_SEQUENCE[index - 1] not in snapshot_text),
+               f"snapshot body repetition {index} checks its own cumulative marker")
     dep_info = open(os.path.join(REPO, "src", "dep_info.rs"), encoding="utf-8").read()
-    expect(dep_info.count(SNAPSHOT_INTERFACE_OLD) == 1, "snapshot const anchor occurs once")
-    expect(dep_info.count(SNAPSHOT_INTERFACE_CAST_OLD) == SNAPSHOT_INTERFACE_CASTS,
-           f"snapshot cast anchor occurs exactly {SNAPSHOT_INTERFACE_CASTS} times")
-    snapshot_body_edited = apply_edit(usage, SNAPSHOT_BODY_OLD, SNAPSHOT_BODY_NEW)
-    expect(SNAPSHOT_HELP_EDITED.splitlines()[0] + "\n" in snapshot_body_edited,
-           "the edited help line is byte-exact")
-    dep_info_edited = apply_edit(apply_edit(dep_info, SNAPSHOT_INTERFACE_OLD,
-                                            SNAPSHOT_INTERFACE_NEW),
-                                 SNAPSHOT_INTERFACE_CAST_OLD,
-                                 SNAPSHOT_INTERFACE_CAST_NEW, SNAPSHOT_INTERFACE_CASTS)
-    expect("pub const MAX_STRING_BYTES: u64 = 2048;" in dep_info_edited,
-           "the snapshot interface edit changes the const type")
-    expect(dep_info_edited.count("reader.string(MAX_STRING_BYTES as usize)?")
-           == SNAPSHOT_INTERFACE_CASTS, "every cast site is rewritten")
+    snapshot_dep = dep_info
+    for index in range(5):
+        before = snapshot_dep
+        for old, new, count in snapshot_interface_steps(index):
+            snapshot_dep = apply_edit(snapshot_dep, old, new, count)
+        expect(snapshot_dep != before,
+               f"snapshot interface repetition {index} changes bytes")
+        expect("2048;" in snapshot_dep and "reader.string(MAX_STRING_BYTES as usize)?"
+               in snapshot_dep,
+               f"snapshot interface repetition {index} keeps the const and casts")
+    expect(snapshot_dep.count("reader.string(MAX_STRING_BYTES as usize)?") == 4,
+           "all four cast sites are rewritten once on the first step")
+    cumulative_line = SNAPSHOT_HELP_MARKER + " " + SNAPSHOT_BODY_SEQUENCE[-1]
+    expect(cumulative_line + "\n" in snapshot_text,
+           "the cumulative snapshot body lands on [trial-5]")
 
     # Oracles against fixture transcripts.
     expect(oracle_exact_stdout({"stdout": GREET_EXPECTED_V1 + "\n", "exit": 0},
@@ -888,7 +999,7 @@ def self_check() -> None:
     expect(oracle_exact_stdout({"stdout": GREET_EXPECTED_V1 + "\n", "exit": 101},
                                GREET_EXPECTED_V1 + "\n") == "mismatch", "exit matters")
     expect(greeting_expectation(None) == GREET_EXPECTED_V1, "warm expects v1")
-    expect(greeting_expectation("body") == GREET_EXPECTED_V2, "body edit expects v2")
+    expect(greeting_expectation("body") == greet_expected("howdy"), "body edit expects howdy")
     try:
         greeting_expectation("nonsense")
         raise AssertionError("unknown greet edit must refuse")
@@ -1033,9 +1144,11 @@ def self_check() -> None:
     expect(tokenstream_in_scope(qualified_variant),
            "a fully qualified TokenStream with no import satisfies the control")
 
-    # Receipt trimming: every case-derived figure is recomputed from the rows
-    # the receipt carries, so a truncated receipt never claims more than it
-    # carries; cases_omitted + cases_in_receipt == cases_total.
+    # Receipt trimming: statistics are computed ONCE over the COMPLETE set
+    # (statistics_basis complete) and never recomputed from the carried
+    # suffix, while the summary's `cases` array is a disclosed excerpt:
+    # cases_omitted + cases_in_receipt == cases_total, and the complete
+    # per-sample artifact is hash-bound into the summary.
     huge_row = {
         "workload": "greet", "case": "cold", "arm": "cargo", "verdict": "match",
         "seconds": 1.0, "stdout_evidence": {"prefix": "x" * 4096, "truncated": True},
@@ -1046,21 +1159,139 @@ def self_check() -> None:
     trimmed = build_receipt({"schema": "t"}, trim_cases, cap_bytes=32 * 1024)
     expect(trimmed["cases_omitted"] + trimmed["cases_in_receipt"] == trimmed["cases_total"],
            "omitted + carried equals the total")
-    expect(sum(trimmed["verdicts"].values()) == trimmed["cases_in_receipt"],
-           "verdicts tally exactly the carried rows")
-    expect(trimmed["declared_unexecuted"]
-           == sum(1 for row in trimmed["cases"] if row["verdict"] == "unexecuted"),
-           "declared_unexecuted counts only carried rows")
-    expect(all(key.startswith("greet/cold-") and row["case"].startswith("cold-")
-               for key in trimmed["timing_summary"]
-               for row in trimmed["cases"] if f"{row['workload']}/{row['case']}" == key),
-           "timing_summary keys all come from carried rows")
+    expect(sum(trimmed["verdicts"].values()) == len(trim_cases),
+           "verdicts cover the complete set, not the carried suffix")
+    expect(trimmed["verdicts"] == verdict_tally(trim_cases),
+           "verdicts equal the full-set tally after forced trimming")
+    expect(trimmed["declared_unexecuted"] == 1,
+           "declared_unexecuted counts the complete set's unexecuted row even when its row is trimmed")
+    expect(all(f"greet/{row['case']}" in trimmed["timing_summary"]
+               for row in trim_cases if row["verdict"] == "match"),
+           "timing_summary covers every matching complete-set case, carried or not")
+    expect(trimmed["cases_in_receipt"] < trimmed["cases_total"],
+           "the forced trim actually trimmed the excerpt")
     untrimmed = build_receipt({"schema": "t"}, trim_cases, cap_bytes=8 * 1024 * 1024)
     expect(untrimmed["cases_omitted"] == 0
            and untrimmed["cases_in_receipt"] == len(trim_cases),
            "a fitting receipt carries every row")
 
-    print("self-check: all controls passed (no scratch, child, network or engine)\n")
+    # Complete samples artifact, hash-bound into the summary, plus the real
+    # publication seam under one private temporary directory that this check
+    # removes; no child, no network, no engine, no scratch outside it.
+    full_matrix = []
+    for case in ("cold", "warm-unchanged", "edit-body", "edit-interface"):
+        for rep in (None, 0, 1, 2, 3, 4):
+            for arm in ARMS:
+                full_matrix.append({"workload": "greet", "case": case, "arm": arm,
+                                    "rep": rep, "verdict": "match", "seconds": 1.0})
+    samples = {
+        "schema": "oxide.relax-quick-trial-samples/1",
+        "cases_total": len(full_matrix),
+        "cases": full_matrix,
+    }
+    samples_bytes = json.dumps(samples, indent=1).encode()
+    bound = build_receipt({"schema": "t", "samples_sha256":
+                           hashlib.sha256(samples_bytes).hexdigest(),
+                           "samples_rows": len(full_matrix)},
+                          full_matrix, cap_bytes=8 * 1024)
+    expect(bound["samples_sha256"] == hashlib.sha256(samples_bytes).hexdigest(),
+           "the summary binds the samples artifact's exact bytes")
+    expect(bound["samples_rows"] == len(full_matrix), "the summary names the row count")
+    expect(bound["declared_unexecuted"] == 0 and len(bound["verdicts"]) == 1,
+           "the complete statistics survive a forced summary trim")
+
+    import tempfile
+    import shutil
+    seam_dir = tempfile.mkdtemp(dir=os.environ.get("TMPDIR") or None)
+    try:
+        # Complete samples artifact, hash-bound into the summary, published
+        # through the real publish() with a forced summary cap.
+        seam = TrialRun.__new__(TrialRun)
+        seam.mode = "diagnostic"
+        seam.binding = {"paths": {"run_root_name": "seam-run", "packet_name": "seam-packet"},
+                        "planner_reference": "self-check-seam"}
+        seam.figures = {}
+        seam.cases = [dict(row) for row in full_matrix]
+        seam.cases.extend(declared_unexecuted(seam.cases))
+        seam.run_root = os.path.join(seam_dir, "run")
+        seam.packet_dir = os.path.join(seam_dir, "packet")
+        seam.aborted = None
+        module_cap = MAX_RECEIPT_BYTES
+        globals()["MAX_RECEIPT_BYTES"] = 16 * 1024  # force the excerpt path
+        try:
+            seam.publish()
+        finally:
+            globals()["MAX_RECEIPT_BYTES"] = module_cap
+        receipt_path = os.path.join(seam.packet_dir, "receipt-seam-packet.json")
+        samples_path = os.path.join(seam.packet_dir, "samples-seam-packet.json")
+        published_receipt = json.load(open(receipt_path))
+        published_samples = open(samples_path, "rb").read()
+        expect(published_receipt["samples_sha256"]
+               == hashlib.sha256(published_samples).hexdigest(),
+               "the published summary binds the published samples bytes")
+        expect(json.loads(published_samples.decode())["cases_total"] == len(seam.cases),
+               "the published samples artifact carries the complete row set")
+        expect(published_receipt["cases_in_receipt"] < published_receipt["cases_total"],
+               "the forced-cap publication trimmed only the summary excerpt")
+        expect(sum(published_receipt["verdicts"].values()) == published_receipt["cases_total"],
+               "the published statistics cover the complete set despite trimming")
+
+        # The real arm env seams pin every child toolchain: RUSTUP_TOOLCHAIN
+        # is the declared 1.97.1 for all arms (overriding any inherited
+        # value), RUSTUP_AUTO_INSTALL is 0, the rustup home survives, and an
+        # inherited wrong toolchain cannot leak through. The synthetic works
+        # live inside seam_dir, so the oxide seam's real per-arm home creation
+        # lands in the removed directory.
+        seam_run = TrialRun.__new__(TrialRun)
+        seam_run.env = {
+            "HOME": os.path.join(seam_dir, "home"), "PATH": "/bin",
+            "RUSTUP_HOME": "/rustup/invoking",
+            "RUSTUP_AUTO_INSTALL": "0",
+            "TMPDIR": os.path.join(seam_dir, "home", "tmp"),
+            "MAKEPAD_RUN_HOME": os.path.join(seam_dir, "home", ".makepad-run"),
+            "OXIDE_TEST_HOME_FROM_ENV": "1",
+            "RUSTUP_TOOLCHAIN": "1.99.1",  # a hostile inherited value must be overridden
+        }
+        seam_run.shared_cargo_home = os.path.join(seam_dir, "cargo")
+        seam_run.relax_bin = "/bin/relax"
+        seam_run.oxide_bin = "/bin/oxide"
+        seam_run.works = {
+            "greet": {arm: os.path.join(seam_dir, "w", "greet", arm, "greet") for arm in ARMS},
+            "corr": {arm: os.path.join(seam_dir, "w", "corr-suite", arm, "corr-suite") for arm in ARMS},
+            "snapshot": {arm: os.path.join(seam_dir, "w", "snapshot", arm, "tree") for arm in ARMS},
+        }
+        for arm in ARMS:
+            argv, env = seam_run.arm_argv_env(arm, "greet", ["Tom"])
+            expect(env.get("RUSTUP_TOOLCHAIN") == TOOLCHAIN,
+                   f"{arm} arm pins the declared toolchain over any inherited value")
+            expect(env.get("RUSTUP_AUTO_INSTALL") == "0", f"{arm} arm keeps auto-install off")
+            expect(env.get("RUSTUP_HOME") == "/rustup/invoking", f"{arm} arm preserves the rustup home")
+        oxide_argv, oxide_env = seam_run.arm_argv_env("oxide", "greet", ["Tom"])
+        expect(oxide_env.get("OXIDE_TEST_HOME_FROM_ENV") == "1"
+               and oxide_env.get("CARGO_HOME") == seam_run.shared_cargo_home
+               and oxide_env.get("OXIDE_POOL").startswith(os.path.join(seam_dir, "w", "greet", "oxide")),
+               "oxide arm keeps its private home, pool and shared cargo home")
+        relax_argv, relax_env = seam_run.arm_argv_env("relax", "greet", ["Tom"])
+        expect(relax_env.get("MAKEPAD_RUN_OFFLINE") == "1"
+               and relax_env.get("CARGO_HOME") == seam_run.shared_cargo_home,
+               "relax arm stays offline on the shared seeded home")
+        corr_argv, corr_env = seam_run.corr_command("relax", "basics", ["one"])
+        expect(corr_env.get("RUSTUP_TOOLCHAIN") == TOOLCHAIN,
+               "correspondence relax children pin the declared toolchain too")
+    finally:
+        shutil.rmtree(seam_dir)
+
+    # Memory normalization: the raw figure is retained with its unit and the
+    # explicit byte figure is derived by the declared unit scale.
+    expect(RSS_UNIT_NAME == "bytes" and RSS_UNIT_BYTES == 1,
+           "this host's ru_maxrss unit is verified bytes")
+    raw_sample = 75_677_696
+    expect(raw_sample * RSS_UNIT_BYTES == raw_sample
+           and 64 * 1024 * 1024 < raw_sample < 128 * 1024 * 1024,
+           "the verification probe's magnitude stays consistent with bytes")
+
+    print("self-check: all controls passed (one removed temp directory; no child, "
+          "network, engine or scratch outside it)")
 
 
 # --------------------------------------------------------------------------
@@ -1228,6 +1459,9 @@ def measure_one(
     """One fresh child, spawn to reap. Wall time is end-to-end. Peak RSS is
 `os.wait4` ru_maxrss for this child and its reaped descendants only:
 grandchildren still running at reap are not attributed, and reports say so.
+The raw value is platform-scaled (macOS: bytes, verified on this host;
+Linux: KiB), so it is retained with its unit name and normalized to the
+explicit rss_bytes figure; no whole-session monitored RSS is claimed.
 A timed-out child is killed by its own unreaped PID and positively reaped."""
     allowed = budget_s(deadline_ns, cap_s)
     if allowed <= 0.0:
@@ -1262,7 +1496,9 @@ A timed-out child is killed by its own unreaped PID and positively reaped."""
         "cwd": cwd,
         "exit": process.returncode,
         "seconds": round(elapsed, 4),
-        "rss_max_kib": int(usage.ru_maxrss),
+        "rss_maxrss_raw": int(usage.ru_maxrss),
+        "rss_unit": RSS_UNIT_NAME,
+        "rss_bytes": int(usage.ru_maxrss) * RSS_UNIT_BYTES,
         "timed_out": timed_out,
         "cap_s": round(allowed, 2),
     }
@@ -1359,33 +1595,30 @@ def verdict_tally(cases: list[dict]) -> dict[str, int]:
     return tally
 
 
-def build_receipt(base: dict, cases: list[dict], cap_bytes: int = MAX_RECEIPT_BYTES) -> dict:
-    """One bounded receipt document. When the case rows exceed the byte cap,
-    rows are dropped from the end and EVERY case-derived figure — verdicts,
-    declared_unexecuted, timing_summary, cases_in_receipt — is recomputed
-    from the rows the receipt actually carries, so a truncated receipt never
-    claims more than it carries; `cases_omitted` and `cases_total` disclose
-    the remainder."""
+def build_receipt(base: dict, cases: list[dict], cap_bytes: int | None = None) -> dict:
+    """One bounded summary receipt. Statistics — verdicts, declared_unexecuted,
+    timing_summary — are computed ONCE over the COMPLETE case set and never
+    recomputed from a carried suffix, so a divergence or figure is never
+    silently reduced by trimming. When the rows exceed the byte cap, rows
+    drop from the end of the `cases` excerpt only, and `cases_in_receipt`,
+    `cases_omitted` and `cases_total` disclose exactly what was dropped; the
+    complete hash-bound samples artifact carries every row."""
+    cap = MAX_RECEIPT_BYTES if cap_bytes is None else cap_bytes
     document = dict(base)
     document["cases"] = list(cases)
     document["cases_total"] = len(cases)
     document["cases_omitted"] = 0
     document["cases_in_receipt"] = len(document["cases"])
-    document["verdicts"] = verdict_tally(document["cases"])
+    document["verdicts"] = verdict_tally(cases)
     document["declared_unexecuted"] = sum(
-        1 for row in document["cases"] if row.get("verdict") == "unexecuted"
+        1 for row in cases if row.get("verdict") == "unexecuted"
     )
-    document["timing_summary"] = timing_summary(document["cases"])
+    document["timing_summary"] = timing_summary(cases)
     encoded = json.dumps(document, indent=1).encode()
-    while len(encoded) > cap_bytes and len(document["cases"]) > 1:
+    while len(encoded) > cap and len(document["cases"]) > 1:
         document["cases"].pop()
         document["cases_omitted"] += 1
         document["cases_in_receipt"] = len(document["cases"])
-        document["verdicts"] = verdict_tally(document["cases"])
-        document["declared_unexecuted"] = sum(
-            1 for row in document["cases"] if row.get("verdict") == "unexecuted"
-        )
-        document["timing_summary"] = timing_summary(document["cases"])
         encoded = json.dumps(document, indent=1).encode()
     return document
 
@@ -1678,6 +1911,7 @@ exported scratch, evidence and deadline, after the source and volume gates."""
                 OXIDE_TEST_HOME_FROM_ENV="1",
                 OXIDE_POOL=os.path.join(os.path.dirname(workdir), "pool"),
                 CARGO_HOME=self.shared_cargo_home,
+                RUSTUP_TOOLCHAIN=TOOLCHAIN,
                 TMPDIR=os.path.join(arm_home, "tmp"),
                 TMP=os.path.join(arm_home, "tmp"),
                 TEMP=os.path.join(arm_home, "tmp"),
@@ -1692,6 +1926,7 @@ exported scratch, evidence and deadline, after the source and volume gates."""
             MAKEPAD_RUN_HOME=self.env["MAKEPAD_RUN_HOME"],
             MAKEPAD_RUN_OFFLINE="1",
             CARGO_HOME=self.shared_cargo_home,
+            RUSTUP_TOOLCHAIN=TOOLCHAIN,
         )
         argv = [self.relax_bin, "run", "--check-first", "--no-live", "--quiet",
                 relax_target, *package_flags, *trailing]
@@ -1712,8 +1947,12 @@ exported scratch, evidence and deadline, after the source and volume gates."""
             "workload": workload,
             "case": case,
             "arm": record.get("arm"),
+            "rep": record.get("rep"),
+            "source_sha256": record.get("source_sha256"),
             "seconds": record.get("seconds"),
-            "rss_max_kib": record.get("rss_max_kib"),
+            "rss_maxrss_raw": record.get("rss_maxrss_raw"),
+            "rss_unit": record.get("rss_unit"),
+            "rss_bytes": record.get("rss_bytes"),
             "exit": record.get("exit"),
             "timed_out": record.get("timed_out"),
             "verdict": verdict,
@@ -1725,13 +1964,22 @@ exported scratch, evidence and deadline, after the source and volume gates."""
     def unexecuted_rows(self) -> list[dict]:
         return declared_unexecuted(self.cases)
 
-    def apply_edit_everywhere(self, path_relative: str, old: str, new: str, count: int = 1) -> str:
+    def apply_ops_everywhere(self, path_relative: str, ops: list[tuple[str, str, int]]) -> str:
+        """Apply one repetition edit's operations identically across arms and
+        return the shared post-edit digest. Every repetition edit must change
+        bytes (a no-op repetition is refused, never silently recorded)."""
         digest = None
-        for workload_key, workdir in self._edit_targets(path_relative):
+        for _key, workdir in self._edit_targets(path_relative):
             full = os.path.join(workdir, path_relative)
             with open(full, "r", encoding="utf-8") as handle:
                 text = handle.read()
-            edited = apply_edit(text, old, new, count)
+            edited = text
+            for old, new, count in ops:
+                edited = apply_edit(edited, old, new, count)
+            if edited == text:
+                raise Refusal(
+                    f"the predeclared repetition edit at {path_relative} produced no byte change"
+                )
             with open(full, "w", encoding="utf-8") as handle:
                 handle.write(edited)
             current = hashlib.sha256(edited.encode()).hexdigest()
@@ -1742,6 +1990,25 @@ exported scratch, evidence and deadline, after the source and volume gates."""
         if digest is None:
             raise Refusal("the edit reached no workdir")
         return digest
+
+    def repetition_block(self, workload: str, case: str, program_args: list[str],
+                         cap_s: float, steps: list[dict], oracle_factory) -> None:
+        """One edit-labelled block: every repetition applies its own fresh
+        predeclared change identically across arms (each step must change
+        bytes; the shared post-edit digest is recorded per sample), then all
+        arms launch in balanced rotation against that repetition's expected
+        observation. Every sample carries its rep index and edit identity."""
+        for rep, step in enumerate(steps):
+            digest = self.apply_ops_everywhere(step["path"], step["ops"])
+            oracle = oracle_factory(step)
+            if budget_s(self.deadline_ns, cap_s) <= 0:
+                self.figures.setdefault("reps_reached", {})[f"{workload}-{case}"] = rep
+                break
+            for arm in rotate(ARMS, rep):
+                record = self.run_arm(arm, workload, program_args, cap_s)
+                record["rep"] = rep
+                record["source_sha256"] = digest
+                self.record_case(workload, case, record, oracle(record))
 
     def _edit_targets(self, path_relative: str) -> list[tuple[str, str]]:
         if path_relative.startswith("greet-core/"):
@@ -1755,34 +2022,48 @@ exported scratch, evidence and deadline, after the source and volume gates."""
         for arm in ARMS:
             record = self.run_arm(arm, "greet", ["Tom"], cap)
             self.record_case("greet", "cold", record,
-                             oracle_exact_stdout(record, GREET_EXPECTED_V1 + "\n"))
+                             oracle_exact_stdout(record, greet_expected("hello") + "\n"))
         self.cache_snapshot("greet-cold")
+        # The genuinely unchanged warm block: no edit between repetitions.
         for rep in range(5):
             if budget_s(self.deadline_ns, cap) <= 0:
                 self.figures.setdefault("reps_reached", {})["greet-warm"] = rep
                 break
             for arm in rotate(ARMS, rep):
                 record = self.run_arm(arm, "greet", ["Tom"], cap)
+                record["rep"] = rep
                 self.record_case("greet", "warm-unchanged", record,
-                                 oracle_exact_stdout(record, GREET_EXPECTED_V1 + "\n"))
-        self.apply_edit_everywhere("greet-core/src/lib.rs", GREET_BODY_OLD, GREET_BODY_NEW)
-        for rep in range(5):
-            if budget_s(self.deadline_ns, cap) <= 0:
-                self.figures.setdefault("reps_reached", {})["greet-body"] = rep
-                break
-            for arm in rotate(ARMS, rep):
-                record = self.run_arm(arm, "greet", ["Tom"], cap)
-                self.record_case("greet", "edit-body", record,
-                                 oracle_exact_stdout(record, GREET_EXPECTED_V2 + "\n"))
-        self.apply_edit_everywhere("greet-core/src/lib.rs", GREET_INTERFACE_OLD, GREET_INTERFACE_NEW)
-        for rep in range(5):
-            if budget_s(self.deadline_ns, cap) <= 0:
-                self.figures.setdefault("reps_reached", {})["greet-interface"] = rep
-                break
-            for arm in rotate(ARMS, rep):
-                record = self.run_arm(arm, "greet", ["Tom"], cap)
-                self.record_case("greet", "edit-interface", record,
-                                 oracle_exact_stdout(record, GREET_EXPECTED_V2 + "\n"))
+                                 oracle_exact_stdout(record, greet_expected("hello") + "\n"))
+        # Five distinct predeclared body edits, one per repetition.
+        body_steps = []
+        for index in range(5):
+            old, new = greet_body_step(index)
+            body_steps.append({
+                "path": "greet-core/src/lib.rs",
+                "ops": [(old, new, 1)],
+                "greeting": GREET_BODY_SEQUENCE[index],
+            })
+        self.repetition_block(
+            "greet", "edit-body", ["Tom"], cap, body_steps,
+            lambda step: (lambda record: oracle_exact_stdout(
+                record, greet_expected(step["greeting"]) + "\n")),
+        )
+        # Five alternating interface edits; the observable bytes stay the
+        # cumulative body expectation and the greet dependant is invalidated
+        # by each type change.
+        interface_steps = []
+        for index in range(5):
+            old, new = greet_interface_step(index)
+            interface_steps.append({
+                "path": "greet-core/src/lib.rs",
+                "ops": [(old, new, 1)],
+                "greeting": GREET_BODY_SEQUENCE[-1],
+            })
+        self.repetition_block(
+            "greet", "edit-interface", ["Tom"], cap, interface_steps,
+            lambda step: (lambda record: oracle_exact_stdout(
+                record, greet_expected(step["greeting"]) + "\n")),
+        )
         self.cache_snapshot("greet-final")
 
     def snapshot_block(self) -> None:
@@ -1796,32 +2077,55 @@ exported scratch, evidence and deadline, after the source and volume gates."""
             )
             self.record_case("snapshot", "cold", record, verdict)
         self.cache_snapshot("snapshot-cold")
-        for label, edit in (("warm-unchanged", None), ("edit-body", "body"),
-                            ("edit-interface", "interface")):
-            if edit == "body":
-                self.apply_edit_everywhere("src/bin/oxide/main.rs", SNAPSHOT_BODY_OLD, SNAPSHOT_BODY_NEW)
-            elif edit == "interface":
-                text_target = "src/dep_info.rs"
-                self.apply_edit_everywhere(text_target, SNAPSHOT_INTERFACE_OLD, SNAPSHOT_INTERFACE_NEW)
-                self.apply_edit_everywhere(text_target, SNAPSHOT_INTERFACE_CAST_OLD,
-                                           SNAPSHOT_INTERFACE_CAST_NEW, SNAPSHOT_INTERFACE_CASTS)
-            # Cumulative sequence: after the body edit the [trial] marker stays
-            # applied, so both later cases expect the edited help line.
-            expected_contains = (
-                (SNAPSHOT_HELP_MARKER,) if edit is None else (SNAPSHOT_HELP_EDITED,)
+        # The genuinely unchanged warm block: no edit between repetitions.
+        for rep in range(5):
+            if budget_s(self.deadline_ns, cap) <= 0:
+                self.figures.setdefault("reps_reached", {})["snapshot-warm"] = rep
+                break
+            for arm in rotate(ARMS, rep):
+                record = self.run_arm(arm, "snapshot", program, cap)
+                record["rep"] = rep
+                verdict = oracle_fragments(
+                    record, exit_codes=(0,), stdout_contains=(SNAPSHOT_HELP_MARKER,),
+                    stdout_not_contains=("[trial]",),
+                )
+                self.record_case("snapshot", "warm-unchanged", record, verdict)
+
+        def snapshot_body_oracle(step):
+            expected = SNAPSHOT_HELP_MARKER + " " + step["marker"]
+            previous = step["previous_marker"]
+            absent = () if previous is None else (previous,)
+            return lambda record: oracle_fragments(
+                record, exit_codes=(0,), stdout_contains=(expected,),
+                stdout_not_contains=absent,
             )
-            expected_absent = ("[trial]",) if edit is None else ()
-            for rep in range(5):
-                if budget_s(self.deadline_ns, cap) <= 0:
-                    self.figures.setdefault("reps_reached", {})[f"snapshot-{label}"] = rep
-                    break
-                for arm in rotate(ARMS, rep):
-                    record = self.run_arm(arm, "snapshot", program, cap)
-                    verdict = oracle_fragments(
-                        record, exit_codes=(0,), stdout_contains=expected_contains,
-                        stdout_not_contains=expected_absent,
-                    )
-                    self.record_case("snapshot", label, record, verdict)
+
+        body_steps = []
+        for index in range(5):
+            old, new = snapshot_body_step(index)
+            body_steps.append({
+                "path": "src/bin/oxide/main.rs",
+                "ops": [(old, new, 1)],
+                "marker": SNAPSHOT_BODY_SEQUENCE[index],
+                "previous_marker": None if index == 0 else SNAPSHOT_BODY_SEQUENCE[index - 1],
+            })
+        self.repetition_block("snapshot", "edit-body", program, cap, body_steps,
+                              snapshot_body_oracle)
+
+        def snapshot_interface_oracle(step):
+            cumulative = SNAPSHOT_HELP_MARKER + " " + SNAPSHOT_BODY_SEQUENCE[-1]
+            return lambda record: oracle_fragments(
+                record, exit_codes=(0,), stdout_contains=(cumulative,),
+            )
+
+        interface_steps = []
+        for index in range(5):
+            interface_steps.append({
+                "path": "src/dep_info.rs",
+                "ops": snapshot_interface_steps(index),
+            })
+        self.repetition_block("snapshot", "edit-interface", program, cap,
+                              interface_steps, snapshot_interface_oracle)
         self.cache_snapshot("snapshot-final")
 
     def corr_block(self) -> None:
@@ -1908,6 +2212,7 @@ exported scratch, evidence and deadline, after the source and volume gates."""
                 MAKEPAD_RUN_HOME=self.env["MAKEPAD_RUN_HOME"],
                 MAKEPAD_RUN_OFFLINE="1",
                 CARGO_HOME=self.shared_cargo_home,
+                RUSTUP_TOOLCHAIN=TOOLCHAIN,
             )
             if test:
                 argv = [self.relax_bin, "test", "--quiet", package]
@@ -1965,7 +2270,20 @@ exported scratch, evidence and deadline, after the source and volume gates."""
                 self.aborted = f"{name}: {error}"
                 break
 
+    def samples_bytes(self) -> bytes:
+        """The complete, untrimmed per-sample artifact: every recorded case
+        row (reached, unexecuted, aborted) with its repetition and edit
+        identities, so statistics never silently use only a carried suffix."""
+        document = {
+            "schema": "oxide.relax-quick-trial-samples/1",
+            "cases_total": len(self.cases),
+            "cases": self.cases,
+        }
+        return json.dumps(document, indent=1).encode()
+
     def receipt(self) -> bytes:
+        samples = self.samples_bytes()
+        packet_name = self.binding["paths"]["packet_name"]
         base = {
             "schema": "oxide.relax-quick-trial/1",
             "mode": self.mode,
@@ -1977,6 +2295,14 @@ exported scratch, evidence and deadline, after the source and volume gates."""
             "source": self.figures.get("source"),
             "figures": {k: v for k, v in self.figures.items() if k != "acquisition"},
             "acquisition": self.figures.get("acquisition"),
+            "samples_file": f"samples-{packet_name}.json",
+            "samples_rows": len(self.cases),
+            "samples_sha256": hashlib.sha256(samples).hexdigest(),
+            "statistics_basis": (
+                "complete: verdicts, declared_unexecuted and timing_summary cover "
+                "every recorded case in the hash-bound samples artifact, whether "
+                "this summary carries its row or not"
+            ),
             "aborted": self.aborted,
             "exit_rule": (
                 "exit 0 only when nothing aborted, every declared case executed, and "
@@ -1986,7 +2312,11 @@ exported scratch, evidence and deadline, after the source and volume gates."""
                 "wall_limit_s": LIMIT_SECONDS,
                 "scratch_mib": SCRATCH_MIB,
                 "stop_margin_s": STOP_MARGIN_S,
-                "attribution": "ru_maxrss covers the direct child and its reaped descendants only",
+                "attribution": (
+                    "rss covers the direct child and its reaped descendants only; "
+                    f"raw ru_maxrss is platform-scaled ({RSS_UNIT_NAME} here) and "
+                    "normalized to rss_bytes"
+                ),
                 "cache_bytes": "occupied apparent size; never an SSD-write claim",
                 "filesystem_caches": "not globally flushable under this scope",
             },
@@ -1995,8 +2325,8 @@ exported scratch, evidence and deadline, after the source and volume gates."""
         return json.dumps(document, indent=1).encode()
 
     def publish(self) -> None:
-        # Unreached declared cases become unexecuted rows before the receipt
-        # is built, so absence is never silent.
+        # Unreached declared cases become unexecuted rows before both
+        # artifacts are built, so absence is never silent.
         self.cases.extend(self.unexecuted_rows())
         self.figures["owned_bytes"] = {
             "run_root": walk_bytes(self.run_root) if os.path.isdir(self.run_root)
@@ -2006,18 +2336,22 @@ exported scratch, evidence and deadline, after the source and volume gates."""
             "note": "occupied apparent bytes of the owned scratch and evidence packet; "
                     "never an SSD-write claim",
         }
-        self._receipt_encoded = self.receipt()
+        samples = self.samples_bytes()
         os.makedirs(self.packet_dir, exist_ok=True)
-        destination = os.path.join(
-            self.packet_dir, f"receipt-{self.binding['paths']['packet_name']}.json"
-        )
-        temporary = destination + ".tmp"
+        packet_name = self.binding["paths"]["packet_name"]
+        samples_destination = os.path.join(self.packet_dir, f"samples-{packet_name}.json")
+        destination = os.path.join(self.packet_dir, f"receipt-{packet_name}.json")
         try:
-            with open(temporary, "wb") as handle:
+            with open(samples_destination + ".tmp", "wb") as handle:
+                handle.write(samples)
+            os.replace(samples_destination + ".tmp", samples_destination)
+            self._receipt_encoded = self.receipt()
+            with open(destination + ".tmp", "wb") as handle:
                 handle.write(self._receipt_encoded)
-            os.replace(temporary, destination)
+            os.replace(destination + ".tmp", destination)
         except OSError as error:
             raise Refusal(f"the receipt packet could not be written: {error}")
+        print(f"samples: {samples_destination} ({len(samples)} bytes)")
         print(f"receipt: {destination} ({len(self._receipt_encoded)} bytes)")
 
 
