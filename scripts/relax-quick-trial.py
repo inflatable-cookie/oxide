@@ -279,7 +279,11 @@ extracted registry sources the runner can read are authenticated against their
 locked archives and re-checked after use: every member matches byte for byte,
 Cargo's `Cargo.toml.orig` is bound to its OWN archive member where the archive
 carries one, and a re-normalized `Cargo.toml` is accepted only beside that
-authenticated original and the same package identity. Because retained targets are expected
+authenticated original and the same package identity. The precheck/closeout
+baseline is compared PER PACKAGE: a package authenticated earlier must keep its
+digest or vanish-refuse, while a newly extracted lock-listed package is admitted
+only after its own archive authentication, so Cargo's legitimately growing
+extracted set is never a change. Because retained targets are expected
 to exceed 4096 MiB at peak (engine release target plus the snapshot baseline
 target and the Relax caches), fit is UNMEASURED and a truthful fit refusal at
 activation is a valid outcome for the planner to dispose of; no cap is raised,
@@ -3467,7 +3471,10 @@ def expected_manifest_bytes(archive_members: dict, name_version: str,
 def verify_extracted_sources(cargo_home: str, lock_text: str,
                              baseline: dict | None = None) -> dict:
     """Authenticate EVERY extracted registry source tree the children can read,
-    against its locked archive, and optionally re-check a recorded baseline.
+    against its locked archive, and optionally re-check a recorded baseline per
+    package: a package seen earlier must keep its digest or it is refused, while
+    a newly extracted lock-listed package is admitted only after its archive
+    authentication, so a legitimately growing extracted set is never a change.
 
     The pinned resolver reads `$CARGO_HOME/registry/src`, so an extracted tree
     that differs from its locked archive is a real build input drift even when
@@ -3517,11 +3524,17 @@ def verify_extracted_sources(cargo_home: str, lock_text: str,
         digest.update((name + "\0" + facts["digest"] + "\n").encode())
     result = {"packages": len(rows), "digest": digest.hexdigest(), "rows": rows}
     if baseline is not None:
-        if baseline.get("digest") != result["digest"]:
-            changed = sorted(set(baseline.get("rows") or {}) ^ set(rows))
+        # Compare PER PACKAGE, never by one digest over the whole set: Cargo
+        # legitimately extracts more lock-listed crates as it builds, and those
+        # are authenticated by the archive checks above before they are added.
+        prior = baseline.get("rows") or {}
+        changed = sorted(name for name, facts in prior.items()
+                         if name in rows and rows[name]["digest"] != facts["digest"])
+        missing = sorted(name for name in prior if name not in rows)
+        if changed or missing:
             raise Refusal(
-                "the extracted registry sources changed after they were authenticated: "
-                f"{changed[:6] or 'a file inside a package'}"
+                "an extracted registry source authenticated earlier changed or vanished: "
+                f"changed {changed[:6]}, missing {missing[:6]}"
             )
     return result
 
@@ -4281,6 +4294,9 @@ def compat_plan_text() -> str:
     lines.append("     Cargo.toml.orig against the archive's Cargo.toml.orig where present, a")
     lines.append("     re-normalized Cargo.toml only beside that authenticated original and the")
     lines.append("     same package identity, and .cargo-ok recorded; the three are re-checked).")
+    lines.append("     The precheck/closeout baseline is per package: an earlier package may not")
+    lines.append("     change or vanish, while a newly extracted lock-listed package is admitted")
+    lines.append("     only after its archive authentication, so a growing set is never a change.")
     lines.append("     The lock must")
     lines.append("     force one version per package name; a multi-version lock refuses, because")
     lines.append("     the resolver's choice would not be forced. --frozen alone does not enforce")
@@ -5578,8 +5594,13 @@ class CompatRun:
         else:
             facts = verify_extracted_sources(shared, self.workload_lock_text,
                                              self.extracted_baseline)
-        if self.extracted_baseline is None:
-            self.extracted_baseline = {"digest": facts["digest"], "rows": facts["rows"]}
+        # The baseline is the union of every package seen so far, so a later
+        # check still refuses a changed or vanished earlier package while a
+        # newly extracted lock-listed package is admitted only after its own
+        # archive authentication above.
+        seen = dict((self.extracted_baseline or {}).get("rows") or {})
+        seen.update(facts.get("rows") or {})
+        self.extracted_baseline = {"digest": facts["digest"], "rows": seen}
         self.figures.setdefault("extracted_checks", {})[stage] = {
             "packages": facts["packages"], "digest": facts["digest"]}
         self.progress("extracted_sources", stage=stage, packages=facts["packages"],
@@ -6969,6 +6990,99 @@ def compat_self_check() -> None:
         except Refusal:
             pass
         shutil.rmtree(b_dir)
+
+        # Empty seed -> Cargo-shaped extraction -> Relax precheck -> closeout,
+        # through the real verify_extracted_sources baseline composition: a
+        # legitimately growing extracted set is admitted only by authenticating
+        # each new lock-listed tree against its archive, while a changed or
+        # vanished earlier package, a foreign package and a malformed entry all
+        # refuse.
+        growth = os.path.join(extracted_dir, "growth")
+        g_home = os.path.join(growth, "home")
+        g_cache = os.path.join(g_home, "registry", "cache", namespace)
+        g_src = os.path.join(g_home, "registry", "src", namespace)
+        os.makedirs(g_cache)
+        os.makedirs(g_src)
+
+        def grow_crate(name: str, version: str) -> bytes:
+            body = (f"[package]\nname = \"{name}\"\nversion = \"{version}\"\n"
+                    "edition = \"2021\"\n").encode()
+            archive_path = os.path.join(g_cache, f"{name}-{version}.crate")
+            with tarfile.open(archive_path, "w:gz") as archive:
+                for member, data in (("Cargo.toml", body),
+                                     ("Cargo.toml.orig", body),
+                                     ("src/lib.rs", b"pub fn x() {}\n")):
+                    info = tarfile.TarInfo(f"{name}-{version}/" + member)
+                    info.size = len(data)
+                    archive.addfile(info, io.BytesIO(data))
+            return body
+
+        def extract_crate(name: str, version: str) -> None:
+            target = os.path.join(g_src, f"{name}-{version}")
+            os.makedirs(os.path.join(target, "src"))
+            for member, dest in (("Cargo.toml", "Cargo.toml"),
+                                 ("Cargo.toml.orig", "Cargo.toml.orig"),
+                                 ("src/lib.rs", "src/lib.rs")):
+                with tarfile.open(os.path.join(g_cache, f"{name}-{version}.crate")) as archive:
+                    data = archive.extractfile(f"{name}-{version}/{member}").read()
+                with open(os.path.join(target, dest), "wb") as handle:
+                    handle.write(data)
+            with open(os.path.join(target, ".cargo-ok"), "wb") as handle:
+                handle.write(b"ok")
+
+        a_body = grow_crate("grow-a", "1.0.0")
+        grow_crate("grow-b", "2.0.0")
+        growth_lock = (
+            "version = 4\n"
+            "\n[[package]]\nname = \"grow-a\"\nversion = \"1.0.0\"\n"
+            'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+            f'checksum = "{hashlib.sha256(open(os.path.join(g_cache, "grow-a-1.0.0.crate"), "rb").read()).hexdigest()}"\n'
+            "\n[[package]]\nname = \"grow-b\"\nversion = \"2.0.0\"\n"
+            'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+            f'checksum = "{hashlib.sha256(open(os.path.join(g_cache, "grow-b-2.0.0.crate"), "rb").read()).hexdigest()}"\n')
+        empty = verify_extracted_sources(g_home, growth_lock)
+        expect(empty["packages"] == 0 and empty["rows"] == {},
+               "an empty seed has no extracted sources to authenticate")
+        extract_crate("grow-a", "1.0.0")
+        precheck = verify_extracted_sources(g_home, growth_lock, empty)
+        expect(precheck["packages"] == 1 and "grow-a-1.0.0" in precheck["rows"],
+               "the first lock-listed extraction is authenticated and admitted")
+        extract_crate("grow-b", "2.0.0")
+        closeout = verify_extracted_sources(g_home, growth_lock, precheck)
+        expect(closeout["packages"] == 2
+               and set(closeout["rows"]) == {"grow-a-1.0.0", "grow-b-2.0.0"},
+               "a later lock-listed extraction grows the authenticated set without refusing")
+        with open(os.path.join(g_src, "grow-a-1.0.0", "src", "lib.rs"), "ab") as handle:
+            handle.write(b"// drift\n")
+        try:
+            verify_extracted_sources(g_home, growth_lock, closeout)
+            raise AssertionError("a changed earlier package must refuse")
+        except Refusal:
+            pass
+        with open(os.path.join(g_src, "grow-a-1.0.0", "src", "lib.rs"), "wb") as handle:
+            handle.write(b"pub fn x() {}\n")
+        shutil.rmtree(os.path.join(g_src, "grow-b-2.0.0"))
+        try:
+            verify_extracted_sources(g_home, growth_lock, closeout)
+            raise AssertionError("a vanished earlier package must refuse")
+        except Refusal:
+            pass
+        extract_crate("grow-b", "2.0.0")
+        os.makedirs(os.path.join(g_src, "foreign-9.9.9"))
+        try:
+            verify_extracted_sources(g_home, growth_lock, closeout)
+            raise AssertionError("a foreign extracted package must refuse")
+        except Refusal:
+            pass
+        shutil.rmtree(os.path.join(g_src, "foreign-9.9.9"))
+        with open(os.path.join(g_src, "not-a-package"), "wb") as handle:
+            handle.write(b"x")
+        try:
+            verify_extracted_sources(g_home, growth_lock)
+            raise AssertionError("a malformed extracted entry must refuse")
+        except Refusal:
+            pass
+        os.remove(os.path.join(g_src, "not-a-package"))
         extracted_lock = (
             "version = 4\n\n[[package]]\nname = \"crate-a\"\nversion = \"1.0.0\"\n"
             'source = "registry+https://github.com/rust-lang/crates.io-index"\n'

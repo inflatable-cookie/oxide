@@ -19,5 +19,8 @@ fixture/apparatus premises, which are corrected here: the float probe now takes 
 plain-Cargo baseline's own complete output and exit as its expectation (the pinned
 serde_json/zmij pair mis-rounds the double below 1.0), and an extracted
 `Cargo.toml.orig` is authenticated against its OWN archive member rather than the
-archive's normalized `Cargo.toml`. That diagnostic remains spent with no
-compatibility credit; no retry, pin/feature change or weakened authentication.
+archive's normalized `Cargo.toml`. A second diagnostic then showed the extracted-source baseline must be compared
+per package: a lock-listed package extracted by Cargo after setup is admitted
+only after its archive authentication, while an earlier package that changed or
+vanished refuses. Both diagnostics remain spent with no compatibility credit;
+no retry, pin/feature change or weakened authentication.

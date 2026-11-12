@@ -537,7 +537,10 @@ for byte, with Cargo's own three files authenticated against their own members
 (`Cargo.toml.orig` against the archive's `Cargo.toml.orig` where the archive
 carries one, a re-normalized `Cargo.toml` only beside that authenticated
 original and the same package identity, and the `.cargo-ok` marker recorded) and
-re-checked after use; the first activated diagnostic showed the earlier
+re-checked after use per package — an earlier package may not change or vanish,
+while a newly extracted lock-listed package is admitted only after its own
+archive authentication, so Cargo's legitimately growing extracted set is never a
+change; the first activated diagnostic showed the earlier
 same-name premise is false for `adler2` 2.0.1, whose archive carries both
 members. The lock must
 force one version per package name; a multi-version lock refuses, because the
