@@ -1687,3 +1687,51 @@ run = "python3 scripts/census-stall-observation.py --plan"
 [tasks."rust:census-stall-observation"]
 admission = "heavy"
 run = "python3 scripts/census-stall-observation.py --observe"
+
+# Relax quick-run trial (oxide#307). ONE minimal reproducible apparatus,
+# `scripts/relax-quick-trial.py`, comparing the pinned Relax engine
+# (makepad/relax at aa540c1468844af159e2f106d31966b84be9fdf1, 2026-11-11,
+# MIT; its bundled std notices live upstream under
+# libs/relax/compiler/std/CREDITS.md and are never copied here) with current
+# stable-LLVM quick execution on isolated fixtures. `:test` is the pure
+# apparatus check (`--self-check`): argument boundary, activation-binding
+# parser, verdict oracles against fixture transcripts, the full predeclared
+# edit-repetition composition against committed bytes (every edit-labelled
+# repetition changes bytes and checks its own expected observation),
+# arm/toolchain env seams (every child pins the declared 1.97.1 with
+# auto-install off and the preserved rustup home), the seed-source
+# normalization composed with the REAL anchored seeder on tiny real fixture
+# directories and links (accepted common-root relocation seeds; split,
+# renamed-namespace-basename, unresolved and interior-link cases refuse
+# through the real SeedRefusal translated at the trial boundary), the real
+# guarded_main drive of the ACTUAL seeder refusal through the entry, gates,
+# setup, translation and publication under injected external seams (source
+# identities bound from the activation; heavy acquisition/build substituted),
+# receipt trimming with complete-set statistics, and the hash-bound samples
+# publication through the real publish() seam inside one private temporary
+# directory it removes; no child, no network, no engine, no scratch outside
+# that directory.
+# `:plan` is effect-free and derives readiness from actual metadata
+# without compiling or running anything.
+# `research:relax:diagnostic` and `research:relax:measure` are heavy guarded
+# entries that are NOT activated by this preparation: both refuse before any
+# effect until a planner binds one occurrence through the two environment
+# variables, both are the whole command of the unchanged qualified shared
+# supervisor (600 s INCLUDING acquisition/staging/probes, 4096 MiB monitored
+# owned scratch on the selected Stash volume, 30 s stop margin, no image),
+# and the diagnostic is always unqualified keep-going while the measurement
+# needs an adequate diagnostic at the unchanged accepted head first. Not a
+# benchmark, not QA, no product capability change, no installation.
+[tasks."research:relax:test"]
+run = "python3 scripts/relax-quick-trial.py --self-check"
+
+[tasks."research:relax:plan"]
+run = "python3 scripts/relax-quick-trial.py --plan"
+
+[tasks."research:relax:diagnostic"]
+admission = "heavy"
+run = 'python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 4096 -- python3 scripts/relax-quick-trial.py --diagnostic --binding "$RELAX_TRIAL_ACTIVATION" --sha256 "$RELAX_TRIAL_ACTIVATION_SHA256"'
+
+[tasks."research:relax:measure"]
+admission = "heavy"
+run = 'python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 4096 -- python3 scripts/relax-quick-trial.py --measure --binding "$RELAX_TRIAL_ACTIVATION" --sha256 "$RELAX_TRIAL_ACTIVATION_SHA256"'

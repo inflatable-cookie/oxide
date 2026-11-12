@@ -427,6 +427,15 @@ the operating rules.
   total scan ceilings. Scoped implementation, independent review and separately
   activated Elevated proofs precede the Oxide reconnection. This grants no
   installation, live adoption or retained-image cleanup.
+- **Relax quick-run trial** (Tom, 2026-11-11, decision
+  `d6a33913-cc2d-460f-bce0-25c424c176d1` v2, "Agreed. OK, shall we dispatch
+  the trial? See if it offers more than the cranelift spike?"): a bounded
+  compatibility/performance trial and recommendation, not product
+  integration or adoption. Oxide owns execution, admission, storage and
+  diagnostics; the trial embeds no compiler, changes no
+  quick/test/debug/release default, installs nothing and keeps the Barge
+  integration independent. Owning research record:
+  [landscape](rust-dx-landscape.md#relax-quick-run-trial-2026-11-11-prepared).
 - **Still need Tom's scoped approval:**
   - host installs beyond the planner's receipt-matched `oxide` reinstall;
   - releases, tags and workflow changes;
