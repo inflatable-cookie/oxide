@@ -1683,3 +1683,34 @@ run = "oxide check --bin oxide --locked --features outputs-operation-proof,barge
 [tasks."rust:test-launch-check"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 120 --scratch-budget-mib 512 -- oxide test --locked --test launch_check a_blocked_copy_start_or_removal_cannot_outlive_the_cli -- --exact --nocapture --test-threads=1"
+
+# Post-stop census-stall observation diagnostic (oxide#306). `:test` is the
+# pure apparatus check (`--self-test`): it stages nothing, starts no supervisor,
+# queries no kernel process or thread state, runs no Cargo/image/fixture, and
+# writes only one private TMPDIR directory it removes. `:plan` is effect-free.
+# `rust:census-stall-observation` is the ONE future observation occurrence,
+# declared here but NOT activated or run by this preparation. It places the
+# whole observer behind the pinned qualification bootstrap's minimal outer actor
+# (`scripts/qualify-supervisor.py` `bounded`/`hold`) so a blocked read or write
+# cannot extend the run; inside that one original ≤300 s it composes guard 270 s,
+# worker 286 s, actor KILL 293 s and finish 299 s. The worker spawns the
+# unchanged deployed default supervisor (`bounded-test.py`, SHA-256 `fcfda2b0…`)
+# with the default selected-volume routing around a synthetic declared-exit
+# leader, checks the guard receipt's `command` against the INNER leader command
+# the pinned runner's own parser constructs after `--`, samples only its own new
+# monitor's census-thread CPU/run state plus a count-only process-table size and
+# load under fixed caps (100 instants at 4 Hz, 64 monitor threads, 1 MiB observer
+# bytes, 512 MiB guard scratch), and always records `qualified: false` with no
+# qualification, consumer or supervisor credit. A sample cap ends sampling only;
+# cancellation, a post-spawn error or the fixed worker deadline may KILL only
+# its own unreaped direct guard child, and an actor-deadline worker KILL leaves
+# omitted evidence and any guard Unknown.
+[tasks."proof:census-stall-observation:test"]
+run = "python3 scripts/census-stall-observation.py --self-test"
+
+[tasks."proof:census-stall-observation:plan"]
+run = "python3 scripts/census-stall-observation.py --plan"
+
+[tasks."rust:census-stall-observation"]
+admission = "heavy"
+run = "python3 scripts/census-stall-observation.py --observe"

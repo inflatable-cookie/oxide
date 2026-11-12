@@ -7178,3 +7178,133 @@ separately rather than blindly replacing strings. Consumer-specific limits,
 read-only sibling boundaries and adoption holds remain in force. Old receipts
 stay bound to their actual runner bytes and limits; repinning source does not
 migrate proof credit or authorize reruns, installation or consumer adoption.
+
+**Post-stop census stall, two Barge #056 diagnostic guards (oxide#305
+assessment, 2026-11-10; observation only — no supervisor, proof, candidate or
+consumer change).** Two Barge descriptor-listing diagnostics (Barge task
+`4bab8efb`, heads `43f8bb4d` then `bb8aa725`) each ended with the selector's
+natural exit 125 and an `UNCLOSED` guard sharing one post-stop fingerprint: the
+census thread started within ~0.17 ms of the processed stop, built its Census,
+entered round 0, and `Census.round()` never returned — settlement frozen at
+phase `round-start` with `rounds_started: 1`, `rounds_completed: 0`,
+`loop_exit_ns: null`, no census message, `census_join.joined: false` at the 3 s
+bound, and the custodian's fixed 10 s window ending in the fault `closure not
+established: no certain empty census after the leader was reaped` (occurrence
+`na85ok9x`, guard `a61c3f5b…`, evidence receipts `6ca61a8a…`/`cbc3081b…`;
+occurrence `ye5za15u`, guard `4f58eed6…`, receipts `ce699552…`/`00170998…`; the
+oxide#305 assessment verified all eight packet metadata digests and read source
+only). Both packet source manifests additionally record the guard's runner as
+the deployed default `scripts/bounded-test.py` `fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b`
+(311647 bytes, `expected_sha256` equal to the actual, `match`/`matched` true,
+before and after), so these stalls are observations of the deployed default
+runner, not of the isolated candidate. The stall lasted at least the ~13 s from
+thread start to the final publication in both runs, while the monitor's own tail matched source exactly
+(`stop_requested_ns` → join expiry → final publish 1.5–6.8 ms later) and reserve
+sampling stayed at ~3.9 Hz with a ≤0.47 s maximum gap — the monitor process was
+healthy; only the census thread stalled.
+
+| Boundary or fact | Source and receipts |
+| --- | --- |
+| Round-start → first record | `Monitor.census_loop` notes `round-start`, calls `Census.round()`; the first later settlement stamp (`scanned`) never came. All in-round stats are copied only after return, so the receipt has no visibility inside the round. |
+| Inside `Census.round()` | Snapshot (`Kinfo.all`, ≤3 sysctl attempts), tracked pruning, `exclusion_rule` (never raises; ancestor-PID rows cost 1–3 reads, children of recorded ancestors 6), per-row `getsid` + reread (guarded), up to 19 shared 50 ms confirmation pauses with rereads, one final reread per surviving ESRCH identity (guarded), snapshot-order assembly. Every raising site is guarded, so thread death by exception is source-excluded; a call that did not return, or an extraordinarily slow round, is the remaining class. |
+| What the receipts distinguish | Started vs completed rounds, thread latency, join expiry, zero census messages, EOF witnesses, `deadline: false`, reserve/owned samples. Empty `survivors: []` is not absence. |
+| What they cannot distinguish | Blocked vs slow round; which call stuck; the snapshot row count (`rows: null`); and host process-table size or load at the stall. The runner bytes are NOT among the unknowns: ordinary guard receipts bind no runner digest, but the packets' source manifests record the deployed default `fcfda2b0…` for both guards (expected = actual, match true), so identification comes from the packets, not the receipts. |
+| Proof-side failures, separate | Occurrence one staged in 71 s and failed its own L1–L3 fixed-count oracles (36 vs 35, 5004 vs 5003, cause not established, L4 passed, `first_fault: L1`) — the stall began only after that leader had already exited on its own oracle failure and was reaped with status 256 (exit code 1). Occurrence two timed out staging the proof build at the 270 s work stop (L1–L4 unexecuted, no binary). Neither proof-side outcome shares a demonstrated cause with the stall; the two stalls share only their identical fingerprint, ~53 minutes apart on one host. |
+| Coverage by recorded census work | None demonstrated. The #230/#233 replacement worklist and the counted-qualified isolated candidate `c5782431…` classify replacements in rounds that COMPLETE. The candidate's 2 s phase deadline is enforced inside the round — `CensusWork.check` before every reader and pause and again in each `finally` after the call returns, with one recheck after `round()` — so a slow round becomes honest uncertain evidence at the first returning call, with `replacement_work.status: "deadline"`; the limit that matters here is that an in-progress blocked kernel call cannot be interrupted, so a round stuck inside one call still never returns and yields the identical receipt. The historical completed-but-uncertain rounds (command-budgets/removable-removal receipts) and the Effigy launcher-ancestry rows (oxide#197) are different shapes. Calling the recorded changes a fix for this stall would be hypothesis, not evidence. |
+
+Explicit unknowns: the stuck call and blocked-versus-slow; the snapshot's row
+count; host process-table size and load at the stall moments; and the cause of
+occurrence one's one-extra-row oracle divergence (Barge-owned, historic). The
+runner bytes are established by the packets' source manifests: both guards ran
+the deployed default `fcfda2b0…`.
+
+**Prepared diagnostic (oxide#306; source and ordinary effect-free readiness
+only — not activated, no observation credit).** `scripts/census-stall-observation.py`
+is the ONE source-immutable, observation-only diagnostic the assessment asked
+for, with three fixed Effigy selectors: `proof:census-stall-observation:test`
+(`--self-test`, the pure apparatus check), `proof:census-stall-observation:plan`
+(`--plan`, effect-free) and the heavy `rust:census-stall-observation`
+(`--observe`, the one future occurrence, declared but **not activated** here).
+`--observe` is an outside-guard observer: it spawns the unchanged deployed
+default `scripts/bounded-test.py` (`fcfda2b0…`) as its own direct child with the
+guard's normal default selected-volume routing, and the guard's leader is the
+same script in `--leader` mode. That synthetic leader publishes one bounded
+document naming the guard's own run id, its own PID/start, its parent
+(custodian) PID/start, session/group, and the guard's evidence/scratch/deadline,
+then exits the **declared** status 1, which the run labels as synthetic and
+never as either historical producer exit. The observer records only this new
+run's own identities and facts: the guard/custodian PID plus the same `kinfo_proc`
+start token the census uses, the monitor as the guard's other direct child
+(exactly one remaining same-session child; zero, several or unreadable is
+recorded Unknown), and the census thread as the ONE monitor thread that appears
+after the guard's recorded `stopped` receive (source establishes no other
+post-`ready` thread; anything else is Unknown). Per sample it records
+`CLOCK_UPTIME_RAW`, the monitor thread ids/CPU/run state, the system process-table
+size as a **count only** (`libproc`, no foreign identities or rows persisted)
+and the load average, under fixed caps: at most 100 instants at ~4 Hz, 64
+monitor threads, 16 stored thread rows per sample and 1 MiB of observer bytes
+(256 KiB report, 64 KiB per captured stream). It reads the guard's own new
+`evidence/receipt.json` and copies a bounded digest of the decision-relevant
+fields; closure, signals, deadlines, custody and cleanup remain the unchanged
+guard's.
+
+The whole observer is bounded by the pinned qualification bootstrap's minimal
+outer actor (`scripts/qualify-supervisor.py`, SHA-256
+`fa1ad548…`, `bounded`/`hold` and `CLOCK_UPTIME_RAW`): the actor forks the whole
+observer as one worker child, holds it unreaped, forwards INT/TERM, and KILLs it
+only at the fixed actor deadline. All probe, filesystem, stdio and report work
+runs in that worker, so a blocked read or write cannot extend the run. The inner
+budgets compose inside the one original ≤300 s occurrence and never grant a
+fresh allowance: guard 270 s, worker deadline 286 s, actor KILL 293 s, actor
+finish 299 s, with the guard's 512 MiB monitored scratch. A sample cap stops
+**sampling only**: it is not the guard's deadline, and the worker still waits for
+the guard's natural settlement up to its own deadline. The observer KILLs its
+own still-unreaped direct guard child only on explicit cancellation, on a
+post-spawn internal error after one bounded grace, or at the fixed worker
+deadline, and it records which trigger applied. If the actor must KILL the
+worker (including a blocked call), that worker's report is omitted or partial
+and any guard it spawned remains Unknown under its own bound: the exit is 124
+and no closure is claimed. The receipt's `command` is checked against the INNER
+leader command the pinned runner's own parser constructs after `--` (never the
+outer invocation), and `limit_s` against the fixed inner limit. It uses no
+ptrace/DTrace/sample, no suspension, no signal injection, no host setting or
+limit change and no historical root/image/process read; an unreaped guard, an
+unobserved monitor or a killed worker keeps every resource and fails the
+observation as unknown/omitted custody.
+The observer's own root (report, captured streams and leader document) lives
+under the run `TMPDIR` outside the guard's owned-byte accounting; its bounded
+allocation is counted in the task total and is not a guard measurement, and the
+sampler supplies no closure, reserve or cleanup verdict. The actor's own pinned
+helper read/import is its only pre-bound step; it creates nothing.
+
+Four outcomes are recorded separately: `reproduced_discriminated` (the exact
+receipt fingerprint — round started, zero completed, no loop exit, join expired,
+no census message, the census fault and guard exit 125 — plus an attributed
+census thread and a late window of at least 1 s that names either
+`blocked_call_shape` (no measurable CPU progress, parked run state) or
+`slow_round_shape` (CPU progress)), `reproduced_insufficient` (the fingerprint
+without honest thread evidence), `not_reproduced` (a normal closure with the
+declared leader status in this one window) and `observation_incomplete`
+(apparatus, identity, custody, receipt or guard-outcome facts missing or
+contradictory). Thread state cannot name the kernel call or prove
+blocked-versus-slow by itself, so the report states the observed shape, records
+the exact call as Unknown, and describes the sampler's own perturbation. A
+non-reproduction only bounds current behaviour; neither outcome is a historical
+cause, a fix, a qualification or permission for any consumer native.
+
+**Remaining gates.** The source has an independent exact-head reviewer; the ONE
+actual occurrence is separately owner-activated on the same verified Stash
+route (UUID `8A660440-C919-45C6-A3F1-3365B9BD2006`) and its packet is returned to
+that same reviewer for interpretation. No wait/cap increase, fallback observer,
+weak closure, global repin, candidate use or promotion, consumer resume or
+inferred acceptance follows. If a reproduction still does not discriminate, a
+source observability correction — sub-phase settlement stamps written as the
+round progresses, and a runner-bytes digest in ordinary guard receipts — is a
+separately scoped future supervisor-bytes change with its own qualification
+chain; it is not activated here. Closure semantics stand unchanged and correctly
+failed closed — certain-empty named and final census, joined thread, both EOFs,
+identity-bound signal custody, no-signal and
+unknown-keeps — and both retained Barge roots stay `UNCLOSED` and kept. The
+Barge operation-journal native gates stay held until the owner separately
+accepts a safe path; this assessment grants no native, activation, cleanup,
+promotion or pin authority.
