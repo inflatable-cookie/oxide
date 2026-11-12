@@ -468,10 +468,15 @@ occurrence cannot sit waiting for a resume that never comes.
   patterns, 18 `f32` patterns and 12 decimal decode inputs covering signs,
   negative zero, fractions, the scientific-notation thresholds, both finite
   extremes and the normal/subnormal and rounding boundaries. It prints the
-  input bits, the serialized text and the decoded bits, exits nonzero on any
-  round-trip mismatch, and the apparatus independently decodes every printed
-  number, requires the declared coverage floors and required extreme patterns,
-  and compares the arms byte for byte.
+  input bits, the serialized text and the decoded bits and exits nonzero on any
+  round-trip mismatch. The plain-Cargo baseline's OWN complete output and exit
+  are the expectation, not a zero-failure baseline: the first activated
+  diagnostic showed the pinned `serde_json`/`zmij` pair serializes the double
+  below 1.0 as `0.9999999999999999` and decodes it back to `1.0`, so the
+  apparatus validates the declared shape, coverage, row order and the summary's
+  own failure count, records any independent decode that differs from a printed
+  one, and requires the Relax arm to reproduce the baseline's complete stdout
+  bytes and exit exactly.
 - `compat-crc32`: the committed fixture pins `crc32fast =1.5.3` from the same
   workload lock (the aarch64 `__crc32b`/`__crc32d` `target_feature("crc")`
   path, relevant to upstream issue #21) and prints five ordered pattern
@@ -527,9 +532,14 @@ is verified to hold EXACTLY the workload lock's sources: the seeder's own record
 is checked against the lock (git sources by its authoritative `source` spelling
 and `rev`, registry files by name, version and checksum), then the actual files
 are re-hashed, and every extracted `registry/src` tree the pinned runner can read
-is authenticated against its locked archive — every file matching the archive
-except Cargo's normalized `Cargo.toml`, its `Cargo.toml.orig` copy and its
-`.cargo-ok` marker, which are recorded and re-checked after use. The lock must
+is authenticated against its locked archive — every archive member matching byte
+for byte, with Cargo's own three files authenticated against their own members
+(`Cargo.toml.orig` against the archive's `Cargo.toml.orig` where the archive
+carries one, a re-normalized `Cargo.toml` only beside that authenticated
+original and the same package identity, and the `.cargo-ok` marker recorded) and
+re-checked after use; the first activated diagnostic showed the earlier
+same-name premise is false for `adler2` 2.0.1, whose archive carries both
+members. The lock must
 force one version per package name; a multi-version lock refuses, because the
 pinned resolver's choice would then not be forced. For each required Cargo arm,
 `cargo metadata --locked --offline` derives that arm's locked graph from its own

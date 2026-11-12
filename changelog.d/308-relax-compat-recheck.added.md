@@ -14,4 +14,10 @@ measured, and no product behaviour, recipe, default, dependency, installation
 or consumer changes. Freshly built engine and probe targets are retained through the
 occurrence and cleanup belongs solely to the qualified shared supervisor;
 no private process census or in-run deletion exists, and retained-target
-fit is unmeasured (a truthful refusal at activation is a valid outcome).
+fit is unmeasured (a truthful refusal at activation is a valid outcome). The first activated diagnostic then contradicted two
+fixture/apparatus premises, which are corrected here: the float probe now takes the
+plain-Cargo baseline's own complete output and exit as its expectation (the pinned
+serde_json/zmij pair mis-rounds the double below 1.0), and an extracted
+`Cargo.toml.orig` is authenticated against its OWN archive member rather than the
+archive's normalized `Cargo.toml`. That diagnostic remains spent with no
+compatibility credit; no retry, pin/feature change or weakened authentication.

@@ -236,8 +236,12 @@ recorded identity:
      scientific-notation thresholds, both finite extremes and the
      normal/subnormal and rounding boundaries. It prints the input bits, the
      serialized text and the decoded bits and exits nonzero on any round-trip
-     mismatch; the apparatus independently decodes every serialized field and
-     requires exact cross-arm stdout equality.
+     mismatch. The plain-Cargo baseline's own complete output and exit are the
+     EXPECTATION (the pinned serde_json/zmij pair is known to mis-round the
+     double below 1.0, so a zero-failure baseline is not the premise): the
+     apparatus validates the declared shape and the summary's own failure count,
+     records any independent decode that differs from a printed one, and requires
+     the Relax arm to reproduce the baseline's complete stdout bytes and exit.
   2. `compat-crc32` (required): `crc32fast =1.5.3` from the same workload lock
      is the aarch64 `__crc32b`/`__crc32d` `target_feature("crc")` path, with a
      deterministic multi-stream buffer, a 7-byte streaming fold and the
@@ -272,7 +276,10 @@ daemon) and this body records only each direct child's bounded wait/reap facts;
 it never labels that as whole-group closure. An unreaped child, an unknown
 writer or a guard fault leaves the occurrence incomplete/unqualified. The
 extracted registry sources the runner can read are authenticated against their
-locked archives and re-checked after use. Because retained targets are expected
+locked archives and re-checked after use: every member matches byte for byte,
+Cargo's `Cargo.toml.orig` is bound to its OWN archive member where the archive
+carries one, and a re-normalized `Cargo.toml` is accepted only beside that
+authenticated original and the same package identity. Because retained targets are expected
 to exceed 4096 MiB at peak (engine release target plus the snapshot baseline
 target and the Relax caches), fit is UNMEASURED and a truthful fit refusal at
 activation is a valid outcome for the planner to dispose of; no cap is raised,
@@ -2945,10 +2952,13 @@ COMPAT_CASES = [
     {"case": "format", "workload": "compat-fmt", "required": True, "arms": COMPAT_ARMS,
      "probe": "serde_json =1.0.151 float formatting through zmij 1.0.23: 30 f64 and 18 "
               "f32 declared bit patterns plus 12 decimal decode inputs",
-     "oracle": "exit 0, every printed decode equals its input bits, every serialized "
-               "field independently decodes to those bits, declared coverage meets its "
-               "floor and the required sign/subnormal/extreme patterns, and the Relax "
-               "arm's stdout equals the plain-Cargo baseline byte for byte"},
+     "oracle": "the plain-Cargo baseline's OWN complete output and exit ARE the "
+               "expectation: declared coverage, required sign/subnormal/extreme patterns, "
+               "row order and a summary whose printed failures equal the rows that differ "
+               "from their inputs are required, while an independent decode that differs "
+               "from a printed one is recorded (the pinned serde_json/zmij pair is known to "
+               "mis-round the double below 1.0). The Relax arm must then reproduce the "
+               "baseline's COMPLETE stdout bytes and exit exactly"},
     {"case": "crc32", "workload": "compat-crc32", "required": True, "arms": COMPAT_ARMS,
      "probe": "crc32fast =1.5.3 aarch64 target_feature(\"crc\") path: five named "
               "patterns, an 8200-byte multi-stream buffer and a 7-byte streaming fold",
@@ -3305,6 +3315,7 @@ def _archive_members(crate_path: str) -> dict:
         raise Refusal(f"the locked archive {crate_path} is unreadable: {error}")
     if not members:
         raise Refusal(f"the locked archive {crate_path} is empty")
+    members["__path__"] = crate_path
     return members
 
 
@@ -3312,23 +3323,58 @@ def _strip_archive_root(members: dict, name_version: str) -> dict:
     prefix = name_version + "/"
     stripped: dict = {}
     for path, digest in members.items():
+        if path == "__path__":
+            continue
         if not path.startswith(prefix):
             raise Refusal(f"the archive member {path!r} is outside the {name_version} root")
         stripped[path[len(prefix):]] = digest
     return stripped
 
 
+def _manifest_package_identity(body: bytes) -> tuple:
+    """(name, version) from one manifest's `[package]` table, or a refusal."""
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise Refusal(f"a registry manifest is not valid UTF-8: {error}")
+    in_package = False
+    name = None
+    version = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_package = stripped == "[package]"
+            continue
+        if not in_package:
+            continue
+        match = re.match(r'^(name|version)\s*=\s*"([^"]+)"\s*$', stripped)
+        if match is None:
+            continue
+        if match.group(1) == "name":
+            name = match.group(2)
+        else:
+            version = match.group(2)
+    if not name or not version:
+        raise Refusal("a registry manifest has no [package] name and version")
+    return (name, version)
+
+
 def verify_extracted_package(package_dir: str, name_version: str,
                              archive_members: dict) -> dict:
     """Authenticate one extracted registry source tree against its locked archive.
 
-    Cargo writes three files of its own on extraction: a normalized
-    `Cargo.toml`, its own byte copy `Cargo.toml.orig` and a `.cargo-ok` marker.
-    Every OTHER file must match the archive byte for byte, `Cargo.toml.orig`
-    must equal the archive's `Cargo.toml`, a `Cargo.toml` without that copy must
-    equal the archive's, and no other entry may appear. The returned digest
-    covers the whole extracted tree (including Cargo's three files) so closeout
-    can re-check exactly what the children read."""
+    A published `.crate` normally carries BOTH a Cargo-normalized `Cargo.toml`
+    and the publisher's original `Cargo.toml.orig`, and Cargo's extraction
+    writes those same two members plus a `.cargo-ok` marker. Each of Cargo's
+    files is therefore authenticated against its OWN archive member: the
+    extracted `Cargo.toml.orig` must equal the archive's `Cargo.toml.orig` when
+    the archive has one (else the archive's `Cargo.toml`), an extracted
+    `Cargo.toml` may differ from the archive's normalized member only as Cargo's
+    re-normalization of that authenticated original and must still declare the
+    same package name and version, and every other member must match byte for
+    byte with no other entry present. The returned digest covers the whole
+    extracted tree (including Cargo's three files) so closeout can re-check
+    exactly what the children read."""
     expected = _strip_archive_root(archive_members, name_version)
     actual: dict = {}
     for base, dirs, files in os.walk(package_dir):
@@ -3346,30 +3392,50 @@ def verify_extracted_package(package_dir: str, name_version: str,
     normalized = actual.pop("Cargo.toml", None)
     original = actual.pop("Cargo.toml.orig", None)
     marker = actual.pop(".cargo-ok", None)
-    archive_manifest = expected.get("Cargo.toml")
-    if original is not None:
-        if original != archive_manifest:
-            raise Refusal(
-                f"the extracted {name_version}/Cargo.toml.orig is not the archive's Cargo.toml"
-            )
-    elif normalized is not None and normalized != archive_manifest:
-        raise Refusal(
-            f"the extracted {name_version}/Cargo.toml is neither the archive's nor a "
-            "copy-backed normalization"
-        )
+    archive_normalized = expected.get("Cargo.toml")
+    archive_original = expected.get("Cargo.toml.orig")
     for rel, digest in expected.items():
-        if rel == "Cargo.toml":
+        if rel in ("Cargo.toml", "Cargo.toml.orig"):
             continue
         if actual.get(rel) != digest:
             raise Refusal(
                 f"the extracted source {name_version}/{rel} does not match its locked archive"
             )
-    extras = sorted(set(actual) - set(expected))
+    extras = sorted(set(actual) - (set(expected) - {"Cargo.toml", "Cargo.toml.orig"}))
     if extras:
         raise Refusal(
             f"the extracted source {name_version} holds entries outside its locked archive: "
             f"{extras[:6]}"
         )
+    if archive_original is not None:
+        if original is None:
+            raise Refusal(
+                f"the extracted source {name_version} has no Cargo.toml.orig although its "
+                "archive carries one"
+            )
+        if original != archive_original:
+            raise Refusal(
+                f"the extracted {name_version}/Cargo.toml.orig is not the archive's "
+                "Cargo.toml.orig member"
+            )
+    elif original is not None and original != archive_normalized:
+        raise Refusal(
+            f"the extracted {name_version}/Cargo.toml.orig has no archive member to match"
+        )
+    if normalized is not None and normalized != archive_normalized:
+        if archive_original is None or original != archive_original:
+            raise Refusal(
+                f"the extracted {name_version}/Cargo.toml differs from its archive without an "
+                "authenticated original to normalize"
+            )
+        if _manifest_package_identity(
+            open(os.path.join(package_dir, "Cargo.toml"), "rb").read()
+        ) != _manifest_package_identity(
+            expected_manifest_bytes(archive_members, name_version, "Cargo.toml")
+        ):
+            raise Refusal(
+                f"the extracted {name_version}/Cargo.toml re-normalized a different package"
+            )
     digest_rows = list(actual.items())
     if normalized is not None:
         digest_rows.append(("Cargo.toml", normalized))
@@ -3382,6 +3448,20 @@ def verify_extracted_package(package_dir: str, name_version: str,
         cumulative.update((rel + "\0" + value + "\n").encode())
     return {"name_version": name_version, "files": len(expected),
             "digest": cumulative.hexdigest()}
+
+
+def expected_manifest_bytes(archive_members: dict, name_version: str,
+                            member: str) -> bytes:
+    """One member's bytes from the locked archive (read again, never assumed)."""
+    import tarfile
+    path = archive_members.get("__path__")
+    if not path:
+        raise Refusal("the archive path was not recorded for a re-read")
+    with tarfile.open(path, "r:gz") as archive:
+        handle = archive.extractfile(name_version + "/" + member)
+        if handle is None:
+            raise Refusal(f"the locked archive has no {member} member")
+        return handle.read()
 
 
 def verify_extracted_sources(cargo_home: str, lock_text: str,
@@ -3692,6 +3772,8 @@ def compat_correspondence(verdict: str, baseline_record: dict, arm_record: dict)
             or baseline_record.get("stdout_sha256") != arm_record.get("stdout_sha256")
             or baseline_record.get("stdout_bytes") != arm_record.get("stdout_bytes")):
         return "mismatch"
+    if baseline_record.get("exit") != arm_record.get("exit"):
+        return "mismatch"
     return "match"
 
 
@@ -3711,14 +3793,22 @@ def _json_number(text: str) -> float:
 
 
 def compat_fmt_oracle(record: dict) -> tuple[str, dict]:
-    """The independent float-formatting oracle: structure, self-declared
-    coverage, both decodes (the program's and this process's) and the summary.
-    Only the cross-arm byte comparison is left to the caller."""
+    """Structural acceptance of ONE float-formatting transcript.
+
+    The pinned serde_json/zmij pair is known NOT to round-trip every declared
+    value (the double below 1.0 serializes as 0.9999999999999999 and decodes
+    back to 1.0), so a successful Cargo baseline is not the premise. The
+    baseline's own complete output IS the expectation: this oracle accepts any
+    integer exit, validates the declared shape and coverage, requires each
+    printed summary to equal the failures it can count. An independent decode
+    that differs from a printed decode is RECORDED as an observation (the
+    pinned pair is known to mis-round some texts), never required to agree.
+    Cross-arm exact output (and exit) correspondence is the caller's job."""
     text, refusal = compat_output_text(record)
     if refusal is not None:
         return ("timeout" if record.get("timed_out") else "mismatch", {"reason": refusal})
-    if record.get("exit") != 0:
-        return ("mismatch", {"reason": f"exit {record.get('exit')}"})
+    if not isinstance(record.get("exit"), int):
+        return ("mismatch", {"reason": f"no integer exit ({record.get('exit')!r})"})
     lines = text.splitlines()
     if not lines:
         return ("mismatch", {"reason": "empty stdout"})
@@ -3737,43 +3827,57 @@ def compat_fmt_oracle(record: dict) -> tuple[str, dict]:
     if summary is None:
         return ("mismatch", {"reason": "no checked/failures summary line"})
     total = counts["f64"] + counts["f32"] + counts["parse_f64"] + counts["parse_f32"]
-    if int(summary.group(1)) != total or int(summary.group(2)) != 0:
+    if int(summary.group(1)) != total:
         return ("mismatch", {"reason": f"summary {body[-1]!r} does not cover {total} inputs"})
     rows = body[:-1]
     if len(rows) != total:
         return ("mismatch", {"reason": f"{len(rows)} rows, expected {total}"})
     position = 0
-    seen_f64: list[str] = []
+    failures = 0
+    independent = 0
+    failing_rows: list = []
+    independent_rows: list = []
+    seen_f64: list = []
     for index in range(counts["f64"]):
         match = COMPAT_FMT_F64.match(rows[position])
         position += 1
         if match is None or int(match.group(1)) != index:
             return ("mismatch", {"reason": f"f64 row {index} is malformed or out of order"})
-        bits, text, back = match.group(2), match.group(3), match.group(4)
-        if back != bits:
-            return ("mismatch", {"reason": f"f64 row {index} decoded {back} for input {bits}"})
+        bits, text_field, back = match.group(2), match.group(3), match.group(4)
         try:
-            decoded = _json_number(text)
+            decoded = _json_number(text_field)
         except (ValueError, TypeError) as error:
             return ("mismatch", {"reason": f"f64 row {index} text is not a JSON number: {error}"})
-        if struct.unpack("<Q", struct.pack("<d", decoded))[0] != int(bits, 16):
-            return ("mismatch", {"reason": f"f64 row {index} independent decode differs from {bits}"})
+        if struct.unpack("<Q", struct.pack("<d", decoded))[0] != int(back, 16):
+            independent += 1
+            if len(independent_rows) < 8:
+                independent_rows.append({"kind": "f64", "index": index,
+                                         "text": text_field, "back": back})
+        if back != bits:
+            failures += 1
+            if len(failing_rows) < 8:
+                failing_rows.append({"kind": "f64", "index": index, "bits": bits, "back": back})
         seen_f64.append(bits)
-    seen_f32: list[str] = []
+    seen_f32: list = []
     for index in range(counts["f32"]):
         match = COMPAT_FMT_F32.match(rows[position])
         position += 1
         if match is None or int(match.group(1)) != index:
             return ("mismatch", {"reason": f"f32 row {index} is malformed or out of order"})
-        bits, text, back = match.group(2), match.group(3), match.group(4)
-        if back != bits:
-            return ("mismatch", {"reason": f"f32 row {index} decoded {back} for input {bits}"})
+        bits, text_field, back = match.group(2), match.group(3), match.group(4)
         try:
-            decoded = _json_number(text)
+            decoded = _json_number(text_field)
         except (ValueError, TypeError) as error:
             return ("mismatch", {"reason": f"f32 row {index} text is not a JSON number: {error}"})
-        if struct.unpack("<I", struct.pack("<f", decoded))[0] != int(bits, 16):
-            return ("mismatch", {"reason": f"f32 row {index} independent decode differs from {bits}"})
+        if struct.unpack("<I", struct.pack("<f", decoded))[0] != int(back, 16):
+            independent += 1
+            if len(independent_rows) < 8:
+                independent_rows.append({"kind": "f32", "index": index,
+                                         "text": text_field, "back": back})
+        if back != bits:
+            failures += 1
+            if len(failing_rows) < 8:
+                failing_rows.append({"kind": "f32", "index": index, "bits": bits, "back": back})
         seen_f32.append(bits)
     for index in range(counts["parse_f64"]):
         match = COMPAT_FMT_PARSE_F64.match(rows[position])
@@ -3781,36 +3885,57 @@ def compat_fmt_oracle(record: dict) -> tuple[str, dict]:
         if match is None or int(match.group(1)) != index:
             return ("mismatch", {"reason": f"parse-f64 row {index} is malformed or out of order"})
         bits, again, back = match.group(3), match.group(4), match.group(5)
-        if back != bits:
-            return ("mismatch", {"reason": f"parse-f64 row {index} re-encode differs from {bits}"})
         try:
             decoded = _json_number(again)
         except (ValueError, TypeError) as error:
             return ("mismatch", {"reason": f"parse-f64 row {index} re-encoding is unreadable: {error}"})
-        if struct.unpack("<Q", struct.pack("<d", decoded))[0] != int(bits, 16):
-            return ("mismatch", {"reason": f"parse-f64 row {index} independent decode differs from {bits}"})
+        if struct.unpack("<Q", struct.pack("<d", decoded))[0] != int(back, 16):
+            independent += 1
+            if len(independent_rows) < 8:
+                independent_rows.append({"kind": "parse-f64", "index": index,
+                                         "text": again, "back": back})
+        if back != bits:
+            failures += 1
+            if len(failing_rows) < 8:
+                failing_rows.append({"kind": "parse-f64", "index": index, "bits": bits,
+                                     "back": back})
     for index in range(counts["parse_f32"]):
         match = COMPAT_FMT_PARSE_F32.match(rows[position])
         position += 1
         if match is None or int(match.group(1)) != index:
             return ("mismatch", {"reason": f"parse-f32 row {index} is malformed or out of order"})
         bits, again, back = match.group(3), match.group(4), match.group(5)
-        if back != bits:
-            return ("mismatch", {"reason": f"parse-f32 row {index} re-encode differs from {bits}"})
         try:
             decoded = _json_number(again)
         except (ValueError, TypeError) as error:
             return ("mismatch", {"reason": f"parse-f32 row {index} re-encoding is unreadable: {error}"})
-        if struct.unpack("<I", struct.pack("<f", decoded))[0] != int(bits, 16):
-            return ("mismatch", {"reason": f"parse-f32 row {index} independent decode differs from {bits}"})
+        if struct.unpack("<I", struct.pack("<f", decoded))[0] != int(back, 16):
+            independent += 1
+            if len(independent_rows) < 8:
+                independent_rows.append({"kind": "parse-f32", "index": index,
+                                         "text": again, "back": back})
+        if back != bits:
+            failures += 1
+            if len(failing_rows) < 8:
+                failing_rows.append({"kind": "parse-f32", "index": index, "bits": bits,
+                                     "back": back})
+    if int(summary.group(2)) != failures:
+        return ("mismatch", {"reason": f"summary reports {summary.group(2)} failures but the rows "
+                                       f"show {failures}"})
     missing = [bits for bits in COMPAT_FMT_REQUIRED_F64 if bits not in seen_f64]
     if missing:
         return ("mismatch", {"reason": f"required f64 patterns absent: {missing}"})
     missing = [bits for bits in COMPAT_FMT_REQUIRED_F32 if bits not in seen_f32]
     if missing:
         return ("mismatch", {"reason": f"required f32 patterns absent: {missing}"})
-    return ("match", {"counts": counts, "checked": total, "f64_rows": len(seen_f64),
-                      "f32_rows": len(seen_f32)})
+    return ("match", {"counts": counts, "checked": total, "failures": failures,
+                      "failing_rows": failing_rows, "exit": record["exit"],
+                      "independent_decode_mismatches": independent,
+                      "independent_decode_rows": independent_rows,
+                      "f64_rows": len(seen_f64), "f32_rows": len(seen_f32),
+                      "note": ("the printed decode is the observation; an independent decode "
+                               "that differs from it is recorded, not required to agree, "
+                               "because the pinned pair is known to mis-round some texts")})
 
 
 def compat_crc32_oracle(record: dict) -> tuple[str, dict]:
@@ -4095,8 +4220,11 @@ def compat_plan_text() -> str:
     lines.append("      cargo: cargo run --locked --offline --quiet --bin compat-fmt")
     lines.append("      relax: <relax> run --check-first --frozen --unattended --quiet "
                  "compat-fmt")
-    lines.append("      oracle: exit 0, declared coverage, both decodes bit-exact, exact "
-                 "cross-arm stdout")
+    lines.append("      oracle: the plain-Cargo baseline's own complete output/exit is the")
+    lines.append("      expectation (shape, coverage, row order, summary failures == differing rows;")
+    lines.append("      independent-decode differences are recorded, the pinned pair is known to")
+    lines.append("      mis-round the double below 1.0); the Relax arm must reproduce the complete")
+    lines.append("      stdout bytes and exit exactly")
     lines.append("  - crc32 (compat-crc32, crc32fast =1.5.3)")
     lines.append("      cargo: cargo run --locked --offline --quiet --bin compat-crc32")
     lines.append("      relax: <relax> run --check-first --frozen --unattended --quiet "
@@ -4149,8 +4277,11 @@ def compat_plan_text() -> str:
     lines.append("     every git source at its locked commit identified by the seeder's")
     lines.append("     authoritative `source` spelling and `rev`, and every extracted registry")
     lines.append("     package authenticated against its locked archive (every file matching")
-    lines.append("     the archive except Cargo's normalized Cargo.toml, its Cargo.toml.orig copy")
-    lines.append("     and .cargo-ok marker, which are recorded and re-checked). The lock must")
+    lines.append("     every archive member, with Cargo's own files bound to their OWN members:")
+    lines.append("     Cargo.toml.orig against the archive's Cargo.toml.orig where present, a")
+    lines.append("     re-normalized Cargo.toml only beside that authenticated original and the")
+    lines.append("     same package identity, and .cargo-ok recorded; the three are re-checked).")
+    lines.append("     The lock must")
     lines.append("     force one version per package name; a multi-version lock refuses, because")
     lines.append("     the resolver's choice would not be forced. --frozen alone does not enforce")
     lines.append("     lock drift, so this verified set is what bounds resolution. Then, for each")
@@ -6290,8 +6421,36 @@ def compat_self_check() -> None:
     transcript = fmt_transcript(counts)
     expect(compat_fmt_oracle(out_record(transcript))[0] == "match",
            "a complete synthetic float transcript matches")
-    expect(compat_fmt_oracle(out_record(transcript, exit_code=1))[0] == "mismatch",
-           "a float transcript with a nonzero exit mismatches")
+    expect(compat_fmt_oracle(out_record(transcript, exit_code=1))[0] == "match",
+           "the Cargo baseline's own nonzero exit is accepted: its output IS the expectation")
+    # Build a transcript whose printed decode differs from its input and whose
+    # summary reports exactly that one failure: the structural oracle accepts it
+    # (the pinned pair really does this for the double below 1.0) and records it.
+    lines = transcript.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("f64 1 0000000000000001"):
+            lines[index] = "f64 1 0000000000000001 5e-324 0000000000000002"
+            break
+    lines[-1] = lines[-1].replace("failures=0", "failures=1")
+    one_failure = "\n".join(lines) + "\n"
+    verdict, facts = compat_fmt_oracle(out_record(one_failure, exit_code=1))
+    expect(verdict == "match" and facts["failures"] == 1
+           and facts["failing_rows"][0]["bits"] == "0000000000000001"
+           and facts["independent_decode_mismatches"] == 1,
+           "a transcript with one real decode difference matches structurally and its "
+           "failure is recorded")
+    expect(compat_correspondence("match", out_record(one_failure, exit_code=1),
+                                out_record(one_failure, exit_code=1)) == "match",
+           "two arms with the same complete bytes and exit correspond")
+    expect(compat_correspondence("match", out_record(one_failure, exit_code=1),
+                                out_record(one_failure, exit_code=0)) == "mismatch",
+           "a differing exit status is a correspondence mismatch")
+    expect(compat_correspondence("match", out_record(transcript, exit_code=1),
+                                out_record(one_failure, exit_code=1)) == "mismatch",
+           "a changed decoded value between arms is a correspondence mismatch")
+    expect(compat_fmt_oracle(out_record(
+        one_failure.replace("failures=1", "failures=0"), exit_code=1))[0] == "mismatch",
+           "a summary that contradicts the printed rows is refused")
     expect(compat_fmt_oracle(out_record(transcript, timed_out=True))[0] == "timeout",
            "a timed-out float probe is a timeout")
     fmt_mutations = {
@@ -6301,7 +6460,8 @@ def compat_self_check() -> None:
         "count": fmt_transcript({**counts, "f64": 4}),
         "back": transcript.replace("f64 0 8000000000000000 -0.0 8000000000000000",
                                    "f64 0 8000000000000000 -0.0 0000000000000000", 1),
-        "decode": transcript.replace("f64 0 8000000000000000 -0.0", "f64 0 8000000000000000 1.5", 1),
+        "unparsable": transcript.replace("f64 0 8000000000000000 -0.0",
+                                        "f64 0 8000000000000000 not-a-number", 1),
         "order": transcript.replace("f64 1 ", "f64 9 ", 1),
         "coverage": fmt_transcript(counts).replace(
             "f64 0 8000000000000000 -0.0 8000000000000000",
@@ -6763,6 +6923,52 @@ def compat_self_check() -> None:
             handle.write(members["Cargo.toml"])
         with open(os.path.join(package_dir, ".cargo-ok"), "wb") as handle:
             handle.write(b"ok")
+        # A published archive that carries BOTH a normalized Cargo.toml and the
+        # publisher's Cargo.toml.orig: Cargo's extracted .orig is authenticated
+        # against the archive's .orig member, never against Cargo.toml.
+        orig_member = b"[package]\nname = \"crate-b\"\nversion = \"2.0.0\"\nedition = \"2021\"\n"
+        norm_member = b"[package]\nname = \"crate-b\"\nversion = \"2.0.0\"\nedition = \"2021\"\n[lib]\n"
+        crate_b = os.path.join(cache, "crate-b-2.0.0.crate")
+        with tarfile.open(crate_b, "w:gz") as archive:
+            for name, body in (("Cargo.toml", norm_member), ("Cargo.toml.orig", orig_member),
+                               ("src/lib.rs", b"pub fn b() {}\n")):
+                info = tarfile.TarInfo("crate-b-2.0.0/" + name)
+                info.size = len(body)
+                archive.addfile(info, io.BytesIO(body))
+        b_dir = os.path.join(src_root, "crate-b-2.0.0")
+        for name, body in (("Cargo.toml", norm_member), ("Cargo.toml.orig", orig_member),
+                           ("src/lib.rs", b"pub fn b() {}\n")):
+            target = os.path.join(b_dir, *name.split("/"))
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "wb") as handle:
+                handle.write(body)
+        with open(os.path.join(b_dir, ".cargo-ok"), "wb") as handle:
+            handle.write(b"ok")
+        b_lock = (
+            "version = 4\n"
+            "\n[[package]]\nname = \"crate-a\"\nversion = \"1.0.0\"\n"
+            'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+            f'checksum = "{hashlib.sha256(open(archive_path, "rb").read()).hexdigest()}"\n'
+            "\n[[package]]\nname = \"crate-b\"\nversion = \"2.0.0\"\n"
+            'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+            f'checksum = "{hashlib.sha256(open(crate_b, "rb").read()).hexdigest()}"\n')
+        expect(verify_extracted_sources(home, b_lock)["packages"] == 2,
+               "an archive carrying Cargo.toml and Cargo.toml.orig authenticates its "
+               "extracted pair against the same-named members")
+        with open(os.path.join(b_dir, "Cargo.toml"), "wb") as handle:
+            handle.write(b"[package]\nname = \"crate-b\"\nversion = \"2.0.0\"\n"
+                         b"edition = \"2021\"\n[lib]\nname = \"b\"\n")
+        expect(verify_extracted_sources(home, b_lock)["packages"] == 2,
+               "Cargo's re-normalized Cargo.toml is accepted beside the authenticated original")
+        with open(os.path.join(b_dir, "Cargo.toml.orig"), "wb") as handle:
+            handle.write(b"[package]\nname = \"crate-b\"\nversion = \"2.0.0\"\n")
+        try:
+            verify_extracted_sources(home, b_lock)
+            raise AssertionError("an extracted Cargo.toml.orig that differs from the archive's "
+                                 "own .orig member must refuse")
+        except Refusal:
+            pass
+        shutil.rmtree(b_dir)
         extracted_lock = (
             "version = 4\n\n[[package]]\nname = \"crate-a\"\nversion = \"1.0.0\"\n"
             'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
