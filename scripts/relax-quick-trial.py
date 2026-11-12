@@ -105,12 +105,19 @@ are not attributed, and that limit is stated in every report.
 
 Receipt and custody: one bounded receipt (64 KiB cap) beside the guard's own
 under `OXIDE_PROOF_EVIDENCE`, with identities, per-case records (bounded
-prefixes, full-output SHA-256s, omission counters), network time/bytes, seed
-and stage figures, and the honest statements that this receipt never claims
-guard closure, session census, qualification or a performance
+prefixes, full-output SHA-256s, omission counters), a per-case timing
+summary (sample counts, median/min/max, relative time and absolute saving
+against the cargo baseline arm, matching cases only), the network time and
+received-byte figure parsed from the forced clone progress, owned-scratch
+and evidence-packet occupied-byte totals, declared-but-unreached cases as
+explicit `unexecuted` rows, and the honest statements that this receipt
+never claims guard closure, session census, qualification or a performance
 recommendation from failed or unclosed execution; closure stays the
 supervisor's. Evidence is published beside the guard receipt, outside the
-disposable execution scratch.
+disposable execution scratch. A guarded run exits 0 only when nothing
+aborted, every declared case executed and every verdict is `match`; any
+divergence (including the recorded known gap), unexecuted case or abort
+exits 1, so a divergence-only run can never read as a clean pass.
 """
 
 from __future__ import annotations
@@ -174,7 +181,7 @@ GREET_EXPECTED_V2 = (
 )
 SNAPSHOT_HELP_MARKER = "oxide: Cargo with managed build storage and profiles"
 SNAPSHOT_HELP_EDITED = SNAPSHOT_HELP_MARKER + " [trial]"
-PANIC_LOCATION = "src/main.rs:11:5"
+PANIC_LOCATION = "main.rs:11:5"
 COLLISION_RUSTC = "app=a b=b"
 COLLISION_KNOWN_GAP = "app=a b=a"
 
@@ -215,9 +222,12 @@ PREMISE_CHECKLIST = {
     ),
     "environment_isolation": (
         "Applies. Every child environment is built from a scrubbed base "
-        "that drops inherited OXIDE_*, CARGO_*, RUST*, MAKEPAD_* and XDG_* "
-        "values, then sets only the declared controls. Host pool or "
-        "account provenance cannot leak into an arm."
+        "that drops inherited OXIDE_*, CARGO_*, every RUST* value (RUSTC, "
+        "RUSTC_WRAPPER, RUSTDOCFLAGS, RUST_MIN_STACK and friends), MAKEPAD_*, "
+        "XDG_* and SCCACHE_*, then sets only the declared controls: "
+        "RUSTFLAGS is declared empty, RUSTUP_HOME is restored from the "
+        "invoking environment, and PATH is kept. Host pool, account or "
+        "wrapper provenance cannot leak into an arm."
     ),
     "automatic_adoption": (
         "Does not apply: the trial converts nothing and owns no permanent-"
@@ -405,13 +415,23 @@ def oracle_exact_stdout(record: dict, expected_stdout: str) -> str:
     return "mismatch"
 
 
-def oracle_exact_with_exit(record: dict, expected_stdout: str, expected_exit: int) -> str:
-    stdout = record.get("stdout", "")
+def oracle_exact_with_exit(
+    record: dict, expected_stdout: str, expected_exit: int,
+    expected_stderr: str | None = None,
+    stderr_contains: tuple[str, ...] = (),
+) -> str:
     if record.get("timed_out"):
         return "timeout"
-    if stdout == expected_stdout and record.get("exit") == expected_exit:
-        return "match"
-    return "mismatch"
+    if record.get("exit") != expected_exit:
+        return "mismatch"
+    if record.get("stdout", "") != expected_stdout:
+        return "mismatch"
+    if expected_stderr is not None and record.get("stderr", "") != expected_stderr:
+        return "mismatch"
+    for needle in stderr_contains:
+        if needle not in record.get("stderr", ""):
+            return "mismatch"
+    return "match"
 
 
 def oracle_fragments(
@@ -451,7 +471,7 @@ def oracle_pid_line(record: dict) -> str:
     if record.get("exit") != 0:
         return "mismatch"
     for line in record.get("stdout", "").splitlines():
-        found = re.fullmatch(r"sum=6 pid=([1-9][0-9]*)", line)
+        found = re.fullmatch(r"sum=10 pid=([1-9][0-9]*)", line)
         if found:
             return "match"
     return "mismatch"
@@ -654,13 +674,14 @@ CASE_TABLE.extend(
         "figure": "correspondence",
     }
     for name, oracle in [
-        ("basics", "exact stdout/stderr and exit 7"),
+        ("basics", "exact stdout and exit 7; cargo's stderr compared exactly, relax's "
+         "stderr must carry the program's line (its runner logs on stderr)"),
         ("panic-caught", "exact stdout CAUGHT:corr-caught-boom, exit 0"),
         ("panic-uncaught", "exit 101, stderr names " + PANIC_LOCATION),
         ("panic-uncaught-backtrace", "RUST_BACKTRACE=1, a frame names " + PANIC_LOCATION),
         ("overflow", "exit 101, stderr names attempt to add with overflow"),
         ("gen", "exact stdout generated=gen-constant-v1, exit 0"),
-        ("threads-ffi", "exit 0, stdout line sum=6 pid=<positive>"),
+        ("threads-ffi", "exit 0, stdout line sum=10 pid=<positive>"),
         ("testkit", "exit 0, both test names in the combined output"),
         ("collision", COLLISION_RUSTC + "; the known gap " + COLLISION_KNOWN_GAP
          + " is recorded as mismatch-known-gap-1, never passed"),
@@ -873,9 +894,26 @@ def self_check() -> None:
     except Refusal:
         pass
     expect(oracle_exact_with_exit({"stdout": "args=one,two,7\nenv=corridor\ncwd=corr-suite\n",
-                                   "exit": 7},
-                                  "args=one,two,7\nenv=corridor\ncwd=corr-suite\n", 7) == "match",
-           "basics oracle matches its transcript")
+                                   "stderr": "corr-trial-stderr-line\n", "exit": 7},
+                                  "args=one,two,7\nenv=corridor\ncwd=corr-suite\n", 7,
+                                  expected_stderr="corr-trial-stderr-line\n") == "match",
+           "basics oracle matches its transcript including stderr")
+    expect(oracle_exact_with_exit({"stdout": "args=one,two,7\nenv=corridor\ncwd=corr-suite\n",
+                                   "stderr": "WRONG\n", "exit": 7},
+                                  "args=one,two,7\nenv=corridor\ncwd=corr-suite\n", 7,
+                                  expected_stderr="corr-trial-stderr-line\n") == "mismatch",
+           "basics oracle refuses wrong stderr bytes")
+    expect(oracle_exact_with_exit({"stdout": "args=one,two,7\nenv=corridor\ncwd=corr-suite\n",
+                                   "stderr": "relax-remote: pid 42 app basics socket /x\n"
+                                             "corr-trial-stderr-line\n", "exit": 7},
+                                  "args=one,two,7\nenv=corridor\ncwd=corr-suite\n", 7,
+                                  stderr_contains=("corr-trial-stderr-line",)) == "match",
+           "relax's basics stderr only needs the program line beside its own log")
+    expect(oracle_exact_with_exit({"stdout": "args=one,two,7\nenv=corridor\ncwd=corr-suite\n",
+                                   "stderr": "relax-remote: pid 42 app basics socket /x\n", "exit": 7},
+                                  "args=one,two,7\nenv=corridor\ncwd=corr-suite\n", 7,
+                                  stderr_contains=("corr-trial-stderr-line",)) == "mismatch",
+           "a relax basics run missing the program's stderr line is a mismatch")
     expect(oracle_fragments({"exit": 101, "stdout": "",
                              "stderr": f"thread 'main' panicked at {PANIC_LOCATION}: "
                                        "corr-uncaught-boom"},
@@ -886,9 +924,11 @@ def self_check() -> None:
                             exit_codes=(101,),
                             stderr_contains=("attempt to add with overflow",)) == "match",
            "overflow oracle matches its transcript")
-    expect(oracle_pid_line({"exit": 0, "stdout": "sum=6 pid=41041\n"}) == "match",
+    expect(oracle_pid_line({"exit": 0, "stdout": "sum=10 pid=41041\n"}) == "match",
            "pid oracle matches its transcript")
-    expect(oracle_pid_line({"exit": 0, "stdout": "sum=6 pid=0\n"}) == "mismatch",
+    expect(oracle_pid_line({"exit": 0, "stdout": "sum=6 pid=41041\n"}) == "mismatch",
+           "pid oracle refuses a wrong sum")
+    expect(oracle_pid_line({"exit": 0, "stdout": "sum=10 pid=0\n"}) == "mismatch",
            "pid oracle refuses a zero pid")
     expect(oracle_collision({"exit": 0, "stdout": COLLISION_RUSTC + "\n"}) == "match",
            "collision rustc truth matches")
@@ -910,6 +950,46 @@ def self_check() -> None:
     expect(str(LIMIT_SECONDS) in document and str(SCRATCH_MIB) in document,
            "plan carries the fixed bounds")
 
+    # Median, timing summary, unexecuted rows and the exit rule.
+    expect(median([3.0]) == 3.0 and median([1.0, 2.0, 4.0]) == 2.0
+           and median([1.0, 2.0]) == 1.5 and median([]) is None,
+           "median covers odd, even, single and empty samples")
+    fake_cases = [
+        {"workload": "greet", "case": "cold", "arm": "cargo", "verdict": "match", "seconds": 1.0},
+        {"workload": "greet", "case": "cold", "arm": "relax", "verdict": "match", "seconds": 0.5},
+        {"workload": "greet", "case": "cold", "arm": "relax", "verdict": "match", "seconds": 1.5},
+        {"workload": "greet", "case": "cold", "arm": "oxide", "verdict": "mismatch", "seconds": 2.0},
+    ]
+    summary = timing_summary(fake_cases)
+    cold = summary["greet/cold"]
+    expect(cold["cargo"]["median_s"] == 1.0, "cargo baseline median recorded")
+    expect(cold["relax"]["median_s"] == 1.0 and cold["relax"]["relative_to_cargo"] == 1.0,
+           "relax median 1.0 s against the cargo baseline")
+    expect("oxide" not in cold, "a non-matching arm contributes no timing figure")
+    expect(cold["relax"]["absolute_saving_s"] == 0.0, "absolute saving against the baseline")
+    full_cold = [{"workload": "greet", "case": "cold", "arm": arm, "verdict": "match",
+                  "seconds": 1.0} for arm in ARMS]
+    expect(all((row["workload"], row["case"]) != ("greet", "cold")
+               for row in declared_unexecuted(full_cold)),
+           "a fully reached declared case yields no unexecuted rows for itself")
+    sparse = [{"workload": "greet", "case": "cold", "arm": "cargo", "verdict": "match",
+               "seconds": 1.0}]
+    rows = declared_unexecuted(sparse)
+    expect(any(row["case"] == "cold" and row["arm"] == "relax" and row["verdict"] == "unexecuted"
+               for row in rows), "unreached declared arms become unexecuted rows")
+    declared_total = sum(len(case["arms"]) for case in CASE_TABLE)
+    expect(len(rows) == declared_total - 1,
+           "unexecuted rows cover exactly the unreached declared combinations")
+    expect(collection_exit(None, [{"verdict": "match"}]) == 0, "clean collection exits 0")
+    expect(collection_exit(None, [{"verdict": "match"}, {"verdict": "mismatch"}]) == 1,
+           "a divergence-only run exits 1, never a clean pass")
+    expect(collection_exit(None, [{"verdict": "mismatch-known-gap-1"}]) == 1,
+           "the recorded known gap keeps the exit nonzero")
+    expect(collection_exit(None, [{"verdict": "unexecuted"}]) == 1,
+           "an unreached declared case keeps the exit nonzero")
+    expect(collection_exit("greet: boom", [{"verdict": "match"}]) == 1,
+           "an aborted collection exits 1")
+
     print("self-check: all controls passed (no scratch, child, network or engine)\n")
 
 
@@ -918,7 +998,11 @@ def self_check() -> None:
 # --------------------------------------------------------------------------
 
 GUARD_EXPORTS = ("OXIDE_TASK_SCRATCH_ROOT", "OXIDE_PROOF_DEADLINE_NS", "OXIDE_PROOF_EVIDENCE")
-SCRUB_PREFIXES = ("OXIDE_", "CARGO_", "RUSTFLAGS", "RUST_LIB_BACKTRACE", "MAKEPAD_", "XDG_", "SCCACHE_")
+# Every key equal to or prefixed by one of these is dropped from child
+# environments; RUST covers RUSTC, RUSTC_WRAPPER, RUSTDOCFLAGS, RUST_MIN_STACK
+# and friends. RUSTUP_HOME is restored explicitly below and RUSTFLAGS is
+# declared empty, so a host wrapper or flag set cannot reach a fixture.
+SCRUB_PREFIXES = ("OXIDE_", "CARGO_", "RUST", "MAKEPAD_", "XDG_", "SCCACHE_")
 
 
 def guard_exports() -> dict[str, str]:
@@ -955,11 +1039,13 @@ def scrubbed_env() -> dict[str, str]:
         key: value
         for key, value in os.environ.items()
         if not any(key == prefix or key.startswith(prefix) for prefix in SCRUB_PREFIXES)
-        and key not in ("RUSTUP_TOOLCHAIN",)
+        and key != "RUSTUP_TOOLCHAIN"
     }
     env["RUSTUP_AUTO_INSTALL"] = "0"
     env["RUSTFLAGS"] = ""
     env["PATH"] = os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+    # The invoking toolchain home is the one deliberate RUST* survivor: the
+    # pinned toolchain resolves through it and is never installed.
     if os.environ.get("RUSTUP_HOME"):
         env["RUSTUP_HOME"] = os.environ["RUSTUP_HOME"]
     elif os.environ.get("HOME"):
@@ -1124,6 +1210,77 @@ A timed-out child is killed by its own unreaped PID and positively reaped."""
     return record
 
 
+def declared_unexecuted(cases: list[dict]) -> list[dict]:
+    """Every declared case/arm combination the collection never reached,
+    recorded as unexecuted rather than silently absent."""
+    present = {
+        (row.get("workload"), row.get("case"), row.get("arm"))
+        for row in cases
+    }
+    rows: list[dict] = []
+    for case in CASE_TABLE:
+        for arm in case["arms"]:
+            key = (case["workload"], case["case"], arm)
+            if key not in present:
+                rows.append({"workload": case["workload"], "case": case["case"],
+                             "arm": arm, "verdict": "unexecuted"})
+    return rows
+
+
+def median(samples: list[float]) -> float | None:
+    ordered = sorted(samples)
+    if not ordered:
+        return None
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def timing_summary(cases: list[dict]) -> dict:
+    """Per workload/case and arm: all sample counts, median/min/max, and the
+    relative wall time and absolute saving against the cargo baseline arm.
+    Only matching cases carry a time figure; slower arms report >1.0."""
+    groups: dict[str, dict[str, list[float]]] = {}
+    for row in cases:
+        if row.get("verdict") != "match" or row.get("seconds") is None:
+            continue
+        key = f"{row.get('workload')}/{row.get('case')}"
+        groups.setdefault(key, {}).setdefault(row.get("arm"), []).append(row["seconds"])
+    summary: dict = {}
+    for key, by_arm in sorted(groups.items()):
+        baseline = by_arm.get("cargo") or next(iter(by_arm.values()))
+        base_median = median(baseline)
+        entry: dict = {}
+        for arm, samples in sorted(by_arm.items()):
+            arm_median = median(samples)
+            figure: dict = {
+                "samples": len(samples),
+                "median_s": round(arm_median, 4),
+                "min_s": round(min(samples), 4),
+                "max_s": round(max(samples), 4),
+            }
+            if arm_median is not None and base_median:
+                figure["relative_to_cargo"] = round(arm_median / base_median, 3)
+                figure["absolute_saving_s"] = round(base_median - arm_median, 4)
+            entry[arm] = figure
+        summary[key] = entry
+    return summary
+
+
+def collection_exit(aborted: str | None, cases: list[dict]) -> int:
+    """Exit 0 only for a complete, clean collection: nothing aborted, every
+    declared case executed, and every verdict `match` (the documented known
+    gap `mismatch-known-gap-1` is a finding and keeps the exit nonzero, so a
+    divergence-only run can never read as a clean pass)."""
+    if aborted:
+        return 1
+    for row in cases:
+        if row.get("verdict") != "match":
+            return 1
+    return 0
+
+
 def rotate(arms: tuple[str, ...], rep: int) -> tuple[str, ...]:
     shift = rep % len(arms)
     return arms[shift:] + arms[:shift]
@@ -1186,11 +1343,20 @@ exported scratch, evidence and deadline, after the source and volume gates."""
 
     def acquire_upstream(self) -> None:
         dest = os.path.join(self.run_root, "relax-src")
-        clone = ["git", "clone", UPSTREAM_URL, dest]
+        # --progress forces the transfer lines into the captured stderr even
+        # when it is a file, so the received byte figure is parseable.
+        clone = ["git", "clone", "--progress", UPSTREAM_URL, dest]
         started = time.monotonic()
         record = measure_one(clone, self.run_root, child_env(self.env), CAP_CLONE_S, self.deadline_ns)
         if record["exit"] != 0:
             raise Refusal(f"upstream clone failed: {record['stderr'][:300]!r}")
+        network_bytes = None
+        for match in re.finditer(
+            r"Receiving objects:\s+\d+% \(\d+/\d+\), ([0-9.]+) (KiB|MiB|GiB)",
+            record["stderr"],
+        ):
+            value, unit = float(match.group(1)), match.group(2)
+            network_bytes = int(value * {"KiB": 1024, "MiB": 1024**2, "GiB": 1024**3}[unit])
         checkout = measure_one(
             ["git", "checkout", UPSTREAM_COMMIT], dest, child_env(self.env), 30, self.deadline_ns
         )
@@ -1208,6 +1374,11 @@ exported scratch, evidence and deadline, after the source and volume gates."""
             "commit": UPSTREAM_COMMIT,
             "tree": UPSTREAM_TREE,
             "network_seconds": round(time.monotonic() - started, 3),
+            "network_bytes": network_bytes,
+            "network_bytes_source": (
+                "parsed from the forced git clone progress output" if network_bytes is not None
+                else "unparsed; occupied bytes below bound the checkout instead"
+            ),
             "occupied": walk_bytes(dest),
         }
 
@@ -1402,11 +1573,11 @@ exported scratch, evidence and deadline, after the source and volume gates."""
 
     # -- cases -------------------------------------------------------------
 
-    def record_case(self, name: str, record: dict, verdict: str) -> None:
+    def record_case(self, workload: str, case: str, record: dict, verdict: str) -> None:
         row = {
-            "case": name,
+            "workload": workload,
+            "case": case,
             "arm": record.get("arm"),
-            "workload": record.get("workload"),
             "seconds": record.get("seconds"),
             "rss_max_kib": record.get("rss_max_kib"),
             "exit": record.get("exit"),
@@ -1416,6 +1587,9 @@ exported scratch, evidence and deadline, after the source and volume gates."""
             "stderr_evidence": record.get("stderr_evidence"),
         }
         self.cases.append(row)
+
+    def unexecuted_rows(self) -> list[dict]:
+        return declared_unexecuted(self.cases)
 
     def apply_edit_everywhere(self, path_relative: str, old: str, new: str, count: int = 1) -> str:
         digest = None
@@ -1446,7 +1620,8 @@ exported scratch, evidence and deadline, after the source and volume gates."""
         cap = CAP_SMALL_S
         for arm in ARMS:
             record = self.run_arm(arm, "greet", ["Tom"], cap)
-            self.record_case("greet/cold", record, oracle_exact_stdout(record, GREET_EXPECTED_V1 + "\n"))
+            self.record_case("greet", "cold", record,
+                             oracle_exact_stdout(record, GREET_EXPECTED_V1 + "\n"))
         self.cache_snapshot("greet-cold")
         for rep in range(5):
             if budget_s(self.deadline_ns, cap) <= 0:
@@ -1454,7 +1629,7 @@ exported scratch, evidence and deadline, after the source and volume gates."""
                 break
             for arm in rotate(ARMS, rep):
                 record = self.run_arm(arm, "greet", ["Tom"], cap)
-                self.record_case("greet/warm-unchanged", record,
+                self.record_case("greet", "warm-unchanged", record,
                                  oracle_exact_stdout(record, GREET_EXPECTED_V1 + "\n"))
         self.apply_edit_everywhere("greet-core/src/lib.rs", GREET_BODY_OLD, GREET_BODY_NEW)
         for rep in range(5):
@@ -1463,7 +1638,7 @@ exported scratch, evidence and deadline, after the source and volume gates."""
                 break
             for arm in rotate(ARMS, rep):
                 record = self.run_arm(arm, "greet", ["Tom"], cap)
-                self.record_case("greet/edit-body", record,
+                self.record_case("greet", "edit-body", record,
                                  oracle_exact_stdout(record, GREET_EXPECTED_V2 + "\n"))
         self.apply_edit_everywhere("greet-core/src/lib.rs", GREET_INTERFACE_OLD, GREET_INTERFACE_NEW)
         for rep in range(5):
@@ -1472,7 +1647,7 @@ exported scratch, evidence and deadline, after the source and volume gates."""
                 break
             for arm in rotate(ARMS, rep):
                 record = self.run_arm(arm, "greet", ["Tom"], cap)
-                self.record_case("greet/edit-interface", record,
+                self.record_case("greet", "edit-interface", record,
                                  oracle_exact_stdout(record, GREET_EXPECTED_V2 + "\n"))
         self.cache_snapshot("greet-final")
 
@@ -1485,7 +1660,7 @@ exported scratch, evidence and deadline, after the source and volume gates."""
                 record, exit_codes=(0,), stdout_contains=(SNAPSHOT_HELP_MARKER,),
                 stdout_not_contains=("[trial]",),
             )
-            self.record_case("snapshot/cold", record, verdict)
+            self.record_case("snapshot", "cold", record, verdict)
         self.cache_snapshot("snapshot-cold")
         for label, edit in (("warm-unchanged", None), ("edit-body", "body"),
                             ("edit-interface", "interface")):
@@ -1512,7 +1687,7 @@ exported scratch, evidence and deadline, after the source and volume gates."""
                         record, exit_codes=(0,), stdout_contains=expected_contains,
                         stdout_not_contains=expected_absent,
                     )
-                    self.record_case(f"snapshot/{label}", record, verdict)
+                    self.record_case("snapshot", label, record, verdict)
         self.cache_snapshot("snapshot-final")
 
     def corr_block(self) -> None:
@@ -1526,27 +1701,37 @@ exported scratch, evidence and deadline, after the source and volume gates."""
                                           env_overrides={"CORR_TRIAL_ENV": "corridor"})
             record = measure_one(argv, suite[arm], env, cap, self.deadline_ns)
             record["arm"], record["workload"] = arm, "corr"
+            # stdout is exact for both arms. The cargo arm's stderr is exact;
+            # the relax arm only requires the program's stderr line, because
+            # its runner unconditionally logs `relax-remote: pid ...` on
+            # stderr (inspect/mod.rs start()), which is harness output, not
+            # program semantics.
             verdict = oracle_exact_with_exit(
-                record, "args=one,two,7\nenv=corridor\ncwd=corr-suite\n", 7
+                record, "args=one,two,7\nenv=corridor\ncwd=corr-suite\n", 7,
+                expected_stderr="corr-trial-stderr-line\n" if arm == "cargo" else None,
+                stderr_contains=() if arm == "cargo" else ("corr-trial-stderr-line",),
             )
-            self.record_case("corr/basics", record, verdict)
+            self.record_case("corr", "basics", record, verdict)
         # panic-caught / panic-uncaught / overflow / gen / threads-ffi / testkit / collision.
         for arm in ("cargo", "relax"):
-            for package, args, oracle in (
-                ("panic", ["caught"], lambda r: oracle_exact_stdout(r, "CAUGHT:corr-caught-boom\n")),
-                ("panic", ["uncaught"], lambda r: oracle_fragments(
-                    r, exit_codes=(101,), stderr_contains=(PANIC_LOCATION,))),
-                ("overflow", [], lambda r: oracle_fragments(
-                    r, exit_codes=(101,), stderr_contains=("attempt to add with overflow",))),
-                ("gen", [], lambda r: oracle_exact_stdout(r, "generated=gen-constant-v1\n")),
-                ("threads-ffi", [], oracle_pid_line),
-                ("collision-app", [], oracle_collision),
+            for package, args, case_name, oracle in (
+                ("panic", ["caught"], "panic-caught",
+                 lambda r: oracle_exact_stdout(r, "CAUGHT:corr-caught-boom\n")),
+                ("panic", ["uncaught"], "panic-uncaught",
+                 lambda r: oracle_fragments(
+                     r, exit_codes=(101,), stderr_contains=(PANIC_LOCATION,))),
+                ("overflow", [], "overflow",
+                 lambda r: oracle_fragments(
+                     r, exit_codes=(101,), stderr_contains=("attempt to add with overflow",))),
+                ("gen", [], "gen",
+                 lambda r: oracle_exact_stdout(r, "generated=gen-constant-v1\n")),
+                ("threads-ffi", [], "threads-ffi", oracle_pid_line),
+                ("collision-app", [], "collision", oracle_collision),
             ):
                 argv, env = self.corr_command(arm, package, args)
                 record = measure_one(argv, suite[arm], env, cap, self.deadline_ns)
                 record["arm"], record["workload"] = arm, "corr"
-                self.record_case(f"corr/{package}{('-' + args[0]) if args else ''}",
-                                 record, oracle(record))
+                self.record_case("corr", case_name, record, oracle(record))
             # The uncaught-panic backtrace expectation.
             argv, env = self.corr_command(arm, "panic", ["uncaught"])
             env = child_env(env, RUST_BACKTRACE="1", RUST_LIB_BACKTRACE="1")
@@ -1556,7 +1741,7 @@ exported scratch, evidence and deadline, after the source and volume gates."""
             verdict = "match" if (
                 record["exit"] == 101 and PANIC_LOCATION in combined
             ) else ("timeout" if record["timed_out"] else "mismatch")
-            self.record_case("corr/panic-uncaught-backtrace", record, verdict)
+            self.record_case("corr", "panic-uncaught-backtrace", record, verdict)
             # Basic test execution: a correspondence probe, not qualification.
             # `relax test` carries leading flags through to the harness run, so
             # `--quiet` reaches it; the strict run flags are not claimed here.
@@ -1564,7 +1749,7 @@ exported scratch, evidence and deadline, after the source and volume gates."""
             record = measure_one(argv, suite[arm], env, cap, self.deadline_ns)
             record["arm"], record["workload"] = arm, "corr"
             verdict = oracle_fragments(record, exit_codes=(0,), combined_contains=("adds", "concats"))
-            self.record_case("corr/testkit", record, verdict)
+            self.record_case("corr", "testkit", record, verdict)
 
     def corr_command(self, arm: str, package: str, args: list[str], *, test: bool = False,
                      env_overrides: dict | None = None) -> tuple[list[str], dict]:
@@ -1638,7 +1823,8 @@ exported scratch, evidence and deadline, after the source and volume gates."""
                 break
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 if self.mode == "diagnostic":
-                    self.cases.append({"case": f"{name}/infra", "verdict": "aborted",
+                    self.cases.append({"workload": name, "case": "infra",
+                                       "verdict": "aborted",
                                        "error": str(error)[:300]})
                     self.aborted = f"{name}: {error}"
                     break
@@ -1660,10 +1846,18 @@ exported scratch, evidence and deadline, after the source and volume gates."""
             "source": self.figures.get("source"),
             "figures": {k: v for k, v in self.figures.items() if k != "acquisition"},
             "acquisition": self.figures.get("acquisition"),
+            "timing_summary": timing_summary(self.cases),
             "verdicts": verdicts,
             "cases": self.cases,
             "cases_total": len(self.cases),
+            "declared_unexecuted": sum(
+                1 for row in self.cases if row.get("verdict") == "unexecuted"
+            ),
             "aborted": self.aborted,
+            "exit_rule": (
+                "exit 0 only when nothing aborted, every declared case executed, and "
+                "every verdict is match; a divergence-only run exits 1 and is a finding"
+            ),
             "limits": {
                 "wall_limit_s": LIMIT_SECONDS,
                 "scratch_mib": SCRATCH_MIB,
@@ -1682,6 +1876,17 @@ exported scratch, evidence and deadline, after the source and volume gates."""
         return encoded
 
     def publish(self) -> None:
+        # Unreached declared cases become unexecuted rows before the receipt
+        # is built, so absence is never silent.
+        self.cases.extend(self.unexecuted_rows())
+        self.figures["owned_bytes"] = {
+            "run_root": walk_bytes(self.run_root) if os.path.isdir(self.run_root)
+            else {"path": self.run_root, "absent": True},
+            "packet_dir": walk_bytes(self.packet_dir) if os.path.isdir(self.packet_dir)
+            else {"path": self.packet_dir, "absent": True},
+            "note": "occupied apparent bytes of the owned scratch and evidence packet; "
+                    "never an SSD-write claim",
+        }
         self._receipt_encoded = self.receipt()
         destination = os.path.join(
             self.packet_dir, f"receipt-{self.binding['paths']['packet_name']}.json"
@@ -1713,17 +1918,26 @@ def guarded_main(mode: str, binding_path: str, binding_sha: str) -> int:
         return 1
     run.execute()
     run.publish()
+    exit_code = collection_exit(run.aborted, run.cases)
     summary = {
         "verdicts": {
             verdict: sum(1 for row in run.cases if row.get("verdict") == verdict)
             for verdict in sorted({row.get("verdict", "?") for row in run.cases})
         },
         "cases": len(run.cases),
+        "declared_unexecuted": sum(
+            1 for row in run.cases if row.get("verdict") == "unexecuted"
+        ),
         "aborted": run.aborted,
+        "exit": exit_code,
     }
     print(json.dumps(summary))
-    if run.aborted:
-        print(f"aborted: {run.aborted}", file=sys.stderr)
+    if exit_code != 0:
+        print(
+            "collection carries findings, unreached cases or an abort; exit 1 "
+            "(uncounted diagnostic, never a pass)",
+            file=sys.stderr,
+        )
         return 1
     return 0
 

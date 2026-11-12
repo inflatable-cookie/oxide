@@ -2,8 +2,10 @@
 //! uncaught panic must exit 101 naming this file and the exact line:column of
 //! the panic call in its message. The driver passes the mode as argv[1].
 //!
-//! The uncaught probe's panic call is at src/main.rs:11:5 exactly; keep that
-//! location stable when editing this file.
+//! The uncaught probe's panic call sits at file main.rs line 11, column 5.
+//! The oracle requires `main.rs:11:5` so the file-name and exact position
+//! are pinned without betting on the path prefix spelling rustc prints for
+//! a workspace member; the captured stderr prefix keeps the full form.
 
 use std::panic;
 

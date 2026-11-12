@@ -13,12 +13,18 @@ fn main() {
     let record = Record { name, count: 42 };
     let rendered = render(&record);
     let payload = json!({ "record": record, "rendered": rendered });
-    // The derive round trip must reproduce the record exactly: re-serialize
-    // the parsed record and require byte-equality with the payload member. A
-    // mismatch panics with a nonzero exit instead of printing a wrong line.
+    // The derive round trip must reproduce the record exactly: parse the
+    // payload member back into a Record, re-value it and require structural
+    // equality with the payload member (never string equality, whose two
+    // spellings differ in key order). A mismatch panics with a nonzero exit
+    // instead of printing a wrong line.
     let back: Record =
         serde_json::from_value(payload["record"].clone()).expect("record round trip");
-    let redone = serde_json::to_string(&back).expect("record re-serialize");
-    assert_eq!(redone, payload["record"].to_string());
+    // Compare as Values, not as strings: serde_json's default Map sorts keys,
+    // while direct struct serialization keeps declaration order, so byte
+    // equality between those two spellings would always fail. Value equality
+    // is structural and proves the derive round trip preserved the record.
+    let back_value = serde_json::to_value(&back).expect("record re-value");
+    assert_eq!(back_value, payload["record"]);
     println!("{payload}");
 }
