@@ -25,10 +25,6 @@ pub mod lease;
 #[cfg(unix)]
 pub mod owned_delete;
 
-/// Immutable, bounded storage for Oxide's original delegated-prune requests.
-#[cfg(unix)]
-pub mod output_request_store;
-
 /// Debug-only guard for product proof hooks (oxide#155).
 #[cfg(debug_assertions)]
 pub mod proof;

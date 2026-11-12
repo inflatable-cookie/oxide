@@ -40,8 +40,6 @@ pub mod dep_info;
 pub mod inventory;
 #[path = "../../lease/mod.rs"]
 pub mod lease;
-#[path = "../../output_request_store.rs"]
-pub mod output_request_store;
 #[path = "../../owned_delete.rs"]
 pub mod owned_delete;
 #[cfg(debug_assertions)]

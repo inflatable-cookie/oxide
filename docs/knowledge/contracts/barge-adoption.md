@@ -4948,204 +4948,158 @@ Original custody/seed oracles, CLOEXEC and historical uncertainty are preserved.
 
 #### Explicit recovery upgrade implementation boundary (oxide#304)
 
-`oxide outputs upgrade-recovery` is the explicit metadata-only transition;
-ordinary preview and adoption never invoke it. It requires the existing
-complete registry and the same initialized transaction in both controls,
-with writers positively closed under internal-first publication/admission
-custody. Preflight validates the prospective image and its size before any
-fence. Each pool syncs `/4` plus `initializing`, internal first; the registry
-then atomically publishes schema 3 with explicit local routes for retained
-settled history, before each control syncs `ready`, internal first. A restart
-uses the same transaction and retains every published fence. A missing or
-unreadable registry, unfinished predecessor intent, conflicting transaction
-or impossible paired ordering refuses. Numeric owned-output state floor
-remains 4; higher unrelated fences remain intact. No host upgrade was run.
+Tom selected the reviewed single-authority fixture implementation in decision
+`1735df31-7cc1-4748-9f8a-0767ee6259ff` v2. Its operation contract is Barge's
+published stage4 design at `adc352792eaa6348d76ab31afc2bebceeefd6ca0`, “One
+operation journal for delegated recovery”, including R2b, retained cancellation,
+integrity inventory and atomic domain settlement.
 
-The connected readers reject partial paired readiness and missing or corrupt
-metadata before ordinary replay or exclusion decisions. Private per-control
-views retain the pair identity in memory, without new durable fields. Source
-regressions exercise five paired crash images, missing state and failed
-registry publication; these are not native crash proof.
+`oxide outputs upgrade-recovery` is now a one-time **guarded disposable-fixture
+adoption**, refused before opening an Oxide store outside that guard. It is never
+called by preview, ordinary adoption or a build. It initializes/verifies Barge's
+actual `barge.journal/1` plus external `barge.journal.identity/1`; a pending journal
+refuses adoption. The existing internal-first paired transaction then advances
+Oxide's owned-output fence to `/5`, preserving the numeric state floor4 and all
+unrelated fences, before publishing `oxide.outputs.registry/4` (numeric schema4)
+with an explicit bounded `settled` array. Both controls become ready afterward.
+Partial adoption refuses ordinary mutation and resumes through this explicit
+command; no missing registry is reconstructed or fence lowered.
 
-Barge053 is now published at merge
-`4069398b5dd576635e38acc221a94f580b9e23c5`, reviewed head
-`102454f91a6feffc70b24dce016fd4970007f1ef` (PR53). Its retained reviewer accepted
-source, the adequate uncounted diagnostic and separate counted author and
-reviewer A1–A16 fixtures in comment6766022020. The corrected reader/route and
-absence-only API was the prerequisite pin. Prior051/052 packets retain their own
-source and limits. These synthetic-account adapter fixtures provide no
-integrated Oxide caller, production-account or live-adoption credit.
+Registry1/2 and registry3/routes retain their historical meanings. Every
+unfinished predecessor intent must drain with its original supported build
+before adoption; this binary refuses predecessor covered recovery instead of
+choosing a local deleter. Retained settled local intent history remains readable.
+The old registry3, `/4` fence and per-operation sidecars are not silently reused
+for new operations. Older writers refuse the new registry/fence. No live store
+is assumed to have shipped either transition, and no live migration is activated.
 
 #### Connected caller and recovery source (oxide#304)
 
-Delegation starts only after the explicit `/4` + registry3 upgrade. Historical
-schema1/2 and `/3` retain their existing local meaning. In the upgraded store,
-the complete existing candidate/group checks and exact `/2` marker image
-choose the Barge route; selected, legacy, receiptless, local and known
-superseded-generation classes retain their existing handling. Unregistered,
-non-expendable or undeclared authority does not turn a Barge candidate local.
-Preview records the deleter and a bounded per-root unavailable reason, with
-no execute or upgrade. The real call reads the original grant once before
-publication custody, persists ready or tagged-unavailable metadata, and
-publishes intent plus route together. It drops publication before Barge,
-retaining the checkout barrier and binding. Unavailable/unknown keeps pending
-with exit3 and a recovery line naming operation and root.
+The caller pins Barge059's published merge
+`8efd3452fcced9b5b322eb3f7ba0ac794244fc82`, tree
+`07147ae958bae5744a0fabbdbcd9db8bc2599152`, equal to its accepted native head
+`b09ce942cb9bfc4936034d91190a16be71f17e1a`. It includes qualified058's journal
+(published `0e8dd90a031454b8b7319b27d70bd63474c69977`, accepted native
+`ddea813a7e0010cbdc40402056c72c86d81ea262`) and the qualified shared listing.
+Those are prerequisite fixture evidence, never integrated Oxide or production
+account qualification. Barge remains a pinned library, read-only from Oxide.
 
-`prune_barge.rs` calls the pinned adapter, checked four-state lookup and
-absence-only API. Recovery takes its route before inspecting local phases;
-local quarantine, deletion and rollback also refuse Barge routes directly.
-Pending lookup replays the same request and checks the returned Barge id;
-terminal settlement confirms that id and positively absent original/local
-and matching Barge leaves. Caller ids never stand in for Barge ids.
-A refused or rolled-back adapter reply needs positive absence and original
-identity before Oxide rollback. Only the first immediately published call
-may use KnownNoEffectLocked without that lookup; the privilege is consumed
-before the call, including a lost reply. Resumed Locked remains pending.
-Both resolve prechecks require terminal or positively absent Barge state;
-terminal lookup additionally requires the actual Barge quarantine absent.
-Missing/corrupt metadata refuses without journal changes.
+Covered roots branch before Oxide's local intent/quarantine code. Oxide retains
+complete non-selected eligibility, receipt/history, exact marker/owner/nonce,
+checkout absence, volume/grant and writer safeguards. A fresh guarded verdict
+captures the original bounded typed payload, receipt SHA, registry revision,
+grant generation, key and fixed terminal time. Group size is at most6 and payload
+at most2560 bytes; Barge additionally enforces its4096-byte whole-record bound.
+Unsupported size refuses before begin without truncation. A full retained domain
+settlement set refuses before begin; exhaustion during an in-flight operation
+leaves finalization owed, never evicts another fact.
 
-Barge alone handles rename and partial deletion. Oxide retains its group,
-receipt preimage and writer/absence checks, then uses the existing terminal,
-receipt image and receipt-settled ordering. A failed receipt stays
-recoverable; a durable Oxide terminal record completes only its remaining
-receipt work. Route compaction follows intent compaction; request files
-remain retained, including after rollback and settlement. No Barge journal
-is read or rewritten by Oxide.
+Publication/admission is released before `begin_checked_delegated`, execution,
+cancellation or replay waits for Barge. The real clean checkout barrier and
+binding remain held across verdict, begin, guarded re-affirmation and effect.
+Re-affirmation freshly checks the complete original group, receipt, marker,
+checkout-volume binding, absence and both pools' writer custody. Changed facts
+permit only Barge's positively proven pre-effect retained cancellation; Locked
+alone proves nothing. Resumption reconstructs the exact original public
+`BeginRequest` from the checked record, including declaration and absence, never
+from a replacement grant or a parsed journal file. Post-capture replay and
+positive `removed` evidence belong solely to Barge. An unlink without durable
+removed publication remains unknown.
 
-Default calls use Barge's production AccountFacts and account state path.
-Only the existing guarded debug proof context can supply its fixture state
-path; the linked proof-account feature is off by default. Synthetic-account
-and native integrated qualification remain separate from source regressions.
-No native/image/staging or live upgrade/adoption was run for this source.
-
+All six registry-writer surfaces use one common fail-fast consult immediately
+before their guarded publication: adopt, command binding, reservation, local
+intent publication, settlement revisions and registry-intent compaction. Changed
+row pairs and live root references scope the conflicts. Receipt publication also
+projects its checkout when rows compare equal, because receipt bytes may change
+independently. Compaction refuses any pending delegated record. Missing, busy,
+gapped, over-cap or unsupported journal observations refuse; there is no wait or
+empty fallback under admission. The current API's opaque `FinalizationContext`
+exempts only its exact dispatch-minted owed operation during settlement, while
+all other conflicts still apply. Already-complete context permits no publication.
 
 #### Domain verification preparation for single authority
 
-Tom decision `1735df31-7cc1-4748-9f8a-0767ee6259ff` v2 selects Barge-owned
-progress and repeatable Oxide domain settlement on disposable fixtures. The
-current caller still uses the historical two-journal protocol above. Its private
-`verify_domain_group` now checks the complete exact member set, recorded row
-facts, foreign live references and actual receipt independently of intent lookup.
-The existing wrapper retains durable-intent equality, the same pruning/preimage
-expectations, clean barrier/binding and runtime custody and absence checks.
-The verifier acquires no lock; current call sites and publication boundaries are
-unchanged. Future guarded settlement must supply its freshly read complete
-revision and may not cache this verdict across guard release. Explicit
-duplicate-member refusal also protects direct checker inputs; validated registry
-behavior is unchanged.
+The prepared `verify_domain_group` is consumed by the new re-affirmation and
+finalization paths. Every guarded domain revision reads the registry and actual
+receipt again; no verdict crosses guard release. The complete nonempty member
+set must match exactly, including each member's flags, generation, nonce, inode,
+marker digest, checkout/receipt paths, root kind and UUID. Original checkout-volume
+identity is also bound. Per-row recorded `root_dev` is excluded because a remount
+can renumber that observation; inode, volume UUID and marker identity remain.
+Missing, partial, extra, duplicated or recreated members and other checkouts'
+live references refuse. The receipt must retain its original byte SHA, be
+non-pruning and place none of this root. The released-root receipt stays read-only.
 
-Ordinary regressions exercise this checker with private receipt files and no
-journal, including changed fields, partial/absent groups, live foreign references,
-receipt placement/transition and byte-pin refusals. They establish no runtime
-custody or native qualification. The old covered route, sidecars and recovery
-remain until the actual published, qualified Barge operation journal and checked
-coordinator/hooks are available. This preparation adds no Barge interface,
-format, dependency, settlement write or runtime effect. Integrated diagnostics,
-counted sessions, image closure and live adoption remain separately held; all
-failed sessions and retained image obligations remain historical facts.
+One typed linked handler (`oxide.outputs.settle`, version1) first marks exactly
+those rows with the original fixed terminal time. In its next guarded revision
+it re-verifies the whole set and receipt, then removes exactly those rows **and**
+appends the operation's settlement fact in the same atomic registry image.
+Facts bind caller/key, checkout/root/nonce, request SHA, outcome and terminal
+time. The256-entry retained set is append-only and never compacted or evicted.
+Absent rows alone or diagnostic tombstones never acknowledge a hook. All-absent
+acknowledgement requires this exact fact; conflicting/recreated rows stay owed.
+Lost acknowledgements and concurrent dispatchers reuse that fact without another
+domain revision. Momentary journal contention may refuse a dispatcher immediately.
+
+| Removed covered-path machinery | Current responsibility |
+| --- | --- |
+| Oxide prune-intent plus route publication and immutable Ready/Unavailable sidecars | One Barge operation record owns progress, original binding and owed finalization |
+| `prune_request.rs`, RequestStore and its library/capture exports | Bounded typed original payload in Barge; no third file/journal |
+| Four-state adapter/absence-only lookup and first-call Locked privilege | Checked begin/state/replay/cancellation APIs with original authority |
+| Dual Barge resolve prechecks and old adapter observation scaffold | Explicit checked caller drain and linked handler |
+| Per-operation paired-format orchestration | One-time fixture adoption; ordinary local legacy journals remain |
+
+Added costs are explicit: gapless journal reads and mutable watermark/static
+identity, six scoped writer consults, a guarded re-affirmation, two domain
+settlement revisions, an atomic retained settlement entry and contention
+refusals. These are safety/availability constraints, not measured speed or
+simplicity gains. Barge's older generic reference reader conservatively refuses
+an unknown Oxide format; it is not substituted for this checked coordinator.
 
 #### Integrated delegation proof readiness (oxide#304)
 
-The focused selectors are `proof:outputs-delegation:test` (source/oracle and bounded local-file
-controls, with no child/engine/seed/image effects), `proof:outputs-delegation:plan` (bounded read-only input metadata),
-`rust:compile:outputs-delegation` (the staging account feature through Oxide),
-and the separately activated heavy `rust:outputs-delegation:diagnostic` and
-`rust:outputs-delegation`. Both heavy selectors use the unchanged qualified
-`fcfda2b0…` supervisor, one 128 MiB owners-on APFS image, prospective600s /512MiB and a
-30 s work-stop margin. Declaring these selectors activates no native run.
+The current apparatus uses actual `barge.operation/1` records, original absence
+and declaration authority, atomic settlement facts and acknowledged hooks. Its
+fixed new-protocol case map is printed by `proof:outputs-delegation:plan`; old
+sidecar, four-state and same-call tests are removed rather than re-labelled.
+Cases cover positive grouped deletion and selected/legacy boundaries, authority
+changes, real held/unknown pool custody, busy begin, pre-effect and post-capture
+replay, unlink/publication gaps, domain marking/removal/lost-ack boundaries,
+changed groups/receipt, journal integrity and partial adoption. Ordinary tests
+add actual dispatcher/context, concurrent dispatcher and scoped publication
+controls on private journal/receipt files. Crafted terminal-record premises in
+those tests are labelled domain fixtures, never deletion or custody evidence.
 
-The fixed script composes existing source-archive verification, the bounded
-lock seeder, child runner and image-custody primitives. It stages the exact
-clean tree inside the guard with installed Rust 1.97.1, locked/offline Cargo,
-private HOME/CARGO_HOME and explicit `barge/proof-synthetic-account`. Before
-fixture writes, the debug fixture entry requires Oxide and Barge account
-paths to agree inside that guard, checks its private backing declaration,
-and binds the image's kernel UUID. Ordinary calls keep the feature off.
-Stage inputs, tool/binary/lock/source hashes, partial outputs and bounded
-per-case failures are retained. There is no Barge journal parser: fixture
-observations use Barge's typed public reader; only fixture fault cases move
-an owned journal directory aside, unchanged, to model lost state.
+The default-off `outputs-operation-proof` feature enables only Barge's existing
+proof-journal phase faults under the current qualified guard. The staged fixture
+also enables Barge's proof-synthetic-account feature; production account lookup
+remains unproved. The ordinary feature compile selector checks that exact
+combination. Existing native selectors remain separately activated; neither
+self-check nor plan starts a child engine, seed, stage or image. Their meaningful
+external-boundary controls still enter actual helper, environment/World,
+publication, staging/sealing, permission and default image-custody composition.
 
-Case bodies exercise the real commands and default adapter, including grouped
-delete/settlement, selected roots, identity and grant refusals, unavailable
-previews versus pending real calls, actual held writers and busy custody
-admission in each pool, competing adopt/Barge locks, lost/malformed replies,
-first/resumed Locked, both replay entry points, replacement/lost state,
-resolve refusals, immutable metadata failures and generic host release.
-Transparent debug descriptor wrappers pause real effects after the actual
-Barge intent, rename sync or first unlink. Parent-owned children are observed
-at that durable point and positively reaped after interruption. Additional
-pauses cover original-request publication, Oxide intent/terminal/receipt
-settlement and the five paired-upgrade publication boundaries. A history
-receipt whose current successor is unchanged takes the existing no-rewrite
-settlement branch; that observation is not a claim of publishing another
-receipt image. Before effects, the proof independently captures both old
-members and both selected successor rows. After settlement it requires the
-old members and completed intent to be absent from the live registry and the
-successor rows to match that capture. An omitted empty intent list is the
-actual serde representation of an empty list. Fresh first-call Locked must
-report the all-kept exit2, an actual KnownNoEffectLocked reply, unchanged
-physical roots, no Barge intent/effect and no pending Oxide exclusion. Pure
-controls reject retained pruned rows, incomplete groups, changed successors,
-remaining intents and the old success-exit expectation before native use.
-No source test or final-row match earns native credit.
+Future native bounds remain600s/512MiB, one fresh128MiB APFS image on owned Stash,
+the original30s work/closure margin and170s stage ceiling. All nine printed
+premises remain required: installed absolute Rust1.97.1 tools before private HOME,
+one private account-home route shared with Barge, inherited-setting isolation
+with genuine admission context retained, actual guarded fixture/adoption,
+locked/offline argv, owners-on image identity, consistent flags, owned scratch/TMP
+and explicit macOS mktemp. Phased accounting stays448MiB all-owned preparation
+plus64MiB margin, then at most288MiB retained plus128MiB image,32MiB growth and
+64MiB margin. Sealing follows positive producer closure; only its own identity-
+bound fresh compilation target is disposed. The sealed executable/source/seed/
+provenance remain bound to that occurrence. No new supervisor or larger cap.
 
-All nine workflow premises are applied in the executable preparation and
-environments and listed by the plan. Genuine Nucleus admission remains
-inherited. Image custody is published before backing creation; detach is
-requested only after known child closure, then the independent guard must
-prove ordinary detach/reap and whole-backing absence. Unknown child, writer
-or image custody aborts and retains resources. Diagnostic continuation is
-limited to classified oracle failures after child closure; failed worlds
-remain retained. Missing or incomplete final reports fail.
-
-The historical simultaneous allocation was 128 MiB seed, 160 MiB source/target, 128 MiB
-image, 32 MiB fixtures/evidence and 64 MiB margin. Read-only cache metadata
-found about 35.8 MiB of admissible candidates plus registry inputs; a roughly
-2.73 GiB candidate is skipped by the existing seeder before copying. These
-are source-readiness observations, not measured staging, native runtime or
-peak RSS. The original45/170/55/30s allocation failed to fit the partial
-run; the v19 amendment below prospectively replaces it with45/170/355/30s. Actual native fit and every integrated outcome remain unproved
-until the separately planner-activated diagnostic and counted sessions.
-
-Two caller corrections accompany this readiness work: profile receipt writes
-preserve registry3 after upgrade, and an authenticated raw pending Barge route
-with unreadable original metadata reports exit3 with operation/root while
-leaving exclusion unchanged. Neither path repairs metadata, chooses a current
-replacement grant or falls back to local deletion.
-
-
-**Historical executable prerequisite: deciding checkout-volume absence.** Source
-inspection of published Barge `4069398b…` found that `oxide_outputs.rs`
-1275–1283 calls `prove_checkout_absent` without a checkout-volume identity.
-At 1304–1321, any mount-parent prefix is an unconditional `UnknownState`;
-only the boot-data branch can prove absence. Its `OxideIntentIdentity` has no
-checkout-volume field. Although the `/2` marker carries
-`checkout_volume_uuid`, the deciding adapter call does not use it. Thus the
-approved all-Stash fixture cannot produce positive actual adapter deletion
-or replay. This finding does not invalidate or extend PR53's original A1–A16
-synthetic-account evidence.
-
-Retained reviewer `571ea642-ef37-4c64-b30b-b44bae3739dc` confirmed this exact
-source conflict in Nucleus answer
-`bea8c7e7ce76f9f1a5c556233ad0536848b0c37145ffefe7cd8d5736e390c5d2`:
-request a linked Barge correction using the verified digest-bound marker's
-checkout volume for deciding F2 and replay; preserve strict Oxide intent/1
-and conservative unknown. The correction needs actual adapter/replay
-observations for matching, missing, mismatched and changed volume facts.
-No boot-volume substitution, alternate evaluator, journal parsing or guessed
-API is a workaround. At that source, the proof plan reported `execution_ready: false`,
-with a named refusal before staging or backing creation. Source preparation
-is retained on the same task/PR; qualification waits for reviewed published
-Barge code and evidence, followed by this task's separate activation gates.
-
-
-The deciding F2/replay prerequisite was linked as Barge054, task
-`36cd1a04-a367-411a-bff5-abf2810f1034`. Its actual reviewed published source
-and accepted evidence must be bound before removing the integrated execution
-gate; dispatch alone grants no API, staging, image or native credit.
-
+The new-protocol timing allocation is prospective; positive/full recovery fit is
+unmeasured. Source, ordinary regressions, local controls and a ready plan give no
+native credit. Exact-head independent readiness, an adequate uncounted diagnostic,
+counted author, distinct retained-reviewer native, ordinary image closure,
+separate completed joined deciding/final group closure and final owner judgment
+remain release gates. No native, installation, live adoption or retained-resource
+cleanup follows from source work. The historical sections below preserve their
+original two-journal sources, failed sessions and limits; they do not describe
+the current caller or transfer qualification to it.
 
 #### Completed F2 binding and current source readiness (oxide#304)
 

@@ -2811,7 +2811,7 @@ impl Store {
             if initialization.transaction() != transaction
                 || !matches!(
                     state.owned_outputs.as_deref(),
-                    Some(OWNED_OUTPUTS_FENCE | DELEGATED_OUTPUTS_FENCE)
+                    Some(OWNED_OUTPUTS_FENCE | DELEGATED_OUTPUTS_FENCE | COORDINATED_OUTPUTS_FENCE)
                 )
                 || (state.owned_outputs.as_deref() == Some(OWNED_OUTPUTS_FENCE)
                     && !matches!(initialization, OutputsInit::Ready { .. }))
@@ -2825,7 +2825,7 @@ impl Store {
         }
         if let Some(second) = &second {
             let delegated =
-                |state: &State| state.owned_outputs.as_deref() == Some(DELEGATED_OUTPUTS_FENCE);
+                |state: &State| state.owned_outputs.as_deref() == Some(COORDINATED_OUTPUTS_FENCE);
             let ready =
                 |state: &State| matches!(state.outputs_init, Some(OutputsInit::Ready { .. }));
             if (!delegated(&first) && delegated(second))
@@ -2841,8 +2841,8 @@ impl Store {
         for (side, state) in
             std::iter::once((&internal, &mut first)).chain(sibling.as_ref().zip(second.as_mut()))
         {
-            if state.owned_outputs.as_deref() != Some(DELEGATED_OUTPUTS_FENCE) {
-                state.owned_outputs = Some(DELEGATED_OUTPUTS_FENCE.to_owned());
+            if state.owned_outputs.as_deref() != Some(COORDINATED_OUTPUTS_FENCE) {
+                state.owned_outputs = Some(COORDINATED_OUTPUTS_FENCE.to_owned());
                 state.outputs_init = Some(OutputsInit::Initializing {
                     transaction: transaction.clone(),
                     started_ms: process::now_ms(),
@@ -2859,7 +2859,7 @@ impl Store {
                 )?;
             }
         }
-        // Both /4 fences are synced before the atomic schema-3 image. On a
+        // Both /5 fences are synced before the atomic registry/4 image. On a
         // failure leave every fence/initializer in place; the same call resumes.
         registry(&transaction, true)?;
         crate::prune::recovery_upgrade_pause(&control, &transaction, "registry")?;
@@ -2922,7 +2922,10 @@ impl Store {
                 transaction: recorded,
                 ..
             }) => {
-                if internal_state.owned_outputs.as_deref() == Some(DELEGATED_OUTPUTS_FENCE) {
+                if matches!(
+                    internal_state.owned_outputs.as_deref(),
+                    Some(DELEGATED_OUTPUTS_FENCE | COORDINATED_OUTPUTS_FENCE)
+                ) {
                     // load() already proved paired /4 readiness and the exact
                     // schema3 image. This path validates; it never downgrades.
                     create(&recorded, false)?;
@@ -5661,7 +5664,7 @@ impl Store {
             let (owner, _) = self.recovery_controls();
             crate::prune::refuse_delegated_without_fence(&owner)?;
         }
-        if state.owned_outputs.as_deref() == Some(DELEGATED_OUTPUTS_FENCE) {
+        if state.owned_outputs.as_deref() == Some(COORDINATED_OUTPUTS_FENCE) {
             let Some(OutputsInit::Ready { transaction, .. }) = &state.outputs_init else {
                 return Err(
                     "output recovery upgrade is incomplete; resume oxide outputs upgrade-recovery"
@@ -5674,7 +5677,7 @@ impl Store {
                     continue;
                 }
                 let paired = self.view(control).load_recovery_upgrade()?;
-                if paired.owned_outputs.as_deref() != Some(DELEGATED_OUTPUTS_FENCE)
+                if paired.owned_outputs.as_deref() != Some(COORDINATED_OUTPUTS_FENCE)
                     || !matches!(&paired.outputs_init, Some(OutputsInit::Ready { transaction: other, .. }) if other == transaction)
                 {
                     return Err("the paired output recovery upgrade is incomplete; resume oxide outputs upgrade-recovery".to_owned());
@@ -5718,7 +5721,7 @@ impl Store {
         // build ran (oxide#129). A legacy state is validated against the new
         // fields and object caps first; an oversized legacy field refuses
         // with the original file untouched.
-        if state.owned_outputs.as_deref() != Some(DELEGATED_OUTPUTS_FENCE) {
+        if state.owned_outputs.as_deref() != Some(COORDINATED_OUTPUTS_FENCE) {
             let (owner, peer) = self.recovery_controls();
             for control in std::iter::once(&owner).chain(peer.as_ref()) {
                 if control == &self.control {
@@ -5729,7 +5732,7 @@ impl Store {
                     .load_recovery_upgrade()?
                     .owned_outputs
                     .as_deref()
-                    == Some(DELEGATED_OUTPUTS_FENCE)
+                    == Some(COORDINATED_OUTPUTS_FENCE)
                 {
                     return Err("the paired pool is upgrading delegated recovery; ordinary mutation refuses".to_owned());
                 }
@@ -5746,7 +5749,7 @@ impl Store {
         let holding = fenced.holding.is_some();
         let successor = matches!(
             fenced.owned_outputs.as_deref(),
-            Some(OWNED_OUTPUTS_FENCE | DELEGATED_OUTPUTS_FENCE)
+            Some(OWNED_OUTPUTS_FENCE | DELEGATED_OUTPUTS_FENCE | COORDINATED_OUTPUTS_FENCE)
         );
         let previous = fenced.outputs_init.is_some()
             || fenced.owned_outputs.as_deref() == Some(LEGACY_OWNED_OUTPUTS_FENCE);
@@ -7898,30 +7901,30 @@ pub(crate) mod tests {
             ),
             (
                 "internal-fence",
-                DELEGATED_OUTPUTS_FENCE,
+                COORDINATED_OUTPUTS_FENCE,
                 false,
                 OWNED_OUTPUTS_FENCE,
                 true,
             ),
             (
                 "paired-fence",
-                DELEGATED_OUTPUTS_FENCE,
+                COORDINATED_OUTPUTS_FENCE,
                 false,
-                DELEGATED_OUTPUTS_FENCE,
+                COORDINATED_OUTPUTS_FENCE,
                 false,
             ),
             (
                 "internal-ready",
-                DELEGATED_OUTPUTS_FENCE,
+                COORDINATED_OUTPUTS_FENCE,
                 true,
-                DELEGATED_OUTPUTS_FENCE,
+                COORDINATED_OUTPUTS_FENCE,
                 false,
             ),
             (
                 "all-ready",
-                DELEGATED_OUTPUTS_FENCE,
+                COORDINATED_OUTPUTS_FENCE,
                 true,
-                DELEGATED_OUTPUTS_FENCE,
+                COORDINATED_OUTPUTS_FENCE,
                 true,
             ),
         ] {
@@ -7931,7 +7934,7 @@ pub(crate) mod tests {
                 (&paired, second_fence, second_ready),
             ] {
                 let mut state = State {
-                    owned_outputs: Some(DELEGATED_OUTPUTS_FENCE.to_owned()),
+                    owned_outputs: Some(COORDINATED_OUTPUTS_FENCE.to_owned()),
                     outputs_init: Some(if ready {
                         OutputsInit::Ready {
                             transaction: "a".repeat(32),
@@ -7950,7 +7953,7 @@ pub(crate) mod tests {
                     ..State::default()
                 };
                 // Seed exact crash images directly: no ordinary writer is
-                // allowed to restore the historical string after /4 exists.
+                // allowed to restore the historical string after /5 exists.
                 state.owned_outputs = Some(fence.to_owned());
                 state.version = HOLDING_STATE_VERSION;
                 validate_state(&state, false).unwrap();
@@ -7976,7 +7979,7 @@ pub(crate) mod tests {
                                     .unwrap()
                                     .owned_outputs
                                     .as_deref(),
-                                Some(DELEGATED_OUTPUTS_FENCE)
+                                Some(COORDINATED_OUTPUTS_FENCE)
                             );
                         }
                     }
@@ -8028,7 +8031,7 @@ pub(crate) mod tests {
             let state = side.load_recovery_upgrade().unwrap();
             assert_eq!(
                 state.owned_outputs.as_deref(),
-                Some(DELEGATED_OUTPUTS_FENCE)
+                Some(COORDINATED_OUTPUTS_FENCE)
             );
             assert!(matches!(
                 state.outputs_init,

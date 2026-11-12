@@ -119,7 +119,7 @@ def setup_failures(m,root):
         finally:proof.evidence.chmod(0o700)
         report=json.loads(out.getvalue())
         assert code==1 and report['qualified'] is False and report['detach']=='retained'
-        assert len(out.getvalue())<64*1024 and len(report['cases'])==43
+        assert len(out.getvalue())<64*1024 and len(report['cases'])==len(m.CASES)
         assert all(row['state']=='unexecuted' for row in report['cases'])
         assert [row['case'] for row in report['cases']]==list(m.CASES)
         primary='SETUP_PRIMARY' if kind in ('setup','report') else ('IsADirectoryError' if kind=='provenance' else 'SEED_PRIMARY')
@@ -472,7 +472,8 @@ def fixture_composition(m,root):
                 for path in (control,peer,old,successor):path.mkdir(parents=True,exist_ok=True)
                 data.update(root=str(old),successor=str(successor),control=str(control),peer_control=str(peer),
                     checkout=home+'/checkouts/anchor/c',uuid=image.volume_uuid,mount=image.mount,
-                    checkout_volume_uuid='synthetic-checkout-volume',checkout_ancestor_inode=1)
+                    checkout_volume_uuid='synthetic-checkout-volume',checkout_ancestor_inode=1,receipt=str(control/'synthetic-receipt.json'))
+                (control/'synthetic-receipt.json').write_text('synthetic local composition control')
                 text=json.dumps(data)
                 if mode[0]=='setup-malformed':text='[]'
             elif argv[1:4]==['outputs','__delegation-fixture','inspect']:

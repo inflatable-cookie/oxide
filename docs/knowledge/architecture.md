@@ -98,6 +98,25 @@ measurement. This ruling does not authorize volume creation or change
 uncertain lease release. If write attribution is unavailable, record it as
 unavailable; occupied-space deltas are not disk-write counts or SSD lifetime.
 
+## Covered output operations
+
+On explicitly adopted disposable fixtures, Barge's operation journal is the
+single authority for covered output deletion progress and owed finalization.
+Oxide owns complete eligibility, checkout binding and guarded repeatable domain
+settlement. Covered refusals never select the local deleter; legacy local prune
+journals retain their scope. Six registry-writer surfaces use fail-fast journal
+consults under their own publication/admission guard; no Barge lock wait occurs
+under it. Only a checked dispatch-minted own-operation context can exempt a
+settlement consult.
+
+Exact member/receipt verification precedes both domain revisions. Group removal
+and its original-bound settlement entry share one atomic registry image. Absent
+rows and diagnostic tombstones alone prove no settlement. Retention is bounded
+and append-only; unknown journal/custody, partial groups or changed references
+remain refused/owed. The [owning contract](contracts/barge-adoption.md#connected-caller-and-recovery-source-oxide304)
+records the actual API, one-time forward adoption, costs and release gates.
+This source implements no live initialization, adoption or native qualification.
+
 ## Cargo boundary
 
 Cargo's `build.build-dir` / `CARGO_BUILD_BUILD_DIR` is stable starting in Rust

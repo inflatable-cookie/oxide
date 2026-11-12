@@ -1676,7 +1676,7 @@ run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- p
 # Compile the exact staging feature through normal Oxide admission; no staging
 # or native execution. Default product covering remains unchanged.
 [tasks."rust:compile:outputs-delegation"]
-run = "oxide check --bin oxide --locked --features barge/proof-synthetic-account"
+run = "oxide check --bin oxide --locked --features outputs-operation-proof,barge/proof-synthetic-account"
 
 # 304/v5: exactly one separately authorized focused ordinary investigation.
 # This is not the held integrated Barge diagnostic or a staging/image run.

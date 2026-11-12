@@ -379,32 +379,117 @@ pub(super) fn run(args: &[OsString]) -> Result<(), String> {
         ["inspect"] => {
             let store = paired_store()?;
             let registry = read_registry_image(store.owner_control())?.ok_or("registry missing")?;
-            let intents = barge::state::read_intents(&paths()?, 256).map_err(|e| e.to_string())?;
-            if intents.truncated {
-                return Err("Barge observation truncated".into());
-            }
+            let os = barge::os::platform();
+            let paths = paths()?;
+            let mut locks = barge::state::LockSet::new(paths.clone());
+            let view = barge::operation::consult_operations(
+                &os,
+                &os,
+                &paths,
+                &mut locks,
+                barge::contract::INTENT_ROWS,
+            )
+            .map_err(|e| e.to_string())?;
+            let records = view
+                .as_ref()
+                .map(|view| view.records.as_slice())
+                .unwrap_or(&[]);
             println!(
                 "{}",
-                serde_json::json!({"oxide":registry,"barge":intents.records})
+                serde_json::json!({"oxide":registry,"barge":records,"journal_initialized":view.is_some()})
             );
             Ok(())
         }
         ["replay"] => {
+            let store = paired_store()?;
+            let roots = delegation::drain(&store, store.owner_control(), None)?;
+            println!("{}", serde_json::json!({"completed_roots": roots}));
+            Ok(())
+        }
+        ["journal-fault", kind @ ("missing" | "gap")] => {
+            let state = paths()?;
             let os = barge::os::platform();
-            let report = barge::delete::replay_pending(
-                &paths()?,
-                &os,
-                &os,
-                &os,
-                barge::delete::DeleteBounds::default(),
-                None,
+            let view =
+                barge::operation::read_operations(&os, &os, &state, barge::contract::INTENT_ROWS)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("journal missing before fault")?;
+            if *kind == "missing" {
+                fs::rename(
+                    state.operations_dir(),
+                    state.root().join("retained-operations"),
+                )
+                .map_err(|e| e.to_string())?;
+            } else {
+                let record = view
+                    .records
+                    .first()
+                    .ok_or("no record for the gap fixture")?;
+                let file = state
+                    .operations_dir()
+                    .join(format!("{}.json", record.sequence));
+                fs::rename(file, state.root().join("retained-gap-record.json"))
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        }
+        ["domain-fault", root, kind] => {
+            let store = paired_store()?;
+            let control = store.owner_control();
+            let _guard = store::publication_guard(control)?;
+            let mut registry = ready_registry(control)?;
+            let target = Path::new(root);
+            let evidence = proof_evidence().ok_or("current guard missing")?;
+            let image: serde_json::Value = serde_json::from_slice(
+                &fs::read(evidence.join("delegation-image.json")).map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string())?;
-            println!(
-                "{}",
-                serde_json::to_string(&report).map_err(|e| e.to_string())?
-            );
-            Ok(())
+            let mount = Path::new(image["mount"].as_str().ok_or("image mount missing")?);
+            let _binding = Binding::open(mount, image["volume_uuid"].as_str())?;
+            if target.parent() != Some(mount.join(outputs::EXTERNAL_DIR).as_path()) {
+                return Err("fault root escapes current image".to_owned());
+            }
+            let first = registry
+                .rows
+                .iter()
+                .position(|row| row.root == target)
+                .ok_or("fault group missing")?;
+            match *kind {
+                "partial" => {
+                    registry.rows.remove(first);
+                }
+                "absent" => registry.rows.retain(|row| row.root != target),
+                "extra" => {
+                    let mut row = registry.rows[first].clone();
+                    row.member = "extra".to_owned();
+                    registry.rows.push(row);
+                }
+                "foreign" => {
+                    let mut row = registry.rows[first].clone();
+                    row.checkout_id = "f".repeat(64);
+                    row.selected = true;
+                    registry.rows.push(row);
+                }
+                "selected" => registry.rows[first].selected = true,
+                "nonce" => registry.rows[first].nonce = Some("f".repeat(32)),
+                "receipt" => {
+                    fs::write(
+                        &registry.rows[first].receipt,
+                        b"labelled private receipt fault",
+                    )
+                    .map_err(|e| e.to_string())?;
+                    return Ok(());
+                }
+                _ => return Err("unknown domain fault".to_owned()),
+            }
+            registry.bump()?;
+            registry.validate()?;
+            let temp = registry_dir(control).join(format!(".domain-fault-{}", fresh_nonce()?));
+            write_fixture_file(
+                &temp,
+                &serde_json::to_vec(&registry).map_err(|e| e.to_string())?,
+            )?;
+            fs::rename(temp, registry_path(control)).map_err(|e| e.to_string())?;
+            sync_directory(&registry_dir(control))
         }
         ["generic-release", uuid] => {
             let os = barge::os::platform();

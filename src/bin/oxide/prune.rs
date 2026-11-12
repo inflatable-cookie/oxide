@@ -44,11 +44,10 @@ mod delegation;
 #[cfg(debug_assertions)]
 #[path = "prune_delegation_fixture.rs"]
 mod delegation_fixture;
-#[path = "prune_request.rs"]
-mod request;
 
 pub const REGISTRY_VERSION: &str = "oxide.outputs.registry/2";
 const DELEGATED_REGISTRY_VERSION: &str = "oxide.outputs.registry/3";
+const COORDINATED_REGISTRY_VERSION: &str = "oxide.outputs.registry/4";
 /// Schema 1 named only a whole `target` placement; schema 2 names one
 /// reference per profile member and is read from a version-1 document without
 /// changing its meaning.
@@ -134,6 +133,33 @@ struct Registry {
         skip_serializing_if = "Option::is_none"
     )]
     deletion_routes: Option<Vec<DeletionRoute>>,
+    #[serde(
+        default,
+        deserialize_with = "read_settlements",
+        skip_serializing_if = "Option::is_none"
+    )]
+    settled: Option<Vec<Settlement>>,
+}
+
+/// An atomic fact in the same registry image that removed the exact group.
+/// It is retained, bounded and never substituted by a diagnostic tombstone.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Settlement {
+    caller: String,
+    key: String,
+    checkout_id: String,
+    root: PathBuf,
+    nonce: Option<String>,
+    outcome: String,
+    terminal_ms: u64,
+    request_sha256: String,
+}
+fn read_settlements<'de, D>(deserializer: D) -> Result<Option<Vec<Settlement>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::deserialize(deserializer).map(Some)
 }
 
 // Wire pinned to Barge053's published stage4 contract at 9a91199b. Explicit
@@ -176,7 +202,7 @@ struct Incomplete {
 /// One live reference to an output root. Rows key by checkout, placement
 /// member and root; history rows keep `selected`/`pending` false and never
 /// grant deletion authority.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Row {
     checkout_id: String,
@@ -562,6 +588,7 @@ pub fn ensure_ready(internal: &Store, checkout: &Path) -> Result<(), String> {
 /// An explicit metadata upgrade, never called by preview or adoption. No
 /// adapter or filesystem root effect is possible here.
 fn upgrade_recovery() -> Result<u8, String> {
+    delegation::initialize_fixture_journal()?;
     let internal = paired_store()?;
     let control = internal.owner_control().to_path_buf();
     let _authority = AuthorityScope::begin()?;
@@ -584,30 +611,17 @@ fn upgrade_registry_recovery(
     if registry.created_by != transaction || !registry.complete || registry.incomplete.is_some() {
         return Err("recovery upgrade requires the same complete initialized registry".to_owned());
     }
-    if registry.version == DELEGATED_REGISTRY_VERSION {
-        request::validate_registry_requests(control, &registry)?;
+    if registry.version == COORDINATED_REGISTRY_VERSION {
         return Ok(());
     }
     if registry.intents.iter().any(|intent| !intent.settled()) {
-        return Err(
-            "settle every unfinished predecessor intent before upgrading recovery".to_owned(),
-        );
+        return Err("drain every predecessor intent with its original supported build before adopting single authority".to_owned());
     }
-    registry.version = DELEGATED_REGISTRY_VERSION.to_owned();
-    registry.schema = 3;
-    registry.revision = registry
-        .revision
-        .checked_add(1)
-        .ok_or("registry revision exhausted")?;
-    registry.deletion_routes = Some(
-        registry
-            .intents
-            .iter()
-            .map(|intent| DeletionRoute::Local {
-                intent_id: intent.id.clone(),
-            })
-            .collect(),
-    );
+    registry.version = COORDINATED_REGISTRY_VERSION.to_owned();
+    registry.schema = 4;
+    registry.bump()?;
+    registry.deletion_routes = None;
+    registry.settled = Some(Vec::new());
     registry.validate()?;
     // Validate size before publishing even the first pool fence.
     let bytes = serde_json::to_vec(&registry).map_err(|error| error.to_string())?;
@@ -766,6 +780,7 @@ fn create_or_validate_registry(
                 intents: Vec::new(),
                 cancelled_overflow: Vec::new(),
                 deletion_routes: None,
+                settled: None,
             };
             // Seed live references from the bounded committed receipts this
             // control directory already holds. Never from markers, and never
@@ -806,18 +821,24 @@ fn create_or_validate_registry(
 /// absent.
 fn read_registry(control: &Path) -> Result<Option<Registry>, String> {
     let registry = read_registry_image(control)?;
-    if let Some(registry) = &registry {
-        if registry.version == DELEGATED_REGISTRY_VERSION {
-            request::validate_registry_requests(control, registry)?;
-        }
+    if registry.as_ref().is_some_and(|image| {
+        image.version == DELEGATED_REGISTRY_VERSION
+            && image
+                .unfinished_intents()
+                .any(|intent| delegation::route(image, &intent.id).is_some())
+    }) {
+        return Err("predecessor covered operations must drain with their original supported build before adoption; no local fallback".to_owned());
     }
     Ok(registry)
 }
 
 pub(crate) fn refuse_delegated_without_fence(control: &Path) -> Result<(), String> {
-    if read_registry_image(control)?
-        .is_some_and(|registry| registry.version == DELEGATED_REGISTRY_VERSION)
-    {
+    if read_registry_image(control)?.is_some_and(|registry| {
+        matches!(
+            registry.version.as_str(),
+            DELEGATED_REGISTRY_VERSION | COORDINATED_REGISTRY_VERSION
+        )
+    }) {
         return Err("the delegated registry has no matching owned-output fence; keep pending, never reconstruct or downgrade control state".to_owned());
     }
     Ok(())
@@ -826,9 +847,9 @@ pub(crate) fn refuse_delegated_without_fence(control: &Path) -> Result<(), Strin
 pub(crate) fn recovery_format_ready(control: &Path, transaction: &str) -> Result<(), String> {
     let registry = read_registry_image(control)?
         .ok_or("the upgraded registry is absent; resume upgrade-recovery")?;
-    if registry.version != DELEGATED_REGISTRY_VERSION || registry.created_by != transaction {
+    if registry.version != COORDINATED_REGISTRY_VERSION || registry.created_by != transaction {
         return Err(
-            "the paired /4 fences have no matching schema3 registry; resume upgrade-recovery"
+            "the paired operation-adoption fences have no matching registry/4 image; resume upgrade-recovery"
                 .to_owned(),
         );
     }
@@ -927,6 +948,7 @@ fn ready_registry(control: &Path) -> Result<Registry, String> {
 impl Registry {
     fn validate(&self) -> Result<(), String> {
         let schema = match self.version.as_str() {
+            COORDINATED_REGISTRY_VERSION if self.schema == 4 => 4,
             DELEGATED_REGISTRY_VERSION if self.schema == 3 => 3,
             REGISTRY_VERSION if self.schema == REGISTRY_SCHEMA => REGISTRY_SCHEMA,
             LEGACY_REGISTRY_VERSION if self.schema == LEGACY_REGISTRY_SCHEMA => {
@@ -963,6 +985,32 @@ impl Registry {
             intent.validate()?;
         }
         self.validate_routes(schema)?;
+        if schema == 4 {
+            let settled = self
+                .settled
+                .as_ref()
+                .ok_or("the adopted registry omits its settlement set")?;
+            if settled.len() > MAX_INTENTS {
+                return Err("the retained settlement set exceeds its cap".to_owned());
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for entry in settled {
+                if entry.caller != "oxide.outputs"
+                    || !hex32(&entry.key)
+                    || !hex64(&entry.checkout_id)
+                    || !entry.root.is_absolute()
+                    || !entry.nonce.as_deref().is_some_and(hex32)
+                    || entry.outcome != "deleted"
+                    || entry.terminal_ms == 0
+                    || !hex64(&entry.request_sha256)
+                    || !seen.insert((&entry.caller, &entry.key))
+                {
+                    return Err("the retained settlement set is invalid or repeated".to_owned());
+                }
+            }
+        } else if self.settled.is_some() {
+            return Err("a predecessor registry cannot carry settlement facts".to_owned());
+        }
         Ok(())
     }
 
@@ -1159,6 +1207,11 @@ pub fn unsettled_for(control: &Path, checkout_id: &str) -> Result<Option<String>
     let Some(registry) = read_registry(control)? else {
         return Ok(None);
     };
+    if registry.version == COORDINATED_REGISTRY_VERSION {
+        if let Some(key) = delegation::unsettled(checkout_id)? {
+            return Ok(Some(key));
+        }
+    }
     let found = registry
         .unfinished_intents()
         .find(|intent| intent.identity.checkout_id == checkout_id)
@@ -1215,7 +1268,7 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
         row.pending = false;
     }
     note_reservation(&mut registry, receipt, &receipt_path, checkout_volume_uuid)?;
-    write_registry(control, &registry)
+    publish_registry(control, &registry, None, Some(&checkout_id))
 }
 
 /// Publish one placement's selected and proposed references.
@@ -1737,7 +1790,31 @@ fn volume_uuid_of(path: &Path) -> Result<Option<String>, String> {
 }
 
 fn write_registry(control: &Path, registry: &Registry) -> Result<(), String> {
+    publish_registry(control, registry, None, None)
+}
+fn write_registry_with_context(
+    control: &Path,
+    registry: &Registry,
+    context: Option<(
+        &barge::state::StatePaths,
+        &barge::operation::FinalizationContext,
+    )>,
+) -> Result<(), String> {
+    publish_registry(control, registry, context, None)
+}
+fn publish_registry(
+    control: &Path,
+    registry: &Registry,
+    context: Option<(
+        &barge::state::StatePaths,
+        &barge::operation::FinalizationContext,
+    )>,
+    receipt_checkout: Option<&str>,
+) -> Result<(), String> {
     registry.validate()?;
+    if let Some(previous) = read_registry_image(control)? {
+        delegation::consult_publication(control, &previous, registry, context, receipt_checkout)?;
+    }
     let directory = registry_dir(control);
     ensure_private_dir(&directory)?;
     let bytes = serde_json::to_vec(registry).map_err(|error| error.to_string())?;
@@ -2464,7 +2541,14 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
     // pre-intent selection, which is not a completion: its root stays in
     // the plan and is re-evaluated below like any other candidate.
     let pending: Vec<Intent> = registry.unfinished_intents().cloned().collect();
-    let mut completed_roots = Vec::new();
+    let mut completed_roots = if registry.version == COORDINATED_REGISTRY_VERSION {
+        match delegation::drain(&store, &control, None) {
+            Ok(roots) => roots,
+            Err(reason) => return Ok(unsettled(&control, &reason)),
+        }
+    } else {
+        Vec::new()
+    };
     let mut rolled_back = 0usize;
     for intent in &pending {
         let planned = preview.candidates.iter().any(|candidate| {
@@ -3363,7 +3447,7 @@ fn evaluate(
             if candidate.deleter.as_deref() == Some("barge") {
                 candidate.barge_unavailable = delegation::grant(candidate)
                     .err()
-                    .map(|reason| request::bounded_reason(&reason));
+                    .map(|reason| delegation::bounded_reason(&reason));
             }
         }
     }
@@ -6505,34 +6589,6 @@ pub(crate) fn recovery_upgrade_pause(
     Ok(())
 }
 
-/// Guarded interruption seam: a parent observes the real durable image before
-/// terminating its own child. It grants no effect or recovery authority.
-fn delegation_pause(control: &Path, intent: &Intent, phase: &str) -> Result<(), String> {
-    #[cfg(debug_assertions)]
-    if std::env::var("OXIDE_TEST_BARGE_OXIDE_PHASE").as_deref() == Ok(phase)
-        && prune_fixture_fault(
-            control,
-            "OXIDE_TEST_BARGE_OXIDE_PAUSE",
-            &intent.identity.root,
-            &format!("oxide-{phase}-{}", intent.id),
-        )
-    {
-        let evidence = proof_evidence().ok_or("proof evidence missing")?;
-        let stop = Instant::now() + Duration::from_secs(5);
-        while !evidence
-            .join(format!("oxide-phase-release-{}", intent.id))
-            .exists()
-        {
-            if Instant::now() >= stop {
-                return Err("bounded Oxide durable-point pause expired".into());
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-    let _ = (control, intent, phase);
-    Ok(())
-}
-
 fn crash_point(point: &str) -> Result<(), String> {
     #[cfg(debug_assertions)]
     if std::env::var(CRASH_ENVIRONMENT).is_ok_and(|value| value == point) {
@@ -6580,6 +6636,9 @@ fn prune_one(
     store
         .abandon_clean(guard)
         .map_err(|error| Stop::Pending(format!("cannot release the clean barrier: {error}")))?;
+    if candidate.deleter.as_deref() == Some("barge") && matches!(outcome, Ok(true)) {
+        delegation::drain(store, control, None).map_err(Stop::Pending)?;
+    }
     outcome
 }
 
@@ -6594,6 +6653,10 @@ fn prune_one_barrier(
     let _binding = store
         .lock_binding(&candidate.checkout)
         .map_err(Stop::Refuse)?;
+    if candidate.deleter.as_deref() == Some("barge") {
+        return delegation::fresh(store, control, candidate, plan_sha, list, evidence)
+            .map_err(Stop::Pending);
+    }
     // Everything up to the journal is a per-root refusal: the root, its
     // registry row and every receipt are unchanged. This first ancestry proof
     // runs under the clean barrier and binding and is an EARLY refusal only;
@@ -6615,8 +6678,6 @@ fn prune_one_barrier(
     // The locked full reread of this root's authority, then a revision
     // compare-and-set at the journal write. A revision change in between
     // gets one bounded reread; a second change keeps the root.
-    let delegated = candidate.deleter.as_deref() == Some("barge");
-    let authority = delegated.then(|| delegation::grant(candidate));
     let mut attempts = 0;
     loop {
         let revision = if candidate.receiptless {
@@ -6688,28 +6749,15 @@ fn prune_one_barrier(
         } else {
             revision
         };
-        let published = if let Some(authority) = &authority {
-            journal_intent_with_route(
-                store,
-                control,
-                candidate,
-                plan_sha,
-                &id,
-                &quarantine,
-                revision,
-                Some(authority),
-            )
-        } else {
-            journal_intent(
-                store,
-                control,
-                candidate,
-                plan_sha,
-                &id,
-                &quarantine,
-                revision,
-            )
-        };
+        let published = journal_intent(
+            store,
+            control,
+            candidate,
+            plan_sha,
+            &id,
+            &quarantine,
+            revision,
+        );
         if candidate.receiptless && matches!(published, Ok(false) | Err(Stop::Refuse(_))) {
             outputs::discard_pruning_receipt(control, &candidate.checkout, &candidate.checkout_id, &id)
                 .map_err(|error| {
@@ -6730,19 +6778,9 @@ fn prune_one_barrier(
             ));
         }
     }
-    if delegated {
-        let registry = ready_registry(control).map_err(Stop::Pending)?;
-        let intent = registry
-            .intent(&id)
-            .ok_or_else(|| Stop::Pending(format!("operation {id} disappeared; keep pending")))?;
-        delegation::fresh(store, control, intent)
-            .map(|result| matches!(result, Resumed::Completed))
-            .map_err(Stop::Pending)
-    } else {
-        prune_journaled(store, control, &session, &id)
-            .map(|()| true)
-            .map_err(after_journal)
-    }
+    prune_journaled(store, control, &session, &id)
+        .map(|()| true)
+        .map_err(after_journal)
 }
 
 /// Under the checkout's barrier and binding lock: reread the ready registry
@@ -7103,28 +7141,6 @@ fn journal_intent(
     quarantine: &Path,
     expected_revision: u64,
 ) -> Result<bool, Stop> {
-    journal_intent_with_route(
-        _store,
-        control,
-        candidate,
-        plan_sha,
-        id,
-        quarantine,
-        expected_revision,
-        None,
-    )
-}
-
-fn journal_intent_with_route(
-    _store: &Store,
-    control: &Path,
-    candidate: &Candidate,
-    plan_sha: &str,
-    id: &str,
-    quarantine: &Path,
-    expected_revision: u64,
-    authority: Option<&Result<u64, String>>,
-) -> Result<bool, Stop> {
     let _guard = store::publication_guard(control).map_err(Stop::Refuse)?;
     let mut registry = ready_registry(control).map_err(Stop::Refuse)?;
     registry.validate().map_err(Stop::Refuse)?;
@@ -7137,8 +7153,7 @@ fn journal_intent_with_route(
         ));
     }
     let covered = delegation::covered(&registry, candidate).map_err(Stop::Refuse)?;
-    if covered != authority.is_some() || (candidate.deleter.as_deref() == Some("barge")) != covered
-    {
+    if covered || candidate.deleter.as_deref() == Some("barge") {
         return Err(Stop::Refuse(
             "the deciding deleter choice changed; make a fresh preview".to_owned(),
         ));
@@ -7265,41 +7280,10 @@ fn journal_intent_with_route(
         expected_terminal_sha: None,
         terminal_ms: None,
     });
-    let intent = registry
-        .intent(id)
-        .ok_or_else(|| Stop::Refuse("the new intent disappeared".to_owned()))?;
-    let route = if let Some(authority) = authority {
-        if registry.version != DELEGATED_REGISTRY_VERSION {
-            return Err(Stop::Refuse(
-                "Barge delegation requires the explicit recovery-format upgrade".to_owned(),
-            ));
-        }
-        let bytes = request::encode(intent, authority).map_err(Stop::Refuse)?;
-        let fd = store::open_control_directory(control)
-            .map_err(Stop::Refuse)?
-            .ok_or_else(|| Stop::Refuse("the delegated control is absent".to_owned()))?;
-        let outputs = open_directory_at(fd.as_fd(), c"outputs")
-            .map_err(|error| Stop::Refuse(error.to_string()))?;
-        let requests =
-            oxide_storage::output_request_store::RequestStore::open(outputs.as_fd(), true)
-                .map_err(|error| Stop::Refuse(error.to_string()))?;
-        let sha = requests.publish(id, &bytes).map_err(|error| Stop::Pending(format!(
-            "operation {id} for {}: original request publication is uncertain ({error}); retain metadata and inspect before recovery",
-            candidate.root.display()
-        )))?;
-        delegation_pause(control, &intent, "request").map_err(Stop::Pending)?;
-        crash_point("delegation-request").map_err(Stop::Pending)?;
-        DeletionRoute::Barge {
-            intent_id: id.to_owned(),
-            request_sha256: sha,
-        }
-    } else {
-        DeletionRoute::Local {
-            intent_id: id.to_owned(),
-        }
-    };
     if let Some(routes) = &mut registry.deletion_routes {
-        routes.push(route);
+        routes.push(DeletionRoute::Local {
+            intent_id: id.to_owned(),
+        });
     }
     registry.bump().map_err(Stop::Refuse)?;
     // A failed publication may still have landed: the journal is then an
@@ -7396,9 +7380,6 @@ fn complete_intent(_store: &Store, control: &Path, id: &str, outcome: &str) -> R
     #[cfg(debug_assertions)]
     if std::env::var("OXIDE_TEST_BARGE_OXIDE_PHASE").as_deref() == Ok("terminal") {
         let registry = ready_registry(control).map_err(Stop::Pending)?;
-        if let Some(intent) = registry.intent(id) {
-            delegation_pause(control, intent, "terminal").map_err(Stop::Pending)?;
-        }
     }
     crash_point("terminal").map_err(Stop::Pending)?;
     settle_receipt(control, id, outcome).map_err(Stop::Pending)
@@ -7541,7 +7522,6 @@ fn settle_receipt(control: &Path, id: &str, outcome: &str) -> Result<(), String>
         // pre-settlement meaning.
         crash_point("terminal-image")?;
     }
-    delegation_pause(control, &intent, "receipt")?;
     {
         let _guard = store::publication_guard(control)?;
         let mut registry = ready_registry(control)?;
@@ -7723,7 +7703,10 @@ fn under_checkout_barrier<T>(
 fn resume_intent(store: &Store, control: &Path, intent: &Intent) -> Result<Resumed, String> {
     let registry = ready_registry(control)?;
     if delegation::route(&registry, &intent.id).is_some() {
-        return delegation::resume(store, control, intent);
+        return Err(
+            "predecessor covered recovery requires its original supported build; no local fallback"
+                .to_owned(),
+        );
     }
     match intent.phase {
         IntentPhase::Deleted => {
@@ -8370,6 +8353,13 @@ fn resolve_intent(id: &str) -> Result<u8, String> {
         Ok(registry) => registry,
         Err(reason) => return Ok(refused(&reason)),
     };
+    if registry.version == COORDINATED_REGISTRY_VERSION && registry.intent(id).is_none() {
+        return match delegation::drain(&store, &control, Some(id)) {
+            Ok(roots) if !roots.is_empty() => Ok(0),
+            Ok(_) => Ok(refused("no pending delegated operation has that key")),
+            Err(reason) => Ok(unsettled(&control, &reason)),
+        };
+    }
     let Some(intent) = registry.intent(id).cloned() else {
         return Ok(refused("no pending intent has that ID"));
     };
@@ -8534,7 +8524,11 @@ fn resolve_precheck(
     intent: &Intent,
     registry: &Registry,
 ) -> Result<(), String> {
-    delegation::resolve_check(control, registry, intent)?;
+    if delegation::route(registry, &intent.id).is_some() {
+        return Err(
+            "resolve the predecessor Barge operation with its original supported build".to_owned(),
+        );
+    }
     if !registry.complete {
         return Err(
             "the output registry is sticky-incomplete, so no intent can be resolved".to_owned(),
@@ -9700,6 +9694,7 @@ mod tests {
             intents: Vec::new(),
             cancelled_overflow: Vec::new(),
             deletion_routes: None,
+            settled: None,
         };
         let rows = group_rows(&registry, &debug.checkout_id, &debug.root);
         assert_eq!(
@@ -9764,6 +9759,7 @@ mod tests {
             intents: vec![intent.clone()],
             cancelled_overflow: Vec::new(),
             deletion_routes: None,
+            settled: None,
         };
         write_registry(&fixture.root, &registry).unwrap();
         let loaded = read_registry(&fixture.root).unwrap().unwrap();
@@ -9811,6 +9807,7 @@ mod tests {
             intents: Vec::new(),
             cancelled_overflow: Vec::new(),
             deletion_routes: None,
+            settled: None,
         };
         let preview = build_preview(&registry, &[], None, registry.complete).unwrap();
         let first = serde_json::to_vec(&preview).unwrap();
@@ -9836,6 +9833,7 @@ mod tests {
             intents: Vec::new(),
             cancelled_overflow: Vec::new(),
             deletion_routes: None,
+            settled: None,
         }
     }
 
@@ -9934,41 +9932,16 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_successor_metadata_cannot_reach_legacy_replay_or_release_exclusion() {
-        let (fixture, mut registry) = routed_registry();
-        let original = fixture.root.join("original");
-        fs::create_dir(&original).unwrap();
-        fs::write(original.join("payload"), b"kept").unwrap();
-        registry.intents[0].identity.root = original.clone();
-        let outputs = File::open(registry_dir(&fixture.root)).unwrap();
-        let requests =
-            oxide_storage::output_request_store::RequestStore::open(outputs.as_fd(), true).unwrap();
-        let sha = requests
-            .publish(
-                &registry.intents[0].id,
-                &request::ready_fixture(&registry.intents[0], 7),
-            )
-            .unwrap();
-        registry.deletion_routes = Some(vec![DeletionRoute::Barge {
-            intent_id: registry.intents[0].id.clone(),
-            request_sha256: sha,
-        }]);
+    fn predecessor_covered_journals_require_the_original_build_and_never_local_fallback() {
+        let (fixture, registry) = routed_registry();
         write_registry(&fixture.root, &registry).unwrap();
-        assert!(read_registry(&fixture.root).is_ok());
-        fs::write(
-            registry_dir(&fixture.root)
-                .join("prune-delegations")
-                .join(format!("{}.json", registry.intents[0].id)),
-            b"corrupt",
-        )
-        .unwrap();
         let before = fs::read(registry_path(&fixture.root)).unwrap();
         assert!(read_registry(&fixture.root)
             .unwrap_err()
-            .contains("keep pending"));
+            .contains("original supported build"));
         assert!(unsettled_for(&fixture.root, &registry.intents[0].identity.checkout_id).is_err());
+        assert!(upgrade_registry_recovery(&fixture.root, &registry.created_by, true).is_err());
         assert_eq!(fs::read(registry_path(&fixture.root)).unwrap(), before);
-        assert_eq!(fs::read(original.join("payload")).unwrap(), b"kept");
     }
 
     #[test]
@@ -9990,16 +9963,14 @@ mod tests {
         assert!(upgrade_registry_recovery(&fixture.root, "wrong", true).is_err());
         upgrade_registry_recovery(&fixture.root, &transaction, true).unwrap();
         let next = read_registry_image(&fixture.root).unwrap().unwrap();
-        assert_eq!(next.schema, 3);
+        assert_eq!(next.schema, 4);
         assert_eq!(next.revision, old.revision + 1);
         assert_eq!(
             serde_json::to_value(&next.intents).unwrap(),
             serde_json::to_value(&old.intents).unwrap()
         );
-        assert!(matches!(
-            &next.deletion_routes.as_ref().unwrap()[0],
-            DeletionRoute::Local { .. }
-        ));
+        assert!(next.deletion_routes.is_none());
+        assert_eq!(next.settled.as_ref().unwrap().len(), 0);
         let upgraded = fs::read(registry_path(&fixture.root)).unwrap();
         upgrade_registry_recovery(&fixture.root, &transaction, true).unwrap();
         assert_eq!(upgraded, fs::read(registry_path(&fixture.root)).unwrap());
@@ -10048,7 +10019,7 @@ mod tests {
             let document: serde_json::Value =
                 serde_json::from_slice(&fs::read(side.control().join("state.json")).unwrap())
                     .unwrap();
-            assert_eq!(document["owned_outputs"], "oxide.outputs/4");
+            assert_eq!(document["owned_outputs"], "oxide.outputs/5");
         }
         let state_path = internal.control().join("state.json");
         fs::rename(
@@ -10073,8 +10044,9 @@ mod tests {
         let mut entries = eligible_entries(2, 0);
         let candidate = entries[0].candidate.as_mut().unwrap();
         candidate.deleter = Some("barge".to_owned());
-        candidate.barge_unavailable =
-            Some(request::bounded_reason(&"unregistered volume ".repeat(200)));
+        candidate.barge_unavailable = Some(delegation::bounded_reason(
+            &"unregistered volume ".repeat(200),
+        ));
         let preview = preview_of(&entries);
         preview.validate().unwrap();
         assert_eq!(preview.candidates.len(), 2);
@@ -10094,7 +10066,7 @@ mod tests {
         let mut invalid = preview;
         invalid.candidates[0].deleter = Some("fallback".to_owned());
         assert!(invalid.validate().is_err());
-        assert!(text(&request::bounded_reason(&"☃".repeat(1000))));
+        assert!(text(&delegation::bounded_reason(&"☃".repeat(1000))));
     }
 
     #[test]
@@ -10103,7 +10075,7 @@ mod tests {
         assert!(delegation_fixture::run(&[]).is_err());
     }
 
-    fn delegated_group_fixture() -> (Fixture, PathBuf, Store, Candidate) {
+    pub(super) fn delegated_group_fixture() -> (Fixture, PathBuf, Store, Candidate) {
         let fixture = Fixture::new();
         let root = fixture.root.join("oxide-outputs").join("owned");
         fs::create_dir_all(&root).unwrap();
@@ -10112,12 +10084,14 @@ mod tests {
         debug.root = root.clone();
         debug.member = "debug".to_owned();
         debug.selected = false;
+        ensure_private_dir(&fixture.root.join("gone")).unwrap();
         debug.checkout = fixture.root.join("gone/checkout");
+        debug.checkout_volume_uuid = volume_uuid_of(&fixture.root).unwrap();
         debug.volume_uuid = Some("A6AC3ED7-33EA-46B4-8082-7254CF291ED2".to_owned());
         debug.nonce = Some("b".repeat(32));
         let marker = serde_json::to_vec(&serde_json::json!({
             "version": "oxide.outputs.root/2", "checkout": debug.checkout,
-            "checkout_id": debug.checkout_id, "label": "fixture", "recipe": debug.recipe,
+            "checkout_id": debug.checkout_id, "checkout_volume_uuid": debug.checkout_volume_uuid, "label": "fixture", "recipe": debug.recipe,
             "kind": "external", "volume_uuid": debug.volume_uuid, "nonce": debug.nonce,
             "generation": debug.generation, "created_ms": 1
         }))
@@ -10164,6 +10138,7 @@ mod tests {
         candidate.dev = facts.dev();
         candidate.ino = facts.ino();
         candidate.marker_digest = sha256_hex(&marker);
+        candidate.checkout_volume_uuid = debug.checkout_volume_uuid.clone();
         candidate.deleter = Some("barge".to_owned());
         let store = Store::for_tests(&fixture.root.join("pool"));
         (fixture, control, store, candidate)
@@ -10171,16 +10146,16 @@ mod tests {
 
     #[test]
     fn profile_receipt_writer_preserves_the_explicit_successor_format() {
-        let (_fixture, control, _store, candidate) = delegated_group_fixture();
+        let (fixture, control, _store, candidate) = delegated_group_fixture();
         let receipt =
             outputs::read_receipt_for_prune(&control, &candidate.checkout, &candidate.checkout_id)
                 .unwrap()
                 .unwrap();
-        note_receipt(&control, &receipt).unwrap();
+        delegation::with_test_journal(&fixture.root, |_| note_receipt(&control, &receipt).unwrap());
         let registry = ready_registry(&control).unwrap();
-        assert_eq!(registry.version, DELEGATED_REGISTRY_VERSION);
-        assert_eq!(registry.schema, 3);
-        assert!(registry.deletion_routes.as_ref().is_some_and(Vec::is_empty));
+        assert_eq!(registry.version, COORDINATED_REGISTRY_VERSION);
+        assert_eq!(registry.schema, 4);
+        assert!(registry.deletion_routes.is_none());
     }
 
     #[test]
@@ -10219,9 +10194,10 @@ mod tests {
             !delegation::covered(&registry, &candidate).unwrap(),
             "historical meanings never silently change"
         );
-        registry.version = DELEGATED_REGISTRY_VERSION.to_owned();
-        registry.schema = 3;
-        registry.deletion_routes = Some(Vec::new());
+        registry.version = COORDINATED_REGISTRY_VERSION.to_owned();
+        registry.schema = 4;
+        registry.deletion_routes = None;
+        registry.settled = Some(Vec::new());
         let mut local = candidate.clone();
         local.root_kind = RootKind::Local;
         assert!(!delegation::covered(&registry, &local).unwrap());
@@ -10240,135 +10216,6 @@ mod tests {
             delegation::covered(&registry, &candidate).is_err(),
             "changed bytes must never choose a local fallback"
         );
-    }
-
-    #[test]
-    fn delegated_publication_is_one_group_with_immutable_unavailable_authority() {
-        if store::tests::fixture_child(
-            "prune::tests::delegated_publication_is_one_group_with_immutable_unavailable_authority",
-        ) {
-            return;
-        }
-        let (_fixture, control, store, candidate) = delegated_group_fixture();
-        let id = "c".repeat(32);
-        let quarantine = candidate
-            .root
-            .parent()
-            .unwrap()
-            .join(format!("{QUARANTINE_PREFIX}{id}"));
-        let revision = ready_registry(&control).unwrap().revision;
-        let authority = Err("volume unregistered".to_owned());
-        assert!(matches!(
-            journal_intent_with_route(
-                &store,
-                &control,
-                &candidate,
-                &"f".repeat(64),
-                &id,
-                &quarantine,
-                revision - 1,
-                Some(&authority)
-            ),
-            Ok(false)
-        ));
-        assert!(!registry_dir(&control).join("prune-delegations").exists());
-        assert!(journal_intent_with_route(
-            &store,
-            &control,
-            &candidate,
-            &"f".repeat(64),
-            &id,
-            &quarantine,
-            revision,
-            Some(&authority)
-        )
-        .map_err(stop_text)
-        .unwrap());
-        let registry = ready_registry(&control).unwrap();
-        let intent = registry.intent(&id).unwrap();
-        assert_eq!(intent.group.len(), 2);
-        assert!(registry
-            .rows
-            .iter()
-            .filter(|row| row.root == candidate.root)
-            .all(|row| !row.selected && row.pruning.as_deref() == Some(id.as_str())));
-        let sha = delegation::route(&registry, &id).unwrap();
-        assert_ne!(sha, intent.preview_sha256);
-        assert!(matches!(
-            request::load(&control, intent, sha).unwrap(),
-            request::Metadata::Unavailable { .. }
-        ));
-        let before = fs::read(registry_path(&control)).unwrap();
-        assert!(require_local_route(&control, &id).is_err());
-        assert!(rollback_intent(&store, &control, intent).is_err());
-        assert_eq!(before, fs::read(registry_path(&control)).unwrap());
-        assert!(!quarantine.exists());
-        assert_eq!(
-            fs::read(candidate.root.join("payload")).unwrap(),
-            b"kept until Barge deletes"
-        );
-    }
-
-    #[test]
-    fn delegated_terminal_receipt_failure_retains_route_and_replays_exact_group() {
-        if store::tests::fixture_child("prune::tests::delegated_terminal_receipt_failure_retains_route_and_replays_exact_group") { return; }
-        let (_fixture, control, store, candidate) = delegated_group_fixture();
-        let id = "d".repeat(32);
-        let quarantine = candidate
-            .root
-            .parent()
-            .unwrap()
-            .join(format!("{QUARANTINE_PREFIX}{id}"));
-        let revision = ready_registry(&control).unwrap().revision;
-        assert!(journal_intent_with_route(
-            &store,
-            &control,
-            &candidate,
-            &"f".repeat(64),
-            &id,
-            &quarantine,
-            revision,
-            Some(&Ok(7))
-        )
-        .map_err(stop_text)
-        .unwrap());
-        let request_path = registry_dir(&control)
-            .join("prune-delegations")
-            .join(format!("{id}.json"));
-        let request_bytes = fs::read(&request_path).unwrap();
-        let receipt_path = outputs::receipt_path_public(&control, &candidate.checkout_id);
-        let preimage = fs::read(&receipt_path).unwrap();
-        fs::write(&receipt_path, b"corrupted receipt fixture").unwrap();
-        // This unit test supplies a terminal-effect premise to the actual
-        // settlement function. It performs no deletion and earns no native credit.
-        assert!(complete_intent(&store, &control, &id, "deleted").is_err());
-        let registry = ready_registry(&control).unwrap();
-        let terminal = registry.intent(&id).unwrap();
-        assert_eq!(terminal.phase, IntentPhase::Deleted);
-        assert!(!terminal.receipt_settled);
-        assert!(delegation::route(&registry, &id).is_some());
-        fs::write(&receipt_path, preimage).unwrap();
-        assert!(matches!(
-            resume_intent(&store, &control, terminal),
-            Ok(Resumed::Completed)
-        ));
-        let settled = ready_registry(&control).unwrap();
-        assert!(settled.intents.is_empty() && settled.deletion_routes.unwrap().is_empty());
-        assert!(
-            !settled.rows.iter().any(|row| row.root == candidate.root),
-            "one physical root settles every member"
-        );
-        assert_eq!(settled.rows.len(), 2);
-        assert!(
-            settled.rows.iter().all(|row| row.selected),
-            "the selected successor is preserved"
-        );
-        assert_eq!(
-            fs::read(request_path).unwrap(),
-            request_bytes,
-            "terminal metadata remains immutable and retained"
-        );
-        assert!(!quarantine.exists());
     }
 
     fn synthetic_entry(index: usize, pad: usize, kept: Option<&str>) -> Evaluated {
@@ -10660,6 +10507,7 @@ mod tests {
             intents: Vec::new(),
             cancelled_overflow: Vec::new(),
             deletion_routes: None,
+            settled: None,
         };
         assert!(registry.validate().is_err());
         registry.version = REGISTRY_VERSION.to_owned();
@@ -11186,6 +11034,7 @@ mod tests {
             intents: Vec::new(),
             cancelled_overflow: Vec::new(),
             deletion_routes: None,
+            settled: None,
         };
         write_registry(&control, &registry).unwrap();
         let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
@@ -11382,16 +11231,12 @@ mod tests {
             ino: candidate.ino,
             marker_digest: candidate.marker_digest.clone(),
         };
-        let pruning = "d".repeat(32);
-        for row in &mut registry.rows {
-            row.pruning = Some(pruning.clone());
-        }
         let control = ready_control(&fixture, registry.rows.clone(), Vec::new());
         let receipt = snapshot_receipt(&first, "oxide.outputs.transition/2", "detached", None);
         publish_snapshot_receipt(&control, &first, &receipt);
         let prior = receipt_preimage(&control, &first.checkout_id).unwrap();
         let verify = |registry: &Registry, group: &[GroupRow], prior: &str| {
-            delegation::verify_domain_group(&control, registry, &identity, group, &pruning, prior)
+            delegation::verify_domain_group(&control, registry, &identity, group, None, prior)
                 .map(|row| row.member.clone())
         };
         assert!(registry.intents.is_empty());
@@ -11408,11 +11253,9 @@ mod tests {
             ("pending", |row| row.pending = true),
             ("reservation", |row| row.reservation = Some("e".repeat(32))),
             ("cancelling", |row| row.cancelling = Some("e".repeat(32))),
-            ("missing pruning", |row| row.pruning = None),
             ("other pruning", |row| row.pruning = Some("e".repeat(32))),
             ("nonce", |row| row.nonce = Some("e".repeat(32))),
             ("generation", |row| row.generation += 1),
-            ("device", |row| row.root_dev = Some(42)),
             ("inode", |row| row.root_ino = Some(42)),
             ("marker", |row| row.marker_digest = Some("e".repeat(64))),
             ("checkout", |row| row.checkout.push("replacement")),
@@ -11451,7 +11294,7 @@ mod tests {
         // Released history is permitted; every live reference must refuse.
         foreign.rows.push(row);
         assert!(verify(&foreign, &group, &prior).is_ok());
-        for index in [3, 4, 5, 6, 8] {
+        for index in [3, 4, 5, 6, 7] {
             let (name, change) = changes[index];
             let mut live = foreign.clone();
             change(live.rows.last_mut().unwrap());
@@ -11484,7 +11327,7 @@ mod tests {
             .selected = true;
         // A matching selected subset is accepted by the existing receipt rule;
         // changing its generation or nonce independently must still refuse.
-        assert!(verify(&registry, &selected_group, "").is_ok());
+        assert!(verify(&registry, &selected_group, &pin).is_err());
         for field in ["generation", "nonce"] {
             let mut mismatch = placing.clone();
             mismatch["links"][0]["selected"][field] = if field == "generation" {
@@ -11493,7 +11336,15 @@ mod tests {
                 serde_json::json!("e".repeat(32))
             };
             publish_snapshot_receipt(&control, &first, &mismatch);
-            assert!(verify(&registry, &selected_group, "").is_err(), "{field}");
+            assert!(
+                verify(
+                    &registry,
+                    &selected_group,
+                    &receipt_preimage(&control, &first.checkout_id).unwrap()
+                )
+                .is_err(),
+                "{field}"
+            );
         }
         let mut pruning_receipt = receipt.clone();
         pruning_receipt["state"] = serde_json::json!("pruning");
@@ -11531,7 +11382,7 @@ mod tests {
             .unwrap_err()
             .contains("pending transition"));
         fs::remove_file(outputs::receipt_path_public(&control, &first.checkout_id)).unwrap();
-        assert!(verify(&registry, &group, "").is_err());
+        assert!(verify(&registry, &group, &prior).is_err());
     }
 
     /// oxide#152: a mixed snapshot of version-1, version-2 and version-3
@@ -11902,6 +11753,7 @@ mod tests {
             intents: vec![intent.clone()],
             cancelled_overflow: Vec::new(),
             deletion_routes: None,
+            settled: None,
         };
         let refused = resolve_precheck(&store, &control, &intent, &registry).unwrap_err();
         assert!(refused.contains("sticky-incomplete"), "{refused}");
@@ -11928,6 +11780,7 @@ mod tests {
             intents,
             cancelled_overflow: Vec::new(),
             deletion_routes: None,
+            settled: None,
         };
         write_registry(&control, &registry).unwrap();
         control
@@ -13053,6 +12906,7 @@ mod tests {
             intents: Vec::new(),
             cancelled_overflow: Vec::new(),
             deletion_routes: None,
+            settled: None,
         };
         let mut candidate = candidate_of(&debug);
         candidate.dev = 777;
@@ -13759,6 +13613,7 @@ mod tests {
             intents: Vec::new(),
             cancelled_overflow: Vec::new(),
             deletion_routes: None,
+            settled: None,
         };
         let candidate = candidate_of(&debug);
         let group = verified_group(&registry, &candidate).unwrap();
@@ -13799,6 +13654,7 @@ mod tests {
             intents: Vec::new(),
             cancelled_overflow: Vec::new(),
             deletion_routes: None,
+            settled: None,
         };
         let group = verified_group(&registry, &candidate_of(&debug)).unwrap();
         assert_eq!(group.len(), 2);
@@ -14020,6 +13876,7 @@ mod tests {
             intents: Vec::new(),
             cancelled_overflow: Vec::new(),
             deletion_routes: None,
+            settled: None,
         };
         let candidate = candidate_of(&debug);
         verified_group(&base, &candidate).unwrap();

@@ -27,30 +27,30 @@ sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 SUPERVISOR = 'fcfda2b0a43afd192a4f75e0d575b9aa94f0fd79d195bd75b1c66305f37f046b'
-BARGE = '63163686d212e6e5a900d6cc2ddfcce65b475890'
-BARGE_REVIEWED = '547fbe99cdc9676b80b58730cf09715c64c5a9cd'
-BARGE_TREE = '8a3b368e7883be862fe8319bb34e9f987e38731b'
+BARGE = '8efd3452fcced9b5b322eb3f7ba0ac794244fc82'
+BARGE_REVIEWED = 'b09ce942cb9bfc4936034d91190a16be71f17e1a'
+BARGE_TREE = '07147ae958bae5744a0fabbdbcd9db8bc2599152'
 STASH = '8A660440-C919-45C6-A3F1-3365B9BD2006'
 SECONDS, MIB, BUDGET = 600, 1024 * 1024, 512
 PREPARE_MIB, RESIDENT_MIB, GROWTH_MIB = 448, 288, 32
-FEATURES = 'barge/proof-synthetic-account'
+FEATURES = 'outputs-operation-proof,barge/proof-synthetic-account'
 # Support is established from the published source export, lock and actual
 # cached bytes below. No task-completion notice or boolean forces readiness.
 SOURCE_BINDING = HERE / 'outputs-delegation-source.json'
 # Every name has an executable body below. No native credit from self-checks.
 CASES = (
-    'positive-group', 'generic-release', 'selected', 'marker-nonce',
-    'marker-digest', 'marker-owner', 'grant-withdrawn', 'grant-generation',
-    'volume-kept', 'volume-unregistered', 'unavailable', 'grant-invalid', 'marker-volume',
-    'lost-reply', 'malformed-reply', 'fresh-locked', 'resumed-locked',
-    'intent-replay-oxide', 'intent-replay-barge', 'rename-replay-oxide',
-    'partial-replay-barge', 'terminal-before-receipt', 'receipt-before-settled',
-    'root-replaced', 'checkout-ancestor-replaced', 'missing-barge-after-rename', 'resolve-pending',
-    'resolve-quarantine-original-absent', 'metadata-missing', 'metadata-corrupt',
-    'metadata-swapped', 'adoption-race', 'internal-held-writer',
-    'removable-held-writer', 'internal-unknown-custody', 'removable-unknown-custody',
-    'sidecar-before-intent', 'oxide-intent-before-call', 'upgrade-internal-fence', 'upgrade-paired-fence',
-    'upgrade-registry', 'upgrade-internal-ready', 'upgrade-paired-ready',
+    'positive-group', 'generic-release', 'selected',
+    'marker-nonce', 'marker-digest', 'marker-owner', 'marker-volume',
+    'grant-withdrawn', 'grant-generation', 'volume-kept', 'volume-unregistered',
+    'unavailable', 'grant-invalid', 'adoption-race', 'fresh-busy',
+    'internal-held-writer', 'removable-held-writer',
+    'internal-unknown-custody', 'removable-unknown-custody',
+    'intent-replay', 'rename-replay', 'removed-replay', 'capture-gap', 'unlink-gap',
+    'deleted-before-hook', 'mark-before-removal', 'settled-before-ack', 'lost-ack',
+    'root-replaced', 'checkout-ancestor-replaced', 'journal-missing', 'journal-gap',
+    'partial-group', 'extra-group', 'absent-without-settlement', 'receipt-changed',
+    'upgrade-internal-fence', 'upgrade-paired-fence', 'upgrade-registry',
+    'upgrade-internal-ready', 'upgrade-paired-ready',
 )
 
 
@@ -90,7 +90,7 @@ def last_json(text):
 
 
 def pending(doc):
-    return [i for i in doc['oxide'].get('intents', []) if not i.get('receipt_settled', False)]
+    return [record for record in doc['barge'] if record.get('phase') not in ('complete','cancelled')]
 
 
 def fixture_groups(doc, root, successor):
@@ -105,22 +105,31 @@ def fixture_groups(doc, root, successor):
 
 
 def settled_group(doc, root, successor, before):
-    # A complete settlement compacts the old non-live rows and intent. The
-    # independent pre-effect capture proves this was an N-member group.
     fixture_groups({'oxide':{'rows':before['old']+before['successor']}},root,successor)
-    require(not [r for r in doc['oxide']['rows'] if r['root']==str(root)],'completed old members remain in the live registry')
+    require(not [r for r in doc['oxide']['rows'] if r['root']==str(root)],'completed old members remain')
     rows=sorted((r for r in doc['oxide']['rows'] if r['root']==str(successor)),key=lambda r:r['member'])
-    require(rows==before['successor'],'selected successor group changed during settlement')
-    require(not doc['oxide'].get('intents', []),'completed fixture intent remains in the live registry')
+    require(rows==before['successor'],'selected successor group changed')
+    require(not doc['oxide'].get('intents',[]) and 'deletion_routes' not in doc['oxide'],'covered path used a second journal/route')
+    record=native_phase(doc,'complete')
+    require(record.get('finalize_status')=='acknowledged','domain settlement was not acknowledged')
+    payload=json.loads(record['finalize']['payload'])
+    entries=[entry for entry in doc['oxide'].get('settled',[]) if entry['caller']=='oxide.outputs' and entry['key']==record['key']]
+    require(len(entries)==1,'exact atomic settlement fact missing or repeated')
+    entry=entries[0]
+    require(entry['root']==str(root) and entry['nonce']==before['old'][0]['nonce']
+            and entry['checkout_id']==before['old'][0]['checkout_id']
+            and entry['request_sha256']==record['request_digest']
+            and entry['terminal_ms']==payload['terminal_ms'] and entry['outcome']=='deleted','settlement fact not original-bound')
+    require(hashlib.sha256(record['finalize']['payload'].encode()).hexdigest()==record['request_digest'],'actual payload digest differs')
 
 
 def native_phase(doc, phase):
-    """Require an actual typed Barge record, not a matching Oxide final row."""
-    records = doc['barge']
-    require(len(records) == 1, f'expected one actual Barge intent: {records}')
-    record = records[0]
-    require(record['phase'] == phase, f'actual Barge phase is {record["phase"]}, expected {phase}')
-    require(len(record['intent_id']) == 32 and all(c in '0123456789abcdef' for c in record['intent_id']), 'actual Barge identity missing')
+    records=doc['barge']
+    require(len(records)==1,'expected exactly one checked operation record')
+    record=records[0]
+    require(record.get('schema')=='barge.operation/1' and isinstance(record.get('sequence'),int) and record['sequence']>0,'actual operation identity missing')
+    require(record.get('phase')==phase,f'actual operation phase differs: {record.get("phase")} vs {phase}')
+    require(record.get('caller')=='oxide.outputs' and re.fullmatch('[0-9a-f]{32}',record.get('key','')),'actual operation caller/key differs')
     return record
 
 
@@ -177,7 +186,7 @@ def binding_document():
 
 
 def verify_source_files(files,reader):
-    required={'Cargo.toml','crates/barge/Cargo.toml',*('crates/barge/src/'+name for name in ('oxide_outputs.rs','delete.rs','evidence.rs','reference.rs','state.rs'))}
+    required={'Cargo.toml','crates/barge/Cargo.toml',*('crates/barge/src/'+name for name in ('operation.rs','oxide_outputs.rs','delete.rs','evidence.rs','reference.rs','state.rs'))}
     require(isinstance(files,dict) and required<=set(files) and len(files)<=128,'source binding omits deciding/replay source')
     for name,digest in sorted(files.items()):
         path=Path(name)
@@ -498,11 +507,10 @@ class World:
         self.check_setup(image)
         self.root=Path(self.data['root']); self.successor=Path(self.data['successor'])
         self.control=Path(self.data['control']); self.peer=Path(self.data['peer_control']); self.checkout=Path(self.data['checkout'])
-        self.env['OXIDE_TEST_BARGE_RECORD_REPLY']=str(self.root)
-        self.reply_records=set()
         if not name.startswith('upgrade-'):
             self.invoke(['outputs','upgrade-recovery'],expect=0,label='upgrade')
         self.groups_before=fixture_groups(self.inspect(),self.root,self.successor)
+        self.receipt_sha=hashlib.sha256(Path(self.data['receipt']).read_bytes()).hexdigest()
         write_json(self.proof.evidence/(self.name+'-groups-before.json'),self.groups_before)
         self.plan_path=self.base/'presented.json'
         self.plan=None
@@ -543,25 +551,10 @@ class World:
         code,out,err=result
         permanent.require_confirmed_closure(label,err)
         permanent.require_normal_exit(label,code)
-        self.check_replies()
+        if code not in (0,-9) and any(word in err.lower() for word in ('custody is not proven','descriptor scan','process observation')):
+            raise RuntimeError('actual custody uncertainty; abort and retain: '+err[-1600:])
         if expect is not None and code!=expect:raise RuntimeError(f'{label}: unexpected exit {code}: {err[-1200:]}')
         return result
-
-    def check_replies(self):
-        if not hasattr(self,'reply_records'):return
-        for path in self.proof.evidence.glob('barge-actual-reply-*.json'):
-            if path in self.reply_records:continue
-            value=json.loads(path.read_text())
-            if value.get('root')!=str(self.root):continue
-            self.reply_records.add(path)
-            kind=value.get('kind');reason=str(value.get('reason') or '').lower()
-            if any(word in reason for word in ('writer','descriptor','custody','process observation')) and kind not in ('Deleted','KnownNoEffectLocked'):
-                raise RuntimeError('actual writer/custody uncertainty; retain and abort: '+str(value)[:2400])
-            if kind in ('Unknown','Pending') and self.name!='root-replaced':
-                raise RuntimeError('unexpected actual adapter uncertainty; retain and abort: '+str(value)[:2400])
-
-    def require_reply(self,kind):
-        require(any(json.loads(path.read_text()).get('kind')==kind for path in self.reply_records),'actual adapter reply missing: '+kind)
 
     def helper(self,*args):
         _,out,_=self.invoke(['outputs','__delegation-fixture',*args],expect=0,label='fixture-'+str(args[0]))
@@ -595,6 +588,10 @@ class World:
 
     def inspect(self): return self.helper('inspect')
 
+    def domain_digest(self):
+        return {str(path):hashlib.sha256(path.read_bytes()).hexdigest() for path in
+                (self.control/'outputs/registry.json',Path(self.data['receipt']))}
+
     def kept(self):
         require(self.root.is_dir() and self.successor.is_dir(),'a kept root or successor changed')
         require(not list(self.root.parent.glob('.prune-*')),'local quarantine used for Barge route')
@@ -604,7 +601,9 @@ class World:
         require(not self.root.exists() and self.successor.is_dir(),'root/successor deletion oracle failed')
         settled_group(doc,self.root,self.successor,self.groups_before)
         require(not list(self.root.parent.glob('.prune-*')),'local quarantine used')
-        self.absence(native_phase(doc,'deleted'))
+        self.absence(native_phase(doc,'complete'))
+        require(hashlib.sha256(Path(self.data['receipt']).read_bytes()).hexdigest()==self.receipt_sha,'released-root receipt was rewritten')
+        require(not (self.control/'outputs/prune-delegations').exists(),'old covered request sidecars were created')
         return doc
 
     def absence(self,record):
@@ -631,7 +630,8 @@ class World:
         else:
             permanent.require_normal_exit(label,code)
             permanent.require_confirmed_closure(label,err)
-        self.check_replies()
+        if code not in (0,-9) and any(word in err.lower() for word in ('custody is not proven','descriptor scan','process observation')):
+            raise RuntimeError('actual custody uncertainty; abort and retain: '+err[-1600:])
         return code,out,err
 
     def wait(self,pattern,child):
@@ -643,186 +643,116 @@ class World:
             time.sleep(.005)
         raise RuntimeError('bounded durable-point observation expired')
 
-    def interrupt(self,phase,side='barge'):
+    def interrupt(self,phase):
         if self.plan is None:self.preview()
-        extra=({'OXIDE_TEST_BARGE_DURABLE_PAUSE':str(self.root),'OXIDE_TEST_BARGE_PAUSE_PHASE':phase} if side=='barge' else {'OXIDE_TEST_BARGE_OXIDE_PAUSE':str(self.root),'OXIDE_TEST_BARGE_OXIDE_PHASE':phase})
-        child=self.start(self.argv(),extra)
+        child=self.start(self.argv(),{'OXIDE_TEST_OPERATION_ROOT':str(self.root),'OXIDE_TEST_OPERATION_PAUSE':phase})
         try:
-            self.wait(f'{side}-{phase}-*',child)
+            marker=self.wait('operation-'+phase+'-*',child)
             doc=self.inspect()
-            require(len(pending(doc))==1,'durable Oxide intent not observed')
-            record=native_phase(doc,'intent' if phase in ('intent','renamed') else ('deleted' if side=='oxide' else 'renamed'))
+            record=native_phase(doc,'intent' if phase=='intent' else 'deleted')
             self.absence(record)
-            original=self.root.exists()
-            quarantine=self.root.parent/('.barge-prune-'+record['intent_id'])
-            if phase=='partial':
-                require(quarantine.is_dir(),'partial deletion quarantine absent')
-                leaves=[p.name for p in quarantine.iterdir()]
-                require(len([n for n in leaves if n.startswith('payload-')])<2 and bool(leaves),'no discriminating partial deletion observed')
-            if phase=='intent': require(original,'intent-before-rename already renamed')
-            else:require(not original,'post-rename original still exists')
-            write_json(self.proof.evidence/(self.name+'-interruption.json'),{'pid':child.pid,'point':phase,'side':side,'observed':doc,'original_exists':original,'record':record})
-            child.kill()
-            self.finish(child,'interrupted',interrupted=True)
+            require(not doc['oxide'].get('intents',[]),'second Oxide progress journal observed')
+            write_json(self.proof.evidence/(self.name+'-interruption.json'),{'pid':child.pid,'point':phase,'observed':doc,'marker':str(marker)})
+            child.kill();self.finish(child,'interrupted',interrupted=True)
             return doc
         except BaseException:
-            if child.poll() is None:
-                child.kill()
-                self.finish(child,'failed-interruption',interrupted=True)
+            if child.poll() is None:child.kill();self.finish(child,'failed-interruption',interrupted=True)
             raise
 
 
-def run_case(world, name):
-    w=world
-    if name.startswith('upgrade-'):
-        upgrade_case(w,name.removeprefix('upgrade-'));return
-    if name=='positive-group':w.preview();w.execute(expect=0);w.settled();return
+def run_case(w, name):
+    if name.startswith('upgrade-'):upgrade_case(w,name.removeprefix('upgrade-'));return
+    if name in ('positive-group','selected'):
+        doc=w.preview()
+        require(not any(c['root']==str(w.successor) for c in doc['candidates']),'selected successor offered')
+        w.execute(expect=0);w.settled();return
     if name=='generic-release':
-        report=w.helper('generic-release',w.data['uuid']); w.kept()
-        require(not report['run'].get('rows') or all(r['outcome']!='released' for r in report['run']['rows']),report)
-        require(not w.inspect()['barge'],'generic release wrote deletion intent');return
-    if name=='selected':
-        doc=w.preview();require(not any(c['root']==str(w.successor) for c in doc['candidates']),'selected root offered');w.execute(expect=0);w.settled();return
+        report=w.helper('generic-release',w.data['uuid']);w.kept()
+        require(not report['run'].get('rows') or all(row['outcome']!='released' for row in report['run']['rows']),report)
+        require(not w.inspect()['barge'],'generic release created a delegated operation');return
     if name in ('volume-kept','volume-unregistered','unavailable','grant-invalid'):
         if name=='volume-kept':w.helper('volume',w.data['uuid'],w.data['mount'],'kept')
         elif name=='volume-unregistered':
-            # Private fixture registry loss, retained unchanged. Never journal parsing.
-            path=Path(w.env['BARGE_STATE_DIR'])/'registry.json'
-            path.rename(path.with_suffix('.retained'))
-        elif name=='grant-invalid':w.helper('grant','invalid')
-        else:w.helper('grant','withdraw')
-        doc=w.preview(); require(any(c.get('barge_unavailable') for c in doc['candidates']),doc)
-        w.execute(expect=3);w.kept();require(len(pending(w.inspect()))==1,'unavailable did not keep pending');return
-    if name in ('lost-reply','malformed-reply'):
-        w.preview();variable='OXIDE_TEST_BARGE_'+('LOST_REPLY' if name=='lost-reply' else 'MALFORMED_REPLY')
-        w.execute(expect=3,extra={variable:str(w.root)})
-        require(any(json.loads(p.read_text()).get('kind')=='Deleted' for p in w.reply_records),'lost/malformed case lacks actual Deleted reply')
-        doc=w.inspect();native_phase(doc,'deleted');require(len(pending(doc))==1,'lost reply cleared exclusion')
-        w.execute(expect=0,label='resume');w.settled();return
-    if name in ('marker-nonce','marker-digest','marker-owner','marker-volume','grant-withdrawn','grant-generation','adoption-race'):
+            path=Path(w.env['BARGE_STATE_DIR'])/'registry.json';path.rename(path.with_suffix('.retained'))
+        else:w.helper('grant','invalid' if name=='grant-invalid' else 'withdraw')
+        doc=w.preview();require(any(c.get('barge_unavailable') for c in doc['candidates']),'unavailable reason absent')
+        w.execute(expect=3);w.kept();require(not w.inspect()['barge'],'refused begin allocated an operation');return
+    if name.startswith('marker-') or name in ('grant-withdrawn','grant-generation','adoption-race'):
         if name=='grant-generation':w.helper('grant','present')
-        w.preview();child=w.start(w.argv(),{'OXIDE_TEST_BARGE_BEFORE_CALL':str(w.root)})
+        w.preview();child=w.start(w.argv(),{'OXIDE_TEST_OPERATION_ROOT':str(w.root),'OXIDE_TEST_OPERATION_PAUSE':'verdict'})
         try:
-            marker=w.wait('barge-before-call-*',child);doc=w.inspect();intent=pending(doc)[0]
+            marker=w.wait('operation-verdict-*',child);key=marker.name.removeprefix('operation-verdict-')
+            require(not w.inspect()['barge'],'begin preceded the guarded verdict observation')
             if name.startswith('marker-'):
                 path=w.root/'.oxide-output.json';value=json.loads(path.read_text())
-                key={'marker-nonce':'nonce','marker-digest':'label','marker-owner':'checkout_id','marker-volume':'volume_uuid'}[name]
-                value[key]=('d'*32 if key=='nonce' else ('e'*64 if key=='checkout_id' else ('11111111-2222-3333-4444-555555555555' if key=='volume_uuid' else 'changed bytes')))
+                field={'marker-nonce':'nonce','marker-digest':'label','marker-owner':'checkout_id','marker-volume':'volume_uuid'}[name]
+                value[field]={'nonce':'d'*32,'label':'changed bytes','checkout_id':'e'*64,'volume_uuid':'11111111-2222-3333-4444-555555555555'}[field]
                 write_json(path,value)
-            elif name=='grant-withdrawn':w.helper('grant','withdraw')
-            elif name=='grant-generation':w.helper('grant','older')
+            elif name.startswith('grant-'):w.helper('grant','older' if name=='grant-generation' else 'withdraw')
             else:
-                # Actual competing adopt must encounter durable exclusion while
-                # the caller retains the checkout barrier; do not mutate rows.
-                w.checkout.mkdir()
-                (w.checkout/'Cargo.toml').write_text('[package]\nname="fixture"\nversion="0.1.0"\nedition="2021"\n')
-                code,_,_=w.proof.run([str(w.binary),'outputs','adopt'],cwd=w.checkout,env=w.command_env(),label=w.name+'-adopt-race',limit=4)
-                require(code!=0,'adoption crossed a pending prune exclusion')
-            (w.proof.evidence/('barge-call-release-'+intent['id'])).write_text('release')
-            code,_,err=w.finish(child,'refusal')
-            require(code in (0,2,3),err);w.kept();require(not w.inspect()['barge'],'refusal created a Barge effect')
+                w.checkout.mkdir();(w.checkout/'Cargo.toml').write_text('[package]\nname="fixture"\nversion="0.1.0"\nedition="2021"\n')
+                code,_,_=w.proof.run([str(w.binary),'outputs','adopt'],cwd=w.checkout,env=w.command_env(),label='competing-adopt',limit=4)
+                require(code!=0,'competing adoption crossed the real barrier')
+            (w.proof.evidence/('operation-release-'+key)).write_text('release')
+            code,_,err=w.finish(child,'changed-authority');require(code in (2,3),err);w.kept()
+            require(all(record['phase']=='cancelled' for record in w.inspect()['barge']),'changed authority caused an effect')
         finally:
-            if child.poll() is None:
-                child.kill();w.finish(child,'refusal-stop',interrupted=True)
+            if child.poll() is None:child.kill();w.finish(child,'race-stop',interrupted=True)
         return
-    if name=='fresh-locked':
+    if name=='fresh-busy':
         w.preview();token=secrets.token_hex(16);child=w.start(['outputs','__delegation-fixture','lock',w.data['uuid'],token])
         try:
-            w.wait('lock-'+token,child);w.execute(expect=2);w.kept()
-            w.require_reply('KnownNoEffectLocked')
-            doc=w.inspect()
-            require(not pending(doc),'fresh known-no-effect Locked did not roll back')
-            require(not doc['barge'],'fresh Locked created a Barge intent/effect')
+            w.wait('lock-'+token,child);w.execute(expect=3);w.kept()
+            require(not w.inspect()['barge'],'busy begin created a record')
         finally:
-            (w.proof.evidence/('release-'+token)).write_text('release')
-            code,_,err=w.finish(child,'lock');require(code==0,err)
+            (w.proof.evidence/('release-'+token)).write_text('release');code,_,err=w.finish(child,'busy-lock');require(code==0,err)
         return
-    if name in ('sidecar-before-intent','oxide-intent-before-call'):
-        w.preview()
-        sidecar=name=='sidecar-before-intent'
-        extra=({'OXIDE_TEST_BARGE_OXIDE_PAUSE':str(w.root),'OXIDE_TEST_BARGE_OXIDE_PHASE':'request'} if sidecar else {'OXIDE_TEST_BARGE_BEFORE_CALL':str(w.root)})
-        child=w.start(w.argv(),extra)
-        try:
-            w.wait('oxide-request-*' if sidecar else 'barge-before-call-*',child)
-            doc=w.inspect()
-            require(not doc['barge'] and len(pending(doc))==(0 if sidecar else 1),'pre-Barge publication boundary wrong')
-            require(list((w.control/'outputs/prune-delegations').iterdir()),'synced original metadata missing')
-            write_json(w.proof.evidence/(name+'-observed.json'),{'pid':child.pid,'observed':doc})
-            child.kill();w.finish(child,'pre-Barge-interrupted',interrupted=True);w.kept()
-            w.execute(expect=0,label='resume');w.settled()
-        finally:
-            if child.poll() is None:child.kill();w.finish(child,'pre-Barge-stop',interrupted=True)
-        return
-    if name in ('internal-held-writer','removable-held-writer'):
-        held_writer(w,name.startswith('removable'));return
+    if name in ('internal-held-writer','removable-held-writer'):held_writer(w,name.startswith('removable'));return
     if name in ('internal-unknown-custody','removable-unknown-custody'):
         control=w.peer if name.startswith('removable') else w.control
-        # A real held flock means the actual writer witness is unavailable.
-        # This is uncertainty in custody admission, not a fabricated process row.
         with (control/'admission.lock').open('rb') as handle:
             fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
             before=fresh.tree_digest(str(w.control));doc=w.preview(candidate=False)
-            require(not doc['coverage']['complete'] and not doc['candidates'],'unknown custody admitted a root')
-            require('admission lock is busy' in json.dumps(doc),'unknown custody reason absent')
-            require(fresh.tree_digest(str(w.control))==before,'unknown custody mutated journals')
+            require(not doc['coverage']['complete'] and not doc['candidates'],'unknown custody admitted root')
+            require('admission lock is busy' in json.dumps(doc),'actual unknown observation absent')
+            require(fresh.tree_digest(str(w.control))==before,'unknown observation mutated state')
         w.kept();return
-    require(name in {'intent-replay-oxide','intent-replay-barge','rename-replay-oxide','partial-replay-barge','terminal-before-receipt','receipt-before-settled','root-replaced','checkout-ancestor-replaced','missing-barge-after-rename','resolve-pending','resolve-quarantine-original-absent','metadata-missing','metadata-corrupt','metadata-swapped','resumed-locked'}, 'unimplemented native case '+name)
-    phase={'intent-replay-oxide':'intent','intent-replay-barge':'intent','rename-replay-oxide':'renamed','partial-replay-barge':'partial','terminal-before-receipt':'terminal','receipt-before-settled':'receipt'}.get(name,'renamed')
-    if name in ('metadata-missing','metadata-corrupt','metadata-swapped','resumed-locked','resolve-pending'):
-        phase='intent'
-    doc=w.interrupt(phase,'oxide' if name in ('terminal-before-receipt','receipt-before-settled') else 'barge')
-    intent=pending(doc)[0];actual=doc['barge'][0]['intent_id']
+    if name=='lost-ack':
+        w.preview();w.execute(expect=3,extra={'OXIDE_TEST_OPERATION_ROOT':str(w.root),'OXIDE_TEST_OPERATION_FAULT':'lost-ack'})
+        doc=w.inspect();native_phase(doc,'deleted')
+        require(not [row for row in doc['oxide']['rows'] if row['root']==str(w.root)] and len(doc['oxide']['settled'])==1,'lost-ack lacked atomic removal fact')
+        w.execute(expect=0,label='retry-ack');w.settled();return
+    if name in ('intent-replay','deleted-before-hook','mark-before-removal','settled-before-ack','partial-group','extra-group','absent-without-settlement','receipt-changed','journal-missing','journal-gap'):
+        phase={'intent-replay':'intent','deleted-before-hook':'deleted','mark-before-removal':'marked','settled-before-ack':'settled','journal-missing':'intent','journal-gap':'intent'}.get(name,'marked')
+        w.interrupt(phase)
+        if name.startswith('journal-'):
+            w.helper('journal-fault',name.removeprefix('journal-'));w.execute(expect=3,label='unknown-journal');return
+        if name in ('partial-group','extra-group','absent-without-settlement','receipt-changed'):
+            kind={'partial-group':'partial','extra-group':'extra','absent-without-settlement':'absent','receipt-changed':'receipt'}[name]
+            w.helper('domain-fault',w.root,kind)
+            before=w.domain_digest();record=w.inspect()['barge'][0]
+            w.execute(expect=3,label='changed-domain')
+            require(w.domain_digest()==before,'changed domain was partially settled')
+            require(w.inspect()['barge'][0]==record,'refused finalization rewrote the operation')
+            native_phase(w.inspect(),'deleted');return
+        if name=='deleted-before-hook':
+            doc=w.helper('replay');require(str(w.root) in doc['completed_roots'],'explicit caller drain did not settle')
+            w.settled();return
+        w.execute(expect=0,label='resume');w.settled();return
+    require(name in ('rename-replay','removed-replay','capture-gap','unlink-gap','root-replaced','checkout-ancestor-replaced'),'unimplemented fixed case '+name)
+    w.preview();fault={'rename-replay':'renamed','removed-replay':'removed','root-replaced':'renamed','checkout-ancestor-replaced':'renamed','capture-gap':'capture-gap','unlink-gap':'unlink-gap'}[name]
+    w.execute(expect=3,extra={'OXIDE_TEST_OPERATION_ROOT':str(w.root),'OXIDE_TEST_OPERATION_FAULT':fault})
+    doc=w.inspect();record=native_phase(doc,{'capture-gap':'intent','unlink-gap':'marker_last','removed-replay':'removed'}.get(name,'renamed'))
+    w.absence(record)
+    if name=='root-replaced':w.root.mkdir(mode=0o700);(w.root/'replacement').write_text('different object')
     if name=='checkout-ancestor-replaced':
-        anchor=w.checkout.parent
-        anchor.rename(anchor.with_name('retained-anchor'))
-        anchor.mkdir(mode=0o700)
-        require(anchor.stat().st_ino!=w.data['checkout_ancestor_inode'],'ancestor replacement did not change identity')
-        # Actual replay must reprove the recorded ancestor. Its expected
-        # conservative refusal is inspected directly, never retried destructively.
-        report=w.helper('replay')
-        require(bool(report['pending']),'changed ancestor was completed by Barge replay')
-        require(len(pending(w.inspect()))==1,'changed ancestor cleared Oxide exclusion')
-        return
-    if name=='root-replaced':
-        w.root.mkdir();(w.root/'replacement').write_text('different object')
-        w.execute(expect=3);require((w.root/'replacement').exists(),'replacement deleted');return
-    if name=='missing-barge-after-rename':
-        state=Path(w.env['BARGE_STATE_DIR']);journal=state/'journal'
-        journal.rename(state/'retained-journal');journal.mkdir(mode=0o700)
-        w.execute(expect=3);require(len(pending(w.inspect()))==1,'missing Barge state was completion');return
-    if name.startswith('metadata-'):
-        files=list((w.control/'outputs/prune-delegations').glob('*.json'))
-        require(len(files)==1,'expected exact original metadata')
-        path=files[0]
-        if name=='metadata-missing':path.rename(path.with_suffix('.retained'))
-        elif name=='metadata-corrupt':path.write_bytes(b'{corrupt')
-        else:
-            value=json.loads(path.read_text());value['caller_intent_id']='f'*32;write_json(path,value)
-        before=fresh.tree_digest(str(w.control));w.execute(expect=3);require(fresh.tree_digest(str(w.control))==before,'bad metadata changed exclusion');return
-    if name in ('resolve-pending','resolve-quarantine-original-absent'):
-        before=fresh.tree_digest(str(w.control));w.invoke(['outputs','resolve-intent',intent['id']],expect=2,label='resolve')
-        require(fresh.tree_digest(str(w.control))==before,'pending Barge resolve changed journal')
-        if name.endswith('absent'):require(not w.root.exists(),'original should be absent after real rename')
-        return
-    if name=='resumed-locked':
-        child=w.start(w.argv(),{'OXIDE_TEST_BARGE_BEFORE_CALL':str(w.root)})
-        lock=None;token=secrets.token_hex(16)
-        try:
-            w.wait('barge-before-call-'+intent['id'],child)
-            lock=w.start(['outputs','__delegation-fixture','lock',w.data['uuid'],token]);w.wait('lock-'+token,lock)
-            (w.proof.evidence/('barge-call-release-'+intent['id'])).write_text('release')
-            code,_,_=w.finish(child,'resumed-locked');require(code==3,'resumed Locked rolled back')
-            require(len(pending(w.inspect()))==1,'resumed Locked cleared pending');w.kept()
-        finally:
-            (w.proof.evidence/('release-'+token)).write_text('release')
-            if lock is not None:w.finish(lock,'lock')
-            if child.poll() is None:child.kill();w.finish(child,'resumed-stop',interrupted=True)
-        return
-    if name.endswith('barge'):
-        w.helper('replay')
-        # A pre-rename Barge replay can prove rollback; Oxide then reuses the
-        # original request under its own intent, never another deleter.
-    w.execute(expect=0,label='resume');w.settled()
+        anchor=w.checkout.parent;anchor.rename(anchor.with_name('retained-anchor'));anchor.mkdir(mode=0o700)
+        require(anchor.stat().st_ino!=w.data['checkout_ancestor_inode'],'ancestor replacement was not discriminating')
+    if name in ('capture-gap','unlink-gap','root-replaced','checkout-ancestor-replaced'):
+        w.execute(expect=3,label='conservative-replay');require(len(pending(w.inspect()))==1,'unknown replay was acknowledged')
+        if name=='root-replaced':require((w.root/'replacement').exists(),'replacement was removed')
+        require(not w.inspect()['oxide']['settled'],'unknown removal produced a settlement fact');return
+    w.execute(expect=0,label='checked-replay');w.settled()
 
 
 def upgrade_case(w,phase):
@@ -832,11 +762,11 @@ def upgrade_case(w,phase):
         states=[json.loads((p/'state.json').read_text()) for p in (w.control,w.peer)]
         registry=json.loads((w.control/'outputs/registry.json').read_text())
         expected={
-            'internal-fence':(['/4','/3'],['initializing','ready'],2),
-            'paired-fence':(['/4','/4'],['initializing','initializing'],2),
-            'registry':(['/4','/4'],['initializing','initializing'],3),
-            'internal-ready':(['/4','/4'],['ready','initializing'],3),
-            'paired-ready':(['/4','/4'],['ready','ready'],3),
+            'internal-fence':(['/5','/3'],['initializing','ready'],2),
+            'paired-fence':(['/5','/5'],['initializing','initializing'],2),
+            'registry':(['/5','/5'],['initializing','initializing'],4),
+            'internal-ready':(['/5','/5'],['ready','initializing'],4),
+            'paired-ready':(['/5','/5'],['ready','ready'],4),
         }[phase]
         require([s['owned_outputs'][-2:] for s in states]==expected[0],'upgrade fence ordering')
         require([next(iter(s['outputs_init'])) for s in states]==expected[1],'upgrade ready ordering')
@@ -936,10 +866,8 @@ def plan_document():
             'supervisor_sha256':SUPERVISOR,'barge':BARGE,'seconds':SECONDS,'scratch_mib':BUDGET,
             'work_stop_margin_s':30,'image_mib':128,'staging':'clean exact tree, Rust1.97.1 locked/offline, private Cargo seed, '+FEATURES,
             'fit':{'measured':False,'prospective_seconds':{'seed_and_source':45,'build_seal_cleanup':170,'cases':355,'closure_margin':30},
-                   'historical_partial':{'head':'ff8c7638','overall_limit_s':300,'script_elapsed_s':269.44583875,'stage_s':23.40,'returned_rows':20,'completed':1,'failed':19,'unexecuted':23,
-                       'linear_projection_s':(269.44583875-23.40)/20*43+23.40+30,
-                       'method':'failed-path elapsed excluding stage, scaled from 20 returned rows to 43, plus observed stage and 30s margin; not an acceptance bound',
-                       'limitation':'positive deletion/recovery and remaining setup costs unmeasured; 600s sufficiency unproved; prior 300s outcomes/charges unchanged'},
+                   'estimate_basis':'170s existing stage ceiling + 45s bounded seed/source + 355s fixed case allowance + original30s margin. New coordinator prerequisite fixtures observed about20-28s for14 cases; this integration includes more command startup and pool/receipt work, so no linear equivalence is claimed.',
+                   'unmeasured':'full positive/recovery and repeated command costs; new-protocol600s sufficiency is prospective, not established. Earlier300s/600s failed diagnostics retain their exact limits/outcomes/charges and open custody.',
                    'prospective_phase_mib':{'preparation':{'all_owned':448,'margin':64},'run':{'retained':288,'image':128,'fixture_and_evidence_growth':32,'margin':64}},
                    'seed_copy_mib':128,'artifact_lifecycle':'closed producer -> exclusive verified executable in evidence -> bound provenance -> dispose only fresh target -> verify retained copy -> resident gate',
                    'accounting':'all run-owned source, target, expanded Cargo cache including seed, home, tools copied if any, evidence, sealed artifact and other files; phase observations plus unchanged qualified guard'},
@@ -957,75 +885,80 @@ def plan_document():
 
 
 def settlement_oracle_check():
-    def image(rows,intents=None):
-        oxide={'rows':rows}
-        if intents is not None:oxide['intents']=intents
-        return {'oxide':oxide}
-    old=[{'root':'old','member':m,'selected':False,'pending':False} for m in ('debug','release')]
-    successor=[{'root':'successor','member':m,'selected':True,'pending':False} for m in ('debug','release')]
-    before=fixture_groups(image(old+successor),'old','successor')
-    settled_group(image(successor),'old','successor',before)  # serde omits empty intents
-    settled_group(image(successor,[]),'old','successor',before)
-    bad_before=[image(old[:1]+successor),image([old[0],old[0]]+successor)]
-    for bad in bad_before:
-        try:fixture_groups(bad,'old','successor')
-        except OracleFailure:pass
-        else:raise AssertionError('incomplete/duplicate old member evidence accepted')
-    stale=[dict(r,pruned_ms=1) for r in old]
-    changed=[dict(r,selected=False) for r in successor]
-    for bad in (image(stale+successor),image(old[:1]+successor),image(successor[:1]),image(changed),image(successor,[{'receipt_settled':False}]),image(successor,[{'receipt_settled':True}])):
+    # Synthetic receipt/record images exercise this apparatus's evidence
+    # requirements only; they are never presented as product outcomes.
+    old=[dict(root='old',member=member,selected=False,pending=False,nonce='b'*32,checkout_id='a'*64) for member in ('debug','release')]
+    successor=[dict(root='successor',member=member,selected=True,pending=False) for member in ('debug','release')]
+    before=fixture_groups({'oxide':{'rows':old+successor}},'old','successor')
+    payload=json.dumps({'terminal_ms':123})
+    digest=hashlib.sha256(payload.encode()).hexdigest()
+    record={'schema':'barge.operation/1','sequence':1,'phase':'complete','caller':'oxide.outputs','key':'d'*32,
+            'request_digest':digest,'finalize_status':'acknowledged','finalize':{'payload':payload}}
+    entry={'caller':'oxide.outputs','key':'d'*32,'root':'old','nonce':'b'*32,'checkout_id':'a'*64,
+           'request_sha256':digest,'terminal_ms':123,'outcome':'deleted'}
+    good={'oxide':{'rows':successor,'settled':[entry]},'barge':[record]}
+    settled_group(good,'old','successor',before)
+    bads=[]
+    for mutate in (
+        lambda doc:doc['oxide'].pop('settled'),
+        lambda doc:doc['oxide']['settled'].append(dict(entry)),
+        lambda doc:doc['oxide']['settled'][0].update(key='e'*32),
+        lambda doc:doc['oxide']['settled'][0].update(request_sha256='e'*64),
+        lambda doc:doc['oxide']['settled'][0].update(terminal_ms=124),
+        lambda doc:doc['oxide']['rows'].append(old[0]),
+        lambda doc:doc['oxide']['rows'].pop(),
+        lambda doc:doc['oxide'].update(intents=[{'phase':'deleted'}]),
+        lambda doc:doc['barge'][0].update(phase='deleted'),
+        lambda doc:doc['barge'][0].update(finalize_status='owed'),
+    ):
+        doc=json.loads(json.dumps(good));mutate(doc);bads.append(doc)
+    for bad in bads:
         try:settled_group(bad,'old','successor',before)
         except OracleFailure:pass
-        else:raise AssertionError('incomplete compaction, successor loss/change or pending exclusion accepted')
+        else:raise AssertionError('missing/wrong atomic fact, group or actual acknowledgement accepted')
 
 
-def fresh_locked_oracle_check():
-    # Drive the actual case body with no filesystem or child effects. This
-    # catches the old expect=0 before any separately activated native session.
+def busy_oracle_check():
     class Evidence:
         def __init__(self,events):self.events=events
         def __truediv__(self,key):return self
         def write_text(self,text):self.events.append('release')
-    class Locked:
-        data={'uuid':'fixture'}
-        def __init__(self,code=2,doc=None,kind='KnownNoEffectLocked'):
-            self.code,self.doc,self.kind=code,doc or {'oxide':{},'barge':[]},kind
-            self.events=[]
+    class Busy:
+        data={'uuid':'synthetic'}
+        def __init__(self,code=3,records=None):
+            self.code,self.records,self.events=code,records or [],[]
             self.proof=type('Proof',(),{'evidence':Evidence(self.events)})()
         def preview(self):self.events.append('preview')
         def start(self,args):self.events.append('start');return object()
         def wait(self,*args):self.events.append('wait')
-        def execute(self,expect):
-            self.events.append('execute')
-            require(self.code==expect,'fresh Locked exit oracle differs')
+        def execute(self,expect):self.events.append('execute');require(expect==self.code,'busy begin exit differs')
         def kept(self):self.events.append('kept')
-        def require_reply(self,kind):require(self.kind==kind,'fresh Locked actual outcome differs')
-        def inspect(self):return self.doc
+        def inspect(self):return {'barge':self.records}
         def finish(self,*args):self.events.append('finish');return 0,'',''
-    world=Locked();run_case(world,'fresh-locked')
-    require(world.events==['preview','start','wait','execute','kept','release','finish'],'fresh Locked case skipped effect/closure controls')
-    for world in (Locked(code=0),Locked(code=3),Locked(doc={'oxide':{'intents':[{'receipt_settled':False}]},'barge':[]}),Locked(doc={'oxide':{},'barge':[{'phase':'intent'}]}),Locked(kind='Refused')):
-        try:run_case(world,'fresh-locked')
+    world=Busy();run_case(world,'fresh-busy')
+    require(world.events==['preview','start','wait','execute','kept','release','finish'],'busy case skipped a real command/closure obligation')
+    for world in (Busy(code=0),Busy(records=[{'phase':'intent'}])):
+        try:run_case(world,'fresh-busy')
         except OracleFailure:pass
-        else:raise AssertionError('wrong Locked exit/outcome or remaining Oxide/Barge intent accepted')
-        require(world.events[-2:]==['release','finish'],'failed Locked oracle did not close its lock child')
+        else:raise AssertionError('busy begin accepted an effect/record or wrong exit')
+        require(world.events[-2:]==['release','finish'],'busy oracle failure abandoned its child')
 
 
 def self_check():
     # Counterfactuals exercise orchestration oracles, not product semantics.
     load('delegation_controls','test-outputs-delegation-controls.py').check(sys.modules[__name__])
     settlement_oracle_check()
-    fresh_locked_oracle_check()
+    busy_oracle_check()
     require(len(set(CASES))==len(CASES),'duplicate cases')
-    good={'barge':[{'intent_id':'a'*32,'phase':'intent'}]}
+    good={'barge':[{'schema':'barge.operation/1','sequence':1,'key':'a'*32,'caller':'oxide.outputs','phase':'intent'}]}
     native_phase(good,'intent')
-    for bad in ({'barge':[]},{'barge':[{'intent_id':'a'*32,'phase':'deleted'}]}):
+    for bad in ({'barge':[]},{'barge':[dict(good['barge'][0],phase='deleted')]}):
         try:native_phase(bad,'intent')
         except OracleFailure:pass
-        else:raise AssertionError('phase oracle accepted missing/wrong actual record')
-    require(pending({'oxide':{'intents':[{'receipt_settled':False},{'receipt_settled':True}]}})==[{'receipt_settled':False}],'pending settlement oracle')
+        else:raise AssertionError('missing/wrong actual operation accepted')
+    require(len(pending({'barge':[{'phase':'intent'},{'phase':'complete'},{'phase':'cancelled'}]}))==1,'pending operation oracle')
     require(plan_document()['native_activated'] is False,'plan cannot activate native')
-    fake={name:b'bound source' for name in ('Cargo.toml','crates/barge/Cargo.toml','crates/barge/src/oxide_outputs.rs','crates/barge/src/delete.rs','crates/barge/src/evidence.rs','crates/barge/src/reference.rs','crates/barge/src/state.rs')}
+    fake={name:b'bound source' for name in ('Cargo.toml','crates/barge/Cargo.toml','crates/barge/src/operation.rs','crates/barge/src/oxide_outputs.rs','crates/barge/src/delete.rs','crates/barge/src/evidence.rs','crates/barge/src/reference.rs','crates/barge/src/state.rs')}
     digests={name:hashlib.sha256(data).hexdigest() for name,data in fake.items()}
     verify_source_files(digests,lambda parts:hashlib.sha256(fake['/'.join(parts)]).hexdigest())
     for altered in ('missing','changed'):
@@ -1034,7 +967,7 @@ def self_check():
         else:bad['crates/barge/src/delete.rs']='0'*64
         try:verify_source_files(bad,lambda parts:hashlib.sha256(fake['/'.join(parts)]).hexdigest())
         except OracleFailure:pass
-        else:raise AssertionError('unbound adapter source accepted')
+        else:raise AssertionError('unbound coordinator source accepted')
     links={'crates/barge/src/alias.rs':'delete.rs'}
     verify_source_links(digests,links,lambda parts:'delete.rs')
     for bad in ('../delete.rs','missing.rs'):
@@ -1073,7 +1006,7 @@ def self_check():
         except (AttributeError,TypeError) as exc:
             raise AssertionError('case dispatch escaped its first action: '+name) from exc
     globals()['held_writer'],globals()['upgrade_case']=original_writer,original_upgrade
-    try:native_phase({'barge':[{'intent_id':'x'*32,'phase':'intent'}]},'intent')
+    try:native_phase({'barge':[dict(good['barge'][0],sequence=0)]},'intent')
     except OracleFailure:pass
     else:raise AssertionError('malformed actual Barge id accepted')
     print('outputs delegation apparatus self-check: OK (effect-free; no native credit)')

@@ -6187,27 +6187,32 @@ Both retained images remain open custody obligations, with no survey, reuse or
 manual cleanup authority. A fresh diagnostic and the counted qualification
 chain remain separately planner-activated after independent readiness.
 
-The [domain-verification preparation](barge-adoption.md#domain-verification-preparation-for-single-authority)
-separates exact registry/receipt checks from the existing covered caller's intent
-lookup. Its wrapper retains the same barrier/binding, publication boundaries and
-separate runtime custody/absence checks. The verifier acquires no lock and its
-verdict cannot be reused across a guarded publication revision. This source refactor
-neither activates the selected single-authority integration nor resumes the old
-native protocol; actual published Barge journal/coordinator inputs remain required.
+The current [single-authority caller](barge-adoption.md#connected-caller-and-recovery-source-oxide304)
+uses Barge's checked operation journal and linked durable handler. Covered roots
+branch before local intent/quarantine publication; the sidecars, route write,
+four-state join and same-call Locked rule are removed. Original eligibility and
+barrier/binding remain Oxide-owned. Admission is released before Barge waits;
+re-affirmation and each exact-group settlement revision re-read under admission.
+The six registry publication surfaces consult the complete journal fail-fast,
+including receipt writes whose rows compare equal. Only Barge's opaque exact
+own-operation context exempts a handler; every other conflict still refuses.
 
-The focused [integrated delegation apparatus](barge-adoption.md#integrated-delegation-proof-readiness-oxide304)
-uses the ordinary qualified supervisor and separately activated600s /512MiB
-native selectors (the prospective v19 amendment; all earlier occurrences
-retain their original300s bounds). The pinned reviewed Barge054 now supplies deciding checkout-volume absence
-and replay evidence. The effect-free plan binds its actual exported source,
-lock, installed tools and selected scratch; a ready source plan grants no native,
-installation or live migration credit. Its first integrated diagnostic failed
-before all43 cases because JSON publication called a nonexistent imported
-helper; the [failure and apparatus correction](barge-adoption.md#first-integrated-diagnostic-and-publication-correction-oxide304)
-preserve that spent occurrence and unknown seed result. The source/local-file
-self-check now exercises the real replacement writer and primary/secondary
-failure composition with fake execution boundaries. It starts no engine or
-image and supplies no diagnostic credit.
+The [one-time fixture adoption](barge-adoption.md#explicit-recovery-upgrade-implementation-boundary-oxide304)
+uses registry4 and paired `/5` fences, retaining predecessor meanings and refusing
+unfinished old operations. It is never automatic or activated on a live store.
+The prepared verifier now serves this caller and its atomic retained settlement
+entry. Released receipts are read-only; absent rows without the exact settlement
+fact never acknowledge an operation. The bounded set is never evicted.
+
+The [integrated apparatus](barge-adoption.md#integrated-delegation-proof-readiness-oxide304)
+has a fixed new-protocol case map and actual checked API/source bindings. Existing
+helper, environment, stage/seal and image-custody controls remain effect-free.
+Future native bounds stay600s/512MiB/one128MiB image/original30s margin; source and
+ordinary checks do not activate them. Exact-head readiness and the diagnostic,
+counted author, distinct reviewer and final closure/evidence chain remain held.
+The following paragraphs record historical failed two-journal apparatus work,
+not the current protocol or new qualification.
+
 The replacement65c86590 diagnostic built but failed the160MiB staging allocation
 before all43 cases. The [phased staging correction](barge-adoption.md#phased-staging-and-sealed-case-executable-oxide304)
 keeps the512MiB overall guard while sealing the case executable and disposing
