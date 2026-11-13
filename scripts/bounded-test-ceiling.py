@@ -364,6 +364,20 @@ def now_ns():
     return time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
 
 
+def monitor_absolute(ctx):
+    """The monitor's original window, capped by the optional caller ceiling.
+
+    Admission extensions are custodian-owned; retaining the original monitor
+    window is conservative and preserves the baseline's monitor behavior.
+    """
+    original = ctx["start_ns"] + int(ctx["limit_s"] * NS)
+    return min(original, ctx.get("ceiling_ns", original))
+
+
+def monitor_remaining(ctx, reserve_ns=0):
+    return max(0, monitor_absolute(ctx) - reserve_ns - now_ns()) / NS
+
+
 def settlement_record():
     """The monitor's observation-only settlement diagnostics (oxide#147).
 
@@ -2561,7 +2575,7 @@ def cleanup_safety(ctx, probe=None, facts=None):
     start_ns, limit_s = ctx.get("start_ns"), ctx.get("limit_s")
     deadline_ns = None
     if typed(start_ns, int) and typed(limit_s, (int, float)):
-        deadline_ns = (start_ns + int(limit_s * NS) - EXIT_MARGIN_S * NS
+        deadline_ns = (monitor_absolute(ctx) - EXIT_MARGIN_S * NS
                        - DETACH_GATE_MARGIN_NS)
         if (deadline_ns - now_ns()) <= 0:
             return {"state": "kept", "at_ns": now_ns(), "unrequested": list(backings),
@@ -2692,7 +2706,7 @@ def detach_budget(ctx, now=None):
     bounded attempt always finishes and reports before the custodian would
     declare the monitor incomplete."""
     now = now_ns() if now is None else now
-    exit_at = ctx["start_ns"] + int(ctx["limit_s"] * NS) - EXIT_MARGIN_S * NS
+    exit_at = monitor_absolute(ctx) - EXIT_MARGIN_S * NS
     return max(0, exit_at - now - DETACH_GATE_MARGIN_NS)
 
 
@@ -2848,7 +2862,7 @@ def detach_record(ctx, document):
               # Only the cheap reserve read is sampled inside the custodial window;
               # no owned-byte walk runs here (the samplers already record the peak).
               "reserve_before": None, "reserve_after": None,
-              "deadline_ns": ctx["start_ns"] + int(ctx["limit_s"] * NS), "at_ns": now_ns()}
+              "deadline_ns": monitor_absolute(ctx), "at_ns": now_ns()}
     if isinstance(document, dict):
         for name in ("backing", "mount", "device", "volume_uuid"):
             record[name] = detach_text(document, name)
@@ -4118,6 +4132,12 @@ class Monitor:
             "survivors": [],
             "admission": admission_record(), "admission_waiting": admission_waiting_record(),
         }
+        if ctx.get("ceiling_ns") is not None:
+            self.receipt["ceiling"] = {
+                "clock": "CLOCK_UPTIME_RAW", "requested_ns": ctx["ceiling_ns"],
+                "initial_effective_ns": ctx["initial_absolute_ns"],
+                "start_ns": ctx["start_ns"], "relative_limit_s": ctx["limit_s"],
+            }
 
     def close_orphan_reads(self, ctx):
         """Attachment reads whose child was never reaped are closed here, bounded
@@ -4125,7 +4145,7 @@ class Monitor:
         closed is unaccounted custody: the monitor holds instead of completing."""
         if not INFO_ORPHANS:
             return True
-        window_end = (ctx["start_ns"] + int(ctx["limit_s"] * NS) - EXIT_MARGIN_S * NS
+        window_end = (monitor_absolute(ctx) - EXIT_MARGIN_S * NS
                       - int(0.2 * NS))
         while INFO_ORPHANS:
             handle = INFO_ORPHANS.pop(0)
@@ -4146,12 +4166,12 @@ class Monitor:
             # Unaccounted custody: keep everything and let the custodian end the run.
             self.publish("orphan_read_unaccounted: monitor_held")
             self.summary()
-            end = ctx["start_ns"] + int(ctx["limit_s"] * NS) - int(0.1 * NS)
+            end = monitor_absolute(ctx) - int(0.1 * NS)
             while not self.stop.is_set() and now_ns() < end:
                 time.sleep(0.02)
             return
         if drain:
-            remaining = (ctx["start_ns"] + int(ctx["limit_s"] * NS) - EXIT_MARGIN_S * NS
+            remaining = (monitor_absolute(ctx) - EXIT_MARGIN_S * NS
                          - now_ns()) / NS
             # One short drain: the custodian's records are already in the pipe by
             # the time its last answer was read, and the wait never exceeds what is
@@ -4172,6 +4192,8 @@ class Monitor:
         """Append `record` messages the custodian sent after the decision (detach
         pin/signal/observation, cleanup keeps) to the receipt. Bounded, never
         blocks past `wait_s`, and other command types are ignored."""
+        if self.ctx.get("ceiling_ns") is not None:
+            wait_s = min(wait_s, monitor_remaining(self.ctx, EXIT_MARGIN_S * NS))
         deadline = time.monotonic() + max(0.0, wait_s)
         buffer = b""
         while True:
@@ -4221,6 +4243,8 @@ class Monitor:
         return seq
 
     def publish(self, phase):
+        if self.ctx.get("ceiling_ns") is not None and monitor_remaining(self.ctx) <= 0:
+            raise RuntimeError("ceiling exhausted before receipt publication")
         with self.lock:
             self.receipt["phase"] = phase
             self.receipt["published_ns"] = now_ns()
@@ -4491,6 +4515,8 @@ class Monitor:
             return stored
         thread = getattr(self, "census_thread", None)
         bound = max(0.0, float(timeout_s))
+        if getattr(self, "ctx", {}).get("ceiling_ns") is not None:
+            bound = min(bound, monitor_remaining(self.ctx, EXIT_MARGIN_S * NS))
         started = now_ns()
         joined = True
         if thread is not None:
@@ -4643,6 +4669,8 @@ class Monitor:
     def await_command(self, kind, wait_s):
         """One bounded read of a specific command from the custodian. A missing,
         late, malformed or different answer is None: no authority is inferred."""
+        if self.ctx.get("ceiling_ns") is not None:
+            wait_s = min(wait_s, monitor_remaining(self.ctx, EXIT_MARGIN_S * NS))
         deadline = time.monotonic() + max(0.0, wait_s)
         buffer = b""
         while True:
@@ -4685,11 +4713,15 @@ class Monitor:
         and the closure verdict -- before the one detach attempt and again while it
         runs. Bounded by the budget itself: a missing, late, malformed or refused
         answer authorizes nothing, so the mount, backing and evidence are kept."""
+        if self.ctx.get("ceiling_ns") is not None and monitor_remaining(self.ctx, EXIT_MARGIN_S * NS) <= 0:
+            return False, "the ceiling window is exhausted", 0
         try:
             self.send("detach_ready", budget_ns=int(budget_ns))
         except OSError:
             return False, "the authorization request could not be sent", 0
         wait = DETACH_GATE_WAIT_S if wait_s is None else wait_s
+        if self.ctx.get("ceiling_ns") is not None:
+            wait = min(wait, monitor_remaining(self.ctx, EXIT_MARGIN_S * NS))
         deadline = time.monotonic() + (min(wait, budget_ns / NS) if budget_ns else wait)
         buffer = b""
         while True:
@@ -4794,6 +4826,10 @@ class Monitor:
         join = self.join_census()
         settled, unsettled_reason = census_settled(
             join, getattr(self, "census_last", None), self.receipt.get("deciding_census"))
+        if (decision == "cleanup" and ctx.get("ceiling_ns") is not None
+                and monitor_remaining(ctx, EXIT_MARGIN_S * NS) <= 0):
+            decision = "keep"
+            self.send("cleanup_kept", reason="ceiling window exhausted before cleanup")
         if decision == "cleanup" and not settled:
             # The census evidence cannot be shown final and certainly empty from the
             # message the decision named, so certain closure is not available.
@@ -4829,7 +4865,7 @@ class Monitor:
                         # names the child by PID AND start time, then waits for the
                         # custodian's acknowledgement before touching it again.
                         row, identity_problem = process_row(getattr(handle, "pid", 0) or 0)
-                        window_end = (ctx["start_ns"] + int(ctx["limit_s"] * NS)
+                        window_end = (monitor_absolute(ctx)
                                       - EXIT_MARGIN_S * NS - int(0.2 * NS))
                         ack = None
                         if row is not None:
@@ -4857,7 +4893,7 @@ class Monitor:
                             if not absent_reaped:
                                 self.publish("detach_child_unaccounted: monitor_held")
                                 self.summary()
-                                end = ctx["start_ns"] + int(ctx["limit_s"] * NS) - int(0.1 * NS)
+                                end = monitor_absolute(ctx) - int(0.1 * NS)
                                 while not self.stop.is_set() and now_ns() < end:
                                     time.sleep(0.02)
                                 return
@@ -4908,7 +4944,7 @@ class Monitor:
                                 return
                             self.publish("detach_child_unaccounted: monitor_held")
                             self.summary()
-                            end = ctx["start_ns"] + int(ctx["limit_s"] * NS) - int(0.1 * NS)
+                            end = monitor_absolute(ctx) - int(0.1 * NS)
                             while not self.stop.is_set() and now_ns() < end:
                                 time.sleep(0.02)
                             return
@@ -4941,7 +4977,7 @@ class Monitor:
                         # never claiming a closure nobody observed.
                         self.publish("detach_child_unaccounted: monitor_held")
                         self.summary()
-                        end = ctx["start_ns"] + int(ctx["limit_s"] * NS) - int(0.1 * NS)
+                        end = monitor_absolute(ctx) - int(0.1 * NS)
                         while not self.stop.is_set() and now_ns() < end:
                             time.sleep(0.02)
                         return
@@ -5145,10 +5181,13 @@ def monitor_main(ctx, ctl_w, cmd_r, out_r, err_r):
 
 
 class Custodian:
-    def __init__(self, command, limit_s=LIMIT_S, budget=SCRATCH_BUDGET, evidence=None, root_parent=None):
+    def __init__(self, command, limit_s=LIMIT_S, budget=SCRATCH_BUDGET, evidence=None, root_parent=None,
+                 ceiling_ns=None):
         _ROLE[0] = "custodian"
         self.command, self.limit_s, self.budget, self.evidence_arg = command, limit_s, budget, evidence
         self.root_parent = root_parent
+        self.ceiling_ns = ceiling_ns
+        self.admission_ceiling_capped_ns = 0
         self.inject = {item for item in os.environ.get("OXIDE_SUPERVISOR_INJECT", "").split(",") if item}
         if self.inject - INJECTIONS:
             raise SystemExit(f"bounded-test.py: unknown injection {sorted(self.inject - INJECTIONS)}")
@@ -5369,10 +5408,13 @@ class Custodian:
                 # grant the same wait twice.
                 self.admission_duplicates += 1
                 return
-            if self.stopped_at is not None or self.deadline_hit:
+            if (self.stopped_at is not None or self.deadline_hit
+                    or (self.ceiling_ns is not None and at >= self.stop_at)):
                 self.admission_ignored += 1
                 self.admission_late_ns = at
-                self.admission_late_reason = "stopped" if self.stopped_at is not None else "deadline"
+                self.admission_late_reason = ("stopped" if self.stopped_at is not None
+                                              or (self.ceiling_ns is not None and at >= self.stop_at)
+                                              else "deadline")
                 # The wait ended after the stop: still a completed wait for this
                 # command, so it is never reported as unfinished.
                 if pair is not None and pair["ended"] is None:
@@ -5397,6 +5439,10 @@ class Custodian:
                 waited = elapsed
             room = max(0, ADMISSION_CAP_NS - self.admission_granted)
             grant = min(waited, room)
+            if self.ceiling_ns is not None:
+                ceiling_room = max(0, self.ceiling_ns - self.absolute)
+                self.admission_ceiling_capped_ns += grant - min(grant, ceiling_room)
+                grant = min(grant, ceiling_room)
             self.admission_counted += 1
             self.admission_reported = min(U64MAX, self.admission_reported + message["waited_ns"])
             self.admission_clamped = self.admission_clamped or clamped
@@ -5648,9 +5694,16 @@ class Custodian:
         for number in (signal.SIGINT, signal.SIGTERM):
             signal.signal(number, lambda n, _f: setattr(self, "cancelled", self.cancelled or n))
         self.start = now_ns()
-        self.absolute = self.start + int(self.limit_s * NS)
-        self.stop_at = self.absolute - STOP_RESERVE_S * NS
-        self.exit_at = self.absolute - EXIT_MARGIN_S * NS
+        if self.ceiling_ns is None:
+            self.absolute = self.start + int(self.limit_s * NS)
+            self.stop_at = self.absolute - STOP_RESERVE_S * NS
+            self.exit_at = self.absolute - EXIT_MARGIN_S * NS
+        else:
+            try:
+                self.absolute, self.stop_at, self.exit_at = ceiling_deadlines(
+                    self.start, self.ceiling_ns, self.limit_s)
+            except ValueError as error:
+                raise SystemExit(f"bounded-test-ceiling.py: refused before proof work: {error}")
         self.setup_at = min(self.start + SETUP_S * NS, self.stop_at)
         self.run_id = secrets.token_hex(16)
         self.guard = Guard(self.start, budget=self.budget)
@@ -5666,12 +5719,19 @@ class Custodian:
             "root_parent": self.root_parent, "budget": self.budget, "start_ns": self.start,
             "inject": sorted(self.inject),
         }
+        if self.ceiling_ns is not None:
+            self.ctx["ceiling_ns"] = self.ceiling_ns
+            self.ctx["initial_absolute_ns"] = self.absolute
 
     def setup_expired(self, now):
         """Setup is bounded by its own deadline, never by reading freshness."""
         return now >= self.setup_at
 
     def launch_monitor(self):
+        if self.ceiling_ns is not None and self.setup_expired(now_ns()):
+            self.not_launched = "ceiling setup window exhausted"
+            self.guard.latch(self.not_launched)
+            return False
         self.ctl_r, ctl_w = os.pipe()
         cmd_r, self.cmd_w = os.pipe()
         out_r, self.out_w = os.pipe()
@@ -5702,6 +5762,9 @@ class Custodian:
         return False
 
     def launch_leader(self):
+        if self.ceiling_ns is not None and self.setup_expired(now_ns()):
+            self.guard.latch("ceiling setup window exhausted before leader")
+            return False
         ack_r, ack_w = os.pipe()
         gate_r, gate_w = os.pipe()
         pid = os.fork()
@@ -5775,7 +5838,8 @@ class Custodian:
                 pending = signal.sigpending() & held
                 if pending and not self.cancelled:
                     self.cancelled = int(min(pending))
-                if self.cancelled or self.guard.fault is not None:
+                if (self.cancelled or self.guard.fault is not None
+                        or (self.ceiling_ns is not None and self.setup_expired(now_ns()))):
                     detector = False
             if detector:
                 os.write(gate_w, b"G")
@@ -5852,6 +5916,8 @@ class Custodian:
         One bounded line names the reason before the pinned monitor is stopped, so
         a launch refusal is never silent."""
         report(f"bounded-test.py: not launched: {self.not_launched or 'setup did not finish'}\n")
+        if self.monitor is None:
+            return 125
         try:
             self.signal_pinned(self.monitor, signal.SIGKILL, group=False)
             status, end = None, min(now_ns() + NS, self.exit_at)
@@ -5990,6 +6056,9 @@ class Custodian:
                       "unclassified": self.admission_unclassified,
                       "cap_ns": ADMISSION_CAP_NS, "limit_s": self.limit_s,
                       "absolute_ns": self.absolute}
+            if self.ceiling_ns is not None:
+                record.update(requested_ceiling_ns=self.ceiling_ns, start_ns=self.start,
+                              ceiling_capped_ns=self.admission_ceiling_capped_ns)
             os.write(self.cmd_w, (json.dumps({"run": self.run_id, "seq": self.seq, "type": "record",
                                               "record": record}) + "\n").encode())
         except BaseException:
@@ -6064,7 +6133,8 @@ class Custodian:
 
     def closure(self, launched):
         return (launched and self.guard.fault is None and not self.census_uncertain and self.census_ok
-                and len(self.eof) == 2)
+                and len(self.eof) == 2
+                and (self.ceiling_ns is None or (not self.deadline_hit and now_ns() < self.stop_at)))
 
     def finish(self, launched):
         self.closed = self.closure(launched)
@@ -6073,6 +6143,12 @@ class Custodian:
             os.WEXITSTATUS(status) if os.WIFEXITED(status) else -os.WTERMSIG(status) if os.WIFSIGNALED(status) else None)
         outcome = {"closure": "closed" if self.closed else "UNCLOSED", "status": decoded,
                    "fault": self.guard.fault, "deadline": self.deadline_hit, "launched": launched}
+        if self.ceiling_ns is not None:
+            outcome.update(requested_ceiling_ns=self.ceiling_ns, effective_deadline_ns=self.absolute,
+                           start_ns=self.start, relative_limit_s=self.limit_s,
+                           admission_reported_ns=self.admission_reported,
+                           admission_granted_ns=self.admission_granted,
+                           admission_ceiling_capped_ns=self.admission_ceiling_capped_ns)
         self.tell("cleanup" if self.closed else "keep", outcome=outcome,
                   census=self.census_decision)
         # The monitor stops sampling once it publishes `monitor_complete`; its
@@ -6142,17 +6218,23 @@ def ceiling_deadlines(start_ns, ceiling_ns, limit_s):
 
 def parse(argv):
     options = {"limit": LIMIT_S, "budget": SCRATCH_BUDGET, "evidence": None, "root_parent": None}
+    ceiling_text = None
     while argv and argv[0].startswith("--"):
         flag = argv.pop(0)
         if flag == "--":
             break
-        if flag not in ("--limit", "--scratch-budget-mib", "--evidence", "--root-parent") or not argv:
+        if flag not in ("--limit", "--scratch-budget-mib", "--evidence", "--root-parent",
+                        "--ceiling-uptime-ns") or not argv:
             raise SystemExit(f"bounded-test.py: unknown or incomplete option {flag}")
         value = argv.pop(0)
         if flag == "--limit":
             options["limit"] = float(value)
         elif flag == "--scratch-budget-mib":
             options["budget"] = int(value) * MIB
+        elif flag == "--ceiling-uptime-ns":
+            if ceiling_text is not None:
+                raise SystemExit("bounded-test-ceiling.py: duplicate ceiling")
+            ceiling_text = value
         elif flag == "--evidence":
             options["evidence"] = value
         else:
@@ -6161,6 +6243,17 @@ def parse(argv):
         raise SystemExit("bounded-test.py: no command")
     if options["limit"] <= STOP_RESERVE_S + SETUP_S:
         raise SystemExit(f"bounded-test.py: --limit must exceed {STOP_RESERVE_S + SETUP_S} s")
+    if ceiling_text is not None:
+        if not re.fullmatch(r"[0-9]{1,20}", ceiling_text):
+            raise SystemExit("bounded-test-ceiling.py: ceiling must be an unsigned integer")
+        ceiling = int(ceiling_text)
+        try:
+            # Zero is a convenient synthetic start for validating numeric ranges;
+            # setup uses the actual local clock before any owned effect or spawn.
+            ceiling_deadlines(0, ceiling, options["limit"])
+        except ValueError as error:
+            raise SystemExit(f"bounded-test-ceiling.py: invalid ceiling or limit: {error}")
+        options["ceiling_ns"] = ceiling
     return argv, options
 
 
