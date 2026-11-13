@@ -327,6 +327,32 @@ class CustodianWindow(unittest.TestCase):
         with mock.patch.object(candidate, "now_ns", return_value=90 * ns):
             self.assertEqual(candidate.detach_budget(ctx), 0)
 
+    def test_expired_detach_keeps_live_handle_and_unknown_post_state(self):
+        ns = candidate.NS
+        ctx = {"start_ns": 0, "limit_s": 100, "ceiling_ns": 100 * ns,
+               "reserve_path": "synthetic", "evidence": "synthetic", "inject": []}
+        probe, handle = mock.Mock(), mock.Mock()
+        clock = [0]
+
+        def delayed_detach(*_args):
+            clock[0] = 51 * ns
+            return {"exit": None, "reaped": False, "handle": handle, "output": ""}
+
+        probe.detach.side_effect = delayed_detach
+        record = {"mount": "synthetic", "backing": "synthetic", "qualified": False,
+                  "attempted": False, "reason": None}
+        with mock.patch.object(candidate, "read_detach_request", return_value=({}, None)), \
+             mock.patch.object(candidate, "detach_record", return_value=record), \
+             mock.patch.object(candidate, "detach_request_problems", return_value=[]), \
+             mock.patch.object(candidate, "detach_budget", return_value=50 * ns), \
+             mock.patch.object(candidate, "_free_bytes", return_value=1), \
+             mock.patch.object(candidate, "now_ns", side_effect=lambda: clock[0]):
+            result = candidate.post_census_detach(ctx, probe=probe)
+        self.assertIs(result["_handle"], handle)
+        self.assertEqual(result["post_state"], "unknown")
+        self.assertFalse(result["qualified"])
+        probe.mount_point.assert_not_called()
+
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--plan"]:

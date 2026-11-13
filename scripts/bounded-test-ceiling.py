@@ -3008,6 +3008,10 @@ def post_census_detach(ctx, probe=None, authorize=None, still_allowed=None):
                           "utf-8", "replace")).decode("utf-8", "replace"),
                       output_truncated=bool(attempt.get("truncated")))
         record["at_ns"] = now_ns()
+        if ctx.get("ceiling_ns") is not None and left() <= 0:
+            record.update(state="timed_out", timed_out=True, post_state="unknown",
+                          reason="ceiling window expired before post-state verification")
+            return record  # preserve any live handle for the monitor's custody path
         if still_allowed is not None:
             allowed, reason = still_allowed()
             if not allowed:
@@ -4995,9 +4999,10 @@ class Monitor:
                 if not detach["qualified"]:
                     # Never retried, never cleaned up and never a positive conclusion:
                     # the mount, its backing and the evidence are kept.
-                    self.publish("detach_unqualified: scratch_kept")
-                    self.receipt["scratch_marker"] = self.conclude_marker(
-                        False, reason="detach", outcome="failed")
+                    if handle is None or ctx.get("ceiling_ns") is None:
+                        self.publish("detach_unqualified: scratch_kept")
+                        self.receipt["scratch_marker"] = self.conclude_marker(
+                            False, reason="detach", outcome="failed")
                     if handle is not None and not detach.get("reaped"):
                         # The direct child is live and unreaped. The monitor may not
                         # reap it after handing custody over (a reaped PID can be
@@ -5031,7 +5036,8 @@ class Monitor:
                                 detach["reap_timed_out"] = not absent_reaped
                                 self.receipt["detach"] = detach
                             if not absent_reaped:
-                                self.publish("detach_child_unaccounted: monitor_held")
+                                if ctx.get("ceiling_ns") is None:
+                                    self.publish("detach_child_unaccounted: monitor_held")
                                 self.summary()
                                 end = monitor_absolute(ctx) - int(0.1 * NS)
                                 while not self.stop.is_set() and now_ns() < end:
@@ -5047,7 +5053,8 @@ class Monitor:
                             # is held unreaped its PID cannot be recycled, so it is
                             # stopped and reaped here, positively, inside the
                             # custodian's remaining deadline.
-                            self.publish("detach_child_identity_unreadable: closing_own_child")
+                            if ctx.get("ceiling_ns") is None:
+                                self.publish("detach_child_identity_unreadable: closing_own_child")
                             reaped_here = False
                             status = None
                             if "detach-handoff-unreadable" not in injections():
@@ -5082,7 +5089,8 @@ class Monitor:
                                 self.publish("detach_child_closed_by_custodian: scratch_kept")
                                 self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
                                 return
-                            self.publish("detach_child_unaccounted: monitor_held")
+                            if ctx.get("ceiling_ns") is None:
+                                self.publish("detach_child_unaccounted: monitor_held")
                             self.summary()
                             end = monitor_absolute(ctx) - int(0.1 * NS)
                             while not self.stop.is_set() and now_ns() < end:
@@ -5115,7 +5123,8 @@ class Monitor:
                                 return
                         # Still unaccounted: hold until the custodian ends the run,
                         # never claiming a closure nobody observed.
-                        self.publish("detach_child_unaccounted: monitor_held")
+                        if ctx.get("ceiling_ns") is None:
+                            self.publish("detach_child_unaccounted: monitor_held")
                         self.summary()
                         end = monitor_absolute(ctx) - int(0.1 * NS)
                         while not self.stop.is_set() and now_ns() < end:
