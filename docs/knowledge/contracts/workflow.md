@@ -622,6 +622,14 @@ inherited rustc wrapper ([below](#inherited-rustc-wrapper)). `oxide
 init` readiness still reports the toolchain rustup resolves at the workspace
 root. A new Cargo release needs this check before it joins the table.
 
+**Rust 1.100 (oxide#083): not yet qualified.** Stable 1.100.0 was released
+2026-11-12 and makes build-dir layout v2 the default. It is not in the table,
+so the shipped gate runs its fallback on it. The planned single proof,
+`effigy proof:foundation:rust-1-100:diagnostic`, refuses before any effect
+because its retained focused oracles still read the retired lease CLI and
+image-pool state (oxide#102); `:plan` and `:test` are effect-free
+([readiness](../evidence/rust-1-100-foundation-083/README.md)).
+
 ## What one command does (local executor)
 
 Help is Cargo's and needs no storage (oxide#182): `oxide <cmd> --help` or
