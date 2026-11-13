@@ -1,5 +1,10 @@
 # Open questions
 
+The oxide#309 absolute-deadline candidate is unqualified. Its native suite,
+bootstrap inputs and case inventory still need owner binding and independent
+review before separate diagnostic, author and reviewer activations; no consumer
+adoption follows from source controls.
+
 ## Q-018 — How do per-command admission and execution budgets behave after freeze?
 
 Settled for implementation by Tom's 2026-10-24 decision (oxide#140): the two

@@ -2327,6 +2327,16 @@ applicable separately activated diagnostic before a counted run.
 
 ## Shared proof supervisor
 
+An isolated, unqualified ceiling candidate lives at `scripts/bounded-test-ceiling.py`
+(oxide#309). Its `--ceiling-uptime-ns` option takes an absolute integer in the
+local `CLOCK_UPTIME_RAW` domain and caps the initial and admission-extended
+deadline. It retains the 20-second stop reserve and two-second exit margin.
+`proof:supervisor:ceiling:plan` and `proof:supervisor:ceiling:test` cover
+synthetic source controls only; neither qualifies a runner. The ordinary
+`scripts/bounded-test.py` and the separate oxide#233 candidate remain unchanged.
+Source review, an independently scoped diagnostic and separate author and
+reviewer native qualifications precede any promotion or consumer adoption.
+
 **Interim admission allowance (Tom, 2026-10-22).** Until Queue #381's
 admission-hook adapter lands, Oxide native proofs may use Effigy `heavy`
 inline, with a fresh owner scheduler headroom receipt immediately before

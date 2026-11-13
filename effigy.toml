@@ -34,6 +34,10 @@ minimum_effigy_version = "0.14.0"
 # The shared session supervisor's pure cases (oxide#109): fake clock, process
 # table, signals and readings; spawns nothing. Not the qualification.
 "proof:supervisor:test" = "python3 scripts/test_supervisor.py --pure"
+# Source-only ceiling candidate controls. These exercise scripted clocks and
+# fake effects; neither selector launches the candidate or qualifies it.
+"proof:supervisor:ceiling:test" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_supervisor_ceiling.py"
+"proof:supervisor:ceiling:plan" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_supervisor_ceiling.py --plan"
 # Effect-free readiness for the selected host (oxide#151): path, mode, owner and
 # device metadata only. Creates nothing (an absent private leaf is reported as
 # planned), never sweeps, marks, forks the deadline actor or launches the

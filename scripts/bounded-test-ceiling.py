@@ -375,7 +375,18 @@ def monitor_absolute(ctx):
 
 
 def monitor_remaining(ctx, reserve_ns=0):
-    return max(0, monitor_absolute(ctx) - reserve_ns - now_ns()) / NS
+    # Long-lived samplers and command readers must survive a legitimate grant.
+    # The custodian enforces the effective deadline; this independent bound is
+    # the immutable outer ceiling, which a grant can never move.
+    bound = ctx.get("ceiling_ns", monitor_absolute(ctx))
+    return max(0, bound - reserve_ns - now_ns()) / NS
+
+
+def monitor_sleep(ctx, duration):
+    if ctx.get("ceiling_ns") is not None:
+        duration = min(duration, monitor_remaining(ctx))
+    if duration > 0:
+        time.sleep(duration)
 
 
 def settlement_record():
@@ -2091,6 +2102,9 @@ class SelectionRefused(Exception):
 
 
 class DefaultProbe:
+    def __init__(self, deadline_ns=None):
+        self.deadline_ns = deadline_ns
+
     """The facts the default selection reads: kernel metadata, two bounded
     documents and the account home. Tests substitute their own."""
 
@@ -2133,11 +2147,12 @@ class DefaultProbe:
     def attachments(self, backing, timeout=None):
         """[(device, mount-point, volume-uuid)] of the attached image whose
         path is exactly `backing`, or None when that is unreadable."""
-        return image_attachments(backing, DETACH_INFO_TIMEOUT_S if timeout is None else timeout)
+        return image_attachments(backing, DETACH_INFO_TIMEOUT_S if timeout is None else timeout,
+                                 deadline_ns=self.deadline_ns)
 
     def detach(self, mount, timeout, still_allowed=None):
         """One bounded ORDINARY detach attempt; never a forced one."""
-        return detach_image(mount, timeout, still_allowed)
+        return detach_image(mount, timeout, still_allowed, deadline_ns=self.deadline_ns)
 
 
 _ATTR_BIT_MAP_COUNT = 5
@@ -2241,13 +2256,18 @@ def _bounded_tail(tail, chunk, cap=DETACH_OUTPUT_MAX_BYTES):
     return combined[-cap:] if len(combined) > cap else combined
 
 
-def bounded_run(argv, timeout, cap=DETACH_OUTPUT_MAX_BYTES, still_allowed=None, spawn=None):
+def bounded_run(argv, timeout, cap=DETACH_OUTPUT_MAX_BYTES, still_allowed=None, spawn=None, deadline_ns=None):
     """One bounded child: at most `timeout` seconds and at most `cap` bytes kept,
     however much it writes. `still_allowed()` is asked at `DETACH_POLL_S`
     intervals while the child runs, so authority withdrawn mid-attempt stops it
     instead of waiting out the bound; a False answer KILLs and reaps the child
     here and is reported as `withdrawn`. Returns the attempt's own facts (never
     raises for a spawn failure). `spawn` substitutes the process factory."""
+    clock = time.monotonic if deadline_ns is None else lambda: now_ns() / NS
+    deadline = None
+    if deadline_ns is not None:
+        deadline = min(clock() + timeout, deadline_ns / NS)
+        timeout = deadline - clock()
     if timeout <= 0:  # a spent window never spawns a child at all
         return {"exit": None, "timed_out": False, "error": "no time left in the window", "output": "",
                 "truncated": False, "withdrawn": None, "reap_timed_out": False, "reaped": False,
@@ -2260,9 +2280,10 @@ def bounded_run(argv, timeout, cap=DETACH_OUTPUT_MAX_BYTES, still_allowed=None, 
         return {"exit": None, "timed_out": False, "error": errno_name(error), "output": "",
                 "truncated": False, "withdrawn": None, "reap_timed_out": False, "reaped": False,
                 "handle": None}
-    deadline = time.monotonic() + timeout
+    if deadline_ns is None:
+        deadline = time.monotonic() + timeout
     tail, seen, timed_out, withdrawn, reap_timed_out, reaped = b"", 0, False, None, False, False
-    poll_at = time.monotonic() + DETACH_POLL_S
+    poll_at = clock() + DETACH_POLL_S
     try:
         # One owner for the descriptor: detaching the buffer gives this function
         # the raw stream, so the descriptor is closed exactly once here and never
@@ -2271,24 +2292,24 @@ def bounded_run(argv, timeout, cap=DETACH_OUTPUT_MAX_BYTES, still_allowed=None, 
         raw = child.stdout.detach()
         fd = raw.fileno()
     except BaseException as error:
-        return _unreaped_record(child, error, deadline)
+        return _unreaped_record(child, error, deadline, clock)
     try:
         try:
             while True:
-                remaining = deadline - time.monotonic()
+                remaining = deadline - clock()
                 if remaining <= 0:
                     timed_out = True
                     break
-                if still_allowed is not None and time.monotonic() >= poll_at:
+                if still_allowed is not None and clock() >= poll_at:
                     allowed, reason = still_allowed()
-                    poll_at = time.monotonic() + DETACH_POLL_S
+                    poll_at = clock() + DETACH_POLL_S
                     if not allowed:
                         withdrawn = reason or "authority withdrawn"
                         break
                 try:
                     ready, _, _ = select.select(
                         [fd], [], [], max(0.0, min(0.25, remaining,
-                                                   max(0.0, poll_at - time.monotonic()))))
+                                                   max(0.0, poll_at - clock()))))
                 except OSError:
                     ready = [fd]  # readable in the failing sense: the read reports it
                 if not ready:
@@ -2323,7 +2344,7 @@ def bounded_run(argv, timeout, cap=DETACH_OUTPUT_MAX_BYTES, still_allowed=None, 
                 except OSError:
                     pass
             for _round in (1, 2, 3):  # three bounded rounds, each inside the deadline
-                remaining = max(0.0, deadline - time.monotonic())
+                remaining = max(0.0, deadline - clock())
                 try:
                     reaped = child.wait(timeout=remaining) is not None
                 except subprocess.TimeoutExpired:
@@ -2338,7 +2359,7 @@ def bounded_run(argv, timeout, cap=DETACH_OUTPUT_MAX_BYTES, still_allowed=None, 
                 except OSError:
                     pass
     except BaseException as error:
-        return _unreaped_record(child, error, deadline)
+        return _unreaped_record(child, error, deadline, clock)
     status = child.returncode
     return {"exit": status, "timed_out": timed_out, "error": None,
             "output": tail.decode("utf-8", "replace"), "truncated": seen > len(tail),
@@ -2391,7 +2412,7 @@ def read_detach_request(evidence, probe):
         return None, "request is not a JSON document"
 
 
-def image_attachments(backing=None, timeout=DETACH_INFO_TIMEOUT_S, run=None):
+def image_attachments(backing=None, timeout=DETACH_INFO_TIMEOUT_S, run=None, deadline_ns=None):
     """[(device, mount-point, volume-uuid)] for the attached image whose path is
     exactly `backing` (or, with no backing, `[(image-path, device, mount-point,
     volume-uuid)]` for every attachment), or None when the facts are unreadable.
@@ -2404,7 +2425,11 @@ def image_attachments(backing=None, timeout=DETACH_INFO_TIMEOUT_S, run=None):
     or empty attachment set. Callers treat None as uncertain: a detach post-state
     is unknown and a custody check keeps the root. `run` substitutes the child
     runner (the parser's own seam)."""
-    attempt = (run or bounded_run)([HDIUTIL, "info", "-plist"], timeout, DETACH_INFO_MAX_BYTES)
+    if deadline_ns is None:
+        attempt = (run or bounded_run)([HDIUTIL, "info", "-plist"], timeout, DETACH_INFO_MAX_BYTES)
+    else:
+        attempt = (run or bounded_run)([HDIUTIL, "info", "-plist"], timeout, DETACH_INFO_MAX_BYTES,
+                                       deadline_ns=deadline_ns)
     if attempt.get("handle") is not None:
         # A read whose child could not be reaped is unreadable AND its custody is
         # kept: the caller must close or hand it over before completing.
@@ -2508,7 +2533,8 @@ def read_custody(ctx, probe):
     return [str(backing) for backing in backings], None
 
 
-def custody_problems(paths, probe, facts=None, timeout=DETACH_INFO_TIMEOUT_S, deadline_ns=None):
+def custody_problems(paths, probe, facts=None, timeout=DETACH_INFO_TIMEOUT_S, deadline_ns=None,
+                     hard_deadline_ns=None):
     """Why a decayed custody record must keep the root, from attachment facts and
     device nodes: a mounted entity is live, an entity without a mount point is
     live when its /dev node still exists (attached but unmounted) and stale
@@ -2517,7 +2543,7 @@ def custody_problems(paths, probe, facts=None, timeout=DETACH_INFO_TIMEOUT_S, de
     detached. With an absolute `deadline_ns`, the deadline is rechecked before
     EVERY backing read and each read gets only what is left, so earlier reads can
     never buy a later one a fresh allowance."""
-    read = facts or image_attachments
+    read = facts or (lambda backing, budget: image_attachments(backing, budget, deadline_ns=hard_deadline_ns))
     problems = []
     for index, backing in enumerate(paths):
         budget = timeout
@@ -2582,9 +2608,13 @@ def cleanup_safety(ctx, probe=None, facts=None):
                     "reason": ("no custodian wait window is left to read the custody indication;"
                                " the root, its backings and the evidence are kept")}
     try:
-        problems = custody_problems(backings, probe, facts, DETACH_INFO_TIMEOUT_S, deadline_ns)
+        problems = custody_problems(backings, probe, facts, DETACH_INFO_TIMEOUT_S, deadline_ns,
+                                    deadline_ns if ctx.get("ceiling_ns") is not None else None)
     except BaseException as error:
         problems = [f"attachment facts failed: {type_name(error)}"]
+    if (ctx.get("ceiling_ns") is not None and deadline_ns is not None
+            and now_ns() >= deadline_ns):
+        problems.append("custodian wait window expired before custody was established")
     if not problems:
         return {"state": "ok", "reason": None, "unrequested": list(backings), "at_ns": now_ns()}
     return {"state": "kept", "at_ns": now_ns(),
@@ -2645,12 +2675,12 @@ def reap_own_child(handle, window_end_ns):
         return False, None
 
 
-def _unreaped_record(child, error, deadline):
+def _unreaped_record(child, error, deadline, clock=time.monotonic):
     """A failure record that never loses a live child: one last bounded wait, and
     the handle is handed back whenever the child is not positively reaped."""
     reaped = False
     try:
-        reaped = child.wait(timeout=max(0.0, deadline - time.monotonic())) is not None
+        reaped = child.wait(timeout=max(0.0, deadline - clock())) is not None
     except BaseException:
         reaped = False
     try:
@@ -2681,11 +2711,11 @@ def _stuck_child_attempt():
             "withdrawn": None, "reaped": False, "handle": child}
 
 
-def detach_image(mount, timeout, still_allowed=None):
+def detach_image(mount, timeout, still_allowed=None, deadline_ns=None):
     """One bounded ORDINARY detach of `mount`. Returns the attempt's own facts;
     the caller judges the post-state separately and never trusts a zero exit."""
     attempt = bounded_run([HDIUTIL, "detach", mount], timeout, DETACH_OUTPUT_MAX_BYTES,
-                          still_allowed=still_allowed)
+                          still_allowed=still_allowed, deadline_ns=deadline_ns)
     return {"exit": attempt["exit"], "timed_out": attempt["timed_out"], "error": attempt["error"],
             "output": attempt["output"], "truncated": attempt["truncated"],
             "withdrawn": attempt["withdrawn"], "reap_timed_out": attempt["reap_timed_out"],
@@ -2879,7 +2909,8 @@ def post_census_detach(ctx, probe=None, authorize=None, still_allowed=None):
     is the one-time gate; `still_allowed` is asked again while the child runs, so
     authority withdrawn mid-attempt kills it. Never raises: an unknown outcome
     stays unknown, is kept and is unqualified."""
-    probe = probe or DefaultProbe()
+    probe = probe or DefaultProbe(monitor_absolute(ctx) - EXIT_MARGIN_S * NS
+                                  if ctx.get("ceiling_ns") is not None else None)
     record = None
     try:
         document, problem = read_detach_request(ctx["evidence"], probe)
@@ -2897,10 +2928,11 @@ def post_census_detach(ctx, probe=None, authorize=None, still_allowed=None):
         if budget_ns < DETACH_MIN_BUDGET_NS:
             record["reason"] = "not enough of the custodian's wait window left for one bounded detach"
             return record
-        deadline = time.monotonic() + budget_ns / NS
+        clock = time.monotonic if ctx.get("ceiling_ns") is None else lambda: now_ns() / NS
+        deadline = clock() + budget_ns / NS
 
         def left():
-            return max(0.0, deadline - time.monotonic())
+            return max(0.0, deadline - clock())
 
         problems = detach_request_problems(ctx, document, probe,
                                            max(0.0, min(DETACH_INFO_TIMEOUT_S, left() * 0.25)))
@@ -2917,7 +2949,7 @@ def post_census_detach(ctx, probe=None, authorize=None, still_allowed=None):
                 record["reason"] = f"the guard withdrew the authorization: {reason}"
                 return record
             if granted:
-                deadline = min(deadline, time.monotonic() + granted / NS)
+                deadline = min(deadline, clock() + granted / NS)
         post_reserve = max(0.0, min(DETACH_POST_RESERVE_S, 0.25 * left()))
         timeout = min(DETACH_TIMEOUT_S, left() - post_reserve)
         if timeout <= 0.0:
@@ -2926,6 +2958,9 @@ def post_census_detach(ctx, probe=None, authorize=None, still_allowed=None):
         record["timeout_s"] = round(timeout, 3)
         record["reserve_before"] = _free_bytes(ctx["reserve_path"])
         record["at_ns"] = now_ns()
+        if ctx.get("ceiling_ns") is not None and record["at_ns"] >= monitor_absolute(ctx) - EXIT_MARGIN_S * NS:
+            record["reason"] = "ceiling window exhausted before detach"
+            return record
         inject = set(ctx.get("inject") or ())
         if "detach-fail" in inject:
             attempt = {"exit": 1, "timed_out": False, "error": None, "output": "injected failing detach",
@@ -4016,6 +4051,10 @@ class Monitor:
         except BaseException:
             return None
 
+    def check_setup_clock(self):
+        if self.ctx.get("ceiling_ns") is not None and now_ns() >= self.ctx["setup_at_ns"]:
+            raise SetupRefused("ceiling setup window exhausted")
+
     def owned_root(self):
         """This run's owned root and the selection facts behind it. A caller's
         `--root-parent` keeps its existing semantics; the default is the
@@ -4023,6 +4062,7 @@ class Monitor:
         with one bounded self-expiry sweep and an owner marker written before any
         run resource, with a warned fallback."""
         ctx = self.ctx
+        self.check_setup_clock()
         if ctx["root_parent"] is not None:
             parent = ctx["root_parent"]
             root = os.path.realpath(tempfile.mkdtemp(prefix=SCRATCH_LEAF, dir=parent))
@@ -4034,10 +4074,19 @@ class Monitor:
         selection = select_default_parent(os.environ, probe)
         sweep, root, marker, refusal = None, None, None, None
         try:
+            self.check_setup_clock()
             parent = prepare_scratch_parent(selection, probe)
-            sweep = sweep_concluded_roots(parent, selection["device"], probe)
+            self.check_setup_clock()
+            if ctx.get("ceiling_ns") is None:
+                sweep = sweep_concluded_roots(parent, selection["device"], probe)
+            else:
+                sweep = sweep_concluded_roots(
+                    parent, selection["device"], probe,
+                    deadline_ns=min(now_ns() + SWEEP_TIME_BUDGET_NS, ctx["setup_at_ns"]))
+            self.check_setup_clock()
             root = create_owned_root(parent, probe)
             run_id = new_run_id()
+            self.check_setup_clock()
             path = write_marker(root, marker_document(run_id, root, probe), probe)
             marker = {"path": path, "state": "written", "run_id": run_id, "sweep": sweep}
         except (SelectionRefused, MarkerInvalid) as error:
@@ -4048,6 +4097,7 @@ class Monitor:
             selection["prepared_parent"] = parent
             return selection, root, marker
         if root is not None:  # remove exactly the empty root this call created
+            self.check_setup_clock()
             try:
                 shutil.rmtree(root, ignore_errors=True)
             except BaseException:
@@ -4057,6 +4107,7 @@ class Monitor:
                     "pool": selection.get("pool"), "pool_source": selection.get("pool_source"),
                     "registration": selection.get("registration"), "mount": None,
                     "volume_uuid": None, "device": None}
+        self.check_setup_clock()
         return fallback, create_owned_root(FALLBACK_PARENT, probe), {
             "path": None, "state": "none", "run_id": None, "sweep": sweep}
 
@@ -4066,6 +4117,7 @@ class Monitor:
         creation. A stall here leaves `ready` unsent; the custodian KILLs
         this pinned monitor at the setup deadline and launches nothing."""
         ctx = self.ctx
+        self.check_setup_clock()
         try:
             Kinfo.check()
         except Exception as error:
@@ -4080,6 +4132,7 @@ class Monitor:
             if not os.path.isdir(scratch):
                 raise SetupRefused(f"OXIDE_TASK_SCRATCH_ROOT {scratch} is not a directory")
             root, owned, reserve_path = scratch, False, scratch
+            self.check_setup_clock()
             evidence = ctx["evidence_arg"] or tempfile.mkdtemp(prefix="supervisor-evidence.", dir=scratch)
             selection = {"source": "adopted-scratch-root", "root_parent": None, "reason": None,
                          "pool": None, "pool_source": None, "registration": None,
@@ -4089,6 +4142,7 @@ class Monitor:
             selection, root, marker = self.owned_root()
             scratch, owned = os.path.join(root, "scratch"), True
             reserve_path = root
+            self.check_setup_clock()
             os.mkdir(scratch)
             evidence = ctx["evidence_arg"] or os.path.join(root, "evidence")
         ctx["marker"] = marker
@@ -4168,7 +4222,7 @@ class Monitor:
             self.summary()
             end = monitor_absolute(ctx) - int(0.1 * NS)
             while not self.stop.is_set() and now_ns() < end:
-                time.sleep(0.02)
+                monitor_sleep(ctx, 0.02)
             return
         if drain:
             remaining = (monitor_absolute(ctx) - EXIT_MARGIN_S * NS
@@ -4194,10 +4248,11 @@ class Monitor:
         blocks past `wait_s`, and other command types are ignored."""
         if self.ctx.get("ceiling_ns") is not None:
             wait_s = min(wait_s, monitor_remaining(self.ctx, EXIT_MARGIN_S * NS))
-        deadline = time.monotonic() + max(0.0, wait_s)
+        clock = time.monotonic if self.ctx.get("ceiling_ns") is None else lambda: now_ns() / NS
+        deadline = clock() + max(0.0, wait_s)
         buffer = b""
         while True:
-            remaining = deadline - time.monotonic()
+            remaining = deadline - clock()
             if remaining <= 0:
                 return
             try:
@@ -4256,6 +4311,8 @@ class Monitor:
     def sample_reserve(self):
         stats = self.receipt["reserve"]
         while not self.stop.is_set():
+            if self.ctx.get("ceiling_ns") is not None and monitor_remaining(self.ctx) <= 0:
+                return
             try:
                 reading = os.statvfs(self.ctx["reserve_path"])
                 value = reading.f_bavail * reading.f_frsize
@@ -4272,18 +4329,23 @@ class Monitor:
                 stall = "reserve-delay-stall" in self.inject and stats["samples"] >= 8
                 if stall:
                     with self.lock:  # publication delayed by the shared I/O lock
-                        time.sleep(RESERVE_DELAY_S)
+                        monitor_sleep(self.ctx, RESERVE_DELAY_S)
                 self.send("reading", kind="reserve", value=value, completed=at)
                 if stall:
-                    self.stop.wait()  # then the sampler stalls: no further reading
+                    self.stop.wait(None if self.ctx.get("ceiling_ns") is None else monitor_remaining(self.ctx))
                     return
             except OSError as error:
                 self.send("reading", kind="reserve", error=str(error))
-            self.stop.wait(RESERVE_INTERVAL)
+            wait = RESERVE_INTERVAL
+            if self.ctx.get("ceiling_ns") is not None:
+                wait = min(wait, monitor_remaining(self.ctx))
+            self.stop.wait(wait)
 
     def sample_owned(self):
         stats = self.receipt["owned_bytes"]
         while not self.stop.is_set():
+            if self.ctx.get("ceiling_ns") is not None and monitor_remaining(self.ctx) <= 0:
+                return
             try:
                 value = tree_bytes(self.ctx["root"])
                 at = now_ns()
@@ -4293,14 +4355,17 @@ class Monitor:
                     stats["maximum"] = value if stats["maximum"] is None else max(stats["maximum"], value)
                 stall = "scratch-delay-stall" in self.inject and stats["samples"] >= 2
                 if stall:
-                    time.sleep(SCRATCH_DELAY_S)  # publication delayed (not under the lock: reserve stays fresh)
+                    monitor_sleep(self.ctx, SCRATCH_DELAY_S)  # delayed outside the lock
                 self.send("reading", kind="scratch", value=value, complete=True, completed=at)
                 if stall:
-                    self.stop.wait()
+                    self.stop.wait(None if self.ctx.get("ceiling_ns") is None else monitor_remaining(self.ctx))
                     return
             except OSError as error:
                 self.send("reading", kind="scratch", complete=False, error=str(error))
-            self.stop.wait(SCRATCH_INTERVAL)
+            wait = SCRATCH_INTERVAL
+            if self.ctx.get("ceiling_ns") is not None:
+                wait = min(wait, monitor_remaining(self.ctx))
+            self.stop.wait(wait)
 
     def note_admission(self, error=False, key="admission"):
         """One bounded, never-latched admission-observation failure."""
@@ -4418,6 +4483,8 @@ class Monitor:
                  ("admission_waiting", self.ctx.get("waiting_path")))
         seen = {"admission": None, "admission_waiting": None}
         while not self.stop.is_set():
+            if self.ctx.get("ceiling_ns") is not None and monitor_remaining(self.ctx) <= 0:
+                return
             for key, path in paths:
                 if not path:
                     continue
@@ -4433,13 +4500,22 @@ class Monitor:
                     seen[key] = None
                 except OSError:
                     self.note_admission(error=True, key=key)
-            self.stop.wait(ADMISSION_POLL_S)
+            wait = ADMISSION_POLL_S
+            if self.ctx.get("ceiling_ns") is not None:
+                wait = min(wait, monitor_remaining(self.ctx))
+            self.stop.wait(wait)
 
     def drain(self, fd, name, sink):
         counts = self.receipt["output"].setdefault(
             name, {"bytes": 0, "persisted": 0, "forwarded": 0, "discarded": 0})
+        if self.ctx.get("ceiling_ns") is not None and monitor_remaining(self.ctx) <= 0:
+            return
         with open(os.path.join(self.ctx["evidence"], f"{name}.log"), "wb") as log:
             while True:
+                if self.ctx.get("ceiling_ns") is not None:
+                    remaining = monitor_remaining(self.ctx)
+                    if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+                        return
                 chunk = os.read(fd, 65536)
                 if not chunk:
                     break
@@ -4605,6 +4681,8 @@ class Monitor:
             ancestors=record.get("identities") or ())
         self.note(census_built_ns=now_ns())
         while not self.census_stop.is_set():
+            if self.ctx.get("ceiling_ns") is not None and monitor_remaining(self.ctx) <= 0:
+                break
             begin = now_ns()
             entry = self.note_round(begin)
             self.note(phase="round-start")
@@ -4659,7 +4737,12 @@ class Monitor:
             done = now_ns()
             self.note(entry, end_ns=done, phase="complete")
             self.note(rounds_completed=self.settlement["rounds_completed"] + 1, phase="round-complete")
-            self.census_stop.wait(CENSUS_INTERVAL)
+            wait = CENSUS_INTERVAL
+            if self.ctx.get("ceiling_ns") is not None:
+                wait = min(wait, monitor_remaining(self.ctx))
+                if wait <= 0:
+                    break
+            self.census_stop.wait(wait)
         try:
             self.settlement["loop_exit_ns"] = now_ns()
             self.settlement["phase"] = "loop-exit"
@@ -4671,10 +4754,11 @@ class Monitor:
         late, malformed or different answer is None: no authority is inferred."""
         if self.ctx.get("ceiling_ns") is not None:
             wait_s = min(wait_s, monitor_remaining(self.ctx, EXIT_MARGIN_S * NS))
-        deadline = time.monotonic() + max(0.0, wait_s)
+        clock = time.monotonic if self.ctx.get("ceiling_ns") is None else lambda: now_ns() / NS
+        deadline = clock() + max(0.0, wait_s)
         buffer = b""
         while True:
-            remaining = deadline - time.monotonic()
+            remaining = deadline - clock()
             if remaining <= 0:
                 return None
             try:
@@ -4722,10 +4806,11 @@ class Monitor:
         wait = DETACH_GATE_WAIT_S if wait_s is None else wait_s
         if self.ctx.get("ceiling_ns") is not None:
             wait = min(wait, monitor_remaining(self.ctx, EXIT_MARGIN_S * NS))
-        deadline = time.monotonic() + (min(wait, budget_ns / NS) if budget_ns else wait)
+        clock = time.monotonic if self.ctx.get("ceiling_ns") is None else lambda: now_ns() / NS
+        deadline = clock() + (min(wait, budget_ns / NS) if budget_ns else wait)
         buffer = b""
         while True:
-            remaining = deadline - time.monotonic()
+            remaining = deadline - clock()
             if remaining <= 0:
                 return False, "the guard did not answer in time", 0
             try:
@@ -4759,6 +4844,10 @@ class Monitor:
     def commands(self):
         buffer = b""
         while True:
+            if self.ctx.get("ceiling_ns") is not None:
+                remaining = monitor_remaining(self.ctx)
+                if remaining <= 0 or not select.select([self.cmd_r], [], [], remaining)[0]:
+                    return
             chunk = os.read(self.cmd_r, 4096)
             if not chunk:
                 return
@@ -4770,24 +4859,36 @@ class Monitor:
     def run(self):
         ctx = self.ctx
         self.setup()
+        if ctx.get("ceiling_ns") is not None and now_ns() >= ctx["setup_at_ns"]:
+            raise SetupRefused("ceiling setup window exhausted")
+        self.check_setup_clock()
         os.makedirs(ctx["evidence"], exist_ok=True)
         self.publish("started: incomplete")
         self.send("setup", root=ctx["root"], scratch=ctx["scratch"], evidence=ctx["evidence"], owned=ctx["owned"])
         if "setup-stall" in self.inject:
-            time.sleep(SETUP_S + 5)
+            monitor_sleep(ctx, SETUP_S + 5)
         if "setup-delay" in self.inject:
             # A cold setup slower than the reserve freshness window, still inside
             # the setup deadline: no reading exists yet, and that is not a fault.
-            time.sleep(SETUP_DELAY_S)
+            monitor_sleep(ctx, SETUP_DELAY_S)
         for target in (self.sample_reserve, self.sample_owned, self.sample_admission):
+            if ctx.get("ceiling_ns") is not None and now_ns() >= ctx["setup_at_ns"]:
+                raise SetupRefused("ceiling setup window exhausted")
             threading.Thread(target=target, daemon=True).start()
         for fd, name, sink in self.pipes:
+            if ctx.get("ceiling_ns") is not None and now_ns() >= ctx["setup_at_ns"]:
+                raise SetupRefused("ceiling setup window exhausted")
             threading.Thread(target=self.drain, args=(fd, name, sink), daemon=True).start()
         while self.receipt["reserve"]["samples"] == 0 or self.receipt["owned_bytes"]["samples"] == 0:
-            time.sleep(0.02)
+            wait = 0.02
+            if ctx.get("ceiling_ns") is not None:
+                wait = max(0.0, min(wait, (ctx["setup_at_ns"] - now_ns()) / NS))
+                if wait <= 0:
+                    raise SetupRefused("ceiling setup window exhausted awaiting samples")
+            time.sleep(wait)
         self.send("ready")
         if "monitor-die" in self.inject:
-            time.sleep(1.0)
+            monitor_sleep(ctx, 1.0)
             os._exit(3)
         decision = "keep"
         for command in self.commands():
@@ -4806,8 +4907,9 @@ class Monitor:
                 self.note_stopped(command, now_ns())
                 if "monitor-stall" in self.inject:
                     with self.lock:  # every sender blocks: readings go stale
-                        time.sleep(LIMIT_S)
-                if self.leader is not None:
+                        monitor_sleep(ctx, LIMIT_S)
+                if (self.leader is not None and
+                        (ctx.get("ceiling_ns") is None or monitor_remaining(ctx) > 0)):
                     self.census_thread = threading.Thread(
                         target=self.census_loop, args=(command["seq"],), daemon=True)
                     self.census_thread.start()
@@ -4829,6 +4931,10 @@ class Monitor:
         if (decision == "cleanup" and ctx.get("ceiling_ns") is not None
                 and monitor_remaining(ctx, EXIT_MARGIN_S * NS) <= 0):
             decision = "keep"
+            with self.lock:
+                outcome = self.receipt.get("outcome")
+                if isinstance(outcome, dict):
+                    outcome.update(closure="UNCLOSED", ceiling_exhausted=True)
             self.send("cleanup_kept", reason="ceiling window exhausted before cleanup")
         if decision == "cleanup" and not settled:
             # The census evidence cannot be shown final and certainly empty from the
@@ -4845,6 +4951,10 @@ class Monitor:
             # authorize the one attempt from its own fault/deadline state.
             detach = post_census_detach(ctx, authorize=self.authorize_detach,
                                         still_allowed=self.detach_still_allowed)
+            if (detach is None and ctx.get("ceiling_ns") is not None
+                    and monitor_remaining(ctx, EXIT_MARGIN_S * NS) <= 0):
+                self.send("cleanup_kept", reason="ceiling window exhausted after detach check")
+                return
             opted_in = detach is not None
             if detach is not None:
                 handle = detach.pop("_handle", None)  # a live child never reaches the receipt
@@ -4895,7 +5005,7 @@ class Monitor:
                                 self.summary()
                                 end = monitor_absolute(ctx) - int(0.1 * NS)
                                 while not self.stop.is_set() and now_ns() < end:
-                                    time.sleep(0.02)
+                                    monitor_sleep(ctx, 0.02)
                                 return
                             self.publish("detach_child_absent: scratch_kept")
                             self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
@@ -4946,7 +5056,7 @@ class Monitor:
                             self.summary()
                             end = monitor_absolute(ctx) - int(0.1 * NS)
                             while not self.stop.is_set() and now_ns() < end:
-                                time.sleep(0.02)
+                                monitor_sleep(ctx, 0.02)
                             return
                         if detach["custodian_closed"]:
                             # The custodian positively closed the child it was handed.
@@ -4979,7 +5089,7 @@ class Monitor:
                         self.summary()
                         end = monitor_absolute(ctx) - int(0.1 * NS)
                         while not self.stop.is_set() and now_ns() < end:
-                            time.sleep(0.02)
+                            monitor_sleep(ctx, 0.02)
                         return
                     self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
                     return
@@ -5024,6 +5134,9 @@ class Monitor:
                 self.finish_monitor(ctx, "monitor_complete: pending_custodian", drain=True)
                 return
             self.publish("cleanup_partial_or_unknown")
+            if ctx.get("ceiling_ns") is not None and monitor_remaining(ctx, EXIT_MARGIN_S * NS) <= 0:
+                self.send("cleanup_kept", reason="ceiling window exhausted before removal")
+                return
             if ctx["owned"]:
                 if "cleanup-interrupt" in self.inject:
                     os._exit(4)  # the published phase stays partial
@@ -5310,6 +5423,8 @@ class Custodian:
         failure is latched and the wait degrades to select on the control
         pipe, so shutdown keeps reading the monitor and stays bounded."""
         timeout = max(0, min(timeout_ns, 50_000_000)) / NS
+        if self.ceiling_ns is not None:
+            timeout = min(timeout, max(0, self.absolute - now_ns()) / NS)
         if self.inject_once("pump-exception"):
             raise RuntimeError("injected event-loop exception")
         if self.inject_once("kqueue-exception"):
@@ -5441,7 +5556,8 @@ class Custodian:
             grant = min(waited, room)
             if self.ceiling_ns is not None:
                 ceiling_room = max(0, self.ceiling_ns - self.absolute)
-                self.admission_ceiling_capped_ns += grant - min(grant, ceiling_room)
+                self.admission_ceiling_capped_ns = min(
+                    U64MAX, self.admission_ceiling_capped_ns + grant - min(grant, ceiling_room))
                 grant = min(grant, ceiling_room)
             self.admission_counted += 1
             self.admission_reported = min(U64MAX, self.admission_reported + message["waited_ns"])
@@ -5722,6 +5838,7 @@ class Custodian:
         if self.ceiling_ns is not None:
             self.ctx["ceiling_ns"] = self.ceiling_ns
             self.ctx["initial_absolute_ns"] = self.absolute
+            self.ctx["setup_at_ns"] = self.setup_at
 
     def setup_expired(self, now):
         """Setup is bounded by its own deadline, never by reading freshness."""
@@ -5736,6 +5853,12 @@ class Custodian:
         cmd_r, self.cmd_w = os.pipe()
         out_r, self.out_w = os.pipe()
         err_r, self.err_w = os.pipe()
+        if self.ceiling_ns is not None and self.setup_expired(now_ns()):
+            for fd in (self.ctl_r, ctl_w, cmd_r, self.cmd_w, out_r, self.out_w, err_r, self.err_w):
+                os.close(fd)
+            self.not_launched = "ceiling setup window exhausted before monitor fork"
+            self.guard.latch(self.not_launched)
+            return False
         pid = os.fork()
         if pid == 0:
             for fd in (self.ctl_r, self.cmd_w, self.out_w, self.err_w):
@@ -5767,6 +5890,11 @@ class Custodian:
             return False
         ack_r, ack_w = os.pipe()
         gate_r, gate_w = os.pipe()
+        if self.ceiling_ns is not None and self.setup_expired(now_ns()):
+            for fd in (ack_r, ack_w, gate_r, gate_w):
+                os.close(fd)
+            self.guard.latch("ceiling setup window exhausted before leader fork")
+            return False
         pid = os.fork()
         if pid == 0:
             try:
@@ -6137,6 +6265,8 @@ class Custodian:
                 and (self.ceiling_ns is None or (not self.deadline_hit and now_ns() < self.stop_at)))
 
     def finish(self, launched):
+        if self.ceiling_ns is not None and launched and now_ns() >= self.stop_at:
+            self.deadline_hit = True
         self.closed = self.closure(launched)
         status = self.leader_status
         decoded = None if status is None else (
@@ -6258,9 +6388,9 @@ def parse(argv):
 
 
 def main(argv):
-    # This source-only work-in-progress is never a consumer runner. Do not
-    # launch until all deadline, custody and receipt paths are implemented.
-    raise SystemExit("bounded-test-ceiling.py: unqualified candidate is not executable")
+    command, options = parse(list(argv))
+    return Custodian(command, options["limit"], options["budget"], options["evidence"],
+                     options["root_parent"], options.get("ceiling_ns")).run()
 
 
 if __name__ == "__main__":
