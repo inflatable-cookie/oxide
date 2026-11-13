@@ -4323,15 +4323,29 @@ class Monitor:
         return seq
 
     def publish(self, phase):
-        if self.ctx.get("ceiling_ns") is not None and monitor_remaining(self.ctx) <= 0:
-            raise RuntimeError("ceiling exhausted before receipt publication")
-        with self.lock:
+        ceiling = self.ctx.get("ceiling_ns") is not None
+        if ceiling:
+            remaining = monitor_remaining(self.ctx)
+            if remaining <= 0 or not self.lock.acquire(timeout=remaining):
+                raise RuntimeError("ceiling exhausted awaiting receipt publication lock")
+        else:
+            self.lock.acquire()
+        try:
+            published = now_ns()
+            if ceiling and published >= monitor_end(self.ctx):
+                raise RuntimeError("ceiling exhausted before receipt publication")
             self.receipt["phase"] = phase
-            self.receipt["published_ns"] = now_ns()
+            self.receipt["published_ns"] = published
             path = os.path.join(self.ctx["evidence"], "receipt.json")
+            if ceiling and monitor_remaining(self.ctx) <= 0:
+                raise RuntimeError("ceiling exhausted before temporary receipt")
             with open(path + ".tmp", "w") as handle:
                 json.dump(self.receipt, handle, indent=1)
+            if ceiling and monitor_remaining(self.ctx) <= 0:
+                raise RuntimeError("ceiling exhausted before receipt replacement")
             os.replace(path + ".tmp", path)
+        finally:
+            self.lock.release()
 
     def sample_reserve(self):
         stats = self.receipt["reserve"]
@@ -5562,13 +5576,10 @@ class Custodian:
                 # grant the same wait twice.
                 self.admission_duplicates += 1
                 return
-            if (self.stopped_at is not None or self.deadline_hit
-                    or (self.ceiling_ns is not None and at >= self.stop_at)):
+            if self.stopped_at is not None or self.deadline_hit:
                 self.admission_ignored += 1
                 self.admission_late_ns = at
-                self.admission_late_reason = ("stopped" if self.stopped_at is not None
-                                              or (self.ceiling_ns is not None and at >= self.stop_at)
-                                              else "deadline")
+                self.admission_late_reason = "stopped" if self.stopped_at is not None else "deadline"
                 # The wait ended after the stop: still a completed wait for this
                 # command, so it is never reported as unfinished.
                 if pair is not None and pair["ended"] is None:

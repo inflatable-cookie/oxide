@@ -93,7 +93,7 @@ class CustodianWindow(unittest.TestCase):
         self.assertEqual((custodian.start, custodian.absolute, custodian.stop_at),
                          (20 * ns, 110 * ns, 90 * ns))
 
-    def test_grants_cap_and_at_stop_is_late(self):
+    def test_grants_cap_and_duplicates(self):
         ns = candidate.NS
         custodian = self.make_custodian(0, 110 * ns)
         custodian.admit({"command": "a", "waited_ns": 20 * ns}, 30 * ns)
@@ -102,8 +102,6 @@ class CustodianWindow(unittest.TestCase):
         self.assertEqual(custodian.admission_ceiling_capped_ns, 10 * ns)
         custodian.admit({"command": "a", "waited_ns": 20 * ns}, 40 * ns)
         self.assertEqual(custodian.admission_duplicates, 1)
-        custodian.admit({"command": "b", "waited_ns": ns}, 90 * ns)
-        self.assertEqual(custodian.admission_late_reason, "stopped")
         self.assertEqual(custodian.absolute, 110 * ns)
 
     def test_monitor_window_never_exceeds_ceiling(self):
@@ -230,15 +228,33 @@ class CustodianWindow(unittest.TestCase):
                                              str(200 * ns), "--", "proof"]), 7)
         self.assertEqual(constructor.call_args.args[-1], 200 * ns)
 
-    def test_late_grants_do_not_move_deadline(self):
+    def test_watch_drains_boundary_grant_and_classifies_late_reports(self):
         ns = candidate.NS
-        for offset in (0, 1, 20):
-            custodian = self.make_custodian(0, 150 * ns)
-            initial = custodian.absolute
-            custodian.admit({"command": "late", "waited_ns": 10 * ns},
-                            custodian.stop_at + offset * ns)
-            self.assertEqual(custodian.absolute, initial)
-            self.assertEqual(custodian.admission_late_reason, "stopped")
+        for ceiling, expected, timed_out in ((150, 110, False), (100, 100, True)):
+            with self.subTest(ceiling=ceiling):
+                custodian = self.make_custodian(0, ceiling * ns)
+                def drain(_timeout):
+                    custodian.admit({"command": "queued", "waited_ns": 10 * ns}, 80 * ns)
+                    if ceiling > 100:
+                        custodian.leader_exited = True
+                custodian.pump = mock.Mock(side_effect=drain)
+                with mock.patch.object(candidate, "now_ns", return_value=80 * ns):
+                    custodian.watch()
+                custodian.pump.assert_called_once_with(0)
+                self.assertEqual(custodian.absolute, expected * ns)
+                self.assertEqual(custodian.deadline_hit, timed_out)
+                if timed_out:
+                    custodian.admit({"command": "late", "waited_ns": ns}, 81 * ns)
+                    self.assertEqual(custodian.admission_late_reason, "deadline")
+                    self.assertEqual(custodian.absolute, expected * ns)
+
+    def test_post_stop_admission_is_late(self):
+        ns = candidate.NS
+        custodian = self.make_custodian(0, 150 * ns)
+        custodian.stopped_at = 80 * ns
+        custodian.admit({"command": "late", "waited_ns": ns}, 81 * ns)
+        self.assertEqual(custodian.admission_late_reason, "stopped")
+        self.assertEqual(custodian.absolute, 100 * ns)
 
     def test_stale_and_malformed_admission_markers_remain_rejected(self):
         marker = {"schema": 2, "source": "fixture", "run": "old", "command": "a", "waited_ns": 1}
@@ -334,6 +350,50 @@ class CustodianWindow(unittest.TestCase):
                 monitor.publish("complete")
             with self.assertRaises(candidate.SetupRefused):
                 monitor.check_setup_clock()
+        opened.assert_not_called()
+
+    def test_publication_rechecks_after_lock_and_before_replacement(self):
+        ns = candidate.NS
+        ctx = {"start_ns": 0, "limit_s": 100, "ceiling_ns": 90 * ns,
+               "evidence": "synthetic", "inject": []}
+        for stage in ("lock", "write"):
+            with self.subTest(stage=stage):
+                monitor = candidate.Monitor(ctx, 0, 0, 0, 0)
+                monitor.receipt = {"phase": "incomplete"}
+                clock = [89 * ns]
+                lock = mock.Mock()
+                def acquire(**_kwargs):
+                    if stage == "lock":
+                        clock[0] = 90 * ns
+                    return True
+                lock.acquire.side_effect = acquire
+                monitor.lock = lock
+                def write(*_args, **_kwargs):
+                    if stage == "write":
+                        clock[0] = 90 * ns
+                with mock.patch.object(candidate, "now_ns", side_effect=lambda: clock[0]), \
+                     mock.patch("builtins.open", mock.mock_open()) as opened, \
+                     mock.patch.object(candidate.json, "dump", side_effect=write), \
+                     mock.patch.object(candidate.os, "replace") as replace:
+                    with self.assertRaises(RuntimeError):
+                        monitor.publish("complete")
+                lock.acquire.assert_called_once_with(timeout=1.0)
+                lock.release.assert_called_once()
+                replace.assert_not_called()
+                if stage == "lock":
+                    opened.assert_not_called()
+
+    def test_publication_refuses_lock_timeout(self):
+        ns = candidate.NS
+        ctx = {"start_ns": 0, "limit_s": 100, "ceiling_ns": 90 * ns, "inject": []}
+        monitor = candidate.Monitor(ctx, 0, 0, 0, 0)
+        monitor.lock = mock.Mock()
+        monitor.lock.acquire.return_value = False
+        with mock.patch.object(candidate, "now_ns", return_value=89 * ns), \
+             mock.patch("builtins.open") as opened:
+            with self.assertRaises(RuntimeError):
+                monitor.publish("complete")
+        monitor.lock.release.assert_not_called()
         opened.assert_not_called()
 
     def test_image_cleanup_budget_has_no_floor(self):
