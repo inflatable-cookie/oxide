@@ -117,6 +117,18 @@ class CustodianWindow(unittest.TestCase):
             self.assertEqual(candidate.monitor_absolute(ctx), 110 * ns)
             self.assertEqual(candidate.monitor_remaining(ctx), 10)
 
+    def test_monitor_binds_only_valid_effective_deadline(self):
+        ns = candidate.NS
+        ctx = {"start_ns": 0, "limit_s": 100, "initial_absolute_ns": 100 * ns,
+               "ceiling_ns": 120 * ns}
+        for value in (None, True, 99 * ns, 121 * ns):
+            with self.subTest(value=value):
+                self.assertFalse(candidate.bind_monitor_deadline(ctx, {"effective_deadline_ns": value}))
+                self.assertNotIn("effective_deadline_ns", ctx)
+        self.assertTrue(candidate.bind_monitor_deadline(ctx, {"effective_deadline_ns": 110 * ns}))
+        with mock.patch.object(candidate, "now_ns", return_value=109 * ns):
+            self.assertEqual(candidate.monitor_remaining(ctx), 1.0)
+
     def test_overflow_and_duplicate_reports_do_not_extend(self):
         ns = candidate.NS
         custodian = self.make_custodian(0, 200 * ns)

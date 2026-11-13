@@ -374,12 +374,28 @@ def monitor_absolute(ctx):
     return min(original, ctx.get("ceiling_ns", original))
 
 
+def monitor_end(ctx):
+    bound = ctx.get("ceiling_ns", monitor_absolute(ctx))
+    return min(bound, ctx.get("effective_deadline_ns", bound))
+
+
+def bind_monitor_deadline(ctx, outcome):
+    """Bind the custodian's actual decision deadline without inferring one."""
+    if ctx.get("ceiling_ns") is None:
+        return True
+    value = outcome.get("effective_deadline_ns") if isinstance(outcome, dict) else None
+    if (type(value) is not int or value < ctx["initial_absolute_ns"]
+            or value > ctx["ceiling_ns"]):
+        return False
+    ctx["effective_deadline_ns"] = value
+    return True
+
+
 def monitor_remaining(ctx, reserve_ns=0):
     # Long-lived samplers and command readers must survive a legitimate grant.
     # The custodian enforces the effective deadline; this independent bound is
     # the immutable outer ceiling, which a grant can never move.
-    bound = ctx.get("ceiling_ns", monitor_absolute(ctx))
-    return max(0, bound - reserve_ns - now_ns()) / NS
+    return max(0, monitor_end(ctx) - reserve_ns - now_ns()) / NS
 
 
 def monitor_sleep(ctx, duration):
@@ -4254,7 +4270,7 @@ class Monitor:
         clock = time.monotonic if self.ctx.get("ceiling_ns") is None else lambda: now_ns() / NS
         deadline = clock() + max(0.0, wait_s)
         if self.ctx.get("ceiling_ns") is not None:
-            deadline = min(deadline, (self.ctx["ceiling_ns"] - EXIT_MARGIN_S * NS) / NS)
+            deadline = min(deadline, (monitor_end(self.ctx) - EXIT_MARGIN_S * NS) / NS)
         buffer = b""
         while True:
             remaining = deadline - clock()
@@ -4762,7 +4778,7 @@ class Monitor:
         clock = time.monotonic if self.ctx.get("ceiling_ns") is None else lambda: now_ns() / NS
         deadline = clock() + max(0.0, wait_s)
         if self.ctx.get("ceiling_ns") is not None:
-            deadline = min(deadline, (self.ctx["ceiling_ns"] - EXIT_MARGIN_S * NS) / NS)
+            deadline = min(deadline, (monitor_end(self.ctx) - EXIT_MARGIN_S * NS) / NS)
         buffer = b""
         while True:
             remaining = deadline - clock()
@@ -4816,7 +4832,7 @@ class Monitor:
         clock = time.monotonic if self.ctx.get("ceiling_ns") is None else lambda: now_ns() / NS
         deadline = clock() + (min(wait, budget_ns / NS) if budget_ns else wait)
         if self.ctx.get("ceiling_ns") is not None:
-            deadline = min(deadline, (self.ctx["ceiling_ns"] - EXIT_MARGIN_S * NS) / NS)
+            deadline = min(deadline, (monitor_end(self.ctx) - EXIT_MARGIN_S * NS) / NS)
         buffer = b""
         while True:
             remaining = deadline - clock()
@@ -4924,6 +4940,11 @@ class Monitor:
                     self.census_thread.start()
             elif kind in ("cleanup", "keep"):
                 decision = kind
+                if not bind_monitor_deadline(ctx, command.get("outcome")):
+                    decision = "keep"
+                    command["outcome"] = {"closure": "UNCLOSED", "deadline": None,
+                                          "fault": "missing or invalid effective deadline"}
+                    self.send("cleanup_kept", reason="missing or invalid effective deadline")
                 with self.lock:
                     self.receipt["outcome"] = command.get("outcome")
                     self.receipt["custodian_census"] = command.get("census")
