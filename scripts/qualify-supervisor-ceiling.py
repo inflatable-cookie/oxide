@@ -15,7 +15,7 @@ filesystem, hashing and stdout work happens in the worker, so a blocked
 stdout reader or slow read cannot extend the 600 s: at the deadline the
 worker is KILLed and the exit is 124 with whatever output was written.
 
-The worker runs the candidate with a 560 s limit and a 512 MiB monitored
+The worker runs the candidate with a 560 s limit and a 384 MiB monitored
 budget around `scripts/test_supervisor.py` and **no** `--root-parent` and no
 `--evidence`, so the candidate's default scratch routing is what runs: one
 owned root under `<mount>/scratch/oxide` on the volume the machine's
@@ -70,15 +70,24 @@ import subprocess
 import sys
 import tempfile
 import time
-import traceback
 
 NS = 1_000_000_000
 WALL_NS = 600 * NS  # oxide#192 amendment (2026-10-31): was 420 s (#191), 300 s before
 CANDIDATE_LIMIT = 560  # oxide#192 amendment: was 380 s (#191), 280 s before
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
-BOOTSTRAP_RESERVE_MIB = 8
-GUARD_BUDGET_MIB = 512 - BOOTSTRAP_RESERVE_MIB
+BOOTSTRAP_RESERVE_MIB = 8  # base only, inside the shared outside allowance
+OUTSIDE_BUDGET_MIB = 128
+GUARD_BUDGET_MIB = 384
+BOOTSTRAP_OUTPUT_LIMIT = 2 * MIB
+QUALIFICATION_DOCUMENT_LIMIT = MIB
+# Simultaneous task-owned bytes, including one complete raw log and all copies.
+# Allocation and closeout reserves are separate; no compression is assumed.
+OUTSIDE_PARTS_MIB = {"forwarded_streams": 64, "bootstrap_stream_and_actor": 3,
+                     "bootstrap_base": 8, "source_and_index_copies": 16,
+                     "capture_metadata": 4, "delivery_copies": 8,
+                     "allocation_headroom": 8, "closeout_headroom": 8}
+assert sum(OUTSIDE_PARTS_MIB.values()) <= OUTSIDE_BUDGET_MIB
 EXPECTED_CASES = 445  # 382 baseline pure + 57 baseline real + 6 ceiling real.
                       # oxide#151 added the routing, marker,
                       # nested-window protection, bounded-sweep, qualify-entry,
@@ -155,7 +164,7 @@ LIMITATIONS = [
     "The candidate's settlement diagnostics (receipt `settlement` and the custodian's decision-time `settlement` record) are bounded observations, not acceptance gates: they never decide classification, closure, EOF, the deadline or cleanup, and a lost or truncated observation only means missing evidence. The receipt object keeps accumulating after the decision, so only the custodian's record is the decision-time view.",
     "macOS only (kqueue NOTE_EXIT, sysctl kinfo_proc at self-checked offsets); Linux is not qualified.",
     "Effigy admission waits happen before this script starts and are not inside its 600 s.",
-    "Nested candidate sessions are outside the outer session; their UNCLOSED cases are settled by no guardian. Their case directories, receipts and kept UNCLOSED scratch live in the outer candidate's own evidence directory inside its selected-volume owned root, so the outer monitored walk and 512 MiB budget cover them and cleanup never removes them; their fixture processes end only at the finite fallback, which is not closure.",
+    "Nested candidate sessions are outside the outer session; their UNCLOSED cases are settled by no guardian. Their case directories, receipts and kept UNCLOSED scratch live in the outer candidate's own evidence directory inside its selected-volume owned root, so the outer monitored walk and 384 MiB budget cover them and cleanup never removes them; their fixture processes end only at the finite fallback, which is not closure.",
     "The outer actor KILLs only its pinned worker at the deadline; a candidate still running then is bounded by its own 560 s limit, not by the actor.",
     "Synthetic fixtures model Cargo's setpgid groups; no real Cargo build or live application ran.",
     "Owned bytes are a non-atomic best-effort walk: an entry past the platform path limit is reached one descriptor-relative component at a time from its nearest nameable directory, and any error other than a vanished entry is a measurement fault, never a smaller total.",
@@ -175,7 +184,46 @@ def free_bytes(path):
     return sample.f_bavail * sample.f_frsize
 
 
-MAX_DOCUMENT = 1024 * 1024  # topology record, cases and registration are far smaller
+MAX_DOCUMENT = 1024 * 1024  # each complete input document, not a truncation limit
+
+
+class OutputLimit(ValueError):
+    pass
+
+
+_output_bytes = 0
+
+
+def bounded_print(*args, file=None, sep=" ", end="\n", flush=False):
+    """Refuse an entire record on overflow; never label a prefix complete."""
+    global _output_bytes
+    data = (sep.join(str(value) for value in args) + end).encode("utf-8")
+    if _output_bytes + len(data) > BOOTSTRAP_OUTPUT_LIMIT:
+        raise OutputLimit("bootstrap output limit")
+    stream = sys.stdout if file is None else file
+    stream.write(data.decode("utf-8"))
+    _output_bytes += len(data)
+    if flush:
+        stream.flush()
+
+
+print = bounded_print
+
+
+def read_document(path):
+    with open(path, "rb") as handle:
+        data = handle.read(MAX_DOCUMENT + 1)
+    if len(data) > MAX_DOCUMENT:
+        raise ValueError("input document exceeds 1 MiB; evidence kept")
+    return json.loads(data.decode("utf-8"))
+
+
+def qualification_bytes(document):
+    data = json.dumps(document, indent=1).encode("utf-8")
+    if len(data) > QUALIFICATION_DOCUMENT_LIMIT:
+        raise OutputLimit("qualification document exceeds 1 MiB; evidence kept")
+    return data
+
 
 
 class KernelFacts:
@@ -195,8 +243,7 @@ class KernelFacts:
         return free_bytes(path)
 
     def document(self, path):
-        with open(path, "rb") as handle:
-            return json.loads(handle.read(MAX_DOCUMENT).decode("utf-8"))
+        return read_document(path)
 
 
 def reserve_readings(scratch_volume, boot_volume, facts=None):
@@ -253,8 +300,15 @@ def bounded(work, deadline_ns, finish_ns):
         code = 1
         try:
             code = work()
-        except BaseException:
-            traceback.print_exc()
+        except BaseException as error:
+            # A bounded reason, not an unbounded traceback or a partial receipt.
+            # Original guard evidence is retained; exception detail is omitted.
+            try:
+                os.write(2, ("bootstrap incomplete: " + ("output or document limit exceeded" if isinstance(error, OutputLimit)
+                             else type(error).__name__[:128])
+                             + "; evidence kept; exception detail omitted\n").encode())
+            except OSError:
+                pass
         finally:
             for stream in (sys.stdout, sys.stderr):
                 try:
@@ -1051,6 +1105,7 @@ def qualify(diagnostic=False):
     if closing["boot_volume"]["free"] < THRESHOLD:
         problems.append(f"boot volume free {closing['boot_volume']['free']} below 22 GiB")
     receipt, results, record, rows = {}, {}, None, []
+    input_complete = False
     if diagnostic:
         # Uncounted keep-going: one unreadable phase or failing oracle must not
         # hide the rest, and a skipped check is never a pass.
@@ -1061,10 +1116,9 @@ def qualify(diagnostic=False):
         problems += topology_problems
         layout = record or {"evidence": os.path.join(base, "missing")}
         try:
-            with open(os.path.join(layout["evidence"], "receipt.json")) as handle:
-                receipt = json.load(handle)
-            with open(env["OXIDE_SUPERVISOR_CASES"]) as handle:
-                results = json.load(handle)
+            receipt = read_document(os.path.join(layout["evidence"], "receipt.json"))
+            results = read_document(env["OXIDE_SUPERVISOR_CASES"])
+            input_complete = True
         except Exception as error:
             problems.append(f"missing or malformed candidate evidence: {error!r}")
         if receipt and results:
@@ -1080,10 +1134,9 @@ def qualify(diagnostic=False):
             record, topology_problems = topology(base, expected, facts)
             problems += topology_problems
             layout = record or {"evidence": os.path.join(base, "missing")}
-            with open(os.path.join(layout["evidence"], "receipt.json")) as handle:
-                receipt = json.load(handle)
-            with open(env["OXIDE_SUPERVISOR_CASES"]) as handle:
-                results = json.load(handle)
+            receipt = read_document(os.path.join(layout["evidence"], "receipt.json"))
+            results = read_document(env["OXIDE_SUPERVISOR_CASES"])
+            input_complete = True
             problems += check(receipt, results, expected, record, facts, base)
         except (OSError, ValueError, KeyError, TypeError) as error:
             problems.append(f"missing or malformed candidate evidence: {error!r}")
@@ -1094,24 +1147,6 @@ def qualify(diagnostic=False):
     # unconcluded, because a positive conclusion of ALL owned resources was not
     # established.
     qualified = not problems and code == 0 and (receipt.get("outcome") or {}).get("closure") == "closed"
-    candidate_concluded = False
-    if record is not None:
-        try:
-            candidate_problems, candidate_concluded = finish_candidate(
-                guard, probe, record, nested_unclosed, (record or {}).get("protection"))
-        except Exception as error:
-            if not diagnostic:
-                raise
-            candidate_problems, candidate_concluded = [f"candidate conclusion unreadable: {error!r}"], False
-        problems += candidate_problems
-    try:
-        base_problems = finish_base(guard, probe, base, run_id, qualified, bool(nested_unclosed),
-                                    candidate_concluded, (record or {}).get("protection"))
-    except Exception as error:
-        if not diagnostic:
-            raise
-        base_problems = [f"bootstrap conclusion unreadable: {error!r}"]
-    problems += base_problems
     reserve, owned = receipt.get("reserve", {}), receipt.get("owned_bytes", {})
     qualification = {
         "selector": ("proof:supervisor:ceiling:qualify:diagnostic" if diagnostic else "proof:supervisor:ceiling:qualify"),
@@ -1144,6 +1179,8 @@ def qualify(diagnostic=False):
                                              "threshold": THRESHOLD}},
         "owned_bytes_peak": owned.get("maximum"),
         "all_owned_budget": {"total_bytes": 512 * MIB, "guard_bytes": GUARD_BUDGET_MIB * MIB,
+                             "outside_shared_bytes": OUTSIDE_BUDGET_MIB * MIB,
+                             "outside_reserved_parts_mib": OUTSIDE_PARTS_MIB,
                              "bootstrap_reserve_bytes": BOOTSTRAP_RESERVE_MIB * MIB,
                              "bootstrap_point_before_finalization": bootstrap_bytes,
                              "finalization_headroom_bytes": MIB},
@@ -1167,8 +1204,44 @@ def qualify(diagnostic=False):
         qualification["mode"] = "diagnostic"
         qualification["selector"] = "proof:supervisor:ceiling:qualify:diagnostic"
         qualification["result"] = "diagnostic"
+    # Refuse oversize before concluding either retained root. Reserve room for
+    # bounded marker/finalization additions; the final document is checked again.
+    preliminary = qualification_bytes(qualification)
+    if (len(preliminary) > QUALIFICATION_DOCUMENT_LIMIT - 65536
+            or _output_bytes + len(preliminary) > BOOTSTRAP_OUTPUT_LIMIT - 65536):
+        raise OutputLimit("qualification document lacks finalization room; evidence kept")
+    candidate_concluded = False
+    if record is not None and input_complete:
+        try:
+            candidate_problems, candidate_concluded = finish_candidate(
+                guard, probe, record, nested_unclosed, (record or {}).get("protection"))
+        except Exception as error:
+            if not diagnostic:
+                raise
+            candidate_problems, candidate_concluded = [f"candidate conclusion unreadable: {error!r}"], False
+        problems += candidate_problems
+    qualified = qualified and not problems
+    try:
+        base_problems = finish_base(guard, probe, base, run_id, qualified, bool(nested_unclosed),
+                                    candidate_concluded, (record or {}).get("protection"))
+    except Exception as error:
+        if not diagnostic:
+            raise
+        base_problems = [f"bootstrap conclusion unreadable: {error!r}"]
+    problems += base_problems
+    qualification["scratch_marker"] = {
+        "candidate": marker_state_of(guard, probe, (record or {}).get("root")),
+        "base": marker_state_of(guard, probe, base)}
+    qualification["problems"] = problems
+    if diagnostic:
+        qualification.update(diagnostic_receipt(problems, rows, {"collection": collection}))
+        qualification["mode"] = "diagnostic"
+        qualification["selector"] = "proof:supervisor:ceiling:qualify:diagnostic"
+        qualification["result"] = "diagnostic"
+    else:
+        qualification["result"] = "fail" if problems else "pass"
     qualification["worker_wall_ns_before_print"] = now_ns() - START
-    print("qualification receipt:", json.dumps(qualification, indent=1), flush=True)
+    print("qualification receipt:", qualification_bytes(qualification).decode("utf-8"), flush=True)
     if diagnostic:
         print(f"diagnostic (UNCOUNTED, never a PASS): {len(rows)} named checks, "
               f"{sum(1 for row in rows if row['result'] == 'pass')} passed, {len(problems)} problems;"
@@ -1179,4 +1252,14 @@ def qualify(diagnostic=False):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    try:
+        result = main(sys.argv[1:])
+    except BaseException as error:
+        try:
+            os.write(2, ("bootstrap incomplete: " + ("output or document limit exceeded" if isinstance(error, OutputLimit)
+                         else type(error).__name__[:128])
+                         + "; evidence kept; exception detail omitted\n").encode())
+        except OSError:
+            pass
+        result = 1
+    sys.exit(result)

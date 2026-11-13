@@ -7236,3 +7236,7 @@ unknown-keeps — and both retained Barge roots stay `UNCLOSED` and kept. The
 Barge operation-journal native gates stay held until the owner separately
 accepts a safe path; this assessment grants no native, activation, cleanup,
 promotion or pin authority.
+
+The unqualified oxide#309 ceiling qualification candidate proposes 384 MiB monitored plus 128 MiB shared outside for its unchanged 512 MiB total. The outside plan reserves 64 MiB for the two forwarded streams, 3 MiB for bootstrap and actor output, 8 MiB for the base, 16 MiB for source and index copies, 4 MiB for capture metadata, 8 MiB for delivery copies, 8 MiB for allocation and 8 MiB for closeout: 119 MiB reserved, leaving 9 MiB. The future occurrence must verify those actual reservations and the supported Effigy capture route before effects. A single complete raw log is retained on owned scratch; a bounded proofFiles manifest names its exact immutable copy, size and digest for the reviewer rather than assuming compression or a larger API limit. Oversized or unreadable inputs and oversized bootstrap output refuse incomplete evidence. Source review and separate native activation remain required under decisions 775190 and a833.
+
+The proposed ceiling bootstrap is `dabbe2715f75d77aa7ef226533b6a1012069e9721b9b81071b568e204e9d71f6` and its source pin document is `12cc65952bcc1fa1940a8386d01f487822aa3a9ae897954dceb5658f61a5a0bb`. The candidate remains `4aba8be3120abc67a0a9b4df6793bbc2b74ece79199f56bbfa355fed368231e0`; none is qualified by these source controls.

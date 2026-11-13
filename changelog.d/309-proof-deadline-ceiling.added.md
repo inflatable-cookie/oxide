@@ -1,1 +1,1 @@
-Add an isolated, unqualified supervisor candidate with an opt-in absolute deadline ceiling and a proposed qualification inventory.
+Add an isolated, unqualified supervisor candidate with an opt-in absolute deadline ceiling and a proposed qualification inventory. The proposed qualification bootstrap bounds receipt and output capture within a revised 384/128 MiB partition.

@@ -26,6 +26,8 @@ Do not repoint consumers or run native qualification without its separate gates.
 The proposed qualification plan is `proof:supervisor:ceiling:qualification:plan`;
 its oxide#195-derived suite and bootstrap remain unqualified and separately reviewed.
 The effect-free compatibility check is `proof:supervisor:ceiling:qualification:compat`.
+The proposed split is 384 MiB monitored and 128 MiB shared outside, within 512 MiB;
+receipt and bootstrap output limits refuse incomplete evidence. No native is activated.
 
 Tom approved risk-proportionate verification on 2026-10-20 ([vision](docs/knowledge/vision.md#validation-policy)). Every product brief names its tier, covering Effigy selectors, wall-clock limit and scratch-disk budget.
 Tom decision `c6e3e9c8` v2 (2026-11-04) permits the named capture-only Cargo selectors `rust:compile:cargo`, `rust:compile-release:cargo`, `rust:format:cargo` and `rust:test-600:cargo` for direct capture covering. They establish build and embedded-harness behavior, not private launcher isolation or current export production. Ordinary Rust selectors remain through Oxide. The direct checks require separate planner activation and the existing guard, root and host safeguards.
