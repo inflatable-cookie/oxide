@@ -79,7 +79,7 @@ THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
 BOOTSTRAP_RESERVE_MIB = 8
 GUARD_BUDGET_MIB = 512 - BOOTSTRAP_RESERVE_MIB
-EXPECTED_CASES = 443  # 382 baseline pure + 57 baseline real + 4 ceiling real.
+EXPECTED_CASES = 445  # 382 baseline pure + 57 baseline real + 6 ceiling real.
                       # oxide#151 added the routing, marker,
                       # nested-window protection, bounded-sweep, qualify-entry,
                       # shared-ancestor/private-leaf and readiness cases; oxide#191

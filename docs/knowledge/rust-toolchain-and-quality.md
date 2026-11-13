@@ -5,6 +5,8 @@ The supervisor ceiling candidate's focused source controls are
 They are synthetic checks, not native qualification or Rust toolchain evidence.
 The separate `proof:supervisor:ceiling:qualification:plan` collects the proposed
 oxide#195-based qualification inventory without running its cases.
+`proof:supervisor:ceiling:qualification:compat` checks monitor stub compatibility
+with substituted I/O and no native fixture.
 
 The repository pins the already-installed Rust 1.97.1 toolchain in
 [`rust-toolchain.toml`](../../rust-toolchain.toml). The selected compiler is

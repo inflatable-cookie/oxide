@@ -6097,6 +6097,7 @@ class PureQualificationTopology(unittest.TestCase):
 
     def monitor_stub(self, receipt=None):
         monitor = bounded.Monitor.__new__(bounded.Monitor)
+        monitor.ctx = {}  # explicit absent-option context for the retained stub
         cmd_r, cmd_w = os.pipe()
         self.addCleanup(os.close, cmd_r)
         self.addCleanup(os.close, cmd_w)
@@ -6213,6 +6214,7 @@ class PureQualificationTopology(unittest.TestCase):
         # The custodian sends its detach pin/signal/observation records after the
         # monitor stopped reading commands; the monitor drains them at completion.
         monitor = bounded.Monitor.__new__(bounded.Monitor)
+        monitor.ctx = {}  # explicit absent-option context for the retained stub
         cmd_r, cmd_w = os.pipe()
         self.addCleanup(os.close, cmd_r)
         self.addCleanup(os.close, cmd_w)
@@ -7041,6 +7043,7 @@ class PureDetach(unittest.TestCase):
     def test_the_monitor_takes_no_detach_without_a_usable_answer(self):
         def monitor(answer, close=False):
             monitor = bounded.Monitor.__new__(bounded.Monitor)
+            monitor.ctx = {}  # explicit absent-option context for the retained stub
             _ctl_r, _ctl_w = os.pipe()
             cmd_r, cmd_w = os.pipe()
             self.addCleanup(os.close, _ctl_r)
@@ -8099,6 +8102,7 @@ class PureDetach(unittest.TestCase):
 
     def monitor_stub(self):
         monitor = bounded.Monitor.__new__(bounded.Monitor)
+        monitor.ctx = {}  # explicit absent-option context for the retained stub
         cmd_r, cmd_w = os.pipe()
         self.addCleanup(os.close, cmd_r)
         self.addCleanup(os.close, cmd_w)
@@ -10813,6 +10817,36 @@ class CeilingReal(unittest.TestCase):
         self.assertEqual(self.outcome()["closure"], "closed")
         self.assertTrue(self.receipt["census_join"]["joined"])
 
+    def test_ceiling_runtime_deadline_keeps_owned_root(self):
+        ceiling = self.started + 34 * NS
+        self.assertEqual(self.guardian(SLEEPER, owned=True, limit=35, ceiling_ns=ceiling), 124)
+        outcome = self.outcome()
+        self.assertEqual(outcome["requested_ceiling_ns"], ceiling)
+        self.assertEqual(outcome["effective_deadline_ns"], ceiling)
+        self.assertTrue(outcome["deadline"])
+        self.assertEqual(outcome["closure"], "UNCLOSED")
+        self.assertTrue(os.path.isdir(self.receipt["scratch"]))
+        join = self.receipt["census_join"]
+        self.assertTrue(join["joined"])
+        self.assertTrue(bounded.census_settled(join, join["final"], self.receipt["deciding_census"])[0])
+
+    def test_ceiling_unknown_image_custody_keeps_owned_root(self):
+        ceiling = self.started + 34 * NS
+        code = fixture("p = os.path.join(os.environ['OXIDE_PROOF_EVIDENCE'], 'image-custody.json')\n"
+                       "with open(p + '.tmp', 'w') as f: f.write('null')\n"
+                       "os.replace(p + '.tmp', p)\n")
+        self.assertEqual(self.guardian(code, owned=True, limit=35, ceiling_ns=ceiling), 125)
+        CASES[-1]["retained_unclosed"] = True
+        CASES[-1]["cleanup"] = self.receipt["cleanup"]
+        self.assertEqual(self.outcome()["requested_ceiling_ns"], ceiling)
+        self.assertEqual(self.outcome()["effective_deadline_ns"], ceiling)
+        self.assertEqual(self.receipt["cleanup"]["state"], "kept")
+        self.assertNotEqual(self.receipt["scratch_marker"]["state"], "concluded")
+        self.assertTrue(os.path.isdir(self.receipt["scratch"]))
+        join = self.receipt["census_join"]
+        self.assertTrue(join["joined"])
+        self.assertTrue(bounded.census_settled(join, join["final"], self.receipt["deciding_census"])[0])
+
 
 class Results(unittest.TextTestResult):
     outcomes = []
@@ -10856,7 +10890,7 @@ def main():
                           "pure": [{"id": name, "expected": "pass"} for name in pure_names],
                           "real": [{"id": name, "expected": "pass"} for name in real_names],
                           "pure_count": len(pure_names), "real_count": len(real_names)}, indent=2))
-        return 0 if (len(pure_names), len(real_names)) == (382, 61) else 1
+        return 0 if (len(pure_names), len(real_names)) == (382, 63) else 1
     SCRATCH = Path(tempfile.mkdtemp(prefix="suite.", dir=os.environ.get("OXIDE_TASK_SCRATCH_ROOT") or None)).resolve()
     # Secondary bound; the supervisor's deadline is primary. It is the 560 s
     # candidate limit less its 30 s margin (oxide#192 amendment: was 350 s; 250 s before #191).

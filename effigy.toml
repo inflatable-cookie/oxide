@@ -39,7 +39,8 @@ minimum_effigy_version = "0.14.0"
 "proof:supervisor:ceiling:test" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_supervisor_ceiling.py"
 "proof:supervisor:ceiling:plan" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_supervisor_ceiling.py --plan"
 # Collection only: no scratch, fixture, child or qualification is started.
-"proof:supervisor:ceiling:qualification:plan" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_supervisor_ceiling_qualification.py --pins-sha256 2ea08162790fb187a5380d4e86e2b00cc4e39e3d42c10083ba57c240f5a6ae8a --plan"
+"proof:supervisor:ceiling:qualification:plan" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_supervisor_ceiling_qualification.py --pins-sha256 acd85824547f2b42ee396f7ec62b6de7ee4cce5a691dc2bb51dea98b0e795aac --plan"
+"proof:supervisor:ceiling:qualification:compat" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_ceiling_qualification_compat.py"
 # Effect-free readiness for the selected host (oxide#151): path, mode, owner and
 # device metadata only. Creates nothing (an absent private leaf is reported as
 # planned), never sweeps, marks, forks the deadline actor or launches the
@@ -820,11 +821,11 @@ run = "python3 scripts/qualify-supervisor.py --diagnostic"
 # declaring it, and the guard remains unqualified until the complete gate chain.
 [tasks."proof:supervisor:ceiling:qualify"]
 admission = "heavy"
-run = "python3 scripts/qualify-supervisor-ceiling.py --pins-sha256 2ea08162790fb187a5380d4e86e2b00cc4e39e3d42c10083ba57c240f5a6ae8a"
+run = "python3 scripts/qualify-supervisor-ceiling.py --pins-sha256 acd85824547f2b42ee396f7ec62b6de7ee4cce5a691dc2bb51dea98b0e795aac"
 
 [tasks."proof:supervisor:ceiling:qualify:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/qualify-supervisor-ceiling.py --pins-sha256 2ea08162790fb187a5380d4e86e2b00cc4e39e3d42c10083ba57c240f5a6ae8a --diagnostic"
+run = "python3 scripts/qualify-supervisor-ceiling.py --pins-sha256 acd85824547f2b42ee396f7ec62b6de7ee4cce5a691dc2bb51dea98b0e795aac --diagnostic"
 
 # SUSPENDED by oxide#102: provisions its pool with the retired standalone
 # lease CLI and APFS image backend, so it refuses before any effect until

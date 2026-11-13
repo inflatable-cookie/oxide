@@ -2340,18 +2340,19 @@ reviewer native qualifications precede any promotion or consumer adoption.
 The proposed oxide#309 qualification apparatus is isolated in
 `scripts/test_supervisor_ceiling_qualification.py` and
 `scripts/qualify-supervisor-ceiling.py`. It derives from oxide#195 head
-`b29ef6ca` (382 pure and 57 real cases), adds four ceiling real cases and
+`b29ef6ca` (382 pure and 57 real cases), adds six ceiling real cases and
 retains the fixed 600/560/530-second outer/guard/suite bounds and 512 MiB
 all-owned budget. The guard's monitored share is 504 MiB and 8 MiB is reserved
 for the separate bootstrap base, whose two result documents are each capped at
 1 MiB and measured before finalization. `ceiling-qualification-pins.json` binds the ordinary guard, ceiling
 candidate, suite and bootstrap; the qualification routes supply its digest.
 The effect-free `proof:supervisor:ceiling:qualification:plan` collects case
-names only. No apparatus execution, qualification or adoption follows from this
+names only; `proof:supervisor:ceiling:qualification:compat` checks the retained
+monitor stubs with substituted I/O. No apparatus execution, qualification or adoption follows from this
 source. Tom's `775190c6` ceiling and separate `a833` guest-clock rulings remain
 distinct; native occurrences require the separate owner activations.
 The candidate digest is `4aba8be3120abc67a0a9b4df6793bbc2b74ece79199f56bbfa355fed368231e0`;
-the pin manifest digest is `2ea08162790fb187a5380d4e86e2b00cc4e39e3d42c10083ba57c240f5a6ae8a`.
+the pin manifest digest is `acd85824547f2b42ee396f7ec62b6de7ee4cce5a691dc2bb51dea98b0e795aac`.
 The manifest records the full suite and bootstrap digests alongside the
 unchanged `fcfda2b0` ordinary guard.
 The candidate records whether an accepted admission grant was handled inside
