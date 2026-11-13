@@ -201,7 +201,12 @@ def bounded_print(*args, file=None, sep=" ", end="\n", flush=False):
     if _output_bytes + len(data) > BOOTSTRAP_OUTPUT_LIMIT:
         raise OutputLimit("bootstrap output limit")
     stream = sys.stdout if file is None else file
-    stream.write(data.decode("utf-8"))
+    # Write exactly the bytes counted above, independent of the caller's
+    # locale or PYTHONIOENCODING. StringIO remains available to pure tests.
+    if hasattr(stream, "buffer"):
+        stream.buffer.write(data)
+    else:
+        stream.write(data.decode("utf-8"))
     _output_bytes += len(data)
     if flush:
         stream.flush()

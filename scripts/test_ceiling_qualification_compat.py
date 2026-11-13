@@ -115,6 +115,12 @@ class BootstrapBounds(unittest.TestCase):
             with self.assertRaises(b.OutputLimit):
                 b.bounded_print("not a partial record", file=sink)
         self.assertEqual(sink.getvalue(), "")
+        binary = io.BytesIO()
+        alternate_encoding = mock.Mock(buffer=binary)
+        with mock.patch.object(b, "_output_bytes", 0):
+            b.bounded_print("é", file=alternate_encoding)
+        self.assertEqual(binary.getvalue(), b"\xc3\xa9\n")
+        alternate_encoding.write.assert_not_called()
         self.assertEqual(json.loads(b.qualification_bytes({"qualified": False})), {"qualified": False})
 
 
