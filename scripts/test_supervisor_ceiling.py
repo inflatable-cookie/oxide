@@ -207,6 +207,21 @@ class CustodianWindow(unittest.TestCase):
         self.assertEqual(custodian.absolute, 110 * ns)
         self.assertEqual(custodian.admission_granted, 10 * ns)
 
+    def test_default_setup_matches_qualified_baseline(self):
+        ns = candidate.NS
+        current = candidate.Custodian(["proof"], limit_s=100)
+        qualified = baseline.Custodian(["proof"], limit_s=100)
+        for module, instance in ((candidate, current), (baseline, qualified)):
+            with mock.patch.object(module, "capability", return_value=[]), \
+                 mock.patch.object(module.signal, "signal"), \
+                 mock.patch.object(module, "now_ns", return_value=5 * ns), \
+                 mock.patch.object(module.secrets, "token_hex", return_value="synthetic"):
+                instance.setup()
+        self.assertEqual((current.start, current.absolute, current.stop_at, current.exit_at,
+                          current.setup_at, current.ctx),
+                         (qualified.start, qualified.absolute, qualified.stop_at, qualified.exit_at,
+                          qualified.setup_at, qualified.ctx))
+
     def test_entrypoint_passes_ceiling_without_spawning(self):
         ns = candidate.NS
         with mock.patch.object(candidate, "Custodian") as constructor:
@@ -352,6 +367,34 @@ class CustodianWindow(unittest.TestCase):
         self.assertEqual(result["post_state"], "unknown")
         self.assertFalse(result["qualified"])
         probe.mount_point.assert_not_called()
+
+    def test_composed_cleanup_decision_keeps_root_at_exit_margin(self):
+        ns = candidate.NS
+        ctx = {"start_ns": 0, "limit_s": 100, "initial_absolute_ns": 100 * ns,
+               "ceiling_ns": 100 * ns, "setup_at_ns": 10 * ns, "inject": [],
+               "evidence": "synthetic", "scratch": "synthetic", "owned": True}
+        monitor = candidate.Monitor(ctx, 0, 0, 0, 0)
+        monitor.receipt = {"reserve": {"samples": 1}, "owned_bytes": {"samples": 1},
+                           "survivors": []}
+        monitor.setup = mock.Mock()
+        monitor.publish = mock.Mock()
+        monitor.send = mock.Mock()
+        monitor.conclude_marker = mock.Mock(return_value={})
+        monitor.finish_monitor = mock.Mock()
+        monitor.commands = mock.Mock(return_value=iter([{"type": "cleanup",
+            "outcome": {"closure": "closed", "effective_deadline_ns": 100 * ns}, "census": None}]))
+        monitor.join_census = mock.Mock(return_value={"joined": True})
+        clock = [0]
+        monitor.bind_deciding_census = mock.Mock(side_effect=lambda: clock.__setitem__(0, 99 * ns))
+        with mock.patch.object(candidate, "now_ns", side_effect=lambda: clock[0]), \
+             mock.patch.object(candidate.os, "makedirs"), \
+             mock.patch.object(candidate.shutil, "rmtree") as remove, \
+             mock.patch.object(candidate.threading, "Thread"), \
+             mock.patch.object(candidate, "census_settled", return_value=(True, None)):
+            monitor.run()
+        remove.assert_not_called()
+        self.assertEqual(monitor.receipt["outcome"]["closure"], "UNCLOSED")
+        self.assertTrue(any(call.args[0] == "cleanup_kept" for call in monitor.send.call_args_list))
 
 
 if __name__ == "__main__":
