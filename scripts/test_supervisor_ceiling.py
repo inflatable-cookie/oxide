@@ -372,7 +372,7 @@ class CustodianWindow(unittest.TestCase):
         ns = candidate.NS
         ctx = {"start_ns": 0, "limit_s": 100, "initial_absolute_ns": 100 * ns,
                "ceiling_ns": 100 * ns, "setup_at_ns": 10 * ns, "inject": [],
-               "evidence": "synthetic", "scratch": "synthetic", "owned": True}
+               "root": "synthetic", "evidence": "synthetic", "scratch": "synthetic", "owned": True}
         monitor = candidate.Monitor(ctx, 0, 0, 0, 0)
         monitor.receipt = {"reserve": {"samples": 1}, "owned_bytes": {"samples": 1},
                            "survivors": []}
