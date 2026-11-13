@@ -283,6 +283,38 @@ class CustodianWindow(unittest.TestCase):
             result = candidate.cleanup_safety(ctx, probe=mock.Mock(), facts=mock.Mock(return_value=None))
         self.assertEqual(result["state"], "kept")
 
+    def test_delayed_authorization_never_waits_past_ceiling(self):
+        ns = candidate.NS
+        ctx = {"start_ns": 0, "limit_s": 100, "ceiling_ns": 90 * ns, "inject": []}
+        monitor = candidate.Monitor(ctx, 0, 0, 0, 0)
+        monitor.send = mock.Mock()
+        with mock.patch.object(candidate, "now_ns", side_effect=[87 * ns, 87 * ns, 89 * ns, 89 * ns]), \
+             mock.patch.object(candidate.select, "select") as select:
+            allowed, _reason, grant = monitor.authorize_detach(10 * ns)
+        self.assertFalse(allowed)
+        self.assertEqual(grant, 0)
+        select.assert_not_called()
+
+    def test_expired_publication_and_setup_refuse_effects(self):
+        ns = candidate.NS
+        ctx = {"start_ns": 0, "limit_s": 100, "ceiling_ns": 90 * ns,
+               "setup_at_ns": 10 * ns, "inject": []}
+        monitor = candidate.Monitor(ctx, 0, 0, 0, 0)
+        monitor.receipt = {}
+        with mock.patch.object(candidate, "now_ns", return_value=90 * ns), \
+             mock.patch("builtins.open") as opened:
+            with self.assertRaises(RuntimeError):
+                monitor.publish("complete")
+            with self.assertRaises(candidate.SetupRefused):
+                monitor.check_setup_clock()
+        opened.assert_not_called()
+
+    def test_image_cleanup_budget_has_no_floor(self):
+        ns = candidate.NS
+        ctx = {"start_ns": 0, "limit_s": 100, "ceiling_ns": 90 * ns}
+        with mock.patch.object(candidate, "now_ns", return_value=90 * ns):
+            self.assertEqual(candidate.detach_budget(ctx), 0)
+
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--plan"]:

@@ -2930,6 +2930,9 @@ def post_census_detach(ctx, probe=None, authorize=None, still_allowed=None):
             return record
         clock = time.monotonic if ctx.get("ceiling_ns") is None else lambda: now_ns() / NS
         deadline = clock() + budget_ns / NS
+        if ctx.get("ceiling_ns") is not None:
+            deadline = min(deadline, (monitor_absolute(ctx) - EXIT_MARGIN_S * NS
+                                      - DETACH_GATE_MARGIN_NS) / NS)
 
         def left():
             return max(0.0, deadline - clock())
@@ -4250,6 +4253,8 @@ class Monitor:
             wait_s = min(wait_s, monitor_remaining(self.ctx, EXIT_MARGIN_S * NS))
         clock = time.monotonic if self.ctx.get("ceiling_ns") is None else lambda: now_ns() / NS
         deadline = clock() + max(0.0, wait_s)
+        if self.ctx.get("ceiling_ns") is not None:
+            deadline = min(deadline, (self.ctx["ceiling_ns"] - EXIT_MARGIN_S * NS) / NS)
         buffer = b""
         while True:
             remaining = deadline - clock()
@@ -4756,6 +4761,8 @@ class Monitor:
             wait_s = min(wait_s, monitor_remaining(self.ctx, EXIT_MARGIN_S * NS))
         clock = time.monotonic if self.ctx.get("ceiling_ns") is None else lambda: now_ns() / NS
         deadline = clock() + max(0.0, wait_s)
+        if self.ctx.get("ceiling_ns") is not None:
+            deadline = min(deadline, (self.ctx["ceiling_ns"] - EXIT_MARGIN_S * NS) / NS)
         buffer = b""
         while True:
             remaining = deadline - clock()
@@ -4808,6 +4815,8 @@ class Monitor:
             wait = min(wait, monitor_remaining(self.ctx, EXIT_MARGIN_S * NS))
         clock = time.monotonic if self.ctx.get("ceiling_ns") is None else lambda: now_ns() / NS
         deadline = clock() + (min(wait, budget_ns / NS) if budget_ns else wait)
+        if self.ctx.get("ceiling_ns") is not None:
+            deadline = min(deadline, (self.ctx["ceiling_ns"] - EXIT_MARGIN_S * NS) / NS)
         buffer = b""
         while True:
             remaining = deadline - clock()
