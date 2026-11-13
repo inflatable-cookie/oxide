@@ -889,7 +889,7 @@ def diagnostic_receipt(problems, rows, extra=None):
     """The diagnostic mode's receipt. Pure, so the suite can prove the one
     property that matters: an uncounted collection is NEVER `qualified`, not even
     when every named oracle passed. `result` is never `pass` either."""
-    receipt = {"selector": "proof:supervisor:qualify:diagnostic", "result": "diagnostic",
+    receipt = {"selector": "proof:supervisor:ceiling:qualify:diagnostic", "result": "diagnostic",
                "qualified": False, "claims": ("diagnostic coverage and oracle outcomes only; "
                                               "never a counted native PASS, closure, census or custody claim"),
                "problems": list(problems),
@@ -908,18 +908,30 @@ def main(argv=None):
         raise SystemExit("ceiling qualification: missing source pin")
     PINS_TOKEN = argv[1]
     del argv[:2]
-    try:
-        verify_source_pins(PINS_TOKEN)
-    except (OSError, ValueError, TypeError) as error:
-        raise SystemExit("ceiling qualification: source refusal: " + type(error).__name__)
     if argv and argv[0] == PREFLIGHT_FLAG:
+        try:
+            verify_source_pins(PINS_TOKEN)
+        except (OSError, ValueError, TypeError) as error:
+            raise SystemExit("ceiling qualification: source refusal: " + type(error).__name__)
         return preflight(list(argv))
     diagnostic = DIAGNOSTIC_FLAG in argv
     if diagnostic:
         argv.remove(DIAGNOSTIC_FLAG)
     if argv:
         raise SystemExit(f"qualify-supervisor.py: unknown argument {argv[0]}")
-    return bounded(lambda: qualify(diagnostic=diagnostic), DEADLINE - ACTOR_MARGIN_NS, DEADLINE - NS // 2)
+    def verified_work():
+        # The existing pinned outer actor bounds even a blocked source read.
+        # This worker verifies before selection, owned resources or candidate use.
+        try:
+            verify_source_pins(PINS_TOKEN)
+        except (OSError, ValueError, TypeError) as error:
+            message = "ceiling qualification: source refusal: " + type(error).__name__
+            print(message, file=sys.stderr)
+            if diagnostic:
+                print(json.dumps(diagnostic_receipt([message], [])), flush=True)
+            return 1 if diagnostic else 2
+        return qualify(diagnostic=diagnostic)
+    return bounded(verified_work, DEADLINE - ACTOR_MARGIN_NS, DEADLINE - NS // 2)
 
 
 def refusal(message, diagnostic, extra=None):
@@ -944,7 +956,7 @@ def qualify(diagnostic=False):
     forward = []  # INT and TERM go to the candidate, which cancels itself
     for number in (signal.SIGINT, signal.SIGTERM):
         signal.signal(number, lambda n, _f: forward.append(n))
-    print("proof:supervisor:qualify: the supervisor is the candidate under test; this bootstrap (Effigy heavy"
+    print("proof:supervisor:ceiling:qualify: the supervisor is the candidate under test; this bootstrap (Effigy heavy"
           " admission, reserve readings, fixed 600 s deadline, finite fixture fallbacks) does not qualify it",
           flush=True)
     if sys.platform != "darwin":
@@ -1102,7 +1114,7 @@ def qualify(diagnostic=False):
     problems += base_problems
     reserve, owned = receipt.get("reserve", {}), receipt.get("owned_bytes", {})
     qualification = {
-        "selector": ("proof:supervisor:qualify:diagnostic" if diagnostic else "proof:supervisor:qualify"),
+        "selector": ("proof:supervisor:ceiling:qualify:diagnostic" if diagnostic else "proof:supervisor:ceiling:qualify"),
         "result": "diagnostic" if diagnostic else ("fail" if problems else "pass"),
         "problems": problems,
         "head": head,
@@ -1153,7 +1165,7 @@ def qualify(diagnostic=False):
     if diagnostic:  # an uncounted collection is never `qualified`, even when clean
         qualification.update(diagnostic_receipt(problems, rows, {"collection": collection}))
         qualification["mode"] = "diagnostic"
-        qualification["selector"] = "proof:supervisor:qualify:diagnostic"
+        qualification["selector"] = "proof:supervisor:ceiling:qualify:diagnostic"
         qualification["result"] = "diagnostic"
     qualification["worker_wall_ns_before_print"] = now_ns() - START
     print("qualification receipt:", json.dumps(qualification, indent=1), flush=True)

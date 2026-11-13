@@ -10807,6 +10807,7 @@ class CeilingReal(unittest.TestCase):
         self.assertEqual(self.guardian(code, limit=35, ceiling_ns=ceiling), 0)
         grants = [r for r in self.receipt["custodian"] if r["event"] == "admission"]
         self.assertEqual(len(grants), 1)
+        self.assertIs(grants[0]["boundary_drain"], True)
         self.assertGreaterEqual(grants[0]["at"], self.receipt["start_ns"] + 15 * NS)
         self.assertLessEqual(grants[0]["absolute_ns"], ceiling)
         self.assertEqual(self.outcome()["closure"], "closed")

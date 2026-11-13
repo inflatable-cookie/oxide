@@ -5354,6 +5354,7 @@ class Custodian:
         self.root_parent = root_parent
         self.ceiling_ns = ceiling_ns
         self.admission_ceiling_capped_ns = 0
+        self.admission_boundary_drain = False
         self.inject = {item for item in os.environ.get("OXIDE_SUPERVISOR_INJECT", "").split(",") if item}
         if self.inject - INJECTIONS:
             raise SystemExit(f"bounded-test.py: unknown injection {sorted(self.inject - INJECTIONS)}")
@@ -5622,9 +5623,12 @@ class Custodian:
             self.exit_at = self.absolute - EXIT_MARGIN_S * NS
             if self.admission_records < ADMISSION_RECORDS:
                 self.admission_records += 1
-                self.record("admission", command=message["command"], waited_ns=message["waited_ns"],
-                            grant_ns=grant, clamped=clamped, granted_ns=self.admission_granted,
-                            absolute_ns=self.absolute)
+                fields = {"command": message["command"], "waited_ns": message["waited_ns"],
+                          "grant_ns": grant, "clamped": clamped, "granted_ns": self.admission_granted,
+                          "absolute_ns": self.absolute}
+                if self.ceiling_ns is not None:
+                    fields["boundary_drain"] = self.admission_boundary_drain
+                self.record("admission", **fields)
         except BaseException as error:
             self.exception(error)
 
@@ -6116,7 +6120,11 @@ class Custodian:
                 # can still grant and move the stop (oxide#192). Only a grant
                 # that moves the stop past now continues the loop; a marker with
                 # no room cannot spin it.
-                self.pump(0)
+                self.admission_boundary_drain = True
+                try:
+                    self.pump(0)
+                finally:
+                    self.admission_boundary_drain = False
                 if now_ns() >= self.stop_at:
                     self.deadline_hit = True
                     break

@@ -2350,10 +2350,13 @@ The effect-free `proof:supervisor:ceiling:qualification:plan` collects case
 names only. No apparatus execution, qualification or adoption follows from this
 source. Tom's `775190c6` ceiling and separate `a833` guest-clock rulings remain
 distinct; native occurrences require the separate owner activations.
-The candidate digest is `3a90b0bfd034025475a0125d187006301fd73b3064ed3205785d27ec8b431270`;
-the pin manifest digest is `2631bb819e01162214bb02ac563bf4373b745df5387e07e551301b4176e952ea`.
+The candidate digest is `4aba8be3120abc67a0a9b4df6793bbc2b74ece79199f56bbfa355fed368231e0`;
+the pin manifest digest is `2ea08162790fb187a5380d4e86e2b00cc4e39e3d42c10083ba57c240f5a6ae8a`.
 The manifest records the full suite and bootstrap digests alongside the
 unchanged `fcfda2b0` ordinary guard.
+The candidate records whether an accepted admission grant was handled inside
+the stop-boundary drain; that observation grants no authority and is required
+to distinguish the real boundary case from an earlier ordinary poll.
 
 **Interim admission allowance (Tom, 2026-10-22).** Until Queue #381's
 admission-hook adapter lands, Oxide native proofs may use Effigy `heavy`

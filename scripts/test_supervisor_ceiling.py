@@ -100,6 +100,7 @@ class CustodianWindow(unittest.TestCase):
         self.assertEqual(custodian.absolute, 110 * ns)
         self.assertEqual(custodian.admission_granted, 10 * ns)
         self.assertEqual(custodian.admission_ceiling_capped_ns, 10 * ns)
+        self.assertIs(custodian.record.call_args.kwargs["boundary_drain"], False)
         custodian.admit({"command": "a", "waited_ns": 20 * ns}, 40 * ns)
         self.assertEqual(custodian.admission_duplicates, 1)
         self.assertEqual(custodian.absolute, 110 * ns)
@@ -243,6 +244,10 @@ class CustodianWindow(unittest.TestCase):
                 custodian.pump.assert_called_once_with(0)
                 self.assertEqual(custodian.absolute, expected * ns)
                 self.assertEqual(custodian.deadline_hit, timed_out)
+                if not timed_out:
+                    admission = [call for call in custodian.record.call_args_list if call.args[0] == "admission"]
+                    self.assertEqual(len(admission), 1)
+                    self.assertIs(admission[0].kwargs["boundary_drain"], True)
                 if timed_out:
                     custodian.admit({"command": "late", "waited_ns": ns}, 81 * ns)
                     self.assertEqual(custodian.admission_late_reason, "deadline")
