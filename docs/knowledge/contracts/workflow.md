@@ -2342,14 +2342,16 @@ The proposed oxide#309 qualification apparatus is isolated in
 `scripts/qualify-supervisor-ceiling.py`. It derives from oxide#195 head
 `b29ef6ca` (382 pure and 57 real cases), adds four ceiling real cases and
 retains the fixed 600/560/530-second outer/guard/suite bounds and 512 MiB
-budget. `ceiling-qualification-pins.json` binds the ordinary guard, ceiling
+all-owned budget. The guard's monitored share is 504 MiB and 8 MiB is reserved
+for the separate bootstrap base, whose two result documents are each capped at
+1 MiB and measured before finalization. `ceiling-qualification-pins.json` binds the ordinary guard, ceiling
 candidate, suite and bootstrap; the qualification routes supply its digest.
 The effect-free `proof:supervisor:ceiling:qualification:plan` collects case
 names only. No apparatus execution, qualification or adoption follows from this
 source. Tom's `775190c6` ceiling and separate `a833` guest-clock rulings remain
 distinct; native occurrences require the separate owner activations.
 The candidate digest is `3a90b0bfd034025475a0125d187006301fd73b3064ed3205785d27ec8b431270`;
-the pin manifest digest is `3d7f2164246c773573305f51159d5c1b26815cf3dd2b71521cf709971dcdf676`.
+the pin manifest digest is `2631bb819e01162214bb02ac563bf4373b745df5387e07e551301b4176e952ea`.
 The manifest records the full suite and bootstrap digests alongside the
 unchanged `fcfda2b0` ordinary guard.
 

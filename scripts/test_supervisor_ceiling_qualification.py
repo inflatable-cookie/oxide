@@ -9456,6 +9456,15 @@ def protect_outer_root():
     return {"state": "protected", "root": root, "run_id": document["run_id"]}
 
 
+def write_bootstrap_document(path, document, indent=None):
+    """The bootstrap-owned directory has a fixed reserve outside the guard root."""
+    data = json.dumps(document, indent=indent).encode("utf-8")
+    if len(data) > 1024 * 1024:
+        raise ValueError("bootstrap document exceeds its 1 MiB bound")
+    with open(path, "wb") as handle:
+        handle.write(data)
+
+
 def record_layout():
     """Record the layout this suite ran in for the qualification bootstrap
     (oxide#145, oxide#151): the candidate's owned root, scratch and evidence,
@@ -9469,8 +9478,7 @@ def record_layout():
         return
     record = {"scratch": os.path.realpath(scratch), "evidence": os.path.realpath(OUTER_EVIDENCE),
               "suite_pid": os.getpid(), "protection": dict(PROTECTION)}
-    with open(path, "w") as handle:
-        json.dump(record, handle)
+    write_bootstrap_document(path, record)
 
 
 class Real(unittest.TestCase):
@@ -10875,8 +10883,7 @@ def main():
         write("after.bin", 1024 * 1024)
         path = os.environ.get("OXIDE_SUPERVISOR_CASES")
         if path:
-            with open(path, "w") as handle:
-                json.dump({"outcomes": Results.outcomes, "cases": CASES}, handle, indent=1)
+            write_bootstrap_document(path, {"outcomes": Results.outcomes, "cases": CASES}, indent=1)
     return 0 if ok else 1
 
 

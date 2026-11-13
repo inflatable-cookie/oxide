@@ -77,6 +77,8 @@ WALL_NS = 600 * NS  # oxide#192 amendment (2026-10-31): was 420 s (#191), 300 s 
 CANDIDATE_LIMIT = 560  # oxide#192 amendment: was 380 s (#191), 280 s before
 THRESHOLD = 22 * 1024 ** 3
 GIB, MIB = 1024 ** 3, 1024 ** 2
+BOOTSTRAP_RESERVE_MIB = 8
+GUARD_BUDGET_MIB = 512 - BOOTSTRAP_RESERVE_MIB
 EXPECTED_CASES = 443  # 382 baseline pure + 57 baseline real + 4 ceiling real.
                       # oxide#151 added the routing, marker,
                       # nested-window protection, bounded-sweep, qualify-entry,
@@ -989,6 +991,8 @@ def qualify(diagnostic=False):
     except (guard.MarkerInvalid, OSError) as error:
         return refusal(f"refused: the bootstrap base {base} could not be marked ({error!r}); it is kept"
                        " and never swept, so an owner must remove it", diagnostic)
+    if guard.tree_bytes(base) > BOOTSTRAP_RESERVE_MIB * MIB:
+        return refusal("refused: bootstrap base exceeds its 8 MiB reserve; it is kept", diagnostic)
     print(f"scratch base {base} on the selected volume (marked, kept: never deleted by this bootstrap)",
           flush=True)
     env = {k: v for k, v in os.environ.items() if k not in ("OXIDE_TASK_SCRATCH_ROOT", "OXIDE_SUPERVISOR_INJECT")}
@@ -1003,7 +1007,8 @@ def qualify(diagnostic=False):
     # The Popen handle is a local: its name must not shadow the module-level
     # `candidate()` loader resolved above (diagnostic2 UnboundLocalError).
     candidate_process = subprocess.Popen(
-        [sys.executable, SOURCES["supervisor"], "--limit", str(CANDIDATE_LIMIT), "--scratch-budget-mib", "512",
+        [sys.executable, SOURCES["supervisor"], "--limit", str(CANDIDATE_LIMIT), "--scratch-budget-mib",
+         str(GUARD_BUDGET_MIB),
          "--ceiling-uptime-ns", str(START + CANDIDATE_LIMIT * NS),
          "--", sys.executable, SOURCES["suite"], "--pins-sha256", PINS_TOKEN], env=env)
     problems = []
@@ -1020,6 +1025,13 @@ def qualify(diagnostic=False):
     candidate_process.returncode = code
     if code != 0:
         problems.append(f"candidate exit {code}")
+    try:
+        bootstrap_bytes = guard.tree_bytes(base)
+        if bootstrap_bytes > (BOOTSTRAP_RESERVE_MIB - 1) * MIB:
+            problems.append(f"bootstrap base {bootstrap_bytes} bytes leaves less than 1 MiB for finalization")
+    except OSError as error:
+        bootstrap_bytes = None
+        problems.append(f"bootstrap base accounting unreadable: {error!r}")
     closing = reserve_readings(expected["root_parent"], "/private/tmp", facts)
     if closing["scratch_volume"]["free"] < THRESHOLD:
         problems.append(f"selected qualification scratch volume free {closing['scratch_volume']['free']}"
@@ -1119,6 +1131,10 @@ def qualify(diagnostic=False):
                                              "final": closing["boot_volume"]["free"],
                                              "threshold": THRESHOLD}},
         "owned_bytes_peak": owned.get("maximum"),
+        "all_owned_budget": {"total_bytes": 512 * MIB, "guard_bytes": GUARD_BUDGET_MIB * MIB,
+                             "bootstrap_reserve_bytes": BOOTSTRAP_RESERVE_MIB * MIB,
+                             "bootstrap_point_before_finalization": bootstrap_bytes,
+                             "finalization_headroom_bytes": MIB},
         "candidate_signals": [r for r in receipt.get("custodian", []) if r["event"] == "signal"],
         "cases": results.get("cases"),
         "kept": {"base": base, "nested_unclosed": nested_unclosed},
