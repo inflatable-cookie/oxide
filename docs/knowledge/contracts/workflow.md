@@ -2352,7 +2352,7 @@ monitor stubs with substituted I/O. No apparatus execution, qualification or ado
 source. Tom's `775190c6` ceiling and separate `a833` guest-clock rulings remain
 distinct; native occurrences require the separate owner activations.
 The candidate digest is `4aba8be3120abc67a0a9b4df6793bbc2b74ece79199f56bbfa355fed368231e0`;
-the pin manifest digest is `acd85824547f2b42ee396f7ec62b6de7ee4cce5a691dc2bb51dea98b0e795aac`.
+the pin manifest digest is `53be559f1d2501f727c4342cdf0263a7ac2f50ac21162c8403670c76f53ea570`.
 The manifest records the full suite and bootstrap digests alongside the
 unchanged `fcfda2b0` ordinary guard.
 The candidate records whether an accepted admission grant was handled inside

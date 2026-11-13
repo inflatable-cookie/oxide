@@ -10823,8 +10823,13 @@ class CeilingReal(unittest.TestCase):
         outcome = self.outcome()
         self.assertEqual(outcome["requested_ceiling_ns"], ceiling)
         self.assertEqual(outcome["effective_deadline_ns"], ceiling)
+        self.assertEqual(self.receipt["ceiling"]["initial_effective_ns"], ceiling)
         self.assertTrue(outcome["deadline"])
         self.assertEqual(outcome["closure"], "UNCLOSED")
+        stops = [row for row in self.receipt["custodian"] if row.get("event") == "stop"]
+        self.assertEqual(len(stops), 1)
+        self.assertGreaterEqual(stops[0]["at"], ceiling - 20 * NS)
+        self.assertLess(stops[0]["at"], ceiling)
         self.assertTrue(os.path.isdir(self.receipt["scratch"]))
         join = self.receipt["census_join"]
         self.assertTrue(join["joined"])
@@ -10840,6 +10845,7 @@ class CeilingReal(unittest.TestCase):
         CASES[-1]["cleanup"] = self.receipt["cleanup"]
         self.assertEqual(self.outcome()["requested_ceiling_ns"], ceiling)
         self.assertEqual(self.outcome()["effective_deadline_ns"], ceiling)
+        self.assertEqual(self.receipt["ceiling"]["initial_effective_ns"], ceiling)
         self.assertEqual(self.receipt["cleanup"]["state"], "kept")
         self.assertNotEqual(self.receipt["scratch_marker"]["state"], "concluded")
         self.assertTrue(os.path.isdir(self.receipt["scratch"]))
