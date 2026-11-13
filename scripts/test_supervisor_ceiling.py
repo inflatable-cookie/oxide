@@ -166,7 +166,7 @@ class CustodianWindow(unittest.TestCase):
         child = mock.Mock()
         child.stdout.detach.side_effect = OSError("synthetic descriptor failure")
         child.wait.side_effect = candidate.subprocess.TimeoutExpired("synthetic", 0)
-        with mock.patch.object(candidate, "now_ns", side_effect=[0, 0, 20 * ns]):
+        with mock.patch.object(candidate, "now_ns", side_effect=[0, 0, 20 * ns, 20 * ns]):
             result = candidate.bounded_run(["synthetic"], 10, spawn=mock.Mock(return_value=child),
                                            deadline_ns=10 * ns)
         child.wait.assert_called_once_with(timeout=0.0)
