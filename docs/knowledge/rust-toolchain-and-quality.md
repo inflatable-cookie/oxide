@@ -3,6 +3,8 @@
 The supervisor ceiling candidate's focused source controls are
 `effigy proof:supervisor:ceiling:plan` and `effigy proof:supervisor:ceiling:test`.
 They are synthetic checks, not native qualification or Rust toolchain evidence.
+The separate `proof:supervisor:ceiling:qualification:plan` collects the proposed
+oxide#195-based qualification inventory without running its cases.
 
 The repository pins the already-installed Rust 1.97.1 toolchain in
 [`rust-toolchain.toml`](../../rust-toolchain.toml). The selected compiler is

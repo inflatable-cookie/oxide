@@ -2337,6 +2337,22 @@ synthetic source controls only; neither qualifies a runner. The ordinary
 Source review, an independently scoped diagnostic and separate author and
 reviewer native qualifications precede any promotion or consumer adoption.
 
+The proposed oxide#309 qualification apparatus is isolated in
+`scripts/test_supervisor_ceiling_qualification.py` and
+`scripts/qualify-supervisor-ceiling.py`. It derives from oxide#195 head
+`b29ef6ca` (382 pure and 57 real cases), adds four ceiling real cases and
+retains the fixed 600/560/530-second outer/guard/suite bounds and 512 MiB
+budget. `ceiling-qualification-pins.json` binds the ordinary guard, ceiling
+candidate, suite and bootstrap; the qualification routes supply its digest.
+The effect-free `proof:supervisor:ceiling:qualification:plan` collects case
+names only. No apparatus execution, qualification or adoption follows from this
+source. Tom's `775190c6` ceiling and separate `a833` guest-clock rulings remain
+distinct; native occurrences require the separate owner activations.
+The candidate digest is `3a90b0bfd034025475a0125d187006301fd73b3064ed3205785d27ec8b431270`;
+the pin manifest digest is `3d7f2164246c773573305f51159d5c1b26815cf3dd2b71521cf709971dcdf676`.
+The manifest records the full suite and bootstrap digests alongside the
+unchanged `fcfda2b0` ordinary guard.
+
 **Interim admission allowance (Tom, 2026-10-22).** Until Queue #381's
 admission-hook adapter lands, Oxide native proofs may use Effigy `heavy`
 inline, with a fresh owner scheduler headroom receipt immediately before
