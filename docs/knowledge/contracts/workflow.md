@@ -2342,9 +2342,10 @@ The proposed oxide#309 qualification apparatus is isolated in
 `scripts/qualify-supervisor-ceiling.py`. It derives from oxide#195 head
 `b29ef6ca` (382 pure and 57 real cases), adds six ceiling real cases and
 retains the fixed 600/560/530-second outer/guard/suite bounds and 512 MiB
-all-owned budget. The guard's monitored share is 504 MiB and 8 MiB is reserved
-for the separate bootstrap base, whose two result documents are each capped at
-1 MiB and measured before finalization. `ceiling-qualification-pins.json` binds the ordinary guard, ceiling
+all-owned budget. The proposed guard share is 384 MiB, with 128 MiB shared
+outside it, including the bootstrap base, complete capture and delivery. The
+bootstrap's two result documents are each capped at 1 MiB and the base is
+measured before finalization. `ceiling-qualification-pins.json` binds the ordinary guard, ceiling
 candidate, suite and bootstrap; the qualification routes supply its digest.
 The effect-free `proof:supervisor:ceiling:qualification:plan` collects case
 names only; `proof:supervisor:ceiling:qualification:compat` checks the retained
@@ -2352,9 +2353,28 @@ monitor stubs with substituted I/O. No apparatus execution, qualification or ado
 source. Tom's `775190c6` ceiling and separate `a833` guest-clock rulings remain
 distinct; native occurrences require the separate owner activations.
 The candidate digest is `4aba8be3120abc67a0a9b4df6793bbc2b74ece79199f56bbfa355fed368231e0`;
-the pin manifest digest is `53be559f1d2501f727c4342cdf0263a7ac2f50ac21162c8403670c76f53ea570`.
-The manifest records the full suite and bootstrap digests alongside the
-unchanged `fcfda2b0` ordinary guard.
+the pin manifest digest is `fcb6e7d179e988b0ad97d7f6eefcedfa9df49c7d7f4976807f3da9d8c51e1cda`.
+The bootstrap digest is `cc4a7aeb47cff71b2b4645b142c7a599cd12d99473f407f1ef0c8f4d77adeadc`. The manifest records the full suite digest
+alongside the unchanged `fcfda2b0` ordinary guard.
+For a future separately activated diagnostic, the proposed capture argv is
+`effigy proof:supervisor:ceiling:qualify:diagnostic` with stdout and stderr
+redirected together to one new task-owned `raw.log`. No archive or second raw
+log is assumed. Copy each of the eight named source inputs, the raw Git index
+and its entry listing once before and once after; retain the original bounded
+bootstrap base, one producer, a source/case manifest and one bounded receipt
+copy. A single bounded proofFiles manifest has its own and one delivered copy;
+it names the immutable raw log by exact path, length and digest. The receipt
+inside the guard stays counted in the guard share. The pure `capture_fit`
+model counts every representation, allocation rounding, a separate filesystem
+reserve and closeout reserve simultaneously, without compression. It refuses
+unknown route output, extra raw-log copies, invalid source inventory and any
+combined total above 128 MiB. The proposed 1 MiB allowance for all guard,
+actor, Effigy and admission output beyond the 64 MiB forwarding and 2 MiB
+bootstrap output is not yet established for the actual admitted route: the
+owner must bind a real finite route bound, actual index/source sizes and
+allocation unit before effects. A failed or unknown bound is not native
+readiness or permission to truncate output.
+
 The candidate records whether an accepted admission grant was handled inside
 the stop-boundary drain; that observation grants no authority and is required
 to distinguish the real boundary case from an earlier ordinary poll.
@@ -7236,7 +7256,3 @@ unknown-keeps — and both retained Barge roots stay `UNCLOSED` and kept. The
 Barge operation-journal native gates stay held until the owner separately
 accepts a safe path; this assessment grants no native, activation, cleanup,
 promotion or pin authority.
-
-The unqualified oxide#309 ceiling qualification candidate proposes 384 MiB monitored plus 128 MiB shared outside for its unchanged 512 MiB total. The outside plan reserves 64 MiB for the two forwarded streams, 3 MiB for bootstrap and actor output, 8 MiB for the base, 16 MiB for source and index copies, 4 MiB for capture metadata, 8 MiB for delivery copies, 8 MiB for allocation and 8 MiB for closeout: 119 MiB reserved, leaving 9 MiB. The future occurrence must verify those actual reservations and the supported Effigy capture route before effects. A single complete raw log is retained on owned scratch; a bounded proofFiles manifest names its exact immutable copy, size and digest for the reviewer rather than assuming compression or a larger API limit. Oversized or unreadable inputs and oversized bootstrap output refuse incomplete evidence. Source review and separate native activation remain required under decisions 775190 and a833.
-
-The proposed ceiling bootstrap is `599eaa82353288d3eab3c490c4ea771cdf1bf8973f7d92d6861377253236946b` and its source pin document is `6aca750cb5562209b1349d75e433a2304165c7d7ab2e5bbbdf596827acf0a2a2`. The candidate remains `4aba8be3120abc67a0a9b4df6793bbc2b74ece79199f56bbfa355fed368231e0`; none is qualified by these source controls.

@@ -121,6 +121,65 @@ EXPECTED_CASES = 445  # 382 baseline pure + 57 baseline real + 6 ceiling real.
                       # oxide#195 replaces the separate-group survivor case
                       # with one recorded-and-never-signalled Cargo survivor case
                       # and adds its pure custody/publication/join cases.
+# Prospective capture recipe; it is descriptive and never activates a native run.
+NATIVE_CAPTURE_ARGV = ("effigy", "proof:supervisor:ceiling:qualify:diagnostic")
+CAPTURE_SOURCE_FILES = ("scripts/bounded-test.py", "scripts/bounded-test-candidate.py",
+                        "scripts/bounded-test-ceiling.py", "scripts/test_supervisor_ceiling_qualification.py",
+                        "scripts/qualify-supervisor-ceiling.py", "scripts/ceiling-qualification-pins.json",
+                        "effigy.toml", "scripts/test_ceiling_qualification_compat.py")
+
+
+def capture_fit(source_sizes, index_size, entries_size, route_extra_limit, allocation_unit,
+                raw_copies=1, raw_delivery_copies=0):
+    """Pure pre-effect bound for the exact proposed single-log native route.
+
+    source_sizes are complete copies of the named immutable inputs. The raw
+    index and its entry listing and every source are copied before and after.
+    route_extra_limit covers all guard summaries, actor messages and Effigy /
+    hook output beyond forwarded child and bootstrap streams. It must come
+    from the actual supported route; None is unknown, never a zero-byte claim.
+    allocation_unit is a verified upper bound for per-file allocation rounding.
+    The raw log is retained once, and a bounded manifest is copied for delivery;
+    it names the log with path, bytes and digest. No raw-log archive is created.
+    """
+    if route_extra_limit is None:
+        return {"fits": False, "reason": "Effigy/guard extra output bound is unproven"}
+    if (not isinstance(source_sizes, dict) or set(source_sizes) != set(CAPTURE_SOURCE_FILES)
+            or any(type(n) is not int or n < 0 for n in source_sizes.values())
+            or any(type(n) is not int or n < 0 for n in (index_size, entries_size, route_extra_limit))
+            or type(allocation_unit) is not int or not 0 < allocation_unit <= MIB):
+        return {"fits": False, "reason": "invalid source inventory or allocation bound"}
+    if raw_copies != 1 or raw_delivery_copies != 0:
+        return {"fits": False, "reason": "raw capture multiplicity differs from the reviewed route"}
+    if route_extra_limit > MIB:
+        return {"fits": False, "reason": "route extra output exceeds its 1 MiB reservation"}
+    def allocated(n):
+        return ((n + allocation_unit - 1) // allocation_unit) * allocation_unit
+    # Raw log: candidate's two 32 MiB forward ceilings + bounded bootstrap +
+    # one explicit cap shared by guard, actor, admission and Effigy output.
+    raw = allocated(64 * MIB + BOOTSTRAP_OUTPUT_LIMIT + route_extra_limit)
+    sources = 2 * sum(allocated(n) for n in source_sizes.values())
+    index = 2 * (allocated(index_size) + allocated(entries_size))
+    if sources + index > OUTSIDE_PARTS_MIB["source_and_index_copies"] * MIB:
+        return {"fits": False, "reason": "source and index copies exceed 16 MiB reservation"}
+    # Base contains both 1 MiB suite documents; copies are not counted again.
+    base = BOOTSTRAP_RESERVE_MIB * MIB
+    # Producer, source/case/receipt manifest and one receipt copy, each <=1 MiB.
+    metadata = 3 * allocated(MIB)
+    # The <=1 MiB proofFiles manifest has one own and one delivered copy.
+    delivery = 2 * allocated(MIB)
+    # Separate reserve for directories/metadata and closeout, not a peak claim.
+    filesystem_reserve, closeout_reserve = 8 * MIB, 8 * MIB
+    parts = {"raw_log_once": raw, "source_copies_before_after": sources,
+             "index_and_entries_before_after": index, "bootstrap_base": base,
+             "producer_manifest_receipt_copy": metadata, "manifest_and_delivery_copy": delivery,
+             "filesystem_reserve": filesystem_reserve, "closeout_reserve": closeout_reserve}
+    total = sum(parts.values())
+    return {"fits": total <= OUTSIDE_BUDGET_MIB * MIB, "parts": parts, "total": total,
+            "remaining": OUTSIDE_BUDGET_MIB * MIB - total,
+            "requires": "actual route output cap, source/index sizes and allocation unit before effects"}
+
+
 ACTOR_MARGIN_NS = 2 * NS  # the actor's own KILL, reap and exit
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPTS)

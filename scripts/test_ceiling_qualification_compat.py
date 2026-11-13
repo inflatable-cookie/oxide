@@ -84,6 +84,34 @@ class BootstrapBounds(unittest.TestCase):
         self.assertEqual(b.EXPECTED_CASES, 445)
         self.assertEqual(guard.FORWARD, 32 * b.MIB)
 
+    def test_capture_composition_accounts_for_full_simultaneous_inventory(self):
+        b = self.bootstrap
+        sizes = {name: (scripts.parent / name).stat().st_size for name in b.CAPTURE_SOURCE_FILES}
+        result = b.capture_fit(sizes, 200_001, 100_001, b.MIB, 4096)
+        self.assertTrue(result["fits"])
+        ceil = lambda n: ((n + 4095) // 4096) * 4096
+        self.assertEqual(result["parts"]["raw_log_once"], 67 * b.MIB)
+        self.assertEqual(result["parts"]["source_copies_before_after"],
+                         2 * sum(ceil(n) for n in sizes.values()))
+        self.assertEqual(result["parts"]["index_and_entries_before_after"],
+                         2 * (ceil(200_001) + ceil(100_001)))
+        self.assertEqual(result["parts"]["bootstrap_base"], 8 * b.MIB)
+        self.assertEqual(result["parts"]["producer_manifest_receipt_copy"], 3 * b.MIB)
+        self.assertEqual(result["parts"]["manifest_and_delivery_copy"], 2 * b.MIB)
+        self.assertEqual(result["total"], sum(result["parts"].values()))
+        self.assertEqual(result["remaining"], 128 * b.MIB - result["total"])
+        self.assertEqual(b.NATIVE_CAPTURE_ARGV, ("effigy", "proof:supervisor:ceiling:qualify:diagnostic"))
+
+    def test_capture_composition_refuses_unknown_or_extra_representations(self):
+        b = self.bootstrap
+        sizes = {name: 1 for name in b.CAPTURE_SOURCE_FILES}
+        self.assertFalse(b.capture_fit(sizes, 1, 1, None, 4096)["fits"])
+        self.assertFalse(b.capture_fit(sizes, 1, 1, b.MIB + 1, 4096)["fits"])
+        self.assertFalse(b.capture_fit(sizes, 1, 1, 0, 4096, raw_copies=2)["fits"])
+        self.assertFalse(b.capture_fit(sizes, 1, 1, 0, 4096, raw_delivery_copies=1)["fits"])
+        self.assertFalse(b.capture_fit(sizes, 30 * b.MIB, 1, 0, 4096)["fits"])
+        self.assertFalse(b.capture_fit({}, 1, 1, 0, 4096)["fits"])
+
     def test_pins_and_default_isolation(self):
         b = self.bootstrap
         raw = (scripts / "ceiling-qualification-pins.json").read_bytes()
