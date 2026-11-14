@@ -30,6 +30,7 @@ import importlib.util
 import json
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -86,11 +87,20 @@ TAIL_BYTES = 4096
 # guard budget is the remainder of the ORIGINAL 512 MiB, so every branch
 # (live, failed/UNCLOSED with scratch kept, delivery) stays within it.
 TOTAL_MIB = 512
-RAW_LOG_MIB = 32          # one combined raw log, enforced by the capture writer
-CAPTURE_CONTROL_MIB = 1   # capture receipt (bounded 256 KiB) + producer slack
+RAW_LOG_MIB = 24          # one combined raw log (<= the original 32 MiB maximum), enforced by the writer
+DELIVERY_CHUNK_MIB = 8    # Nucleus proofFiles: <= 8 MiB per file
+DELIVERY_TOTAL_MIB = 32   # Nucleus proofFiles: <= 32 MiB in total
+DELIVERY_MAX_FILES = 12   # Nucleus proofFiles: <= 12 files
+PHASE_RECEIPT_MIB = 1     # each diagnostic receipt (RECEIPT_BYTES)
+# Capture dir: raw log + its delivery chunk copies (copies of ONE log, not a
+# second log) + capture.json/delivery manifest slack.
+CAPTURE_CONTROL_MIB = RAW_LOG_MIB + 1
 RETAINED_EVIDENCE_MIB = 32  # a closed phase's kept evidence dir, measured before phase 2
-DELIVERY_COPY_MIB = 35    # Nucleus copies after exit: raw log 32 + receipts <= 3
+# Nucleus copies after exit: the chunk copies + capture.json + 2 phase receipts.
+DELIVERY_COPY_MIB = RAW_LOG_MIB + 1 + 2 * PHASE_RECEIPT_MIB
 GUARD_BUDGET_MIB = TOTAL_MIB - RAW_LOG_MIB - CAPTURE_CONTROL_MIB - RETAINED_EVIDENCE_MIB - DELIVERY_COPY_MIB
+PHASE_WINDOW_S = 300      # the original per-phase clock; the parent never reads or waits past it
+EVIDENCE_MAX_ENTRIES = 4096
 CAPTURE_RECEIPT_BYTES = 256 * 1024
 CAPTURE_INCOMPLETE = 6    # raw log truncated, EOF not seen, oversized evidence or receipt not written
 EVIDENCE_PREFIX = "foundation-083-evidence "
@@ -114,7 +124,7 @@ COMMAND = "python3 scripts/foundation-rust-1-100.py --compose"
 def budget_branches() -> dict:
     """Worst all-owned MiB in each branch of the composition."""
     b = GUARD_BUDGET_MIB
-    c = RAW_LOG_MIB + CAPTURE_CONTROL_MIB
+    c = RAW_LOG_MIB + CAPTURE_CONTROL_MIB  # raw log + its chunk copies + receipts
     return {
         "phase 1 live": b + c,
         "phase 1 unclosed (scratch kept) + delivery": b + c + DELIVERY_COPY_MIB,
@@ -163,6 +173,63 @@ def capture_stream(chunks, log, mirror, cap: int, on_line) -> dict:
     return state
 
 
+class CaptureDeadline(RuntimeError):
+    pass
+
+
+def bounded_chunks(ready, read, deadline_ns: int, clock):
+    """Yield the phase's output until EOF, never waiting past the ORIGINAL
+    phase window: `ready(timeout_s)` is a select on the pipe, `read()` one
+    non-blocking read. A spent or reached deadline raises before any wait."""
+    while True:
+        left = (deadline_ns - clock()) / 1e9
+        if left <= 0:
+            raise CaptureDeadline("phase window spent before EOF")
+        if not ready(min(left, 1.0)):
+            continue
+        chunk = read()
+        if not chunk:
+            return
+        yield chunk
+
+
+def delivery_plan(files: list) -> dict:
+    """Check a proofFiles delivery set: each <= 8 MiB, total <= 32 MiB,
+    at most 12 files, no duplicate path. Returns the plan or raises."""
+    paths = [f["path"] for f in files]
+    if len(set(paths)) != len(paths):
+        raise ValueError("duplicate delivery copy")
+    if len(files) > DELIVERY_MAX_FILES:
+        raise ValueError(f"{len(files)} files exceed {DELIVERY_MAX_FILES}")
+    for f in files:
+        if f["bytes"] > DELIVERY_CHUNK_MIB * MIB:
+            raise ValueError(f"{f['path']} exceeds {DELIVERY_CHUNK_MIB} MiB")
+    total = sum(f["bytes"] for f in files)
+    if total > DELIVERY_TOTAL_MIB * MIB:
+        raise ValueError(f"delivery total {total} exceeds {DELIVERY_TOTAL_MIB} MiB")
+    return {"files": files, "count": len(files), "bytes": total}
+
+
+def chunk_raw_log(capture_dir: str) -> list:
+    """Copy the ONE raw log into <= 8 MiB delivery chunks (copies, not a
+    second log) and return their entries."""
+    entries = []
+    with open(os.path.join(capture_dir, "raw.log"), "rb") as src:
+        index = 0
+        while True:
+            data = src.read(DELIVERY_CHUNK_MIB * MIB)
+            if not data and index:
+                break
+            name = f"raw.log.part-{index:02d}"
+            with open(os.path.join(capture_dir, name), "wb") as dst:
+                dst.write(data)
+            entries.append({"path": name, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+            index += 1
+            if not data:
+                break
+    return entries
+
+
 def compose_decision(status, capture: dict, evidence_bytes) -> tuple:
     """After phase 1: continue only on DONE, a complete capture and a measured
     retained evidence dir within its allowance."""
@@ -203,10 +270,12 @@ def compose(env: dict, run_phase, gate_fn, measure, source_fn, capture_dir: str,
                 phase_status, capture = run_phase(toolchain, lambda chunks: capture_stream(
                     chunks, log, mirror, RAW_LOG_MIB * MIB, on_line))
                 evidence_bytes = measure(marker.get("path"))
+                receipt_bytes = receipt_size(marker.get("path"), toolchain)
                 line = f"foundation-083 phase {toolchain} status {phase_status}\n".encode()
                 capture_stream([line], log, mirror, RAW_LOG_MIB * MIB, lambda _l: None)
                 receipt["phases"].append({"toolchain": toolchain, "status": phase_status, "capture": capture,
-                                          "evidence": marker.get("path"), "evidence_bytes": evidence_bytes})
+                                          "evidence": receipt_path(marker.get("path"), toolchain),
+                                          "evidence_bytes": evidence_bytes, "receipt_bytes": receipt_bytes})
                 if index == 1:
                     decision = compose_decision(phase_status, capture, evidence_bytes)
                     if decision[0] == "stop":
@@ -218,6 +287,15 @@ def compose(env: dict, run_phase, gate_fn, measure, source_fn, capture_dir: str,
     if receipt["gate"] == "passed" and len(receipt["phases"]) == 2:
         last = receipt["phases"][-1]
         status = final_status(last["status"], last["capture"], last["evidence_bytes"], True)
+    if receipt["gate"] == "passed":
+        try:
+            files = chunk_raw_log(capture_dir) + [
+                {"path": p["evidence"], "bytes": p["receipt_bytes"]} for p in receipt["phases"]
+                if p.get("receipt_bytes") is not None]
+            receipt["delivery"] = delivery_plan(files)
+        except (OSError, ValueError) as error:
+            receipt["delivery"] = {"error": str(error)}
+            status = CAPTURE_INCOMPLETE
     receipt["final_status"] = status
     receipt["complete"] = status == DIAGNOSTIC_DONE
     # ONE write carries the final status; if it fails, the evidence is
@@ -225,6 +303,28 @@ def compose(env: dict, run_phase, gate_fn, measure, source_fn, capture_dir: str,
     if not (writer or write_capture_receipt)(capture_dir, receipt) and receipt["gate"] == "passed":
         return CAPTURE_INCOMPLETE
     return status
+
+
+def receipt_path(evidence, toolchain):
+    return os.path.join(evidence, f"foundation-083-{toolchain}.json") if evidence else None
+
+
+def receipt_size(evidence, toolchain):
+    path = receipt_path(evidence, toolchain)
+    try:
+        return os.lstat(path).st_size if path and os.path.isfile(path) and not os.path.islink(path) else None
+    except OSError:
+        return None
+
+
+def try_status(write, text: str) -> bool:
+    """Best-effort one-line status to an external stream: a full or closed
+    pipe drops the line instead of blocking the producer."""
+    try:
+        write(text.encode())
+        return True
+    except (BlockingIOError, BrokenPipeError, OSError):
+        return False
 
 
 def write_capture_receipt(capture_dir: str, receipt: dict) -> bool:
@@ -250,23 +350,46 @@ def compose_main() -> int:
         print("refused before any effect: TMPDIR is required for the capture directory", file=sys.stderr)
         return DIAGNOSTIC_REFUSED
     capture_dir = tempfile.mkdtemp(prefix="f083-capture-", dir=base)
-    print(f"foundation-083 capture {capture_dir}", flush=True)
+    out = sys.stdout.fileno()
+    os.set_blocking(out, False)
+    status_line = lambda text: try_status(lambda b: os.write(out, b), text)
+    status_line(f"foundation-083 capture {capture_dir}\n")
 
     def gate_fn(e):
         return gate(["--gate", "--binding", e.get("FOUNDATION_083_BINDING", ""),
                      "--sha256", e.get("FOUNDATION_083_BINDING_SHA256", "")])
 
     def run_phase(toolchain, consume):
+        deadline = uptime_ns() + PHASE_WINDOW_S * 10**9
         child = subprocess.Popen([*PHASE_ARGV, toolchain], cwd=REPO, stdin=subprocess.DEVNULL,
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        capture = consume(iter(lambda: child.stdout.read(65536), b""))
-        child.stdout.close()
-        return child.wait(), capture
+        fd = child.stdout.fileno()
+        os.set_blocking(fd, False)
+        ready = lambda timeout: bool(select.select([fd], [], [], timeout)[0])
+        def read():
+            try:
+                return os.read(fd, 65536)
+            except BlockingIOError:
+                return None  # spurious readiness: not EOF
+        def chunks():
+            for chunk in bounded_chunks(ready, read, deadline, uptime_ns):
+                if chunk is not None:
+                    yield chunk
+        try:
+            capture = consume(chunks())
+        except (CaptureDeadline, OSError) as error:
+            capture = {"eof": False, "truncated": None, "lost": f"{type(error).__name__}: {error}"}
+        left = max(0.0, (deadline - uptime_ns()) / 1e9)
+        try:
+            status = child.wait(timeout=left)  # never past the original window; no signal is sent
+        except subprocess.TimeoutExpired:
+            status = None  # custody unknown: kept, incomplete, no later phase
+        return status, capture
 
     def measure(path):
         if not path or not os.path.isdir(path) or os.path.islink(path):
             return None
-        return evidence_tree_bytes(path)
+        return evidence_tree_bytes(path)  # None past EVIDENCE_MAX_ENTRIES
 
     def source_fn():
         def git(*args):
@@ -275,17 +398,18 @@ def compose_main() -> int:
         return {"head": git("rev-parse", "HEAD"), "tree": git("rev-parse", "HEAD^{tree}"),
                 "dirty": git("status", "--porcelain", "--untracked-files=no"), "guard_sha256": sha256(GUARD)}
 
-    mirror = os.fdopen(os.dup(sys.stdout.fileno()), "wb", buffering=0)
-    try:
-        return compose(env, run_phase, gate_fn, measure, source_fn, capture_dir, mirror)
-    finally:
-        mirror.close()
+    status = compose(env, run_phase, gate_fn, measure, source_fn, capture_dir, None)
+    status_line(f"foundation-083 final status {status}\n")
+    return status
 
 
-def evidence_tree_bytes(path: str) -> int:
-    total = 0
+def evidence_tree_bytes(path: str):
+    total = entries = 0
     for root, dirs, files in os.walk(path):
         dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+        entries += len(dirs) + len(files)
+        if entries > EVIDENCE_MAX_ENTRIES:
+            return None  # unmeasured: incomplete, never assumed small
         for name in files:
             st = os.lstat(os.path.join(root, name))
             total += max(st.st_size, st.st_blocks * 512)
@@ -1123,8 +1247,56 @@ def legacy_reads_retired(name: str) -> bool:
 def compose_controls(check) -> None:
     """The whole composition through fake seams: no process, no guard."""
     import io
+
+    def raises(fn, *args) -> bool:
+        try:
+            fn(*args)
+        except (LedgerError, ValueError, RuntimeError):
+            return True
+        return False
     good_cap = {"eof": True, "truncated": False}
     check("compose: DONE + complete capture + small evidence continues", compose_decision(3, good_cap, 1024) == ("continue", None))
+    t = [0]
+    clock = lambda: t[0]
+    def never_ready(timeout):
+        t[0] += int(timeout * 1e9)
+        return False
+    try:
+        list(bounded_chunks(never_ready, lambda: b"", 5 * 10**9, clock))
+        never = False
+    except CaptureDeadline:
+        never = True
+    check("parent: never-EOF stops at the original window, no wait past it", never and t[0] <= 6 * 10**9)
+    reads = []
+    try:
+        list(bounded_chunks(lambda _t: True, lambda: reads.append(1) or b"x", 0, lambda: 1))
+        spent = False
+    except CaptureDeadline:
+        spent = True
+    check("parent: a spent remainder raises before any read", spent and reads == [])
+    seq = iter([b"a", b"b", b""])
+    check("parent: normal output drains to EOF", list(bounded_chunks(lambda _t: True, lambda: next(seq), 10**12, lambda: 0)) == [b"a", b"b"])
+    def blocked(_b):
+        raise BlockingIOError()
+    check("status line to a blocked stream is dropped, not waited on", try_status(blocked, "x") is False)
+    tree = ast.parse(read("scripts/foundation-rust-1-100.py").decode())
+    cm = ast.unparse(next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "compose_main"))
+    check("producer mirrors nothing and waits only within the window",
+          "compose(env, run_phase, gate_fn, measure, source_fn, capture_dir, None)" in cm
+          and "child.wait(timeout=left)" in cm and "bounded_chunks(" in cm and ".kill" not in cm and "signal" not in cm)
+    plan_ok = [{"path": f"raw.log.part-{i:02d}", "bytes": 8 * MIB} for i in range(3)] + [
+        {"path": "capture.json", "bytes": 256 * 1024}, {"path": "a.json", "bytes": MIB}, {"path": "b.json", "bytes": MIB}]
+    check("delivery: 24 MiB log as 3 chunks + receipts fits 8/32/12", delivery_plan(plan_ok)["bytes"] <= 32 * MIB)
+    check("delivery: a 9 MiB file is refused", raises(delivery_plan, [{"path": "x", "bytes": 9 * MIB}]))
+    check("delivery: an extra copy is refused", raises(delivery_plan, plan_ok + [dict(plan_ok[0])]))
+    check("delivery: over 32 MiB total is refused", raises(delivery_plan, [{"path": str(i), "bytes": 8 * MIB} for i in range(5)]))
+    check("delivery: 13 files are refused", raises(delivery_plan, [{"path": str(i), "bytes": 1} for i in range(13)]))
+    check("delivery budget derived from the plan", DELIVERY_COPY_MIB * MIB >= delivery_plan(plan_ok)["bytes"])
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+        open(os.path.join(tmp, "raw.log"), "wb").write(b"z" * (8 * MIB + 5))
+        parts = chunk_raw_log(tmp)
+        check("raw log chunks are <= 8 MiB copies of the one log", [p["bytes"] for p in parts] == [8 * MIB, 5]
+              and b"".join(open(os.path.join(tmp, p["path"]), "rb").read() for p in parts) == open(os.path.join(tmp, "raw.log"), "rb").read())
     check("compose: truncated raw log stops", compose_decision(3, {"eof": True, "truncated": True}, 1) == ("stop", CAPTURE_INCOMPLETE))
     check("compose: missing EOF stops", compose_decision(3, {"eof": False, "truncated": False}, 1) == ("stop", CAPTURE_INCOMPLETE))
     check("compose: unmeasured evidence stops", compose_decision(3, good_cap, None) == ("stop", CAPTURE_INCOMPLETE))
@@ -1196,7 +1368,7 @@ def compose_controls(check) -> None:
     rc, calls, receipt, _ = run(ok, gate_rc=2)
     check("compose: gate refusal runs no phase", rc == DIAGNOSTIC_REFUSED and calls == [] and receipt["gate"] == "refused")
     rc, calls, receipt, _ = run({PINNED: (3, b"z" * (RAW_LOG_MIB * MIB + 1)), TESTED: (3, b"")})
-    check("compose: raw log over 32 MiB stops as incomplete, log capped",
+    check("compose: raw log over its cap stops as incomplete, log capped",
           rc == CAPTURE_INCOMPLETE and calls == [PINNED] and receipt["raw_log_bytes"] <= RAW_LOG_MIB * MIB)
     tree = ast.parse(read("scripts/foundation-rust-1-100.py").decode())
     diag = ast.unparse(next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "diagnostic"))
@@ -1401,7 +1573,8 @@ def self_check() -> int:
     check("phase argv: ordinary guard, 300 s, derived budget", list(PHASE_ARGV[:7]) == ["python3", GUARD, "--limit", "300",
           "--scratch-budget-mib", str(GUARD_BUDGET_MIB), "--"])
     branches = budget_branches()
-    check("guard budget is the remainder of the original 512 MiB", GUARD_BUDGET_MIB == 512 - 32 - 1 - 32 - 35 == 412)
+    check("guard budget is the remainder of the original 512 MiB", GUARD_BUDGET_MIB == 512 - 24 - 25 - 32 - 27 == 404)
+    check("raw log within the original 32 MiB maximum", RAW_LOG_MIB <= LIMITS["raw_log_bytes"] // MIB)
     for name, mib in branches.items():
         check(f"branch within 512 MiB: {name} = {mib}", mib <= TOTAL_MIB)
     check("pool cap fits inside the guard budget", LIMITS["pool_cap_bytes"] <= GUARD_BUDGET_MIB * MIB)

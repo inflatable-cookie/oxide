@@ -56,7 +56,7 @@ only on nightly 2026-08-05 and gives no 1.100 credit.
 `scripts/foundation-rust-1-100.py`:
 
 - `effigy proof:foundation:rust-1-100:plan`: the effect-free plan.
-- `effigy proof:foundation:rust-1-100:test`: 165 pure controls.
+- `effigy proof:foundation:rust-1-100:test`: 178 pure controls.
 - `effigy proof:foundation:rust-1-100:diagnostic` (heavy):
   `python3 scripts/foundation-rust-1-100.py --compose`, one fixed
   task-specific capture producer.
@@ -70,8 +70,8 @@ only on nightly 2026-08-05 and gives no 1.100 credit.
    `decision`) with a matching `FOUNDATION_083_BINDING_SHA256` and both
    toolchains are installed. A refusal runs no phase.
 3. Runs phase 1:
-   `python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 412 -- python3 scripts/foundation-rust-1-100.py --diagnostic --toolchain 1.97.1`.
-   Its merged output is copied to `raw.log` and mirrored to stdout, drained
+   `python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 404 -- python3 scripts/foundation-rust-1-100.py --diagnostic --toolchain 1.97.1`.
+   Its merged output is copied to `raw.log` only (no external mirror), drained
    to EOF. Each phase re-checks the binding inside the guard before any
    effect and prints its evidence directory.
 4. Measures phase 1's retained evidence directory. Phase 2 (`1.100.0`) runs
@@ -101,24 +101,43 @@ diagnostic returns:
 
 ### Whole-capture accounting (original 512 MiB)
 
-The guard budget is what the original 512 MiB leaves after every byte outside
-the live guard root:
+**Parent liveness.** The producer mirrors nothing to an external stream.
+Each phase's output is read with `select` plus non-blocking reads that never
+wait past that phase's original 300 s window (`bounded_chunks`). The child
+wait is capped at what is left of the window, and no signal is sent. A
+window reached before EOF, or a guard still running at its end, is recorded
+as incomplete or unknown custody (status 6, or 125 when the status is
+missing), and no later phase runs. Status lines to stdout are best effort and
+non-blocking, so a full pipe drops them. The evidence walk stops at 4096
+entries and reports unmeasured. Residual calls outside a phase window: the
+gate's and source record's `git` reads (10 s timeout each), the evidence
+walk, the chunk copies and the one `capture.json` write with fsync. All are
+small local operations, disclosed rather than clocked.
+
+**Delivery.** The raw log is capped at 24 MiB, within the original 32 MiB
+maximum. At finalization it is copied into at most three `raw.log.part-NN`
+chunks of 8 MiB or less: copies of the one log, not a second log. Delivery is
+those chunks, `capture.json` (at most 256 KiB) and the two phase receipts (at
+most 1 MiB each): at most 6 files and about 26.3 MiB, within Nucleus
+proofFiles limits of 8 MiB per file, 32 MiB total and 12 files.
+`delivery_plan` refuses an oversized file, an extra copy, more than 32 MiB or
+more than 12 files, and that refusal makes the capture incomplete (6).
 
 | Item | MiB | Bound |
 | --- | --- | --- |
-| Raw log | 32 | enforced by the capture writer; overflow is marked, status 6 |
-| Capture receipt and producer slack | 1 | receipt refused above 256 KiB |
+| Raw log | 24 | enforced by the capture writer; overflow is marked, status 6 |
+| Capture dir: chunk copies + receipt/manifest slack | 25 | 24 + 1 |
 | Retained phase-1 evidence (while phase 2 runs) | 32 | measured before phase 2; over → status 6, no phase 2 |
-| Nucleus delivery copies (after exit) | 35 | raw log 32 + receipts ≤ 3 |
-| **Guard budget per phase** | **412** | 512 − 32 − 1 − 32 − 35; pool cap 128 fits inside |
+| Nucleus delivery copies (after exit) | 27 | chunks 24 + capture 1 + receipts 2 |
+| **Guard budget per phase** | **404** | 512 − 24 − 25 − 32 − 27; pool cap 128 fits inside |
 
 | Branch | All owned (MiB) |
 | --- | --- |
-| Phase 1 live | 412 + 33 = 445 |
-| Phase 1 UNCLOSED (scratch kept) + delivery | 445 + 35 = 480 |
-| Phase 2 live | 32 + 412 + 33 = 477 |
-| Phase 2 UNCLOSED (scratch kept) + delivery | 32 + 412 + 33 + 35 = 512 |
-| Both closed + delivery | 32 + 32 + 33 + 35 = 132 |
+| Phase 1 live | 404 + 49 = 453 |
+| Phase 1 UNCLOSED (scratch kept) + delivery | 453 + 27 = 480 |
+| Phase 2 live | 32 + 404 + 49 = 485 |
+| Phase 2 UNCLOSED (scratch kept) + delivery | 32 + 404 + 49 + 27 = 512 |
+| Both closed + delivery | 32 + 32 + 49 + 27 = 140 |
 
 Remaining premises, not derived maxima:
 
@@ -204,5 +223,5 @@ legacy `/private/tmp` `mktemp`. Fixtures pin 1.97.1 in `rust-toolchain.toml`;
 ## Not run
 
 Every native, the toolchain install, `rust:compile`, `rust:compile-release`,
-`rust:format` and `test rust` (no Rust changed). Run: `:test` (165/165),
+`rust:format` and `test rust` (no Rust changed). Run: `:test` (178/178),
 `:plan`, `docs:check`.
