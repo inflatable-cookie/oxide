@@ -1692,6 +1692,7 @@ def self_check() -> int:
         check("fixture pool is strictly inside the declared scratch root and is the runner's pool",
               os.path.dirname(pool) == root and pool == runner.pool and runner.env.get("OXIDE_POOL_CAP") == "128MiB")
         check("inherited OXIDE_SCRATCH_ROOT/OXIDE_POOL never reach the fixture", "/elsewhere" not in root + pool)
+        check("fixture keeps the pool-creation opt-in OXIDE_POOL_CREATE exactly 1", runner.env.get("OXIDE_POOL_CREATE") == "1")
     src = ast.unparse(next(n for n in ast.parse(read("scripts/foundation-rust-1-100.py").decode()).body
                            if isinstance(n, ast.FunctionDef) and n.name == "directory_runner"))
     check("directory runner sets the scratch declaration after the environment scrub",

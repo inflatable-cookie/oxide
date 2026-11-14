@@ -103,7 +103,7 @@ only on nightly 2026-08-05 and gives no 1.100 credit.
 `scripts/foundation-rust-1-100.py`:
 
 - `effigy proof:foundation:rust-1-100:plan`: the effect-free plan.
-- `effigy proof:foundation:rust-1-100:test`: 190 pure controls.
+- `effigy proof:foundation:rust-1-100:test`: 191 pure controls.
 - `effigy proof:foundation:rust-1-100:diagnostic` (heavy):
   `python3 scripts/foundation-rust-1-100.py --compose`, one fixed
   task-specific capture producer.
@@ -283,7 +283,13 @@ legacy `/private/tmp` `mktemp`. Fixtures pin 1.97.1 in `rust-toolchain.toml`;
 
 ## Not run
 
-Every native, including the single diagnostic, plus `rust:compile`,
-`rust:compile-release`, `rust:format` and `test rust` (no Rust changed). The
-one approved install already ran at `b9138a6` and is not repeated. Run: `:test` (190/190),
-`:plan`, `docs:check`.
+- The single diagnostic **did run**, once at `364d605`, and **failed** (see
+  "Spent proof result"). That occurrence is spent.
+- **No native has run since the fixture correction**, so the declared
+  `OXIDE_SCRATCH_ROOT` route is unexercised. Every per-area 1.100 verdict
+  above stays absent, and per-phase fit stays unmeasured.
+- `rust:compile`, `rust:compile-release`, `rust:format` and `test rust` were
+  not run because no Rust changed.
+- The one approved install ran at `b9138a6` and is not repeated.
+
+Run at this head: `:test` (191/191) and `docs:check`.
