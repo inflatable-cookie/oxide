@@ -130,7 +130,8 @@ CAPTURE_SOURCE_FILES = ("scripts/bounded-test.py", "scripts/bounded-test-candida
 
 
 def capture_fit(source_sizes, index_size, entries_size, route_extra_limit, allocation_unit,
-                raw_copies=1, raw_delivery_copies=0):
+                raw_copies=1, raw_delivery_copies=0, *, ring_physical=None,
+                gates_physical=None, prepare_physical=None):
     """Pure pre-effect bound for the exact proposed single-log native route.
 
     source_sizes are complete copies of the named immutable inputs. The raw
@@ -144,6 +145,11 @@ def capture_fit(source_sizes, index_size, entries_size, route_extra_limit, alloc
     """
     if route_extra_limit is None:
         return {"fits": False, "reason": "Effigy/guard extra output bound is unproven"}
+    if any(value is None for value in (ring_physical, gates_physical, prepare_physical)):
+        return {"fits": False, "reason": "strict ring, gate or separate preparation physical bound is unknown"}
+    if (any(type(value) is not int for value in (ring_physical, gates_physical, prepare_physical))
+            or ring_physical < 16448 or gates_physical < 8192 or prepare_physical <= 0):
+        return {"fits": False, "reason": "invalid strict physical accounting"}
     if (not isinstance(source_sizes, dict) or set(source_sizes) != set(CAPTURE_SOURCE_FILES)
             or any(type(n) is not int or n < 0 for n in source_sizes.values())
             or any(type(n) is not int or n < 0 for n in (index_size, entries_size, route_extra_limit))
@@ -173,11 +179,55 @@ def capture_fit(source_sizes, index_size, entries_size, route_extra_limit, alloc
     parts = {"raw_log_once": raw, "source_copies_before_after": sources,
              "index_and_entries_before_after": index, "bootstrap_base": base,
              "producer_manifest_receipt_copy": metadata, "manifest_and_delivery_copy": delivery,
-             "filesystem_reserve": filesystem_reserve, "closeout_reserve": closeout_reserve}
+             "filesystem_reserve": filesystem_reserve, "closeout_reserve": closeout_reserve,
+             "strict_ring_physical": ring_physical, "gates_physical": gates_physical,
+             "separate_preparation_physical": prepare_physical}
     total = sum(parts.values())
     return {"fits": total <= OUTSIDE_BUDGET_MIB * MIB, "parts": parts, "total": total,
             "remaining": OUTSIDE_BUDGET_MIB * MIB - total,
-            "requires": "actual route output cap, source/index sizes and allocation unit before effects"}
+            "requires": "source-bound route, physical allocation, separate preparation and terminal evidence before effects"}
+
+
+def strict_route_plan(strict_value, protocol_value, ring_observation, allocation_bound):
+    """Effect-free proposal only; never changes env, reads a ring or grants admission."""
+    missing = []
+    if strict_value != "1":
+        missing.append("strict persistence is not enabled")
+    if protocol_value != "2":
+        missing.append("actual admission protocol is not v2")
+    if ring_observation != "ready":
+        missing.append("prepared ring readiness is unknown or refused")
+    if type(allocation_bound) is not int or allocation_bound < 16448:
+        missing.append("physical ring allocation/COW bound is unknown")
+    return {"native_authorized": False, "qualified": False, "fits": False,
+            "missing": missing + ["source-bound capture finalization and independently bound preparation required"],
+            "strict_env": strict_value, "protocol_env": protocol_value,
+            "ring_logical_bytes": 64 + 16 * 1024,
+            "terminal_writes": [1023, 1], "fsync_after_each": True,
+            "gate_body_max_bytes": 2 * 4096,
+            "prepare_argv": ["effigy", "run", "prepare"],
+            "prepare_scope": "separate effectful prerequisite; not activated",
+            "warning": "gate release and holder reap are not joined group closure"}
+
+
+def capture_finalization_control(raw, expected_cap, *, source_attribution, capture_eof,
+                                 joined_census, terminal_settled, final_receipt):
+    """Pure refusal control, not an authority or a native qualification result."""
+    if not isinstance(raw, bytes) or type(expected_cap) is not int or expected_cap < 185:
+        return {"qualified": False, "complete": False, "reason": "invalid capture"}
+    import re
+    footer = rb"effigy: output complete \(payload ([0-9]+) bytes; cap ([0-9]+) bytes\)"
+    matches = list(re.finditer(footer, raw))
+    if b"output_truncated" in raw or len(matches) != 1:
+        return {"qualified": False, "complete": False, "reason": "truncated, missing or duplicate footer"}
+    found = matches[0]
+    if int(found.group(2)) != expected_cap or not raw.endswith(found.group(0) + b"\n"):
+        return {"qualified": False, "complete": False, "reason": "wrong cap or trailing output"}
+    if any(value is not True for value in (source_attribution, capture_eof, joined_census,
+                                           terminal_settled, final_receipt)):
+        return {"qualified": False, "complete": False, "reason": "missing attributable final evidence"}
+    return {"qualified": False, "complete": False,
+            "reason": "synthetic control only; no authority to establish native completeness"}
 
 
 ACTOR_MARGIN_NS = 2 * NS  # the actor's own KILL, reap and exit

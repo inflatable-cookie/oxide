@@ -87,7 +87,8 @@ class BootstrapBounds(unittest.TestCase):
     def test_capture_composition_accounts_for_full_simultaneous_inventory(self):
         b = self.bootstrap
         sizes = {name: (scripts.parent / name).stat().st_size for name in b.CAPTURE_SOURCE_FILES}
-        result = b.capture_fit(sizes, 200_001, 100_001, b.MIB, 4096)
+        result = b.capture_fit(sizes, 200_001, 100_001, b.MIB, 4096,
+                               ring_physical=20480, gates_physical=8192, prepare_physical=4096)
         self.assertTrue(result["fits"])
         ceil = lambda n: ((n + 4095) // 4096) * 4096
         self.assertEqual(result["parts"]["raw_log_once"], 67 * b.MIB)
@@ -98,6 +99,9 @@ class BootstrapBounds(unittest.TestCase):
         self.assertEqual(result["parts"]["bootstrap_base"], 8 * b.MIB)
         self.assertEqual(result["parts"]["producer_manifest_receipt_copy"], 3 * b.MIB)
         self.assertEqual(result["parts"]["manifest_and_delivery_copy"], 2 * b.MIB)
+        self.assertEqual(result["parts"]["strict_ring_physical"], 20480)
+        self.assertEqual(result["parts"]["gates_physical"], 8192)
+        self.assertEqual(result["parts"]["separate_preparation_physical"], 4096)
         self.assertEqual(result["total"], sum(result["parts"].values()))
         self.assertEqual(result["remaining"], 128 * b.MIB - result["total"])
         self.assertEqual(b.NATIVE_CAPTURE_ARGV, ("effigy", "proof:supervisor:ceiling:qualify:diagnostic"))
@@ -105,12 +109,43 @@ class BootstrapBounds(unittest.TestCase):
     def test_capture_composition_refuses_unknown_or_extra_representations(self):
         b = self.bootstrap
         sizes = {name: 1 for name in b.CAPTURE_SOURCE_FILES}
-        self.assertFalse(b.capture_fit(sizes, 1, 1, None, 4096)["fits"])
-        self.assertFalse(b.capture_fit(sizes, 1, 1, b.MIB + 1, 4096)["fits"])
-        self.assertFalse(b.capture_fit(sizes, 1, 1, 0, 4096, raw_copies=2)["fits"])
-        self.assertFalse(b.capture_fit(sizes, 1, 1, 0, 4096, raw_delivery_copies=1)["fits"])
-        self.assertFalse(b.capture_fit(sizes, 30 * b.MIB, 1, 0, 4096)["fits"])
-        self.assertFalse(b.capture_fit({}, 1, 1, 0, 4096)["fits"])
+        physical = dict(ring_physical=20480, gates_physical=8192, prepare_physical=4096)
+        self.assertFalse(b.capture_fit(sizes, 1, 1, None, 4096, **physical)["fits"])
+        self.assertFalse(b.capture_fit(sizes, 1, 1, 0, 4096)["fits"])
+        self.assertFalse(b.capture_fit(sizes, 1, 1, b.MIB + 1, 4096, **physical)["fits"])
+        self.assertFalse(b.capture_fit(sizes, 1, 1, 0, 4096, raw_copies=2, **physical)["fits"])
+        self.assertFalse(b.capture_fit(sizes, 1, 1, 0, 4096, raw_delivery_copies=1, **physical)["fits"])
+        self.assertFalse(b.capture_fit(sizes, 30 * b.MIB, 1, 0, 4096, **physical)["fits"])
+        self.assertFalse(b.capture_fit({}, 1, 1, 0, 4096, **physical)["fits"])
+        self.assertFalse(b.capture_fit(sizes, 1, 1, 0, 4096,
+                                       ring_physical=0, gates_physical=8192, prepare_physical=0)["fits"])
+
+    def test_strict_preparation_is_distinct_and_never_grants_authority(self):
+        b = self.bootstrap
+        plan = b.strict_route_plan(None, None, None, None)
+        self.assertFalse(plan["fits"])
+        self.assertFalse(plan["native_authorized"])
+        self.assertEqual(plan["ring_logical_bytes"], 16448)
+        self.assertEqual(plan["terminal_writes"], [1023, 1])
+        self.assertEqual(plan["prepare_argv"], ["effigy", "run", "prepare"])
+        self.assertTrue(any("protocol" in reason for reason in plan["missing"]))
+        self.assertFalse(b.strict_route_plan("1", "2", "ready", 20480)["fits"])
+
+    def test_finalization_refuses_partial_marker_and_missing_evidence(self):
+        b = self.bootstrap
+        good = b"effigy: output complete (payload 1 bytes; cap 524288 bytes)\n"
+        evidence = dict(source_attribution=True, capture_eof=True, joined_census=True,
+                        terminal_settled=True, final_receipt=True)
+        for raw in (b"", good[:-1], good + good, good + b"late",
+                    b"output_truncated\n" + good,
+                    b"effigy: output complete (payload 1 bytes; cap 524289 bytes)\n"):
+            self.assertFalse(b.capture_finalization_control(raw, 524288, **evidence)["complete"])
+        for key in evidence:
+            missing = dict(evidence, **{key: False})
+            self.assertFalse(b.capture_finalization_control(good, 524288, **missing)["complete"])
+        result = b.capture_finalization_control(good, 524288, **evidence)
+        self.assertFalse(result["qualified"])
+        self.assertFalse(result["complete"])
 
     def test_pins_and_default_isolation(self):
         b = self.bootstrap
