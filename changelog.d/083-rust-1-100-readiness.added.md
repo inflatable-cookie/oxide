@@ -1,0 +1,1 @@
+Rust/Cargo 1.100 foundation qualification recipe (oxide#083): migrated focused oracles, a gated two-phase capture producer and the Cargo `3acc79c0c` source facts. The one diagnostic ran and failed on a fixture premise (undeclared `OXIDE_SCRATCH_ROOT`), so 1.100 has no verdict; the fixture declaration is corrected in source but not re-run.

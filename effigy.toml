@@ -1789,3 +1789,26 @@ run = 'python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 4096 -- 
 [tasks."research:relax:compat:qualify"]
 admission = "heavy"
 run = 'python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 4096 -- python3 scripts/relax-quick-trial.py --compat-qualify --binding "$RELAX_COMPAT_ACTIVATION" --sha256 "$RELAX_COMPAT_ACTIVATION_SHA256"'
+
+# Rust/Cargo 1.100 foundation qualification (oxide#083). `:plan` and `:test`
+# read repository source only (the test writes removed temp dirs under
+# TMPDIR) and start no child, compiler, Cargo, toolchain, pool or image.
+# `:diagnostic` is the planned single Queue proof: one fixed capture producer
+# (`--compose`) that refuses until the planner issues FOUNDATION_083_BINDING
+# (+_SHA256) for the exact head and both toolchains are installed, then runs
+# two ordinary-guard phases (1.97.1, then 1.100.0; 300 s each; guard budget
+# 402 MiB so guard roots plus the 24 MiB raw log, its <= 8 MiB delivery chunk
+# copies, receipt copies, retained phase-1 evidence and Nucleus copies stay within
+# the original 512 MiB). The parent never reads or waits past a phase's 300 s.
+# Phase 2 runs only after phase 1 returns 3 with complete capture; the final
+# exit is phase 2's status or 6 for incomplete capture. Not activated; do not
+# execute without owner activation. Not full QA.
+[tasks."proof:foundation:rust-1-100:plan"]
+run = "python3 -B scripts/foundation-rust-1-100.py --plan"
+
+[tasks."proof:foundation:rust-1-100:test"]
+run = "python3 -B scripts/foundation-rust-1-100.py --self-check"
+
+[tasks."proof:foundation:rust-1-100:diagnostic"]
+admission = "heavy"
+run = 'python3 scripts/foundation-rust-1-100.py --compose'
