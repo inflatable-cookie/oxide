@@ -188,6 +188,26 @@ def capture_fit(source_sizes, index_size, entries_size, route_extra_limit, alloc
             "requires": "source-bound route, physical allocation, separate preparation and terminal evidence before effects"}
 
 
+INSTALLED_LAUNCHER_SHA256 = "00747fa62d7acde5448d9b0b7f18dc99e2622d6de49fffbc1dacf6e005ab3083"
+INSTALLED_BINARY_SHA256 = "7d4667efe2b813d11ccdbd4b8630e6f2a62156795d9b04a9c0bcfaf1545e2e58"
+INSTALLED_RECEIPT_SHA256 = "79e70f53ac93c307007b9c97464aa53d018855780c539288220855d503de0443"
+INSTALLED_SOURCE_HEAD = "974954729ec5efd0f450f87276b15ba72c1cbbca"
+INSTALLED_SOURCE_TREE = "8b42756d41dd1ed985a9a69524f606c674e8e634"
+
+
+def installed_route_control(launcher_sha, binary_sha, receipt_sha, source_head, source_tree,
+                            launch_setting, strict_value, protocol_value):
+    """Effect-free drift refusal; supplied facts are not provenance or admission authority."""
+    if (launcher_sha != INSTALLED_LAUNCHER_SHA256 or binary_sha != INSTALLED_BINARY_SHA256
+            or receipt_sha != INSTALLED_RECEIPT_SHA256 or source_head != INSTALLED_SOURCE_HEAD
+            or source_tree != INSTALLED_SOURCE_TREE or launch_setting == "stable"):
+        return {"fits": False, "qualified": False, "reason": "installed route drift"}
+    if strict_value != "1" or protocol_value != "2":
+        return {"fits": False, "qualified": False, "reason": "actual strict/protocol route is not bound"}
+    return {"fits": False, "qualified": False,
+            "reason": "input comparison is not runtime attestation or native readiness"}
+
+
 def strict_route_plan(strict_value, protocol_value, ring_observation, allocation_bound):
     """Effect-free proposal only; never changes env, reads a ring or grants admission."""
     missing = []
@@ -221,7 +241,9 @@ def capture_finalization_control(raw, expected_cap, *, source_attribution, captu
     if b"output_truncated" in raw or len(matches) != 1:
         return {"qualified": False, "complete": False, "reason": "truncated, missing or duplicate footer"}
     found = matches[0]
-    if int(found.group(2)) != expected_cap or not raw.endswith(found.group(0) + b"\n"):
+    if (len(found.group(1)) > 20 or len(found.group(2)) > 20
+            or int(found.group(1)) > expected_cap or int(found.group(2)) != expected_cap
+            or not raw.endswith(found.group(0) + b"\n")):
         return {"qualified": False, "complete": False, "reason": "wrong cap or trailing output"}
     if any(value is not True for value in (source_attribution, capture_eof, joined_census,
                                            terminal_settled, final_receipt)):

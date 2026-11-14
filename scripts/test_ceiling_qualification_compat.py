@@ -120,6 +120,21 @@ class BootstrapBounds(unittest.TestCase):
         self.assertFalse(b.capture_fit(sizes, 1, 1, 0, 4096,
                                        ring_physical=0, gates_physical=8192, prepare_physical=0)["fits"])
 
+    def test_installed_identity_and_launcher_drift_refuse(self):
+        b = self.bootstrap
+        args = [b.INSTALLED_LAUNCHER_SHA256, b.INSTALLED_BINARY_SHA256,
+                b.INSTALLED_RECEIPT_SHA256, b.INSTALLED_SOURCE_HEAD, b.INSTALLED_SOURCE_TREE,
+                None, "1", "2"]
+        self.assertFalse(b.installed_route_control(*args)["fits"])
+        for i in range(5):
+            changed = list(args)
+            changed[i] = "wrong"
+            self.assertEqual(b.installed_route_control(*changed)["reason"], "installed route drift")
+        changed = list(args)
+        changed[5] = "stable"
+        self.assertEqual(b.installed_route_control(*changed)["reason"], "installed route drift")
+        self.assertFalse(b.installed_route_control(*args[:6], None, None)["fits"])
+
     def test_strict_preparation_is_distinct_and_never_grants_authority(self):
         b = self.bootstrap
         plan = b.strict_route_plan(None, None, None, None)
@@ -138,7 +153,8 @@ class BootstrapBounds(unittest.TestCase):
                         terminal_settled=True, final_receipt=True)
         for raw in (b"", good[:-1], good + good, good + b"late",
                     b"output_truncated\n" + good,
-                    b"effigy: output complete (payload 1 bytes; cap 524289 bytes)\n"):
+                    b"effigy: output complete (payload 1 bytes; cap 524289 bytes)\n",
+                    b"effigy: output complete (payload " + b"9" * 5000 + b" bytes; cap 524288 bytes)\n"):
             self.assertFalse(b.capture_finalization_control(raw, 524288, **evidence)["complete"])
         for key in evidence:
             missing = dict(evidence, **{key: False})

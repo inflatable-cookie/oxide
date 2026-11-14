@@ -2353,8 +2353,8 @@ monitor stubs with substituted I/O. No apparatus execution, qualification or ado
 source. Tom's `775190c6` ceiling and separate `a833` guest-clock rulings remain
 distinct; native occurrences require the separate owner activations.
 The candidate digest is `4aba8be3120abc67a0a9b4df6793bbc2b74ece79199f56bbfa355fed368231e0`;
-the pin manifest digest is `066e08fc55215054c6c4053cde41bcf0ef05b2bac948373cd2731db249effc91`.
-The bootstrap digest is `5f111584af2a9bbb5f2a5028b6c3133e438f2c6f95df1a219b7ed73ce25fff09`. The manifest records the full suite digest
+the pin manifest digest is `737bfab8e626db5a6636d8b78e84ed87a49978e405713b3b4eb47bb07466adbe`.
+The bootstrap digest is `06aea189d0712d5b0d7999dca0b6ad46ffb43a7c2118bc125805c4ccc40f0d73`. The manifest records the full suite digest
 alongside the unchanged `fcfda2b0` ordinary guard.
 For a future separately activated diagnostic, the proposed capture argv is
 `effigy proof:supervisor:ceiling:qualify:diagnostic` with stdout and stderr
@@ -2388,7 +2388,9 @@ joined census or final receipt; it deliberately cannot grant completeness or
 qualification from synthetic inputs. A concrete capture/finalization producer,
 source-bound footer attribution, physical allocation guarantees and owner
 activation remain outstanding. The installed source receipt is attribution,
-not runtime self-attestation or an independent qualification.
+not runtime self-attestation or an independent qualification. The effect-free
+installed-route comparison rejects changed launcher, receipt, source or binary
+and the stable branch; comparing supplied values grants no native authority.
 
 The candidate records whether an accepted admission grant was handled inside
 the stop-boundary drain; that observation grants no authority and is required
