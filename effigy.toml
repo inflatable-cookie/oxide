@@ -1790,13 +1790,15 @@ run = 'python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 4096 -- 
 admission = "heavy"
 run = 'python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 4096 -- python3 scripts/relax-quick-trial.py --compat-qualify --binding "$RELAX_COMPAT_ACTIVATION" --sha256 "$RELAX_COMPAT_ACTIVATION_SHA256"'
 
-# Rust/Cargo 1.100 foundation qualification (oxide#083). SOURCE/CONTROL only:
-# `:plan` and `:test` read repository source and start no child, compiler,
-# Cargo, toolchain, pool, image or scratch. `:diagnostic` is the planned single
-# Queue proof under the ordinary qualified guard (300 s, 512 MiB); at this head
-# its script refuses before any effect because the retained focused oracles
-# still read the retired lease CLI/APFS pool surfaces (oxide#102). Do not
-# execute it; activation is a separate owner decision. Not full QA.
+# Rust/Cargo 1.100 foundation qualification (oxide#083). `:plan` and `:test`
+# read repository source only (the test writes one removed temp dir under
+# TMPDIR) and start no child, compiler, Cargo, toolchain, pool or image.
+# `:diagnostic` is the planned single Queue proof: a pre-guard gate that
+# refuses until the planner issues FOUNDATION_083_BINDING(+_SHA256) for the
+# exact head and both toolchains are installed, then two separately guarded
+# sequential phases (1.97.1, then 1.100.0) under the ordinary qualified guard,
+# 300 s / 512 MiB each, ending nonzero (uncounted, qualified: false). Not
+# activated; do not execute without owner activation. Not full QA.
 [tasks."proof:foundation:rust-1-100:plan"]
 run = "python3 -B scripts/foundation-rust-1-100.py --plan"
 
@@ -1805,4 +1807,4 @@ run = "python3 -B scripts/foundation-rust-1-100.py --self-check"
 
 [tasks."proof:foundation:rust-1-100:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/foundation-rust-1-100.py --diagnostic"
+run = 'python3 scripts/foundation-rust-1-100.py --gate --binding "$FOUNDATION_083_BINDING" --sha256 "$FOUNDATION_083_BINDING_SHA256" && { python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/foundation-rust-1-100.py --diagnostic --toolchain 1.97.1; python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/foundation-rust-1-100.py --diagnostic --toolchain 1.100.0; exit 1; }'

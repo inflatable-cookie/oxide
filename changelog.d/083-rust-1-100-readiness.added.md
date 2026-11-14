@@ -1,1 +1,1 @@
-Effect-free plan and self-check for the Rust/Cargo 1.100 foundation qualification (oxide#083), with the planned diagnostic selector refusing until its retired-pool oracles are migrated.
+Rust/Cargo 1.100 foundation qualification recipe (oxide#083): the six focused oracles migrated to the directory-budget pool, a gated two-phase diagnostic selector, effect-free plan and self-check, and the Cargo `3acc79c0c` source facts showing layout v2 keeps 1.100 unverified.
