@@ -4,6 +4,7 @@ import importlib.util
 import io
 import hashlib
 import json
+import os
 from pathlib import Path
 import threading
 import unittest
@@ -110,6 +111,21 @@ class BootstrapBounds(unittest.TestCase):
         with self.assertRaises(ValueError):
             sink.seal()
 
+    def test_raw_sink_extracts_one_complete_qualification_document(self):
+        b = self.bootstrap
+        stream = mock.Mock()
+        stream.write.side_effect = lambda data: len(data)
+        stream.fileno.return_value = 9
+        sink = b.CaptureSink(stream)
+        for piece in (b"qualifi", b"cation receipt: {\"mode\":", b"\"diagnostic\"}\n",
+                      b"\neffigy: output complete (payload 3 bytes; cap 524288 bytes)\n"):
+            sink.write(piece)
+        with mock.patch.object(b.os, "fsync"):
+            record = sink.seal()
+        self.assertEqual(record["qualification_markers"], 1)
+        self.assertEqual(record["qualification"], {"mode": "diagnostic"})
+        self.assertEqual(b.capture_footer(record)["cap_bytes"], 524288)
+
     def test_capture_drains_to_eof_and_refuses_lost_eof(self):
         b = self.bootstrap
         sink = mock.Mock()
@@ -139,6 +155,7 @@ class BootstrapBounds(unittest.TestCase):
         proc.stdout.fileno.return_value = 7
         proc.stderr.fileno.return_value = 8
         with mock.patch.object(b, "now_ns", return_value=10), \
+             mock.patch.object(b, "source_supervision_readiness", return_value={"ready": True}), \
              mock.patch.object(b.subprocess, "Popen", return_value=proc), \
              mock.patch.object(b.select, "select", return_value=([7, 8], [], [])), \
              mock.patch.object(b.os, "read", side_effect=[b"out", b"err", b"", b""]), \
@@ -147,6 +164,7 @@ class BootstrapBounds(unittest.TestCase):
                              (0, b"out", b"err"))
         self.assertNotIn(proc, b._capture_unreaped)
         with mock.patch.object(b, "now_ns", side_effect=[10, 20]), \
+             mock.patch.object(b, "source_supervision_readiness", return_value={"ready": True}), \
              mock.patch.object(b.subprocess, "Popen", return_value=proc):
             with self.assertRaises(TimeoutError):
                 b.bounded_capture_command(["git", "status"], ".", 20, 10)
@@ -163,6 +181,20 @@ class BootstrapBounds(unittest.TestCase):
         with mock.patch.object(b, "bounded_capture_command", side_effect=rows):
             with self.assertRaises(ValueError):
                 b.snapshot_git_identity(20)
+
+    def test_source_snapshot_refuses_unowned_child_custody_before_effects(self):
+        b = self.bootstrap
+        with mock.patch.object(b.os, "mkdir") as mkdir, \
+             mock.patch.object(b, "bounded_capture_command") as command:
+            with self.assertRaises(ValueError):
+                b.snapshot_source_inputs("/unused", 20)
+        mkdir.assert_not_called()
+        command.assert_not_called()
+        self.assertFalse(b.source_supervision_readiness()["qualified"])
+        with mock.patch.object(b.subprocess, "Popen") as spawn:
+            with self.assertRaises(ValueError):
+                b.bounded_capture_command(["effigy", "docs:check"], ".", 20, 1024)
+        spawn.assert_not_called()
 
     def test_real_capture_footer_parser_rejects_incomplete_output(self):
         b = self.bootstrap
@@ -186,13 +218,20 @@ class BootstrapBounds(unittest.TestCase):
         provenance = {"environment": {"EFFIGY_STRICT_PERSISTENCE": "1",
                                        "EFFIGY_ADMISSION_PROTOCOL": None}}
         with mock.patch.object(b, "now_ns", side_effect=[10, 20]), \
+             mock.patch.object(b, "source_supervision_readiness", return_value={"ready": True}), \
              mock.patch.object(b, "observe_installed_route", return_value=provenance), \
              mock.patch.object(b.subprocess, "Popen") as spawn:
             with self.assertRaises(TimeoutError):
                 b.capture_foreground(mock.Mock(), 20)
         spawn.assert_not_called()
         with mock.patch.object(b, "now_ns", return_value=10), \
+             mock.patch.object(b, "source_supervision_readiness", return_value={"ready": True}), \
              mock.patch.object(b, "observe_installed_route", return_value=provenance), \
+             mock.patch.object(b.os, "pipe", return_value=(7, 8)), \
+             mock.patch.object(b.os, "fpathconf", return_value=4096), \
+             mock.patch.object(b.os, "close"), \
+             mock.patch("builtins.open", mock.mock_open(read_data=b"source")), \
+             mock.patch.object(b, "derived_route_extra", return_value={"bounded": True}), \
              mock.patch.object(b.subprocess, "Popen", return_value=proc) as spawn, \
              mock.patch.object(b, "drain_capture", return_value=raw), \
              mock.patch.object(b, "hold", return_value=0):
@@ -202,13 +241,21 @@ class BootstrapBounds(unittest.TestCase):
         self.assertEqual(spawn.call_args.kwargs["env"]["EFFIGY_OUTPUT_CAP_BYTES"], "524288")
         self.assertNotIn(proc, b._capture_unreaped)
         with mock.patch.object(b, "now_ns", return_value=10), \
+             mock.patch.object(b, "source_supervision_readiness", return_value={"ready": True}), \
              mock.patch.object(b, "observe_installed_route", return_value=provenance), \
+             mock.patch.object(b.os, "pipe", return_value=(7, 8)), \
+             mock.patch.object(b.os, "fpathconf", return_value=4096), \
+             mock.patch.object(b.os, "close"), \
+             mock.patch("builtins.open", mock.mock_open(read_data=b"source")), \
+             mock.patch.object(b, "derived_route_extra", return_value={"bounded": True}), \
              mock.patch.object(b.subprocess, "Popen", return_value=proc), \
              mock.patch.object(b, "drain_capture", side_effect=TimeoutError):
             with self.assertRaises(TimeoutError):
                 b.capture_foreground(mock.Mock(), 20)
         self.assertIn(proc, b._capture_unreaped)
         b._capture_unreaped.remove(proc)
+        self.assertIn(7, b._capture_open_pipes)
+        b._capture_open_pipes.remove(7)
 
     def test_single_log_creation_refuses_existing_or_expired(self):
         b = self.bootstrap
@@ -269,6 +316,35 @@ class BootstrapBounds(unittest.TestCase):
             with self.assertRaises(ValueError):
                 b.declared_backing_evidence({}, mock.Mock(), 20)
 
+    def test_fixed_suite_rechecks_every_image_case(self):
+        b = self.bootstrap
+        names = ("test_success_detaches_exactly_the_requested_volume",
+                 "test_an_unbound_identity_is_refused_before_any_detach",
+                 "test_an_unrequested_attachment_keeps_the_owned_root",
+                 "test_a_stuck_detach_child_is_closed_by_the_custodian",
+                 "test_an_unreadable_identity_closes_the_child_in_the_monitor",
+                 "test_an_unreadable_identity_can_be_handed_off_by_parentage",
+                 "test_a_custodian_side_unreadable_lookup_refuses_without_signalling",
+                 "test_a_failed_attempt_keeps_the_mount_and_is_unqualified")
+        rows = [{"case": name, "dir": f"/owned/evidence/{i}"} for i, name in enumerate(names)]
+        results = {"cases": rows, "outcomes": [[f"case-{i}", "pass"] for i in range(445)]}
+        probe = mock.Mock()
+        probe.realpath.side_effect = lambda path: path
+        def document(path, _deadline):
+            if path.endswith("receipt.json"):
+                return {"root": "/owned", "evidence": path.rsplit("/", 1)[0]}
+            return {"image": path.rsplit("/", 1)[0] + "/image"}
+        def custody(ctx, _probe, _deadline):
+            return {"backings": [ctx["evidence"].rsplit("/", 1)[0] + "/image"],
+                    "state": "whole-backing-absent"}
+        with mock.patch.object(b, "now_ns", return_value=10), \
+             mock.patch.object(b, "read_capture_document", side_effect=document), \
+             mock.patch.object(b, "declared_backing_evidence", side_effect=custody) as check:
+            self.assertEqual(len(b.suite_backing_evidence(results, "/owned/evidence", probe, 20)), 8)
+            self.assertEqual(check.call_count, 8)
+            with self.assertRaises(ValueError):
+                b.suite_backing_evidence(dict(results, cases=rows[:-1]), "/owned/evidence", probe, 20)
+
     def test_capture_receipt_publication_refuses_short_or_failed_writes(self):
         b = self.bootstrap
         stream = mock.MagicMock()
@@ -280,7 +356,11 @@ class BootstrapBounds(unittest.TestCase):
              mock.patch.object(b.os, "fsync") as sync, \
              mock.patch.object(b.os, "link") as link:
             stream.write.side_effect = lambda data: len(data)
-            b.publish_capture_receipt("capture.json", {"complete": True, "qualified": False}, 20)
+            ack = b.publish_capture_receipt("capture.json", {"complete": True, "qualified": True}, 20)
+            provisional = json.loads(stream.write.call_args.args[0])
+            self.assertFalse(provisional["complete"])
+            self.assertFalse(provisional["qualified"])
+            self.assertEqual(ack["published_ns"], 10)
             sync.assert_called_once_with(8)
             link.assert_called_once_with("capture.json.partial", "capture.json")
             link.reset_mock()
@@ -294,6 +374,106 @@ class BootstrapBounds(unittest.TestCase):
             with self.assertRaises(OSError):
                 b.publish_capture_receipt("capture.json", {"complete": True}, 20)
             link.assert_not_called()
+        stream = mock.MagicMock()
+        stream.__enter__.return_value = stream
+        stream.write.side_effect = lambda data: len(data)
+        with mock.patch.object(b, "now_ns", side_effect=[10, 10, 20]), \
+             mock.patch.object(b.os, "open", return_value=8), \
+             mock.patch.object(b.os, "fdopen", return_value=stream), \
+             mock.patch.object(b.os, "fsync"), mock.patch.object(b.os, "link"):
+            with self.assertRaises(TimeoutError):
+                b.publish_capture_receipt("capture.json", {"complete": True}, 20)
+        self.assertFalse(json.loads(stream.write.call_args.args[0])["complete"])
+
+    def test_actor_accepts_only_settled_in_window_publication(self):
+        b = self.bootstrap
+        acknowledgment = {"sha256": "a" * 64, "bytes": 100, "published_ns": 12}
+        raw = json.dumps(acknowledgment).encode() + b"\n"
+        with mock.patch.object(b, "START", 0), mock.patch.object(b, "now_ns", side_effect=[10, 14, 15]), \
+             mock.patch.object(b.os, "fork", return_value=42), \
+             mock.patch.object(b.os, "close"), mock.patch.object(b.os, "set_blocking"), \
+             mock.patch.object(b.os, "read", side_effect=[raw, b""]), \
+             mock.patch.object(b.signal, "signal"), mock.patch.object(b, "hold", return_value=0):
+            result = b.bounded(lambda: 0, 20, 22, ack_pipe=(7, 8))
+        self.assertTrue(result["complete"])
+        self.assertFalse(result["qualified"])
+        with mock.patch.object(b, "START", 0):
+            for value, status, observed in ((raw, 1, 15), (raw, 0, 20),
+                                             (b"", 0, 15),
+                                             (raw + b"late", 0, 15),
+                                             (b'{"sha256":"a","sha256":"b"}', 0, 15)):
+                with self.assertRaises((ValueError, json.JSONDecodeError)):
+                    b.settled_publication(value, status, observed, 20)
+
+    def test_composed_synthetic_capture_is_complete_but_never_qualified(self):
+        b = self.bootstrap
+        empty = {"certain": True, "members": 0, "uncertain": 0}
+        outcome = {"closure": "closed", "status": 0, "fault": None, "deadline": False}
+        def census(leader, result):
+            return {"leader": leader, "outcome": result,
+                    "census_join": {"started": True, "joined": True, "deciding": empty, "final": empty},
+                    "deciding_census": empty, "deciding_census_seq": 3,
+                    "custodian_census": dict(empty, seq=3)}
+        nested = dict(census([42, 99], outcome), evidence="/owned/evidence")
+        pins = {os.path.basename(path): "a" * 64 for path in b.SOURCES.values()}
+        hashes = {name: pins[os.path.basename(path)] for name, path in b.SOURCES.items()}
+        qualification = {"mode": "diagnostic", "qualified": False,
+                         "selector": "proof:supervisor:ceiling:qualify:diagnostic",
+                         "head": "b" * 40, "sha256": hashes, "candidate_outcome": outcome,
+                         "default_scratch": {"topology": {"evidence": "/owned/evidence"}},
+                         "cases": [], "outcomes": []}
+        stream = mock.Mock()
+        stream.write.side_effect = lambda data: len(data)
+        stream.fileno.return_value = 9
+        sink = b.CaptureSink(stream)
+        sink.write(b"qualification receipt: " + json.dumps(qualification).encode() + b"\n")
+        sink.write(b"\neffigy: output complete (payload 3 bytes; cap 524288 bytes)\n")
+        with mock.patch.object(b.os, "fsync"):
+            record = sink.seal()
+        record.update(effigy_exit=1, effigy_footer=b.capture_footer(record),
+                      installed_provenance={"launcher_sha256": b.INSTALLED_LAUNCHER_SHA256,
+                                            "binary_sha256": b.INSTALLED_BINARY_SHA256,
+                                            "receipt_sha256": b.INSTALLED_RECEIPT_SHA256,
+                                            "source_head": b.INSTALLED_SOURCE_HEAD,
+                                            "source_tree": b.INSTALLED_SOURCE_TREE,
+                                            "source_hashes": b.INSTALLED_SOURCE_INPUTS,
+                                            "environment": {"EFFIGY_LAUNCH": None,
+                                                            "EFFIGY_STRICT_PERSISTENCE": "1",
+                                                            "EFFIGY_ADMISSION_PROTOCOL": None}},
+                      route_extra={"bounded": True, "effigy_cap_including_marker_footer": 524288,
+                                   "route_extra_bytes_max": 859136})
+        probe = mock.Mock()
+        probe.realpath.side_effect = lambda path: path
+        def document(path, _deadline):
+            return pins if path.endswith("ceiling-qualification-pins.json") else nested
+        with mock.patch.object(b, "verify_source_pins"), \
+             mock.patch.object(b, "read_capture_document", side_effect=document), \
+             mock.patch.object(b, "installed_file_digest", return_value=record["sha256"]), \
+             mock.patch.object(b, "suite_backing_evidence", return_value=[{"state": "whole-backing-absent"}]):
+            candidate_evidence = b.inspect_candidate_capture(record, "/owned/capture.raw", {"head": "b" * 40}, probe, 20)
+        command = ["python", "worker"]
+        group = dict(census([43, 100], {"closure": "closed", "status": 1, "fault": None, "deadline": False}),
+                     command=command, evidence="/owned/outer", phase="monitor_complete",
+                     output={name: {"bytes": 0, "persisted": 0, "forwarded": 0, "discarded": 0}
+                             for name in ("stdout", "stderr")})
+        self.assertNotEqual(b.inspect_outer_group(group, command, "/owned/outer", [42, 99])["leader"],
+                            candidate_evidence["candidate_group"]["leader"])
+        for bad in (dict(group, command=["other"]), dict(group, phase="started"),
+                    dict(group, leader=[42, 99]), dict(group, output={}),
+                    dict(group, outcome={"closure": "closed", "status": 1, "fault": None, "deadline": True})):
+            with self.assertRaises(ValueError):
+                b.inspect_outer_group(bad, command, "/owned/outer", [42, 99])
+        output = mock.MagicMock()
+        output.__enter__.return_value = output
+        output.write.side_effect = lambda data: len(data)
+        with mock.patch.object(b, "now_ns", return_value=10), \
+             mock.patch.object(b.os, "open", return_value=8), mock.patch.object(b.os, "fdopen", return_value=output), \
+             mock.patch.object(b.os, "fsync"), mock.patch.object(b.os, "link"):
+            publication = b.publish_capture_receipt("/owned/final.json", {"candidate": candidate_evidence}, 20)
+        with mock.patch.object(b, "START", 0):
+            result = b.settled_publication(json.dumps(publication).encode(), 0, 15, 20)
+        self.assertTrue(result["complete"])
+        self.assertFalse(result["qualified"])
 
     def test_partition_and_delivery_reserves(self):
         b = self.bootstrap
@@ -308,17 +488,23 @@ class BootstrapBounds(unittest.TestCase):
     def test_capture_composition_accounts_for_full_simultaneous_inventory(self):
         b = self.bootstrap
         sizes = {name: (scripts.parent / name).stat().st_size for name in b.CAPTURE_SOURCE_FILES}
+        installed = {name: 1 for name in b.INSTALLED_SOURCE_INPUTS}
         result = b.capture_fit(sizes, 200_001, 100_001, b.MIB, 4096,
-                               ring_physical=20480, gates_physical=8192, prepare_physical=4096)
+                               ring_physical=20480, gates_physical=8192, prepare_physical=4096,
+                               installed_source_sizes=installed)
         self.assertTrue(result["fits"])
         ceil = lambda n: ((n + 4095) // 4096) * 4096
         self.assertEqual(result["parts"]["raw_log_once"], 67 * b.MIB)
         self.assertEqual(result["parts"]["source_copies_before_after"],
                          2 * sum(ceil(n) for n in sizes.values()))
+        self.assertEqual(result["parts"]["installed_source_copies_before_after"],
+                         2 * sum(ceil(n) for n in installed.values()))
         self.assertEqual(result["parts"]["index_and_entries_before_after"],
                          2 * (ceil(200_001) + ceil(100_001)))
         self.assertEqual(result["parts"]["bootstrap_base"], 8 * b.MIB)
-        self.assertEqual(result["parts"]["producer_manifest_receipt_copy"], 3 * b.MIB)
+        self.assertEqual(result["parts"]["outer_group_root"], 8 * b.MIB)
+        self.assertEqual(result["parts"]["outer_group_outputs"], 3 * b.MIB)
+        self.assertEqual(result["parts"]["producer_manifest_receipt_copy"], 4 * b.MIB)
         self.assertEqual(result["parts"]["manifest_and_delivery_copy"], 2 * b.MIB)
         self.assertEqual(result["parts"]["strict_ring_physical"], 20480)
         self.assertEqual(result["parts"]["gates_physical"], 8192)
@@ -330,7 +516,8 @@ class BootstrapBounds(unittest.TestCase):
     def test_capture_composition_refuses_unknown_or_extra_representations(self):
         b = self.bootstrap
         sizes = {name: 1 for name in b.CAPTURE_SOURCE_FILES}
-        physical = dict(ring_physical=20480, gates_physical=8192, prepare_physical=4096)
+        physical = dict(ring_physical=20480, gates_physical=8192, prepare_physical=4096,
+                        installed_source_sizes={name: 1 for name in b.INSTALLED_SOURCE_INPUTS})
         self.assertFalse(b.capture_fit(sizes, 1, 1, None, 4096, **physical)["fits"])
         self.assertFalse(b.capture_fit(sizes, 1, 1, 0, 4096)["fits"])
         self.assertFalse(b.capture_fit(sizes, 1, 1, b.MIB + 1, 4096, **physical)["fits"])

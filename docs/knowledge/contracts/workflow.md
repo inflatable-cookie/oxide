@@ -2353,8 +2353,8 @@ monitor stubs with substituted I/O. No apparatus execution, qualification or ado
 source. Tom's `775190c6` ceiling and separate `a833` guest-clock rulings remain
 distinct; native occurrences require the separate owner activations.
 The candidate digest is `4aba8be3120abc67a0a9b4df6793bbc2b74ece79199f56bbfa355fed368231e0`;
-the pin manifest digest is `9c6447340da5ed655c452dd0b25d15c8d36455cc313576a1e5dbbb8b8b60d20e`.
-The bootstrap digest is `7539b30436c36672d2d2da35538b02e1fdaae400367cdccaef5bbdcc4ea8d342`. The manifest records the full suite digest
+the pin manifest digest is `a62ee1f7e6ca5ab62cddabc63c0b72502810a282c067a9349639efe28381d126`.
+The bootstrap digest is `b19285a6fb7ee2d052dae65e8475a0943aaac97d87905c917026da4c2d6df698`. The manifest records the full suite digest
 alongside the unchanged `fcfda2b0` ordinary guard.
 For a future separately activated diagnostic, the proposed capture argv is
 `effigy proof:supervisor:ceiling:qualify:diagnostic` with stdout and stderr
@@ -2374,6 +2374,21 @@ bootstrap output is not yet established for the actual admitted route: the
 owner must bind a real finite route bound, actual index/source sizes and
 allocation unit before effects. A failed or unknown bound is not native
 readiness or permission to truncate output.
+
+The prospective capture implementation also reserves 8 MiB for the separate
+qualified outer group's scratch and 3 MiB for its bounded metadata output. Its
+two snapshots cover the eight Oxide inputs, eight pinned Effigy source inputs,
+and the index and entries within a 5 MiB source-copy reservation; an oversized
+inventory refuses. The outer group's own output logs are metadata, not a second
+copy of the raw diagnostic stream. A provisional receipt alone never establishes
+completeness: a late publication or a worker without an in-window actor
+acknowledgment and positive reap is unqualified. The source-command route now
+refuses before spawning: the present actor pins its worker, but cannot retain
+that worker's unreaped subprocess handles if it must stop the worker. A
+qualified custodian that survives through child and joined-group closure is
+still needed; the ordinary guard's relative deadline and admission extensions
+do not by themselves enforce the original absolute window. These prospective
+controls are not native readiness or evidence that physical allocation fits.
 
 The pinned `4aba8be3` guard has five summary call sites: two in
 `finish_monitor` and three in `Monitor.run`, each ending in a return or stop.

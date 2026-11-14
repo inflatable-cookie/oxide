@@ -60,6 +60,7 @@ scratch base is kept and its path printed for the owner.
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import json
@@ -88,7 +89,8 @@ QUALIFICATION_DOCUMENT_LIMIT = MIB
 # Simultaneous task-owned bytes, including one complete raw log and all copies.
 # Allocation and closeout reserves are separate; no compression is assumed.
 OUTSIDE_PARTS_MIB = {"forwarded_streams": 64, "bootstrap_stream_and_actor": 3,
-                     "bootstrap_base": 8, "source_and_index_copies": 16,
+                     "bootstrap_base": 8, "source_and_index_copies": 5,
+                     "outer_group_root": 8, "outer_group_outputs": 3,
                      "capture_metadata": 4, "delivery_copies": 8,
                      "allocation_headroom": 8, "closeout_headroom": 8}
 assert sum(OUTSIDE_PARTS_MIB.values()) <= OUTSIDE_BUDGET_MIB
@@ -135,7 +137,7 @@ CAPTURE_SOURCE_FILES = ("scripts/bounded-test.py", "scripts/bounded-test-candida
 
 def capture_fit(source_sizes, index_size, entries_size, route_extra_limit, allocation_unit,
                 raw_copies=1, raw_delivery_copies=0, *, ring_physical=None,
-                gates_physical=None, prepare_physical=None):
+                gates_physical=None, prepare_physical=None, installed_source_sizes=None):
     """Pure pre-effect bound for the exact proposed single-log native route.
 
     source_sizes are complete copies of the named immutable inputs. The raw
@@ -156,6 +158,9 @@ def capture_fit(source_sizes, index_size, entries_size, route_extra_limit, alloc
         return {"fits": False, "reason": "invalid strict physical accounting"}
     if (not isinstance(source_sizes, dict) or set(source_sizes) != set(CAPTURE_SOURCE_FILES)
             or any(type(n) is not int or n < 0 for n in source_sizes.values())
+            or not isinstance(installed_source_sizes, dict)
+            or set(installed_source_sizes) != set(INSTALLED_SOURCE_INPUTS)
+            or any(type(n) is not int or n < 0 for n in installed_source_sizes.values())
             or any(type(n) is not int or n < 0 for n in (index_size, entries_size, route_extra_limit))
             or type(allocation_unit) is not int or not 0 < allocation_unit <= MIB):
         return {"fits": False, "reason": "invalid source inventory or allocation bound"}
@@ -169,19 +174,24 @@ def capture_fit(source_sizes, index_size, entries_size, route_extra_limit, alloc
     # one explicit cap shared by guard, actor, admission and Effigy output.
     raw = allocated(64 * MIB + BOOTSTRAP_OUTPUT_LIMIT + route_extra_limit)
     sources = 2 * sum(allocated(n) for n in source_sizes.values())
+    installed_sources = 2 * sum(allocated(n) for n in installed_source_sizes.values())
     index = 2 * (allocated(index_size) + allocated(entries_size))
-    if sources + index > OUTSIDE_PARTS_MIB["source_and_index_copies"] * MIB:
-        return {"fits": False, "reason": "source and index copies exceed 16 MiB reservation"}
+    if sources + installed_sources + index > OUTSIDE_PARTS_MIB["source_and_index_copies"] * MIB:
+        return {"fits": False, "reason": "source and index copies exceed 5 MiB reservation"}
     # Base contains both 1 MiB suite documents; copies are not counted again.
     base = BOOTSTRAP_RESERVE_MIB * MIB
-    # Producer, source/case/receipt manifest and one receipt copy, each <=1 MiB.
-    metadata = 3 * allocated(MIB)
+    # Preflight, worker, final provisional documents and outer guard receipt.
+    # Each provisional publication also has a hard-link staging name; its
+    # directory metadata remains in the separate filesystem reserve.
+    metadata = 4 * allocated(MIB)
     # The <=1 MiB proofFiles manifest has one own and one delivered copy.
     delivery = 2 * allocated(MIB)
     # Separate reserve for directories/metadata and closeout, not a peak claim.
     filesystem_reserve, closeout_reserve = 8 * MIB, 8 * MIB
     parts = {"raw_log_once": raw, "source_copies_before_after": sources,
+             "installed_source_copies_before_after": installed_sources,
              "index_and_entries_before_after": index, "bootstrap_base": base,
+             "outer_group_root": 8 * MIB, "outer_group_outputs": 3 * MIB,
              "producer_manifest_receipt_copy": metadata, "manifest_and_delivery_copy": delivery,
              "filesystem_reserve": filesystem_reserve, "closeout_reserve": closeout_reserve,
              "strict_ring_physical": ring_physical, "gates_physical": gates_physical,
@@ -197,6 +207,17 @@ INSTALLED_BINARY_SHA256 = "7d4667efe2b813d11ccdbd4b8630e6f2a62156795d9b04a9c0bcf
 INSTALLED_RECEIPT_SHA256 = "79e70f53ac93c307007b9c97464aa53d018855780c539288220855d503de0443"
 INSTALLED_SOURCE_HEAD = "974954729ec5efd0f450f87276b15ba72c1cbbca"
 INSTALLED_SOURCE_TREE = "8b42756d41dd1ed985a9a69524f606c674e8e634"
+INSTALLED_SOURCE_ROOT = "/Users/tom/Dev/projects/effigy"
+INSTALLED_SOURCE_INPUTS = {
+    "crates/effigy-core/src/output_cap.rs": "bd93d554b89dee673ada7d4201ef7c20bae40fdaa55568b0f2fe2bf7efafb4f1",
+    "crates/effigy-kernel/src/run/terminal_ring.rs": "7138e5b4a89100ee2eee30a96d2937ff975a76595f3399aafcbefc8721bac5ad",
+    "crates/effigy-kernel/src/run/foreground.rs": "183ca2f248964d3af9e2c75c90adc930d8cab92b9ad4048dd5b12e5c1ebcce5a",
+    "crates/effigy-kernel/src/supervise/memory.rs": "72d9b741782aaf3f8bc06f01b436d61d765ed489f14e6816e69a78c6d581e5b1",
+    "crates/effigy-kernel/src/supervise.rs": "13cd98135a41ac62b55780bc7ec2e8563b65e3a9e7200586d510bcb3a01b07ad",
+    "crates/effigy-kernel/src/store.rs": "f58f0e0ba2751e60cc3f414376f733bc4e6321ce54b4d6dfc9dd498be3662083",
+    "src/runner/task_engine/admission.rs": "ed4dec7cd85d6d7a4a339e2716af78e9d4c4e40d89466821cb0ae9b9271b0815",
+    "src/runner/task_engine/run/foreground.rs": "b7b04b60b807b4c1a8cc6395e51cbb31d984ee36902b7207ed5007c41f49ebab",
+}
 
 
 def installed_file_digest(path, byte_limit, deadline_ns):
@@ -242,9 +263,16 @@ def observe_installed_route(deadline_ns):
             or fields.get("binary_sha256") != INSTALLED_BINARY_SHA256
             or fields.get("dirty") != "false"):
         raise ValueError("installed Effigy receipt is inconsistent")
+    source_hashes = {}
+    for name, expected in INSTALLED_SOURCE_INPUTS.items():
+        path = os.path.join(INSTALLED_SOURCE_ROOT, name)
+        observed = installed_file_digest(path, MIB, deadline_ns)
+        if observed != expected:
+            raise ValueError("installed Effigy source drift: " + name)
+        source_hashes[name] = observed
     return {"launcher": launcher, "launcher_sha256": hashes[0], "binary_sha256": hashes[1],
             "receipt_sha256": hashes[2], "source_head": fields["source_head"],
-            "source_tree": fields["source_tree"],
+            "source_tree": fields["source_tree"], "source_hashes": source_hashes,
             "environment": {key: os.environ.get(key) for key in
                             ("EFFIGY_LAUNCH", "EFFIGY_STRICT_PERSISTENCE",
                              "EFFIGY_ADMISSION_PROTOCOL", "EFFIGY_ADMITTED")},
@@ -273,6 +301,9 @@ class CaptureSink:
         self.tail = b""
         self.markers = 0
         self.footers = 0
+        self.qualification_markers = 0
+        self.qualification_bytes = None
+        self.qualification = None
         self.failed = False
         self.sealed = False
 
@@ -285,9 +316,11 @@ class CaptureSink:
         # Detect a marker across chunk boundaries without retaining another log.
         marker = b"output_truncated"
         footer = b"effigy: output complete ("
+        qualification = b"qualification receipt: "
         joined = self.tail + chunk
         self.markers += joined.count(marker) - self.tail.count(marker)
         self.footers += joined.count(footer) - self.tail.count(footer)
+        self.qualification_markers += joined.count(qualification) - self.tail.count(qualification)
         try:
             written = self.stream.write(chunk)
             if written != len(chunk):
@@ -297,6 +330,30 @@ class CaptureSink:
             raise
         self.digest.update(chunk)
         self.length += len(chunk)
+        if self.qualification is None:
+            if self.qualification_bytes is None:
+                offset = joined.find(qualification)
+                if offset >= 0:
+                    self.qualification_bytes = bytearray(joined[offset + len(qualification):])
+            else:
+                self.qualification_bytes.extend(chunk)
+            if self.qualification_bytes is not None:
+                if len(self.qualification_bytes) > QUALIFICATION_DOCUMENT_LIMIT + 65536:
+                    self.failed = True
+                    raise OutputLimit("qualification receipt could not be bounded")
+                try:
+                    text = self.qualification_bytes.decode("utf-8", "surrogateescape")
+                    value, end = json.JSONDecoder(object_pairs_hook=unique_json_object).raw_decode(text)
+                    document_bytes = text[:end].encode("utf-8", "surrogateescape")
+                    document_bytes.decode("utf-8")
+                except (ValueError, UnicodeError):
+                    pass
+                else:
+                    if not isinstance(value, dict) or len(document_bytes) > QUALIFICATION_DOCUMENT_LIMIT:
+                        self.failed = True
+                        raise ValueError("invalid qualification receipt")
+                    self.qualification = value
+                    self.qualification_bytes = None
         self.tail = joined[-self.TAIL:]
 
     def seal(self):
@@ -311,7 +368,8 @@ class CaptureSink:
         self.sealed = True
         return {"bytes": self.length, "sha256": self.digest.hexdigest(),
                 "tail": self.tail, "truncation_markers": self.markers,
-                "footer_count": self.footers}
+                "footer_count": self.footers, "qualification": self.qualification,
+                "qualification_markers": self.qualification_markers}
 
 
 def drain_capture(fd, sink, deadline_ns):
@@ -350,6 +408,7 @@ def capture_footer(record):
 
 
 _capture_unreaped = []
+_capture_open_pipes = []
 
 
 def bounded_capture_command(argv, cwd, deadline_ns, limit):
@@ -359,6 +418,8 @@ def bounded_capture_command(argv, cwd, deadline_ns, limit):
     claim that a child or its descendants closed. The enclosing pinned actor
     owns the whole source-verification window.
     """
+    if not source_supervision_readiness()["ready"]:
+        raise ValueError("source command custody is not established")
     if type(limit) is not int or limit <= 0 or now_ns() >= deadline_ns:
         raise TimeoutError("command window or output limit invalid")
     proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -436,6 +497,8 @@ def copy_source_input(source, target, deadline_ns, limit):
 
 def snapshot_source_inputs(destination, deadline_ns):
     """Produce named source/index/entry copies in a newly created scratch leaf."""
+    if not source_supervision_readiness()["ready"]:
+        raise ValueError("source selector custody is not established")
     scratch = os.path.realpath(os.environ["TMPDIR"])
     parent = os.path.realpath(os.path.dirname(destination))
     if parent != scratch or os.path.dirname(os.path.abspath(destination)) != parent:
@@ -455,6 +518,12 @@ def snapshot_source_inputs(destination, deadline_ns):
         result[name] = copy_source_input(os.path.join(REPO, name),
                                          os.path.join(destination, f"source-{number}"),
                                          deadline_ns, 4 * MIB)
+    for number, (name, expected) in enumerate(INSTALLED_SOURCE_INPUTS.items()):
+        row = copy_source_input(os.path.join(INSTALLED_SOURCE_ROOT, name),
+                                os.path.join(destination, f"effigy-source-{number}"), deadline_ns, MIB)
+        if row["sha256"] != expected:
+            raise ValueError("installed Effigy source copy drift: " + name)
+        result["effigy:" + name] = row
     result["raw_index"] = copy_source_input(index_path, os.path.join(destination, "index"),
                                              deadline_ns, 4 * MIB)
     code, entries, errors = bounded_capture_command(
@@ -474,6 +543,17 @@ def snapshot_source_inputs(destination, deadline_ns):
         raise TimeoutError("Git entry copy exceeded deadline")
     result["entries"] = {"bytes": len(entries), "sha256": hashlib.sha256(entries).hexdigest()}
     return result
+
+
+def source_supervision_readiness():
+    """Refuse the spawn-owning worker route until qualified custody is bound.
+
+    The actor pins only its direct worker. Killing that worker cannot establish
+    closure or preserve handles for a Git, Effigy or supervisor grandchild.
+    This is a source-only refusal; it does not activate a qualified guard.
+    """
+    return {"ready": False, "qualified": False,
+            "reason": "the bounded actor cannot retain the worker's subprocess custody"}
 
 
 def snapshot_git_identity(deadline_ns):
@@ -500,6 +580,8 @@ def capture_foreground(stream, deadline_ns):
     The caller must already have established the independently reviewed route,
     physical fit and preparation. It must run inside the original bounded actor.
     """
+    if not source_supervision_readiness()["ready"]:
+        raise ValueError("capture child custody is not established")
     if now_ns() >= deadline_ns:
         raise TimeoutError("capture deadline expired before launch")
     provenance = observe_installed_route(deadline_ns)
@@ -511,26 +593,40 @@ def capture_foreground(stream, deadline_ns):
     env["EFFIGY_OUTPUT_CAP_BYTES"] = str(EFFIGY_TEXT_CAP_BYTES)
     if now_ns() >= deadline_ns:
         raise TimeoutError("capture deadline expired during provenance")
-    proc = subprocess.Popen(NATIVE_CAPTURE_ARGV, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, env=env, cwd=REPO)
+    read_fd, write_fd = os.pipe()
+    try:
+        pipe_buf = os.fpathconf(write_fd, "PC_PIPE_BUF")
+        with open(SOURCES["supervisor"], "rb") as source:
+            data = source.read(4 * MIB + 1)
+        bound = derived_route_extra(data, pipe_buf, EFFIGY_TEXT_CAP_BYTES)
+        if not bound.get("bounded") or now_ns() >= deadline_ns:
+            raise ValueError("capture output route is not bounded before launch")
+        proc = subprocess.Popen(NATIVE_CAPTURE_ARGV, stdout=write_fd,
+                                stderr=subprocess.STDOUT, env=env, cwd=REPO)
+    except BaseException:
+        os.close(read_fd)
+        os.close(write_fd)
+        raise
     # Keep the handle if an exception or timeout makes its status unknown.
     _capture_unreaped.append(proc)
+    _capture_open_pipes.append(read_fd)
+    os.close(write_fd)
     sink = CaptureSink(stream)
-    try:
-        record = drain_capture(proc.stdout.fileno(), sink, deadline_ns)
-        if now_ns() >= deadline_ns:
-            raise TimeoutError("capture deadline expired before reap")
-        status = hold(proc.pid, deadline_ns, [])
-        if status is None:
-            raise TimeoutError("foreground process not reaped before deadline")
-        proc.returncode = code_of(status)
-        _capture_unreaped.remove(proc)
-        record["effigy_exit"] = proc.returncode
-        record["effigy_footer"] = capture_footer(record)
-        record["installed_provenance"] = provenance
-        return record
-    finally:
-        proc.stdout.close()
+    record = drain_capture(read_fd, sink, deadline_ns)
+    if now_ns() >= deadline_ns:
+        raise TimeoutError("capture deadline expired before reap")
+    status = hold(proc.pid, deadline_ns, [])
+    if status is None:
+        raise TimeoutError("foreground process not reaped before deadline")
+    proc.returncode = code_of(status)
+    _capture_unreaped.remove(proc)
+    _capture_open_pipes.remove(read_fd)
+    os.close(read_fd)
+    record["effigy_exit"] = proc.returncode
+    record["effigy_footer"] = capture_footer(record)
+    record["installed_provenance"] = provenance
+    record["route_extra"] = bound
+    return record
 
 
 def capture_raw_log(path, deadline_ns):
@@ -543,13 +639,13 @@ def capture_raw_log(path, deadline_ns):
         return capture_foreground(stream, deadline_ns)
 
 
-def joined_group_evidence(receipt, expected_leader):
+def joined_group_evidence(receipt, expected_leader, guard=None):
     """Validate a supervisor receipt's own joined, deciding and final census.
 
     This checks one receipt, not the separate whole-image observation or the
     source binding of the receipt to a particular capture occurrence.
     """
-    guard = candidate()
+    guard = candidate() if guard is None else guard
     if (not isinstance(expected_leader, list) or len(expected_leader) != 2
             or type(expected_leader[0]) is not int or expected_leader[0] <= 1
             or expected_leader[1] is None
@@ -597,13 +693,360 @@ def declared_backing_evidence(ctx, probe, deadline_ns):
     return {"backings": list(backings), "state": "whole-backing-absent"}
 
 
+def read_capture_document(path, deadline_ns):
+    """Read one bounded, unlinked regular evidence document."""
+    if now_ns() >= deadline_ns:
+        raise TimeoutError("capture evidence deadline expired")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb", buffering=0) as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MIB:
+            raise ValueError("capture evidence is not a bounded regular file")
+        data = handle.read(MIB + 1)
+    if len(data) > MIB or now_ns() >= deadline_ns:
+        raise ValueError("capture evidence exceeded its bound or deadline")
+    value = json.loads(data, object_pairs_hook=unique_json_object)
+    if not isinstance(value, dict):
+        raise ValueError("capture evidence must be an object")
+    return value
+
+
+def unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON field")
+        result[key] = value
+    return result
+
+
+def suite_backing_evidence(results, outer_evidence, probe, deadline_ns):
+    """Recheck every image-owning case identified in the pinned fixed suite."""
+    suite = SOURCES["suite"]
+    if installed_file_digest(suite, 4 * MIB, deadline_ns) != (
+            "b8d7cd84967bac075b04fc06fe8e4d9dfbd1ff55ccd0ce977a69949866ca170d"):
+        raise ValueError("fixed suite source drift")
+    with open(suite, "rb") as handle:
+        source = handle.read(4 * MIB + 1)
+    if len(source) > 4 * MIB or now_ns() >= deadline_ns:
+        raise ValueError("fixed suite source incomplete")
+    if hashlib.sha256(source).hexdigest() != "b8d7cd84967bac075b04fc06fe8e4d9dfbd1ff55ccd0ce977a69949866ca170d":
+        raise ValueError("fixed suite source changed during observation")
+    tree = ast.parse(source)
+    classes = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "DetachReal"]
+    if len(classes) != 1:
+        raise ValueError("image case inventory missing")
+    names = {node.name for node in classes[0].body
+             if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")}
+    if (len(names) != 8 or not isinstance(results, dict)
+            or not isinstance(results.get("cases"), list)
+            or not isinstance(results.get("outcomes"), list)
+            or len(results["outcomes"]) != EXPECTED_CASES):
+        raise ValueError("image case inventory incomplete")
+    outcomes = results["outcomes"]
+    if (any(not isinstance(row, list) or len(row) != 2 or not isinstance(row[0], str)
+            or row[1] not in ("pass", "fail", "error") for row in outcomes)
+            or len({row[0] for row in outcomes}) != EXPECTED_CASES):
+        raise ValueError("fixed-suite outcomes are malformed or duplicated")
+    selected = [row for row in results["cases"] if isinstance(row, dict) and row.get("case") in names]
+    if len(selected) != len(names) or {row["case"] for row in selected} != names:
+        raise ValueError("image case outcomes missing or duplicated")
+    outer = probe.realpath(outer_evidence)
+    observations = []
+    for row in selected:
+        case = row.get("dir")
+        if (not isinstance(case, str) or not os.path.isabs(case) or probe.realpath(case) != case
+                or not case.startswith(outer + os.sep)):
+            raise ValueError("image case is outside the captured evidence")
+        evidence = os.path.join(case, "evidence")
+        nested = read_capture_document(os.path.join(evidence, "receipt.json"), deadline_ns)
+        volume = read_capture_document(os.path.join(case, "volume.json"), deadline_ns)
+        if nested.get("evidence") != evidence or not isinstance(nested.get("root"), str):
+            raise ValueError("nested image case receipt is not bound")
+        observation = declared_backing_evidence({"root": nested["root"], "evidence": evidence}, probe, deadline_ns)
+        if observation["backings"] != [volume.get("image")]:
+            raise ValueError("image custody and case volume differ")
+        observations.append({"case": row["case"], **observation})
+    return observations
+
+
+def inspect_candidate_capture(record, raw_log, source_identity, probe, deadline_ns):
+    """Bind a completed diagnostic stream to its sources, census and images.
+
+    This examines the actual raw file and candidate-owned receipts. The outer
+    qualified group and actor settlement remain separate requirements.
+    """
+    if not isinstance(record, dict) or record.get("qualification_markers") != 1:
+        raise ValueError("missing or duplicate qualification receipt")
+    qualification = record.get("qualification")
+    if (not isinstance(qualification, dict) or qualification.get("mode") != "diagnostic"
+            or qualification.get("qualified") is not False
+            or qualification.get("selector") != "proof:supervisor:ceiling:qualify:diagnostic"
+            or qualification.get("head") != source_identity.get("head")
+            or record.get("effigy_exit") != 1):
+        raise ValueError("diagnostic outcome or source head is not bound")
+    if capture_footer(record) != record.get("effigy_footer"):
+        raise ValueError("Effigy footer changed")
+    provenance = record.get("installed_provenance")
+    route = record.get("route_extra")
+    environment = provenance.get("environment") if isinstance(provenance, dict) else None
+    if (not isinstance(provenance, dict) or provenance.get("launcher_sha256") != INSTALLED_LAUNCHER_SHA256
+            or provenance.get("binary_sha256") != INSTALLED_BINARY_SHA256
+            or provenance.get("receipt_sha256") != INSTALLED_RECEIPT_SHA256
+            or provenance.get("source_head") != INSTALLED_SOURCE_HEAD
+            or provenance.get("source_tree") != INSTALLED_SOURCE_TREE
+            or provenance.get("source_hashes") != INSTALLED_SOURCE_INPUTS
+            or not isinstance(environment, dict) or environment.get("EFFIGY_LAUNCH") == "stable"
+            or environment.get("EFFIGY_STRICT_PERSISTENCE") != "1"
+            or environment.get("EFFIGY_ADMISSION_PROTOCOL") not in (None, "", "2")
+            or not isinstance(route, dict) or route.get("bounded") is not True
+            or route.get("effigy_cap_including_marker_footer") != EFFIGY_TEXT_CAP_BYTES
+            or type(route.get("route_extra_bytes_max")) is not int
+            or route["route_extra_bytes_max"] > MIB):
+        raise ValueError("installed Effigy or output route is not bound")
+    if (type(record.get("bytes")) is not int or not 0 < record["bytes"] <= CaptureSink.LIMIT
+            or not isinstance(record.get("sha256"), str)
+            or installed_file_digest(raw_log, CaptureSink.LIMIT, deadline_ns) != record["sha256"]):
+        raise ValueError("complete raw capture is missing or changed")
+    verify_source_pins(PINS_TOKEN)
+    pins_path = os.path.join(SCRIPTS, "ceiling-qualification-pins.json")
+    pins = read_capture_document(pins_path, deadline_ns)
+    expected = {name: pins[os.path.basename(path)] for name, path in SOURCES.items()}
+    if qualification.get("sha256") != expected:
+        raise ValueError("qualification source hashes differ from the pinned route")
+    default = qualification.get("default_scratch")
+    topology_record = default.get("topology") if isinstance(default, dict) else None
+    evidence = topology_record.get("evidence") if isinstance(topology_record, dict) else None
+    if not isinstance(evidence, str) or not os.path.isabs(evidence) or probe.realpath(evidence) != evidence:
+        raise ValueError("candidate evidence location is missing or linked")
+    candidate_receipt = read_capture_document(os.path.join(evidence, "receipt.json"), deadline_ns)
+    if (candidate_receipt.get("evidence") != evidence
+            or candidate_receipt.get("outcome") != qualification.get("candidate_outcome")):
+        raise ValueError("candidate receipt and captured qualification differ")
+    joined = joined_group_evidence(candidate_receipt, candidate_receipt.get("leader"))
+    images = suite_backing_evidence({"cases": qualification.get("cases"),
+                                     "outcomes": qualification.get("outcomes")},
+                                    evidence, probe, deadline_ns)
+    return {"raw_sha256": record["sha256"], "raw_bytes": record["bytes"],
+            "effigy_exit": record["effigy_exit"], "effigy_footer": record["effigy_footer"],
+            "candidate_group": joined, "image_backings": images,
+            "suite_cases": EXPECTED_CASES, "qualification": "uncounted diagnostic"}
+
+
+def supported_capture_physical_bounds():
+    """No installed allocation/prepare contract has been accepted yet."""
+    return None
+
+
+CAPTURE_WORKER_MARKER = b"ceiling capture worker result: "
+
+
+def capture_worker(raw_path, result_path, deadline_ns):
+    """Fixed child under the qualified outer supervisor, never a qualification."""
+    if (type(deadline_ns) is not int or not now_ns() < deadline_ns <= START + WALL_NS
+            or not isinstance(raw_path, str) or not os.path.isabs(raw_path)
+            or not isinstance(result_path, str) or not os.path.isabs(result_path)):
+        raise ValueError("capture worker window or path is invalid")
+    scratch = os.path.realpath(os.environ["TMPDIR"])
+    parent = os.path.realpath(os.path.dirname(raw_path))
+    if not parent.startswith(scratch + os.sep) or os.path.dirname(raw_path) != parent:
+        raise ValueError("capture log is outside the owned scratch leaf")
+    if os.path.dirname(result_path) != parent or result_path == raw_path:
+        raise ValueError("capture result is outside the same owned leaf")
+    if supported_capture_physical_bounds() is None:
+        raise ValueError("supported physical capture and preparation bounds are unavailable")
+    verify_source_pins(PINS_TOKEN)
+    record = capture_raw_log(raw_path, deadline_ns)
+    record["tail_hex"] = record.pop("tail").hex()
+    publication = publish_capture_receipt(result_path, {"record": record}, deadline_ns)
+    encoded = json.dumps(publication, sort_keys=True, separators=(",", ":"))
+    print(CAPTURE_WORKER_MARKER.decode("ascii") + encoded, flush=True)
+    return 1  # an uncounted diagnostic must never exit as a qualification
+
+
+def parse_capture_worker(stdout):
+    """Read exactly one fixed worker result from the outer guard's output."""
+    if not isinstance(stdout, bytes) or stdout.count(CAPTURE_WORKER_MARKER) != 1:
+        raise ValueError("capture worker output is missing or duplicated")
+    prefix, remainder = stdout.split(CAPTURE_WORKER_MARKER, 1)
+    if prefix and not prefix.endswith(b"\n"):
+        raise ValueError("capture worker marker is not at a line boundary")
+    line, separator, _after = remainder.partition(b"\n")
+    if not separator or len(line) > BOOTSTRAP_OUTPUT_LIMIT:
+        raise ValueError("capture worker result is incomplete")
+    publication = json.loads(line, object_pairs_hook=unique_json_object)
+    if (not isinstance(publication, dict) or set(publication) != {"sha256", "bytes", "published_ns"}
+            or not isinstance(publication["sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", publication["sha256"]) is None
+            or type(publication["bytes"]) is not int or not 0 < publication["bytes"] <= MIB
+            or type(publication["published_ns"]) is not int):
+        raise ValueError("capture worker publication is malformed")
+    return publication
+
+
+def read_capture_bytes(path, limit, deadline_ns):
+    if now_ns() >= deadline_ns:
+        raise TimeoutError("capture input deadline expired")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb", buffering=0) as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise ValueError("capture input is not a bounded regular file")
+        data = handle.read(limit + 1)
+    if len(data) > limit or now_ns() >= deadline_ns:
+        raise ValueError("capture input exceeded its bound or deadline")
+    return data
+
+
+def read_worker_publication(stdout_log, result_path, deadline_ns):
+    """Bind the supervisor's complete stdout to the exact provisional result."""
+    publication = parse_capture_worker(read_capture_bytes(stdout_log, 3 * MIB, deadline_ns))
+    data = read_capture_bytes(result_path, MIB, deadline_ns)
+    if (len(data) != publication["bytes"] or hashlib.sha256(data).hexdigest() != publication["sha256"]
+            or not START <= publication["published_ns"] < now_ns() < deadline_ns):
+        raise ValueError("capture worker publication is missing, changed or late")
+    document = json.loads(data, object_pairs_hook=unique_json_object)
+    if (not isinstance(document, dict) or document.get("complete") is not False
+            or document.get("qualified") is not False
+            or document.get("state") != "awaiting-actor-settlement"
+            or not isinstance(document.get("record"), dict)):
+        raise ValueError("capture worker provisional document is malformed")
+    record = document["record"]
+    if not isinstance(record.get("tail_hex"), str):
+        raise ValueError("capture worker tail is missing")
+    try:
+        record["tail"] = bytes.fromhex(record.pop("tail_hex"))
+    except ValueError as error:
+        raise ValueError("capture worker tail is malformed") from error
+    if len(record["tail"]) > CaptureSink.TAIL:
+        raise ValueError("capture worker tail is oversized")
+    return record, publication
+
+
+def inspect_outer_group(receipt, worker_command, evidence_path, candidate_leader):
+    """Require a distinct qualified supervisor's own completed joined census."""
+    if (not isinstance(receipt, dict) or receipt.get("command") != worker_command
+            or receipt.get("evidence") != evidence_path or receipt.get("phase") != "monitor_complete"):
+        raise ValueError("outer supervisor receipt does not bind the capture command")
+    outcome = receipt.get("outcome")
+    if (not isinstance(outcome, dict) or outcome.get("status") != 1
+            or outcome.get("fault") is not None or outcome.get("deadline") is not False):
+        raise ValueError("outer supervisor outcome is incomplete")
+    if receipt.get("leader") == candidate_leader:
+        raise ValueError("outer and candidate group identities are not distinct")
+    streams = receipt.get("output")
+    if not isinstance(streams, dict):
+        raise ValueError("outer supervisor output accounting is missing")
+    for name in ("stdout", "stderr"):
+        row = streams.get(name)
+        if (not isinstance(row, dict) or type(row.get("bytes")) is not int
+                or row["bytes"] < 0 or row.get("persisted") != row["bytes"]
+                or row.get("forwarded") != row["bytes"] or row.get("discarded") != 0):
+            raise ValueError("outer supervisor output was not forwarded completely")
+    return joined_group_evidence(receipt, receipt.get("leader"), qualified_guard())
+
+
+def capture_worker_command(root, deadline_ns):
+    return [sys.executable, os.path.abspath(__file__), "--pins-sha256", PINS_TOKEN,
+            "--_capture-worker", str(deadline_ns), os.path.join(root, "capture.raw"),
+            os.path.join(root, "worker.json")]
+
+
+def prepare_capture_evidence(root, deadline_ns):
+    """Bind exact inputs and readiness before the separate outer guard starts."""
+    physical = supported_capture_physical_bounds()
+    if not isinstance(physical, dict):
+        raise ValueError("supported physical allocation and separate prepare remain unknown")
+    if os.environ.get("OXIDE_TASK_SCRATCH_ROOT"):
+        raise ValueError("outer supervisor would adopt an inherited scratch root")
+    scratch = os.path.realpath(os.environ["TMPDIR"])
+    if os.path.dirname(os.path.abspath(root)) != scratch or now_ns() >= deadline_ns:
+        raise ValueError("capture root or original deadline is invalid")
+    verify_source_pins(PINS_TOKEN)
+    identity = snapshot_git_identity(deadline_ns)
+    identity["status"] = identity["status"].hex()
+    provenance = observe_installed_route(deadline_ns)
+    env = provenance["environment"]
+    if (env["EFFIGY_STRICT_PERSISTENCE"] != "1"
+            or env["EFFIGY_ADMISSION_PROTOCOL"] not in (None, "", "2")):
+        raise ValueError("strict Effigy foreground route is not bound")
+    sources = snapshot_source_inputs(root + "-before", deadline_ns)
+    source_sizes = {name: sources[name]["bytes"] for name in CAPTURE_SOURCE_FILES}
+    installed_sizes = {name: sources["effigy:" + name]["bytes"] for name in INSTALLED_SOURCE_INPUTS}
+    with open(SOURCES["supervisor"], "rb") as handle:
+        candidate_bytes = handle.read(4 * MIB + 1)
+    route = derived_route_extra(candidate_bytes, 4096, EFFIGY_TEXT_CAP_BYTES)
+    if not route.get("bounded"):
+        raise ValueError("fixed candidate output bound is unavailable")
+    fit = capture_fit(source_sizes, sources["raw_index"]["bytes"], sources["entries"]["bytes"],
+                      route["route_extra_bytes_max"], physical.get("allocation_unit"),
+                      ring_physical=physical.get("ring_physical"),
+                      gates_physical=physical.get("gates_physical"),
+                      prepare_physical=physical.get("prepare_physical"),
+                      installed_source_sizes=installed_sizes)
+    if not fit.get("fits"):
+        raise ValueError("capture and outer group do not fit the fixed outside share")
+    if now_ns() >= deadline_ns:
+        raise TimeoutError("capture deadline expired during staging")
+    os.mkdir(root, 0o700)
+    os.mkdir(os.path.join(root, "outer-parent"), 0o700)
+    publish_capture_receipt(os.path.join(root, "preflight.json"),
+                            {"identity": identity, "sources": sources, "provenance": provenance,
+                             "fit": fit, "route_extra": route}, deadline_ns)
+    return 0
+
+
+def finish_capture_evidence(root, deadline_ns, ack_fd):
+    """Finalizer: bind source, both supervisor receipts, images and raw sink.
+
+    This runs in the existing actor's pinned worker after the qualified outer
+    supervisor has itself been reaped. Its published file remains provisional
+    until the actor observes this worker's in-window exit and acknowledgment.
+    """
+    preflight = read_capture_document(os.path.join(root, "preflight.json"), deadline_ns)
+    if (preflight.get("complete") is not False or preflight.get("qualified") is not False
+            or preflight.get("state") != "awaiting-actor-settlement"):
+        raise ValueError("capture preflight evidence is malformed")
+    before_identity = preflight.get("identity")
+    before_sources = preflight.get("sources")
+    after_identity = snapshot_git_identity(deadline_ns)
+    after_identity["status"] = after_identity["status"].hex()
+    after_sources = snapshot_source_inputs(root + "-after", deadline_ns)
+    if (not isinstance(before_identity, dict) or before_identity != after_identity
+            or not isinstance(before_sources, dict) or before_sources != after_sources):
+        raise ValueError("source head, index, entries or source bytes changed")
+    outer_evidence = os.path.join(root, "outer-evidence")
+    group = read_capture_document(os.path.join(outer_evidence, "receipt.json"), deadline_ns)
+    worker_record, worker_publication = read_worker_publication(
+        os.path.join(outer_evidence, "stdout.log"), os.path.join(root, "worker.json"), deadline_ns)
+    worker_command = capture_worker_command(root, deadline_ns)
+    probe = candidate().DefaultProbe()
+    candidate_evidence = inspect_candidate_capture(worker_record, os.path.join(root, "capture.raw"),
+                                                   before_identity, probe, deadline_ns)
+    outer = inspect_outer_group(group, worker_command, outer_evidence,
+                                candidate_evidence["candidate_group"]["leader"])
+    document = {"kind": "ceiling-capture", "clock": "CLOCK_UPTIME_RAW", "original_start_ns": START,
+                "deadline_ns": deadline_ns, "head": before_identity["head"],
+                "tree": before_identity["tree"], "branch": before_identity["branch"],
+                "source_inventory": before_sources, "outer_group": outer,
+                "candidate": candidate_evidence, "worker_publication": worker_publication,
+                "workload_result": "uncounted diagnostic", "effigy_exit": worker_record["effigy_exit"],
+                "effigy_output": "complete", "sink": "fsynced after EOF", "qualified": False}
+    publication = publish_capture_receipt(os.path.join(root, "capture-final.json"), document, deadline_ns)
+    acknowledge_publication(ack_fd, publication, deadline_ns)
+    return 0
+
+
 def publish_capture_receipt(path, document, deadline_ns):
-    """Publish a bounded complete document only after its contents are fsynced.
+    """Publish provisional evidence and return only an in-window acknowledgment.
 
     The caller owns the fresh private directory. A partial or failed write is
-    left at the temporary name and is never presented as the final receipt.
+    left at the temporary name and is never presented as the final receipt. A
+    late link can still become visible, so the file itself explicitly claims
+    no completeness; only the separately settled actor may accept its digest.
     """
-    encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    provisional = dict(document, complete=False, qualified=False, state="awaiting-actor-settlement")
+    encoded = json.dumps(provisional, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
     if len(encoded) > MIB:
         raise OutputLimit("capture receipt exceeds its reserve")
     if now_ns() >= deadline_ns:
@@ -619,6 +1062,11 @@ def publish_capture_receipt(path, document, deadline_ns):
         raise TimeoutError("capture receipt deadline expired before publication")
     # link is exclusive: an existing final receipt is never replaced.
     os.link(temporary, path)
+    published_ns = now_ns()
+    if published_ns >= deadline_ns:
+        raise TimeoutError("capture receipt publication exceeded deadline")
+    return {"sha256": hashlib.sha256(encoded).hexdigest(), "bytes": len(encoded),
+            "published_ns": published_ns}
 
 
 def derived_route_extra(candidate_source, pipe_buf, effigy_cap):
@@ -731,7 +1179,9 @@ def verify_source_pins(token):
     if os.path.islink(path):
         raise ValueError("linked source pin")
     with open(path, "rb") as handle:
-        raw = handle.read()
+        raw = handle.read(MIB + 1)
+    if len(raw) > MIB or now_ns() >= DEADLINE:
+        raise ValueError("source pin is oversized or the window expired")
     if hashlib.sha256(raw).hexdigest() != token:
         raise ValueError("source pin mismatch")
     pins = json.loads(raw)
@@ -854,8 +1304,7 @@ def reserve_readings(scratch_volume, boot_volume, facts=None):
 
 
 def sha256(path):
-    with open(path, "rb") as handle:
-        return hashlib.sha256(handle.read()).hexdigest()
+    return installed_file_digest(path, 4 * MIB, DEADLINE)
 
 
 def git(*args):
@@ -886,7 +1335,40 @@ def code_of(status):
     return os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status)
 
 
-def bounded(work, deadline_ns, finish_ns):
+def settled_publication(raw, status, observed_ns, deadline_ns):
+    """Accept only an in-window acknowledgment from a successfully reaped worker."""
+    if status != 0 or observed_ns >= deadline_ns or not isinstance(raw, bytes) or len(raw) > 1024:
+        raise ValueError("capture worker did not settle within its window")
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate acknowledgment field")
+            result[key] = value
+        return result
+    ack = json.loads(raw, object_pairs_hook=unique)
+    if (not isinstance(ack, dict) or set(ack) != {"sha256", "bytes", "published_ns"}
+            or not isinstance(ack["sha256"], str) or re.fullmatch(r"[0-9a-f]{64}", ack["sha256"]) is None
+            or type(ack["bytes"]) is not int or not 0 < ack["bytes"] <= MIB
+            or type(ack["published_ns"]) is not int or not START <= ack["published_ns"] <= observed_ns):
+        raise ValueError("capture publication acknowledgment is invalid")
+    return {"complete": True, "qualified": False, "publication": ack,
+            "worker_settled_ns": observed_ns, "clock": "CLOCK_UPTIME_RAW"}
+
+
+def acknowledge_publication(fd, acknowledgment, deadline_ns):
+    """The publishing worker emits a single finite acknowledgment after link."""
+    if now_ns() >= deadline_ns:
+        raise TimeoutError("capture acknowledgment deadline expired")
+    data = json.dumps(acknowledgment, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    if len(data) > 1024:
+        raise OutputLimit("capture acknowledgment exceeds bound")
+    os.set_blocking(fd, False)
+    if os.write(fd, data) != len(data):
+        raise OSError("partial capture acknowledgment")
+
+
+def bounded(work, deadline_ns, finish_ns, *, ack_pipe=None):
     """Minimal outer deadline actor. Runs `work` in a forked child held
     unreaped (so its PID cannot be reused) and makes only WNOHANG reaps,
     bounded sleeps and signals to that pinned child: no file or blocking
@@ -902,6 +1384,8 @@ def bounded(work, deadline_ns, finish_ns):
     if pid == 0:
         code = 1
         try:
+            if ack_pipe is not None:
+                os.close(ack_pipe[0])
             code = 124 if now_ns() >= deadline_ns else work()
         except BaseException as error:
             # A bounded reason, not an unbounded traceback or a partial receipt.
@@ -913,30 +1397,50 @@ def bounded(work, deadline_ns, finish_ns):
             except OSError:
                 pass
         finally:
+            if ack_pipe is not None:
+                os.close(ack_pipe[1])
             for stream in (sys.stdout, sys.stderr):
                 try:
                     stream.flush()
                 except (OSError, ValueError):
                     pass
             os._exit(code)
+    if ack_pipe is not None:
+        os.close(ack_pipe[1])
     forward = []
     for number in (signal.SIGINT, signal.SIGTERM):
         signal.signal(number, lambda n, _f: forward.append(n))
     status = hold(pid, deadline_ns, forward)
     if status is not None:
+        if now_ns() >= deadline_ns:
+            if ack_pipe is not None:
+                os.close(ack_pipe[0])
+            return 124
+        if ack_pipe is not None:
+            try:
+                os.set_blocking(ack_pipe[0], False)
+                raw = os.read(ack_pipe[0], 1025)
+                if os.read(ack_pipe[0], 1) != b"":
+                    raise ValueError("capture acknowledgment was not closed")
+                return settled_publication(raw, code_of(status), now_ns(), deadline_ns)
+            finally:
+                os.close(ack_pipe[0])
         return code_of(status)
     forward[:] = [signal.SIGKILL]  # still unreaped: the pin holds
     reaped = hold(pid, finish_ns, forward) is not None
     try:  # best effort; never blocks
         os.set_blocking(2, False)
-        os.write(2, f"bootstrap: worker overran the fixed deadline; KILLed (reaped {reaped}); exit 124,"
+        os.write(2, f"bootstrap: worker overran the fixed deadline; stop requested (reaped {reaped}); exit 124,"
                     " nothing deleted\n".encode())
     except OSError:
         pass
+    if ack_pipe is not None:
+        os.close(ack_pipe[0])
     return 124
 
 
 CANDIDATE = []
+QUALIFIED = []
 
 
 def candidate():
@@ -948,6 +1452,16 @@ def candidate():
         spec.loader.exec_module(module)
         CANDIDATE.append(module)
     return CANDIDATE[0]
+
+
+def qualified_guard():
+    """Load the separately pinned ordinary supervisor's evidence rules."""
+    if not QUALIFIED:
+        spec = importlib.util.spec_from_file_location("bounded_test_qualified", SOURCES["qualified"])
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        QUALIFIED.append(module)
+    return QUALIFIED[0]
 
 
 def selection():
@@ -1565,6 +2079,10 @@ def main(argv=None):
         raise SystemExit("ceiling qualification: missing source pin")
     PINS_TOKEN = argv[1]
     del argv[:2]
+    if argv and argv[0] == "--_capture-worker":
+        if len(argv) != 4 or not argv[1].isascii() or not argv[1].isdecimal() or len(argv[1]) > 20:
+            raise SystemExit("ceiling capture worker: invalid fixed arguments")
+        return capture_worker(argv[2], argv[3], int(argv[1]))
     if argv and argv[0] == PREFLIGHT_FLAG:
         try:
             verify_source_pins(PINS_TOKEN)
