@@ -467,6 +467,10 @@ def bounded(work, deadline_ns, finish_ns):
     stdio. INT and TERM are forwarded to the worker. At `deadline_ns` the
     worker is KILLed, reaped with WNOHANG until `finish_ns`, and the exit is
     124. Otherwise the worker's own exit code is returned."""
+    # Never create a worker after the original window has already expired.
+    # The finish margin belongs to that same window; it is not a fresh wait.
+    if now_ns() >= deadline_ns or finish_ns <= deadline_ns:
+        return 124
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     pid = os.fork()
     if pid == 0:

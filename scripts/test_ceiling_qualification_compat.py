@@ -74,6 +74,14 @@ class BootstrapBounds(unittest.TestCase):
         cls.bootstrap = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.bootstrap)
 
+    def test_expired_outer_window_never_forks(self):
+        b = self.bootstrap
+        with mock.patch.object(b, "now_ns", return_value=100), \
+             mock.patch.object(b.os, "fork") as fork:
+            self.assertEqual(b.bounded(lambda: 0, 100, 102), 124)
+            self.assertEqual(b.bounded(lambda: 0, 101, 101), 124)
+        fork.assert_not_called()
+
     def test_partition_and_delivery_reserves(self):
         b = self.bootstrap
         self.assertEqual((b.GUARD_BUDGET_MIB, b.OUTSIDE_BUDGET_MIB), (384, 128))
