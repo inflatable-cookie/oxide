@@ -87,14 +87,35 @@ GATE = (
     'python3 scripts/foundation-rust-1-100.py --gate --binding "$FOUNDATION_083_BINDING" '
     '--sha256 "$FOUNDATION_083_BINDING_SHA256"'
 )
-# The whole selector: the gate, then two separately guarded sequential phases
-# (one invocation each), then a fixed nonzero exit. The second phase runs even
-# if the first failed (keep-going); the third allowed invocation is a spare
+# Diagnostic phase statuses (all nonzero; the ordinary guard passes the
+# command's own status through only for a closed run within its bounds and
+# otherwise returns 124 deadline / 125 fault, refusal or UNCLOSED / 128+N).
+DIAGNOSTIC_DONE = 3        # receipt written, case collection not aborted
+DIAGNOSTIC_INCOMPLETE = 4  # receipt written, but setup fault or aborted collection
+DIAGNOSTIC_NO_RECEIPT = 5  # receipt could not be written
+DIAGNOSTIC_REFUSED = 2     # refused before any effect
+# The whole selector: the gate, then phase 1; phase 2 runs ONLY if phase 1's
+# guard status is DIAGNOSTIC_DONE (closed, within bounds, complete receipt).
+# Any other status (124, 125, 128+N, refusal, crash, incomplete, no receipt)
+# stops the selector with that status; phase 2's own status is the final one,
+# never overwritten. The third allowed invocation is a spare
 # that the selector never spends.
 COMMAND = (
-    f"{GATE} && {{ {PHASE.format(toolchain=PINNED)}; "
-    f"{PHASE.format(toolchain=TESTED)}; exit 1; }}"
+    f"{GATE} && {{ {PHASE.format(toolchain=PINNED)}; s=$?; "
+    f'echo "foundation-083 phase {PINNED} status $s"; [ "$s" -eq {DIAGNOSTIC_DONE} ] || exit "$s"; '
+    f"{PHASE.format(toolchain=TESTED)}; s=$?; "
+    f'echo "foundation-083 phase {TESTED} status $s"; exit "$s"; }}'
 )
+
+
+def phase_decision(phase: int, status) -> tuple:
+    """What COMMAND does with a phase's guard status: ("continue", None) or
+    ("stop", exit). Mirrors the shell exactly; the self-check binds both."""
+    if not isinstance(status, int) or isinstance(status, bool) or not 0 <= status <= 255:
+        return ("stop", 125)  # a missing or malformed status is never closure
+    if phase == 1 and status == DIAGNOSTIC_DONE:
+        return ("continue", None)
+    return ("stop", status)
 
 # Planned invocations: at most three TOTAL across both toolchains.
 INVOCATIONS = (
@@ -295,13 +316,35 @@ def phase_parent(env: dict) -> str:
     return tempfile.mkdtemp(prefix="f083-", dir=root)
 
 
-def work_seconds(env: dict, now_ns: int) -> float:
-    """Seconds left before the guard's exported deadline (30 s margin is the
-    guard's own); never more than the 270 s guard work window."""
+STOP_RESERVE_S = 30
+
+
+def uptime_ns() -> int:
+    """The ordinary guard's one clock (bounded-test.py now_ns)."""
+    return time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
+
+
+def work_seconds(env: dict, now_uptime_ns: int) -> float:
+    """Work seconds left: the guard's ABSOLUTE deadline (exported in
+    CLOCK_UPTIME_RAW ns as start + 300 s) minus now on the same clock, minus
+    the 30 s stop reserve the script keeps for the guard. Time already spent
+    in setup and the gate is therefore charged; nothing is reset."""
     raw = env.get("OXIDE_PROOF_DEADLINE_NS")
     if not raw or not raw.isdigit():
         raise RuntimeError("OXIDE_PROOF_DEADLINE_NS from the qualified guard is required")
-    return max(0.0, min(LIMITS["guard_work_seconds"], (int(raw) - now_ns) / 1e9))
+    left = (int(raw) - now_uptime_ns) / 1e9 - STOP_RESERVE_S
+    return max(0.0, min(LIMITS["guard_work_seconds"], left))
+
+
+def install_clock(module, env: dict, clock) -> None:
+    """Every legacy helper bounds its children with `remaining()`; replace it
+    with the guard-deadline remainder read fresh on the guard's clock."""
+    def remaining() -> float:
+        left = work_seconds(env, clock())
+        if left <= 0:
+            raise RuntimeError("work window before the guard's stop reserve is spent")
+        return left
+    module.remaining = remaining
 
 
 # ---------------------------------------------------------------- activation
@@ -763,19 +806,20 @@ def diagnostic(toolchain: str) -> int:
     refuses before the guard starts until a planner binding exists."""
     if toolchain not in TOOLCHAINS:
         print(f"usage: --toolchain {' | '.join(TOOLCHAINS)}", file=sys.stderr)
-        return 2
+        return DIAGNOSTIC_REFUSED
     # Re-check the planner binding inside the guard before any effect; the
     # selector's outer gate already refused if it was absent.
     if not os.environ.get("FOUNDATION_083_BINDING") or not os.environ.get("FOUNDATION_083_BINDING_SHA256"):
         print("refused before any effect: no planner binding issued", file=sys.stderr)
-        return 2
+        return DIAGNOSTIC_REFUSED
     if gate(["--gate", "--binding", os.environ["FOUNDATION_083_BINDING"],
              "--sha256", os.environ["FOUNDATION_083_BINDING_SHA256"]]) != 0:
-        return 2
+        return DIAGNOSTIC_REFUSED
     legacy = load_legacy()
     env = dict(os.environ)
-    legacy.STARTED = time.monotonic()
-    legacy.PROOF_SECONDS = work_seconds(env, time.time_ns())
+    legacy.STARTED = time.monotonic()  # elapsed reporting only
+    install_clock(legacy, env, uptime_ns)
+    legacy.remaining()  # refuse before any effect if the window is already spent
     receipt = {"schema": "oxide.foundation-083/1", "toolchain": toolchain, "qualified": False,
                "guard_sha256": sha256(GUARD), "observed": {}}
     evidence = env.get("OXIDE_PROOF_EVIDENCE")
@@ -824,13 +868,28 @@ def diagnostic(toolchain: str) -> int:
     except BaseException as error:
         receipt["setup_fault"] = f"{type(error).__name__}: {error}"[-TAIL_BYTES:]
     receipt["elapsed_s"] = round(time.monotonic() - legacy.STARTED, 1)
+    status = phase_status(receipt)
+    receipt["phase_status"] = status
+    written = False
     if evidence and os.path.isdir(evidence):
-        with open(os.path.join(evidence, f"foundation-083-{toolchain}.json"), "wb") as handle:
-            handle.write(bounded_receipt(receipt))
-    print(json.dumps({k: receipt.get(k) for k in ("toolchain", "verified", "aborted", "setup_fault", "elapsed_s")}))
+        try:
+            with open(os.path.join(evidence, f"foundation-083-{toolchain}.json"), "wb") as handle:
+                handle.write(bounded_receipt(receipt))
+            written = True
+        except OSError as error:
+            print(f"receipt not written: {error}", file=sys.stderr)
+    print(json.dumps({k: receipt.get(k) for k in ("toolchain", "verified", "aborted", "setup_fault", "elapsed_s", "phase_status")}))
     # Scratch, pool and slots stay inside the guard root for its census; the
     # guard's retention policy owns cleanup. Always nonzero: uncounted.
-    return 1
+    return status if written else DIAGNOSTIC_NO_RECEIPT
+
+
+def phase_status(receipt: dict) -> int:
+    """DONE only for a complete, non-aborted collection; ordinary case
+    failures inside it stay keep-going results in the receipt."""
+    if receipt.get("setup_fault") or receipt.get("aborted") is not False or "cases" not in receipt:
+        return DIAGNOSTIC_INCOMPLETE
+    return DIAGNOSTIC_DONE
 
 
 # ------------------------------------------------------------ pure controls
@@ -1009,8 +1068,30 @@ def self_check() -> int:
           and "CARGO_ENCODED_RUSTFLAGS" not in stage and "OXIDE_POOL" not in stage and "XDG_STATE_HOME" not in stage
           and stage["OXIDE_PROOF_DEADLINE_NS"] == "1" and stage["CARGO_TARGET_DIR"] == "/s")
     check("work window needs the guard deadline", raises(work_seconds, {}, 0))
-    check("work window caps at 270 s", work_seconds({"OXIDE_PROOF_DEADLINE_NS": str(10**15)}, 0) == 270)
-    check("spent deadline leaves 0 s", work_seconds({"OXIDE_PROOF_DEADLINE_NS": "5"}, 10) == 0)
+    up, epoch = 987_654 * 10**9, 1_763_100_000 * 10**9  # synthetic uptime vs an unrelated epoch stamp
+    guard_env = {"OXIDE_PROOF_DEADLINE_NS": str(up + 300 * 10**9)}  # guard: absolute = start + 300 s
+    check("uptime deadline at phase start leaves 300 - 30 reserve", work_seconds(guard_env, up) == 270)
+    check("an epoch stamp is a different domain (the old bug read 0)", work_seconds(guard_env, epoch) == 0)
+    check("late setup leaves only the original remainder minus reserve", work_seconds(guard_env, up + 250 * 10**9) == 20)
+    check("spent window (inside the reserve) leaves 0", work_seconds(guard_env, up + 280 * 10**9) == 0)
+
+    class Fake:
+        pass
+    ticks = [up + 100 * 10**9]
+    fake = Fake()
+    install_clock(fake, guard_env, lambda: ticks[0])
+    check("installed remaining() reads the guard clock fresh", fake.remaining() == 170)
+    ticks[0] = up + 290 * 10**9
+    check("installed remaining() refuses once only the reserve is left", raises(fake.remaining))
+    tree = ast.parse(read("scripts/foundation-rust-1-100.py").decode())
+    diag = ast.unparse(next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "diagnostic"))
+    check("diagnostic installs the guard clock and checks it before effects",
+          "install_clock(legacy, env, uptime_ns)" in diag and diag.index("legacy.remaining()") < diag.index("phase_parent("))
+    check("no wall-clock or reset deadline anywhere in the recipe",
+          not any(isinstance(n, ast.Attribute) and n.attr in ("time_ns", "PROOF_SECONDS") for n in ast.walk(tree)))
+    check("uptime_ns is the guard's clock", "CLOCK_UPTIME_RAW" in ast.unparse(
+          next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "uptime_ns"))
+          and "time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)" in read(GUARD).decode())
 
     head = "a" * 40
     good = json.dumps({"task": "oxide#083", "selector": "proof:foundation:rust-1-100:diagnostic", "head": head, "decision": "d1"})
@@ -1059,7 +1140,26 @@ def self_check() -> int:
     check("two phases' receipts within 32 MiB raw logs", 2 * RECEIPT_BYTES <= LIMITS["raw_log_bytes"])
     check("command: gate first, ordinary guard, original caps", COMMAND.startswith(GATE + " && ")
           and COMMAND.count(f"python3 {GUARD} --limit 300 --scratch-budget-mib 512 -- ") == 2)
-    check("command always ends nonzero (uncounted)", COMMAND.endswith("exit 1; }"))
+    check("phase 1 DONE continues", phase_decision(1, DIAGNOSTIC_DONE) == ("continue", None))
+    for status in (124, 125, 128 + 9, 128 + 15, DIAGNOSTIC_REFUSED, 1, DIAGNOSTIC_INCOMPLETE, DIAGNOSTIC_NO_RECEIPT, 0):
+        check(f"phase 1 status {status} stops with that status", phase_decision(1, status) == ("stop", status))
+    for status in (None, "3", -1, 256, True):
+        check(f"phase 1 malformed status {status!r} stops as 125", phase_decision(1, status) == ("stop", 125))
+    for status in (DIAGNOSTIC_DONE, 124, 125, 137):
+        check(f"phase 2 status {status} is the final exit, not overwritten", phase_decision(2, status) == ("stop", status))
+    between = COMMAND.split(PHASE.format(toolchain=PINNED), 1)[1].split(PHASE.format(toolchain=TESTED), 1)[0]
+    check("shell stops after phase 1 unless DONE", between == f'; s=$?; echo "foundation-083 phase {PINNED} status $s"; '
+          f'[ "$s" -eq {DIAGNOSTIC_DONE} ] || exit "$s"; ')
+    check("shell's final exit is phase 2's own status (no unconditional exit 1)",
+          COMMAND.endswith(f'; s=$?; echo "foundation-083 phase {TESTED} status $s"; exit "$s"; }}') and "exit 1" not in COMMAND)
+    check("DONE is distinct from 0, crash 1, refusal, 124/125 and signals", DIAGNOSTIC_DONE not in (0, 1, 2, 124, 125)
+          and len({DIAGNOSTIC_DONE, DIAGNOSTIC_INCOMPLETE, DIAGNOSTIC_NO_RECEIPT, DIAGNOSTIC_REFUSED}) == 4)
+    check("phase status DONE only for a complete collection", phase_status({"cases": {}, "aborted": False}) == DIAGNOSTIC_DONE)
+    check("case failures inside a closed phase stay DONE (keep-going)",
+          phase_status({"cases": {"a": {"state": "failed"}}, "aborted": False}) == DIAGNOSTIC_DONE)
+    check("aborted collection is INCOMPLETE", phase_status({"cases": {}, "aborted": True}) == DIAGNOSTIC_INCOMPLETE)
+    check("setup fault is INCOMPLETE", phase_status({"setup_fault": "x"}) == DIAGNOSTIC_INCOMPLETE)
+    check("missing collection is INCOMPLETE", phase_status({}) == DIAGNOSTIC_INCOMPLETE)
     declared = re.search(r'\[tasks\."proof:foundation:rust-1-100:diagnostic"\]\nadmission = "heavy"\nrun = \'(.*)\'\n',
                          read("effigy.toml").decode())
     check("effigy selector is heavy and runs exactly COMMAND", bool(declared) and declared.group(1) == COMMAND)

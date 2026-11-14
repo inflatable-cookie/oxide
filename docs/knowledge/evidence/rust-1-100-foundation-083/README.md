@@ -56,20 +56,41 @@ only on nightly 2026-08-05 and gives no 1.100 credit.
 `scripts/foundation-rust-1-100.py`:
 
 - `effigy proof:foundation:rust-1-100:plan`: the effect-free plan.
-- `effigy proof:foundation:rust-1-100:test`: 101 pure controls.
+- `effigy proof:foundation:rust-1-100:test`: 134 pure controls.
 - `effigy proof:foundation:rust-1-100:diagnostic` (heavy): a pre-guard gate,
-  then two separately guarded sequential phases, then `exit 1`.
+  then two separately guarded sequential phases; phase 2 runs only after a
+  positively closed, complete phase 1.
 
 Command (also pinned by the self-check against `effigy.toml`):
 
 ```sh
-python3 scripts/foundation-rust-1-100.py --gate --binding "$FOUNDATION_083_BINDING" --sha256 "$FOUNDATION_083_BINDING_SHA256" && { python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/foundation-rust-1-100.py --diagnostic --toolchain 1.97.1; python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/foundation-rust-1-100.py --diagnostic --toolchain 1.100.0; exit 1; }
+python3 scripts/foundation-rust-1-100.py --gate --binding "$FOUNDATION_083_BINDING" --sha256 "$FOUNDATION_083_BINDING_SHA256" && { python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/foundation-rust-1-100.py --diagnostic --toolchain 1.97.1; s=$?; echo "foundation-083 phase 1.97.1 status $s"; [ "$s" -eq 3 ] || exit "$s"; python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/foundation-rust-1-100.py --diagnostic --toolchain 1.100.0; s=$?; echo "foundation-083 phase 1.100.0 status $s"; exit "$s"; }
 ```
 
 The gate refuses before the guard creates anything unless the planner issued
 a binding JSON (`task`, `selector`, exact `head`, `decision`) with a matching
 SHA-256 and both toolchains are installed. Each phase re-checks the binding
 inside the guard before any effect.
+
+**Clock.** The guard exports `OXIDE_PROOF_DEADLINE_NS` as its absolute
+deadline (start + 300 s) in `CLOCK_UPTIME_RAW` nanoseconds. The phase reads
+the same clock: every legacy `remaining()` is replaced by
+deadline − now − 30 s stop reserve, read fresh at each call. Time spent in
+setup and the gate is charged, nothing is reset, and an already-spent window
+refuses before any effect. (The `dd54af4` source subtracted epoch time from
+that uptime deadline and would have read 0 s before staging.)
+
+**Phase continuation.** The guard passes the command's own status through
+only for a closed run within its bounds; otherwise it returns 124 (deadline),
+125 (fault, refusal, UNCLOSED or missing status) or 128+N (signal). The
+diagnostic returns 3 when it wrote its receipt and the case collection was
+not aborted (ordinary case failures stay keep-going results inside it), 4
+for a setup fault or aborted collection, 5 when no receipt was written and 2
+for a refusal. Phase 2 starts only on status 3 from phase 1; any other status
+stops the selector with that status. The final exit is phase 2's own status,
+so a phase-2 guard fault is never hidden. Each phase prints
+`foundation-083 phase <toolchain> status <n>`. Nothing retries, and the third
+invocation is never spent.
 
 The whole command cannot be shown to fit one 300 s clock: each phase stages
 `oxide` and runs every retained case. It therefore uses the smallest existing
@@ -151,5 +172,5 @@ legacy `/private/tmp` `mktemp`. Fixtures pin 1.97.1 in `rust-toolchain.toml`;
 ## Not run
 
 Every native, the toolchain install, `rust:compile`, `rust:compile-release`,
-`rust:format` and `test rust` (no Rust changed). Run: `:test` (101/101),
+`rust:format` and `test rust` (no Rust changed). Run: `:test` (134/134),
 `:plan`, `docs:check`.
