@@ -56,7 +56,7 @@ only on nightly 2026-08-05 and gives no 1.100 credit.
 `scripts/foundation-rust-1-100.py`:
 
 - `effigy proof:foundation:rust-1-100:plan`: the effect-free plan.
-- `effigy proof:foundation:rust-1-100:test`: 95 pure controls.
+- `effigy proof:foundation:rust-1-100:test`: 101 pure controls.
 - `effigy proof:foundation:rust-1-100:diagnostic` (heavy): a pre-guard gate,
   then two separately guarded sequential phases, then `exit 1`.
 
@@ -127,10 +127,12 @@ receipt ≤ 1 MiB. Owned bytes are checked after every case against 512 MiB and
 the 20 GiB reserve is sampled before and after every case; the guard's own
 monitor is the continuous bound. Probe Cargo calls are counted against 8
 (2 version + baseline + 4 rebuilds = 7; the version pair is the tested
-toolchain identity check). Plain Cargo calls inside the focused invocations
-(staging and builder identity, `generate-lockfile` per fixture, routing's
-plain `cargo test`, one plain `cargo check` per layout case and the legacy
-freshness calls) are bounded by the phase guard like the original proofs and
+toolchain identity check). The 90 s probe window starts when the probe case
+starts, after staging and the other cases, and each probe call's timeout is
+clipped to what is left of it. Plain Cargo calls inside the focused invocations
+(staging and builder identity, the 1.97.1 fixture identity pair,
+`generate-lockfile` per fixture, routing's plain `cargo test` and one plain
+`cargo check` per layout case) are bounded by the phase guard like the original proofs and
 listed by `:plan`. Two receipts stay inside the 32 MiB
 raw-log budget. Nothing is deleted in-script: pool, slots and staging stay in
 the guard root for its post-leader census. The toolchain install footprint is
@@ -149,5 +151,5 @@ legacy `/private/tmp` `mktemp`. Fixtures pin 1.97.1 in `rust-toolchain.toml`;
 ## Not run
 
 Every native, the toolchain install, `rust:compile`, `rust:compile-release`,
-`rust:format` and `test rust` (no Rust changed). Run: `:test` (95/95),
+`rust:format` and `test rust` (no Rust changed). Run: `:test` (101/101),
 `:plan`, `docs:check`.

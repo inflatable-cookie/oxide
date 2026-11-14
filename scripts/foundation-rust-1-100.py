@@ -132,9 +132,10 @@ PROBES = (
 # not by the 8-call probe cap, and are listed so nothing is hidden.
 IN_PLANE_CARGO = (
     ("both", "staging: cargo -V, rustc -V of the 1.97.1 builder, one `cargo build --locked --offline`"),
-    ("both", "commit_lock: `cargo generate-lockfile --offline` per fixture (app, gated or gated-fallback)"),
+    ("1.97.1", "fixture toolchain identity: cargo -V, rustc -V under RUSTUP_TOOLCHAIN=1.97.1"),
+    ("both", "commit_lock: `cargo generate-lockfile --offline` per fixture (app; gated in freshness-gate or gated-fallback)"),
     ("both", "routing: one plain `cargo test` for the exit-code comparison"),
-    ("1.97.1", "freshness-gate: legacy prove_freshness plain calls; layout: one plain `cargo check --offline`"),
+    ("1.97.1", "layout: one plain `cargo check --offline`"),
     ("1.100.0", "layout-observation: one plain `cargo check --offline`"),
 )
 
@@ -654,8 +655,19 @@ def reshape_v2_dep_info(roots: list, dest: str) -> int:
     return count
 
 
+def probe_gate(calls_made: int, started: float, now: float) -> float:
+    """The probe's own budget: at most 8 Cargo calls (the tested toolchain's
+    version pair is charged up front) and a 90 s window that starts when the
+    probe case starts, not at phase start. Returns the seconds left."""
+    left = LIMITS["probe_seconds_aggregate"] - (now - started)
+    if calls_made >= LIMITS["probe_cargo_calls_per_participant"] or left <= 0:
+        raise RuntimeError(f"probe call or time budget exhausted ({calls_made} calls, {now - started:.1f} s)")
+    return left
+
+
 def case_probes(legacy, runner, app, ctx) -> None:
     calls = ctx["probe_calls"]
+    started = time.monotonic()
     root = tempfile.mkdtemp(prefix="probe-", dir=runner.parent)
     with open(os.path.join(root, "Cargo.toml"), "w", encoding="utf-8") as handle:
         handle.write('[package]\nname = "rcgu"\nversion = "0.1.0"\nedition = "2021"\n')
@@ -663,11 +675,10 @@ def case_probes(legacy, runner, app, ctx) -> None:
     main = os.path.join(root, "src", "main.rs")
 
     def cargo(args: list) -> subprocess.CompletedProcess:
-        if calls[0] >= LIMITS["probe_cargo_calls_per_participant"] or time.monotonic() - ctx["probe_start"] > LIMITS["probe_seconds_aggregate"]:
-            legacy.fail("probe call or time budget exhausted")
+        left = probe_gate(calls[0], started, time.monotonic())
         calls[0] += 1
         return subprocess.run(["cargo", *args], cwd=root, env=runner.environment({"CARGO_TARGET_DIR": os.path.join(root, "target")}),
-                              capture_output=True, text=True, timeout=min(60, legacy.remaining()))
+                              capture_output=True, text=True, timeout=min(60, left, legacy.remaining()))
 
     counts = []
     for step in range(5):
@@ -678,6 +689,7 @@ def case_probes(legacy, runner, app, ctx) -> None:
         counts.append(sum(1 for _, _, files in os.walk(os.path.join(root, "target")) for f in files if f.endswith(".rcgu.o")))
     size = legacy.tree_bytes(root, False)
     ctx["observed"]["rcgu_counts"] = counts
+    ctx["observed"]["probe_seconds"] = round(time.monotonic() - started, 1)
     ctx["observed"]["probe_bytes"] = size
     if size > LIMITS["probe_scratch_bytes"]:
         legacy.fail(f"probe scratch {size} exceeds 64 MiB")
@@ -793,7 +805,7 @@ def diagnostic(toolchain: str) -> int:
         legacy.git(app, "add", "-A")
         legacy.git(app, "commit", "--quiet", "-m", "fixture")
         ctx = {"identity": identity, "verified": verified, "decoder": executables["dep_info_matrix"],
-               "observed": receipt["observed"], "probe_calls": [2], "probe_start": time.monotonic()}
+               "observed": receipt["observed"], "probe_calls": [2]}
 
         def run_case(key: str) -> None:
             body = CASE_BODIES.get(key) or (lambda r, a, c, f=legacy_body(legacy, key): f(r, a, c))
@@ -1031,9 +1043,19 @@ def self_check() -> int:
     big = bounded_receipt({"cases": {"x": {"state": "failed", "reason": "r"}}, "observed": {"blob": "x" * (2 * MIB)}})
     check("receipt is bounded to 1 MiB", len(big) <= RECEIPT_BYTES and b'"truncated": true' in big)
 
+    check("probe window starts at the probe case: fresh window admits", probe_gate(2, 1000.0, 1000.0) == 90)
+    check("probe window: late phase start is irrelevant", probe_gate(2, 5000.0, 5010.0) == 80)
+    check("probe window: 90 s spent refuses", raises(probe_gate, 3, 1000.0, 1090.0))
+    check("probe calls: the 9th refuses", raises(probe_gate, 8, 0.0, 1.0))
+    check("probe calls: 2 identity + 5 builds stays within 8", probe_gate(6, 0.0, 1.0) > 0)
+    probe_src = ast.unparse(next(n for n in ast.parse(read("scripts/foundation-rust-1-100.py").decode()).body
+                                 if isinstance(n, ast.FunctionDef) and n.name == "case_probes"))
+    check("case_probes stamps its own window and uses probe_gate",
+          "started = time.monotonic()" in probe_src and "probe_gate(" in probe_src and "probe_start" not in probe_src)
+
     alloc = allocation()
     check("at most three focused invocations, selector spends two", alloc["focused_invocations"] <= 3 and COMMAND.count("--diagnostic") == 2)
-    check("probe calls within 8 (rcgu baseline + four = 5)", alloc["probe_cargo_calls"] <= 8 and alloc["rcgu_calls"] == 5)
+    check("probe calls total 7 of 8 (rcgu baseline + four = 5)", alloc["probe_cargo_calls"] == 7 and alloc["rcgu_calls"] == 5)
     check("two phases' receipts within 32 MiB raw logs", 2 * RECEIPT_BYTES <= LIMITS["raw_log_bytes"])
     check("command: gate first, ordinary guard, original caps", COMMAND.startswith(GATE + " && ")
           and COMMAND.count(f"python3 {GUARD} --limit 300 --scratch-budget-mib 512 -- ") == 2)
@@ -1058,8 +1080,10 @@ def self_check() -> int:
 def allocation() -> dict:
     return {
         "focused_invocations": len([i for i in INVOCATIONS if i[1] != "spare"]),
-        "probe_cargo_calls": 1 + sum(calls for _, _, calls in PROBES),  # +1: the probe crate needs no lock call
-        "rcgu_calls": 1 + dict((k, c) for k, _, c in PROBES)["rcgu"],
+        "probe_cargo_calls": sum(calls for _, _, calls in PROBES),
+        # baseline build + four rebuilds; the probe crate has no dependencies
+        # and no lock call
+        "rcgu_calls": dict((k, c) for k, _, c in PROBES)["plain build"] + dict((k, c) for k, _, c in PROBES)["rcgu"],
     }
 
 
