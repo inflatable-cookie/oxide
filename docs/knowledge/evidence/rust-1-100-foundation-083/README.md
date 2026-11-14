@@ -223,8 +223,10 @@ clipped to what is left of it. Plain Cargo calls inside the focused invocations
 `cargo check` per layout case) are bounded by the phase guard like the original proofs and
 listed by `:plan`. Two receipts stay inside the 32 MiB
 raw-log budget. Nothing is deleted in-script: pool, slots and staging stay in
-the guard root for its post-leader census. The toolchain install footprint is
-reported separately when the install runs.
+the guard root for its post-leader census. The toolchain install footprint
+(473,039,609 B logical, 480,686,080 B allocated, internal Data volume; APFS
+point observations, not a peak) belongs to the separate install authority and
+is not proof scratch.
 
 ### Premise checklist
 
@@ -238,6 +240,7 @@ legacy `/private/tmp` `mktemp`. Fixtures pin 1.97.1 in `rust-toolchain.toml`;
 
 ## Not run
 
-Every native, the toolchain install, `rust:compile`, `rust:compile-release`,
-`rust:format` and `test rust` (no Rust changed). Run: `:test` (186/186),
+Every native, including the single diagnostic, plus `rust:compile`,
+`rust:compile-release`, `rust:format` and `test rust` (no Rust changed). The
+one approved install already ran at `b9138a6` and is not repeated. Run: `:test` (186/186),
 `:plan`, `docs:check`.
