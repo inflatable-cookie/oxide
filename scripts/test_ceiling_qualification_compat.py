@@ -127,6 +127,11 @@ class BootstrapBounds(unittest.TestCase):
                 b.drain_capture(7, sink, 20)
         select_call.assert_not_called()
         sink.seal.assert_not_called()
+        with mock.patch.object(b, "now_ns", side_effect=[10, 10, 10, 20]), \
+             mock.patch.object(b.select, "select", return_value=([7], [], [])), \
+             mock.patch.object(b.os, "read", return_value=b""):
+            with self.assertRaises(TimeoutError):
+                b.drain_capture(7, sink, 20)
 
     def test_bounded_command_drains_both_streams_and_preserves_unknown(self):
         b = self.bootstrap

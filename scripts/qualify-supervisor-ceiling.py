@@ -329,7 +329,10 @@ def drain_capture(fd, sink, deadline_ns):
         if not chunk:
             if now_ns() >= deadline_ns:
                 raise TimeoutError("capture deadline expired before final flush")
-            return sink.seal()
+            record = sink.seal()
+            if now_ns() >= deadline_ns:
+                raise TimeoutError("capture final flush exceeded deadline")
+            return record
         sink.write(chunk)
 
 
@@ -426,6 +429,8 @@ def copy_source_input(source, target, deadline_ns, limit):
                 raise TimeoutError("source snapshot deadline expired before flush")
             outgoing.flush()
             os.fsync(outgoing.fileno())
+    if now_ns() >= deadline_ns:
+        raise TimeoutError("source snapshot flush exceeded deadline")
     return {"bytes": total, "sha256": digest.hexdigest()}
 
 
@@ -465,6 +470,8 @@ def snapshot_source_inputs(destination, deadline_ns):
             raise OSError("partial Git entry copy")
         outgoing.flush()
         os.fsync(outgoing.fileno())
+    if now_ns() >= deadline_ns:
+        raise TimeoutError("Git entry copy exceeded deadline")
     result["entries"] = {"bytes": len(entries), "sha256": hashlib.sha256(entries).hexdigest()}
     return result
 
