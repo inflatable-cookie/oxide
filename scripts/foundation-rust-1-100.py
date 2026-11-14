@@ -114,9 +114,9 @@ CASES = (
     ("crash-recovery", ("profiles",), "both", "legacy.prove_recovery", "reused: state.json records/recoveries + ledger lease_id"),
     ("group-gone", ("crash-recovery",), "both", "legacy.prove_group_gone", "reused: state.json records"),
     ("freshness-gate", (), "verified", "legacy.prove_freshness (+prove_gate_crash)", "reused: verified Cargo only"),
-    ("layout", ("freshness-gate",), "verified", "legacy.prove_layout", "reused: payload/slots walk, stray none/holds, decoder"),
+    ("layout", ("freshness-gate",), "verified", "case_layout", "legacy.prove_layout with stray read via `status --measure` (recorded status measures nothing)"),
     ("fallback", (), "unverified", "case_fallback", "rewritten from prove_fallback for the tested Cargo itself"),
-    ("layout-observation", ("fallback",), "unverified", "case_layout_observation", "new: stray unknown, observed dirs, shipped decoder over v1 and reshaped v2 dep-info"),
+    ("layout-observation", ("fallback",), "unverified", "case_layout_observation", "new: measured stray holds-or-unknown (never none), observed dirs, shipped decoder over v1 and reshaped v2 dep-info"),
     ("probes", (), "tested", "case_probes", "new: version, plain build, rcgu x4 within 8 Cargo calls"),
 )
 
@@ -125,6 +125,17 @@ PROBES = (
     ("version", "cargo -V and rustc -V", 2),
     ("plain build", "baseline `cargo build --offline` of the tiny crate (stray, dep-info, rcgu baseline)", 1),
     ("rcgu", "four rebuilds after touching src/main.rs", 4),
+)
+
+# Plain Cargo calls INSIDE the focused invocations (as in the original
+# rust:oxide-cli / cargo-matrix proofs). They are bounded by the phase guard,
+# not by the 8-call probe cap, and are listed so nothing is hidden.
+IN_PLANE_CARGO = (
+    ("both", "staging: cargo -V, rustc -V of the 1.97.1 builder, one `cargo build --locked --offline`"),
+    ("both", "commit_lock: `cargo generate-lockfile --offline` per fixture (app, gated or gated-fallback)"),
+    ("both", "routing: one plain `cargo test` for the exit-code comparison"),
+    ("1.97.1", "freshness-gate: legacy prove_freshness plain calls; layout: one plain `cargo check --offline`"),
+    ("1.100.0", "layout-observation: one plain `cargo check --offline`"),
 )
 
 # Product text the oracles depend on; each must exist in source.
@@ -157,7 +168,7 @@ PREMISES = (
 UNVERIFIED_FACTS = (
     "fixture rust-toolchain.toml pins 1.97.1; RUSTUP_TOOLCHAIN in the fixture env overrides it (rustup precedence)",
     "dep_info_matrix only finds .fingerprint/<unit>/dep-*; v2 files (build/<pkg>/<meta>/fingerprint/dep-*, Cargo 3acc79c0c layout.rs) are copied unchanged into that shape for the shipped decoder; zero found is insufficient, never a pass",
-    "layout v2 creates no <profile>/deps or .fingerprint but still <profile>/incremental (Cargo 3acc79c0c BuildDirLayout::prepare); stray detection for an unverified Cargo reports unknown regardless",
+    "layout v2 creates no <profile>/deps or .fingerprint but still <profile>/incremental (Cargo 3acc79c0c BuildDirLayout::prepare); for an unverified Cargo report_stray prints holds when incremental/ has files, else unknown, never none; the observation records which",
     "fit is UNMEASURED: historical rust:oxide-cli (65 s) and cargo-matrix (33-67 s) ran on the retired image pool and give no current figure",
 )
 
@@ -207,7 +218,10 @@ def ledger_view(pool: str) -> dict:
         if not isinstance(row, dict) or not isinstance(row.get("id"), int) or not isinstance(row.get("state"), str) \
                 or "lease_id" not in row:
             raise LedgerError(f"ledger.json slot row is partial: {row!r}"[:300])
-    return {"slots": slots, "coverage": None}
+    # The retired CLI's rows named the slot `slot_id` (a string); the ledger
+    # names it `id` (an integer). Reused helpers read `slot_id`, so each row
+    # gets that alias; the product's recovery line prints the same number.
+    return {"slots": [{**row, "slot_id": str(row["id"])} for row in slots], "coverage": None}
 
 
 def control_state(pool: str) -> dict:
@@ -434,6 +448,13 @@ def case_routing(legacy, runner, app, ctx) -> None:
         legacy.fail(f"run --bin other output {stdout!r}")
     if any(slot["state"] != "idle" for slot in ledger_view(runner.pool)["slots"]):
         legacy.fail("run left a slot held after executing the program")
+    virtual = os.path.join(runner.parent, "checkouts", "virtual")
+    legacy.write_fixture(virtual, legacy.VIRTUAL)
+    for cwd, want in ((virtual, "virtual app"), (os.path.join(virtual, "tool"), "virtual tool")):
+        code, stdout, stderr = runner.run(cwd, ["run"])
+        legacy.expect(code, 0, f"run from {cwd}", stderr)
+        if stdout.strip() != want:
+            legacy.fail(f"default-run from {cwd} output {stdout!r}")
     ledger = os.path.join(runner.pool, "ledger.json")
     with open(ledger, "rb") as handle:
         before = handle.read()
@@ -495,6 +516,64 @@ def case_clean_cross(legacy, runner, app, ctx) -> None:
     ctx["app2"] = app2
 
 
+STRAY_PREFIX = "stray Cargo output:"
+
+
+def stray_measured(legacy, runner, cwd: str, label: str) -> str:
+    """The stray line comes only from `oxide status --measure`: recorded
+    status prints `not measured by status` (main.rs print_checkout)."""
+    code, stdout, stderr = runner.run(cwd, ["status", "--measure"])
+    legacy.expect(code, 0, f"status --measure {label}", stderr)
+    return stray_line_of(stdout)
+
+
+def stray_line_of(stdout: str) -> str:
+    lines = [line for line in stdout.splitlines() if line.startswith(STRAY_PREFIX)]
+    if len(lines) != 1:
+        raise RuntimeError(f"expected one stray line, got {len(lines)}")
+    if "not measured by status" in lines[0] or "scan unavailable" in lines[0] or "(partial scan)" in lines[0]:
+        raise RuntimeError(f"stray line is not a complete measurement: {lines[0]}")
+    return lines[0]
+
+
+def unverified_stray_ok(line: str, target: str, cargo: str) -> str:
+    """For an unverified Cargo, report_stray prints `holds` when deps/ or
+    incremental/ holds files (layout v2 keeps <profile>/incremental) and
+    `unknown` otherwise; `none` is never valid. Returns which."""
+    if line.startswith(f"{STRAY_PREFIX} {target} holds plain-Cargo deps/ or incremental/ ("):
+        return "holds"
+    if line.startswith(f"{STRAY_PREFIX} unknown in {target} ({cargo} is not a Cargo release"):
+        return "unknown"
+    raise RuntimeError(f"unverified Cargo stray line is neither holds nor unknown: {line}")
+
+
+def case_layout(legacy, runner, app, ctx) -> None:
+    """legacy.prove_layout with the stray reads through `status --measure`."""
+    root = os.path.join(runner.parent, "gated")
+    a, c = os.path.join(root, "a"), os.path.join(root, "c")
+    leaked = [path for path in legacy.walk_dirs(os.path.join(a, "target"), {"deps", "incremental", ".fingerprint"})
+              if any(files for _, _, files in os.walk(path))]
+    if leaked:
+        legacy.fail(f"build.build-dir was not effective; intermediates in target: {leaked}")
+    slots = os.path.join(runner.pool, "payload", "slots")
+    units = legacy.walk_dirs(slots, {".fingerprint", "deps"})
+    if not any(p.endswith(".fingerprint") for p in units) or not any(p.endswith("deps") for p in units):
+        legacy.fail(f"slot build directories lack deps/ or .fingerprint/: {units}")
+    line = stray_measured(legacy, runner, a, "after oxide only")
+    ctx["observed"]["stray_oxide_only"] = line
+    if not line.startswith(f"{STRAY_PREFIX} none "):
+        legacy.fail(f"verified Cargo with only Oxide output did not report none: {line}")
+    legacy.decode_dep_info(runner, ctx["decoder"], slots, "slots")
+    plain = subprocess.run(["cargo", "check", "--offline"], cwd=c, env=runner.environment(None),
+                           capture_output=True, text=True, timeout=min(120, legacy.remaining()))
+    legacy.expect(plain.returncode, 0, "plain cargo check", plain.stderr)
+    line = stray_measured(legacy, runner, c, "after plain cargo")
+    ctx["observed"]["stray_plain"] = line
+    if "holds plain-Cargo deps/ or incremental/" not in line:
+        legacy.fail(f"plain Cargo output was not reported as stray: {line}")
+    legacy.decode_dep_info(runner, ctx["decoder"], os.path.join(c, "target"), "plain target")
+
+
 def case_fallback(legacy, runner, app, ctx) -> None:
     root = os.path.join(runner.parent, "gated-fallback")
     a, b = os.path.join(root, "a"), os.path.join(root, "b")
@@ -525,13 +604,11 @@ def case_layout_observation(legacy, runner, app, ctx) -> None:
     plain = subprocess.run(["cargo", "check", "--offline"], cwd=a, env=runner.environment(None),
                            capture_output=True, text=True, timeout=min(120, legacy.remaining()))
     legacy.expect(plain.returncode, 0, "plain cargo check", plain.stderr)
-    _, stdout, _ = runner.run(a, ["status"])
-    line = next((x for x in stdout.splitlines() if x.startswith("stray Cargo output:")), "")
-    ctx["observed"]["stray"] = line
-    if not line.startswith(f"stray Cargo output: unknown in {a}/target ({ctx['identity'][0]} is not a Cargo release"):
-        legacy.fail(f"unverified Cargo did not report stray output as unknown: {line}")
     layout = {name: bool(legacy.walk_dirs(os.path.join(a, "target"), {name})) for name in ("deps", "incremental", ".fingerprint", "build")}
     ctx["observed"]["plain_layout_dirs"] = layout
+    line = stray_measured(legacy, runner, a, "unverified plain cargo")
+    ctx["observed"]["stray"] = line
+    ctx["observed"]["stray_kind"] = unverified_stray_ok(line, os.path.join(a, "target"), ctx["identity"][0])
     shaped = reshape_v2_dep_info([os.path.join(a, "target"), os.path.join(runner.pool, "payload", "slots")],
                                  os.path.join(runner.parent, "dep-info-v2"))
     ctx["observed"]["v2_dep_info_files"] = shaped
@@ -609,7 +686,7 @@ def case_probes(legacy, runner, app, ctx) -> None:
 CASE_BODIES = {
     "profiles": case_profiles, "routing": case_routing, "status": case_status,
     "clean-cross-checkout": case_clean_cross, "fallback": case_fallback,
-    "layout-observation": case_layout_observation, "probes": case_probes,
+    "layout-observation": case_layout_observation, "probes": case_probes, "layout": case_layout,
 }
 
 
@@ -623,7 +700,6 @@ def legacy_body(legacy, key: str):
         "crash-recovery": lambda r, app, ctx: legacy.prove_recovery(r, app),
         "group-gone": lambda r, app, ctx: legacy.prove_group_gone(r, app),
         "freshness-gate": lambda r, app, ctx: legacy.prove_freshness(r),
-        "layout": lambda r, app, ctx: legacy.prove_layout(r, ctx["decoder"]),
     }
     return table[key]
 
@@ -781,6 +857,12 @@ def legacy_refusals() -> dict:
     return found
 
 
+def legacy_names() -> set:
+    tree = ast.parse(read(LEGACY).decode())
+    return {target.id for node in tree.body if isinstance(node, ast.Assign) for target in node.targets
+            if isinstance(target, ast.Name)} | {"STARTED", "PROOF_SECONDS"}
+
+
 def legacy_reads_retired(name: str) -> bool:
     """Whether a legacy helper calls the retired lease CLI (`program=runner.lease`
     or a standalone lease helper) directly rather than via the shimmed readers."""
@@ -825,9 +907,32 @@ def self_check() -> int:
     for _, _, _, body, _ in CASES:
         for name in re.findall(r"legacy\.(\w+)", body) + re.findall(r"\+(prove_\w+)", body):
             check(f"legacy {name} exists and avoids retired surfaces", name in functions(LEGACY) and not legacy_reads_retired(name))
-    for name in ("prove_native", "prove_routing", "prove_fallback"):
+    for name in ("prove_native", "prove_routing", "prove_fallback", "prove_layout", "stray_line"):
         check(f"legacy {name} is replaced, not reused", not any(name in b for _, _, _, b, _ in CASES))
     check("legacy prove_routing/native carry retired text (why rewritten)", legacy_reads_retired("prove_native"))
+    main_text = read(MAIN).decode()
+    check("recorded status measures no stray output (why --measure)",
+          'println!("stray Cargo output: not measured by status; use `oxide status --measure`");' in main_text)
+    check("legacy stray_line reads recorded status (why not reused)", "['status']" in ast.unparse(
+        next(n for n in ast.parse(read(LEGACY).decode()).body if isinstance(n, ast.FunctionDef) and n.name == "stray_line")))
+    used = {node.attr for node in ast.walk(ast.parse(read("scripts/foundation-rust-1-100.py").decode()))
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "legacy"}
+    check("no foundation case calls legacy stray_line/prove_layout", not used & {"stray_line", "prove_layout", "prove_fallback"})
+    check("every legacy attribute used exists in the legacy source", used <= functions(LEGACY) | legacy_names())
+    check("product recovery line matches the reused oracle", '"oxide: recovered slot {} after oxide pid {} died ({})"' in read("src/bin/oxide/store.rs").decode())
+    t, cargo = "/w/a/target", "cargo 1.100.0 (3acc79c0c 2026-11-05)"
+    check("unverified stray: holds accepted", unverified_stray_ok(
+        f"stray Cargo output: {t} holds plain-Cargo deps/ or incremental/ (3 files, 0 MiB); `oxide clean` removes it", t, cargo) == "holds")
+    check("unverified stray: unknown accepted", unverified_stray_ok(
+        f"stray Cargo output: unknown in {t} ({cargo} is not a Cargo release Oxide verified; its layout is unchecked)", t, cargo) == "unknown")
+    check("unverified stray: none refused", raises(unverified_stray_ok, f"stray Cargo output: none in {t}", t, cargo))
+    check("unverified stray: other target refused", raises(unverified_stray_ok,
+          f"stray Cargo output: /x/target holds plain-Cargo deps/ or incremental/ (1 files, 0 MiB)", t, cargo))
+    for bad in ("outputs: x\n", "stray Cargo output: not measured by status; use `oxide status --measure`\n",
+                "stray Cargo output: scan unavailable (e)\n", "stray Cargo output: none in /t (partial scan)\n",
+                "stray Cargo output: none in /t\nstray Cargo output: none in /u\n"):
+        check(f"stray line refused: {bad[:40]!r}", raises(stray_line_of, bad))
+    check("one complete stray line accepted", stray_line_of("pool: p\nstray Cargo output: none in /t\n") == "stray Cargo output: none in /t")
     for _, _, rel, symbol in PREMISES:
         if rel:
             check(f"premise source {symbol} exists", symbol in functions(rel) or symbol in read(rel).decode())
@@ -844,6 +949,7 @@ def self_check() -> int:
         check("missing ledger refuses", raises(ledger_view, pool))
         put(ledger, '{"version":1,"slots":[{"id":3,"state":"idle","lease_id":null,"dir":"app-1/quick-3"}]}')
         check("valid ledger reads", ledger_view(pool)["slots"][0]["id"] == 3)
+        check("ledger rows carry the slot_id alias reused helpers read", ledger_view(pool)["slots"][0]["slot_id"] == "3")
         check("slot dir comes from the recorded nested dir", slot_dir(pool, "3").endswith("payload/slots/app-1/quick-3"))
         check("unknown slot refuses", raises(slot_dir, pool, "9"))
         put(ledger, '{"version":1,"slots":[{"id":3,"state":"idle","lease_id":null,"dir":"../x"}]}')
@@ -974,7 +1080,11 @@ def plan() -> int:
     for key, what, calls in PROBES:
         print(f"  {key}: {what} ({calls})")
     alloc = allocation()
-    print(f"  total {alloc['probe_cargo_calls']} of 8 calls (rcgu {alloc['rcgu_calls']}), 90 s, 64 MiB")
+    print(f"  total {alloc['probe_cargo_calls']} of 8 calls (rcgu {alloc['rcgu_calls']}), 90 s, 64 MiB;"
+          " the version pair is the tested toolchain identity check")
+    print("plain Cargo calls inside the focused invocations (guard-bounded, not probe calls):")
+    for chain, what in IN_PLANE_CARGO:
+        print(f"  {chain}: {what}")
     print("allocation per phase (ceilings, not measurements): staging target + copied oxide, private CARGO_HOME,")
     print("  directory pool (OXIDE_POOL_CAP 128 MiB), fixtures <= 8 MiB, probe <= 64 MiB, receipt <= 1 MiB;")
     print("  owned bytes checked after every case against 512 MiB; 20 GiB reserve sampled before and after every case")

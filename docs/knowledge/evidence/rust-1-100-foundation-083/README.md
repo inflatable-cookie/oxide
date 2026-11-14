@@ -43,7 +43,7 @@ without incremental leaves neither under v2, so a verified 1.100 would print
 `build/<pkg>/<meta>/fingerprint/`. Making 1.100 verified therefore needs a
 layout-v2-aware detection change and a gate path review — a freshness-adjacent
 change outside this task's tiny-correction scope. Until then the shipped
-behaviour on 1.100 is the fallback: affine slots, stray `unknown`. That is
+behaviour on 1.100 is the fallback: affine slots, and stray output reads `holds` (incremental files) or `unknown`, never `none`. That is
 what the recipe tests.
 
 ## Prior input
@@ -56,7 +56,7 @@ only on nightly 2026-08-05 and gives no 1.100 credit.
 `scripts/foundation-rust-1-100.py`:
 
 - `effigy proof:foundation:rust-1-100:plan`: the effect-free plan.
-- `effigy proof:foundation:rust-1-100:test`: 78 pure controls.
+- `effigy proof:foundation:rust-1-100:test`: 95 pure controls.
 - `effigy proof:foundation:rust-1-100:diagnostic` (heavy): a pre-guard gate,
   then two separately guarded sequential phases, then `exit 1`.
 
@@ -85,7 +85,7 @@ figure.
 | Case | Toolchains | Body | Origin |
 | --- | --- | --- | --- |
 | profiles | both | `case_profiles` | rewritten from `prove_native`: no APFS init/cap conflict, binary at `target/debug` (oxide#160), budget-only summary |
-| routing | both | `case_routing` | rewritten from `prove_routing`: external `$CARGO` build dir from the ledger's recorded slot dir (oxide#104), test/run exits, passthrough and refusals leave the ledger unchanged |
+| routing | both | `case_routing` | rewritten from `prove_routing`: external `$CARGO` build dir from the ledger's recorded slot dir (oxide#104), test/run exits, virtual-workspace and member `default-run`, passthrough and refusals leave the ledger unchanged |
 | status | both | `case_status` | rewritten: current `slot_line` format, default status writes nothing |
 | clean-cross-checkout | both | `case_clean_cross` | rewritten from `prove_native` tail: clean detaches affinity; second checkout shares through the gate (verified) or stays affine (unverified); old project-cap-of-2 oracle dropped (cap is 12 since oxide#118) |
 | waiting | both | `prove_waiting`, `prove_clean_waits` | reused |
@@ -93,13 +93,15 @@ figure.
 | crash-recovery | both | `prove_recovery` | reused |
 | group-gone | both | `prove_group_gone` | reused |
 | freshness-gate | 1.97.1 | `prove_freshness` (+`prove_gate_crash`) | reused, verified Cargo only |
-| layout | 1.97.1 | `prove_layout` | reused |
+| layout | 1.97.1 | `case_layout` | `prove_layout` with the stray line read from `oxide status --measure` |
 | fallback | 1.100.0 | `case_fallback` | rewritten from `prove_fallback` for the tested Cargo itself (no third toolchain) |
-| layout-observation | 1.100.0 | `case_layout_observation` | new: stray `unknown`, observed plain-target dirs, shipped decoder over v1 and reshaped v2 dep-info |
+| layout-observation | 1.100.0 | `case_layout_observation` | new: measured stray `holds` or `unknown` (never `none`), observed plain-target dirs, shipped decoder over v1 and reshaped v2 dep-info |
 | probes | 1.100.0 | `case_probes` | new: rcgu baseline + four rebuilds |
 
 Reused helpers run through a `legacy.Runner` subclass whose `lease_status()`
-reads `ledger.json` and whose `state()` reads `oxide-managed/state.json`; the
+reads `ledger.json` (each row also carries the retired CLI's `slot_id` name,
+which `prove_recovery` reads) and whose `state()` reads
+`oxide-managed/state.json`; the
 self-check proves none of them calls the retired lease CLI, a standalone
 lease, `hdiutil` or APFS text. Dropped: the standalone-lease-never-recovered
 sub-case and the APFS backend/cap paragraphs, whose product surfaces were
@@ -110,6 +112,13 @@ The v2 dep-info files are copied byte for byte into
 finds them; no Rust or decoder change. Zero files found is insufficient,
 never a pass.
 
+Stray lines are read only from `oxide status --measure`: recorded status
+prints `not measured by status` (`main.rs` `print_checkout`). On an
+unverified Cargo `report_stray` prints `holds` when `deps/` or `incremental/`
+holds files, else `unknown`. Layout v2 still creates `<profile>/incremental`,
+so a dev-profile plain build may read `holds`; the oracle accepts either,
+refuses `none`, and records which.
+
 ### Allocation (ceilings, not measurements)
 
 Per phase: staging target and copied `oxide`, private `CARGO_HOME`,
@@ -117,7 +126,12 @@ directory pool (`OXIDE_POOL_CAP=128MiB`), fixtures ≤ 8 MiB, probe ≤ 64 MiB,
 receipt ≤ 1 MiB. Owned bytes are checked after every case against 512 MiB and
 the 20 GiB reserve is sampled before and after every case; the guard's own
 monitor is the continuous bound. Probe Cargo calls are counted against 8
-(2 version + baseline + 4 rebuilds = 7). Two receipts stay inside the 32 MiB
+(2 version + baseline + 4 rebuilds = 7; the version pair is the tested
+toolchain identity check). Plain Cargo calls inside the focused invocations
+(staging and builder identity, `generate-lockfile` per fixture, routing's
+plain `cargo test`, one plain `cargo check` per layout case and the legacy
+freshness calls) are bounded by the phase guard like the original proofs and
+listed by `:plan`. Two receipts stay inside the 32 MiB
 raw-log budget. Nothing is deleted in-script: pool, slots and staging stay in
 the guard root for its post-leader census. The toolchain install footprint is
 reported separately when the install runs.
@@ -135,5 +149,5 @@ legacy `/private/tmp` `mktemp`. Fixtures pin 1.97.1 in `rust-toolchain.toml`;
 ## Not run
 
 Every native, the toolchain install, `rust:compile`, `rust:compile-release`,
-`rust:format` and `test rust` (no Rust changed). Run: `:test` (78/78),
+`rust:format` and `test rust` (no Rust changed). Run: `:test` (95/95),
 `:plan`, `docs:check`.
