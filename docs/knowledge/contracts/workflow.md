@@ -2353,8 +2353,8 @@ monitor stubs with substituted I/O. No apparatus execution, qualification or ado
 source. Tom's `775190c6` ceiling and separate `a833` guest-clock rulings remain
 distinct; native occurrences require the separate owner activations.
 The candidate digest is `4aba8be3120abc67a0a9b4df6793bbc2b74ece79199f56bbfa355fed368231e0`;
-the pin manifest digest is `6d208a63e0539718e4e45de260d6bfb54af8dcc4c8c7dbfda00fbb6a1e117d54`.
-The bootstrap digest is `cd2cc49ccfee7ddc0faf24dbb8f2cb1234819f2affdc3a2562d1e0c31f0b5048`. The manifest records the full suite digest
+the pin manifest digest is `2dce1a04b029a263a6b94641dc9dd6f916d660235170f8b82ed7fc2c4e64dc44`.
+The bootstrap digest is `365529e4ba0f3f17474128dd2f4fe91c7dcf46a83030b088441065cc1c4f6813`. The manifest records the full suite digest
 alongside the unchanged `fcfda2b0` ordinary guard.
 For a future separately activated diagnostic, the proposed capture argv is
 `effigy proof:supervisor:ceiling:qualify:diagnostic` with stdout and stderr

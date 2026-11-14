@@ -69,6 +69,7 @@ import re
 import select
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -322,8 +323,12 @@ def drain_capture(fd, sink, deadline_ns):
         readable, _, _ = select.select([fd], [], [], remaining / NS)
         if not readable:
             raise TimeoutError("capture EOF not observed before deadline")
+        if now_ns() >= deadline_ns:
+            raise TimeoutError("capture deadline expired before read")
         chunk = os.read(fd, 65536)
         if not chunk:
+            if now_ns() >= deadline_ns:
+                raise TimeoutError("capture deadline expired before final flush")
             return sink.seal()
         sink.write(chunk)
 
@@ -332,16 +337,153 @@ def capture_footer(record):
     """Parse the last line after EOF and durable sink flush; this is not closure."""
     if record["truncation_markers"] or record["footer_count"] != 1:
         raise ValueError("truncated or missing/duplicate Effigy footer")
-    match = re.search(rb"(?:^|\n)effigy: output complete \(payload ([0-9]{1,20}) bytes; cap ([0-9]{1,20}) bytes\)\n\Z", record["tail"])
+    match = re.search(rb"\neffigy: output complete \(payload ([0-9]{1,20}) bytes; cap ([0-9]{1,20}) bytes\)\n\Z", record["tail"])
     if match is None:
         raise ValueError("partial, malformed or nonfinal Effigy footer")
     payload, cap = (int(value) for value in match.groups())
-    if cap != EFFIGY_TEXT_CAP_BYTES or payload > cap:
+    if cap != EFFIGY_TEXT_CAP_BYTES or payload + len(match.group(0)) > cap:
         raise ValueError("wrong Effigy output cap or payload")
     return {"payload_bytes": payload, "cap_bytes": cap}
 
 
 _capture_unreaped = []
+
+
+def bounded_capture_command(argv, cwd, deadline_ns, limit):
+    """Read both command streams to EOF with a shared bounded allocation.
+
+    On timeout, the live handle and pipes remain held; this function does not
+    claim that a child or its descendants closed. The enclosing pinned actor
+    owns the whole source-verification window.
+    """
+    if type(limit) is not int or limit <= 0 or now_ns() >= deadline_ns:
+        raise TimeoutError("command window or output limit invalid")
+    proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    _capture_unreaped.append(proc)
+    stdout_fd, stderr_fd = proc.stdout.fileno(), proc.stderr.fileno()
+    outputs = {stdout_fd: bytearray(), stderr_fd: bytearray()}
+    streams = dict(outputs)
+    used = 0
+    overflow = False
+    while streams:
+        remaining = deadline_ns - now_ns()
+        if remaining <= 0:
+            raise TimeoutError("command output did not close before deadline")
+        readable, _, _ = select.select(list(streams), [], [], remaining / NS)
+        if not readable:
+            raise TimeoutError("command output did not close before deadline")
+        for fd in readable:
+            if now_ns() >= deadline_ns:
+                raise TimeoutError("command deadline expired before read")
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                del streams[fd]
+                continue
+            if used + len(chunk) > limit:
+                overflow = True
+            else:
+                outputs[fd].extend(chunk)
+                used += len(chunk)
+    if now_ns() >= deadline_ns:
+        raise TimeoutError("command deadline expired before reap")
+    status = hold(proc.pid, deadline_ns, [])
+    if status is None:
+        raise TimeoutError("command reaping remained unknown")
+    proc.returncode = code_of(status)
+    _capture_unreaped.remove(proc)
+    proc.stdout.close()
+    proc.stderr.close()
+    if overflow:
+        raise OutputLimit("command output exceeded its bound")
+    return proc.returncode, bytes(outputs[stdout_fd]), bytes(outputs[stderr_fd])
+
+
+def copy_source_input(source, target, deadline_ns, limit):
+    """Copy one regular input with an exclusive destination and bounded reads."""
+    if now_ns() >= deadline_ns:
+        raise TimeoutError("source snapshot deadline expired before open")
+    source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(source_fd, "rb", buffering=0) as incoming:
+        info = os.fstat(incoming.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise ValueError("source input is not a bounded regular file")
+        if now_ns() >= deadline_ns:
+            raise TimeoutError("source snapshot deadline expired before creation")
+        target_fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(target_fd, "wb", buffering=0) as outgoing:
+            digest, total = hashlib.sha256(), 0
+            while True:
+                if now_ns() >= deadline_ns:
+                    raise TimeoutError("source snapshot deadline expired during copy")
+                block = incoming.read(min(65536, limit - total + 1))
+                if not block:
+                    break
+                total += len(block)
+                if total > limit or outgoing.write(block) != len(block):
+                    raise OutputLimit("source snapshot overflow or partial write")
+                digest.update(block)
+            if now_ns() >= deadline_ns:
+                raise TimeoutError("source snapshot deadline expired before flush")
+            outgoing.flush()
+            os.fsync(outgoing.fileno())
+    return {"bytes": total, "sha256": digest.hexdigest()}
+
+
+def snapshot_source_inputs(destination, deadline_ns):
+    """Produce named source/index/entry copies in a newly created scratch leaf."""
+    scratch = os.path.realpath(os.environ["TMPDIR"])
+    parent = os.path.realpath(os.path.dirname(destination))
+    if parent != scratch or os.path.dirname(os.path.abspath(destination)) != parent:
+        raise ValueError("source snapshot leaf is not directly in this run's scratch")
+    if now_ns() >= deadline_ns:
+        raise TimeoutError("source snapshot deadline expired before staging")
+    os.mkdir(destination, 0o700)
+    code, raw_path, errors = bounded_capture_command(
+        ["git", "rev-parse", "--git-path", "index"], REPO, deadline_ns, 65536)
+    if code or errors or b"\n" not in raw_path or len(raw_path.splitlines()) != 1:
+        raise ValueError("cannot resolve this checkout's Git index")
+    index_path = os.fsdecode(raw_path.strip())
+    if not os.path.isabs(index_path):
+        index_path = os.path.join(REPO, index_path)
+    result = {}
+    for number, name in enumerate(CAPTURE_SOURCE_FILES):
+        result[name] = copy_source_input(os.path.join(REPO, name),
+                                         os.path.join(destination, f"source-{number}"),
+                                         deadline_ns, 4 * MIB)
+    result["raw_index"] = copy_source_input(index_path, os.path.join(destination, "index"),
+                                             deadline_ns, 4 * MIB)
+    code, entries, errors = bounded_capture_command(
+        ["git", "ls-files", "--stage", "-z"], REPO, deadline_ns, 4 * MIB)
+    if code or errors:
+        raise ValueError("cannot obtain Git index entries")
+    if now_ns() >= deadline_ns:
+        raise TimeoutError("source snapshot deadline expired before entries")
+    fd = os.open(os.path.join(destination, "entries"),
+                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb", buffering=0) as outgoing:
+        if outgoing.write(entries) != len(entries):
+            raise OSError("partial Git entry copy")
+        outgoing.flush()
+        os.fsync(outgoing.fileno())
+    result["entries"] = {"bytes": len(entries), "sha256": hashlib.sha256(entries).hexdigest()}
+    return result
+
+
+def snapshot_git_identity(deadline_ns):
+    """Bind branch, commit, tree and clean status with bounded Git output."""
+    queries = {"branch": ["symbolic-ref", "--short", "HEAD"],
+               "head": ["rev-parse", "HEAD"], "tree": ["rev-parse", "HEAD^{tree}"],
+               "status": ["status", "--porcelain=v1", "-z"]}
+    result = {}
+    for name, args in queries.items():
+        code, output, errors = bounded_capture_command(["git", *args], REPO, deadline_ns, MIB)
+        if code or errors:
+            raise ValueError("Git identity observation failed: " + name)
+        result[name] = output if name == "status" else output.strip().decode("ascii")
+    if (result["branch"] != "ns-55b433e9-d921-4cfb-a31a-98e2d58157a5" or result["status"]
+            or any(re.fullmatch(r"[0-9a-f]{40}", result[name]) is None for name in ("head", "tree"))):
+        raise ValueError("qualification source branch is wrong or dirty")
+    return result
 
 
 def capture_foreground(stream, deadline_ns):
@@ -360,6 +502,8 @@ def capture_foreground(stream, deadline_ns):
         raise ValueError("strict foreground route is not bound")
     env = dict(os.environ)
     env["EFFIGY_OUTPUT_CAP_BYTES"] = str(EFFIGY_TEXT_CAP_BYTES)
+    if now_ns() >= deadline_ns:
+        raise TimeoutError("capture deadline expired during provenance")
     proc = subprocess.Popen(NATIVE_CAPTURE_ARGV, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, env=env, cwd=REPO)
     # Keep the handle if an exception or timeout makes its status unknown.
@@ -421,6 +565,53 @@ def joined_group_evidence(receipt, expected_leader):
         raise ValueError("joined census is not settled: " + str(reason))
     return {"leader": expected_leader, "deciding_sequence": sequence,
             "joined": True, "deciding": join["deciding"], "final": join["final"]}
+
+
+def declared_backing_evidence(ctx, probe, deadline_ns):
+    """Recheck one declared custody set using the candidate's existing reader.
+
+    This says nothing about whether other case roots declared other backings;
+    the fixed-suite inventory must establish that separately.
+    """
+    if now_ns() >= deadline_ns:
+        raise TimeoutError("image custody deadline expired before reading")
+    guard = candidate()
+    backings, problem = guard.read_custody(ctx, probe)
+    if problem or not backings:
+        raise ValueError("missing or unreadable image custody indication")
+    if now_ns() >= deadline_ns:
+        raise TimeoutError("image custody deadline expired before observation")
+    problems = guard.custody_problems(backings, probe, deadline_ns=deadline_ns,
+                                      hard_deadline_ns=deadline_ns)
+    if problems:
+        raise ValueError("image custody remains unknown or attached")
+    if now_ns() >= deadline_ns:
+        raise TimeoutError("image custody deadline expired during observation")
+    return {"backings": list(backings), "state": "whole-backing-absent"}
+
+
+def publish_capture_receipt(path, document, deadline_ns):
+    """Publish a bounded complete document only after its contents are fsynced.
+
+    The caller owns the fresh private directory. A partial or failed write is
+    left at the temporary name and is never presented as the final receipt.
+    """
+    encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    if len(encoded) > MIB:
+        raise OutputLimit("capture receipt exceeds its reserve")
+    if now_ns() >= deadline_ns:
+        raise TimeoutError("capture receipt deadline expired")
+    temporary = path + ".partial"
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb", buffering=0) as stream:
+        if stream.write(encoded) != len(encoded):
+            raise OSError("partial capture receipt write")
+        stream.flush()
+        os.fsync(stream.fileno())
+    if now_ns() >= deadline_ns:
+        raise TimeoutError("capture receipt deadline expired before publication")
+    # link is exclusive: an existing final receipt is never replaced.
+    os.link(temporary, path)
 
 
 def derived_route_extra(candidate_source, pipe_buf, effigy_cap):
@@ -669,6 +860,8 @@ def hold(pid, until_ns, forward):
     None. Signals recorded in `forward` by handlers are sent here, before each
     reap attempt, so none can reach the PID after this loop reaped it."""
     while True:
+        if now_ns() >= until_ns:
+            return None
         while forward:
             try:
                 os.kill(pid, forward.pop(0))

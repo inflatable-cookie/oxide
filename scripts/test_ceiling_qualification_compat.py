@@ -81,6 +81,12 @@ class BootstrapBounds(unittest.TestCase):
             self.assertEqual(b.bounded(lambda: 0, 100, 102), 124)
             self.assertEqual(b.bounded(lambda: 0, 101, 101), 124)
         fork.assert_not_called()
+        with mock.patch.object(b, "now_ns", return_value=100), \
+             mock.patch.object(b.os, "waitpid") as waitpid, \
+             mock.patch.object(b.os, "kill") as kill:
+            self.assertIsNone(b.hold(42, 100, [9]))
+        waitpid.assert_not_called()
+        kill.assert_not_called()
 
     def test_raw_sink_detects_split_markers_and_rejects_partial_writes(self):
         b = self.bootstrap
@@ -108,7 +114,7 @@ class BootstrapBounds(unittest.TestCase):
         b = self.bootstrap
         sink = mock.Mock()
         sink.seal.return_value = {"sealed": True}
-        with mock.patch.object(b, "now_ns", side_effect=[10, 11]), \
+        with mock.patch.object(b, "now_ns", return_value=10), \
              mock.patch.object(b.select, "select", return_value=([7], [], [])), \
              mock.patch.object(b.os, "read", side_effect=[b"abc", b""]):
             self.assertEqual(b.drain_capture(7, sink, 20), {"sealed": True})
@@ -122,6 +128,37 @@ class BootstrapBounds(unittest.TestCase):
         select_call.assert_not_called()
         sink.seal.assert_not_called()
 
+    def test_bounded_command_drains_both_streams_and_preserves_unknown(self):
+        b = self.bootstrap
+        proc = mock.Mock(pid=42)
+        proc.stdout.fileno.return_value = 7
+        proc.stderr.fileno.return_value = 8
+        with mock.patch.object(b, "now_ns", return_value=10), \
+             mock.patch.object(b.subprocess, "Popen", return_value=proc), \
+             mock.patch.object(b.select, "select", return_value=([7, 8], [], [])), \
+             mock.patch.object(b.os, "read", side_effect=[b"out", b"err", b"", b""]), \
+             mock.patch.object(b, "hold", return_value=0):
+            self.assertEqual(b.bounded_capture_command(["git", "status"], ".", 20, 10),
+                             (0, b"out", b"err"))
+        self.assertNotIn(proc, b._capture_unreaped)
+        with mock.patch.object(b, "now_ns", side_effect=[10, 20]), \
+             mock.patch.object(b.subprocess, "Popen", return_value=proc):
+            with self.assertRaises(TimeoutError):
+                b.bounded_capture_command(["git", "status"], ".", 20, 10)
+        self.assertIn(proc, b._capture_unreaped)
+        b._capture_unreaped.remove(proc)
+
+    def test_source_identity_requires_the_task_branch_and_clean_status(self):
+        b = self.bootstrap
+        rows = [(0, b"ns-55b433e9-d921-4cfb-a31a-98e2d58157a5\n", b""),
+                (0, b"a" * 40 + b"\n", b""), (0, b"b" * 40 + b"\n", b""), (0, b"", b"")]
+        with mock.patch.object(b, "bounded_capture_command", side_effect=rows):
+            self.assertEqual(b.snapshot_git_identity(20)["status"], b"")
+        rows[-1] = (0, b" M changed\0", b"")
+        with mock.patch.object(b, "bounded_capture_command", side_effect=rows):
+            with self.assertRaises(ValueError):
+                b.snapshot_git_identity(20)
+
     def test_real_capture_footer_parser_rejects_incomplete_output(self):
         b = self.bootstrap
         good = b"\neffigy: output complete (payload 1 bytes; cap 524288 bytes)\n"
@@ -129,6 +166,7 @@ class BootstrapBounds(unittest.TestCase):
         self.assertEqual(b.capture_footer(record), {"payload_bytes": 1, "cap_bytes": 524288})
         for changes in ({"tail": good[:-1]}, {"tail": good + b"late"},
                         {"tail": good.replace(b"524288", b"524289")},
+                        {"tail": good.replace(b"payload 1", b"payload 524288")},
                         {"footer_count": 0}, {"footer_count": 2},
                         {"truncation_markers": 1}):
             with self.assertRaises(ValueError):
@@ -142,6 +180,12 @@ class BootstrapBounds(unittest.TestCase):
                "truncation_markers": 0, "footer_count": 1}
         provenance = {"environment": {"EFFIGY_STRICT_PERSISTENCE": "1",
                                        "EFFIGY_ADMISSION_PROTOCOL": None}}
+        with mock.patch.object(b, "now_ns", side_effect=[10, 20]), \
+             mock.patch.object(b, "observe_installed_route", return_value=provenance), \
+             mock.patch.object(b.subprocess, "Popen") as spawn:
+            with self.assertRaises(TimeoutError):
+                b.capture_foreground(mock.Mock(), 20)
+        spawn.assert_not_called()
         with mock.patch.object(b, "now_ns", return_value=10), \
              mock.patch.object(b, "observe_installed_route", return_value=provenance), \
              mock.patch.object(b.subprocess, "Popen", return_value=proc) as spawn, \
@@ -203,6 +247,48 @@ class BootstrapBounds(unittest.TestCase):
                                                   "deciding": empty, "final": dict(empty, uncertain=1)})):
             with self.assertRaises(ValueError):
                 b.joined_group_evidence(dict(receipt, **{key: replacement}), [42, 99])
+
+    def test_declared_backing_evidence_requires_positive_observation(self):
+        b = self.bootstrap
+        guard = mock.Mock()
+        guard.read_custody.return_value = (["/owned/image"], None)
+        guard.custody_problems.return_value = []
+        with mock.patch.object(b, "candidate", return_value=guard), \
+             mock.patch.object(b, "now_ns", return_value=10):
+            self.assertEqual(b.declared_backing_evidence({}, mock.Mock(), 20)["state"],
+                             "whole-backing-absent")
+            guard.custody_problems.return_value = ["unreadable"]
+            with self.assertRaises(ValueError):
+                b.declared_backing_evidence({}, mock.Mock(), 20)
+            guard.read_custody.return_value = (None, None)
+            with self.assertRaises(ValueError):
+                b.declared_backing_evidence({}, mock.Mock(), 20)
+
+    def test_capture_receipt_publication_refuses_short_or_failed_writes(self):
+        b = self.bootstrap
+        stream = mock.MagicMock()
+        stream.__enter__.return_value = stream
+        stream.fileno.return_value = 8
+        with mock.patch.object(b, "now_ns", return_value=10), \
+             mock.patch.object(b.os, "open", return_value=8), \
+             mock.patch.object(b.os, "fdopen", return_value=stream), \
+             mock.patch.object(b.os, "fsync") as sync, \
+             mock.patch.object(b.os, "link") as link:
+            stream.write.side_effect = lambda data: len(data)
+            b.publish_capture_receipt("capture.json", {"complete": True, "qualified": False}, 20)
+            sync.assert_called_once_with(8)
+            link.assert_called_once_with("capture.json.partial", "capture.json")
+            link.reset_mock()
+            stream.write.side_effect = None
+            stream.write.return_value = 1
+            with self.assertRaises(OSError):
+                b.publish_capture_receipt("capture.json", {"complete": True}, 20)
+            link.assert_not_called()
+            stream.write.side_effect = lambda data: len(data)
+            sync.side_effect = OSError("failed flush")
+            with self.assertRaises(OSError):
+                b.publish_capture_receipt("capture.json", {"complete": True}, 20)
+            link.assert_not_called()
 
     def test_partition_and_delivery_reserves(self):
         b = self.bootstrap
@@ -282,6 +368,11 @@ class BootstrapBounds(unittest.TestCase):
 
     def test_installed_identity_and_launcher_drift_refuse(self):
         b = self.bootstrap
+        with mock.patch.object(b.shutil, "which", return_value="/unexpected/effigy"), \
+             mock.patch.object(b, "installed_file_digest") as digest:
+            with self.assertRaises(ValueError):
+                b.observe_installed_route(100)
+        digest.assert_not_called()
         args = [b.INSTALLED_LAUNCHER_SHA256, b.INSTALLED_BINARY_SHA256,
                 b.INSTALLED_RECEIPT_SHA256, b.INSTALLED_SOURCE_HEAD, b.INSTALLED_SOURCE_TREE,
                 None, "1", "2"]
