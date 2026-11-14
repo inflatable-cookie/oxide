@@ -1,12 +1,55 @@
 # Rust/Cargo 1.100 foundation qualification: readiness (oxide#083)
 
-Status: **source-complete for review; proof not run.** The one approved
-`rustup toolchain install 1.100.0 --profile minimal` ran at source `b9138a6`
-under a task-owned heavy Effigy manifest (exit 0, 14.0 s). Default stable,
-overrides and the 1.97.1 pin were unchanged. As a side effect rustup
-self-updated from 1.29.1 to 1.29.3; the owner recorded this. No compiler,
-Cargo, staging, fixture, pool, image or proof has run, so no 1.100 behaviour
-verdict exists yet.
+Status: **the one proof ran and FAILED; no 1.100 verdict.** The one
+approved `rustup toolchain install 1.100.0 --profile minimal` ran at
+`b9138a6` (exit 0, 14.0 s); as a side effect rustup self-updated from 1.29.1
+to 1.29.3, which the owner recorded. The single Queue diagnostic then ran
+once at `364d605` and failed (see below). That occurrence is spent: no retry,
+second occurrence or native follows from this document.
+
+## Spent proof result (`364d605`, Queue run `d9c1616b`)
+
+- **Delivered evidence:** one complete raw log (4,686 B, EOF, no
+  truncation), both copied phase receipts and the final capture receipt;
+  4 files, 11,643 B, retained by Nucleus with original locators and
+  SHA-256. This was the first end-to-end use of the capture and delivery
+  route, and it worked.
+- **Composition:** phase 1.97.1 closed with status 3 (no fault, no
+  deadline); phase 2 1.100.0 then ran and also closed with 3. Capture was
+  complete, `qualified: false`. Two of three invocations were used.
+- **Observations (sampled, not peaks):** about 37 s in total (phases about
+  15.3 s and 14.5 s). Owned peak 170.8 and 171.8 MiB of 402. Host free
+  minimum about 2314 GiB.
+- **Identities:** `cargo 1.100.0 (3acc79c0c 2026-11-05)`,
+  `rustc 1.100.0 (0ef1bc386 2026-11-09)`; `verified: false`, as the
+  unchanged table requires.
+- **Cases: every focused product case failed or was skipped.**
+  - On 1.97.1, `profiles` and `freshness-gate` failed.
+  - On 1.100.0, `profiles` and `fallback` failed.
+  - Eight dependent cases were skipped in each phase.
+  - Cause: the recipe put the fixture pool on the selected external volume
+    but did not declare `OXIDE_SCRATCH_ROOT`, so the shipped product's
+    external-volume refusal (`config::judge_pool_path`) fired on the first
+    leased command. This is a fixture premise defect, not evidence of a 1.100
+    product regression.
+- **The only case that completed** was the 1.100.0 tiny probe: 7 Cargo
+  calls, 0.8 s, 1,015,808 bytes, `rcgu_counts [1,1,1,1,1]`. Stale `*.rcgu.o`
+  did not accumulate across four rebuilds of that crate. This is a single
+  observation and does not qualify anything.
+
+**No verdict exists** for routing, profiles, checkout-affine and
+cross-checkout freshness, crash recovery, group-gone, status,
+waiting/interrupt, layout and stray detection, the dep-info decoder (v1 or
+reshaped v2) or the unverified-Cargo fallback. Per-phase 300 s fit is still
+unmeasured: cold staging took almost all of each phase while the substantive
+cases were skipped. The required dual-toolchain focused proof stays failed.
+
+**Source correction after the run:** the runner now declares a private
+owner-only `scratch-pools` directory inside the phase parent as
+`OXIDE_SCRATCH_ROOT`, with the fixture pool strictly inside it, following
+`rust:front-door-accounting`. Self-check controls pin it. It has **not been
+exercised natively**: correcting the source does not reopen the spent
+occurrence, and any further run needs a separate owner decision.
 
 ## Release and source facts
 
@@ -60,7 +103,7 @@ only on nightly 2026-08-05 and gives no 1.100 credit.
 `scripts/foundation-rust-1-100.py`:
 
 - `effigy proof:foundation:rust-1-100:plan`: the effect-free plan.
-- `effigy proof:foundation:rust-1-100:test`: 186 pure controls.
+- `effigy proof:foundation:rust-1-100:test`: 190 pure controls.
 - `effigy proof:foundation:rust-1-100:diagnostic` (heavy):
   `python3 scripts/foundation-rust-1-100.py --compose`, one fixed
   task-specific capture producer.
@@ -242,5 +285,5 @@ legacy `/private/tmp` `mktemp`. Fixtures pin 1.97.1 in `rust-toolchain.toml`;
 
 Every native, including the single diagnostic, plus `rust:compile`,
 `rust:compile-release`, `rust:format` and `test rust` (no Rust changed). The
-one approved install already ran at `b9138a6` and is not repeated. Run: `:test` (186/186),
+one approved install already ran at `b9138a6` and is not repeated. Run: `:test` (190/190),
 `:plan`, `docs:check`.

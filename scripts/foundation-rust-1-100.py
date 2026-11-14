@@ -511,7 +511,7 @@ SOURCE_NEEDLES = (
 PREMISES = (
     ("1 private HOME/rustup", "legacy.scrubbed captures RUSTUP_HOME before HOME; RUSTUP_AUTO_INSTALL=0; locks from offline generate-lockfile in each fixture before --locked", LEGACY, "scrubbed"),
     ("2 account-home control", "legacy.Runner sets OXIDE_TEST_HOME_FROM_ENV=1 with a private HOME", LEGACY, "Runner"),
-    ("3 environment isolation", "scrubbed drops OXIDE_POOL/OXIDE_CONFIG/OXIDE_TEST_*/XDG_*; fixture_environment drops every other OXIDE_* and CARGO_* override", "scripts/foundation-rust-1-100.py", "fixture_environment"),
+    ("3 environment isolation", "scrubbed drops OXIDE_POOL/OXIDE_CONFIG/OXIDE_TEST_*/XDG_*; fixture_environment drops every other OXIDE_* and CARGO_* override; the runner then declares its own OXIDE_SCRATCH_ROOT with the pool strictly inside", "scripts/foundation-rust-1-100.py", "fixture_environment"),
     ("4 automatic adoption", "applies only in permanent drive mode; no drive is registered in the private HOME, so no conversion can occur", None, None),
     ("5 Cargo external argv", "routing's cargo-oxprobe reads only env (PROBE script ignores argv)", LEGACY, "PROBE"),
     ("6 owned images", "no image: the pool is directory-budget-v1 under the guard root", None, None),
@@ -639,6 +639,16 @@ def staging_environment(env: dict, target: str) -> dict:
     return out
 
 
+def scratch_declaration(parent: str) -> tuple:
+    """One private owner-only `scratch-pools` directory inside the phase's
+    guard-scratch parent, declared as OXIDE_SCRATCH_ROOT, with the fixture
+    pool strictly inside it (the pattern rust:front-door-accounting uses)."""
+    root = os.path.join(os.path.realpath(parent), "scratch-pools")
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    os.chmod(root, 0o700)
+    return root, os.path.join(root, "pool")
+
+
 def phase_parent(env: dict) -> str:
     raw = env.get("OXIDE_TASK_SCRATCH_ROOT")
     if not raw or not os.path.isdir(raw):
@@ -745,6 +755,14 @@ def directory_runner(legacy, oxide: str, parent: str, toolchain: str):
         def __init__(self):
             super().__init__(oxide, None, parent)
             self.env = fixture_environment(self.env, toolchain)
+            # The selected volume is external, so the shipped product admits
+            # the fixture pool only under a declared scratch root
+            # (scratch_io: OXIDE_SCRATCH_ROOT, pool strictly inside it). The
+            # 083 diagnostic at 364d605 omitted this and every leased case
+            # was refused; that spent run stays failed.
+            root, pool = scratch_declaration(parent)
+            self.pool = pool
+            self.env.update({"OXIDE_SCRATCH_ROOT": root, "OXIDE_POOL": pool})
 
         def lease_status(self) -> dict:
             return ledger_view(self.pool)
@@ -1653,6 +1671,31 @@ def self_check() -> int:
                                  if isinstance(n, ast.FunctionDef) and n.name == "case_probes"))
     check("case_probes stamps its own window and uses probe_gate",
           "started = time.monotonic()" in probe_src and "probe_gate(" in probe_src and "probe_start" not in probe_src)
+
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+        legacy = load_legacy()
+        hostile_env = {"OXIDE_SCRATCH_ROOT": "/elsewhere", "OXIDE_POOL": "/elsewhere/pool"}
+        saved = {k: os.environ.get(k) for k in hostile_env}
+        os.environ.update(hostile_env)
+        try:
+            runner = directory_runner(legacy, "/bin/false", tmp, TESTED)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        root = runner.env.get("OXIDE_SCRATCH_ROOT", "")
+        pool = runner.env.get("OXIDE_POOL", "")
+        check("fixture declares a canonical private scratch root inside the phase parent",
+              root == os.path.join(os.path.realpath(tmp), "scratch-pools") and os.stat(root).st_mode & 0o077 == 0)
+        check("fixture pool is strictly inside the declared scratch root and is the runner's pool",
+              os.path.dirname(pool) == root and pool == runner.pool and runner.env.get("OXIDE_POOL_CAP") == "128MiB")
+        check("inherited OXIDE_SCRATCH_ROOT/OXIDE_POOL never reach the fixture", "/elsewhere" not in root + pool)
+    src = ast.unparse(next(n for n in ast.parse(read("scripts/foundation-rust-1-100.py").decode()).body
+                           if isinstance(n, ast.FunctionDef) and n.name == "directory_runner"))
+    check("directory runner sets the scratch declaration after the environment scrub",
+          src.index("fixture_environment(") < src.index("scratch_declaration(parent)"))
 
     alloc = allocation()
     check("at most three focused invocations, composition spends two", alloc["focused_invocations"] <= 3 and len(TOOLCHAINS) == 2)

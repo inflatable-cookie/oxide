@@ -622,15 +622,16 @@ inherited rustc wrapper ([below](#inherited-rustc-wrapper)). `oxide
 init` readiness still reports the toolchain rustup resolves at the workspace
 root. A new Cargo release needs this check before it joins the table.
 
-**Rust 1.100 (oxide#083): not yet qualified.** Stable 1.100.0 (Cargo
+**Rust 1.100 (oxide#083): not qualified.** Stable 1.100.0 (Cargo
 `3acc79c0c`) keeps every fact above except the layout: build-dir layout v2 is
 the default, with no `<profile>/deps` or `.fingerprint`. 1.100.0 therefore
 stays out of the table, and the shipped gate runs its fallback on it. Joining
-needs a layout-v2-aware stray detection and a gate path review first. The
-planned single proof, `effigy proof:foundation:rust-1-100:diagnostic`, runs
-the migrated focused oracles on the directory-budget pool in two guarded
-phases. Its gate refuses until a planner binding is issued
-([readiness](../evidence/rust-1-100-foundation-083/README.md)).
+needs a layout-v2-aware stray detection and a gate path review first. The one
+proof, `effigy proof:foundation:rust-1-100:diagnostic`, ran once at
+`364d605` and failed: its fixture pool lacked an `OXIDE_SCRATCH_ROOT`
+declaration, so every focused case was refused or skipped on both
+toolchains. No area has a 1.100 verdict
+([result](../evidence/rust-1-100-foundation-083/README.md)).
 
 ## What one command does (local executor)
 
