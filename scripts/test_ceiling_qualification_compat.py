@@ -120,6 +120,36 @@ class BootstrapBounds(unittest.TestCase):
         self.assertFalse(b.capture_fit(sizes, 1, 1, 0, 4096,
                                        ring_physical=0, gates_physical=8192, prepare_physical=0)["fits"])
 
+    def test_source_bound_guard_output_and_effigy_cap(self):
+        b = self.bootstrap
+        source = (scripts / "bounded-test-ceiling.py").read_bytes()
+        tree = ast.parse(source)
+        monitor = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Monitor")
+        functions = {n.name: n for n in monitor.body if isinstance(n, ast.FunctionDef)}
+        calls = lambda node, name: [x for x in ast.walk(node) if isinstance(x, ast.Call)
+                                    and isinstance(x.func, ast.Attribute)
+                                    and isinstance(x.func.value, ast.Name)
+                                    and x.func.value.id == "self" and x.func.attr == name]
+        self.assertEqual(len(calls(functions["finish_monitor"], "summary")), 2)
+        self.assertEqual(len(calls(functions["run"], "summary")), 3)
+        reports = [x for x in ast.walk(tree) if isinstance(x, ast.Call)
+                   and isinstance(x.func, ast.Name) and x.func.id == "report"]
+        summary_reports = [x for x in ast.walk(functions["summary"]) if isinstance(x, ast.Call)
+                           and isinstance(x.func, ast.Name) and x.func.id == "report"]
+        self.assertEqual((len(reports), len(summary_reports)), (14, 8))
+        self.assertEqual(guard.FORWARD * 2, 64 * b.MIB)
+        self.assertEqual(b.BOOTSTRAP_OUTPUT_LIMIT, 2 * b.MIB)
+        self.assertEqual(b.EFFIGY_TEXT_CAP_BYTES, 524288)
+        bound = b.derived_route_extra(source, 4096, b.EFFIGY_TEXT_CAP_BYTES)
+        self.assertTrue(bound["bounded"])
+        self.assertEqual(bound["guard_report_calls_max"], 81)
+        self.assertEqual(bound["guard_actor_direct_bytes_max"], 334848)
+        self.assertEqual(bound["route_extra_bytes_max"], 859136)
+        self.assertLessEqual(bound["route_extra_bytes_max"], b.MIB)
+        self.assertFalse(b.derived_route_extra(source + b"# drift", 512, b.EFFIGY_TEXT_CAP_BYTES)["bounded"])
+        self.assertFalse(b.derived_route_extra(source, 4097, b.EFFIGY_TEXT_CAP_BYTES)["bounded"])
+        self.assertFalse(b.derived_route_extra(source, 512, b.MIB)["bounded"])
+
     def test_installed_identity_and_launcher_drift_refuse(self):
         b = self.bootstrap
         args = [b.INSTALLED_LAUNCHER_SHA256, b.INSTALLED_BINARY_SHA256,
@@ -143,8 +173,15 @@ class BootstrapBounds(unittest.TestCase):
         self.assertEqual(plan["ring_logical_bytes"], 16448)
         self.assertEqual(plan["terminal_writes"], [1023, 1])
         self.assertEqual(plan["prepare_argv"], ["effigy", "run", "prepare"])
+        self.assertEqual(plan["prepare_store_wait_seconds"], 30)
+        self.assertIsNone(plan["prepare_total_time_bound"])
+        self.assertIsNone(plan["prepare_physical_bound"])
         self.assertTrue(any("protocol" in reason for reason in plan["missing"]))
         self.assertFalse(b.strict_route_plan("1", "2", "ready", 20480)["fits"])
+        for state in ("missing", "full", "corrupt", "wrong-size"):
+            refused = b.strict_route_plan("1", "2", state, None)
+            self.assertFalse(refused["fits"])
+            self.assertTrue(any("ring" in reason for reason in refused["missing"]))
 
     def test_finalization_refuses_partial_marker_and_missing_evidence(self):
         b = self.bootstrap

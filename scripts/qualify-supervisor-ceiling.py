@@ -195,6 +195,41 @@ INSTALLED_SOURCE_HEAD = "974954729ec5efd0f450f87276b15ba72c1cbbca"
 INSTALLED_SOURCE_TREE = "8b42756d41dd1ed985a9a69524f606c674e8e634"
 
 
+# The installed 974 cap includes marker and maximum-width footer in this share.
+EFFIGY_TEXT_CAP_BYTES = 512 * 1024
+EXPECTED_CEILING_SHA256 = "4aba8be3120abc67a0a9b4df6793bbc2b74ece79199f56bbfa355fed368231e0"
+
+
+def derived_route_extra(candidate_source, pipe_buf, effigy_cap):
+    """Source-bound output arithmetic only; no process, admission or fit authority.
+
+    For the pinned candidate, summary emits at most seven base/optional rows,
+    then one grant, one late, one pairs, three unpaired, one boundary and one
+    rejected row: 15 report calls. The five summary call sites in
+    finish_monitor/Monitor.run each lead to a return or stop; charging all five
+    independently is conservative. Six other report call sites cover setup,
+    monitor refusal/exception, launch refusal, finish failure and main error.
+    report writes at most PIPE_BUF. The bootstrap has at most three fixed
+    actor/exception writes, each bounded at 1024 bytes. Its separate worker
+    print cap and the child's two forwarding caps are counted elsewhere.
+    """
+    if not isinstance(candidate_source, bytes) or hashlib.sha256(candidate_source).hexdigest() != EXPECTED_CEILING_SHA256:
+        return {"bounded": False, "reason": "candidate source mismatch"}
+    if type(pipe_buf) is not int or not 0 < pipe_buf <= 4096:
+        return {"bounded": False, "reason": "PIPE_BUF is unknown or exceeds reviewed bound"}
+    if type(effigy_cap) is not int or effigy_cap != EFFIGY_TEXT_CAP_BYTES:
+        return {"bounded": False, "reason": "Effigy cap differs from reviewed route"}
+    report_calls = 5 * 15 + 6
+    own_direct = report_calls * pipe_buf + 3 * 1024
+    combined = effigy_cap + own_direct
+    if combined > MIB:
+        return {"bounded": False, "reason": "combined route output exceeds 1 MiB"}
+    return {"bounded": True, "guard_report_calls_max": report_calls,
+            "guard_actor_direct_bytes_max": own_direct, "effigy_cap_including_marker_footer": effigy_cap,
+            "route_extra_bytes_max": combined,
+            "note": "source arithmetic only; provenance, capture EOF and physical fit remain separate"}
+
+
 def installed_route_control(launcher_sha, binary_sha, receipt_sha, source_head, source_tree,
                             launch_setting, strict_value, protocol_value):
     """Effect-free drift refusal; supplied facts are not provenance or admission authority."""
@@ -226,6 +261,8 @@ def strict_route_plan(strict_value, protocol_value, ring_observation, allocation
             "terminal_writes": [1023, 1], "fsync_after_each": True,
             "gate_body_max_bytes": 2 * 4096,
             "prepare_argv": ["effigy", "run", "prepare"],
+            "prepare_store_wait_seconds": 30,
+            "prepare_total_time_bound": None, "prepare_physical_bound": None,
             "prepare_scope": "separate effectful prerequisite; not activated",
             "warning": "gate release and holder reap are not joined group closure"}
 

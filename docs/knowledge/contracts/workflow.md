@@ -2353,8 +2353,8 @@ monitor stubs with substituted I/O. No apparatus execution, qualification or ado
 source. Tom's `775190c6` ceiling and separate `a833` guest-clock rulings remain
 distinct; native occurrences require the separate owner activations.
 The candidate digest is `4aba8be3120abc67a0a9b4df6793bbc2b74ece79199f56bbfa355fed368231e0`;
-the pin manifest digest is `737bfab8e626db5a6636d8b78e84ed87a49978e405713b3b4eb47bb07466adbe`.
-The bootstrap digest is `06aea189d0712d5b0d7999dca0b6ad46ffb43a7c2118bc125805c4ccc40f0d73`. The manifest records the full suite digest
+the pin manifest digest is `1ae7d20ac0fac1157de03f3059e88bd5675cb48e27e9c5fcd36a5fae88e1fa90`.
+The bootstrap digest is `a1cf3d8b72f39a9903a271f6ab9be196f71f47d660bc2047011307a189045791`. The manifest records the full suite digest
 alongside the unchanged `fcfda2b0` ordinary guard.
 For a future separately activated diagnostic, the proposed capture argv is
 `effigy proof:supervisor:ceiling:qualify:diagnostic` with stdout and stderr
@@ -2375,13 +2375,29 @@ owner must bind a real finite route bound, actual index/source sizes and
 allocation unit before effects. A failed or unknown bound is not native
 readiness or permission to truncate output.
 
+The pinned `4aba8be3` guard has five summary call sites: two in
+`finish_monitor` and three in `Monitor.run`, each ending in a return or stop.
+A summary has at most seven base/optional rows, one grant, one late, one
+pairs, three unpaired, one boundary and one rejected row: 15 reports. Six
+other report call sites cover setup, monitor refusal/exception, launch refusal,
+finish failure and main error. Charging all five summary sites gives at most
+81 reports; each `report` writes at most `PIPE_BUF` bytes. Three bootstrap
+actor/exception writes reserve 1,024 bytes each. With a verified `PIPE_BUF` at
+most 4,096, the source arithmetic reserves 334,848 direct bytes; an Effigy cap
+of 524,288 bytes includes its marker and footer and yields 859,136 bytes of
+the 1 MiB route-extra allowance. `derived_route_extra` rejects candidate source
+drift, a larger or unknown `PIPE_BUF`, and any other cap. This is source
+arithmetic, not evidence that the actual runtime branch, capture or storage fit.
+
 The installed `97495472` strict route keeps a 16,448-byte logical ring and
 writes a 1,023-byte body followed by a one-byte marker, flushing each. At most
 two gate bodies have 4,096 bytes each; physical allocation, copy-on-write,
 metadata and separately scoped `effigy run prepare` remain unbounded inputs,
 not zero-cost facts. `strict_route_plan` is an effect-free refusal proposal;
 it does not read or prepare a ring, change an admission protocol, or authorize
-a native run. `capture_fit` refuses missing physical bounds and counts the
+a native run. The supported `effigy run prepare` has a 30-second busy-store
+wait, but no total elapsed-time or physical-write bound is established here;
+it requires its own prospectively activated scope and accounting. `capture_fit` refuses missing physical bounds and counts the
 separate preparation reservation. The pure finalization control refuses
 missing or partial footer, unknown attribution, capture EOF, terminal settlement,
 joined census or final receipt; it deliberately cannot grant completeness or
