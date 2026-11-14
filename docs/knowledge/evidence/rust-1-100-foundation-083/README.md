@@ -1,8 +1,12 @@
 # Rust/Cargo 1.100 foundation qualification: readiness (oxide#083)
 
-Status: **source-complete for review; not run.** No toolchain was installed
-and no compiler, Cargo, staging, fixture, pool, image or proof ran. No 1.100
-behaviour verdict exists yet.
+Status: **source-complete for review; proof not run.** The one approved
+`rustup toolchain install 1.100.0 --profile minimal` ran at source `b9138a6`
+under a task-owned heavy Effigy manifest (exit 0, 14.0 s). Default stable,
+overrides and the 1.97.1 pin were unchanged. As a side effect rustup
+self-updated from 1.29.1 to 1.29.3; the owner recorded this. No compiler,
+Cargo, staging, fixture, pool, image or proof has run, so no 1.100 behaviour
+verdict exists yet.
 
 ## Release and source facts
 
@@ -56,7 +60,7 @@ only on nightly 2026-08-05 and gives no 1.100 credit.
 `scripts/foundation-rust-1-100.py`:
 
 - `effigy proof:foundation:rust-1-100:plan`: the effect-free plan.
-- `effigy proof:foundation:rust-1-100:test`: 178 pure controls.
+- `effigy proof:foundation:rust-1-100:test`: 186 pure controls.
 - `effigy proof:foundation:rust-1-100:diagnostic` (heavy):
   `python3 scripts/foundation-rust-1-100.py --compose`, one fixed
   task-specific capture producer.
@@ -70,7 +74,7 @@ only on nightly 2026-08-05 and gives no 1.100 credit.
    `decision`) with a matching `FOUNDATION_083_BINDING_SHA256` and both
    toolchains are installed. A refusal runs no phase.
 3. Runs phase 1:
-   `python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 404 -- python3 scripts/foundation-rust-1-100.py --diagnostic --toolchain 1.97.1`.
+   `python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 402 -- python3 scripts/foundation-rust-1-100.py --diagnostic --toolchain 1.97.1`.
    Its merged output is copied to `raw.log` only (no external mirror), drained
    to EOF. Each phase re-checks the binding inside the guard before any
    effect and prints its evidence directory.
@@ -116,28 +120,40 @@ small local operations, disclosed rather than clocked.
 
 **Delivery.** The raw log is capped at 24 MiB, within the original 32 MiB
 maximum. At finalization it is copied into at most three `raw.log.part-NN`
-chunks of 8 MiB or less: copies of the one log, not a second log. Delivery is
-those chunks, `capture.json` (at most 256 KiB) and the two phase receipts (at
-most 1 MiB each): at most 6 files and about 26.3 MiB, within Nucleus
-proofFiles limits of 8 MiB per file, 32 MiB total and 12 files.
+chunks of 8 MiB or less: copies of the one log, not a second log. Each phase
+receipt that ran is copied into the capture leaf as `receipt-<toolchain>.json`,
+with its original path, size and SHA-256 recorded. A missing, symlinked,
+non-regular, unreadable or oversized (over 1 MiB) receipt, or a failed copy,
+makes the capture incomplete (6); it is never silently dropped.
+
+The recorded delivery set gives absolute paths under the recorded
+`capture_dir`: the chunks, the two receipt copies and a reserved 256 KiB
+`capture.json` entry. That is at most 6 files and about 26.3 MiB, within
+Nucleus proofFiles limits of 8 MiB per file, 32 MiB total and 12 files.
 `delivery_plan` refuses an oversized file, an extra copy, more than 32 MiB or
-more than 12 files, and that refusal makes the capture incomplete (6).
+more than 12 files, and that refusal also gives status 6.
+
+**Read completeness.** A non-blocking read with no data (spurious readiness)
+is retried inside the same window and is never treated as EOF; only a real
+empty read is EOF. The synthetic phase status line goes through the same
+capped writer, and if it does not fit, the phase capture is marked truncated
+(status 6).
 
 | Item | MiB | Bound |
 | --- | --- | --- |
 | Raw log | 24 | enforced by the capture writer; overflow is marked, status 6 |
-| Capture dir: chunk copies + receipt/manifest slack | 25 | 24 + 1 |
+| Capture dir: chunk copies + receipt copies + capture.json slack | 27 | 24 + 2 + 1 |
 | Retained phase-1 evidence (while phase 2 runs) | 32 | measured before phase 2; over → status 6, no phase 2 |
 | Nucleus delivery copies (after exit) | 27 | chunks 24 + capture 1 + receipts 2 |
-| **Guard budget per phase** | **404** | 512 − 24 − 25 − 32 − 27; pool cap 128 fits inside |
+| **Guard budget per phase** | **402** | 512 − 24 − 27 − 32 − 27; pool cap 128 fits inside |
 
 | Branch | All owned (MiB) |
 | --- | --- |
-| Phase 1 live | 404 + 49 = 453 |
+| Phase 1 live | 402 + 51 = 453 |
 | Phase 1 UNCLOSED (scratch kept) + delivery | 453 + 27 = 480 |
-| Phase 2 live | 32 + 404 + 49 = 485 |
-| Phase 2 UNCLOSED (scratch kept) + delivery | 32 + 404 + 49 + 27 = 512 |
-| Both closed + delivery | 32 + 32 + 49 + 27 = 140 |
+| Phase 2 live | 32 + 402 + 51 = 485 |
+| Phase 2 UNCLOSED (scratch kept) + delivery | 32 + 402 + 51 + 27 = 512 |
+| Both closed + delivery | 32 + 32 + 51 + 27 = 142 |
 
 Remaining premises, not derived maxima:
 
@@ -223,5 +239,5 @@ legacy `/private/tmp` `mktemp`. Fixtures pin 1.97.1 in `rust-toolchain.toml`;
 ## Not run
 
 Every native, the toolchain install, `rust:compile`, `rust:compile-release`,
-`rust:format` and `test rust` (no Rust changed). Run: `:test` (178/178),
+`rust:format` and `test rust` (no Rust changed). Run: `:test` (186/186),
 `:plan`, `docs:check`.

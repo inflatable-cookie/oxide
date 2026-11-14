@@ -1797,8 +1797,8 @@ run = 'python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 4096 -- 
 # (`--compose`) that refuses until the planner issues FOUNDATION_083_BINDING
 # (+_SHA256) for the exact head and both toolchains are installed, then runs
 # two ordinary-guard phases (1.97.1, then 1.100.0; 300 s each; guard budget
-# 404 MiB so guard roots plus the 24 MiB raw log, its <= 8 MiB delivery chunk
-# copies, receipts, retained phase-1 evidence and Nucleus copies stay within
+# 402 MiB so guard roots plus the 24 MiB raw log, its <= 8 MiB delivery chunk
+# copies, receipt copies, retained phase-1 evidence and Nucleus copies stay within
 # the original 512 MiB). The parent never reads or waits past a phase's 300 s.
 # Phase 2 runs only after phase 1 returns 3 with complete capture; the final
 # exit is phase 2's status or 6 for incomplete capture. Not activated; do not

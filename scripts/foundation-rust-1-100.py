@@ -94,7 +94,7 @@ DELIVERY_MAX_FILES = 12   # Nucleus proofFiles: <= 12 files
 PHASE_RECEIPT_MIB = 1     # each diagnostic receipt (RECEIPT_BYTES)
 # Capture dir: raw log + its delivery chunk copies (copies of ONE log, not a
 # second log) + capture.json/delivery manifest slack.
-CAPTURE_CONTROL_MIB = RAW_LOG_MIB + 1
+CAPTURE_CONTROL_MIB = RAW_LOG_MIB + 2 * PHASE_RECEIPT_MIB + 1  # chunk copies + receipt copies + capture.json/slack
 RETAINED_EVIDENCE_MIB = 32  # a closed phase's kept evidence dir, measured before phase 2
 # Nucleus copies after exit: the chunk copies + capture.json + 2 phase receipts.
 DELIVERY_COPY_MIB = RAW_LOG_MIB + 1 + 2 * PHASE_RECEIPT_MIB
@@ -188,8 +188,10 @@ def bounded_chunks(ready, read, deadline_ns: int, clock):
         if not ready(min(left, 1.0)):
             continue
         chunk = read()
-        if not chunk:
-            return
+        if chunk is None:
+            continue  # spurious readiness / no data: retry inside the SAME window, never EOF
+        if chunk == b"":
+            return  # real EOF
         yield chunk
 
 
@@ -251,7 +253,8 @@ def final_status(phase2_status, capture: dict, evidence_bytes, receipt_written: 
     return phase_decision(2, phase2_status)[1]
 
 
-def compose(env: dict, run_phase, gate_fn, measure, source_fn, capture_dir: str, mirror, writer=None) -> int:
+def compose(env: dict, run_phase, gate_fn, measure, source_fn, capture_dir: str, mirror, writer=None,
+            copier=None) -> int:
     """The fixed composition with injectable seams (processes in production,
     fakes in the self-check). Writes raw.log and capture.json in capture_dir."""
     receipt = {"schema": "oxide.foundation-083.capture/1", "qualified": False, "guard_budget_mib": GUARD_BUDGET_MIB,
@@ -272,7 +275,9 @@ def compose(env: dict, run_phase, gate_fn, measure, source_fn, capture_dir: str,
                 evidence_bytes = measure(marker.get("path"))
                 receipt_bytes = receipt_size(marker.get("path"), toolchain)
                 line = f"foundation-083 phase {toolchain} status {phase_status}\n".encode()
-                capture_stream([line], log, mirror, RAW_LOG_MIB * MIB, lambda _l: None)
+                written_line = capture_stream([line], log, mirror, RAW_LOG_MIB * MIB, lambda _l: None)
+                if written_line["truncated"]:
+                    capture = {**capture, "truncated": True, "status_line_truncated": True}
                 receipt["phases"].append({"toolchain": toolchain, "status": phase_status, "capture": capture,
                                           "evidence": receipt_path(marker.get("path"), toolchain),
                                           "evidence_bytes": evidence_bytes, "receipt_bytes": receipt_bytes})
@@ -287,11 +292,14 @@ def compose(env: dict, run_phase, gate_fn, measure, source_fn, capture_dir: str,
     if receipt["gate"] == "passed" and len(receipt["phases"]) == 2:
         last = receipt["phases"][-1]
         status = final_status(last["status"], last["capture"], last["evidence_bytes"], True)
+    receipt["capture_dir"] = os.path.realpath(capture_dir)
     if receipt["gate"] == "passed":
         try:
-            files = chunk_raw_log(capture_dir) + [
-                {"path": p["evidence"], "bytes": p["receipt_bytes"]} for p in receipt["phases"]
-                if p.get("receipt_bytes") is not None]
+            files = [dict(f, path=os.path.join(receipt["capture_dir"], f["path"])) for f in chunk_raw_log(capture_dir)]
+            for phase in receipt["phases"]:
+                files.append(copy_phase_receipt(phase["evidence"], capture_dir, phase["toolchain"], copier))
+            files.append({"path": os.path.join(receipt["capture_dir"], "capture.json"),
+                          "bytes": CAPTURE_RECEIPT_BYTES, "reserved": True})
             receipt["delivery"] = delivery_plan(files)
         except (OSError, ValueError) as error:
             receipt["delivery"] = {"error": str(error)}
@@ -303,6 +311,32 @@ def compose(env: dict, run_phase, gate_fn, measure, source_fn, capture_dir: str,
     if not (writer or write_capture_receipt)(capture_dir, receipt) and receipt["gate"] == "passed":
         return CAPTURE_INCOMPLETE
     return status
+
+
+def copy_phase_receipt(source, capture_dir: str, toolchain: str, copier=None) -> dict:
+    """Copy one required phase receipt into the capture leaf with its
+    original path and byte/hash provenance. Missing, symlinked, non-regular,
+    unreadable or oversized receipts raise: never filtered out silently."""
+    if not source:
+        raise ValueError(f"phase {toolchain} receipt location unknown")
+    st = os.lstat(source)  # OSError when missing
+    import stat as _stat
+    if not _stat.S_ISREG(st.st_mode):
+        raise ValueError(f"phase {toolchain} receipt is not a regular file")
+    if st.st_size > PHASE_RECEIPT_MIB * MIB:
+        raise ValueError(f"phase {toolchain} receipt exceeds {PHASE_RECEIPT_MIB} MiB")
+    with open(source, "rb") as handle:
+        data = handle.read(PHASE_RECEIPT_MIB * MIB + 1)
+    if len(data) > PHASE_RECEIPT_MIB * MIB:
+        raise ValueError(f"phase {toolchain} receipt grew past {PHASE_RECEIPT_MIB} MiB")
+    target = os.path.join(os.path.realpath(capture_dir), f"receipt-{toolchain}.json")
+    (copier or _write_copy)(target, data)
+    return {"path": target, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(), "original": source}
+
+
+def _write_copy(target: str, data: bytes) -> None:
+    with open(target, "xb") as handle:
+        handle.write(data)
 
 
 def receipt_path(evidence, toolchain):
@@ -1274,6 +1308,18 @@ def compose_controls(check) -> None:
     except CaptureDeadline:
         spent = True
     check("parent: a spent remainder raises before any read", spent and reads == [])
+    seq = iter([None, b"payload", None, b""])
+    check("parent: None is no-data, payload kept, real EOF ends", list(bounded_chunks(lambda _t: True, lambda: next(seq), 10**12, lambda: 0)) == [b"payload"])
+    t2 = [0]
+    def none_tick():
+        t2[0] += 10**9
+        return None
+    try:
+        list(bounded_chunks(lambda _t: True, none_tick, 5 * 10**9, lambda: t2[0]))
+        none_eof = True
+    except CaptureDeadline:
+        none_eof = False
+    check("parent: repeated None exhausts the window as incomplete, never EOF", not none_eof and t2[0] <= 6 * 10**9)
     seq = iter([b"a", b"b", b""])
     check("parent: normal output drains to EOF", list(bounded_chunks(lambda _t: True, lambda: next(seq), 10**12, lambda: 0)) == [b"a", b"b"])
     def blocked(_b):
@@ -1323,16 +1369,27 @@ def compose_controls(check) -> None:
     check("final: unwritten capture receipt is incomplete", final_status(3, good_cap, 1, False) == CAPTURE_INCOMPLETE)
     check("final: truncated phase-2 log is incomplete even with status 3", final_status(3, {"eof": True, "truncated": True}, 1, True) == CAPTURE_INCOMPLETE)
 
-    def run(script, gate_rc=0, big=False, writer=None):
-        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+    def run(script, gate_rc=0, big=False, writer=None, copier=None, receipt_mode="ok"):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as base:
+            tmp = os.path.join(base, "capture")
+            os.mkdir(tmp)
             calls = []
             def run_phase(toolchain, consume):
                 calls.append(toolchain)
                 status, out = script[toolchain]
-                body = [c for c in (out, f"{EVIDENCE_PREFIX}/ev/{toolchain}\n".encode()) if c]
+                ev = os.path.join(base, "ev", toolchain)
+                os.makedirs(ev)
+                rpath = os.path.join(ev, f"foundation-083-{toolchain}.json")
+                if receipt_mode == "ok":
+                    open(rpath, "w").write("{}")
+                elif receipt_mode == "oversize":
+                    open(rpath, "wb").write(b"x" * (PHASE_RECEIPT_MIB * MIB + 1))
+                elif receipt_mode == "symlink":
+                    os.symlink("/dev/null", rpath)
+                body = [c for c in (out, f"{EVIDENCE_PREFIX}{ev}\n".encode()) if c]
                 return status, consume(body)
             measure = lambda path: (40 * MIB if big else 2 * MIB) if path else None
-            rc = compose({}, run_phase, lambda _e: gate_rc, measure, lambda: {"head": "x"}, tmp, None, writer)
+            rc = compose({}, run_phase, lambda _e: gate_rc, measure, lambda: {"head": "x"}, tmp, None, writer, copier)
             path = os.path.join(tmp, "capture.json")
             receipt = json.load(open(path)) if os.path.exists(path) else None
             raw = open(os.path.join(tmp, "raw.log"), "rb").read()
@@ -1347,6 +1404,37 @@ def compose_controls(check) -> None:
     check("compose: phase 1 deadline stops before phase 2 with 124", rc == 124 and calls == [PINNED] and not receipt["complete"])
     rc, calls, receipt, _ = run({PINNED: (3, b"x\n"), TESTED: (125, b"")})
     check("compose: phase 2 fault is the final status", rc == 125 and calls == [PINNED, TESTED])
+    # A payload whose bytes (output + evidence marker) exactly fill the cap: the
+    # status line then has no room. Built by measuring the marker length first.
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as base:
+        tmp = os.path.join(base, "capture")
+        os.mkdir(tmp)
+        ev = os.path.join(base, "ev", PINNED)
+        os.makedirs(ev)
+        open(os.path.join(ev, f"foundation-083-{PINNED}.json"), "w").write("{}")
+        marker = f"{EVIDENCE_PREFIX}{ev}\n".encode()
+        calls_cap = []
+        def phase_cap(toolchain, consume):
+            calls_cap.append(toolchain)
+            return 3, consume([b"z" * (RAW_LOG_MIB * MIB - len(marker)), marker])
+        rc = compose({}, phase_cap, lambda _e: 0, lambda p: MIB if p else None, lambda: {}, tmp, None)
+        cap_receipt = json.load(open(os.path.join(tmp, "capture.json")))
+    check("compose: payload exactly at the cap truncates the status line -> 6, no phase 2",
+          rc == CAPTURE_INCOMPLETE and calls_cap == [PINNED] and cap_receipt["phases"][0]["capture"].get("status_line_truncated"))
+    for mode in ("missing", "oversize", "symlink"):
+        rc, calls, receipt, _ = run(ok, receipt_mode=mode)
+        check(f"compose: {mode} phase receipt is incomplete (6), never filtered out",
+              rc == CAPTURE_INCOMPLETE and "error" in receipt["delivery"] and receipt["complete"] is False)
+    def failing_copy(_t, _d):
+        raise OSError("copy failed")
+    rc, _, receipt, _ = run(ok, copier=failing_copy)
+    check("compose: receipt copy failure is incomplete (6)", rc == CAPTURE_INCOMPLETE and "copy failed" in receipt["delivery"]["error"])
+    rc, _, receipt, _ = run(ok)
+    paths = [f["path"] for f in receipt["delivery"]["files"]]
+    check("compose: delivery set is self-locating: absolute chunk, two receipt copies and reserved capture.json",
+          all(os.path.isabs(x) for x in paths) and sum(x.endswith(".json") and "receipt-" in x for x in paths) == 2
+          and any(f.get("reserved") and f["bytes"] == CAPTURE_RECEIPT_BYTES for f in receipt["delivery"]["files"])
+          and receipt["capture_dir"] in paths[0] and all("original" in f for f in receipt["delivery"]["files"] if "receipt-" in f["path"]))
     rc, calls, receipt, _ = run(ok, writer=lambda _d, _r: False)
     check("compose: failed final receipt write turns closed/closed 3 into 6", rc == CAPTURE_INCOMPLETE
           and calls == [PINNED, TESTED] and receipt is None)
@@ -1573,7 +1661,7 @@ def self_check() -> int:
     check("phase argv: ordinary guard, 300 s, derived budget", list(PHASE_ARGV[:7]) == ["python3", GUARD, "--limit", "300",
           "--scratch-budget-mib", str(GUARD_BUDGET_MIB), "--"])
     branches = budget_branches()
-    check("guard budget is the remainder of the original 512 MiB", GUARD_BUDGET_MIB == 512 - 24 - 25 - 32 - 27 == 404)
+    check("guard budget is the remainder of the original 512 MiB", GUARD_BUDGET_MIB == 512 - 24 - 27 - 32 - 27 == 402)
     check("raw log within the original 32 MiB maximum", RAW_LOG_MIB <= LIMITS["raw_log_bytes"] // MIB)
     for name, mib in branches.items():
         check(f"branch within 512 MiB: {name} = {mib}", mib <= TOTAL_MIB)
