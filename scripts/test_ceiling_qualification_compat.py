@@ -140,7 +140,10 @@ class BootstrapBounds(unittest.TestCase):
         proc.stdout.fileno.return_value = 7
         raw = {"tail": b"\neffigy: output complete (payload 1 bytes; cap 524288 bytes)\n",
                "truncation_markers": 0, "footer_count": 1}
+        provenance = {"environment": {"EFFIGY_STRICT_PERSISTENCE": "1",
+                                       "EFFIGY_ADMISSION_PROTOCOL": None}}
         with mock.patch.object(b, "now_ns", return_value=10), \
+             mock.patch.object(b, "observe_installed_route", return_value=provenance), \
              mock.patch.object(b.subprocess, "Popen", return_value=proc) as spawn, \
              mock.patch.object(b, "drain_capture", return_value=raw), \
              mock.patch.object(b, "hold", return_value=0):
@@ -150,12 +153,56 @@ class BootstrapBounds(unittest.TestCase):
         self.assertEqual(spawn.call_args.kwargs["env"]["EFFIGY_OUTPUT_CAP_BYTES"], "524288")
         self.assertNotIn(proc, b._capture_unreaped)
         with mock.patch.object(b, "now_ns", return_value=10), \
+             mock.patch.object(b, "observe_installed_route", return_value=provenance), \
              mock.patch.object(b.subprocess, "Popen", return_value=proc), \
              mock.patch.object(b, "drain_capture", side_effect=TimeoutError):
             with self.assertRaises(TimeoutError):
                 b.capture_foreground(mock.Mock(), 20)
         self.assertIn(proc, b._capture_unreaped)
         b._capture_unreaped.remove(proc)
+
+    def test_single_log_creation_refuses_existing_or_expired(self):
+        b = self.bootstrap
+        stream = mock.MagicMock()
+        stream.__enter__.return_value = stream
+        with mock.patch.object(b, "now_ns", return_value=10), \
+             mock.patch.object(b.os, "open", return_value=8) as open_call, \
+             mock.patch.object(b.os, "fdopen", return_value=stream), \
+             mock.patch.object(b, "capture_foreground", return_value={"bytes": 1}) as run:
+            self.assertEqual(b.capture_raw_log("owned.raw", 20), {"bytes": 1})
+        self.assertTrue(open_call.call_args.args[1] & b.os.O_EXCL)
+        run.assert_called_once_with(stream, 20)
+        with mock.patch.object(b, "now_ns", return_value=10), \
+             mock.patch.object(b.os, "open", side_effect=FileExistsError), \
+             mock.patch.object(b, "capture_foreground") as run:
+            with self.assertRaises(FileExistsError):
+                b.capture_raw_log("owned.raw", 20)
+        run.assert_not_called()
+        with mock.patch.object(b, "now_ns", return_value=20), \
+             mock.patch.object(b.os, "open") as open_call:
+            with self.assertRaises(TimeoutError):
+                b.capture_raw_log("owned.raw", 20)
+        open_call.assert_not_called()
+
+    def test_joined_group_evidence_requires_both_certain_censuses(self):
+        b = self.bootstrap
+        empty = {"certain": True, "members": 0, "uncertain": 0}
+        receipt = {"leader": [42, 99], "outcome": {"closure": "closed"},
+                   "census_join": {"started": True, "joined": True,
+                                   "deciding": empty, "final": empty},
+                   "deciding_census": empty, "deciding_census_seq": 3,
+                   "custodian_census": dict(empty, seq=3)}
+        self.assertEqual(b.joined_group_evidence(receipt, [42, 99])["deciding_sequence"], 3)
+        for key, replacement in (("leader", [42, 100]),
+                                 ("deciding_census_seq", None),
+                                 ("custodian_census", dict(empty, seq=4)),
+                                 ("outcome", {"closure": "UNCLOSED"}),
+                                 ("census_join", {"started": True, "joined": False,
+                                                  "deciding": empty, "final": empty}),
+                                 ("census_join", {"started": True, "joined": True,
+                                                  "deciding": empty, "final": dict(empty, uncertain=1)})):
+            with self.assertRaises(ValueError):
+                b.joined_group_evidence(dict(receipt, **{key: replacement}), [42, 99])
 
     def test_partition_and_delivery_reserves(self):
         b = self.bootstrap

@@ -67,6 +67,7 @@ import os
 import platform
 import re
 import select
+import shutil
 import signal
 import subprocess
 import sys
@@ -197,6 +198,58 @@ INSTALLED_SOURCE_HEAD = "974954729ec5efd0f450f87276b15ba72c1cbbca"
 INSTALLED_SOURCE_TREE = "8b42756d41dd1ed985a9a69524f606c674e8e634"
 
 
+def installed_file_digest(path, byte_limit, deadline_ns):
+    """Read a finite file under the original window, without retaining it."""
+    digest = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as handle:
+        while True:
+            if now_ns() >= deadline_ns:
+                raise TimeoutError("installed provenance deadline")
+            block = handle.read(min(1024 * 1024, byte_limit - size + 1))
+            if not block:
+                break
+            size += len(block)
+            if size > byte_limit:
+                raise ValueError("installed provenance file exceeds bound")
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def observe_installed_route(deadline_ns):
+    """Observe this process's selected launcher and installed receipt, read-only."""
+    launcher = shutil.which("effigy")
+    binary = "/Users/tom/Dev/projects/effigy/.local-install/bin/effigy"
+    receipt = binary + ".source-receipt"
+    if launcher != "/Users/tom/.local/bin/effigy" or os.environ.get("EFFIGY_LAUNCH") == "stable":
+        raise ValueError("installed Effigy launcher selection changed")
+    hashes = [installed_file_digest(launcher, 4096, deadline_ns),
+              installed_file_digest(binary, 64 * MIB, deadline_ns),
+              installed_file_digest(receipt, 4096, deadline_ns)]
+    if hashes != [INSTALLED_LAUNCHER_SHA256, INSTALLED_BINARY_SHA256, INSTALLED_RECEIPT_SHA256]:
+        raise ValueError("installed Effigy provenance changed")
+    if now_ns() >= deadline_ns:
+        raise TimeoutError("installed provenance deadline")
+    with open(receipt, "rb") as handle:
+        raw = handle.read(4097)
+    if len(raw) > 4096 or hashlib.sha256(raw).hexdigest() != INSTALLED_RECEIPT_SHA256:
+        raise ValueError("installed Effigy receipt changed")
+    lines = raw.decode("utf-8").splitlines()
+    fields = dict(line.split("=", 1) for line in lines)
+    if (len(fields) != len(lines) or fields.get("source_head") != INSTALLED_SOURCE_HEAD
+            or fields.get("source_tree") != INSTALLED_SOURCE_TREE
+            or fields.get("binary_sha256") != INSTALLED_BINARY_SHA256
+            or fields.get("dirty") != "false"):
+        raise ValueError("installed Effigy receipt is inconsistent")
+    return {"launcher": launcher, "launcher_sha256": hashes[0], "binary_sha256": hashes[1],
+            "receipt_sha256": hashes[2], "source_head": fields["source_head"],
+            "source_tree": fields["source_tree"],
+            "environment": {key: os.environ.get(key) for key in
+                            ("EFFIGY_LAUNCH", "EFFIGY_STRICT_PERSISTENCE",
+                             "EFFIGY_ADMISSION_PROTOCOL", "EFFIGY_ADMITTED")},
+            "note": "installer attribution only, not runtime attestation"}
+
+
 # The installed 974 cap includes marker and maximum-width footer in this share.
 EFFIGY_TEXT_CAP_BYTES = 512 * 1024
 EXPECTED_CEILING_SHA256 = "4aba8be3120abc67a0a9b4df6793bbc2b74ece79199f56bbfa355fed368231e0"
@@ -300,6 +353,11 @@ def capture_foreground(stream, deadline_ns):
     """
     if now_ns() >= deadline_ns:
         raise TimeoutError("capture deadline expired before launch")
+    provenance = observe_installed_route(deadline_ns)
+    observed_env = provenance["environment"]
+    if (observed_env["EFFIGY_STRICT_PERSISTENCE"] != "1"
+            or observed_env["EFFIGY_ADMISSION_PROTOCOL"] not in (None, "", "2")):
+        raise ValueError("strict foreground route is not bound")
     env = dict(os.environ)
     env["EFFIGY_OUTPUT_CAP_BYTES"] = str(EFFIGY_TEXT_CAP_BYTES)
     proc = subprocess.Popen(NATIVE_CAPTURE_ARGV, stdout=subprocess.PIPE,
@@ -318,9 +376,51 @@ def capture_foreground(stream, deadline_ns):
         _capture_unreaped.remove(proc)
         record["effigy_exit"] = proc.returncode
         record["effigy_footer"] = capture_footer(record)
+        record["installed_provenance"] = provenance
         return record
     finally:
         proc.stdout.close()
+
+
+def capture_raw_log(path, deadline_ns):
+    """Create the single retained log once; incomplete files stay in place."""
+    if now_ns() >= deadline_ns:
+        raise TimeoutError("capture deadline expired before log creation")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "wb", buffering=0) as stream:
+        return capture_foreground(stream, deadline_ns)
+
+
+def joined_group_evidence(receipt, expected_leader):
+    """Validate a supervisor receipt's own joined, deciding and final census.
+
+    This checks one receipt, not the separate whole-image observation or the
+    source binding of the receipt to a particular capture occurrence.
+    """
+    guard = candidate()
+    if (not isinstance(expected_leader, list) or len(expected_leader) != 2
+            or type(expected_leader[0]) is not int or expected_leader[0] <= 1
+            or expected_leader[1] is None
+            or not isinstance(receipt, dict) or receipt.get("leader") != expected_leader):
+        raise ValueError("supervisor leader identity is missing or mismatched")
+    outcome = receipt.get("outcome")
+    join = receipt.get("census_join")
+    deciding = receipt.get("deciding_census")
+    named = receipt.get("custodian_census")
+    sequence = receipt.get("deciding_census_seq")
+    if (not isinstance(outcome, dict) or outcome.get("closure") != "closed"
+            or not isinstance(join, dict) or join.get("started") is not True
+            or type(sequence) is not int or sequence < 1
+            or not isinstance(named, dict) or named.get("seq") != sequence
+            or guard.census_summary(deciding) != guard.census_summary(named)
+            or join.get("deciding") != guard.census_summary(deciding)):
+        raise ValueError("joined deciding census is incomplete or mismatched")
+    settled, reason = guard.census_settled(join, join.get("final"), deciding)
+    if not settled:
+        raise ValueError("joined census is not settled: " + str(reason))
+    return {"leader": expected_leader, "deciding_sequence": sequence,
+            "joined": True, "deciding": join["deciding"], "final": join["final"]}
 
 
 def derived_route_extra(candidate_source, pipe_buf, effigy_cap):

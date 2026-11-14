@@ -39,7 +39,7 @@ minimum_effigy_version = "0.14.0"
 "proof:supervisor:ceiling:test" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_supervisor_ceiling.py"
 "proof:supervisor:ceiling:plan" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_supervisor_ceiling.py --plan"
 # Collection only: no scratch, fixture, child or qualification is started.
-"proof:supervisor:ceiling:qualification:plan" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_supervisor_ceiling_qualification.py --pins-sha256 1dd78df383967436536bb67eba476de61d95b48c6abfe9c7ca9753bdb5a55921 --plan"
+"proof:supervisor:ceiling:qualification:plan" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_supervisor_ceiling_qualification.py --pins-sha256 6d208a63e0539718e4e45de260d6bfb54af8dcc4c8c7dbfda00fbb6a1e117d54 --plan"
 "proof:supervisor:ceiling:qualification:compat" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_ceiling_qualification_compat.py"
 # Effect-free readiness for the selected host (oxide#151): path, mode, owner and
 # device metadata only. Creates nothing (an absent private leaf is reported as
@@ -821,11 +821,11 @@ run = "python3 scripts/qualify-supervisor.py --diagnostic"
 # declaring it, and the guard remains unqualified until the complete gate chain.
 [tasks."proof:supervisor:ceiling:qualify"]
 admission = "heavy"
-run = "python3 scripts/qualify-supervisor-ceiling.py --pins-sha256 1dd78df383967436536bb67eba476de61d95b48c6abfe9c7ca9753bdb5a55921"
+run = "python3 scripts/qualify-supervisor-ceiling.py --pins-sha256 6d208a63e0539718e4e45de260d6bfb54af8dcc4c8c7dbfda00fbb6a1e117d54"
 
 [tasks."proof:supervisor:ceiling:qualify:diagnostic"]
 admission = "heavy"
-run = "python3 scripts/qualify-supervisor-ceiling.py --pins-sha256 1dd78df383967436536bb67eba476de61d95b48c6abfe9c7ca9753bdb5a55921 --diagnostic"
+run = "python3 scripts/qualify-supervisor-ceiling.py --pins-sha256 6d208a63e0539718e4e45de260d6bfb54af8dcc4c8c7dbfda00fbb6a1e117d54 --diagnostic"
 
 # SUSPENDED by oxide#102: provisions its pool with the retired standalone
 # lease CLI and APFS image backend, so it refuses before any effect until
