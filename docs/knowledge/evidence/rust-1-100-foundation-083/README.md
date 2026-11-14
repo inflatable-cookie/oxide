@@ -56,7 +56,7 @@ only on nightly 2026-08-05 and gives no 1.100 credit.
 `scripts/foundation-rust-1-100.py`:
 
 - `effigy proof:foundation:rust-1-100:plan`: the effect-free plan.
-- `effigy proof:foundation:rust-1-100:test`: 161 pure controls.
+- `effigy proof:foundation:rust-1-100:test`: 165 pure controls.
 - `effigy proof:foundation:rust-1-100:diagnostic` (heavy):
   `python3 scripts/foundation-rust-1-100.py --compose`, one fixed
   task-specific capture producer.
@@ -77,7 +77,7 @@ only on nightly 2026-08-05 and gives no 1.100 credit.
 4. Measures phase 1's retained evidence directory. Phase 2 (`1.100.0`) runs
    only when phase 1 returned 3 and capture is complete: EOF seen, raw log
    not truncated, evidence measured at no more than 32 MiB.
-5. Writes `capture.json` atomically (at most 256 KiB). The final exit is
+5. Writes `capture.json` once, atomically (at most 256 KiB), carrying the final status; a failed or oversized write returns 6. The final exit is
    phase 2's own status, the stopping phase's status, or 6 when capture is
    incomplete (truncated, no EOF, lost stream, oversized or unmeasured
    evidence, or receipt not written). The third invocation is never spent.
@@ -204,5 +204,5 @@ legacy `/private/tmp` `mktemp`. Fixtures pin 1.97.1 in `rust-toolchain.toml`;
 ## Not run
 
 Every native, the toolchain install, `rust:compile`, `rust:compile-release`,
-`rust:format` and `test rust` (no Rust changed). Run: `:test` (161/161),
+`rust:format` and `test rust` (no Rust changed). Run: `:test` (165/165),
 `:plan`, `docs:check`.

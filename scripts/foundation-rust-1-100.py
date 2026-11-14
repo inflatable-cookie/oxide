@@ -184,7 +184,7 @@ def final_status(phase2_status, capture: dict, evidence_bytes, receipt_written: 
     return phase_decision(2, phase2_status)[1]
 
 
-def compose(env: dict, run_phase, gate_fn, measure, source_fn, capture_dir: str, mirror) -> int:
+def compose(env: dict, run_phase, gate_fn, measure, source_fn, capture_dir: str, mirror, writer=None) -> int:
     """The fixed composition with injectable seams (processes in production,
     fakes in the self-check). Writes raw.log and capture.json in capture_dir."""
     receipt = {"schema": "oxide.foundation-083.capture/1", "qualified": False, "guard_budget_mib": GUARD_BUDGET_MIB,
@@ -215,15 +215,15 @@ def compose(env: dict, run_phase, gate_fn, measure, source_fn, capture_dir: str,
                 else:
                     status = None
         receipt["raw_log_bytes"] = log.tell()
-    written = write_capture_receipt(capture_dir, receipt)
     if receipt["gate"] == "passed" and len(receipt["phases"]) == 2:
         last = receipt["phases"][-1]
-        status = final_status(last["status"], last["capture"], last["evidence_bytes"], written)
-    elif not written and receipt["gate"] == "passed":
-        status = CAPTURE_INCOMPLETE
-    receipt["complete"] = written and status in (DIAGNOSTIC_DONE,)
-    if written:
-        write_capture_receipt(capture_dir, {**receipt, "final_status": status})
+        status = final_status(last["status"], last["capture"], last["evidence_bytes"], True)
+    receipt["final_status"] = status
+    receipt["complete"] = status == DIAGNOSTIC_DONE
+    # ONE write carries the final status; if it fails, the evidence is
+    # incomplete and the run can never report 3 (or any phase status).
+    if not (writer or write_capture_receipt)(capture_dir, receipt) and receipt["gate"] == "passed":
+        return CAPTURE_INCOMPLETE
     return status
 
 
@@ -1151,7 +1151,7 @@ def compose_controls(check) -> None:
     check("final: unwritten capture receipt is incomplete", final_status(3, good_cap, 1, False) == CAPTURE_INCOMPLETE)
     check("final: truncated phase-2 log is incomplete even with status 3", final_status(3, {"eof": True, "truncated": True}, 1, True) == CAPTURE_INCOMPLETE)
 
-    def run(script, gate_rc=0, big=False):
+    def run(script, gate_rc=0, big=False, writer=None):
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
             calls = []
             def run_phase(toolchain, consume):
@@ -1160,8 +1160,9 @@ def compose_controls(check) -> None:
                 body = [c for c in (out, f"{EVIDENCE_PREFIX}/ev/{toolchain}\n".encode()) if c]
                 return status, consume(body)
             measure = lambda path: (40 * MIB if big else 2 * MIB) if path else None
-            rc = compose({}, run_phase, lambda _e: gate_rc, measure, lambda: {"head": "x"}, tmp, None)
-            receipt = json.load(open(os.path.join(tmp, "capture.json")))
+            rc = compose({}, run_phase, lambda _e: gate_rc, measure, lambda: {"head": "x"}, tmp, None, writer)
+            path = os.path.join(tmp, "capture.json")
+            receipt = json.load(open(path)) if os.path.exists(path) else None
             raw = open(os.path.join(tmp, "raw.log"), "rb").read()
             return rc, calls, receipt, raw
     ok = {PINNED: (3, b"p1\n"), TESTED: (3, b"p2\n")}
@@ -1174,6 +1175,22 @@ def compose_controls(check) -> None:
     check("compose: phase 1 deadline stops before phase 2 with 124", rc == 124 and calls == [PINNED] and not receipt["complete"])
     rc, calls, receipt, _ = run({PINNED: (3, b"x\n"), TESTED: (125, b"")})
     check("compose: phase 2 fault is the final status", rc == 125 and calls == [PINNED, TESTED])
+    rc, calls, receipt, _ = run(ok, writer=lambda _d, _r: False)
+    check("compose: failed final receipt write turns closed/closed 3 into 6", rc == CAPTURE_INCOMPLETE
+          and calls == [PINNED, TESTED] and receipt is None)
+    rc, _, _, _ = run({PINNED: (3, b"x\n"), TESTED: (125, b"")}, writer=lambda _d, _r: False)
+    check("compose: failed final write is incomplete even after a phase-2 fault", rc == CAPTURE_INCOMPLETE)
+    seen_receipts = []
+    def recording(d, r):
+        seen_receipts.append(dict(r))
+        return write_capture_receipt(d, r)
+    rc, _, receipt, _ = run(ok, writer=recording)
+    check("compose: exactly one receipt write, carrying final_status and complete",
+          len(seen_receipts) == 1 and seen_receipts[0]["final_status"] == 3 and seen_receipts[0]["complete"] is True)
+    big_receipt = {"pad": "x" * (CAPTURE_RECEIPT_BYTES + 1)}
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+        check("an oversized capture receipt is refused, never written", not write_capture_receipt(tmp, big_receipt)
+              and not os.path.exists(os.path.join(tmp, "capture.json")))
     rc, calls, _, _ = run(ok, big=True)
     check("compose: oversized phase-1 evidence stops before phase 2", rc == CAPTURE_INCOMPLETE and calls == [PINNED])
     rc, calls, receipt, _ = run(ok, gate_rc=2)
