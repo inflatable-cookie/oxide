@@ -79,14 +79,24 @@ LIMITS = {
 RECEIPT_BYTES = 1 * MIB  # per phase; two phases stay far inside 32 MiB
 TAIL_BYTES = 4096
 
-PHASE = (
-    "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- "
-    "python3 scripts/foundation-rust-1-100.py --diagnostic --toolchain {toolchain}"
-)
-GATE = (
-    'python3 scripts/foundation-rust-1-100.py --gate --binding "$FOUNDATION_083_BINDING" '
-    '--sha256 "$FOUNDATION_083_BINDING_SHA256"'
-)
+# Whole-capture accounting (brief v12). One phase's "all owned" bytes are the
+# live guard root PLUS everything outside it that exists at the same time:
+# the capture directory (one raw log + one receipt), phase 1's retained guard
+# evidence while phase 2 runs, and Nucleus delivery copies after exit. The
+# guard budget is the remainder of the ORIGINAL 512 MiB, so every branch
+# (live, failed/UNCLOSED with scratch kept, delivery) stays within it.
+TOTAL_MIB = 512
+RAW_LOG_MIB = 32          # one combined raw log, enforced by the capture writer
+CAPTURE_CONTROL_MIB = 1   # capture receipt (bounded 256 KiB) + producer slack
+RETAINED_EVIDENCE_MIB = 32  # a closed phase's kept evidence dir, measured before phase 2
+DELIVERY_COPY_MIB = 35    # Nucleus copies after exit: raw log 32 + receipts <= 3
+GUARD_BUDGET_MIB = TOTAL_MIB - RAW_LOG_MIB - CAPTURE_CONTROL_MIB - RETAINED_EVIDENCE_MIB - DELIVERY_COPY_MIB
+CAPTURE_RECEIPT_BYTES = 256 * 1024
+CAPTURE_INCOMPLETE = 6    # raw log truncated, EOF not seen, oversized evidence or receipt not written
+EVIDENCE_PREFIX = "foundation-083-evidence "
+
+PHASE_ARGV = ("python3", GUARD, "--limit", "300", "--scratch-budget-mib", str(GUARD_BUDGET_MIB), "--",
+              "python3", "scripts/foundation-rust-1-100.py", "--diagnostic", "--toolchain")
 # Diagnostic phase statuses (all nonzero; the ordinary guard passes the
 # command's own status through only for a closed run within its bounds and
 # otherwise returns 124 deadline / 125 fault, refusal or UNCLOSED / 128+N).
@@ -94,18 +104,24 @@ DIAGNOSTIC_DONE = 3        # receipt written, case collection not aborted
 DIAGNOSTIC_INCOMPLETE = 4  # receipt written, but setup fault or aborted collection
 DIAGNOSTIC_NO_RECEIPT = 5  # receipt could not be written
 DIAGNOSTIC_REFUSED = 2     # refused before any effect
-# The whole selector: the gate, then phase 1; phase 2 runs ONLY if phase 1's
-# guard status is DIAGNOSTIC_DONE (closed, within bounds, complete receipt).
-# Any other status (124, 125, 128+N, refusal, crash, incomplete, no receipt)
-# stops the selector with that status; phase 2's own status is the final one,
-# never overwritten. The third allowed invocation is a spare
-# that the selector never spends.
-COMMAND = (
-    f"{GATE} && {{ {PHASE.format(toolchain=PINNED)}; s=$?; "
-    f'echo "foundation-083 phase {PINNED} status $s"; [ "$s" -eq {DIAGNOSTIC_DONE} ] || exit "$s"; '
-    f"{PHASE.format(toolchain=TESTED)}; s=$?; "
-    f'echo "foundation-083 phase {TESTED} status $s"; exit "$s"; }}'
-)
+# The whole selector is one fixed task-specific capture producer (`--compose`):
+# gate, phase 1, measured phase-1 evidence, then phase 2 ONLY on status 3 with
+# complete capture; the final exit is phase 2's own status, or 6 when the
+# capture itself is incomplete. The third allowed invocation is never spent.
+COMMAND = "python3 scripts/foundation-rust-1-100.py --compose"
+
+
+def budget_branches() -> dict:
+    """Worst all-owned MiB in each branch of the composition."""
+    b = GUARD_BUDGET_MIB
+    c = RAW_LOG_MIB + CAPTURE_CONTROL_MIB
+    return {
+        "phase 1 live": b + c,
+        "phase 1 unclosed (scratch kept) + delivery": b + c + DELIVERY_COPY_MIB,
+        "phase 2 live": RETAINED_EVIDENCE_MIB + b + c,
+        "phase 2 unclosed (scratch kept) + delivery": RETAINED_EVIDENCE_MIB + b + c + DELIVERY_COPY_MIB,
+        "both closed + delivery": 2 * RETAINED_EVIDENCE_MIB + c + DELIVERY_COPY_MIB,
+    }
 
 
 def phase_decision(phase: int, status) -> tuple:
@@ -116,6 +132,165 @@ def phase_decision(phase: int, status) -> tuple:
     if phase == 1 and status == DIAGNOSTIC_DONE:
         return ("continue", None)
     return ("stop", status)
+
+def capture_stream(chunks, log, mirror, cap: int, on_line) -> dict:
+    """Copy one phase's merged output to the raw log (up to `cap` bytes in
+    total across the log) and to `mirror`, draining to EOF. Lines are fed to
+    `on_line` for the evidence marker. Never claims completeness it lacks."""
+    state = {"bytes": 0, "logged": 0, "truncated": False, "eof": False}
+    pending = b""
+    for chunk in chunks:
+        if not chunk:
+            break  # an empty read is EOF
+        state["bytes"] += len(chunk)
+        room = cap - log.tell()
+        if room > 0:
+            log.write(chunk[:room])
+            state["logged"] += min(room, len(chunk))
+        if len(chunk) > max(room, 0):
+            state["truncated"] = True
+        if mirror is not None:
+            mirror.write(chunk)
+        pending = (pending + chunk)[-8192:]
+        *lines, pending = pending.split(b"\n")
+        for line in lines:
+            on_line(line)
+    # Reaching here means the iterator ended or returned an empty read: EOF.
+    # A lost stream raises out of the loop instead and never sets this.
+    state["eof"] = True
+    if pending:
+        on_line(pending)
+    return state
+
+
+def compose_decision(status, capture: dict, evidence_bytes) -> tuple:
+    """After phase 1: continue only on DONE, a complete capture and a measured
+    retained evidence dir within its allowance."""
+    verdict = phase_decision(1, status)
+    if verdict[0] != "continue":
+        return verdict
+    if not capture.get("eof") or capture.get("truncated"):
+        return ("stop", CAPTURE_INCOMPLETE)
+    if not isinstance(evidence_bytes, int) or evidence_bytes > RETAINED_EVIDENCE_MIB * MIB:
+        return ("stop", CAPTURE_INCOMPLETE)
+    return ("continue", None)
+
+
+def final_status(phase2_status, capture: dict, evidence_bytes, receipt_written: bool) -> int:
+    if not receipt_written or not capture.get("eof") or capture.get("truncated"):
+        return CAPTURE_INCOMPLETE
+    if not isinstance(evidence_bytes, int) or evidence_bytes > RETAINED_EVIDENCE_MIB * MIB:
+        return CAPTURE_INCOMPLETE
+    return phase_decision(2, phase2_status)[1]
+
+
+def compose(env: dict, run_phase, gate_fn, measure, source_fn, capture_dir: str, mirror) -> int:
+    """The fixed composition with injectable seams (processes in production,
+    fakes in the self-check). Writes raw.log and capture.json in capture_dir."""
+    receipt = {"schema": "oxide.foundation-083.capture/1", "qualified": False, "guard_budget_mib": GUARD_BUDGET_MIB,
+               "budget_branches_mib": budget_branches(), "source": source_fn(), "phases": [], "complete": False}
+    status = DIAGNOSTIC_REFUSED
+    with open(os.path.join(capture_dir, "raw.log"), "wb") as log:
+        if gate_fn(env) != 0:
+            receipt["gate"] = "refused"
+        else:
+            receipt["gate"] = "passed"
+            for index, toolchain in enumerate(TOOLCHAINS, start=1):
+                marker = {}
+                def on_line(line, marker=marker):
+                    if line.startswith(EVIDENCE_PREFIX.encode()):
+                        marker["path"] = line[len(EVIDENCE_PREFIX):].decode(errors="replace").strip()
+                phase_status, capture = run_phase(toolchain, lambda chunks: capture_stream(
+                    chunks, log, mirror, RAW_LOG_MIB * MIB, on_line))
+                evidence_bytes = measure(marker.get("path"))
+                line = f"foundation-083 phase {toolchain} status {phase_status}\n".encode()
+                capture_stream([line], log, mirror, RAW_LOG_MIB * MIB, lambda _l: None)
+                receipt["phases"].append({"toolchain": toolchain, "status": phase_status, "capture": capture,
+                                          "evidence": marker.get("path"), "evidence_bytes": evidence_bytes})
+                if index == 1:
+                    decision = compose_decision(phase_status, capture, evidence_bytes)
+                    if decision[0] == "stop":
+                        status = decision[1]
+                        break
+                else:
+                    status = None
+        receipt["raw_log_bytes"] = log.tell()
+    written = write_capture_receipt(capture_dir, receipt)
+    if receipt["gate"] == "passed" and len(receipt["phases"]) == 2:
+        last = receipt["phases"][-1]
+        status = final_status(last["status"], last["capture"], last["evidence_bytes"], written)
+    elif not written and receipt["gate"] == "passed":
+        status = CAPTURE_INCOMPLETE
+    receipt["complete"] = written and status in (DIAGNOSTIC_DONE,)
+    if written:
+        write_capture_receipt(capture_dir, {**receipt, "final_status": status})
+    return status
+
+
+def write_capture_receipt(capture_dir: str, receipt: dict) -> bool:
+    raw = json.dumps(receipt, indent=1, sort_keys=True).encode()
+    if len(raw) > CAPTURE_RECEIPT_BYTES:
+        return False
+    try:
+        path = os.path.join(capture_dir, "capture.json")
+        with open(path + ".tmp", "wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(path + ".tmp", path)
+        return True
+    except OSError:
+        return False
+
+
+def compose_main() -> int:
+    env = dict(os.environ)
+    base = env.get("TMPDIR")
+    if not base or not os.path.isdir(base):
+        print("refused before any effect: TMPDIR is required for the capture directory", file=sys.stderr)
+        return DIAGNOSTIC_REFUSED
+    capture_dir = tempfile.mkdtemp(prefix="f083-capture-", dir=base)
+    print(f"foundation-083 capture {capture_dir}", flush=True)
+
+    def gate_fn(e):
+        return gate(["--gate", "--binding", e.get("FOUNDATION_083_BINDING", ""),
+                     "--sha256", e.get("FOUNDATION_083_BINDING_SHA256", "")])
+
+    def run_phase(toolchain, consume):
+        child = subprocess.Popen([*PHASE_ARGV, toolchain], cwd=REPO, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        capture = consume(iter(lambda: child.stdout.read(65536), b""))
+        child.stdout.close()
+        return child.wait(), capture
+
+    def measure(path):
+        if not path or not os.path.isdir(path) or os.path.islink(path):
+            return None
+        return evidence_tree_bytes(path)
+
+    def source_fn():
+        def git(*args):
+            r = subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True, timeout=10)
+            return r.stdout.strip() if r.returncode == 0 else None
+        return {"head": git("rev-parse", "HEAD"), "tree": git("rev-parse", "HEAD^{tree}"),
+                "dirty": git("status", "--porcelain", "--untracked-files=no"), "guard_sha256": sha256(GUARD)}
+
+    mirror = os.fdopen(os.dup(sys.stdout.fileno()), "wb", buffering=0)
+    try:
+        return compose(env, run_phase, gate_fn, measure, source_fn, capture_dir, mirror)
+    finally:
+        mirror.close()
+
+
+def evidence_tree_bytes(path: str) -> int:
+    total = 0
+    for root, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+        for name in files:
+            st = os.lstat(os.path.join(root, name))
+            total += max(st.st_size, st.st_blocks * 512)
+    return total
+
 
 # Planned invocations: at most three TOTAL across both toolchains.
 INVOCATIONS = (
@@ -879,6 +1054,8 @@ def diagnostic(toolchain: str) -> int:
         except OSError as error:
             print(f"receipt not written: {error}", file=sys.stderr)
     print(json.dumps({k: receipt.get(k) for k in ("toolchain", "verified", "aborted", "setup_fault", "elapsed_s", "phase_status")}))
+    if evidence:
+        print(f"{EVIDENCE_PREFIX}{evidence}", flush=True)
     # Scratch, pool and slots stay inside the guard root for its census; the
     # guard's retention policy owns cleanup. Always nonzero: uncounted.
     return status if written else DIAGNOSTIC_NO_RECEIPT
@@ -941,6 +1118,72 @@ def legacy_reads_retired(name: str) -> bool:
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
     text = ast.unparse(node)
     return bool(re.search(r"runner\.lease\b", text)) or any(t in text for t in ("take_standalone_lease", "keep_standalone_lease", "apfs-sparse-image", "hdiutil"))
+
+
+def compose_controls(check) -> None:
+    """The whole composition through fake seams: no process, no guard."""
+    import io
+    good_cap = {"eof": True, "truncated": False}
+    check("compose: DONE + complete capture + small evidence continues", compose_decision(3, good_cap, 1024) == ("continue", None))
+    check("compose: truncated raw log stops", compose_decision(3, {"eof": True, "truncated": True}, 1) == ("stop", CAPTURE_INCOMPLETE))
+    check("compose: missing EOF stops", compose_decision(3, {"eof": False, "truncated": False}, 1) == ("stop", CAPTURE_INCOMPLETE))
+    check("compose: unmeasured evidence stops", compose_decision(3, good_cap, None) == ("stop", CAPTURE_INCOMPLETE))
+    check("compose: oversized retained evidence stops", compose_decision(3, good_cap, 33 * MIB) == ("stop", CAPTURE_INCOMPLETE))
+    check("compose: guard 125 stops with 125", compose_decision(125, good_cap, 1) == ("stop", 125))
+    log = io.BytesIO()
+    lines = []
+    st = capture_stream([b"a" * 10, b"b\n", b"c"], log, None, 8, lines.append)
+    check("capture: cap enforced, truncation marked, EOF still drained", st["truncated"] and st["eof"] and log.tell() == 8 and st["bytes"] == 13)
+    def lost():
+        yield b"partial"
+        raise OSError("lost")
+    try:
+        capture_stream(lost(), io.BytesIO(), None, 99, lambda _l: None)
+        lost_raises = False
+    except OSError:
+        lost_raises = True
+    check("capture: a lost stream raises, never returns EOF", lost_raises)
+    seen = []
+    check("capture: an empty read is EOF and later chunks are not consumed",
+          capture_stream(iter([b"x\n", b"", b"late\n"]), io.BytesIO(), None, 99, seen.append)["eof"] and seen == [b"x"])
+    check("final: phase 2 status passes through when capture complete", final_status(3, good_cap, 1, True) == 3)
+    check("final: phase 2 guard 125 is not overwritten", final_status(125, good_cap, 1, True) == 125)
+    check("final: unwritten capture receipt is incomplete", final_status(3, good_cap, 1, False) == CAPTURE_INCOMPLETE)
+    check("final: truncated phase-2 log is incomplete even with status 3", final_status(3, {"eof": True, "truncated": True}, 1, True) == CAPTURE_INCOMPLETE)
+
+    def run(script, gate_rc=0, big=False):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+            calls = []
+            def run_phase(toolchain, consume):
+                calls.append(toolchain)
+                status, out = script[toolchain]
+                body = [c for c in (out, f"{EVIDENCE_PREFIX}/ev/{toolchain}\n".encode()) if c]
+                return status, consume(body)
+            measure = lambda path: (40 * MIB if big else 2 * MIB) if path else None
+            rc = compose({}, run_phase, lambda _e: gate_rc, measure, lambda: {"head": "x"}, tmp, None)
+            receipt = json.load(open(os.path.join(tmp, "capture.json")))
+            raw = open(os.path.join(tmp, "raw.log"), "rb").read()
+            return rc, calls, receipt, raw
+    ok = {PINNED: (3, b"p1\n"), TESTED: (3, b"p2\n")}
+    rc, calls, receipt, raw = run(ok)
+    check("compose: both phases closed -> final 3, both run, receipt complete",
+          rc == 3 and calls == [PINNED, TESTED] and receipt["complete"] and receipt["final_status"] == 3)
+    check("compose: raw log holds both phases and their status lines",
+          b"p1" in raw and b"p2" in raw and f"phase {TESTED} status 3".encode() in raw)
+    rc, calls, receipt, _ = run({PINNED: (124, b"x\n"), TESTED: (3, b"")})
+    check("compose: phase 1 deadline stops before phase 2 with 124", rc == 124 and calls == [PINNED] and not receipt["complete"])
+    rc, calls, receipt, _ = run({PINNED: (3, b"x\n"), TESTED: (125, b"")})
+    check("compose: phase 2 fault is the final status", rc == 125 and calls == [PINNED, TESTED])
+    rc, calls, _, _ = run(ok, big=True)
+    check("compose: oversized phase-1 evidence stops before phase 2", rc == CAPTURE_INCOMPLETE and calls == [PINNED])
+    rc, calls, receipt, _ = run(ok, gate_rc=2)
+    check("compose: gate refusal runs no phase", rc == DIAGNOSTIC_REFUSED and calls == [] and receipt["gate"] == "refused")
+    rc, calls, receipt, _ = run({PINNED: (3, b"z" * (RAW_LOG_MIB * MIB + 1)), TESTED: (3, b"")})
+    check("compose: raw log over 32 MiB stops as incomplete, log capped",
+          rc == CAPTURE_INCOMPLETE and calls == [PINNED] and receipt["raw_log_bytes"] <= RAW_LOG_MIB * MIB)
+    tree = ast.parse(read("scripts/foundation-rust-1-100.py").decode())
+    diag = ast.unparse(next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "diagnostic"))
+    check("diagnostic prints its evidence marker", "EVIDENCE_PREFIX" in diag)
 
 
 def self_check() -> int:
@@ -1135,11 +1378,18 @@ def self_check() -> int:
           "started = time.monotonic()" in probe_src and "probe_gate(" in probe_src and "probe_start" not in probe_src)
 
     alloc = allocation()
-    check("at most three focused invocations, selector spends two", alloc["focused_invocations"] <= 3 and COMMAND.count("--diagnostic") == 2)
+    check("at most three focused invocations, composition spends two", alloc["focused_invocations"] <= 3 and len(TOOLCHAINS) == 2)
     check("probe calls total 7 of 8 (rcgu baseline + four = 5)", alloc["probe_cargo_calls"] == 7 and alloc["rcgu_calls"] == 5)
     check("two phases' receipts within 32 MiB raw logs", 2 * RECEIPT_BYTES <= LIMITS["raw_log_bytes"])
-    check("command: gate first, ordinary guard, original caps", COMMAND.startswith(GATE + " && ")
-          and COMMAND.count(f"python3 {GUARD} --limit 300 --scratch-budget-mib 512 -- ") == 2)
+    check("phase argv: ordinary guard, 300 s, derived budget", list(PHASE_ARGV[:7]) == ["python3", GUARD, "--limit", "300",
+          "--scratch-budget-mib", str(GUARD_BUDGET_MIB), "--"])
+    branches = budget_branches()
+    check("guard budget is the remainder of the original 512 MiB", GUARD_BUDGET_MIB == 512 - 32 - 1 - 32 - 35 == 412)
+    for name, mib in branches.items():
+        check(f"branch within 512 MiB: {name} = {mib}", mib <= TOTAL_MIB)
+    check("pool cap fits inside the guard budget", LIMITS["pool_cap_bytes"] <= GUARD_BUDGET_MIB * MIB)
+    check("a 512 MiB guard would overflow once outside bytes exist (why it shrank)",
+          512 + RAW_LOG_MIB + CAPTURE_CONTROL_MIB > TOTAL_MIB)
     check("phase 1 DONE continues", phase_decision(1, DIAGNOSTIC_DONE) == ("continue", None))
     for status in (124, 125, 128 + 9, 128 + 15, DIAGNOSTIC_REFUSED, 1, DIAGNOSTIC_INCOMPLETE, DIAGNOSTIC_NO_RECEIPT, 0):
         check(f"phase 1 status {status} stops with that status", phase_decision(1, status) == ("stop", status))
@@ -1147,11 +1397,7 @@ def self_check() -> int:
         check(f"phase 1 malformed status {status!r} stops as 125", phase_decision(1, status) == ("stop", 125))
     for status in (DIAGNOSTIC_DONE, 124, 125, 137):
         check(f"phase 2 status {status} is the final exit, not overwritten", phase_decision(2, status) == ("stop", status))
-    between = COMMAND.split(PHASE.format(toolchain=PINNED), 1)[1].split(PHASE.format(toolchain=TESTED), 1)[0]
-    check("shell stops after phase 1 unless DONE", between == f'; s=$?; echo "foundation-083 phase {PINNED} status $s"; '
-          f'[ "$s" -eq {DIAGNOSTIC_DONE} ] || exit "$s"; ')
-    check("shell's final exit is phase 2's own status (no unconditional exit 1)",
-          COMMAND.endswith(f'; s=$?; echo "foundation-083 phase {TESTED} status $s"; exit "$s"; }}') and "exit 1" not in COMMAND)
+    compose_controls(check)
     check("DONE is distinct from 0, crash 1, refusal, 124/125 and signals", DIAGNOSTIC_DONE not in (0, 1, 2, 124, 125)
           and len({DIAGNOSTIC_DONE, DIAGNOSTIC_INCOMPLETE, DIAGNOSTIC_NO_RECEIPT, DIAGNOSTIC_REFUSED}) == 4)
     check("phase status DONE only for a complete collection", phase_status({"cases": {}, "aborted": False}) == DIAGNOSTIC_DONE)
@@ -1191,6 +1437,14 @@ def plan() -> int:
     print("oxide#083 foundation qualification on Rust/Cargo 1.100 (layout v2)")
     print("selector: effigy proof:foundation:rust-1-100:diagnostic (heavy)")
     print(f"command:  {COMMAND}")
+    print(f"phase argv: {' '.join(PHASE_ARGV)} <toolchain>")
+    print(f"capture: one raw log <= {RAW_LOG_MIB} MiB + capture.json <= {CAPTURE_RECEIPT_BYTES // 1024} KiB in a fresh TMPDIR dir;"
+          " incomplete capture (truncated, no EOF, lost stream, unwritten receipt, retained evidence over"
+          f" {RETAINED_EVIDENCE_MIB} MiB) -> status {CAPTURE_INCOMPLETE}")
+    print(f"guard budget {GUARD_BUDGET_MIB} MiB = 512 - raw log {RAW_LOG_MIB} - capture control {CAPTURE_CONTROL_MIB}"
+          f" - retained phase-1 evidence {RETAINED_EVIDENCE_MIB} - delivery copies {DELIVERY_COPY_MIB}")
+    for name, mib in budget_branches().items():
+        print(f"  branch {name}: {mib} MiB of {TOTAL_MIB}")
     print(f"guard:    {GUARD} sha256 {sha256(GUARD)} (ordinary qualified default)")
     print(f"toolchains: pinned {PINNED} {PINNED_IDENTITY}; tested {TESTED} ({TESTED_RUSTC}, manifest {TESTED_MANIFEST_SHA256[:16]}...)")
     print(f"tested cargo must start {TESTED_CARGO_PREFIX!r} (pin in evidence README)")
@@ -1233,6 +1487,8 @@ def main(argv: list) -> int:
         return gate(argv)
     if len(argv) == 3 and argv[:2] == ["--diagnostic", "--toolchain"]:
         return diagnostic(argv[2])
+    if argv == ["--compose"]:
+        return compose_main()
     print("usage: foundation-rust-1-100.py --plan | --self-check | --gate --binding B --sha256 D | "
           "--diagnostic --toolchain T", file=sys.stderr)
     return 2

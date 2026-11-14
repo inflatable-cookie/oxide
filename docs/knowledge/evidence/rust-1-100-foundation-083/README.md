@@ -56,50 +56,82 @@ only on nightly 2026-08-05 and gives no 1.100 credit.
 `scripts/foundation-rust-1-100.py`:
 
 - `effigy proof:foundation:rust-1-100:plan`: the effect-free plan.
-- `effigy proof:foundation:rust-1-100:test`: 134 pure controls.
-- `effigy proof:foundation:rust-1-100:diagnostic` (heavy): a pre-guard gate,
-  then two separately guarded sequential phases; phase 2 runs only after a
-  positively closed, complete phase 1.
+- `effigy proof:foundation:rust-1-100:test`: 161 pure controls.
+- `effigy proof:foundation:rust-1-100:diagnostic` (heavy):
+  `python3 scripts/foundation-rust-1-100.py --compose`, one fixed
+  task-specific capture producer.
 
-Command (also pinned by the self-check against `effigy.toml`):
+`--compose` does, in order:
 
-```sh
-python3 scripts/foundation-rust-1-100.py --gate --binding "$FOUNDATION_083_BINDING" --sha256 "$FOUNDATION_083_BINDING_SHA256" && { python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/foundation-rust-1-100.py --diagnostic --toolchain 1.97.1; s=$?; echo "foundation-083 phase 1.97.1 status $s"; [ "$s" -eq 3 ] || exit "$s"; python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/foundation-rust-1-100.py --diagnostic --toolchain 1.100.0; s=$?; echo "foundation-083 phase 1.100.0 status $s"; exit "$s"; }
-```
-
-The gate refuses before the guard creates anything unless the planner issued
-a binding JSON (`task`, `selector`, exact `head`, `decision`) with a matching
-SHA-256 and both toolchains are installed. Each phase re-checks the binding
-inside the guard before any effect.
+1. Creates one fresh capture directory under `TMPDIR` and records the source
+   (HEAD, tree, tracked-dirty state, guard digest).
+2. Runs the gate in-process. It refuses unless the planner issued
+   `FOUNDATION_083_BINDING` (JSON naming `task`, `selector`, exact `head`,
+   `decision`) with a matching `FOUNDATION_083_BINDING_SHA256` and both
+   toolchains are installed. A refusal runs no phase.
+3. Runs phase 1:
+   `python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 412 -- python3 scripts/foundation-rust-1-100.py --diagnostic --toolchain 1.97.1`.
+   Its merged output is copied to `raw.log` and mirrored to stdout, drained
+   to EOF. Each phase re-checks the binding inside the guard before any
+   effect and prints its evidence directory.
+4. Measures phase 1's retained evidence directory. Phase 2 (`1.100.0`) runs
+   only when phase 1 returned 3 and capture is complete: EOF seen, raw log
+   not truncated, evidence measured at no more than 32 MiB.
+5. Writes `capture.json` atomically (at most 256 KiB). The final exit is
+   phase 2's own status, the stopping phase's status, or 6 when capture is
+   incomplete (truncated, no EOF, lost stream, oversized or unmeasured
+   evidence, or receipt not written). The third invocation is never spent.
 
 **Clock.** The guard exports `OXIDE_PROOF_DEADLINE_NS` as its absolute
-deadline (start + 300 s) in `CLOCK_UPTIME_RAW` nanoseconds. The phase reads
+deadline (start + 300 s) in `CLOCK_UPTIME_RAW` nanoseconds. Each phase reads
 the same clock: every legacy `remaining()` is replaced by
-deadline − now − 30 s stop reserve, read fresh at each call. Time spent in
-setup and the gate is charged, nothing is reset, and an already-spent window
-refuses before any effect. (The `dd54af4` source subtracted epoch time from
-that uptime deadline and would have read 0 s before staging.)
+deadline − now − 30 s stop reserve, read fresh. Setup time is charged and an
+already-spent window refuses before any effect.
 
-**Phase continuation.** The guard passes the command's own status through
-only for a closed run within its bounds; otherwise it returns 124 (deadline),
-125 (fault, refusal, UNCLOSED or missing status) or 128+N (signal). The
-diagnostic returns 3 when it wrote its receipt and the case collection was
-not aborted (ordinary case failures stay keep-going results inside it), 4
-for a setup fault or aborted collection, 5 when no receipt was written and 2
-for a refusal. Phase 2 starts only on status 3 from phase 1; any other status
-stops the selector with that status. The final exit is phase 2's own status,
-so a phase-2 guard fault is never hidden. Each phase prints
-`foundation-083 phase <toolchain> status <n>`. Nothing retries, and the third
-invocation is never spent.
+**Phase statuses.** The guard passes the command's own status through only
+for a closed run within its bounds; otherwise it returns 124 (deadline), 125
+(fault, refusal, UNCLOSED or missing status) or 128+N (signal). The
+diagnostic returns:
 
-The whole command cannot be shown to fit one 300 s clock: each phase stages
-`oxide` and runs every retained case. It therefore uses the smallest existing
-composition: two separately guarded phases of the ordinary qualified guard
-(`fcfda2b0…`), each with the original 300 s / 512 MiB, two of the three
-allowed invocations, in ONE Queue occurrence. The third invocation is never
-spent by the selector. **Fit is unmeasured**; historical `rust:oxide-cli` (65 s)
-and `cargo-matrix` (33–67 s) ran on the retired image pool and give no current
-figure.
+- 3: receipt written, collection not aborted; ordinary case failures stay
+  keep-going results inside it;
+- 4: setup fault or aborted collection;
+- 5: no receipt written;
+- 2: refused.
+
+### Whole-capture accounting (original 512 MiB)
+
+The guard budget is what the original 512 MiB leaves after every byte outside
+the live guard root:
+
+| Item | MiB | Bound |
+| --- | --- | --- |
+| Raw log | 32 | enforced by the capture writer; overflow is marked, status 6 |
+| Capture receipt and producer slack | 1 | receipt refused above 256 KiB |
+| Retained phase-1 evidence (while phase 2 runs) | 32 | measured before phase 2; over → status 6, no phase 2 |
+| Nucleus delivery copies (after exit) | 35 | raw log 32 + receipts ≤ 3 |
+| **Guard budget per phase** | **412** | 512 − 32 − 1 − 32 − 35; pool cap 128 fits inside |
+
+| Branch | All owned (MiB) |
+| --- | --- |
+| Phase 1 live | 412 + 33 = 445 |
+| Phase 1 UNCLOSED (scratch kept) + delivery | 445 + 35 = 480 |
+| Phase 2 live | 32 + 412 + 33 = 477 |
+| Phase 2 UNCLOSED (scratch kept) + delivery | 32 + 412 + 33 + 35 = 512 |
+| Both closed + delivery | 32 + 32 + 33 + 35 = 132 |
+
+Remaining premises, not derived maxima:
+
+- the guard's owned-bytes monitor is sampled, so it bounds the live root only
+  at its sampling cadence;
+- a closed guard removes its scratch and keeps its evidence (guard source);
+- the guard persists at most 8 MiB per output stream into evidence;
+- delivery copies are the raw log and receipts only.
+
+The diagnostic's after-case `owned_peak` is a sample, not a physical peak.
+Staging bytes and per-phase 300 s runtime fit remain **unmeasured**.
+Historical `rust:oxide-cli` (65 s) and `cargo-matrix` (33–67 s) ran on the
+retired image pool and give no current figure.
 
 ### Cases
 
@@ -172,5 +204,5 @@ legacy `/private/tmp` `mktemp`. Fixtures pin 1.97.1 in `rust-toolchain.toml`;
 ## Not run
 
 Every native, the toolchain install, `rust:compile`, `rust:compile-release`,
-`rust:format` and `test rust` (no Rust changed). Run: `:test` (134/134),
+`rust:format` and `test rust` (no Rust changed). Run: `:test` (161/161),
 `:plan`, `docs:check`.

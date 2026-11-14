@@ -1791,17 +1791,17 @@ admission = "heavy"
 run = 'python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 4096 -- python3 scripts/relax-quick-trial.py --compat-qualify --binding "$RELAX_COMPAT_ACTIVATION" --sha256 "$RELAX_COMPAT_ACTIVATION_SHA256"'
 
 # Rust/Cargo 1.100 foundation qualification (oxide#083). `:plan` and `:test`
-# read repository source only (the test writes one removed temp dir under
+# read repository source only (the test writes removed temp dirs under
 # TMPDIR) and start no child, compiler, Cargo, toolchain, pool or image.
-# `:diagnostic` is the planned single Queue proof: a pre-guard gate that
-# refuses until the planner issues FOUNDATION_083_BINDING(+_SHA256) for the
-# exact head and both toolchains are installed, then two separately guarded
-# sequential phases (1.97.1, then 1.100.0) under the ordinary qualified guard,
-# 300 s / 512 MiB each. Phase 2 runs only if phase 1's guard status is 3
-# (closed, within bounds, complete receipt); any other status (124, 125,
-# 128+N, refusal, crash, incomplete) stops with that status, and phase 2's
-# own status is the final exit (uncounted, qualified: false). Not activated;
-# do not execute without owner activation. Not full QA.
+# `:diagnostic` is the planned single Queue proof: one fixed capture producer
+# (`--compose`) that refuses until the planner issues FOUNDATION_083_BINDING
+# (+_SHA256) for the exact head and both toolchains are installed, then runs
+# two ordinary-guard phases (1.97.1, then 1.100.0; 300 s each; guard budget
+# 412 MiB so guard roots plus the 32 MiB raw log, capture receipt, retained
+# phase-1 evidence and delivery copies stay within the original 512 MiB).
+# Phase 2 runs only after phase 1 returns 3 with complete capture; the final
+# exit is phase 2's status or 6 for incomplete capture. Not activated; do not
+# execute without owner activation. Not full QA.
 [tasks."proof:foundation:rust-1-100:plan"]
 run = "python3 -B scripts/foundation-rust-1-100.py --plan"
 
@@ -1810,4 +1810,4 @@ run = "python3 -B scripts/foundation-rust-1-100.py --self-check"
 
 [tasks."proof:foundation:rust-1-100:diagnostic"]
 admission = "heavy"
-run = 'python3 scripts/foundation-rust-1-100.py --gate --binding "$FOUNDATION_083_BINDING" --sha256 "$FOUNDATION_083_BINDING_SHA256" && { python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/foundation-rust-1-100.py --diagnostic --toolchain 1.97.1; s=$?; echo "foundation-083 phase 1.97.1 status $s"; [ "$s" -eq 3 ] || exit "$s"; python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/foundation-rust-1-100.py --diagnostic --toolchain 1.100.0; s=$?; echo "foundation-083 phase 1.100.0 status $s"; exit "$s"; }'
+run = 'python3 scripts/foundation-rust-1-100.py --compose'
