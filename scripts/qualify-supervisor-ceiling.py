@@ -65,6 +65,8 @@ import importlib.util
 import json
 import os
 import platform
+import re
+import select
 import signal
 import subprocess
 import sys
@@ -200,6 +202,127 @@ EFFIGY_TEXT_CAP_BYTES = 512 * 1024
 EXPECTED_CEILING_SHA256 = "4aba8be3120abc67a0a9b4df6793bbc2b74ece79199f56bbfa355fed368231e0"
 
 
+class CaptureSink:
+    """One raw stream; a failed write or an incomplete stream stays unusable.
+
+    The caller owns the already-open file and must observe EOF before sealing.
+    This sink makes no process-closure or qualification decision.
+    """
+
+    LIMIT = 64 * MIB + BOOTSTRAP_OUTPUT_LIMIT + MIB
+    TAIL = 256
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.digest = hashlib.sha256()
+        self.length = 0
+        self.tail = b""
+        self.markers = 0
+        self.footers = 0
+        self.failed = False
+        self.sealed = False
+
+    def write(self, chunk):
+        if self.failed or self.sealed or not isinstance(chunk, bytes):
+            raise ValueError("capture is not writable")
+        if self.length + len(chunk) > self.LIMIT:
+            self.failed = True
+            raise OutputLimit("raw capture limit")
+        # Detect a marker across chunk boundaries without retaining another log.
+        marker = b"output_truncated"
+        footer = b"effigy: output complete ("
+        joined = self.tail + chunk
+        self.markers += joined.count(marker) - self.tail.count(marker)
+        self.footers += joined.count(footer) - self.tail.count(footer)
+        try:
+            written = self.stream.write(chunk)
+            if written != len(chunk):
+                raise OSError("partial raw capture write")
+        except BaseException:
+            self.failed = True
+            raise
+        self.digest.update(chunk)
+        self.length += len(chunk)
+        self.tail = joined[-self.TAIL:]
+
+    def seal(self):
+        if self.failed or self.sealed:
+            raise ValueError("capture is incomplete or already sealed")
+        try:
+            self.stream.flush()
+            os.fsync(self.stream.fileno())
+        except BaseException:
+            self.failed = True
+            raise
+        self.sealed = True
+        return {"bytes": self.length, "sha256": self.digest.hexdigest(),
+                "tail": self.tail, "truncation_markers": self.markers,
+                "footer_count": self.footers}
+
+
+def drain_capture(fd, sink, deadline_ns):
+    """Drain the combined pipe through EOF without extending the given window."""
+    while True:
+        remaining = deadline_ns - now_ns()
+        if remaining <= 0:
+            raise TimeoutError("capture EOF not observed before deadline")
+        readable, _, _ = select.select([fd], [], [], remaining / NS)
+        if not readable:
+            raise TimeoutError("capture EOF not observed before deadline")
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            return sink.seal()
+        sink.write(chunk)
+
+
+def capture_footer(record):
+    """Parse the last line after EOF and durable sink flush; this is not closure."""
+    if record["truncation_markers"] or record["footer_count"] != 1:
+        raise ValueError("truncated or missing/duplicate Effigy footer")
+    match = re.search(rb"(?:^|\n)effigy: output complete \(payload ([0-9]{1,20}) bytes; cap ([0-9]{1,20}) bytes\)\n\Z", record["tail"])
+    if match is None:
+        raise ValueError("partial, malformed or nonfinal Effigy footer")
+    payload, cap = (int(value) for value in match.groups())
+    if cap != EFFIGY_TEXT_CAP_BYTES or payload > cap:
+        raise ValueError("wrong Effigy output cap or payload")
+    return {"payload_bytes": payload, "cap_bytes": cap}
+
+
+_capture_unreaped = []
+
+
+def capture_foreground(stream, deadline_ns):
+    """Launch only the fixed diagnostic route and drain its combined output.
+
+    This is a producer seam, not readiness or authority to start a native run.
+    The caller must already have established the independently reviewed route,
+    physical fit and preparation. It must run inside the original bounded actor.
+    """
+    if now_ns() >= deadline_ns:
+        raise TimeoutError("capture deadline expired before launch")
+    env = dict(os.environ)
+    env["EFFIGY_OUTPUT_CAP_BYTES"] = str(EFFIGY_TEXT_CAP_BYTES)
+    proc = subprocess.Popen(NATIVE_CAPTURE_ARGV, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, env=env, cwd=REPO)
+    # Keep the handle if an exception or timeout makes its status unknown.
+    _capture_unreaped.append(proc)
+    sink = CaptureSink(stream)
+    try:
+        record = drain_capture(proc.stdout.fileno(), sink, deadline_ns)
+        if now_ns() >= deadline_ns:
+            raise TimeoutError("capture deadline expired before reap")
+        status = hold(proc.pid, deadline_ns, [])
+        if status is None:
+            raise TimeoutError("foreground process not reaped before deadline")
+        proc.returncode = code_of(status)
+        _capture_unreaped.remove(proc)
+        record["effigy_exit"] = proc.returncode
+        record["effigy_footer"] = capture_footer(record)
+        return record
+    finally:
+        proc.stdout.close()
+
+
 def derived_route_extra(candidate_source, pipe_buf, effigy_cap):
     """Source-bound output arithmetic only; no process, admission or fit authority.
 
@@ -237,9 +360,10 @@ def installed_route_control(launcher_sha, binary_sha, receipt_sha, source_head, 
             or receipt_sha != INSTALLED_RECEIPT_SHA256 or source_head != INSTALLED_SOURCE_HEAD
             or source_tree != INSTALLED_SOURCE_TREE or launch_setting == "stable"):
         return {"fits": False, "qualified": False, "reason": "installed route drift"}
-    if strict_value != "1" or protocol_value != "2":
+    if strict_value != "1" or protocol_value not in (None, "", "2"):
         return {"fits": False, "qualified": False, "reason": "actual strict/protocol route is not bound"}
     return {"fits": False, "qualified": False,
+            "effective_protocol": 2 if protocol_value == "2" else 1,
             "reason": "input comparison is not runtime attestation or native readiness"}
 
 
@@ -248,8 +372,8 @@ def strict_route_plan(strict_value, protocol_value, ring_observation, allocation
     missing = []
     if strict_value != "1":
         missing.append("strict persistence is not enabled")
-    if protocol_value != "2":
-        missing.append("actual admission protocol is not v2")
+    if protocol_value not in (None, "", "2"):
+        missing.append("actual admission protocol is invalid")
     if ring_observation != "ready":
         missing.append("prepared ring readiness is unknown or refused")
     if type(allocation_bound) is not int or allocation_bound < 16448:
@@ -257,6 +381,8 @@ def strict_route_plan(strict_value, protocol_value, ring_observation, allocation
     return {"native_authorized": False, "qualified": False, "fits": False,
             "missing": missing + ["source-bound capture finalization and independently bound preparation required"],
             "strict_env": strict_value, "protocol_env": protocol_value,
+            "effective_protocol": (2 if protocol_value == "2" else 1)
+            if protocol_value in (None, "", "2") else None,
             "ring_logical_bytes": 64 + 16 * 1024,
             "terminal_writes": [1023, 1], "fsync_after_each": True,
             "gate_body_max_bytes": 2 * 4096,
@@ -476,7 +602,7 @@ def bounded(work, deadline_ns, finish_ns):
     if pid == 0:
         code = 1
         try:
-            code = work()
+            code = 124 if now_ns() >= deadline_ns else work()
         except BaseException as error:
             # A bounded reason, not an unbounded traceback or a partial receipt.
             # Original guard evidence is retained; exception detail is omitted.

@@ -82,6 +82,81 @@ class BootstrapBounds(unittest.TestCase):
             self.assertEqual(b.bounded(lambda: 0, 101, 101), 124)
         fork.assert_not_called()
 
+    def test_raw_sink_detects_split_markers_and_rejects_partial_writes(self):
+        b = self.bootstrap
+        stream = mock.Mock()
+        stream.write.side_effect = lambda data: len(data)
+        stream.fileno.return_value = 9
+        sink = b.CaptureSink(stream)
+        sink.write(b"output_trunc")
+        sink.write(b"ated\neffigy: output complete (")
+        with mock.patch.object(b.os, "fsync") as sync:
+            record = sink.seal()
+        self.assertEqual((record["truncation_markers"], record["footer_count"]), (1, 1))
+        sync.assert_called_once_with(9)
+        with self.assertRaises(ValueError):
+            sink.write(b"late")
+        stream = mock.Mock()
+        stream.write.return_value = 1
+        sink = b.CaptureSink(stream)
+        with self.assertRaises(OSError):
+            sink.write(b"partial")
+        with self.assertRaises(ValueError):
+            sink.seal()
+
+    def test_capture_drains_to_eof_and_refuses_lost_eof(self):
+        b = self.bootstrap
+        sink = mock.Mock()
+        sink.seal.return_value = {"sealed": True}
+        with mock.patch.object(b, "now_ns", side_effect=[10, 11]), \
+             mock.patch.object(b.select, "select", return_value=([7], [], [])), \
+             mock.patch.object(b.os, "read", side_effect=[b"abc", b""]):
+            self.assertEqual(b.drain_capture(7, sink, 20), {"sealed": True})
+        sink.write.assert_called_once_with(b"abc")
+        sink.seal.assert_called_once()
+        sink.reset_mock()
+        with mock.patch.object(b, "now_ns", return_value=20), \
+             mock.patch.object(b.select, "select") as select_call:
+            with self.assertRaises(TimeoutError):
+                b.drain_capture(7, sink, 20)
+        select_call.assert_not_called()
+        sink.seal.assert_not_called()
+
+    def test_real_capture_footer_parser_rejects_incomplete_output(self):
+        b = self.bootstrap
+        good = b"\neffigy: output complete (payload 1 bytes; cap 524288 bytes)\n"
+        record = {"tail": good, "truncation_markers": 0, "footer_count": 1}
+        self.assertEqual(b.capture_footer(record), {"payload_bytes": 1, "cap_bytes": 524288})
+        for changes in ({"tail": good[:-1]}, {"tail": good + b"late"},
+                        {"tail": good.replace(b"524288", b"524289")},
+                        {"footer_count": 0}, {"footer_count": 2},
+                        {"truncation_markers": 1}):
+            with self.assertRaises(ValueError):
+                b.capture_footer(dict(record, **changes))
+
+    def test_foreground_capture_uses_fixed_route_and_keeps_unknown_child(self):
+        b = self.bootstrap
+        proc = mock.Mock(pid=42)
+        proc.stdout.fileno.return_value = 7
+        raw = {"tail": b"\neffigy: output complete (payload 1 bytes; cap 524288 bytes)\n",
+               "truncation_markers": 0, "footer_count": 1}
+        with mock.patch.object(b, "now_ns", return_value=10), \
+             mock.patch.object(b.subprocess, "Popen", return_value=proc) as spawn, \
+             mock.patch.object(b, "drain_capture", return_value=raw), \
+             mock.patch.object(b, "hold", return_value=0):
+            result = b.capture_foreground(mock.Mock(), 20)
+        self.assertEqual(result["effigy_exit"], 0)
+        self.assertEqual(spawn.call_args.args[0], b.NATIVE_CAPTURE_ARGV)
+        self.assertEqual(spawn.call_args.kwargs["env"]["EFFIGY_OUTPUT_CAP_BYTES"], "524288")
+        self.assertNotIn(proc, b._capture_unreaped)
+        with mock.patch.object(b, "now_ns", return_value=10), \
+             mock.patch.object(b.subprocess, "Popen", return_value=proc), \
+             mock.patch.object(b, "drain_capture", side_effect=TimeoutError):
+            with self.assertRaises(TimeoutError):
+                b.capture_foreground(mock.Mock(), 20)
+        self.assertIn(proc, b._capture_unreaped)
+        b._capture_unreaped.remove(proc)
+
     def test_partition_and_delivery_reserves(self):
         b = self.bootstrap
         self.assertEqual((b.GUARD_BUDGET_MIB, b.OUTSIDE_BUDGET_MIB), (384, 128))
@@ -184,7 +259,11 @@ class BootstrapBounds(unittest.TestCase):
         self.assertEqual(plan["prepare_store_wait_seconds"], 30)
         self.assertIsNone(plan["prepare_total_time_bound"])
         self.assertIsNone(plan["prepare_physical_bound"])
-        self.assertTrue(any("protocol" in reason for reason in plan["missing"]))
+        self.assertEqual(plan["effective_protocol"], 1)
+        self.assertEqual(b.strict_route_plan("1", "2", "ready", 20480)["effective_protocol"], 2)
+        invalid = b.strict_route_plan("1", "3", "ready", 20480)
+        self.assertIsNone(invalid["effective_protocol"])
+        self.assertTrue(any("protocol" in reason for reason in invalid["missing"]))
         self.assertFalse(b.strict_route_plan("1", "2", "ready", 20480)["fits"])
         for state in ("missing", "full", "corrupt", "wrong-size"):
             refused = b.strict_route_plan("1", "2", state, None)
