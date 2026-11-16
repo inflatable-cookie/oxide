@@ -1,13 +1,18 @@
-# Cooperative qualification acceptance (proposed)
+# Cooperative qualification acceptance target for future 309 work
 
-**Proposal only.** Tom's decision `57374e05-7506-4a7b-b296-9642e136e3f3`
-v2 (2026-11-16) selects drafting and independent review: all 445 cases,
-600 seconds as a work/stop target, 512 MiB monitored scratch; blocking/reap
-time and all-owned physical peak unguaranteed. The board label ends at
-“blocking”; the selected full `options[0]` supplies this scope.
-This is no adopted execution policy, implementation, qualification or activation.
-AGENTS.md, existing briefs and the 309/061/304 dispatch and merge holds remain
-binding. This document alone establishes no safe execution route.
+Tom's decision `ea8ee47f-adc0-4cd3-b420-aaa30642d623` v2
+(2026-11-16) adopts this reviewed contract as the acceptance target for future
+309 work and scopes one independently reviewed Nucleus-owned execution-route
+proposal, with no implementation or proof runs. Earlier decision `57374e05`
+v2 authorized drafting and independent review only.
+
+Adoption is prospective: it establishes no implemented or qualified route,
+source acceptance, resource fit, backing capability, runtime readiness or proof
+activation. Existing 309/061/304 briefs and their dispatch and merge holds remain
+binding and require full prospective amendment before later activation. No old
+receipt, native credit, source pin, budget or historical hard-clock or physical
+claim migrates to this target. This changes no Barge guest/host or Rust setup
+policy, consumer adoption or installation scope, or global proof rule.
 
 ## Work and accounting promises
 
@@ -137,8 +142,9 @@ lane `v015-qualification` v19,
 sha256 `368de92769966ffbc992f286e28324f7207c25e7573f8738fb82d20a8dd874b1`.
 Both conclude `fits:false`; Effigy's Explore advice is not retained Queue
 review. Installed `e6d7` source availability supplies no qualification credit.
-Paths below are relative to the named repository/head. Later requirements are
-proposals; readiness remaining false is this contract's inference.
+Paths below are relative to the named repository/head. The target does not
+establish a supported route; readiness remaining false is this contract's
+inference.
 
 | Predicate/promise | Existing supported source behavior; later gap |
 | --- | --- |
@@ -151,8 +157,9 @@ proposals; readiness remaining false is this contract's inference.
 
 ## Disposition and premise coverage
 
-Owner disposition of this proposal, scoped implementation and actual fit/readiness
-must precede separately activated adequate uncounted **445-case diagnostic**,
+The Nucleus route proposal, any separately scoped reviewed implementation and
+accepted source and actual fit/readiness must precede a separately activated
+adequate uncounted **445-case diagnostic**,
 counted author, distinct retained reviewer and final exact-head disposition,
 before 309 publication → 061 → 304. No ladder step is waived or activated.
 Old receipts, grants, failures and clocks stay bound to their original bytes.
