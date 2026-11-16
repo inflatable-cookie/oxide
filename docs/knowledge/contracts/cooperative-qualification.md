@@ -85,11 +85,13 @@ Require separately and conjunctively:
 
 - qualified, completed, custodian-bound **DECIDING** census and completed join;
 - a separate **FINAL** certain-empty census for the exact closure group;
-- ordinary whole-backing clearance evidence where the proof owns an image.
+- separate ordinary provider evidence, where the proof owns an image, that
+  the **entire owned backing and its residual allocations are absent**.
 
 None replaces actual waits or another predicate. Directory deletion,
-removed-container flags and empty groups prove no whole-backing clearance.
-Clearance never authorizes erasing evidence retained on another backing.
+removed-container flags, empty groups and a detached or unmounted image do not
+prove whole-backing absence. That absence never authorizes erasing evidence
+retained on another backing; its storage remains accounted.
 
 PASS requires every applicable source, **445-case**, oracle, admission,
 capture, EOF, drain, successful fsync, binding, acknowledgement, publisher-wait,
@@ -121,7 +123,7 @@ unproved custody/closure obligations; cleanup can later settle closure only.
 | Known scratch breach/overflow | R or F; stop through supported route, retain breach and all unresolved bytes. |
 | External total physical peak unknown | Disclosed unguaranteed observation; alone no failure/PASS. R/U if a required safety input is unknown; all independent gates still apply. |
 | Metadata/COW exceeds measured logical bytes | Disclose actual/unknown physical costs; no physical-ceiling claim. R/F for known monitored breach, R/U for unknown required safety input. |
-| Missing image whole-backing evidence | U; image/backing and evidence remain held; no clearance from unlink/group facts. |
+| Missing image whole-backing absence evidence | U; provider must prove the entire owned backing and residual allocations absent. Keep backing, residuals and evidence held/accounted; detach, unmount, unlink and group facts do not suffice. |
 | Report/turn/owner loss | U unless all required evidence was already durably accepted in target; prove surviving actual-parent custody or retain unknown. No replay/new occurrence. |
 | Complete evidence only after target | F permanently; late evidence may reconcile closure, never acquire PASS or refund. |
 
@@ -143,7 +145,7 @@ proposals; readiness remaining false is this contract's inference.
 | Exact source, admission, all 445 cases unchanged | Nucleus N `core/qa/proof-source.ts:21–59` binds published source; Effigy E `src/runner/task_engine/run/foreground.rs:181–225` supplies actual admission (reported). No proof-to-host-run integration selected; actual end-to-end binding remains required. |
 | Resource promises changed only as above | Nucleus N `core/machine/process-exec.ts:252–262` starts its timer at spawn; Effigy E `src/runner/run_control.rs:95–147` prepares separately (reported). Later design must cover original effects and all monitored footprints; neither launch timers nor logical limits suffice. Hard blocked-I/O/physical guarantees are no longer proposed. |
 | Actual parents and positive waits unchanged | Nucleus N `core/qa/supervisor-process.ts:46–55` returns PID, not a retained parent handle; Effigy E `crates/effigy-kernel/src/custody/spawn.rs:741–787` waits its own leader (reported). Surviving application graph/provider remains unsupported. |
-| DECIDING/join, FINAL, whole backing unchanged | Nucleus N `shared/schema/host-runs.ts:48–92` lacks these receipts (reported Spec 063). Separate qualified providers/evidence remain required. |
+| DECIDING/join, FINAL, whole-backing absence unchanged | Nucleus N `shared/schema/host-runs.ts:48–92` lacks these receipts (reported Spec 063). Separate qualified providers/evidence remain required, including absence of the entire owned backing and its residual allocations. |
 | Complete capture/delivery unchanged | Nucleus N `core/host-runs/host-run-retained-output.ts:35–85` truncates/redacts and swallows sync faults; `core/machine/process-exec.ts:219–246` can settle without pipe closure. Complete durable raw delivery/ack/publisher-wait support remains unresolved. |
 | Permanent failure/retention unchanged | Nucleus N `core/qa/proof-admission.ts:28–45`, `core/intake/proof-settlement.ts:45–62` preserve spent proofs (reported). No complete Oxide lifecycle/accounting implementation is established. |
 
