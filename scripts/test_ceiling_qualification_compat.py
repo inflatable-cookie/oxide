@@ -75,6 +75,60 @@ class BootstrapBounds(unittest.TestCase):
         cls.bootstrap = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.bootstrap)
 
+    def test_effigy_process_origin_never_proves_original_raw_window(self):
+        b = self.bootstrap
+        start = 123 * b.NS
+        end = start + b.WALL_NS
+        plan = b.effigy_deadline_plan(start, end, start + 5 * b.NS)
+        self.assertFalse(plan["ready"])
+        self.assertEqual(plan["remaining_raw_ns"], 595 * b.NS)
+        self.assertEqual(plan["arithmetic_remaining_ms"], 595000)
+        self.assertIsNone(plan["launch_delay_bound"])
+        self.assertIsNone(plan["cross_clock_bound"])
+        for observed in (start - 1, end, end + 1):
+            self.assertFalse(b.effigy_deadline_plan(start, end, observed)["ready"])
+        self.assertFalse(b.effigy_deadline_plan(start, end - 1, start)["ready"])
+        self.assertFalse(b.effigy_deadline_plan(start, end, end - 10 * b.NS)["ready"])
+        source = (Path(b.INSTALLED_SOURCE_ROOT) / "crates/effigy-core/src/run_deadline.rs").read_bytes()
+        contract = b.effigy_deadline_source_contract(source)
+        self.assertTrue(contract["bound"])
+        self.assertFalse(contract["ready"])
+        self.assertFalse(b.effigy_deadline_source_contract(source + b" ")["bound"])
+        with mock.patch.object(b, "START", start), mock.patch.object(b, "now_ns", return_value=start + b.NS), \
+             mock.patch.object(b.os, "mkdir") as mkdir, \
+             mock.patch.object(b, "snapshot_source_inputs") as snapshot, \
+             mock.patch.object(b, "bounded_capture_command") as command:
+            with self.assertRaises(ValueError):
+                b.prepare_capture_evidence("/unused", end)
+        mkdir.assert_not_called()
+        snapshot.assert_not_called()
+        command.assert_not_called()
+
+    def test_effigy_deadline_readback_requires_exact_single_consistent_line(self):
+        b = self.bootstrap
+        line = (b"run deadline 20000ms: clock monotonic, origin process start "
+                b"(sampled before capture, staging or admission), 1ms since origin, "
+                b"settlement allowance 10000ms, workload budget 10000ms, "
+                b"9999ms remaining at admission, guard pid 42\n")
+        result = b.parse_effigy_deadline_readback(line, 20000)
+        self.assertTrue(result["guard_identity_reported"])
+        self.assertFalse(result["original_raw_deadline_proven"])
+        for raw, cap in ((b"", 20000), (line[:-1], 20000), (line + line, 20000),
+                         (line, 20001), (line.replace(b"10000ms, workload", b"9999ms, workload"), 20000),
+                         (line.replace(b"9999ms remaining", b"10001ms remaining"), 20000)):
+            with self.assertRaises(ValueError):
+                b.parse_effigy_deadline_readback(raw, cap)
+        stream = mock.Mock()
+        stream.write.side_effect = lambda data: len(data)
+        stream.fileno.return_value = 9
+        sink = b.CaptureSink(stream)
+        sink.write(line[:7])
+        sink.write(line[7:])
+        with mock.patch.object(b.os, "fsync"):
+            captured = sink.seal()
+        self.assertEqual(captured["deadline_markers"], 1)
+        self.assertEqual(b.parse_effigy_deadline_readback(captured["deadline_line"], 20000), result)
+
     def test_expired_outer_window_never_forks(self):
         b = self.bootstrap
         with mock.patch.object(b, "now_ns", return_value=100), \
@@ -214,19 +268,25 @@ class BootstrapBounds(unittest.TestCase):
         proc = mock.Mock(pid=42)
         proc.stdout.fileno.return_value = 7
         raw = {"tail": b"\neffigy: output complete (payload 1 bytes; cap 524288 bytes)\n",
-               "truncation_markers": 0, "footer_count": 1}
+               "truncation_markers": 0, "footer_count": 1, "deadline_markers": 1,
+               "deadline_line": (b"run deadline 20000ms: clock monotonic, origin process start "
+                                 b"(sampled before capture, staging or admission), 1ms since origin, "
+                                 b"settlement allowance 10000ms, workload budget 10000ms, "
+                                 b"9999ms remaining at admission\n")}
         provenance = {"environment": {"EFFIGY_STRICT_PERSISTENCE": "1",
                                        "EFFIGY_ADMISSION_PROTOCOL": None}}
-        with mock.patch.object(b, "now_ns", side_effect=[10, 20]), \
+        with mock.patch.object(b, "now_ns", side_effect=[10, 10, 20]), \
              mock.patch.object(b, "source_supervision_readiness", return_value={"ready": True}), \
              mock.patch.object(b, "observe_installed_route", return_value=provenance), \
+             mock.patch.object(b, "effigy_deadline_plan", return_value={"ready": True, "configured_ms": 20000}), \
              mock.patch.object(b.subprocess, "Popen") as spawn:
             with self.assertRaises(TimeoutError):
-                b.capture_foreground(mock.Mock(), 20)
+                b.capture_foreground(mock.Mock(), 20, 0)
         spawn.assert_not_called()
         with mock.patch.object(b, "now_ns", return_value=10), \
              mock.patch.object(b, "source_supervision_readiness", return_value={"ready": True}), \
              mock.patch.object(b, "observe_installed_route", return_value=provenance), \
+             mock.patch.object(b, "effigy_deadline_plan", return_value={"ready": True, "configured_ms": 20000}), \
              mock.patch.object(b.os, "pipe", return_value=(7, 8)), \
              mock.patch.object(b.os, "fpathconf", return_value=4096), \
              mock.patch.object(b.os, "close"), \
@@ -235,7 +295,7 @@ class BootstrapBounds(unittest.TestCase):
              mock.patch.object(b.subprocess, "Popen", return_value=proc) as spawn, \
              mock.patch.object(b, "drain_capture", return_value=raw), \
              mock.patch.object(b, "hold", return_value=0):
-            result = b.capture_foreground(mock.Mock(), 20)
+            result = b.capture_foreground(mock.Mock(), 20, 0)
         self.assertEqual(result["effigy_exit"], 0)
         self.assertEqual(spawn.call_args.args[0], b.NATIVE_CAPTURE_ARGV)
         self.assertEqual(spawn.call_args.kwargs["env"]["EFFIGY_OUTPUT_CAP_BYTES"], "524288")
@@ -243,6 +303,7 @@ class BootstrapBounds(unittest.TestCase):
         with mock.patch.object(b, "now_ns", return_value=10), \
              mock.patch.object(b, "source_supervision_readiness", return_value={"ready": True}), \
              mock.patch.object(b, "observe_installed_route", return_value=provenance), \
+             mock.patch.object(b, "effigy_deadline_plan", return_value={"ready": True, "configured_ms": 20000}), \
              mock.patch.object(b.os, "pipe", return_value=(7, 8)), \
              mock.patch.object(b.os, "fpathconf", return_value=4096), \
              mock.patch.object(b.os, "close"), \
@@ -251,7 +312,7 @@ class BootstrapBounds(unittest.TestCase):
              mock.patch.object(b.subprocess, "Popen", return_value=proc), \
              mock.patch.object(b, "drain_capture", side_effect=TimeoutError):
             with self.assertRaises(TimeoutError):
-                b.capture_foreground(mock.Mock(), 20)
+                b.capture_foreground(mock.Mock(), 20, 0)
         self.assertIn(proc, b._capture_unreaped)
         b._capture_unreaped.remove(proc)
         self.assertIn(7, b._capture_open_pipes)
@@ -262,22 +323,31 @@ class BootstrapBounds(unittest.TestCase):
         stream = mock.MagicMock()
         stream.__enter__.return_value = stream
         with mock.patch.object(b, "now_ns", return_value=10), \
+             mock.patch.object(b, "source_supervision_readiness", return_value={"ready": True}), \
+             mock.patch.object(b, "effigy_deadline_plan", return_value={"ready": True}), \
              mock.patch.object(b.os, "open", return_value=8) as open_call, \
              mock.patch.object(b.os, "fdopen", return_value=stream), \
              mock.patch.object(b, "capture_foreground", return_value={"bytes": 1}) as run:
-            self.assertEqual(b.capture_raw_log("owned.raw", 20), {"bytes": 1})
+            self.assertEqual(b.capture_raw_log("owned.raw", 20, 0), {"bytes": 1})
         self.assertTrue(open_call.call_args.args[1] & b.os.O_EXCL)
-        run.assert_called_once_with(stream, 20)
+        run.assert_called_once_with(stream, 20, 0)
         with mock.patch.object(b, "now_ns", return_value=10), \
+             mock.patch.object(b, "source_supervision_readiness", return_value={"ready": True}), \
+             mock.patch.object(b, "effigy_deadline_plan", return_value={"ready": True}), \
              mock.patch.object(b.os, "open", side_effect=FileExistsError), \
              mock.patch.object(b, "capture_foreground") as run:
             with self.assertRaises(FileExistsError):
-                b.capture_raw_log("owned.raw", 20)
+                b.capture_raw_log("owned.raw", 20, 0)
         run.assert_not_called()
         with mock.patch.object(b, "now_ns", return_value=20), \
              mock.patch.object(b.os, "open") as open_call:
             with self.assertRaises(TimeoutError):
                 b.capture_raw_log("owned.raw", 20)
+        open_call.assert_not_called()
+        with mock.patch.object(b, "now_ns", return_value=10), \
+             mock.patch.object(b.os, "open") as open_call:
+            with self.assertRaises(ValueError):
+                b.capture_raw_log("owned.raw", 20, 0)
         open_call.assert_not_called()
 
     def test_joined_group_evidence_requires_both_certain_censuses(self):
@@ -426,27 +496,36 @@ class BootstrapBounds(unittest.TestCase):
         stream.write.side_effect = lambda data: len(data)
         stream.fileno.return_value = 9
         sink = b.CaptureSink(stream)
+        deadline_line = (b"run deadline 20000ms: clock monotonic, origin process start "
+                         b"(sampled before capture, staging or admission), 1ms since origin, "
+                         b"settlement allowance 10000ms, workload budget 10000ms, "
+                         b"9999ms remaining at admission\n")
+        sink.write(deadline_line)
         sink.write(b"qualification receipt: " + json.dumps(qualification).encode() + b"\n")
         sink.write(b"\neffigy: output complete (payload 3 bytes; cap 524288 bytes)\n")
         with mock.patch.object(b.os, "fsync"):
             record = sink.seal()
         record.update(effigy_exit=1, effigy_footer=b.capture_footer(record),
+                      deadline_plan={"ready": True, "configured_ms": 20000},
+                      effigy_deadline=b.parse_effigy_deadline_readback(deadline_line, 20000),
                       installed_provenance={"launcher_sha256": b.INSTALLED_LAUNCHER_SHA256,
                                             "binary_sha256": b.INSTALLED_BINARY_SHA256,
                                             "receipt_sha256": b.INSTALLED_RECEIPT_SHA256,
                                             "source_head": b.INSTALLED_SOURCE_HEAD,
                                             "source_tree": b.INSTALLED_SOURCE_TREE,
                                             "source_hashes": b.INSTALLED_SOURCE_INPUTS,
+                                            "deadline_source_contract": {"bound": True, "ready": False},
                                             "environment": {"EFFIGY_LAUNCH": None,
                                                             "EFFIGY_STRICT_PERSISTENCE": "1",
-                                                            "EFFIGY_ADMISSION_PROTOCOL": None}},
+                                                            "EFFIGY_ADMISSION_PROTOCOL": "5"}},
                       route_extra={"bounded": True, "effigy_cap_including_marker_footer": 524288,
                                    "route_extra_bytes_max": 859136})
         probe = mock.Mock()
         probe.realpath.side_effect = lambda path: path
         def document(path, _deadline):
             return pins if path.endswith("ceiling-qualification-pins.json") else nested
-        with mock.patch.object(b, "verify_source_pins"), \
+        with mock.patch.dict(b.os.environ, {"EFFIGY_ADMISSION_PROTOCOL": "5"}), \
+             mock.patch.object(b, "verify_source_pins"), \
              mock.patch.object(b, "read_capture_document", side_effect=document), \
              mock.patch.object(b, "installed_file_digest", return_value=record["sha256"]), \
              mock.patch.object(b, "suite_backing_evidence", return_value=[{"state": "whole-backing-absent"}]):
@@ -523,6 +602,10 @@ class BootstrapBounds(unittest.TestCase):
         self.assertFalse(b.capture_fit(sizes, 1, 1, b.MIB + 1, 4096, **physical)["fits"])
         self.assertFalse(b.capture_fit(sizes, 1, 1, 0, 4096, raw_copies=2, **physical)["fits"])
         self.assertFalse(b.capture_fit(sizes, 1, 1, 0, 4096, raw_delivery_copies=1, **physical)["fits"])
+        extra = dict(physical, installed_source_sizes={**physical["installed_source_sizes"], "unexpected": 1})
+        self.assertFalse(b.capture_fit(sizes, 1, 1, 0, 4096, **extra)["fits"])
+        missing = dict(physical, installed_source_sizes={})
+        self.assertFalse(b.capture_fit(sizes, 1, 1, 0, 4096, **missing)["fits"])
         self.assertFalse(b.capture_fit(sizes, 30 * b.MIB, 1, 0, 4096, **physical)["fits"])
         self.assertFalse(b.capture_fit({}, 1, 1, 0, 4096, **physical)["fits"])
         self.assertFalse(b.capture_fit(sizes, 1, 1, 0, 4096,

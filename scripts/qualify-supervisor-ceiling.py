@@ -203,20 +203,31 @@ def capture_fit(source_sizes, index_size, entries_size, route_extra_limit, alloc
 
 
 INSTALLED_LAUNCHER_SHA256 = "00747fa62d7acde5448d9b0b7f18dc99e2622d6de49fffbc1dacf6e005ab3083"
-INSTALLED_BINARY_SHA256 = "7d4667efe2b813d11ccdbd4b8630e6f2a62156795d9b04a9c0bcfaf1545e2e58"
-INSTALLED_RECEIPT_SHA256 = "79e70f53ac93c307007b9c97464aa53d018855780c539288220855d503de0443"
-INSTALLED_SOURCE_HEAD = "974954729ec5efd0f450f87276b15ba72c1cbbca"
-INSTALLED_SOURCE_TREE = "8b42756d41dd1ed985a9a69524f606c674e8e634"
+INSTALLED_BINARY_SHA256 = "372679d525b5559d55aec04055a2a60633eae7db37cff158cb254d9eba66302b"
+INSTALLED_RECEIPT_SHA256 = "cab3bb9961975e53fb2420fd9e32b819a4e125e062a064b10fa0bd0ab6f8d70a"
+INSTALLED_SOURCE_HEAD = "e6d7ac361889c330e9a1f03a072d0b598541c9c9"
+INSTALLED_SOURCE_TREE = "fc1d8497dadefeb981ea7998633cb477144f07b3"
 INSTALLED_SOURCE_ROOT = "/Users/tom/Dev/projects/effigy"
 INSTALLED_SOURCE_INPUTS = {
-    "crates/effigy-core/src/output_cap.rs": "bd93d554b89dee673ada7d4201ef7c20bae40fdaa55568b0f2fe2bf7efafb4f1",
+    "crates/effigy-core/src/output_cap.rs": "92ff15ed980b6b054d87aaeb76481bf160d55221ce723cacdcc907644d3000e2",
     "crates/effigy-kernel/src/run/terminal_ring.rs": "7138e5b4a89100ee2eee30a96d2937ff975a76595f3399aafcbefc8721bac5ad",
-    "crates/effigy-kernel/src/run/foreground.rs": "183ca2f248964d3af9e2c75c90adc930d8cab92b9ad4048dd5b12e5c1ebcce5a",
-    "crates/effigy-kernel/src/supervise/memory.rs": "72d9b741782aaf3f8bc06f01b436d61d765ed489f14e6816e69a78c6d581e5b1",
-    "crates/effigy-kernel/src/supervise.rs": "13cd98135a41ac62b55780bc7ec2e8563b65e3a9e7200586d510bcb3a01b07ad",
-    "crates/effigy-kernel/src/store.rs": "f58f0e0ba2751e60cc3f414376f733bc4e6321ce54b4d6dfc9dd498be3662083",
-    "src/runner/task_engine/admission.rs": "ed4dec7cd85d6d7a4a339e2716af78e9d4c4e40d89466821cb0ae9b9271b0815",
-    "src/runner/task_engine/run/foreground.rs": "b7b04b60b807b4c1a8cc6395e51cbb31d984ee36902b7207ed5007c41f49ebab",
+    "crates/effigy-kernel/src/run/foreground.rs": "7c01b23d5ebe1d6f2c95e7f30f0645d933815d41e6c618295dbfbdf79602cc6c",
+    "crates/effigy-kernel/src/supervise/memory.rs": "00a6828b984f37f1d8af5ad343aa46774d29d1f1e2bd273be1ca7659aa10884f",
+    "crates/effigy-kernel/src/supervise.rs": "62fc6efe9c7a54b26d796f001e8ed42cc4e15c08867cb831ba2c84f7c8476ee8",
+    "crates/effigy-kernel/src/store.rs": "e534d6f9a7bacdbd9e8a23a1c30550f311afe2938a6480a157459a2d01419a18",
+    "src/runner/task_engine/admission.rs": "160e3778ee8f43d0bae65015feee9fdb66dd0868b77cccf4c7a3571e2caa2b96",
+    "src/runner/task_engine/run/foreground.rs": "6ae232603da1e1f44cd61cef66c592502dc5fb19e3ef3f880357ccadfaf99981",
+    "crates/effigy-core/src/run_deadline.rs": "0b864adc833a2adc8e79cfef587d8ae1bfbabd0f445c1333f86e0617d2b0a761",
+    "src/bin/effigy.rs": "cd84005369edbc5c5d437861f82b040fcdb0d66fa3d958a083970a5696686e1b",
+    "src/runner/task_engine/process.rs": "703a01b037319dad5f6e638dd07480a12381907c0e8097313aaaa245bea92f53",
+    "src/runner/task_engine/spawn_env.rs": "695bf2f213b0214f7d4471c5f9e4293bf8c6c7c93c3d4877967bf0330376f81f",
+    "crates/effigy-kernel/src/custody.rs": "e5b53deaebb79e24382a58c8dfb77329559a6a7dff871a5446f19c0a830eb2f9",
+    "crates/effigy-kernel/src/custody/spawn.rs": "ba6db5728c62a9e6491fd40e57dbdb732ba6916d03e7234829dcc58316c2d6cd",
+    "crates/effigy-kernel/src/ctx.rs": "03e2b84c66b912ebcc683e6cfdbdd967cc33f4bcc976b97d2f672ecdfb4e01d6",
+    "crates/effigy-kernel/src/run/mod.rs": "8c178ca17bf04d209924d128d04d4ce17bff856761674b22f08ebd12af3d2765",
+    "src/runner/task_engine/run.rs": "a814a36d0540079df67630d21e2a1932af63f4e3c09d1bc1aa4215830588cffd",
+    "src/runner/execute/pipeline/standard.rs": "e7fd28fe2b2d4fdab59099dee32a57c779eec0c4984261f5c075fdeb46b2a144",
+    "crates/effigy-kernel/src/gate.rs": "184ebcecf0042c2a02418d18c7568315afe4a8dead3079d7125eb4948d4f6333",
 }
 
 
@@ -270,18 +281,91 @@ def observe_installed_route(deadline_ns):
         if observed != expected:
             raise ValueError("installed Effigy source drift: " + name)
         source_hashes[name] = observed
+    deadline_source = os.path.join(INSTALLED_SOURCE_ROOT, "crates/effigy-core/src/run_deadline.rs")
+    if now_ns() >= deadline_ns:
+        raise TimeoutError("installed deadline source observation expired")
+    with open(deadline_source, "rb") as handle:
+        source_contract = effigy_deadline_source_contract(handle.read(MIB + 1))
+    if not source_contract.get("bound") or now_ns() >= deadline_ns:
+        raise ValueError("installed deadline source is changed or incomplete")
     return {"launcher": launcher, "launcher_sha256": hashes[0], "binary_sha256": hashes[1],
             "receipt_sha256": hashes[2], "source_head": fields["source_head"],
             "source_tree": fields["source_tree"], "source_hashes": source_hashes,
+            "deadline_source_contract": source_contract,
             "environment": {key: os.environ.get(key) for key in
                             ("EFFIGY_LAUNCH", "EFFIGY_STRICT_PERSISTENCE",
-                             "EFFIGY_ADMISSION_PROTOCOL", "EFFIGY_ADMITTED")},
+                             "EFFIGY_ADMISSION_PROTOCOL", "EFFIGY_ADMITTED",
+                             "EFFIGY_RUN_DEADLINE_MS")},
             "note": "installer attribution only, not runtime attestation"}
 
 
 # The installed 974 cap includes marker and maximum-width footer in this share.
 EFFIGY_TEXT_CAP_BYTES = 512 * 1024
 EXPECTED_CEILING_SHA256 = "4aba8be3120abc67a0a9b4df6793bbc2b74ece79199f56bbfa355fed368231e0"
+
+
+def effigy_deadline_plan(original_start_ns, original_deadline_ns, observed_ns):
+    """Describe the installed deadline without asserting a cross-clock bound.
+
+    The returned millisecond duration is arithmetic on the caller's RAW clock,
+    not permission to launch. Effigy samples its own later Instant origin; its
+    helper ceiling is sampled separately on CLOCK_MONOTONIC. Neither launch
+    latency nor the relationship between those clocks is bounded here.
+    """
+    values = (original_start_ns, original_deadline_ns, observed_ns)
+    if (any(type(value) is not int or value < 0 or value >= 2**64 for value in values)
+            or original_deadline_ns <= original_start_ns
+            or original_deadline_ns - original_start_ns != WALL_NS
+            or observed_ns < original_start_ns or observed_ns >= original_deadline_ns):
+        return {"ready": False, "reason": "invalid or expired original RAW window"}
+    remaining_ns = original_deadline_ns - observed_ns
+    remaining_ms = remaining_ns // 1_000_000
+    if remaining_ms <= 10_000:
+        return {"ready": False, "reason": "Effigy settlement allowance does not fit",
+                "remaining_raw_ns": remaining_ns}
+    return {"ready": False, "qualified": False, "remaining_raw_ns": remaining_ns,
+            "arithmetic_remaining_ms": remaining_ms,
+            "effigy_origin": "later process-start Instant",
+            "helper_origin": "separate CLOCK_MONOTONIC sample",
+            "launch_delay_bound": None, "cross_clock_bound": None,
+            "reason": "remaining duration cannot establish the original RAW deadline"}
+
+
+def effigy_deadline_source_contract(source):
+    """Bind the changed installed deadline source, without granting authority."""
+    expected = INSTALLED_SOURCE_INPUTS["crates/effigy-core/src/run_deadline.rs"]
+    if not isinstance(source, bytes) or hashlib.sha256(source).hexdigest() != expected:
+        return {"bound": False, "ready": False, "reason": "installed deadline source drift"}
+    required = (b"let origin = Instant::now();", b"origin.checked_add(Duration::from_millis(ms))",
+                b"system_monotonic_nanos().checked_add", b"libc::CLOCK_MONOTONIC",
+                b"CONFIGURED_ENV.get_or_init(configure_env_once)")
+    if any(fragment not in source for fragment in required):
+        return {"bound": False, "ready": False, "reason": "deadline source path is incomplete"}
+    return {"bound": True, "ready": False, "instant_origin": "process entry",
+            "helper_origin": "separate CLOCK_MONOTONIC sample",
+            "launch_delay_bound": None, "cross_clock_bound": None,
+            "reason": "source readback does not bind the earlier caller RAW origin"}
+
+
+def parse_effigy_deadline_readback(raw, configured_ms):
+    """Parse the installed text readback; this does not prove outer custody."""
+    if not isinstance(raw, bytes) or type(configured_ms) is not int or configured_ms <= 10_000:
+        raise ValueError("invalid deadline readback input")
+    pattern = (rb"(?m)^run deadline ([0-9]{1,20})ms: clock monotonic, origin process start "
+               rb"\(sampled before capture, staging or admission\), ([0-9]{1,20})ms since origin, "
+               rb"settlement allowance ([0-9]{1,20})ms, workload budget ([0-9]{1,20})ms, "
+               rb"([0-9]{1,20})ms remaining at admission(?:, guard pid ([0-9]{1,20}))?\n")
+    matches = list(re.finditer(pattern, raw))
+    if len(matches) != 1 or raw.count(b"run deadline ") != 1:
+        raise ValueError("missing, malformed or duplicate Effigy deadline readback")
+    cap, elapsed, settlement, workload, remaining = (int(value) for value in matches[0].groups()[:5])
+    if (cap != configured_ms or settlement != 10_000 or workload != cap - settlement
+            or elapsed > cap or remaining > workload):
+        raise ValueError("inconsistent Effigy deadline readback")
+    return {"configured_ms": cap, "elapsed_ms": elapsed, "settlement_ms": settlement,
+            "workload_ms": workload, "admission_remaining_ms": remaining,
+            "guard_identity_reported": matches[0].group(6) is not None,
+            "original_raw_deadline_proven": False}
 
 
 class CaptureSink:
@@ -304,6 +388,9 @@ class CaptureSink:
         self.qualification_markers = 0
         self.qualification_bytes = None
         self.qualification = None
+        self.deadline_markers = 0
+        self.deadline_line = None
+        self.deadline_line_done = False
         self.failed = False
         self.sealed = False
 
@@ -317,10 +404,12 @@ class CaptureSink:
         marker = b"output_truncated"
         footer = b"effigy: output complete ("
         qualification = b"qualification receipt: "
+        deadline_marker = b"run deadline "
         joined = self.tail + chunk
         self.markers += joined.count(marker) - self.tail.count(marker)
         self.footers += joined.count(footer) - self.tail.count(footer)
         self.qualification_markers += joined.count(qualification) - self.tail.count(qualification)
+        self.deadline_markers += joined.count(deadline_marker) - self.tail.count(deadline_marker)
         try:
             written = self.stream.write(chunk)
             if written != len(chunk):
@@ -330,6 +419,21 @@ class CaptureSink:
             raise
         self.digest.update(chunk)
         self.length += len(chunk)
+        if not self.deadline_line_done:
+            if self.deadline_line is None:
+                offset = joined.find(deadline_marker)
+                if offset >= 0:
+                    self.deadline_line = bytearray(joined[offset:])
+            else:
+                self.deadline_line.extend(chunk)
+            if self.deadline_line is not None:
+                newline = self.deadline_line.find(b"\n")
+                if newline >= 0:
+                    self.deadline_line = self.deadline_line[:newline + 1]
+                    self.deadline_line_done = True
+                if len(self.deadline_line) > 512:
+                    self.failed = True
+                    raise OutputLimit("Effigy deadline readback exceeded its bound")
         if self.qualification is None:
             if self.qualification_bytes is None:
                 offset = joined.find(qualification)
@@ -369,7 +473,9 @@ class CaptureSink:
         return {"bytes": self.length, "sha256": self.digest.hexdigest(),
                 "tail": self.tail, "truncation_markers": self.markers,
                 "footer_count": self.footers, "qualification": self.qualification,
-                "qualification_markers": self.qualification_markers}
+                "qualification_markers": self.qualification_markers,
+                "deadline_markers": self.deadline_markers,
+                "deadline_line": None if self.deadline_line is None else bytes(self.deadline_line)}
 
 
 def drain_capture(fd, sink, deadline_ns):
@@ -553,7 +659,12 @@ def source_supervision_readiness():
     This is a source-only refusal; it does not activate a qualified guard.
     """
     return {"ready": False, "qualified": False,
-            "reason": "the bounded actor cannot retain the worker's subprocess custody"}
+            "reason": "the bounded actor cannot retain the worker's subprocess custody",
+            "effigy_deadline_origin": "Effigy process-start Instant after caller preparation",
+            "helper_deadline_origin": "separately sampled CLOCK_MONOTONIC",
+            "original_clock": "CLOCK_UPTIME_RAW", "launch_delay_bound": None,
+            "cross_clock_bound": None,
+            "limitation": "Effigy readback and foreground settlement do not establish the original RAW deadline"}
 
 
 def snapshot_git_identity(deadline_ns):
@@ -573,7 +684,7 @@ def snapshot_git_identity(deadline_ns):
     return result
 
 
-def capture_foreground(stream, deadline_ns):
+def capture_foreground(stream, deadline_ns, original_start_ns=None):
     """Launch only the fixed diagnostic route and drain its combined output.
 
     This is a producer seam, not readiness or authority to start a native run.
@@ -584,12 +695,21 @@ def capture_foreground(stream, deadline_ns):
         raise ValueError("capture child custody is not established")
     if now_ns() >= deadline_ns:
         raise TimeoutError("capture deadline expired before launch")
+    if type(original_start_ns) is not int or deadline_ns > original_start_ns + WALL_NS:
+        raise ValueError("the original capture window is not bound")
     provenance = observe_installed_route(deadline_ns)
     observed_env = provenance["environment"]
     if (observed_env["EFFIGY_STRICT_PERSISTENCE"] != "1"
-            or observed_env["EFFIGY_ADMISSION_PROTOCOL"] not in (None, "", "2")):
+            or observed_env["EFFIGY_ADMISSION_PROTOCOL"] != os.environ.get("EFFIGY_ADMISSION_PROTOCOL")):
         raise ValueError("strict foreground route is not bound")
     env = dict(os.environ)
+    plan = effigy_deadline_plan(original_start_ns, original_start_ns + WALL_NS, now_ns())
+    if not plan.get("ready"):
+        raise ValueError("Effigy process origin is not bound to the original window")
+    configured_ms = plan["configured_ms"]
+    if env.get("EFFIGY_RUN_DEADLINE_MS") not in (None, "", str(configured_ms)):
+        raise ValueError("inherited Effigy deadline differs from the bound route")
+    env["EFFIGY_RUN_DEADLINE_MS"] = str(configured_ms)
     env["EFFIGY_OUTPUT_CAP_BYTES"] = str(EFFIGY_TEXT_CAP_BYTES)
     if now_ns() >= deadline_ns:
         raise TimeoutError("capture deadline expired during provenance")
@@ -626,17 +746,25 @@ def capture_foreground(stream, deadline_ns):
     record["effigy_footer"] = capture_footer(record)
     record["installed_provenance"] = provenance
     record["route_extra"] = bound
+    if record.get("deadline_markers") != 1 or record.get("deadline_line") is None:
+        raise ValueError("Effigy deadline readback is missing or duplicated")
+    record["effigy_deadline"] = parse_effigy_deadline_readback(record["deadline_line"], configured_ms)
+    record["deadline_plan"] = plan
     return record
 
 
-def capture_raw_log(path, deadline_ns):
+def capture_raw_log(path, deadline_ns, original_start_ns=None):
     """Create the single retained log once; incomplete files stay in place."""
-    if now_ns() >= deadline_ns:
+    observed_ns = now_ns()
+    if observed_ns >= deadline_ns:
         raise TimeoutError("capture deadline expired before log creation")
+    if (not source_supervision_readiness()["ready"] or type(original_start_ns) is not int
+            or not effigy_deadline_plan(original_start_ns, original_start_ns + WALL_NS, observed_ns).get("ready")):
+        raise ValueError("original deadline and child custody are not established")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
     fd = os.open(path, flags, 0o600)
     with os.fdopen(fd, "wb", buffering=0) as stream:
-        return capture_foreground(stream, deadline_ns)
+        return capture_foreground(stream, deadline_ns, original_start_ns)
 
 
 def joined_group_evidence(receipt, expected_leader, guard=None):
@@ -787,18 +915,28 @@ def inspect_candidate_capture(record, raw_log, source_identity, probe, deadline_
         raise ValueError("diagnostic outcome or source head is not bound")
     if capture_footer(record) != record.get("effigy_footer"):
         raise ValueError("Effigy footer changed")
+    plan = record.get("deadline_plan")
+    if (not isinstance(plan, dict) or plan.get("ready") is not True
+            or record.get("deadline_markers") != 1
+            or type(plan.get("configured_ms")) is not int
+            or parse_effigy_deadline_readback(record.get("deadline_line"), plan["configured_ms"])
+            != record.get("effigy_deadline")):
+        raise ValueError("Effigy deadline origin or readback is not bound")
     provenance = record.get("installed_provenance")
     route = record.get("route_extra")
     environment = provenance.get("environment") if isinstance(provenance, dict) else None
+    deadline_source = provenance.get("deadline_source_contract") if isinstance(provenance, dict) else None
     if (not isinstance(provenance, dict) or provenance.get("launcher_sha256") != INSTALLED_LAUNCHER_SHA256
             or provenance.get("binary_sha256") != INSTALLED_BINARY_SHA256
             or provenance.get("receipt_sha256") != INSTALLED_RECEIPT_SHA256
             or provenance.get("source_head") != INSTALLED_SOURCE_HEAD
             or provenance.get("source_tree") != INSTALLED_SOURCE_TREE
             or provenance.get("source_hashes") != INSTALLED_SOURCE_INPUTS
+            or not isinstance(deadline_source, dict) or deadline_source.get("bound") is not True
             or not isinstance(environment, dict) or environment.get("EFFIGY_LAUNCH") == "stable"
             or environment.get("EFFIGY_STRICT_PERSISTENCE") != "1"
-            or environment.get("EFFIGY_ADMISSION_PROTOCOL") not in (None, "", "2")
+            or ("EFFIGY_ADMISSION_PROTOCOL" not in environment
+                or environment["EFFIGY_ADMISSION_PROTOCOL"] != os.environ.get("EFFIGY_ADMISSION_PROTOCOL"))
             or not isinstance(route, dict) or route.get("bounded") is not True
             or route.get("effigy_cap_including_marker_footer") != EFFIGY_TEXT_CAP_BYTES
             or type(route.get("route_extra_bytes_max")) is not int
@@ -841,9 +979,10 @@ def supported_capture_physical_bounds():
 CAPTURE_WORKER_MARKER = b"ceiling capture worker result: "
 
 
-def capture_worker(raw_path, result_path, deadline_ns):
+def capture_worker(raw_path, result_path, original_start_ns, deadline_ns):
     """Fixed child under the qualified outer supervisor, never a qualification."""
-    if (type(deadline_ns) is not int or not now_ns() < deadline_ns <= START + WALL_NS
+    if (type(original_start_ns) is not int or type(deadline_ns) is not int
+            or not 0 <= original_start_ns <= now_ns() < deadline_ns <= original_start_ns + WALL_NS
             or not isinstance(raw_path, str) or not os.path.isabs(raw_path)
             or not isinstance(result_path, str) or not os.path.isabs(result_path)):
         raise ValueError("capture worker window or path is invalid")
@@ -856,8 +995,9 @@ def capture_worker(raw_path, result_path, deadline_ns):
     if supported_capture_physical_bounds() is None:
         raise ValueError("supported physical capture and preparation bounds are unavailable")
     verify_source_pins(PINS_TOKEN)
-    record = capture_raw_log(raw_path, deadline_ns)
+    record = capture_raw_log(raw_path, deadline_ns, original_start_ns)
     record["tail_hex"] = record.pop("tail").hex()
+    record["deadline_line_hex"] = record.pop("deadline_line").hex()
     publication = publish_capture_receipt(result_path, {"record": record}, deadline_ns)
     encoded = json.dumps(publication, sort_keys=True, separators=(",", ":"))
     print(CAPTURE_WORKER_MARKER.decode("ascii") + encoded, flush=True)
@@ -912,13 +1052,14 @@ def read_worker_publication(stdout_log, result_path, deadline_ns):
             or not isinstance(document.get("record"), dict)):
         raise ValueError("capture worker provisional document is malformed")
     record = document["record"]
-    if not isinstance(record.get("tail_hex"), str):
+    if not isinstance(record.get("tail_hex"), str) or not isinstance(record.get("deadline_line_hex"), str):
         raise ValueError("capture worker tail is missing")
     try:
         record["tail"] = bytes.fromhex(record.pop("tail_hex"))
+        record["deadline_line"] = bytes.fromhex(record.pop("deadline_line_hex"))
     except ValueError as error:
         raise ValueError("capture worker tail is malformed") from error
-    if len(record["tail"]) > CaptureSink.TAIL:
+    if len(record["tail"]) > CaptureSink.TAIL or len(record["deadline_line"]) > 512:
         raise ValueError("capture worker tail is oversized")
     return record, publication
 
@@ -948,12 +1089,15 @@ def inspect_outer_group(receipt, worker_command, evidence_path, candidate_leader
 
 def capture_worker_command(root, deadline_ns):
     return [sys.executable, os.path.abspath(__file__), "--pins-sha256", PINS_TOKEN,
-            "--_capture-worker", str(deadline_ns), os.path.join(root, "capture.raw"),
+            "--_capture-worker", str(START), str(deadline_ns), os.path.join(root, "capture.raw"),
             os.path.join(root, "worker.json")]
 
 
 def prepare_capture_evidence(root, deadline_ns):
     """Bind exact inputs and readiness before the separate outer guard starts."""
+    plan = effigy_deadline_plan(START, START + WALL_NS, now_ns())
+    if not plan.get("ready"):
+        raise ValueError("Effigy's process origin is not bound to the original RAW deadline")
     physical = supported_capture_physical_bounds()
     if not isinstance(physical, dict):
         raise ValueError("supported physical allocation and separate prepare remain unknown")
@@ -968,7 +1112,7 @@ def prepare_capture_evidence(root, deadline_ns):
     provenance = observe_installed_route(deadline_ns)
     env = provenance["environment"]
     if (env["EFFIGY_STRICT_PERSISTENCE"] != "1"
-            or env["EFFIGY_ADMISSION_PROTOCOL"] not in (None, "", "2")):
+            or env["EFFIGY_ADMISSION_PROTOCOL"] != os.environ.get("EFFIGY_ADMISSION_PROTOCOL")):
         raise ValueError("strict Effigy foreground route is not bound")
     sources = snapshot_source_inputs(root + "-before", deadline_ns)
     source_sizes = {name: sources[name]["bytes"] for name in CAPTURE_SOURCE_FILES}
@@ -2080,9 +2224,10 @@ def main(argv=None):
     PINS_TOKEN = argv[1]
     del argv[:2]
     if argv and argv[0] == "--_capture-worker":
-        if len(argv) != 4 or not argv[1].isascii() or not argv[1].isdecimal() or len(argv[1]) > 20:
+        if (len(argv) != 5 or any(not value.isascii() or not value.isdecimal() or len(value) > 20
+                                  for value in argv[1:3])):
             raise SystemExit("ceiling capture worker: invalid fixed arguments")
-        return capture_worker(argv[2], argv[3], int(argv[1]))
+        return capture_worker(argv[3], argv[4], int(argv[1]), int(argv[2]))
     if argv and argv[0] == PREFLIGHT_FLAG:
         try:
             verify_source_pins(PINS_TOKEN)

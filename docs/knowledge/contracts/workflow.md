@@ -2353,8 +2353,8 @@ monitor stubs with substituted I/O. No apparatus execution, qualification or ado
 source. Tom's `775190c6` ceiling and separate `a833` guest-clock rulings remain
 distinct; native occurrences require the separate owner activations.
 The candidate digest is `4aba8be3120abc67a0a9b4df6793bbc2b74ece79199f56bbfa355fed368231e0`;
-the pin manifest digest is `a62ee1f7e6ca5ab62cddabc63c0b72502810a282c067a9349639efe28381d126`.
-The bootstrap digest is `b19285a6fb7ee2d052dae65e8475a0943aaac97d87905c917026da4c2d6df698`. The manifest records the full suite digest
+the pin manifest digest is `adc09837bbac2c5daf0a5d9f8bc10f21bce668f35e70c78e8bfcb3f6dd29c03f`.
+The bootstrap digest is `0405db397d05dc423c83f4088ac8ca4a8e4998ce620e6c2a1b16a584bdfc6831`. The manifest records the full suite digest
 alongside the unchanged `fcfda2b0` ordinary guard.
 For a future separately activated diagnostic, the proposed capture argv is
 `effigy proof:supervisor:ceiling:qualify:diagnostic` with stdout and stderr
@@ -2377,7 +2377,7 @@ readiness or permission to truncate output.
 
 The prospective capture implementation also reserves 8 MiB for the separate
 qualified outer group's scratch and 3 MiB for its bounded metadata output. Its
-two snapshots cover the eight Oxide inputs, eight pinned Effigy source inputs,
+two snapshots cover the eight Oxide inputs, nineteen pinned Effigy source inputs,
 and the index and entries within a 5 MiB source-copy reservation; an oversized
 inventory refuses. The outer group's own output logs are metadata, not a second
 copy of the raw diagnostic stream. A provisional receipt alone never establishes
@@ -2389,6 +2389,19 @@ qualified custodian that survives through child and joined-group closure is
 still needed; the ordinary guard's relative deadline and admission extensions
 do not by themselves enforce the original absolute window. These prospective
 controls are not native readiness or evidence that physical allocation fits.
+
+The installed Effigy `e6d7ac3` deadline samples `Instant` at its own entry and
+reads a separately sampled `CLOCK_MONOTONIC` value for helper custody. Its text
+readback reports its configured duration, elapsed time and phase allowance;
+it does not name Oxide's earlier `CLOCK_UPTIME_RAW` start. Sampling a remaining
+duration before launch leaves launch delay unbounded, and the helper's later
+clock sample adds an unmeasured residual. The capture plan therefore keeps the
+original-window binding unproven. Its parser and arithmetic are source controls,
+not a clock conversion, settlement receipt or permission to launch. The
+`docs:check` selector also starts nested Effigy commands; each receives a
+sampled remaining duration and starts its own clock, so that route requires
+an independently established original-window bound as well. The observed
+admission protocol is preserved and bound, not forced to a synthetic value.
 
 The pinned `4aba8be3` guard has five summary call sites: two in
 `finish_monitor` and three in `Monitor.run`, each ending in a return or stop.
