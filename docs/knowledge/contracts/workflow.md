@@ -2338,6 +2338,12 @@ applicable separately activated diagnostic before a counted run.
 
 ## Shared proof supervisor
 
+The [cooperative qualification acceptance contract](cooperative-qualification.md)
+is a proposed replacement boundary for the held 309 chain, authorized for
+drafting and independent review only. It changes no current instruction,
+qualified source pin, selector, task hold or execution policy. Its narrower
+resource promises are not active for any run.
+
 **Interim admission allowance (Tom, 2026-10-22).** Until Queue #381's
 admission-hook adapter lands, Oxide native proofs may use Effigy `heavy`
 inline, with a fresh owner scheduler headroom receipt immediately before

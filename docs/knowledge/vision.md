@@ -317,6 +317,14 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
 
 ## Validation policy
 
+Tom decision `57374e05-7506-4a7b-b296-9642e136e3f3` v2 (2026-11-16)
+selects a [proposed cooperative qualification contract](contracts/cooperative-qualification.md)
+and independent review: preserve all 445 cases, use a 600-second work/stop
+target and 512 MiB monitored scratch, with blocking/reap time and all-owned
+physical peak unguaranteed. This authorizes drafting only. It adopts no
+replacement execution policy, implementation or proof activation; AGENTS.md,
+existing briefs and 309/061/304 dispatch and merge holds remain binding.
+
 Tom decision `c6e3e9c8` v2 (2026-11-04) separates capture delivery from
 private launcher qualification for the bounded O2 capture tasks. Their named
 capture-only Cargo selectors cover build and embedded harness behavior; they
